@@ -28,3 +28,4 @@ hex.workspace = true
 bytes.workspace = true
 dotenvy.workspace = true
 sqlx.workspace = true
+async-stream = "0.3"
