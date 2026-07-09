@@ -1,0 +1,17 @@
+# Local dev composition. Only the LiteLLM model gateway runs in Docker here;
+# the fluidbox server and dashboard run on the host (`just dev`).
+#
+# LiteLLM is pinned to a known-clean release and bound to loopback only.
+# Sandboxes never talk to it — only the fluidbox session facade does.
+services:
+  litellm:
+    image: ${LITELLM_IMAGE:-ghcr.io/berriai/litellm:main-v1.91.1}
+    command: ["--config", "/etc/litellm/config.yaml", "--port", "4000"]
+    ports:
+      - "127.0.0.1:4000:4000"
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+    volumes:
+      - ./litellm/config.yaml:/etc/litellm/config.yaml:ro
+    restart: unless-stopped
