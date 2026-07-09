@@ -60,23 +60,26 @@ impl SessionStatus {
         if self.is_terminal() {
             return false;
         }
-        match (self, next) {
-            (Created, Provisioning) | (Created, Cancelled) => true,
-            (Provisioning, Initializing) | (Provisioning, Failed) | (Provisioning, Cancelled) => {
-                true
-            }
-            (Initializing, Running) | (Initializing, Failed) | (Initializing, Cancelled) => true,
-            (Running, AwaitingApproval)
-            | (Running, Completed)
-            | (Running, Failed)
-            | (Running, Cancelled)
-            | (Running, BudgetExceeded) => true,
-            (AwaitingApproval, Running)
-            | (AwaitingApproval, Failed)
-            | (AwaitingApproval, Cancelled)
-            | (AwaitingApproval, BudgetExceeded) => true,
-            _ => false,
-        }
+        matches!(
+            (self, next),
+            (Created, Provisioning)
+                | (Created, Cancelled)
+                | (Provisioning, Initializing)
+                | (Provisioning, Failed)
+                | (Provisioning, Cancelled)
+                | (Initializing, Running)
+                | (Initializing, Failed)
+                | (Initializing, Cancelled)
+                | (Running, AwaitingApproval)
+                | (Running, Completed)
+                | (Running, Failed)
+                | (Running, Cancelled)
+                | (Running, BudgetExceeded)
+                | (AwaitingApproval, Running)
+                | (AwaitingApproval, Failed)
+                | (AwaitingApproval, Cancelled)
+                | (AwaitingApproval, BudgetExceeded)
+        )
     }
 }
 
