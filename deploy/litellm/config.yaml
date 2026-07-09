@@ -1,0 +1,30 @@
+# LiteLLM gateway configuration for fluidbox.
+# The fluidbox session facade is the only client; it authenticates with
+# LITELLM_MASTER_KEY. Provider keys live here and only here.
+
+model_list:
+  - model_name: claude-opus-4-8
+    litellm_params:
+      model: anthropic/claude-opus-4-8
+      api_key: os.environ/ANTHROPIC_API_KEY
+  - model_name: claude-sonnet-5
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: anthropic/claude-haiku-4-5-20251001
+      api_key: os.environ/ANTHROPIC_API_KEY
+  # Catch-all: any claude-* model id the Agent SDK sends (incl. dated ids)
+  # routes to Anthropic unchanged.
+  - model_name: "claude-*"
+    litellm_params:
+      model: "anthropic/claude-*"
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+litellm_settings:
+  # Never let an unknown param 400 a native Anthropic request.
+  drop_params: true
