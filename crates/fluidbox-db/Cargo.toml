@@ -1,0 +1,20 @@
+[package]
+name = "fluidbox-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fluidbox-core.workspace = true
+sqlx.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+hex.workspace = true
