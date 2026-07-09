@@ -54,7 +54,7 @@ sha2 = "0.10"
 hex = "0.4"
 globset = "0.4"
 regex = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 bytes = "1"
 async-trait = "0.1"
 dotenvy = "0.15"
