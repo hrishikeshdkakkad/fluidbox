@@ -41,6 +41,8 @@ sqlx = { version = "0.9", default-features = false, features = [
     "chrono",
     "json",
     "migrate",
+    "macros",
+    "derive",
 ] }
 reqwest = { version = "0.13", default-features = false, features = [
     "rustls",
