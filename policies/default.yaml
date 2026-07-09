@@ -1,0 +1,98 @@
+# fluidbox seed policy. First-match-wins over `tools`; anything unmatched
+# falls back to defaults.tool_action (fail-safe: ask a human).
+name: default
+defaults:
+  tool_action: approve
+egress:
+  mode: proxy-only
+budgets:
+  max_wall_clock_secs: 1800
+  max_tokens: 2000000
+  max_cost_usd: 5.0
+  max_tool_calls: 200
+approvals:
+  default_ttl_secs: 600
+  scope: once
+  timeout_action: deny
+autonomy:
+  permitted: true
+  on_approval_rule: deny
+tools:
+  # Reading and searching are safe anywhere in the sandbox.
+  - match: ["Read", "Glob", "Grep", "LS", "TodoWrite", "Task", "NotebookRead"]
+    action: allow
+
+  # Edits are free inside the workspace; anything else asks a human.
+  - match: ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+    action: allow
+    paths:
+      allow: ["/workspace/**"]
+      deny: ["**/.env", "**/.env.*", "**/.git/config", "**/.git/hooks/**"]
+
+  # Shell: a benign toolbox is pre-approved; destructive or exfiltrating
+  # patterns are denied outright; everything else pauses for approval.
+  - match: ["Bash", "BashOutput", "KillShell"]
+    action: allow
+    shell:
+      allow_prefixes:
+        - "ls"
+        - "cat"
+        - "head"
+        - "tail"
+        - "wc"
+        - "grep"
+        - "rg"
+        - "find"
+        - "pwd"
+        - "echo"
+        - "which"
+        - "env | grep"
+        - "python"
+        - "python3"
+        - "pytest"
+        - "pip install -r"
+        - "node"
+        - "npm test"
+        - "npm run test"
+        - "npx jest"
+        - "npx vitest"
+        - "cargo test"
+        - "cargo build"
+        - "cargo check"
+        - "go test"
+        - "make test"
+        - "git status"
+        - "git diff"
+        - "git log"
+        - "git add"
+        - "git commit"
+        - "git show"
+        - "cd"
+        - "mkdir"
+        - "touch"
+        - "mv"
+        - "cp"
+        - "sed"
+        - "awk"
+      deny_regex:
+        - "rm\\s+-[a-z]*r[a-z]*f?\\s+/(?:\\s|$)"   # rm -rf /
+        - "\\bcurl\\b"
+        - "\\bwget\\b"
+        - "\\bnc\\b"
+        - "\\bssh\\b"
+        - "\\bscp\\b"
+        - "git\\s+push\\s+--force"
+        - "\\bsudo\\b"
+        - "/etc/passwd"
+        - "\\bchmod\\s+777\\b"
+      on_no_match: approve
+
+  # Network tools: the sandbox has no business fetching the internet.
+  - match: ["WebFetch", "WebSearch"]
+    action: deny
+    risk: network egress from sandbox
+
+  # Any MCP tool that shows up asks a human until bundles land (M3).
+  - match: ["mcp__*"]
+    action: approve
+    risk: unreviewed MCP tool
