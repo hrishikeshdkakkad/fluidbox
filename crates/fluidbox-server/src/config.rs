@@ -1,5 +1,15 @@
 use std::path::PathBuf;
 
+/// Docker bind mounts require absolute host paths. Resolve the data dir to an
+/// absolute path at startup (creating it first so canonicalize succeeds).
+fn absolute(p: &str) -> PathBuf {
+    let path = PathBuf::from(p);
+    std::fs::create_dir_all(&path).ok();
+    std::fs::canonicalize(&path).unwrap_or_else(|_| {
+        std::env::current_dir().map(|d| d.join(&path)).unwrap_or(path)
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind: String,
@@ -40,7 +50,7 @@ impl Config {
                 .map_err(|_| anyhow::anyhow!("FLUIDBOX_ADMIN_TOKEN is required"))?,
             public_control_url: get("FLUIDBOX_PUBLIC_CONTROL_URL")
                 .unwrap_or_else(|_| "http://host.docker.internal:8787".into()),
-            data_dir: PathBuf::from(get("FLUIDBOX_DATA_DIR").unwrap_or_else(|_| "./data".into())),
+            data_dir: absolute(&get("FLUIDBOX_DATA_DIR").unwrap_or_else(|_| "./data".into())),
             sandbox_image: get("FLUIDBOX_SANDBOX_IMAGE")
                 .unwrap_or_else(|_| "fluidbox-sandbox-runner:dev".into()),
             default_model: get("FLUIDBOX_DEFAULT_MODEL")
