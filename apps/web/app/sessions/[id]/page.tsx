@@ -1,0 +1,336 @@
+"use client";
+
+import { use, useEffect, useRef, useState, useCallback } from "react";
+import Link from "next/link";
+import {
+  apiGet,
+  apiPost,
+  streamUrl,
+  isTerminal,
+  Session,
+  Approval,
+  Artifact,
+  Usage,
+  EventRow,
+} from "../../lib/api";
+import { Pill, AutoPill, DiffView, short } from "../../components/bits";
+
+export default function SessionDetail({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = use(params);
+  const [session, setSession] = useState<Session | null>(null);
+  const [usage, setUsage] = useState<Usage | null>(null);
+  const [events, setEvents] = useState<EventRow[]>([]);
+  const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  const seenSeq = useRef<Set<number>>(new Set());
+
+  const loadMeta = useCallback(async () => {
+    try {
+      const s = await apiGet<{ session: Session; usage: Usage }>(`/sessions/${id}`);
+      setSession(s.session);
+      setUsage(s.usage);
+      const a = await apiGet<{ approvals: Approval[] }>(`/sessions/${id}/approvals`);
+      setApprovals(a.approvals);
+      const ar = await apiGet<{ artifacts: Artifact[] }>(`/sessions/${id}/artifacts`);
+      setArtifacts(ar.artifacts);
+    } catch {
+      /* ignore */
+    }
+  }, [id]);
+
+  // Live SSE timeline.
+  useEffect(() => {
+    const es = new EventSource(streamUrl(id));
+    es.onmessage = (e) => {
+      try {
+        const ev: EventRow = JSON.parse(e.data);
+        if (seenSeq.current.has(ev.seq)) return;
+        seenSeq.current.add(ev.seq);
+        setEvents((prev) => [...prev, ev]);
+        // React to lifecycle-relevant events by refreshing meta.
+        if (
+          ["session.status_changed", "approval.requested", "approval.decided", "run.result", "model.response"].includes(
+            ev.type,
+          )
+        ) {
+          loadMeta();
+        }
+      } catch {
+        /* skip */
+      }
+    };
+    es.onerror = () => {
+      /* browser auto-reconnects with Last-Event-ID */
+    };
+    return () => es.close();
+  }, [id, loadMeta]);
+
+  useEffect(() => {
+    loadMeta();
+    const t = setInterval(loadMeta, 4000);
+    return () => clearInterval(t);
+  }, [loadMeta]);
+
+  const decide = async (approvalId: string, decision: string) => {
+    await apiPost(`/approvals/${approvalId}/decision`, { decision, decided_by: "dashboard" });
+    loadMeta();
+  };
+
+  const cancel = async () => {
+    await apiPost(`/sessions/${id}/cancel`, {});
+    loadMeta();
+  };
+
+  const pending = approvals.filter((a) => a.status === "pending");
+  const diff = artifacts.find((a) => a.kind === "diff");
+  const summary = artifacts.find((a) => a.kind === "summary");
+  const terminal = session ? isTerminal(session.status) : false;
+
+  return (
+    <>
+      <div className="pagehead">
+        <div>
+          <div className="eyebrow">
+            <Link href="/" className="link">
+              operations
+            </Link>{" "}
+            / session {short(id)}
+          </div>
+          <h1 className="title" style={{ fontSize: 22 }}>
+            {session?.task || "…"}
+          </h1>
+          <div className="sub" style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 8 }}>
+            {session && <Pill status={session.status} />}
+            {session && <AutoPill autonomy={session.autonomy} />}
+          </div>
+        </div>
+        {session && !terminal && (
+          <button className="btn danger" onClick={cancel}>
+            Cancel run
+          </button>
+        )}
+      </div>
+
+      {/* Approval banners */}
+      {pending.map((a) => (
+        <div className="approval" key={a.id} style={{ marginBottom: 14 }}>
+          <span className="icon">⏸</span>
+          <div className="txt">
+            <div className="h">approval needed{a.risk ? ` · ${a.risk}` : ""}</div>
+            <div className="d">
+              <b className="mono" style={{ color: "var(--ink)" }}>
+                {a.tool}
+              </b>{" "}
+              — <span className="mono">{a.summary}</span>
+            </div>
+          </div>
+          <div className="acts">
+            <button className="btn human" onClick={() => decide(a.id, "approved_once")}>
+              Approve once
+            </button>
+            <button className="btn sm ghost" onClick={() => decide(a.id, "approved_session")}>
+              Approve session
+            </button>
+            <button className="btn sm ghost danger" onClick={() => decide(a.id, "denied")}>
+              Deny
+            </button>
+          </div>
+        </div>
+      ))}
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 300px", gap: 18, alignItems: "start" }}>
+        {/* Timeline */}
+        <div className="panel pad">
+          <div className="sectitle" style={{ marginTop: 0 }}>
+            timeline
+          </div>
+          {events.length === 0 ? (
+            <div className="empty">waiting for events…</div>
+          ) : (
+            <div className="timeline">
+              {events.map((ev) => (
+                <TimelineItem key={ev.seq} ev={ev} />
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Cost + meta */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <div className="panel pad">
+            <div className="sectitle" style={{ marginTop: 0 }}>
+              cost & usage
+            </div>
+            <CostRow label="Cost" value={`$${(usage?.cost_usd || 0).toFixed(4)}`} />
+            <CostRow label="Input tok" value={(usage?.input_tokens || 0).toLocaleString()} />
+            <CostRow label="Output tok" value={(usage?.output_tokens || 0).toLocaleString()} />
+            <CostRow label="Cache read" value={(usage?.cache_read_tokens || 0).toLocaleString()} />
+            <CostRow label="Model calls" value={String(usage?.requests || 0)} />
+          </div>
+
+          {session && (
+            <div className="panel pad">
+              <div className="sectitle" style={{ marginTop: 0 }}>
+                run spec
+              </div>
+              <div className="chips" style={{ flexDirection: "column", alignItems: "flex-start" }}>
+                <span className="chip">
+                  autonomy <b>{session.autonomy}</b>
+                </span>
+                {session.base_commit && (
+                  <span className="chip">
+                    base <b>{session.base_commit.slice(0, 10)}</b>
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Result summary */}
+      {summary && (
+        <>
+          <div className="sectitle">result</div>
+          <div className="panel pad" style={{ whiteSpace: "pre-wrap", fontSize: 13.5 }}>
+            {summary.content}
+          </div>
+        </>
+      )}
+
+      {/* Diff */}
+      {diff && (
+        <>
+          <div className="sectitle">changes</div>
+          <DiffView content={diff.content} />
+        </>
+      )}
+    </>
+  );
+}
+
+function CostRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="spread" style={{ padding: "5px 0", borderBottom: "1px solid var(--line-soft)" }}>
+      <span className="mut mono" style={{ fontSize: 11.5 }}>
+        {label}
+      </span>
+      <span className="mono tnum" style={{ fontSize: 13 }}>
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function TimelineItem({ ev }: { ev: EventRow }) {
+  const d = ev.payload?.data || {};
+  const s = (k: string) => (d[k] == null ? "" : String(d[k]));
+  let cls = "";
+  let tag = ev.type.split(".")[1] || ev.type;
+  let body: React.ReactNode = ev.type;
+
+  switch (ev.type) {
+    case "session.created":
+      body = (
+        <>
+          run created for agent <span className="em">{s("agent")}</span>
+        </>
+      );
+      break;
+    case "session.status_changed":
+      cls = s("to") === "failed" || s("to") === "budget_exceeded" ? "danger" : s("to") === "completed" ? "good" : "accent";
+      tag = "status";
+      body = (
+        <>
+          → <span className="em">{s("to")}</span>
+          {s("reason") ? ` · ${s("reason")}` : ""}
+        </>
+      );
+      break;
+    case "workspace.initialized":
+      tag = "workspace";
+      body = <>workspace ready ({s("files")} files)</>;
+      break;
+    case "agent.message":
+      tag = s("role") === "system" ? "system" : "agent";
+      body = <span style={{ color: s("role") === "system" ? "var(--muted)" : undefined }}>{s("text")}</span>;
+      break;
+    case "tool.requested":
+      cls = "accent";
+      tag = "tool";
+      body = (
+        <>
+          <code>{s("tool")}</code> {s("summary")}
+        </>
+      );
+      break;
+    case "tool.decision": {
+      const v = s("verdict");
+      cls = v === "allow" ? "good" : "danger";
+      tag = "decision";
+      body = (
+        <>
+          {v === "allow" ? "✓ allowed" : "✗ denied"}{" "}
+          <span className="mut">({s("source")})</span>
+          {s("original_verdict") ? <span className="mut"> · was {s("original_verdict")}</span> : null}
+        </>
+      );
+      break;
+    }
+    case "approval.requested":
+      cls = "human";
+      tag = "approval";
+      body = (
+        <>
+          human approval requested for <code>{s("tool")}</code>
+        </>
+      );
+      break;
+    case "approval.decided":
+      cls = "human";
+      tag = "approval";
+      body = (
+        <>
+          {s("decision")} by <span className="em">{s("decided_by")}</span>
+        </>
+      );
+      break;
+    case "model.response":
+      tag = "model";
+      body = (
+        <span className="mut">
+          {s("model")} · in {s("input_tokens")} out {s("output_tokens")} · ${Number(d.cost_usd || 0).toFixed(4)}
+        </span>
+      );
+      break;
+    case "budget.exceeded":
+      cls = "danger";
+      tag = "budget";
+      body = (
+        <>
+          budget <span className="em">{s("budget")}</span> exceeded (limit {s("limit")})
+        </>
+      );
+      break;
+    case "run.result":
+      cls = s("outcome") === "completed" ? "good" : "danger";
+      tag = "result";
+      body = <>run {s("outcome")}</>;
+      break;
+    case "run.error":
+      cls = "danger";
+      tag = "error";
+      body = <span style={{ color: "var(--danger)" }}>{s("message")}</span>;
+      break;
+  }
+
+  return (
+    <div className={`tl-item ${cls}`}>
+      <span className="node" />
+      <div className="tl-line">
+        <span className="tl-tag">{tag}</span>
+        <span className="tl-body">{body}</span>
+      </div>
+    </div>
+  );
+}
