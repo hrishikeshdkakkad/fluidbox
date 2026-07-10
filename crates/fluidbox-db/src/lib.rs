@@ -489,6 +489,7 @@ pub struct TriggerSubscriptionRow {
     pub allow_task_override: bool,
     pub allow_workspace_override: bool,
     pub autonomy: Option<String>,
+    pub concurrency_policy: String,
     pub budget_override: Option<Value>,
     pub workspace_override: Option<Value>,
     pub result_destinations: Value,
@@ -498,7 +499,7 @@ pub struct TriggerSubscriptionRow {
 
 const SUBSCRIPTION_COLS: &str = "id, tenant_id, agent_id, name, trigger_kind, pinned_revision_id, \
      enabled, task_template, allow_task_override, allow_workspace_override, autonomy, \
-     budget_override, workspace_override, result_destinations, created_at, updated_at";
+     concurrency_policy, budget_override, workspace_override, result_destinations, created_at, updated_at";
 
 #[allow(clippy::too_many_arguments)]
 pub async fn create_trigger_subscription(
@@ -512,6 +513,7 @@ pub async fn create_trigger_subscription(
     allow_task_override: bool,
     allow_workspace_override: bool,
     autonomy: Option<&str>,
+    concurrency_policy: &str,
     budget_override: Option<&Value>,
     workspace_override: Option<&Value>,
     result_destinations: &Value,
@@ -520,9 +522,9 @@ pub async fn create_trigger_subscription(
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "insert into trigger_subscriptions
            (id, tenant_id, agent_id, name, trigger_kind, pinned_revision_id, task_template,
-            allow_task_override, allow_workspace_override, autonomy, budget_override,
-            workspace_override, result_destinations, callback_secret_sealed)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+            allow_task_override, allow_workspace_override, autonomy, concurrency_policy,
+            budget_override, workspace_override, result_destinations, callback_secret_sealed)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
          returning {SUBSCRIPTION_COLS}"
     )))
     .bind(Uuid::now_v7())
@@ -535,6 +537,7 @@ pub async fn create_trigger_subscription(
     .bind(allow_task_override)
     .bind(allow_workspace_override)
     .bind(autonomy)
+    .bind(concurrency_policy)
     .bind(budget_override)
     .bind(workspace_override)
     .bind(result_destinations)
@@ -610,8 +613,10 @@ pub async fn create_session(
     run_spec: &Value,
     budgets: &Value,
     trigger: Option<&Value>,
+    bind_invocation: Option<Uuid>,
 ) -> sqlx::Result<SessionRow> {
-    sqlx::query_as(
+    let mut tx = pool.begin().await?;
+    let row: SessionRow = sqlx::query_as(
         "insert into sessions
            (id, tenant_id, agent_id, agent_revision_id, autonomy, task, repo_source, run_spec, budgets, trigger)
          values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
@@ -627,8 +632,20 @@ pub async fn create_session(
     .bind(run_spec)
     .bind(budgets)
     .bind(trigger)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    // Atomic claim bind: the run and its idempotency claim commit together,
+    // so a crash can never orphan a created run from its claim (which would
+    // let the stale-claim takeover duplicate it).
+    if let Some(invocation) = bind_invocation {
+        sqlx::query("update trigger_invocations set session_id = $2 where id = $1")
+            .bind(invocation)
+            .bind(row.id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(row)
 }
 
 pub async fn get_session(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<SessionRow>> {
@@ -1091,6 +1108,9 @@ pub enum InvocationClaim {
         session_id: Uuid,
         request_digest: String,
     },
+    /// This key's firing was skipped (overlap | missed | error: …) — a
+    /// terminal outcome; replays of the key return it forever.
+    Skipped { reason: String },
     /// Another request holds the key mid-creation — caller should 409.
     InFlight,
 }
@@ -1122,7 +1142,7 @@ pub async fn claim_invocation(
         });
     }
     let existing = sqlx::query(
-        "select id, session_id, request_digest, created_at from trigger_invocations
+        "select id, session_id, request_digest, skip_reason, created_at from trigger_invocations
          where subscription_id = $1 and idempotency_key = $2",
     )
     .bind(subscription)
@@ -1135,12 +1155,17 @@ pub async fn claim_invocation(
             request_digest: existing.get("request_digest"),
         });
     }
+    if let Some(reason) = existing.get::<Option<String>, _>("skip_reason") {
+        return Ok(InvocationClaim::Skipped { reason });
+    }
     // Unbound claim: take it over only once it is stale (crashed creator).
+    // Skipped rows are terminal — never stealable.
     let takeover = sqlx::query(
         "update trigger_invocations
             set created_at = now(), request_digest = $3
           where subscription_id = $1 and idempotency_key = $2
-            and session_id is null and created_at < now() - interval '60 seconds'
+            and session_id is null and skip_reason is null
+            and created_at < now() - interval '60 seconds'
           returning id",
     )
     .bind(subscription)
@@ -1156,6 +1181,8 @@ pub async fn claim_invocation(
     })
 }
 
+/// Post-hoc claim bind. Being replaced by the atomic bind inside
+/// create_session — kept only until every caller has switched.
 pub async fn bind_invocation(pool: &PgPool, invocation: Uuid, session: Uuid) -> sqlx::Result<()> {
     sqlx::query("update trigger_invocations set session_id = $2 where id = $1")
         .bind(invocation)
@@ -1163,6 +1190,68 @@ pub async fn bind_invocation(pool: &PgPool, invocation: Uuid, session: Uuid) -> 
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// A skipped firing is the terminal state of its claim row: visibly
+/// recorded, never re-claimable. Guarded on session_id so a bound run can
+/// never be relabelled a skip.
+pub async fn mark_invocation_skipped(
+    pool: &PgPool,
+    invocation: Uuid,
+    reason: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "update trigger_invocations set skip_reason = $2
+         where id = $1 and session_id is null",
+    )
+    .bind(invocation)
+    .bind(reason)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct TriggerInvocationRow {
+    pub id: Uuid,
+    pub subscription_id: Uuid,
+    pub idempotency_key: String,
+    pub session_id: Option<Uuid>,
+    pub skip_reason: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+pub async fn list_subscription_invocations(
+    pool: &PgPool,
+    subscription: Uuid,
+    limit: i64,
+) -> sqlx::Result<Vec<TriggerInvocationRow>> {
+    sqlx::query_as(
+        "select id, subscription_id, idempotency_key, session_id, skip_reason, created_at
+         from trigger_invocations where subscription_id = $1
+         order by created_at desc limit $2",
+    )
+    .bind(subscription)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Non-terminal runs of a subscription — the concurrency-policy input.
+pub async fn active_subscription_sessions(
+    pool: &PgPool,
+    subscription: Uuid,
+) -> sqlx::Result<Vec<SessionRow>> {
+    sqlx::query_as(
+        "select s.* from sessions s
+         join trigger_invocations i on i.session_id = s.id
+         where i.subscription_id = $1
+           and s.status not in ('completed','failed','cancelled','budget_exceeded')
+         order by s.created_at",
+    )
+    .bind(subscription)
+    .fetch_all(pool)
+    .await
 }
 
 /// Free a claim whose run creation failed, so an immediate retry can re-try.
@@ -1323,6 +1412,106 @@ pub async fn list_subscription_deliveries(
     .await
 }
 
+// ─── Schedules (Phase 3: the clock on a subscription) ────────────────────
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct ScheduleRow {
+    pub id: Uuid,
+    pub subscription_id: Uuid,
+    pub cron: String,
+    pub timezone: String,
+    pub next_fire_at: Option<DateTime<Utc>>,
+    pub missed_run_policy: String,
+    pub last_fired_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+pub async fn create_schedule(
+    pool: &PgPool,
+    subscription: Uuid,
+    cron: &str,
+    timezone: &str,
+    next_fire_at: DateTime<Utc>,
+    missed_run_policy: &str,
+) -> sqlx::Result<ScheduleRow> {
+    sqlx::query_as(
+        "insert into schedules (id, subscription_id, cron, timezone, next_fire_at, missed_run_policy)
+         values ($1, $2, $3, $4, $5, $6) returning *",
+    )
+    .bind(Uuid::now_v7())
+    .bind(subscription)
+    .bind(cron)
+    .bind(timezone)
+    .bind(next_fire_at)
+    .bind(missed_run_policy)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn schedule_for_subscription(
+    pool: &PgPool,
+    subscription: Uuid,
+) -> sqlx::Result<Option<ScheduleRow>> {
+    sqlx::query_as("select * from schedules where subscription_id = $1")
+        .bind(subscription)
+        .fetch_optional(pool)
+        .await
+}
+
+pub async fn schedules_for_tenant(pool: &PgPool, tenant: Uuid) -> sqlx::Result<Vec<ScheduleRow>> {
+    sqlx::query_as(
+        "select sc.* from schedules sc
+         join trigger_subscriptions sub on sub.id = sc.subscription_id
+         where sub.tenant_id = $1",
+    )
+    .bind(tenant)
+    .fetch_all(pool)
+    .await
+}
+
+/// Due work for the (single, sequential) scheduler worker — same no-locking
+/// contract as due_result_deliveries. A disabled subscription's schedule is
+/// not due and does NOT advance: re-enabling turns the gap into a
+/// missed-run case, exactly like a scheduler outage.
+pub async fn due_schedules(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<ScheduleRow>> {
+    sqlx::query_as(
+        "select sc.* from schedules sc
+         join trigger_subscriptions sub on sub.id = sc.subscription_id
+         where sc.next_fire_at is not null and sc.next_fire_at <= now() and sub.enabled
+         order by sc.next_fire_at limit $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// CAS advance: only moves the clock if next_fire_at is still the fire time
+/// this worker processed — two workers can never double-advance past an
+/// unhandled fire time.
+pub async fn advance_schedule(
+    pool: &PgPool,
+    id: Uuid,
+    from: DateTime<Utc>,
+    to: Option<DateTime<Utc>>,
+    fired_at: Option<DateTime<Utc>>,
+) -> sqlx::Result<bool> {
+    let res = sqlx::query(
+        "update schedules set
+            next_fire_at = $2,
+            last_fired_at = coalesce($3, last_fired_at),
+            updated_at = now()
+         where id = $1 and next_fire_at = $4",
+    )
+    .bind(id)
+    .bind(to)
+    .bind(fired_at)
+    .bind(from)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 pub async fn create_trigger_token(
     pool: &PgPool,
     tenant: Uuid,
@@ -1469,6 +1658,7 @@ mod tests {
             &serde_json::json!({}),
             &serde_json::json!({}),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1548,6 +1738,7 @@ mod tests {
             &empty,
             &empty,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1561,6 +1752,7 @@ mod tests {
             &repo,
             &empty,
             &empty,
+            None,
             None,
         )
         .await
@@ -1711,6 +1903,7 @@ mod tests {
             false,
             false,
             None,
+            "allow",
             None,
             None,
             &serde_json::json!([{"kind": "signed_webhook", "url": "http://127.0.0.1:1/cb"}]),
@@ -1814,6 +2007,7 @@ mod tests {
             false,
             false,
             None,
+            "allow",
             None,
             None,
             &serde_json::json!([]),
@@ -1838,7 +2032,8 @@ mod tests {
             InvocationClaim::InFlight
         ));
 
-        // Bind to a real session, then the same key replays that session.
+        // Bind atomically with session creation (same transaction), then
+        // the same key replays that session.
         let session = create_session(
             &pool,
             tenant,
@@ -1850,13 +2045,11 @@ mod tests {
             &serde_json::json!({}),
             &serde_json::json!({}),
             Some(&serde_json::json!({"kind":"api"})),
+            Some(invocation_id),
         )
         .await
         .unwrap();
         assert_eq!(session.trigger, Some(serde_json::json!({"kind":"api"})));
-        bind_invocation(&pool, invocation_id, session.id)
-            .await
-            .unwrap();
         let c3 = claim_invocation(&pool, sub.id, "key-1", "digest-a")
             .await
             .unwrap();
@@ -1908,6 +2101,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schedule_lifecycle_and_skip_claims() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let agent = create_agent(&pool, tenant, "test-sched-agent", None)
+            .await
+            .unwrap();
+        let sub = create_trigger_subscription(
+            &pool,
+            tenant,
+            agent.id,
+            &format!("test-sched-{}", Uuid::now_v7()),
+            "schedule",
+            None,
+            Some("maintenance sweep"),
+            false,
+            false,
+            None,
+            "skip_if_running",
+            None,
+            None,
+            &serde_json::json!([]),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sub.concurrency_policy, "skip_if_running");
+
+        // Overdue schedule → due; disabled subscription → not due.
+        let past = Utc::now() - chrono::Duration::seconds(1);
+        let sched = create_schedule(&pool, sub.id, "*/5 * * * * *", "UTC", past, "skip")
+            .await
+            .unwrap();
+        assert!(due_schedules(&pool, 50)
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.id == sched.id));
+        set_trigger_subscription_enabled(&pool, sub.id, false)
+            .await
+            .unwrap();
+        assert!(!due_schedules(&pool, 50)
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.id == sched.id));
+        set_trigger_subscription_enabled(&pool, sub.id, true)
+            .await
+            .unwrap();
+
+        // Deterministic fire key: claim once, mark skipped, replay the skip.
+        let key = "sched:2026-07-10T00:00:00Z";
+        let claim = claim_invocation(&pool, sub.id, key, "d1").await.unwrap();
+        let InvocationClaim::Claimed { invocation_id } = claim else {
+            panic!("expected Claimed, got {claim:?}");
+        };
+        mark_invocation_skipped(&pool, invocation_id, "missed")
+            .await
+            .unwrap();
+        let again = claim_invocation(&pool, sub.id, key, "d1").await.unwrap();
+        let InvocationClaim::Skipped { reason } = again else {
+            panic!("expected Skipped, got {again:?}");
+        };
+        assert_eq!(reason, "missed");
+        let inv = list_subscription_invocations(&pool, sub.id, 10)
+            .await
+            .unwrap();
+        assert_eq!(inv.len(), 1);
+        assert_eq!(inv[0].skip_reason.as_deref(), Some("missed"));
+        assert!(inv[0].session_id.is_none());
+
+        // CAS advance: succeeds from the processed fire time, then refuses.
+        // (`stored` is read back so both sides carry Postgres µs precision.)
+        use chrono::SubsecRound;
+        let stored = schedule_for_subscription(&pool, sub.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .next_fire_at
+            .unwrap();
+        let future = (Utc::now() + chrono::Duration::seconds(60)).trunc_subsecs(6);
+        assert!(
+            advance_schedule(&pool, sched.id, stored, Some(future), None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !advance_schedule(&pool, sched.id, stored, Some(future), None)
+                .await
+                .unwrap()
+        );
+        let row = schedule_for_subscription(&pool, sub.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.next_fire_at, Some(future));
+        assert!(row.last_fired_at.is_none()); // skips never touch last_fired_at
+        assert!(!due_schedules(&pool, 50)
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.id == sched.id));
+
+        // Cleanup (cascades schedules + invocations).
+        sqlx::query("delete from trigger_subscriptions where id = $1")
+            .bind(sub.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn result_delivery_attempt_state_machine() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
             eprintln!("skipping: DATABASE_URL not set");
@@ -1950,6 +2258,7 @@ mod tests {
             &serde_json::json!({"kind":"scratch"}),
             &serde_json::json!({}),
             &serde_json::json!({}),
+            None,
             None,
         )
         .await
