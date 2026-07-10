@@ -33,6 +33,11 @@ pub fn spawn_all(state: AppState) {
     tokio::spawn(approval_expiry(state));
 }
 
+/// A healthy orchestrator moves created → provisioning → initializing in
+/// seconds (initializing: minutes at worst for a big repo copy). Older than
+/// this, the control plane died mid-launch and nothing owns the session.
+const STALE_LAUNCH_MINS: i32 = 15;
+
 /// Fail sessions whose sandbox died or whose heartbeat went stale.
 async fn watchdog(state: AppState) {
     let mut tick = tokio::time::interval(Duration::from_secs(15));
@@ -64,6 +69,23 @@ async fn watchdog(state: AppState) {
                     }
                 }
             }
+        }
+
+        // Sessions stuck before launch (created/provisioning/initializing).
+        match fluidbox_db::stale_nonstarted_sessions(&state.pool, STALE_LAUNCH_MINS).await {
+            Ok(stale) => {
+                for s in stale {
+                    tracing::warn!(
+                        "watchdog: {} stalled in '{}' for >{}m — failing",
+                        s.id,
+                        s.status,
+                        STALE_LAUNCH_MINS
+                    );
+                    orchestrator::fail(&state, s.id, "stalled before launch (control plane interrupted)")
+                        .await;
+                }
+            }
+            Err(e) => tracing::warn!("stale-launch sweep failed: {e}"),
         }
     }
 }
