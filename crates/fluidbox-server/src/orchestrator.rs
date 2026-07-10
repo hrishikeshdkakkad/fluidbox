@@ -361,22 +361,17 @@ pub async fn reap(state: &AppState, id: Uuid) {
     }
 }
 
-/// Cancel a session (admin action). Captures whatever the agent produced so
-/// far as the diff artifact, then tears everything down.
-pub async fn cancel(state: &AppState, id: Uuid) -> bool {
+/// Cancel a session (admin action, or a `replace` concurrency policy).
+/// Captures whatever the agent produced so far as the diff artifact, then
+/// tears everything down.
+pub async fn cancel(state: &AppState, id: Uuid, reason: &str) -> bool {
     let Ok(Some(session)) = fluidbox_db::get_session(&state.pool, id).await else {
         return false;
     };
     if session.status_enum().is_terminal() {
         return false;
     }
-    let ok = transition(
-        state,
-        id,
-        SessionStatus::Cancelled,
-        Some("cancelled by user"),
-    )
-    .await;
+    let ok = transition(state, id, SessionStatus::Cancelled, Some(reason)).await;
     if ok {
         reap(state, id).await;
         capture_diff_and_cleanup(state, &session).await;
