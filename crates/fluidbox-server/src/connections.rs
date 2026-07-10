@@ -132,6 +132,7 @@ pub async fn create(
         &serde_json::to_value(&scopes)?,
         &json!({}),
         &json!({ "login": login }),
+        None,
     )
     .await?;
     Ok(Json(json!({ "connection": row })))
