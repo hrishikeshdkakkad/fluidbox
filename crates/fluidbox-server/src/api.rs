@@ -422,6 +422,7 @@ pub async fn create_session(
             task: req.task,
             explicit_workspace: explicit,
             autonomy,
+            trust_tier: fluidbox_core::spec::TrustTier::Trusted,
             budget_override: req.budgets,
             invocation: InvocationContext {
                 kind: InvocationKind::Manual,
@@ -433,6 +434,7 @@ pub async fn create_session(
             },
             result_destinations: vec![],
             bound_invocation: None,
+            bound_dispatch: None,
         },
     )
     .await?;

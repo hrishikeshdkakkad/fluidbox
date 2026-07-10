@@ -176,6 +176,7 @@ async fn build_and_create(
             task,
             explicit_workspace,
             autonomy,
+            trust_tier: fluidbox_core::spec::TrustTier::Trusted,
             budget_override,
             invocation: InvocationContext {
                 kind: InvocationKind::Schedule,
@@ -192,6 +193,7 @@ async fn build_and_create(
             },
             result_destinations,
             bound_invocation: Some(invocation_id),
+            bound_dispatch: None,
         },
     )
     .await
