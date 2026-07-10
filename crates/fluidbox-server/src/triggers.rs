@@ -9,6 +9,7 @@ use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::Json;
+use fluidbox_core::schedule::{ConcurrencyPolicy, CronSchedule, MissedRunPolicy};
 use fluidbox_core::spec::{
     Autonomy, Budgets, InvocationContext, InvocationKind, ResultDestination, WorkspaceSpec,
 };
@@ -58,6 +59,51 @@ pub fn render_task_template(
     }
     out.push_str(rest);
     Ok(out)
+}
+
+/// The template context a schedule firing renders with. Kept deliberately
+/// small: schedules have no external caller, so `fire_time` (RFC3339 UTC)
+/// is the only variable input.
+pub fn schedule_context(fire_time: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([("fire_time".to_string(), fire_time.to_string())])
+}
+
+/// Subscription-stored run parameters shared by every borrow path (API
+/// invoke and schedule firing).
+pub struct SubRunParams {
+    pub autonomy: Autonomy,
+    pub budget_override: Option<Budgets>,
+    pub result_destinations: Vec<ResultDestination>,
+    /// The subscription's workspace override, if any.
+    pub workspace: Option<WorkspaceSpec>,
+}
+
+pub fn sub_run_params(sub: &fluidbox_db::TriggerSubscriptionRow) -> ApiResult<SubRunParams> {
+    let autonomy = match sub.autonomy.as_deref() {
+        Some("autonomous") => Autonomy::Autonomous,
+        _ => Autonomy::Supervised,
+    };
+    let budget_override: Option<Budgets> = sub
+        .budget_override
+        .as_ref()
+        .map(|v| serde_json::from_value(v.clone()))
+        .transpose()
+        .map_err(|e| ApiError::Internal(format!("bad stored budget override: {e}")))?;
+    let result_destinations: Vec<ResultDestination> =
+        serde_json::from_value(sub.result_destinations.clone())
+            .map_err(|e| ApiError::Internal(format!("bad stored destinations: {e}")))?;
+    let workspace: Option<WorkspaceSpec> = sub
+        .workspace_override
+        .as_ref()
+        .map(|v| serde_json::from_value(v.clone()))
+        .transpose()
+        .map_err(|e| ApiError::Internal(format!("bad stored subscription workspace: {e}")))?;
+    Ok(SubRunParams {
+        autonomy,
+        budget_override,
+        result_destinations,
+        workspace,
+    })
 }
 
 /// Narrow a git workspace within the subscription's authority: swap the
@@ -173,6 +219,24 @@ pub struct CreateTrigger {
     /// Pin the run to a specific revision id; omitted = always latest.
     #[serde(default)]
     pub pinned_revision_id: Option<Uuid>,
+    /// allow (default) | skip_if_running | replace — enforced for ALL
+    /// invocations of this subscription (§17 #5).
+    #[serde(default)]
+    pub concurrency_policy: Option<String>,
+    /// Attach a clock: the subscription becomes trigger_kind='schedule'.
+    #[serde(default)]
+    pub schedule: Option<ScheduleInput>,
+}
+
+#[derive(Deserialize)]
+pub struct ScheduleInput {
+    pub cron: String,
+    /// IANA name; defaults to UTC. Explicit so next-fire is DST-correct.
+    #[serde(default)]
+    pub timezone: Option<String>,
+    /// skip (default) | catch_up (§17 #5).
+    #[serde(default)]
+    pub missed_run_policy: Option<String>,
 }
 
 pub async fn create(
@@ -209,6 +273,50 @@ pub async fn create(
             "provide a task_template or set allow_task_override".into(),
         ));
     }
+    let concurrency = req.concurrency_policy.as_deref().unwrap_or("allow");
+    if ConcurrencyPolicy::parse(concurrency).is_none() {
+        return Err(ApiError::BadRequest(
+            "concurrency_policy must be allow | skip_if_running | replace".into(),
+        ));
+    }
+    // A schedule fires with no caller: the cron/timezone must parse, the
+    // template must exist and render from the schedule context alone, and
+    // there must actually be a future firing.
+    let schedule_cfg = match &req.schedule {
+        None => None,
+        Some(s) => {
+            let tz = s.timezone.as_deref().unwrap_or("UTC");
+            let cron = CronSchedule::parse(&s.cron, tz).map_err(ApiError::BadRequest)?;
+            let missed = s.missed_run_policy.as_deref().unwrap_or("skip");
+            if MissedRunPolicy::parse(missed).is_none() {
+                return Err(ApiError::BadRequest(
+                    "missed_run_policy must be skip | catch_up".into(),
+                ));
+            }
+            let tpl = template.ok_or_else(|| {
+                ApiError::BadRequest("a schedule needs a task_template (there is no caller)".into())
+            })?;
+            render_task_template(tpl, &schedule_context("2026-01-01T00:00:00Z")).map_err(|e| {
+                ApiError::BadRequest(format!(
+                    "task_template must render from the schedule context ({{{{fire_time}}}}): {e}"
+                ))
+            })?;
+            let first = cron.next_fire_after(chrono::Utc::now()).ok_or_else(|| {
+                ApiError::BadRequest("cron expression never fires in the future".into())
+            })?;
+            Some((
+                s.cron.trim().to_string(),
+                tz.to_string(),
+                missed.to_string(),
+                first,
+            ))
+        }
+    };
+    let trigger_kind = if schedule_cfg.is_some() {
+        "schedule"
+    } else {
+        "api"
+    };
     let workspace_value = match req.workspace {
         None => None,
         Some(input) => match crate::api::resolve_workspace_input(&state, input).await? {
@@ -244,13 +352,13 @@ pub async fn create(
         state.tenant_id,
         agent.id,
         name,
-        "api",
+        trigger_kind,
         req.pinned_revision_id,
         template,
         req.allow_task_override,
         req.allow_workspace_override,
         req.autonomous.then_some("autonomous"),
-        "allow",
+        concurrency,
         req.budgets
             .as_ref()
             .map(serde_json::to_value)
@@ -271,9 +379,17 @@ pub async fn create(
     let token = random_hex_token(TOKEN_PREFIX);
     fluidbox_db::create_trigger_token(&state.pool, state.tenant_id, sub.id, &token).await?;
 
+    let schedule_row = match schedule_cfg {
+        None => None,
+        Some((cron, tz, missed, first)) => Some(
+            fluidbox_db::create_schedule(&state.pool, sub.id, &cron, &tz, first, &missed).await?,
+        ),
+    };
+
     // token + callback_secret appear ONLY here, once, at creation.
     Ok(Json(json!({
         "subscription": sub,
+        "schedule": schedule_row,
         "token": token,
         "callback_secret": secret_plain,
     })))
@@ -282,7 +398,10 @@ pub async fn create(
 pub async fn list(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let subscriptions =
         fluidbox_db::list_trigger_subscriptions(&state.pool, state.tenant_id).await?;
-    Ok(Json(json!({ "subscriptions": subscriptions })))
+    let schedules = fluidbox_db::schedules_for_tenant(&state.pool, state.tenant_id).await?;
+    Ok(Json(
+        json!({ "subscriptions": subscriptions, "schedules": schedules }),
+    ))
 }
 
 pub async fn get(
@@ -296,8 +415,11 @@ pub async fn get(
         .ok_or(ApiError::NotFound)?;
     let sessions = fluidbox_db::list_subscription_sessions(&state.pool, id, 20).await?;
     let deliveries = fluidbox_db::list_subscription_deliveries(&state.pool, id, 20).await?;
+    let schedule = fluidbox_db::schedule_for_subscription(&state.pool, id).await?;
+    let invocations = fluidbox_db::list_subscription_invocations(&state.pool, id, 30).await?;
     Ok(Json(json!({
-        "subscription": sub, "sessions": sessions, "deliveries": deliveries
+        "subscription": sub, "schedule": schedule, "sessions": sessions,
+        "deliveries": deliveries, "invocations": invocations
     })))
 }
 
@@ -454,15 +576,16 @@ pub async fn invoke(
         }
     };
 
+    let SubRunParams {
+        autonomy,
+        budget_override,
+        result_destinations: destinations,
+        workspace: sub_workspace,
+    } = sub_run_params(&sub)?;
+
     // Effective workspace: subscription override > (narrowed by caller when
     // allowed). When neither exists, create_run falls through to the agent
     // revision default and then scratch — same precedence as every run.
-    let sub_workspace: Option<WorkspaceSpec> = sub
-        .workspace_override
-        .as_ref()
-        .map(|v| serde_json::from_value(v.clone()))
-        .transpose()
-        .map_err(|e| ApiError::Internal(format!("bad stored subscription workspace: {e}")))?;
     let explicit_workspace = match &body.workspace {
         None => sub_workspace,
         Some(nw) => {
@@ -547,20 +670,6 @@ pub async fn invoke(
         }
         fluidbox_db::InvocationClaim::Claimed { invocation_id } => invocation_id,
     };
-
-    let autonomy = match sub.autonomy.as_deref() {
-        Some("autonomous") => Autonomy::Autonomous,
-        _ => Autonomy::Supervised,
-    };
-    let budget_override: Option<Budgets> = sub
-        .budget_override
-        .as_ref()
-        .map(|v| serde_json::from_value(v.clone()))
-        .transpose()
-        .map_err(|e| ApiError::Internal(format!("bad stored budget override: {e}")))?;
-    let destinations: Vec<ResultDestination> =
-        serde_json::from_value(sub.result_destinations.clone())
-            .map_err(|e| ApiError::Internal(format!("bad stored destinations: {e}")))?;
 
     let invocation = InvocationContext {
         kind: InvocationKind::Api,
@@ -793,6 +902,17 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    #[test]
+    fn schedule_context_renders_fire_time_only() {
+        let ctx = schedule_context("2026-07-10T00:00:00Z");
+        assert_eq!(
+            render_task_template("sweep at {{fire_time}}", &ctx).unwrap(),
+            "sweep at 2026-07-10T00:00:00Z"
+        );
+        // A schedule template referencing caller keys is dead config.
+        assert!(render_task_template("do {{ticket}}", &ctx).is_err());
     }
 
     #[test]
