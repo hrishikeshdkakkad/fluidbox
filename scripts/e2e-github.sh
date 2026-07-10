@@ -400,6 +400,11 @@ if [ "${E2E_SKIP_LIVE:-0}" = "1" ] || [ -z "${ANTHROPIC_API_KEY:-}" ] \
    || ! curl -fsS -m 2 http://127.0.0.1:4000/health/liveliness >/dev/null 2>&1; then
   echo "  SKIP: live tier needs ANTHROPIC_API_KEY + gateway (E2E_SKIP_LIVE=${E2E_SKIP_LIVE:-0})"
 else
+  # Isolate the live lane: the no-model subs also listen on acme/site and
+  # would fan out (and publish) for this PR too.
+  for SUB in "$SUBA" "$SUBB" "$SUBC" "$SUBF"; do
+    curl -s -X POST -H "$H" "$API/v1/triggers/$SUB/disable" >/dev/null
+  done
   LB='{"max_wall_clock_secs": 240, "max_cost_usd": 0.30}'
   mk_live() { # name agent focus → sub id
     post "/agents" "{\"name\":\"$2\",\"policy\":\"default\"}" >/dev/null
@@ -427,10 +432,12 @@ else
   [ "$COMPLETED" = "3" ] && ok "three live reviews completed in three isolated workspaces" || no "completed: $COMPLETED/3"
   wait_req POST "/repos/acme/site/issues/7/comments" 3 "" 40 \
     && ok "three attributable PR comments published" || no "live comments: $(req_count POST '/repos/acme/site/issues/7/comments')"
+  NAMED=0
   for A in "live-correct-agent-$$" "live-style-agent-$$" "live-tests-agent-$$"; do
-    [ "$(req_count POST "/repos/acme/site/issues/7/comments" "$A")" = "1" ] || { no "missing attributable comment for $A"; continue; }
+    wait_req POST "/repos/acme/site/issues/7/comments" 1 "$A" 20 \
+      && NAMED=$((NAMED+1)) || no "missing attributable comment for $A"
   done
-  ok "each comment names its agent (independent, attributable results)"
+  [ "$NAMED" = "3" ] && ok "each comment names its agent (independent, attributable results)" || no "attributable comments: $NAMED/3"
 fi
 
 say "RESULT"
