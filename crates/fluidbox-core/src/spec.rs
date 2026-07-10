@@ -1,4 +1,6 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 /// Who answers the permission question: a waiting human, or the policy's
@@ -26,6 +28,58 @@ pub enum TrustTier {
     #[default]
     Trusted,
     ReadOnly,
+}
+
+/// Why a run exists (design doc §3.4) — the provider-neutral envelope frozen
+/// into the RunSpec and stored on `sessions.trigger`. Phase 2 uses
+/// `manual` and `api`; `schedule`/`event` arrive with later phases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InvocationKind {
+    #[default]
+    Manual,
+    Api,
+    Schedule,
+    Event,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InvocationContext {
+    pub kind: InvocationKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_id: Option<Uuid>,
+    /// Human-attributable origin, e.g. "trigger:<subscription name>".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// Caller-supplied structured context (untrusted external text — it is
+    /// context, never system instruction).
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub attributes: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_at: Option<DateTime<Utc>>,
+}
+
+impl Default for InvocationContext {
+    /// The default an old frozen RunSpec deserializes to: a manual run.
+    fn default() -> Self {
+        Self {
+            kind: InvocationKind::Manual,
+            subscription_id: None,
+            actor: None,
+            attributes: Value::Null,
+            received_at: None,
+        }
+    }
+}
+
+/// Where a run's canonical result is published (design doc §3.7). The run's
+/// artifacts and ledger stay in fluidbox either way; publication is
+/// asynchronous and independently retryable. Secrets are NOT part of the
+/// destination — the signing secret stays sealed on the subscription.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ResultDestination {
+    SignedWebhook { url: String },
 }
 
 /// Budgets frozen into the RunSpec. `max_wall_clock_secs: None` means the
@@ -154,6 +208,12 @@ pub struct RunSpec {
     /// Full parsed policy snapshot — the run is governed by this exact
     /// document even if the policy row is edited later.
     pub policy_snapshot: crate::policy::Policy,
+    /// Why this run exists. `#[serde(default)]` keeps every pre-Phase-2
+    /// frozen RunSpec deserializable (defaults to a manual invocation).
+    #[serde(default)]
+    pub invocation: InvocationContext,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub result_destinations: Vec<ResultDestination>,
 }
 
 #[cfg(test)]
@@ -266,6 +326,56 @@ mod tests {
             spec.workspace,
             WorkspaceSpec::LocalCopy { path: "/x".into() }
         );
+    }
+
+    #[test]
+    fn run_spec_without_invocation_defaults_to_manual() {
+        // Every frozen M1/Phase-1 RunSpec lacks these fields — they must
+        // deserialize forever, defaulting to a manual invocation.
+        let old = serde_json::json!({
+            "agent_id": Uuid::now_v7(), "agent_revision_id": Uuid::now_v7(),
+            "agent_name": "a", "harness": "claude-agent-sdk", "runner_image": "img",
+            "model": "m", "system_prompt": null, "task": "t",
+            "workspace": {"kind": "scratch"},
+            "autonomy": "supervised", "trust_tier": "trusted",
+            "budgets": {"max_wall_clock_secs": 1, "max_tokens": 1, "max_cost_usd": 1.0, "max_tool_calls": 1},
+            "policy_id": Uuid::now_v7(), "policy_version": 1,
+            "policy_snapshot": {"name": "p"}
+        });
+        let spec: RunSpec = serde_json::from_value(old).unwrap();
+        assert_eq!(spec.invocation.kind, InvocationKind::Manual);
+        assert!(spec.invocation.subscription_id.is_none());
+        assert!(spec.result_destinations.is_empty());
+    }
+
+    #[test]
+    fn invocation_context_roundtrips_api_kind() {
+        let sub = Uuid::now_v7();
+        let ctx = InvocationContext {
+            kind: InvocationKind::Api,
+            subscription_id: Some(sub),
+            actor: Some("trigger:nightly".into()),
+            attributes: serde_json::json!({"context": {"ticket": "INC-42"}}),
+            received_at: Some(chrono::Utc::now()),
+        };
+        let v = serde_json::to_value(&ctx).unwrap();
+        assert_eq!(v["kind"], "api");
+        let back: InvocationContext = serde_json::from_value(v).unwrap();
+        assert_eq!(back.subscription_id, Some(sub));
+    }
+
+    #[test]
+    fn result_destination_wire_shape() {
+        let d = ResultDestination::SignedWebhook {
+            url: "https://x.test/cb".into(),
+        };
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"kind": "signed_webhook", "url": "https://x.test/cb"})
+        );
+        let back: ResultDestination = serde_json::from_value(v).unwrap();
+        assert_eq!(back, d);
     }
 
     #[test]

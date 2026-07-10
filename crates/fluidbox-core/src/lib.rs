@@ -13,5 +13,7 @@ pub mod usage;
 
 pub use event::{EventBody, EventEnvelope, Redacted, Redactor};
 pub use policy::{EvaluationOutcome, Policy, ToolCallRequest, Verdict};
-pub use spec::{Autonomy, Budgets, RunSpec, TrustTier};
+pub use spec::{
+    Autonomy, Budgets, InvocationContext, InvocationKind, ResultDestination, RunSpec, TrustTier,
+};
 pub use state::SessionStatus;
