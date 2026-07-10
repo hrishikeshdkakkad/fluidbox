@@ -1,11 +1,204 @@
-//! Result payload + signed webhook delivery (design doc §9).
+//! Result payload + signed webhook delivery (design doc §9). Publication is
+//! asynchronous and independently retryable — a completed run stays
+//! completed even when its callback destination is down forever.
 
 use crate::error::ApiResult;
 use crate::state::AppState;
-use fluidbox_core::spec::RunSpec;
+use fluidbox_core::event::{Actor, EventBody};
+use fluidbox_core::spec::{ResultDestination, RunSpec};
 use fluidbox_db::SessionRow;
 use serde_json::{json, Value};
+use std::time::Duration;
 use uuid::Uuid;
+
+/// attempts→wait: 5s, 30s, 2m, 10m, 30m, then 1h forever (attempt n is the
+/// n-th failure; MAX_ATTEMPTS bounds the total).
+const BACKOFF_SECS: [i64; 6] = [5, 30, 120, 600, 1800, 3600];
+pub const MAX_ATTEMPTS: i32 = 6;
+const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub fn backoff_secs(attempt: i32) -> i64 {
+    BACKOFF_SECS
+        .get((attempt.max(1) - 1) as usize)
+        .copied()
+        .unwrap_or(3600)
+}
+
+/// `v1=<hex hmac-sha256(secret, "{timestamp}.{body}")>` — receivers verify
+/// by recomputing over the exact raw body bytes.
+pub fn sign_payload(secret: &str, timestamp: i64, body: &str) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac accepts any key length");
+    mac.update(timestamp.to_string().as_bytes());
+    mac.update(b".");
+    mac.update(body.as_bytes());
+    format!("v1={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+/// Called by the orchestrator on every transition into a terminal state.
+/// Failures here are logged, never propagated — result publication must not
+/// touch the run lifecycle (design §9).
+pub async fn enqueue_for_session(state: &AppState, session_id: Uuid) {
+    let Ok(Some(session)) = fluidbox_db::get_session(&state.pool, session_id).await else {
+        return;
+    };
+    let Ok(run_spec) = serde_json::from_value::<RunSpec>(session.run_spec.clone()) else {
+        return;
+    };
+    for dest in &run_spec.result_destinations {
+        let dest_json = match serde_json::to_value(dest) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        match fluidbox_db::enqueue_result_delivery(
+            &state.pool,
+            session_id,
+            run_spec.invocation.subscription_id,
+            &dest_json,
+        )
+        .await
+        {
+            Ok(d) => tracing::info!("enqueued result delivery {} for {session_id}", d.id),
+            Err(e) => tracing::error!("enqueue delivery for {session_id} failed: {e}"),
+        }
+    }
+}
+
+/// The delivery worker: single sequential loop (no locking needed — see
+/// due_result_deliveries). At-least-once semantics; receivers dedup on
+/// x-fluidbox-delivery.
+pub fn spawn_worker(state: AppState) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(3));
+        loop {
+            tick.tick().await;
+            let due = match fluidbox_db::due_result_deliveries(&state.pool, 10).await {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("delivery poll failed: {e}");
+                    continue;
+                }
+            };
+            for d in due {
+                attempt(&state, &d).await;
+            }
+        }
+    });
+}
+
+async fn attempt(state: &AppState, d: &fluidbox_db::ResultDeliveryRow) {
+    let outcome = try_deliver(state, d).await;
+    let (ok, err, digest) = match &outcome {
+        Ok(digest) => (true, None, Some(digest.as_str())),
+        Err(e) => (false, Some(e.as_str()), None),
+    };
+    let next_attempt = d.attempts + 1;
+    let updated = fluidbox_db::mark_delivery_attempt(
+        &state.pool,
+        d.id,
+        ok,
+        err,
+        digest,
+        backoff_secs(next_attempt),
+        MAX_ATTEMPTS,
+    )
+    .await;
+    let Ok(Some(row)) = updated else { return };
+    // Timeline visibility: record delivered / terminally-failed (not every
+    // intermediate retry — that's the deliveries table's job).
+    let url = row
+        .destination
+        .get("url")
+        .and_then(|u| u.as_str())
+        .unwrap_or("?")
+        .to_string();
+    match row.status.as_str() {
+        "delivered" => {
+            crate::ledger::record(
+                state,
+                row.session_id,
+                Actor::System,
+                EventBody::CallbackDelivered {
+                    delivery_id: row.id,
+                    url,
+                    attempt: row.attempts,
+                },
+            )
+            .await;
+        }
+        "failed" => {
+            crate::ledger::record(
+                state,
+                row.session_id,
+                Actor::System,
+                EventBody::CallbackFailed {
+                    delivery_id: row.id,
+                    url,
+                    attempts: row.attempts,
+                    error: row.last_error.clone().unwrap_or_default(),
+                },
+            )
+            .await;
+        }
+        _ => {}
+    }
+}
+
+/// One HTTP attempt. Returns the payload digest on 2xx.
+async fn try_deliver(
+    state: &AppState,
+    d: &fluidbox_db::ResultDeliveryRow,
+) -> Result<String, String> {
+    let dest: ResultDestination = serde_json::from_value(d.destination.clone())
+        .map_err(|e| format!("bad destination: {e}"))?;
+    let ResultDestination::SignedWebhook { url } = dest;
+    let sub_id = d
+        .subscription_id
+        .ok_or("delivery has no subscription (cannot resolve signing secret)")?;
+    let sealed = fluidbox_db::subscription_callback_secret_sealed(&state.pool, sub_id)
+        .await
+        .map_err(|e| format!("secret lookup failed: {e}"))?
+        .ok_or("subscription has no callback secret")?;
+    let sealer = state
+        .sealer
+        .as_ref()
+        .ok_or("FLUIDBOX_CREDENTIAL_KEY not configured")?;
+    let secret = sealer.open(&sealed).map_err(|e| e.to_string())?;
+
+    let session = fluidbox_db::get_session(&state.pool, d.session_id)
+        .await
+        .map_err(|e| format!("session lookup failed: {e}"))?
+        .ok_or("session vanished")?;
+    let payload = result_payload(state, &session, Some(d.id), Some(d.attempts + 1))
+        .await
+        .map_err(|e| format!("payload build failed: {e}"))?;
+    let body = payload.to_string();
+    let digest = format!("sha256:{}", fluidbox_db::sha256_hex(&body));
+    let ts = chrono::Utc::now().timestamp();
+    let sig = sign_payload(&secret, ts, &body);
+
+    let res = state
+        .http
+        .post(&url)
+        .timeout(DELIVERY_TIMEOUT)
+        .header("content-type", "application/json")
+        .header("x-fluidbox-event", "run.finished")
+        .header("x-fluidbox-delivery", d.id.to_string())
+        .header("x-fluidbox-timestamp", ts.to_string())
+        .header("x-fluidbox-signature", sig)
+        .body(body)
+        .send()
+        .await
+        // reqwest errors carry the URL, never headers/body — safe to store.
+        .map_err(|e| format!("request failed: {e}"))?;
+    if res.status().is_success() {
+        Ok(digest)
+    } else {
+        Err(format!("destination returned {}", res.status()))
+    }
+}
 
 /// The canonical run result (design §9): status, summary, artifacts, usage/
 /// cost, timestamps, invocation reference. Shared by the signed callback and
@@ -52,4 +245,39 @@ pub async fn result_payload(
             "content_type": a.content_type, "content": a.content,
         })).collect::<Vec<_>>(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signature_is_stable_and_verifiable() {
+        // Pinned vector — the e2e receiver recomputes this with
+        // `printf '%s.%s' ts body | openssl dgst -sha256 -hmac secret`.
+        let sig = sign_payload("fbx_whsec_test", 1_752_000_000, r#"{"a":1}"#);
+        // Exact vector cross-checked against
+        //   printf '%s.%s' 1752000000 '{"a":1}' | openssl dgst -sha256 -hmac fbx_whsec_test
+        assert_eq!(
+            sig,
+            "v1=b519ceca5a07a724c2e3aef9decbc4420a5cd7f303bfdf1a28a8c2b63625aa72"
+        );
+        assert_eq!(
+            sig,
+            sign_payload("fbx_whsec_test", 1_752_000_000, r#"{"a":1}"#)
+        );
+        assert_ne!(
+            sig,
+            sign_payload("fbx_whsec_test", 1_752_000_001, r#"{"a":1}"#)
+        );
+        assert_ne!(sig, sign_payload("other", 1_752_000_000, r#"{"a":1}"#));
+    }
+
+    #[test]
+    fn backoff_grows_then_caps() {
+        assert_eq!(backoff_secs(1), 5);
+        assert_eq!(backoff_secs(2), 30);
+        assert_eq!(backoff_secs(6), 3600);
+        assert_eq!(backoff_secs(99), 3600);
+    }
 }

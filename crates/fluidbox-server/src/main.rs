@@ -82,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
     // Boot-time housekeeping + background workers.
     workers::boot_orphan_sweep(state.clone()).await;
     workers::spawn_all(state.clone());
+    deliveries::spawn_worker(state.clone());
 
     let public = Router::new()
         .route("/health", get(api::health))
@@ -106,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/sessions/{id}/artifacts", get(api::list_artifacts))
         .route("/sessions/{id}/artifacts/{aid}", get(api::get_artifact))
         .route("/sessions/{id}/cost", get(api::get_cost))
+        .route("/sessions/{id}/deliveries", get(api::session_deliveries))
         .route("/approvals", get(api::approvals_inbox))
         .route("/approvals/{id}/decision", post(api::decide_approval))
         .route(
