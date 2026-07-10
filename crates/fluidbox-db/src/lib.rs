@@ -189,6 +189,35 @@ pub async fn upsert_policy(
     .await
 }
 
+/// Bootstrap a policy from a seed file only if it does not already exist.
+/// Returns the existing or newly-inserted row — so UI edits (which bump the
+/// version) are never clobbered by a later boot re-reading the disk YAML.
+pub async fn seed_policy_if_absent(
+    pool: &PgPool,
+    tenant: Uuid,
+    name: &str,
+    yaml_source: &str,
+    parsed: &Value,
+) -> sqlx::Result<(PolicyRow, bool)> {
+    if let Some(existing) = get_policy_by_name(pool, tenant, name).await? {
+        return Ok((existing, false));
+    }
+    let row = sqlx::query_as(
+        "insert into policies (id, tenant_id, name, yaml_source, parsed)
+         values ($1, $2, $3, $4, $5)
+         on conflict (tenant_id, name) do update set name = excluded.name
+         returning *",
+    )
+    .bind(Uuid::now_v7())
+    .bind(tenant)
+    .bind(name)
+    .bind(yaml_source)
+    .bind(parsed)
+    .fetch_one(pool)
+    .await?;
+    Ok((row, true))
+}
+
 pub async fn list_policies(pool: &PgPool, tenant: Uuid) -> sqlx::Result<Vec<PolicyRow>> {
     sqlx::query_as("select * from policies where tenant_id = $1 order by name")
         .bind(tenant)
