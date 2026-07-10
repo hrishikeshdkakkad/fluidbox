@@ -28,10 +28,15 @@ pub struct CreateRun {
     pub revision: RevisionSelector,
     pub task: String,
     /// Validated workspace the invocation supplies explicitly (precedence:
-    /// explicit > revision default > scratch). Callers validate their own
-    /// inputs (admin API: resolve_workspace_input; triggers: narrowing).
+    /// event-derived/explicit > revision default > scratch). Callers
+    /// validate their own inputs (admin API: resolve_workspace_input;
+    /// triggers: narrowing; events: connector normalization).
     pub explicit_workspace: Option<WorkspaceSpec>,
     pub autonomy: Autonomy,
+    /// Frozen into the RunSpec and enforced at the permission gate. Fork /
+    /// untrusted event sources arrive pre-downgraded to ReadOnly (§7.3);
+    /// nothing downstream can widen it back.
+    pub trust_tier: TrustTier,
     pub budget_override: Option<Budgets>,
     pub invocation: InvocationContext,
     pub result_destinations: Vec<ResultDestination>,
@@ -39,6 +44,9 @@ pub struct CreateRun {
     /// transaction) — a crash can never leave a created run unclaimed, so a
     /// stale-claim takeover can never duplicate it. None for manual runs.
     pub bound_invocation: Option<Uuid>,
+    /// Event fan-out claim (trigger_dispatches), bound in the same
+    /// transaction — same crash-safety argument as bound_invocation.
+    pub bound_dispatch: Option<Uuid>,
 }
 
 pub enum RunCreation {
@@ -176,7 +184,7 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
         task: req.task.clone(),
         workspace: workspace.clone(),
         autonomy: req.autonomy,
-        trust_tier: TrustTier::Trusted,
+        trust_tier: req.trust_tier,
         budgets: effective_budgets.clone(),
         policy_id: policy_row.id,
         policy_version: policy_row.version,
@@ -198,7 +206,7 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
         &serde_json::to_value(&effective_budgets)?,
         Some(&serde_json::to_value(&req.invocation)?),
         req.bound_invocation,
-        None,
+        req.bound_dispatch,
     )
     .await?;
 

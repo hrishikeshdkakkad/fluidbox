@@ -45,7 +45,7 @@ pub enum EventBody {
         tool_call_id: String,
         tool: String,
         verdict: String,
-        /// policy | human | autonomy_rewrite | timeout | session_scope
+        /// policy | human | autonomy_rewrite | timeout | session_scope | trust_tier
         source: String,
         /// Original policy verdict when a rewrite happened (autonomy).
         original_verdict: Option<String>,
