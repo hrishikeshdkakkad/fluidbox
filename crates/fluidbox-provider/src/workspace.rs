@@ -76,16 +76,23 @@ pub fn materialize_local(
 
     // Ensure a git repo + a base commit to diff against. If the source was
     // already a git repo we snapshot its current state as our base.
-    let is_git = dest.join(".git").exists();
-    if !is_git {
-        run_git(&dest, &["init", "-q"])?;
-        run_git(&dest, &["config", "user.email", "runner@fluidbox.local"])?;
-        run_git(&dest, &["config", "user.name", "fluidbox"])?;
-    } else {
-        // Make sure identity is set for the throwaway copy.
-        let _ = run_git(&dest, &["config", "user.email", "runner@fluidbox.local"]);
-        let _ = run_git(&dest, &["config", "user.name", "fluidbox"]);
+    // Always start a fresh git history in the copy so our base commit is
+    // meaningful and the source repo's objects don't bloat the diff. `copy_tree`
+    // already skipped any incoming .git, but a nested one is possible — remove it.
+    if dest.join(".git").exists() {
+        std::fs::remove_dir_all(dest.join(".git")).ok();
     }
+    run_git(&dest, &["init", "-q"])?;
+    run_git(&dest, &["config", "user.email", "runner@fluidbox.local"])?;
+    run_git(&dest, &["config", "user.name", "fluidbox"])?;
+
+    // Keep build/tooling junk out of the base commit and the captured diff,
+    // via git's LOCAL exclude (never written into the repo the agent sees).
+    let _ = std::fs::write(
+        dest.join(".git/info/exclude"),
+        "__pycache__/\n*.pyc\n*.pyo\n.pytest_cache/\nnode_modules/\n.DS_Store\n*.class\ntarget/\n.venv/\nvenv/\n*.egg-info/\n",
+    );
+
     run_git(&dest, &["add", "-A"])?;
     // Commit may be empty if nothing to add; allow it.
     let _ = run_git(&dest, &["commit", "-q", "--allow-empty", "-m", "fluidbox base"]);
