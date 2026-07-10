@@ -1,8 +1,15 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import { apiGet, apiPost, Agent, Revision } from "../lib/api";
+import { apiGet, apiPost, Agent, Revision, workspaceLabel } from "../lib/api";
 import { PageHead, short } from "../components/bits";
+import {
+  WorkspacePicker,
+  WorkspaceDraft,
+  emptyDraft,
+  specToDraft,
+  draftToInput,
+} from "../components/WorkspacePicker";
 
 export default function Agents() {
   const [agents, setAgents] = useState<Agent[]>([]);
@@ -82,6 +89,11 @@ export default function Agents() {
                           model <b>{r.model}</b>
                         </span>
                         {r.system_prompt && <span className="chip">prompt set</span>}
+                        {r.default_workspace && (
+                          <span className="chip">
+                            workspace <b>{workspaceLabel(r.default_workspace)}</b>
+                          </span>
+                        )}
                         <span className="chip">image {short(r.runner_image, 24)}</span>
                       </div>
                     ))}
@@ -138,6 +150,9 @@ function AddRevision({
 }) {
   const [model, setModel] = useState(current?.model || "claude-haiku-4-5");
   const [systemPrompt, setSystemPrompt] = useState(current?.system_prompt || "");
+  const [workspace, setWorkspace] = useState<WorkspaceDraft>(
+    specToDraft(current?.default_workspace)
+  );
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
@@ -146,9 +161,11 @@ function AddRevision({
     setBusy(true);
     try {
       // Inherits harness/policy/image/budgets from the latest revision.
+      // The workspace is sent explicitly (WYSIWYG): scratch clears a default.
       await apiPost(`/agents/${agentId}/revisions`, {
         model,
         system_prompt: systemPrompt.trim() || null,
+        default_workspace: draftToInput(workspace),
       });
       onAdded();
     } catch (e) {
@@ -195,6 +212,7 @@ function AddRevision({
               onChange={(e) => setSystemPrompt(e.target.value)}
             />
           </label>
+          <WorkspacePicker draft={workspace} onChange={setWorkspace} />
           {err && <div className="err">{err}</div>}
           <div className="spread" style={{ marginTop: 14 }}>
             <span className="mut" style={{ fontSize: 12 }}>
@@ -215,6 +233,7 @@ function NewAgent({ onClose, onCreated }: { onClose: () => void; onCreated: () =
   const [description, setDescription] = useState("");
   const [model, setModel] = useState("claude-haiku-4-5");
   const [systemPrompt, setSystemPrompt] = useState("");
+  const [workspace, setWorkspace] = useState<WorkspaceDraft>(emptyDraft("scratch"));
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
@@ -232,6 +251,7 @@ function NewAgent({ onClose, onCreated }: { onClose: () => void; onCreated: () =
         model,
         system_prompt: systemPrompt.trim() || null,
         policy: "default",
+        default_workspace: draftToInput(workspace),
       });
       onCreated();
     } catch (e) {
@@ -270,6 +290,7 @@ function NewAgent({ onClose, onCreated }: { onClose: () => void; onCreated: () =
             <span className="lab">System prompt (optional)</span>
             <textarea className="inp" style={{ minHeight: 70 }} value={systemPrompt} onChange={(e) => setSystemPrompt(e.target.value)} />
           </label>
+          <WorkspacePicker draft={workspace} onChange={setWorkspace} />
           {err && <div className="err">{err}</div>}
           <div className="spread" style={{ marginTop: 16 }}>
             <span className="mut" style={{ fontSize: 12 }}>
