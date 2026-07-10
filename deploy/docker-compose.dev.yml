@@ -5,7 +5,7 @@
 # Sandboxes never talk to it — only the fluidbox session facade does.
 services:
   litellm:
-    image: ${LITELLM_IMAGE:-ghcr.io/berriai/litellm:main-v1.91.1}
+    image: ${LITELLM_IMAGE:-ghcr.io/berriai/litellm:main-stable}
     command: ["--config", "/etc/litellm/config.yaml", "--port", "4000"]
     ports:
       - "127.0.0.1:4000:4000"
