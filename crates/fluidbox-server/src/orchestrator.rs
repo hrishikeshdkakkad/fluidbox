@@ -236,25 +236,15 @@ async fn materialize_workspace(
     Ok(Some(ws.host_dir))
 }
 
-/// Resolve a connection into an `Authorization` header value for git fetch.
+/// Resolve a connection into an `Authorization` header value for git fetch
+/// via the provider's connector (PAT, or a minted App installation token).
 /// Fails closed: missing/revoked connection or missing key stops the run
 /// during `initializing` — before any model spend.
 async fn connection_auth_header(state: &AppState, connection_id: Uuid) -> anyhow::Result<String> {
-    let sealed = fluidbox_db::connection_credential_sealed(&state.pool, connection_id)
+    let conn = fluidbox_db::get_connection(&state.pool, connection_id)
         .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!("connection {connection_id} is not active (revoked or missing)")
-        })?;
-    let sealer = state
-        .sealer
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("FLUIDBOX_CREDENTIAL_KEY not configured on the server"))?;
-    let token = sealer.open(&sealed)?;
-    use base64::Engine;
-    Ok(format!(
-        "basic {}",
-        base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"))
-    ))
+        .ok_or_else(|| anyhow::anyhow!("connection {connection_id} not found"))?;
+    crate::connectors::fetch_auth_header(state, &conn).await
 }
 
 /// Capture the diff artifact from the materialized workspace, then remove

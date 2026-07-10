@@ -77,6 +77,7 @@ async fn main() -> anyhow::Result<()> {
             .timeout(std::time::Duration::from_secs(15 * 60))
             .build()?,
         sealer,
+        connector_tokens: Default::default(),
         pool,
         cfg,
     });
