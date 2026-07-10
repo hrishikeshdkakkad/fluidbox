@@ -188,6 +188,7 @@ async fn build_and_create(
                     "catch_up": catch_up,
                 }),
                 received_at: Some(Utc::now()),
+                ..Default::default()
             },
             result_destinations,
             bound_invocation: Some(invocation_id),
