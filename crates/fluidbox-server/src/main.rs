@@ -6,6 +6,7 @@ mod connections;
 mod connectors;
 mod deliveries;
 mod error;
+mod events;
 mod facade;
 mod internal;
 mod ledger;
@@ -120,6 +121,16 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/connections/{id}/revoke", post(connections::revoke))
         .route("/connections/{id}/repos", get(connections::repos))
+        .route(
+            "/connections/{id}/deliveries",
+            get(events::connection_deliveries),
+        )
+        // Unauthenticated by design: the webhook signature (verified against
+        // the connection's sealed secret) is the authentication.
+        .route(
+            "/ingress/{provider}/{connection_id}",
+            post(events::ingress),
+        )
         .route("/triggers", get(triggers::list).post(triggers::create))
         .route("/triggers/{id}", get(triggers::get))
         .route("/triggers/{id}/enable", post(triggers::enable))
