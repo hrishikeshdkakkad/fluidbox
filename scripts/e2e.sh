@@ -2,7 +2,8 @@
 # `just e2e` — the one-command acceptance suite:
 #   phase 1: live demo A        (real model; self-skips without key/gateway)
 #   phase 2: governance plane   (policy, approvals, autonomy — no model)
-#   phase 3: failure paths      (budget stop, watchdog, restart — no model)
+#   phase 3: git workspaces     (clone/precedence/cleanup; live tier self-skips)
+#   phase 4: failure paths      (budget stop, watchdog, restart — no model)
 # Owns the stack: builds binaries, starts the gateway + control plane.
 # Refuses to run while `just dev` holds :8787.
 set -uo pipefail
@@ -32,13 +33,16 @@ trap 'stop_server' EXIT
 start_server || exit 1
 ok "stack up (gateway + control plane)"
 
-say "PHASE 1/3 — live demo A"
+say "PHASE 1/4 — live demo A"
 bash "$ROOT/scripts/e2e-live.sh" || SUITE_FAIL=1
 
-say "PHASE 2/3 — governance plane"
+say "PHASE 2/4 — governance plane"
 bash "$ROOT/scripts/governance-e2e.sh" || SUITE_FAIL=1
 
-say "PHASE 3/3 — failure paths"
+say "PHASE 3/4 — git workspaces"
+bash "$ROOT/scripts/e2e-git-workspace.sh" || SUITE_FAIL=1
+
+say "PHASE 4/4 — failure paths"
 stop_server   # the failure suite owns (and restarts) its own control plane
 bash "$ROOT/scripts/e2e-failures.sh" || SUITE_FAIL=1
 

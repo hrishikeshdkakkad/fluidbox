@@ -1,6 +1,6 @@
 # fluidbox — Session Handover
 
-**Date:** 2026-07-10 (rev 2: §6.A hardening shipped) · **State:** M0 + M1 complete + near-term hardening done; one-command acceptance suite green.
+**Date:** 2026-07-10 (rev 3: borrow-the-agent Phase 1 shipped) · **State:** M0 + M1 + §6.A hardening + **connected git workspaces (design-doc Phase 1)** done; `just e2e` = 71 checks green across 4 phases.
 
 Read `CLAUDE.md` (commands + invariants + gotchas) and `PLAN.md` (authoritative design + roadmap) alongside this. This doc is the "where we are right now / how to pick up" note.
 
@@ -15,7 +15,8 @@ M1 (the local-first governed MVP) is **done and proven live**, not just compiled
 - **Governance plane (demos B & C mechanics)** proven via `scripts/governance-e2e.sh` — 14/14 checks over real HTTP: policy allow/deny, approval pause→resume, `tool_call_id` idempotency, autonomous instant-deny with the ledger recording `source=autonomy_rewrite` + `original_verdict`.
 - **LLM gateway** (LiteLLM, pinned by digest) + Rust facade with SSE tee metering; the sandbox's fake `ANTHROPIC_API_KEY` is its session token, real key isolated to the gateway.
 - **Dashboard** (Next.js 16, control-room UI): Operations, New Run, live SSE timeline, agents registry + add-revision, approvals inbox, policies YAML editor + validate, settings/health.
-- **Quality bar:** `cargo clippy --workspace -D warnings` clean; 28 unit/integration tests green; **`just e2e` = 45 acceptance checks green** (9 live demo A + 14 governance + 22 failure-path). ~5,000 lines of Rust across 5 crates.
+- **Connected git workspaces (design-doc Phase 1, shipped 2026-07-10):** `WorkspaceSpec` (scratch | local_copy | git_repository) evolved from `RepoSource` with wire-compat aliases; GitHub **integration connections** (PAT validated against the GitHub API, AEAD-sealed at rest via `FLUIDBOX_CREDENTIAL_KEY`, never in any response/RunSpec/sandbox/ledger); repository picker (`GET /v1/connections/{id}/repos`); optional **default workspace on agent revisions** with resolution precedence explicit > revision default > scratch; control-plane-side clone of exact ref/commit (`materialize_git` — creds via `GIT_CONFIG_*` env only, origin remote removed, shallow + full-fetch fallback for SHAs); per-session workspace **cleanup after diff capture** (idempotent; `FLUIDBOX_KEEP_WORKSPACES=1` to keep); Connections page + workspace pickers in the dashboard; CLI `--git-url/--git-ref/--git-commit/--connection`.
+- **Quality bar:** `cargo clippy --workspace -D warnings` clean; 43 unit/integration tests green; **`just e2e` = 71 acceptance checks green** (9 live demo A + 14 governance + 26 git workspaces + 22 failure-path). ~7,000 lines of Rust across 5 crates.
 
 ## 2. What's running right now (dev environment)
 
@@ -44,7 +45,9 @@ Seeded state: agent `claude-fixer` is on **rev 4 = haiku** (current, so new runs
 - **Add-revision can't clear a system prompt** — omitting it inherits the previous revision's prompt (there's no "set to none" path). Minor API gap.
 - **No delete for agents/policies/sessions** — registry only grows in the UI. Fine for M1.
 - **LiteLLM runs under amd64 emulation on this arm64 Mac** — works, slightly slower boot. A native arm64 tag or `platform` override would speed it up.
-- **`git-url` repos are not enabled** — `RepoSource::GitUrl` bails in `orchestrator.rs`; only local paths / scratch workspaces work in M1 (by design — GitHub is roadmap).
+- **GitHub connections are PAT-based** (fine-grained PAT pasted in the Connections page, validated then sealed). A proper GitHub App installation flow arrives with webhook triggers (design-doc Phase 4). Design-doc §17 decision #1 (App identity vs user-delegated) is still open.
+- **`checkout_mode: read_only` is frozen intent only** — every checkout is a writable copy by construction; trust tiers keying off it come with fork-PR handling.
+- **Repo picker lists the first 100 repos by update time** (`per_page` capped at 100, `page` param supported); no search box yet.
 
 ## 5. How to resume common tasks
 
@@ -80,4 +83,10 @@ Implement `LambdaMicrovmProvider` behind the existing `ExecutionProvider` trait.
 ### D. Roadmap — triggers & integrations (descoped from MVP)
 GitHub App (webhook ingress, trigger router, fork-PR trust tier, Checks/PR-comment writers), then Slack/Jira. The seams (`sessions.trigger` jsonb, `trust_tier`, event-ingress boundary) already ship in M1 — a trigger just *creates a run of a registered agent*, so the run model doesn't change.
 
-**Sequence (user decision 2026-07-10):** ~~A~~ done → **next is the "borrow the agent, on demand" axis (D + the M3 bundle piece), ahead of B/M2 MicroVMs**. The user's priority list: (5) API + scheduled triggers, (6) custom tools/MCP bundles, (7) git sign-in + repo on agent config (enable `RepoSource::GitUrl`), (8) GitHub PR-review triggers / vertical integrations. Slice ordering within 5–8 is still open — brainstorm it first. **Read `docs/plans/2026-07-10-agent-workspaces-triggers-integrations-design.md` (user-authored, same day): it is the product/architecture direction for this exact phase** (workspace / invocation context / capabilities / result destination as the four optional inputs around an unchanged agent definition). PLAN.md roadmap order: trigger tokens → scheduled runs → result delivery → git sign-in → GitHub App.
+**Sequence (user decision 2026-07-10):** ~~A~~ done → **the "borrow the agent, on demand" axis (D + the M3 bundle piece), ahead of B/M2 MicroVMs**, following the phase order in **`docs/plans/2026-07-10-agent-workspaces-triggers-integrations-design.md` §12** (user-authored; the product/architecture direction for this whole axis).
+
+Progress against that roadmap:
+- **Phase 0 (hardening)** — ✅ done (§6.A above).
+- **Phase 1 (connected git workspace)** — ✅ **shipped 2026-07-10** (see §1). Acceptance: `scripts/e2e-git-workspace.sh` (suite phase 3/4) — precedence, exact ref/commit checkout, zero-spend init failure, cleanup, live agent fix inside a `file://` clone with the remote untouched. Real-GitHub pass is manual: connect a fine-grained PAT in Connections, pick a repo on an agent, run it.
+- **Phase 2 (generic API borrowing: scoped trigger tokens, trigger subscriptions, unified `create_run`, idempotency keys, signed result callbacks)** — ⏭ **next**.
+- Phases 3–7 (schedules, GitHub PR fan-out, capability/MCP catalog, second harness, more verticals) follow per the design doc.
