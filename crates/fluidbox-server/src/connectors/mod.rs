@@ -6,10 +6,6 @@
 //! n=1 discipline (§17 #8): plain match dispatch, no trait registry / SDK —
 //! adding Slack later means one new module + one arm in each match here.
 
-// Consumers arrive with events.rs and the publisher (same phase); this
-// allow is deleted when they land.
-#![allow(dead_code)]
-
 pub mod github;
 
 use axum::http::HeaderMap;
@@ -77,6 +73,24 @@ pub fn verify(
     match connector {
         "github" => github::verify(headers, body, secret),
         other => Err(format!("unknown connector '{other}'")),
+    }
+}
+
+/// Build the normalization context for a connector — the one place its
+/// provider-specific config knobs are read, so the ingress router stays
+/// provider-ignorant.
+pub fn normalize_ctx(
+    state: &crate::state::AppState,
+    connector: &str,
+    connection_id: Uuid,
+) -> NormalizeCtx {
+    let clone_base = match connector {
+        "github" => state.cfg.github_clone_base.clone(),
+        _ => String::new(),
+    };
+    NormalizeCtx {
+        connection_id,
+        clone_base,
     }
 }
 

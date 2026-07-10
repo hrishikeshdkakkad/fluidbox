@@ -37,7 +37,6 @@ pub struct Config {
     pub github_api_url: String,
     /// Base for repository clone URLs derived from event payloads
     /// (https://github.com in production; a file:// fixture root in e2e).
-    #[allow(dead_code)] // consumed by the event ingress (this phase)
     pub github_clone_base: String,
     /// Keep per-session workspace dirs after terminal diff capture (debug aid).
     pub keep_workspaces: bool,
