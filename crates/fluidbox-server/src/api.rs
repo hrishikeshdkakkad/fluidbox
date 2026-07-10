@@ -491,6 +491,8 @@ pub async fn create_session(
         policy_id: policy_row.id,
         policy_version: policy_row.version,
         policy_snapshot: policy,
+        invocation: Default::default(),
+        result_destinations: vec![],
     };
 
     let session = fluidbox_db::create_session(
