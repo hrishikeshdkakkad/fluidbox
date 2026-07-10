@@ -1,6 +1,6 @@
 # fluidbox — Session Handover
 
-**Date:** 2026-07-10 · **State:** M0 + M1 complete, built and verified end-to-end with a live agent.
+**Date:** 2026-07-10 (rev 2: §6.A hardening shipped) · **State:** M0 + M1 complete + near-term hardening done; one-command acceptance suite green.
 
 Read `CLAUDE.md` (commands + invariants + gotchas) and `PLAN.md` (authoritative design + roadmap) alongside this. This doc is the "where we are right now / how to pick up" note.
 
@@ -15,7 +15,7 @@ M1 (the local-first governed MVP) is **done and proven live**, not just compiled
 - **Governance plane (demos B & C mechanics)** proven via `scripts/governance-e2e.sh` — 14/14 checks over real HTTP: policy allow/deny, approval pause→resume, `tool_call_id` idempotency, autonomous instant-deny with the ledger recording `source=autonomy_rewrite` + `original_verdict`.
 - **LLM gateway** (LiteLLM, pinned by digest) + Rust facade with SSE tee metering; the sandbox's fake `ANTHROPIC_API_KEY` is its session token, real key isolated to the gateway.
 - **Dashboard** (Next.js 16, control-room UI): Operations, New Run, live SSE timeline, agents registry + add-revision, approvals inbox, policies YAML editor + validate, settings/health.
-- **Quality bar:** `cargo clippy --workspace -D warnings` clean; 25 unit/integration tests + 14 governance E2E checks green. ~4,900 lines of Rust across 5 crates.
+- **Quality bar:** `cargo clippy --workspace -D warnings` clean; 28 unit/integration tests green; **`just e2e` = 45 acceptance checks green** (9 live demo A + 14 governance + 22 failure-path). ~5,000 lines of Rust across 5 crates.
 
 ## 2. What's running right now (dev environment)
 
@@ -48,7 +48,8 @@ Seeded state: agent `claude-fixer` is on **rev 4 = haiku** (current, so new runs
 
 ## 5. How to resume common tasks
 
-- **Run the acceptance suite:** `set -a; source .env; set +a; cargo test --workspace` then `bash scripts/governance-e2e.sh`.
+- **Run the acceptance suite:** `just e2e` (stop `just dev` first — the suite owns the stack). Phases: live demo A (self-skips without `ANTHROPIC_API_KEY`), governance plane, failure paths. Unit tests: `set -a; source .env; set +a; cargo test --workspace`.
+- **Edit the seed policy:** change `policies/default.yaml` **and** the `seed_policy_semantics` test that pins it, then `just policy-sync` to push it to the running control plane (version++; in-flight runs keep their frozen snapshot).
 - **Live agent run:** ensure `ANTHROPIC_API_KEY` in `.env` + `just gateway-up`, then `cargo run -p fluidbox-cli -- run --task "…" --repo /abs/path` or use New Run in the dashboard.
 - **Change the default model:** Agents page → expand `claude-fixer` → Add revision (or `POST /v1/agents/{id}/revisions`). The current (latest) revision is what runs use.
 - **Rebuild the sandbox image** after editing `images/sandbox-runner/`: `just sandbox-build`.
@@ -59,11 +60,11 @@ Seeded state: agent `claude-fixer` is on **rev 4 = haiku** (current, so new runs
 
 Ordered by leverage. The seams for all of these already exist (that's the point of the M1 architecture) — none require reworking the core.
 
-### A. Near-term hardening (before scaling out) — ~1 short session
-The system is demo-proven but thin on failure-mode coverage. Highest-value before building M2:
-1. **Automate the demos as CI-runnable tests** — wrap demo A + `governance-e2e.sh` behind a `just e2e` that spins the gateway, seeds a temp repo, asserts `completed` + diff + cost. Right now they're manual.
-2. **Failure-path tests that PLAN.md lists but aren't automated:** kill a running container mid-run → watchdog fails + reaps; `max_tool_calls: 2` → `budget_exceeded`; restart server with a live sandbox → boot orphan sweep. The code paths exist; they need assertions.
-3. **The two reserved policy decisions** (PLAN.md §10): tune the shell-risk classifier (`policies/default.yaml` deny_regex/allow_prefixes) against real agent behavior, and pick real seed budget numbers. These are judgment calls best made now that you can watch real runs.
+### A. Near-term hardening — ✅ DONE 2026-07-10
+All three items shipped (plan: `docs/superpowers/plans/2026-07-10-6a-hardening.md`):
+1. **`just e2e`** — one command, three phases, 45 checks: `scripts/e2e.sh` orchestrates `e2e-live.sh` (demo A: live agent fixes a failing test → completed + diff + cost + isolation), `governance-e2e.sh`, `e2e-failures.sh`, over a shared `e2e-lib.sh`.
+2. **Failure paths automated** (`scripts/e2e-failures.sh`): tool-call budget stop, dead-container watchdog, restart orphan sweep (reaps unknown-session containers, spares live sessions), **plus a newly-found gap fixed**: sessions stuck in `created`/`provisioning`/`initializing` after a control-plane crash are now failed by a 15-min stale-launch sweep (`Created→Failed` edge added; two real zombie rows in Neon got cleaned by it).
+3. **PLAN §10 #1 + #3 resolved** from ledger data: classifier tuned (read-only utils allowed; any force-push spelling and split-flag `rm -rf /` denied) and budgets set to 1800 s / 1 M tokens / $2.50 / 100 tool calls — pinned by `seed_policy_semantics`. Bonus fix: `policy.budgets` was parsed but never read; it's now a **ceiling** at session creation. Live DB policy synced (v4).
 
 ### B. M2 — Lambda MicroVM provider + BYOC (the flagship runtime) — the big one
 Implement `LambdaMicrovmProvider` behind the existing `ExecutionProvider` trait. This is where "customer-owned execution" becomes real. Key work (all validated in PLAN.md §2/§7):
@@ -79,4 +80,4 @@ Implement `LambdaMicrovmProvider` behind the existing `ExecutionProvider` trait.
 ### D. Roadmap — triggers & integrations (descoped from MVP)
 GitHub App (webhook ingress, trigger router, fork-PR trust tier, Checks/PR-comment writers), then Slack/Jira. The seams (`sessions.trigger` jsonb, `trust_tier`, event-ingress boundary) already ship in M1 — a trigger just *creates a run of a registered agent*, so the run model doesn't change.
 
-**Recommended sequence:** do **A** first (cheap, de-risks everything downstream), then **B** (it's the product's headline promise and the hardest integration — worth tackling while the design is fresh), then **C**, then **D**.
+**Sequence (user decision 2026-07-10):** ~~A~~ done → **next is the "borrow the agent, on demand" axis (D + the M3 bundle piece), ahead of B/M2 MicroVMs**. The user's priority list: (5) API + scheduled triggers, (6) custom tools/MCP bundles, (7) git sign-in + repo on agent config (enable `RepoSource::GitUrl`), (8) GitHub PR-review triggers / vertical integrations. Slice ordering within 5–8 is still open — brainstorm it first (PLAN.md roadmap order is trigger tokens → scheduled runs → result delivery → git sign-in → GitHub App).
