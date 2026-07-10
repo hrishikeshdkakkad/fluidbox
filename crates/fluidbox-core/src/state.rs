@@ -110,7 +110,13 @@ mod tests {
     fn any_nonterminal_state_can_fail() {
         // A crashed control plane must be able to fail a session wherever
         // it was left — Created included (the stalled-launch sweep).
-        for s in [Created, Provisioning, Initializing, Running, AwaitingApproval] {
+        for s in [
+            Created,
+            Provisioning,
+            Initializing,
+            Running,
+            AwaitingApproval,
+        ] {
             assert!(s.can_transition_to(Failed), "{s:?} must be able to fail");
         }
     }

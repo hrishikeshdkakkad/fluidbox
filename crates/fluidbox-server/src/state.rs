@@ -19,7 +19,9 @@ pub struct ApprovalRegistry {
 impl ApprovalRegistry {
     pub async fn notifier(&self, approval_id: Uuid) -> Arc<Notify> {
         let mut w = self.waiters.lock().await;
-        w.entry(approval_id).or_insert_with(|| Arc::new(Notify::new())).clone()
+        w.entry(approval_id)
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone()
     }
 
     pub async fn wake(&self, approval_id: Uuid) {

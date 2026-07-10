@@ -56,13 +56,24 @@ pub async fn permission(
             let session_clone = session.clone();
             let state2 = state.clone();
             tokio::spawn(async move {
-                orchestrator::finalize(&state2, &session_clone, "budget_exceeded", Some("tool-call budget exceeded")).await;
+                orchestrator::finalize(
+                    &state2,
+                    &session_clone,
+                    "budget_exceeded",
+                    Some("tool-call budget exceeded"),
+                )
+                .await;
             });
-            return Ok(Json(json!({ "decision": "deny", "message": "tool-call budget exceeded" })));
+            return Ok(Json(
+                json!({ "decision": "deny", "message": "tool-call budget exceeded" }),
+            ));
         }
     }
 
-    let tool_req = ToolCallRequest { tool: req.tool.clone(), input: req.input.clone() };
+    let tool_req = ToolCallRequest {
+        tool: req.tool.clone(),
+        input: req.input.clone(),
+    };
     let outcome: EvaluationOutcome = policy.evaluate(&tool_req, run_spec.autonomy);
 
     match &outcome.effective {
@@ -74,10 +85,23 @@ pub async fn permission(
             emit_decision(&state, session.id, &req, &outcome, "deny", Some(reason)).await;
             Ok(Json(json!({ "decision": "deny", "message": reason })))
         }
-        Verdict::RequireApproval { risk, ttl_secs, scope, scope_key } => {
+        Verdict::RequireApproval {
+            risk,
+            ttl_secs,
+            scope,
+            scope_key,
+        } => {
             // Session-scope grant already given for this key?
             if fluidbox_db::has_session_grant(&state.pool, session.id, scope_key).await? {
-                emit_decision(&state, session.id, &req, &outcome, "allow", Some("session-approved")).await;
+                emit_decision(
+                    &state,
+                    session.id,
+                    &req,
+                    &outcome,
+                    "allow",
+                    Some("session-approved"),
+                )
+                .await;
                 return Ok(Json(json!({ "decision": "allow" })));
             }
 
@@ -289,10 +313,7 @@ pub async fn events(
     Ok(Json(json!({ "seq": seq })))
 }
 
-pub async fn heartbeat(
-    auth: SessionAuth,
-    State(state): State<AppState>,
-) -> ApiResult<Json<Value>> {
+pub async fn heartbeat(auth: SessionAuth, State(state): State<AppState>) -> ApiResult<Json<Value>> {
     fluidbox_db::heartbeat(&state.pool, auth.session_id).await?;
     Ok(Json(json!({ "ok": true })))
 }

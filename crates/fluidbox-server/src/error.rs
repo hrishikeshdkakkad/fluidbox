@@ -28,7 +28,9 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
             ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             ApiError::Conflict(_) => (StatusCode::CONFLICT, self.to_string()),
-            ApiError::UnprocessableEntity(_) => (StatusCode::UNPROCESSABLE_ENTITY, self.to_string()),
+            ApiError::UnprocessableEntity(_) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, self.to_string())
+            }
             ApiError::Db(e) => {
                 tracing::error!("db error: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())

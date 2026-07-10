@@ -6,7 +6,9 @@ fn absolute(p: &str) -> PathBuf {
     let path = PathBuf::from(p);
     std::fs::create_dir_all(&path).ok();
     std::fs::canonicalize(&path).unwrap_or_else(|_| {
-        std::env::current_dir().map(|d| d.join(&path)).unwrap_or(path)
+        std::env::current_dir()
+            .map(|d| d.join(&path))
+            .unwrap_or(path)
     })
 }
 

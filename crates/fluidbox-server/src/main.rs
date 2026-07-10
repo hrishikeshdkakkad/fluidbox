@@ -73,9 +73,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/agents", get(api::list_agents).post(api::create_agent))
         .route("/agents/{id}", get(api::get_agent))
         .route("/agents/{id}/revisions", post(api::add_revision))
-        .route("/policies", get(api::list_policies).post(api::upsert_policy))
+        .route(
+            "/policies",
+            get(api::list_policies).post(api::upsert_policy),
+        )
         .route("/policies/validate", post(api::validate_policy))
-        .route("/sessions", get(api::list_sessions).post(api::create_session))
+        .route(
+            "/sessions",
+            get(api::list_sessions).post(api::create_session),
+        )
         .route("/sessions/{id}", get(api::get_session))
         .route("/sessions/{id}/cancel", post(api::cancel_session))
         .route("/sessions/{id}/events", get(api::get_events))
