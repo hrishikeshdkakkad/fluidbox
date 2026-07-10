@@ -505,6 +505,7 @@ pub async fn create_session(
         &serde_json::to_value(&workspace)?,
         &serde_json::to_value(&run_spec)?,
         &serde_json::to_value(&effective_budgets)?,
+        None,
     )
     .await?;
 
