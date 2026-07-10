@@ -2,8 +2,14 @@
 
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
-import { apiGet, apiPost, isTerminal, Session, Agent } from "./lib/api";
+import { apiGet, apiPost, isTerminal, Session, Agent, Revision, workspaceLabel } from "./lib/api";
 import { Pill, AutoPill, PageHead, short } from "./components/bits";
+import {
+  WorkspacePicker,
+  WorkspaceDraft,
+  emptyDraft,
+  draftToInput,
+} from "./components/WorkspacePicker";
 
 export default function Operations() {
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -84,7 +90,8 @@ function NewRun({ onClose, onCreated }: { onClose: () => void; onCreated: () => 
   const [agents, setAgents] = useState<Agent[]>([]);
   const [agent, setAgent] = useState("claude-fixer");
   const [task, setTask] = useState("");
-  const [repo, setRepo] = useState("");
+  const [workspace, setWorkspace] = useState<WorkspaceDraft>(emptyDraft("default"));
+  const [agentDefault, setAgentDefault] = useState("scratch");
   const [autonomous, setAutonomous] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
@@ -92,6 +99,15 @@ function NewRun({ onClose, onCreated }: { onClose: () => void; onCreated: () => 
   useEffect(() => {
     apiGet<{ agents: Agent[] }>("/agents").then((r) => setAgents(r.agents)).catch(() => {});
   }, []);
+
+  // Show what "agent default" resolves to for the selected agent.
+  useEffect(() => {
+    const a = agents.find((x) => x.name === agent);
+    if (!a) return;
+    apiGet<{ revisions: Revision[] }>(`/agents/${a.id}`)
+      .then((r) => setAgentDefault(workspaceLabel(r.revisions[0]?.default_workspace)))
+      .catch(() => setAgentDefault("scratch"));
+  }, [agent, agents]);
 
   const submit = async () => {
     setErr("");
@@ -101,10 +117,10 @@ function NewRun({ onClose, onCreated }: { onClose: () => void; onCreated: () => 
     }
     setBusy(true);
     try {
-      const repoJson = repo.trim()
-        ? { kind: "local_path", path: repo.trim() }
-        : { kind: "none" };
-      await apiPost("/sessions", { agent, task, repo: repoJson, autonomous });
+      const body: Record<string, unknown> = { agent, task, autonomous };
+      const ws = draftToInput(workspace);
+      if (ws !== undefined) body.workspace = ws;
+      await apiPost("/sessions", body);
       onCreated();
       onClose();
     } catch (e) {
@@ -152,15 +168,11 @@ function NewRun({ onClose, onCreated }: { onClose: () => void; onCreated: () => 
             />
           </label>
 
-          <label className="field">
-            <span className="lab">Workspace (local path — optional)</span>
-            <input
-              className="inp"
-              placeholder="/absolute/path/to/repo  (blank = scratch workspace)"
-              value={repo}
-              onChange={(e) => setRepo(e.target.value)}
-            />
-          </label>
+          <WorkspacePicker
+            draft={workspace}
+            onChange={setWorkspace}
+            defaultOptionLabel={`agent default (${agentDefault})`}
+          />
 
           <div
             className={`toggle ${autonomous ? "on" : ""}`}
