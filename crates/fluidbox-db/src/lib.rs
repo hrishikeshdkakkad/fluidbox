@@ -469,6 +469,131 @@ pub async fn connection_credential_sealed(
     Ok(row.map(|r| r.get::<Vec<u8>, _>("credential_sealed")))
 }
 
+// ─── Trigger subscriptions ────────────────────────────────────────────────
+
+/// Deliberately has NO callback-secret field — every query selects explicit
+/// columns so the sealed secret can never ride into an API response.
+/// `subscription_callback_secret_sealed` is the only reader.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct TriggerSubscriptionRow {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub agent_id: Uuid,
+    pub name: String,
+    pub trigger_kind: String,
+    pub pinned_revision_id: Option<Uuid>,
+    pub enabled: bool,
+    pub task_template: Option<String>,
+    pub allow_task_override: bool,
+    pub allow_workspace_override: bool,
+    pub autonomy: Option<String>,
+    pub budget_override: Option<Value>,
+    pub workspace_override: Option<Value>,
+    pub result_destinations: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+const SUBSCRIPTION_COLS: &str = "id, tenant_id, agent_id, name, trigger_kind, pinned_revision_id, \
+     enabled, task_template, allow_task_override, allow_workspace_override, autonomy, \
+     budget_override, workspace_override, result_destinations, created_at, updated_at";
+
+#[allow(clippy::too_many_arguments)]
+pub async fn create_trigger_subscription(
+    pool: &PgPool,
+    tenant: Uuid,
+    agent_id: Uuid,
+    name: &str,
+    trigger_kind: &str,
+    pinned_revision_id: Option<Uuid>,
+    task_template: Option<&str>,
+    allow_task_override: bool,
+    allow_workspace_override: bool,
+    autonomy: Option<&str>,
+    budget_override: Option<&Value>,
+    workspace_override: Option<&Value>,
+    result_destinations: &Value,
+    callback_secret_sealed: Option<&[u8]>,
+) -> sqlx::Result<TriggerSubscriptionRow> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "insert into trigger_subscriptions
+           (id, tenant_id, agent_id, name, trigger_kind, pinned_revision_id, task_template,
+            allow_task_override, allow_workspace_override, autonomy, budget_override,
+            workspace_override, result_destinations, callback_secret_sealed)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+         returning {SUBSCRIPTION_COLS}"
+    )))
+    .bind(Uuid::now_v7())
+    .bind(tenant)
+    .bind(agent_id)
+    .bind(name)
+    .bind(trigger_kind)
+    .bind(pinned_revision_id)
+    .bind(task_template)
+    .bind(allow_task_override)
+    .bind(allow_workspace_override)
+    .bind(autonomy)
+    .bind(budget_override)
+    .bind(workspace_override)
+    .bind(result_destinations)
+    .bind(callback_secret_sealed)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn list_trigger_subscriptions(
+    pool: &PgPool,
+    tenant: Uuid,
+) -> sqlx::Result<Vec<TriggerSubscriptionRow>> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "select {SUBSCRIPTION_COLS} from trigger_subscriptions
+         where tenant_id = $1 order by created_at desc"
+    )))
+    .bind(tenant)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_trigger_subscription(
+    pool: &PgPool,
+    id: Uuid,
+) -> sqlx::Result<Option<TriggerSubscriptionRow>> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "select {SUBSCRIPTION_COLS} from trigger_subscriptions where id = $1"
+    )))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn set_trigger_subscription_enabled(
+    pool: &PgPool,
+    id: Uuid,
+    enabled: bool,
+) -> sqlx::Result<Option<TriggerSubscriptionRow>> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "update trigger_subscriptions set enabled = $2, updated_at = now()
+         where id = $1 returning {SUBSCRIPTION_COLS}"
+    )))
+    .bind(id)
+    .bind(enabled)
+    .fetch_optional(pool)
+    .await
+}
+
+/// The only reader of the sealed callback secret. Deliveries for in-flight
+/// runs must still sign after a disable, so this does not require `enabled`.
+pub async fn subscription_callback_secret_sealed(
+    pool: &PgPool,
+    id: Uuid,
+) -> sqlx::Result<Option<Vec<u8>>> {
+    let row = sqlx::query("select callback_secret_sealed from trigger_subscriptions where id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.and_then(|r| r.get::<Option<Vec<u8>>, _>("callback_secret_sealed")))
+}
+
 // ─── Sessions ─────────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -951,6 +1076,55 @@ pub async fn extend_session_token(
     Ok(res.rows_affected() > 0)
 }
 
+pub async fn create_trigger_token(
+    pool: &PgPool,
+    tenant: Uuid,
+    subscription: Uuid,
+    token_plain: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "insert into api_tokens (id, tenant_id, kind, subscription_id, token_sha256)
+         values ($1, $2, 'trigger', $3, $4)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(tenant)
+    .bind(subscription)
+    .bind(sha256_hex(token_plain))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Resolves a scoped trigger token to its subscription. This is the entire
+/// authority of the token — it can never satisfy Admin or SessionAuth.
+pub async fn subscription_for_token(
+    pool: &PgPool,
+    token_plain: &str,
+) -> sqlx::Result<Option<Uuid>> {
+    let row = sqlx::query(
+        "select subscription_id from api_tokens
+         where kind = 'trigger' and token_sha256 = $1
+           and revoked_at is null
+           and (expires_at is null or expires_at > now())",
+    )
+    .bind(sha256_hex(token_plain))
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|r| r.get::<Option<Uuid>, _>("subscription_id")))
+}
+
+/// Rotation support: kill every live token for the subscription.
+pub async fn revoke_trigger_tokens(pool: &PgPool, subscription: Uuid) -> sqlx::Result<u64> {
+    let res = sqlx::query(
+        "update api_tokens set revoked_at = now()
+         where kind = 'trigger' and subscription_id = $1 and revoked_at is null",
+    )
+    .bind(subscription)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 // ─── LISTEN/NOTIFY wakeup hub ─────────────────────────────────────────────
 
 /// Spawns the notify listener with a reconnect loop. Payloads are
@@ -1236,6 +1410,111 @@ mod tests {
 
         sqlx::query("delete from integration_connections where id = $1")
             .bind(conn.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn trigger_subscription_lifecycle_token_and_secret_isolation() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let policy = upsert_policy(
+            &pool,
+            tenant,
+            "test-trig",
+            "name: test-trig",
+            &serde_json::json!({"name": "test-trig"}),
+        )
+        .await
+        .unwrap();
+        let agent = create_agent(&pool, tenant, "test-trig-agent", None)
+            .await
+            .unwrap();
+        let _rev = append_agent_revision(
+            &pool,
+            agent.id,
+            "claude-agent-sdk",
+            "img:test",
+            "claude-haiku-4-5",
+            None,
+            policy.id,
+            &serde_json::json!({}),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let sealed = b"nonce||not-a-real-secret".to_vec();
+        let sub = create_trigger_subscription(
+            &pool,
+            tenant,
+            agent.id,
+            "test-sub",
+            "api",
+            None,
+            Some("Investigate {{ticket}}"),
+            false,
+            false,
+            None,
+            None,
+            None,
+            &serde_json::json!([{"kind": "signed_webhook", "url": "http://127.0.0.1:1/cb"}]),
+            Some(&sealed),
+        )
+        .await
+        .unwrap();
+        assert!(sub.enabled);
+        assert!(!sub.allow_task_override);
+
+        // Row serialization can never leak the sealed secret.
+        let as_json = serde_json::to_value(&sub).unwrap();
+        assert!(as_json.get("callback_secret_sealed").is_none());
+
+        // The single secret reader returns the sealed bytes.
+        let got = subscription_callback_secret_sealed(&pool, sub.id)
+            .await
+            .unwrap();
+        assert_eq!(got, Some(sealed));
+
+        // Trigger tokens: hashed at rest, resolvable, revocable.
+        create_trigger_token(&pool, tenant, sub.id, "fbx_trig_testtoken123")
+            .await
+            .unwrap();
+        assert_eq!(
+            subscription_for_token(&pool, "fbx_trig_testtoken123")
+                .await
+                .unwrap(),
+            Some(sub.id)
+        );
+        assert_eq!(
+            subscription_for_token(&pool, "fbx_trig_wrong")
+                .await
+                .unwrap(),
+            None
+        );
+        let revoked = revoke_trigger_tokens(&pool, sub.id).await.unwrap();
+        assert_eq!(revoked, 1);
+        assert_eq!(
+            subscription_for_token(&pool, "fbx_trig_testtoken123")
+                .await
+                .unwrap(),
+            None
+        );
+
+        // Enable toggle.
+        let off = set_trigger_subscription_enabled(&pool, sub.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!off.enabled);
+
+        sqlx::query("delete from trigger_subscriptions where id = $1")
+            .bind(sub.id)
             .execute(&pool)
             .await
             .unwrap();
