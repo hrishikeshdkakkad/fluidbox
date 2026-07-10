@@ -429,6 +429,7 @@ pub async fn create_session(
                 actor: Some("operator".into()),
                 attributes: Value::Null,
                 received_at: Some(chrono::Utc::now()),
+                ..Default::default()
             },
             result_destinations: vec![],
             bound_invocation: None,

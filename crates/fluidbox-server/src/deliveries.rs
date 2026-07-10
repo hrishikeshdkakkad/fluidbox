@@ -153,7 +153,11 @@ async fn try_deliver(
 ) -> Result<String, String> {
     let dest: ResultDestination = serde_json::from_value(d.destination.clone())
         .map_err(|e| format!("bad destination: {e}"))?;
-    let ResultDestination::SignedWebhook { url } = dest;
+    // GitHub destinations are routed to the connector publisher (Task 9);
+    // until then they fail visibly rather than silently.
+    let ResultDestination::SignedWebhook { url } = dest else {
+        return Err("destination kind not yet routable".into());
+    };
     let sub_id = d
         .subscription_id
         .ok_or("delivery has no subscription (cannot resolve signing secret)")?;

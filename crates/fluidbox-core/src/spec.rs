@@ -27,7 +27,20 @@ impl Autonomy {
 pub enum TrustTier {
     #[default]
     Trusted,
+    /// Untrusted event source (e.g. a fork PR): the run may read and review
+    /// but never write or reach for secrets — enforced at the permission
+    /// gate via `policy::read_only_denial`, above any policy/subscription.
     ReadOnly,
+}
+
+impl TrustTier {
+    /// Matches the serde wire form (and the `sessions.trust_tier` column).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Trusted => "trusted",
+            Self::ReadOnly => "read_only",
+        }
+    }
 }
 
 /// Why a run exists (design doc §3.4) — the provider-neutral envelope frozen
@@ -57,6 +70,22 @@ pub struct InvocationContext {
     pub attributes: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub received_at: Option<DateTime<Utc>>,
+    // ── kind = event only (design §3.4); all optional for wire compat ──
+    /// Connector name, e.g. "github".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Provider delivery id — the level-1 dedup key, kept for audit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_event_id: Option<String>,
+    /// Normalized, e.g. "pull_request.opened".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_type: Option<String>,
+    /// Normalized resource identity, e.g. "acme/site#42".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+    /// When the event happened at the provider (received_at = our clock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<DateTime<Utc>>,
 }
 
 impl Default for InvocationContext {
@@ -68,6 +97,11 @@ impl Default for InvocationContext {
             actor: None,
             attributes: Value::Null,
             received_at: None,
+            provider: None,
+            external_event_id: None,
+            event_type: None,
+            resource: None,
+            occurred_at: None,
         }
     }
 }
@@ -79,7 +113,27 @@ impl Default for InvocationContext {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResultDestination {
-    SignedWebhook { url: String },
+    SignedWebhook {
+        url: String,
+    },
+    /// One stable comment per (subscription, PR) — later events update it in
+    /// place (§17 #3); posted under the App identity (§17 #1).
+    /// (Explicit rename: snake_case would derive "git_hub_pr_comment".)
+    #[serde(rename = "github_pr_comment")]
+    GitHubPrComment {
+        connection_id: Uuid,
+        /// "owner/name"
+        repository: String,
+        pr_number: i64,
+    },
+    /// One check run per head SHA under the stable name
+    /// `fluidbox/<subscription>`; requires an App connection (§17 #1).
+    #[serde(rename = "github_check")]
+    GitHubCheck {
+        connection_id: Uuid,
+        repository: String,
+        head_sha: String,
+    },
 }
 
 /// Budgets frozen into the RunSpec. `max_wall_clock_secs: None` means the
@@ -357,11 +411,88 @@ mod tests {
             actor: Some("trigger:nightly".into()),
             attributes: serde_json::json!({"context": {"ticket": "INC-42"}}),
             received_at: Some(chrono::Utc::now()),
+            ..Default::default()
         };
         let v = serde_json::to_value(&ctx).unwrap();
         assert_eq!(v["kind"], "api");
         let back: InvocationContext = serde_json::from_value(v).unwrap();
         assert_eq!(back.subscription_id, Some(sub));
+    }
+
+    #[test]
+    fn invocation_context_event_fields_roundtrip_and_old_rows_stay_valid() {
+        // Frozen Phase-2/3 contexts have none of the event fields — they must
+        // deserialize forever with the fields absent.
+        let old = serde_json::json!({
+            "kind": "api",
+            "subscription_id": Uuid::now_v7(),
+            "actor": "trigger:x",
+            "attributes": {"context": {}}
+        });
+        let ctx: InvocationContext = serde_json::from_value(old).unwrap();
+        assert!(ctx.provider.is_none());
+        assert!(ctx.external_event_id.is_none());
+        assert!(ctx.event_type.is_none());
+        assert!(ctx.resource.is_none());
+        assert!(ctx.occurred_at.is_none());
+
+        let ev = InvocationContext {
+            kind: InvocationKind::Event,
+            subscription_id: Some(Uuid::now_v7()),
+            actor: Some("github:octocat".into()),
+            attributes: serde_json::json!({"pr_number": 42}),
+            received_at: Some(chrono::Utc::now()),
+            provider: Some("github".into()),
+            external_event_id: Some("delivery-1".into()),
+            event_type: Some("pull_request.opened".into()),
+            resource: Some("acme/site#42".into()),
+            occurred_at: Some(chrono::Utc::now()),
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["kind"], "event");
+        assert_eq!(v["provider"], "github");
+        assert_eq!(v["event_type"], "pull_request.opened");
+        let back: InvocationContext = serde_json::from_value(v).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn github_result_destinations_wire_shape() {
+        let cid = Uuid::now_v7();
+        let comment = ResultDestination::GitHubPrComment {
+            connection_id: cid,
+            repository: "acme/site".into(),
+            pr_number: 42,
+        };
+        let v = serde_json::to_value(&comment).unwrap();
+        assert_eq!(v["kind"], "github_pr_comment");
+        assert_eq!(v["pr_number"], 42);
+        assert_eq!(v["repository"], "acme/site");
+        let back: ResultDestination = serde_json::from_value(v).unwrap();
+        assert_eq!(back, comment);
+
+        let check = ResultDestination::GitHubCheck {
+            connection_id: cid,
+            repository: "acme/site".into(),
+            head_sha: "a".repeat(40),
+        };
+        let v = serde_json::to_value(&check).unwrap();
+        assert_eq!(v["kind"], "github_check");
+        assert_eq!(v["head_sha"], "a".repeat(40));
+        let back: ResultDestination = serde_json::from_value(v).unwrap();
+        assert_eq!(back, check);
+    }
+
+    #[test]
+    fn trust_tier_string_forms() {
+        assert_eq!(TrustTier::Trusted.as_str(), "trusted");
+        assert_eq!(TrustTier::ReadOnly.as_str(), "read_only");
+        // as_str must match the serde wire form (sessions.trust_tier column
+        // and the RunSpec json must agree).
+        assert_eq!(
+            serde_json::to_value(TrustTier::ReadOnly).unwrap(),
+            serde_json::json!("read_only")
+        );
     }
 
     #[test]
