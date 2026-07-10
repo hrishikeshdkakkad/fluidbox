@@ -6,6 +6,7 @@
 
 pub mod event;
 pub mod policy;
+pub mod schedule;
 pub mod spec;
 pub mod state;
 pub mod traits;
