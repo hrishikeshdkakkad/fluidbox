@@ -411,6 +411,28 @@ pub async fn sessions_in_status(
         .await
 }
 
+/// Sessions stuck before launch. The orchestrator moves created →
+/// provisioning → initializing in seconds (initializing: minutes at worst
+/// for a big repo copy), so a stale row means the control plane died
+/// mid-launch and nothing owns the session anymore.
+pub async fn stale_nonstarted_sessions(
+    pool: &PgPool,
+    max_age_mins: i32,
+) -> sqlx::Result<Vec<SessionRow>> {
+    sqlx::query_as(
+        "select * from sessions
+         where status = any($1) and updated_at < now() - make_interval(mins => $2)",
+    )
+    .bind(vec![
+        "created".to_string(),
+        "provisioning".to_string(),
+        "initializing".to_string(),
+    ])
+    .bind(max_age_mins)
+    .fetch_all(pool)
+    .await
+}
+
 /// The single status writer. Validates the transition inside a transaction;
 /// returns Ok(None) if the transition is not legal (caller decides whether
 /// that is an error or a benign race).
@@ -932,5 +954,90 @@ mod tests {
         let events = events_after(&pool, session.id, 0, 10).await.unwrap();
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].r#type, "agent.message");
+    }
+
+    #[tokio::test]
+    async fn stale_nonstarted_sweep_finds_only_old_prelaunch_sessions() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let policy = upsert_policy(
+            &pool,
+            tenant,
+            "test-stale",
+            "name: test-stale",
+            &serde_json::json!({"name": "test-stale"}),
+        )
+        .await
+        .unwrap();
+        let agent = create_agent(&pool, tenant, "test-stale-agent", None).await.unwrap();
+        let rev = append_agent_revision(
+            &pool,
+            agent.id,
+            "claude-agent-sdk",
+            "img:test",
+            "claude-haiku-4-5",
+            None,
+            policy.id,
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        let repo = serde_json::json!({"kind":"none"});
+        let empty = serde_json::json!({});
+        let fresh = create_session(
+            &pool, tenant, agent.id, rev.id, "supervised", "stale-test fresh", &repo, &empty,
+            &empty,
+        )
+        .await
+        .unwrap();
+        let stale = create_session(
+            &pool, tenant, agent.id, rev.id, "supervised", "stale-test old", &repo, &empty, &empty,
+        )
+        .await
+        .unwrap();
+        sqlx::query("update sessions set updated_at = now() - interval '20 minutes' where id = $1")
+            .bind(stale.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let ids: Vec<Uuid> = stale_nonstarted_sessions(&pool, 15)
+            .await
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert!(ids.contains(&stale.id), "old created session must be swept");
+        assert!(!ids.contains(&fresh.id), "fresh session must not be swept");
+
+        // Terminal sessions are never swept even when old.
+        use fluidbox_core::state::SessionStatus;
+        transition_session(&pool, stale.id, SessionStatus::Failed, Some("test"))
+            .await
+            .unwrap();
+        sqlx::query("update sessions set updated_at = now() - interval '20 minutes' where id = $1")
+            .bind(stale.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let ids: Vec<Uuid> = stale_nonstarted_sessions(&pool, 15)
+            .await
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert!(!ids.contains(&stale.id), "terminal session must not be swept");
+
+        for id in [fresh.id, stale.id] {
+            sqlx::query("delete from sessions where id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
     }
 }

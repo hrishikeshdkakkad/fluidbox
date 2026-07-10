@@ -63,6 +63,7 @@ impl SessionStatus {
         matches!(
             (self, next),
             (Created, Provisioning)
+                | (Created, Failed)
                 | (Created, Cancelled)
                 | (Provisioning, Initializing)
                 | (Provisioning, Failed)
@@ -102,6 +103,15 @@ mod tests {
         for s in [Completed, Failed, Cancelled, BudgetExceeded] {
             assert!(!s.can_transition_to(Running));
             assert!(!s.can_transition_to(Failed));
+        }
+    }
+
+    #[test]
+    fn any_nonterminal_state_can_fail() {
+        // A crashed control plane must be able to fail a session wherever
+        // it was left — Created included (the stalled-launch sweep).
+        for s in [Created, Provisioning, Initializing, Running, AwaitingApproval] {
+            assert!(s.can_transition_to(Failed), "{s:?} must be able to fail");
         }
     }
 
