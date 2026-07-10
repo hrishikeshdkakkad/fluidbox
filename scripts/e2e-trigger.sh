@@ -84,8 +84,12 @@ AGENT_GIT="trig-agent-git-$$"
 post "/agents" "{\"name\":\"$AGENT_GIT\",\"policy\":\"default\",
   \"default_workspace\":{\"kind\":\"git_repository\",\"clone_url\":\"$URL\",\"ref\":\"main\"}}" >/dev/null
 
+# autonomous: a live model may reach for approval-gated tools (git/file
+# writes) on any of these tasks; supervised would hang the run at
+# awaiting_approval with nobody to approve. Auto-deny keeps runs terminal —
+# supervision itself is the governance phase's job.
 CODE=$(post "/triggers" "{\"agent\":\"$AGENT\",\"name\":\"sub1-$$\",
-  \"task_template\":\"Investigate {{ticket}} and report.\",
+  \"task_template\":\"Investigate {{ticket}} and report.\",\"autonomous\":true,
   \"callback_url\":\"http://127.0.0.1:$RCV_PORT/cb\"}")
 SUB1=$(cat "$B" | j "['subscription']['id']")
 TOK1=$(cat "$B" | j "['token']")
@@ -96,13 +100,13 @@ case "$SEC1" in fbx_whsec_*) ok "callback secret minted (fbx_whsec_ prefix)";; *
 LEAKS=$(curl -s -H "$H" "$API/v1/triggers" | grep -c "fbx_whsec_\|fbx_trig_\|callback_secret_sealed" || true)
 [ "${LEAKS:-1}" = "0" ] && ok "list endpoint never re-exposes token/secret" || no "secret material leaked in list"
 
-CODE=$(post "/triggers" "{\"agent\":\"$AGENT_GIT\",\"name\":\"sub2-$$\",
+CODE=$(post "/triggers" "{\"agent\":\"$AGENT_GIT\",\"name\":\"sub2-$$\",\"autonomous\":true,
   \"task_template\":\"noop\",\"allow_task_override\":true,\"allow_workspace_override\":true}")
 SUB2=$(cat "$B" | j "['subscription']['id']"); TOK2=$(cat "$B" | j "['token']")
 [ "$CODE" = "200" ] && ok "SUB2 (overrides on) created" || no "SUB2 create → $CODE"
 
 CODE=$(post "/triggers" "{\"agent\":\"$AGENT_GIT\",\"name\":\"sub3-$$\",
-  \"task_template\":\"noop\",\"allow_workspace_override\":true,
+  \"task_template\":\"noop\",\"allow_workspace_override\":true,\"autonomous\":true,
   \"callback_url\":\"http://127.0.0.1:9/dead\"}")
 SUB3=$(cat "$B" | j "['subscription']['id']"); TOK3=$(cat "$B" | j "['token']")
 [ "$CODE" = "200" ] && ok "SUB3 (dead callback) created" || no "SUB3 create → $CODE"
@@ -237,7 +241,7 @@ if [ "${E2E_SKIP_LIVE:-0}" = "1" ] || [ -z "${ANTHROPIC_API_KEY:-}" ] \
   echo "  SKIP: live tier needs ANTHROPIC_API_KEY + gateway (E2E_SKIP_LIVE=${E2E_SKIP_LIVE:-0})"
 else
   CODE=$(post "/triggers" "{\"agent\":\"claude-fixer\",\"name\":\"sub-live-$$\",
-    \"task_template\":\"State the result of {{a}} plus {{b}}, then stop.\",
+    \"task_template\":\"State the result of {{a}} plus {{b}}, then stop.\",\"autonomous\":true,
     \"callback_url\":\"http://127.0.0.1:$RCV_PORT/cb\"}")
   SUBL=$(cat "$B" | j "['subscription']['id']"); TOKL=$(cat "$B" | j "['token']"); SECL=$(cat "$B" | j "['callback_secret']")
   CODE=$(tpost "$TOKL" "/triggers/$SUBL/invoke" '{"context":{"a":"2","b":"3"}}' "Idempotency-Key: live-1")
