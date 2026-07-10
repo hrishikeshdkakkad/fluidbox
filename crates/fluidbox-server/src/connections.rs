@@ -124,7 +124,10 @@ async fn create_github_app(state: &AppState, req: CreateConnection) -> ApiResult
         .await
         .map_err(ApiError::BadRequest)?;
     let app_slug = metadata["app_slug"].as_str().unwrap_or("app").to_string();
-    let account = metadata["account_login"].as_str().unwrap_or("unknown").to_string();
+    let account = metadata["account_login"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_string();
 
     let sealed_key = sealer.seal(&private_key);
     let sealed_webhook = sealer.seal(&webhook_secret);
@@ -145,7 +148,9 @@ async fn create_github_app(state: &AppState, req: CreateConnection) -> ApiResult
     .await?;
     // The one thing the operator must paste into GitHub webhook settings.
     let ingress_path = format!("/v1/ingress/github/{}", row.id);
-    Ok(Json(json!({ "connection": row, "ingress_path": ingress_path })))
+    Ok(Json(
+        json!({ "connection": row, "ingress_path": ingress_path }),
+    ))
 }
 
 pub async fn list(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Value>> {
