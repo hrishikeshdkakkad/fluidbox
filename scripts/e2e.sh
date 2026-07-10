@@ -5,7 +5,8 @@
 #   phase 3: git workspaces     (clone/precedence/cleanup; live tier self-skips)
 #   phase 4: api triggers       (scoped tokens, idempotency, signed callbacks)
 #   phase 5: scheduled borrowing (cron firing, exactly-once, overlap/missed)
-#   phase 6: failure paths      (budget stop, watchdog, restart — no model)
+#   phase 6: github pr fan-out  (event spine, dedup, fork tier, publishers)
+#   phase 7: failure paths      (budget stop, watchdog, restart — no model)
 # Owns the stack: builds binaries, starts the gateway + control plane.
 # Refuses to run while `just dev` holds :8787.
 set -uo pipefail
@@ -35,23 +36,26 @@ trap 'stop_server' EXIT
 start_server || exit 1
 ok "stack up (gateway + control plane)"
 
-say "PHASE 1/6 — live demo A"
+say "PHASE 1/7 — live demo A"
 bash "$ROOT/scripts/e2e-live.sh" || SUITE_FAIL=1
 
-say "PHASE 2/6 — governance plane"
+say "PHASE 2/7 — governance plane"
 bash "$ROOT/scripts/governance-e2e.sh" || SUITE_FAIL=1
 
-say "PHASE 3/6 — git workspaces"
+say "PHASE 3/7 — git workspaces"
 bash "$ROOT/scripts/e2e-git-workspace.sh" || SUITE_FAIL=1
 
-say "PHASE 4/6 — api triggers & signed callbacks"
+say "PHASE 4/7 — api triggers & signed callbacks"
 bash "$ROOT/scripts/e2e-trigger.sh" || SUITE_FAIL=1
 
-say "PHASE 5/6 — scheduled borrowing"
+say "PHASE 5/7 — scheduled borrowing"
 stop_server   # the schedule suite owns (and restarts) its own control plane
 bash "$ROOT/scripts/e2e-schedule.sh" || SUITE_FAIL=1
 
-say "PHASE 6/6 — failure paths"
+say "PHASE 6/7 — github pr-review fan-out"
+bash "$ROOT/scripts/e2e-github.sh" || SUITE_FAIL=1
+
+say "PHASE 7/7 — failure paths"
 bash "$ROOT/scripts/e2e-failures.sh" || SUITE_FAIL=1
 
 say "E2E RESULT"
