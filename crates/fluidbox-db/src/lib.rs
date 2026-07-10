@@ -99,6 +99,8 @@ pub struct SessionRow {
     pub task: String,
     pub repo_source: Value,
     pub run_spec: Value,
+    /// InvocationContext envelope (design §3.4). Null for pre-Phase-2 rows.
+    pub trigger: Option<Value>,
     pub sandbox_handle: Option<Value>,
     pub budgets: Value,
     pub base_commit: Option<String>,
@@ -607,11 +609,12 @@ pub async fn create_session(
     repo_source: &Value,
     run_spec: &Value,
     budgets: &Value,
+    trigger: Option<&Value>,
 ) -> sqlx::Result<SessionRow> {
     sqlx::query_as(
         "insert into sessions
-           (id, tenant_id, agent_id, agent_revision_id, autonomy, task, repo_source, run_spec, budgets)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+           (id, tenant_id, agent_id, agent_revision_id, autonomy, task, repo_source, run_spec, budgets, trigger)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
          returning *",
     )
     .bind(Uuid::now_v7())
@@ -623,6 +626,7 @@ pub async fn create_session(
     .bind(repo_source)
     .bind(run_spec)
     .bind(budgets)
+    .bind(trigger)
     .fetch_one(pool)
     .await
 }
@@ -1076,6 +1080,249 @@ pub async fn extend_session_token(
     Ok(res.rows_affected() > 0)
 }
 
+// ─── Trigger invocations (Idempotency-Key) ────────────────────────────────
+
+#[derive(Debug)]
+pub enum InvocationClaim {
+    /// We own this key — create the run, then `bind_invocation`.
+    Claimed { invocation_id: Uuid },
+    /// This key already produced a run — return it (after digest check).
+    Replay {
+        session_id: Uuid,
+        request_digest: String,
+    },
+    /// Another request holds the key mid-creation — caller should 409.
+    InFlight,
+}
+
+/// Claim an idempotency key. Exactly one concurrent caller wins the insert;
+/// a claim whose creation crashed (bound to no session) becomes re-claimable
+/// after 60s so a dangling row can't wedge the key forever.
+pub async fn claim_invocation(
+    pool: &PgPool,
+    subscription: Uuid,
+    idempotency_key: &str,
+    request_digest: &str,
+) -> sqlx::Result<InvocationClaim> {
+    let inserted = sqlx::query(
+        "insert into trigger_invocations (id, subscription_id, idempotency_key, request_digest)
+         values ($1, $2, $3, $4)
+         on conflict (subscription_id, idempotency_key) do nothing
+         returning id",
+    )
+    .bind(Uuid::now_v7())
+    .bind(subscription)
+    .bind(idempotency_key)
+    .bind(request_digest)
+    .fetch_optional(pool)
+    .await?;
+    if let Some(row) = inserted {
+        return Ok(InvocationClaim::Claimed {
+            invocation_id: row.get("id"),
+        });
+    }
+    let existing = sqlx::query(
+        "select id, session_id, request_digest, created_at from trigger_invocations
+         where subscription_id = $1 and idempotency_key = $2",
+    )
+    .bind(subscription)
+    .bind(idempotency_key)
+    .fetch_one(pool)
+    .await?;
+    if let Some(session_id) = existing.get::<Option<Uuid>, _>("session_id") {
+        return Ok(InvocationClaim::Replay {
+            session_id,
+            request_digest: existing.get("request_digest"),
+        });
+    }
+    // Unbound claim: take it over only once it is stale (crashed creator).
+    let takeover = sqlx::query(
+        "update trigger_invocations
+            set created_at = now(), request_digest = $3
+          where subscription_id = $1 and idempotency_key = $2
+            and session_id is null and created_at < now() - interval '60 seconds'
+          returning id",
+    )
+    .bind(subscription)
+    .bind(idempotency_key)
+    .bind(request_digest)
+    .fetch_optional(pool)
+    .await?;
+    Ok(match takeover {
+        Some(row) => InvocationClaim::Claimed {
+            invocation_id: row.get("id"),
+        },
+        None => InvocationClaim::InFlight,
+    })
+}
+
+pub async fn bind_invocation(pool: &PgPool, invocation: Uuid, session: Uuid) -> sqlx::Result<()> {
+    sqlx::query("update trigger_invocations set session_id = $2 where id = $1")
+        .bind(invocation)
+        .bind(session)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Free a claim whose run creation failed, so an immediate retry can re-try.
+pub async fn release_invocation(pool: &PgPool, invocation: Uuid) -> sqlx::Result<()> {
+    sqlx::query("delete from trigger_invocations where id = $1 and session_id is null")
+        .bind(invocation)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn list_subscription_sessions(
+    pool: &PgPool,
+    subscription: Uuid,
+    limit: i64,
+) -> sqlx::Result<Vec<SessionRow>> {
+    sqlx::query_as(
+        "select s.* from sessions s
+         join trigger_invocations i on i.session_id = s.id
+         where i.subscription_id = $1
+         order by s.created_at desc limit $2",
+    )
+    .bind(subscription)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Scopes the trigger-token polling endpoint to runs this subscription made.
+pub async fn subscription_owns_session(
+    pool: &PgPool,
+    subscription: Uuid,
+    session: Uuid,
+) -> sqlx::Result<bool> {
+    let row = sqlx::query(
+        "select exists(
+           select 1 from trigger_invocations
+           where subscription_id = $1 and session_id = $2
+         ) as owned",
+    )
+    .bind(subscription)
+    .bind(session)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get::<bool, _>("owned"))
+}
+
+// ─── Result deliveries ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct ResultDeliveryRow {
+    pub id: Uuid,
+    pub session_id: Uuid,
+    pub subscription_id: Option<Uuid>,
+    pub destination: Value,
+    pub status: String,
+    pub attempts: i32,
+    pub next_attempt_at: DateTime<Utc>,
+    pub last_error: Option<String>,
+    pub payload_digest: Option<String>,
+    pub delivered_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+pub async fn enqueue_result_delivery(
+    pool: &PgPool,
+    session: Uuid,
+    subscription: Option<Uuid>,
+    destination: &Value,
+) -> sqlx::Result<ResultDeliveryRow> {
+    sqlx::query_as(
+        "insert into result_deliveries (id, session_id, subscription_id, destination)
+         values ($1, $2, $3, $4) returning *",
+    )
+    .bind(Uuid::now_v7())
+    .bind(session)
+    .bind(subscription)
+    .bind(destination)
+    .fetch_one(pool)
+    .await
+}
+
+/// Due work for the (single, sequential) delivery worker. No row locking:
+/// there is one worker task per server and attempts are awaited one at a
+/// time, so a row can never be attempted twice concurrently. Delivery is
+/// at-least-once by design — receivers dedup on the delivery id.
+pub async fn due_result_deliveries(
+    pool: &PgPool,
+    limit: i64,
+) -> sqlx::Result<Vec<ResultDeliveryRow>> {
+    sqlx::query_as(
+        "select * from result_deliveries
+         where status = 'pending' and next_attempt_at <= now()
+         order by next_attempt_at limit $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Record one attempt. ok → delivered; failure → attempts+1 and either
+/// rescheduled (`retry_in_secs`) or terminally 'failed' at `max_attempts`.
+pub async fn mark_delivery_attempt(
+    pool: &PgPool,
+    id: Uuid,
+    ok: bool,
+    error: Option<&str>,
+    payload_digest: Option<&str>,
+    retry_in_secs: i64,
+    max_attempts: i32,
+) -> sqlx::Result<Option<ResultDeliveryRow>> {
+    sqlx::query_as(
+        "update result_deliveries set
+            attempts = attempts + 1,
+            status = case when $2 then 'delivered'
+                          when attempts + 1 >= $6 then 'failed'
+                          else 'pending' end,
+            delivered_at = case when $2 then now() else delivered_at end,
+            last_error = $3,
+            payload_digest = coalesce($4, payload_digest),
+            next_attempt_at = now() + make_interval(secs => $5),
+            updated_at = now()
+         where id = $1 returning *",
+    )
+    .bind(id)
+    .bind(ok)
+    .bind(error)
+    .bind(payload_digest)
+    .bind(retry_in_secs as f64)
+    .bind(max_attempts)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn list_session_deliveries(
+    pool: &PgPool,
+    session: Uuid,
+) -> sqlx::Result<Vec<ResultDeliveryRow>> {
+    sqlx::query_as("select * from result_deliveries where session_id = $1 order by created_at")
+        .bind(session)
+        .fetch_all(pool)
+        .await
+}
+
+pub async fn list_subscription_deliveries(
+    pool: &PgPool,
+    subscription: Uuid,
+    limit: i64,
+) -> sqlx::Result<Vec<ResultDeliveryRow>> {
+    sqlx::query_as(
+        "select * from result_deliveries where subscription_id = $1
+         order by created_at desc limit $2",
+    )
+    .bind(subscription)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 pub async fn create_trigger_token(
     pool: &PgPool,
     tenant: Uuid,
@@ -1221,6 +1468,7 @@ mod tests {
             &serde_json::json!({"kind":"none"}),
             &serde_json::json!({}),
             &serde_json::json!({}),
+            None,
         )
         .await
         .unwrap();
@@ -1299,6 +1547,7 @@ mod tests {
             &repo,
             &empty,
             &empty,
+            None,
         )
         .await
         .unwrap();
@@ -1312,6 +1561,7 @@ mod tests {
             &repo,
             &empty,
             &empty,
+            None,
         )
         .await
         .unwrap();
@@ -1515,6 +1765,247 @@ mod tests {
 
         sqlx::query("delete from trigger_subscriptions where id = $1")
             .bind(sub.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn invocation_claims_are_idempotent_by_key() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let policy = upsert_policy(
+            &pool,
+            tenant,
+            "test-idem",
+            "name: test-idem",
+            &serde_json::json!({"name": "test-idem"}),
+        )
+        .await
+        .unwrap();
+        let agent = create_agent(&pool, tenant, "test-idem-agent", None)
+            .await
+            .unwrap();
+        let rev = append_agent_revision(
+            &pool,
+            agent.id,
+            "claude-agent-sdk",
+            "img:test",
+            "claude-haiku-4-5",
+            None,
+            policy.id,
+            &serde_json::json!({}),
+            None,
+        )
+        .await
+        .unwrap();
+        let sub = create_trigger_subscription(
+            &pool,
+            tenant,
+            agent.id,
+            "test-idem-sub",
+            "api",
+            None,
+            Some("t"),
+            false,
+            false,
+            None,
+            None,
+            None,
+            &serde_json::json!([]),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // First claim wins.
+        let c1 = claim_invocation(&pool, sub.id, "key-1", "digest-a")
+            .await
+            .unwrap();
+        let InvocationClaim::Claimed { invocation_id } = c1 else {
+            panic!("wanted Claimed, got {c1:?}")
+        };
+
+        // Same key while unbound → InFlight (a concurrent retry must wait).
+        assert!(matches!(
+            claim_invocation(&pool, sub.id, "key-1", "digest-a")
+                .await
+                .unwrap(),
+            InvocationClaim::InFlight
+        ));
+
+        // Bind to a real session, then the same key replays that session.
+        let session = create_session(
+            &pool,
+            tenant,
+            agent.id,
+            rev.id,
+            "supervised",
+            "t",
+            &serde_json::json!({"kind":"scratch"}),
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            Some(&serde_json::json!({"kind":"api"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(session.trigger, Some(serde_json::json!({"kind":"api"})));
+        bind_invocation(&pool, invocation_id, session.id)
+            .await
+            .unwrap();
+        let c3 = claim_invocation(&pool, sub.id, "key-1", "digest-a")
+            .await
+            .unwrap();
+        match c3 {
+            InvocationClaim::Replay {
+                session_id,
+                request_digest,
+            } => {
+                assert_eq!(session_id, session.id);
+                assert_eq!(request_digest, "digest-a");
+            }
+            other => panic!("wanted Replay, got {other:?}"),
+        }
+
+        // A released (failed-creation) claim frees the key immediately.
+        let c4 = claim_invocation(&pool, sub.id, "key-2", "digest-b")
+            .await
+            .unwrap();
+        let InvocationClaim::Claimed {
+            invocation_id: inv2,
+        } = c4
+        else {
+            panic!()
+        };
+        release_invocation(&pool, inv2).await.unwrap();
+        assert!(matches!(
+            claim_invocation(&pool, sub.id, "key-2", "digest-b")
+                .await
+                .unwrap(),
+            InvocationClaim::Claimed { .. }
+        ));
+
+        assert!(subscription_owns_session(&pool, sub.id, session.id)
+            .await
+            .unwrap());
+        let listed = list_subscription_sessions(&pool, sub.id, 10).await.unwrap();
+        assert!(listed.iter().any(|s| s.id == session.id));
+
+        sqlx::query("delete from sessions where id = $1")
+            .bind(session.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("delete from trigger_subscriptions where id = $1")
+            .bind(sub.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn result_delivery_attempt_state_machine() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let policy = upsert_policy(
+            &pool,
+            tenant,
+            "test-del",
+            "name: test-del",
+            &serde_json::json!({"name": "test-del"}),
+        )
+        .await
+        .unwrap();
+        let agent = create_agent(&pool, tenant, "test-del-agent", None)
+            .await
+            .unwrap();
+        let rev = append_agent_revision(
+            &pool,
+            agent.id,
+            "claude-agent-sdk",
+            "img:test",
+            "claude-haiku-4-5",
+            None,
+            policy.id,
+            &serde_json::json!({}),
+            None,
+        )
+        .await
+        .unwrap();
+        let session = create_session(
+            &pool,
+            tenant,
+            agent.id,
+            rev.id,
+            "supervised",
+            "t",
+            &serde_json::json!({"kind":"scratch"}),
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let dest = serde_json::json!({"kind": "signed_webhook", "url": "http://127.0.0.1:1/cb"});
+        let d = enqueue_result_delivery(&pool, session.id, None, &dest)
+            .await
+            .unwrap();
+        assert_eq!(d.status, "pending");
+        assert_eq!(d.attempts, 0);
+
+        // Due immediately.
+        let due = due_result_deliveries(&pool, 10).await.unwrap();
+        assert!(due.iter().any(|x| x.id == d.id));
+
+        // Failure → still pending, attempts=1, pushed into the future (not due).
+        let after =
+            mark_delivery_attempt(&pool, d.id, false, Some("connection refused"), None, 30, 3)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!((after.status.as_str(), after.attempts), ("pending", 1));
+        assert!(!due_result_deliveries(&pool, 50)
+            .await
+            .unwrap()
+            .iter()
+            .any(|x| x.id == d.id));
+
+        // Exhausting attempts → failed, terminal for the delivery only.
+        mark_delivery_attempt(&pool, d.id, false, Some("refused"), None, 30, 3)
+            .await
+            .unwrap();
+        let last = mark_delivery_attempt(&pool, d.id, false, Some("refused"), None, 30, 3)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((last.status.as_str(), last.attempts), ("failed", 3));
+
+        // Success path on a second delivery.
+        let d2 = enqueue_result_delivery(&pool, session.id, None, &dest)
+            .await
+            .unwrap();
+        let okd = mark_delivery_attempt(&pool, d2.id, true, None, Some("sha256:x"), 0, 3)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(okd.status, "delivered");
+        assert!(okd.delivered_at.is_some());
+        assert_eq!(okd.payload_digest.as_deref(), Some("sha256:x"));
+
+        let listed = list_session_deliveries(&pool, session.id).await.unwrap();
+        assert_eq!(listed.len(), 2);
+
+        sqlx::query("delete from sessions where id = $1")
+            .bind(session.id)
             .execute(&pool)
             .await
             .unwrap();
