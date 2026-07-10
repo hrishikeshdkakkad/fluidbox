@@ -10,6 +10,7 @@ import {
   Session,
   Approval,
   Artifact,
+  ResultDelivery,
   Usage,
   EventRow,
   workspaceLabel,
@@ -23,6 +24,7 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
   const [events, setEvents] = useState<EventRow[]>([]);
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  const [deliveries, setDeliveries] = useState<ResultDelivery[]>([]);
   const seenSeq = useRef<Set<number>>(new Set());
 
   const loadMeta = useCallback(async () => {
@@ -34,6 +36,8 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
       setApprovals(a.approvals);
       const ar = await apiGet<{ artifacts: Artifact[] }>(`/sessions/${id}/artifacts`);
       setArtifacts(ar.artifacts);
+      const d = await apiGet<{ deliveries: ResultDelivery[] }>(`/sessions/${id}/deliveries`);
+      setDeliveries(d.deliveries);
     } catch {
       /* ignore */
     }
@@ -103,6 +107,11 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
           <div className="sub" style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 8 }}>
             {session && <Pill status={session.status} />}
             {session && <AutoPill autonomy={session.autonomy} />}
+            {session?.trigger && session.trigger.kind !== "manual" && (
+              <span className="chip">
+                via <b>{session.trigger.actor || session.trigger.kind}</b>
+              </span>
+            )}
           </div>
         </div>
         {session && !terminal && (
@@ -187,6 +196,35 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
                   </span>
                 )}
               </div>
+            </div>
+          )}
+
+          {deliveries.length > 0 && (
+            <div className="panel pad">
+              <div className="sectitle" style={{ marginTop: 0 }}>
+                result deliveries
+              </div>
+              {deliveries.map((d) => (
+                <div key={d.id} style={{ padding: "5px 0", borderBottom: "1px solid var(--line-soft)" }}>
+                  <div className="spread">
+                    <span className="mono mut" style={{ fontSize: 11, overflow: "hidden", textOverflow: "ellipsis" }}>
+                      {(d.destination.url || "?").slice(0, 26)}
+                    </span>
+                    <span
+                      className={`autopill ${
+                        d.status === "delivered" ? "supervised" : d.status === "failed" ? "autonomous" : ""
+                      }`}
+                    >
+                      {d.status} ×{d.attempts}
+                    </span>
+                  </div>
+                  {d.last_error && d.status !== "delivered" && (
+                    <div className="mut mono" style={{ fontSize: 10.5, marginTop: 2 }}>
+                      {d.last_error.slice(0, 60)}
+                    </div>
+                  )}
+                </div>
+              ))}
             </div>
           )}
         </div>
@@ -336,6 +374,25 @@ function TimelineItem({ ev }: { ev: EventRow }) {
       cls = "danger";
       tag = "error";
       body = <span style={{ color: "var(--danger)" }}>{s("message")}</span>;
+      break;
+    case "callback.delivered":
+      cls = "good";
+      tag = "callback";
+      body = (
+        <>
+          result delivered to <span className="mono">{s("url")}</span>
+          {Number(d.attempt || 1) > 1 ? ` (attempt ${s("attempt")})` : ""}
+        </>
+      );
+      break;
+    case "callback.failed":
+      cls = "danger";
+      tag = "callback";
+      body = (
+        <>
+          callback to <span className="mono">{s("url")}</span> failed after {s("attempts")} attempts
+        </>
+      );
       break;
   }
 
