@@ -698,10 +698,12 @@ pub async fn invoke(
             task,
             explicit_workspace,
             autonomy,
+            trust_tier: fluidbox_core::spec::TrustTier::Trusted,
             budget_override,
             invocation,
             result_destinations: destinations,
             bound_invocation: Some(invocation_id),
+            bound_dispatch: None,
         },
     )
     .await;

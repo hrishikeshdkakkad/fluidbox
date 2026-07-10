@@ -76,6 +76,30 @@ pub async fn permission(
     };
     let outcome: EvaluationOutcome = policy.evaluate(&tool_req, run_spec.autonomy);
 
+    // Trust-tier floor (design §7.3): fork/untrusted event sources run hard
+    // read-only. Applied ABOVE the policy verdict and BEFORE the approval
+    // machinery — no policy, subscription, or human approval can widen past
+    // it. Both the tier denial and the policy's own verdict are ledgered.
+    if run_spec.trust_tier == fluidbox_core::spec::TrustTier::ReadOnly {
+        if let Some(reason) = fluidbox_core::policy::read_only_denial(&tool_req) {
+            ledger::record(
+                &state,
+                session.id,
+                Actor::System,
+                EventBody::ToolDecision {
+                    tool_call_id: req.tool_call_id.clone(),
+                    tool: req.tool.clone(),
+                    verdict: "deny".into(),
+                    source: "trust_tier".into(),
+                    original_verdict: Some(outcome.original.name().into()),
+                    reason: Some(reason.clone()),
+                },
+            )
+            .await;
+            return Ok(Json(json!({ "decision": "deny", "message": reason })));
+        }
+    }
+
     match &outcome.effective {
         Verdict::Allow => {
             emit_decision(&state, session.id, &req, &outcome, "allow", None).await;
