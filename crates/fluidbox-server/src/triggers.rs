@@ -680,6 +680,7 @@ pub async fn invoke(
             "idempotency_key": provided_key,
         }),
         received_at: Some(chrono::Utc::now()),
+        ..Default::default()
     };
 
     let created = crate::run_service::create_run(
