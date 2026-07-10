@@ -388,12 +388,13 @@ pub async fn create_connection(
     granted_scopes: &Value,
     resource_selection: &Value,
     metadata: &Value,
+    webhook_secret_sealed: Option<&[u8]>,
 ) -> sqlx::Result<IntegrationConnectionRow> {
     sqlx::query_as(
         "insert into integration_connections
            (id, tenant_id, provider, external_account_id, display_name, credential_sealed,
-            granted_scopes, resource_selection, metadata)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            granted_scopes, resource_selection, metadata, webhook_secret_sealed)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
          returning id, tenant_id, provider, external_account_id, display_name,
                    granted_scopes, resource_selection, status, metadata, created_at, updated_at",
     )
@@ -406,6 +407,7 @@ pub async fn create_connection(
     .bind(granted_scopes)
     .bind(resource_selection)
     .bind(metadata)
+    .bind(webhook_secret_sealed)
     .fetch_one(pool)
     .await
 }
@@ -471,6 +473,22 @@ pub async fn connection_credential_sealed(
     Ok(row.map(|r| r.get::<Vec<u8>, _>("credential_sealed")))
 }
 
+/// The only reader of the sealed webhook secret (verified on every ingress
+/// request). Active connections only — a revoked connection stops receiving.
+pub async fn connection_webhook_secret_sealed(
+    pool: &PgPool,
+    id: Uuid,
+) -> sqlx::Result<Option<Vec<u8>>> {
+    let row = sqlx::query(
+        "select webhook_secret_sealed from integration_connections
+         where id = $1 and status = 'active'",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|r| r.get::<Option<Vec<u8>>, _>("webhook_secret_sealed")))
+}
+
 // ─── Trigger subscriptions ────────────────────────────────────────────────
 
 /// Deliberately has NO callback-secret field — every query selects explicit
@@ -493,13 +511,19 @@ pub struct TriggerSubscriptionRow {
     pub budget_override: Option<Value>,
     pub workspace_override: Option<Value>,
     pub result_destinations: Value,
+    /// Event subscriptions only (trigger_kind = 'event'); NULL otherwise.
+    pub connection_id: Option<Uuid>,
+    pub resource_selector: Option<Value>,
+    pub event_filter: Option<Value>,
+    pub event_publish: Option<Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 const SUBSCRIPTION_COLS: &str = "id, tenant_id, agent_id, name, trigger_kind, pinned_revision_id, \
      enabled, task_template, allow_task_override, allow_workspace_override, autonomy, \
-     concurrency_policy, budget_override, workspace_override, result_destinations, created_at, updated_at";
+     concurrency_policy, budget_override, workspace_override, result_destinations, \
+     connection_id, resource_selector, event_filter, event_publish, created_at, updated_at";
 
 #[allow(clippy::too_many_arguments)]
 pub async fn create_trigger_subscription(
@@ -518,13 +542,18 @@ pub async fn create_trigger_subscription(
     workspace_override: Option<&Value>,
     result_destinations: &Value,
     callback_secret_sealed: Option<&[u8]>,
+    connection_id: Option<Uuid>,
+    resource_selector: Option<&Value>,
+    event_filter: Option<&Value>,
+    event_publish: Option<&Value>,
 ) -> sqlx::Result<TriggerSubscriptionRow> {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "insert into trigger_subscriptions
            (id, tenant_id, agent_id, name, trigger_kind, pinned_revision_id, task_template,
             allow_task_override, allow_workspace_override, autonomy, concurrency_policy,
-            budget_override, workspace_override, result_destinations, callback_secret_sealed)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+            budget_override, workspace_override, result_destinations, callback_secret_sealed,
+            connection_id, resource_selector, event_filter, event_publish)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
          returning {SUBSCRIPTION_COLS}"
     )))
     .bind(Uuid::now_v7())
@@ -542,7 +571,27 @@ pub async fn create_trigger_subscription(
     .bind(workspace_override)
     .bind(result_destinations)
     .bind(callback_secret_sealed)
+    .bind(connection_id)
+    .bind(resource_selector)
+    .bind(event_filter)
+    .bind(event_publish)
     .fetch_one(pool)
+    .await
+}
+
+/// Enabled event subscriptions listening on a connection — the matcher's
+/// candidate set.
+pub async fn list_event_subscriptions(
+    pool: &PgPool,
+    connection: Uuid,
+) -> sqlx::Result<Vec<TriggerSubscriptionRow>> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "select {SUBSCRIPTION_COLS} from trigger_subscriptions
+         where connection_id = $1 and trigger_kind = 'event' and enabled
+         order by created_at"
+    )))
+    .bind(connection)
+    .fetch_all(pool)
     .await
 }
 
@@ -608,18 +657,20 @@ pub async fn create_session(
     agent_id: Uuid,
     agent_revision_id: Uuid,
     autonomy: &str,
+    trust_tier: &str,
     task: &str,
     repo_source: &Value,
     run_spec: &Value,
     budgets: &Value,
     trigger: Option<&Value>,
     bind_invocation: Option<Uuid>,
+    bind_dispatch: Option<Uuid>,
 ) -> sqlx::Result<SessionRow> {
     let mut tx = pool.begin().await?;
     let row: SessionRow = sqlx::query_as(
         "insert into sessions
-           (id, tenant_id, agent_id, agent_revision_id, autonomy, task, repo_source, run_spec, budgets, trigger)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+           (id, tenant_id, agent_id, agent_revision_id, autonomy, trust_tier, task, repo_source, run_spec, budgets, trigger)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
          returning *",
     )
     .bind(Uuid::now_v7())
@@ -627,6 +678,7 @@ pub async fn create_session(
     .bind(agent_id)
     .bind(agent_revision_id)
     .bind(autonomy)
+    .bind(trust_tier)
     .bind(task)
     .bind(repo_source)
     .bind(run_spec)
@@ -640,6 +692,15 @@ pub async fn create_session(
     if let Some(invocation) = bind_invocation {
         sqlx::query("update trigger_invocations set session_id = $2 where id = $1")
             .bind(invocation)
+            .bind(row.id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    // Same discipline for the event fan-out claim (level-2 dedup): the
+    // dispatch row and the session commit together.
+    if let Some(dispatch) = bind_dispatch {
+        sqlx::query("update trigger_dispatches set session_id = $2 where id = $1")
+            .bind(dispatch)
             .bind(row.id)
             .execute(&mut *tx)
             .await?;
@@ -1556,6 +1617,214 @@ pub async fn revoke_trigger_tokens(pool: &PgPool, subscription: Uuid) -> sqlx::R
 /// Spawns the notify listener with a reconnect loop. Payloads are
 /// (session_id, seq). Delivery is best-effort by design — every consumer
 /// polls the seq catch-up query as the source of truth.
+// ─── Event deliveries & dispatches (design §6.4) ──────────────────────────
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct TriggerDeliveryRow {
+    pub id: Uuid,
+    pub connection_id: Uuid,
+    pub external_event_id: String,
+    pub event_type: String,
+    pub payload: Value,
+    pub payload_digest: String,
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub received_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct TriggerDispatchRow {
+    pub id: Uuid,
+    pub delivery_id: Uuid,
+    pub subscription_id: Uuid,
+    pub session_id: Option<Uuid>,
+    pub status: String,
+    pub skip_reason: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Level-1 dedup: store the delivery once; a retry returns the stored row
+/// with `fresh = false` and the caller re-walks dispatch (which is itself
+/// idempotent) — so a retry can only ever HEAL a partial fan-out.
+pub async fn insert_trigger_delivery(
+    pool: &PgPool,
+    connection: Uuid,
+    external_event_id: &str,
+    event_type: &str,
+    payload: &Value,
+    payload_digest: &str,
+    occurred_at: Option<DateTime<Utc>>,
+) -> sqlx::Result<(TriggerDeliveryRow, bool)> {
+    let inserted: Option<TriggerDeliveryRow> = sqlx::query_as(
+        "insert into trigger_deliveries
+           (id, connection_id, external_event_id, event_type, payload, payload_digest, occurred_at)
+         values ($1,$2,$3,$4,$5,$6,$7)
+         on conflict (connection_id, external_event_id) do nothing
+         returning *",
+    )
+    .bind(Uuid::now_v7())
+    .bind(connection)
+    .bind(external_event_id)
+    .bind(event_type)
+    .bind(payload)
+    .bind(payload_digest)
+    .bind(occurred_at)
+    .fetch_optional(pool)
+    .await?;
+    if let Some(row) = inserted {
+        return Ok((row, true));
+    }
+    let existing = sqlx::query_as(
+        "select * from trigger_deliveries where connection_id = $1 and external_event_id = $2",
+    )
+    .bind(connection)
+    .bind(external_event_id)
+    .fetch_one(pool)
+    .await?;
+    Ok((existing, false))
+}
+
+/// Level-2 dedup: claim the (delivery, subscription) slot. `None` means the
+/// slot already produced its outcome (a bound run, a recorded skip/error, or
+/// a fresh in-flight creation) — the caller fires nothing. Like
+/// `claim_invocation`, an unbound `created` claim older than 60s is
+/// stealable (crashed creator); skipped/errored rows are terminal.
+pub async fn claim_trigger_dispatch(
+    pool: &PgPool,
+    delivery: Uuid,
+    subscription: Uuid,
+) -> sqlx::Result<Option<TriggerDispatchRow>> {
+    let inserted: Option<TriggerDispatchRow> = sqlx::query_as(
+        "insert into trigger_dispatches (id, delivery_id, subscription_id)
+         values ($1,$2,$3)
+         on conflict (delivery_id, subscription_id) do nothing
+         returning *",
+    )
+    .bind(Uuid::now_v7())
+    .bind(delivery)
+    .bind(subscription)
+    .fetch_optional(pool)
+    .await?;
+    if inserted.is_some() {
+        return Ok(inserted);
+    }
+    sqlx::query_as(
+        "update trigger_dispatches
+            set created_at = now()
+          where delivery_id = $1 and subscription_id = $2
+            and session_id is null and status = 'created'
+            and created_at < now() - interval '60 seconds'
+          returning *",
+    )
+    .bind(delivery)
+    .bind(subscription)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Terminal bookkeeping for a claimed-but-not-run dispatch (skipped |
+/// error). Guarded on session_id so a bound run can never be relabelled.
+pub async fn mark_dispatch_outcome(
+    pool: &PgPool,
+    dispatch: Uuid,
+    status: &str,
+    skip_reason: Option<&str>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "update trigger_dispatches set status = $2, skip_reason = $3
+         where id = $1 and session_id is null",
+    )
+    .bind(dispatch)
+    .bind(status)
+    .bind(skip_reason)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_delivery_dispatches(
+    pool: &PgPool,
+    delivery: Uuid,
+) -> sqlx::Result<Vec<TriggerDispatchRow>> {
+    sqlx::query_as("select * from trigger_dispatches where delivery_id = $1 order by created_at")
+        .bind(delivery)
+        .fetch_all(pool)
+        .await
+}
+
+pub async fn list_connection_deliveries(
+    pool: &PgPool,
+    connection: Uuid,
+    limit: i64,
+) -> sqlx::Result<Vec<TriggerDeliveryRow>> {
+    sqlx::query_as(
+        "select * from trigger_deliveries where connection_id = $1
+         order by received_at desc limit $2",
+    )
+    .bind(connection)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+// ─── External results (§17 #3: stable update-in-place identity) ───────────
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct ExternalResultRow {
+    pub id: Uuid,
+    pub subscription_id: Uuid,
+    pub kind: String,
+    pub resource_key: String,
+    pub external_id: String,
+    pub external_url: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+pub async fn get_external_result(
+    pool: &PgPool,
+    subscription: Uuid,
+    kind: &str,
+    resource_key: &str,
+) -> sqlx::Result<Option<ExternalResultRow>> {
+    sqlx::query_as(
+        "select * from external_results
+         where subscription_id = $1 and kind = $2 and resource_key = $3",
+    )
+    .bind(subscription)
+    .bind(kind)
+    .bind(resource_key)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn upsert_external_result(
+    pool: &PgPool,
+    subscription: Uuid,
+    kind: &str,
+    resource_key: &str,
+    external_id: &str,
+    external_url: Option<&str>,
+) -> sqlx::Result<ExternalResultRow> {
+    sqlx::query_as(
+        "insert into external_results
+           (id, subscription_id, kind, resource_key, external_id, external_url)
+         values ($1,$2,$3,$4,$5,$6)
+         on conflict (subscription_id, kind, resource_key)
+           do update set external_id = excluded.external_id,
+                         external_url = excluded.external_url,
+                         updated_at = now()
+         returning *",
+    )
+    .bind(Uuid::now_v7())
+    .bind(subscription)
+    .bind(kind)
+    .bind(resource_key)
+    .bind(external_id)
+    .bind(external_url)
+    .fetch_one(pool)
+    .await
+}
+
 pub fn spawn_listener(database_url: String) -> tokio::sync::broadcast::Sender<(Uuid, i64)> {
     let (tx, _) = tokio::sync::broadcast::channel::<(Uuid, i64)>(1024);
     let tx2 = tx.clone();
@@ -1643,10 +1912,12 @@ mod tests {
             agent.id,
             rev.id,
             "supervised",
+            "trusted",
             "t",
             &serde_json::json!({"kind":"none"}),
             &serde_json::json!({}),
             &serde_json::json!({}),
+            None,
             None,
             None,
         )
@@ -1723,10 +1994,12 @@ mod tests {
             agent.id,
             rev.id,
             "supervised",
+            "trusted",
             "stale-test fresh",
             &repo,
             &empty,
             &empty,
+            None,
             None,
             None,
         )
@@ -1738,10 +2011,12 @@ mod tests {
             agent.id,
             rev.id,
             "supervised",
+            "trusted",
             "stale-test old",
             &repo,
             &empty,
             &empty,
+            None,
             None,
             None,
         )
@@ -1812,6 +2087,7 @@ mod tests {
             &serde_json::json!(["repo"]),
             &serde_json::json!({}),
             &serde_json::json!({"test": true}),
+            None,
         )
         .await
         .unwrap();
@@ -1898,6 +2174,10 @@ mod tests {
             None,
             &serde_json::json!([{"kind": "signed_webhook", "url": "http://127.0.0.1:1/cb"}]),
             Some(&sealed),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -2002,6 +2282,10 @@ mod tests {
             None,
             &serde_json::json!([]),
             None,
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -2030,12 +2314,14 @@ mod tests {
             agent.id,
             rev.id,
             "supervised",
+            "trusted",
             "t",
             &serde_json::json!({"kind":"scratch"}),
             &serde_json::json!({}),
             &serde_json::json!({}),
             Some(&serde_json::json!({"kind":"api"})),
             Some(invocation_id),
+            None,
         )
         .await
         .unwrap();
@@ -2116,6 +2402,10 @@ mod tests {
             None,
             None,
             &serde_json::json!([]),
+            None,
+            None,
+            None,
+            None,
             None,
         )
         .await
@@ -2244,10 +2534,12 @@ mod tests {
             agent.id,
             rev.id,
             "supervised",
+            "trusted",
             "t",
             &serde_json::json!({"kind":"scratch"}),
             &serde_json::json!({}),
             &serde_json::json!({}),
+            None,
             None,
             None,
         )

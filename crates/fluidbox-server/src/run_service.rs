@@ -191,12 +191,14 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
         agent.id,
         rev.id,
         req.autonomy.as_str(),
+        run_spec.trust_tier.as_str(),
         &req.task,
         &serde_json::to_value(&workspace)?,
         &serde_json::to_value(&run_spec)?,
         &serde_json::to_value(&effective_budgets)?,
         Some(&serde_json::to_value(&req.invocation)?),
         req.bound_invocation,
+        None,
     )
     .await?;
 
