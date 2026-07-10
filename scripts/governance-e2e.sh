@@ -39,11 +39,21 @@ perm() { # token session_id json-body  -> prints decision json
     -d "$3" "$API/internal/sessions/$2/permission"
 }
 
+# The script drives the runner contract itself; kill the real runner so it
+# can't race our choreography (finish its probe task and complete the
+# session mid-assertion) or spend model tokens.
+silence_runner() {
+  local cid
+  cid=$(docker ps -q --filter "label=fluidbox.session=$1" | head -1)
+  [ -n "$cid" ] && docker kill "$cid" >/dev/null 2>&1
+}
+
 # ── Supervised session ──────────────────────────────────────────────────
 say "SUPERVISED — policy verdicts + approval pause/resume"
 S=$(new_session false); echo "  session $S"
 T=$(token_for "$S")
 [ -n "$T" ] && ok "sandbox launched; got session token" || { no "no token"; exit 1; }
+silence_runner "$S"
 
 # safe tool → allow
 D=$(perm "$T" "$S" '{"tool_call_id":"g1","tool":"Read","input":{"file_path":"/workspace/x"}}' | j "['decision']")
@@ -86,6 +96,7 @@ say "AUTONOMOUS — instant policy fallback, no human"
 S2=$(new_session true); echo "  session $S2"
 T2=$(token_for "$S2")
 [ -n "$T2" ] && ok "autonomous sandbox launched" || no "no token"
+silence_runner "$S2"
 
 # risky tool that WOULD require approval → instant deny (fallback), no block
 START=$(date +%s)

@@ -17,6 +17,8 @@ just web            # dashboard only (Next.js, port 3000)
 just gateway-up     # start the pinned LiteLLM container (reads .env)
 just sandbox-build  # rebuild the sandbox runner image after editing images/sandbox-runner/
 just check          # fmt + clippy -D warnings + test + web build (the full bar)
+just e2e            # full acceptance: live demo A + governance + failure paths (owns the stack; stop `just dev` first)
+just policy-sync    # push policies/*.yaml to the running control plane (version++)
 
 cargo test -p fluidbox-core                              # fast, no DB needed
 cargo test -p fluidbox-db                                # needs DATABASE_URL (real Neon)

@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# `just e2e` — the one-command acceptance suite:
+#   phase 1: live demo A        (real model; self-skips without key/gateway)
+#   phase 2: governance plane   (policy, approvals, autonomy — no model)
+#   phase 3: failure paths      (budget stop, watchdog, restart — no model)
+# Owns the stack: builds binaries, starts the gateway + control plane.
+# Refuses to run while `just dev` holds :8787.
+set -uo pipefail
+source "$(dirname "$0")/e2e-lib.sh"
+load_env
+require_cmd docker psql python3 curl git cargo
+SUITE_FAIL=0
+
+say "PREFLIGHT"
+docker info >/dev/null 2>&1 || { echo "docker daemon not running"; exit 1; }
+if port_in_use; then
+  echo "port 8787 already serving — stop 'just dev' first; the e2e suite owns the stack"
+  exit 1
+fi
+if ! docker image inspect "$FLUIDBOX_SANDBOX_IMAGE" >/dev/null 2>&1; then
+  echo "building sandbox image $FLUIDBOX_SANDBOX_IMAGE…"
+  docker build -t "$FLUIDBOX_SANDBOX_IMAGE" "$ROOT/images/sandbox-runner" || exit 1
+fi
+echo "building server + cli…"
+cargo build -q -p fluidbox-server -p fluidbox-cli || exit 1
+docker compose -f "$ROOT/deploy/docker-compose.dev.yml" up -d litellm >/dev/null 2>&1 || true
+for _ in $(seq 1 40); do
+  curl -fsS -m 2 http://127.0.0.1:4000/health/liveliness >/dev/null 2>&1 && break
+  sleep 0.5
+done
+trap 'stop_server' EXIT
+start_server || exit 1
+ok "stack up (gateway + control plane)"
+
+say "PHASE 1/3 — live demo A"
+bash "$ROOT/scripts/e2e-live.sh" || SUITE_FAIL=1
+
+say "PHASE 2/3 — governance plane"
+bash "$ROOT/scripts/governance-e2e.sh" || SUITE_FAIL=1
+
+say "PHASE 3/3 — failure paths"
+stop_server   # the failure suite owns (and restarts) its own control plane
+bash "$ROOT/scripts/e2e-failures.sh" || SUITE_FAIL=1
+
+say "E2E RESULT"
+if [ "$SUITE_FAIL" = "0" ]; then
+  printf "  \033[1;32mALL PHASES PASSED\033[0m\n"
+else
+  printf "  \033[1;31mFAILURES\033[0m — see phase output above\n"
+fi
+exit "$SUITE_FAIL"

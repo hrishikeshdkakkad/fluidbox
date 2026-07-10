@@ -53,3 +53,16 @@ test:
 
 check: fmt lint test
     cd apps/web && pnpm build
+
+# ── E2E acceptance ───────────────────────────────────────────────────────
+
+# Full acceptance suite: live demo A + governance plane + failure paths.
+# Owns the stack (requires :8787 free — stop `just dev` first). The live
+# phase self-skips without ANTHROPIC_API_KEY; E2E_SKIP_LIVE=1 skips it too.
+e2e:
+    bash scripts/e2e.sh
+
+# Push policies/*.yaml to the running control plane (bumps policy version;
+# in-flight runs keep their frozen snapshot).
+policy-sync:
+    bash scripts/policy-sync.sh
