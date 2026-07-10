@@ -45,7 +45,7 @@ Core nouns (all present in the schema from M1 onward — the MVP is a thin *inst
 | **M1** | The full vertical slice with one harness: agent definitions w/ revisions, RunSpec freeze, governed sandbox (with its post-startup workspace-init phase), LiteLLM gateway + facade, approvals/ledger/budgets/artifacts, and the "New Run" dashboard flow shaped like the end-state UX |
 | **M2** | The execution substrate the product promises: Lambda MicroVMs + BYOC Terraform, behind the same `ExecutionProvider` seam — long-running agents get lease rollover + idle-suspend |
 | **M3** | Multi-harness for real: the Codex runner, the tool/MCP capability-bundle catalog + UI, customer-signed runner images — the north star, verbatim |
-| **Roadmap** | Runs triggered by the outside world (GitHub App, Slack, Jira…). Descoped 2026-07-09: triggers only *create runs of registered agents*, so nothing about the run model changes — the seams (trigger jsonb, trust tiers) still ship in M1 |
+| **Roadmap** | "Borrow the agent, on demand": scoped trigger tokens, scheduled runs, result callbacks, git sign-in + repo-on-agent, then GitHub App / Slack / Jira events. Triggers only *create runs of registered agents*, so nothing about the run model changes — the seams (trigger jsonb, trust tiers, token kinds) ship in M1 |
 
 ## 3. Validation findings (what's real, what's adjusted)
 
@@ -252,8 +252,17 @@ Tool installs as needed: `cargo install sqlx-cli --no-default-features --feature
 
 **Converges by:** this is the milestone where the north star's "select Claude or Codex, pick your tool/MCP bundles, provide a prompt, we run it" sentence is true verbatim.
 
-### Roadmap — integrations & triggers (descoped from MVP, 2026-07-09)
-GitHub App (manifest flow) + webhook ingress (octocrab; HMAC via hmac/sha2/subtle; delivery-GUID idempotency), trigger router (PR opened / `/agent` comment / failed check_run), fork-PR read-only trust tier, Checks + PR-comment result writers; then Slack/Jira/Linear triggers, SSO/RBAC. Seams already in place from M1: trigger jsonb, trust_tier, event-ingress module boundary — a trigger only *creates a run of a registered agent*, so nothing about the run model changes when this lands. Until then, "Connect GitHub" = a stored fetch token consumed by the workspace-init phase.
+### Roadmap — triggers, integrations & "borrow the agent, on demand" (descoped from MVP; refined 2026-07-10)
+The user's framing: a registered agent must be startable by *any* external circumstance and hand its results back — "borrow the agent, on demand." Ordered pieces:
+
+1. **Scoped trigger tokens** — API tokens bound to specific agent definitions (kind `trigger` alongside admin/session), so an external service can start runs of *its* agent only, never touch the admin surface. This upgrades today's `POST /v1/sessions` (admin-token) into a real API trigger.
+2. **Scheduled runs** — cron-style trigger rows (`agent`, `task` template, `schedule`, `autonomy`) evaluated by a scheduler worker; each firing is an ordinary session with `trigger: {kind: "schedule", …}`.
+3. **Result delivery** — per-trigger callback: webhook URL (HMAC-signed) receiving `{session_id, status, summary, diff_artifact, cost}` on terminal state, so the borrowing service gets the outcome, not fire-and-forget. (Vertical writers like GitHub Checks/PR comments are specializations of this.)
+4. **"Sign in with git" + repo on the agent config** — GitHub OAuth/App install stores a fetch credential; an agent revision may carry a **default `RepoSource`** (repo URL + ref) so runs of that agent clone it during the workspace-init phase without per-run input. The credentialed clone stays control-plane-side (§6.6) — enabling `RepoSource::GitUrl` in the orchestrator is the M1-adjacent first step.
+5. **GitHub App events** — webhook ingress (octocrab; HMAC via hmac/sha2/subtle; delivery-GUID idempotency), trigger router (PR opened / `/agent` comment / failed check_run), fork-PR read-only trust tier, Checks + PR-comment result writers.
+6. Then Slack/Jira/Linear triggers, SSO/RBAC.
+
+Seams already in place from M1: trigger jsonb, trust_tier, event-ingress module boundary, `api_tokens.kind`, workspace-init phase — a trigger only *creates a run of a registered agent*, so nothing about the run model changes when any of this lands.
 
 ## 8. Verification
 
