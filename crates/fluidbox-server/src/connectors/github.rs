@@ -520,6 +520,227 @@ pub async fn fetch_auth_header(
     ))
 }
 
+// ─── Duty #5: publish (§17 #1 App-only, §17 #3 update in place) ──────────
+
+pub async fn publish(
+    state: &AppState,
+    dest: &ResultDestination,
+    ctx: &super::PublishContext,
+) -> Result<super::PublishOutcome, String> {
+    match dest {
+        ResultDestination::GitHubPrComment {
+            connection_id,
+            repository,
+            pr_number,
+        } => publish_pr_comment(state, *connection_id, repository, *pr_number, ctx).await,
+        ResultDestination::GitHubCheck {
+            connection_id,
+            repository,
+            head_sha,
+        } => publish_check(state, *connection_id, repository, head_sha, ctx).await,
+        ResultDestination::SignedWebhook { .. } => Err("not a github destination".into()),
+    }
+}
+
+/// Publishing identity is the App installation, never a user (§17 #1) —
+/// checks REQUIRE it, and comments carry attribution in their content.
+async fn app_connection(
+    state: &AppState,
+    connection_id: uuid::Uuid,
+) -> Result<IntegrationConnectionRow, String> {
+    let conn = fluidbox_db::get_connection(&state.pool, connection_id)
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?
+        .ok_or("destination connection is missing")?;
+    if conn.provider != "github_app" {
+        return Err("publishing requires a github_app connection (§17 #1: App identity)".into());
+    }
+    Ok(conn)
+}
+
+fn short_sha(sha: Option<&str>) -> String {
+    sha.map(|s| s.chars().take(12).collect())
+        .unwrap_or_else(|| "-".into())
+}
+
+/// The attributable comment body: agent name up top, run identity in the
+/// footer. One agent's failure appears only here, on its own comment.
+fn comment_body(ctx: &super::PublishContext) -> String {
+    let status_note = if ctx.status == "completed" {
+        String::new()
+    } else {
+        format!(
+            "\n> ⚠️ this run ended `{}` — the review may be incomplete.\n",
+            ctx.status
+        )
+    };
+    let body = ctx
+        .summary
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("(no summary produced)");
+    format!(
+        "### 🤖 {agent} review\n{status_note}\n{body}\n\n---\n_fluidbox · trigger **{sub}** · run `{run}` · commit `{sha}`_\n",
+        agent = ctx.agent_name,
+        status_note = status_note,
+        body = body,
+        sub = ctx.subscription_name,
+        run = ctx.session_id,
+        sha = short_sha(ctx.commit_sha.as_deref()),
+    )
+}
+
+/// Run status → check conclusion. The check reports RUN health; the review
+/// verdict itself lives in the output text.
+fn check_conclusion(status: &str) -> &'static str {
+    match status {
+        "completed" => "success",
+        "cancelled" => "cancelled",
+        _ => "failure",
+    }
+}
+
+async fn publish_pr_comment(
+    state: &AppState,
+    connection_id: uuid::Uuid,
+    repository: &str,
+    pr_number: i64,
+    ctx: &super::PublishContext,
+) -> Result<super::PublishOutcome, String> {
+    let sub_id = ctx
+        .subscription_id
+        .ok_or("comment publishing requires a subscription (stable identity is per subscription)")?;
+    let conn = app_connection(state, connection_id).await?;
+    let token = installation_token(state, &conn).await?;
+    let auth = format!("Bearer {token}");
+    let resource_key = format!("{repository}#{pr_number}");
+    let body_md = comment_body(ctx);
+    let digest = format!("sha256:{}", fluidbox_db::sha256_hex(&body_md));
+    let payload = json!({ "body": body_md });
+
+    // §17 #3: one stable comment per (subscription, PR) — update it in
+    // place; recreate only if it was deleted out from under us.
+    if let Some(existing) =
+        fluidbox_db::get_external_result(&state.pool, sub_id, "github_pr_comment", &resource_key)
+            .await
+            .map_err(|e| format!("external result lookup failed: {e}"))?
+    {
+        let (status, body, _) = api(
+            state,
+            reqwest::Method::PATCH,
+            &auth,
+            &format!("/repos/{repository}/issues/comments/{}", existing.external_id),
+            Some(&payload),
+        )
+        .await?;
+        if status.is_success() {
+            let url = body["html_url"]
+                .as_str()
+                .map(str::to_string)
+                .or(existing.external_url.clone())
+                .unwrap_or_default();
+            fluidbox_db::upsert_external_result(
+                &state.pool,
+                sub_id,
+                "github_pr_comment",
+                &resource_key,
+                &existing.external_id,
+                Some(&url),
+            )
+            .await
+            .map_err(|e| format!("external result update failed: {e}"))?;
+            return Ok(super::PublishOutcome {
+                external_url: url,
+                digest,
+            });
+        }
+        if status != reqwest::StatusCode::NOT_FOUND && status != reqwest::StatusCode::GONE {
+            return Err(format!("github comment update returned {status}"));
+        }
+        // Deleted externally → fall through and create a fresh one.
+    }
+
+    let (status, body, _) = api(
+        state,
+        reqwest::Method::POST,
+        &auth,
+        &format!("/repos/{repository}/issues/{pr_number}/comments"),
+        Some(&payload),
+    )
+    .await?;
+    if !status.is_success() {
+        return Err(format!("github comment create returned {status}"));
+    }
+    let external_id = body["id"]
+        .as_i64()
+        .ok_or("github comment create response has no id")?
+        .to_string();
+    let url = body["html_url"].as_str().unwrap_or("").to_string();
+    fluidbox_db::upsert_external_result(
+        &state.pool,
+        sub_id,
+        "github_pr_comment",
+        &resource_key,
+        &external_id,
+        Some(&url),
+    )
+    .await
+    .map_err(|e| format!("external result record failed: {e}"))?;
+    Ok(super::PublishOutcome {
+        external_url: url,
+        digest,
+    })
+}
+
+async fn publish_check(
+    state: &AppState,
+    connection_id: uuid::Uuid,
+    repository: &str,
+    head_sha: &str,
+    ctx: &super::PublishContext,
+) -> Result<super::PublishOutcome, String> {
+    let conn = app_connection(state, connection_id).await?;
+    let token = installation_token(state, &conn).await?;
+    // Stable name per subscription; one run per head SHA (that's how
+    // commit-attached checks version — §17 #3).
+    let name = format!("fluidbox/{}", ctx.subscription_name);
+    let summary: String = ctx
+        .summary
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("(no summary produced)")
+        .chars()
+        .take(60_000) // GitHub caps output.summary at 65535 chars
+        .collect();
+    let payload = json!({
+        "name": name,
+        "head_sha": head_sha,
+        "status": "completed",
+        "conclusion": check_conclusion(&ctx.status),
+        "completed_at": Utc::now().to_rfc3339(),
+        "output": {
+            "title": format!("{}: {}", ctx.agent_name, ctx.status),
+            "summary": summary,
+        },
+    });
+    let digest = format!("sha256:{}", fluidbox_db::sha256_hex(&payload.to_string()));
+    let (status, body, _) = api(
+        state,
+        reqwest::Method::POST,
+        &format!("Bearer {token}"),
+        &format!("/repos/{repository}/check-runs"),
+        Some(&payload),
+    )
+    .await?;
+    if !status.is_success() {
+        return Err(format!("github check create returned {status}"));
+    }
+    Ok(super::PublishOutcome {
+        external_url: body["html_url"].as_str().unwrap_or("").to_string(),
+        digest,
+    })
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -767,6 +988,45 @@ o+rncG5hSLaqG1A2w8vlQ3BS7Q==
         assert!(iat <= Utc::now().timestamp());
         // Garbage keys are refused without panicking.
         assert!(app_jwt("12345", "not a pem").is_err());
+    }
+
+    #[test]
+    fn comment_body_is_attributable_and_flags_failures() {
+        let ctx = super::super::PublishContext {
+            session_id: Uuid::now_v7(),
+            subscription_id: Some(Uuid::now_v7()),
+            subscription_name: "security-review".into(),
+            agent_name: "sec-agent".into(),
+            status: "completed".into(),
+            summary: Some("Looks solid. One nit on error handling.".into()),
+            commit_sha: Some("abcdef0123456789abcdef0123456789abcdef01".into()),
+        };
+        let body = comment_body(&ctx);
+        assert!(body.contains("sec-agent review"));
+        assert!(body.contains("security-review"));
+        assert!(body.contains(&ctx.session_id.to_string()));
+        assert!(body.contains("abcdef012345")); // 12-char short sha
+        assert!(body.contains("Looks solid"));
+        assert!(!body.contains("⚠️"), "completed runs carry no warning");
+
+        // One agent's failure shows only on its own comment — and honestly.
+        let failed = super::super::PublishContext {
+            status: "failed".into(),
+            summary: None,
+            ..ctx
+        };
+        let body = comment_body(&failed);
+        assert!(body.contains("⚠️"));
+        assert!(body.contains("`failed`"));
+        assert!(body.contains("(no summary produced)"));
+    }
+
+    #[test]
+    fn check_conclusion_maps_run_status() {
+        assert_eq!(check_conclusion("completed"), "success");
+        assert_eq!(check_conclusion("cancelled"), "cancelled");
+        assert_eq!(check_conclusion("failed"), "failure");
+        assert_eq!(check_conclusion("budget_exceeded"), "failure");
     }
 
     #[test]

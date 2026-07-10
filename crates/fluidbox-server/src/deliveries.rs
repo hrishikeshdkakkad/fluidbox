@@ -90,9 +90,9 @@ pub fn spawn_worker(state: AppState) {
 
 async fn attempt(state: &AppState, d: &fluidbox_db::ResultDeliveryRow) {
     let outcome = try_deliver(state, d).await;
-    let (ok, err, digest) = match &outcome {
-        Ok(digest) => (true, None, Some(digest.as_str())),
-        Err(e) => (false, Some(e.as_str()), None),
+    let (ok, err, digest, external_url) = match &outcome {
+        Ok((digest, external_url)) => (true, None, Some(digest.as_str()), external_url.clone()),
+        Err(e) => (false, Some(e.as_str()), None, None),
     };
     let next_attempt = d.attempts + 1;
     let updated = fluidbox_db::mark_delivery_attempt(
@@ -107,13 +107,9 @@ async fn attempt(state: &AppState, d: &fluidbox_db::ResultDeliveryRow) {
     .await;
     let Ok(Some(row)) = updated else { return };
     // Timeline visibility: record delivered / terminally-failed (not every
-    // intermediate retry — that's the deliveries table's job).
-    let url = row
-        .destination
-        .get("url")
-        .and_then(|u| u.as_str())
-        .unwrap_or("?")
-        .to_string();
+    // intermediate retry — that's the deliveries table's job). Provider
+    // publishes surface the created comment/check URL.
+    let url = external_url.unwrap_or_else(|| destination_label(&row.destination));
     match row.status.as_str() {
         "delivered" => {
             crate::ledger::record(
@@ -146,18 +142,88 @@ async fn attempt(state: &AppState, d: &fluidbox_db::ResultDeliveryRow) {
     }
 }
 
-/// One HTTP attempt. Returns the payload digest on 2xx.
+/// Human-readable destination identity for ledger events: the webhook URL,
+/// or `kind:repository` for provider destinations (which have no url).
+fn destination_label(dest: &Value) -> String {
+    if let Some(u) = dest.get("url").and_then(|u| u.as_str()) {
+        return u.to_string();
+    }
+    let kind = dest.get("kind").and_then(|k| k.as_str()).unwrap_or("?");
+    match dest.get("repository").and_then(|r| r.as_str()) {
+        Some(repo) => format!("{kind}:{repo}"),
+        None => kind.to_string(),
+    }
+}
+
+/// One delivery attempt. Returns (payload digest, external url if the
+/// destination created one). The destination decides the wire: signed
+/// webhooks are handled here; provider destinations route through the
+/// connector publisher.
 async fn try_deliver(
     state: &AppState,
     d: &fluidbox_db::ResultDeliveryRow,
-) -> Result<String, String> {
+) -> Result<(String, Option<String>), String> {
     let dest: ResultDestination = serde_json::from_value(d.destination.clone())
         .map_err(|e| format!("bad destination: {e}"))?;
-    // GitHub destinations are routed to the connector publisher (Task 9);
-    // until then they fail visibly rather than silently.
-    let ResultDestination::SignedWebhook { url } = dest else {
-        return Err("destination kind not yet routable".into());
+    let session = fluidbox_db::get_session(&state.pool, d.session_id)
+        .await
+        .map_err(|e| format!("session lookup failed: {e}"))?
+        .ok_or("session vanished")?;
+    match &dest {
+        ResultDestination::SignedWebhook { url } => {
+            let digest = deliver_signed_webhook(state, d, &session, url).await?;
+            Ok((digest, None))
+        }
+        _ => {
+            let ctx = publish_context(state, d, &session).await?;
+            let outcome = crate::connectors::publish(state, &dest, &ctx).await?;
+            Ok((
+                outcome.digest,
+                Some(outcome.external_url).filter(|u| !u.is_empty()),
+            ))
+        }
+    }
+}
+
+/// Provider-neutral publish inputs from the session + frozen RunSpec.
+async fn publish_context(
+    state: &AppState,
+    d: &fluidbox_db::ResultDeliveryRow,
+    session: &SessionRow,
+) -> Result<crate::connectors::PublishContext, String> {
+    let run_spec: Option<RunSpec> = serde_json::from_value(session.run_spec.clone()).ok();
+    let subscription_name = match d.subscription_id {
+        Some(sid) => fluidbox_db::get_trigger_subscription(&state.pool, sid)
+            .await
+            .map_err(|e| format!("subscription lookup failed: {e}"))?
+            .map(|s| s.name)
+            .unwrap_or_else(|| "unknown".into()),
+        None => "unknown".into(),
     };
+    let commit_sha = run_spec.as_ref().and_then(|r| match &r.workspace {
+        fluidbox_core::spec::WorkspaceSpec::GitRepository { commit_sha, .. } => commit_sha.clone(),
+        _ => None,
+    });
+    Ok(crate::connectors::PublishContext {
+        session_id: session.id,
+        subscription_id: d.subscription_id,
+        subscription_name,
+        agent_name: run_spec
+            .as_ref()
+            .map(|r| r.agent_name.clone())
+            .unwrap_or_else(|| "agent".into()),
+        status: session.status.clone(),
+        summary: session.result_summary.clone(),
+        commit_sha,
+    })
+}
+
+async fn deliver_signed_webhook(
+    state: &AppState,
+    d: &fluidbox_db::ResultDeliveryRow,
+    session: &SessionRow,
+    url: &str,
+) -> Result<String, String> {
     let sub_id = d
         .subscription_id
         .ok_or("delivery has no subscription (cannot resolve signing secret)")?;
@@ -171,11 +237,7 @@ async fn try_deliver(
         .ok_or("FLUIDBOX_CREDENTIAL_KEY not configured")?;
     let secret = sealer.open(&sealed).map_err(|e| e.to_string())?;
 
-    let session = fluidbox_db::get_session(&state.pool, d.session_id)
-        .await
-        .map_err(|e| format!("session lookup failed: {e}"))?
-        .ok_or("session vanished")?;
-    let payload = result_payload(state, &session, Some(d.id), Some(d.attempts + 1))
+    let payload = result_payload(state, session, Some(d.id), Some(d.attempts + 1))
         .await
         .map_err(|e| format!("payload build failed: {e}"))?;
     let body = payload.to_string();
@@ -185,7 +247,7 @@ async fn try_deliver(
 
     let res = state
         .http
-        .post(&url)
+        .post(url)
         .timeout(DELIVERY_TIMEOUT)
         .header("content-type", "application/json")
         .header("x-fluidbox-event", "run.finished")
