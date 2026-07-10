@@ -3,6 +3,7 @@ mod auth;
 mod callback;
 mod config;
 mod connections;
+mod connectors;
 mod deliveries;
 mod error;
 mod facade;
