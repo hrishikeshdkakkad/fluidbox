@@ -10,6 +10,7 @@ mod internal;
 mod ledger;
 mod orchestrator;
 mod run_service;
+mod scheduler;
 mod seal;
 mod sse;
 mod state;
@@ -83,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
     workers::boot_orphan_sweep(state.clone()).await;
     workers::spawn_all(state.clone());
     deliveries::spawn_worker(state.clone());
+    scheduler::spawn_worker(state.clone());
 
     let public = Router::new()
         .route("/health", get(api::health))
