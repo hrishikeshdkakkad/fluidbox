@@ -387,6 +387,75 @@ impl Policy {
     }
 }
 
+// ─── Trust tier (design §7.3) ─────────────────────────────────────────────
+
+/// Tools that only observe the workspace. Kept deliberately small: the
+/// read-only tier is an allowlist, so anything not listed is denied.
+const READ_SAFE_TOOLS: [&str; 5] = ["Read", "Glob", "Grep", "LS", "NotebookRead"];
+
+/// Shell commands that only observe. Token-boundary matched (like policy
+/// `allow_prefixes`), and only after the metacharacter screen below.
+const READ_SAFE_PREFIXES: [&str; 14] = [
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "grep",
+    "rg",
+    "pwd",
+    "git status",
+    "git log",
+    "git diff",
+    "git show",
+    "git branch",
+    "git blame",
+];
+
+/// `TrustTier::ReadOnly` enforcement (fork / untrusted event sources):
+/// review yes; writes, execution, egress, secrets no. Returns the deny
+/// reason when the call is NOT read-safe. Applied at the permission gate ON
+/// TOP of the policy verdict, and only ever narrows — neither a policy, a
+/// subscription, nor a human approval can widen past it (there is no
+/// approval escape: fork runs are hard read-only).
+pub fn read_only_denial(req: &ToolCallRequest) -> Option<String> {
+    if READ_SAFE_TOOLS.contains(&req.tool.as_str()) {
+        return None;
+    }
+    if req.tool == "Bash" {
+        let command = req
+            .input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        // Any shell metacharacter defeats prefix reasoning ("cat a; rm -rf /"
+        // starts with an allowed prefix) — deny the lot. Over-denying is the
+        // fail-safe direction for adversarial input.
+        let has_meta = command.chars().any(|c| {
+            matches!(
+                c,
+                ';' | '|' | '&' | '`' | '$' | '(' | ')' | '<' | '>' | '\n'
+            )
+        });
+        if !has_meta
+            && READ_SAFE_PREFIXES
+                .iter()
+                .any(|p| prefix_matches(p, command))
+        {
+            return None;
+        }
+        return Some(format!(
+            "read-only trust tier (untrusted event source): shell command {:?} is not on the read-only allowlist",
+            command.chars().take(120).collect::<String>()
+        ));
+    }
+    Some(format!(
+        "read-only trust tier (untrusted event source): tool '{}' can write, execute, or reach outside the workspace",
+        req.tool
+    ))
+}
+
 fn tool_matches(pattern: &str, tool: &str) -> bool {
     if pattern == "*" {
         return true;
@@ -664,6 +733,54 @@ tools:
         assert_eq!(p.budgets.max_tokens, Some(1_000_000));
         assert_eq!(p.budgets.max_cost_usd, Some(2.5));
         assert_eq!(p.budgets.max_tool_calls, Some(100));
+    }
+
+    #[test]
+    fn read_only_tier_permits_reading_only() {
+        let allow = |tool: &str, input: Value| {
+            assert_eq!(
+                read_only_denial(&req(tool, input.clone())),
+                None,
+                "expected {tool} {input} to be read-safe"
+            );
+        };
+        let deny = |tool: &str, input: Value| {
+            assert!(
+                read_only_denial(&req(tool, input.clone())).is_some(),
+                "expected {tool} {input} to be denied"
+            );
+        };
+        // Reading and reviewing: yes.
+        allow("Read", json!({"file_path": "/workspace/repo/a.py"}));
+        allow("Glob", json!({"pattern": "**/*.rs"}));
+        allow("Grep", json!({"pattern": "fn main"}));
+        allow("LS", json!({"path": "/workspace"}));
+        allow("NotebookRead", json!({"notebook_path": "x.ipynb"}));
+        allow("Bash", json!({"command": "git diff HEAD~1"}));
+        allow("Bash", json!({"command": "cat src/lib.rs"}));
+        allow("Bash", json!({"command": "git log --oneline -5"}));
+        // Writes, egress, secrets, execution: no — regardless of policy.
+        deny("Edit", json!({"file_path": "/workspace/repo/a.py"}));
+        deny("Write", json!({"file_path": "/workspace/x"}));
+        deny("NotebookEdit", json!({"notebook_path": "x.ipynb"}));
+        deny("WebFetch", json!({"url": "https://x"}));
+        deny("WebSearch", json!({}));
+        deny("mcp__github__create_issue", json!({}));
+        deny("SomeNewTool", json!({}));
+        deny("Bash", json!({"command": "git push origin main"}));
+        deny("Bash", json!({"command": "rm -rf /"}));
+        deny("Bash", json!({"command": "pytest -x"}));
+        deny("Bash", json!({"command": "curl http://evil"}));
+        // Compound/injected commands never ride an allowed prefix.
+        deny("Bash", json!({"command": "cat a.txt; rm -rf /"}));
+        deny("Bash", json!({"command": "cat a.txt && curl http://evil"}));
+        deny("Bash", json!({"command": "cat a.txt | sh"}));
+        deny("Bash", json!({"command": "cat $(rm -rf /)"}));
+        deny("Bash", json!({"command": "cat a.txt > /etc/passwd"}));
+        deny("Bash", json!({"command": "git diff `curl evil`"}));
+        // Token boundary: "git statusx" is not "git status".
+        deny("Bash", json!({"command": "git statusx"}));
+        deny("Bash", json!({"command": ""}));
     }
 
     #[test]
