@@ -40,12 +40,15 @@ pub struct Budgets {
 }
 
 impl Default for Budgets {
+    /// Last-resort fallback only — the seed policy (`policies/default.yaml`,
+    /// pinned by `seed_policy_semantics`) is the source of truth for real
+    /// deployments; keep these numbers matching it.
     fn default() -> Self {
         Self {
             max_wall_clock_secs: Some(1800),
-            max_tokens: Some(2_000_000),
-            max_cost_usd: Some(5.0),
-            max_tool_calls: Some(200),
+            max_tokens: Some(1_000_000),
+            max_cost_usd: Some(2.5),
+            max_tool_calls: Some(100),
         }
     }
 }
@@ -119,8 +122,8 @@ mod tests {
         };
         let eff = base.tightened_by(&run);
         assert_eq!(eff.max_wall_clock_secs, Some(60));
-        assert_eq!(eff.max_tokens, Some(2_000_000));
-        assert_eq!(eff.max_cost_usd, Some(5.0));
+        assert_eq!(eff.max_tokens, Some(1_000_000));
+        assert_eq!(eff.max_cost_usd, Some(2.5));
         assert_eq!(eff.max_tool_calls, Some(2));
     }
 

@@ -283,8 +283,8 @@ Seams already in place from M1: trigger jsonb, trust_tier, event-ingress module 
 
 ## 10. Open decision points (deliberately deferred to implementation)
 
-1. `fluidbox-core` policy engine — the shell-command risk classifier (which prefixes/regexes are allow vs approve vs deny): a security-posture judgment call.
+1. ~~`fluidbox-core` policy engine — the shell-command risk classifier~~ **Resolved 2026-07-10** from live-run ledger data (observed agent behavior: `python3 -m unittest`, `Edit /workspace/…`): see `policies/default.yaml` (rationale in comments; read-only utilities allowed, any force-push denied, split-flag `rm -rf /` variants denied) — pinned by the `seed_policy_semantics` test in fluidbox-core.
 2. Approval timeout semantics beyond the MVP default (10 min → deny): escalate? notify? per-policy configurable?
-3. Default budget numbers for the seed policy (wall-clock / tokens / USD): a cost-appetite call.
+3. ~~Default budget numbers for the seed policy~~ **Resolved 2026-07-10**: 1800 s / 1 M tokens / $2.50 / 100 tool calls (observed real runs: ≤ $0.38, ≤ 231k tokens, ≤ 4 tool calls — caps sit 4–25× above observed). Policy budgets are now enforced as a **ceiling** at session creation (revision/run budgets can only tighten below them), and the seeded agent revision inherits them.
 4. LiteLLM callback transport — generic webhook vs a minimal custom callback: decided empirically at M1 step 9, whichever delivers per-call usage (incl. cache tokens) most reliably.
 5. Long-run budget semantics for autonomous agents — total caps (M1) vs rolling windows ($/day, tokens/hour): a cost-appetite + safety call once real long-running workloads exist.

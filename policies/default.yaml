@@ -1,15 +1,27 @@
 # fluidbox seed policy. First-match-wins over `tools`; anything unmatched
 # falls back to defaults.tool_action (fail-safe: ask a human).
+#
+# The shell classifier and budgets below are the PLAN.md §10 #1/#3 decisions,
+# resolved 2026-07-10 from live-run ledger data and pinned by the
+# `seed_policy_semantics` test in fluidbox-core (change both together).
+# Applying edits to a running deployment: `just policy-sync` (version++;
+# in-flight runs keep their frozen snapshot).
 name: default
 defaults:
   tool_action: approve
 egress:
   mode: proxy-only
+# Budgets are a CEILING for every run of an agent on this policy: revision
+# defaults and per-run requests may tighten them, never widen past them.
+# Data (2026-07-10, live demo runs on haiku + opus): a real fix-a-failing-test
+# run costs $0.05–$0.37, uses 34k–231k tokens (incl. cache) and ≤4 tool
+# calls. Caps sit 4–25× above observed so a runaway loop stops early while
+# legitimate bigger tasks fit; widen per-agent deliberately when needed.
 budgets:
   max_wall_clock_secs: 1800
-  max_tokens: 2000000
-  max_cost_usd: 5.0
-  max_tool_calls: 200
+  max_tokens: 1000000
+  max_cost_usd: 2.5
+  max_tool_calls: 100
 approvals:
   default_ttl_secs: 600
   scope: once
@@ -23,6 +35,9 @@ tools:
     action: allow
 
   # Edits are free inside the workspace; anything else asks a human.
+  # (These path globs are hygiene, not hard security: shell redirection via
+  # an allowed prefix can still write files. The real boundary is that the
+  # workspace is a disposable copy inside an isolated sandbox.)
   - match: ["Edit", "Write", "MultiEdit", "NotebookEdit"]
     action: allow
     paths:
@@ -31,10 +46,14 @@ tools:
 
   # Shell: a benign toolbox is pre-approved; destructive or exfiltrating
   # patterns are denied outright; everything else pauses for approval.
+  # python/node/pytest are allowed because running the project's code IS the
+  # job — network egress from inside them is bounded by the sandbox network
+  # mode (containment layer), not by this classifier.
   - match: ["Bash", "BashOutput", "KillShell"]
     action: allow
     shell:
       allow_prefixes:
+        # observed agent behavior (ledger): python3 -m unittest, git status…
         - "ls"
         - "cat"
         - "head"
@@ -74,14 +93,29 @@ tools:
         - "cp"
         - "sed"
         - "awk"
+        # read-only text/file utilities (zero write surface of their own)
+        - "diff"
+        - "sort"
+        - "uniq"
+        - "cut"
+        - "tr"
+        - "stat"
+        - "file"
+        - "du"
+        - "printf"
+        - "basename"
+        - "dirname"
+        - "date"
       deny_regex:
-        - "rm\\s+-[a-z]*r[a-z]*f?\\s+/(?:\\s|$)"   # rm -rf /
+        # rm -rf / and /*, including split flags (rm -r -f /)
+        - "rm\\s+(-[a-z]+\\s+)*-[a-z]*r[a-z]*(\\s+-[a-z]+)*\\s+/\\*?(\\s|$)"
         - "\\bcurl\\b"
         - "\\bwget\\b"
         - "\\bnc\\b"
         - "\\bssh\\b"
         - "\\bscp\\b"
-        - "git\\s+push\\s+--force"
+        # any force push: --force, --force-with-lease, -f
+        - "git\\s+push\\b.*\\s(--force(-with-lease)?|-f)\\b"
         - "\\bsudo\\b"
         - "/etc/passwd"
         - "\\bchmod\\s+777\\b"
