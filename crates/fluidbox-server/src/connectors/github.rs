@@ -43,8 +43,8 @@ pub fn verify(headers: &HeaderMap, body: &[u8], secret: &str) -> Result<Verified
 
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-        .expect("hmac accepts any key length");
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac accepts any key length");
     mac.update(body);
     let expected = hex::encode(mac.finalize().into_bytes());
     // Constant-time-ish compare via sha256 of both sides (auth.rs pattern).
@@ -102,11 +102,15 @@ pub fn normalize(
     // signature proves the sender, not the content's intent) — and this
     // value feeds a clone URL. Validate hard, derive the URL ourselves.
     if !crate::api::valid_repo_name(&repository) {
-        return Err(format!("payload repository '{repository}' is not owner/name"));
+        return Err(format!(
+            "payload repository '{repository}' is not owner/name"
+        ));
     }
 
     let pr = &payload["pull_request"];
-    let pr_number = pr["number"].as_i64().ok_or("payload has no pull_request.number")?;
+    let pr_number = pr["number"]
+        .as_i64()
+        .ok_or("payload has no pull_request.number")?;
     let head_sha = pr["head"]["sha"]
         .as_str()
         .ok_or("payload has no pull_request.head.sha")?
@@ -116,14 +120,20 @@ pub fn normalize(
     }
     let pr_title = pr["title"].as_str().unwrap_or("").to_string();
     let pr_url = pr["html_url"].as_str().unwrap_or("").to_string();
-    let pr_author = pr["user"]["login"].as_str().unwrap_or("unknown").to_string();
+    let pr_author = pr["user"]["login"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_string();
     let head_ref = pr["head"]["ref"].as_str().unwrap_or("").to_string();
     let base_sha = pr["base"]["sha"].as_str().unwrap_or("").to_string();
     let base_ref = pr["base"]["ref"].as_str().unwrap_or("").to_string();
 
     // Fork detection keys on repo identity, and FAILS TOWARD FORK: a payload
     // that hides the head repo gets the untrusted tier, never the trusted one.
-    let fork = match (pr["head"]["repo"]["id"].as_i64(), pr["base"]["repo"]["id"].as_i64()) {
+    let fork = match (
+        pr["head"]["repo"]["id"].as_i64(),
+        pr["base"]["repo"]["id"].as_i64(),
+    ) {
         (Some(h), Some(b)) => h != b,
         _ => true,
     };
@@ -317,7 +327,10 @@ fn app_metadata<'a>(conn: &'a IntegrationConnectionRow, key: &str) -> Result<&'a
 }
 
 /// Unseal the connection credential (PAT or App private key).
-async fn unsealed_credential(state: &AppState, conn: &IntegrationConnectionRow) -> Result<String, String> {
+async fn unsealed_credential(
+    state: &AppState,
+    conn: &IntegrationConnectionRow,
+) -> Result<String, String> {
     let sealer = state
         .sealer
         .as_ref()
@@ -380,10 +393,18 @@ pub async fn validate_pat(
     state: &AppState,
     token: &str,
 ) -> Result<(String, String, Vec<String>), String> {
-    let (status, user, headers) =
-        api(state, reqwest::Method::GET, &format!("Bearer {token}"), "/user", None).await?;
+    let (status, user, headers) = api(
+        state,
+        reqwest::Method::GET,
+        &format!("Bearer {token}"),
+        "/user",
+        None,
+    )
+    .await?;
     if status == reqwest::StatusCode::UNAUTHORIZED {
-        return Err("github rejected the token (401) — check that it is valid and unexpired".into());
+        return Err(
+            "github rejected the token (401) — check that it is valid and unexpired".into(),
+        );
     }
     if !status.is_success() {
         return Err(format!("github /user returned {status}"));
@@ -443,7 +464,10 @@ pub async fn validate_app(
     if !status.is_success() {
         return Err(format!("github /app/installations returned {status}"));
     }
-    let account_login = inst["account"]["login"].as_str().unwrap_or("unknown").to_string();
+    let account_login = inst["account"]["login"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_string();
     Ok(json!({
         "app_id": app_id,
         "installation_id": installation_id,
@@ -607,9 +631,9 @@ async fn publish_pr_comment(
     pr_number: i64,
     ctx: &super::PublishContext,
 ) -> Result<super::PublishOutcome, String> {
-    let sub_id = ctx
-        .subscription_id
-        .ok_or("comment publishing requires a subscription (stable identity is per subscription)")?;
+    let sub_id = ctx.subscription_id.ok_or(
+        "comment publishing requires a subscription (stable identity is per subscription)",
+    )?;
     let conn = app_connection(state, connection_id).await?;
     let token = installation_token(state, &conn).await?;
     let auth = format!("Bearer {token}");
@@ -629,7 +653,10 @@ async fn publish_pr_comment(
             state,
             reqwest::Method::PATCH,
             &auth,
-            &format!("/repos/{repository}/issues/comments/{}", existing.external_id),
+            &format!(
+                "/repos/{repository}/issues/comments/{}",
+                existing.external_id
+            ),
             Some(&payload),
         )
         .await?;
@@ -766,7 +793,10 @@ mod tests {
         assert_eq!(v.external_event_id, "d-1");
         assert_eq!(v.event_name, "ping");
         // Uppercase hex from a proxy still verifies.
-        let upper = format!("sha256={}", sig.trim_start_matches("sha256=").to_uppercase());
+        let upper = format!(
+            "sha256={}",
+            sig.trim_start_matches("sha256=").to_uppercase()
+        );
         assert!(verify(&signed_headers(&upper, "d-1", "ping"), body, "whsec-test").is_ok());
     }
 
@@ -869,7 +899,10 @@ mod tests {
 
         assert_eq!(ev.context["repository"], "acme/site");
         assert_eq!(ev.context["pr_number"], "42");
-        assert_eq!(ev.context["head_sha"], "abcdef0123456789abcdef0123456789abcdef01");
+        assert_eq!(
+            ev.context["head_sha"],
+            "abcdef0123456789abcdef0123456789abcdef01"
+        );
         assert_eq!(ev.context["base_ref"], "main");
         assert_eq!(ev.context["fork"], "false");
 
@@ -895,10 +928,14 @@ mod tests {
             assert!(SUPPORTED_EVENTS.contains(&ev.event_type.as_str()));
         }
         // Unhandled PR actions and other event families are ignored politely.
-        assert!(normalize("pull_request", &pr_payload("labeled", 7, 7), &ctx())
+        assert!(
+            normalize("pull_request", &pr_payload("labeled", 7, 7), &ctx())
+                .unwrap()
+                .is_none()
+        );
+        assert!(normalize("ping", &json!({"zen": "x"}), &ctx())
             .unwrap()
             .is_none());
-        assert!(normalize("ping", &json!({"zen": "x"}), &ctx()).unwrap().is_none());
         assert!(normalize("push", &json!({}), &ctx()).unwrap().is_none());
     }
 
@@ -975,11 +1012,9 @@ o+rncG5hSLaqG1A2w8vlQ3BS7Q==
         assert_eq!(parts.len(), 3, "jwt has three parts");
         use base64::Engine;
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        let header: Value =
-            serde_json::from_slice(&b64.decode(parts[0]).unwrap()).unwrap();
+        let header: Value = serde_json::from_slice(&b64.decode(parts[0]).unwrap()).unwrap();
         assert_eq!(header["alg"], "RS256");
-        let claims: Value =
-            serde_json::from_slice(&b64.decode(parts[1]).unwrap()).unwrap();
+        let claims: Value = serde_json::from_slice(&b64.decode(parts[1]).unwrap()).unwrap();
         assert_eq!(claims["iss"], "12345");
         // iat backdated 60s; exp 10 minutes after iat (GitHub's cap).
         let iat = claims["iat"].as_i64().unwrap();
