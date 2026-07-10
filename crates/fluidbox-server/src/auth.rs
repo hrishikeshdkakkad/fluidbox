@@ -36,6 +36,28 @@ impl FromRequestParts<AppState> for Admin {
     }
 }
 
+/// Scoped trigger-token authentication. The token's entire authority is its
+/// subscription: it can invoke that subscription and poll the runs it
+/// created — it can never satisfy `Admin` or `SessionAuth`.
+pub struct TriggerAuth {
+    pub subscription_id: Uuid,
+}
+
+impl FromRequestParts<AppState> for TriggerAuth {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let token = bearer(parts).ok_or(ApiError::Unauthorized)?;
+        let subscription_id = fluidbox_db::subscription_for_token(&state.pool, &token)
+            .await?
+            .ok_or(ApiError::Unauthorized)?;
+        Ok(TriggerAuth { subscription_id })
+    }
+}
+
 /// Per-session authentication for the internal gateway. Resolves the bearer
 /// token to the session it belongs to (unexpired, unrevoked).
 pub struct SessionAuth {
