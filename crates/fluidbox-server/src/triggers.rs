@@ -226,6 +226,22 @@ pub struct CreateTrigger {
     /// Attach a clock: the subscription becomes trigger_kind='schedule'.
     #[serde(default)]
     pub schedule: Option<ScheduleInput>,
+    /// Listen on a connection's events: the subscription becomes
+    /// trigger_kind='event' (mutually exclusive with `schedule`).
+    #[serde(default)]
+    pub connection: Option<String>,
+    /// Resource selector: only these repositories match. Empty/omitted =
+    /// every repository the connection can see.
+    #[serde(default)]
+    pub repositories: Option<Vec<String>>,
+    /// Event filter. Omitted = the connector's defaults (§17 #2: opened +
+    /// reopened; synchronize is an explicit opt-in — it fires per push).
+    #[serde(default)]
+    pub events: Option<Vec<String>>,
+    /// Provider publish modes ("pr_comment", "check"). Omitted =
+    /// ["pr_comment"]; an explicit [] publishes to the dashboard/webhook only.
+    #[serde(default)]
+    pub publish: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -312,8 +328,116 @@ pub async fn create(
             ))
         }
     };
+    // Event subscription config (design §6.3): validated against the
+    // connection's connector so dead config is refused at create time.
+    let event_cfg = match &req.connection {
+        None => {
+            if req.repositories.is_some() || req.events.is_some() || req.publish.is_some() {
+                return Err(ApiError::BadRequest(
+                    "repositories/events/publish require a connection".into(),
+                ));
+            }
+            None
+        }
+        Some(conn_str) => {
+            if req.schedule.is_some() {
+                return Err(ApiError::BadRequest(
+                    "a subscription is either scheduled or event-driven, not both".into(),
+                ));
+            }
+            let cid = Uuid::parse_str(conn_str.trim())
+                .map_err(|_| ApiError::BadRequest("connection must be a connection id".into()))?;
+            let conn = fluidbox_db::get_connection(&state.pool, cid)
+                .await?
+                .filter(|c| c.tenant_id == state.tenant_id)
+                .ok_or_else(|| ApiError::BadRequest(format!("unknown connection {cid}")))?;
+            if conn.status != "active" {
+                return Err(ApiError::BadRequest(format!(
+                    "connection is {} — reconnect it first",
+                    conn.status
+                )));
+            }
+            let connector = crate::connectors::connector_for(&conn.provider).ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "provider '{}' has no event connector",
+                    conn.provider
+                ))
+            })?;
+            let can_receive =
+                fluidbox_db::connection_webhook_secret_sealed(&state.pool, cid).await?;
+            if can_receive.is_none() {
+                return Err(ApiError::BadRequest(
+                    "this connection cannot receive events (no webhook secret) — connect a github_app".into(),
+                ));
+            }
+            // §17 #2: defaults from the connector; anything explicit must be
+            // a supported event.
+            let supported = crate::connectors::supported_events(connector);
+            let events: Vec<String> = match &req.events {
+                None => crate::connectors::default_events(connector),
+                Some(list) if list.is_empty() => {
+                    return Err(ApiError::BadRequest("events must not be empty".into()))
+                }
+                Some(list) => {
+                    for e in list {
+                        if !supported.contains(&e.as_str()) {
+                            return Err(ApiError::BadRequest(format!(
+                                "unsupported event '{e}' (supported: {})",
+                                supported.join(", ")
+                            )));
+                        }
+                    }
+                    list.clone()
+                }
+            };
+            let modes = crate::connectors::publish_modes(connector);
+            let publish: Vec<String> = match &req.publish {
+                None => vec!["pr_comment".to_string()],
+                Some(list) => {
+                    for m in list {
+                        if !modes.contains(&m.as_str()) {
+                            return Err(ApiError::BadRequest(format!(
+                                "unsupported publish mode '{m}' (supported: {})",
+                                modes.join(", ")
+                            )));
+                        }
+                    }
+                    list.clone()
+                }
+            };
+            let repositories: Vec<String> = req.repositories.clone().unwrap_or_default();
+            for r in &repositories {
+                if !crate::api::valid_repo_name(r) {
+                    return Err(ApiError::BadRequest(format!(
+                        "repository must be 'owner/name' (got '{r}')"
+                    )));
+                }
+            }
+            // An event fires with no caller: the template must exist and
+            // render from the event context alone.
+            let tpl = template.ok_or_else(|| {
+                ApiError::BadRequest("an event subscription needs a task_template".into())
+            })?;
+            render_task_template(tpl, &crate::connectors::sample_context(connector)).map_err(
+                |e| {
+                    ApiError::BadRequest(format!(
+                        "task_template must render from the event context ({}): {e}",
+                        crate::connectors::sample_context(connector)
+                            .keys()
+                            .map(|k| format!("{{{{{k}}}}}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    ))
+                },
+            )?;
+            Some((cid, connector, repositories, events, publish))
+        }
+    };
+
     let trigger_kind = if schedule_cfg.is_some() {
         "schedule"
+    } else if event_cfg.is_some() {
+        "event"
     } else {
         "api"
     };
@@ -347,6 +471,18 @@ pub async fn create(
         }
     };
 
+    let (connection_id, resource_selector, event_filter, event_publish, ingress_path) =
+        match &event_cfg {
+            None => (None, None, None, None, None),
+            Some((cid, connector, repos, events, publish)) => (
+                Some(*cid),
+                Some(json!({ "repositories": repos })),
+                Some(json!({ "events": events })),
+                Some(json!(publish)),
+                Some(format!("/v1/ingress/{connector}/{cid}")),
+            ),
+        };
+
     let sub = fluidbox_db::create_trigger_subscription(
         &state.pool,
         state.tenant_id,
@@ -367,10 +503,10 @@ pub async fn create(
         workspace_value.as_ref(),
         &destinations,
         secret_sealed.as_deref(),
-        None,
-        None,
-        None,
-        None,
+        connection_id,
+        resource_selector.as_ref(),
+        event_filter.as_ref(),
+        event_publish.as_ref(),
     )
     .await
     .map_err(|e| match &e {
@@ -396,6 +532,7 @@ pub async fn create(
         "schedule": schedule_row,
         "token": token,
         "callback_secret": secret_plain,
+        "ingress_path": ingress_path,
     })))
 }
 
