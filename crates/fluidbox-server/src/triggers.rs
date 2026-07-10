@@ -587,19 +587,27 @@ pub async fn invoke(
             budget_override,
             invocation,
             result_destinations: destinations,
+            bound_invocation: Some(invocation_id),
         },
     )
     .await;
 
     match created {
-        Ok(session) => {
-            fluidbox_db::bind_invocation(&state.pool, invocation_id, session.id).await?;
-            Ok(Json(json!({
-                "session_id": session.id,
-                "status": session.status,
-                "replay": false,
-                "poll_url": format!("/v1/triggers/{}/runs/{}", sub.id, session.id),
-            })))
+        Ok(crate::run_service::RunCreation::Created(session)) => Ok(Json(json!({
+            "session_id": session.id,
+            "status": session.status,
+            "replay": false,
+            "poll_url": format!("/v1/triggers/{}/runs/{}", sub.id, session.id),
+        }))),
+        Ok(crate::run_service::RunCreation::SkippedOverlap { running_session_id }) => {
+            // The skip is the terminal outcome of this key — recorded, not
+            // retried; the caller uses a new key once the run finishes.
+            fluidbox_db::mark_invocation_skipped(&state.pool, invocation_id, "overlap")
+                .await
+                .ok();
+            Err(ApiError::Conflict(format!(
+                "skipped: run {running_session_id} from this subscription is still active (concurrency_policy=skip_if_running)"
+            )))
         }
         Err(e) => {
             // Free the key so the caller's retry isn't wedged behind a failure.
