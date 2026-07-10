@@ -2,7 +2,7 @@
 
 Paste the block below (or an edited version) as the next session's goal. It follows the
 same shape as the Phase 3 brief and reflects everything settled/shipped through
-2026-07-10 (`main` @ 95177e5, pushed).
+2026-07-10 (`main` @ 4639cbd, pushed).
 
 ---
 
@@ -14,7 +14,7 @@ READ FIRST (in this order):
 3. docs/plans/2026-07-10-agent-workspaces-triggers-integrations-design.md — §6.3 (event trigger), §6.4 (two-level idempotency), §7 (GitHub PR fan-out, the flagship demo), §10 (trigger_deliveries/trigger_dispatches seeds), §12 Phase 4, §17 #1–#3
 
 WHERE WE ARE:
-- Phases 0–3 shipped & verified: `just check` green (fmt, clippy -D warnings, 65 tests incl. Neon-gated) and `just e2e` = 175/175 across 6 phases (live demo A, governance, git workspaces, api triggers + signed callbacks, scheduled borrowing, failure paths). Tree clean & pushed at 95177e5.
+- Phases 0–3 shipped & verified: `just check` green (fmt, clippy -D warnings, 65 tests incl. Neon-gated) and `just e2e` = 175/175 across 6 phases (live demo A, governance, git workspaces, api triggers + signed callbacks, scheduled borrowing, failure paths). Tree clean & pushed at 4639cbd (code frozen at 95177e5; later commits are docs only).
 - Phase 3 delivered: schedules table (migration 0004; explicit IANA tz, DST-correct via fluidbox-core/src/schedule.rs); scheduler.rs tick worker; exactly-once firing via deterministic claim keys (sched:{fire_time}) bound to the session IN THE SAME TRANSACTION (create_session's bind_invocation param); §17 #5 SETTLED: overlap default allow, missed default skip, concurrency_policy enforced in run_service::create_run for ALL invocations (API invokes get 409 + recorded skip); skips are terminal claim rows (trigger_invocations.skip_reason); disabled subscription = clock paused → missed-run path on re-enable; Triggers dashboard shows cron/next/last fire + firings & skips. Plan doc: docs/superpowers/plans/2026-07-10-phase3-scheduled-borrowing.md.
 
 YOUR TASK — design-doc Phase 4, "GitHub PR-review fan-out":
@@ -75,4 +75,4 @@ OPERATIONAL NOTES:
 - E2E lesson from Phase 3: live-model runs in e2e must be AUTONOMOUS subscriptions — a supervised run can hang at awaiting_approval if the model reaches for a gated tool (this bit Phase 4's suite once; fixed in e2e-trigger.sh).
 - Touching the permission/approval path? Re-run scripts/governance-e2e.sh.
 - FLUIDBOX_CREDENTIAL_KEY is already in .env; new GitHub App env vars will need .env.example + CLAUDE.md notes.
-- Check `git status` FIRST — the tree should be clean at 95177e5 (pushed); if it isn't, ask me before starting. ultrathink
+- Check `git status` FIRST — the tree should be clean at 4639cbd (pushed); if it isn't, ask me before starting. ultrathink
