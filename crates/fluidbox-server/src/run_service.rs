@@ -9,6 +9,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::orchestrator;
 use crate::state::AppState;
 use fluidbox_core::policy::Policy;
+use fluidbox_core::schedule::ConcurrencyPolicy;
 use fluidbox_core::spec::{
     Autonomy, Budgets, InvocationContext, ResultDestination, RunSpec, TrustTier, WorkspaceSpec,
 };
@@ -34,9 +35,23 @@ pub struct CreateRun {
     pub budget_override: Option<Budgets>,
     pub invocation: InvocationContext,
     pub result_destinations: Vec<ResultDestination>,
+    /// Idempotency claim bound atomically with session creation (same DB
+    /// transaction) — a crash can never leave a created run unclaimed, so a
+    /// stale-claim takeover can never duplicate it. None for manual runs.
+    pub bound_invocation: Option<Uuid>,
 }
 
-pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<fluidbox_db::SessionRow> {
+pub enum RunCreation {
+    Created(Box<fluidbox_db::SessionRow>),
+    /// concurrency_policy = skip_if_running and another run of this
+    /// subscription is still active. Nothing was created; the caller
+    /// records the skip visibly (claim row → skip_reason, or 409).
+    SkippedOverlap {
+        running_session_id: Uuid,
+    },
+}
+
+pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreation> {
     // Resolve agent by id or name.
     let agent = match Uuid::parse_str(&req.agent) {
         Ok(id) => fluidbox_db::get_agent(&state.pool, id).await?,
@@ -70,6 +85,47 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<fluidbox_
         return Err(ApiError::BadRequest(
             "policy does not permit autonomous runs".into(),
         ));
+    }
+
+    // §17 #5 (settled 2026-07-10): the subscription's concurrency policy
+    // governs EVERY invocation that carries one — API invokes and schedule
+    // firings alike. Manual runs carry no subscription and are never gated.
+    if let Some(sub_id) = req.invocation.subscription_id {
+        let sub = fluidbox_db::get_trigger_subscription(&state.pool, sub_id)
+            .await?
+            .filter(|s| s.tenant_id == state.tenant_id)
+            .ok_or_else(|| {
+                ApiError::Internal("invocation references a missing subscription".into())
+            })?;
+        let concurrency = ConcurrencyPolicy::parse(&sub.concurrency_policy).ok_or_else(|| {
+            ApiError::Internal(format!(
+                "bad stored concurrency_policy '{}'",
+                sub.concurrency_policy
+            ))
+        })?;
+        if concurrency != ConcurrencyPolicy::Allow {
+            let active = fluidbox_db::active_subscription_sessions(&state.pool, sub_id).await?;
+            match concurrency {
+                ConcurrencyPolicy::SkipIfRunning => {
+                    if let Some(s) = active.first() {
+                        return Ok(RunCreation::SkippedOverlap {
+                            running_session_id: s.id,
+                        });
+                    }
+                }
+                ConcurrencyPolicy::Replace => {
+                    for s in &active {
+                        orchestrator::cancel(
+                            state,
+                            s.id,
+                            "replaced by a newer invocation of this subscription",
+                        )
+                        .await;
+                    }
+                }
+                ConcurrencyPolicy::Allow => unreachable!(),
+            }
+        }
     }
 
     let agent_budgets: Budgets = serde_json::from_value(rev.budgets.clone()).unwrap_or_default();
@@ -140,7 +196,7 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<fluidbox_
         &serde_json::to_value(&run_spec)?,
         &serde_json::to_value(&effective_budgets)?,
         Some(&serde_json::to_value(&req.invocation)?),
-        None,
+        req.bound_invocation,
     )
     .await?;
 
@@ -159,5 +215,5 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<fluidbox_
     // Kick off the run.
     orchestrator::spawn_run(state.clone(), session.id);
 
-    Ok(session)
+    Ok(RunCreation::Created(Box::new(session)))
 }

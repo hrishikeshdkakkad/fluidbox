@@ -1101,7 +1101,8 @@ pub async fn extend_session_token(
 
 #[derive(Debug)]
 pub enum InvocationClaim {
-    /// We own this key — create the run, then `bind_invocation`.
+    /// We own this key — create the run, binding this claim atomically via
+    /// create_session's bind_invocation param.
     Claimed { invocation_id: Uuid },
     /// This key already produced a run — return it (after digest check).
     Replay {
@@ -1179,17 +1180,6 @@ pub async fn claim_invocation(
         },
         None => InvocationClaim::InFlight,
     })
-}
-
-/// Post-hoc claim bind. Being replaced by the atomic bind inside
-/// create_session — kept only until every caller has switched.
-pub async fn bind_invocation(pool: &PgPool, invocation: Uuid, session: Uuid) -> sqlx::Result<()> {
-    sqlx::query("update trigger_invocations set session_id = $2 where id = $1")
-        .bind(invocation)
-        .bind(session)
-        .execute(pool)
-        .await?;
-    Ok(())
 }
 
 /// A skipped firing is the terminal state of its claim row: visibly

@@ -414,7 +414,7 @@ pub async fn create_session(
     } else {
         Autonomy::Supervised
     };
-    let session = crate::run_service::create_run(
+    let created = crate::run_service::create_run(
         &state,
         crate::run_service::CreateRun {
             agent: req.agent,
@@ -431,9 +431,19 @@ pub async fn create_session(
                 received_at: Some(chrono::Utc::now()),
             },
             result_destinations: vec![],
+            bound_invocation: None,
         },
     )
     .await?;
+    let session = match created {
+        crate::run_service::RunCreation::Created(s) => *s,
+        // Manual runs carry no subscription — unreachable, but honest.
+        crate::run_service::RunCreation::SkippedOverlap { running_session_id } => {
+            return Err(ApiError::Conflict(format!(
+                "skipped: run {running_session_id} is still active (concurrency_policy=skip_if_running)"
+            )))
+        }
+    };
     Ok(Json(json!({ "session": session })))
 }
 
@@ -472,7 +482,7 @@ pub async fn cancel_session(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let ok = orchestrator::cancel(&state, id).await;
+    let ok = orchestrator::cancel(&state, id, "cancelled by user").await;
     Ok(Json(json!({ "cancelled": ok })))
 }
 
