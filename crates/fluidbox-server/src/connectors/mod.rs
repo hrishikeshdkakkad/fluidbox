@@ -139,6 +139,41 @@ pub fn sample_context(connector: &str) -> BTreeMap<String, String> {
     }
 }
 
+/// What a publish produced, for delivery bookkeeping.
+pub struct PublishOutcome {
+    pub external_url: String,
+    pub digest: String,
+}
+
+/// Provider-neutral inputs a publisher needs — built by deliveries.rs from
+/// the session + frozen RunSpec, no provider types involved.
+pub struct PublishContext {
+    pub session_id: Uuid,
+    pub subscription_id: Option<Uuid>,
+    pub subscription_name: String,
+    pub agent_name: String,
+    pub status: String,
+    pub summary: Option<String>,
+    pub commit_sha: Option<String>,
+}
+
+/// Duty #5: publish a canonical result to a provider destination.
+/// SignedWebhook never reaches here (deliveries.rs owns it directly).
+pub async fn publish(
+    state: &crate::state::AppState,
+    dest: &ResultDestination,
+    ctx: &PublishContext,
+) -> Result<PublishOutcome, String> {
+    match dest {
+        ResultDestination::SignedWebhook { .. } => {
+            Err("signed_webhook is not a connector destination".into())
+        }
+        ResultDestination::GitHubPrComment { .. } | ResultDestination::GitHubCheck { .. } => {
+            github::publish(state, dest, ctx).await
+        }
+    }
+}
+
 /// Resolve a connection into a git-fetch `Authorization` header value.
 /// Providers differ (a durable PAT vs a minted installation token); the
 /// orchestrator doesn't care.
