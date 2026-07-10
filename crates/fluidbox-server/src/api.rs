@@ -7,7 +7,9 @@ use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use fluidbox_core::policy::Policy;
-use fluidbox_core::spec::{Autonomy, Budgets, CheckoutMode, RunSpec, TrustTier, WorkspaceSpec};
+use fluidbox_core::spec::{
+    Autonomy, Budgets, CheckoutMode, InvocationContext, InvocationKind, WorkspaceSpec,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -42,7 +44,7 @@ pub enum WorkspaceInput {
     },
 }
 
-fn valid_repo_name(repo: &str) -> bool {
+pub(crate) fn valid_repo_name(repo: &str) -> bool {
     match repo.split_once('/') {
         Some((owner, name)) => {
             let ok = |s: &str| {
@@ -56,7 +58,7 @@ fn valid_repo_name(repo: &str) -> bool {
     }
 }
 
-async fn resolve_workspace_input(
+pub(crate) async fn resolve_workspace_input(
     state: &AppState,
     input: WorkspaceInput,
 ) -> ApiResult<WorkspaceSpec> {
@@ -395,47 +397,6 @@ pub async fn create_session(
     State(state): State<AppState>,
     Json(req): Json<CreateSession>,
 ) -> ApiResult<Json<Value>> {
-    // Resolve agent by id or name.
-    let agent = match Uuid::parse_str(&req.agent) {
-        Ok(id) => fluidbox_db::get_agent(&state.pool, id).await?,
-        Err(_) => fluidbox_db::get_agent_by_name(&state.pool, state.tenant_id, &req.agent).await?,
-    }
-    .ok_or_else(|| ApiError::BadRequest(format!("unknown agent '{}'", req.agent)))?;
-
-    let rev = fluidbox_db::latest_revision(&state.pool, agent.id)
-        .await?
-        .ok_or_else(|| ApiError::BadRequest("agent has no revisions".into()))?;
-    let policy_row = fluidbox_db::get_policy(&state.pool, rev.policy_id)
-        .await?
-        .ok_or_else(|| ApiError::Internal("revision policy missing".into()))?;
-    let policy: Policy = serde_json::from_value(policy_row.parsed.clone())
-        .map_err(|e| ApiError::Internal(format!("bad stored policy: {e}")))?;
-
-    let autonomy = if req.autonomous {
-        Autonomy::Autonomous
-    } else {
-        Autonomy::Supervised
-    };
-
-    // Autonomy permission gate: a policy may forbid autonomous runs.
-    if autonomy == Autonomy::Autonomous && !policy.autonomy.permitted {
-        return Err(ApiError::BadRequest(
-            "policy does not permit autonomous runs".into(),
-        ));
-    }
-
-    let agent_budgets: Budgets = serde_json::from_value(rev.budgets.clone()).unwrap_or_default();
-    // The policy's budgets are a ceiling: revision defaults and per-run
-    // requests may only tighten below them, never widen past them.
-    let ceiling = agent_budgets.tightened_by(&policy.budgets);
-    let effective_budgets = match &req.budgets {
-        Some(b) => ceiling.tightened_by(b),
-        None => ceiling,
-    };
-
-    // Workspace resolution (design §3.3): explicit invocation workspace
-    // > agent revision default > scratch. Validation happens on the explicit
-    // input; the stored default was validated when the revision was created.
     let explicit_input = match (req.workspace, req.repo) {
         (Some(_), Some(_)) => {
             return Err(ApiError::BadRequest(
@@ -448,82 +409,31 @@ pub async fn create_session(
         Some(input) => Some(resolve_workspace_input(&state, input).await?),
         None => None,
     };
-    let revision_default: Option<WorkspaceSpec> = rev
-        .default_workspace
-        .as_ref()
-        .map(|v| serde_json::from_value(v.clone()))
-        .transpose()
-        .map_err(|e| ApiError::Internal(format!("bad stored default workspace: {e}")))?;
-    let workspace = WorkspaceSpec::resolve(explicit, revision_default);
-
-    // A connection-backed workspace must still be usable at run time (the
-    // connection may have been revoked since the default was stored).
-    if let WorkspaceSpec::GitRepository {
-        connection_id: Some(cid),
-        ..
-    } = &workspace
-    {
-        let active = fluidbox_db::get_connection(&state.pool, *cid)
-            .await?
-            .filter(|c| c.tenant_id == state.tenant_id)
-            .map(|c| c.status == "active")
-            .unwrap_or(false);
-        if !active {
-            return Err(ApiError::BadRequest(format!(
-                "workspace connection {cid} is not active — reconnect it or override the workspace"
-            )));
-        }
-    }
-
-    let run_spec = RunSpec {
-        agent_id: agent.id,
-        agent_revision_id: rev.id,
-        agent_name: agent.name.clone(),
-        harness: rev.harness.clone(),
-        runner_image: rev.runner_image.clone(),
-        model: rev.model.clone(),
-        system_prompt: rev.system_prompt.clone(),
-        task: req.task.clone(),
-        workspace: workspace.clone(),
-        autonomy,
-        trust_tier: TrustTier::Trusted,
-        budgets: effective_budgets.clone(),
-        policy_id: policy_row.id,
-        policy_version: policy_row.version,
-        policy_snapshot: policy,
-        invocation: Default::default(),
-        result_destinations: vec![],
+    let autonomy = if req.autonomous {
+        Autonomy::Autonomous
+    } else {
+        Autonomy::Supervised
     };
-
-    let session = fluidbox_db::create_session(
-        &state.pool,
-        state.tenant_id,
-        agent.id,
-        rev.id,
-        autonomy.as_str(),
-        &req.task,
-        &serde_json::to_value(&workspace)?,
-        &serde_json::to_value(&run_spec)?,
-        &serde_json::to_value(&effective_budgets)?,
-        None,
-    )
-    .await?;
-
-    crate::ledger::record(
+    let session = crate::run_service::create_run(
         &state,
-        session.id,
-        fluidbox_core::event::Actor::System,
-        fluidbox_core::event::EventBody::SessionCreated {
-            task: req.task.clone(),
-            agent: agent.name.clone(),
-            autonomy: autonomy.as_str().into(),
+        crate::run_service::CreateRun {
+            agent: req.agent,
+            revision: crate::run_service::RevisionSelector::Latest,
+            task: req.task,
+            explicit_workspace: explicit,
+            autonomy,
+            budget_override: req.budgets,
+            invocation: InvocationContext {
+                kind: InvocationKind::Manual,
+                subscription_id: None,
+                actor: Some("operator".into()),
+                attributes: Value::Null,
+                received_at: Some(chrono::Utc::now()),
+            },
+            result_destinations: vec![],
         },
     )
-    .await;
-
-    // Kick off the run.
-    orchestrator::spawn_run(state.clone(), session.id);
-
+    .await?;
     Ok(Json(json!({ "session": session })))
 }
 

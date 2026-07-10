@@ -8,6 +8,7 @@ mod facade;
 mod internal;
 mod ledger;
 mod orchestrator;
+mod run_service;
 mod seal;
 mod sse;
 mod state;
