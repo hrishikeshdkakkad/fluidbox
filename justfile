@@ -56,7 +56,7 @@ check: fmt lint test
 
 # ── E2E acceptance ───────────────────────────────────────────────────────
 
-# Full acceptance suite: live demo A + governance plane + failure paths.
+# Full acceptance suite: live demo A + governance + git workspaces + api triggers + failure paths.
 # Owns the stack (requires :8787 free — stop `just dev` first). The live
 # phase self-skips without ANTHROPIC_API_KEY; E2E_SKIP_LIVE=1 skips it too.
 e2e:
