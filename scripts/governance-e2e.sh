@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Governance-plane E2E over real HTTP. Drives the internal gateway with a real
 # session token (exactly the runner's contract), proving policy eval,
-# approval pause/resume, idempotency, session-scope, autonomous auto-deny, and
-# tool-call budget — all against the live server + Neon. No model required.
+# approval pause/resume, idempotency, session-scope, and autonomous
+# auto-deny — all against the live server + Neon. No model required.
+# (Budget/watchdog/restart failure paths live in scripts/e2e-failures.sh.)
 set -uo pipefail
-cd /Users/hrishikeshkakkad/Documents/infra
+cd "$(dirname "$0")/.."
 set -a; source .env; set +a
 API=http://127.0.0.1:8787
 H="authorization: Bearer $FLUIDBOX_ADMIN_TOKEN"
