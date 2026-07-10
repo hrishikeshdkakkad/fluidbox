@@ -6,6 +6,7 @@ import {
   apiGet,
   apiPost,
   Agent,
+  Connection,
   ResultDelivery,
   Schedule,
   Session,
@@ -160,6 +161,19 @@ function TriggerRow({
               {ts(schedule.last_fired_at) ? ` · last ${ts(schedule.last_fired_at)}` : ""}
             </span>
           )}
+          {sub.trigger_kind === "event" && (
+            <span
+              className="mut mono"
+              style={{ display: "block", fontSize: 11.5, marginTop: 2 }}
+            >
+              ⚡ {(sub.event_filter?.events || []).map((e) => e.replace("pull_request.", "")).join(", ")}
+              {" · "}
+              {sub.resource_selector?.repositories?.length
+                ? sub.resource_selector.repositories.join(", ")
+                : "all connected repos"}
+              {sub.event_publish?.length ? ` · publishes ${sub.event_publish.join(" + ")}` : ""}
+            </span>
+          )}
         </span>
         <span className={`autopill ${sub.enabled ? "supervised" : "autonomous"}`}>
           {sub.enabled ? "enabled" : "disabled"}
@@ -296,6 +310,7 @@ interface Minted {
   subscription: TriggerSubscription;
   token: string;
   callback_secret: string | null;
+  ingress_path?: string | null;
   rotated?: boolean;
 }
 
@@ -320,8 +335,30 @@ function NewTrigger({
   const [cron, setCron] = useState("");
   const [timezone, setTimezone] = useState("UTC");
   const [missedPolicy, setMissedPolicy] = useState("skip");
+  const [eventMode, setEventMode] = useState(false);
+  const [connections, setConnections] = useState<Connection[]>([]);
+  const [connection, setConnection] = useState("");
+  const [repositories, setRepositories] = useState("");
+  const [evOpened, setEvOpened] = useState(true);
+  const [evReopened, setEvReopened] = useState(true);
+  const [evSync, setEvSync] = useState(false);
+  const [pubComment, setPubComment] = useState(true);
+  const [pubCheck, setPubCheck] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+
+  useEffect(() => {
+    if (!eventMode || connections.length > 0) return;
+    apiGet<{ connections: Connection[] }>("/connections")
+      .then((r) => {
+        const apps = r.connections.filter(
+          (c) => c.provider === "github_app" && c.status === "active"
+        );
+        setConnections(apps);
+        if (apps[0]) setConnection(apps[0].id);
+      })
+      .catch(() => {});
+  }, [eventMode, connections.length]);
 
   const submit = async () => {
     setErr("");
@@ -331,6 +368,10 @@ function NewTrigger({
     }
     if (scheduled && !cron.trim()) {
       setErr("a schedule needs a cron expression");
+      return;
+    }
+    if (eventMode && !connection) {
+      setErr("event subscriptions need a github_app connection");
       return;
     }
     setBusy(true);
@@ -352,12 +393,36 @@ function NewTrigger({
           missed_run_policy: missedPolicy,
         };
       }
+      if (eventMode) {
+        body.connection = connection;
+        const repos = repositories
+          .split(",")
+          .map((r) => r.trim())
+          .filter(Boolean);
+        if (repos.length > 0) body.repositories = repos;
+        const events = [
+          ...(evOpened ? ["pull_request.opened"] : []),
+          ...(evReopened ? ["pull_request.reopened"] : []),
+          ...(evSync ? ["pull_request.synchronize"] : []),
+        ];
+        body.events = events;
+        body.publish = [
+          ...(pubComment ? ["pr_comment"] : []),
+          ...(pubCheck ? ["check"] : []),
+        ];
+      }
       const r = await apiPost<{
         subscription: TriggerSubscription;
         token: string;
         callback_secret: string | null;
+        ingress_path: string | null;
       }>("/triggers", body);
-      onCreated({ subscription: r.subscription, token: r.token, callback_secret: r.callback_secret });
+      onCreated({
+        subscription: r.subscription,
+        token: r.token,
+        callback_secret: r.callback_secret,
+        ingress_path: r.ingress_path,
+      });
     } catch (e) {
       setErr(String(e));
       setBusy(false);
@@ -443,11 +508,101 @@ function NewTrigger({
             </select>
           </label>
           <label className="field" style={{ flexDirection: "row", gap: 8, alignItems: "center" }}>
-            <input type="checkbox" checked={scheduled} onChange={(e) => setScheduled(e.target.checked)} />
+            <input
+              type="checkbox"
+              checked={scheduled}
+              disabled={eventMode}
+              onChange={(e) => setScheduled(e.target.checked)}
+            />
             <span className="lab" style={{ margin: 0 }}>
               run on a schedule (cron — the template renders {"{{fire_time}}"})
             </span>
           </label>
+          <label className="field" style={{ flexDirection: "row", gap: 8, alignItems: "center" }}>
+            <input
+              type="checkbox"
+              checked={eventMode}
+              disabled={scheduled}
+              onChange={(e) => setEventMode(e.target.checked)}
+            />
+            <span className="lab" style={{ margin: 0 }}>
+              fire on repository events (PRs via a GitHub App connection)
+            </span>
+          </label>
+          {eventMode && (
+            <>
+              <label className="field">
+                <span className="lab">Connection (github_app — receives the webhooks)</span>
+                <select
+                  className="inp"
+                  value={connection}
+                  onChange={(e) => setConnection(e.target.value)}
+                >
+                  {connections.length === 0 && <option value="">no github_app connections</option>}
+                  {connections.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.display_name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field">
+                <span className="lab">
+                  Repositories (comma-separated owner/name; empty = all the connection sees)
+                </span>
+                <input
+                  className="inp mono"
+                  value={repositories}
+                  onChange={(e) => setRepositories(e.target.value)}
+                  placeholder="acme/site, acme/api"
+                />
+              </label>
+              <label className="field" style={{ flexDirection: "row", gap: 8, alignItems: "center" }}>
+                <input type="checkbox" checked={evOpened} onChange={(e) => setEvOpened(e.target.checked)} />
+                <span className="lab" style={{ margin: 0 }}>
+                  pull_request.opened (default)
+                </span>
+              </label>
+              <label className="field" style={{ flexDirection: "row", gap: 8, alignItems: "center" }}>
+                <input
+                  type="checkbox"
+                  checked={evReopened}
+                  onChange={(e) => setEvReopened(e.target.checked)}
+                />
+                <span className="lab" style={{ margin: 0 }}>
+                  pull_request.reopened (default)
+                </span>
+              </label>
+              <label className="field" style={{ flexDirection: "row", gap: 8, alignItems: "center" }}>
+                <input type="checkbox" checked={evSync} onChange={(e) => setEvSync(e.target.checked)} />
+                <span className="lab" style={{ margin: 0 }}>
+                  pull_request.synchronize — fires on EVERY push to the PR (cost amplifier, opt-in)
+                </span>
+              </label>
+              <label className="field" style={{ flexDirection: "row", gap: 8, alignItems: "center" }}>
+                <input
+                  type="checkbox"
+                  checked={pubComment}
+                  onChange={(e) => setPubComment(e.target.checked)}
+                />
+                <span className="lab" style={{ margin: 0 }}>
+                  publish a PR comment (one stable comment per PR, updated in place)
+                </span>
+              </label>
+              <label className="field" style={{ flexDirection: "row", gap: 8, alignItems: "center" }}>
+                <input type="checkbox" checked={pubCheck} onChange={(e) => setPubCheck(e.target.checked)} />
+                <span className="lab" style={{ margin: 0 }}>
+                  publish a check run (fluidbox/&lt;trigger-name&gt; on the head commit)
+                </span>
+              </label>
+              <p className="mut" style={{ fontSize: 12, marginTop: 0 }}>
+                The task template renders event keys: {"{{repository}}"}, {"{{pr_number}}"},{" "}
+                {"{{pr_title}}"}, {"{{pr_url}}"}, {"{{pr_author}}"}, {"{{head_sha}}"},{" "}
+                {"{{head_ref}}"}, {"{{base_ref}}"}, {"{{fork}}"}. Fork PRs run with a read-only
+                trust tier no subscription can override.
+              </p>
+            </>
+          )}
           {scheduled && (
             <>
               <label className="field">
@@ -550,6 +705,19 @@ function ShowOnce({ minted, onClose }: { minted: Minted; onClose: () => void }) 
                 style={{ fontSize: 12, whiteSpace: "pre-wrap", wordBreak: "break-all", margin: 0 }}
               >
                 {minted.callback_secret}
+              </pre>
+            </label>
+          )}
+          {minted.ingress_path && (
+            <label className="field">
+              <span className="lab">
+                Event ingress — the connection&apos;s GitHub webhook must point here
+              </span>
+              <pre
+                className="mono"
+                style={{ fontSize: 12, whiteSpace: "pre-wrap", wordBreak: "break-all", margin: 0 }}
+              >
+                {`<control-plane>${minted.ingress_path}`}
               </pre>
             </label>
           )}

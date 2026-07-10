@@ -90,13 +90,23 @@ export function workspaceLabel(ws: WorkspaceSpec | null | undefined): string {
 
 export interface Connection {
   id: string;
-  provider: string;
+  provider: string; // github (PAT) | github_app
   external_account_id: string;
   display_name: string;
   granted_scopes: string[];
   status: string;
-  metadata: { login?: string };
+  metadata: {
+    login?: string;
+    app_slug?: string;
+    account_login?: string;
+    installation_id?: string;
+  };
   created_at: string;
+}
+
+/** Where a github_app connection receives provider webhooks. */
+export function ingressPath(c: Connection): string | null {
+  return c.provider === "github_app" ? `/v1/ingress/github/${c.id}` : null;
 }
 
 export interface Repo {
@@ -111,7 +121,7 @@ export interface TriggerSubscription {
   id: string;
   agent_id: string;
   name: string;
-  trigger_kind: string;
+  trigger_kind: string; // api | schedule | event
   pinned_revision_id: string | null;
   enabled: boolean;
   task_template: string | null;
@@ -120,6 +130,11 @@ export interface TriggerSubscription {
   autonomy: string | null;
   concurrency_policy: string;
   result_destinations: { kind: string; url?: string }[];
+  /* event subscriptions only */
+  connection_id: string | null;
+  resource_selector: { repositories?: string[] } | null;
+  event_filter: { events?: string[] } | null;
+  event_publish: string[] | null;
   created_at: string;
 }
 
