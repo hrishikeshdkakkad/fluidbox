@@ -17,7 +17,7 @@ just web            # dashboard only (Next.js, port 3000)
 just gateway-up     # start the pinned LiteLLM container (reads .env)
 just sandbox-build  # rebuild the sandbox runner image after editing images/sandbox-runner/
 just check          # fmt + clippy -D warnings + test + web build (the full bar)
-just e2e            # full acceptance: live demo A + governance + git workspaces + api triggers + failure paths (owns the stack; stop `just dev` first)
+just e2e            # full acceptance: live demo A + governance + git workspaces + api triggers + schedules + failure paths (owns the stack; stop `just dev` first)
 just policy-sync    # push policies/*.yaml to the running control plane (version++)
 
 cargo test -p fluidbox-core                              # fast, no DB needed
@@ -64,6 +64,7 @@ The crate dependency order is `fluidbox-core` → `fluidbox-db` / `fluidbox-prov
 - **Workspace init is control-plane-side.** The credentialed fetch/copy happens in the orchestrator during the `initializing` state (before the agent starts); the agent only ever sees a bind-mounted copy at `/workspace`. The original repo is never touched, and the sandbox stays egress-free.
 - **Trigger tokens are subscription-scoped** (`api_tokens.kind='trigger'`, sha256-hashed): a token can invoke its one subscription (`POST /v1/triggers/{id}/invoke`) and poll the runs it created — never the admin API, and the admin token can never invoke. Invoke task/workspace overrides are **opt-in per subscription** (design doc §17 #6, default off) and can only narrow authority (repo/ref/commit inside the subscription's github/connection base; never a new connection, clone URL, or local path). All entry points converge on `run_service::create_run`, which freezes the `InvocationContext` + result destinations into the RunSpec.
 - **Result delivery is decoupled from the run lifecycle** (`deliveries.rs`): rows are enqueued inside the single `orchestrator::transition` funnel on terminal entry (exactly-once by the state machine); the retry worker signs payloads `v1=hmac-sha256(secret, "{ts}.{body}")` with per-subscription AEAD-sealed secrets and backs off 5s→1h over 6 attempts. A callback failure can never mutate a session; delivery is at-least-once — receivers dedup on `x-fluidbox-delivery`.
+- **A schedule is a trigger subscription with a clock, never a new object** (`schedules`, migration 0004; `scheduler.rs`). The tick worker fires through the same `run_service::create_run` with `InvocationContext.kind=schedule`; firing is **exactly-once** via a deterministic idempotency claim (`sched:{fire_time}` on `trigger_invocations`) that `create_session` binds in the same transaction as the session insert. §17 #5 (settled 2026-07-10): `concurrency_policy` defaults `allow` and is enforced in `create_run` for ALL invocations (`skip_if_running`/`replace` are opt-in; an API invoke against an active run gets a 409 skip); missed-run defaults `skip` — a gap records ONE skip row keyed at the oldest missed fire time, `catch_up` fires exactly ONE make-up run, never fire-all-missed. Skips are terminal claim rows (`skip_reason`), visible per subscription. A disabled subscription's schedule does not advance — re-enabling goes through the missed-run path.
 
 ## Extension points
 
