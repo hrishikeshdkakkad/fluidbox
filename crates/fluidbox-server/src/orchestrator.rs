@@ -5,7 +5,7 @@
 use crate::ledger;
 use crate::state::AppState;
 use fluidbox_core::event::{Actor, EventBody};
-use fluidbox_core::spec::{RepoSource, RunSpec};
+use fluidbox_core::spec::{RunSpec, WorkspaceSpec};
 use fluidbox_core::state::SessionStatus;
 use fluidbox_core::traits::{ExecutionProvider, NetworkMode, SandboxHandle, SandboxSpec};
 use fluidbox_db::SessionRow;
@@ -156,85 +156,112 @@ async fn materialize_workspace(
     session_id: Uuid,
     run_spec: &RunSpec,
 ) -> anyhow::Result<Option<PathBuf>> {
-    match &run_spec.repo {
-        RepoSource::LocalPath { path } => {
-            let ws = fluidbox_provider::workspace::materialize_local(
-                &state.cfg.data_dir,
-                session_id,
-                std::path::Path::new(path),
-            )?;
-            if let Some(bc) = &ws.base_commit {
-                fluidbox_db::set_base_commit(&state.pool, session_id, bc)
-                    .await
-                    .ok();
-            }
-            ledger::record(
-                state,
-                session_id,
-                Actor::System,
-                EventBody::WorkspaceInitialized {
-                    base_commit: ws.base_commit.clone(),
-                    files: Some(ws.file_count),
-                },
-            )
-            .await;
-            Ok(Some(ws.host_dir))
+    let data_dir = state.cfg.data_dir.clone();
+    let (ws, repo, r#ref) = match &run_spec.workspace {
+        WorkspaceSpec::LocalCopy { path } => {
+            let src = PathBuf::from(path);
+            let ws = tokio::task::spawn_blocking(move || {
+                fluidbox_provider::workspace::materialize_local(&data_dir, session_id, &src)
+            })
+            .await??;
+            (ws, None, None)
         }
-        RepoSource::GitUrl { .. } => {
-            // Deferred: MVP tests use LocalPath / None. Cloning a git URL is
-            // control-plane-side too, but not needed for M1 acceptance.
-            anyhow::bail!("git-url repos are not enabled in M1");
+        WorkspaceSpec::GitRepository {
+            connection_id,
+            clone_url,
+            r#ref,
+            commit_sha,
+            ..
+        } => {
+            // The credential is unsealed here, used for the fetch, and
+            // dropped — it never reaches the RunSpec, sandbox env, ledger,
+            // or artifacts.
+            let auth_header = match connection_id {
+                Some(cid) => Some(connection_auth_header(state, *cid).await?),
+                None => None,
+            };
+            let (url, rf, sha) = (clone_url.clone(), r#ref.clone(), commit_sha.clone());
+            let ws = tokio::task::spawn_blocking(move || {
+                fluidbox_provider::workspace::materialize_git(
+                    &data_dir,
+                    session_id,
+                    &url,
+                    rf.as_deref(),
+                    sha.as_deref(),
+                    auth_header.as_deref(),
+                )
+            })
+            .await??;
+            (ws, Some(clone_url.clone()), r#ref.clone())
         }
-        RepoSource::None => {
+        WorkspaceSpec::Scratch => {
             // A scratch workspace so the agent still has somewhere to write.
-            let dir = state
-                .cfg
-                .data_dir
+            let dir = data_dir
                 .join("workspaces")
                 .join(session_id.to_string())
                 .join("repo");
             std::fs::create_dir_all(&dir)?;
-            let ws = fluidbox_provider::workspace::materialize_local(
-                &state.cfg.data_dir,
-                session_id,
-                &dir,
-            )?;
-            if let Some(bc) = &ws.base_commit {
-                fluidbox_db::set_base_commit(&state.pool, session_id, bc)
-                    .await
-                    .ok();
-            }
-            ledger::record(
-                state,
-                session_id,
-                Actor::System,
-                EventBody::WorkspaceInitialized {
-                    base_commit: ws.base_commit.clone(),
-                    files: Some(0),
-                },
-            )
-            .await;
-            Ok(Some(ws.host_dir))
+            let ws = tokio::task::spawn_blocking(move || {
+                fluidbox_provider::workspace::materialize_local(&data_dir, session_id, &dir)
+            })
+            .await??;
+            (ws, None, None)
         }
+    };
+
+    if let Some(bc) = &ws.base_commit {
+        fluidbox_db::set_base_commit(&state.pool, session_id, bc)
+            .await
+            .ok();
     }
+    ledger::record(
+        state,
+        session_id,
+        Actor::System,
+        EventBody::WorkspaceInitialized {
+            base_commit: ws.base_commit.clone(),
+            files: Some(ws.file_count),
+            repo,
+            r#ref,
+        },
+    )
+    .await;
+    Ok(Some(ws.host_dir))
 }
 
-/// Called by the internal /result handler: finalize a run, capture the diff,
-/// then reap the sandbox.
-pub async fn finalize(
-    state: &AppState,
-    session: &SessionRow,
-    outcome: &str,
-    summary: Option<&str>,
-) {
+/// Resolve a connection into an `Authorization` header value for git fetch.
+/// Fails closed: missing/revoked connection or missing key stops the run
+/// during `initializing` — before any model spend.
+async fn connection_auth_header(state: &AppState, connection_id: Uuid) -> anyhow::Result<String> {
+    let sealed = fluidbox_db::connection_credential_sealed(&state.pool, connection_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!("connection {connection_id} is not active (revoked or missing)")
+        })?;
+    let sealer = state
+        .sealer
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("FLUIDBOX_CREDENTIAL_KEY not configured on the server"))?;
+    let token = sealer.open(&sealed)?;
+    use base64::Engine;
+    Ok(format!(
+        "basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"))
+    ))
+}
+
+/// Capture the diff artifact from the materialized workspace, then remove
+/// the per-session workspace dir (idempotent; kept when the capture failed
+/// or FLUIDBOX_KEEP_WORKSPACES is set, so there's something to debug).
+async fn capture_diff_and_cleanup(state: &AppState, session: &SessionRow) {
     let id = session.id;
-    // Capture the diff artifact from the materialized workspace.
     let ws_dir = state
         .cfg
         .data_dir
         .join("workspaces")
         .join(id.to_string())
         .join("repo");
+    let mut captured = true;
     if ws_dir.exists() {
         match fluidbox_provider::workspace::capture_diff(&ws_dir, session.base_commit.as_deref()) {
             Ok(diff) if !diff.trim().is_empty() => {
@@ -261,9 +288,29 @@ pub async fn finalize(
                 .await
                 .ok();
             }
-            Err(e) => tracing::warn!("diff capture failed for {id}: {e}"),
+            Err(e) => {
+                captured = false;
+                tracing::warn!("diff capture failed for {id}: {e}");
+            }
         }
     }
+    if captured && !state.cfg.keep_workspaces {
+        if let Err(e) = fluidbox_provider::workspace::cleanup_workspace(&state.cfg.data_dir, id) {
+            tracing::warn!("workspace cleanup failed for {id}: {e}");
+        }
+    }
+}
+
+/// Called by the internal /result handler: finalize a run, capture the diff,
+/// then reap the sandbox.
+pub async fn finalize(
+    state: &AppState,
+    session: &SessionRow,
+    outcome: &str,
+    summary: Option<&str>,
+) {
+    let id = session.id;
+    capture_diff_and_cleanup(state, session).await;
 
     if let Some(s) = summary {
         fluidbox_db::set_result_summary(&state.pool, id, s)
@@ -307,12 +354,14 @@ pub async fn reap(state: &AppState, id: Uuid) {
     }
 }
 
-/// Cancel a session (admin action).
+/// Cancel a session (admin action). Captures whatever the agent produced so
+/// far as the diff artifact, then tears everything down.
 pub async fn cancel(state: &AppState, id: Uuid) -> bool {
-    if let Ok(Some(s)) = fluidbox_db::get_session(&state.pool, id).await {
-        if s.status_enum().is_terminal() {
-            return false;
-        }
+    let Ok(Some(session)) = fluidbox_db::get_session(&state.pool, id).await else {
+        return false;
+    };
+    if session.status_enum().is_terminal() {
+        return false;
     }
     let ok = transition(
         state,
@@ -323,6 +372,7 @@ pub async fn cancel(state: &AppState, id: Uuid) -> bool {
     .await;
     if ok {
         reap(state, id).await;
+        capture_diff_and_cleanup(state, &session).await;
     }
     ok
 }

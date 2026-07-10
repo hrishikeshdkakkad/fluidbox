@@ -17,7 +17,7 @@ just web            # dashboard only (Next.js, port 3000)
 just gateway-up     # start the pinned LiteLLM container (reads .env)
 just sandbox-build  # rebuild the sandbox runner image after editing images/sandbox-runner/
 just check          # fmt + clippy -D warnings + test + web build (the full bar)
-just e2e            # full acceptance: live demo A + governance + failure paths (owns the stack; stop `just dev` first)
+just e2e            # full acceptance: live demo A + governance + git workspaces + failure paths (owns the stack; stop `just dev` first)
 just policy-sync    # push policies/*.yaml to the running control plane (version++)
 
 cargo test -p fluidbox-core                              # fast, no DB needed
@@ -36,6 +36,7 @@ The `fluidbox-db` and workspace-wide test runs hit **real Neon** — `set -a; so
 - **The Anthropic key lives ONLY in the LiteLLM container**, injected via docker-compose from `.env`. The Rust server never holds it (it authenticates to LiteLLM with `LITELLM_MASTER_KEY`). No server restart is needed after adding the key — just `just gateway-up`.
 - **`.env` is gitignored; `apps/web/.env.local` too** (it carries the admin token for the dashboard proxy). Never commit either.
 - sqlx needs the `macros` + `derive` features; clap needs `env`; reqwest 0.13 uses the `rustls` feature (not `rustls-tls`). LiteLLM is pinned by **digest** in `.env` (`LITELLM_IMAGE=...@sha256:...`); tag `main-v1.91.1` does not exist as an image — use `main-stable` and re-pin the digest.
+- **`FLUIDBOX_CREDENTIAL_KEY` (32-byte hex/base64) gates integration connections.** Without it the server boots fine but Connections are disabled. It seals GitHub tokens at rest (`seal.rs`); losing/rotating the key orphans stored credentials — reconnect afterwards. Git fetch credentials pass to git via `GIT_CONFIG_*` env vars only (never argv, never on-disk config — the `.git` dir is mounted into the sandbox).
 
 ## Architecture — how a run flows
 

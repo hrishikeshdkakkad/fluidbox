@@ -2,11 +2,13 @@ mod api;
 mod auth;
 mod callback;
 mod config;
+mod connections;
 mod error;
 mod facade;
 mod internal;
 mod ledger;
 mod orchestrator;
+mod seal;
 mod sse;
 mod state;
 mod workers;
@@ -50,6 +52,16 @@ async fn main() -> anyhow::Result<()> {
 
     let events_tx = fluidbox_db::spawn_listener(cfg.database_url.clone());
 
+    let sealer = match &cfg.credential_key {
+        Some(k) => Some(seal::Sealer::from_key_string(k)?),
+        None => {
+            tracing::warn!(
+                "FLUIDBOX_CREDENTIAL_KEY not set — integration connections are disabled"
+            );
+            None
+        }
+    };
+
     let state: state::AppState = Arc::new(AppStateInner {
         tenant_id: seed.tenant_id,
         redactor: fluidbox_core::event::Redactor::default(),
@@ -59,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15 * 60))
             .build()?,
+        sealer,
         pool,
         cfg,
     });
@@ -91,7 +104,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/sessions/{id}/artifacts/{aid}", get(api::get_artifact))
         .route("/sessions/{id}/cost", get(api::get_cost))
         .route("/approvals", get(api::approvals_inbox))
-        .route("/approvals/{id}/decision", post(api::decide_approval));
+        .route("/approvals/{id}/decision", post(api::decide_approval))
+        .route(
+            "/connections",
+            get(connections::list).post(connections::create),
+        )
+        .route("/connections/{id}/revoke", post(connections::revoke))
+        .route("/connections/{id}/repos", get(connections::repos));
 
     let internal = Router::new()
         .route("/sessions/{id}/permission", post(internal::permission))

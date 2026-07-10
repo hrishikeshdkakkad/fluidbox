@@ -7,10 +7,165 @@ use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use fluidbox_core::policy::Policy;
-use fluidbox_core::spec::{Autonomy, Budgets, RepoSource, RunSpec, TrustTier};
+use fluidbox_core::spec::{Autonomy, Budgets, CheckoutMode, RunSpec, TrustTier, WorkspaceSpec};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
+
+// ─── Workspace input (shared by run creation and agent defaults) ──────────
+
+/// What callers may ask for. Resolved and validated into a frozen
+/// `WorkspaceSpec` before anything is stored: connection-bound repositories
+/// are checked against the connection (existence, tenant, status, host), so
+/// an invocation can narrow authority but never escape it.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkspaceInput {
+    #[serde(alias = "none")]
+    Scratch,
+    #[serde(alias = "local_path")]
+    LocalCopy { path: String },
+    GitRepository {
+        #[serde(default)]
+        connection_id: Option<Uuid>,
+        /// "owner/name" — used with a connection to derive the clone URL.
+        #[serde(default)]
+        repository: Option<String>,
+        #[serde(default)]
+        clone_url: Option<String>,
+        #[serde(default)]
+        r#ref: Option<String>,
+        #[serde(default)]
+        commit_sha: Option<String>,
+        #[serde(default)]
+        checkout_mode: Option<CheckoutMode>,
+    },
+}
+
+fn valid_repo_name(repo: &str) -> bool {
+    match repo.split_once('/') {
+        Some((owner, name)) => {
+            let ok = |s: &str| {
+                !s.is_empty()
+                    && s.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            };
+            ok(owner) && ok(name)
+        }
+        None => false,
+    }
+}
+
+async fn resolve_workspace_input(
+    state: &AppState,
+    input: WorkspaceInput,
+) -> ApiResult<WorkspaceSpec> {
+    Ok(match input {
+        WorkspaceInput::Scratch => WorkspaceSpec::Scratch,
+        WorkspaceInput::LocalCopy { path } => {
+            if path.trim().is_empty() {
+                return Err(ApiError::BadRequest("workspace path is empty".into()));
+            }
+            WorkspaceSpec::LocalCopy { path }
+        }
+        WorkspaceInput::GitRepository {
+            connection_id,
+            repository,
+            clone_url,
+            r#ref,
+            commit_sha,
+            checkout_mode,
+        } => {
+            if let Some(sha) = &commit_sha {
+                if sha.len() < 7 || sha.len() > 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err(ApiError::BadRequest(format!("invalid commit_sha '{sha}'")));
+                }
+            }
+            if let Some(repo) = &repository {
+                if !valid_repo_name(repo) {
+                    return Err(ApiError::BadRequest(format!(
+                        "repository must be 'owner/name' (got '{repo}')"
+                    )));
+                }
+            }
+            let clone_url = match connection_id {
+                Some(cid) => {
+                    let conn = fluidbox_db::get_connection(&state.pool, cid)
+                        .await?
+                        .filter(|c| c.tenant_id == state.tenant_id)
+                        .ok_or_else(|| ApiError::BadRequest(format!("unknown connection {cid}")))?;
+                    if conn.status != "active" {
+                        return Err(ApiError::BadRequest(format!(
+                            "connection {cid} is {} — reconnect it first",
+                            conn.status
+                        )));
+                    }
+                    if conn.provider != "github" {
+                        return Err(ApiError::BadRequest(format!(
+                            "connection provider '{}' does not supply git workspaces",
+                            conn.provider
+                        )));
+                    }
+                    match clone_url {
+                        // A supplied URL may narrow but not escape the
+                        // connection's provider.
+                        Some(url) => {
+                            if !url.starts_with("https://github.com/") {
+                                return Err(ApiError::BadRequest(
+                                    "clone_url must be on https://github.com/ for a github connection".into(),
+                                ));
+                            }
+                            url
+                        }
+                        None => {
+                            let repo = repository.as_deref().ok_or_else(|| {
+                                ApiError::BadRequest(
+                                    "repository (owner/name) or clone_url is required".into(),
+                                )
+                            })?;
+                            format!("https://github.com/{repo}.git")
+                        }
+                    }
+                }
+                None => match clone_url {
+                    // Unauthenticated clone (public repo, or file:// in dev —
+                    // this API is admin-token-gated, same trust as LocalCopy).
+                    Some(url) => url,
+                    None => match &repository {
+                        Some(repo) => format!("https://github.com/{repo}.git"),
+                        None => {
+                            return Err(ApiError::BadRequest(
+                                "clone_url or connection_id+repository is required".into(),
+                            ))
+                        }
+                    },
+                },
+            };
+            WorkspaceSpec::GitRepository {
+                connection_id,
+                repository,
+                clone_url,
+                r#ref,
+                commit_sha,
+                checkout_mode: checkout_mode.unwrap_or_default(),
+            }
+        }
+    })
+}
+
+/// A revision default of Scratch means "no default" — store nothing.
+async fn default_workspace_value(
+    state: &AppState,
+    input: Option<WorkspaceInput>,
+) -> ApiResult<Option<Value>> {
+    match input {
+        None => Ok(None),
+        Some(input) => match resolve_workspace_input(state, input).await? {
+            WorkspaceSpec::Scratch => Ok(None),
+            spec => Ok(Some(serde_json::to_value(&spec)?)),
+        },
+    }
+}
 
 // ─── Health ───────────────────────────────────────────────────────────────
 
@@ -38,6 +193,8 @@ pub struct CreateAgent {
     pub policy: Option<String>,       // policy name
     pub runner_image: Option<String>, // defaults to configured sandbox image
     pub budgets: Option<Budgets>,
+    #[serde(default)]
+    pub default_workspace: Option<WorkspaceInput>,
 }
 
 pub async fn create_agent(
@@ -59,6 +216,7 @@ pub async fn create_agent(
         .await?
         .ok_or_else(|| ApiError::BadRequest(format!("unknown policy '{policy_name}'")))?;
     let budgets = req.budgets.unwrap_or_default();
+    let default_workspace = default_workspace_value(&state, req.default_workspace).await?;
     let rev = fluidbox_db::append_agent_revision(
         &state.pool,
         agent.id,
@@ -70,6 +228,7 @@ pub async fn create_agent(
         req.system_prompt.as_deref(),
         policy.id,
         &serde_json::to_value(&budgets)?,
+        default_workspace.as_ref(),
     )
     .await?;
 
@@ -101,6 +260,10 @@ pub struct AddRevision {
     pub policy: Option<String>,
     pub runner_image: Option<String>,
     pub budgets: Option<Budgets>,
+    /// Omitted → inherit from the latest revision. An explicit
+    /// `{"kind":"scratch"}` clears the default.
+    #[serde(default)]
+    pub default_workspace: Option<WorkspaceInput>,
 }
 
 pub async fn add_revision(
@@ -131,6 +294,11 @@ pub async fn add_revision(
         .map(|b| serde_json::to_value(b).unwrap())
         .or_else(|| latest.as_ref().map(|r| r.budgets.clone()))
         .unwrap_or_else(|| serde_json::to_value(Budgets::default()).unwrap());
+    // Omitted → inherit; explicit scratch → cleared (stored as NULL).
+    let default_workspace = match req.default_workspace {
+        Some(input) => default_workspace_value(&state, Some(input)).await?,
+        None => latest.as_ref().and_then(|r| r.default_workspace.clone()),
+    };
 
     let rev = fluidbox_db::append_agent_revision(
         &state.pool,
@@ -152,6 +320,7 @@ pub async fn add_revision(
             .or(latest.as_ref().and_then(|r| r.system_prompt.as_deref())),
         policy_id,
         &budgets,
+        default_workspace.as_ref(),
     )
     .await?;
     Ok(Json(json!({ "revision": rev })))
@@ -207,20 +376,18 @@ pub struct CreateSession {
     /// Agent name or id.
     pub agent: String,
     pub task: String,
+    /// Explicit invocation workspace. Omitted → the agent revision's default
+    /// workspace → scratch.
     #[serde(default)]
-    pub repo: Option<RepoInput>,
+    pub workspace: Option<WorkspaceInput>,
+    /// Deprecated alias for `workspace` (M1 callers).
+    #[serde(default)]
+    pub repo: Option<WorkspaceInput>,
     #[serde(default)]
     pub autonomous: bool,
     /// Optional per-run budget tightening.
     #[serde(default)]
     pub budgets: Option<Budgets>,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RepoInput {
-    LocalPath { path: String },
-    None,
 }
 
 pub async fn create_session(
@@ -266,10 +433,47 @@ pub async fn create_session(
         None => ceiling,
     };
 
-    let repo = match req.repo {
-        Some(RepoInput::LocalPath { path }) => RepoSource::LocalPath { path },
-        _ => RepoSource::None,
+    // Workspace resolution (design §3.3): explicit invocation workspace
+    // > agent revision default > scratch. Validation happens on the explicit
+    // input; the stored default was validated when the revision was created.
+    let explicit_input = match (req.workspace, req.repo) {
+        (Some(_), Some(_)) => {
+            return Err(ApiError::BadRequest(
+                "provide either `workspace` or legacy `repo`, not both".into(),
+            ))
+        }
+        (w, r) => w.or(r),
     };
+    let explicit = match explicit_input {
+        Some(input) => Some(resolve_workspace_input(&state, input).await?),
+        None => None,
+    };
+    let revision_default: Option<WorkspaceSpec> = rev
+        .default_workspace
+        .as_ref()
+        .map(|v| serde_json::from_value(v.clone()))
+        .transpose()
+        .map_err(|e| ApiError::Internal(format!("bad stored default workspace: {e}")))?;
+    let workspace = WorkspaceSpec::resolve(explicit, revision_default);
+
+    // A connection-backed workspace must still be usable at run time (the
+    // connection may have been revoked since the default was stored).
+    if let WorkspaceSpec::GitRepository {
+        connection_id: Some(cid),
+        ..
+    } = &workspace
+    {
+        let active = fluidbox_db::get_connection(&state.pool, *cid)
+            .await?
+            .filter(|c| c.tenant_id == state.tenant_id)
+            .map(|c| c.status == "active")
+            .unwrap_or(false);
+        if !active {
+            return Err(ApiError::BadRequest(format!(
+                "workspace connection {cid} is not active — reconnect it or override the workspace"
+            )));
+        }
+    }
 
     let run_spec = RunSpec {
         agent_id: agent.id,
@@ -280,7 +484,7 @@ pub async fn create_session(
         model: rev.model.clone(),
         system_prompt: rev.system_prompt.clone(),
         task: req.task.clone(),
-        repo: repo.clone(),
+        workspace: workspace.clone(),
         autonomy,
         trust_tier: TrustTier::Trusted,
         budgets: effective_budgets.clone(),
@@ -296,7 +500,7 @@ pub async fn create_session(
         rev.id,
         autonomy.as_str(),
         &req.task,
-        &serde_json::to_value(&repo)?,
+        &serde_json::to_value(&workspace)?,
         &serde_json::to_value(&run_spec)?,
         &serde_json::to_value(&effective_budgets)?,
     )
