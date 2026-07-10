@@ -34,8 +34,24 @@ enum Cmd {
         #[arg(long)]
         task: String,
         /// Local repo path to work in (copied; original untouched).
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["git_url", "repository"])]
         repo: Option<String>,
+        /// Remote repository to clone (fetched control-plane-side; the
+        /// sandbox never holds a git credential).
+        #[arg(long)]
+        git_url: Option<String>,
+        /// GitHub repository as owner/name (with --connection or public).
+        #[arg(long)]
+        repository: Option<String>,
+        /// Branch/tag to check out (default: remote HEAD).
+        #[arg(long)]
+        git_ref: Option<String>,
+        /// Exact commit to check out (wins over --git-ref).
+        #[arg(long)]
+        git_commit: Option<String>,
+        /// Integration connection id supplying the fetch credential.
+        #[arg(long)]
+        connection: Option<String>,
         /// Run without a human in the loop.
         #[arg(long)]
         autonomous: bool,
@@ -43,6 +59,8 @@ enum Cmd {
         #[arg(long)]
         detach: bool,
     },
+    /// List integration connections.
+    Connections,
     /// List recent sessions.
     Sessions,
     /// Show one session (status, usage).
@@ -126,23 +144,55 @@ async fn main() -> Result<()> {
             agent,
             task,
             repo,
+            git_url,
+            repository,
+            git_ref,
+            git_commit,
+            connection,
             autonomous,
             detach,
         } => {
-            let repo_json = match repo {
-                Some(p) => {
-                    let abs = std::fs::canonicalize(&p)
-                        .with_context(|| format!("repo path {p} not found"))?;
-                    json!({ "kind": "local_path", "path": abs.to_string_lossy() })
+            let is_git = git_url.is_some() || repository.is_some();
+            if !is_git && (git_ref.is_some() || git_commit.is_some() || connection.is_some()) {
+                return Err(anyhow!(
+                    "--git-ref/--git-commit/--connection need --git-url or --repository"
+                ));
+            }
+            let workspace = if is_git {
+                let mut ws = json!({ "kind": "git_repository" });
+                if let Some(u) = git_url {
+                    ws["clone_url"] = json!(u);
                 }
-                None => json!({ "kind": "none" }),
+                if let Some(r) = repository {
+                    ws["repository"] = json!(r);
+                }
+                if let Some(r) = git_ref {
+                    ws["ref"] = json!(r);
+                }
+                if let Some(c) = git_commit {
+                    ws["commit_sha"] = json!(c);
+                }
+                if let Some(c) = connection {
+                    ws["connection_id"] = json!(c);
+                }
+                Some(ws)
+            } else {
+                match repo {
+                    Some(p) => {
+                        let abs = std::fs::canonicalize(&p)
+                            .with_context(|| format!("repo path {p} not found"))?;
+                        Some(json!({ "kind": "local_copy", "path": abs.to_string_lossy() }))
+                    }
+                    // Omitted → the server resolves the agent's default
+                    // workspace (or scratch).
+                    None => None,
+                }
             };
-            let res = client
-                .post(
-                    "/v1/sessions",
-                    json!({ "agent": agent, "task": task, "repo": repo_json, "autonomous": autonomous }),
-                )
-                .await?;
+            let mut body = json!({ "agent": agent, "task": task, "autonomous": autonomous });
+            if let Some(ws) = workspace {
+                body["workspace"] = ws;
+            }
+            let res = client.post("/v1/sessions", body).await?;
             let id = res["session"]["id"]
                 .as_str()
                 .ok_or_else(|| anyhow!("no session id"))?
@@ -217,6 +267,22 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             println!("✗ denied");
+        }
+        Cmd::Connections => {
+            let res = client.get("/v1/connections").await?;
+            let list = res["connections"].as_array().cloned().unwrap_or_default();
+            if list.is_empty() {
+                println!("(no connections — add one in the dashboard's Connections page)");
+            }
+            for c in list {
+                println!(
+                    "{}  {:<8}  {:<8}  {}",
+                    c["id"].as_str().unwrap_or(""),
+                    c["provider"].as_str().unwrap_or(""),
+                    c["status"].as_str().unwrap_or(""),
+                    c["display_name"].as_str().unwrap_or("")
+                );
+            }
         }
         Cmd::Agents => {
             let res = client.get("/v1/agents").await?;

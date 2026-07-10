@@ -24,6 +24,11 @@ pub enum EventBody {
     WorkspaceInitialized {
         base_commit: Option<String>,
         files: Option<u64>,
+        /// Remote identity for git workspaces (clone URL — never credentialed).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        r#ref: Option<String>,
     },
     #[serde(rename = "agent.message")]
     AgentMessage { role: String, text: String },

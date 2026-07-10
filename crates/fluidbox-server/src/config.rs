@@ -30,6 +30,13 @@ pub struct Config {
     /// Whether the upstream speaks native Anthropic (fallback) — governs how
     /// the facade authenticates upstream.
     pub llm_upstream_is_anthropic: bool,
+    /// 32-byte key (hex/base64) sealing connection credentials at rest.
+    /// Optional: without it, integration connections are disabled.
+    pub credential_key: Option<String>,
+    /// GitHub REST base — overridable for tests/GHE.
+    pub github_api_url: String,
+    /// Keep per-session workspace dirs after terminal diff capture (debug aid).
+    pub keep_workspaces: bool,
 }
 
 impl Config {
@@ -60,6 +67,14 @@ impl Config {
             llm_upstream_url: upstream,
             llm_upstream_key: upstream_key,
             llm_upstream_is_anthropic: is_anthropic,
+            credential_key: get("FLUIDBOX_CREDENTIAL_KEY")
+                .ok()
+                .filter(|k| !k.is_empty()),
+            github_api_url: get("FLUIDBOX_GITHUB_API_URL")
+                .unwrap_or_else(|_| "https://api.github.com".into()),
+            keep_workspaces: get("FLUIDBOX_KEEP_WORKSPACES")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         })
     }
 }

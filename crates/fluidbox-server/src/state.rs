@@ -45,6 +45,10 @@ pub struct AppStateInner {
     /// LISTEN/NOTIFY wakeups (session_id, seq) for SSE fanout.
     pub events_tx: broadcast::Sender<(Uuid, i64)>,
     pub http: reqwest::Client,
+    /// Seals/unseals connection credentials. None until
+    /// FLUIDBOX_CREDENTIAL_KEY is configured — connection endpoints and
+    /// connection-backed workspaces refuse to operate without it.
+    pub sealer: Option<crate::seal::Sealer>,
 }
 
 pub type AppState = Arc<AppStateInner>;
