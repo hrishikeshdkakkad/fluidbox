@@ -96,6 +96,19 @@ pub enum EventBody {
     },
     #[serde(rename = "run.error")]
     RunError { message: String },
+    #[serde(rename = "callback.delivered")]
+    CallbackDelivered {
+        delivery_id: Uuid,
+        url: String,
+        attempt: i32,
+    },
+    #[serde(rename = "callback.failed")]
+    CallbackFailed {
+        delivery_id: Uuid,
+        url: String,
+        attempts: i32,
+        error: String,
+    },
     /// Forward-compat: events written by newer components still round-trip.
     #[serde(untagged)]
     Unknown(Value),

@@ -38,6 +38,13 @@ async fn transition(state: &AppState, id: Uuid, next: SessionStatus, reason: Opt
                 },
             )
             .await;
+            if next.is_terminal() {
+                // Publication is decoupled: enqueue rows; the delivery worker
+                // owns retries. This is the ONLY enqueue point — every exit
+                // path (finalize/fail/cancel/sweeps) funnels through here,
+                // and the state machine makes terminal entry exactly-once.
+                crate::deliveries::enqueue_for_session(state, id).await;
+            }
             true
         }
         Ok(None) => false,
