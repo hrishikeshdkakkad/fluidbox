@@ -35,6 +35,7 @@ export interface Session {
   result_summary: string | null;
   created_at: string;
   base_commit: string | null;
+  repo_source: WorkspaceSpec | null;
 }
 
 export interface Agent {
@@ -53,7 +54,47 @@ export interface Revision {
   system_prompt: string | null;
   policy_id: string;
   budgets: Record<string, unknown>;
+  default_workspace: WorkspaceSpec | null;
   created_at: string;
+}
+
+/** Mirrors fluidbox-core WorkspaceSpec (tagged by `kind`). */
+export interface WorkspaceSpec {
+  kind: "scratch" | "local_copy" | "git_repository" | "none" | "local_path";
+  path?: string;
+  connection_id?: string;
+  repository?: string;
+  clone_url?: string;
+  ref?: string;
+  commit_sha?: string;
+}
+
+/** Human one-liner for a workspace spec (old + new wire tags). */
+export function workspaceLabel(ws: WorkspaceSpec | null | undefined): string {
+  if (!ws || ws.kind === "scratch" || ws.kind === "none") return "scratch";
+  if (ws.kind === "local_copy" || ws.kind === "local_path") return `local: ${ws.path}`;
+  const repo = ws.repository || ws.clone_url || "?";
+  const at = ws.commit_sha ? `@${ws.commit_sha.slice(0, 8)}` : ws.ref ? `@${ws.ref}` : "";
+  return `${repo}${at}`;
+}
+
+export interface Connection {
+  id: string;
+  provider: string;
+  external_account_id: string;
+  display_name: string;
+  granted_scopes: string[];
+  status: string;
+  metadata: { login?: string };
+  created_at: string;
+}
+
+export interface Repo {
+  id: number;
+  full_name: string;
+  private: boolean;
+  default_branch: string;
+  html_url: string;
 }
 
 export interface Approval {

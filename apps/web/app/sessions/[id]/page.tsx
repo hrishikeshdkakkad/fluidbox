@@ -12,6 +12,7 @@ import {
   Artifact,
   Usage,
   EventRow,
+  workspaceLabel,
 } from "../../lib/api";
 import { Pill, AutoPill, DiffView, short } from "../../components/bits";
 
@@ -177,6 +178,9 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
                 <span className="chip">
                   autonomy <b>{session.autonomy}</b>
                 </span>
+                <span className="chip">
+                  workspace <b>{workspaceLabel(session.repo_source)}</b>
+                </span>
                 {session.base_commit && (
                   <span className="chip">
                     base <b>{session.base_commit.slice(0, 10)}</b>
@@ -249,7 +253,18 @@ function TimelineItem({ ev }: { ev: EventRow }) {
       break;
     case "workspace.initialized":
       tag = "workspace";
-      body = <>workspace ready ({s("files")} files)</>;
+      body = (
+        <>
+          workspace ready ({s("files")} files)
+          {s("repo") ? (
+            <span className="mut">
+              {" "}
+              · {s("repo")}
+              {s("ref") ? ` @ ${s("ref")}` : ""}
+            </span>
+          ) : null}
+        </>
+      );
       break;
     case "agent.message":
       tag = s("role") === "system" ? "system" : "agent";
