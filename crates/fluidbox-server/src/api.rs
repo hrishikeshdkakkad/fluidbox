@@ -21,7 +21,9 @@ pub async fn health() -> Json<Value> {
 pub async fn health_ready(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     sqlx::query("select 1").execute(&state.pool).await?;
     let docker_ok = state.provider.ping().await.is_ok();
-    Ok(Json(json!({ "status": "ready", "db": true, "docker": docker_ok })))
+    Ok(Json(
+        json!({ "status": "ready", "db": true, "docker": docker_ok }),
+    ))
 }
 
 // ─── Agents & revisions ───────────────────────────────────────────────────
@@ -43,9 +45,13 @@ pub async fn create_agent(
     State(state): State<AppState>,
     Json(req): Json<CreateAgent>,
 ) -> ApiResult<Json<Value>> {
-    let agent =
-        fluidbox_db::create_agent(&state.pool, state.tenant_id, &req.name, req.description.as_deref())
-            .await?;
+    let agent = fluidbox_db::create_agent(
+        &state.pool,
+        state.tenant_id,
+        &req.name,
+        req.description.as_deref(),
+    )
+    .await?;
 
     // Create an initial revision so the agent is immediately runnable.
     let policy_name = req.policy.as_deref().unwrap_or("default");
@@ -57,7 +63,9 @@ pub async fn create_agent(
         &state.pool,
         agent.id,
         req.harness.as_deref().unwrap_or("claude-agent-sdk"),
-        req.runner_image.as_deref().unwrap_or(&state.cfg.sandbox_image),
+        req.runner_image
+            .as_deref()
+            .unwrap_or(&state.cfg.sandbox_image),
         req.model.as_deref().unwrap_or(&state.cfg.default_model),
         req.system_prompt.as_deref(),
         policy.id,
@@ -78,7 +86,9 @@ pub async fn get_agent(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let agent = fluidbox_db::get_agent(&state.pool, id).await?.ok_or(ApiError::NotFound)?;
+    let agent = fluidbox_db::get_agent(&state.pool, id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     let revisions = fluidbox_db::list_revisions(&state.pool, id).await?;
     Ok(Json(json!({ "agent": agent, "revisions": revisions })))
 }
@@ -99,7 +109,9 @@ pub async fn add_revision(
     Path(id): Path<Uuid>,
     Json(req): Json<AddRevision>,
 ) -> ApiResult<Json<Value>> {
-    let agent = fluidbox_db::get_agent(&state.pool, id).await?.ok_or(ApiError::NotFound)?;
+    let agent = fluidbox_db::get_agent(&state.pool, id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     let latest = fluidbox_db::latest_revision(&state.pool, id).await?;
     // Inherit from the latest revision unless overridden.
     let policy_name = req.policy.clone();
@@ -123,10 +135,21 @@ pub async fn add_revision(
     let rev = fluidbox_db::append_agent_revision(
         &state.pool,
         agent.id,
-        req.harness.as_deref().or(latest.as_ref().map(|r| r.harness.as_str())).unwrap_or("claude-agent-sdk"),
-        req.runner_image.as_deref().or(latest.as_ref().map(|r| r.runner_image.as_str())).unwrap_or(&state.cfg.sandbox_image),
-        req.model.as_deref().or(latest.as_ref().map(|r| r.model.as_str())).unwrap_or(&state.cfg.default_model),
-        req.system_prompt.as_deref().or(latest.as_ref().and_then(|r| r.system_prompt.as_deref())),
+        req.harness
+            .as_deref()
+            .or(latest.as_ref().map(|r| r.harness.as_str()))
+            .unwrap_or("claude-agent-sdk"),
+        req.runner_image
+            .as_deref()
+            .or(latest.as_ref().map(|r| r.runner_image.as_str()))
+            .unwrap_or(&state.cfg.sandbox_image),
+        req.model
+            .as_deref()
+            .or(latest.as_ref().map(|r| r.model.as_str()))
+            .unwrap_or(&state.cfg.default_model),
+        req.system_prompt
+            .as_deref()
+            .or(latest.as_ref().and_then(|r| r.system_prompt.as_deref())),
         policy_id,
         &budgets,
     )
@@ -152,13 +175,16 @@ pub async fn upsert_policy(
     State(state): State<AppState>,
     Json(req): Json<UpsertPolicy>,
 ) -> ApiResult<Json<Value>> {
-    let policy = Policy::parse_yaml(&req.yaml)
-        .map_err(ApiError::UnprocessableEntity)?;
+    let policy = Policy::parse_yaml(&req.yaml).map_err(ApiError::UnprocessableEntity)?;
     if policy.name != req.name {
-        return Err(ApiError::BadRequest("policy name must match yaml `name`".into()));
+        return Err(ApiError::BadRequest(
+            "policy name must match yaml `name`".into(),
+        ));
     }
     let parsed = serde_json::to_value(&policy)?;
-    let row = fluidbox_db::upsert_policy(&state.pool, state.tenant_id, &req.name, &req.yaml, &parsed).await?;
+    let row =
+        fluidbox_db::upsert_policy(&state.pool, state.tenant_id, &req.name, &req.yaml, &parsed)
+            .await?;
     Ok(Json(json!({ "policy": row })))
 }
 
@@ -167,10 +193,7 @@ pub struct ValidatePolicy {
     pub yaml: String,
 }
 
-pub async fn validate_policy(
-    _: Admin,
-    Json(req): Json<ValidatePolicy>,
-) -> ApiResult<Json<Value>> {
+pub async fn validate_policy(_: Admin, Json(req): Json<ValidatePolicy>) -> ApiResult<Json<Value>> {
     match Policy::parse_yaml(&req.yaml) {
         Ok(p) => Ok(Json(json!({ "valid": true, "name": p.name }))),
         Err(e) => Err(ApiError::UnprocessableEntity(e)),
@@ -221,7 +244,11 @@ pub async fn create_session(
     let policy: Policy = serde_json::from_value(policy_row.parsed.clone())
         .map_err(|e| ApiError::Internal(format!("bad stored policy: {e}")))?;
 
-    let autonomy = if req.autonomous { Autonomy::Autonomous } else { Autonomy::Supervised };
+    let autonomy = if req.autonomous {
+        Autonomy::Autonomous
+    } else {
+        Autonomy::Supervised
+    };
 
     // Autonomy permission gate: a policy may forbid autonomous runs.
     if autonomy == Autonomy::Autonomous && !policy.autonomy.permitted {
@@ -231,9 +258,12 @@ pub async fn create_session(
     }
 
     let agent_budgets: Budgets = serde_json::from_value(rev.budgets.clone()).unwrap_or_default();
+    // The policy's budgets are a ceiling: revision defaults and per-run
+    // requests may only tighten below them, never widen past them.
+    let ceiling = agent_budgets.tightened_by(&policy.budgets);
     let effective_budgets = match &req.budgets {
-        Some(b) => agent_budgets.tightened_by(b),
-        None => agent_budgets,
+        Some(b) => ceiling.tightened_by(b),
+        None => ceiling,
     };
 
     let repo = match req.repo {
@@ -313,7 +343,9 @@ pub async fn get_session(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let session = fluidbox_db::get_session(&state.pool, id).await?.ok_or(ApiError::NotFound)?;
+    let session = fluidbox_db::get_session(&state.pool, id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     let totals = fluidbox_db::usage_totals(&state.pool, id).await?;
     Ok(Json(json!({ "session": session, "usage": totals })))
 }
@@ -409,7 +441,9 @@ pub async fn get_artifact(
     State(state): State<AppState>,
     Path((_sid, aid)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<Value>> {
-    let artifact = fluidbox_db::get_artifact(&state.pool, aid).await?.ok_or(ApiError::NotFound)?;
+    let artifact = fluidbox_db::get_artifact(&state.pool, aid)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     Ok(Json(json!({ "artifact": artifact })))
 }
 

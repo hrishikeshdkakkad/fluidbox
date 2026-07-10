@@ -20,11 +20,15 @@ pub async fn run(
 
     // Policies from disk (idempotent upsert; version bumps on change).
     let mut default_policy_id = None;
+    let mut default_policy_budgets = None;
     if policies_dir.is_dir() {
         let mut entries: Vec<_> = std::fs::read_dir(policies_dir)?
             .filter_map(|e| e.ok())
             .filter(|e| {
-                e.path().extension().map(|x| x == "yaml" || x == "yml").unwrap_or(false)
+                e.path()
+                    .extension()
+                    .map(|x| x == "yaml" || x == "yml")
+                    .unwrap_or(false)
             })
             .collect();
         entries.sort_by_key(|e| e.path());
@@ -43,6 +47,7 @@ pub async fn run(
                     }
                     if policy.name == "default" {
                         default_policy_id = Some(row.id);
+                        default_policy_budgets = Some(policy.budgets.clone());
                     }
                 }
                 Err(e) => {
@@ -57,10 +62,16 @@ pub async fn run(
         None => {
             // Guarantee a fail-safe policy exists even with an empty dir.
             let p = Policy::parse_yaml("name: default").unwrap();
-            seed_policy_if_absent(pool, tenant, "default", "name: default", &serde_json::to_value(&p)?)
-                .await?
-                .0
-                .id
+            seed_policy_if_absent(
+                pool,
+                tenant,
+                "default",
+                "name: default",
+                &serde_json::to_value(&p)?,
+            )
+            .await?
+            .0
+            .id
         }
     };
 
@@ -73,7 +84,9 @@ pub async fn run(
     )
     .await?;
     if latest_revision(pool, agent.id).await?.is_none() {
-        let budgets = serde_json::to_value(fluidbox_core::spec::Budgets::default())?;
+        // The seed policy's budgets are the source of truth for the curated
+        // agent; Budgets::default() is only the no-policy fallback.
+        let budgets = serde_json::to_value(default_policy_budgets.unwrap_or_default())?;
         append_agent_revision(
             pool,
             agent.id,
@@ -88,5 +101,8 @@ pub async fn run(
         tracing::info!("seeded agent claude-fixer rev 1");
     }
 
-    Ok(SeedOutcome { tenant_id: tenant, default_agent: "claude-fixer".into() })
+    Ok(SeedOutcome {
+        tenant_id: tenant,
+        default_agent: "claude-fixer".into(),
+    })
 }
