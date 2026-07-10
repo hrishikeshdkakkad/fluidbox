@@ -63,7 +63,27 @@ pub struct AgentRevisionRow {
     pub policy_id: Uuid,
     pub budgets: Value,
     pub capability_bundles: Value,
+    /// Optional WorkspaceSpec jsonb — the agent's default workspace.
+    pub default_workspace: Option<Value>,
     pub created_at: DateTime<Utc>,
+}
+
+/// Deliberately has NO credential field: every query selects explicit
+/// columns, so the sealed credential can never ride along into an API
+/// response or log. `connection_credential_sealed` is the only reader.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct IntegrationConnectionRow {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub provider: String,
+    pub external_account_id: String,
+    pub display_name: String,
+    pub granted_scopes: Value,
+    pub resource_selection: Value,
+    pub status: String,
+    pub metadata: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
@@ -303,13 +323,15 @@ pub async fn append_agent_revision(
     system_prompt: Option<&str>,
     policy_id: Uuid,
     budgets: &Value,
+    default_workspace: Option<&Value>,
 ) -> sqlx::Result<AgentRevisionRow> {
     sqlx::query_as(
         "insert into agent_revisions
-           (id, agent_id, rev, harness, runner_image, model, system_prompt, policy_id, budgets)
+           (id, agent_id, rev, harness, runner_image, model, system_prompt, policy_id, budgets,
+            default_workspace)
          values ($1, $2,
            coalesce((select max(rev) from agent_revisions where agent_id = $2), 0) + 1,
-           $3, $4, $5, $6, $7, $8)
+           $3, $4, $5, $6, $7, $8, $9)
          returning *",
     )
     .bind(Uuid::now_v7())
@@ -320,6 +342,7 @@ pub async fn append_agent_revision(
     .bind(system_prompt)
     .bind(policy_id)
     .bind(budgets)
+    .bind(default_workspace)
     .fetch_one(pool)
     .await
 }
@@ -346,6 +369,104 @@ pub async fn get_revision(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<AgentR
         .bind(id)
         .fetch_optional(pool)
         .await
+}
+
+// ─── Integration connections ──────────────────────────────────────────────
+
+// Every connection query selects this explicit column list (never `*`) so
+// the sealed credential can't ride along; keep the four copies in sync.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_connection(
+    pool: &PgPool,
+    tenant: Uuid,
+    provider: &str,
+    external_account_id: &str,
+    display_name: &str,
+    credential_sealed: &[u8],
+    granted_scopes: &Value,
+    resource_selection: &Value,
+    metadata: &Value,
+) -> sqlx::Result<IntegrationConnectionRow> {
+    sqlx::query_as(
+        "insert into integration_connections
+           (id, tenant_id, provider, external_account_id, display_name, credential_sealed,
+            granted_scopes, resource_selection, metadata)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         returning id, tenant_id, provider, external_account_id, display_name,
+                   granted_scopes, resource_selection, status, metadata, created_at, updated_at",
+    )
+    .bind(Uuid::now_v7())
+    .bind(tenant)
+    .bind(provider)
+    .bind(external_account_id)
+    .bind(display_name)
+    .bind(credential_sealed)
+    .bind(granted_scopes)
+    .bind(resource_selection)
+    .bind(metadata)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn list_connections(
+    pool: &PgPool,
+    tenant: Uuid,
+) -> sqlx::Result<Vec<IntegrationConnectionRow>> {
+    sqlx::query_as(
+        "select id, tenant_id, provider, external_account_id, display_name,
+                granted_scopes, resource_selection, status, metadata, created_at, updated_at
+         from integration_connections
+         where tenant_id = $1 order by created_at desc",
+    )
+    .bind(tenant)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_connection(
+    pool: &PgPool,
+    id: Uuid,
+) -> sqlx::Result<Option<IntegrationConnectionRow>> {
+    sqlx::query_as(
+        "select id, tenant_id, provider, external_account_id, display_name,
+                granted_scopes, resource_selection, status, metadata, created_at, updated_at
+         from integration_connections where id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn revoke_connection(
+    pool: &PgPool,
+    id: Uuid,
+) -> sqlx::Result<Option<IntegrationConnectionRow>> {
+    sqlx::query_as(
+        "update integration_connections set status = 'revoked', updated_at = now()
+         where id = $1 and status <> 'revoked'
+         returning id, tenant_id, provider, external_account_id, display_name,
+                   granted_scopes, resource_selection, status, metadata, created_at, updated_at",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// The only reader of the sealed credential. Returns None unless the
+/// connection exists AND is active — a revoked connection can never again
+/// produce a credential.
+pub async fn connection_credential_sealed(
+    pool: &PgPool,
+    id: Uuid,
+) -> sqlx::Result<Option<Vec<u8>>> {
+    let row = sqlx::query(
+        "select credential_sealed from integration_connections
+         where id = $1 and status = 'active'",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.get::<Vec<u8>, _>("credential_sealed")))
 }
 
 // ─── Sessions ─────────────────────────────────────────────────────────────
@@ -912,6 +1033,7 @@ mod tests {
             None,
             policy.id,
             &serde_json::json!({}),
+            None,
         )
         .await
         .unwrap();
@@ -987,6 +1109,7 @@ mod tests {
             None,
             policy.id,
             &serde_json::json!({}),
+            None,
         )
         .await
         .unwrap();
@@ -1061,5 +1184,129 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn connection_lifecycle_and_credential_isolation() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let tenant = ensure_default_tenant(&pool).await.unwrap();
+
+        let sealed = b"nonce||ciphertext-not-a-real-secret".to_vec();
+        let conn = create_connection(
+            &pool,
+            tenant,
+            "github",
+            "test-account-42",
+            "test-connection",
+            &sealed,
+            &serde_json::json!(["repo"]),
+            &serde_json::json!({}),
+            &serde_json::json!({"test": true}),
+        )
+        .await
+        .unwrap();
+
+        // The row type/serialization can never leak the credential.
+        let as_json = serde_json::to_value(&conn).unwrap();
+        assert!(as_json.get("credential_sealed").is_none());
+        assert!(!serde_json::to_string(&as_json)
+            .unwrap()
+            .contains("ciphertext-not-a-real-secret"));
+
+        // Active connection yields the sealed bytes.
+        let got = connection_credential_sealed(&pool, conn.id)
+            .await
+            .unwrap()
+            .expect("active connection has credential");
+        assert_eq!(got, sealed);
+
+        // Revocation is terminal for credential access.
+        let revoked = revoke_connection(&pool, conn.id).await.unwrap().unwrap();
+        assert_eq!(revoked.status, "revoked");
+        assert!(connection_credential_sealed(&pool, conn.id)
+            .await
+            .unwrap()
+            .is_none());
+        // Idempotent second revoke: no row to update.
+        assert!(revoke_connection(&pool, conn.id).await.unwrap().is_none());
+
+        sqlx::query("delete from integration_connections where id = $1")
+            .bind(conn.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn revision_default_workspace_roundtrips() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let policy = upsert_policy(
+            &pool,
+            tenant,
+            "test-ws",
+            "name: test-ws",
+            &serde_json::json!({"name": "test-ws"}),
+        )
+        .await
+        .unwrap();
+        let agent = create_agent(&pool, tenant, "test-ws-agent", None)
+            .await
+            .unwrap();
+
+        let ws = serde_json::json!({
+            "kind": "git_repository",
+            "clone_url": "https://github.com/o/r.git",
+            "ref": "main"
+        });
+        let rev = append_agent_revision(
+            &pool,
+            agent.id,
+            "claude-agent-sdk",
+            "img:test",
+            "claude-haiku-4-5",
+            None,
+            policy.id,
+            &serde_json::json!({}),
+            Some(&ws),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rev.default_workspace, Some(ws));
+
+        // A revision without one stays None.
+        let rev2 = append_agent_revision(
+            &pool,
+            agent.id,
+            "claude-agent-sdk",
+            "img:test",
+            "claude-haiku-4-5",
+            None,
+            policy.id,
+            &serde_json::json!({}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(rev2.default_workspace.is_none());
+
+        sqlx::query("delete from agent_revisions where agent_id = $1")
+            .bind(agent.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("delete from agents where id = $1")
+            .bind(agent.id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }
