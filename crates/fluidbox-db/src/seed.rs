@@ -33,8 +33,14 @@ pub async fn run(
             match Policy::parse_yaml(&yaml) {
                 Ok(policy) => {
                     let parsed = serde_json::to_value(&policy)?;
-                    let row = upsert_policy(pool, tenant, &policy.name, &yaml, &parsed).await?;
-                    tracing::info!(policy = %policy.name, version = row.version, "seeded policy");
+                    // Bootstrap only when absent — never clobber UI edits on reboot.
+                    let (row, inserted) =
+                        seed_policy_if_absent(pool, tenant, &policy.name, &yaml, &parsed).await?;
+                    if inserted {
+                        tracing::info!(policy = %policy.name, "seeded policy from disk");
+                    } else {
+                        tracing::debug!(policy = %policy.name, version = row.version, "policy exists; leaving UI-managed version intact");
+                    }
                     if policy.name == "default" {
                         default_policy_id = Some(row.id);
                     }
@@ -51,8 +57,9 @@ pub async fn run(
         None => {
             // Guarantee a fail-safe policy exists even with an empty dir.
             let p = Policy::parse_yaml("name: default").unwrap();
-            upsert_policy(pool, tenant, "default", "name: default", &serde_json::to_value(&p)?)
+            seed_policy_if_absent(pool, tenant, "default", "name: default", &serde_json::to_value(&p)?)
                 .await?
+                .0
                 .id
         }
     };
