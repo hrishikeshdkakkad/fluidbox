@@ -18,8 +18,6 @@ pub enum RevisionSelector {
     /// The agent's current (latest) revision — what manual runs use today.
     Latest,
     /// A subscription-pinned revision; must belong to the agent.
-    /// (expect self-erases when the trigger invoke path lands.)
-    #[expect(dead_code)]
     Pinned(Uuid),
 }
 

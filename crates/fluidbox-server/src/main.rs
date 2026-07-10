@@ -3,6 +3,7 @@ mod auth;
 mod callback;
 mod config;
 mod connections;
+mod deliveries;
 mod error;
 mod facade;
 mod internal;
@@ -12,6 +13,7 @@ mod run_service;
 mod seal;
 mod sse;
 mod state;
+mod triggers;
 mod workers;
 
 use axum::routing::{get, post};
@@ -111,7 +113,14 @@ async fn main() -> anyhow::Result<()> {
             get(connections::list).post(connections::create),
         )
         .route("/connections/{id}/revoke", post(connections::revoke))
-        .route("/connections/{id}/repos", get(connections::repos));
+        .route("/connections/{id}/repos", get(connections::repos))
+        .route("/triggers", get(triggers::list).post(triggers::create))
+        .route("/triggers/{id}", get(triggers::get))
+        .route("/triggers/{id}/enable", post(triggers::enable))
+        .route("/triggers/{id}/disable", post(triggers::disable))
+        .route("/triggers/{id}/rotate_token", post(triggers::rotate_token))
+        .route("/triggers/{id}/invoke", post(triggers::invoke))
+        .route("/triggers/{id}/runs/{sid}", get(triggers::poll_run));
 
     let internal = Router::new()
         .route("/sessions/{id}/permission", post(internal::permission))
