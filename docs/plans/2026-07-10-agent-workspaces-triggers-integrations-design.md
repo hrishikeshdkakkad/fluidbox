@@ -740,12 +740,12 @@ Product and system health should be visible through:
 
 These decisions do not block the overall architecture, but each must be settled before its phase ships:
 
-1. Whether GitHub results appear only under the fluidbox App identity or support user-delegated identities.
-2. Whether a PR subscription defaults to `opened` only or also `synchronize` and `reopened`.
-3. Whether subsequent reviews update a stable comment/check or preserve a history of separate results.
+1. Whether GitHub results appear only under the fluidbox App identity or support user-delegated identities. — **SETTLED 2026-07-10 (Phase 4): App-only.** Comments and checks post under the App installation identity; per-agent attribution lives in the content (agent name + run id in the comment body, check name `fluidbox/<subscription>`). Checks require an App identity anyway; user-delegated identities can layer on later without schema changes.
+2. Whether a PR subscription defaults to `opened` only or also `synchronize` and `reopened`. — **SETTLED 2026-07-10 (Phase 4): default `opened` + `reopened`;** `synchronize` is a per-subscription opt-in because it fires on every push to the PR branch — a cost amplifier (pushes × matching subscriptions = runs).
+3. Whether subsequent reviews update a stable comment/check or preserve a history of separate results. — **SETTLED 2026-07-10 (Phase 4): update in place.** One stable comment per (subscription, PR), tracked in `external_results` and edited on later events (recreated only if deleted externally); checks get one run per head SHA under the stable subscription name. The ledger and `result_deliveries` keep the full history.
 4. Which branch-write operations are allowed through the first brokered Git capability.
-5. Schedule missed-run and overlap defaults.
-6. Whether API trigger task/workspace overrides are opt-in per subscription.
+5. Schedule missed-run and overlap defaults. — **SETTLED 2026-07-10 (Phase 3): overlap default `allow`, missed-run default `skip`; `concurrency_policy` enforced in `create_run` for ALL invocations.**
+6. Whether API trigger task/workspace overrides are opt-in per subscription. — **SETTLED 2026-07-10 (Phase 2): opt-in per subscription, both default OFF.**
 7. Capability-bundle versioning and upgrade behavior for existing agent revisions.
 8. When the connector boundary is mature enough to expose as a public SDK.
 

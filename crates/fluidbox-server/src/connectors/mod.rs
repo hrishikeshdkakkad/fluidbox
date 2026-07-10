@@ -118,7 +118,10 @@ pub fn supported_events(connector: &str) -> &'static [&'static str] {
 /// §17 #2: the default filter a new subscription gets when it doesn't pick.
 pub fn default_events(connector: &str) -> Vec<String> {
     match connector {
-        "github" => github::DEFAULT_EVENTS.iter().map(|s| s.to_string()).collect(),
+        "github" => github::DEFAULT_EVENTS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         _ => vec![],
     }
 }
@@ -189,4 +192,3 @@ pub async fn fetch_auth_header(
         ),
     }
 }
-

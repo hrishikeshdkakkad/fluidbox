@@ -127,9 +127,14 @@ pub async fn ingress(
             Ok(RunCreation::SkippedOverlap { running_session_id }) => {
                 // §17 #5: the subscription's concurrency policy governs
                 // event fan-out too; the skip is recorded visibly.
-                fluidbox_db::mark_dispatch_outcome(&state.pool, claim.id, "skipped", Some("overlap"))
-                    .await
-                    .ok();
+                fluidbox_db::mark_dispatch_outcome(
+                    &state.pool,
+                    claim.id,
+                    "skipped",
+                    Some("overlap"),
+                )
+                .await
+                .ok();
                 skipped.push(json!({
                     "subscription_id": sub.id,
                     "reason": "overlap",
@@ -149,7 +154,8 @@ pub async fn ingress(
                 .await
                 .ok();
                 tracing::warn!("dispatch {} for delivery {}: {msg}", sub.id, delivery.id);
-                skipped.push(json!({ "subscription_id": sub.id, "reason": format!("error: {msg}") }));
+                skipped
+                    .push(json!({ "subscription_id": sub.id, "reason": format!("error: {msg}") }));
             }
         }
     }
@@ -174,9 +180,10 @@ async fn dispatch_one(
     verified: &VerifiedDelivery,
     dispatch_id: Uuid,
 ) -> ApiResult<RunCreation> {
-    let template = sub.task_template.as_deref().ok_or_else(|| {
-        ApiError::Internal("event subscription has no task_template".into())
-    })?;
+    let template = sub
+        .task_template
+        .as_deref()
+        .ok_or_else(|| ApiError::Internal("event subscription has no task_template".into()))?;
     let task = render_task_template(template, &event.context).map_err(ApiError::BadRequest)?;
     let SubRunParams {
         autonomy,
@@ -297,25 +304,75 @@ mod tests {
     #[test]
     fn matcher_requires_an_event_filter_and_honors_it() {
         let filter = json!({"events": ["pull_request.opened", "pull_request.reopened"]});
-        assert!(subscription_matches("pull_request.opened", "acme/site", Some(&filter), None));
-        assert!(subscription_matches("pull_request.reopened", "acme/site", Some(&filter), None));
+        assert!(subscription_matches(
+            "pull_request.opened",
+            "acme/site",
+            Some(&filter),
+            None
+        ));
+        assert!(subscription_matches(
+            "pull_request.reopened",
+            "acme/site",
+            Some(&filter),
+            None
+        ));
         // Not in the filter (synchronize is opt-in, §17 #2).
-        assert!(!subscription_matches("pull_request.synchronize", "acme/site", Some(&filter), None));
+        assert!(!subscription_matches(
+            "pull_request.synchronize",
+            "acme/site",
+            Some(&filter),
+            None
+        ));
         // Fail closed: no filter / malformed filter matches nothing.
-        assert!(!subscription_matches("pull_request.opened", "acme/site", None, None));
-        assert!(!subscription_matches("pull_request.opened", "acme/site", Some(&json!({})), None));
+        assert!(!subscription_matches(
+            "pull_request.opened",
+            "acme/site",
+            None,
+            None
+        ));
+        assert!(!subscription_matches(
+            "pull_request.opened",
+            "acme/site",
+            Some(&json!({})),
+            None
+        ));
     }
 
     #[test]
     fn matcher_resource_selector_narrows_and_empty_means_all() {
         let filter = json!({"events": ["pull_request.opened"]});
         let only_site = json!({"repositories": ["acme/site"]});
-        assert!(subscription_matches("pull_request.opened", "acme/site", Some(&filter), Some(&only_site)));
+        assert!(subscription_matches(
+            "pull_request.opened",
+            "acme/site",
+            Some(&filter),
+            Some(&only_site)
+        ));
         // Case-insensitive resource compare (provider names are).
-        assert!(subscription_matches("pull_request.opened", "Acme/Site", Some(&filter), Some(&only_site)));
-        assert!(!subscription_matches("pull_request.opened", "acme/other", Some(&filter), Some(&only_site)));
+        assert!(subscription_matches(
+            "pull_request.opened",
+            "Acme/Site",
+            Some(&filter),
+            Some(&only_site)
+        ));
+        assert!(!subscription_matches(
+            "pull_request.opened",
+            "acme/other",
+            Some(&filter),
+            Some(&only_site)
+        ));
         // Empty/absent selector = every resource the connection sees.
-        assert!(subscription_matches("pull_request.opened", "acme/anything", Some(&filter), Some(&json!({"repositories": []})), ));
-        assert!(subscription_matches("pull_request.opened", "acme/anything", Some(&filter), Some(&json!({})), ));
+        assert!(subscription_matches(
+            "pull_request.opened",
+            "acme/anything",
+            Some(&filter),
+            Some(&json!({"repositories": []})),
+        ));
+        assert!(subscription_matches(
+            "pull_request.opened",
+            "acme/anything",
+            Some(&filter),
+            Some(&json!({})),
+        ));
     }
 }

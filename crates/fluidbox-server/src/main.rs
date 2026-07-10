@@ -127,10 +127,7 @@ async fn main() -> anyhow::Result<()> {
         )
         // Unauthenticated by design: the webhook signature (verified against
         // the connection's sealed secret) is the authentication.
-        .route(
-            "/ingress/{provider}/{connection_id}",
-            post(events::ingress),
-        )
+        .route("/ingress/{provider}/{connection_id}", post(events::ingress))
         .route("/triggers", get(triggers::list).post(triggers::create))
         .route("/triggers/{id}", get(triggers::get))
         .route("/triggers/{id}/enable", post(triggers::enable))
