@@ -1,11 +1,11 @@
 # fluidbox — Validation & MVP Plan
 
 > **Status:** validated & scoped, awaiting build kickoff · **Date:** 2026-07-09 (rev 2: north-star convergence + LiteLLM gateway) · **License target:** MIT (OSS)
-> **Source spec:** [`init_prompt.txt`](./init_prompt.txt) — "Agent Execution Platform on AWS Lambda MicroVMs"
+> **Source spec:** the internal product brief "Agent Execution Platform on AWS Lambda MicroVMs" (kept out of this repo)
 
 ## 1. Context
 
-`init_prompt.txt` specifies a **BYOC agent-execution governance platform**: a control plane that lets AI coding agents (Claude, Codex, others) safely run code and tools inside isolated, customer-owned execution environments, with per-action policy, human approvals, append-only audit, and cost controls. The wedge product is "secure event-triggered coding agents for private GitHub repositories."
+The source spec describes a **BYOC agent-execution governance platform**: a control plane that lets AI coding agents (Claude, Codex, others) safely run code and tools inside isolated, customer-owned execution environments, with per-action policy, human approvals, append-only audit, and cost controls. The wedge product is "secure event-triggered coding agents for private GitHub repositories."
 
 This document is the result of mechanically validating that spec against reality (2026-07-09) and scoping an MVP under these hard constraints:
 
@@ -100,7 +100,7 @@ axum 0.8.9 (native SSE) · sqlx 0.9.0 · bollard 0.21.0 (Docker Engine API) · o
 
 ## 5. Spec → MVP traceability
 
-| `init_prompt.txt` element | Disposition |
+| Source-spec element | Disposition |
 |---|---|
 | Control-plane services (api/session/policy/approval/tool-gateway/orchestrator/cost) | **M1** — modules in one `fluidbox-server` binary (mono-binary, not microservices, for OSS simplicity) |
 | Agent registry / multi-agent configuration | **M1 (minimal, structural):** `agents` + immutable `agent_revisions` + frozen per-run RunSpec — one curated harness. **M3:** second harness, capability-bundle catalog, customer images |
