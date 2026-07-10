@@ -7,13 +7,16 @@ import {
   apiPost,
   Agent,
   ResultDelivery,
+  Schedule,
   Session,
+  TriggerInvocation,
   TriggerSubscription,
 } from "../lib/api";
 import { PageHead, Pill, short } from "../components/bits";
 
 export default function Triggers() {
   const [subs, setSubs] = useState<TriggerSubscription[]>([]);
+  const [schedules, setSchedules] = useState<Record<string, Schedule>>({});
   const [agents, setAgents] = useState<Agent[]>([]);
   const [showNew, setShowNew] = useState(false);
   const [minted, setMinted] = useState<Minted | null>(null);
@@ -21,8 +24,11 @@ export default function Triggers() {
 
   const load = useCallback(async () => {
     try {
-      const r = await apiGet<{ subscriptions: TriggerSubscription[] }>("/triggers");
+      const r = await apiGet<{ subscriptions: TriggerSubscription[]; schedules?: Schedule[] }>(
+        "/triggers"
+      );
       setSubs(r.subscriptions);
+      setSchedules(Object.fromEntries((r.schedules || []).map((s) => [s.subscription_id, s])));
       const a = await apiGet<{ agents: Agent[] }>("/agents");
       setAgents(a.agents);
     } catch {
@@ -80,6 +86,7 @@ export default function Triggers() {
               <TriggerRow
                 key={s.id}
                 sub={s}
+                schedule={schedules[s.id]}
                 agentName={agentName(s.agent_id)}
                 onToggle={setEnabled}
                 onRotate={rotate}
@@ -108,17 +115,20 @@ export default function Triggers() {
 
 function TriggerRow({
   sub,
+  schedule,
   agentName,
   onToggle,
   onRotate,
 }: {
   sub: TriggerSubscription;
+  schedule?: Schedule;
   agentName: string;
   onToggle: (s: TriggerSubscription, enabled: boolean) => void;
   onRotate: (s: TriggerSubscription) => void;
 }) {
   const [open, setOpen] = useState(false);
   const callback = sub.result_destinations.find((d) => d.kind === "signed_webhook");
+  const ts = (v: string | null) => (v ? new Date(v).toLocaleTimeString() : null);
   return (
     <div className="row" style={{ display: "block" }}>
       <div
@@ -137,8 +147,19 @@ function TriggerRow({
             {sub.allow_task_override ? " · task override" : ""}
             {sub.allow_workspace_override ? " · workspace override" : ""}
             {sub.autonomy === "autonomous" ? " · autonomous" : ""}
+            {sub.concurrency_policy !== "allow" ? ` · ${sub.concurrency_policy}` : ""}
             {callback?.url ? ` · cb ${callback.url.slice(0, 34)}` : ""}
           </span>
+          {schedule && (
+            <span
+              className="mut mono"
+              style={{ display: "block", fontSize: 11.5, marginTop: 2 }}
+            >
+              ⏱ {schedule.cron} ({schedule.timezone}) · missed: {schedule.missed_run_policy}
+              {ts(schedule.next_fire_at) ? ` · next ${ts(schedule.next_fire_at)}` : ""}
+              {ts(schedule.last_fired_at) ? ` · last ${ts(schedule.last_fired_at)}` : ""}
+            </span>
+          )}
         </span>
         <span className={`autopill ${sub.enabled ? "supervised" : "autonomous"}`}>
           {sub.enabled ? "enabled" : "disabled"}
@@ -161,15 +182,21 @@ function TriggerRow({
 function TriggerActivity({ id }: { id: string }) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [deliveries, setDeliveries] = useState<ResultDelivery[]>([]);
+  const [invocations, setInvocations] = useState<TriggerInvocation[]>([]);
 
   useEffect(() => {
     let alive = true;
     const poll = async () => {
       try {
-        const r = await apiGet<{ sessions: Session[]; deliveries: ResultDelivery[] }>(`/triggers/${id}`);
+        const r = await apiGet<{
+          sessions: Session[];
+          deliveries: ResultDelivery[];
+          invocations?: TriggerInvocation[];
+        }>(`/triggers/${id}`);
         if (alive) {
           setSessions(r.sessions);
           setDeliveries(r.deliveries);
+          setInvocations(r.invocations || []);
         }
       } catch {
         /* ignore */
@@ -184,7 +211,7 @@ function TriggerActivity({ id }: { id: string }) {
   }, [id]);
 
   return (
-    <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+    <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 14 }}>
       <div>
         <div className="sectitle" style={{ marginTop: 0 }}>
           recent runs
@@ -201,6 +228,35 @@ function TriggerActivity({ id }: { id: string }) {
                 {s.task}
               </span>
               <Pill status={s.status} />
+            </div>
+          ))
+        )}
+      </div>
+      <div>
+        <div className="sectitle" style={{ marginTop: 0 }}>
+          firings &amp; skips
+        </div>
+        {invocations.length === 0 ? (
+          <div className="empty">no invocations yet</div>
+        ) : (
+          invocations.map((i) => (
+            <div key={i.id} className="spread" style={{ padding: "4px 0", gap: 8 }}>
+              <span
+                className="mono mut"
+                style={{ fontSize: 11.5, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                title={i.idempotency_key}
+              >
+                {i.idempotency_key}
+              </span>
+              {i.session_id ? (
+                <Link className="link mono" href={`/sessions/${i.session_id}`} style={{ fontSize: 12 }}>
+                  {short(i.session_id)}
+                </Link>
+              ) : (
+                <span className="autopill autonomous" title={i.skip_reason || undefined}>
+                  {i.skip_reason ? `skipped: ${i.skip_reason.slice(0, 24)}` : "pending"}
+                </span>
+              )}
             </div>
           ))
         )}
@@ -259,6 +315,11 @@ function NewTrigger({
   const [allowWorkspace, setAllowWorkspace] = useState(false);
   const [autonomous, setAutonomous] = useState(false);
   const [callbackUrl, setCallbackUrl] = useState("");
+  const [concurrency, setConcurrency] = useState("allow");
+  const [scheduled, setScheduled] = useState(false);
+  const [cron, setCron] = useState("");
+  const [timezone, setTimezone] = useState("UTC");
+  const [missedPolicy, setMissedPolicy] = useState("skip");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
@@ -266,6 +327,10 @@ function NewTrigger({
     setErr("");
     if (!name.trim() || !agent) {
       setErr("agent and name are required");
+      return;
+    }
+    if (scheduled && !cron.trim()) {
+      setErr("a schedule needs a cron expression");
       return;
     }
     setBusy(true);
@@ -279,6 +344,14 @@ function NewTrigger({
       };
       if (template.trim()) body.task_template = template;
       if (callbackUrl.trim()) body.callback_url = callbackUrl.trim();
+      if (concurrency !== "allow") body.concurrency_policy = concurrency;
+      if (scheduled) {
+        body.schedule = {
+          cron: cron.trim(),
+          timezone: timezone.trim() || "UTC",
+          missed_run_policy: missedPolicy,
+        };
+      }
       const r = await apiPost<{
         subscription: TriggerSubscription;
         token: string;
@@ -361,6 +434,49 @@ function NewTrigger({
               autonomous runs (policy permitting)
             </span>
           </label>
+          <label className="field">
+            <span className="lab">Overlap policy — a new invocation arrives while a run is active</span>
+            <select className="inp" value={concurrency} onChange={(e) => setConcurrency(e.target.value)}>
+              <option value="allow">allow (default — runs may overlap)</option>
+              <option value="skip_if_running">skip_if_running (classic cron — the skip is recorded)</option>
+              <option value="replace">replace (cancel the running run, start the new one)</option>
+            </select>
+          </label>
+          <label className="field" style={{ flexDirection: "row", gap: 8, alignItems: "center" }}>
+            <input type="checkbox" checked={scheduled} onChange={(e) => setScheduled(e.target.checked)} />
+            <span className="lab" style={{ margin: 0 }}>
+              run on a schedule (cron — the template renders {"{{fire_time}}"})
+            </span>
+          </label>
+          {scheduled && (
+            <>
+              <label className="field">
+                <span className="lab">Cron (5-field standard, or 6-field with seconds)</span>
+                <input
+                  className="inp mono"
+                  value={cron}
+                  onChange={(e) => setCron(e.target.value)}
+                  placeholder="0 7 * * 1-5"
+                />
+              </label>
+              <label className="field">
+                <span className="lab">Timezone (IANA — DST-correct)</span>
+                <input
+                  className="inp mono"
+                  value={timezone}
+                  onChange={(e) => setTimezone(e.target.value)}
+                  placeholder="America/New_York"
+                />
+              </label>
+              <label className="field">
+                <span className="lab">Missed-run policy — the scheduler was down across fire times</span>
+                <select className="inp" value={missedPolicy} onChange={(e) => setMissedPolicy(e.target.value)}>
+                  <option value="skip">skip (default — record the gap, resume the cadence)</option>
+                  <option value="catch_up">catch_up (fire exactly one make-up run)</option>
+                </select>
+              </label>
+            </>
+          )}
           <label className="field">
             <span className="lab">Signed callback URL (optional — the secret is minted on create)</span>
             <input

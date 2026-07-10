@@ -118,7 +118,29 @@ export interface TriggerSubscription {
   allow_task_override: boolean;
   allow_workspace_override: boolean;
   autonomy: string | null;
+  concurrency_policy: string;
   result_destinations: { kind: string; url?: string }[];
+  created_at: string;
+}
+
+/** The clock on a subscription (schedules table). */
+export interface Schedule {
+  id: string;
+  subscription_id: string;
+  cron: string;
+  timezone: string;
+  next_fire_at: string | null;
+  missed_run_policy: string;
+  last_fired_at: string | null;
+}
+
+/** One claim row: a firing/invoke bound to a run, or a recorded skip. */
+export interface TriggerInvocation {
+  id: string;
+  subscription_id: string;
+  idempotency_key: string;
+  session_id: string | null;
+  skip_reason: string | null;
   created_at: string;
 }
 
