@@ -20,7 +20,10 @@ pub struct Admin;
 impl FromRequestParts<AppState> for Admin {
     type Rejection = ApiError;
 
-    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
         let token = bearer(parts).ok_or(ApiError::Unauthorized)?;
         // Constant-time-ish compare via sha256 of both sides.
         let expected = fluidbox_db::sha256_hex(&state.cfg.admin_token);
@@ -43,7 +46,10 @@ pub struct SessionAuth {
 impl FromRequestParts<AppState> for SessionAuth {
     type Rejection = ApiError;
 
-    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
         let token = bearer(parts).ok_or(ApiError::Unauthorized)?;
         let session_id = fluidbox_db::session_for_token(&state.pool, &token)
             .await?

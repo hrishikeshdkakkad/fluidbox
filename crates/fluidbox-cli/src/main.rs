@@ -6,10 +6,17 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 
 #[derive(Parser)]
-#[command(name = "fluidbox", about = "Run governed AI coding agents in disposable sandboxes")]
+#[command(
+    name = "fluidbox",
+    about = "Run governed AI coding agents in disposable sandboxes"
+)]
 struct Cli {
     /// Control plane URL (env: FLUIDBOX_API_URL)
-    #[arg(long, env = "FLUIDBOX_API_URL", default_value = "http://127.0.0.1:8787")]
+    #[arg(
+        long,
+        env = "FLUIDBOX_API_URL",
+        default_value = "http://127.0.0.1:8787"
+    )]
     url: String,
     /// Admin token (env: FLUIDBOX_ADMIN_TOKEN)
     #[arg(long, env = "FLUIDBOX_ADMIN_TOKEN")]
@@ -65,7 +72,11 @@ struct Client {
 
 impl Client {
     fn new(url: String, token: String) -> Self {
-        Self { http: reqwest::Client::new(), url: url.trim_end_matches('/').to_string(), token }
+        Self {
+            http: reqwest::Client::new(),
+            url: url.trim_end_matches('/').to_string(),
+            token,
+        }
     }
 
     async fn get(&self, path: &str) -> Result<Value> {
@@ -104,12 +115,20 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let cli = Cli::parse();
     if cli.token.is_empty() {
-        return Err(anyhow!("admin token required (--token or FLUIDBOX_ADMIN_TOKEN)"));
+        return Err(anyhow!(
+            "admin token required (--token or FLUIDBOX_ADMIN_TOKEN)"
+        ));
     }
     let client = Client::new(cli.url, cli.token);
 
     match cli.cmd {
-        Cmd::Run { agent, task, repo, autonomous, detach } => {
+        Cmd::Run {
+            agent,
+            task,
+            repo,
+            autonomous,
+            detach,
+        } => {
             let repo_json = match repo {
                 Some(p) => {
                     let abs = std::fs::canonicalize(&p)
@@ -124,8 +143,18 @@ async fn main() -> Result<()> {
                     json!({ "agent": agent, "task": task, "repo": repo_json, "autonomous": autonomous }),
                 )
                 .await?;
-            let id = res["session"]["id"].as_str().ok_or_else(|| anyhow!("no session id"))?.to_string();
-            println!("▶ session {id}  (agent={agent}, autonomy={})", if autonomous { "autonomous" } else { "supervised" });
+            let id = res["session"]["id"]
+                .as_str()
+                .ok_or_else(|| anyhow!("no session id"))?
+                .to_string();
+            println!(
+                "▶ session {id}  (agent={agent}, autonomy={})",
+                if autonomous {
+                    "autonomous"
+                } else {
+                    "supervised"
+                }
+            );
             if detach {
                 return Ok(());
             }
@@ -164,22 +193,39 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Approve { id, session } => {
-            let decision = if session { "approved_session" } else { "approved_once" };
+            let decision = if session {
+                "approved_session"
+            } else {
+                "approved_once"
+            };
             let res = client
-                .post(&format!("/v1/approvals/{id}/decision"), json!({ "decision": decision, "decided_by": "cli" }))
+                .post(
+                    &format!("/v1/approvals/{id}/decision"),
+                    json!({ "decision": decision, "decided_by": "cli" }),
+                )
                 .await?;
-            println!("✓ {}", res["approval"]["status"].as_str().unwrap_or("decided"));
+            println!(
+                "✓ {}",
+                res["approval"]["status"].as_str().unwrap_or("decided")
+            );
         }
         Cmd::Deny { id } => {
             client
-                .post(&format!("/v1/approvals/{id}/decision"), json!({ "decision": "denied", "decided_by": "cli" }))
+                .post(
+                    &format!("/v1/approvals/{id}/decision"),
+                    json!({ "decision": "denied", "decided_by": "cli" }),
+                )
                 .await?;
             println!("✗ denied");
         }
         Cmd::Agents => {
             let res = client.get("/v1/agents").await?;
             for a in res["agents"].as_array().cloned().unwrap_or_default() {
-                println!("{}  {}", a["name"].as_str().unwrap_or(""), a["description"].as_str().unwrap_or(""));
+                println!(
+                    "{}  {}",
+                    a["name"].as_str().unwrap_or(""),
+                    a["description"].as_str().unwrap_or("")
+                );
             }
         }
     }
@@ -189,7 +235,12 @@ async fn main() -> Result<()> {
 /// Follow a session's SSE timeline until it reaches a terminal state.
 async fn watch(client: &Client, id: &str) -> Result<()> {
     let url = format!("{}/v1/sessions/{}/events/stream", client.url, id);
-    let res = client.http.get(&url).bearer_auth(&client.token).send().await?;
+    let res = client
+        .http
+        .get(&url)
+        .bearer_auth(&client.token)
+        .send()
+        .await?;
     if !res.status().is_success() {
         return Err(anyhow!("watch failed: HTTP {}", res.status()));
     }
@@ -226,7 +277,10 @@ fn print_event(ev: &Value) -> bool {
             matches!(to, "completed" | "failed" | "cancelled" | "budget_exceeded")
         }
         "workspace.initialized" => {
-            println!("  ⬡ workspace ready (files={})", p["files"].as_u64().unwrap_or(0));
+            println!(
+                "  ⬡ workspace ready (files={})",
+                p["files"].as_u64().unwrap_or(0)
+            );
             false
         }
         "agent.message" => {
@@ -238,7 +292,11 @@ fn print_event(ev: &Value) -> bool {
             false
         }
         "tool.requested" => {
-            println!("  🔧 {} — {}", p["tool"].as_str().unwrap_or(""), p["summary"].as_str().unwrap_or(""));
+            println!(
+                "  🔧 {} — {}",
+                p["tool"].as_str().unwrap_or(""),
+                p["summary"].as_str().unwrap_or("")
+            );
             false
         }
         "tool.decision" => {
@@ -248,12 +306,23 @@ fn print_event(ev: &Value) -> bool {
             false
         }
         "approval.requested" => {
-            println!("  ⏸ APPROVAL NEEDED: {} — {}", p["tool"].as_str().unwrap_or(""), p["summary"].as_str().unwrap_or(""));
-            println!("     approve with: fluidbox approve {}", p["approval_id"].as_str().unwrap_or(""));
+            println!(
+                "  ⏸ APPROVAL NEEDED: {} — {}",
+                p["tool"].as_str().unwrap_or(""),
+                p["summary"].as_str().unwrap_or("")
+            );
+            println!(
+                "     approve with: fluidbox approve {}",
+                p["approval_id"].as_str().unwrap_or("")
+            );
             false
         }
         "approval.decided" => {
-            println!("  ▶ approval {} by {}", p["decision"].as_str().unwrap_or(""), p["decided_by"].as_str().unwrap_or(""));
+            println!(
+                "  ▶ approval {} by {}",
+                p["decision"].as_str().unwrap_or(""),
+                p["decided_by"].as_str().unwrap_or("")
+            );
             false
         }
         "model.response" => {
@@ -267,7 +336,11 @@ fn print_event(ev: &Value) -> bool {
             false
         }
         "budget.exceeded" => {
-            println!("  ⚠ budget exceeded: {} (limit {})", p["budget"].as_str().unwrap_or(""), p["limit"].as_str().unwrap_or(""));
+            println!(
+                "  ⚠ budget exceeded: {} (limit {})",
+                p["budget"].as_str().unwrap_or(""),
+                p["limit"].as_str().unwrap_or("")
+            );
             false
         }
         "run.result" => {

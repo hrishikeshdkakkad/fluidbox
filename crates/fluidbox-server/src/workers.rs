@@ -64,7 +64,8 @@ async fn watchdog(state: AppState) {
                         // Confirm the sandbox is actually gone before failing.
                         if sandbox_dead(&state, &s.sandbox_handle).await {
                             tracing::warn!("watchdog: {} heartbeat stale + sandbox dead", s.id);
-                            orchestrator::fail(&state, s.id, "sandbox died (stale heartbeat)").await;
+                            orchestrator::fail(&state, s.id, "sandbox died (stale heartbeat)")
+                                .await;
                         }
                     }
                 }
@@ -81,8 +82,12 @@ async fn watchdog(state: AppState) {
                         s.status,
                         STALE_LAUNCH_MINS
                     );
-                    orchestrator::fail(&state, s.id, "stalled before launch (control plane interrupted)")
-                        .await;
+                    orchestrator::fail(
+                        &state,
+                        s.id,
+                        "stalled before launch (control plane interrupted)",
+                    )
+                    .await;
                 }
             }
             Err(e) => tracing::warn!("stale-launch sweep failed: {e}"),
@@ -108,7 +113,9 @@ async fn budget_sweeper(state: AppState) {
     loop {
         tick.tick().await;
         let active =
-            match fluidbox_db::sessions_in_status(&state.pool, &["running", "awaiting_approval"]).await {
+            match fluidbox_db::sessions_in_status(&state.pool, &["running", "awaiting_approval"])
+                .await
+            {
                 Ok(s) => s,
                 Err(_) => continue,
             };
@@ -131,7 +138,13 @@ async fn budget_sweeper(state: AppState) {
                             },
                         )
                         .await;
-                        orchestrator::finalize(&state, &s, "budget_exceeded", Some("wall-clock budget exceeded")).await;
+                        orchestrator::finalize(
+                            &state,
+                            &s,
+                            "budget_exceeded",
+                            Some("wall-clock budget exceeded"),
+                        )
+                        .await;
                     }
                 }
             }

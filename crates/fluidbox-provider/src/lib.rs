@@ -8,11 +8,11 @@
 //! /workspace.
 
 use async_trait::async_trait;
+use bollard::models::{ContainerCreateBody, HostConfig, NetworkCreateRequest};
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, InspectContainerOptions, ListContainersOptionsBuilder,
     RemoveContainerOptionsBuilder,
 };
-use bollard::models::{ContainerCreateBody, HostConfig, NetworkCreateRequest};
 use bollard::Docker;
 use fluidbox_core::traits::{
     ExecutionProvider, NetworkMode, ProviderError, SandboxHandle, SandboxSpec, SandboxState,
@@ -118,7 +118,10 @@ impl ExecutionProvider for DockerProvider {
             .map_err(map_err)?;
 
         self.docker
-            .start_container(&created.id, None::<bollard::query_parameters::StartContainerOptions>)
+            .start_container(
+                &created.id,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
             .await
             .map_err(map_err)?;
 
@@ -149,8 +152,15 @@ impl ExecutionProvider for DockerProvider {
     }
 
     async fn terminate(&self, handle: &SandboxHandle) -> Result<(), ProviderError> {
-        let opts = RemoveContainerOptionsBuilder::new().force(true).v(true).build();
-        match self.docker.remove_container(&handle.external_id, Some(opts)).await {
+        let opts = RemoveContainerOptionsBuilder::new()
+            .force(true)
+            .v(true)
+            .build();
+        match self
+            .docker
+            .remove_container(&handle.external_id, Some(opts))
+            .await
+        {
             Ok(_) => {}
             Err(e) if e.to_string().contains("No such container") => {}
             Err(e) => return Err(map_err(e)),
@@ -168,11 +178,18 @@ impl ExecutionProvider for DockerProvider {
             .all(true)
             .filters(&filters)
             .build();
-        let containers = self.docker.list_containers(Some(opts)).await.map_err(map_err)?;
+        let containers = self
+            .docker
+            .list_containers(Some(opts))
+            .await
+            .map_err(map_err)?;
         let mut out = Vec::new();
         for c in containers {
             let labels = c.labels.unwrap_or_default();
-            let Some(sid) = labels.get(SESSION_LABEL).and_then(|s| Uuid::parse_str(s).ok()) else {
+            let Some(sid) = labels
+                .get(SESSION_LABEL)
+                .and_then(|s| Uuid::parse_str(s).ok())
+            else {
                 continue;
             };
             let net = c

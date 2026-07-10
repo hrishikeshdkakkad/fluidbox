@@ -56,26 +56,51 @@ pub async fn messages(
     let totals = fluidbox_db::usage_totals(&state.pool, session_id).await?;
     if let Some(max_cost) = run_spec.budgets.max_cost_usd {
         if totals.cost_usd >= max_cost {
-            trigger_budget_stop(&state, session_id, "max_cost_usd", max_cost, totals.cost_usd).await;
+            trigger_budget_stop(
+                &state,
+                session_id,
+                "max_cost_usd",
+                max_cost,
+                totals.cost_usd,
+            )
+            .await;
             return Err(ApiError::BadRequest("cost budget exhausted".into()));
         }
     }
     if let Some(max_tokens) = run_spec.budgets.max_tokens {
         let used = (totals.input_tokens + totals.output_tokens) as u64;
         if used >= max_tokens {
-            trigger_budget_stop(&state, session_id, "max_tokens", max_tokens as f64, used as f64).await;
+            trigger_budget_stop(
+                &state,
+                session_id,
+                "max_tokens",
+                max_tokens as f64,
+                used as f64,
+            )
+            .await;
             return Err(ApiError::BadRequest("token budget exhausted".into()));
         }
     }
 
     // Build the upstream request. In LiteLLM mode we authenticate with the
     // master key; in fallback (direct Anthropic) with the real Anthropic key.
-    let suffix = if rest.is_empty() { "v1/messages".to_string() } else { rest };
-    let upstream = format!("{}/{}", state.cfg.llm_upstream_url.trim_end_matches('/'), suffix);
+    let suffix = if rest.is_empty() {
+        "v1/messages".to_string()
+    } else {
+        rest
+    };
+    let upstream = format!(
+        "{}/{}",
+        state.cfg.llm_upstream_url.trim_end_matches('/'),
+        suffix
+    );
 
     let mut req = state.http.post(&upstream).body(body.clone());
     // Forward version + beta headers verbatim (native Anthropic contract).
-    if let Some(v) = headers.get("anthropic-version").and_then(|h| h.to_str().ok()) {
+    if let Some(v) = headers
+        .get("anthropic-version")
+        .and_then(|h| h.to_str().ok())
+    {
         req = req.header("anthropic-version", v);
     } else {
         req = req.header("anthropic-version", "2023-06-01");
@@ -88,11 +113,17 @@ pub async fn messages(
         req = req.header("x-api-key", &state.cfg.llm_upstream_key);
     } else {
         req = req
-            .header("authorization", format!("Bearer {}", state.cfg.llm_upstream_key))
+            .header(
+                "authorization",
+                format!("Bearer {}", state.cfg.llm_upstream_key),
+            )
             .header("x-api-key", &state.cfg.llm_upstream_key);
     }
 
-    let resp = req.send().await.map_err(|e| ApiError::Internal(format!("upstream: {e}")))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ApiError::Internal(format!("upstream: {e}")))?;
     let status = resp.status();
     let is_stream = resp
         .headers()
@@ -173,7 +204,13 @@ pub async fn messages(
     Ok(response)
 }
 
-async fn trigger_budget_stop(state: &AppState, session_id: Uuid, budget: &str, limit: f64, spent: f64) {
+async fn trigger_budget_stop(
+    state: &AppState,
+    session_id: Uuid,
+    budget: &str,
+    limit: f64,
+    spent: f64,
+) {
     ledger::record(
         state,
         session_id,
@@ -189,7 +226,8 @@ async fn trigger_budget_stop(state: &AppState, session_id: Uuid, budget: &str, l
         let state2 = state.clone();
         let reason = format!("{budget} budget exceeded");
         tokio::spawn(async move {
-            crate::orchestrator::finalize(&state2, &session, "budget_exceeded", Some(&reason)).await;
+            crate::orchestrator::finalize(&state2, &session, "budget_exceeded", Some(&reason))
+                .await;
         });
     }
 }
@@ -234,7 +272,9 @@ async fn record_usage(
 
 fn extract_model(body: &[u8]) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-    v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string())
+    v.get("model")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string())
 }
 
 fn parse_usage_json(body: &[u8]) -> Option<UsageDelta> {
@@ -269,12 +309,16 @@ impl UsageAccumulator {
         let text = String::from_utf8_lossy(bytes);
         for line in text.lines() {
             let line = line.trim();
-            let Some(data) = line.strip_prefix("data:") else { continue };
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
             let data = data.trim();
             if data.is_empty() || data == "[DONE]" {
                 continue;
             }
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else { continue };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
             match v.get("type").and_then(|t| t.as_str()) {
                 Some("message_start") => {
                     if let Some(u) = v.get("message").and_then(|m| m.get("usage")) {

@@ -27,11 +27,20 @@ pub struct ModelPrice {
 pub fn price_for(model: &str) -> Option<ModelPrice> {
     let m = model.to_ascii_lowercase();
     let p = if m.contains("opus-4") {
-        ModelPrice { input_per_mtok: 5.0, output_per_mtok: 25.0 }
+        ModelPrice {
+            input_per_mtok: 5.0,
+            output_per_mtok: 25.0,
+        }
     } else if m.contains("sonnet-5") || m.contains("sonnet-4") {
-        ModelPrice { input_per_mtok: 2.0, output_per_mtok: 10.0 }
+        ModelPrice {
+            input_per_mtok: 2.0,
+            output_per_mtok: 10.0,
+        }
     } else if m.contains("haiku-4") {
-        ModelPrice { input_per_mtok: 1.0, output_per_mtok: 5.0 }
+        ModelPrice {
+            input_per_mtok: 1.0,
+            output_per_mtok: 5.0,
+        }
     } else {
         return None;
     };

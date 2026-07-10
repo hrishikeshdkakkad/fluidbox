@@ -9,11 +9,22 @@ use uuid::Uuid;
 #[serde(tag = "type", content = "data")]
 pub enum EventBody {
     #[serde(rename = "session.created")]
-    SessionCreated { task: String, agent: String, autonomy: String },
+    SessionCreated {
+        task: String,
+        agent: String,
+        autonomy: String,
+    },
     #[serde(rename = "session.status_changed")]
-    StatusChanged { from: String, to: String, reason: Option<String> },
+    StatusChanged {
+        from: String,
+        to: String,
+        reason: Option<String>,
+    },
     #[serde(rename = "workspace.initialized")]
-    WorkspaceInitialized { base_commit: Option<String>, files: Option<u64> },
+    WorkspaceInitialized {
+        base_commit: Option<String>,
+        files: Option<u64>,
+    },
     #[serde(rename = "agent.message")]
     AgentMessage { role: String, text: String },
     #[serde(rename = "tool.requested")]
@@ -36,7 +47,12 @@ pub enum EventBody {
         reason: Option<String>,
     },
     #[serde(rename = "tool.completed")]
-    ToolCompleted { tool_call_id: String, tool: String, ok: bool, summary: Option<String> },
+    ToolCompleted {
+        tool_call_id: String,
+        tool: String,
+        ok: bool,
+        summary: Option<String>,
+    },
     #[serde(rename = "approval.requested")]
     ApprovalRequested {
         approval_id: Uuid,
@@ -63,9 +79,16 @@ pub enum EventBody {
         cost_usd: Option<f64>,
     },
     #[serde(rename = "budget.exceeded")]
-    BudgetExceeded { budget: String, limit: String, spent: String },
+    BudgetExceeded {
+        budget: String,
+        limit: String,
+        spent: String,
+    },
     #[serde(rename = "run.result")]
-    RunResult { outcome: String, summary: Option<String> },
+    RunResult {
+        outcome: String,
+        summary: Option<String>,
+    },
     #[serde(rename = "run.error")]
     RunError { message: String },
     /// Forward-compat: events written by newer components still round-trip.
@@ -157,14 +180,14 @@ pub struct Redactor {
 impl Default for Redactor {
     fn default() -> Self {
         let raw = [
-            r"sk-ant-[A-Za-z0-9_\-]{8,}",       // Anthropic keys / oauth tokens
-            r"sk-[A-Za-z0-9]{20,}",              // OpenAI-style keys
-            r"ghp_[A-Za-z0-9]{20,}",             // GitHub PAT
-            r"github_pat_[A-Za-z0-9_]{20,}",     // GitHub fine-grained PAT
-            r"gho_[A-Za-z0-9]{20,}",             // GitHub OAuth
-            r"AKIA[0-9A-Z]{16}",                 // AWS access key id
-            r"xox[baprs]-[A-Za-z0-9\-]{10,}",    // Slack tokens
-            r"npg_[A-Za-z0-9]{8,}",              // Neon passwords
+            r"sk-ant-[A-Za-z0-9_\-]{8,}",     // Anthropic keys / oauth tokens
+            r"sk-[A-Za-z0-9]{20,}",           // OpenAI-style keys
+            r"ghp_[A-Za-z0-9]{20,}",          // GitHub PAT
+            r"github_pat_[A-Za-z0-9_]{20,}",  // GitHub fine-grained PAT
+            r"gho_[A-Za-z0-9]{20,}",          // GitHub OAuth
+            r"AKIA[0-9A-Z]{16}",              // AWS access key id
+            r"xox[baprs]-[A-Za-z0-9\-]{10,}", // Slack tokens
+            r"npg_[A-Za-z0-9]{8,}",           // Neon passwords
             r"(?i)bearer\s+[A-Za-z0-9\._\-]{16,}",
             r"postgres(ql)?://[^\s:]+:[^@\s]+@", // connection-string passwords
         ];
@@ -252,7 +275,8 @@ mod tests {
             Actor::Agent,
             EventBody::AgentMessage {
                 role: "assistant".into(),
-                text: "use key sk-ant-api03-abcdefgh12345678 and ghp_0123456789abcdefghij ok".into(),
+                text: "use key sk-ant-api03-abcdefgh12345678 and ghp_0123456789abcdefghij ok"
+                    .into(),
             },
         );
         let red = r.scrub(env);

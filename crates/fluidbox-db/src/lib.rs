@@ -400,10 +400,7 @@ pub async fn list_sessions(
         .await
 }
 
-pub async fn sessions_in_status(
-    pool: &PgPool,
-    statuses: &[&str],
-) -> sqlx::Result<Vec<SessionRow>> {
+pub async fn sessions_in_status(pool: &PgPool, statuses: &[&str]) -> sqlx::Result<Vec<SessionRow>> {
     let list: Vec<String> = statuses.iter().map(|s| s.to_string()).collect();
     sqlx::query_as("select * from sessions where status = any($1)")
         .bind(&list)
@@ -903,7 +900,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let agent = create_agent(&pool, tenant, "test-seq-agent", None).await.unwrap();
+        let agent = create_agent(&pool, tenant, "test-seq-agent", None)
+            .await
+            .unwrap();
         let rev = append_agent_revision(
             &pool,
             agent.id,
@@ -939,7 +938,10 @@ mod tests {
             let env = EventEnvelope::new(
                 session.id,
                 Actor::System,
-                EventBody::AgentMessage { role: "assistant".into(), text: format!("m{i}") },
+                EventBody::AgentMessage {
+                    role: "assistant".into(),
+                    text: format!("m{i}"),
+                },
             );
             seqs.push(append_event(&pool, redactor.scrub(env)).await.unwrap());
         }
@@ -973,7 +975,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let agent = create_agent(&pool, tenant, "test-stale-agent", None).await.unwrap();
+        let agent = create_agent(&pool, tenant, "test-stale-agent", None)
+            .await
+            .unwrap();
         let rev = append_agent_revision(
             &pool,
             agent.id,
@@ -989,13 +993,28 @@ mod tests {
         let repo = serde_json::json!({"kind":"none"});
         let empty = serde_json::json!({});
         let fresh = create_session(
-            &pool, tenant, agent.id, rev.id, "supervised", "stale-test fresh", &repo, &empty,
+            &pool,
+            tenant,
+            agent.id,
+            rev.id,
+            "supervised",
+            "stale-test fresh",
+            &repo,
+            &empty,
             &empty,
         )
         .await
         .unwrap();
         let stale = create_session(
-            &pool, tenant, agent.id, rev.id, "supervised", "stale-test old", &repo, &empty, &empty,
+            &pool,
+            tenant,
+            agent.id,
+            rev.id,
+            "supervised",
+            "stale-test old",
+            &repo,
+            &empty,
+            &empty,
         )
         .await
         .unwrap();
@@ -1030,7 +1049,10 @@ mod tests {
             .iter()
             .map(|s| s.id)
             .collect();
-        assert!(!ids.contains(&stale.id), "terminal session must not be swept");
+        assert!(
+            !ids.contains(&stale.id),
+            "terminal session must not be swept"
+        );
 
         for id in [fresh.id, stale.id] {
             sqlx::query("delete from sessions where id = $1")
