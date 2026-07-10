@@ -36,6 +36,16 @@ export interface Session {
   created_at: string;
   base_commit: string | null;
   repo_source: WorkspaceSpec | null;
+  trigger: InvocationEnvelope | null;
+}
+
+/** Mirrors fluidbox-core InvocationContext (sessions.trigger jsonb). */
+export interface InvocationEnvelope {
+  kind: string; // manual | api | schedule | event
+  subscription_id?: string;
+  actor?: string;
+  attributes?: Record<string, unknown>;
+  received_at?: string;
 }
 
 export interface Agent {
@@ -95,6 +105,34 @@ export interface Repo {
   private: boolean;
   default_branch: string;
   html_url: string;
+}
+
+export interface TriggerSubscription {
+  id: string;
+  agent_id: string;
+  name: string;
+  trigger_kind: string;
+  pinned_revision_id: string | null;
+  enabled: boolean;
+  task_template: string | null;
+  allow_task_override: boolean;
+  allow_workspace_override: boolean;
+  autonomy: string | null;
+  result_destinations: { kind: string; url?: string }[];
+  created_at: string;
+}
+
+export interface ResultDelivery {
+  id: string;
+  session_id: string;
+  subscription_id: string | null;
+  destination: { kind: string; url?: string };
+  status: string; // pending | delivered | failed
+  attempts: number;
+  next_attempt_at: string;
+  last_error: string | null;
+  delivered_at: string | null;
+  created_at: string;
 }
 
 export interface Approval {
