@@ -140,6 +140,7 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<fluidbox_
         &serde_json::to_value(&run_spec)?,
         &serde_json::to_value(&effective_budgets)?,
         Some(&serde_json::to_value(&req.invocation)?),
+        None,
     )
     .await?;
 

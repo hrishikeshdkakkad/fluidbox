@@ -250,6 +250,7 @@ pub async fn create(
         req.allow_task_override,
         req.allow_workspace_override,
         req.autonomous.then_some("autonomous"),
+        "allow",
         req.budgets
             .as_ref()
             .map(serde_json::to_value)
@@ -533,6 +534,11 @@ pub async fn invoke(
                 "replay": true,
                 "poll_url": format!("/v1/triggers/{}/runs/{}", sub.id, session.id),
             })));
+        }
+        fluidbox_db::InvocationClaim::Skipped { reason } => {
+            return Err(ApiError::Conflict(format!(
+                "this Idempotency-Key was skipped ({reason}) — use a new key to retry"
+            )))
         }
         fluidbox_db::InvocationClaim::InFlight => {
             return Err(ApiError::Conflict(
