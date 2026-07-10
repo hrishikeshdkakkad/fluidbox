@@ -125,3 +125,19 @@ pub fn sample_context(connector: &str) -> BTreeMap<String, String> {
     }
 }
 
+/// Resolve a connection into a git-fetch `Authorization` header value.
+/// Providers differ (a durable PAT vs a minted installation token); the
+/// orchestrator doesn't care.
+pub async fn fetch_auth_header(
+    state: &crate::state::AppState,
+    connection: &fluidbox_db::IntegrationConnectionRow,
+) -> anyhow::Result<String> {
+    match connector_for(&connection.provider) {
+        Some("github") => github::fetch_auth_header(state, connection).await,
+        _ => anyhow::bail!(
+            "connection provider '{}' does not supply git credentials",
+            connection.provider
+        ),
+    }
+}
+

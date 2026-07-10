@@ -35,6 +35,10 @@ pub struct Config {
     pub credential_key: Option<String>,
     /// GitHub REST base — overridable for tests/GHE.
     pub github_api_url: String,
+    /// Base for repository clone URLs derived from event payloads
+    /// (https://github.com in production; a file:// fixture root in e2e).
+    #[allow(dead_code)] // consumed by the event ingress (this phase)
+    pub github_clone_base: String,
     /// Keep per-session workspace dirs after terminal diff capture (debug aid).
     pub keep_workspaces: bool,
 }
@@ -72,6 +76,8 @@ impl Config {
                 .filter(|k| !k.is_empty()),
             github_api_url: get("FLUIDBOX_GITHUB_API_URL")
                 .unwrap_or_else(|_| "https://api.github.com".into()),
+            github_clone_base: get("FLUIDBOX_GITHUB_CLONE_BASE")
+                .unwrap_or_else(|_| "https://github.com".into()),
             keep_workspaces: get("FLUIDBOX_KEEP_WORKSPACES")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),

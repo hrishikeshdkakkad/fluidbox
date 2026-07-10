@@ -5,11 +5,16 @@
 //! events.rs; (5) publish comments/checks (added with the publisher).
 
 use super::{NormalizeCtx, NormalizedEvent, VerifiedDelivery};
+use crate::state::AppState;
 use axum::http::HeaderMap;
 use chrono::{DateTime, Utc};
 use fluidbox_core::spec::{CheckoutMode, ResultDestination, TrustTier, WorkspaceSpec};
+use fluidbox_db::IntegrationConnectionRow;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::time::Duration;
+
+const GITHUB_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// PR lifecycle actions fluidbox can react to. `synchronize` fires on EVERY
 /// push to the PR branch — a cost amplifier, hence opt-in (§17 #2).
@@ -231,6 +236,290 @@ pub fn sample_context() -> BTreeMap<String, String> {
     .collect()
 }
 
+// ─── GitHub REST plumbing ─────────────────────────────────────────────────
+
+fn api_url(state: &AppState, path: &str) -> String {
+    format!("{}{path}", state.cfg.github_api_url.trim_end_matches('/'))
+}
+
+/// One GitHub REST call. Errors only on transport/parse problems — callers
+/// interpret the status. Error text carries the URL/path, never headers.
+pub(crate) async fn api(
+    state: &AppState,
+    method: reqwest::Method,
+    authorization: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> Result<(reqwest::StatusCode, Value, reqwest::header::HeaderMap), String> {
+    let mut req = state
+        .http
+        .request(method, api_url(state, path))
+        .timeout(GITHUB_TIMEOUT)
+        .header("authorization", authorization)
+        .header("accept", "application/vnd.github+json")
+        .header("user-agent", "fluidbox")
+        .header("x-github-api-version", "2022-11-28");
+    if let Some(b) = body {
+        req = req.json(b);
+    }
+    let res = req
+        .send()
+        .await
+        .map_err(|e| format!("github unreachable: {e}"))?;
+    let status = res.status();
+    let headers = res.headers().clone();
+    let text = res
+        .text()
+        .await
+        .map_err(|e| format!("github {path}: unreadable response: {e}"))?;
+    let value = if text.trim().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(&text).unwrap_or(Value::Null)
+    };
+    Ok((status, value, headers))
+}
+
+// ─── GitHub App identity (§17 #1: results appear App-only) ───────────────
+
+#[derive(serde::Serialize)]
+struct AppJwtClaims {
+    iat: i64,
+    exp: i64,
+    iss: String,
+}
+
+/// Short-lived RS256 JWT proving we are the App (GitHub caps exp at 10
+/// minutes; iat is backdated 60s against clock drift).
+pub fn app_jwt(app_id: &str, private_key_pem: &str) -> Result<String, String> {
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
+        .map_err(|_| "app private key is not a valid RSA PEM".to_string())?;
+    let now = Utc::now().timestamp();
+    let claims = AppJwtClaims {
+        iat: now - 60,
+        exp: now + 540,
+        iss: app_id.to_string(),
+    };
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
+        &claims,
+        &key,
+    )
+    .map_err(|_| "app jwt signing failed".to_string())
+}
+
+fn app_metadata<'a>(conn: &'a IntegrationConnectionRow, key: &str) -> Result<&'a str, String> {
+    conn.metadata
+        .get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("connection metadata is missing '{key}' — reconnect the app"))
+}
+
+/// Unseal the connection credential (PAT or App private key).
+async fn unsealed_credential(state: &AppState, conn: &IntegrationConnectionRow) -> Result<String, String> {
+    let sealer = state
+        .sealer
+        .as_ref()
+        .ok_or("FLUIDBOX_CREDENTIAL_KEY not configured")?;
+    let sealed = fluidbox_db::connection_credential_sealed(&state.pool, conn.id)
+        .await
+        .map_err(|e| format!("credential lookup failed: {e}"))?
+        .ok_or("connection is not active (revoked or missing)")?;
+    sealer.open(&sealed).map_err(|e| e.to_string())
+}
+
+/// Mint (or reuse) the installation access token for an App connection.
+/// Tokens live ~1h; the cache refreshes when <5 minutes remain. The durable
+/// secret (the private key) never leaves this function's scope.
+pub async fn installation_token(
+    state: &AppState,
+    conn: &IntegrationConnectionRow,
+) -> Result<String, String> {
+    {
+        let cache = state.connector_tokens.lock().await;
+        if let Some((token, expires_at)) = cache.get(&conn.id) {
+            if *expires_at > Utc::now() + chrono::Duration::seconds(300) {
+                return Ok(token.clone());
+            }
+        }
+    }
+    let pem = unsealed_credential(state, conn).await?;
+    let app_id = app_metadata(conn, "app_id")?;
+    let installation_id = app_metadata(conn, "installation_id")?;
+    let jwt = app_jwt(app_id, &pem)?;
+    let (status, body, _) = api(
+        state,
+        reqwest::Method::POST,
+        &format!("Bearer {jwt}"),
+        &format!("/app/installations/{installation_id}/access_tokens"),
+        Some(&json!({})),
+    )
+    .await?;
+    if !status.is_success() {
+        return Err(format!("github installation token mint returned {status}"));
+    }
+    let token = body["token"]
+        .as_str()
+        .ok_or("github token mint response has no token")?
+        .to_string();
+    let expires_at: DateTime<Utc> = body["expires_at"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| Utc::now() + chrono::Duration::minutes(55));
+    state
+        .connector_tokens
+        .lock()
+        .await
+        .insert(conn.id, (token.clone(), expires_at));
+    Ok(token)
+}
+
+/// Prove a pasted PAT works and identify its account (connection create).
+pub async fn validate_pat(
+    state: &AppState,
+    token: &str,
+) -> Result<(String, String, Vec<String>), String> {
+    let (status, user, headers) =
+        api(state, reqwest::Method::GET, &format!("Bearer {token}"), "/user", None).await?;
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("github rejected the token (401) — check that it is valid and unexpired".into());
+    }
+    if !status.is_success() {
+        return Err(format!("github /user returned {status}"));
+    }
+    let login = user["login"].as_str().unwrap_or("unknown").to_string();
+    let account_id = user["id"]
+        .as_i64()
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| login.clone());
+    // Classic PATs advertise scopes; fine-grained PATs don't (empty list).
+    let scopes: Vec<String> = headers
+        .get("x-oauth-scopes")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((login, account_id, scopes))
+}
+
+/// Prove App credentials work and identify the installation (connection
+/// create). Returns metadata to store on the row (all non-secret).
+pub async fn validate_app(
+    state: &AppState,
+    app_id: &str,
+    installation_id: &str,
+    private_key_pem: &str,
+) -> Result<Value, String> {
+    let jwt = app_jwt(app_id, private_key_pem)?;
+    let auth = format!("Bearer {jwt}");
+    let (status, app, _) = api(state, reqwest::Method::GET, &auth, "/app", None).await?;
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(
+            "github rejected the app credentials (401) — check app_id and the private key".into(),
+        );
+    }
+    if !status.is_success() {
+        return Err(format!("github /app returned {status}"));
+    }
+    let app_slug = app["slug"].as_str().unwrap_or("app").to_string();
+    let (status, inst, _) = api(
+        state,
+        reqwest::Method::GET,
+        &auth,
+        &format!("/app/installations/{installation_id}"),
+        None,
+    )
+    .await?;
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(format!(
+            "installation {installation_id} not found for this app — install the app first"
+        ));
+    }
+    if !status.is_success() {
+        return Err(format!("github /app/installations returned {status}"));
+    }
+    let account_login = inst["account"]["login"].as_str().unwrap_or("unknown").to_string();
+    Ok(json!({
+        "app_id": app_id,
+        "installation_id": installation_id,
+        "app_slug": app_slug,
+        "account_login": account_login,
+    }))
+}
+
+/// Repository picker for both connection flavors. The credential never
+/// leaves the control plane.
+pub async fn list_repos(
+    state: &AppState,
+    conn: &IntegrationConnectionRow,
+    page: u32,
+    per_page: u32,
+) -> Result<Vec<Value>, String> {
+    let (auth, path, items_key) = if conn.provider == "github_app" {
+        let token = installation_token(state, conn).await?;
+        (
+            format!("Bearer {token}"),
+            format!("/installation/repositories?per_page={per_page}&page={page}"),
+            Some("repositories"),
+        )
+    } else {
+        let pat = unsealed_credential(state, conn).await?;
+        (
+            format!("Bearer {pat}"),
+            format!("/user/repos?per_page={per_page}&page={page}&sort=updated"),
+            None,
+        )
+    };
+    let (status, body, _) = api(state, reqwest::Method::GET, &auth, &path, None).await?;
+    if !status.is_success() {
+        return Err(format!("github repository listing returned {status}"));
+    }
+    let items = match items_key {
+        Some(k) => body[k].as_array().cloned().unwrap_or_default(),
+        None => body.as_array().cloned().unwrap_or_default(),
+    };
+    Ok(items
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.get("id"),
+                "full_name": r.get("full_name"),
+                "private": r.get("private"),
+                "default_branch": r.get("default_branch"),
+                "html_url": r.get("html_url"),
+            })
+        })
+        .collect())
+}
+
+/// Git-fetch `Authorization` header for workspace materialization: a PAT
+/// directly, or a freshly minted installation token — the same
+/// `basic x-access-token:…` shape either way.
+pub async fn fetch_auth_header(
+    state: &AppState,
+    conn: &IntegrationConnectionRow,
+) -> anyhow::Result<String> {
+    let token = if conn.provider == "github_app" {
+        installation_token(state, conn)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+    } else {
+        unsealed_credential(state, conn)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+    };
+    use base64::Engine;
+    Ok(format!(
+        "basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"))
+    ))
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -426,6 +715,58 @@ mod tests {
         let mut bad_sha = pr_payload("opened", 7, 7);
         bad_sha["pull_request"]["head"]["sha"] = json!("--upload-pack=evil");
         assert!(normalize("pull_request", &bad_sha, &ctx()).is_err());
+    }
+
+    /// Throwaway RSA key generated for this test only (never a real secret).
+    const TEST_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQCsOESN3lHbbsmz
+upjUgGdPjymvaFA06ZjLCAPquiC2KhDpFnHaouEucrO18ByAzlSU5mGPmF1h7MNo
+2dNOPNspKYWualjVxWKJs6wHLGTYSZdl37Sszmi4lHG4YHeoE2rp1AZHv0BuNPeC
+9HdycodY4BLd4mFORGRrBPTVYa7BjX7/X1YI7RHcvvrqON9efr2XpIDZBE+2Fa6d
+Hamdf+fzVgo8b3/xT67RgkyqQrJPQJjxJzB1pU/P6sHQOrRBHc+oLiD2EIpffPTV
+H420KdkoDwnarjsTJG3o172S6+VXw4ReaY8XqOvsKTGqTm7rnZsODbjxXpTNGosh
+PT/dRK3DAgMBAAECggEADu9J1QqApPVZRrdGgpy1Mm6Mifp5t76PZZstb8d+7h0w
+Xm5EwFX1dI6cEnAfBw9QwW4UuGjZP3rSdVjFqZhYbxwVMv6XWcgMvaFLQhhk95nm
+KBguwsYBlqQoFBOovMNP6oHDBUMxTLCJZR3BiZ2J92vMs9lqYJwVhm+L5dp01uVd
+A9/C552GmgZR2W/c+Cmxyj9Go5bNv8/gKuQIyNYuhmf6DXVh14hM9Qraq1/vYzt5
+ptliFuUjgTA0wMMZ+4JKBZlcOBbs/qN0WOkbZTxlyoLIX3CRyCRoycoPrfIhG2Yj
+iBxTD6Y4ZrZ13pAyOSsmBE/hoNRwGZm3ebKHYXD1fQKBgQDrenCjnfbj7RZI/Aav
+M1Bj04mSQSCzyk+B9kAbOA1KybWgn8lvw885frQn8LAuWcYw5cKIvQHYmvQMxc9S
+X3+rZrBCOzNgTmeakavMboC4q+xprRuYPZB3zOByKBRCasIeiRwh94R40IA60kNs
+TLNsJRkp6VI7uiK+6GKwwE4RpQKBgQC7OoU2mMLh3PgZp+LK+cBJgfff62K9gDLE
+nVfP3EMwRMd6DlRt8hmazq5RtGxup4kGJOw1qBskzBYw9p/jb+ehQ17uzdIu6R0J
+rAB+1sMTX0R/7OIB8LDFMhytoIREIiavHQ0IQ35zRfHdWjDgAqYF3zeBlKoWSi2N
+/QH8vRpVRwKBgQCFJeGFEq/kp02fjSo2bLx7BcTXNw5HuxCD+vq6qVISxMV3goJD
+OSP2baduohDs1IRVZ8U8ziq6ELwIcN1OxYMKJvFpMdJWFV9NrirHWIBea5AtHN3q
+kn0a0HTk97ak63rCC2Ml7bAxJCwtlnDbTu9xKfT1luGRtikpa3tKWCKMpQKBgQCp
+eS0/4EL3I4dH4dm+FRfi8cwnWe/EzJgntKzZr+z5ciiF6RavdqeKo27S8lf8SZYU
+g7N0VjhLtJiZtYPA4XhvVoZF7vREFip8qL7CES//BwsAKLHjQ7Ueql+fIl7XNXqC
+o+85/a4mNbfav1riSkNxqT2bA7B6AKb/kXcNCTce3QKBgQC6t7IeokZ5oO6p0H/m
+RoJoJrIXrJVizujdLsk9W5/9F1q2rvm3HVvV6eBVWWIUUT0fGarVr2GeW/Zcz8y0
+QXZUSO8W9IUDM0HDnU2s0GcyFEtOq1WvgeYf2OiIh4qCHEg0afzCNiEBGrgKOplc
+o+rncG5hSLaqG1A2w8vlQ3BS7Q==
+-----END PRIVATE KEY-----";
+
+    #[test]
+    fn app_jwt_has_rs256_header_and_app_claims() {
+        let jwt = app_jwt("12345", TEST_PEM).expect("valid key signs");
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3, "jwt has three parts");
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let header: Value =
+            serde_json::from_slice(&b64.decode(parts[0]).unwrap()).unwrap();
+        assert_eq!(header["alg"], "RS256");
+        let claims: Value =
+            serde_json::from_slice(&b64.decode(parts[1]).unwrap()).unwrap();
+        assert_eq!(claims["iss"], "12345");
+        // iat backdated 60s; exp 10 minutes after iat (GitHub's cap).
+        let iat = claims["iat"].as_i64().unwrap();
+        let exp = claims["exp"].as_i64().unwrap();
+        assert_eq!(exp - iat, 600);
+        assert!(iat <= Utc::now().timestamp());
+        // Garbage keys are refused without panicking.
+        assert!(app_jwt("12345", "not a pem").is_err());
     }
 
     #[test]

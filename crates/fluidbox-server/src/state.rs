@@ -1,4 +1,5 @@
 use crate::config::Config;
+use chrono::{DateTime, Utc};
 use fluidbox_core::event::Redactor;
 use fluidbox_provider::DockerProvider;
 use sqlx::PgPool;
@@ -49,6 +50,10 @@ pub struct AppStateInner {
     /// FLUIDBOX_CREDENTIAL_KEY is configured — connection endpoints and
     /// connection-backed workspaces refuse to operate without it.
     pub sealer: Option<crate::seal::Sealer>,
+    /// Short-lived provider tokens minted per connection (e.g. GitHub App
+    /// installation tokens, ~1h TTL) — a cache only; the durable credential
+    /// stays sealed in the DB and entries refresh on expiry.
+    pub connector_tokens: Mutex<HashMap<Uuid, (String, DateTime<Utc>)>>,
 }
 
 pub type AppState = Arc<AppStateInner>;
