@@ -49,7 +49,15 @@ async fn transition(state: &AppState, id: Uuid, next: SessionStatus, reason: Opt
 }
 
 pub async fn fail(state: &AppState, id: Uuid, reason: &str) {
-    ledger::record(state, id, Actor::System, EventBody::RunError { message: reason.into() }).await;
+    ledger::record(
+        state,
+        id,
+        Actor::System,
+        EventBody::RunError {
+            message: reason.into(),
+        },
+    )
+    .await;
     transition(state, id, SessionStatus::Failed, Some(reason)).await;
     reap(state, id).await;
 }
@@ -88,7 +96,10 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
         ("FLUIDBOX_SESSION_ID".into(), session_id.to_string()),
         ("FLUIDBOX_SESSION_TOKEN".into(), session_token.clone()),
         ("FLUIDBOX_TASK".into(), run_spec.task.clone()),
-        ("FLUIDBOX_AUTONOMY".into(), run_spec.autonomy.as_str().into()),
+        (
+            "FLUIDBOX_AUTONOMY".into(),
+            run_spec.autonomy.as_str().into(),
+        ),
         ("FLUIDBOX_MODEL".into(), run_spec.model.clone()),
         ("FLUIDBOX_WORKSPACE".into(), "/workspace".into()),
         (
@@ -113,7 +124,8 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
     };
 
     let handle = state.provider.provision(&sandbox_spec).await?;
-    fluidbox_db::set_sandbox_handle(&state.pool, session_id, &serde_json::to_value(&handle)?).await?;
+    fluidbox_db::set_sandbox_handle(&state.pool, session_id, &serde_json::to_value(&handle)?)
+        .await?;
 
     // initializing → running (traffic is now expected)
     transition(&state, session_id, SessionStatus::Running, None).await;
@@ -128,7 +140,10 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
         Actor::System,
         EventBody::AgentMessage {
             role: "system".into(),
-            text: format!("sandbox launched ({})", handle.external_id.chars().take(12).collect::<String>()),
+            text: format!(
+                "sandbox launched ({})",
+                handle.external_id.chars().take(12).collect::<String>()
+            ),
         },
     )
     .await;
@@ -149,7 +164,9 @@ async fn materialize_workspace(
                 std::path::Path::new(path),
             )?;
             if let Some(bc) = &ws.base_commit {
-                fluidbox_db::set_base_commit(&state.pool, session_id, bc).await.ok();
+                fluidbox_db::set_base_commit(&state.pool, session_id, bc)
+                    .await
+                    .ok();
             }
             ledger::record(
                 state,
@@ -170,7 +187,12 @@ async fn materialize_workspace(
         }
         RepoSource::None => {
             // A scratch workspace so the agent still has somewhere to write.
-            let dir = state.cfg.data_dir.join("workspaces").join(session_id.to_string()).join("repo");
+            let dir = state
+                .cfg
+                .data_dir
+                .join("workspaces")
+                .join(session_id.to_string())
+                .join("repo");
             std::fs::create_dir_all(&dir)?;
             let ws = fluidbox_provider::workspace::materialize_local(
                 &state.cfg.data_dir,
@@ -178,13 +200,18 @@ async fn materialize_workspace(
                 &dir,
             )?;
             if let Some(bc) = &ws.base_commit {
-                fluidbox_db::set_base_commit(&state.pool, session_id, bc).await.ok();
+                fluidbox_db::set_base_commit(&state.pool, session_id, bc)
+                    .await
+                    .ok();
             }
             ledger::record(
                 state,
                 session_id,
                 Actor::System,
-                EventBody::WorkspaceInitialized { base_commit: ws.base_commit.clone(), files: Some(0) },
+                EventBody::WorkspaceInitialized {
+                    base_commit: ws.base_commit.clone(),
+                    files: Some(0),
+                },
             )
             .await;
             Ok(Some(ws.host_dir))
@@ -194,7 +221,12 @@ async fn materialize_workspace(
 
 /// Called by the internal /result handler: finalize a run, capture the diff,
 /// then reap the sandbox.
-pub async fn finalize(state: &AppState, session: &SessionRow, outcome: &str, summary: Option<&str>) {
+pub async fn finalize(
+    state: &AppState,
+    session: &SessionRow,
+    outcome: &str,
+    summary: Option<&str>,
+) {
     let id = session.id;
     // Capture the diff artifact from the materialized workspace.
     let ws_dir = state
@@ -206,21 +238,37 @@ pub async fn finalize(state: &AppState, session: &SessionRow, outcome: &str, sum
     if ws_dir.exists() {
         match fluidbox_provider::workspace::capture_diff(&ws_dir, session.base_commit.as_deref()) {
             Ok(diff) if !diff.trim().is_empty() => {
-                fluidbox_db::add_artifact(&state.pool, id, "diff", "changes.patch", &diff, "text/x-diff")
-                    .await
-                    .ok();
+                fluidbox_db::add_artifact(
+                    &state.pool,
+                    id,
+                    "diff",
+                    "changes.patch",
+                    &diff,
+                    "text/x-diff",
+                )
+                .await
+                .ok();
             }
             Ok(_) => {
-                fluidbox_db::add_artifact(&state.pool, id, "diff", "changes.patch", "(no changes)", "text/plain")
-                    .await
-                    .ok();
+                fluidbox_db::add_artifact(
+                    &state.pool,
+                    id,
+                    "diff",
+                    "changes.patch",
+                    "(no changes)",
+                    "text/plain",
+                )
+                .await
+                .ok();
             }
             Err(e) => tracing::warn!("diff capture failed for {id}: {e}"),
         }
     }
 
     if let Some(s) = summary {
-        fluidbox_db::set_result_summary(&state.pool, id, s).await.ok();
+        fluidbox_db::set_result_summary(&state.pool, id, s)
+            .await
+            .ok();
         fluidbox_db::add_artifact(&state.pool, id, "summary", "summary.md", s, "text/markdown")
             .await
             .ok();
@@ -236,7 +284,10 @@ pub async fn finalize(state: &AppState, session: &SessionRow, outcome: &str, sum
         state,
         id,
         Actor::Harness,
-        EventBody::RunResult { outcome: outcome.into(), summary: summary.map(|s| s.to_string()) },
+        EventBody::RunResult {
+            outcome: outcome.into(),
+            summary: summary.map(|s| s.to_string()),
+        },
     )
     .await;
     transition(state, id, terminal, summary).await;
@@ -263,7 +314,13 @@ pub async fn cancel(state: &AppState, id: Uuid) -> bool {
             return false;
         }
     }
-    let ok = transition(state, id, SessionStatus::Cancelled, Some("cancelled by user")).await;
+    let ok = transition(
+        state,
+        id,
+        SessionStatus::Cancelled,
+        Some("cancelled by user"),
+    )
+    .await;
     if ok {
         reap(state, id).await;
     }

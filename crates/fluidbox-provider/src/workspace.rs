@@ -68,7 +68,10 @@ pub fn materialize_local(
     if !source.exists() {
         return Err(WorkspaceError::NoSource(source.display().to_string()));
     }
-    let dest = data_dir.join("workspaces").join(session.to_string()).join("repo");
+    let dest = data_dir
+        .join("workspaces")
+        .join(session.to_string())
+        .join("repo");
     std::fs::create_dir_all(&dest)?;
 
     // Copy contents (excluding any existing .git so we control history).
@@ -95,7 +98,10 @@ pub fn materialize_local(
 
     run_git(&dest, &["add", "-A"])?;
     // Commit may be empty if nothing to add; allow it.
-    let _ = run_git(&dest, &["commit", "-q", "--allow-empty", "-m", "fluidbox base"]);
+    let _ = run_git(
+        &dest,
+        &["commit", "-q", "--allow-empty", "-m", "fluidbox base"],
+    );
     let base_commit = run_git(&dest, &["rev-parse", "HEAD"]).ok();
 
     Ok(MaterializedWorkspace {
