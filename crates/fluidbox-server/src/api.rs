@@ -542,6 +542,17 @@ pub async fn decide_approval(
     Ok(Json(json!({ "approval": row })))
 }
 
+// ─── Result deliveries ────────────────────────────────────────────────────
+
+pub async fn session_deliveries(
+    _: Admin,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Value>> {
+    let deliveries = fluidbox_db::list_session_deliveries(&state.pool, id).await?;
+    Ok(Json(json!({ "deliveries": deliveries })))
+}
+
 // ─── Artifacts & cost ─────────────────────────────────────────────────────
 
 pub async fn list_artifacts(
