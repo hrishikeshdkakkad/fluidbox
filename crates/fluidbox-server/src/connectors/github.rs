@@ -343,12 +343,46 @@ async fn unsealed_credential(
 }
 
 /// Mint (or reuse) the installation access token for an App connection.
-/// Tokens live ~1h; the cache refreshes when <5 minutes remain. The durable
-/// secret (the private key) never leaves this function's scope.
+/// Custody is gated by FRESH DB reads before the cache may serve (the cache
+/// is an optimization, never the security boundary — design 5.6 §4.6): the
+/// connection must be active, and a linked registration must itself be
+/// active. Resolution never falls back across custody kinds: a linked
+/// registration that is missing/revoked refuses outright. Tokens live ~1h;
+/// the cache refreshes when <5 minutes remain. The durable secret (the
+/// private key) never leaves this function's scope.
 pub async fn installation_token(
     state: &AppState,
     conn: &IntegrationConnectionRow,
 ) -> Result<String, String> {
+    // The caller's row may be stale (revoked/suspended out from under a
+    // cached token) — re-read status from the database first.
+    let conn = fluidbox_db::get_connection(&state.pool, conn.id)
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?
+        .ok_or("connection is gone")?;
+    if conn.status != "active" {
+        return Err(format!(
+            "connection is {} — reconnect it in Connections",
+            conn.status
+        ));
+    }
+    let registration = match conn.registration_id {
+        Some(rid) => {
+            let reg = fluidbox_db::get_github_app_registration(&state.pool, rid)
+                .await
+                .map_err(|e| format!("registration lookup failed: {e}"))?
+                .filter(|r| r.tenant_id == conn.tenant_id)
+                .ok_or("github app registration is missing — reconnect GitHub")?;
+            if reg.status != "active" {
+                return Err(format!(
+                    "github app registration is {} — reconnect GitHub",
+                    reg.status
+                ));
+            }
+            Some(reg)
+        }
+        None => None,
+    };
     {
         let cache = state.connector_tokens.lock().await;
         if let Some((token, expires_at)) = cache.get(&conn.id) {
@@ -357,10 +391,32 @@ pub async fn installation_token(
             }
         }
     }
-    let pem = unsealed_credential(state, conn).await?;
-    let app_id = app_metadata(conn, "app_id")?;
-    let installation_id = app_metadata(conn, "installation_id")?;
-    let jwt = app_jwt(app_id, &pem)?;
+    let (app_id, pem) = match &registration {
+        Some(reg) => {
+            let sealer = state
+                .sealer
+                .as_ref()
+                .ok_or("FLUIDBOX_CREDENTIAL_KEY not configured")?;
+            let sealed = fluidbox_db::github_app_registration_pem_sealed(&state.pool, reg.id)
+                .await
+                .map_err(|e| format!("registration key lookup failed: {e}"))?
+                .ok_or("github app registration key unavailable — recreate the app")?;
+            let app_id = reg
+                .app_id
+                .clone()
+                .ok_or("github app registration is incomplete")?;
+            (app_id, sealer.open(&sealed).map_err(|e| e.to_string())?)
+        }
+        None => {
+            let app_id = app_metadata(&conn, "app_id")?.to_string();
+            (app_id, unsealed_credential(state, &conn).await?)
+        }
+    };
+    // The AUTHORITATIVE installation identity is the row key (both flavors
+    // store it there); metadata copies are display-only and must never
+    // steer custody.
+    let installation_id = conn.external_account_id.as_str();
+    let jwt = app_jwt(&app_id, &pem)?;
     let (status, body, _) = api(
         state,
         reqwest::Method::POST,
@@ -474,6 +530,105 @@ pub async fn validate_app(
         "app_slug": app_slug,
         "account_login": account_login,
     }))
+}
+
+// ─── Installation shapes (Phase 5.6 seamless connect) ────────────────────
+
+/// GitHub App deliveries carry the installation scope when they have one;
+/// ping and app-level events don't — extraction is Optional, never asserted
+/// (design 5.6 [F‑10]).
+pub fn installation_ref(payload: &Value) -> Option<i64> {
+    payload["installation"]["id"].as_i64()
+}
+
+/// Installation lifecycle actions the app-level ingress reacts to. Webhook
+/// ORDER is never authoritative for suspend/unsuspend — the caller
+/// reconciles against `fetch_installation` truth (design 5.6 [F‑9]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallationLifecycle {
+    Created {
+        installation_id: i64,
+        account_login: String,
+    },
+    Deleted {
+        installation_id: i64,
+    },
+    Suspend {
+        installation_id: i64,
+    },
+    Unsuspend {
+        installation_id: i64,
+    },
+}
+
+pub fn installation_lifecycle(event_name: &str, payload: &Value) -> Option<InstallationLifecycle> {
+    if event_name != "installation" {
+        return None;
+    }
+    let installation_id = payload["installation"]["id"].as_i64()?;
+    let account_login = payload["installation"]["account"]["login"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_string();
+    match payload["action"].as_str()? {
+        "created" => Some(InstallationLifecycle::Created {
+            installation_id,
+            account_login,
+        }),
+        "deleted" => Some(InstallationLifecycle::Deleted { installation_id }),
+        "suspend" => Some(InstallationLifecycle::Suspend { installation_id }),
+        "unsuspend" => Some(InstallationLifecycle::Unsuspend { installation_id }),
+        _ => None,
+    }
+}
+
+/// One installation lookup under an app JWT — the identifier trust anchor:
+/// `GET /app/installations/{id}` succeeds only for THIS app's
+/// installations, so a spoofed setup `installation_id` gets `Ok(None)`.
+pub(crate) async fn fetch_installation(
+    state: &AppState,
+    app_id: &str,
+    pem: &str,
+    installation_id: &str,
+) -> Result<Option<Value>, String> {
+    let jwt = app_jwt(app_id, pem)?;
+    let (status, body, _) = api(
+        state,
+        reqwest::Method::GET,
+        &format!("Bearer {jwt}"),
+        &format!("/app/installations/{installation_id}"),
+        None,
+    )
+    .await?;
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(format!("github /app/installations returned {status}"));
+    }
+    Ok(Some(body))
+}
+
+/// List this app's installations (first page, 100 — the sync endpoint's
+/// source of truth).
+pub(crate) async fn list_installations(
+    state: &AppState,
+    app_id: &str,
+    pem: &str,
+) -> Result<Vec<Value>, String> {
+    let jwt = app_jwt(app_id, pem)?;
+    let (status, body, _) = api(
+        state,
+        reqwest::Method::GET,
+        &format!("Bearer {jwt}"),
+        "/app/installations?per_page=100",
+        None,
+    )
+    .await?;
+    if !status.is_success() {
+        return Err(format!("github /app/installations returned {status}"));
+    }
+    Ok(body.as_array().cloned().unwrap_or_default())
 }
 
 /// Repository picker for both connection flavors. The credential never
@@ -1054,6 +1209,59 @@ o+rncG5hSLaqG1A2w8vlQ3BS7Q==
         assert!(body.contains("⚠️"));
         assert!(body.contains("`failed`"));
         assert!(body.contains("(no summary produced)"));
+    }
+
+    #[test]
+    fn installation_extraction_is_optional_and_lifecycle_is_classified() {
+        // Ping (no installation scope) → None, never an assertion failure.
+        assert_eq!(installation_ref(&json!({"zen": "ok"})), None);
+        assert_eq!(
+            installation_ref(&json!({"installation": {"id": 77}})),
+            Some(77)
+        );
+
+        let ev = |action: &str| {
+            json!({
+                "action": action,
+                "installation": {"id": 99, "account": {"login": "acme2"}},
+            })
+        };
+        assert_eq!(
+            installation_lifecycle("installation", &ev("created")),
+            Some(InstallationLifecycle::Created {
+                installation_id: 99,
+                account_login: "acme2".into()
+            })
+        );
+        assert_eq!(
+            installation_lifecycle("installation", &ev("deleted")),
+            Some(InstallationLifecycle::Deleted {
+                installation_id: 99
+            })
+        );
+        assert_eq!(
+            installation_lifecycle("installation", &ev("suspend")),
+            Some(InstallationLifecycle::Suspend {
+                installation_id: 99
+            })
+        );
+        assert_eq!(
+            installation_lifecycle("installation", &ev("unsuspend")),
+            Some(InstallationLifecycle::Unsuspend {
+                installation_id: 99
+            })
+        );
+        // Unhandled actions and other event families are not lifecycle.
+        assert_eq!(
+            installation_lifecycle("installation", &ev("new_permissions_accepted")),
+            None
+        );
+        assert_eq!(installation_lifecycle("pull_request", &ev("created")), None);
+        // A lifecycle payload with no installation id is ignored politely.
+        assert_eq!(
+            installation_lifecycle("installation", &json!({"action": "created"})),
+            None
+        );
     }
 
     #[test]

@@ -171,6 +171,7 @@ async fn create_mcp_http(state: &AppState, req: CreateConnection) -> ApiResult<J
                     status: "pending",
                     oauth: Some(&oauth),
                     client_secret_sealed: sealed_secret.as_deref(),
+                    registration_id: None,
                 },
             )
             .await?;
@@ -317,7 +318,7 @@ async fn create_github_app(state: &AppState, req: CreateConnection) -> ApiResult
 
     let sealed_key = sealer.seal(&private_key);
     let sealed_webhook = sealer.seal(&webhook_secret);
-    let row = fluidbox_db::create_connection(
+    let row = match fluidbox_db::create_connection(
         &state.pool,
         state.tenant_id,
         &req.provider,
@@ -332,7 +333,18 @@ async fn create_github_app(state: &AppState, req: CreateConnection) -> ApiResult
         Some(&sealed_webhook),
         fluidbox_db::ConnectionAuth::static_active(),
     )
-    .await?;
+    .await
+    {
+        Ok(row) => row,
+        // ONE live connection per installation (migration 0008): surface
+        // the collision as a decision, not a 500.
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+            return Err(ApiError::Conflict(format!(
+                "installation {installation_id} already has a live connection — revoke it first"
+            )))
+        }
+        Err(e) => return Err(e.into()),
+    };
     // The one thing the operator must paste into GitHub webhook settings.
     let ingress_path = format!("/v1/ingress/github/{}", row.id);
     Ok(Json(
@@ -353,6 +365,119 @@ pub async fn revoke(
     let row = fluidbox_db::revoke_connection(&state.pool, id)
         .await?
         .ok_or_else(|| ApiError::Conflict("connection not found or already revoked".into()))?;
+    // A cached installation/access token must not outlive the revocation.
+    crate::oauth::invalidate_access(&state, row.id).await;
+    Ok(Json(json!({ "connection": row })))
+}
+
+/// Activate a `pending` github_app connection (webhook-discovered) or
+/// revive a revoked/suspended/errored one — the ONE explicit admin act that
+/// turns discovery into authority (design 5.6 §3). Re-verifies the
+/// installation under the app JWT before any transition; the connection id
+/// (and its dedup history) stays continuous.
+pub async fn approve(
+    _: Admin,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Value>> {
+    let conn = fluidbox_db::get_connection(&state.pool, id)
+        .await?
+        .filter(|c| c.tenant_id == state.tenant_id)
+        .ok_or(ApiError::NotFound)?;
+    if conn.provider != "github_app" || conn.registration_id.is_none() {
+        return Err(ApiError::BadRequest(
+            "approve applies to seamless github_app connections only".into(),
+        ));
+    }
+    if conn.status == "active" {
+        return Err(ApiError::Conflict("connection is already active".into()));
+    }
+    let reg = fluidbox_db::get_github_app_registration(
+        &state.pool,
+        conn.registration_id.expect("checked above"),
+    )
+    .await?
+    .filter(|r| r.tenant_id == state.tenant_id && r.status == "active")
+    .ok_or_else(|| {
+        ApiError::Conflict("the github app registration is not active — reconnect GitHub".into())
+    })?;
+    // Reviving a revoked row must not collide with a DIFFERENT live row
+    // that took over the installation since (the partial unique index only
+    // covers live rows) — surface a decision, not a 500.
+    if let Some(other) = fluidbox_db::get_github_app_connection_by_installation(
+        &state.pool,
+        state.tenant_id,
+        &conn.external_account_id,
+    )
+    .await?
+    .filter(|c| c.id != conn.id && c.status != "revoked")
+    {
+        return Err(ApiError::Conflict(format!(
+            "installation {} is already live on connection {} — revoke that one first",
+            conn.external_account_id, other.id
+        )));
+    }
+    let inst = crate::github_app::verify_installation(&state, &reg, &conn.external_account_id)
+        .await
+        .map_err(ApiError::Upstream)?
+        .ok_or_else(|| {
+            ApiError::Conflict(
+                "this installation no longer exists on GitHub — it cannot be approved".into(),
+            )
+        })?;
+    let login = inst["account"]["login"].as_str().unwrap_or("unknown");
+    let suspended = inst["suspended_at"].is_string();
+    let to = if suspended { "suspended" } else { "active" };
+    let row = match fluidbox_db::set_connection_status(
+        &state.pool,
+        conn.id,
+        to,
+        &["pending", "revoked", "suspended", "error"],
+    )
+    .await
+    {
+        Ok(row) => row,
+        // Race-safe fallback for the preflight above.
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+            return Err(ApiError::Conflict(
+                "another live connection claimed this installation — revoke it first".into(),
+            ))
+        }
+        Err(e) => return Err(e.into()),
+    }
+    .ok_or_else(|| ApiError::Conflict("connection changed state underneath".into()))?;
+    // After the transition — the refresh skips revoked rows by design.
+    fluidbox_db::refresh_connection_metadata(
+        &state.pool,
+        row.id,
+        &crate::github_app::installation_display(&reg, login),
+        &crate::github_app::installation_metadata(&reg, &conn.external_account_id, login),
+    )
+    .await?;
+    crate::oauth::invalidate_access(&state, conn.id).await;
+    // Compensating check: a registration revoke racing this approve must
+    // win. Re-read AFTER our transition — if the registration flipped, the
+    // cascade either already caught our row (later writer) or we revert it
+    // here (we were the later writer). Either interleaving converges on
+    // revoked.
+    let reg_now = fluidbox_db::get_github_app_registration(&state.pool, reg.id).await?;
+    if reg_now.map(|r| r.status != "active").unwrap_or(true) {
+        fluidbox_db::set_connection_status(
+            &state.pool,
+            conn.id,
+            "revoked",
+            &["active", "suspended"],
+        )
+        .await
+        .ok();
+        crate::oauth::invalidate_access(&state, conn.id).await;
+        return Err(ApiError::Conflict(
+            "the github app registration was revoked during approval".into(),
+        ));
+    }
+    let row = fluidbox_db::get_connection(&state.pool, row.id)
+        .await?
+        .ok_or_else(|| ApiError::Conflict("connection changed state underneath".into()))?;
     Ok(Json(json!({ "connection": row })))
 }
 
