@@ -671,6 +671,9 @@ pub async fn list_repos(
                 "private": r.get("private"),
                 "default_branch": r.get("default_branch"),
                 "html_url": r.get("html_url"),
+                // Freshness signals for reporting agents/UI.
+                "updated_at": r.get("updated_at"),
+                "pushed_at": r.get("pushed_at"),
             })
         })
         .collect())
