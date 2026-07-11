@@ -184,6 +184,10 @@ export interface CatalogEntry {
   tool_hints: { pattern: string; action: string; note?: string }[];
   sandbox_launch: unknown | null;
   created_at: string;
+  /** Live decoration (derived server-side): the non-revoked connection
+   *  covering this entry, and the latest bundle named after the slug. */
+  connection: { id: string; status: string; auth_kind: string } | null;
+  bundle: { id: string; name: string; version: number } | null;
 }
 
 /** POST /catalog/{slug}/connect response (fields vary by auth_mode). */
