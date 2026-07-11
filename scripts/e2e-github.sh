@@ -260,7 +260,7 @@ pq "update integration_connections set status='revoked', updated_at=now()
     where provider='github_app' and status <> 'revoked'
       and (external_account_id = '77' or display_name like 'e2e-foreign-%')" >/dev/null
 pq "update github_app_registrations set status='revoked', updated_at=now()
-    where status <> 'revoked' and slug in ('fbx-e2e-seamless','fbx-e2e-nosec')" >/dev/null
+    where status <> 'revoked' and (slug in ('fbx-e2e-seamless','fbx-e2e-nosec') or status = 'pending')" >/dev/null
 
 # ── App connection ────────────────────────────────────────────────────────
 say "CONNECTION — github_app: validated, sealed, never echoed"
@@ -726,6 +726,8 @@ else
 fi
 
 say "RESULT"
+post "/github/app/$REG/revoke" "{}" >/dev/null 2>&1  # leave no live fixtures behind
+post "/github/app/$REG2/revoke" "{}" >/dev/null 2>&1
 rm -rf "$FIXROOT" "$GH_DIR" /tmp/fbx-gh-conn.json
 printf "  \033[1m%d passed, %d failed\033[0m\n" "$pass" "$fail"
 [ "$fail" = "0" ]
