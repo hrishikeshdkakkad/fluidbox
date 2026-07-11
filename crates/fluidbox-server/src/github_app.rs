@@ -176,13 +176,15 @@ pub(crate) fn build_manifest(public_url: &str, registration_id: Uuid) -> Value {
             "pull_requests": "write",
             "checks": "write",
         },
-        "default_events": ["pull_request"],
     });
+    // Event subscriptions REQUIRE a webhook ("Hook url cannot be blank"),
+    // so both ride the same reachability switch.
     if webhook_capable(public_url) {
         m["hook_attributes"] = json!({
             "url": format!("{public_url}/v1/ingress/github/app/{registration_id}"),
             "active": true,
         });
+        m["default_events"] = json!(["pull_request"]);
     }
     m
 }
@@ -1398,12 +1400,17 @@ mod tests {
     }
 
     #[test]
-    fn loopback_manifest_omits_the_webhook_entirely() {
+    fn loopback_manifest_omits_webhook_and_events_together() {
         let m = build_manifest("http://127.0.0.1:8787", Uuid::now_v7());
         assert!(m.get("hook_attributes").is_none());
+        // Events require a hook (github.com: "Hook url cannot be blank") —
+        // both must vanish together.
+        assert!(m.get("default_events").is_none());
         // Browser-redirect URLs stay — they run in the USER'S browser.
         assert!(m["redirect_url"].as_str().unwrap().contains("127.0.0.1"));
         assert!(m["setup_url"].as_str().unwrap().contains("/setup"));
+        // Permissions are unaffected.
+        assert_eq!(m["default_permissions"]["contents"], "read");
     }
 
     #[test]
