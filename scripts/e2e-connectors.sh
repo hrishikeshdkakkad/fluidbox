@@ -548,11 +548,24 @@ CODE=$(post "/connections" "{\"provider\":\"mcp_http\",\"auth_kind\":\"oauth\",\
 CIMDCONN=$(jb "['connection']['id']")
 CODE=$(post "/connections/$CIMDCONN/oauth/start" "{}")
 AUTH_URL2=$(jb "['authorize_url']")
-echo "$AUTH_URL2" | grep -q "client_id=http%3A%2F%2F127.0.0.1%3A8787%2F.well-known%2Ffluidbox-client.json" \
-  && ok "CIMD mode: our document URL used as client_id" || no "cimd client_id: $AUTH_URL2"
-[ "$(as_field "['register'].__len__()")" = "$REG_BEFORE" ] && ok "no DCR performed when CIMD is advertised" || no "unexpected DCR"
+# The AS advertises CIMD, but this deployment's public URL is loopback
+# http — an AS could never FETCH our client document (real Notion answered
+# "Unknown OAuth client" to exactly this). The eligibility guard must fall
+# through to DCR, which POSTs our metadata instead.
+echo "$AUTH_URL2" | grep -q "client_id=dcr-client-" \
+  && ok "CIMD advertised but public URL is loopback http → DCR used (eligibility guard)" || no "guard client_id: $AUTH_URL2"
+[ "$(as_field "['register'].__len__()")" = "$((REG_BEFORE + 1))" ] \
+  && ok "fresh DCR registration minted for the new connection" || no "register count: $(as_field "['register'].__len__()")"
 CB2=$(curl -s "$(curl -s -o /dev/null -w '%{redirect_url}' "$AUTH_URL2")")
-echo "$CB2" | grep -q "Connected" && ok "CIMD dance completed" || no "cimd callback: $CB2"
+echo "$CB2" | grep -q "Connected" && ok "guarded dance completed" || no "guarded callback: $CB2"
+# Reconnect re-resolution: seed the pre-guard footgun — a STORED CIMD
+# identity from a loopback deployment — and start again; it must be
+# re-resolved to DCR, never replayed at the AS.
+psql "$DATABASE_URL" -qc "update integration_connections set oauth = oauth || '{\"client_id\": \"http://127.0.0.1:8787/.well-known/fluidbox-client.json\", \"client_id_source\": \"cimd\"}'::jsonb where id = '$CIMDCONN'"
+post "/connections/$CIMDCONN/oauth/start" "{}" >/dev/null
+AUTH_URL2B=$(jb "['authorize_url']")
+echo "$AUTH_URL2B" | grep -q "client_id=dcr-client-" \
+  && ok "stale stored CIMD identity re-resolved on reconnect (not replayed)" || no "stale reuse: $AUTH_URL2B"
 
 PRE_SECRET="pre-secret-xyz-$$"
 CODE=$(post "/connections" "{\"provider\":\"mcp_http\",\"auth_kind\":\"oauth\",\"base_url\":\"http://127.0.0.1:$AS_PORT/mcp\",
