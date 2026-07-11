@@ -80,7 +80,7 @@ Seeded state: agent `claude-fixer` is on **rev 4 = haiku** (current, so new runs
 - **Concurrent connect dances on one connection are not serialized**: each start mints an independent sealed state; the last callback to exchange wins (AS codes are single-use, so nothing duplicates). Harmless single-operator behavior.
 - **The OAuth callback page is minimal HTML** and does not auto-close its tab; the dashboard modal polls the connection status instead of listening for a postMessage.
 - **The proactive-refresh margin (5 min) and state TTL (10 min) are constants** in `oauth.rs` (`EXPIRY_MARGIN_SECS`, `STATE_TTL_SECS`).
-- **Real-provider OAuth (Notion) is a manual pass** — the e2e's AS auto-consents; nobody has clicked a real Notion consent screen from this codebase yet.
+- **Real-provider OAuth VERIFIED against production Notion (2026-07-11, manual pass):** DCR accepted the loopback `http://127.0.0.1:8787/v1/oauth/callback` redirect, the exchange returned a rotating refresh token (sealed; connection active), and the photograph discovered 20 tools — after two real-world fixes: the CIMD eligibility guard (Notion's AS advertises CIMD; a loopback deployment can't serve the document → "Unknown OAuth client"), and `MAX_DESCRIPTION_CHARS` raised 4096 → 32768 (Notion embeds ~7k-char usage manuals in tool descriptions; a 2 MiB whole-definition cap compensates, since definitions freeze into every attaching RunSpec). The e2e's AS still auto-consents; only the human consent click is manual.
 
 ## 5. How to resume common tasks
 

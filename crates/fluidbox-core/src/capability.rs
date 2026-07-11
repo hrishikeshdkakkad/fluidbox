@@ -22,7 +22,16 @@ use uuid::Uuid;
 
 const MAX_SERVERS_PER_BUNDLE: usize = 16;
 const MAX_TOOLS_PER_SERVER: usize = 64;
-const MAX_DESCRIPTION_CHARS: usize = 4096;
+/// Real verified vendors embed entire usage manuals in tool descriptions —
+/// Notion's `notion-create-pages` alone blew the original 4096 cap the
+/// first time a real photograph ran (2026-07-11). The screen's job is
+/// bounding pathological bloat, not vetoing vendor doc styles; the total
+/// definition cap below keeps the frozen-RunSpec worst case sane.
+const MAX_DESCRIPTION_CHARS: usize = 32_768;
+/// Whole-definition ceiling (serialized): with 16 servers × 64 tools ×
+/// 32 KiB descriptions the naive worst case is ~32 MiB — every byte of
+/// which would be frozen into each RunSpec jsonb. Cap it well below that.
+const MAX_DEFINITION_BYTES: usize = 2 * 1024 * 1024;
 
 /// The pin an agent revision stores per attached bundle (§17 #7, settled
 /// 2026-07-10: pin-only — attaching resolves to the newest version AT
@@ -280,6 +289,14 @@ impl CapabilityBundleDef {
                     validate_tools(name, tools)?;
                 }
             }
+        }
+        // Whole-definition bloat bound: this exact JSON is stored per
+        // version AND frozen into every RunSpec that attaches it.
+        let bytes = serde_json::to_string(self).map(|s| s.len()).unwrap_or(0);
+        if bytes > MAX_DEFINITION_BYTES {
+            return Err(format!(
+                "bundle definition is {bytes} bytes serialized (max {MAX_DEFINITION_BYTES}) — trim tool snapshots"
+            ));
         }
         Ok(())
     }
@@ -553,6 +570,30 @@ mod tests {
         }
         .validate()
         .is_err());
+        // A real-vendor-sized manual (real Notion ships >4k-char tool
+        // descriptions) passes the per-tool cap…
+        let mut t = tool("a");
+        t.description = "y".repeat(20_000);
+        CapabilityBundleDef {
+            servers: vec![sandbox("ws", vec![t])],
+        }
+        .validate()
+        .unwrap();
+        // …but the WHOLE definition stays bounded: this exact JSON is
+        // frozen into every RunSpec that attaches the bundle.
+        let big_tools: Vec<ToolSnapshot> = (0..64)
+            .map(|i| {
+                let mut t = tool(&format!("t{i}"));
+                t.description = "z".repeat(MAX_DESCRIPTION_CHARS);
+                t
+            })
+            .collect();
+        let err = CapabilityBundleDef {
+            servers: vec![sandbox("ws", big_tools)],
+        }
+        .validate()
+        .unwrap_err();
+        assert!(err.contains("bytes serialized"), "got: {err}");
     }
 
     #[test]
