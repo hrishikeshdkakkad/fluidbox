@@ -48,6 +48,57 @@ pub fn cimd_client_id(state: &AppState) -> String {
     format!("{}/.well-known/fluidbox-client.json", state.cfg.public_url)
 }
 
+/// CIMD is only PRESENTABLE when the authorization server can actually
+/// fetch our client document: the public URL must be https (the spec
+/// requires https client_ids) and not loopback (127.0.0.1 means "yourself"
+/// to the AS — it would knock on its own door). Local dev deployments
+/// therefore fall through to DCR, which POSTs our metadata to the AS
+/// instead of asking it to fetch anything. Found the hard way against real
+/// Notion (its AS advertises CIMD, then answered "Unknown OAuth client"
+/// after failing to fetch a http://127.0.0.1 document).
+pub fn cimd_eligible(public_url: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(public_url) else {
+        return false;
+    };
+    if u.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = u.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return false;
+    }
+    // IP-literal hosts ([::1] arrives bracketed): loopback is unreachable
+    // from any AS; other IPs are the operator's call.
+    if let Ok(ip) = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+        return !ip.is_loopback();
+    }
+    true
+}
+
+/// Should a STORED client identity be reused for this dance? A stale one
+/// must be re-resolved instead of replayed forever at the AS:
+/// - a CIMD identity is dead the moment CIMD stops being presentable, or
+///   when the document URL no longer matches this deployment;
+/// - a DCR identity is dead when the redirect_uri it was registered with
+///   changed (the AS would refuse the exchange on redirect mismatch);
+/// - pre-registered identities are user-owned and never auto-invalidated.
+fn stored_identity_stale(
+    source: &str,
+    client_id: &str,
+    registered_redirect: Option<&str>,
+    cimd_ok: bool,
+    current_cimd_id: &str,
+    current_redirect: &str,
+) -> bool {
+    match source {
+        "cimd" => !cimd_ok || client_id != current_cimd_id,
+        "dcr" => registered_redirect.is_some_and(|r| r != current_redirect),
+        _ => false,
+    }
+}
+
 fn b64url(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -299,22 +350,35 @@ pub async fn discover(state: &AppState, mcp_url: &str) -> Result<AsMeta, String>
 
 /// Resolve the client identity for this connection against this AS.
 /// Priority: whatever the connection already carries (pre-registered or a
-/// previously minted DCR id — never re-register) → CIMD when advertised →
-/// DCR. Returns (client_id, source).
+/// previously minted DCR id — never re-register while it's still valid) →
+/// CIMD when advertised AND presentable from this deployment → DCR.
+/// Returns (client_id, source).
 async fn resolve_client(
     state: &AppState,
     conn_id: Uuid,
     oauth: &Value,
     meta: &AsMeta,
 ) -> Result<(String, String), String> {
+    let cimd_ok = meta.cimd_supported && cimd_eligible(&state.cfg.public_url);
     if let Some(existing) = oauth.get("client_id").and_then(Value::as_str) {
         let source = oauth
             .get("client_id_source")
             .and_then(Value::as_str)
             .unwrap_or("preregistered");
-        return Ok((existing.to_string(), source.to_string()));
+        if !stored_identity_stale(
+            source,
+            existing,
+            oauth.get("redirect_uri").and_then(Value::as_str),
+            cimd_ok,
+            &cimd_client_id(state),
+            &redirect_uri(state),
+        ) {
+            return Ok((existing.to_string(), source.to_string()));
+        }
+        // Stale — fall through and mint a fresh identity (reconnect after
+        // an ineligible-CIMD dance or a public-URL move lands here).
     }
-    if meta.cimd_supported {
+    if cimd_ok {
         return Ok((cimd_client_id(state), "cimd".to_string()));
     }
     let Some(reg) = &meta.registration_endpoint else {
@@ -432,6 +496,9 @@ pub async fn start_dance(state: &AppState, conn_id: Uuid) -> ApiResult<String> {
     o.insert("token_endpoint".into(), json!(meta.token_endpoint));
     o.insert("client_id".into(), json!(client_id));
     o.insert("client_id_source".into(), json!(client_source));
+    // The redirect this identity was resolved for — staleness detection
+    // re-registers a DCR client if the public URL later moves.
+    o.insert("redirect_uri".into(), json!(redirect_uri(state)));
     o.insert("scopes".into(), json!(scopes));
     fluidbox_db::update_connection_oauth(&state.pool, conn.id, &oauth).await?;
 
@@ -903,6 +970,62 @@ mod tests {
         ok("http://127.0.0.1:8897/mcp", "http://127.0.0.1:8897/mcp");
         assert!(canonical_resource("ftp://x").is_err());
         assert!(canonical_resource("not a url").is_err());
+    }
+
+    #[test]
+    fn cimd_needs_a_fetchable_https_public_url() {
+        // The AS must be able to GET the client document.
+        assert!(cimd_eligible("https://fluidbox.example.com"));
+        assert!(cimd_eligible("https://fluidbox.example.com:8443/base"));
+        // http is refused by the CIMD spec; loopback is unreachable from
+        // any AS ("127.0.0.1" means the AS itself).
+        assert!(!cimd_eligible("http://127.0.0.1:8787"));
+        assert!(!cimd_eligible("http://fluidbox.example.com"));
+        assert!(!cimd_eligible("https://127.0.0.1:8787"));
+        assert!(!cimd_eligible("https://localhost:8787"));
+        assert!(!cimd_eligible("https://[::1]:8787"));
+        assert!(!cimd_eligible("not a url"));
+    }
+
+    #[test]
+    fn stored_identities_re_resolve_when_stale() {
+        let cimd_id = "https://fbx.example.com/.well-known/fluidbox-client.json";
+        let redirect = "https://fbx.example.com/v1/oauth/callback";
+        // Healthy CIMD identity → reuse.
+        assert!(!stored_identity_stale("cimd", cimd_id, None, true, cimd_id, redirect));
+        // CIMD no longer presentable (e.g. the identity was minted before
+        // the eligibility guard, from a loopback deployment) → stale.
+        assert!(stored_identity_stale("cimd", cimd_id, None, false, cimd_id, redirect));
+        // Public URL moved → the document URL no longer matches → stale.
+        assert!(stored_identity_stale(
+            "cimd",
+            "http://127.0.0.1:8787/.well-known/fluidbox-client.json",
+            None,
+            true,
+            cimd_id,
+            redirect
+        ));
+        // DCR identity minted for THIS redirect → reuse; moved → stale;
+        // legacy rows without a recorded redirect → reuse (old behavior).
+        assert!(!stored_identity_stale("dcr", "dcr-1", Some(redirect), false, cimd_id, redirect));
+        assert!(stored_identity_stale(
+            "dcr",
+            "dcr-1",
+            Some("http://127.0.0.1:8787/v1/oauth/callback"),
+            false,
+            cimd_id,
+            redirect
+        ));
+        assert!(!stored_identity_stale("dcr", "dcr-1", None, false, cimd_id, redirect));
+        // Pre-registered identities are user-owned — never auto-stale.
+        assert!(!stored_identity_stale(
+            "preregistered",
+            "pre-7",
+            Some("https://old.example/cb"),
+            false,
+            cimd_id,
+            redirect
+        ));
     }
 
     #[test]
