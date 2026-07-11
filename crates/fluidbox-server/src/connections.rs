@@ -53,6 +53,9 @@ pub struct CreateConnection {
     pub webhook_secret: Option<String>,
     #[serde(default)]
     pub display_name: Option<String>,
+    /// mcp_http flavor: the base URL its credential is audience-bound to.
+    #[serde(default)]
+    pub base_url: Option<String>,
 }
 
 pub async fn create(
@@ -63,10 +66,53 @@ pub async fn create(
     match req.provider.as_str() {
         "github" => create_github_pat(&state, req).await,
         "github_app" => create_github_app(&state, req).await,
+        "mcp_http" => create_mcp_http(&state, req).await,
         other => Err(ApiError::BadRequest(format!(
-            "unsupported provider '{other}' (supported: github, github_app)"
+            "unsupported provider '{other}' (supported: github, github_app, mcp_http)"
         ))),
     }
+}
+
+/// A sealed credential for BROKERED MCP servers (design §8.3 class 2): a
+/// bearer token pinned to a base URL. The broker sends this credential only
+/// to server URLs under `base_url` (audience binding — our RFC-8707
+/// equivalent), so a bundle can never point this token at another host. No
+/// ingress, no git fetch: this flavor exists purely for the tool broker.
+async fn create_mcp_http(state: &AppState, req: CreateConnection) -> ApiResult<Json<Value>> {
+    let base_url = req
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("base_url is required for mcp_http".into()))?;
+    let parsed = reqwest::Url::parse(base_url)
+        .map_err(|_| ApiError::BadRequest("base_url is not a valid URL".into()))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ApiError::BadRequest("base_url must be http(s)".into()));
+    }
+    let token = req.token.as_deref().map(str::trim).unwrap_or_default();
+    if token.is_empty() {
+        return Err(ApiError::BadRequest(
+            "token is required for mcp_http (credential-free servers need no connection)".into(),
+        ));
+    }
+    let sealer = sealer(state)?;
+    let host = parsed.host_str().unwrap_or("mcp").to_string();
+    let sealed = sealer.seal(token);
+    let row = fluidbox_db::create_connection(
+        &state.pool,
+        state.tenant_id,
+        &req.provider,
+        &host,
+        req.display_name.as_deref().unwrap_or(&host),
+        &sealed,
+        &json!([]),
+        &json!({}),
+        &json!({ "base_url": base_url }),
+        None,
+    )
+    .await?;
+    Ok(Json(json!({ "connection": row })))
 }
 
 async fn create_github_pat(state: &AppState, req: CreateConnection) -> ApiResult<Json<Value>> {

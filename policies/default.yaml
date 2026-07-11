@@ -126,7 +126,9 @@ tools:
     action: deny
     risk: network egress from sandbox
 
-  # Any MCP tool that shows up asks a human until bundles land (M3).
+  # MCP tools ask a human by default. Bundles (Phase 5) make tools
+  # AVAILABLE; this rule still judges every call (attach ≠ allow) — grant
+  # per-server/tool allow rules in agent policies deliberately.
   - match: ["mcp__*"]
     action: approve
     risk: unreviewed MCP tool
