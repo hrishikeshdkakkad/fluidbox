@@ -238,13 +238,18 @@ requesting an active hook, the registration still activates but is marked
 **degraded**: fetch/publish work, event ingress cannot authenticate, and the
 card says so with remediation ("recreate the app") **[F‑11]**.
 
-Local deployments **[R‑13]**: manifest/install/setup are pure browser
-redirects and work on loopback; only webhook DELIVERY needs a public
-`FLUIDBOX_PUBLIC_URL`. The registration card states this up front, and if
-GitHub refuses a loopback hook URL at creation, the confirm page surfaces
-GitHub's own error — nothing is stored until the callback. (Real-github.com
-manifest acceptance for a given deployment URL is a documented manual smoke
-check; the e2e proves the protocol against the fake.)
+Local deployments **[R‑13]** (behavior verified against real github.com,
+which REJECTS manifests whose hook URL is loopback): when
+`FLUIDBOX_PUBLIC_URL` is not publicly reachable (`webhook_capable` = false:
+loopback, localhost, private/link-local IPs), the manifest **omits
+`hook_attributes` entirely** — the app still creates, browser redirects
+(redirect/setup URLs) work on any host, fetch/publish work, and the
+registration lands in the degraded no-webhook state with explicit
+remediation copy ("set a public FLUIDBOX_PUBLIC_URL and create a new app").
+Any webhook secret in the conversion response is discarded when hooks were
+omitted — never custody what wasn't wired. The e2e presents a
+webhook-capable internal host (curl `--connect-to`) so the hook path stays
+fully exercised.
 
 ### 4.3 Flow 2 — connect (install; per registration)
 
