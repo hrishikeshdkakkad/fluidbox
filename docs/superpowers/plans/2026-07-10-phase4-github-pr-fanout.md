@@ -50,9 +50,9 @@
 - `ResultDestination` gains: `GitHubPrComment { connection_id: Uuid, repository: String, pr_number: i64 }` (tag `github_pr_comment`), `GitHubCheck { connection_id: Uuid, repository: String, head_sha: String }` (tag `github_check`).
 - `impl TrustTier { pub fn as_str(&self) -> &'static str }` → `"trusted" | "read_only"`.
 
-- [ ] Write failing tests in `spec.rs`: old InvocationContext JSON (no new fields) still deserializes; event-kind context roundtrips; both new destinations roundtrip with exact wire tags; `TrustTier::as_str`.
-- [ ] Implement; `cargo test -p fluidbox-core spec::` green.
-- [ ] Commit `feat(core): event invocation context + github result destinations`.
+- [x] Write failing tests in `spec.rs`: old InvocationContext JSON (no new fields) still deserializes; event-kind context roundtrips; both new destinations roundtrip with exact wire tags; `TrustTier::as_str`.
+- [x] Implement; `cargo test -p fluidbox-core spec::` green.
+- [x] Commit `feat(core): event invocation context + github result destinations`.
 
 ### Task 2: Core — real ReadOnly trust tier classifier
 
@@ -65,8 +65,8 @@ Semantics (allowlist, fail-safe):
 - `Bash`: deny if command contains any shell metachar (`;`, `|`, `&`, `` ` ``, `$`, `(`, `)`, `<`, `>`, newline); else allow only token-bounded prefixes (reuse `prefix_matches`): `ls, cat, head, tail, wc, grep, rg, pwd, git status, git log, git diff, git show, git branch, git blame`.
 - Everything else (Edit/Write/WebFetch/mcp__*/unknown/other Bash) → `Some("read-only trust tier (untrusted event source): …")`.
 
-- [ ] Failing tests: Read/Grep allowed; `git diff`/`cat x` allowed; `cat a; rm -rf /` denied (metachar); `git push`, `Edit`, `WebFetch`, unknown tool denied; `git statusx` denied (token boundary).
-- [ ] Implement; `cargo test -p fluidbox-core policy::` green. Commit `feat(core): read-only trust tier classifier`.
+- [x] Failing tests: Read/Grep allowed; `git diff`/`cat x` allowed; `cat a; rm -rf /` denied (metachar); `git push`, `Edit`, `WebFetch`, unknown tool denied; `git statusx` denied (token boundary).
+- [x] Implement; `cargo test -p fluidbox-core policy::` green. Commit `feat(core): read-only trust tier classifier`.
 
 ### Task 3: Migration 0005 + DB layer
 
@@ -126,8 +126,8 @@ create table external_results (
 
 **Interfaces (Produces):** rows `TriggerDeliveryRow`, `TriggerDispatchRow`, `ExternalResultRow`; fns `insert_trigger_delivery(...) -> (TriggerDeliveryRow, bool /*fresh*/)` (on conflict fetch existing), `claim_trigger_dispatch(pool, delivery, subscription) -> Option<TriggerDispatchRow>` (None = already claimed), `mark_dispatch_outcome(pool, id, status, skip_reason)`, `list_event_subscriptions(pool, connection)` (enabled + kind='event'), `list_delivery_dispatches`, `list_connection_deliveries(pool, connection, limit)`, `get_external_result(pool, sub, kind, key)`, `upsert_external_result(pool, sub, kind, key, external_id, url)`; `create_connection` gains `webhook_secret_sealed: Option<&[u8]>`; `connection_webhook_secret_sealed(pool, id)`; `create_trigger_subscription` gains `connection_id: Option<Uuid>, resource_selector: Option<&Value>, event_filter: Option<&Value>, event_publish: Option<&Value>`; `TriggerSubscriptionRow`/struct gains those fields; `create_session` gains `trust_tier: &str` + `bind_dispatch: Option<Uuid>` (same transaction updates `trigger_dispatches.session_id` and sets `sessions.trust_tier`).
 
-- [ ] Write SQL; extend rows/fns; update ALL `create_session`/`create_trigger_subscription`/`create_connection` callers (`run_service.rs` passes `run_spec.trust_tier.as_str()` and `req.bound_dispatch`; existing callers pass `None`/trusted).
-- [ ] `cargo build --workspace` green (server boots migrations on next run). Commit `feat(db): event delivery/dispatch/external-result tables + wiring`.
+- [x] Write SQL; extend rows/fns; update ALL `create_session`/`create_trigger_subscription`/`create_connection` callers (`run_service.rs` passes `run_spec.trust_tier.as_str()` and `req.bound_dispatch`; existing callers pass `None`/trusted).
+- [x] `cargo build --workspace` green (server boots migrations on next run). Commit `feat(db): event delivery/dispatch/external-result tables + wiring`.
 
 ### Task 4: Connector — GitHub verify + normalize (pure, tested)
 
@@ -159,8 +159,8 @@ pub fn sample_context(connector: &str) -> BTreeMap<String, String>;     // templ
 ```
 GitHub specifics (`github.rs`): `X-Hub-Signature-256: sha256=<hex hmac(secret, raw body)>` (compare sha256-of-both, like `auth.rs`); `X-GitHub-Delivery` → external id; `X-GitHub-Event` → event name. Normalize only `pull_request` with action ∈ {opened, reopened, synchronize} → `Some`; everything else (ping, other actions) → `Ok(None)`. Fork = `pull_request.head.repo.id != pull_request.base.repo.id` **or head repo missing** ⇒ `ReadOnly` + `CheckoutMode::ReadOnly`. Workspace: `GitRepository { connection_id, repository: full_name, clone_url: format!("{clone_base}/{full_name}"), ref: None, commit_sha: Some(head_sha), checkout_mode }`. Context keys: `repository, pr_number, pr_title, pr_url, pr_author, head_sha, head_ref, base_sha, base_ref, action, event, fork`.
 
-- [ ] Failing tests (fixture payload as `serde_json::json!`): signature verify (pinned openssl-cross-checked vector; tampered body fails; missing header fails); opened/reopened/synchronize normalize; other action → None; fork downgrade (+ missing head.repo ⇒ fork); context/workspace/publishable/resource_key contents; `sample_context` renders `default_events` templates.
-- [ ] Implement; `cargo test -p fluidbox-server connectors::` green. Commit `feat(server): github connector — webhook verify + PR normalize`.
+- [x] Failing tests (fixture payload as `serde_json::json!`): signature verify (pinned openssl-cross-checked vector; tampered body fails; missing header fails); opened/reopened/synchronize normalize; other action → None; fork downgrade (+ missing head.repo ⇒ fork); context/workspace/publishable/resource_key contents; `sample_context` renders `default_events` templates.
+- [x] Implement; `cargo test -p fluidbox-server connectors::` green. Commit `feat(server): github connector — webhook verify + PR normalize`.
 
 ### Task 5: GitHub App auth + connections
 
@@ -172,8 +172,8 @@ GitHub specifics (`github.rs`): `X-Hub-Signature-256: sha256=<hex hmac(secret, r
 - `orchestrator.rs::connection_auth_header` → delegate to a provider dispatch `connectors::fetch_auth_header(state, conn)` (mod.rs matches provider → github).
 - `config.rs`: `github_clone_base: String` (env `FLUIDBOX_GITHUB_CLONE_BASE`, default `https://github.com`).
 
-- [ ] Tests: `app_jwt` produces 3-part token whose decoded claims carry `iss`/`exp` (decode header+claims with base64, no network); PAT fetch header unchanged shape.
-- [ ] Implement; `cargo build --workspace` + tests green. Commit `feat(server): github app connections — jwt, installation tokens, sealed webhook secret`.
+- [x] Tests: `app_jwt` produces 3-part token whose decoded claims carry `iss`/`exp` (decode header+claims with base64, no network); PAT fetch header unchanged shape.
+- [x] Implement; `cargo build --workspace` + tests green. Commit `feat(server): github app connections — jwt, installation tokens, sealed webhook secret`.
 
 ### Task 6: Trust tier enforced at the permission gate + create_run plumbing
 
@@ -181,7 +181,7 @@ GitHub specifics (`github.rs`): `X-Hub-Signature-256: sha256=<hex hmac(secret, r
 
 **Interfaces:** `CreateRun` gains `trust_tier: TrustTier` and `bound_dispatch: Option<Uuid>` (existing callers: `TrustTier::Trusted`, `None`). `run_service` freezes it into the RunSpec and passes `as_str()` to `create_session`. In `internal.rs::permission`, immediately after `policy.evaluate(...)`: if `run_spec.trust_tier == TrustTier::ReadOnly` and `read_only_denial(&tool_req)` returns `Some(reason)` and the effective verdict isn't already Deny → respond deny with `source: "trust_tier"` in the `ToolDecision` ledger event (short-circuit before the approval machinery — no approval escape).
 
-- [ ] Implement; run `cargo test --workspace` (stack stopped, env sourced). Commit `feat(server): fork trust tier is real — read-only enforcement at the gate`.
+- [x] Implement; run `cargo test --workspace` (stack stopped, env sourced). Commit `feat(server): fork trust tier is real — read-only enforcement at the gate`.
 
 ### Task 7: Event subscriptions (`triggers.rs::create`)
 
@@ -189,7 +189,7 @@ GitHub specifics (`github.rs`): `X-Hub-Signature-256: sha256=<hex hmac(secret, r
 
 `CreateTrigger` gains: `connection: Option<String>` (uuid), `repositories: Option<Vec<String>>`, `events: Option<Vec<String>>`, `publish: Option<Vec<String>>`. `connection` set ⇒ `trigger_kind = "event"` (mutually exclusive with `schedule`). Validation: connection exists/tenant/active, `connector_for(provider)` known, `webhook_secret_sealed` present (else 400 "connection cannot receive events"); `events ⊆ supported_events` (default `default_events()` — §17 #2); `publish ⊆ publish_modes` (default `["pr_comment"]`; explicit `[]` = dashboard/webhook only); repositories all `valid_repo_name`; task_template required and must render from `sample_context` (strict, like the schedule check). Store via new `create_trigger_subscription` params. Response includes the connection's ingress URL path (`/v1/ingress/github/{connection_id}`).
 
-- [ ] Implement + unit-test validation edges compile-level; `cargo build`. Commit `feat(server): event trigger subscriptions (§17 #2 defaults)`.
+- [x] Implement + unit-test validation edges compile-level; `cargo build`. Commit `feat(server): event trigger subscriptions (§17 #2 defaults)`.
 
 ### Task 8: The event spine — `events.rs` ingress/dedup/match/fan-out
 
@@ -205,7 +205,7 @@ Route: `POST /v1/ingress/{provider}/{connection_id}` (public router, NO auth —
 7. `200 { delivery_id, event_type, duplicate, dispatched: [{subscription_id, session_id}], skipped: [...] }`.
 Also: `GET /v1/connections/{id}/deliveries` (admin) — recent deliveries with their dispatches.
 
-- [ ] Implement; `cargo build`; matcher logic unit tests (event filter + repo selector, in `events.rs::tests` with plain structs — no DB). Commit `feat(server): provider-ignorant event ingress, two-level dedup, fan-out`.
+- [x] Implement; `cargo build`; matcher logic unit tests (event filter + repo selector, in `events.rs::tests` with plain structs — no DB). Commit `feat(server): provider-ignorant event ingress, two-level dedup, fan-out`.
 
 ### Task 9: Publisher — comment/check destinations in the delivery worker
 
@@ -215,7 +215,7 @@ Also: `GET /v1/connections/{id}/deliveries` (admin) — recent deliveries with t
 
 GitHub publish semantics (§17 #1/#3): comment — `resource_key = "{repository}#{pr_number}"`; `get_external_result` → PATCH `/repos/{repo}/issues/comments/{id}`; 404/410 or absent → POST `/repos/{repo}/issues/{pr}/comments` then `upsert_external_result`. Body: `### 🤖 {agent_name} — {status}` + summary (or failure note) + footer `_fluidbox · trigger **{sub}** · run {id} · commit {short_sha}_` (+ "updated for `{sha}`" when updating). Check — POST `/repos/{repo}/check-runs` `{ name: "fluidbox/{sub}", head_sha, status: "completed", conclusion, output: { title: "{agent}: {status}", summary } }`; conclusion map: completed→success, cancelled→cancelled, else failure. Auth: installation token (App-only, #1).
 
-- [ ] Implement + comment-body/conclusion-map unit tests; `cargo test --workspace` green. Commit `feat(server): PR comment/check publishers with stable update-in-place identity`.
+- [x] Implement + comment-body/conclusion-map unit tests; `cargo test --workspace` green. Commit `feat(server): PR comment/check publishers with stable update-in-place identity`.
 
 ### Task 10: Dashboard (presentation-only)
 
@@ -223,7 +223,7 @@ GitHub publish semantics (§17 #1/#3): comment — `resource_key = "{repository}
 
 - Connections: "GitHub App" create form (app id, installation id, private key PEM textarea, webhook secret) beside the PAT form; App rows show the ingress URL to paste into GitHub webhook settings.
 - Triggers: create form gains "fire on repository events" (connection picker, repositories, event checkboxes with synchronize labeled as opt-in cost amplifier, publish modes); event subscriptions show connection/events/repos badges and recent dispatches.
-- [ ] `cd apps/web && pnpm build` green. Commit `web: github app connections + event trigger subscriptions`.
+- [x] `cd apps/web && pnpm build` green. Commit `web: github app connections + event trigger subscriptions`.
 
 ### Task 11: Acceptance — `scripts/e2e-github.sh` + suite wiring
 
@@ -233,15 +233,15 @@ Skeleton: fake GitHub API (python http.server) implementing `GET /app`, `GET /ap
 
 Checks (~55): App connection create (secret sealed, never echoed) → ingress URL; three differently-configured subscriptions (A comment, B check, C comment+check with synchronize opted in); **one signed PR-opened → 3 dispatches, 3 runs, each frozen at the exact head SHA with kind=event context** (assert via `run_spec`); **verbatim retry → duplicate:true, zero new dispatches/runs/comments**; bad signature → 401 + no delivery row; ping + unhandled action → 200 ignored, no row; fork payload → `run_spec.trust_tier == "read_only"` + permission-gate probe (session token via psql like governance-e2e): `Edit` denied source=trust_tier, `Read` allowed; publisher: A's comment POSTed once with agent name + run id; B's check named `fluidbox/<B>` at head SHA; synchronize (new head SHA) → only C fires; C's comment PATCHed in place (no second POST), C gets a second check at the new SHA; `external_results` row count stable; **seam grep**: `events.rs` + `run_service.rs` contain no `github` (case-insensitive); live tier (self-skips): 3 autonomous agents complete a real review of the fixture at the exact SHA and publish 3 attributable comments.
 
-- [ ] Write script; run `bash scripts/e2e-github.sh` standalone until green; wire into `e2e.sh` (phases renumbered 7). Commit `test(e2e): github pr-review fan-out acceptance phase`.
+- [x] Write script; run `bash scripts/e2e-github.sh` standalone until green; wire into `e2e.sh` (phases renumbered 7). Commit `test(e2e): github pr-review fan-out acceptance phase`.
 
 ### Task 12: Docs + full gates
 
 **Files:** Modify design doc §17 (record #1–#3 settled), `.env.example` (+`FLUIDBOX_GITHUB_CLONE_BASE` comment, github_app connection note), `CLAUDE.md` (invariant bullet for the event spine + env note), `docs/HANDOVER.md` (rev 6: what shipped, rough edges, manual real-GitHub pass instructions).
 
-- [ ] `just check` fully green (fmt, clippy -D warnings, workspace tests, web build) — stack stopped, env sourced.
-- [ ] `just e2e` fully green — all 7 phases.
-- [ ] Update docs; commit `docs: handover rev 6 — phase 4 shipped (github pr fan-out)`; push.
+- [x] `just check` fully green (fmt, clippy -D warnings, workspace tests, web build) — stack stopped, env sourced.
+- [x] `just e2e` fully green — all 7 phases.
+- [x] Update docs; commit `docs: handover rev 6 — phase 4 shipped (github pr fan-out)`; push.
 
 ## Self-Review
 
