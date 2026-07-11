@@ -68,6 +68,22 @@ pub struct AgentRevisionRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// One version of a capability bundle (design §3.6): append-only like
+/// agent revisions — publishing a change = a new (name, version) row. The
+/// definition carries the photographed tool snapshots; definition_digest is
+/// the supply-chain anchor frozen into RunSpecs.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct CapabilityBundleRow {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub name: String,
+    pub version: i32,
+    pub description: Option<String>,
+    pub definition: Value,
+    pub definition_digest: String,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Deliberately has NO credential field: every query selects explicit
 /// columns, so the sealed credential can never ride along into an API
 /// response or log. `connection_credential_sealed` is the only reader.
@@ -315,6 +331,8 @@ pub async fn get_agent_by_name(
 
 /// Appends a new immutable revision (rev = max+1). Editing an agent is
 /// always an append — never an update — by construction.
+/// `capability_bundles` is the §17 #7 pin list (BundleRef json array): exact
+/// versions resolved at attach time, never floating.
 #[allow(clippy::too_many_arguments)]
 pub async fn append_agent_revision(
     pool: &PgPool,
@@ -326,14 +344,15 @@ pub async fn append_agent_revision(
     policy_id: Uuid,
     budgets: &Value,
     default_workspace: Option<&Value>,
+    capability_bundles: &Value,
 ) -> sqlx::Result<AgentRevisionRow> {
     sqlx::query_as(
         "insert into agent_revisions
            (id, agent_id, rev, harness, runner_image, model, system_prompt, policy_id, budgets,
-            default_workspace)
+            default_workspace, capability_bundles)
          values ($1, $2,
            coalesce((select max(rev) from agent_revisions where agent_id = $2), 0) + 1,
-           $3, $4, $5, $6, $7, $8, $9)
+           $3, $4, $5, $6, $7, $8, $9, $10)
          returning *",
     )
     .bind(Uuid::now_v7())
@@ -345,6 +364,7 @@ pub async fn append_agent_revision(
     .bind(policy_id)
     .bind(budgets)
     .bind(default_workspace)
+    .bind(capability_bundles)
     .fetch_one(pool)
     .await
 }
@@ -371,6 +391,93 @@ pub async fn get_revision(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<AgentR
         .bind(id)
         .fetch_optional(pool)
         .await
+}
+
+// ─── Capability bundles (Phase 5: the registry) ───────────────────────────
+
+/// Appends a new immutable bundle version (version = max+1 within the
+/// name). Publishing a change is always an append — never an update — by
+/// construction, exactly like agent revisions.
+pub async fn create_capability_bundle(
+    pool: &PgPool,
+    tenant: Uuid,
+    name: &str,
+    description: Option<&str>,
+    definition: &Value,
+    definition_digest: &str,
+) -> sqlx::Result<CapabilityBundleRow> {
+    sqlx::query_as(
+        "insert into capability_bundles
+           (id, tenant_id, name, version, description, definition, definition_digest)
+         values ($1, $2, $3,
+           coalesce((select max(version) from capability_bundles
+                     where tenant_id = $2 and name = $3), 0) + 1,
+           $4, $5, $6)
+         returning *",
+    )
+    .bind(Uuid::now_v7())
+    .bind(tenant)
+    .bind(name)
+    .bind(description)
+    .bind(definition)
+    .bind(definition_digest)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn list_capability_bundles(
+    pool: &PgPool,
+    tenant: Uuid,
+) -> sqlx::Result<Vec<CapabilityBundleRow>> {
+    sqlx::query_as(
+        "select * from capability_bundles where tenant_id = $1
+         order by name, version desc",
+    )
+    .bind(tenant)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_capability_bundle(
+    pool: &PgPool,
+    id: Uuid,
+) -> sqlx::Result<Option<CapabilityBundleRow>> {
+    sqlx::query_as("select * from capability_bundles where id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+pub async fn latest_capability_bundle(
+    pool: &PgPool,
+    tenant: Uuid,
+    name: &str,
+) -> sqlx::Result<Option<CapabilityBundleRow>> {
+    sqlx::query_as(
+        "select * from capability_bundles where tenant_id = $1 and name = $2
+         order by version desc limit 1",
+    )
+    .bind(tenant)
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn get_capability_bundle_version(
+    pool: &PgPool,
+    tenant: Uuid,
+    name: &str,
+    version: i32,
+) -> sqlx::Result<Option<CapabilityBundleRow>> {
+    sqlx::query_as(
+        "select * from capability_bundles
+         where tenant_id = $1 and name = $2 and version = $3",
+    )
+    .bind(tenant)
+    .bind(name)
+    .bind(version)
+    .fetch_optional(pool)
+    .await
 }
 
 // ─── Integration connections ──────────────────────────────────────────────
@@ -516,6 +623,9 @@ pub struct TriggerSubscriptionRow {
     pub resource_selector: Option<Value>,
     pub event_filter: Option<Value>,
     pub event_publish: Option<Value>,
+    /// Capability keep-list (bundle names; §3.5 narrowing). NULL = keep all
+    /// bundles the resolved revision attaches; intersection is remove-only.
+    pub capability_bundles: Option<Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -523,7 +633,8 @@ pub struct TriggerSubscriptionRow {
 const SUBSCRIPTION_COLS: &str = "id, tenant_id, agent_id, name, trigger_kind, pinned_revision_id, \
      enabled, task_template, allow_task_override, allow_workspace_override, autonomy, \
      concurrency_policy, budget_override, workspace_override, result_destinations, \
-     connection_id, resource_selector, event_filter, event_publish, created_at, updated_at";
+     connection_id, resource_selector, event_filter, event_publish, capability_bundles, \
+     created_at, updated_at";
 
 #[allow(clippy::too_many_arguments)]
 pub async fn create_trigger_subscription(
@@ -546,14 +657,15 @@ pub async fn create_trigger_subscription(
     resource_selector: Option<&Value>,
     event_filter: Option<&Value>,
     event_publish: Option<&Value>,
+    capability_bundles: Option<&Value>,
 ) -> sqlx::Result<TriggerSubscriptionRow> {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "insert into trigger_subscriptions
            (id, tenant_id, agent_id, name, trigger_kind, pinned_revision_id, task_template,
             allow_task_override, allow_workspace_override, autonomy, concurrency_policy,
             budget_override, workspace_override, result_destinations, callback_secret_sealed,
-            connection_id, resource_selector, event_filter, event_publish)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+            connection_id, resource_selector, event_filter, event_publish, capability_bundles)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
          returning {SUBSCRIPTION_COLS}"
     )))
     .bind(Uuid::now_v7())
@@ -575,6 +687,7 @@ pub async fn create_trigger_subscription(
     .bind(resource_selector)
     .bind(event_filter)
     .bind(event_publish)
+    .bind(capability_bundles)
     .fetch_one(pool)
     .await
 }
@@ -1903,6 +2016,7 @@ mod tests {
             policy.id,
             &serde_json::json!({}),
             None,
+            &serde_json::json!([]),
         )
         .await
         .unwrap();
@@ -1983,6 +2097,7 @@ mod tests {
             policy.id,
             &serde_json::json!({}),
             None,
+            &serde_json::json!([]),
         )
         .await
         .unwrap();
@@ -2153,6 +2268,7 @@ mod tests {
             policy.id,
             &serde_json::json!({}),
             None,
+            &serde_json::json!([]),
         )
         .await
         .unwrap();
@@ -2174,6 +2290,7 @@ mod tests {
             None,
             &serde_json::json!([{"kind": "signed_webhook", "url": "http://127.0.0.1:1/cb"}]),
             Some(&sealed),
+            None,
             None,
             None,
             None,
@@ -2263,6 +2380,7 @@ mod tests {
             policy.id,
             &serde_json::json!({}),
             None,
+            &serde_json::json!([]),
         )
         .await
         .unwrap();
@@ -2281,6 +2399,7 @@ mod tests {
             None,
             None,
             &serde_json::json!([]),
+            None,
             None,
             None,
             None,
@@ -2407,6 +2526,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2525,6 +2645,7 @@ mod tests {
             policy.id,
             &serde_json::json!({}),
             None,
+            &serde_json::json!([]),
         )
         .await
         .unwrap();
@@ -2638,6 +2759,7 @@ mod tests {
             policy.id,
             &serde_json::json!({}),
             Some(&ws),
+            &serde_json::json!([]),
         )
         .await
         .unwrap();
@@ -2654,6 +2776,7 @@ mod tests {
             policy.id,
             &serde_json::json!({}),
             None,
+            &serde_json::json!([]),
         )
         .await
         .unwrap();
@@ -2666,6 +2789,131 @@ mod tests {
             .unwrap();
         sqlx::query("delete from agents where id = $1")
             .bind(agent.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn capability_bundles_are_append_only_and_refs_roundtrip() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let name = format!("test-bundle-{}", Uuid::now_v7());
+
+        let def_v1 = serde_json::json!({"servers": [{
+            "class": "sandbox", "name": "ws", "command": "node",
+            "args": ["/opt/x.mjs"],
+            "tools": [{"name": "count", "description": "d", "input_schema": {"type": "object"}}]
+        }]});
+        let v1 = create_capability_bundle(&pool, tenant, &name, Some("first"), &def_v1, "sha256:a")
+            .await
+            .unwrap();
+        assert_eq!(v1.version, 1);
+
+        // Publishing again appends version 2 — the v1 row never mutates.
+        let v2 = create_capability_bundle(&pool, tenant, &name, None, &def_v1, "sha256:b")
+            .await
+            .unwrap();
+        assert_eq!(v2.version, 2);
+        assert_ne!(v1.id, v2.id);
+        let v1_again = get_capability_bundle(&pool, v1.id).await.unwrap().unwrap();
+        assert_eq!(v1_again.definition_digest, "sha256:a");
+        assert_eq!(
+            latest_capability_bundle(&pool, tenant, &name)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            v2.id
+        );
+        assert_eq!(
+            get_capability_bundle_version(&pool, tenant, &name, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            v1.id
+        );
+
+        // Revision pins (§17 #7) + subscription keep-list roundtrip as jsonb.
+        let policy = upsert_policy(
+            &pool,
+            tenant,
+            "test-cap",
+            "name: test-cap",
+            &serde_json::json!({"name": "test-cap"}),
+        )
+        .await
+        .unwrap();
+        let agent = create_agent(&pool, tenant, "test-cap-agent", None)
+            .await
+            .unwrap();
+        let pins = serde_json::json!([{"id": v1.id, "name": name, "version": 1}]);
+        let rev = append_agent_revision(
+            &pool,
+            agent.id,
+            "claude-agent-sdk",
+            "img:test",
+            "claude-haiku-4-5",
+            None,
+            policy.id,
+            &serde_json::json!({}),
+            None,
+            &pins,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rev.capability_bundles, pins);
+
+        let keep = serde_json::json!([name]);
+        let sub = create_trigger_subscription(
+            &pool,
+            tenant,
+            agent.id,
+            &format!("test-cap-sub-{}", Uuid::now_v7()),
+            "api",
+            None,
+            Some("t"),
+            false,
+            false,
+            None,
+            "allow",
+            None,
+            None,
+            &serde_json::json!([]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&keep),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sub.capability_bundles, Some(keep));
+
+        sqlx::query("delete from trigger_subscriptions where id = $1")
+            .bind(sub.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("delete from agent_revisions where agent_id = $1")
+            .bind(agent.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("delete from agents where id = $1")
+            .bind(agent.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("delete from capability_bundles where tenant_id = $1 and name = $2")
+            .bind(tenant)
+            .bind(&name)
             .execute(&pool)
             .await
             .unwrap();

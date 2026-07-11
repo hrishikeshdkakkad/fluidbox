@@ -268,6 +268,13 @@ pub struct RunSpec {
     pub invocation: InvocationContext,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub result_destinations: Vec<ResultDestination>,
+    /// Frozen capability bundles (design §3.6/§8): exact pinned versions
+    /// with their photographed tool-schema snapshots. The permission gate
+    /// consults ONLY this set — never the live registry or the live server.
+    /// `#[serde(default)]` keeps every pre-Phase-5 frozen RunSpec
+    /// deserializable (defaults to no capabilities).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<crate::capability::FrozenBundle>,
 }
 
 #[cfg(test)]
@@ -400,6 +407,58 @@ mod tests {
         assert_eq!(spec.invocation.kind, InvocationKind::Manual);
         assert!(spec.invocation.subscription_id.is_none());
         assert!(spec.result_destinations.is_empty());
+        // Pre-Phase-5 rows also lack `capabilities` — empty forever.
+        assert!(spec.capabilities.is_empty());
+    }
+
+    #[test]
+    fn run_spec_capabilities_roundtrip_and_stay_optional() {
+        use crate::capability::{CapabilityServer, FrozenBundle, ToolSnapshot};
+        let bundle = FrozenBundle {
+            id: Uuid::now_v7(),
+            name: "kb-tools".into(),
+            version: 2,
+            definition_digest: "sha256:beef".into(),
+            servers: vec![CapabilityServer::Brokered {
+                name: "kb".into(),
+                url: "https://mcp.example.test/mcp".into(),
+                connection_id: None,
+                identity: None,
+                tools: vec![ToolSnapshot {
+                    name: "kb_search".into(),
+                    description: "search".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                    annotations: None,
+                }],
+            }],
+        };
+        let v = serde_json::to_value(vec![bundle.clone()]).unwrap();
+        let back: Vec<crate::capability::FrozenBundle> = serde_json::from_value(v).unwrap();
+        assert_eq!(back, vec![bundle]);
+        // An empty set serializes to nothing (skip_serializing_if) so old
+        // consumers of run_spec json never see a new key for plain runs.
+        let spec_json = serde_json::to_value(RunSpec {
+            agent_id: Uuid::now_v7(),
+            agent_revision_id: Uuid::now_v7(),
+            agent_name: "a".into(),
+            harness: "claude-agent-sdk".into(),
+            runner_image: "img".into(),
+            model: "m".into(),
+            system_prompt: None,
+            task: "t".into(),
+            workspace: WorkspaceSpec::Scratch,
+            autonomy: Autonomy::Supervised,
+            trust_tier: TrustTier::Trusted,
+            budgets: Budgets::default(),
+            policy_id: Uuid::now_v7(),
+            policy_version: 1,
+            policy_snapshot: crate::policy::Policy::parse_yaml("name: p").unwrap(),
+            invocation: InvocationContext::default(),
+            result_destinations: vec![],
+            capabilities: vec![],
+        })
+        .unwrap();
+        assert!(spec_json.get("capabilities").is_none());
     }
 
     #[test]

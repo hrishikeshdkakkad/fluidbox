@@ -8,6 +8,10 @@
 use crate::error::{ApiError, ApiResult};
 use crate::orchestrator;
 use crate::state::AppState;
+use fluidbox_core::capability::{
+    narrow_bundles, server_collision, BundleRef, CapabilityBundleDef, CapabilityServer,
+    FrozenBundle,
+};
 use fluidbox_core::policy::Policy;
 use fluidbox_core::schedule::ConcurrencyPolicy;
 use fluidbox_core::spec::{
@@ -38,6 +42,11 @@ pub struct CreateRun {
     /// nothing downstream can widen it back.
     pub trust_tier: TrustTier,
     pub budget_override: Option<Budgets>,
+    /// Per-run capability keep-list (§3.5 narrowing, bundle names). None =
+    /// keep everything the revision attaches (after the subscription's own
+    /// keep-list). Removal-only by construction — an intersection can never
+    /// add a bundle the revision lacks.
+    pub capability_selection: Option<Vec<String>>,
     pub invocation: InvocationContext,
     pub result_destinations: Vec<ResultDestination>,
     /// Idempotency claim bound atomically with session creation (same DB
@@ -95,16 +104,24 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
         ));
     }
 
+    // The subscription (when the invocation carries one) governs both the
+    // §17 #5 concurrency policy and the §3.5 capability keep-list below.
+    let subscription = match req.invocation.subscription_id {
+        Some(sub_id) => Some(
+            fluidbox_db::get_trigger_subscription(&state.pool, sub_id)
+                .await?
+                .filter(|s| s.tenant_id == state.tenant_id)
+                .ok_or_else(|| {
+                    ApiError::Internal("invocation references a missing subscription".into())
+                })?,
+        ),
+        None => None,
+    };
+
     // §17 #5 (settled 2026-07-10): the subscription's concurrency policy
     // governs EVERY invocation that carries one — API invokes and schedule
     // firings alike. Manual runs carry no subscription and are never gated.
-    if let Some(sub_id) = req.invocation.subscription_id {
-        let sub = fluidbox_db::get_trigger_subscription(&state.pool, sub_id)
-            .await?
-            .filter(|s| s.tenant_id == state.tenant_id)
-            .ok_or_else(|| {
-                ApiError::Internal("invocation references a missing subscription".into())
-            })?;
+    if let Some(sub) = &subscription {
         let concurrency = ConcurrencyPolicy::parse(&sub.concurrency_policy).ok_or_else(|| {
             ApiError::Internal(format!(
                 "bad stored concurrency_policy '{}'",
@@ -112,7 +129,7 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
             ))
         })?;
         if concurrency != ConcurrencyPolicy::Allow {
-            let active = fluidbox_db::active_subscription_sessions(&state.pool, sub_id).await?;
+            let active = fluidbox_db::active_subscription_sessions(&state.pool, sub.id).await?;
             match concurrency {
                 ConcurrencyPolicy::SkipIfRunning => {
                     if let Some(s) = active.first() {
@@ -173,6 +190,18 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
         }
     }
 
+    // Effective capabilities (design §4): revision pins ∩ subscription
+    // keep-list ∩ per-run keep-list ∩ trust tier — frozen with full schema
+    // snapshots. Narrowing removes, never adds.
+    let capabilities = frozen_capabilities(
+        state,
+        &rev,
+        subscription.as_ref(),
+        req.capability_selection.as_deref(),
+        req.trust_tier,
+    )
+    .await?;
+
     let run_spec = RunSpec {
         agent_id: agent.id,
         agent_revision_id: rev.id,
@@ -191,6 +220,7 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
         policy_snapshot: policy,
         invocation: req.invocation.clone(),
         result_destinations: req.result_destinations.clone(),
+        capabilities,
     };
 
     let session = fluidbox_db::create_session(
@@ -222,8 +252,120 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
     )
     .await;
 
+    // Timeline visibility for the frozen capability set (the RunSpec is the
+    // authoritative copy).
+    if !run_spec.capabilities.is_empty() {
+        crate::ledger::record(
+            state,
+            session.id,
+            fluidbox_core::event::Actor::System,
+            fluidbox_core::event::EventBody::CapabilitiesFrozen {
+                bundles: run_spec
+                    .capabilities
+                    .iter()
+                    .map(|b| format!("{}@{}", b.name, b.version))
+                    .collect(),
+                tools: run_spec
+                    .capabilities
+                    .iter()
+                    .flat_map(|b| &b.servers)
+                    .map(|s| s.tools().len() as u64)
+                    .sum(),
+            },
+        )
+        .await;
+    }
+
     // Kick off the run.
     orchestrator::spawn_run(state.clone(), session.id);
 
     Ok(RunCreation::Created(Box::new(session)))
+}
+
+/// Resolve the run's frozen capability set (design §3.6/§8). The revision's
+/// §17 #7 pins load the exact registered bundle versions — snapshots and
+/// all — then the subscription's and the invocation's keep-lists intersect
+/// them (remove-only), the trust tier gets its say, and fail-closed checks
+/// run BEFORE any model spend.
+async fn frozen_capabilities(
+    state: &AppState,
+    rev: &fluidbox_db::AgentRevisionRow,
+    subscription: Option<&fluidbox_db::TriggerSubscriptionRow>,
+    manual_keep: Option<&[String]>,
+    trust_tier: TrustTier,
+) -> ApiResult<Vec<FrozenBundle>> {
+    // Fork / untrusted event sources run with ZERO MCP surface (§7.3): the
+    // read-only gate would deny every mcp__* call anyway; stripping here
+    // means hostile repo content never even meets a capability server.
+    if trust_tier == TrustTier::ReadOnly {
+        return Ok(vec![]);
+    }
+    let refs: Vec<BundleRef> = serde_json::from_value(rev.capability_bundles.clone())
+        .map_err(|e| ApiError::Internal(format!("bad stored capability pins: {e}")))?;
+    let mut bundles = Vec::with_capacity(refs.len());
+    for r in refs {
+        let row = fluidbox_db::get_capability_bundle(&state.pool, r.id)
+            .await?
+            .filter(|b| {
+                b.tenant_id == state.tenant_id && b.name == r.name && b.version == r.version
+            })
+            .ok_or_else(|| {
+                ApiError::Internal(format!(
+                    "pinned capability bundle {}@{} is missing",
+                    r.name, r.version
+                ))
+            })?;
+        let def: CapabilityBundleDef = serde_json::from_value(row.definition.clone())
+            .map_err(|e| ApiError::Internal(format!("bad stored bundle definition: {e}")))?;
+        bundles.push(FrozenBundle {
+            id: row.id,
+            name: row.name,
+            version: row.version,
+            definition_digest: row.definition_digest,
+            servers: def.servers,
+        });
+    }
+    if let Some(sub) = subscription {
+        if let Some(v) = &sub.capability_bundles {
+            let keep: Vec<String> = serde_json::from_value(v.clone()).map_err(|e| {
+                ApiError::Internal(format!("bad stored subscription capability keep-list: {e}"))
+            })?;
+            bundles = narrow_bundles(bundles, Some(&keep));
+        }
+    }
+    if manual_keep.is_some() {
+        bundles = narrow_bundles(bundles, manual_keep);
+    }
+    // Shadowing defense: one alias, one server, across the whole frozen set.
+    if let Some(name) = server_collision(&bundles) {
+        return Err(ApiError::BadRequest(format!(
+            "capability server name '{name}' appears in more than one attached bundle — narrow the set or re-bundle"
+        )));
+    }
+    // A brokered server's connection must still be usable at run time (it
+    // may have been revoked since the bundle was registered) — fail closed
+    // during creation, before any model spend.
+    for bundle in &bundles {
+        for server in &bundle.servers {
+            if let CapabilityServer::Brokered {
+                name,
+                connection_id: Some(cid),
+                ..
+            } = server
+            {
+                let active = fluidbox_db::get_connection(&state.pool, *cid)
+                    .await?
+                    .filter(|c| c.tenant_id == state.tenant_id)
+                    .map(|c| c.status == "active")
+                    .unwrap_or(false);
+                if !active {
+                    return Err(ApiError::BadRequest(format!(
+                        "capability server '{name}' (bundle {}@{}) uses connection {cid} which is not active — reconnect it or narrow the capabilities",
+                        bundle.name, bundle.version
+                    )));
+                }
+            }
+        }
+    }
+    Ok(bundles)
 }

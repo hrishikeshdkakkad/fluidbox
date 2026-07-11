@@ -97,6 +97,7 @@ pub async fn run(
             default_policy_id,
             &budgets,
             None,
+            &serde_json::json!([]),
         )
         .await?;
         tracing::info!("seeded agent claude-fixer rev 1");

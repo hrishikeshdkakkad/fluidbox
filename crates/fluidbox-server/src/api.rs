@@ -169,6 +169,68 @@ async fn default_workspace_value(
     }
 }
 
+// ─── Capability attachment (§17 #7: pin-only) ─────────────────────────────
+
+/// Resolve `"name"` / `"name@version"` refs into exact pins. A bare name
+/// pins the newest version AT ATTACH TIME — nothing floats afterwards;
+/// upgrading a bundle means appending a new agent revision. Server-alias
+/// collisions across the attached set are refused here so the run-time
+/// intersection can never materialize a shadowed tool.
+pub(crate) async fn resolve_bundle_pins(state: &AppState, specs: &[String]) -> ApiResult<Value> {
+    use fluidbox_core::capability::{
+        server_collision, BundleRef, CapabilityBundleDef, FrozenBundle,
+    };
+    let mut refs: Vec<BundleRef> = Vec::with_capacity(specs.len());
+    let mut frozen: Vec<FrozenBundle> = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let spec = spec.trim();
+        let (name, version) = match spec.split_once('@') {
+            Some((n, v)) => (
+                n.trim(),
+                Some(v.trim().parse::<i32>().map_err(|_| {
+                    ApiError::BadRequest(format!("bad bundle version in '{spec}'"))
+                })?),
+            ),
+            None => (spec, None),
+        };
+        if refs.iter().any(|r| r.name == name) {
+            return Err(ApiError::BadRequest(format!(
+                "bundle '{name}' is attached more than once"
+            )));
+        }
+        let row = match version {
+            Some(v) => {
+                fluidbox_db::get_capability_bundle_version(&state.pool, state.tenant_id, name, v)
+                    .await?
+            }
+            None => {
+                fluidbox_db::latest_capability_bundle(&state.pool, state.tenant_id, name).await?
+            }
+        }
+        .ok_or_else(|| ApiError::BadRequest(format!("unknown capability bundle '{spec}'")))?;
+        let def: CapabilityBundleDef = serde_json::from_value(row.definition.clone())
+            .map_err(|e| ApiError::Internal(format!("bad stored bundle definition: {e}")))?;
+        refs.push(BundleRef {
+            id: row.id,
+            name: row.name.clone(),
+            version: row.version,
+        });
+        frozen.push(FrozenBundle {
+            id: row.id,
+            name: row.name,
+            version: row.version,
+            definition_digest: row.definition_digest,
+            servers: def.servers,
+        });
+    }
+    if let Some(name) = server_collision(&frozen) {
+        return Err(ApiError::BadRequest(format!(
+            "capability server name '{name}' appears in more than one attached bundle"
+        )));
+    }
+    Ok(serde_json::to_value(&refs)?)
+}
+
 // ─── Health ───────────────────────────────────────────────────────────────
 
 pub async fn health() -> Json<Value> {
@@ -197,6 +259,10 @@ pub struct CreateAgent {
     pub budgets: Option<Budgets>,
     #[serde(default)]
     pub default_workspace: Option<WorkspaceInput>,
+    /// Capability bundles to attach: "name" (pins the newest version now)
+    /// or "name@version" (§17 #7 pin-only).
+    #[serde(default)]
+    pub capability_bundles: Option<Vec<String>>,
 }
 
 pub async fn create_agent(
@@ -219,6 +285,10 @@ pub async fn create_agent(
         .ok_or_else(|| ApiError::BadRequest(format!("unknown policy '{policy_name}'")))?;
     let budgets = req.budgets.unwrap_or_default();
     let default_workspace = default_workspace_value(&state, req.default_workspace).await?;
+    let capability_pins = match &req.capability_bundles {
+        Some(specs) => resolve_bundle_pins(&state, specs).await?,
+        None => json!([]),
+    };
     let rev = fluidbox_db::append_agent_revision(
         &state.pool,
         agent.id,
@@ -231,6 +301,7 @@ pub async fn create_agent(
         policy.id,
         &serde_json::to_value(&budgets)?,
         default_workspace.as_ref(),
+        &capability_pins,
     )
     .await?;
 
@@ -266,6 +337,11 @@ pub struct AddRevision {
     /// `{"kind":"scratch"}` clears the default.
     #[serde(default)]
     pub default_workspace: Option<WorkspaceInput>,
+    /// Omitted → inherit the latest revision's pins. An explicit `[]`
+    /// clears them; entries re-resolve ("name" pins the newest version NOW
+    /// — this is how a bundle upgrade lands: append a revision, §17 #7).
+    #[serde(default)]
+    pub capability_bundles: Option<Vec<String>>,
 }
 
 pub async fn add_revision(
@@ -301,6 +377,15 @@ pub async fn add_revision(
         Some(input) => default_workspace_value(&state, Some(input)).await?,
         None => latest.as_ref().and_then(|r| r.default_workspace.clone()),
     };
+    // Omitted → inherit the previous pins verbatim; explicit list (incl.
+    // []) re-resolves — the §17 #7 upgrade path.
+    let capability_pins = match &req.capability_bundles {
+        Some(specs) => resolve_bundle_pins(&state, specs).await?,
+        None => latest
+            .as_ref()
+            .map(|r| r.capability_bundles.clone())
+            .unwrap_or_else(|| json!([])),
+    };
 
     let rev = fluidbox_db::append_agent_revision(
         &state.pool,
@@ -323,6 +408,7 @@ pub async fn add_revision(
         policy_id,
         &budgets,
         default_workspace.as_ref(),
+        &capability_pins,
     )
     .await?;
     Ok(Json(json!({ "revision": rev })))
@@ -390,6 +476,10 @@ pub struct CreateSession {
     /// Optional per-run budget tightening.
     #[serde(default)]
     pub budgets: Option<Budgets>,
+    /// Optional per-run capability narrowing: a keep-list of bundle names
+    /// intersected with the revision's attachments (remove-only, §3.5).
+    #[serde(default)]
+    pub capabilities: Option<Vec<String>>,
 }
 
 pub async fn create_session(
@@ -424,6 +514,7 @@ pub async fn create_session(
             autonomy,
             trust_tier: fluidbox_core::spec::TrustTier::Trusted,
             budget_override: req.budgets,
+            capability_selection: req.capabilities,
             invocation: InvocationContext {
                 kind: InvocationKind::Manual,
                 subscription_id: None,

@@ -21,6 +21,25 @@ const MODEL = process.env.FLUIDBOX_MODEL || "claude-haiku-4-5";
 const WORKSPACE = process.env.FLUIDBOX_WORKSPACE || "/workspace";
 const SYSTEM_PROMPT = process.env.FLUIDBOX_SYSTEM_PROMPT || undefined;
 const MAX_TURNS = parseInt(process.env.FLUIDBOX_MAX_TURNS || "60", 10);
+// The FROZEN capability manifest (control plane strips broker internals —
+// this process never sees upstream URLs or credentials).
+const CAPABILITIES = (() => {
+  const raw = process.env.FLUIDBOX_CAPABILITIES;
+  if (!raw) return { servers: [] };
+  try {
+    const parsed = JSON.parse(raw);
+    return { servers: Array.isArray(parsed?.servers) ? parsed.servers : [] };
+  } catch (e) {
+    console.error("fluidbox-runner: bad FLUIDBOX_CAPABILITIES (ignoring):", e.message);
+    return { servers: [] };
+  }
+})();
+// Brokered server aliases: their calls are gated (and executed) by the
+// control plane's /tools/call endpoint — canUseTool waves them through so
+// each call is decided exactly once, server-side.
+const BROKERED = new Set(
+  CAPABILITIES.servers.filter((s) => s.class === "brokered").map((s) => s.name),
+);
 
 function requireEnv(k) {
   const v = process.env[k];
@@ -124,6 +143,44 @@ function textFromMessage(msg) {
     .join("");
 }
 
+// `mcp__<server>__<tool>` → server alias (server aliases contain no
+// underscores, so the first `__` after the prefix splits unambiguously).
+function mcpServerOf(toolName) {
+  if (!toolName.startsWith("mcp__")) return null;
+  const rest = toolName.slice(5);
+  const i = rest.indexOf("__");
+  return i > 0 ? rest.slice(0, i) : null;
+}
+
+// Build the SDK mcpServers config from the frozen manifest: sandbox-class
+// servers launch as stdio subprocesses inside this container; brokered
+// servers get the broker shim, which forwards intents to the control plane.
+function mcpServersConfig() {
+  const servers = {};
+  for (const srv of CAPABILITIES.servers) {
+    if (srv.class === "sandbox") {
+      servers[srv.name] = {
+        type: "stdio",
+        command: srv.command,
+        args: srv.args || [],
+        env: { ...process.env },
+      };
+    } else if (srv.class === "brokered") {
+      servers[srv.name] = {
+        type: "stdio",
+        command: "node",
+        args: ["/opt/fluidbox-runner/broker-shim.mjs"],
+        env: {
+          ...process.env,
+          FLUIDBOX_BROKER_SERVER: srv.name,
+          FLUIDBOX_BROKER_TOOLS: JSON.stringify(srv.tools || []),
+        },
+      };
+    }
+  }
+  return servers;
+}
+
 async function main() {
   await emit("harness", {
     type: "agent.message",
@@ -132,6 +189,15 @@ async function main() {
   startHeartbeat();
 
   const canUseTool = async (toolName, input, opts) => {
+    // Brokered tools are gated (and executed) server-side at /tools/call —
+    // the broker owns their whole ledger trail, so waving them through here
+    // decides each call exactly once, always on the control plane. A runner
+    // that "forgot" this callback entirely would change nothing: the broker
+    // gates regardless.
+    const mcpServer = mcpServerOf(toolName);
+    if (mcpServer && BROKERED.has(mcpServer)) {
+      return { behavior: "allow", updatedInput: input };
+    }
     const toolUseId = opts?.toolUseID || `tu_${Date.now()}_${Math.random().toString(36).slice(2)}`;
     await emit("agent", {
       type: "tool.requested",
@@ -152,6 +218,19 @@ async function main() {
     };
   };
 
+  const mcpServers = mcpServersConfig();
+  if (Object.keys(mcpServers).length > 0) {
+    await emit("harness", {
+      type: "agent.message",
+      data: {
+        role: "system",
+        text: `capability servers mounted: ${CAPABILITIES.servers
+          .map((s) => `${s.name} (${s.class})`)
+          .join(", ")}`,
+      },
+    });
+  }
+
   let finalText = "";
   let hadError = null;
   try {
@@ -163,6 +242,9 @@ async function main() {
         cwd: WORKSPACE,
         canUseTool,
         maxTurns: MAX_TURNS,
+        // The FROZEN capability manifest, mounted (sandbox stdio servers +
+        // broker shims). Undefined when the run carries no capabilities.
+        mcpServers: Object.keys(mcpServers).length > 0 ? mcpServers : undefined,
         // Clean sandbox: do not load host/user/project settings files.
         settingSources: [],
         // Everything routes through canUseTool → our gateway.

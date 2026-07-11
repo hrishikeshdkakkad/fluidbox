@@ -13,6 +13,8 @@ COPY runner/package.json ./package.json
 RUN npm install --omit=dev && npm cache clean --force
 
 COPY runner/index.mjs ./index.mjs
+COPY runner/broker-shim.mjs ./broker-shim.mjs
+COPY runner/servers ./servers
 
 # Non-root. /workspace is bind-mounted rw by the provider.
 RUN useradd -m -u 10001 runner \
