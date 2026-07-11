@@ -126,22 +126,47 @@ pub(crate) fn open_flow_token(
     Ok((flow, reg))
 }
 
+/// Can GitHub deliver webhooks to this deployment? github.com REJECTS a
+/// manifest whose hook URL is loopback ("Hook url is not supported because
+/// it isn't reachable over the public Internet"), so local deployments
+/// must omit the webhook entirely — the app still creates, fetch/publish
+/// work, and the registration is marked degraded until recreated behind a
+/// public URL.
+pub(crate) fn webhook_capable(public_url: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(public_url) else {
+        return false;
+    };
+    let Some(host) = u.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return false;
+    }
+    if let Ok(ip) = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+        let private_v4 = match ip {
+            std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+            std::net::IpAddr::V6(_) => false,
+        };
+        return !(ip.is_loopback() || ip.is_unspecified() || private_v4);
+    }
+    true
+}
+
 /// The manifest GitHub receives. Built server-side so the dashboard never
 /// sees GitHub shapes; the registration id is embedded in the webhook and
 /// setup URLs — that is how the unauthenticated ingress/setup endpoints
 /// identify their registration without trusting GitHub-supplied values.
+/// Loopback/private deployments omit `hook_attributes` (see
+/// `webhook_capable`); browser redirects (redirect/setup URLs) work on any
+/// host, so those stay.
 pub(crate) fn build_manifest(public_url: &str, registration_id: Uuid) -> Value {
     let host_hint = reqwest::Url::parse(public_url)
         .ok()
         .and_then(|u| u.host_str().map(|h| h.replace('.', "-")))
         .unwrap_or_else(|| "local".into());
-    json!({
+    let mut m = json!({
         "name": format!("fluidbox-{host_hint}"),
         "url": public_url,
-        "hook_attributes": {
-            "url": format!("{public_url}/v1/ingress/github/app/{registration_id}"),
-            "active": true,
-        },
         "redirect_url": format!("{public_url}/v1/github/app/manifest/callback"),
         "setup_url": format!("{public_url}/v1/github/app/{registration_id}/setup"),
         "setup_on_update": true,
@@ -152,7 +177,14 @@ pub(crate) fn build_manifest(public_url: &str, registration_id: Uuid) -> Value {
             "checks": "write",
         },
         "default_events": ["pull_request"],
-    })
+    });
+    if webhook_capable(public_url) {
+        m["hook_attributes"] = json!({
+            "url": format!("{public_url}/v1/ingress/github/app/{registration_id}"),
+            "active": true,
+        });
+    }
+    m
 }
 
 /// Where the manifest form POSTs: the account or organization app-creation
@@ -651,10 +683,17 @@ pub async fn manifest_go(State(state): State<AppState>, Query(q): Query<GoParams
         reg.target_org.as_deref(),
         &state_param,
     );
+    let hook_note = if webhook_capable(&state.cfg.public_url) {
+        "and its webhook pre-wired"
+    } else {
+        "— WITHOUT a webhook, because FLUIDBOX_PUBLIC_URL is not publicly reachable (github.com \
+         refuses loopback hook URLs). Workspaces and publishing will work; PR events need a \
+         public URL and a recreated app"
+    };
     let body = format!(
         "<p>fluidbox will ask GitHub to create a <b>private GitHub App</b> with exactly the \
-         permissions it needs (contents: read, pull requests: write, checks: write) and its \
-         webhook pre-wired. You can adjust the name on GitHub's confirmation page; the app \
+         permissions it needs (contents: read, pull requests: write, checks: write) {hook_note}. \
+         You can adjust the name on GitHub's confirmation page; the app \
          installs on the account that owns it.</p>\
          <form method=\"post\" action=\"{action}\">\
          <input type=\"hidden\" name=\"manifest\" value=\"{manifest}\">\
@@ -806,7 +845,13 @@ pub async fn manifest_callback(
     let slug = conv.slug.clone().unwrap_or_else(|| conv.name.clone());
     let owner_login = conv.owner.as_ref().and_then(|o| o.login.clone());
     let pem_sealed = sealer_ref.seal(&conv.pem);
-    let webhook_sealed = conv.webhook_secret.as_deref().map(|s| sealer_ref.seal(s));
+    // If the manifest omitted the webhook (local deployment), a secret in
+    // the response is meaningless — never custody what we didn't wire.
+    let webhook_sealed = if webhook_capable(&state.cfg.public_url) {
+        conv.webhook_secret.as_deref().map(|s| sealer_ref.seal(s))
+    } else {
+        None
+    };
     let client_sealed = conv.client_secret.as_deref().map(|s| sealer_ref.seal(s));
     let activated = fluidbox_db::activate_github_app_registration(
         &state.pool,
@@ -860,7 +905,11 @@ pub async fn manifest_callback(
         }
         Err(_) => String::new(),
     };
-    let degraded = if conv.webhook_secret.is_none() {
+    let degraded = if !webhook_capable(&state.cfg.public_url) {
+        "<p><b>Note:</b> FLUIDBOX_PUBLIC_URL is not publicly reachable, so the app was created \
+         WITHOUT a webhook — workspaces and result publishing work, but PR events cannot arrive. \
+         To receive events: set a public FLUIDBOX_PUBLIC_URL (e.g. a tunnel) and create a new app.</p>"
+    } else if conv.webhook_secret.is_none() {
         "<p><b>Note:</b> GitHub returned no webhook secret — event ingress is disabled for this app (fetch and publish still work). Recreate the app to fix this.</p>"
     } else {
         ""
@@ -1333,6 +1382,28 @@ mod tests {
 
     fn test_sealer() -> Sealer {
         Sealer::from_key_string(&"ab".repeat(32)).unwrap()
+    }
+
+    #[test]
+    fn webhook_capability_follows_public_reachability() {
+        // github.com refuses loopback/private hook URLs at manifest time.
+        assert!(webhook_capable("https://fbx.example.com"));
+        assert!(webhook_capable("http://fbx.example.com:8443"));
+        assert!(!webhook_capable("http://127.0.0.1:8787"));
+        assert!(!webhook_capable("http://localhost:8787"));
+        assert!(!webhook_capable("https://[::1]:8787"));
+        assert!(!webhook_capable("http://192.168.1.10:8787"));
+        assert!(!webhook_capable("http://10.0.0.5"));
+        assert!(!webhook_capable("not a url"));
+    }
+
+    #[test]
+    fn loopback_manifest_omits_the_webhook_entirely() {
+        let m = build_manifest("http://127.0.0.1:8787", Uuid::now_v7());
+        assert!(m.get("hook_attributes").is_none());
+        // Browser-redirect URLs stay — they run in the USER'S browser.
+        assert!(m["redirect_url"].as_str().unwrap().contains("127.0.0.1"));
+        assert!(m["setup_url"].as_str().unwrap().contains("/setup"));
     }
 
     #[test]
