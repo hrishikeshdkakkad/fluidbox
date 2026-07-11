@@ -1,0 +1,112 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { apiGet, BundleRef, CapabilityBundle } from "../lib/api";
+
+/** Multi-select over the capability-bundle registry. Selection is EXPLICIT
+ *  pins (name@version — §17 #7 made visible): a bundle already pinned keeps
+ *  its version unless deliberately changed; newly checked names default to
+ *  the latest version. Nothing floats. */
+export function BundlePicker({
+  pins,
+  onChange,
+}: {
+  pins: BundleRef[];
+  onChange: (pins: BundleRef[]) => void;
+}) {
+  const [registry, setRegistry] = useState<CapabilityBundle[]>([]);
+  useEffect(() => {
+    apiGet<{ bundles: CapabilityBundle[] }>("/capabilities")
+      .then((r) => setRegistry(r.bundles))
+      .catch(() => {
+        /* offline handled by rail */
+      });
+  }, []);
+
+  // The list is (name, version desc) ordered — group to versions per name.
+  const byName = new Map<string, CapabilityBundle[]>();
+  for (const b of registry) {
+    const l = byName.get(b.name) || [];
+    l.push(b);
+    byName.set(b.name, l);
+  }
+  const names = [...byName.keys()];
+  const pinOf = (name: string) => pins.find((p) => p.name === name);
+
+  const toggle = (name: string) => {
+    const cur = pinOf(name);
+    if (cur) {
+      onChange(pins.filter((p) => p.name !== name));
+    } else {
+      const latest = byName.get(name)![0];
+      onChange([...pins, { id: latest.id, name, version: latest.version }]);
+    }
+  };
+  const setVersion = (name: string, version: number) => {
+    const row = byName.get(name)!.find((b) => b.version === version);
+    if (!row) return;
+    onChange(pins.map((p) => (p.name === name ? { id: row.id, name, version } : p)));
+  };
+
+  if (names.length === 0) {
+    return (
+      <div className="field">
+        <span className="lab">Capability bundles</span>
+        <span className="mut" style={{ fontSize: 12 }}>
+          none registered — connect one from the catalog on the Capabilities page
+        </span>
+      </div>
+    );
+  }
+  return (
+    <div className="field">
+      <span className="lab">Capability bundles (exact pins — upgrading is a deliberate act)</span>
+      <div style={{ display: "grid", gap: 6 }}>
+        {names.map((name) => {
+          const versions = byName.get(name)!;
+          const latest = versions[0];
+          const pin = pinOf(name);
+          const shown = pin
+            ? (versions.find((v) => v.version === pin.version) ?? latest)
+            : latest;
+          return (
+            <label
+              key={name}
+              style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}
+            >
+              <input type="checkbox" checked={!!pin} onChange={() => toggle(name)} />
+              <span className="mono" style={{ color: "var(--accent)" }}>
+                {name}
+              </span>
+              {pin ? (
+                <select
+                  className="inp"
+                  style={{ width: "auto", padding: "2px 6px", fontSize: 12 }}
+                  value={pin.version}
+                  onChange={(e) => setVersion(name, Number(e.target.value))}
+                >
+                  {versions.map((v) => (
+                    <option key={v.version} value={v.version}>
+                      @{v.version}
+                      {v.version === latest.version ? " (latest)" : ""}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <span className="mut" style={{ fontSize: 12 }}>
+                  latest @{latest.version}
+                </span>
+              )}
+              <span className="mut" style={{ fontSize: 11.5 }}>
+                {shown.tool_count} tool{shown.tool_count === 1 ? "" : "s"}
+                {shown.classes.length > 0
+                  ? ` · ${[...new Set(shown.classes)].join("+")}`
+                  : ""}
+              </span>
+            </label>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
