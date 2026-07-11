@@ -112,7 +112,11 @@ export default function Connections() {
       return r.authorize_url;
     });
 
-  const activeRegs = registrations.filter((r) => r.status === "active");
+  // Revoked registrations are history, not workspace: hide them (the DB
+  // keeps them — the FK is RESTRICT by design). The setup card shows
+  // whenever nothing usable exists.
+  const visibleRegs = registrations.filter((r) => r.status !== "revoked");
+  const activeRegs = visibleRegs.filter((r) => r.status === "active");
 
   return (
     <>
@@ -136,7 +140,7 @@ export default function Connections() {
 
       {/* ── GitHub App: the seamless path ─────────────────────────────── */}
       <div className="panel" style={{ marginBottom: 16 }}>
-        {registrations.length === 0 ? (
+        {visibleRegs.length === 0 ? (
           <div style={{ padding: 4 }}>
             <div style={{ fontFamily: "var(--font-mono)", fontSize: 14, marginBottom: 6 }}>
               Connect GitHub
@@ -162,7 +166,7 @@ export default function Connections() {
           </div>
         ) : (
           <div className="rows">
-            {registrations.map((r) => (
+            {visibleRegs.map((r) => (
               <div
                 key={r.id}
                 className="row"
@@ -242,15 +246,15 @@ export default function Connections() {
         )}
       </div>
 
-      {/* ── Connections ───────────────────────────────────────────────── */}
+      {/* ── Connections (revoked rows are history — hidden) ──────────── */}
       <div className="panel">
-        {connections.length === 0 ? (
+        {connections.filter((c) => c.status !== "revoked").length === 0 ? (
           <div className="empty">
             no connections — set up the GitHub App above, then Connect GitHub to pick repositories
           </div>
         ) : (
           <div className="rows">
-            {connections.map((c) => (
+            {connections.filter((c) => c.status !== "revoked").map((c) => (
               <div
                 key={c.id}
                 className="row"
