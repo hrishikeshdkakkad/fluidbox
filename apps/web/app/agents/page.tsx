@@ -1,7 +1,16 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import { apiGet, apiPost, Agent, Revision, workspaceLabel, bundleRefsLabel } from "../lib/api";
+import {
+  apiGet,
+  apiPost,
+  Agent,
+  BundleRef,
+  Revision,
+  workspaceLabel,
+  bundleRefsLabel,
+} from "../lib/api";
+import { BundlePicker } from "../components/BundlePicker";
 import { PageHead, short } from "../components/bits";
 import {
   WorkspacePicker,
@@ -158,9 +167,7 @@ function AddRevision({
   const [workspace, setWorkspace] = useState<WorkspaceDraft>(
     specToDraft(current?.default_workspace)
   );
-  const [capabilities, setCapabilities] = useState(
-    bundleRefsLabel(current?.capability_bundles)
-  );
+  const [pins, setPins] = useState<BundleRef[]>(current?.capability_bundles ?? []);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
@@ -170,16 +177,14 @@ function AddRevision({
     try {
       // Inherits harness/policy/image/budgets from the latest revision.
       // The workspace is sent explicitly (WYSIWYG): scratch clears a default.
-      // Capability pins are WYSIWYG too: the field's refs re-resolve now
-      // (§17 #7 — a bare name pins the newest version at attach time).
+      // Capability pins are WYSIWYG too: exactly the name@version refs
+      // shown in the picker are attached (§17 #7 — nothing floats, and an
+      // existing pin never upgrades unless its version was changed here).
       await apiPost(`/agents/${agentId}/revisions`, {
         model,
         system_prompt: systemPrompt.trim() || null,
         default_workspace: draftToInput(workspace),
-        capability_bundles: capabilities
-          .split(",")
-          .map((s) => s.trim())
-          .filter(Boolean),
+        capability_bundles: pins.map((p) => `${p.name}@${p.version}`),
       });
       onAdded();
     } catch (e) {
@@ -227,17 +232,7 @@ function AddRevision({
             />
           </label>
           <WorkspacePicker draft={workspace} onChange={setWorkspace} />
-          <label className="field">
-            <span className="lab">
-              Capability bundles (comma-separated: name pins latest now, or name@version)
-            </span>
-            <input
-              className="inp mono"
-              value={capabilities}
-              onChange={(e) => setCapabilities(e.target.value)}
-              placeholder="kb-tools, ws-tools@2 — empty = none"
-            />
-          </label>
+          <BundlePicker pins={pins} onChange={setPins} />
           {err && <div className="err">{err}</div>}
           <div className="spread" style={{ marginTop: 14 }}>
             <span className="mut" style={{ fontSize: 12 }}>
@@ -259,7 +254,7 @@ function NewAgent({ onClose, onCreated }: { onClose: () => void; onCreated: () =
   const [model, setModel] = useState("claude-haiku-4-5");
   const [systemPrompt, setSystemPrompt] = useState("");
   const [workspace, setWorkspace] = useState<WorkspaceDraft>(emptyDraft("scratch"));
-  const [capabilities, setCapabilities] = useState("");
+  const [pins, setPins] = useState<BundleRef[]>([]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
@@ -271,10 +266,7 @@ function NewAgent({ onClose, onCreated }: { onClose: () => void; onCreated: () =
     }
     setBusy(true);
     try {
-      const bundles = capabilities
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
+      const bundles = pins.map((p) => `${p.name}@${p.version}`);
       await apiPost("/agents", {
         name: name.trim(),
         description: description.trim() || null,
@@ -322,15 +314,7 @@ function NewAgent({ onClose, onCreated }: { onClose: () => void; onCreated: () =
             <textarea className="inp" style={{ minHeight: 70 }} value={systemPrompt} onChange={(e) => setSystemPrompt(e.target.value)} />
           </label>
           <WorkspacePicker draft={workspace} onChange={setWorkspace} />
-          <label className="field">
-            <span className="lab">Capability bundles (optional, comma-separated)</span>
-            <input
-              className="inp mono"
-              value={capabilities}
-              onChange={(e) => setCapabilities(e.target.value)}
-              placeholder="kb-tools, ws-tools@2"
-            />
-          </label>
+          <BundlePicker pins={pins} onChange={setPins} />
           {err && <div className="err">{err}</div>}
           <div className="spread" style={{ marginTop: 16 }}>
             <span className="mut" style={{ fontSize: 12 }}>
