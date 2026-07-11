@@ -1,18 +1,32 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { apiGet, apiPost, Connection, ingressPath } from "../lib/api";
+import {
+  apiGet,
+  apiPost,
+  appIngressPath,
+  Connection,
+  GithubAppRegistration,
+  ingressPath,
+} from "../lib/api";
 import { PageHead } from "../components/bits";
 
 export default function Connections() {
   const [connections, setConnections] = useState<Connection[]>([]);
-  const [showNew, setShowNew] = useState(false);
+  const [registrations, setRegistrations] = useState<GithubAppRegistration[]>([]);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [org, setOrg] = useState("");
   const [err, setErr] = useState("");
+  const [note, setNote] = useState("");
 
   const load = useCallback(async () => {
     try {
-      const r = await apiGet<{ connections: Connection[] }>("/connections");
-      setConnections(r.connections);
+      const [c, r] = await Promise.all([
+        apiGet<{ connections: Connection[] }>("/connections"),
+        apiGet<{ registrations: GithubAppRegistration[] }>("/github/app"),
+      ]);
+      setConnections(c.connections);
+      setRegistrations(r.registrations);
     } catch {
       /* offline handled by rail */
     }
@@ -20,29 +34,85 @@ export default function Connections() {
 
   useEffect(() => {
     load();
+    // Returning from the GitHub tab should show the new state without a
+    // manual refresh.
+    window.addEventListener("focus", load);
+    return () => window.removeEventListener("focus", load);
   }, [load]);
 
-  const revoke = async (id: string) => {
+  const act = async (fn: () => Promise<void>) => {
     setErr("");
+    setNote("");
     try {
-      await apiPost(`/connections/${id}/revoke`, {});
+      await fn();
       load();
     } catch (e) {
       setErr(String(e));
     }
   };
 
+  // Browsers void the click gesture across an await (popup blockers eat a
+  // late window.open) — open the tab synchronously, then point it at the
+  // URL the API returns.
+  const openVia = (getUrl: () => Promise<string>) => {
+    const tab = window.open("", "_blank");
+    act(async () => {
+      try {
+        const url = await getUrl();
+        if (tab) tab.location.href = url;
+        else window.location.href = url;
+      } catch (e) {
+        tab?.close();
+        throw e;
+      }
+    });
+  };
+
+  // The manifest dance: the server mints a one-time flow; the browser tab
+  // we open is what gets bound to it (cookie), then continues to GitHub.
+  const setupApp = () =>
+    openVia(async () => {
+      const r = await apiPost<{ go_url: string }>("/github/app/manifest/start", {
+        organization: org.trim() || null,
+      });
+      return r.go_url;
+    });
+
+  const connectGithub = (regId: string) =>
+    openVia(async () => {
+      const r = await apiPost<{ go_url: string }>(`/github/app/${regId}/install/start`, {});
+      return r.go_url;
+    });
+
+  const syncReg = (regId: string) =>
+    act(async () => {
+      const r = await apiPost<{ synced: unknown[]; conflicts: unknown[] }>(
+        `/github/app/${regId}/sync`,
+        {}
+      );
+      setNote(`sync: ${r.synced.length} installation(s) reconciled, ${r.conflicts.length} conflict(s)`);
+    });
+
+  const revokeReg = (regId: string) =>
+    act(async () => {
+      await apiPost(`/github/app/${regId}/revoke`, {});
+    });
+
+  const revoke = (id: string) => act(async () => void (await apiPost(`/connections/${id}/revoke`, {})));
+
+  // pending (webhook-discovered) → activate; revoked/suspended/error
+  // registration-backed rows → revive. One explicit admin act either way.
+  const approve = (id: string) => act(async () => void (await apiPost(`/connections/${id}/approve`, {})));
+
   // Restart the OAuth dance on the SAME connection (pending rows finish it,
   // errored rows revive after invalid_grant — nothing is recreated).
-  const reconnect = async (id: string) => {
-    setErr("");
-    try {
+  const reconnectOauth = (id: string) =>
+    openVia(async () => {
       const r = await apiPost<{ authorize_url: string }>(`/connections/${id}/oauth/start`, {});
-      window.open(r.authorize_url, "_blank", "noopener");
-    } catch (e) {
-      setErr(String(e));
-    }
-  };
+      return r.authorize_url;
+    });
+
+  const activeRegs = registrations.filter((r) => r.status === "active");
 
   return (
     <>
@@ -51,17 +121,133 @@ export default function Connections() {
         title="Connections"
         sub="Authorized relationships with external services. A connection sets the maximum authority fluidbox can exercise — agents only ever use a narrower slice, and credentials never enter a sandbox."
         right={
-          <button className="btn primary" onClick={() => setShowNew(true)}>
-            + Connect
+          <button className="btn ghost" onClick={() => setShowAdvanced(true)}>
+            advanced
           </button>
         }
       />
 
       {err && <div className="err">{err}</div>}
+      {note && (
+        <div className="mut" style={{ fontSize: 12.5, marginBottom: 8 }}>
+          {note}
+        </div>
+      )}
 
+      {/* ── GitHub App: the seamless path ─────────────────────────────── */}
+      <div className="panel" style={{ marginBottom: 16 }}>
+        {registrations.length === 0 ? (
+          <div style={{ padding: 4 }}>
+            <div style={{ fontFamily: "var(--font-mono)", fontSize: 14, marginBottom: 6 }}>
+              Connect GitHub
+            </div>
+            <p className="mut" style={{ fontSize: 12.5, marginTop: 0, maxWidth: 640 }}>
+              One click creates a private GitHub App with exactly the permissions fluidbox needs
+              (contents: read, pull requests: write, checks: write) and its webhook pre-wired —
+              nothing to paste. The app installs on the account that owns it; leave the
+              organization blank to create it on your personal account.
+            </p>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              <input
+                className="inp mono"
+                style={{ maxWidth: 220 }}
+                placeholder="organization (optional)"
+                value={org}
+                onChange={(e) => setOrg(e.target.value)}
+              />
+              <button className="btn primary" onClick={setupApp}>
+                Set up GitHub App
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="rows">
+            {registrations.map((r) => (
+              <div
+                key={r.id}
+                className="row"
+                style={{ gridTemplateColumns: "90px 1fr auto auto", alignItems: "center" }}
+              >
+                <span className="mono" style={{ color: "var(--accent)" }}>
+                  github app
+                </span>
+                <span className="task">
+                  {r.html_url ? (
+                    <a href={r.html_url} target="_blank" rel="noreferrer">
+                      {r.name ?? r.slug ?? "pending app"}
+                    </a>
+                  ) : (
+                    (r.name ?? "pending app")
+                  )}
+                  {r.owner_login && (
+                    <span className="mut" style={{ marginLeft: 8, fontSize: 12 }}>
+                      @{r.owner_login}
+                    </span>
+                  )}
+                  {r.status === "active" && (
+                    <span
+                      className="mut mono"
+                      style={{ display: "block", fontSize: 11.5, marginTop: 2 }}
+                    >
+                      webhook → {appIngressPath(r)}
+                      {!r.has_webhook_secret && " · events disabled (no webhook secret — recreate the app)"}
+                    </span>
+                  )}
+                  <span className="mut" style={{ display: "block", fontSize: 11.5, marginTop: 2 }}>
+                    webhook delivery needs a publicly reachable FLUIDBOX_PUBLIC_URL; everything
+                    else works locally
+                  </span>
+                </span>
+                <span className={`autopill ${r.status === "active" ? "supervised" : "autonomous"}`}>
+                  {r.status}
+                </span>
+                <span style={{ display: "flex", gap: 6 }}>
+                  {r.status === "active" && (
+                    <>
+                      <button className="btn primary sm" onClick={() => connectGithub(r.id)}>
+                        Connect GitHub
+                      </button>
+                      <button className="btn ghost sm" onClick={() => syncReg(r.id)}>
+                        sync &amp; activate installs
+                      </button>
+                    </>
+                  )}
+                  {r.status !== "revoked" && (
+                    <button className="btn ghost sm" onClick={() => revokeReg(r.id)}>
+                      revoke
+                    </button>
+                  )}
+                </span>
+              </div>
+            ))}
+            <div className="row" style={{ gridTemplateColumns: "1fr auto", alignItems: "center" }}>
+              <span className="mut" style={{ fontSize: 12 }}>
+                need another account or organization? private apps install only on their owner —
+                create one app per owner
+              </span>
+              <span style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <input
+                  className="inp mono"
+                  style={{ maxWidth: 180, fontSize: 12 }}
+                  placeholder="organization (optional)"
+                  value={org}
+                  onChange={(e) => setOrg(e.target.value)}
+                />
+                <button className="btn ghost sm" onClick={setupApp}>
+                  + new app
+                </button>
+              </span>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── Connections ───────────────────────────────────────────────── */}
       <div className="panel">
         {connections.length === 0 ? (
-          <div className="empty">no connections — connect GitHub to select repositories on agents</div>
+          <div className="empty">
+            no connections — set up the GitHub App above, then Connect GitHub to pick repositories
+          </div>
         ) : (
           <div className="rows">
             {connections.map((c) => (
@@ -78,6 +264,11 @@ export default function Connections() {
                   {c.metadata?.login && c.metadata.login !== c.display_name
                     ? ` (@${c.metadata.login})`
                     : ""}
+                  {c.registration_id && (
+                    <span className="mut mono" style={{ marginLeft: 8, fontSize: 11.5 }}>
+                      via app
+                    </span>
+                  )}
                   {c.auth_kind === "oauth" && (
                     <span className="mut mono" style={{ marginLeft: 8, fontSize: 11.5 }}>
                       oauth{c.oauth?.client_id_source ? ` (${c.oauth.client_id_source})` : ""}
@@ -104,6 +295,14 @@ export default function Connections() {
                         : ""}
                     </span>
                   )}
+                  {c.registration_id && c.metadata?.installation_id && (
+                    <span
+                      className="mut mono"
+                      style={{ display: "block", fontSize: 11.5, marginTop: 2 }}
+                    >
+                      installation {c.metadata.installation_id} · events via the app webhook
+                    </span>
+                  )}
                   {c.status === "error" && c.oauth?.error && (
                     <span className="err" style={{ display: "block", fontSize: 11.5, marginTop: 2 }}>
                       {c.oauth.error}
@@ -113,28 +312,38 @@ export default function Connections() {
                 <span className={`autopill ${c.status === "active" ? "supervised" : "autonomous"}`}>
                   {c.status}
                 </span>
-                {c.status === "active" ? (
-                  <button className="btn ghost sm" onClick={() => revoke(c.id)}>
-                    revoke
-                  </button>
-                ) : c.auth_kind === "oauth" && c.status !== "revoked" ? (
-                  <button className="btn ghost sm" onClick={() => reconnect(c.id)}>
-                    reconnect
-                  </button>
-                ) : (
-                  <span />
-                )}
+                <span style={{ display: "flex", gap: 6 }}>
+                  {c.registration_id && c.status === "pending" && (
+                    <button className="btn primary sm" onClick={() => approve(c.id)}>
+                      approve
+                    </button>
+                  )}
+                  {c.registration_id && ["revoked", "suspended", "error"].includes(c.status) && (
+                    <button className="btn ghost sm" onClick={() => approve(c.id)}>
+                      reconnect
+                    </button>
+                  )}
+                  {c.status === "active" ? (
+                    <button className="btn ghost sm" onClick={() => revoke(c.id)}>
+                      revoke
+                    </button>
+                  ) : c.auth_kind === "oauth" && c.status !== "revoked" ? (
+                    <button className="btn ghost sm" onClick={() => reconnectOauth(c.id)}>
+                      reconnect
+                    </button>
+                  ) : null}
+                </span>
               </div>
             ))}
           </div>
         )}
       </div>
 
-      {showNew && (
+      {showAdvanced && (
         <NewConnection
-          onClose={() => setShowNew(false)}
+          onClose={() => setShowAdvanced(false)}
           onCreated={() => {
-            setShowNew(false);
+            setShowAdvanced(false);
             load();
           }}
         />
@@ -143,6 +352,8 @@ export default function Connections() {
   );
 }
 
+/** Manual credential entry — the fallback path. The seamless GitHub App
+ *  flow above replaces this for the common case. */
 function NewConnection({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
   const [flavor, setFlavor] = useState<"github" | "github_app">("github");
   const [token, setToken] = useState("");
@@ -199,7 +410,7 @@ function NewConnection({ onClose, onCreated }: { onClose: () => void; onCreated:
         <div className="mh">
           <div>
             <div className="eyebrow" style={{ margin: 0 }}>
-              connect service
+              advanced — manual credentials
             </div>
             <div style={{ fontFamily: "var(--font-mono)", fontSize: 15, marginTop: 4 }}>
               GitHub
@@ -210,6 +421,11 @@ function NewConnection({ onClose, onCreated }: { onClose: () => void; onCreated:
           </button>
         </div>
         <div className="mb">
+          <p className="mut" style={{ fontSize: 12.5, marginTop: 0 }}>
+            Prefer <b>Set up GitHub App</b> on the Connections page — it creates and custodies
+            everything below automatically. Use this form only for a pre-existing app or a plain
+            personal access token.
+          </p>
           <label className="field">
             <span className="lab">Connection flavor</span>
             <select
@@ -244,11 +460,10 @@ function NewConnection({ onClose, onCreated }: { onClose: () => void; onCreated:
           ) : (
             <>
               <p className="mut" style={{ fontSize: 12.5, marginTop: 0 }}>
-                Create a GitHub App in your org (permissions: Contents read, Pull requests write,
-                Checks write; subscribe to Pull request events), install it on the repositories,
-                then paste its identity here. The private key and webhook secret are validated,
-                sealed at rest, and never leave the control plane. After connecting, point the
-                App&apos;s webhook at the ingress URL shown on the connection row.
+                Paste the identity of an app you registered yourself. The private key and webhook
+                secret are validated, sealed at rest, and never leave the control plane. After
+                connecting, point the App&apos;s webhook at the ingress URL shown on the
+                connection row.
               </p>
               <label className="field">
                 <span className="lab">App ID</span>

@@ -135,12 +135,16 @@ export interface Connection {
   external_account_id: string;
   display_name: string;
   granted_scopes: string[];
-  status: string; // active | pending | error | revoked
+  status: string; // active | pending | suspended | error | revoked
+  /** Set on seamless github_app connections: custody lives on the App
+   *  registration (created via the manifest dance), not on this row. */
+  registration_id: string | null;
   metadata: {
     login?: string;
     app_slug?: string;
     account_login?: string;
     installation_id?: string;
+    registration_id?: string;
     base_url?: string;
     header_name?: string;
     scheme?: string;
@@ -197,9 +201,38 @@ export interface CatalogConnectResult {
   authorize_url?: string;
 }
 
-/** Where a github_app connection receives provider webhooks. */
+/** Where a LEGACY (hand-pasted) github_app connection receives provider
+ *  webhooks. Seamless connections receive events on their registration's
+ *  app-level ingress instead — shown on the registration card. */
 export function ingressPath(c: Connection): string | null {
-  return c.provider === "github_app" ? `/v1/ingress/github/${c.id}` : null;
+  return c.provider === "github_app" && !c.registration_id
+    ? `/v1/ingress/github/${c.id}`
+    : null;
+}
+
+/** A GitHub App created through the manifest dance (one per GitHub
+ *  account/org — private apps install only on the account that owns them).
+ *  Secrets never appear here; the server custodies them sealed. */
+export interface GithubAppRegistration {
+  id: string;
+  status: string; // pending | active | revoked
+  target_kind: string; // personal | organization
+  target_org: string | null;
+  app_id: string | null;
+  slug: string | null;
+  name: string | null;
+  client_id: string | null;
+  html_url: string | null;
+  owner_login: string | null;
+  has_webhook_secret: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+/** App-level webhook ingress for a registration (ONE URL for every
+ *  installation — GitHub App webhooks are app-scoped). */
+export function appIngressPath(r: GithubAppRegistration): string {
+  return `/v1/ingress/github/app/${r.id}`;
 }
 
 export interface Repo {

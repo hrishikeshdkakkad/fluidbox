@@ -44,6 +44,30 @@ pub enum WorkspaceInput {
     },
 }
 
+/// Same parsed origin (scheme + host + port)? Guards caller-supplied clone
+/// URLs against escaping the configured clone base — string prefixes lie
+/// (`https://github.com.evil.tld`), parsed origins don't. `file://` bases
+/// (the e2e seam) additionally require PATH containment: sharing the file
+/// scheme is not "the same place".
+pub(crate) fn same_origin(a: &str, b: &str) -> bool {
+    match (reqwest::Url::parse(a), reqwest::Url::parse(b)) {
+        (Ok(a), Ok(b)) => {
+            let origin_ok = a.scheme() == b.scheme()
+                && a.host_str() == b.host_str()
+                && a.port_or_known_default() == b.port_or_known_default();
+            if !origin_ok {
+                return false;
+            }
+            if a.scheme() == "file" {
+                let root = b.path().trim_end_matches('/');
+                return a.path() == root || a.path().starts_with(&format!("{root}/"));
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn valid_repo_name(repo: &str) -> bool {
     match repo.split_once('/') {
         Some((owner, name)) => {
@@ -102,20 +126,24 @@ pub(crate) async fn resolve_workspace_input(
                             conn.status
                         )));
                     }
-                    if conn.provider != "github" {
+                    // Both flavors supply git credentials: a PAT directly,
+                    // a github_app via minted installation tokens.
+                    if crate::connectors::connector_for(&conn.provider) != Some("github") {
                         return Err(ApiError::BadRequest(format!(
                             "connection provider '{}' does not supply git workspaces",
                             conn.provider
                         )));
                     }
+                    let base = state.cfg.github_clone_base.trim_end_matches('/');
                     match clone_url {
                         // A supplied URL may narrow but not escape the
-                        // connection's provider.
+                        // connection's provider (parsed-origin compare, so
+                        // the e2e file:// seam and GHES stay honest).
                         Some(url) => {
-                            if !url.starts_with("https://github.com/") {
-                                return Err(ApiError::BadRequest(
-                                    "clone_url must be on https://github.com/ for a github connection".into(),
-                                ));
+                            if !same_origin(&url, base) {
+                                return Err(ApiError::BadRequest(format!(
+                                    "clone_url must be on {base} for a github connection"
+                                )));
                             }
                             url
                         }
@@ -125,7 +153,10 @@ pub(crate) async fn resolve_workspace_input(
                                     "repository (owner/name) or clone_url is required".into(),
                                 )
                             })?;
-                            format!("https://github.com/{repo}.git")
+                            // No `.git` suffix — matches the event-derived
+                            // clone URLs (git accepts both on GitHub, and
+                            // file:// fixture roots only serve this form).
+                            format!("{base}/{repo}")
                         }
                     }
                 }
@@ -687,4 +718,40 @@ pub async fn get_cost(
     let totals = fluidbox_db::usage_totals(&state.pool, id).await?;
     let tool_calls = fluidbox_db::tool_call_count(&state.pool, id).await?;
     Ok(Json(json!({ "usage": totals, "tool_calls": tool_calls })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_origin_compares_parsed_origins_not_prefixes() {
+        assert!(same_origin(
+            "https://github.com/acme/site",
+            "https://github.com"
+        ));
+        // Default ports are equal to elided ones.
+        assert!(same_origin(
+            "https://github.com:443/x",
+            "https://github.com"
+        ));
+        // Prefix tricks that string checks would wave through.
+        assert!(!same_origin(
+            "https://github.com.evil.tld/acme/site",
+            "https://github.com"
+        ));
+        assert!(!same_origin("http://github.com/x", "https://github.com"));
+        assert!(!same_origin(
+            "https://github.com:8443/x",
+            "https://github.com"
+        ));
+        // The e2e file:// clone seam requires PATH containment, not merely
+        // a shared scheme.
+        assert!(same_origin("file:///tmp/fix/acme/site", "file:///tmp/fix"));
+        assert!(same_origin("file:///tmp/fix", "file:///tmp/fix/"));
+        assert!(!same_origin("file:///tmp/other/repo", "file:///tmp/fix"));
+        assert!(!same_origin("file:///tmp/fixother", "file:///tmp/fix"));
+        assert!(!same_origin("file:///tmp/fix", "https://github.com"));
+        assert!(!same_origin("not a url", "https://github.com"));
+    }
 }

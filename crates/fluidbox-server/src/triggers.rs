@@ -138,12 +138,33 @@ pub fn narrow_workspace(
             if !crate::api::valid_repo_name(repo) {
                 return Err(format!("repository must be 'owner/name' (got '{repo}')"));
             }
-            // A repo swap is only meaningful inside a github-backed base;
-            // retargeting an arbitrary clone_url would escape it.
-            if connection_id.is_none() && !clone_url.starts_with("https://github.com/") {
-                return Err("cannot retarget a non-github workspace".into());
+            // A local path is not a provider namespace: swapping repos on a
+            // file:// base would be wider LOCAL filesystem authority, not a
+            // narrowing (§17 #6 allows swaps inside a github/connection
+            // base only).
+            if clone_url.starts_with("file://") {
+                return Err("cannot retarget a file:// workspace".into());
             }
-            (Some(repo.clone()), format!("https://github.com/{repo}.git"))
+            // A swap must stay inside the base's own root: derive it by
+            // stripping the base's repository suffix from its clone URL —
+            // works identically for github.com and GHES, and makes leaving
+            // the root structurally impossible.
+            let base_repo = repository
+                .as_deref()
+                .ok_or("cannot retarget this workspace — its base has no repository identity")?;
+            let stripped = clone_url.strip_suffix(".git").unwrap_or(clone_url);
+            let root = stripped
+                .strip_suffix(base_repo)
+                .and_then(|r| r.strip_suffix('/'))
+                .ok_or(
+                    "cannot retarget this workspace — its clone URL does not embed the repository",
+                )?;
+            let dot_git = if clone_url.ends_with(".git") {
+                ".git"
+            } else {
+                ""
+            };
+            (Some(repo.clone()), format!("{root}/{repo}{dot_git}"))
         }
     };
     Ok(WorkspaceSpec::GitRepository {
@@ -401,9 +422,19 @@ pub async fn create(
                     conn.provider
                 ))
             })?;
-            let can_receive =
-                fluidbox_db::connection_webhook_secret_sealed(&state.pool, cid).await?;
-            if can_receive.is_none() {
+            // Legacy rows carry their own webhook secret; seamless rows
+            // receive events on their REGISTRATION's app-level ingress.
+            let can_receive = match conn.registration_id {
+                Some(rid) => {
+                    fluidbox_db::github_app_registration_webhook_secret_sealed(&state.pool, rid)
+                        .await?
+                        .is_some()
+                }
+                None => fluidbox_db::connection_webhook_secret_sealed(&state.pool, cid)
+                    .await?
+                    .is_some(),
+            };
+            if !can_receive {
                 return Err(ApiError::BadRequest(
                     "this connection cannot receive events (no webhook secret) — connect a github_app".into(),
                 ));
@@ -468,7 +499,14 @@ pub async fn create(
                     ))
                 },
             )?;
-            Some((cid, connector, repositories, events, publish))
+            Some((
+                cid,
+                connector,
+                repositories,
+                events,
+                publish,
+                conn.registration_id,
+            ))
         }
     };
 
@@ -512,12 +550,18 @@ pub async fn create(
     let (connection_id, resource_selector, event_filter, event_publish, ingress_path) =
         match &event_cfg {
             None => (None, None, None, None, None),
-            Some((cid, connector, repos, events, publish)) => (
+            Some((cid, connector, repos, events, publish, registration_id)) => (
                 Some(*cid),
                 Some(json!({ "repositories": repos })),
                 Some(json!({ "events": events })),
                 Some(json!(publish)),
-                Some(format!("/v1/ingress/{connector}/{cid}")),
+                // Seamless connections receive events on their
+                // registration's app-level ingress, not a per-connection
+                // path.
+                Some(match registration_id {
+                    Some(rid) => format!("/v1/ingress/{connector}/app/{rid}"),
+                    None => format!("/v1/ingress/{connector}/{cid}"),
+                }),
             ),
         };
 
@@ -1045,6 +1089,25 @@ mod tests {
             &file_base,
             &InvokeWorkspace {
                 repository: Some("a/b".into()),
+                r#ref: None,
+                commit_sha: None
+            }
+        )
+        .is_err());
+        // A file base WITH a repository identity (event-derived e2e shape)
+        // is refused too — local paths are not a provider namespace.
+        let file_repo_base = WorkspaceSpec::GitRepository {
+            connection_id: Some(Uuid::now_v7()),
+            repository: Some("acme/base".into()),
+            clone_url: "file:///tmp/fixture/acme/base".into(),
+            r#ref: None,
+            commit_sha: None,
+            checkout_mode: CheckoutMode::WritableCopy,
+        };
+        assert!(narrow_workspace(
+            &file_repo_base,
+            &InvokeWorkspace {
+                repository: Some("acme/other".into()),
                 r#ref: None,
                 commit_sha: None
             }
