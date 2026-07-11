@@ -155,15 +155,17 @@ d = json.load(sys.stdin)
 b = [i for i in d['invocations'] if i['session_id']]
 print(b[-1]['idempotency_key'])")   # oldest bound firing
 T="${KEY#sched:}"
-DUP_BEFORE=$(pq "select count(*) from trigger_invocations where idempotency_key = '$KEY'")
+# Scoped to SUB A: fire-time keys are per-subscription — any OTHER 5s-cadence
+# subscription alive in a shared database mints the same key string.
+DUP_BEFORE=$(pq "select count(*) from trigger_invocations where subscription_id = '$SUBA' and idempotency_key = '$KEY'")
 stop_server
 pq "update schedules set next_fire_at = '$T' where subscription_id = '$SUBA' returning id" >/dev/null
 pq "update trigger_subscriptions set enabled = true where id = '$SUBA' returning id" >/dev/null
 start_server || exit 1
 sleep 5
-DUP_AFTER=$(pq "select count(*) from trigger_invocations where idempotency_key = '$KEY'")
+DUP_AFTER=$(pq "select count(*) from trigger_invocations where subscription_id = '$SUBA' and idempotency_key = '$KEY'")
 [ "$DUP_BEFORE" = "1" ] && [ "$DUP_AFTER" = "1" ] && ok "fire time $T claimed exactly once across restart" || no "claims: before=$DUP_BEFORE after=$DUP_AFTER"
-BOUND=$(pq "select count(distinct session_id) from trigger_invocations where idempotency_key = '$KEY' and session_id is not null")
+BOUND=$(pq "select count(distinct session_id) from trigger_invocations where subscription_id = '$SUBA' and idempotency_key = '$KEY' and session_id is not null")
 [ "$BOUND" = "1" ] && ok "…and bound to exactly one run" || no "bound to $BOUND runs"
 # Race-free advance check: while a 5s cadence is live, next_fire_at is
 # briefly ≤ now() between a boundary passing and the tick handling it — the

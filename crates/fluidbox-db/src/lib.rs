@@ -103,6 +103,10 @@ pub struct IntegrationConnectionRow {
     pub metadata: Value,
     pub auth_kind: String,
     pub oauth: Option<Value>,
+    /// Typed custody linkage for seamless github_app connections: the pem +
+    /// webhook secret live on the registration. NULL = legacy per-connection
+    /// custody. Resolution fails closed — never falls back across kinds.
+    pub registration_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -491,16 +495,19 @@ pub async fn get_capability_bundle_version(
 /// the sealed credential / client secret can't ride along into a row.
 const CONNECTION_COLS: &str = "id, tenant_id, provider, external_account_id, display_name, \
      granted_scopes, resource_selection, status, metadata, auth_kind, oauth, \
-     created_at, updated_at";
+     registration_id, created_at, updated_at";
 
 /// Auth flavor of a new connection. `static` seals the pasted secret now and
 /// starts `active`; `oauth` starts `pending` with NO credential — the
 /// callback exchange activates it with the sealed rotating refresh token.
 pub struct ConnectionAuth<'a> {
     pub auth_kind: &'a str, // static | oauth
-    pub status: &'a str,    // active | pending
+    pub status: &'a str,    // active | pending | suspended
     pub oauth: Option<&'a Value>,
     pub client_secret_sealed: Option<&'a [u8]>,
+    /// Set only by the seamless github_app flows (custody on the
+    /// registration); legacy/manual connections leave it NULL.
+    pub registration_id: Option<Uuid>,
 }
 
 impl ConnectionAuth<'static> {
@@ -510,6 +517,7 @@ impl ConnectionAuth<'static> {
             status: "active",
             oauth: None,
             client_secret_sealed: None,
+            registration_id: None,
         }
     }
 }
@@ -532,8 +540,8 @@ pub async fn create_connection(
         "insert into integration_connections
            (id, tenant_id, provider, external_account_id, display_name, credential_sealed,
             granted_scopes, resource_selection, metadata, webhook_secret_sealed,
-            auth_kind, status, oauth, client_secret_sealed)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+            auth_kind, status, oauth, client_secret_sealed, registration_id)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
          returning {CONNECTION_COLS}"
     )))
     .bind(Uuid::now_v7())
@@ -550,6 +558,7 @@ pub async fn create_connection(
     .bind(auth.status)
     .bind(auth.oauth)
     .bind(auth.client_secret_sealed)
+    .bind(auth.registration_id)
     .fetch_one(pool)
     .await
 }
@@ -826,6 +835,364 @@ pub async fn connection_webhook_secret_sealed(
     .fetch_optional(pool)
     .await?;
     Ok(row.and_then(|r| r.get::<Option<Vec<u8>>, _>("webhook_secret_sealed")))
+}
+
+// ─── GitHub App registrations & flows (Phase 5.6) ─────────────────────────
+
+/// The App identity created via GitHub's manifest flow. Secrets (pem,
+/// webhook secret, client secret) are NEVER selected by row queries — the
+/// explicit column list below cannot leak them; the dedicated active-only
+/// readers are the only accessors.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct GithubAppRegistrationRow {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub status: String, // pending | active | revoked
+    pub target_kind: String,
+    pub target_org: Option<String>,
+    pub app_id: Option<String>,
+    pub slug: Option<String>,
+    pub name: Option<String>,
+    pub client_id: Option<String>,
+    pub html_url: Option<String>,
+    pub owner_login: Option<String>,
+    /// False = degraded: GitHub returned no webhook secret at conversion —
+    /// fetch/publish work, event ingress cannot authenticate.
+    pub has_webhook_secret: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+const GH_REG_COLS: &str = "id, tenant_id, status, target_kind, target_org, app_id, slug, \
+     name, client_id, html_url, owner_login, \
+     (webhook_secret_sealed is not null) as has_webhook_secret, created_at, updated_at";
+
+pub async fn create_github_app_registration(
+    pool: &PgPool,
+    tenant: Uuid,
+    target_kind: &str,
+    target_org: Option<&str>,
+) -> sqlx::Result<GithubAppRegistrationRow> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "insert into github_app_registrations (id, tenant_id, target_kind, target_org)
+         values ($1, $2, $3, $4)
+         returning {GH_REG_COLS}"
+    )))
+    .bind(Uuid::now_v7())
+    .bind(tenant)
+    .bind(target_kind)
+    .bind(target_org)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn list_github_app_registrations(
+    pool: &PgPool,
+    tenant: Uuid,
+) -> sqlx::Result<Vec<GithubAppRegistrationRow>> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "select {GH_REG_COLS} from github_app_registrations
+         where tenant_id = $1 order by created_at desc"
+    )))
+    .bind(tenant)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_github_app_registration(
+    pool: &PgPool,
+    id: Uuid,
+) -> sqlx::Result<Option<GithubAppRegistrationRow>> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "select {GH_REG_COLS} from github_app_registrations where id = $1"
+    )))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// The manifest conversion landing: exactly ONE conversion may complete a
+/// registration (`where status = 'pending'`); a racing second conversion
+/// affects zero rows and its result is discarded by the caller.
+#[allow(clippy::too_many_arguments)]
+pub async fn activate_github_app_registration(
+    pool: &PgPool,
+    id: Uuid,
+    app_id: &str,
+    slug: &str,
+    name: &str,
+    client_id: Option<&str>,
+    html_url: &str,
+    owner_login: Option<&str>,
+    pem_sealed: &[u8],
+    webhook_secret_sealed: Option<&[u8]>,
+    client_secret_sealed: Option<&[u8]>,
+) -> sqlx::Result<Option<GithubAppRegistrationRow>> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "update github_app_registrations
+         set app_id = $2, slug = $3, name = $4, client_id = $5, html_url = $6,
+             owner_login = $7, pem_sealed = $8, webhook_secret_sealed = $9,
+             client_secret_sealed = $10, status = 'active', updated_at = now()
+         where id = $1 and status = 'pending'
+         returning {GH_REG_COLS}"
+    )))
+    .bind(id)
+    .bind(app_id)
+    .bind(slug)
+    .bind(name)
+    .bind(client_id)
+    .bind(html_url)
+    .bind(owner_login)
+    .bind(pem_sealed)
+    .bind(webhook_secret_sealed)
+    .bind(client_secret_sealed)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Revoke a registration AND its child connections in one transaction;
+/// returns the affected connection ids so the caller can evict cached
+/// installation tokens. Registrations are revoked, never deleted (the FK is
+/// RESTRICT on purpose).
+pub async fn revoke_github_app_registration(
+    pool: &PgPool,
+    id: Uuid,
+) -> sqlx::Result<Option<Vec<Uuid>>> {
+    let mut tx = pool.begin().await?;
+    let reg = sqlx::query(
+        "update github_app_registrations set status = 'revoked', updated_at = now()
+         where id = $1 and status <> 'revoked'",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    if reg.rows_affected() == 0 {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    let rows = sqlx::query(
+        "update integration_connections set status = 'revoked', updated_at = now()
+         where registration_id = $1 and status <> 'revoked'
+         returning id",
+    )
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some(rows.iter().map(|r| r.get::<Uuid, _>("id")).collect()))
+}
+
+/// Active-only reader for the App signing key (same discipline as
+/// `connection_credential_sealed`): a revoked registration can never again
+/// produce a JWT.
+pub async fn github_app_registration_pem_sealed(
+    pool: &PgPool,
+    id: Uuid,
+) -> sqlx::Result<Option<Vec<u8>>> {
+    let row = sqlx::query(
+        "select pem_sealed from github_app_registrations
+         where id = $1 and status = 'active'",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|r| r.get::<Option<Vec<u8>>, _>("pem_sealed")))
+}
+
+/// Active-only reader for the app-level webhook secret (verified on every
+/// app-level ingress request).
+pub async fn github_app_registration_webhook_secret_sealed(
+    pool: &PgPool,
+    id: Uuid,
+) -> sqlx::Result<Option<Vec<u8>>> {
+    let row = sqlx::query(
+        "select webhook_secret_sealed from github_app_registrations
+         where id = $1 and status = 'active'",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|r| r.get::<Option<Vec<u8>>, _>("webhook_secret_sealed")))
+}
+
+/// Mint a one-time flow (admin intent). Opportunistically sweeps expired
+/// unconsumed flows immediately, and consumed ones after a 7-day audit
+/// window, so abandoned dances never accumulate.
+pub async fn create_github_app_flow(
+    pool: &PgPool,
+    registration_id: Uuid,
+    purpose: &str,
+    ttl_secs: i64,
+) -> sqlx::Result<Uuid> {
+    sqlx::query(
+        "delete from github_app_flows
+         where (consumed_at is null and expires_at < now())
+            or expires_at < now() - interval '7 days'",
+    )
+    .execute(pool)
+    .await?;
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "insert into github_app_flows (id, registration_id, purpose, expires_at)
+         values ($1, $2, $3, now() + make_interval(secs => $4::double precision))",
+    )
+    .bind(id)
+    .bind(registration_id)
+    .bind(purpose)
+    .bind(ttl_secs as f64)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// The go page's one-time claim: binds a fresh browser cookie hash to the
+/// flow. Exactly one browser can ever be bound.
+pub async fn claim_github_app_bootstrap(
+    pool: &PgPool,
+    flow_id: Uuid,
+    purpose: &str,
+    browser_hash: &str,
+) -> sqlx::Result<Option<Uuid>> {
+    let row = sqlx::query(
+        "update github_app_flows
+         set bootstrap_consumed_at = now(), browser_hash = $3
+         where id = $1 and purpose = $2 and bootstrap_consumed_at is null
+           and expires_at > now()
+         returning registration_id",
+    )
+    .bind(flow_id)
+    .bind(purpose)
+    .bind(browser_hash)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.get::<Uuid, _>("registration_id")))
+}
+
+/// The callback/setup one-time claim. The browser-cookie hash sits INSIDE
+/// the predicate: an attacker holding a leaked state parameter but not the
+/// initiating browser's cookie cannot complete OR burn the flow.
+pub async fn claim_github_app_flow(
+    pool: &PgPool,
+    flow_id: Uuid,
+    purpose: &str,
+    registration_id: Uuid,
+    browser_hash: &str,
+) -> sqlx::Result<bool> {
+    let r = sqlx::query(
+        "update github_app_flows
+         set consumed_at = now()
+         where id = $1 and purpose = $2 and registration_id = $3
+           and consumed_at is null and bootstrap_consumed_at is not null
+           and browser_hash = $4 and expires_at > now()",
+    )
+    .bind(flow_id)
+    .bind(purpose)
+    .bind(registration_id)
+    .bind(browser_hash)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected() == 1)
+}
+
+/// Insert a seamless installation connection ONLY if the installation has
+/// never had a row of ANY status — the check rides inside the statement, so
+/// an insert can never land just after a concurrent revoke (F‑6: revoked
+/// rows revive only via approve, never via a fresh import racing in).
+/// Returns None when any row (live or revoked) already exists; the caller
+/// loops back through its existing-row path.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_github_app_connection_if_absent(
+    pool: &PgPool,
+    tenant: Uuid,
+    installation_id: &str,
+    display_name: &str,
+    metadata: &Value,
+    status: &str,
+    registration_id: Uuid,
+) -> sqlx::Result<Option<IntegrationConnectionRow>> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "insert into integration_connections
+           (id, tenant_id, provider, external_account_id, display_name, credential_sealed,
+            granted_scopes, resource_selection, metadata, webhook_secret_sealed,
+            auth_kind, status, oauth, client_secret_sealed, registration_id)
+         select $1, $2, 'github_app', $3, $4, null, '[]'::jsonb, '{{}}'::jsonb, $5, null,
+                'static', $6, null, null, $7
+         where not exists (
+             select 1 from integration_connections
+             where tenant_id = $2 and provider = 'github_app' and external_account_id = $3
+         )
+         returning {CONNECTION_COLS}"
+    )))
+    .bind(Uuid::now_v7())
+    .bind(tenant)
+    .bind(installation_id)
+    .bind(display_name)
+    .bind(metadata)
+    .bind(status)
+    .bind(registration_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// The single live connection row for a GitHub installation, preferring a
+/// live row but surfacing a revoked one (callers refuse or route revival
+/// through the explicit approve path — never a second row).
+pub async fn get_github_app_connection_by_installation(
+    pool: &PgPool,
+    tenant: Uuid,
+    installation_id: &str,
+) -> sqlx::Result<Option<IntegrationConnectionRow>> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "select {CONNECTION_COLS} from integration_connections
+         where tenant_id = $1 and provider = 'github_app' and external_account_id = $2
+         order by (status <> 'revoked') desc, created_at desc
+         limit 1"
+    )))
+    .bind(tenant)
+    .bind(installation_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Guarded status transition: only fires when the current status is one of
+/// `allowed_from`. Returns the fresh row on success.
+pub async fn set_connection_status(
+    pool: &PgPool,
+    id: Uuid,
+    status: &str,
+    allowed_from: &[&str],
+) -> sqlx::Result<Option<IntegrationConnectionRow>> {
+    let from: Vec<String> = allowed_from.iter().map(|s| s.to_string()).collect();
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "update integration_connections set status = $2, updated_at = now()
+         where id = $1 and status = any($3)
+         returning {CONNECTION_COLS}"
+    )))
+    .bind(id)
+    .bind(status)
+    .bind(&from)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Refresh the display metadata a setup/sync re-verification produced.
+pub async fn refresh_connection_metadata(
+    pool: &PgPool,
+    id: Uuid,
+    display_name: &str,
+    metadata: &Value,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "update integration_connections
+         set display_name = $2, metadata = $3, updated_at = now()
+         where id = $1 and status <> 'revoked'",
+    )
+    .bind(id)
+    .bind(display_name)
+    .bind(metadata)
+    .execute(pool)
+    .await
+    .map(|_| ())
 }
 
 // ─── Trigger subscriptions ────────────────────────────────────────────────
@@ -3254,6 +3621,7 @@ mod tests {
                 status: "pending",
                 oauth: Some(&serde_json::json!({"resource": "https://mcp.example.test"})),
                 client_secret_sealed: Some(b"sealed-client-secret"),
+                registration_id: None,
             },
         )
         .await

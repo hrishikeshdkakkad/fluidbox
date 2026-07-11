@@ -416,6 +416,7 @@ pub async fn connect(
                     status: "pending",
                     oauth: Some(&oauth),
                     client_secret_sealed: sealed_secret.as_deref(),
+                    registration_id: None,
                 },
             )
             .await?;

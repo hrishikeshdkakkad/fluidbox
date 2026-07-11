@@ -99,7 +99,7 @@ fn stored_identity_stale(
     }
 }
 
-fn b64url(bytes: &[u8]) -> String {
+pub(crate) fn b64url(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
@@ -114,7 +114,7 @@ fn form_body(pairs: &[(&str, &str)]) -> String {
     url.query().unwrap_or_default().to_string()
 }
 
-fn random_urlsafe() -> String {
+pub(crate) fn random_urlsafe() -> String {
     use chacha20poly1305::aead::rand_core::RngCore;
     let mut buf = [0u8; 32];
     chacha20poly1305::aead::OsRng.fill_bytes(&mut buf);
@@ -992,10 +992,14 @@ mod tests {
         let cimd_id = "https://fbx.example.com/.well-known/fluidbox-client.json";
         let redirect = "https://fbx.example.com/v1/oauth/callback";
         // Healthy CIMD identity → reuse.
-        assert!(!stored_identity_stale("cimd", cimd_id, None, true, cimd_id, redirect));
+        assert!(!stored_identity_stale(
+            "cimd", cimd_id, None, true, cimd_id, redirect
+        ));
         // CIMD no longer presentable (e.g. the identity was minted before
         // the eligibility guard, from a loopback deployment) → stale.
-        assert!(stored_identity_stale("cimd", cimd_id, None, false, cimd_id, redirect));
+        assert!(stored_identity_stale(
+            "cimd", cimd_id, None, false, cimd_id, redirect
+        ));
         // Public URL moved → the document URL no longer matches → stale.
         assert!(stored_identity_stale(
             "cimd",
@@ -1007,7 +1011,14 @@ mod tests {
         ));
         // DCR identity minted for THIS redirect → reuse; moved → stale;
         // legacy rows without a recorded redirect → reuse (old behavior).
-        assert!(!stored_identity_stale("dcr", "dcr-1", Some(redirect), false, cimd_id, redirect));
+        assert!(!stored_identity_stale(
+            "dcr",
+            "dcr-1",
+            Some(redirect),
+            false,
+            cimd_id,
+            redirect
+        ));
         assert!(stored_identity_stale(
             "dcr",
             "dcr-1",
@@ -1016,7 +1027,9 @@ mod tests {
             cimd_id,
             redirect
         ));
-        assert!(!stored_identity_stale("dcr", "dcr-1", None, false, cimd_id, redirect));
+        assert!(!stored_identity_stale(
+            "dcr", "dcr-1", None, false, cimd_id, redirect
+        ));
         // Pre-registered identities are user-owned — never auto-stale.
         assert!(!stored_identity_stale(
             "preregistered",

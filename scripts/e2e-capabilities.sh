@@ -196,6 +196,12 @@ export FLUIDBOX_GITHUB_CLONE_BASE="file://$FIXROOT"
 start_server || exit 1
 ok "stack up (control plane + fake MCP :$MCP_PORT + fake GitHub :$GH_PORT)"
 
+# Installation identity is DB-unique across live rows (migration 0008): the
+# github phase's static fixture installation (77) must retire before this
+# phase re-connects it. Scoped — real connections are untouched.
+pq "update integration_connections set status='revoked', updated_at=now()
+    where provider='github_app' and status <> 'revoked' and external_account_id = '77'" >/dev/null
+
 # ── Policy: attach ≠ allow needs a policy with per-tool verdicts ──────────
 say "POLICY — mcp tools judged per-rule (attach ≠ allow)"
 PY=$(python3 - <<'PYEOF'

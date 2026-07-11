@@ -676,6 +676,47 @@ fails new runs closed at zero spend until a reconnect on the same connection
 revives it, and no secret ever appears in a response, RunSpec, ledger, or
 sandbox.
 
+### Phase 5.6 — Seamless GitHub connect (user-inserted slice, shipped 2026-07-11)
+
+Replaces hand-pasted `app_id` / `installation_id` / private key / webhook
+secret with the standard "Connect GitHub" experience: GitHub's **App
+manifest flow** (one browser click creates a least-privilege private App;
+the conversion response delivers every credential, sealed on arrival) and
+the **installation flow** (setup redirect + app-JWT verification fills in
+the installation). Full design + threat model:
+`2026-07-11-github-seamless-connect-design.md` (adversarially reviewed,
+3 rounds).
+
+**Settled at the boundary (2026-07-11):**
+
+1. **App registration is a first-class custody object**
+   (`github_app_registrations`): one per GitHub account/org
+   (`public: false` apps install only on their owner); connections stay
+   one-per-installation with a typed `registration_id` FK and fail-closed
+   custody resolution. Webhooks are app-level
+   (`/v1/ingress/github/app/{registration_id}`), resolved to a connection
+   per delivery by the verified payload's installation id; the legacy
+   per-connection path is unchanged.
+2. **Activation requires fluidbox-admin intent.** Admin-minted one-time
+   flows (bootstrap token ≠ GitHub-transited state; browser-cookie hash
+   inside the one-time claim predicate) auto-activate; GitHub-initiated
+   discovery (`installation.created`, state-less setup hits) can only
+   produce `pending` rows until an explicit approve/sync. `installation_id`
+   is never trusted — it must resolve under OUR app's JWT.
+3. **Custody is DB-gated, not cache-gated:** installation-token minting
+   re-reads connection + registration status before the token cache may
+   serve; every lifecycle transition (suspend/unsuspend reconcile against
+   GitHub truth, delete → revoke, registration revoke cascades) evicts.
+   ONE live connection row per installation (partial unique index);
+   revoked rows revive only via approve, keeping dedup history continuous.
+
+**Acceptance demo:** `manifest/start` → go page (form + cookie) → callback
+converts the one-hour code and seals pem/webhook/client secrets → chained
+install → spoofed setup id refused, real one connects → repo picker +
+PR fan-out through app-level ingress at the exact head SHA → replays of
+every token refused → suspend/delete fail closed → sync/approve reconcile —
+with the legacy hand-pasted path still passing alongside.
+
 ### Phase 6 — Multi-harness proof
 
 Add the next harness, initially Codex, without modifying the trigger, workspace, policy, or result-delivery model.
@@ -782,6 +823,7 @@ These decisions do not block the overall architecture, but each must be settled 
 6. Whether API trigger task/workspace overrides are opt-in per subscription. — **SETTLED 2026-07-10 (Phase 2): opt-in per subscription, both default OFF.**
 7. Capability-bundle versioning and upgrade behavior for existing agent revisions. — **SETTLED 2026-07-10 (Phase 5): pin-only.** Attaching `"name"` resolves to the newest bundle version AT ATTACH TIME and stores the exact pin (`{id, name, version}`) on the revision; `"name@N"` pins explicitly. Upgrading a bundle = appending a new agent revision — no floating refs exist anywhere, so a bundle publisher can never change what an existing agent runs. The registry itself is append-only ((tenant, name, version) unique; publishing = a new version row), and RunSpecs freeze the pinned definition + digests. Research input: the MCP registry's (name, version) metadata is immutable but carries no content hash for npm/pypi — fluidbox's own snapshot digests are the supply-chain anchor (docs/research/2026-07-10-mcp-ecosystem-findings.md).
 8. When the connector boundary is mature enough to expose as a public SDK.
+9. How GitHub credentials are ACQUIRED. — **SETTLED 2026-07-11 (Phase 5.6): the App manifest + install dances** (see that design doc §7 for the four sub-decisions: app visibility/cardinality, the two-token admin-intent trust anchor, typed registration custody with fail-closed resolution, and installation.created as discovery-only).
 
 ## 18. Definition of the north-star experience
 

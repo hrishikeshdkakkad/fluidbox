@@ -11,6 +11,7 @@ mod deliveries;
 mod error;
 mod events;
 mod facade;
+mod github_app;
 mod internal;
 mod ledger;
 mod oauth;
@@ -130,8 +131,37 @@ async fn main() -> anyhow::Result<()> {
             get(connections::list).post(connections::create),
         )
         .route("/connections/{id}/revoke", post(connections::revoke))
+        .route("/connections/{id}/approve", post(connections::approve))
         .route("/connections/{id}/repos", get(connections::repos))
         .route("/connections/{id}/oauth/start", post(oauth::start))
+        // Seamless GitHub connect (Phase 5.6): admin start endpoints mint
+        // one-time flows; the go/callback/setup legs are browser-facing
+        // (sealed tokens + per-flow cookies ARE the auth); app-level
+        // ingress authenticates by webhook HMAC like per-connection
+        // ingress. 4-segment ingress path cannot collide with the
+        // 3-segment {provider}/{connection_id} route below.
+        .route("/github/app", get(github_app::list))
+        .route(
+            "/github/app/manifest/start",
+            post(github_app::manifest_start),
+        )
+        .route("/github/app/manifest/go", get(github_app::manifest_go))
+        .route(
+            "/github/app/manifest/callback",
+            get(github_app::manifest_callback),
+        )
+        .route("/github/app/install/go", get(github_app::install_go))
+        .route(
+            "/github/app/{id}/install/start",
+            post(github_app::install_start),
+        )
+        .route("/github/app/{id}/setup", get(github_app::setup))
+        .route("/github/app/{id}/sync", post(github_app::sync))
+        .route("/github/app/{id}/revoke", post(github_app::revoke))
+        .route(
+            "/ingress/github/app/{registration_id}",
+            post(github_app::app_ingress),
+        )
         // Unauthenticated by design: a browser redirect can't carry the
         // admin token — the AEAD-sealed `state` parameter is the auth
         // (same pattern as webhook-signature ingress below).
@@ -176,7 +206,13 @@ async fn main() -> anyhow::Result<()> {
         // CIMD (spec 2025-11-25): this document's URL IS our OAuth
         // client_id; authorization servers fetch it — public by nature.
         .route("/.well-known/fluidbox-client.json", get(oauth::cimd_doc))
-        .layer(TraceLayer::new_for_http())
+        // Method + PATH only — never the query string: OAuth `code`/`state`
+        // and the GitHub flow tokens ride queries and must not reach logs.
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<axum::body::Body>| {
+                tracing::debug_span!("http", method = %req.method(), path = %req.uri().path())
+            }),
+        )
         .layer(CorsLayer::permissive())
         .with_state(state.clone());
 

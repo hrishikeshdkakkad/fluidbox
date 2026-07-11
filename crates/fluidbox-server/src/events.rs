@@ -75,27 +75,44 @@ pub async fn ingress(
     let payload: Value = serde_json::from_slice(&body)
         .map_err(|e| ApiError::BadRequest(format!("payload is not json: {e}")))?;
 
+    // The digest covers the exact signed bytes — never a re-serialization.
+    let digest = format!(
+        "sha256:{}",
+        fluidbox_db::sha256_hex(std::str::from_utf8(&body).unwrap_or_default())
+    );
+    process_delivery(&state, &conn, connector, &verified, &payload, &digest).await
+}
+
+/// The provider-ignorant spine after authenticity: normalize → dedup →
+/// match → create_run. Shared by the per-connection ingress above and the
+/// app-level ingress (which resolves the connection from the verified
+/// payload before calling here). `payload_digest` is computed by each
+/// caller from the exact signed bytes.
+pub(crate) async fn process_delivery(
+    state: &AppState,
+    conn: &fluidbox_db::IntegrationConnectionRow,
+    connector: &'static str,
+    verified: &VerifiedDelivery,
+    payload: &Value,
+    payload_digest: &str,
+) -> ApiResult<Json<Value>> {
     // Duties #2+#3 (connector): normalize + event workspace. Events fluidbox
     // doesn't react to are acknowledged without a delivery row.
-    let ctx = connectors::normalize_ctx(&state, connector, conn.id);
-    let normalized = connectors::normalize(connector, &verified.event_name, &payload, &ctx)
+    let ctx = connectors::normalize_ctx(state, connector, conn.id);
+    let normalized = connectors::normalize(connector, &verified.event_name, payload, &ctx)
         .map_err(ApiError::BadRequest)?;
     let Some(event) = normalized else {
         return Ok(Json(json!({ "ignored": verified.event_name })));
     };
 
     // Level-1 dedup: the same external delivery is stored exactly once.
-    let digest = format!(
-        "sha256:{}",
-        fluidbox_db::sha256_hex(std::str::from_utf8(&body).unwrap_or_default())
-    );
     let (delivery, fresh) = fluidbox_db::insert_trigger_delivery(
         &state.pool,
         conn.id,
         &verified.external_event_id,
         &event.event_type,
-        &payload,
-        &digest,
+        payload,
+        payload_digest,
         event.occurred_at,
     )
     .await?;
@@ -120,7 +137,7 @@ pub async fn ingress(
             skipped.push(json!({ "subscription_id": sub.id, "reason": "already_dispatched" }));
             continue;
         };
-        match dispatch_one(&state, &provider, sub, &event, &verified, claim.id).await {
+        match dispatch_one(state, connector, sub, &event, verified, claim.id).await {
             Ok(RunCreation::Created(session)) => {
                 dispatched.push(json!({ "subscription_id": sub.id, "session_id": session.id }));
             }
