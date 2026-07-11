@@ -428,9 +428,7 @@ pub async fn tool_call(
 
     let srv = server.expect("gate allowed the call, so the tool is in the frozen set");
     let CapabilityServer::Brokered {
-        name: server_name,
-        url,
-        ..
+        name: server_name, ..
     } = srv
     else {
         unreachable!("class-checked above")
@@ -454,20 +452,12 @@ pub async fn tool_call(
         )
     };
 
-    // Credential turn: unsealed here, sent to the (audience-bound) server,
-    // dropped. Failure to resolve it is an execution failure, not a policy
-    // denial — visibly ledgered either way.
-    let auth_header = match crate::broker::brokered_auth(&state, srv).await {
-        Ok(a) => a,
-        Err(e) => {
-            record_exec(false, 0, None, Some(e.clone())).await;
-            return Ok(Json(json!({ "ok": false, "error": e })));
-        }
-    };
-
+    // Credential turn happens inside the broker: resolved (static compose
+    // or OAuth mint/refresh), sent to the (audience-bound) server, dropped.
+    // Resolution failure is an execution failure, not a policy denial —
+    // visibly ledgered either way.
     let started = std::time::Instant::now();
-    let outcome =
-        crate::broker::call_tool(&state, url, auth_header.as_deref(), tool_name, &req.input).await;
+    let outcome = crate::broker::call_tool_auth(&state, srv, tool_name, &req.input).await;
     let latency_ms = started.elapsed().as_millis() as u64;
     match outcome {
         Ok((content, is_error)) => {

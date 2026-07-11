@@ -131,18 +131,66 @@ export function workspaceLabel(ws: WorkspaceSpec | null | undefined): string {
 
 export interface Connection {
   id: string;
-  provider: string; // github (PAT) | github_app
+  provider: string; // github (PAT) | github_app | mcp_http
   external_account_id: string;
   display_name: string;
   granted_scopes: string[];
-  status: string;
+  status: string; // active | pending | error | revoked
   metadata: {
     login?: string;
     app_slug?: string;
     account_login?: string;
     installation_id?: string;
+    base_url?: string;
+    header_name?: string;
+    scheme?: string;
   };
+  /** static (pasted secret) | oauth (custodied rotating refresh token). */
+  auth_kind: string;
+  /** Non-secret OAuth custody state; null on static connections. */
+  oauth: {
+    resource?: string;
+    issuer?: string;
+    client_id?: string;
+    client_id_source?: string; // preregistered | cimd | dcr
+    scopes?: string[];
+    error?: string;
+  } | null;
   created_at: string;
+}
+
+/** One connector-catalog entry (untrusted reference data; tool_hints are
+ *  policy-default seeds — the permission gate stays the judge). */
+export interface CatalogEntry {
+  id: string;
+  slug: string;
+  name: string;
+  icon: string | null;
+  description: string | null;
+  categories: string[];
+  tier: string; // verified | community | custom
+  url: string | null;
+  transport: string; // streamable_http | stdio
+  auth_mode: "none" | "api_key" | "oauth";
+  auth_hints: {
+    header_name?: string;
+    scheme?: string;
+    composite?: string;
+    key_url?: string;
+    placeholder?: string;
+  };
+  scopes: string[];
+  egress: string[];
+  tool_hints: { pattern: string; action: string; note?: string }[];
+  sandbox_launch: unknown | null;
+  created_at: string;
+}
+
+/** POST /catalog/{slug}/connect response (fields vary by auth_mode). */
+export interface CatalogConnectResult {
+  bundle?: { name: string; version: number };
+  connection?: Connection;
+  authorize_url?: string;
 }
 
 /** Where a github_app connection receives provider webhooks. */

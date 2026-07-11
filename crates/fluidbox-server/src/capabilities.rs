@@ -36,23 +36,23 @@ pub struct CreateBundle {
     pub servers: Vec<CapabilityServer>,
 }
 
-/// `POST /v1/capabilities` — register a bundle version. Publishing the same
-/// name again appends version max+1; existing rows (and every RunSpec that
-/// froze them) never change.
-pub async fn create(
-    _: Admin,
-    State(state): State<AppState>,
-    Json(req): Json<CreateBundle>,
-) -> ApiResult<Json<Value>> {
-    let name = req.name.trim();
+/// The registration path — shared by the HTTP handler, the catalog Connect
+/// flow, and the OAuth callback's auto-register (settle #4). Validation →
+/// PHOTOGRAPH (brokered discovery with the sealed/minted credential) →
+/// re-validate the untrusted snapshots → digest → append-only insert.
+pub async fn register_bundle(
+    state: &AppState,
+    name: &str,
+    description: Option<&str>,
+    servers: Vec<CapabilityServer>,
+) -> ApiResult<fluidbox_db::CapabilityBundleRow> {
+    let name = name.trim();
     if !valid_bundle_name(name) {
         return Err(ApiError::BadRequest(
             "bundle name must be 1-64 chars of [a-z0-9_-]".into(),
         ));
     }
-    let mut def = CapabilityBundleDef {
-        servers: req.servers,
-    };
+    let mut def = CapabilityBundleDef { servers };
     // Brokered tools are DISCOVERED, never declared — a registrant-supplied
     // list would be a photograph of nothing.
     for server in &def.servers {
@@ -69,7 +69,7 @@ pub async fn create(
     // credential and freeze what tools/list returns.
     for server in &mut def.servers {
         if server.is_brokered() {
-            let tools = broker::photograph_brokered(&state, server).await?;
+            let tools = broker::photograph_brokered(state, server).await?;
             let CapabilityServer::Brokered { tools: slot, .. } = server else {
                 unreachable!()
             };
@@ -84,15 +84,26 @@ pub async fn create(
     })?;
 
     let digest = definition_digest(&def);
-    let row = fluidbox_db::create_capability_bundle(
+    Ok(fluidbox_db::create_capability_bundle(
         &state.pool,
         state.tenant_id,
         name,
-        req.description.as_deref(),
+        description,
         &serde_json::to_value(&def)?,
         &digest,
     )
-    .await?;
+    .await?)
+}
+
+/// `POST /v1/capabilities` — register a bundle version. Publishing the same
+/// name again appends version max+1; existing rows (and every RunSpec that
+/// froze them) never change.
+pub async fn create(
+    _: Admin,
+    State(state): State<AppState>,
+    Json(req): Json<CreateBundle>,
+) -> ApiResult<Json<Value>> {
+    let row = register_bundle(&state, &req.name, req.description.as_deref(), req.servers).await?;
     Ok(Json(bundle_json(&row)))
 }
 
@@ -116,7 +127,7 @@ pub async fn get(
 
 /// Full bundle + per-server tool digests (the SEP-1766-style integrity
 /// anchor operators can compare out of band).
-fn bundle_json(row: &fluidbox_db::CapabilityBundleRow) -> Value {
+pub(crate) fn bundle_json(row: &fluidbox_db::CapabilityBundleRow) -> Value {
     let servers = serde_json::from_value::<CapabilityBundleDef>(row.definition.clone())
         .map(|def| {
             def.servers

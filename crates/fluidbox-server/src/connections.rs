@@ -56,6 +56,26 @@ pub struct CreateConnection {
     /// mcp_http flavor: the base URL its credential is audience-bound to.
     #[serde(default)]
     pub base_url: Option<String>,
+    /// mcp_http static flavor: which header carries the credential (default
+    /// `authorization`) and how the value composes (`Bearer` default,
+    /// `Basic` = base64(email:token), `""` = the bare token).
+    #[serde(default)]
+    pub header_name: Option<String>,
+    #[serde(default)]
+    pub scheme: Option<String>,
+    /// mcp_http: `static` (default; paste a token now) or `oauth` (starts
+    /// pending; `/v1/connections/{id}/oauth/start` begins the dance).
+    #[serde(default)]
+    pub auth_kind: Option<String>,
+    /// oauth flavor: scopes to request, and an optional pre-registered
+    /// client identity (confidential clients supply both; the secret is
+    /// sealed at rest and never returned).
+    #[serde(default)]
+    pub scopes: Option<Vec<String>>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub client_secret: Option<String>,
 }
 
 pub async fn create(
@@ -73,11 +93,16 @@ pub async fn create(
     }
 }
 
-/// A sealed credential for BROKERED MCP servers (design §8.3 class 2): a
-/// bearer token pinned to a base URL. The broker sends this credential only
-/// to server URLs under `base_url` (audience binding — our RFC-8707
-/// equivalent), so a bundle can never point this token at another host. No
-/// ingress, no git fetch: this flavor exists purely for the tool broker.
+/// A sealed credential for BROKERED MCP servers (design §8.3 class 2),
+/// pinned to a base URL. The broker sends this credential only to server
+/// URLs under `base_url` (audience binding — our RFC-8707 equivalent), so a
+/// bundle can never point this token at another host. No ingress, no git
+/// fetch: this flavor exists purely for the tool broker.
+///
+/// Two auth kinds on the one custody object: `static` seals the pasted
+/// secret now (optionally under a custom header/scheme — Sentry, Atlassian);
+/// `oauth` creates a PENDING row whose credential arrives from the
+/// authorization-code dance (`oauth.rs`) as a sealed rotating refresh token.
 async fn create_mcp_http(state: &AppState, req: CreateConnection) -> ApiResult<Json<Value>> {
     let base_url = req
         .base_url
@@ -90,29 +115,143 @@ async fn create_mcp_http(state: &AppState, req: CreateConnection) -> ApiResult<J
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(ApiError::BadRequest("base_url must be http(s)".into()));
     }
+    match req.auth_kind.as_deref().unwrap_or("static") {
+        "static" => {
+            let row = create_mcp_http_connection(state, req).await?;
+            Ok(Json(json!({ "connection": row })))
+        }
+        "oauth" => {
+            let sealer = sealer(state)?;
+            let host = parsed.host_str().unwrap_or("mcp").to_string();
+            if req
+                .token
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|t| !t.is_empty())
+            {
+                return Err(ApiError::BadRequest(
+                    "oauth connections take no token — the authorization flow supplies the credential"
+                        .into(),
+                ));
+            }
+            let resource =
+                crate::oauth::canonical_resource(base_url).map_err(ApiError::BadRequest)?;
+            let mut oauth = json!({
+                "resource": resource,
+                "scopes": req.scopes.clone().unwrap_or_default(),
+            });
+            if let Some(cid) = req
+                .client_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                oauth["client_id"] = json!(cid);
+                oauth["client_id_source"] = json!("preregistered");
+            }
+            let sealed_secret = req
+                .client_secret
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| sealer.seal(s));
+            let row = fluidbox_db::create_connection(
+                &state.pool,
+                state.tenant_id,
+                &req.provider,
+                &host,
+                req.display_name.as_deref().unwrap_or(&host),
+                None,
+                &json!([]),
+                &json!({}),
+                &json!({ "base_url": base_url }),
+                None,
+                fluidbox_db::ConnectionAuth {
+                    auth_kind: "oauth",
+                    status: "pending",
+                    oauth: Some(&oauth),
+                    client_secret_sealed: sealed_secret.as_deref(),
+                },
+            )
+            .await?;
+            let next = format!("/v1/connections/{}/oauth/start", row.id);
+            Ok(Json(json!({ "connection": row, "next": next })))
+        }
+        other => Err(ApiError::BadRequest(format!(
+            "unsupported auth_kind '{other}' (supported: static, oauth)"
+        ))),
+    }
+}
+
+/// The static mcp_http creator, reusable by the catalog Connect flow:
+/// validates base_url + header/scheme, seals the secret, returns the row.
+pub(crate) async fn create_mcp_http_connection(
+    state: &AppState,
+    req: CreateConnection,
+) -> ApiResult<fluidbox_db::IntegrationConnectionRow> {
+    let base_url = req
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("base_url is required for mcp_http".into()))?;
+    let parsed = reqwest::Url::parse(base_url)
+        .map_err(|_| ApiError::BadRequest("base_url is not a valid URL".into()))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ApiError::BadRequest("base_url must be http(s)".into()));
+    }
+    let sealer = sealer(state)?;
+    let host = parsed.host_str().unwrap_or("mcp").to_string();
     let token = req.token.as_deref().map(str::trim).unwrap_or_default();
     if token.is_empty() {
         return Err(ApiError::BadRequest(
             "token is required for mcp_http (credential-free servers need no connection)".into(),
         ));
     }
-    let sealer = sealer(state)?;
-    let host = parsed.host_str().unwrap_or("mcp").to_string();
+    let mut metadata = json!({ "base_url": base_url });
+    if let Some(h) = req
+        .header_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("authorization"))
+    {
+        if !crate::broker::valid_header_name(h) {
+            return Err(ApiError::BadRequest(format!(
+                "'{h}' is not a usable credential header name"
+            )));
+        }
+        metadata["header_name"] = json!(h);
+    }
+    if let Some(s) = req.scheme.as_deref().map(str::trim) {
+        if !matches!(s, "Bearer" | "Basic" | "") {
+            return Err(ApiError::BadRequest(
+                "scheme must be 'Bearer', 'Basic', or '' (bare token)".into(),
+            ));
+        }
+        if s == "Basic" && !token.contains(':') {
+            return Err(ApiError::BadRequest(
+                "Basic scheme expects the token as 'email:api_token'".into(),
+            ));
+        }
+        if s != "Bearer" {
+            metadata["scheme"] = json!(s);
+        }
+    }
     let sealed = sealer.seal(token);
-    let row = fluidbox_db::create_connection(
+    Ok(fluidbox_db::create_connection(
         &state.pool,
         state.tenant_id,
-        &req.provider,
+        "mcp_http",
         &host,
         req.display_name.as_deref().unwrap_or(&host),
-        &sealed,
+        Some(&sealed),
         &json!([]),
         &json!({}),
-        &json!({ "base_url": base_url }),
+        &metadata,
         None,
+        fluidbox_db::ConnectionAuth::static_active(),
     )
-    .await?;
-    Ok(Json(json!({ "connection": row })))
+    .await?)
 }
 
 async fn create_github_pat(state: &AppState, req: CreateConnection) -> ApiResult<Json<Value>> {
@@ -134,11 +273,12 @@ async fn create_github_pat(state: &AppState, req: CreateConnection) -> ApiResult
         &req.provider,
         &account_id,
         req.display_name.as_deref().unwrap_or(&login),
-        &sealed,
+        Some(&sealed),
         &serde_json::to_value(&scopes)?,
         &json!({}),
         &json!({ "login": login }),
         None,
+        fluidbox_db::ConnectionAuth::static_active(),
     )
     .await?;
     Ok(Json(json!({ "connection": row })))
@@ -185,11 +325,12 @@ async fn create_github_app(state: &AppState, req: CreateConnection) -> ApiResult
         req.display_name
             .as_deref()
             .unwrap_or(&format!("{app_slug} → {account}")),
-        &sealed_key,
+        Some(&sealed_key),
         &json!([]),
         &json!({}),
         &metadata,
         Some(&sealed_webhook),
+        fluidbox_db::ConnectionAuth::static_active(),
     )
     .await?;
     // The one thing the operator must paste into GitHub webhook settings.

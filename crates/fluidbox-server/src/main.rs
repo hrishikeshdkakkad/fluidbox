@@ -3,6 +3,7 @@ mod auth;
 mod broker;
 mod callback;
 mod capabilities;
+mod catalog;
 mod config;
 mod connections;
 mod connectors;
@@ -12,6 +13,7 @@ mod events;
 mod facade;
 mod internal;
 mod ledger;
+mod oauth;
 mod orchestrator;
 mod run_service;
 mod scheduler;
@@ -81,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
             .build()?,
         sealer,
         connector_tokens: Default::default(),
+        oauth_locks: Default::default(),
         pool,
         cfg,
     });
@@ -128,6 +131,14 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/connections/{id}/revoke", post(connections::revoke))
         .route("/connections/{id}/repos", get(connections::repos))
+        .route("/connections/{id}/oauth/start", post(oauth::start))
+        // Unauthenticated by design: a browser redirect can't carry the
+        // admin token — the AEAD-sealed `state` parameter is the auth
+        // (same pattern as webhook-signature ingress below).
+        .route("/oauth/callback", get(oauth::callback))
+        .route("/catalog", get(catalog::list).post(catalog::create))
+        .route("/catalog/{slug}", get(catalog::get))
+        .route("/catalog/{slug}/connect", post(catalog::connect))
         .route(
             "/connections/{id}/deliveries",
             get(events::connection_deliveries),
@@ -162,6 +173,9 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .nest("/v1", public)
         .nest("/internal", internal)
+        // CIMD (spec 2025-11-25): this document's URL IS our OAuth
+        // client_id; authorization servers fetch it — public by nature.
+        .route("/.well-known/fluidbox-client.json", get(oauth::cimd_doc))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state.clone());
