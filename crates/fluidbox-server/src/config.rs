@@ -40,6 +40,10 @@ pub struct Config {
     pub github_clone_base: String,
     /// Keep per-session workspace dirs after terminal diff capture (debug aid).
     pub keep_workspaces: bool,
+    /// Browser/AS-facing base URL of this control plane (no trailing slash).
+    /// Feeds the OAuth redirect_uri and the CIMD client_id document — both
+    /// are fetched by parties that can't use host.docker.internal.
+    pub public_url: String,
 }
 
 impl Config {
@@ -80,6 +84,10 @@ impl Config {
             keep_workspaces: get("FLUIDBOX_KEEP_WORKSPACES")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            public_url: get("FLUIDBOX_PUBLIC_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:8787".into())
+                .trim_end_matches('/')
+                .to_string(),
         })
     }
 }

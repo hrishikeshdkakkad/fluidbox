@@ -84,9 +84,12 @@ pub struct CapabilityBundleRow {
     pub created_at: DateTime<Utc>,
 }
 
-/// Deliberately has NO credential field: every query selects explicit
-/// columns, so the sealed credential can never ride along into an API
-/// response or log. `connection_credential_sealed` is the only reader.
+/// Deliberately has NO credential fields: every query selects the explicit
+/// `CONNECTION_COLS` list, so the sealed credential / client secret can
+/// never ride along into an API response or log.
+/// `connection_credential_sealed` / `connection_client_secret_sealed` are
+/// the only readers. `oauth` carries NON-secret custody state (endpoints,
+/// client identity, scopes, error note).
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct IntegrationConnectionRow {
     pub id: Uuid,
@@ -98,6 +101,8 @@ pub struct IntegrationConnectionRow {
     pub resource_selection: Value,
     pub status: String,
     pub metadata: Value,
+    pub auth_kind: String,
+    pub oauth: Option<Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -482,8 +487,33 @@ pub async fn get_capability_bundle_version(
 
 // ─── Integration connections ──────────────────────────────────────────────
 
-// Every connection query selects this explicit column list (never `*`) so
-// the sealed credential can't ride along; keep the four copies in sync.
+/// Every connection query selects this explicit column list (never `*`) so
+/// the sealed credential / client secret can't ride along into a row.
+const CONNECTION_COLS: &str = "id, tenant_id, provider, external_account_id, display_name, \
+     granted_scopes, resource_selection, status, metadata, auth_kind, oauth, \
+     created_at, updated_at";
+
+/// Auth flavor of a new connection. `static` seals the pasted secret now and
+/// starts `active`; `oauth` starts `pending` with NO credential — the
+/// callback exchange activates it with the sealed rotating refresh token.
+pub struct ConnectionAuth<'a> {
+    pub auth_kind: &'a str, // static | oauth
+    pub status: &'a str,    // active | pending
+    pub oauth: Option<&'a Value>,
+    pub client_secret_sealed: Option<&'a [u8]>,
+}
+
+impl ConnectionAuth<'static> {
+    pub fn static_active() -> Self {
+        Self {
+            auth_kind: "static",
+            status: "active",
+            oauth: None,
+            client_secret_sealed: None,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn create_connection(
     pool: &PgPool,
@@ -491,20 +521,21 @@ pub async fn create_connection(
     provider: &str,
     external_account_id: &str,
     display_name: &str,
-    credential_sealed: &[u8],
+    credential_sealed: Option<&[u8]>,
     granted_scopes: &Value,
     resource_selection: &Value,
     metadata: &Value,
     webhook_secret_sealed: Option<&[u8]>,
+    auth: ConnectionAuth<'_>,
 ) -> sqlx::Result<IntegrationConnectionRow> {
-    sqlx::query_as(
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "insert into integration_connections
            (id, tenant_id, provider, external_account_id, display_name, credential_sealed,
-            granted_scopes, resource_selection, metadata, webhook_secret_sealed)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-         returning id, tenant_id, provider, external_account_id, display_name,
-                   granted_scopes, resource_selection, status, metadata, created_at, updated_at",
-    )
+            granted_scopes, resource_selection, metadata, webhook_secret_sealed,
+            auth_kind, status, oauth, client_secret_sealed)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+         returning {CONNECTION_COLS}"
+    )))
     .bind(Uuid::now_v7())
     .bind(tenant)
     .bind(provider)
@@ -515,6 +546,10 @@ pub async fn create_connection(
     .bind(resource_selection)
     .bind(metadata)
     .bind(webhook_secret_sealed)
+    .bind(auth.auth_kind)
+    .bind(auth.status)
+    .bind(auth.oauth)
+    .bind(auth.client_secret_sealed)
     .fetch_one(pool)
     .await
 }
@@ -523,12 +558,10 @@ pub async fn list_connections(
     pool: &PgPool,
     tenant: Uuid,
 ) -> sqlx::Result<Vec<IntegrationConnectionRow>> {
-    sqlx::query_as(
-        "select id, tenant_id, provider, external_account_id, display_name,
-                granted_scopes, resource_selection, status, metadata, created_at, updated_at
-         from integration_connections
-         where tenant_id = $1 order by created_at desc",
-    )
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "select {CONNECTION_COLS} from integration_connections
+         where tenant_id = $1 order by created_at desc"
+    )))
     .bind(tenant)
     .fetch_all(pool)
     .await
@@ -538,11 +571,9 @@ pub async fn get_connection(
     pool: &PgPool,
     id: Uuid,
 ) -> sqlx::Result<Option<IntegrationConnectionRow>> {
-    sqlx::query_as(
-        "select id, tenant_id, provider, external_account_id, display_name,
-                granted_scopes, resource_selection, status, metadata, created_at, updated_at
-         from integration_connections where id = $1",
-    )
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "select {CONNECTION_COLS} from integration_connections where id = $1"
+    )))
     .bind(id)
     .fetch_optional(pool)
     .await
@@ -552,14 +583,215 @@ pub async fn revoke_connection(
     pool: &PgPool,
     id: Uuid,
 ) -> sqlx::Result<Option<IntegrationConnectionRow>> {
-    sqlx::query_as(
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update integration_connections set status = 'revoked', updated_at = now()
          where id = $1 and status <> 'revoked'
-         returning id, tenant_id, provider, external_account_id, display_name,
-                   granted_scopes, resource_selection, status, metadata, created_at, updated_at",
+         returning {CONNECTION_COLS}"
+    )))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Persist non-secret OAuth custody state (discovered endpoints, client
+/// identity, pending bundle) before the connection is activated.
+pub async fn update_connection_oauth(pool: &PgPool, id: Uuid, oauth: &Value) -> sqlx::Result<()> {
+    sqlx::query(
+        "update integration_connections set oauth = $2, updated_at = now()
+         where id = $1 and status <> 'revoked'",
+    )
+    .bind(id)
+    .bind(oauth)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// The callback exchange completing: seal the rotating refresh token into
+/// `credential_sealed` (the SAME custody column static bearers use) and
+/// flip the connection live. Works from pending (first connect) and error
+/// (reconnect after invalid_grant) alike.
+pub async fn activate_connection_oauth(
+    pool: &PgPool,
+    id: Uuid,
+    sealed_refresh: &[u8],
+    oauth: &Value,
+    granted_scopes: &Value,
+) -> sqlx::Result<Option<IntegrationConnectionRow>> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "update integration_connections
+         set credential_sealed = $2, oauth = $3, granted_scopes = $4,
+             status = 'active', updated_at = now()
+         where id = $1 and status <> 'revoked' and auth_kind = 'oauth'
+         returning {CONNECTION_COLS}"
+    )))
+    .bind(id)
+    .bind(sealed_refresh)
+    .bind(oauth)
+    .bind(granted_scopes)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Refresh-token rotation: one atomic overwrite (OAuth 2.1 MUST — old token
+/// is gone the moment the new one lands). Active connections only; returns
+/// false when the row was revoked/errored underneath the caller.
+pub async fn rotate_connection_refresh(
+    pool: &PgPool,
+    id: Uuid,
+    sealed_new: &[u8],
+) -> sqlx::Result<bool> {
+    let r = sqlx::query(
+        "update integration_connections set credential_sealed = $2, updated_at = now()
+         where id = $1 and status = 'active' and auth_kind = 'oauth'",
+    )
+    .bind(id)
+    .bind(sealed_new)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected() == 1)
+}
+
+/// `invalid_grant`-class failure: the refresh token is dead, the connection
+/// needs human re-consent. Everything downstream fails closed off the
+/// status: `connection_credential_sealed` stops returning, run creation
+/// refuses, the broker surfaces "reconnect".
+pub async fn mark_connection_error(pool: &PgPool, id: Uuid, note: &str) -> sqlx::Result<()> {
+    sqlx::query(
+        "update integration_connections
+         set status = 'error', updated_at = now(),
+             oauth = jsonb_set(coalesce(oauth, '{}'::jsonb), '{error}', to_jsonb($2::text))
+         where id = $1 and status = 'active'",
+    )
+    .bind(id)
+    .bind(note)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// Store a (DCR-minted) client secret after connection creation. Sealed by
+/// the caller; readable only via `connection_client_secret_sealed`.
+pub async fn set_connection_client_secret(
+    pool: &PgPool,
+    id: Uuid,
+    sealed: &[u8],
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "update integration_connections set client_secret_sealed = $2, updated_at = now()
+         where id = $1 and status <> 'revoked'",
+    )
+    .bind(id)
+    .bind(sealed)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// The only reader of the sealed client secret (confidential OAuth clients).
+/// Client identity outlives token state — the dance needs it while the row
+/// is still pending (first exchange) or errored (reconnect) — so any
+/// non-revoked status qualifies.
+pub async fn connection_client_secret_sealed(
+    pool: &PgPool,
+    id: Uuid,
+) -> sqlx::Result<Option<Vec<u8>>> {
+    let row = sqlx::query(
+        "select client_secret_sealed from integration_connections
+         where id = $1 and status <> 'revoked'",
     )
     .bind(id)
     .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|r| r.get::<Option<Vec<u8>>, _>("client_secret_sealed")))
+}
+
+// ─── Connector catalog ────────────────────────────────────────────────────
+
+/// One catalog entry — GLOBAL (tenant-less) reference data, a superset of
+/// the MCP registry's server.json. UNTRUSTED everywhere it is consumed:
+/// tool_hints are policy-default seeds for display, never enforcement.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct ConnectorCatalogRow {
+    pub id: Uuid,
+    pub slug: String,
+    pub name: String,
+    pub icon: Option<String>,
+    pub description: Option<String>,
+    pub categories: Value,
+    pub tier: String,
+    pub url: Option<String>,
+    pub transport: String,
+    pub auth_mode: String,
+    pub auth_hints: Value,
+    pub scopes: Value,
+    pub egress: Value,
+    pub tool_hints: Value,
+    pub sandbox_launch: Option<Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+pub async fn list_catalog(pool: &PgPool) -> sqlx::Result<Vec<ConnectorCatalogRow>> {
+    sqlx::query_as(
+        "select * from connector_catalog
+         order by case tier when 'verified' then 0 when 'community' then 1 else 2 end, name",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_catalog_by_slug(
+    pool: &PgPool,
+    slug: &str,
+) -> sqlx::Result<Option<ConnectorCatalogRow>> {
+    sqlx::query_as("select * from connector_catalog where slug = $1")
+        .bind(slug)
+        .fetch_optional(pool)
+        .await
+}
+
+/// API-added entries are always tier `custom` — verified/community are
+/// curation judgements the API cannot self-award.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_catalog_entry(
+    pool: &PgPool,
+    slug: &str,
+    name: &str,
+    icon: Option<&str>,
+    description: Option<&str>,
+    categories: &Value,
+    url: Option<&str>,
+    transport: &str,
+    auth_mode: &str,
+    auth_hints: &Value,
+    scopes: &Value,
+    egress: &Value,
+    tool_hints: &Value,
+    sandbox_launch: Option<&Value>,
+) -> sqlx::Result<ConnectorCatalogRow> {
+    sqlx::query_as(
+        "insert into connector_catalog
+           (id, slug, name, icon, description, categories, tier, url, transport,
+            auth_mode, auth_hints, scopes, egress, tool_hints, sandbox_launch)
+         values ($1,$2,$3,$4,$5,$6,'custom',$7,$8,$9,$10,$11,$12,$13,$14)
+         returning *",
+    )
+    .bind(Uuid::now_v7())
+    .bind(slug)
+    .bind(name)
+    .bind(icon)
+    .bind(description)
+    .bind(categories)
+    .bind(url)
+    .bind(transport)
+    .bind(auth_mode)
+    .bind(auth_hints)
+    .bind(scopes)
+    .bind(egress)
+    .bind(tool_hints)
+    .bind(sandbox_launch)
+    .fetch_one(pool)
     .await
 }
 
@@ -2198,11 +2430,12 @@ mod tests {
             "github",
             "test-account-42",
             "test-connection",
-            &sealed,
+            Some(&sealed),
             &serde_json::json!(["repo"]),
             &serde_json::json!({}),
             &serde_json::json!({"test": true}),
             None,
+            ConnectionAuth::static_active(),
         )
         .await
         .unwrap();
@@ -2914,6 +3147,200 @@ mod tests {
         sqlx::query("delete from capability_bundles where tenant_id = $1 and name = $2")
             .bind(tenant)
             .bind(&name)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn connector_catalog_seeded_and_custom_entries_forced_custom_tier() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+
+        // Migration 0007 seeds the curated set (API-only settle: the
+        // migration IS the seed; no file, no boot sync).
+        let rows = list_catalog(&pool).await.unwrap();
+        assert!(rows.len() >= 7, "expected ≥7 seeded entries");
+        let notion = get_catalog_by_slug(&pool, "notion").await.unwrap().unwrap();
+        assert_eq!(notion.auth_mode, "oauth");
+        assert_eq!(notion.tier, "verified");
+        let sentry = get_catalog_by_slug(&pool, "sentry").await.unwrap().unwrap();
+        assert_eq!(sentry.auth_hints["header_name"], "Sentry-Bearer");
+        assert_eq!(sentry.auth_hints["scheme"], "");
+        let ws = get_catalog_by_slug(&pool, "workspace-info")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ws.transport, "stdio");
+        assert!(ws.sandbox_launch.is_some());
+        // Slack seed is explicitly deferred to the Phase-7 vertical.
+        assert!(get_catalog_by_slug(&pool, "slack").await.unwrap().is_none());
+        // Verified entries sort ahead of custom ones.
+        assert_eq!(rows[0].tier, "verified");
+
+        let slug = format!("test-cat-{}", Uuid::now_v7().simple());
+        let row = create_catalog_entry(
+            &pool,
+            &slug,
+            "Test entry",
+            None,
+            Some("test"),
+            &serde_json::json!(["test"]),
+            Some("https://mcp.example.test/mcp"),
+            "streamable_http",
+            "api_key",
+            &serde_json::json!({}),
+            &serde_json::json!([]),
+            &serde_json::json!([]),
+            &serde_json::json!([]),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(row.tier, "custom", "API entries can't self-award tiers");
+        // Slugs are unique — re-insert conflicts.
+        assert!(create_catalog_entry(
+            &pool,
+            &slug,
+            "dup",
+            None,
+            None,
+            &serde_json::json!([]),
+            None,
+            "streamable_http",
+            "none",
+            &serde_json::json!({}),
+            &serde_json::json!([]),
+            &serde_json::json!([]),
+            &serde_json::json!([]),
+            None,
+        )
+        .await
+        .is_err());
+
+        sqlx::query("delete from connector_catalog where slug = $1")
+            .bind(&slug)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn oauth_connection_lifecycle_pending_activate_rotate_error() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let tenant = ensure_default_tenant(&pool).await.unwrap();
+
+        // Pending OAuth connection: no credential yet.
+        let conn = create_connection(
+            &pool,
+            tenant,
+            "mcp_http",
+            "mcp.example.test",
+            "oauth-lifecycle-test",
+            None,
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            &serde_json::json!({"base_url": "https://mcp.example.test"}),
+            None,
+            ConnectionAuth {
+                auth_kind: "oauth",
+                status: "pending",
+                oauth: Some(&serde_json::json!({"resource": "https://mcp.example.test"})),
+                client_secret_sealed: Some(b"sealed-client-secret"),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(conn.auth_kind, "oauth");
+        assert_eq!(conn.status, "pending");
+        // Pending = no credential, and the active-only reader refuses.
+        assert!(connection_credential_sealed(&pool, conn.id)
+            .await
+            .unwrap()
+            .is_none());
+        // …but client identity IS readable while pending (the dance needs it).
+        assert_eq!(
+            connection_client_secret_sealed(&pool, conn.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(b"sealed-client-secret".as_slice())
+        );
+        // Rotation refuses non-active rows.
+        assert!(!rotate_connection_refresh(&pool, conn.id, b"rt1")
+            .await
+            .unwrap());
+
+        // Callback exchange: seal refresh + activate.
+        let row = activate_connection_oauth(
+            &pool,
+            conn.id,
+            b"sealed-rt-1",
+            &serde_json::json!({"resource": "https://mcp.example.test", "client_id": "c1"}),
+            &serde_json::json!(["read"]),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(row.status, "active");
+        assert_eq!(
+            connection_credential_sealed(&pool, conn.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(b"sealed-rt-1".as_slice())
+        );
+
+        // Rotation is one atomic overwrite; the old bytes are gone.
+        assert!(rotate_connection_refresh(&pool, conn.id, b"sealed-rt-2")
+            .await
+            .unwrap());
+        assert_eq!(
+            connection_credential_sealed(&pool, conn.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(b"sealed-rt-2".as_slice())
+        );
+
+        // invalid_grant ⇒ error: the credential reader fails closed; the
+        // error note lands in oauth jsonb for the dashboard.
+        mark_connection_error(&pool, conn.id, "invalid_grant: reconnect required")
+            .await
+            .unwrap();
+        let row = get_connection(&pool, conn.id).await.unwrap().unwrap();
+        assert_eq!(row.status, "error");
+        assert!(row.oauth.unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid_grant"));
+        assert!(connection_credential_sealed(&pool, conn.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Reconnect path: activation works FROM error too.
+        let row = activate_connection_oauth(
+            &pool,
+            conn.id,
+            b"sealed-rt-3",
+            &serde_json::json!({"resource": "https://mcp.example.test"}),
+            &serde_json::json!([]),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(row.status, "active");
+
+        sqlx::query("delete from integration_connections where id = $1")
+            .bind(conn.id)
             .execute(&pool)
             .await
             .unwrap();

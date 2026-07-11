@@ -32,6 +32,18 @@ export default function Connections() {
     }
   };
 
+  // Restart the OAuth dance on the SAME connection (pending rows finish it,
+  // errored rows revive after invalid_grant — nothing is recreated).
+  const reconnect = async (id: string) => {
+    setErr("");
+    try {
+      const r = await apiPost<{ authorize_url: string }>(`/connections/${id}/oauth/start`, {});
+      window.open(r.authorize_url, "_blank", "noopener");
+    } catch (e) {
+      setErr(String(e));
+    }
+  };
+
   return (
     <>
       <PageHead
@@ -66,6 +78,16 @@ export default function Connections() {
                   {c.metadata?.login && c.metadata.login !== c.display_name
                     ? ` (@${c.metadata.login})`
                     : ""}
+                  {c.auth_kind === "oauth" && (
+                    <span className="mut mono" style={{ marginLeft: 8, fontSize: 11.5 }}>
+                      oauth{c.oauth?.client_id_source ? ` (${c.oauth.client_id_source})` : ""}
+                    </span>
+                  )}
+                  {c.metadata?.header_name && (
+                    <span className="mut mono" style={{ marginLeft: 8, fontSize: 11.5 }}>
+                      header: {c.metadata.header_name}
+                    </span>
+                  )}
                   {c.granted_scopes?.length > 0 && (
                     <span className="mut" style={{ marginLeft: 8, fontSize: 12 }}>
                       scopes: {c.granted_scopes.join(", ")}
@@ -82,6 +104,11 @@ export default function Connections() {
                         : ""}
                     </span>
                   )}
+                  {c.status === "error" && c.oauth?.error && (
+                    <span className="err" style={{ display: "block", fontSize: 11.5, marginTop: 2 }}>
+                      {c.oauth.error}
+                    </span>
+                  )}
                 </span>
                 <span className={`autopill ${c.status === "active" ? "supervised" : "autonomous"}`}>
                   {c.status}
@@ -89,6 +116,10 @@ export default function Connections() {
                 {c.status === "active" ? (
                   <button className="btn ghost sm" onClick={() => revoke(c.id)}>
                     revoke
+                  </button>
+                ) : c.auth_kind === "oauth" && c.status !== "revoked" ? (
+                  <button className="btn ghost sm" onClick={() => reconnect(c.id)}>
+                    reconnect
                   </button>
                 ) : (
                   <span />
