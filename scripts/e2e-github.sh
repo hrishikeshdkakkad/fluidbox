@@ -241,6 +241,13 @@ git -C "$FIXROOT/acme/probe" checkout -q main
 export FLUIDBOX_GITHUB_API_URL="http://127.0.0.1:$GH_PORT"
 export FLUIDBOX_GITHUB_WEB_URL="http://127.0.0.1:$GH_PORT"
 export FLUIDBOX_GITHUB_CLONE_BASE="file://$FIXROOT"
+# A webhook-capable public host (loopback would make the manifest omit
+# hook_attributes — github.com refuses unreachable hook URLs). The host
+# only exists for curl: pcurl pins it to 127.0.0.1, and using it for every
+# cookie-bearing browser leg keeps the jar host-consistent.
+PUB="http://fbx-e2e.internal:8787"
+export FLUIDBOX_PUBLIC_URL="$PUB"
+pcurl() { curl --connect-to fbx-e2e.internal:8787:127.0.0.1:8787 "$@"; }
 start_server || exit 1
 ok "stack up (control plane + fake github api :$GH_PORT + file:// fixtures)"
 
@@ -487,7 +494,7 @@ CODE=$(post "/github/app/manifest/start" '{"organization":null}')
 REG=$(jb "['registration']['id']")
 GO_URL=$(jb "['go_url']")
 JAR="$GH_DIR/jar-manifest.txt"
-curl -s -c "$JAR" -o "$GH_DIR/go.html" "$GO_URL"
+pcurl -s -c "$JAR" -o "$GH_DIR/go.html" "$GO_URL"
 grep -q "settings/apps/new?state=" "$GH_DIR/go.html" && ok "go page form targets GitHub's app-creation endpoint" || no "go form action missing"
 grep -q "/v1/ingress/github/app/$REG" "$GH_DIR/go.html" && ok "manifest pre-wires the app-level webhook (registration-scoped URL)" || no "manifest hook url missing"
 grep -q "pull_requests" "$GH_DIR/go.html" && ok "manifest carries least-privilege permissions" || no "manifest permissions missing"
@@ -499,16 +506,16 @@ print(html.unescape(m.group(1)).split("state=")[1] if m and "state=" in m.group(
 PYEOF
 )
 [ -n "$MSTATE" ] && ok "sealed manifest state minted for the GitHub round-trip" || { no "no state in go form"; exit 1; }
-CODE=$(curl -s -o "$B" -w "%{http_code}" "$GO_URL")
+CODE=$(pcurl -s -o "$B" -w "%{http_code}" "$GO_URL")
 [ "$CODE" = "400" ] && ok "bootstrap replay refused (one browser binds one flow)" || no "go replay: $CODE"
-CB="$API/v1/github/app/manifest/callback?code=mfc-e2e-ok&state=$MSTATE"
-CODE=$(curl -s -o "$B" -w "%{http_code}" "$CB")
+CB="$PUB/v1/github/app/manifest/callback?code=mfc-e2e-ok&state=$MSTATE"
+CODE=$(pcurl -s -o "$B" -w "%{http_code}" "$CB")
 [ "$CODE" = "400" ] && ok "callback without the initiating browser's cookie refused" || no "cookieless callback: $CODE"
 [ "$(req_count POST '/app-manifests/[^/]+/conversions')" = "0" ] && ok "…and no conversion was attempted (flow not burned)" || no "conversion hit early"
-CODE=$(curl -s -b "$JAR" -o "$GH_DIR/created.html" -w "%{http_code}" "$CB")
+CODE=$(pcurl -s -b "$JAR" -o "$GH_DIR/created.html" -w "%{http_code}" "$CB")
 [ "$CODE" = "200" ] && grep -q "GitHub App created" "$GH_DIR/created.html" \
   && ok "manifest callback converted the one-hour code + activated the registration" || { no "callback: $CODE $(cat "$GH_DIR/created.html" 2>/dev/null)"; exit 1; }
-CODE=$(curl -s -b "$JAR" -o /dev/null -w "%{http_code}" "$CB")
+CODE=$(pcurl -s -b "$JAR" -o /dev/null -w "%{http_code}" "$CB")
 [ "$CODE" = "400" ] && ok "manifest state replay refused (flow consumed exactly once)" || no "state replay: $CODE"
 [ "$(req_count POST '/app-manifests/[^/]+/conversions')" = "1" ] && ok "exactly one conversion ever reached GitHub" || no "conversions: $(req_count POST '/app-manifests/[^/]+/conversions')"
 RS=$(pq "select status||'|'||slug||'|'||app_id||'|'||(pem_sealed is not null)||'|'||(webhook_secret_sealed is not null) from github_app_registrations where id='$REG'")
@@ -523,7 +530,7 @@ say "SEAMLESS — install dance: spoofed id refused, real installation connects"
 inst_state() { # cookie-jar → prints the sealed install state from the 302
   post "/github/app/$REG/install/start" '{}' >/dev/null
   local go; go=$(jb "['go_url']")
-  curl -s -c "$1" -o /dev/null -D "$GH_DIR/head.txt" "$go"
+  pcurl -s -c "$1" -o /dev/null -D "$GH_DIR/head.txt" "$go"
   python3 - "$GH_DIR/head.txt" <<'PYEOF'
 import re, sys
 h = open(sys.argv[1]).read()
@@ -535,15 +542,15 @@ PYEOF
 curl -s -X POST "http://127.0.0.1:$GH_PORT/_fixture/add/$SEAM_IID" -d '{"login":"acme2","app":"9876"}' >/dev/null
 JAR2="$GH_DIR/jar-i1.txt"; S2=$(inst_state "$JAR2")
 [ -n "$S2" ] && ok "install go bound this browser and 302'd to installations/new" || { no "install go produced no state"; exit 1; }
-CODE=$(curl -s -b "$JAR2" -o "$B" -w "%{http_code}" "$API/v1/github/app/$REG/setup?installation_id=555&setup_action=install&state=$S2")
+CODE=$(pcurl -s -b "$JAR2" -o "$B" -w "%{http_code}" "$PUB/v1/github/app/$REG/setup?installation_id=555&setup_action=install&state=$S2")
 [ "$CODE" = "400" ] && grep -q "does not belong" "$B" && ok "SPOOFED installation id refused (app-JWT verification is the anchor)" || no "spoof: $CODE $(cat "$B")"
 JAR3="$GH_DIR/jar-i2.txt"; S3=$(inst_state "$JAR3")
-CODE=$(curl -s -b "$JAR3" -o "$B" -w "%{http_code}" "$API/v1/github/app/$REG/setup?installation_id=$SEAM_IID&setup_action=install&state=$S3")
+CODE=$(pcurl -s -b "$JAR3" -o "$B" -w "%{http_code}" "$PUB/v1/github/app/$REG/setup?installation_id=$SEAM_IID&setup_action=install&state=$S3")
 [ "$CODE" = "200" ] && grep -qi "connected" "$B" && ok "real installation verified against GitHub and connected" || no "setup: $CODE $(cat "$B")"
 C2=$(pq "select id from integration_connections where provider='github_app' and external_account_id='$SEAM_IID' and status <> 'revoked'")
 [ -n "$C2" ] && [ "$(pq "select status from integration_connections where id='$C2'")" = "active" ] && ok "connection active for installation $SEAM_IID" || { no "no live connection for $SEAM_IID"; exit 1; }
 [ "$(pq "select registration_id from integration_connections where id='$C2'")" = "$REG" ] && ok "typed registration linkage set (custody on the registration)" || no "registration_id missing"
-CODE=$(curl -s -b "$JAR3" -o "$B" -w "%{http_code}" "$API/v1/github/app/$REG/setup?installation_id=$SEAM_IID&setup_action=install&state=$S3")
+CODE=$(pcurl -s -b "$JAR3" -o "$B" -w "%{http_code}" "$PUB/v1/github/app/$REG/setup?installation_id=$SEAM_IID&setup_action=install&state=$S3")
 [ "$CODE" = "400" ] && ok "setup replay refused" || no "setup replay: $CODE"
 [ "$(pq "select count(*) from integration_connections where provider='github_app' and external_account_id='$SEAM_IID' and status <> 'revoked'")" = "1" ] && ok "ONE live row per installation (partial unique index)" || no "duplicate rows for $SEAM_IID"
 GH_BEFORE=$(wc -l < "$GH_LOG" | tr -d ' ')
@@ -643,7 +650,7 @@ say "SEAMLESS — degraded conversion: no webhook secret ⇒ events fail closed"
 CODE=$(post "/github/app/manifest/start" '{"organization":null}')
 REG2=$(jb "['registration']['id']"); GO2_URL=$(jb "['go_url']")
 JARN="$GH_DIR/jar-nosec.txt"
-curl -s -c "$JARN" -o "$GH_DIR/go2.html" "$GO2_URL"
+pcurl -s -c "$JARN" -o "$GH_DIR/go2.html" "$GO2_URL"
 NSTATE=$(python3 - "$GH_DIR/go2.html" <<'PYEOF'
 import html, re, sys
 h = open(sys.argv[1]).read()
@@ -651,7 +658,7 @@ m = re.search(r'action="([^"]+)"', h)
 print(html.unescape(m.group(1)).split("state=")[1] if m and "state=" in m.group(1) else "")
 PYEOF
 )
-CODE=$(curl -s -b "$JARN" -o "$B" -w "%{http_code}" "$API/v1/github/app/manifest/callback?code=mfc-e2e-nosec&state=$NSTATE")
+CODE=$(pcurl -s -b "$JARN" -o "$B" -w "%{http_code}" "$PUB/v1/github/app/manifest/callback?code=mfc-e2e-nosec&state=$NSTATE")
 [ "$CODE" = "200" ] && grep -q "no webhook secret" "$B" && ok "degraded conversion surfaces the remediation note" || no "nosec callback: $CODE"
 [ "$(pq "select (status='active' and webhook_secret_sealed is null)::text from github_app_registrations where id='$REG2'")" = "true" ] \
   && ok "registration active but marked degraded (no sealed webhook secret)" || no "nosec registration state"
