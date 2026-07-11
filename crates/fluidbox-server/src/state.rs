@@ -50,10 +50,15 @@ pub struct AppStateInner {
     /// FLUIDBOX_CREDENTIAL_KEY is configured — connection endpoints and
     /// connection-backed workspaces refuse to operate without it.
     pub sealer: Option<crate::seal::Sealer>,
-    /// Short-lived provider tokens minted per connection (e.g. GitHub App
-    /// installation tokens, ~1h TTL) — a cache only; the durable credential
-    /// stays sealed in the DB and entries refresh on expiry.
+    /// Short-lived provider tokens minted per connection (GitHub App
+    /// installation tokens ~1h, OAuth access tokens) — a cache only; the
+    /// durable credential (private key / rotating refresh token) stays
+    /// sealed in the DB and entries re-mint on expiry or restart.
     pub connector_tokens: Mutex<HashMap<Uuid, (String, DateTime<Utc>)>>,
+    /// Per-connection serialization of OAuth token refreshes: rotation means
+    /// concurrent brokered calls must mint ONE new refresh token, not race
+    /// each other into invalid_grant (Notion keeps ≤2 valid).
+    pub oauth_locks: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
 }
 
 pub type AppState = Arc<AppStateInner>;

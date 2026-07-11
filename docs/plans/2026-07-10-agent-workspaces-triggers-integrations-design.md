@@ -642,6 +642,40 @@ Implement the optional workspace/context concept before event automation:
 
 **Acceptance demo:** two agents triggered by the same event have different tool bundles; each can use only its frozen capabilities, and every call appears in the governed ledger.
 
+### Phase 5.5 — Connector catalog & OAuth custody (user-inserted slice, shipped 2026-07-11)
+
+The user-facing layer over the Phase-5 seams: a curated connector catalog
+("select capabilities onto your agent") plus OAuth credential custody for
+connectors with no static-key path (Notion-class). RunSpec, the permission
+gate, and the photograph rule are untouched — only credential resolution in
+`broker::brokered_auth` grew (custom `header_name`/`scheme` for static
+secrets; OAuth access-token minting with sealed rotating refresh tokens).
+
+**Settled at the boundary (user, 2026-07-11):**
+
+1. **Both increments in one phase** (catalog + OAuth custody).
+2. **API-only catalog** (deviating from the checked-in/boot-synced
+   recommendation): `connector_catalog` rows are seeded by migration 0007
+   and managed via `/v1/catalog`; there is no seed file and no boot-sync
+   code path. The table is global (tenant-less) reference data; custom
+   entries are forced tier=custom.
+3. **Generic confidential-client support now** (pre-registered client_id +
+   sealed client_secret; priority pre-registered → CIMD → DCR); the **Slack
+   seed entry is deferred to the Phase-7 Slack vertical** (confidential
+   client, no DCR). Notion IS seeded — the OAuth showcase.
+4. **Catalog Connect auto-registers the bundle** (photograph with the fresh
+   credential; authless immediately, api_key after sealing with rollback on
+   refusal, oauth at callback completion).
+
+**Acceptance demo:** a catalog entry is connected end-to-end (401 → PRM →
+AS metadata → PKCE S256 + `resource=` both legs → single unauthenticated
+callback with AEAD-sealed state → sealed rotating refresh token), the broker
+mints/refreshes access tokens server-side (proactive pre-expiry + one
+reactive-401 retry), rotation kills the old refresh token, `invalid_grant`
+fails new runs closed at zero spend until a reconnect on the same connection
+revives it, and no secret ever appears in a response, RunSpec, ledger, or
+sandbox.
+
 ### Phase 6 — Multi-harness proof
 
 Add the next harness, initially Codex, without modifying the trigger, workspace, policy, or result-delivery model.

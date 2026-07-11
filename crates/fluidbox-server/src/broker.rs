@@ -28,15 +28,61 @@ const MAX_LIST_PAGES: usize = 4;
 /// — the ledger stores only digests either way.
 const MAX_RESULT_BYTES: usize = 256 * 1024;
 
-/// Resolve the Authorization header for a brokered server, enforcing
-/// audience binding: the connection pins a `base_url`, and its credential is
-/// only ever sent to URLs under that base (our RFC-8707-equivalent — a
-/// bundle can never point connection X's token at attacker.example).
+/// A resolved outbound credential: which header to set, its full value, and
+/// — for OAuth connections — the connection whose access token can be
+/// re-minted after a 401 (`None` = static credential; a 401 is terminal).
+pub struct BrokeredAuth {
+    pub header: String,
+    pub value: String,
+    pub oauth_connection: Option<uuid::Uuid>,
+}
+
+/// Compose the header VALUE from the connection's scheme and the sealed
+/// raw secret: `Bearer` prefixes, `Basic` base64-encodes (the stored secret
+/// is `email:token`), empty scheme sends the bare token (the Sentry shape).
+pub fn compose_header_value(scheme: &str, secret: &str) -> String {
+    use base64::Engine;
+    match scheme {
+        "Bearer" => format!("Bearer {secret}"),
+        "Basic" => format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(secret)
+        ),
+        _ => secret.to_string(),
+    }
+}
+
+/// RFC 7230 token charset, with headers the MCP transport itself owns
+/// denylisted — a connection must not be able to smuggle protocol fields.
+pub fn valid_header_name(name: &str) -> bool {
+    const DENY: &[&str] = &[
+        "host",
+        "content-length",
+        "content-type",
+        "accept",
+        "mcp-session-id",
+        "mcp-protocol-version",
+    ];
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        && !DENY.contains(&name.to_ascii_lowercase().as_str())
+}
+
+/// Resolve the auth header for a brokered server, enforcing audience
+/// binding: the connection pins a `base_url`, and its credential is only
+/// ever sent to URLs under that base (our RFC-8707-equivalent — a bundle
+/// can never point connection X's token at attacker.example).
 /// `Ok(None)` = the server declared no credential.
+/// Static connections send the sealed secret (per header_name/scheme);
+/// OAuth connections mint/refresh an access token first — the ONLY growth
+/// this phase adds to the broker's credential resolution.
 pub async fn brokered_auth(
     state: &AppState,
     server: &CapabilityServer,
-) -> Result<Option<String>, String> {
+) -> Result<Option<BrokeredAuth>, String> {
     let CapabilityServer::Brokered {
         name,
         url,
@@ -76,6 +122,14 @@ pub async fn brokered_auth(
             "capability server '{name}': url is outside the connection's base_url — refusing to send its credential (audience binding)"
         ));
     }
+    if conn.auth_kind == "oauth" {
+        let access = crate::oauth::ensure_access_token(state, &conn).await?;
+        return Ok(Some(BrokeredAuth {
+            header: "authorization".into(),
+            value: format!("Bearer {access}"),
+            oauth_connection: Some(*cid),
+        }));
+    }
     let sealer = state
         .sealer
         .as_ref()
@@ -85,7 +139,22 @@ pub async fn brokered_auth(
         .map_err(|e| format!("credential lookup failed: {e}"))?
         .ok_or("connection is not active (revoked or missing)")?;
     let token = sealer.open(&sealed).map_err(|e| e.to_string())?;
-    Ok(Some(format!("Bearer {token}")))
+    let header = conn
+        .metadata
+        .get("header_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("authorization")
+        .to_string();
+    let scheme = conn
+        .metadata
+        .get("scheme")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Bearer");
+    Ok(Some(BrokeredAuth {
+        header,
+        value: compose_header_value(scheme, &token),
+        oauth_connection: None,
+    }))
 }
 
 /// scheme + host + port must match; the base path must prefix the url path
@@ -114,6 +183,36 @@ pub fn url_within_base(url: &str, base: &str) -> bool {
 
 // ─── Minimal MCP Streamable HTTP client ───────────────────────────────────
 
+/// Errors where HTTP 401 stays distinguishable: an OAuth connection may
+/// re-mint its access token and retry exactly once (the 401 happened at the
+/// auth layer, so the tool provably never executed — the same reasoning
+/// that makes the session-handshake retry safe).
+enum CallErr {
+    Unauthorized,
+    Other(String),
+}
+
+impl CallErr {
+    fn into_msg(self) -> String {
+        match self {
+            CallErr::Unauthorized => "mcp server rejected the credential (HTTP 401)".into(),
+            CallErr::Other(m) => m,
+        }
+    }
+}
+
+impl From<String> for CallErr {
+    fn from(m: String) -> Self {
+        CallErr::Other(m)
+    }
+}
+
+impl From<&str> for CallErr {
+    fn from(m: &str) -> Self {
+        CallErr::Other(m.into())
+    }
+}
+
 struct McpSession {
     session_id: Option<String>,
     protocol_version: Option<String>,
@@ -122,7 +221,7 @@ struct McpSession {
 async fn post_rpc(
     state: &AppState,
     url: &str,
-    auth: Option<&str>,
+    auth: Option<&BrokeredAuth>,
     session: Option<&McpSession>,
     body: &Value,
 ) -> Result<(reqwest::StatusCode, Option<String>, Value), String> {
@@ -133,7 +232,7 @@ async fn post_rpc(
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream");
     if let Some(a) = auth {
-        req = req.header("authorization", a);
+        req = req.header(a.header.as_str(), a.value.as_str());
     }
     if let Some(s) = session {
         if let Some(sid) = &s.session_id {
@@ -204,14 +303,17 @@ pub fn parse_sse_json(body: &str, want_id: Option<&Value>) -> Option<Value> {
 async fn rpc(
     state: &AppState,
     url: &str,
-    auth: Option<&str>,
+    auth: Option<&BrokeredAuth>,
     method: &str,
     params: Value,
-) -> Result<Value, String> {
+) -> Result<Value, CallErr> {
     let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
     let (status, _, value) = post_rpc(state, url, auth, None, &body).await?;
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(CallErr::Unauthorized);
+    }
     if status.is_success() && value.get("error").is_none() && !value.is_null() {
-        return unwrap_result(value, method);
+        return unwrap_result(value, method).map_err(Into::into);
     }
     // Pre-2026 servers may demand an initialize handshake / session. Those
     // rejections happen before the method dispatches, so one retry is safe.
@@ -227,14 +329,19 @@ async fn rpc(
             })
             .unwrap_or(false);
     if !session_needed {
-        return unwrap_result(rpc_error_to_err(status, value, method)?, method);
+        return unwrap_result(rpc_error_to_err(status, value, method)?, method).map_err(Into::into);
     }
     let session = handshake(state, url, auth).await?;
     let (status, _, value) = post_rpc(state, url, auth, Some(&session), &body).await?;
-    if !status.is_success() {
-        return Err(format!("mcp {method} returned HTTP {status}"));
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(CallErr::Unauthorized);
     }
-    unwrap_result(rpc_error_to_err(status, value, method)?, method)
+    if !status.is_success() {
+        return Err(CallErr::Other(format!(
+            "mcp {method} returned HTTP {status}"
+        )));
+    }
+    unwrap_result(rpc_error_to_err(status, value, method)?, method).map_err(Into::into)
 }
 
 fn rpc_error_to_err(
@@ -276,7 +383,11 @@ fn unwrap_result(value: Value, method: &str) -> Result<Value, String> {
         .ok_or_else(|| format!("mcp {method} returned no result"))
 }
 
-async fn handshake(state: &AppState, url: &str, auth: Option<&str>) -> Result<McpSession, String> {
+async fn handshake(
+    state: &AppState,
+    url: &str,
+    auth: Option<&BrokeredAuth>,
+) -> Result<McpSession, CallErr> {
     let body = json!({
         "jsonrpc": "2.0", "id": 0, "method": "initialize",
         "params": {
@@ -286,8 +397,13 @@ async fn handshake(state: &AppState, url: &str, auth: Option<&str>) -> Result<Mc
         }
     });
     let (status, session_id, value) = post_rpc(state, url, auth, None, &body).await?;
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(CallErr::Unauthorized);
+    }
     if !status.is_success() {
-        return Err(format!("mcp initialize returned HTTP {status}"));
+        return Err(CallErr::Other(format!(
+            "mcp initialize returned HTTP {status}"
+        )));
     }
     let result = unwrap_result(value, "initialize")?;
     let session = McpSession {
@@ -309,11 +425,11 @@ async fn handshake(state: &AppState, url: &str, auth: Option<&str>) -> Result<Mc
 /// tools/list and maps the wire shape (camelCase `inputSchema`) into our
 /// frozen snapshot shape. Validation (charsets, lint, caps) happens in
 /// fluidbox-core after this returns.
-pub async fn discover_tools(
+async fn discover_tools(
     state: &AppState,
     url: &str,
-    auth: Option<&str>,
-) -> Result<Vec<ToolSnapshot>, String> {
+    auth: Option<&BrokeredAuth>,
+) -> Result<Vec<ToolSnapshot>, CallErr> {
     let mut tools = Vec::new();
     let mut cursor: Option<String> = None;
     for _ in 0..MAX_LIST_PAGES {
@@ -354,7 +470,7 @@ pub async fn discover_tools(
         }
     }
     if tools.is_empty() {
-        return Err("mcp server advertises no tools".into());
+        return Err(CallErr::Other("mcp server advertises no tools".into()));
     }
     Ok(tools)
 }
@@ -362,13 +478,13 @@ pub async fn discover_tools(
 /// One brokered tool execution. Returns (content, is_error) from the MCP
 /// result. At-least-once under network failure by design — the caller
 /// ledgers every attempt; we never blind-retry after a request was sent.
-pub async fn call_tool(
+async fn call_tool(
     state: &AppState,
     url: &str,
-    auth: Option<&str>,
+    auth: Option<&BrokeredAuth>,
     tool: &str,
     arguments: &Value,
-) -> Result<(Value, bool), String> {
+) -> Result<(Value, bool), CallErr> {
     let result = rpc(
         state,
         url,
@@ -383,6 +499,69 @@ pub async fn call_tool(
         .unwrap_or(false);
     let content = result.get("content").cloned().unwrap_or(json!([]));
     Ok((cap_content(content), is_error))
+}
+
+/// Reactive-401 recovery, OAuth connections only: drop the cached access
+/// token and mint a fresh one. A static credential that 401s is terminal —
+/// there is nothing to refresh.
+async fn reauth_after_401(
+    state: &AppState,
+    server: &CapabilityServer,
+    auth: Option<BrokeredAuth>,
+) -> Result<Option<BrokeredAuth>, String> {
+    let Some(cid) = auth.as_ref().and_then(|a| a.oauth_connection) else {
+        return Err("mcp server rejected the credential (HTTP 401)".into());
+    };
+    crate::oauth::invalidate_access(state, cid).await;
+    brokered_auth(state, server).await
+}
+
+fn server_url(server: &CapabilityServer) -> Result<&str, String> {
+    match server {
+        CapabilityServer::Brokered { url, .. } => Ok(url),
+        _ => Err("not a brokered server".into()),
+    }
+}
+
+/// Execute one brokered tool with credential resolution + the single
+/// reactive-401 retry (safe: a 401 at the auth layer proves the tool never
+/// executed). This is the broker's public execution surface.
+pub async fn call_tool_auth(
+    state: &AppState,
+    server: &CapabilityServer,
+    tool: &str,
+    arguments: &Value,
+) -> Result<(Value, bool), String> {
+    let url = server_url(server)?;
+    let auth = brokered_auth(state, server).await?;
+    match call_tool(state, url, auth.as_ref(), tool, arguments).await {
+        Err(CallErr::Unauthorized) => {
+            let auth = reauth_after_401(state, server, auth).await?;
+            call_tool(state, url, auth.as_ref(), tool, arguments)
+                .await
+                .map_err(CallErr::into_msg)
+        }
+        r => r.map_err(CallErr::into_msg),
+    }
+}
+
+/// Discover with the same resolution/retry semantics as execution — used by
+/// the photograph.
+pub async fn discover_tools_auth(
+    state: &AppState,
+    server: &CapabilityServer,
+) -> Result<Vec<ToolSnapshot>, String> {
+    let url = server_url(server)?;
+    let auth = brokered_auth(state, server).await?;
+    match discover_tools(state, url, auth.as_ref()).await {
+        Err(CallErr::Unauthorized) => {
+            let auth = reauth_after_401(state, server, auth).await?;
+            discover_tools(state, url, auth.as_ref())
+                .await
+                .map_err(CallErr::into_msg)
+        }
+        r => r.map_err(CallErr::into_msg),
+    }
 }
 
 /// Oversized results are replaced by a truncated text block so a hostile or
@@ -413,13 +592,10 @@ pub async fn photograph_brokered(
     state: &AppState,
     server: &CapabilityServer,
 ) -> ApiResult<Vec<ToolSnapshot>> {
-    let CapabilityServer::Brokered { name, url, .. } = server else {
+    let CapabilityServer::Brokered { name, .. } = server else {
         return Err(ApiError::Internal("not a brokered server".into()));
     };
-    let auth = brokered_auth(state, server)
-        .await
-        .map_err(ApiError::BadRequest)?;
-    discover_tools(state, url, auth.as_deref())
+    discover_tools_auth(state, server)
         .await
         .map_err(|e| ApiError::BadRequest(format!("capability server '{name}': {e}")))
 }
@@ -474,6 +650,35 @@ mod tests {
             "https://mcp.example.test",
         );
         no("not a url", "https://mcp.example.test");
+    }
+
+    #[test]
+    fn header_values_compose_per_scheme() {
+        assert_eq!(compose_header_value("Bearer", "tok"), "Bearer tok");
+        // Basic base64-encodes the stored email:token composite.
+        assert_eq!(
+            compose_header_value("Basic", "a@b.c:tok"),
+            format!("Basic {}", {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.encode("a@b.c:tok")
+            })
+        );
+        // Empty scheme = the bare token (Sentry's custom-header shape).
+        assert_eq!(compose_header_value("", "raw-token"), "raw-token");
+    }
+
+    #[test]
+    fn header_names_validate_and_denylist_protocol_fields() {
+        assert!(valid_header_name("authorization"));
+        assert!(valid_header_name("Sentry-Bearer"));
+        assert!(valid_header_name("x-api-key"));
+        assert!(!valid_header_name(""));
+        assert!(!valid_header_name("bad header"));
+        assert!(!valid_header_name("bad:header"));
+        assert!(!valid_header_name("Content-Type"));
+        assert!(!valid_header_name("mcp-session-id"));
+        assert!(!valid_header_name("Host"));
+        assert!(!valid_header_name(&"x".repeat(65)));
     }
 
     #[test]
