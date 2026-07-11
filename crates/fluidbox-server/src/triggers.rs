@@ -242,6 +242,11 @@ pub struct CreateTrigger {
     /// ["pr_comment"]; an explicit [] publishes to the dashboard/webhook only.
     #[serde(default)]
     pub publish: Option<Vec<String>>,
+    /// Capability keep-list (§3.5): bundle NAMES this subscription's runs
+    /// keep, intersected with the revision's attachments — remove-only.
+    /// Omitted = keep all; an explicit [] strips every capability.
+    #[serde(default)]
+    pub capabilities: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -295,6 +300,39 @@ pub async fn create(
             "concurrency_policy must be allow | skip_if_running | replace".into(),
         ));
     }
+    // Capability keep-list: naming a bundle the target revision doesn't
+    // attach is dead config — refused at create (the intersection at run
+    // time could only ever ignore it). An explicit [] is a deliberate
+    // strip-everything and passes.
+    let capability_keep: Option<Value> = match &req.capabilities {
+        None => None,
+        Some(keep) => {
+            let rev = match req.pinned_revision_id {
+                Some(rid) => fluidbox_db::get_revision(&state.pool, rid).await?,
+                None => fluidbox_db::latest_revision(&state.pool, agent.id).await?,
+            }
+            .ok_or_else(|| ApiError::BadRequest("agent has no revisions".into()))?;
+            let pins: Vec<fluidbox_core::capability::BundleRef> =
+                serde_json::from_value(rev.capability_bundles.clone())
+                    .map_err(|e| ApiError::Internal(format!("bad stored capability pins: {e}")))?;
+            for name in keep {
+                if !pins.iter().any(|p| &p.name == name) {
+                    return Err(ApiError::BadRequest(format!(
+                        "capability keep-list names '{name}' but the agent revision attaches no such bundle (attached: {})",
+                        if pins.is_empty() {
+                            "none".to_string()
+                        } else {
+                            pins.iter()
+                                .map(|p| p.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                    )));
+                }
+            }
+            Some(json!(keep))
+        }
+    };
     // A schedule fires with no caller: the cron/timezone must parse, the
     // template must exist and render from the schedule context alone, and
     // there must actually be a future firing.
@@ -507,6 +545,7 @@ pub async fn create(
         resource_selector.as_ref(),
         event_filter.as_ref(),
         event_publish.as_ref(),
+        capability_keep.as_ref(),
     )
     .await
     .map_err(|e| match &e {
@@ -837,6 +876,10 @@ pub async fn invoke(
             autonomy,
             trust_tier: fluidbox_core::spec::TrustTier::Trusted,
             budget_override,
+            // The subscription's stored keep-list applies inside create_run;
+            // callers cannot send one (narrowing config lives on the
+            // subscription, like every other override).
+            capability_selection: None,
             invocation,
             result_destinations: destinations,
             bound_invocation: Some(invocation_id),

@@ -199,6 +199,29 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
             </div>
           )}
 
+          {(session?.run_spec?.capabilities?.length ?? 0) > 0 && (
+            <div className="panel pad">
+              <div className="sectitle" style={{ marginTop: 0 }}>
+                frozen capabilities
+              </div>
+              {session!.run_spec!.capabilities!.map((b) => (
+                <div
+                  key={b.id}
+                  style={{ padding: "5px 0", borderBottom: "1px solid var(--line-soft)" }}
+                >
+                  <div className="mono" style={{ fontSize: 12 }}>
+                    {b.name}@{b.version}
+                  </div>
+                  <div className="mut mono" style={{ fontSize: 10.5, marginTop: 2 }}>
+                    {b.servers
+                      .map((s) => `${s.name} (${s.class}, ${s.tools.length} tools)`)
+                      .join(" · ")}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
           {deliveries.length > 0 && (
             <div className="panel pad">
               <div className="sectitle" style={{ marginTop: 0 }}>
@@ -394,6 +417,30 @@ function TimelineItem({ ev }: { ev: EventRow }) {
         </>
       );
       break;
+    case "capability.frozen":
+      tag = "capability";
+      body = (
+        <>
+          capabilities frozen: <span className="em">{((d.bundles as string[]) || []).join(", ")}</span>
+          <span className="mut"> · {s("tools")} tools photographed</span>
+        </>
+      );
+      break;
+    case "tool.brokered": {
+      const ok = d.ok === true;
+      cls = ok ? "good" : "danger";
+      tag = "brokered";
+      body = (
+        <>
+          <code>{s("tool")}</code> executed by the control plane{" "}
+          <span className="mut">
+            ({ok ? "ok" : "failed"} · {s("latency_ms")}ms
+            {s("error") ? ` · ${s("error")}` : ""})
+          </span>
+        </>
+      );
+      break;
+    }
   }
 
   return (

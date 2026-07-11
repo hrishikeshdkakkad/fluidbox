@@ -1,6 +1,8 @@
 mod api;
 mod auth;
+mod broker;
 mod callback;
+mod capabilities;
 mod config;
 mod connections;
 mod connectors;
@@ -116,6 +118,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/approvals", get(api::approvals_inbox))
         .route("/approvals/{id}/decision", post(api::decide_approval))
         .route(
+            "/capabilities",
+            get(capabilities::list).post(capabilities::create),
+        )
+        .route("/capabilities/{id}", get(capabilities::get))
+        .route(
             "/connections",
             get(connections::list).post(connections::create),
         )
@@ -138,6 +145,9 @@ async fn main() -> anyhow::Result<()> {
 
     let internal = Router::new()
         .route("/sessions/{id}/permission", post(internal::permission))
+        // Brokered tools (design §8.3 class 2): intent in, governed result
+        // out; the sealed credential turns server-side.
+        .route("/sessions/{id}/tools/call", post(internal::tool_call))
         .route("/sessions/{id}/events", post(internal::events))
         .route("/sessions/{id}/heartbeat", post(internal::heartbeat))
         .route("/sessions/{id}/result", post(internal::result))

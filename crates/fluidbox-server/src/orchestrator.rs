@@ -121,6 +121,12 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
     if let Some(sp) = &run_spec.system_prompt {
         env.push(("FLUIDBOX_SYSTEM_PROMPT".into(), sp.clone()));
     }
+    if !run_spec.capabilities.is_empty() {
+        env.push((
+            "FLUIDBOX_CAPABILITIES".into(),
+            runner_capability_manifest(&run_spec.capabilities).to_string(),
+        ));
+    }
 
     let sandbox_spec = SandboxSpec {
         session_id,
@@ -156,6 +162,40 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
     .await;
 
     Ok(())
+}
+
+/// The sandbox-facing slice of the frozen capability set. The runner needs:
+/// sandbox servers' launch specs (command/args), and brokered servers'
+/// frozen tool snapshots (to advertise them via the broker shim). Broker
+/// internals — URLs, connection ids — stay out of the sandbox: it holds an
+/// intent channel, not a map of the control plane's upstreams.
+fn runner_capability_manifest(
+    capabilities: &[fluidbox_core::capability::FrozenBundle],
+) -> serde_json::Value {
+    use fluidbox_core::capability::CapabilityServer;
+    let servers: Vec<serde_json::Value> = capabilities
+        .iter()
+        .flat_map(|b| &b.servers)
+        .map(|s| match s {
+            CapabilityServer::Sandbox {
+                name,
+                command,
+                args,
+                ..
+            } => serde_json::json!({
+                "class": "sandbox", "name": name, "command": command, "args": args,
+            }),
+            CapabilityServer::Brokered { name, tools, .. } => serde_json::json!({
+                "class": "brokered", "name": name,
+                "tools": tools.iter().map(|t| serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.input_schema,
+                })).collect::<Vec<_>>(),
+            }),
+        })
+        .collect();
+    serde_json::json!({ "servers": servers })
 }
 
 async fn materialize_workspace(

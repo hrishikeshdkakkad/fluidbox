@@ -109,6 +109,25 @@ pub enum EventBody {
         attempts: i32,
         error: String,
     },
+    /// The run's frozen capability set, for timeline visibility (the RunSpec
+    /// is the authoritative copy). `bundles` are "name@version" strings.
+    #[serde(rename = "capability.frozen")]
+    CapabilitiesFrozen { bundles: Vec<String>, tools: u64 },
+    /// One brokered tool execution: the control plane turned the sealed
+    /// credential server-side. Identity, status, latency, result digest —
+    /// never inputs, outputs, or secrets.
+    #[serde(rename = "tool.brokered")]
+    BrokeredToolCall {
+        tool_call_id: String,
+        tool: String,
+        server: String,
+        ok: bool,
+        latency_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result_digest: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// Forward-compat: events written by newer components still round-trip.
     #[serde(untagged)]
     Unknown(Value),
@@ -275,6 +294,33 @@ mod tests {
         assert_eq!(json["type"], "tool.decision");
         let back: EventBody = serde_json::from_value(json).unwrap();
         assert_eq!(back.type_name(), "tool.decision");
+    }
+
+    #[test]
+    fn capability_event_shapes_roundtrip() {
+        let frozen = EventBody::CapabilitiesFrozen {
+            bundles: vec!["kb-tools@1".into(), "ws-tools@2".into()],
+            tools: 5,
+        };
+        let v = serde_json::to_value(&frozen).unwrap();
+        assert_eq!(v["type"], "capability.frozen");
+        assert_eq!(frozen.type_name(), "capability.frozen");
+
+        let brokered = EventBody::BrokeredToolCall {
+            tool_call_id: "t1".into(),
+            tool: "mcp__kb__kb_search".into(),
+            server: "kb".into(),
+            ok: true,
+            latency_ms: 42,
+            result_digest: Some("sha256:abcd".into()),
+            error: None,
+        };
+        let v = serde_json::to_value(&brokered).unwrap();
+        assert_eq!(v["type"], "tool.brokered");
+        assert_eq!(v["data"]["latency_ms"], 42);
+        assert!(v["data"].get("error").is_none());
+        let back: EventBody = serde_json::from_value(v).unwrap();
+        assert_eq!(back.type_name(), "tool.brokered");
     }
 
     #[test]

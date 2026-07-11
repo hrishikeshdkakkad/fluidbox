@@ -4,6 +4,7 @@
 //! policy engine (including autonomy resolution), redaction, usage/cost
 //! types, and the extension traits (`ExecutionProvider`, `Harness`).
 
+pub mod capability;
 pub mod event;
 pub mod policy;
 pub mod schedule;

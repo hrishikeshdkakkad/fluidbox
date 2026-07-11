@@ -149,6 +149,9 @@ function TriggerRow({
             {sub.allow_workspace_override ? " · workspace override" : ""}
             {sub.autonomy === "autonomous" ? " · autonomous" : ""}
             {sub.concurrency_policy !== "allow" ? ` · ${sub.concurrency_policy}` : ""}
+            {sub.capability_bundles
+              ? ` · capabilities: ${sub.capability_bundles.join(", ") || "none"}`
+              : ""}
             {callback?.url ? ` · cb ${callback.url.slice(0, 34)}` : ""}
           </span>
           {schedule && (
@@ -344,6 +347,7 @@ function NewTrigger({
   const [evSync, setEvSync] = useState(false);
   const [pubComment, setPubComment] = useState(true);
   const [pubCheck, setPubCheck] = useState(false);
+  const [capabilities, setCapabilities] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
@@ -386,6 +390,14 @@ function NewTrigger({
       if (template.trim()) body.task_template = template;
       if (callbackUrl.trim()) body.callback_url = callbackUrl.trim();
       if (concurrency !== "allow") body.concurrency_policy = concurrency;
+      // §3.5 narrowing: only send a keep-list when the operator typed one —
+      // omitted means "keep every bundle the revision attaches".
+      if (capabilities.trim()) {
+        body.capabilities = capabilities
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+      }
       if (scheduled) {
         body.schedule = {
           cron: cron.trim(),
@@ -506,6 +518,18 @@ function NewTrigger({
               <option value="skip_if_running">skip_if_running (classic cron — the skip is recorded)</option>
               <option value="replace">replace (cancel the running run, start the new one)</option>
             </select>
+          </label>
+          <label className="field">
+            <span className="lab">
+              Capability keep-list (optional, comma-separated bundle names — narrows the agent&apos;s
+              attached bundles; removal only)
+            </span>
+            <input
+              className="inp mono"
+              value={capabilities}
+              onChange={(e) => setCapabilities(e.target.value)}
+              placeholder="empty = keep all attached bundles"
+            />
           </label>
           <label className="field" style={{ flexDirection: "row", gap: 8, alignItems: "center" }}>
             <input

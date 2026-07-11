@@ -1,4 +1,13 @@
 //! The internal gateway (per-session token). The runner talks only to this.
+//!
+//! ONE server-side gate decides every tool call (`decide_tool_call`):
+//! budget ceiling → capability availability (the frozen RunSpec set) →
+//! policy verdict + trust-tier floor → approval machinery. `/permission`
+//! runs it for sandbox/built-in tools (the runner's canUseTool);
+//! `/tools/call` runs it for brokered tools and then executes them
+//! control-plane-side — the runner never calls `/permission` for those, so
+//! each call is decided exactly once, always server-side. A runner that
+//! skips its callback changes nothing: the broker gates regardless.
 
 use crate::auth::SessionAuth;
 use crate::error::{ApiError, ApiResult};
@@ -7,6 +16,7 @@ use crate::orchestrator;
 use crate::state::AppState;
 use axum::extract::State;
 use axum::Json;
+use fluidbox_core::capability::{self, CapabilityServer};
 use fluidbox_core::event::{digest_json, Actor, EventBody};
 use fluidbox_core::policy::{EvaluationOutcome, Policy, ToolCallRequest, Verdict};
 use fluidbox_core::spec::RunSpec;
@@ -15,27 +25,40 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 
-#[derive(Deserialize)]
-pub struct PermissionReq {
-    pub tool_call_id: String,
-    pub tool: String,
-    #[serde(default)]
-    pub input: Value,
+/// Outcome of the shared gate. `message` carries the deny reason (or the
+/// approval note) for the caller's wire shape.
+struct GateDecision {
+    allowed: bool,
+    message: Option<String>,
 }
 
-/// The canUseTool callback endpoint. Blocks (supervised) until a human
-/// decides or the approval expires; answers instantly (autonomous) with the
-/// policy's pre-resolved verdict. Idempotent by tool_call_id.
-pub async fn permission(
-    auth: SessionAuth,
-    State(state): State<AppState>,
-    Json(req): Json<PermissionReq>,
-) -> ApiResult<Json<Value>> {
-    let session = fluidbox_db::get_session(&state.pool, auth.session_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    let run_spec: RunSpec = serde_json::from_value(session.run_spec.clone())
-        .map_err(|e| ApiError::Internal(format!("bad run_spec: {e}")))?;
+impl GateDecision {
+    fn allow() -> Self {
+        Self {
+            allowed: true,
+            message: None,
+        }
+    }
+    fn deny(message: impl Into<String>) -> Self {
+        Self {
+            allowed: false,
+            message: Some(message.into()),
+        }
+    }
+}
+
+/// The heart of the system: one decision per tool call, made server-side
+/// against the FROZEN RunSpec (never live config). Idempotent by
+/// tool_call_id through the approvals table, so retries re-attach instead
+/// of re-asking.
+async fn decide_tool_call(
+    state: &AppState,
+    session: &fluidbox_db::SessionRow,
+    run_spec: &RunSpec,
+    tool_call_id: &str,
+    tool: &str,
+    input: &Value,
+) -> ApiResult<GateDecision> {
     let policy: Policy = run_spec.policy_snapshot.clone();
 
     // Budget: tool-call ceiling enforced at the gate.
@@ -43,7 +66,7 @@ pub async fn permission(
         let used = fluidbox_db::tool_call_count(&state.pool, session.id).await?;
         if used as u64 > max {
             ledger::record(
-                &state,
+                state,
                 session.id,
                 Actor::System,
                 EventBody::BudgetExceeded {
@@ -64,15 +87,36 @@ pub async fn permission(
                 )
                 .await;
             });
-            return Ok(Json(
-                json!({ "decision": "deny", "message": "tool-call budget exceeded" }),
-            ));
+            return Ok(GateDecision::deny("tool-call budget exceeded"));
         }
     }
 
+    // Capability availability (design §8): an mcp__* call must name a tool
+    // in the run's FROZEN capability set. Attach ≠ allow — but not-attached
+    // = unavailable, whatever the policy says. This is also the rug-pull
+    // defense: a tool the live server started advertising after the
+    // photograph simply does not exist for this run.
+    if let Some(reason) = capability::capability_denial(&run_spec.capabilities, tool) {
+        ledger::record(
+            state,
+            session.id,
+            Actor::System,
+            EventBody::ToolDecision {
+                tool_call_id: tool_call_id.to_string(),
+                tool: tool.to_string(),
+                verdict: "deny".into(),
+                source: "capability".into(),
+                original_verdict: None,
+                reason: Some(reason.clone()),
+            },
+        )
+        .await;
+        return Ok(GateDecision::deny(reason));
+    }
+
     let tool_req = ToolCallRequest {
-        tool: req.tool.clone(),
-        input: req.input.clone(),
+        tool: tool.to_string(),
+        input: input.clone(),
     };
     let outcome: EvaluationOutcome = policy.evaluate(&tool_req, run_spec.autonomy);
 
@@ -83,12 +127,12 @@ pub async fn permission(
     if run_spec.trust_tier == fluidbox_core::spec::TrustTier::ReadOnly {
         if let Some(reason) = fluidbox_core::policy::read_only_denial(&tool_req) {
             ledger::record(
-                &state,
+                state,
                 session.id,
                 Actor::System,
                 EventBody::ToolDecision {
-                    tool_call_id: req.tool_call_id.clone(),
-                    tool: req.tool.clone(),
+                    tool_call_id: tool_call_id.to_string(),
+                    tool: tool.to_string(),
                     verdict: "deny".into(),
                     source: "trust_tier".into(),
                     original_verdict: Some(outcome.original.name().into()),
@@ -96,18 +140,36 @@ pub async fn permission(
                 },
             )
             .await;
-            return Ok(Json(json!({ "decision": "deny", "message": reason })));
+            return Ok(GateDecision::deny(reason));
         }
     }
 
     match &outcome.effective {
         Verdict::Allow => {
-            emit_decision(&state, session.id, &req, &outcome, "allow", None).await;
-            Ok(Json(json!({ "decision": "allow" })))
+            emit_decision(
+                state,
+                session.id,
+                tool_call_id,
+                tool,
+                &outcome,
+                "allow",
+                None,
+            )
+            .await;
+            Ok(GateDecision::allow())
         }
         Verdict::Deny { reason } => {
-            emit_decision(&state, session.id, &req, &outcome, "deny", Some(reason)).await;
-            Ok(Json(json!({ "decision": "deny", "message": reason })))
+            emit_decision(
+                state,
+                session.id,
+                tool_call_id,
+                tool,
+                &outcome,
+                "deny",
+                Some(reason),
+            )
+            .await;
+            Ok(GateDecision::deny(reason.clone()))
         }
         Verdict::RequireApproval {
             risk,
@@ -118,28 +180,29 @@ pub async fn permission(
             // Session-scope grant already given for this key?
             if fluidbox_db::has_session_grant(&state.pool, session.id, scope_key).await? {
                 emit_decision(
-                    &state,
+                    state,
                     session.id,
-                    &req,
+                    tool_call_id,
+                    tool,
                     &outcome,
                     "allow",
                     Some("session-approved"),
                 )
                 .await;
-                return Ok(Json(json!({ "decision": "allow" })));
+                return Ok(GateDecision::allow());
             }
 
             let scope_str = match scope {
                 fluidbox_core::policy::ApprovalScope::Once => "once",
                 fluidbox_core::policy::ApprovalScope::Session => "session",
             };
-            let digest = digest_json(&req.input);
+            let digest = digest_json(input);
             let (approval, inserted) = fluidbox_db::upsert_pending_approval(
                 &state.pool,
                 session.id,
-                &req.tool_call_id,
-                &req.tool,
-                &summarize(&req.tool, &req.input),
+                tool_call_id,
+                tool,
+                &summarize(tool, input),
                 Some(&digest),
                 risk.as_deref(),
                 scope_str,
@@ -150,18 +213,18 @@ pub async fn permission(
 
             // Restart case: the row was already decided while we were away.
             if approval.status != "pending" {
-                return Ok(Json(decision_response(&approval.status)));
+                return Ok(decision_from_status(&approval.status));
             }
 
             if inserted {
                 ledger::record(
-                    &state,
+                    state,
                     session.id,
                     Actor::System,
                     EventBody::ApprovalRequested {
                         approval_id: approval.id,
-                        tool_call_id: req.tool_call_id.clone(),
-                        tool: req.tool.clone(),
+                        tool_call_id: tool_call_id.to_string(),
+                        tool: tool.to_string(),
                         summary: approval.summary.clone(),
                         risk: risk.clone(),
                         expires_at: approval.expires_at,
@@ -213,12 +276,12 @@ pub async fn permission(
                 .and_then(|a| a.decided_by)
                 .unwrap_or_else(|| "system".into());
             ledger::record(
-                &state,
+                state,
                 session.id,
                 Actor::Human,
                 EventBody::ApprovalDecided {
                     approval_id: approval.id,
-                    tool_call_id: req.tool_call_id.clone(),
+                    tool_call_id: tool_call_id.to_string(),
                     decision: final_status.clone(),
                     decided_by: decided_by.clone(),
                 },
@@ -227,18 +290,197 @@ pub async fn permission(
 
             let allowed = final_status == "approved_once" || final_status == "approved_session";
             emit_decision(
-                &state,
+                state,
                 session.id,
-                &req,
+                tool_call_id,
+                tool,
                 &outcome,
                 if allowed { "allow" } else { "deny" },
                 Some(&format!("human:{decided_by}")),
             )
             .await;
 
-            maybe_resume(&state, session.id).await;
+            maybe_resume(state, session.id).await;
 
-            Ok(Json(decision_response(&final_status)))
+            Ok(decision_from_status(&final_status))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PermissionReq {
+    pub tool_call_id: String,
+    pub tool: String,
+    #[serde(default)]
+    pub input: Value,
+}
+
+/// The canUseTool callback endpoint. Blocks (supervised) until a human
+/// decides or the approval expires; answers instantly (autonomous) with the
+/// policy's pre-resolved verdict. Idempotent by tool_call_id.
+pub async fn permission(
+    auth: SessionAuth,
+    State(state): State<AppState>,
+    Json(req): Json<PermissionReq>,
+) -> ApiResult<Json<Value>> {
+    let session = fluidbox_db::get_session(&state.pool, auth.session_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let run_spec: RunSpec = serde_json::from_value(session.run_spec.clone())
+        .map_err(|e| ApiError::Internal(format!("bad run_spec: {e}")))?;
+    let decision = decide_tool_call(
+        &state,
+        &session,
+        &run_spec,
+        &req.tool_call_id,
+        &req.tool,
+        &req.input,
+    )
+    .await?;
+    Ok(Json(if decision.allowed {
+        json!({ "decision": "allow" })
+    } else {
+        json!({
+            "decision": "deny",
+            "message": decision.message.unwrap_or_else(|| "not approved".into()),
+        })
+    }))
+}
+
+// ─── Brokered tool execution (design §8.3 class 2) ────────────────────────
+
+#[derive(Deserialize)]
+pub struct BrokeredCallReq {
+    pub tool_call_id: String,
+    pub tool: String,
+    #[serde(default)]
+    pub input: Value,
+}
+
+/// `POST /internal/sessions/{id}/tools/call` — intent in, governed result
+/// out. The sealed credential turns server-side (broker.rs); the sandbox
+/// sees only the tool result. Ledger trail per call: tool.requested →
+/// tool.decision → tool.brokered (identity, digests, latency — never
+/// inputs, outputs, or secrets).
+pub async fn tool_call(
+    auth: SessionAuth,
+    State(state): State<AppState>,
+    Json(req): Json<BrokeredCallReq>,
+) -> ApiResult<Json<Value>> {
+    let session = fluidbox_db::get_session(&state.pool, auth.session_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if session.status_enum().is_terminal() {
+        return Err(ApiError::BadRequest("session is not active".into()));
+    }
+    let run_spec: RunSpec = serde_json::from_value(session.run_spec.clone())
+        .map_err(|e| ApiError::Internal(format!("bad run_spec: {e}")))?;
+
+    // Class check: only brokered tools cross this endpoint. A tool the
+    // frozen set doesn't know falls through to the gate for a uniform,
+    // ledgered capability denial.
+    let server = capability::parse_mcp_tool(&req.tool)
+        .and_then(|(srv, tool)| capability::find_tool(&run_spec.capabilities, srv, tool))
+        .map(|(srv, _)| srv);
+    if let Some(srv) = server {
+        if !srv.is_brokered() {
+            return Err(ApiError::BadRequest(format!(
+                "tool '{}' is sandbox-class — it executes inside the sandbox, not through the broker",
+                req.tool
+            )));
+        }
+    }
+
+    // The broker owns the whole ledger trail for brokered calls (the runner
+    // does not pre-announce them), so the tool-call budget counts them
+    // exactly once.
+    ledger::record(
+        &state,
+        session.id,
+        Actor::Agent,
+        EventBody::ToolRequested {
+            tool_call_id: req.tool_call_id.clone(),
+            tool: req.tool.clone(),
+            summary: summarize(&req.tool, &req.input),
+            input_digest: digest_json(&req.input),
+        },
+    )
+    .await;
+
+    let decision = decide_tool_call(
+        &state,
+        &session,
+        &run_spec,
+        &req.tool_call_id,
+        &req.tool,
+        &req.input,
+    )
+    .await?;
+    if !decision.allowed {
+        return Ok(Json(json!({
+            "ok": false,
+            "denied": true,
+            "message": decision
+                .message
+                .unwrap_or_else(|| "denied by fluidbox policy".into()),
+        })));
+    }
+
+    let srv = server.expect("gate allowed the call, so the tool is in the frozen set");
+    let CapabilityServer::Brokered {
+        name: server_name,
+        url,
+        ..
+    } = srv
+    else {
+        unreachable!("class-checked above")
+    };
+    let (_, tool_name) = capability::parse_mcp_tool(&req.tool).expect("found in the frozen set");
+
+    let record_exec = |ok: bool, latency_ms: u64, digest: Option<String>, error: Option<String>| {
+        ledger::record(
+            &state,
+            session.id,
+            Actor::System,
+            EventBody::BrokeredToolCall {
+                tool_call_id: req.tool_call_id.clone(),
+                tool: req.tool.clone(),
+                server: server_name.clone(),
+                ok,
+                latency_ms,
+                result_digest: digest,
+                error,
+            },
+        )
+    };
+
+    // Credential turn: unsealed here, sent to the (audience-bound) server,
+    // dropped. Failure to resolve it is an execution failure, not a policy
+    // denial — visibly ledgered either way.
+    let auth_header = match crate::broker::brokered_auth(&state, srv).await {
+        Ok(a) => a,
+        Err(e) => {
+            record_exec(false, 0, None, Some(e.clone())).await;
+            return Ok(Json(json!({ "ok": false, "error": e })));
+        }
+    };
+
+    let started = std::time::Instant::now();
+    let outcome =
+        crate::broker::call_tool(&state, url, auth_header.as_deref(), tool_name, &req.input).await;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    match outcome {
+        Ok((content, is_error)) => {
+            record_exec(!is_error, latency_ms, Some(digest_json(&content)), None).await;
+            Ok(Json(json!({
+                "ok": true,
+                "result": { "content": content, "is_error": is_error },
+            })))
+        }
+        Err(e) => {
+            let msg: String = e.chars().take(300).collect();
+            record_exec(false, latency_ms, None, Some(msg.clone())).await;
+            Ok(Json(json!({ "ok": false, "error": msg })))
         }
     }
 }
@@ -255,17 +497,18 @@ async fn maybe_resume(state: &AppState, session_id: uuid::Uuid) {
     }
 }
 
-fn decision_response(status: &str) -> Value {
+fn decision_from_status(status: &str) -> GateDecision {
     match status {
-        "approved_once" | "approved_session" => json!({ "decision": "allow" }),
-        _ => json!({ "decision": "deny", "message": "not approved" }),
+        "approved_once" | "approved_session" => GateDecision::allow(),
+        _ => GateDecision::deny("not approved"),
     }
 }
 
 async fn emit_decision(
     state: &AppState,
     session: uuid::Uuid,
-    req: &PermissionReq,
+    tool_call_id: &str,
+    tool: &str,
     outcome: &EvaluationOutcome,
     verdict: &str,
     reason: Option<&str>,
@@ -289,8 +532,8 @@ async fn emit_decision(
         session,
         Actor::System,
         EventBody::ToolDecision {
-            tool_call_id: req.tool_call_id.clone(),
-            tool: req.tool.clone(),
+            tool_call_id: tool_call_id.to_string(),
+            tool: tool.to_string(),
             verdict: verdict.into(),
             source: source.into(),
             original_verdict: original,

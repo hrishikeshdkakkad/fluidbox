@@ -178,6 +178,9 @@ async fn build_and_create(
             autonomy,
             trust_tier: fluidbox_core::spec::TrustTier::Trusted,
             budget_override,
+            // The subscription's own capability keep-list applies inside
+            // create_run; firings add no further narrowing.
+            capability_selection: None,
             invocation: InvocationContext {
                 kind: InvocationKind::Schedule,
                 subscription_id: Some(sub.id),

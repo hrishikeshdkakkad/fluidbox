@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import { apiGet, apiPost, Agent, Revision, workspaceLabel } from "../lib/api";
+import { apiGet, apiPost, Agent, Revision, workspaceLabel, bundleRefsLabel } from "../lib/api";
 import { PageHead, short } from "../components/bits";
 import {
   WorkspacePicker,
@@ -94,6 +94,11 @@ export default function Agents() {
                             workspace <b>{workspaceLabel(r.default_workspace)}</b>
                           </span>
                         )}
+                        {r.capability_bundles?.length > 0 && (
+                          <span className="chip">
+                            capabilities <b>{bundleRefsLabel(r.capability_bundles)}</b>
+                          </span>
+                        )}
                         <span className="chip">image {short(r.runner_image, 24)}</span>
                       </div>
                     ))}
@@ -153,6 +158,9 @@ function AddRevision({
   const [workspace, setWorkspace] = useState<WorkspaceDraft>(
     specToDraft(current?.default_workspace)
   );
+  const [capabilities, setCapabilities] = useState(
+    bundleRefsLabel(current?.capability_bundles)
+  );
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
@@ -162,10 +170,16 @@ function AddRevision({
     try {
       // Inherits harness/policy/image/budgets from the latest revision.
       // The workspace is sent explicitly (WYSIWYG): scratch clears a default.
+      // Capability pins are WYSIWYG too: the field's refs re-resolve now
+      // (§17 #7 — a bare name pins the newest version at attach time).
       await apiPost(`/agents/${agentId}/revisions`, {
         model,
         system_prompt: systemPrompt.trim() || null,
         default_workspace: draftToInput(workspace),
+        capability_bundles: capabilities
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean),
       });
       onAdded();
     } catch (e) {
@@ -213,6 +227,17 @@ function AddRevision({
             />
           </label>
           <WorkspacePicker draft={workspace} onChange={setWorkspace} />
+          <label className="field">
+            <span className="lab">
+              Capability bundles (comma-separated: name pins latest now, or name@version)
+            </span>
+            <input
+              className="inp mono"
+              value={capabilities}
+              onChange={(e) => setCapabilities(e.target.value)}
+              placeholder="kb-tools, ws-tools@2 — empty = none"
+            />
+          </label>
           {err && <div className="err">{err}</div>}
           <div className="spread" style={{ marginTop: 14 }}>
             <span className="mut" style={{ fontSize: 12 }}>
@@ -234,6 +259,7 @@ function NewAgent({ onClose, onCreated }: { onClose: () => void; onCreated: () =
   const [model, setModel] = useState("claude-haiku-4-5");
   const [systemPrompt, setSystemPrompt] = useState("");
   const [workspace, setWorkspace] = useState<WorkspaceDraft>(emptyDraft("scratch"));
+  const [capabilities, setCapabilities] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
@@ -245,6 +271,10 @@ function NewAgent({ onClose, onCreated }: { onClose: () => void; onCreated: () =
     }
     setBusy(true);
     try {
+      const bundles = capabilities
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
       await apiPost("/agents", {
         name: name.trim(),
         description: description.trim() || null,
@@ -252,6 +282,7 @@ function NewAgent({ onClose, onCreated }: { onClose: () => void; onCreated: () =
         system_prompt: systemPrompt.trim() || null,
         policy: "default",
         default_workspace: draftToInput(workspace),
+        capability_bundles: bundles.length > 0 ? bundles : null,
       });
       onCreated();
     } catch (e) {
@@ -291,6 +322,15 @@ function NewAgent({ onClose, onCreated }: { onClose: () => void; onCreated: () =
             <textarea className="inp" style={{ minHeight: 70 }} value={systemPrompt} onChange={(e) => setSystemPrompt(e.target.value)} />
           </label>
           <WorkspacePicker draft={workspace} onChange={setWorkspace} />
+          <label className="field">
+            <span className="lab">Capability bundles (optional, comma-separated)</span>
+            <input
+              className="inp mono"
+              value={capabilities}
+              onChange={(e) => setCapabilities(e.target.value)}
+              placeholder="kb-tools, ws-tools@2"
+            />
+          </label>
           {err && <div className="err">{err}</div>}
           <div className="spread" style={{ marginTop: 16 }}>
             <span className="mut" style={{ fontSize: 12 }}>

@@ -215,6 +215,10 @@ async fn dispatch_one(
             autonomy,
             trust_tier: event.trust_tier,
             budget_override,
+            // The subscription's own capability keep-list applies inside
+            // create_run; the event adds no further narrowing (fork PRs are
+            // stripped there via the trust tier).
+            capability_selection: None,
             invocation: InvocationContext {
                 kind: InvocationKind::Event,
                 subscription_id: Some(sub.id),

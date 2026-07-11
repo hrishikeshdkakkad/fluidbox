@@ -37,6 +37,19 @@ export interface Session {
   base_commit: string | null;
   repo_source: WorkspaceSpec | null;
   trigger: InvocationEnvelope | null;
+  /** The frozen RunSpec (jsonb); only the slices the UI renders are typed. */
+  run_spec?: {
+    capabilities?: FrozenBundle[];
+  } | null;
+}
+
+/** Mirrors fluidbox-core FrozenBundle (RunSpec.capabilities entries). */
+export interface FrozenBundle {
+  id: string;
+  name: string;
+  version: number;
+  definition_digest: string;
+  servers: { class: "sandbox" | "brokered"; name: string; tools: { name: string }[] }[];
 }
 
 /** Mirrors fluidbox-core InvocationContext (sessions.trigger jsonb). */
@@ -65,6 +78,34 @@ export interface Revision {
   policy_id: string;
   budgets: Record<string, unknown>;
   default_workspace: WorkspaceSpec | null;
+  /** §17 #7 pins: exact bundle versions resolved at attach time. */
+  capability_bundles: BundleRef[];
+  created_at: string;
+}
+
+/** Mirrors fluidbox-core BundleRef (agent_revisions.capability_bundles). */
+export interface BundleRef {
+  id: string;
+  name: string;
+  version: number;
+}
+
+/** "name@version, name@version" — the attachment refs as text. */
+export function bundleRefsLabel(refs: BundleRef[] | null | undefined): string {
+  if (!refs || refs.length === 0) return "";
+  return refs.map((r) => `${r.name}@${r.version}`).join(", ");
+}
+
+/** One version row of the capability-bundle registry (list shape). */
+export interface CapabilityBundle {
+  id: string;
+  name: string;
+  version: number;
+  description: string | null;
+  definition_digest: string;
+  server_count: number;
+  tool_count: number;
+  classes: string[];
   created_at: string;
 }
 
@@ -135,6 +176,8 @@ export interface TriggerSubscription {
   resource_selector: { repositories?: string[] } | null;
   event_filter: { events?: string[] } | null;
   event_publish: string[] | null;
+  /** Capability keep-list (§3.5 narrowing); null = keep all attached. */
+  capability_bundles: string[] | null;
   created_at: string;
 }
 
