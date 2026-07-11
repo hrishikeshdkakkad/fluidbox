@@ -119,6 +119,15 @@ export default function Capabilities() {
                       ? "api key"
                       : "oauth"}
                   {e.categories.length > 0 ? ` · ${e.categories.join(", ")}` : ""}
+                  {e.connection?.status === "active" || (e.auth_mode === "none" && e.bundle) ? (
+                    <span style={{ color: "var(--accent)" }}> · ✓ connected</span>
+                  ) : e.connection ? (
+                    <span className="err" style={{ background: "none", padding: 0 }}>
+                      {" "}
+                      · {e.connection.status}
+                    </span>
+                  ) : null}
+                  {e.bundle ? ` · ${e.bundle.name}@${e.bundle.version}` : ""}
                 </div>
               </button>
             ))}
@@ -210,6 +219,59 @@ function ConnectCatalog({ entry, onClose }: { entry: CatalogEntry; onClose: () =
     };
   }, []);
 
+  const conn = entry.connection;
+  const isConnected = conn?.status === "active" || (entry.auth_mode === "none" && !!entry.bundle);
+  const needsReattention = !!conn && conn.status !== "active" && !isConnected;
+
+  const watchUntilActive = (connId?: string) => {
+    setWaiting(true);
+    pollTimer.current = setInterval(async () => {
+      try {
+        const list = await apiGet<{ connections: Connection[] }>("/connections");
+        const c = list.connections.find((x) => x.id === connId);
+        if (c?.status === "active") {
+          if (pollTimer.current) clearInterval(pollTimer.current);
+          setWaiting(false);
+          setDone("connected — the bundle was registered with the fresh credential");
+        }
+      } catch {
+        /* keep polling */
+      }
+    }, 2000);
+  };
+
+  const disconnect = async () => {
+    if (!conn) return;
+    setErr("");
+    setBusy(true);
+    try {
+      await apiPost(`/connections/${conn.id}/revoke`, {});
+      setDone("disconnected — the credential is revoked; Connect again any time");
+      setBusy(false);
+    } catch (e) {
+      setErr(String(e));
+      setBusy(false);
+    }
+  };
+
+  const reconnect = async () => {
+    if (!conn) return;
+    setErr("");
+    setBusy(true);
+    try {
+      const r = await apiPost<{ authorize_url: string }>(
+        `/connections/${conn.id}/oauth/start`,
+        {}
+      );
+      window.open(r.authorize_url, "_blank", "noopener");
+      setBusy(false);
+      watchUntilActive(conn.id);
+    } catch (e) {
+      setErr(String(e));
+      setBusy(false);
+    }
+  };
+
   const submit = async () => {
     setErr("");
     if (entry.auth_mode === "api_key" && !token.trim()) {
@@ -239,23 +301,9 @@ function ConnectCatalog({ entry, onClose }: { entry: CatalogEntry; onClose: () =
       }
       // OAuth: hand the browser to the authorization server, then watch the
       // connection flip active (the callback photographs the bundle).
-      const connId = r.connection?.id;
       if (r.authorize_url) window.open(r.authorize_url, "_blank", "noopener");
-      setWaiting(true);
       setBusy(false);
-      pollTimer.current = setInterval(async () => {
-        try {
-          const list = await apiGet<{ connections: Connection[] }>("/connections");
-          const c = list.connections.find((x) => x.id === connId);
-          if (c?.status === "active") {
-            if (pollTimer.current) clearInterval(pollTimer.current);
-            setWaiting(false);
-            setDone("connected — the bundle was registered with the fresh credential");
-          }
-        } catch {
-          /* keep polling */
-        }
-      }, 2000);
+      watchUntilActive(r.connection?.id);
     } catch (e) {
       setErr(String(e));
       setBusy(false);
@@ -310,6 +358,54 @@ function ConnectCatalog({ entry, onClose }: { entry: CatalogEntry; onClose: () =
             <div className="empty" style={{ padding: "18px 0" }}>
               waiting for authorization in the opened tab…
             </div>
+          ) : isConnected ? (
+            <>
+              <div className="empty" style={{ padding: "18px 0" }}>
+                ✓ connected
+                {entry.bundle
+                  ? ` — bundle ${entry.bundle.name}@${entry.bundle.version} is registered and attachable`
+                  : " — no bundle registered yet (use + Register bundle with this connection)"}
+              </div>
+              {err && <div className="err">{err}</div>}
+              <div className="spread" style={{ marginTop: 16 }}>
+                <span className="mut" style={{ fontSize: 12 }}>
+                  {entry.auth_mode === "none"
+                    ? "re-registering appends the next bundle version"
+                    : "disconnecting revokes the credential; frozen runs keep their snapshots"}
+                </span>
+                {entry.auth_mode === "none" ? (
+                  <button className="btn primary" onClick={submit} disabled={busy}>
+                    Register again
+                  </button>
+                ) : (
+                  <button className="btn ghost sm" onClick={disconnect} disabled={busy}>
+                    Disconnect
+                  </button>
+                )}
+              </div>
+            </>
+          ) : needsReattention && conn ? (
+            <>
+              <div className="empty" style={{ padding: "18px 0" }}>
+                connection is {conn.status}
+                {conn.status === "error"
+                  ? " — the credential needs re-consent"
+                  : " — authorization was never completed"}
+              </div>
+              {err && <div className="err">{err}</div>}
+              <div className="spread" style={{ marginTop: 16 }}>
+                <button className="btn ghost sm" onClick={disconnect} disabled={busy}>
+                  Disconnect
+                </button>
+                {conn.auth_kind === "oauth" ? (
+                  <button className="btn primary" onClick={reconnect} disabled={busy}>
+                    Reconnect
+                  </button>
+                ) : (
+                  <span />
+                )}
+              </div>
+            </>
           ) : (
             <>
               {entry.auth_mode === "api_key" && (

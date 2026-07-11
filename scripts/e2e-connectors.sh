@@ -409,6 +409,13 @@ echo "$LAST_LIST" | grep -q "\"sentry_bearer\": \"$SN_KEY\"" \
   && ok "photograph authenticated via Sentry-Bearer: <bare token> (custom header + raw scheme)" || no "header wrong: $LAST_LIST"
 echo "$LAST_LIST" | grep -q '"authorization": ""' \
   && ok "no Authorization header sent (custom header REPLACES, not supplements)" || no "authorization leaked: $LAST_LIST"
+DECOR=$(get "/catalog" | python3 -c "
+import sys, json
+d = {c['slug']: c for c in json.load(sys.stdin)['connectors']}
+e = d.get('fx-sentry', {})
+conn, bundle = e.get('connection') or {}, e.get('bundle') or {}
+print('ok' if conn.get('status') == 'active' and bundle.get('version', 0) >= 1 else str((conn, bundle)))")
+[ "$DECOR" = "ok" ] && ok "catalog entries decorate with live connection + bundle state (UI renders connected/disconnect)" || no "decoration: $DECOR"
 
 CODE=$(post "/catalog/fx-sentry/connect" "{\"token\":\"wrong-key\",\"bundle_name\":\"fx-sentry-bad\",\"display_name\":\"sentry-bad\"}")
 [ "$CODE" = "400" ] && grep -q "rejected this credential" "$B" \

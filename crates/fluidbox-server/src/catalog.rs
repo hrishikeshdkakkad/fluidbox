@@ -34,9 +34,67 @@ fn valid_slug(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
 
+/// List entries DECORATED with their live state — which non-revoked
+/// connection already covers the entry (matched by exact base_url) and the
+/// latest bundle named after the slug. Pure presentation derivation, done
+/// server-side so the dashboard stays logic-free; overridden bundle names
+/// deliberately don't count as "this entry's bundle".
 pub async fn list(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let rows = fluidbox_db::list_catalog(&state.pool).await?;
-    Ok(Json(json!({ "connectors": rows })))
+    let conns = fluidbox_db::list_connections(&state.pool, state.tenant_id).await?;
+    let bundles = fluidbox_db::list_capability_bundles(&state.pool, state.tenant_id).await?;
+    let connectors: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            let mut v = serde_json::to_value(r).unwrap_or_default();
+            if let Some(o) = v.as_object_mut() {
+                o.insert("connection".into(), entry_connection(r, &conns));
+                o.insert("bundle".into(), entry_bundle(r, &bundles));
+            }
+            v
+        })
+        .collect();
+    Ok(Json(json!({ "connectors": connectors })))
+}
+
+/// The connection that covers this entry: same base_url, not revoked;
+/// active beats error beats pending, newest wins within a class
+/// (list_connections is created_at-descending and min_by_key keeps the
+/// first minimum).
+fn entry_connection(
+    entry: &fluidbox_db::ConnectorCatalogRow,
+    conns: &[fluidbox_db::IntegrationConnectionRow],
+) -> Value {
+    let Some(url) = entry.url.as_deref() else {
+        return Value::Null;
+    };
+    conns
+        .iter()
+        .filter(|c| {
+            c.provider == "mcp_http"
+                && c.status != "revoked"
+                && c.metadata.get("base_url").and_then(Value::as_str) == Some(url)
+        })
+        .min_by_key(|c| match c.status.as_str() {
+            "active" => 0,
+            "error" => 1,
+            _ => 2,
+        })
+        .map(|c| json!({ "id": c.id, "status": c.status, "auth_kind": c.auth_kind }))
+        .unwrap_or(Value::Null)
+}
+
+fn entry_bundle(
+    entry: &fluidbox_db::ConnectorCatalogRow,
+    bundles: &[fluidbox_db::CapabilityBundleRow],
+) -> Value {
+    // list_capability_bundles orders by (name, version desc) — the first
+    // slug match is the latest version.
+    bundles
+        .iter()
+        .find(|b| b.name == entry.slug)
+        .map(|b| json!({ "id": b.id, "name": b.name, "version": b.version }))
+        .unwrap_or(Value::Null)
 }
 
 pub async fn get(
