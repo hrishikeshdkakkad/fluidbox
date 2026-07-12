@@ -472,6 +472,14 @@ pub async fn permission(
     let session = fluidbox_db::get_session(&state.pool, auth.session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
+    // A terminal session never gets a fresh decision — the primary guard,
+    // independent of token revocation (which is best-effort defense in depth).
+    if session.status_enum().is_terminal() {
+        return Ok(Json(json!({
+            "decision": "deny",
+            "message": "session is not active",
+        })));
+    }
     let run_spec: RunSpec = serde_json::from_value(session.run_spec.clone())
         .map_err(|e| ApiError::Internal(format!("bad run_spec: {e}")))?;
     let decision = decide_tool_call(
@@ -723,16 +731,37 @@ pub struct ResultIn {
     pub summary: Option<String>,
 }
 
+/// `/result` does NOT use the strict SessionAuth extractor: its whole job is
+/// to terminalize the run, and the terminal transition REVOKES the session's
+/// tokens — so a lost-response retry arrives with a now-revoked token. We
+/// resolve the token leniently (incl. revoked/expired): a terminal session
+/// ACKs idempotently (the result is already recorded); a live session with a
+/// still-valid token finalizes; anything else (a bogus token, or a revoked
+/// token on a non-terminal session — an anomaly, since revoke only fires on
+/// terminal) is 401. This keeps /result idempotent across the revoke without
+/// weakening any other endpoint (all keep strict SessionAuth).
 pub async fn result(
-    auth: SessionAuth,
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(res): Json<ResultIn>,
 ) -> ApiResult<Json<Value>> {
-    let session = fluidbox_db::get_session(&state.pool, auth.session_id)
+    let token = crate::auth::bearer_from_headers(&headers).ok_or(ApiError::Unauthorized)?;
+    let session_id = fluidbox_db::session_for_token_incl_revoked(&state.pool, &token)
+        .await?
+        .ok_or(ApiError::Unauthorized)?;
+    let session = fluidbox_db::get_session(&state.pool, session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
     if session.status_enum().is_terminal() {
         return Ok(Json(json!({ "ok": true, "note": "already terminal" })));
+    }
+    // Non-terminal: the token must still be live to drive a finalize (revoke
+    // only happens on terminal, so this is the ordinary first-post path).
+    if fluidbox_db::session_for_token(&state.pool, &token)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::Unauthorized);
     }
     let state2 = state.clone();
     tokio::spawn(async move {

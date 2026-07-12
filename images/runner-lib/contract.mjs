@@ -138,11 +138,14 @@ export class RunnerClient {
         return res.status === 204 ? null : await res.json().catch(() => null);
       } catch (e) {
         clearTimeout(timer);
-        // A 4xx will never succeed on retry — surface it immediately (a
-        // revoked token, a terminal session, a bad request). Only network /
-        // 5xx errors are worth retrying.
-        const clientError = e.status >= 400 && e.status < 500;
-        if (clientError || attempt >= retries) throw e;
+        // Retry only TRANSIENT failures: a network error (no status), a
+        // request-timeout / too-early / rate-limit, or a 5xx. A hard 4xx
+        // (400/401/403/404) will never heal on retry — surface it at once so
+        // callers (e.g. the renew loop) can act on the status immediately.
+        const s = e.status;
+        const retryable =
+          s === undefined || s === 408 || s === 425 || s === 429 || (s >= 500 && s < 600);
+        if (!retryable || attempt >= retries) throw e;
         await sleep(Math.min(2000 * (attempt + 1), 8000));
       }
     }
@@ -233,24 +236,14 @@ export class RunnerClient {
   }
 
   async postResult(outcome, summary) {
-    try {
-      await this.#post(
-        `${this.sessionBase()}/result`,
-        { outcome, summary: (summary || "").slice(0, 4000) },
-        { retries: 5 },
-      );
-    } catch (e) {
-      // A revoked/unauthorized token at result time means the session already
-      // went terminal — which is exactly what /result achieves. The first
-      // POST lands with a live token and terminalizes the run; only a
-      // lost-response RETRY can arrive after the terminal-transition revoke.
-      // Treat that as an ack so a completed run's exit code never flips to 1.
-      if (e.status === 401 || e.status === 403) {
-        console.error("fluidbox-runner: /result token revoked — session already terminal, ack");
-        return;
-      }
-      throw e;
-    }
+    // The server makes /result idempotent to the terminal-transition token
+    // revoke (a revoked token whose session is already terminal is ACKed
+    // 200), so a lost-response retry never needs a runner-side 401 hack.
+    await this.#post(
+      `${this.sessionBase()}/result`,
+      { outcome, summary: (summary || "").slice(0, 4000) },
+      { retries: 5 },
+    );
   }
 }
 
