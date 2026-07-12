@@ -24,10 +24,12 @@ if port_in_use; then
   echo "port 8787 already serving — stop 'just dev' first; the e2e suite owns the stack"
   exit 1
 fi
-if ! docker image inspect "$FLUIDBOX_SANDBOX_IMAGE" >/dev/null 2>&1; then
-  echo "building sandbox image $FLUIDBOX_SANDBOX_IMAGE…"
-  docker build -t "$FLUIDBOX_SANDBOX_IMAGE" "$ROOT/images/sandbox-runner" || exit 1
-fi
+# ALWAYS rebuild (layer cache makes it fast when unchanged): a stale cached
+# image would silently test the old runner. Context = images/ (shared with
+# codex) with a per-image -f.
+echo "building sandbox image $FLUIDBOX_SANDBOX_IMAGE…"
+docker build -q -t "$FLUIDBOX_SANDBOX_IMAGE" \
+  -f "$ROOT/images/sandbox-runner/Dockerfile" "$ROOT/images" >/dev/null || exit 1
 echo "building server + cli…"
 cargo build -q -p fluidbox-server -p fluidbox-cli || exit 1
 docker compose -f "$ROOT/deploy/docker-compose.dev.yml" up -d litellm >/dev/null 2>&1 || true
