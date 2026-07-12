@@ -1,0 +1,37 @@
+name: 💡 Feature request
+description: Propose an improvement or new capability
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before proposing, skim [`PLAN.md`](https://github.com/hrishikeshdkakkad/fluidbox/blob/main/PLAN.md) — the north star, roadmap, and convergence invariants live there. Ideas that fit the direction land much faster.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the situation where fluidbox falls short today. Concrete scenarios beat abstract wishes.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What you'd like to happen. API sketches, CLI invocations, or dashboard mockups welcome.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches and why they're worse (including "do nothing").
+  - type: dropdown
+    id: willing
+    attributes:
+      label: Are you willing to implement this?
+      options:
+        - Yes, with maintainer guidance
+        - Maybe, depends on scope
+        - No, just proposing
+    validations:
+      required: true
