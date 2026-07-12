@@ -242,7 +242,16 @@ async fn decide_tool_call(
     match &outcome.effective {
         Verdict::Allow => {
             if fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_allowed").await? {
-                emit_decision(state, session.id, tool_call_id, tool, &outcome, "allow", None).await;
+                emit_decision(
+                    state,
+                    session.id,
+                    tool_call_id,
+                    tool,
+                    &outcome,
+                    "allow",
+                    None,
+                )
+                .await;
                 Ok(GateDecision::allow())
             } else {
                 adopt_terminal_or_deny(state, intent.id).await
@@ -250,8 +259,16 @@ async fn decide_tool_call(
         }
         Verdict::Deny { reason } => {
             if fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_denied").await? {
-                emit_decision(state, session.id, tool_call_id, tool, &outcome, "deny", Some(reason))
-                    .await;
+                emit_decision(
+                    state,
+                    session.id,
+                    tool_call_id,
+                    tool,
+                    &outcome,
+                    "deny",
+                    Some(reason),
+                )
+                .await;
                 Ok(GateDecision::deny(reason.clone()))
             } else {
                 adopt_terminal_or_deny(state, intent.id).await
@@ -268,7 +285,8 @@ async fn decide_tool_call(
             // including a wait-join if that handler promoted it to pending
             // (the narrow grant-lands-mid-flight race).
             if fluidbox_db::has_session_grant(&state.pool, session.id, scope_key).await? {
-                if fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_allowed").await?
+                if fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_allowed")
+                    .await?
                 {
                     emit_decision(
                         state,
@@ -687,7 +705,10 @@ fn summarize(tool: &str, input: &Value) -> String {
             .filter_map(|e| e.get("file_path").and_then(|v| v.as_str()))
             .collect();
         if !paths.is_empty() {
-            return format!("{tool}: {}", paths.join(", ")).chars().take(200).collect();
+            return format!("{tool}: {}", paths.join(", "))
+                .chars()
+                .take(200)
+                .collect();
         }
     }
     for k in ["file_path", "path", "pattern"] {
@@ -724,7 +745,9 @@ pub async fn events(
     // so the timeline and the tool-call budget never double-count — and
     // never trust — runner cooperation.
     if matches!(body, EventBody::ToolRequested { .. }) {
-        return Ok(Json(json!({ "seq": Value::Null, "dropped": "tool.requested" })));
+        return Ok(Json(
+            json!({ "seq": Value::Null, "dropped": "tool.requested" }),
+        ));
     }
     let seq = ledger::record(&state, auth.session_id, actor, body).await;
     Ok(Json(json!({ "seq": seq })))

@@ -19,7 +19,7 @@ export const HARNESSES = [
     id: "codex",
     name: "Codex",
     hint: "OpenAI Codex on the same governed runner contract.",
-    available: false,
+    available: true,
   },
 ];
 
