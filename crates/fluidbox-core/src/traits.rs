@@ -1,7 +1,6 @@
 //! Extension seams. Everything replaceable in fluidbox plugs into one of
 //! these; the governance plane (policy, approvals, ledger, budgets) does not.
 
-use crate::spec::RunSpec;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -67,22 +66,8 @@ pub enum ProviderError {
     Other(String),
 }
 
-/// Which agent brain runs inside the sandbox. The harness adapter
-/// orchestrates (spawns the payload / drives a vendor queue); tool intents
-/// always flow back through the control plane's internal API, so this trait
-/// stays thin by design.
-#[async_trait]
-pub trait Harness: Send + Sync {
-    /// Environment the runner payload needs, derived from the RunSpec.
-    fn runner_env(&self, spec: &RunSpec, session_env: &SessionEnv) -> Vec<(String, String)>;
-    fn name(&self) -> &'static str;
-}
-
-/// Per-session wiring the control plane injects into any harness.
-#[derive(Debug, Clone)]
-pub struct SessionEnv {
-    pub session_id: Uuid,
-    pub session_token: String,
-    pub control_url: String,
-    pub workspace_dir: String,
-}
+// NOTE: there is deliberately no `Harness` trait. A harness is a runner
+// image implementing the HTTP runner contract (permission/events/heartbeat/
+// result + env contract + canonical tool vocabulary); the server-side
+// remainder (id validation, image/model defaults, env extras) is a plain
+// match in `fluidbox-server/src/harness.rs`.

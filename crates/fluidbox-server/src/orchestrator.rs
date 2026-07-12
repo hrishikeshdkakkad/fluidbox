@@ -96,9 +96,10 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
     transition(&state, session_id, SessionStatus::Initializing, None).await;
     let workspace_dir = materialize_workspace(&state, session_id, &run_spec).await?;
 
-    // Launch the sandbox.
+    // Launch the sandbox. The generic FLUIDBOX_* block is the harness-neutral
+    // runner contract; everything harness-specific rides runner_env().
     let control_url = state.cfg.public_control_url.clone();
-    let env = vec![
+    let mut env = vec![
         ("FLUIDBOX_CONTROL_URL".into(), control_url.clone()),
         ("FLUIDBOX_SESSION_ID".into(), session_id.to_string()),
         ("FLUIDBOX_SESSION_TOKEN".into(), session_token.clone()),
@@ -109,15 +110,16 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
         ),
         ("FLUIDBOX_MODEL".into(), run_spec.model.clone()),
         ("FLUIDBOX_WORKSPACE".into(), "/workspace".into()),
-        (
-            "ANTHROPIC_BASE_URL".into(),
-            format!("{}/internal/llm", control_url.trim_end_matches('/')),
-        ),
-        // The fake key IS the session token; the facade swaps in the real one.
-        ("ANTHROPIC_API_KEY".into(), session_token.clone()),
-        ("ANTHROPIC_MODEL".into(), run_spec.model.clone()),
     ];
-    let mut env = env;
+    // Per-harness extras: claude gets the Anthropic trio (facade URL + fake
+    // key = session token); codex gets nothing extra — its supervisor wires
+    // the facade from the generic block.
+    env.extend(crate::harness::runner_env(
+        &run_spec.harness,
+        &control_url,
+        &session_token,
+        &run_spec.model,
+    ));
     if let Some(sp) = &run_spec.system_prompt {
         env.push(("FLUIDBOX_SYSTEM_PROMPT".into(), sp.clone()));
     }

@@ -2,6 +2,7 @@
 
 use crate::auth::Admin;
 use crate::error::{ApiError, ApiResult};
+use crate::harness;
 use crate::orchestrator;
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
@@ -296,11 +297,51 @@ pub struct CreateAgent {
     pub capability_bundles: Option<Vec<String>>,
 }
 
+/// Validate a harness id and return its (runner image, model) defaults.
+/// Unknown ids are a 422 — refused before anything persists.
+fn harness_defaults<'a>(
+    harness_id: &str,
+    cfg: &'a crate::config::Config,
+) -> Result<(&'a str, &'a str), ApiError> {
+    match (
+        harness::default_runner_image(harness_id, cfg),
+        harness::default_model(harness_id, cfg),
+    ) {
+        (Some(image), Some(model)) => Ok((image, model)),
+        _ => Err(ApiError::UnprocessableEntity(format!(
+            "unknown harness '{harness_id}' (known: {})",
+            harness::KNOWN.join(", ")
+        ))),
+    }
+}
+
+/// add_revision inheritance for image/model: explicit wins; on a harness
+/// SWITCH the previous harness's value is not inherited — it re-defaults to
+/// the new harness's default (a claude image/model on a codex revision is
+/// never a sane inheritance).
+fn inherit_unless_switched<'a>(
+    explicit: Option<&'a str>,
+    previous: Option<&'a str>,
+    harness_changed: bool,
+    default: &'a str,
+) -> &'a str {
+    match (explicit, harness_changed) {
+        (Some(e), _) => e,
+        (None, true) => default,
+        (None, false) => previous.unwrap_or(default),
+    }
+}
+
 pub async fn create_agent(
     _: Admin,
     State(state): State<AppState>,
     Json(req): Json<CreateAgent>,
 ) -> ApiResult<Json<Value>> {
+    // Validate the harness BEFORE the agent row exists — a 422 here must not
+    // leave a revision-less agent behind.
+    let harness_id = req.harness.as_deref().unwrap_or(harness::CLAUDE_AGENT_SDK);
+    let (default_image, default_model) = harness_defaults(harness_id, &state.cfg)?;
+
     let agent = fluidbox_db::create_agent(
         &state.pool,
         state.tenant_id,
@@ -323,11 +364,9 @@ pub async fn create_agent(
     let rev = fluidbox_db::append_agent_revision(
         &state.pool,
         agent.id,
-        req.harness.as_deref().unwrap_or("claude-agent-sdk"),
-        req.runner_image
-            .as_deref()
-            .unwrap_or(&state.cfg.sandbox_image),
-        req.model.as_deref().unwrap_or(&state.cfg.default_model),
+        harness_id,
+        req.runner_image.as_deref().unwrap_or(default_image),
+        req.model.as_deref().unwrap_or(default_model),
         req.system_prompt.as_deref(),
         policy.id,
         &serde_json::to_value(&budgets)?,
@@ -386,6 +425,16 @@ pub async fn add_revision(
         .ok_or(ApiError::NotFound)?;
     let latest = fluidbox_db::latest_revision(&state.pool, id).await?;
     // Inherit from the latest revision unless overridden.
+    let harness_id = req
+        .harness
+        .as_deref()
+        .or(latest.as_ref().map(|r| r.harness.as_str()))
+        .unwrap_or(harness::CLAUDE_AGENT_SDK);
+    let (default_image, default_model) = harness_defaults(harness_id, &state.cfg)?;
+    let harness_changed = latest
+        .as_ref()
+        .map(|r| r.harness != harness_id)
+        .unwrap_or(false);
     let policy_name = req.policy.clone();
     let policy_id = match policy_name {
         Some(name) => {
@@ -421,18 +470,19 @@ pub async fn add_revision(
     let rev = fluidbox_db::append_agent_revision(
         &state.pool,
         agent.id,
-        req.harness
-            .as_deref()
-            .or(latest.as_ref().map(|r| r.harness.as_str()))
-            .unwrap_or("claude-agent-sdk"),
-        req.runner_image
-            .as_deref()
-            .or(latest.as_ref().map(|r| r.runner_image.as_str()))
-            .unwrap_or(&state.cfg.sandbox_image),
-        req.model
-            .as_deref()
-            .or(latest.as_ref().map(|r| r.model.as_str()))
-            .unwrap_or(&state.cfg.default_model),
+        harness_id,
+        inherit_unless_switched(
+            req.runner_image.as_deref(),
+            latest.as_ref().map(|r| r.runner_image.as_str()),
+            harness_changed,
+            default_image,
+        ),
+        inherit_unless_switched(
+            req.model.as_deref(),
+            latest.as_ref().map(|r| r.model.as_str()),
+            harness_changed,
+            default_model,
+        ),
         req.system_prompt
             .as_deref()
             .or(latest.as_ref().and_then(|r| r.system_prompt.as_deref())),
@@ -753,5 +803,34 @@ mod tests {
         assert!(!same_origin("file:///tmp/fixother", "file:///tmp/fix"));
         assert!(!same_origin("file:///tmp/fix", "https://github.com"));
         assert!(!same_origin("not a url", "https://github.com"));
+    }
+
+    #[test]
+    fn revision_inheritance_re_defaults_on_harness_switch() {
+        // Same harness: previous value inherits.
+        assert_eq!(
+            inherit_unless_switched(None, Some("img:prev"), false, "img:default"),
+            "img:prev"
+        );
+        // Harness switched: the previous harness's value must NOT leak —
+        // fall to the new harness's default.
+        assert_eq!(
+            inherit_unless_switched(None, Some("img:prev"), true, "img:default"),
+            "img:default"
+        );
+        // Explicit always wins, switch or not.
+        assert_eq!(
+            inherit_unless_switched(Some("img:mine"), Some("img:prev"), true, "img:default"),
+            "img:mine"
+        );
+        assert_eq!(
+            inherit_unless_switched(Some("img:mine"), Some("img:prev"), false, "img:default"),
+            "img:mine"
+        );
+        // First revision (no previous): default.
+        assert_eq!(
+            inherit_unless_switched(None, None, false, "img:default"),
+            "img:default"
+        );
     }
 }
