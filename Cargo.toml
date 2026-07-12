@@ -53,7 +53,7 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 bollard = "0.21"
 sha2 = "0.10"
-hmac = "0.12"
+hmac = "0.13"
 hex = "0.4"
 globset = "0.4"
 regex = "1"
