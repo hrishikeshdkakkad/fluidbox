@@ -2,9 +2,21 @@
 
 All notable, user-visible changes to fluidbox are documented here.
 
-The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org) once tagged releases begin. Until then, everything lives under **Unreleased**.
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org).
 
 ## [Unreleased]
+
+_Nothing yet._
+
+## [0.1.0] — 2026-07-12
+
+The first tagged release: the complete governed vertical slice, verified by a 10-phase live-inclusive acceptance suite (468 checks).
+
+### Highlights
+
+- **Governed agent runs end to end** — frozen RunSpecs, fresh sandboxes, live timelines, policy-gated tool calls with human approvals, and a diff + cost report per run.
+- **Two harnesses behind one contract** — Claude Agent SDK and Codex, with an in-server LLM facade that meters usage and keeps provider keys out of every sandbox.
+- **Borrow the agent, on demand** — API triggers, signed webhooks, cron schedules, and GitHub PR fan-out, all converging on one governed run path.
 
 ### Added
 
