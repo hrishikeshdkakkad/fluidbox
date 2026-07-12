@@ -51,8 +51,10 @@ wait_status() { # id want tries [sleep]
   return 1
 }
 containers_for() { docker ps -a --filter "label=fluidbox.session=$1" -q | wc -l | tr -d ' '; }
-# The runner contract: a tool.requested event lands BEFORE /permission —
-# tool_call_count counts those events (see images/sandbox-runner/runner/index.mjs).
+# Phase 6: tool_call_count counts server-registered INTENTS (one per unique
+# tool_call_id crossing the gate); runner-posted tool.requested events are
+# DROPPED at ingest. The posts below stay to prove exactly that — if they
+# counted, call 2 would already blow a budget of 2.
 emit_tool_requested() { # token session call_id
   curl -s -X POST -H "authorization: Bearer $1" -H 'content-type: application/json' \
     -d "{\"actor\":\"agent\",\"body\":{\"type\":\"tool.requested\",\"data\":{\"tool_call_id\":\"$3\",\"tool\":\"Read\",\"summary\":\"budget probe\",\"input_digest\":\"\"}}}" \

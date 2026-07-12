@@ -162,6 +162,7 @@ pub struct ApprovalRow {
     pub tool_call_id: String,
     pub tool: String,
     pub summary: String,
+    pub input_digest: Option<String>,
     pub risk: Option<String>,
     pub scope: String,
     pub scope_key: String,
@@ -1583,56 +1584,110 @@ pub async fn events_after(
     .await
 }
 
-// ─── Approvals ────────────────────────────────────────────────────────────
+// ─── Approvals & tool-call intents ────────────────────────────────────────
+//
+// Phase 6 gate hardening: the approvals table doubles as the INTENT registry.
+// Every gate decision registers one row per (session_id, tool_call_id) —
+// status 'intent' at registration, then either 'auto_allowed'/'auto_denied'
+// (gate-decided) or the human approval lifecycle ('pending' → decided) when
+// the verdict requires one. The row's (tool, input_digest) is the digest
+// binding: a reused id must match it. tool_call_count counts these rows —
+// unique persistent intents, never runner-posted events.
 
-/// Idempotent by (session_id, tool_call_id): a runner retry after a socket
-/// drop re-attaches to the same row instead of duplicating it.
-#[allow(clippy::too_many_arguments)]
-pub async fn upsert_pending_approval(
+/// The full approvals column list as a literal, so every query below stays
+/// a compile-time-audited static string (sqlx 0.9 SqlSafeStr).
+macro_rules! approval_cols {
+    () => {
+        "id, session_id, tool_call_id, tool, summary, input_digest, risk, \
+         scope, scope_key, status, requested_at, expires_at, decided_at, decided_by"
+    };
+}
+
+/// Register a tool-call intent, idempotent by (session_id, tool_call_id).
+/// Returns (row, inserted). When `inserted` is false the caller MUST compare
+/// the row's (tool, input_digest) against the incoming call — a mismatch is
+/// a protocol violation, never a re-attach.
+pub async fn register_tool_intent(
     pool: &PgPool,
     session: Uuid,
     tool_call_id: &str,
     tool: &str,
     summary: &str,
-    input_digest: Option<&str>,
-    risk: Option<&str>,
-    scope: &str,
-    scope_key: &str,
-    ttl_secs: i64,
+    input_digest: &str,
 ) -> sqlx::Result<(ApprovalRow, bool)> {
-    let inserted: Option<ApprovalRow> = sqlx::query_as(
+    let inserted: Option<ApprovalRow> = sqlx::query_as(concat!(
         "insert into approvals
-           (id, session_id, tool_call_id, tool, summary, input_digest, risk, scope, scope_key, expires_at)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9, now() + make_interval(secs => $10))
+           (id, session_id, tool_call_id, tool, summary, input_digest, scope, scope_key,
+            status, expires_at)
+         values ($1,$2,$3,$4,$5,$6,'once',$4,'intent', now())
          on conflict (session_id, tool_call_id) do nothing
-         returning id, session_id, tool_call_id, tool, summary, risk, scope, scope_key, status,
-                   requested_at, expires_at, decided_at, decided_by",
-    )
+         returning ",
+        approval_cols!()
+    ))
     .bind(Uuid::now_v7())
     .bind(session)
     .bind(tool_call_id)
     .bind(tool)
     .bind(summary)
     .bind(input_digest)
-    .bind(risk)
-    .bind(scope)
-    .bind(scope_key)
-    .bind(ttl_secs as f64)
     .fetch_optional(pool)
     .await?;
     if let Some(row) = inserted {
         return Ok((row, true));
     }
-    let existing: ApprovalRow = sqlx::query_as(
-        "select id, session_id, tool_call_id, tool, summary, risk, scope, scope_key, status,
-                requested_at, expires_at, decided_at, decided_by
-         from approvals where session_id = $1 and tool_call_id = $2",
-    )
+    let existing: ApprovalRow = sqlx::query_as(concat!(
+        "select ",
+        approval_cols!(),
+        " from approvals where session_id = $1 and tool_call_id = $2"
+    ))
     .bind(session)
     .bind(tool_call_id)
     .fetch_one(pool)
     .await?;
     Ok((existing, false))
+}
+
+/// Promote a registered intent into a pending human approval (the
+/// RequireApproval path). Returns None when the row is no longer 'intent'
+/// (a concurrent handler already promoted or the verdict landed) — the
+/// caller re-reads and acts on the current status.
+pub async fn promote_intent_to_pending(
+    pool: &PgPool,
+    id: Uuid,
+    risk: Option<&str>,
+    scope: &str,
+    scope_key: &str,
+    ttl_secs: i64,
+) -> sqlx::Result<Option<ApprovalRow>> {
+    sqlx::query_as(concat!(
+        "update approvals
+            set status = 'pending', risk = $2, scope = $3, scope_key = $4,
+                expires_at = now() + make_interval(secs => $5)
+          where id = $1 and status = 'intent'
+          returning ",
+        approval_cols!()
+    ))
+    .bind(id)
+    .bind(risk)
+    .bind(scope)
+    .bind(scope_key)
+    .bind(ttl_secs as f64)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Record the gate's own verdict on an intent ('auto_allowed'/'auto_denied').
+/// Guarded on status='intent' so a human decision is never overwritten.
+pub async fn record_intent_verdict(pool: &PgPool, id: Uuid, status: &str) -> sqlx::Result<()> {
+    sqlx::query(
+        "update approvals set status = $2, decided_at = now(), decided_by = 'gate'
+         where id = $1 and status = 'intent'",
+    )
+    .bind(id)
+    .bind(status)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn decide_approval(
@@ -1641,12 +1696,12 @@ pub async fn decide_approval(
     status: &str,
     decided_by: &str,
 ) -> sqlx::Result<Option<ApprovalRow>> {
-    sqlx::query_as(
+    sqlx::query_as(concat!(
         "update approvals set status = $2, decided_at = now(), decided_by = $3
          where id = $1 and status = 'pending'
-         returning id, session_id, tool_call_id, tool, summary, risk, scope, scope_key, status,
-                   requested_at, expires_at, decided_at, decided_by",
-    )
+         returning ",
+        approval_cols!()
+    ))
     .bind(id)
     .bind(status)
     .bind(decided_by)
@@ -1655,32 +1710,36 @@ pub async fn decide_approval(
 }
 
 pub async fn get_approval(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<ApprovalRow>> {
-    sqlx::query_as(
-        "select id, session_id, tool_call_id, tool, summary, risk, scope, scope_key, status,
-                requested_at, expires_at, decided_at, decided_by
-         from approvals where id = $1",
-    )
+    sqlx::query_as(concat!(
+        "select ",
+        approval_cols!(),
+        " from approvals where id = $1"
+    ))
     .bind(id)
     .fetch_optional(pool)
     .await
 }
 
 pub async fn pending_approvals(pool: &PgPool) -> sqlx::Result<Vec<ApprovalRow>> {
-    sqlx::query_as(
-        "select id, session_id, tool_call_id, tool, summary, risk, scope, scope_key, status,
-                requested_at, expires_at, decided_at, decided_by
-         from approvals where status = 'pending' order by requested_at",
-    )
+    sqlx::query_as(concat!(
+        "select ",
+        approval_cols!(),
+        " from approvals where status = 'pending' order by requested_at"
+    ))
     .fetch_all(pool)
     .await
 }
 
+/// Human-lifecycle rows only: intent bookkeeping ('intent'/'auto_*') is the
+/// gate's, not the approvals API's.
 pub async fn session_approvals(pool: &PgPool, session: Uuid) -> sqlx::Result<Vec<ApprovalRow>> {
-    sqlx::query_as(
-        "select id, session_id, tool_call_id, tool, summary, risk, scope, scope_key, status,
-                requested_at, expires_at, decided_at, decided_by
-         from approvals where session_id = $1 order by requested_at desc",
-    )
+    sqlx::query_as(concat!(
+        "select ",
+        approval_cols!(),
+        " from approvals
+         where session_id = $1 and status not in ('intent','auto_allowed','auto_denied')
+         order by requested_at desc"
+    ))
     .bind(session)
     .fetch_all(pool)
     .await
@@ -1706,12 +1765,12 @@ pub async fn has_session_grant(
 }
 
 pub async fn expire_stale_approvals(pool: &PgPool) -> sqlx::Result<Vec<ApprovalRow>> {
-    sqlx::query_as(
+    sqlx::query_as(concat!(
         "update approvals set status = 'expired', decided_at = now(), decided_by = 'timeout'
          where status = 'pending' and expires_at < now()
-         returning id, session_id, tool_call_id, tool, summary, risk, scope, scope_key, status,
-                   requested_at, expires_at, decided_at, decided_by",
-    )
+         returning ",
+        approval_cols!()
+    ))
     .fetch_all(pool)
     .await
 }
@@ -1806,14 +1865,14 @@ pub async fn usage_totals(pool: &PgPool, session: Uuid) -> sqlx::Result<UsageTot
     .await
 }
 
+/// Unique persistent tool-call INTENTS (one approvals row per tool_call_id)
+/// — the budget's counting unit. Never derived from runner-posted events:
+/// budget parity does not trust runner cooperation.
 pub async fn tool_call_count(pool: &PgPool, session: Uuid) -> sqlx::Result<i64> {
-    let row = sqlx::query(
-        "select count(*)::bigint as n from events
-         where session_id = $1 and type = 'tool.requested'",
-    )
-    .bind(session)
-    .fetch_one(pool)
-    .await?;
+    let row = sqlx::query("select count(*)::bigint as n from approvals where session_id = $1")
+        .bind(session)
+        .fetch_one(pool)
+        .await?;
     Ok(row.get::<i64, _>("n"))
 }
 
@@ -2664,6 +2723,133 @@ mod tests {
         let events = events_after(&pool, session.id, 0, 10).await.unwrap();
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].r#type, "agent.message");
+    }
+
+    #[tokio::test]
+    async fn intent_registry_digest_binding_and_lifecycle() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let policy = upsert_policy(
+            &pool,
+            tenant,
+            "test-intent",
+            "name: test-intent",
+            &serde_json::json!({"name": "test-intent"}),
+        )
+        .await
+        .unwrap();
+        let agent = create_agent(&pool, tenant, "test-intent-agent", None)
+            .await
+            .unwrap();
+        let rev = append_agent_revision(
+            &pool,
+            agent.id,
+            "codex",
+            "img:test",
+            "gpt-5.4-mini",
+            None,
+            policy.id,
+            &serde_json::json!({}),
+            None,
+            &serde_json::json!([]),
+        )
+        .await
+        .unwrap();
+        let session = create_session(
+            &pool,
+            tenant,
+            agent.id,
+            rev.id,
+            "supervised",
+            "trusted",
+            "t",
+            &serde_json::json!({"kind":"none"}),
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Registration is idempotent by (session, tool_call_id).
+        let (row, inserted) =
+            register_tool_intent(&pool, session.id, "tc1", "Bash", "cat x", "digest-a")
+                .await
+                .unwrap();
+        assert!(inserted);
+        assert_eq!(row.status, "intent");
+        assert_eq!(row.input_digest.as_deref(), Some("digest-a"));
+        let (again, inserted2) =
+            register_tool_intent(&pool, session.id, "tc1", "Bash", "cat x", "digest-a")
+                .await
+                .unwrap();
+        assert!(!inserted2);
+        assert_eq!(again.id, row.id);
+        // The caller compares digests — the registry hands back the stored
+        // binding even on a mismatched retry.
+        let (mismatch, inserted3) =
+            register_tool_intent(&pool, session.id, "tc1", "Bash", "cat y", "digest-B")
+                .await
+                .unwrap();
+        assert!(!inserted3);
+        assert_eq!(mismatch.input_digest.as_deref(), Some("digest-a"));
+
+        // Gate verdicts stick, and never overwrite each other.
+        record_intent_verdict(&pool, row.id, "auto_allowed")
+            .await
+            .unwrap();
+        record_intent_verdict(&pool, row.id, "auto_denied")
+            .await
+            .unwrap(); // guarded: no longer 'intent'
+        let cur = get_approval(&pool, row.id).await.unwrap().unwrap();
+        assert_eq!(cur.status, "auto_allowed");
+        // A decided intent can no longer be promoted into an approval.
+        assert!(promote_intent_to_pending(&pool, row.id, None, "once", "Bash", 600)
+            .await
+            .unwrap()
+            .is_none());
+
+        // The approval lifecycle rides the SAME row when promotion wins.
+        let (row2, _) =
+            register_tool_intent(&pool, session.id, "tc2", "Bash", "git push", "digest-c")
+                .await
+                .unwrap();
+        let promoted = promote_intent_to_pending(&pool, row2.id, Some("high"), "once", "Bash", 600)
+            .await
+            .unwrap()
+            .expect("first promotion wins");
+        assert_eq!(promoted.status, "pending");
+        assert!(promoted.expires_at > chrono::Utc::now());
+        assert!(
+            promote_intent_to_pending(&pool, row2.id, Some("high"), "once", "Bash", 600)
+                .await
+                .unwrap()
+                .is_none(),
+            "second promotion is a no-op"
+        );
+        let decided = decide_approval(&pool, row2.id, "approved_once", "tester")
+            .await
+            .unwrap()
+            .expect("pending row decides");
+        assert_eq!(decided.status, "approved_once");
+        record_intent_verdict(&pool, row2.id, "auto_denied")
+            .await
+            .unwrap(); // guarded: human decision stands
+        let cur2 = get_approval(&pool, row2.id).await.unwrap().unwrap();
+        assert_eq!(cur2.status, "approved_once");
+
+        // The budget counts unique intents; the approvals API hides gate
+        // bookkeeping but keeps the human lifecycle.
+        assert_eq!(tool_call_count(&pool, session.id).await.unwrap(), 2);
+        let visible = session_approvals(&pool, session.id).await.unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].tool_call_id, "tc2");
     }
 
     #[tokio::test]
