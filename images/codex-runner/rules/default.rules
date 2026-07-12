@@ -1,19 +1,28 @@
 # fluidbox execpolicy — force EVERY exec through the fluidbox permission gate.
 #
-# codex's approval_policy="untrusted" AUTO-RUNS its built-in "known-safe"
-# reads (cat, ls, grep, git status, …) WITHOUT asking — a whole class of exec
-# that would never cross the fluidbox gate (no ledger, no budget, no policy).
-# execpolicy has only `prefix_rule` (no wildcard: an empty prefix `[""]`
-# matches nothing), so we enumerate codex's known-safe command set and mark
-# each `prompt`. Strictest decision wins (forbidden > prompt > allow), so a
-# `prompt` rule here can only make codex ASK MORE, never less; an ARBITRARY
-# (non-listed) command already prompts under `untrusted`. The result: every
-# exec escalates to an item/commandExecution/requestApproval the supervisor
-# answers via /permission.
+# codex `approval_policy="untrusted"` AUTO-RUNS its built-in is_known_safe_command
+# set (29 read/util basenames in 0.144.1) WITHOUT firing an approval request —
+# a class of exec that would never cross the fluidbox gate (no ledger, budget,
+# or policy). execpolicy has ONLY prefix_rule (no wildcard: an empty prefix
+# matches nothing), and its match is on the LITERAL first argv token, so we
+# enumerate (a) the complete known-safe basename set and (b) their absolute-path
+# spellings across the standard bin dirs. Strictest decision wins
+# (forbidden > prompt > allow), so a `prompt` rule can only make codex ASK MORE.
+# The result: every listed spelling escalates to item/commandExecution/requestApproval,
+# which the supervisor answers via /permission.
 #
-# Pinned to codex 0.144.1's known-safe set (the version pin freezes it); the
-# e2e tier-2 HARD-asserts a bare `cat` gates — if a future codex adds a
-# known-safe command not listed here, that assertion is the tripwire.
+# COMPLETENESS (risk-register #1): the 29 basenames are the AUTHORITATIVE
+# 0.144.1 set (codex is the source); the exact version pin freezes it. The
+# reviewer confirmed codex reduces `/bin/cat`→`cat` for its classifier, so a
+# bare `cat` rule would NOT catch `/bin/cat` unless the app-server resolves
+# executables first — hence the absolute-path variants below, AND the e2e
+# tier-2 HARD-asserts that `cat`, `/bin/cat`, and `git status` all gate (the
+# tripwire: if a spelling slips, the assertion fails and blocks the release).
+# RESIDUAL (recorded): a relative-path spelling (`./cat`) of a known-safe READ
+# with a pre-planted executable in the workspace is not caught by prefix rules;
+# it is an ungoverned READ of a disposable, egress-free workspace (no mutation,
+# no egress) — bounded by the containment envelope. All 29 are reads; every
+# WRITE gates via item/fileChange/requestApproval regardless of spelling.
 #
 # Validate:  codex execpolicy check --pretty --rules default.rules -- cat x
 
@@ -24,19 +33,47 @@ def prompt(cmd):
         justification = "fluidbox: every command must cross the permission gate",
     )
 
-# codex's known-safe reads + the common dev toolchain (over-listing is a
-# no-op: a command that would prompt anyway just prompts).
+# Bare basenames (codex's known-safe set + common dev tools).
 [prompt(c) for c in [
-    "cat", "ls", "pwd", "echo", "printf", "head", "tail", "wc", "nl",
-    "true", "false", "cd", "test", "sleep",
-    "grep", "egrep", "fgrep", "rg", "ripgrep", "ag",
-    "find", "fd", "sed", "awk", "cut", "tr", "sort", "uniq", "comm", "join",
-    "which", "type", "command", "hash",
-    "date", "env", "printenv", "id", "whoami", "uname", "hostname",
-    "stat", "file", "du", "df",
-    "dirname", "basename", "realpath", "readlink", "tree",
-    "diff", "cmp", "md5sum", "sha1sum", "sha256sum", "cksum",
-    "git", "jq", "yq", "xxd", "od", "strings", "column", "tee",
-    "python", "python3", "node", "cargo", "go", "make", "pytest", "npm", "pnpm",
-    "bash", "sh", "zsh",
+    "base64", "cat", "cd", "cut", "echo", "expr", "false", "find", "git", "grep",
+    "head", "id", "ls", "nl", "paste", "pwd", "rev", "rg", "sed", "seq", "stat",
+    "tail", "tr", "true", "uname", "uniq", "wc", "which", "whoami", "printf", "egrep",
+    "fgrep", "fd", "awk", "sort", "comm", "join", "type", "command", "hash", "env",
+    "printenv", "hostname", "file", "du", "df", "dirname", "basename", "realpath",
+    "readlink", "tree", "diff", "cmp", "md5sum", "sha1sum", "sha256sum", "cksum", "jq",
+    "yq", "xxd", "od", "strings", "column", "tee", "sh", "bash", "zsh",
+]]
+
+# Absolute-path spellings of the known-safe basenames (bare rules miss these).
+[prompt(c) for c in [
+    "/bin/base64", "/usr/bin/base64", "/usr/local/bin/base64", "/sbin/base64",
+    "/usr/sbin/base64", "/bin/cat", "/usr/bin/cat", "/usr/local/bin/cat", "/sbin/cat",
+    "/usr/sbin/cat", "/bin/cd", "/usr/bin/cd", "/usr/local/bin/cd", "/sbin/cd",
+    "/usr/sbin/cd", "/bin/cut", "/usr/bin/cut", "/usr/local/bin/cut", "/sbin/cut",
+    "/usr/sbin/cut", "/bin/echo", "/usr/bin/echo", "/usr/local/bin/echo", "/sbin/echo",
+    "/usr/sbin/echo", "/bin/expr", "/usr/bin/expr", "/usr/local/bin/expr", "/sbin/expr",
+    "/usr/sbin/expr", "/bin/false", "/usr/bin/false", "/usr/local/bin/false",
+    "/sbin/false", "/usr/sbin/false", "/bin/find", "/usr/bin/find", "/usr/local/bin/find",
+    "/sbin/find", "/usr/sbin/find", "/bin/git", "/usr/bin/git", "/usr/local/bin/git",
+    "/sbin/git", "/usr/sbin/git", "/bin/grep", "/usr/bin/grep", "/usr/local/bin/grep",
+    "/sbin/grep", "/usr/sbin/grep", "/bin/head", "/usr/bin/head", "/usr/local/bin/head",
+    "/sbin/head", "/usr/sbin/head", "/bin/id", "/usr/bin/id", "/usr/local/bin/id",
+    "/sbin/id", "/usr/sbin/id", "/bin/ls", "/usr/bin/ls", "/usr/local/bin/ls", "/sbin/ls",
+    "/usr/sbin/ls", "/bin/nl", "/usr/bin/nl", "/usr/local/bin/nl", "/sbin/nl",
+    "/usr/sbin/nl", "/bin/paste", "/usr/bin/paste", "/usr/local/bin/paste", "/sbin/paste",
+    "/usr/sbin/paste", "/bin/pwd", "/usr/bin/pwd", "/usr/local/bin/pwd", "/sbin/pwd",
+    "/usr/sbin/pwd", "/bin/rev", "/usr/bin/rev", "/usr/local/bin/rev", "/sbin/rev",
+    "/usr/sbin/rev", "/bin/rg", "/usr/bin/rg", "/usr/local/bin/rg", "/sbin/rg",
+    "/usr/sbin/rg", "/bin/sed", "/usr/bin/sed", "/usr/local/bin/sed", "/sbin/sed",
+    "/usr/sbin/sed", "/bin/seq", "/usr/bin/seq", "/usr/local/bin/seq", "/sbin/seq",
+    "/usr/sbin/seq", "/bin/stat", "/usr/bin/stat", "/usr/local/bin/stat", "/sbin/stat",
+    "/usr/sbin/stat", "/bin/tail", "/usr/bin/tail", "/usr/local/bin/tail", "/sbin/tail",
+    "/usr/sbin/tail", "/bin/tr", "/usr/bin/tr", "/usr/local/bin/tr", "/sbin/tr",
+    "/usr/sbin/tr", "/bin/true", "/usr/bin/true", "/usr/local/bin/true", "/sbin/true",
+    "/usr/sbin/true", "/bin/uname", "/usr/bin/uname", "/usr/local/bin/uname",
+    "/sbin/uname", "/usr/sbin/uname", "/bin/uniq", "/usr/bin/uniq", "/usr/local/bin/uniq",
+    "/sbin/uniq", "/usr/sbin/uniq", "/bin/wc", "/usr/bin/wc", "/usr/local/bin/wc",
+    "/sbin/wc", "/usr/sbin/wc", "/bin/which", "/usr/bin/which", "/usr/local/bin/which",
+    "/sbin/which", "/usr/sbin/which", "/bin/whoami", "/usr/bin/whoami",
+    "/usr/local/bin/whoami", "/sbin/whoami", "/usr/sbin/whoami",
 ]]

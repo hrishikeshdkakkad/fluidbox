@@ -43,16 +43,19 @@ const WORKSPACE = (() => {
   }
 })();
 
-// A cwd is acceptable only if it normalizes to a path INSIDE the frozen
-// workspace (reject outside / missing-that-escapes / symlink escape). A
-// `cat x` verdict is not equivalent if codex runs it from $CODEX_HOME.
+// A cwd is acceptable only if it EXISTS and its FULLY-RESOLVED real path is
+// inside the frozen workspace (reject outside / missing / symlink escape). A
+// `cat x` verdict is not equivalent if codex runs it from $CODEX_HOME, and a
+// non-existent path under a symlink must not be waved through lexically.
 function cwdInWorkspace(cwd) {
   if (cwd == null) return WORKSPACE; // codex omitted it → the thread cwd (= workspace)
-  let resolved = path.resolve(WORKSPACE, cwd);
+  let resolved;
   try {
-    if (fs.existsSync(resolved)) resolved = fs.realpathSync(resolved);
+    // realpathSync resolves EVERY symlink component and throws if the path
+    // (or any component) does not exist — no lexical fallback for cwd.
+    resolved = fs.realpathSync(path.resolve(WORKSPACE, cwd));
   } catch {
-    /* fall through with the lexical resolution */
+    return null;
   }
   const rel = path.relative(WORKSPACE, resolved);
   const inside = resolved === WORKSPACE || (!rel.startsWith("..") && !path.isAbsolute(rel));
@@ -81,16 +84,23 @@ export function canonicalizeCommand(commandStr) {
   return inner.trim();
 }
 
-// fileChange item changes[] → canonical MultiEdit edits[]. A move carries
-// BOTH source and dest paths; the op-type + cwd ride ADDITIVELY (policy
-// ignores unknown fields; the ledger keeps them).
+// fileChange item changes[] → canonical MultiEdit edits[]. Codex 0.144.1's
+// change shape (verified against the generated schema): each element is
+// `{path, kind, diff}` where `kind` is the PatchChangeKind tagged union
+// {type:"add"} | {type:"delete"} | {type:"update", move_path: string|null}.
+// A MOVE is type:"update" with a non-null `kind.move_path` (source =
+// change.path, dest = change.kind.move_path) — BOTH must reach the gate so a
+// rename to an unlisted path (e.g. /workspace/.env) can't hide its
+// destination. op-type + cwd ride ADDITIVELY (policy ignores unknown fields;
+// the ledger keeps them).
 function canonicalizeEdits(changes) {
   const edits = [];
   for (const c of changes || []) {
-    if (typeof c?.path === "string") edits.push({ file_path: c.path, op: c.kind || "update" });
-    for (const k of ["movePath", "dest", "newPath", "destination"]) {
-      if (typeof c?.[k] === "string") edits.push({ file_path: c[k], op: "move_dest" });
-    }
+    const kind = c?.kind || {};
+    const op = typeof kind === "string" ? kind : kind.type || "update";
+    if (typeof c?.path === "string") edits.push({ file_path: c.path, op });
+    const dest = kind?.move_path;
+    if (typeof dest === "string" && dest) edits.push({ file_path: dest, op: "move_dest" });
   }
   return edits;
 }
@@ -103,8 +113,6 @@ let threadId = null;
 let turnId = null;
 // itemId → tracked thread item (command/cwd for exec; changes for fileChange).
 const items = new Map();
-// itemId → cached gate decision (dedup a retried approval to one decision).
-const decided = new Map();
 let finalText = "";
 let hadError = null;
 let turnDone = false;
@@ -145,23 +153,42 @@ function handleLine(line) {
 }
 
 // ─── Approvals → the fluidbox gate (the governance parity core) ───────────
+// Each server-request kind has its OWN response schema; a wrong-shape reply
+// can stall the turn. Dispatch every kind explicitly and fail closed with the
+// correct schema; a truly unknown method gets a JSON-RPC method-not-found.
 async function handleServerRequest(msg) {
   const { method, params, id } = msg;
-  if (method === "item/permissions/requestApproval") {
-    // Sandbox escalation — deny by returning no permissions (the container is
-    // the containment boundary; we never widen it).
-    rpcSend({ id, result: { permissions: {}, scope: "turn" } });
-    return;
+  switch (method) {
+    case "item/commandExecution/requestApproval":
+      return decideExec(id, params);
+    case "item/fileChange/requestApproval":
+      return decideFileChange(id, params);
+    case "item/permissions/requestApproval":
+      // Sandbox escalation — deny by granting no permissions (the container
+      // is the containment boundary; we never widen it).
+      rpcSend({ id, result: { permissions: {}, scope: "turn" } });
+      return;
+    case "item/tool/requestUserInput":
+      // We never provide interactive input to the agent.
+      rpcSend({ id, result: { response: { type: "declined" } } });
+      return;
+    case "mcpServer/elicitation/request":
+      // MCP elicitation — decline (MCP is gated by the shims, not codex).
+      rpcSend({ id, result: { action: "decline" } });
+      return;
+    // Legacy exec/patch approvals do not fire on the v2 surface, but if they
+    // ever did, their decision enum is ReviewDecision ("denied", not
+    // "decline") — fail closed with the correct value.
+    case "execCommandApproval":
+    case "applyPatchApproval":
+      rpcSend({ id, result: { decision: "denied" } });
+      return;
+    default:
+      // Unknown/unsupported request → JSON-RPC method-not-found, never a
+      // malformed decision that could wedge the turn.
+      rpcSend({ id, error: { code: -32601, message: `unsupported request: ${method}` } });
+      return;
   }
-  if (method === "item/commandExecution/requestApproval") {
-    return decideExec(id, params);
-  }
-  if (method === "item/fileChange/requestApproval") {
-    return decideFileChange(id, params);
-  }
-  // Any other server request (item/tool/requestUserInput, mcp elicitation,
-  // legacy execCommandApproval/applyPatchApproval): fail closed — deny.
-  rpcSend({ id, result: { decision: "decline" } });
 }
 
 async function decideExec(id, params) {
@@ -179,26 +206,34 @@ async function decideExec(id, params) {
   }
   const rawCommand = params.command ?? items.get(params.itemId)?.command ?? "";
   const command = canonicalizeCommand(rawCommand);
-  const decision = await gate(key, "Bash", { command, cwd });
-  rpcSend({ id, result: { decision: decision ? "accept" : "decline" } });
+  const decision = await gate(key, "Bash", { command, cwd }, params.availableDecisions);
+  rpcSend({ id, result: decision });
 }
 
 async function decideFileChange(id, params) {
   const key = params.approvalId || params.itemId;
   const changes = items.get(params.itemId)?.changes || [];
   const edits = canonicalizeEdits(changes);
-  const decision = await gate(key, "MultiEdit", { edits, cwd: WORKSPACE });
-  rpcSend({ id, result: { decision: decision ? "accept" : "decline" } });
+  const decision = await gate(key, "MultiEdit", { edits, cwd: WORKSPACE }, params.availableDecisions);
+  rpcSend({ id, result: decision });
 }
 
-// One decision per stable id; a retried approval re-uses it (the server is
-// also idempotent by tool_call_id, but caching avoids a second round-trip).
-async function gate(callId, tool, input) {
-  if (decided.has(callId)) return decided.get(callId);
+// Gate ONE call through /permission and map to a v2 approval decision. NO
+// local decision cache: the SERVER is idempotent by tool_call_id AND enforces
+// the digest binding (Phase 6) — a reused id with CHANGED input is
+// hard-rejected server-side, which a local cache would silently bypass. If
+// `availableDecisions` is present and excludes "accept", we can only decline
+// (never substitute a session grant). Returns the {decision} result object.
+async function gate(callId, tool, input, availableDecisions) {
   const verdict = await client.requestPermission(tool, input, callId);
   const allow = !!(verdict && verdict.decision === "allow");
-  decided.set(callId, allow);
-  return allow;
+  if (!allow) return { decision: "decline" };
+  if (Array.isArray(availableDecisions) && !availableDecisions.includes("accept")) {
+    // The server allowed it, but codex won't take a plain accept here — never
+    // escalate to acceptForSession; decline (the agent can retry differently).
+    return { decision: "decline" };
+  }
+  return { decision: "accept" };
 }
 
 // ─── Notifications → the timeline (deltas suppressed) ─────────────────────
@@ -226,7 +261,12 @@ function handleNotification(msg) {
     }
     case "turn/completed": {
       const st = params?.turn?.status;
-      if (st === "failed") hadError = new Error(params?.turn?.error?.message || "codex turn failed");
+      // ONLY "completed" is success. interrupted / failed / anything else is a
+      // failed run — never post "completed" for a non-completed turn.
+      if (st !== "completed") {
+        hadError =
+          hadError || new Error(params?.turn?.error?.message || `codex turn ${st || "did not complete"}`);
+      }
       // Prefer the final_answer message from the completed turn's items.
       const items2 = params?.turn?.items || [];
       const finals = items2.filter((i) => i.type === "agentMessage");
@@ -282,6 +322,9 @@ function spawnCodex() {
     "-c", "approvals_reviewer=user",
     "-c", "sandbox_mode=read-only",
     "-c", "model_reasoning_effort=low",
+    // Writable runtime state OUTSIDE the read-only CODEX_HOME.
+    "-c", "sqlite_home=/opt/fluidbox-codex/state",
+    "-c", "log_dir=/opt/fluidbox-codex/state/log",
   ];
   child = spawn("codex", args, {
     cwd: env.WORKSPACE,
@@ -331,6 +374,14 @@ async function main() {
       "features.unified_exec": false,
       "features.multi_agent": false,
       "features.apps": false,
+      "features.goals": false,
+      "features.plugins": false,
+      "features.shell_snapshot": false,
+      "features.browser_use": false,
+      "features.computer_use": false,
+      "features.image_generation": false,
+      "features.tool_suggest": false,
+      "features.tool_search": false,
     };
     const mcp = mcpServersConfig();
     if (Object.keys(mcp).length > 0) threadConfig.mcp_servers = mcp;
@@ -342,6 +393,9 @@ async function main() {
       approvalsReviewer: "user",
       sandbox: "read-only",
       developerInstructions: env.SYSTEM_PROMPT || undefined,
+      // ephemeral: no durable thread/session rollout under the read-only
+      // CODEX_HOME (sqlite runtime state rides the writable sqlite_home).
+      ephemeral: true,
       config: threadConfig,
     });
     threadId = ts?.thread?.id;
@@ -357,18 +411,32 @@ async function main() {
     turnDone = true;
   }
 
-  // Wait for turn/completed (or an unexpected codex exit).
-  await waitFor(() => turnDone, 55 * 60 * 1000);
+  // Wait for turn/completed (or an unexpected codex exit). A TIMEOUT is a
+  // failure, never a silent success — interrupt the turn and mark the error.
+  const timedOut = await waitFor(() => turnDone, 55 * 60 * 1000);
+  if (timedOut && !turnDone) {
+    hadError = hadError || new Error("codex turn timed out");
+    try {
+      if (threadId && turnId) rpcSend({ jsonrpc: "2.0", id: nextId++, method: "turn/interrupt", params: { threadId, turnId } });
+    } catch {
+      /* best effort */
+    }
+  }
   await finishRun();
 }
 
+// Resolve when `cond()` holds; resolve true on timeout (the caller treats a
+// timeout as a failure, not a completion).
 function waitFor(cond, timeoutMs) {
   return new Promise((resolve) => {
     const started = Date.now();
     const t = setInterval(() => {
-      if (cond() || Date.now() - started > timeoutMs) {
+      if (cond()) {
         clearInterval(t);
-        resolve();
+        resolve(false);
+      } else if (Date.now() - started > timeoutMs) {
+        clearInterval(t);
+        resolve(true);
       }
     }, 200);
     t.unref?.();

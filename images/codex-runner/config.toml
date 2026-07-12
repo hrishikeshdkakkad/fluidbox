@@ -21,12 +21,20 @@ sandbox_mode = "read-only"
 # app-server's developerInstructions, never a repo-discoverable file.
 project_doc_max_bytes = 0
 
+# Writable runtime state (sqlite + logs) lives OUTSIDE the read-only CODEX_HOME
+# so config.toml + rules stay immutable while codex can still run a thread.
+sqlite_home = "/opt/fluidbox-codex/state"
+log_dir = "/opt/fluidbox-codex/state/log"
+
 # OpenTelemetry off (no phone-home).
 [otel]
 environment = "fluidbox"
 log_user_prompt = false
 
-# Tool-surface lockdown (also re-asserted in thread/start.config).
+# Tool-surface lockdown (also re-asserted in thread/start.config). The facade
+# additionally STRIPS any server-executed tool that survives, so this is
+# defense in depth: disable a SUPERSET (unknown feature keys are ignored
+# without --strict-config).
 [tools]
 web_search = false
 view_image = false
@@ -34,11 +42,25 @@ view_image = false
 [features]
 web_search = false
 standalone_web_search = false
+view_image = false
 unified_exec = false
 multi_agent = false
 apps = false
 hooks = false
 memories = false
+goals = false
+plugins = false
+skills = false
+shell_snapshot = false
+shell_snapshots = false
+browser_use = false
+computer_use = false
+image_generation = false
+in_app_browser = false
+tool_suggest = false
+tool_search = false
+fast_mode = false
+personality = false
 
 # No MCP servers configured here: the frozen capability set is wired per-run
 # by the supervisor (broker-shim / sandbox-gate-shim), never from a static
