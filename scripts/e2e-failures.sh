@@ -106,6 +106,10 @@ wait_status "$S2" failed 150 1 \
   && ok "watchdog failed the session" || no "expected failed, got $(status_of "$S2")"
 reason_of "$S2" | grep -qi "heartbeat" \
   && ok "reason names the stale heartbeat" || no "reason: $(reason_of "$S2")"
+# Reap is async: fail() commits the 'failed' transition (which wait_status
+# observes) BEFORE reap removes the container. Poll like F3/F4 rather than
+# single-shot-racing the removal.
+for _ in $(seq 1 15); do [ "$(containers_for "$S2")" = "0" ] && break; sleep 1; done
 [ "$(containers_for "$S2")" = "0" ] \
   && ok "sandbox reaped" || no "container still present"
 

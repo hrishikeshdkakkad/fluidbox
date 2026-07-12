@@ -21,7 +21,10 @@ import {
 
 // Models are per-harness — a claude model on a codex agent (or vice versa) is
 // never valid. Switching the harness re-defaults the model to that harness's
-// first entry (the server would 422 a cross-harness model anyway).
+// first entry. This is a UI convenience: the server validates only that the
+// harness id is known and pins model==RunSpec.model at the facade — it does
+// NOT check the model belongs to the harness, so a mismatched model would
+// fail (murkily) at model-call time, not with a clean 422.
 const MODELS_BY_HARNESS: Record<string, { id: string; name: string; hint: string }[]> = {
   "claude-agent-sdk": [
     { id: "claude-haiku-4-5", name: "Haiku 4.5", hint: "Fast and inexpensive — the default for most agents." },

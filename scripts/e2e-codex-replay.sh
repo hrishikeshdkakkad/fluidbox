@@ -55,10 +55,15 @@ function replay() {
   step();
 }
 function step() {
-  if (ci === 0) { // fire the move-patch approval once, before the exec cases
+  if (ci === 0) { // move-patch approval (p1 WAS announced via item/started)
     const id = nextId++; pending[id] = "patch-move"; send({ jsonrpc: "2.0", id, method: "item/fileChange/requestApproval", params: { itemId: "p1", threadId: "th_fake", turnId: "tn_fake" } }); ci = 1; return;
   }
-  const k = ci - 1;
+  if (ci === 1) { // blind patch: approval for p2 with NO prior item/started, so
+    // the supervisor never saw its changes → it must DECLINE (fail-closed),
+    // never gate a MultiEdit{edits:[]} a supervised human could blind-approve.
+    const id = nextId++; pending[id] = "patch-blind"; send({ jsonrpc: "2.0", id, method: "item/fileChange/requestApproval", params: { itemId: "p2", threadId: "th_fake", turnId: "tn_fake" } }); ci = 2; return;
+  }
+  const k = ci - 2;
   if (k >= CASES.length) return finish();
   const [label, method, params] = CASES[k]; ci++;
   const id = nextId++; pending[id] = label; send({ jsonrpc: "2.0", id, method, params });
@@ -77,8 +82,12 @@ chmod -R 0777 "$SB/replay"  # the runner uid (10001) writes replies to /out
 SID=$(curl -s -X POST -H "$H" -H 'content-type: application/json' \
   -d '{"agent":"codex-fixer","task":"replay","repo":{"kind":"none"},"autonomous":true}' "$API/v1/sessions" | j "['session']['id']")
 for _ in $(seq 1 100); do C=$(docker ps -a --filter "label=fluidbox.session=$SID" --format '{{.ID}}' | head -1); [ -n "$C" ] && break; sleep 0.15; done
-docker kill "$C" >/dev/null 2>&1  # kill FAST before the real supervisor terminalizes the session
+# Read the token, THEN force-remove the orchestrator's container: rm -f stops
+# AND removes in any state (a plain `docker kill` no-ops on a 'created'
+# container and leaves an 'exited' one lingering), so the real supervisor can't
+# terminalize the session before our manual run, and no container is left behind.
 TOK=$(docker inspect "$C" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | grep '^FLUIDBOX_SESSION_TOKEN=' | cut -d= -f2-)
+docker rm -f "$C" >/dev/null 2>&1
 [ -n "$TOK" ] || { rno "no session token for replay"; exit 1; }
 
 # Run the real supervisor in a manual container: fake codex shadows the real
@@ -100,6 +109,7 @@ dec(){ grep "\"label\":\"$1\"" "$R" | head -1 | python3 -c "import sys,json;prin
 [ "$(dec wrapped-git)" = "accept" ] && rok "wrapped 'bash -lc \"git status\"' → accept (argv unwrap)" || rno "wrapped-git decision: $(dec wrapped-git)"
 [ "$(dec cwd-escape)" = "decline" ] && rok "cwd=/etc → decline (workspace containment)" || rno "cwd-escape decision: $(dec cwd-escape)"
 [ "$(dec env-amendment)" = "decline" ] && rok "proposed execpolicy amendment → decline (no gate)" || rno "env-amendment decision: $(dec env-amendment)"
+[ "$(dec patch-blind)" = "decline" ] && rok "fileChange with no visible changes → decline (fail-closed)" || rno "patch-blind decision: $(dec patch-blind)"
 
 # the move destination reached the gate (canonical MultiEdit ledgered with .env)
 EV=$(curl -s -H "$H" "$API/v1/sessions/$SID/events?limit=500")

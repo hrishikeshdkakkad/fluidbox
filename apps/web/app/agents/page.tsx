@@ -16,8 +16,10 @@ import {
 import { BundlePicker } from "../components/BundlePicker";
 import { HarnessPicker } from "../components/HarnessPicker";
 
-// Per-harness models (a claude model on a codex revision would 422 at run
-// time). Switching the harness re-defaults the model to the first entry.
+// Per-harness models. Switching the harness re-defaults the model to the
+// first entry. UI convenience only: the server validates the harness id but
+// does NOT check the model belongs to the harness, so a mismatched model
+// fails (murkily) at model-call time, not with a clean 422.
 const REV_MODELS: Record<string, string[]> = {
   "claude-agent-sdk": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-4-8"],
   codex: ["gpt-5.4-mini", "gpt-5.4", "gpt-5.6-sol"],
