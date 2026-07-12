@@ -94,10 +94,10 @@ async fn decide_tool_call(
         .await;
     } else {
         let tool_mismatch = intent.tool != tool;
-        let digest_mismatch = intent
-            .input_digest
-            .as_deref()
-            .is_some_and(|stored| stored != digest);
+        // Fail CLOSED: a stored NULL digest (legacy or otherwise) is a
+        // mismatch, never a wildcard that lets a row inherit a verdict for
+        // arbitrary input.
+        let digest_mismatch = intent.input_digest.as_deref() != Some(digest.as_str());
         if tool_mismatch || digest_mismatch {
             ledger::record(
                 state,
@@ -177,24 +177,30 @@ async fn decide_tool_call(
     // defense: a tool the live server started advertising after the
     // photograph simply does not exist for this run.
     if let Some(reason) = capability::capability_denial(&run_spec.capabilities, tool) {
-        ledger::record(
-            state,
-            session.id,
-            Actor::System,
-            EventBody::ToolDecision {
-                tool_call_id: tool_call_id.to_string(),
-                tool: tool.to_string(),
-                verdict: "deny".into(),
-                source: "capability".into(),
-                original_verdict: None,
-                reason: Some(reason.clone()),
-            },
-        )
-        .await;
-        fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_denied")
-            .await
-            .ok();
-        return Ok(GateDecision::deny(reason));
+        // CAS the verdict FIRST; only the handler that owns the decision
+        // emits the ledger event (concurrent duplicates of a deterministic
+        // deny neither double-ledger nor contradict each other).
+        if fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_denied").await? {
+            ledger::record(
+                state,
+                session.id,
+                Actor::System,
+                EventBody::ToolDecision {
+                    tool_call_id: tool_call_id.to_string(),
+                    tool: tool.to_string(),
+                    verdict: "deny".into(),
+                    source: "capability".into(),
+                    original_verdict: None,
+                    reason: Some(reason.clone()),
+                },
+            )
+            .await;
+            return Ok(GateDecision::deny(reason));
+        }
+        // Lost the CAS to a concurrent handler for the same intent. A
+        // capability denial is deterministic on the frozen set, so the
+        // durable outcome is the matching terminal deny — adopt it.
+        return adopt_terminal_or_deny(state, intent.id).await;
     }
 
     let tool_req = ToolCallRequest {
@@ -209,59 +215,44 @@ async fn decide_tool_call(
     // it. Both the tier denial and the policy's own verdict are ledgered.
     if run_spec.trust_tier == fluidbox_core::spec::TrustTier::ReadOnly {
         if let Some(reason) = fluidbox_core::policy::read_only_denial(&tool_req) {
-            ledger::record(
-                state,
-                session.id,
-                Actor::System,
-                EventBody::ToolDecision {
-                    tool_call_id: tool_call_id.to_string(),
-                    tool: tool.to_string(),
-                    verdict: "deny".into(),
-                    source: "trust_tier".into(),
-                    original_verdict: Some(outcome.original.name().into()),
-                    reason: Some(reason.clone()),
-                },
-            )
-            .await;
-            fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_denied")
-                .await
-                .ok();
-            return Ok(GateDecision::deny(reason));
+            if fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_denied").await? {
+                ledger::record(
+                    state,
+                    session.id,
+                    Actor::System,
+                    EventBody::ToolDecision {
+                        tool_call_id: tool_call_id.to_string(),
+                        tool: tool.to_string(),
+                        verdict: "deny".into(),
+                        source: "trust_tier".into(),
+                        original_verdict: Some(outcome.original.name().into()),
+                        reason: Some(reason.clone()),
+                    },
+                )
+                .await;
+                return Ok(GateDecision::deny(reason));
+            }
+            return adopt_terminal_or_deny(state, intent.id).await;
         }
     }
 
     match &outcome.effective {
         Verdict::Allow => {
-            emit_decision(
-                state,
-                session.id,
-                tool_call_id,
-                tool,
-                &outcome,
-                "allow",
-                None,
-            )
-            .await;
-            fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_allowed")
-                .await
-                .ok();
-            Ok(GateDecision::allow())
+            if fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_allowed").await? {
+                emit_decision(state, session.id, tool_call_id, tool, &outcome, "allow", None).await;
+                Ok(GateDecision::allow())
+            } else {
+                adopt_terminal_or_deny(state, intent.id).await
+            }
         }
         Verdict::Deny { reason } => {
-            emit_decision(
-                state,
-                session.id,
-                tool_call_id,
-                tool,
-                &outcome,
-                "deny",
-                Some(reason),
-            )
-            .await;
-            fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_denied")
-                .await
-                .ok();
-            Ok(GateDecision::deny(reason.clone()))
+            if fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_denied").await? {
+                emit_decision(state, session.id, tool_call_id, tool, &outcome, "deny", Some(reason))
+                    .await;
+                Ok(GateDecision::deny(reason.clone()))
+            } else {
+                adopt_terminal_or_deny(state, intent.id).await
+            }
         }
         Verdict::RequireApproval {
             risk,
@@ -269,22 +260,40 @@ async fn decide_tool_call(
             scope,
             scope_key,
         } => {
-            // Session-scope grant already given for this key?
+            // Session-scope grant already given for this key? Adopt the
+            // durable outcome if a concurrent handler moved the row first —
+            // including a wait-join if that handler promoted it to pending
+            // (the narrow grant-lands-mid-flight race).
             if fluidbox_db::has_session_grant(&state.pool, session.id, scope_key).await? {
-                emit_decision(
-                    state,
-                    session.id,
-                    tool_call_id,
-                    tool,
-                    &outcome,
-                    "allow",
-                    Some("session-approved"),
-                )
-                .await;
-                fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_allowed")
-                    .await
-                    .ok();
-                return Ok(GateDecision::allow());
+                if fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_allowed").await?
+                {
+                    emit_decision(
+                        state,
+                        session.id,
+                        tool_call_id,
+                        tool,
+                        &outcome,
+                        "allow",
+                        Some("session-approved"),
+                    )
+                    .await;
+                    return Ok(GateDecision::allow());
+                }
+                let row = fluidbox_db::get_approval(&state.pool, intent.id)
+                    .await?
+                    .ok_or(ApiError::NotFound)?;
+                if row.status == "pending" {
+                    return await_pending_decision(
+                        state,
+                        session.id,
+                        row,
+                        tool_call_id,
+                        tool,
+                        &outcome,
+                    )
+                    .await;
+                }
+                return Ok(decision_from_status(&row.status));
             }
 
             let scope_str = match scope {
@@ -311,7 +320,7 @@ async fn decide_tool_call(
                     .ok_or(ApiError::NotFound)?,
             };
 
-            // Restart case: the row was already decided while we were away.
+            // Restart / lost-the-promotion case: already decided.
             if approval.status != "pending" {
                 return Ok(decision_from_status(&approval.status));
             }
@@ -341,70 +350,94 @@ async fn decide_tool_call(
                 .ok();
             }
 
-            // Wait for a decision (DB is truth; Notify just wakes us early).
-            let notifier = state.approvals.notifier(approval.id).await;
-            let final_status = loop {
-                let cur = fluidbox_db::get_approval(&state.pool, approval.id)
-                    .await?
-                    .ok_or(ApiError::NotFound)?;
-                if cur.status != "pending" {
-                    break cur.status;
-                }
-                if cur.expires_at <= chrono::Utc::now() {
-                    // Timeout → auto-deny (fail-safe).
-                    fluidbox_db::decide_approval(&state.pool, approval.id, "denied", "timeout")
-                        .await
-                        .ok();
-                    break "denied".to_string();
-                }
-                // Wake on decision, or re-poll every 2s, or at expiry.
-                let until_expiry = (cur.expires_at - chrono::Utc::now())
-                    .to_std()
-                    .unwrap_or(Duration::from_secs(1));
-                let tick = until_expiry.min(Duration::from_secs(2));
-                tokio::select! {
-                    _ = notifier.notified() => {}
-                    _ = tokio::time::sleep(tick) => {}
-                }
-            };
-            state.approvals.forget(approval.id).await;
-
-            // Record the decision + wake the session back to running if no
-            // other approvals are pending.
-            let decided_by = fluidbox_db::get_approval(&state.pool, approval.id)
-                .await?
-                .and_then(|a| a.decided_by)
-                .unwrap_or_else(|| "system".into());
-            ledger::record(
-                state,
-                session.id,
-                Actor::Human,
-                EventBody::ApprovalDecided {
-                    approval_id: approval.id,
-                    tool_call_id: tool_call_id.to_string(),
-                    decision: final_status.clone(),
-                    decided_by: decided_by.clone(),
-                },
-            )
-            .await;
-
-            let allowed = final_status == "approved_once" || final_status == "approved_session";
-            emit_decision(
-                state,
-                session.id,
-                tool_call_id,
-                tool,
-                &outcome,
-                if allowed { "allow" } else { "deny" },
-                Some(&format!("human:{decided_by}")),
-            )
-            .await;
-
-            maybe_resume(state, session.id).await;
-
-            Ok(decision_from_status(&final_status))
+            await_pending_decision(state, session.id, approval, tool_call_id, tool, &outcome).await
         }
     }
+}
+
+/// After losing a verdict CAS on a DETERMINISTIC gate path (capability /
+/// trust-tier / policy allow|deny — every concurrent handler for the same
+/// intent computes the identical verdict), adopt the durable terminal
+/// outcome the winner recorded. A row that is somehow still non-terminal
+/// fails safe to deny.
+async fn adopt_terminal_or_deny(
+    state: &AppState,
+    intent_id: uuid::Uuid,
+) -> ApiResult<GateDecision> {
+    let row = fluidbox_db::get_approval(&state.pool, intent_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    Ok(decision_from_status(&row.status))
+}
+
+/// Block on a pending approval row until it is decided (DB is truth; the
+/// Notify only wakes us early), then record the human decision and return
+/// it. Shared by the promoter and any handler that adopts a pending row.
+async fn await_pending_decision(
+    state: &AppState,
+    session_id: uuid::Uuid,
+    approval: fluidbox_db::ApprovalRow,
+    tool_call_id: &str,
+    tool: &str,
+    outcome: &EvaluationOutcome,
+) -> ApiResult<GateDecision> {
+    let notifier = state.approvals.notifier(approval.id).await;
+    let final_status = loop {
+        let cur = fluidbox_db::get_approval(&state.pool, approval.id)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+        if cur.status != "pending" {
+            break cur.status;
+        }
+        if cur.expires_at <= chrono::Utc::now() {
+            // Timeout → auto-deny (fail-safe).
+            fluidbox_db::decide_approval(&state.pool, approval.id, "denied", "timeout")
+                .await
+                .ok();
+            break "denied".to_string();
+        }
+        let until_expiry = (cur.expires_at - chrono::Utc::now())
+            .to_std()
+            .unwrap_or(Duration::from_secs(1));
+        let tick = until_expiry.min(Duration::from_secs(2));
+        tokio::select! {
+            _ = notifier.notified() => {}
+            _ = tokio::time::sleep(tick) => {}
+        }
+    };
+    state.approvals.forget(approval.id).await;
+
+    let decided_by = fluidbox_db::get_approval(&state.pool, approval.id)
+        .await?
+        .and_then(|a| a.decided_by)
+        .unwrap_or_else(|| "system".into());
+    ledger::record(
+        state,
+        session_id,
+        Actor::Human,
+        EventBody::ApprovalDecided {
+            approval_id: approval.id,
+            tool_call_id: tool_call_id.to_string(),
+            decision: final_status.clone(),
+            decided_by: decided_by.clone(),
+        },
+    )
+    .await;
+
+    let allowed = final_status == "approved_once" || final_status == "approved_session";
+    emit_decision(
+        state,
+        session_id,
+        tool_call_id,
+        tool,
+        outcome,
+        if allowed { "allow" } else { "deny" },
+        Some(&format!("human:{decided_by}")),
+    )
+    .await;
+
+    maybe_resume(state, session_id).await;
+    Ok(decision_from_status(&final_status))
 }
 
 #[derive(Deserialize)]
@@ -576,7 +609,8 @@ async fn maybe_resume(state: &AppState, session_id: uuid::Uuid) {
 
 fn decision_from_status(status: &str) -> GateDecision {
     match status {
-        "approved_once" | "approved_session" => GateDecision::allow(),
+        "approved_once" | "approved_session" | "auto_allowed" => GateDecision::allow(),
+        // pending / intent / auto_denied / denied / expired all fail safe.
         _ => GateDecision::deny("not approved"),
     }
 }
