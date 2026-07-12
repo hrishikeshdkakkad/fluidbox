@@ -13,6 +13,7 @@ pub struct SeedOutcome {
 pub async fn run(
     pool: &PgPool,
     policies_dir: &Path,
+    harness: &str,
     sandbox_image: &str,
     default_model: &str,
 ) -> anyhow::Result<SeedOutcome> {
@@ -90,7 +91,7 @@ pub async fn run(
         append_agent_revision(
             pool,
             agent.id,
-            "claude-agent-sdk",
+            harness,
             sandbox_image,
             default_model,
             None,

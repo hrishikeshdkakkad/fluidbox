@@ -86,6 +86,14 @@ fluidbox has shipped Phases 0–5.6 of the "borrow the agent, on demand" axis on
 - Accepted asymmetries recorded: MultiEdit delete-vs-rm; `AGENTS.md`-style prompt replaced by `developer_instructions`.
 - **DISSENT (F9):** declined to teach `policy.rs` patch op-types/cwd/env; compensated by supervisor cwd-in-workspace enforcement + env/permission-field rejection + additive ledger fields.
 
+## Step review log (implementation; codex gpt-5.6-sol @ xhigh, read-only)
+
+- **Steps 1–3** (commit fd2b266; reviewed as one increment — the registry and its two call sites are one coherent unit): 1 MAJOR, 2 MINOR.
+  - MAJOR (dashboard `AddRevision`/new-agent submit `model` unconditionally → a harness switch would explicitly re-submit the old provider's model, bypassing the server's switch re-default): **accepted; folded into Step 9's scope** — model choices become harness-specific in BOTH create and edit flows, reset on harness change.
+  - MINOR (seed.rs owned a literal `"claude-agent-sdk"` / main.rs bypassed the registry): **fixed in the follow-up commit** — seed::run takes the harness id; main.rs sources id+defaults through `harness::`.
+  - MINOR (PLAN.md still promises the deleted `Harness` trait at lines ~108/110/133/153, beyond the §6.2 bullet Step 10 planned to flag): **partial dissent** — PLAN.md is user-authored; per this doc's Step 10 we flag ALL four references to the user at handback rather than editing unilaterally.
+  - Reviewer explicitly endorsed: re-defaulting BOTH image and model on a harness switch (the doc's letter named only runner_image); the create_run `is_known` check is genuinely zero-spend and no run path bypasses `create_run`.
+
 ## Trust model note (pre-existing, follow-up track — NOT Phase 6)
 
 Agent-executed code shares the container with the runner and can read `FLUIDBOX_SESSION_TOKEN` from its own process environment regardless of tool policy; runner-posted narrative events are advisory (authoritative decisions/status/usage are server-emitted). Every run today is `NetworkMode::HostDev` — **Hardened mode is designed-but-NOT-active** in production. Parity-neutral (identical for claude). Follow-up ticket (needs owner + milestone; prerequisite for claiming hardened production isolation): scoped credential split (LLM-only token vs runner-control token), Hardened-as-default in prod, ReadOnly read-path screen (deny `/proc`, `/sys`, home/config, credential files). Also deferred + recorded: LiteLLM callback as a reconciliation meter; atomic budget reservation / per-session model-call serialization.
