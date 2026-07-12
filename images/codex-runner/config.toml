@@ -13,9 +13,16 @@
 approval_policy = "untrusted"
 # Approvals route to the supervisor (us), never an LLM auto-reviewer.
 approvals_reviewer = "user"
-# The sandbox itself is read-only; the container is the real containment
-# boundary (edits still flow through the fileChange approval regardless).
-sandbox_mode = "read-only"
+# Codex's OWN sandbox is disabled: read-only/workspace-write use bubblewrap,
+# which needs user-namespace/setuid privileges the fluidbox container forbids
+# (`cap_drop=ALL` + `no-new-privileges`) — so it fails fatally at startup. The
+# fluidbox CONTAINER is the real containment boundary (no caps, egress-blocked,
+# disposable /workspace), exactly as for the claude harness, which has no OS
+# sandbox either. Governance is UNCHANGED: every exec still crosses the gate
+# via approval_policy=untrusted + the universal execpolicy prompt rule (sandbox
+# mode only affects post-approval isolation, not whether approval is asked),
+# and fork-PR ReadOnly is enforced SERVER-SIDE at the fluidbox gate.
+sandbox_mode = "danger-full-access"
 
 # No project doc / AGENTS.md discovery — the system prompt is injected via the
 # app-server's developerInstructions, never a repo-discoverable file.
@@ -26,10 +33,12 @@ project_doc_max_bytes = 0
 sqlite_home = "/opt/fluidbox-codex/state"
 log_dir = "/opt/fluidbox-codex/state/log"
 
-# OpenTelemetry off (no phone-home).
-[otel]
-environment = "fluidbox"
-log_user_prompt = false
+# OpenTelemetry: OFF. Codex's OTel is opt-IN — it is disabled unless an [otel]
+# section turns it on, so we deliberately DO NOT declare one. (A prior
+# `[otel] environment=…` here did the opposite of its intent: it ENABLED the
+# exporter, which then failed fatally with EACCES inside the hardened, egress-
+# controlled container — the codex app-server never started. No section = no
+# telemetry = no phone-home, and codex boots.)
 
 # Tool-surface lockdown (also re-asserted in thread/start.config). The facade
 # additionally STRIPS any server-executed tool that survives, so this is
