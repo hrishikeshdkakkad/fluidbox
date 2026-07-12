@@ -1,0 +1,45 @@
+# fluidbox codex baseline config — materialized root-owned READ-ONLY into
+# $CODEX_HOME each boot (see entrypoint.sh). The supervisor ALSO re-asserts
+# every security-critical setting per-thread (thread/start) and as `-c` CLI
+# overrides, so a tampered file cannot loosen governance (defense in depth).
+#
+# The governance model: the fluidbox permission gate is the authority, reached
+# because EVERY exec/edit escalates to an approval the supervisor answers. That
+# requires (a) approval_policy that asks, (b) a read-only sandbox, and (c) an
+# execpolicy rule that removes codex's built-in "known-safe read" auto-run.
+
+# Ask before running anything except known-safe reads; the execpolicy rule
+# below removes even that exception so EVERY exec crosses the gate.
+approval_policy = "untrusted"
+# Approvals route to the supervisor (us), never an LLM auto-reviewer.
+approvals_reviewer = "user"
+# The sandbox itself is read-only; the container is the real containment
+# boundary (edits still flow through the fileChange approval regardless).
+sandbox_mode = "read-only"
+
+# No project doc / AGENTS.md discovery — the system prompt is injected via the
+# app-server's developerInstructions, never a repo-discoverable file.
+project_doc_max_bytes = 0
+
+# OpenTelemetry off (no phone-home).
+[otel]
+environment = "fluidbox"
+log_user_prompt = false
+
+# Tool-surface lockdown (also re-asserted in thread/start.config).
+[tools]
+web_search = false
+view_image = false
+
+[features]
+web_search = false
+standalone_web_search = false
+unified_exec = false
+multi_agent = false
+apps = false
+hooks = false
+memories = false
+
+# No MCP servers configured here: the frozen capability set is wired per-run
+# by the supervisor (broker-shim / sandbox-gate-shim), never from a static
+# config the agent could point elsewhere.

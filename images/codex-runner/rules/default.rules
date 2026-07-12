@@ -1,0 +1,42 @@
+# fluidbox execpolicy — force EVERY exec through the fluidbox permission gate.
+#
+# codex's approval_policy="untrusted" AUTO-RUNS its built-in "known-safe"
+# reads (cat, ls, grep, git status, …) WITHOUT asking — a whole class of exec
+# that would never cross the fluidbox gate (no ledger, no budget, no policy).
+# execpolicy has only `prefix_rule` (no wildcard: an empty prefix `[""]`
+# matches nothing), so we enumerate codex's known-safe command set and mark
+# each `prompt`. Strictest decision wins (forbidden > prompt > allow), so a
+# `prompt` rule here can only make codex ASK MORE, never less; an ARBITRARY
+# (non-listed) command already prompts under `untrusted`. The result: every
+# exec escalates to an item/commandExecution/requestApproval the supervisor
+# answers via /permission.
+#
+# Pinned to codex 0.144.1's known-safe set (the version pin freezes it); the
+# e2e tier-2 HARD-asserts a bare `cat` gates — if a future codex adds a
+# known-safe command not listed here, that assertion is the tripwire.
+#
+# Validate:  codex execpolicy check --pretty --rules default.rules -- cat x
+
+def prompt(cmd):
+    prefix_rule(
+        pattern = [cmd],
+        decision = "prompt",
+        justification = "fluidbox: every command must cross the permission gate",
+    )
+
+# codex's known-safe reads + the common dev toolchain (over-listing is a
+# no-op: a command that would prompt anyway just prompts).
+[prompt(c) for c in [
+    "cat", "ls", "pwd", "echo", "printf", "head", "tail", "wc", "nl",
+    "true", "false", "cd", "test", "sleep",
+    "grep", "egrep", "fgrep", "rg", "ripgrep", "ag",
+    "find", "fd", "sed", "awk", "cut", "tr", "sort", "uniq", "comm", "join",
+    "which", "type", "command", "hash",
+    "date", "env", "printenv", "id", "whoami", "uname", "hostname",
+    "stat", "file", "du", "df",
+    "dirname", "basename", "realpath", "readlink", "tree",
+    "diff", "cmp", "md5sum", "sha1sum", "sha256sum", "cksum",
+    "git", "jq", "yq", "xxd", "od", "strings", "column", "tee",
+    "python", "python3", "node", "cargo", "go", "make", "pytest", "npm", "pnpm",
+    "bash", "sh", "zsh",
+]]
