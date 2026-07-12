@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 🔒 Report a security vulnerability
+    url: https://github.com/hrishikeshdkakkad/fluidbox/security/advisories/new
+    about: Sandbox escapes, credential exposure, policy/approval bypasses — please report privately, never as a public issue.
+  - name: 📖 Architecture & design questions
+    url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/docs/ARCHITECTURE.md
+    about: How runs flow, the security model, and the extension seams — check here first.
