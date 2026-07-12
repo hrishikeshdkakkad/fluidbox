@@ -5,8 +5,14 @@ use axum::http::request::Parts;
 use uuid::Uuid;
 
 fn bearer(parts: &Parts) -> Option<String> {
-    parts
-        .headers
+    bearer_from_headers(&parts.headers)
+}
+
+/// Extract a `Bearer <token>` from a header map. Public so handlers that
+/// need a non-standard auth path (e.g. /result acknowledging an
+/// already-terminal session with a revoked token) can resolve it themselves.
+pub fn bearer_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
         .get(axum::http::header::AUTHORIZATION)?
         .to_str()
         .ok()?

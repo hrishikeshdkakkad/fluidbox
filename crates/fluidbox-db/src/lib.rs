@@ -1903,6 +1903,25 @@ pub async fn create_session_token(
     Ok(())
 }
 
+/// Resolve a session token to its session id IGNORING revoked_at/expiry —
+/// used ONLY by /result to acknowledge an already-terminal session whose
+/// token was revoked on the terminal transition (so a lost-response retry
+/// acks cleanly). Every other endpoint uses the strict `session_for_token`.
+/// A completely bogus token still returns None; a real token resolves to its
+/// own session, and the caller gates the ack on that session being terminal.
+pub async fn session_for_token_incl_revoked(
+    pool: &PgPool,
+    token_plain: &str,
+) -> sqlx::Result<Option<Uuid>> {
+    let row = sqlx::query(
+        "select session_id from api_tokens where kind = 'session' and token_sha256 = $1",
+    )
+    .bind(sha256_hex(token_plain))
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|r| r.get::<Option<Uuid>, _>("session_id")))
+}
+
 /// Returns the session id a valid (unexpired, unrevoked) token belongs to.
 pub async fn session_for_token(pool: &PgPool, token_plain: &str) -> sqlx::Result<Option<Uuid>> {
     let row = sqlx::query(
