@@ -41,6 +41,7 @@ pub fn verify(headers: &HeaderMap, body: &[u8], secret: &str) -> Result<Verified
         .ok_or("malformed X-Hub-Signature-256 header")?
         .to_ascii_lowercase();
 
+    use hmac::digest::KeyInit;
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     let mut mac =

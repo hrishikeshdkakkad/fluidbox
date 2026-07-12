@@ -115,9 +115,8 @@ fn form_body(pairs: &[(&str, &str)]) -> String {
 }
 
 pub(crate) fn random_urlsafe() -> String {
-    use chacha20poly1305::aead::rand_core::RngCore;
     let mut buf = [0u8; 32];
-    chacha20poly1305::aead::OsRng.fill_bytes(&mut buf);
+    getrandom::fill(&mut buf).expect("OS RNG is available");
     b64url(&buf)
 }
 

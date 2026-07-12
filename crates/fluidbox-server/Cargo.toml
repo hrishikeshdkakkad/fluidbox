@@ -25,6 +25,7 @@ tracing-subscriber.workspace = true
 reqwest.workspace = true
 sha2.workspace = true
 hmac.workspace = true
+getrandom.workspace = true
 hex.workspace = true
 bytes.workspace = true
 dotenvy.workspace = true
