@@ -1,5 +1,9 @@
 # fluidbox sandbox runner — the Claude Agent SDK harness as a sandbox payload.
 # The image ships no secrets; identity + wiring arrive via env at run time.
+#
+# BUILD CONTEXT = images/ (shared with the codex runner), so this Dockerfile
+# reaches both sandbox-runner/ and the shared runner-lib/. Build with:
+#   docker build -t <img> -f images/sandbox-runner/Dockerfile images
 FROM node:24-bookworm-slim
 
 # Toolchain the agent needs to actually do coding work.
@@ -9,12 +13,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/fluidbox-runner
-COPY runner/package.json ./package.json
+COPY sandbox-runner/runner/package.json ./package.json
 RUN npm install --omit=dev && npm cache clean --force
 
-COPY runner/index.mjs ./index.mjs
-COPY runner/broker-shim.mjs ./broker-shim.mjs
-COPY runner/servers ./servers
+COPY sandbox-runner/runner/index.mjs ./index.mjs
+COPY sandbox-runner/runner/servers ./servers
+# The shared runner contract lib + shims (broker-shim, sandbox-gate-shim).
+COPY runner-lib ./lib
 
 # Non-root. /workspace is bind-mounted rw by the provider.
 RUN useradd -m -u 10001 runner \
