@@ -27,10 +27,10 @@ fi
 # ALWAYS rebuild (layer cache makes it fast when unchanged): a stale cached
 # image would silently test the old runner. Context = images/ (shared with
 # codex) with a per-image -f.
-echo "building sandbox image $FLUIDBOX_SANDBOX_IMAGE…"
+echo "building sandbox image $FLUIDBOX_SANDBOX_IMAGE"
 docker build -q -t "$FLUIDBOX_SANDBOX_IMAGE" \
   -f "$ROOT/images/sandbox-runner/Dockerfile" "$ROOT/images" >/dev/null || exit 1
-echo "building server + cli…"
+echo "building server + cli"
 cargo build -q -p fluidbox-server -p fluidbox-cli || exit 1
 docker compose -f "$ROOT/deploy/docker-compose.dev.yml" up -d litellm >/dev/null 2>&1 || true
 for _ in $(seq 1 40); do

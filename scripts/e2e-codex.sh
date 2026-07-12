@@ -20,7 +20,7 @@ SB="$(cd "$(dirname "$0")/.." && pwd)/scratch-codex"
 rm -rf "$SB"; mkdir -p "$SB"
 
 if port_in_use; then echo "port 8787 already serving — stop 'just dev' first"; exit 1; fi
-echo "building server + codex image…"
+echo "building server + codex image"
 cargo build -q -p fluidbox-server || exit 1
 docker build -q -t "${FLUIDBOX_CODEX_SANDBOX_IMAGE:-fluidbox-codex-runner:dev}" \
   -f "$(dirname "$0")/../images/codex-runner/Dockerfile" "$(dirname "$0")/../images" >/dev/null || exit 1
