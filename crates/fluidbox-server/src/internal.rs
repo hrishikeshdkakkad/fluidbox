@@ -138,36 +138,39 @@ async fn decide_tool_call(
     }
 
     // Budget: tool-call ceiling enforced at the gate. Counts unique intents
-    // (this call's registration included).
+    // (this call's registration included). CAS the verdict FIRST — only the
+    // winner ledgers the overage and finalizes the session; a concurrent
+    // loser adopts the durable outcome (never a second finalize or a deny
+    // that contradicts an already-recorded verdict).
     if let Some(max) = run_spec.budgets.max_tool_calls {
         let used = fluidbox_db::tool_call_count(&state.pool, session.id).await?;
         if used as u64 > max {
-            ledger::record(
-                state,
-                session.id,
-                Actor::System,
-                EventBody::BudgetExceeded {
-                    budget: "max_tool_calls".into(),
-                    limit: max.to_string(),
-                    spent: used.to_string(),
-                },
-            )
-            .await;
-            let session_clone = session.clone();
-            let state2 = state.clone();
-            tokio::spawn(async move {
-                orchestrator::finalize(
-                    &state2,
-                    &session_clone,
-                    "budget_exceeded",
-                    Some("tool-call budget exceeded"),
+            if fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_denied").await? {
+                ledger::record(
+                    state,
+                    session.id,
+                    Actor::System,
+                    EventBody::BudgetExceeded {
+                        budget: "max_tool_calls".into(),
+                        limit: max.to_string(),
+                        spent: used.to_string(),
+                    },
                 )
                 .await;
-            });
-            fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_denied")
-                .await
-                .ok();
-            return Ok(GateDecision::deny("tool-call budget exceeded"));
+                let session_clone = session.clone();
+                let state2 = state.clone();
+                tokio::spawn(async move {
+                    orchestrator::finalize(
+                        &state2,
+                        &session_clone,
+                        "budget_exceeded",
+                        Some("tool-call budget exceeded"),
+                    )
+                    .await;
+                });
+                return Ok(GateDecision::deny("tool-call budget exceeded"));
+            }
+            return adopt_terminal_or_deny(state, intent.id).await;
         }
     }
 
@@ -390,11 +393,21 @@ async fn await_pending_decision(
             break cur.status;
         }
         if cur.expires_at <= chrono::Utc::now() {
-            // Timeout → auto-deny (fail-safe).
-            fluidbox_db::decide_approval(&state.pool, approval.id, "denied", "timeout")
-                .await
-                .ok();
-            break "denied".to_string();
+            // Timeout → auto-deny (fail-safe), but as a CAS: if a human
+            // decision won the row between our read and here, decide_approval
+            // affects nothing — adopt the human's verdict rather than
+            // fabricating a deny that contradicts the durable row.
+            match fluidbox_db::decide_approval(&state.pool, approval.id, "denied", "timeout")
+                .await?
+            {
+                Some(_) => break "denied".to_string(),
+                None => {
+                    let row = fluidbox_db::get_approval(&state.pool, approval.id)
+                        .await?
+                        .ok_or(ApiError::NotFound)?;
+                    break row.status;
+                }
+            }
         }
         let until_expiry = (cur.expires_at - chrono::Utc::now())
             .to_std()

@@ -8,9 +8,10 @@
 //! fallback, api.anthropic.com), and tees the SSE stream to meter usage into
 //! the ledger. Two dialects ride one route, dispatched on RunSpec.harness:
 //! `claude-agent-sdk` (Anthropic Messages) and `codex` (OpenAI Responses).
-//! Response bytes reach the runner verbatim; claude request bytes are
-//! forwarded verbatim, codex request bytes are re-serialized after the
-//! statelessness rewrite (`store=false`).
+//! Response bytes reach the runner verbatim; request bytes are RE-SERIALIZED
+//! from the validated body for BOTH dialects (so what we validated is exactly
+//! what we forward — no duplicate-key differential), with codex additionally
+//! forced stateless (`store=false`).
 
 use crate::error::{ApiError, ApiResult};
 use crate::harness;
@@ -257,7 +258,8 @@ pub async fn messages(
         ));
     };
 
-    // Body screen (both dialects parse; claude bytes still forward verbatim).
+    // Body screen (both dialects parse; both then forward the reserialized
+    // validated Value — see the store=false block below).
     let mut parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
