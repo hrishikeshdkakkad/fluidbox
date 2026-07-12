@@ -169,8 +169,9 @@ async function handleServerRequest(msg) {
       rpcSend({ id, result: { permissions: {}, scope: "turn" } });
       return;
     case "item/tool/requestUserInput":
-      // We never provide interactive input to the agent.
-      rpcSend({ id, result: { response: { type: "declined" } } });
+      // We never provide interactive input (headless). The 0.144.1 response
+      // schema is {answers:{}} — an empty answer map.
+      rpcSend({ id, result: { answers: {} } });
       return;
     case "mcpServer/elicitation/request":
       // MCP elicitation — decline (MCP is gated by the shims, not codex).
