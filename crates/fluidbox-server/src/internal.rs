@@ -61,7 +61,84 @@ async fn decide_tool_call(
 ) -> ApiResult<GateDecision> {
     let policy: Policy = run_spec.policy_snapshot.clone();
 
-    // Budget: tool-call ceiling enforced at the gate.
+    // ── Intent registration + digest binding (Phase 6 hardening). One
+    // persistent row per (session, tool_call_id) is the budget's counting
+    // unit, the idempotency anchor, AND the digest binding: a reused id
+    // must carry the SAME tool + input digest — a mismatch is a protocol
+    // violation that hard-denies without ever touching the stored verdict.
+    let digest = digest_json(input);
+    let (intent, inserted) = fluidbox_db::register_tool_intent(
+        &state.pool,
+        session.id,
+        tool_call_id,
+        tool,
+        &summarize(tool, input),
+        &digest,
+    )
+    .await?;
+    if inserted {
+        // The server (not the runner) writes the canonical tool.requested —
+        // exactly once per intent. Runner-posted copies are dropped at
+        // ingest; budget parity never trusts runner cooperation.
+        ledger::record(
+            state,
+            session.id,
+            Actor::Agent,
+            EventBody::ToolRequested {
+                tool_call_id: tool_call_id.to_string(),
+                tool: tool.to_string(),
+                summary: summarize(tool, input),
+                input_digest: digest.clone(),
+            },
+        )
+        .await;
+    } else {
+        let tool_mismatch = intent.tool != tool;
+        let digest_mismatch = intent
+            .input_digest
+            .as_deref()
+            .is_some_and(|stored| stored != digest);
+        if tool_mismatch || digest_mismatch {
+            ledger::record(
+                state,
+                session.id,
+                Actor::System,
+                EventBody::ToolDecision {
+                    tool_call_id: tool_call_id.to_string(),
+                    tool: tool.to_string(),
+                    verdict: "deny".into(),
+                    source: "protocol_violation".into(),
+                    original_verdict: None,
+                    reason: Some(format!(
+                        "tool_call_id reused with different content (first seen as '{}'); \
+                         a reused id never inherits a verdict",
+                        intent.tool
+                    )),
+                },
+            )
+            .await;
+            return Ok(GateDecision::deny(
+                "tool_call_id reused with a different tool or input",
+            ));
+        }
+        // Faithful retry: a decided intent re-attaches to its recorded
+        // verdict — no re-evaluation, no duplicate ledger events.
+        match intent.status.as_str() {
+            "auto_allowed" | "approved_once" | "approved_session" => {
+                return Ok(GateDecision::allow());
+            }
+            "auto_denied" | "denied" | "expired" => {
+                return Ok(GateDecision::deny("not approved"));
+            }
+            // 'intent' (a crash between registration and verdict) or
+            // 'pending' (an approval wait in flight) — run the gate; the
+            // approval path re-attaches to the pending row.
+            _ => {}
+        }
+    }
+
+    // Budget: tool-call ceiling enforced at the gate. Counts unique intents
+    // (this call's registration included).
     if let Some(max) = run_spec.budgets.max_tool_calls {
         let used = fluidbox_db::tool_call_count(&state.pool, session.id).await?;
         if used as u64 > max {
@@ -87,6 +164,9 @@ async fn decide_tool_call(
                 )
                 .await;
             });
+            fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_denied")
+                .await
+                .ok();
             return Ok(GateDecision::deny("tool-call budget exceeded"));
         }
     }
@@ -111,6 +191,9 @@ async fn decide_tool_call(
             },
         )
         .await;
+        fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_denied")
+            .await
+            .ok();
         return Ok(GateDecision::deny(reason));
     }
 
@@ -140,6 +223,9 @@ async fn decide_tool_call(
                 },
             )
             .await;
+            fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_denied")
+                .await
+                .ok();
             return Ok(GateDecision::deny(reason));
         }
     }
@@ -156,6 +242,9 @@ async fn decide_tool_call(
                 None,
             )
             .await;
+            fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_allowed")
+                .await
+                .ok();
             Ok(GateDecision::allow())
         }
         Verdict::Deny { reason } => {
@@ -169,6 +258,9 @@ async fn decide_tool_call(
                 Some(reason),
             )
             .await;
+            fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_denied")
+                .await
+                .ok();
             Ok(GateDecision::deny(reason.clone()))
         }
         Verdict::RequireApproval {
@@ -189,6 +281,9 @@ async fn decide_tool_call(
                     Some("session-approved"),
                 )
                 .await;
+                fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_allowed")
+                    .await
+                    .ok();
                 return Ok(GateDecision::allow());
             }
 
@@ -196,27 +291,32 @@ async fn decide_tool_call(
                 fluidbox_core::policy::ApprovalScope::Once => "once",
                 fluidbox_core::policy::ApprovalScope::Session => "session",
             };
-            let digest = digest_json(input);
-            let (approval, inserted) = fluidbox_db::upsert_pending_approval(
+            // Promote the registered intent into the human approval
+            // lifecycle. None = a concurrent handler already promoted (or a
+            // verdict landed) — re-read and act on the current status.
+            let promoted = fluidbox_db::promote_intent_to_pending(
                 &state.pool,
-                session.id,
-                tool_call_id,
-                tool,
-                &summarize(tool, input),
-                Some(&digest),
+                intent.id,
                 risk.as_deref(),
                 scope_str,
                 scope_key,
                 *ttl_secs as i64,
             )
             .await?;
+            let newly_pending = promoted.is_some();
+            let approval = match promoted {
+                Some(row) => row,
+                None => fluidbox_db::get_approval(&state.pool, intent.id)
+                    .await?
+                    .ok_or(ApiError::NotFound)?,
+            };
 
             // Restart case: the row was already decided while we were away.
             if approval.status != "pending" {
                 return Ok(decision_from_status(&approval.status));
             }
 
-            if inserted {
+            if newly_pending {
                 ledger::record(
                     state,
                     session.id,
@@ -391,22 +491,9 @@ pub async fn tool_call(
         }
     }
 
-    // The broker owns the whole ledger trail for brokered calls (the runner
-    // does not pre-announce them), so the tool-call budget counts them
-    // exactly once.
-    ledger::record(
-        &state,
-        session.id,
-        Actor::Agent,
-        EventBody::ToolRequested {
-            tool_call_id: req.tool_call_id.clone(),
-            tool: req.tool.clone(),
-            summary: summarize(&req.tool, &req.input),
-            input_digest: digest_json(&req.input),
-        },
-    )
-    .await;
-
+    // The gate registers the intent and writes tool.requested itself
+    // (exactly once per unique tool_call_id) — same trail for brokered and
+    // sandbox calls, counted once each.
     let decision = decide_tool_call(
         &state,
         &session,
@@ -566,6 +653,13 @@ pub async fn events(
     };
     let body: EventBody = serde_json::from_value(ev.body)
         .unwrap_or_else(|_| EventBody::Unknown(json!({"type": "unknown"})));
+    // tool.requested is server-authoritative (Phase 6): the gate writes it
+    // exactly once per registered intent. Runner-posted copies are dropped
+    // so the timeline and the tool-call budget never double-count — and
+    // never trust — runner cooperation.
+    if matches!(body, EventBody::ToolRequested { .. }) {
+        return Ok(Json(json!({ "seq": Value::Null, "dropped": "tool.requested" })));
+    }
     let seq = ledger::record(&state, auth.session_id, actor, body).await;
     Ok(Json(json!({ "seq": seq })))
 }
