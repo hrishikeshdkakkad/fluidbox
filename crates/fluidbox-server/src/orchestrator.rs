@@ -39,10 +39,15 @@ async fn transition(state: &AppState, id: Uuid, next: SessionStatus, reason: Opt
             )
             .await;
             if next.is_terminal() {
-                // Kill the session's tokens the moment it goes terminal — a
-                // runner that keeps running (or a leaked token) can no longer
-                // reach the facade or internal gateway. Exactly-once with the
-                // enqueue below (terminal entry is exactly-once).
+                // Defense-in-depth: kill the session's tokens the moment it
+                // goes terminal so a still-running or leaked token can't reach
+                // the facade/gateway. The PRIMARY guard is each endpoint's own
+                // terminal-session check (facade, permission, tool_call,
+                // result, token_renew all refuse a terminal session), so a
+                // best-effort revoke that fails still leaves the run governed —
+                // hence warn-and-continue, not fail. (Full transactional
+                // terminal + delivery idempotency is a pre-existing follow-up,
+                // HANDOVER §4.)
                 if let Err(e) = fluidbox_db::revoke_session_tokens(&state.pool, id).await {
                     tracing::warn!("revoke_session_tokens {id} failed: {e}");
                 }
