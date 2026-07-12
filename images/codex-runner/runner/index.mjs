@@ -215,6 +215,22 @@ async function decideFileChange(id, params) {
   const key = params.approvalId || params.itemId;
   const changes = items.get(params.itemId)?.changes || [];
   const edits = canonicalizeEdits(changes);
+  // Fail closed when the changes never arrived (item/started or patchUpdated
+  // out of order, or a protocol drift): an empty edit set would gate as
+  // MultiEdit{edits:[]}, which hides the real paths — and which a SUPERVISED
+  // human could approve as a blind patch. Never gate a patch we can't see;
+  // decline and let codex re-propose.
+  if (edits.length === 0) {
+    rpcSend({ id, result: { decision: "decline" } });
+    client.emit("harness", {
+      type: "agent.message",
+      data: {
+        role: "system",
+        text: "declined a fileChange approval carrying no visible changes (fail-closed)",
+      },
+    });
+    return;
+  }
   const decision = await gate(key, "MultiEdit", { edits, cwd: WORKSPACE }, params.availableDecisions);
   rpcSend({ id, result: decision });
 }
@@ -321,7 +337,11 @@ function spawnCodex() {
     "-c", "model_providers.fluidbox.env_key=FLUIDBOX_SESSION_TOKEN",
     "-c", "approval_policy=untrusted",
     "-c", "approvals_reviewer=user",
-    "-c", "sandbox_mode=read-only",
+    // Codex's own sandbox is OFF: bubblewrap can't run under the container's
+    // cap_drop=ALL + no-new-privileges. The container + the /permission gate
+    // are the boundary (claude parity). Governance is unchanged — untrusted +
+    // the universal execpolicy rule still force every exec through the gate.
+    "-c", "sandbox_mode=danger-full-access",
     "-c", "model_reasoning_effort=low",
     // Writable runtime state OUTSIDE the read-only CODEX_HOME.
     "-c", "sqlite_home=/opt/fluidbox-codex/state",
@@ -392,7 +412,9 @@ async function main() {
       model: MODEL,
       approvalPolicy: "untrusted",
       approvalsReviewer: "user",
-      sandbox: "read-only",
+      // See spawnCodex: codex's own sandbox is off (bubblewrap is incompatible
+      // with the container hardening); the container + gate are the boundary.
+      sandbox: "danger-full-access",
       developerInstructions: env.SYSTEM_PROMPT || undefined,
       // ephemeral: no durable thread/session rollout under the read-only
       // CODEX_HOME (sqlite runtime state rides the writable sqlite_home).
