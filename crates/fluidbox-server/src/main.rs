@@ -49,11 +49,16 @@ async fn main() -> anyhow::Result<()> {
     let pool = fluidbox_db::connect(&cfg.database_url).await?;
 
     tracing::info!("seeding…");
+    // The curated seed agent rides the harness registry like any other
+    // agent — the harness id and its defaults have exactly one home.
     let seed = fluidbox_db::seed::run(
         &pool,
         std::path::Path::new("policies"),
-        &cfg.sandbox_image,
-        &cfg.default_model,
+        harness::CLAUDE_AGENT_SDK,
+        harness::default_runner_image(harness::CLAUDE_AGENT_SDK, &cfg)
+            .expect("claude-agent-sdk is a known harness"),
+        harness::default_model(harness::CLAUDE_AGENT_SDK, &cfg)
+            .expect("claude-agent-sdk is a known harness"),
     )
     .await?;
 
