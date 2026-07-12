@@ -1,4 +1,8 @@
-import React from "react";
+"use client";
+
+import React, { useEffect, useId, useRef } from "react";
+import Link from "next/link";
+import { ChevronRight } from "lucide-react";
 
 export function Pill({ status }: { status: string }) {
   const label = status.replace(/_/g, " ");
@@ -10,8 +14,11 @@ export function Pill({ status }: { status: string }) {
   );
 }
 
+/** Small neutral/amber badge for autonomy, enabled-ness, tiers, … */
 export function AutoPill({ autonomy }: { autonomy: string }) {
-  return <span className={`autopill ${autonomy}`}>{autonomy}</span>;
+  return (
+    <span className={`badge ${autonomy === "autonomous" ? "warn" : ""}`}>{autonomy}</span>
+  );
 }
 
 export function short(id: string, n = 8): string {
@@ -19,32 +26,150 @@ export function short(id: string, n = 8): string {
 }
 
 export function PageHead({
-  eyebrow,
   title,
   sub,
   right,
+  crumbs,
 }: {
-  eyebrow: string;
   title: string;
   sub?: string;
   right?: React.ReactNode;
+  crumbs?: { href: string; label: string }[];
 }) {
   return (
     <div className="pagehead">
-      <div>
-        <div className="eyebrow">{eyebrow}</div>
+      <div style={{ minWidth: 0 }}>
+        {crumbs && crumbs.length > 0 && (
+          <div className="crumbs">
+            {crumbs.map((c) => (
+              <React.Fragment key={c.href}>
+                <Link href={c.href}>{c.label}</Link>
+                <ChevronRight size={12} />
+              </React.Fragment>
+            ))}
+          </div>
+        )}
         <h1 className="title">{title}</h1>
         {sub && <div className="sub">{sub}</div>}
       </div>
-      {right}
+      {right && <div className="page-actions">{right}</div>}
     </div>
+  );
+}
+
+/** Modal chrome: header with title/subtitle and a close button. */
+export function ModalShell({
+  title,
+  sub,
+  onClose,
+  children,
+  wide,
+}: {
+  title: string;
+  sub?: string;
+  onClose: () => void;
+  children: React.ReactNode;
+  wide?: boolean;
+}) {
+  const modalRef = useRef<HTMLDivElement>(null);
+  const titleId = useId();
+
+  useEffect(() => {
+    const previous = document.activeElement as HTMLElement | null;
+    const modal = modalRef.current;
+    const focusable = modal?.querySelector<HTMLElement>(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+    );
+    focusable?.focus();
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+      if (event.key !== "Tab" || !modal) return;
+      const elements = Array.from(
+        modal.querySelectorAll<HTMLElement>(
+          'button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])'
+        )
+      );
+      if (elements.length === 0) return;
+      const first = elements[0];
+      const last = elements[elements.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      previous?.focus();
+    };
+  }, [onClose]);
+
+  return (
+    <div className="overlay" onClick={onClose}>
+      <div
+        ref={modalRef}
+        className="modal"
+        style={wide ? { width: "min(680px, 92vw)" } : undefined}
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+      >
+        <div className="mh">
+          <div>
+            <div className="t" id={titleId}>{title}</div>
+            {sub && <div className="s">{sub}</div>}
+          </div>
+          <button className="xbtn" onClick={onClose} aria-label="Close">
+            <X />
+          </button>
+        </div>
+        <div className="mb">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+export function LoadingRows({ rows = 4 }: { rows?: number }) {
+  return (
+    <div className="loading-rows" aria-label="Loading" aria-busy="true">
+      {Array.from({ length: rows }, (_, index) => (
+        <div className="loading-row" key={index}>
+          <span className="skeleton short" />
+          <span className="skeleton" />
+          <span className="skeleton tiny" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function X() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+      <path d="M18 6 6 18M6 6l12 12" />
+    </svg>
+  );
+}
+
+/** The GitHub mark (lucide dropped brand icons). */
+export function GitHubMark({ size = 20 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="currentColor" aria-hidden>
+      <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z" />
+    </svg>
   );
 }
 
 /** Render a unified diff with add/del/hunk coloring. */
 export function DiffView({ content }: { content: string }) {
   if (!content || content === "(no changes)") {
-    return <div className="empty">no file changes</div>;
+    return <div className="empty">No file changes.</div>;
   }
   const lines = content.split("\n");
   return (
@@ -64,4 +189,13 @@ export function DiffView({ content }: { content: string }) {
       })}
     </div>
   );
+}
+
+export function timeAgo(iso: string): string {
+  const d = new Date(iso).getTime();
+  const s = Math.floor((Date.now() - d) / 1000);
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
 }

@@ -2,6 +2,7 @@
 
 import { use, useEffect, useRef, useState, useCallback } from "react";
 import Link from "next/link";
+import { Pause } from "lucide-react";
 import {
   apiGet,
   apiPost,
@@ -71,9 +72,12 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
   }, [id, loadMeta]);
 
   useEffect(() => {
-    loadMeta();
+    const first = window.setTimeout(() => void loadMeta(), 0);
     const t = setInterval(loadMeta, 4000);
-    return () => clearInterval(t);
+    return () => {
+      clearTimeout(first);
+      clearInterval(t);
+    };
   }, [loadMeta]);
 
   const decide = async (approvalId: string, decision: string) => {
@@ -94,19 +98,28 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
   return (
     <>
       <div className="pagehead">
-        <div>
-          <div className="eyebrow">
-            <Link href="/" className="link">
-              operations
-            </Link>{" "}
-            / session {short(id)}
+        <div style={{ minWidth: 0 }}>
+          <div className="crumbs">
+            <Link href="/">Runs</Link>
+            <span>/</span>
+            <span className="mono">{short(id)}</span>
           </div>
-          <h1 className="title" style={{ fontSize: 22 }}>
+          <h1
+            className="title"
+            title={session?.task || undefined}
+            style={{
+              fontSize: 18,
+              display: "-webkit-box",
+              WebkitLineClamp: 2,
+              WebkitBoxOrient: "vertical",
+              overflow: "hidden",
+            }}
+          >
             {session?.task || "…"}
           </h1>
           <div className="sub" style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 8 }}>
             {session && <Pill status={session.status} />}
-            {session && <AutoPill autonomy={session.autonomy} />}
+            {session && session.autonomy === "autonomous" && <AutoPill autonomy={session.autonomy} />}
             {session?.trigger && session.trigger.kind !== "manual" && (
               <span className="chip">
                 via <b>{session.trigger.actor || session.trigger.kind}</b>
@@ -124,22 +137,22 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
       {/* Approval banners */}
       {pending.map((a) => (
         <div className="approval" key={a.id} style={{ marginBottom: 14 }}>
-          <span className="icon">⏸</span>
+          <span className="icon">
+            <Pause size={16} />
+          </span>
           <div className="txt">
-            <div className="h">approval needed{a.risk ? ` · ${a.risk}` : ""}</div>
+            <div className="h">Waiting for you{a.risk ? ` · ${a.risk}` : ""}</div>
             <div className="d">
-              <b className="mono" style={{ color: "var(--ink)" }}>
-                {a.tool}
-              </b>{" "}
-              — <span className="mono">{a.summary}</span>
+              <b className="mono">{a.tool}</b>{" "}
+              <span className="mono mut">{a.summary}</span>
             </div>
           </div>
           <div className="acts">
-            <button className="btn human" onClick={() => decide(a.id, "approved_once")}>
+            <button className="btn human sm" onClick={() => decide(a.id, "approved_once")}>
               Approve once
             </button>
-            <button className="btn sm ghost" onClick={() => decide(a.id, "approved_session")}>
-              Approve session
+            <button className="btn sm" onClick={() => decide(a.id, "approved_session")}>
+              Whole session
             </button>
             <button className="btn sm ghost danger" onClick={() => decide(a.id, "denied")}>
               Deny
@@ -207,7 +220,7 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
               {session!.run_spec!.capabilities!.map((b) => (
                 <div
                   key={b.id}
-                  style={{ padding: "5px 0", borderBottom: "1px solid var(--line-soft)" }}
+                  style={{ padding: "5px 0", borderBottom: "1px solid var(--border)" }}
                 >
                   <div className="mono" style={{ fontSize: 12 }}>
                     {b.name}@{b.version}
@@ -228,14 +241,14 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
                 result deliveries
               </div>
               {deliveries.map((d) => (
-                <div key={d.id} style={{ padding: "5px 0", borderBottom: "1px solid var(--line-soft)" }}>
+                <div key={d.id} style={{ padding: "5px 0", borderBottom: "1px solid var(--border)" }}>
                   <div className="spread">
                     <span className="mono mut" style={{ fontSize: 11, overflow: "hidden", textOverflow: "ellipsis" }}>
                       {(d.destination.url || "?").slice(0, 26)}
                     </span>
                     <span
-                      className={`autopill ${
-                        d.status === "delivered" ? "supervised" : d.status === "failed" ? "autonomous" : ""
+                      className={`badge ${
+                        d.status === "delivered" ? "ok" : d.status === "failed" ? "err" : "warn"
                       }`}
                     >
                       {d.status} ×{d.attempts}
@@ -276,7 +289,7 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
 
 function CostRow({ label, value }: { label: string; value: string }) {
   return (
-    <div className="spread" style={{ padding: "5px 0", borderBottom: "1px solid var(--line-soft)" }}>
+    <div className="spread" style={{ padding: "5px 0", borderBottom: "1px solid var(--border)" }}>
       <span className="mut mono" style={{ fontSize: 11.5 }}>
         {label}
       </span>
@@ -329,7 +342,7 @@ function TimelineItem({ ev }: { ev: EventRow }) {
       break;
     case "agent.message":
       tag = s("role") === "system" ? "system" : "agent";
-      body = <span style={{ color: s("role") === "system" ? "var(--muted)" : undefined }}>{s("text")}</span>;
+      body = <span style={{ color: s("role") === "system" ? "var(--ink-3)" : undefined }}>{s("text")}</span>;
       break;
     case "tool.requested":
       cls = "accent";
@@ -396,7 +409,7 @@ function TimelineItem({ ev }: { ev: EventRow }) {
     case "run.error":
       cls = "danger";
       tag = "error";
-      body = <span style={{ color: "var(--danger)" }}>{s("message")}</span>;
+      body = <span style={{ color: "var(--red)" }}>{s("message")}</span>;
       break;
     case "callback.delivered":
       cls = "good";
