@@ -52,8 +52,9 @@ reqwest = { version = "0.13", default-features = false, features = [
     "stream",
 ] }
 bollard = "0.21"
-sha2 = "0.10"
-hmac = "0.12"
+sha2 = "0.11"
+hmac = "0.13"
+getrandom = "0.3"
 hex = "0.4"
 globset = "0.4"
 regex = "1"
@@ -61,6 +62,8 @@ clap = { version = "4", features = ["derive", "env"] }
 bytes = "1"
 async-trait = "0.1"
 dotenvy = "0.15"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 base64 = "0.22"
-jsonwebtoken = "9"
+# v10 requires choosing exactly one crypto provider; rust_crypto keeps the
+# whole tree on the pure-Rust stack (rustls/RustCrypto), no C toolchain.
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }

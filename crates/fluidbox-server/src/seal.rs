@@ -7,7 +7,7 @@
 //! provider API call). It never enters a RunSpec, sandbox, ledger, artifact,
 //! or API response.
 
-use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
+use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 
 const NONCE_LEN: usize = 24;
@@ -45,7 +45,9 @@ impl Sealer {
     /// nonce makes random generation collision-safe without counter state.
     pub fn seal(&self, plaintext: &str) -> Vec<u8> {
         let cipher = XChaCha20Poly1305::new(&self.key);
-        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        getrandom::fill(&mut nonce_bytes).expect("OS RNG is available");
+        let nonce = XNonce::from(nonce_bytes);
         let ct = cipher
             .encrypt(&nonce, plaintext.as_bytes())
             .expect("XChaCha20Poly1305 encrypt is infallible for in-memory data");

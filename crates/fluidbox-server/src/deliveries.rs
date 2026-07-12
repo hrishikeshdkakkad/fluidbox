@@ -27,6 +27,7 @@ pub fn backoff_secs(attempt: i32) -> i64 {
 /// `v1=<hex hmac-sha256(secret, "{timestamp}.{body}")>` — receivers verify
 /// by recomputing over the exact raw body bytes.
 pub fn sign_payload(secret: &str, timestamp: i64, body: &str) -> String {
+    use hmac::digest::KeyInit;
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     let mut mac =
