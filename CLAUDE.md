@@ -74,7 +74,7 @@ The crate dependency order is `fluidbox-core` → `fluidbox-db` / `fluidbox-prov
 
 ## Extension points
 
-New execution backend → implement `ExecutionProvider` (the Lambda MicroVM provider is the next planned one; `SandboxHandle` is already serializable jsonb for reattach). New agent harness → a new runner image implementing the runner contract + a `Harness` impl. Neither should leak specifics into `fluidbox-core`. The seams exist precisely so nothing above them changes — see PLAN.md §6.2.
+New execution backend → implement `ExecutionProvider` (the Lambda MicroVM provider is the next planned one; `SandboxHandle` is already serializable jsonb for reattach). New agent harness → **a new runner image implementing the HTTP runner contract** (`/permission`, `/events`, `/heartbeat`, `/result` + the broker shim's `/tools/call`; the env contract; the CANONICAL tool vocabulary — names/shapes crossing `/permission` MUST be `Bash{command}`, `Edit/Write/MultiEdit{file_path | edits[].file_path}`, `Read/Glob/Grep/LS`, `mcp__<server>__<tool>` — canonicalization is runner-side) **plus one arm in the `harness.rs` registry** (id validation, image/model defaults, per-harness env extras — a plain match, §17 #8, NOT a trait registry; there is deliberately no `Harness` trait). There are TWO runner images today: `images/sandbox-runner/` (Claude Agent SDK) and `images/codex-runner/` (Codex app-server, the second harness — Phase 6), sharing `images/runner-lib/` (the runner-contract client + broker/sandbox-gate shims). The LLM facade dispatches on `run_spec.harness` (Anthropic Messages vs OpenAI Responses dialect). Neither should leak specifics into `fluidbox-core`. The seams exist precisely so nothing above them changes — see PLAN.md §6.2.
 
 ## Testing acceptance
 
