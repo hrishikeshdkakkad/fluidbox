@@ -41,6 +41,19 @@ fn dialect_for(harness_id: &str) -> Option<Dialect> {
     }
 }
 
+/// Error-shape hint for exits that fire BEFORE the session's dialect is
+/// resolved (terminal-session, unknown-harness): the requested suffix is
+/// enough — only codex uses v1/responses. Auth/lookup failures upstream of
+/// this still use the generic envelope (a runner that can't authenticate
+/// never gets far enough for the shape to matter).
+fn shape_hint(rest: &str) -> Dialect {
+    if rest == "v1/responses" {
+        Dialect::OpenAi
+    } else {
+        Dialect::Anthropic
+    }
+}
+
 /// Exact upstream suffix allowlist per dialect. The matched CONSTANT (never
 /// the caller's string) builds the upstream URL, so percent-encoded slashes
 /// or any other smuggling in `{*rest}` cannot reach the master-keyed
@@ -169,7 +182,11 @@ pub async fn messages(
         .await?
         .ok_or(ApiError::NotFound)?;
     if session.status_enum().is_terminal() {
-        return Err(ApiError::BadRequest("session is not active".into()));
+        return Ok(dialect_error(
+            shape_hint(&rest),
+            StatusCode::BAD_REQUEST,
+            "session is not active",
+        ));
     }
     let run_spec: RunSpec = serde_json::from_value(session.run_spec.clone())
         .map_err(|e| ApiError::Internal(format!("bad run_spec: {e}")))?;
@@ -177,10 +194,11 @@ pub async fn messages(
     let Some(dialect) = dialect_for(&run_spec.harness) else {
         // create_run refuses unknown harnesses; a row that still gets here
         // fails closed.
-        return Err(ApiError::BadRequest(format!(
-            "run harness '{}' has no LLM dialect",
-            run_spec.harness
-        )));
+        return Ok(dialect_error(
+            shape_hint(&rest),
+            StatusCode::BAD_REQUEST,
+            &format!("run harness '{}' has no LLM dialect", run_spec.harness),
+        ));
     };
 
     // Deployment sanity: the direct-Anthropic fallback upstream cannot serve
@@ -254,18 +272,21 @@ pub async fn messages(
         return Ok(dialect_error(dialect, status, &msg));
     }
 
-    // Codex is forced stateless: no upstream-persisted responses, ever.
-    let upstream_body: axum::body::Bytes = match dialect {
-        Dialect::Anthropic => body.clone(),
-        Dialect::OpenAi => {
-            if let Some(obj) = parsed.as_object_mut() {
-                obj.insert("store".into(), json!(false));
-            }
-            serde_json::to_vec(&parsed)
-                .map_err(|e| ApiError::Internal(format!("body rewrite: {e}")))?
-                .into()
+    // Forward the RE-SERIALIZED validated body for BOTH dialects, never the
+    // raw request bytes. Validating a parsed Value while forwarding raw bytes
+    // opens a duplicate-key differential: a body like {"model":A,"model":B}
+    // passes the model/tool screen under serde's last-wins read while an
+    // upstream parser might honor the other occurrence — bypassing the model
+    // pin and server-tool rejection. Re-serializing guarantees "what we
+    // validated" == "what we forward". Codex is additionally forced stateless.
+    if dialect == Dialect::OpenAi {
+        if let Some(obj) = parsed.as_object_mut() {
+            obj.insert("store".into(), json!(false));
         }
-    };
+    }
+    let upstream_body: axum::body::Bytes = serde_json::to_vec(&parsed)
+        .map_err(|e| ApiError::Internal(format!("body reserialize: {e}")))?
+        .into();
 
     let upstream = format!(
         "{}/{}",
@@ -309,10 +330,16 @@ pub async fn messages(
         }
     }
 
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| ApiError::Internal(format!("upstream: {e}")))?;
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(dialect_error(
+                dialect,
+                StatusCode::BAD_GATEWAY,
+                &format!("upstream request failed: {e}"),
+            ));
+        }
+    };
     let status = resp.status();
     let is_stream = resp
         .headers()
@@ -325,10 +352,16 @@ pub async fn messages(
 
     if !is_stream {
         // Non-streaming: read fully, meter, forward.
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| ApiError::Internal(format!("upstream body: {e}")))?;
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                return Ok(dialect_error(
+                    dialect,
+                    StatusCode::BAD_GATEWAY,
+                    &format!("upstream body read failed: {e}"),
+                ));
+            }
+        };
         if status.is_success() {
             if let Some(usage) = parse_usage_json(dialect, &bytes) {
                 record_usage(&state, session_id, &model_hint, usage, None).await;
@@ -531,6 +564,13 @@ struct SseLineDecoder {
     pending: Vec<u8>,
 }
 
+/// A single SSE line we care about (usage JSON) is tiny; anything past this
+/// with no newline is a pathological or hostile upstream. Cap the retained
+/// partial so a never-terminated stream can't grow memory unbounded during
+/// the post-disconnect drain (whose wall-clock is bounded by the shared
+/// reqwest client timeout).
+const MAX_PENDING_LINE: usize = 512 * 1024;
+
 impl SseLineDecoder {
     fn feed(&mut self, chunk: &[u8], mut on_line: impl FnMut(&str)) {
         self.pending.extend_from_slice(chunk);
@@ -543,6 +583,11 @@ impl SseLineDecoder {
         }
         if start > 0 {
             self.pending.drain(..start);
+        }
+        // An over-long unterminated tail can't be a usage line — drop it to
+        // bound memory (we resync at the next newline).
+        if self.pending.len() > MAX_PENDING_LINE {
+            self.pending.clear();
         }
     }
 
@@ -792,6 +837,37 @@ mod tests {
         let d = meter.into_delta();
         assert_eq!(d.input_tokens, 10);
         assert_eq!(d.output_tokens, 5);
+    }
+
+    #[test]
+    fn reserialize_collapses_duplicate_keys_so_validation_matches_forward() {
+        // serde_json is last-wins on duplicate keys. The facade validates the
+        // parsed Value, then FORWARDS the re-serialized Value — so the
+        // upstream can only ever see what we validated. Prove the round-trip
+        // collapses a duplicate `model` to the last (validated) occurrence.
+        let raw = br#"{"model":"claude-opus-4-8","model":"claude-haiku-4-5","messages":[]}"#;
+        let parsed: Value = serde_json::from_slice(raw).unwrap();
+        assert_eq!(parsed.get("model").unwrap(), "claude-haiku-4-5");
+        // Validation sees haiku; if the run is pinned to haiku it passes, and
+        // the forwarded bytes contain exactly one model = haiku.
+        assert!(validate_body(Dialect::Anthropic, "claude-haiku-4-5", &parsed).is_ok());
+        let forwarded = serde_json::to_vec(&parsed).unwrap();
+        let reparsed: Value = serde_json::from_slice(&forwarded).unwrap();
+        assert_eq!(reparsed.get("model").unwrap(), "claude-haiku-4-5");
+        assert_eq!(reparsed.as_object().unwrap().get("model").iter().count(), 1);
+    }
+
+    #[test]
+    fn sse_decoder_caps_unterminated_buffer() {
+        let mut dec = SseLineDecoder::default();
+        // A megabyte with no newline must not be retained.
+        let junk = vec![b'x'; MAX_PENDING_LINE + 1024];
+        dec.feed(&junk, &mut |_l: &str| {});
+        assert!(dec.pending.len() <= MAX_PENDING_LINE);
+        // After the cap resets, a following complete line still parses.
+        let mut seen = Vec::new();
+        dec.feed(b"\ndata: [DONE]\n", &mut |l: &str| seen.push(l.to_string()));
+        assert!(seen.iter().any(|l| l.contains("[DONE]")));
     }
 
     #[test]

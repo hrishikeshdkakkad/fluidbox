@@ -46,6 +46,14 @@ pub fn price_for(model: &str) -> Option<ModelPrice> {
         output_per_mtok: output,
         cache_write_per_mtok: 0.0,
     };
+    // Rates are per-MTok USD, effective 2026-07 (Anthropic + OpenAI public
+    // list prices; the facade tee is the primary meter — the LiteLLM
+    // callback stays a stub). Estimates: correct as list prices move. The
+    // gpt-5 catch-all deliberately charges the BIG-tier rate so any
+    // unrecognized gpt-5 variant OVER-estimates — fail-safe for the cost
+    // budget (an unknown model stops the run earlier, never later). A model
+    // family we don't know at all returns None → the run leans on token /
+    // wall-clock / tool-call budgets instead.
     let p = if m.contains("opus-4") {
         anthropic(5.0, 25.0)
     } else if m.contains("sonnet-5") || m.contains("sonnet-4") {
@@ -56,7 +64,8 @@ pub fn price_for(model: &str) -> Option<ModelPrice> {
         // gpt-5.4-mini — the codex default (cheap tier).
         openai(0.25, 2.0)
     } else if m.starts_with("gpt-5") {
-        // gpt-5.4 / 5.5 / 5.6-{luna,sol,terra} big tier.
+        // gpt-5.4 / 5.5 / 5.6-{luna,sol,terra} + unknown gpt-5* → big-tier
+        // (conservative upper bound).
         openai(1.25, 10.0)
     } else {
         return None;

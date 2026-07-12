@@ -1677,9 +1677,13 @@ pub async fn promote_intent_to_pending(
 }
 
 /// Record the gate's own verdict on an intent ('auto_allowed'/'auto_denied').
-/// Guarded on status='intent' so a human decision is never overwritten.
-pub async fn record_intent_verdict(pool: &PgPool, id: Uuid, status: &str) -> sqlx::Result<()> {
-    sqlx::query(
+/// A compare-and-set guarded on status='intent': returns true iff THIS call
+/// won the transition. A loser (another concurrent handler for the same
+/// tool_call_id already moved the row, or a human decision landed) gets
+/// false and must adopt the durable outcome instead of its locally-computed
+/// verdict — that is what keeps one intent to one decision under races.
+pub async fn record_intent_verdict(pool: &PgPool, id: Uuid, status: &str) -> sqlx::Result<bool> {
+    let res = sqlx::query(
         "update approvals set status = $2, decided_at = now(), decided_by = 'gate'
          where id = $1 and status = 'intent'",
     )
@@ -1687,7 +1691,7 @@ pub async fn record_intent_verdict(pool: &PgPool, id: Uuid, status: &str) -> sql
     .bind(status)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(res.rows_affected() > 0)
 }
 
 pub async fn decide_approval(
@@ -2800,13 +2804,16 @@ mod tests {
         assert!(!inserted3);
         assert_eq!(mismatch.input_digest.as_deref(), Some("digest-a"));
 
-        // Gate verdicts stick, and never overwrite each other.
-        record_intent_verdict(&pool, row.id, "auto_allowed")
+        // Gate verdicts stick, and the CAS reports who won.
+        assert!(record_intent_verdict(&pool, row.id, "auto_allowed")
             .await
-            .unwrap();
-        record_intent_verdict(&pool, row.id, "auto_denied")
-            .await
-            .unwrap(); // guarded: no longer 'intent'
+            .unwrap());
+        assert!(
+            !record_intent_verdict(&pool, row.id, "auto_denied")
+                .await
+                .unwrap(),
+            "second verdict loses the CAS — the first stands"
+        );
         let cur = get_approval(&pool, row.id).await.unwrap().unwrap();
         assert_eq!(cur.status, "auto_allowed");
         // A decided intent can no longer be promoted into an approval.
@@ -2838,9 +2845,12 @@ mod tests {
             .unwrap()
             .expect("pending row decides");
         assert_eq!(decided.status, "approved_once");
-        record_intent_verdict(&pool, row2.id, "auto_denied")
-            .await
-            .unwrap(); // guarded: human decision stands
+        assert!(
+            !record_intent_verdict(&pool, row2.id, "auto_denied")
+                .await
+                .unwrap(),
+            "a human decision is never overwritten by a gate verdict"
+        );
         let cur2 = get_approval(&pool, row2.id).await.unwrap().unwrap();
         assert_eq!(cur2.status, "approved_once");
 
