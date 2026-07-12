@@ -39,6 +39,13 @@ async fn transition(state: &AppState, id: Uuid, next: SessionStatus, reason: Opt
             )
             .await;
             if next.is_terminal() {
+                // Kill the session's tokens the moment it goes terminal — a
+                // runner that keeps running (or a leaked token) can no longer
+                // reach the facade or internal gateway. Exactly-once with the
+                // enqueue below (terminal entry is exactly-once).
+                if let Err(e) = fluidbox_db::revoke_session_tokens(&state.pool, id).await {
+                    tracing::warn!("revoke_session_tokens {id} failed: {e}");
+                }
                 // Publication is decoupled: enqueue rows; the delivery worker
                 // owns retries. This is the ONLY enqueue point — every exit
                 // path (finalize/fail/cancel/sweeps) funnels through here,

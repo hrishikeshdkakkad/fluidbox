@@ -26,9 +26,13 @@ gateway-up:
 gateway-down:
     docker compose -f deploy/docker-compose.dev.yml down
 
-# Build the sandbox runner image
+# Build the Claude sandbox runner image (context = images/, shared with codex)
 sandbox-build:
-    docker build -t $FLUIDBOX_SANDBOX_IMAGE images/sandbox-runner
+    docker build -t $FLUIDBOX_SANDBOX_IMAGE -f images/sandbox-runner/Dockerfile images
+
+# Build the Codex runner image (the second harness)
+codex-build:
+    docker build -t ${FLUIDBOX_CODEX_SANDBOX_IMAGE:-fluidbox-codex-runner:dev} -f images/codex-runner/Dockerfile images
 
 # ── Database ─────────────────────────────────────────────────────────────
 

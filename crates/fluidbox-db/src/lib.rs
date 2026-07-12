@@ -1933,6 +1933,21 @@ pub async fn extend_session_token(
     Ok(res.rows_affected() > 0)
 }
 
+/// Revoke every live session token for a session — called when the session
+/// enters a terminal state so a still-running or wedged runner can no longer
+/// authenticate to the facade or internal gateway (defense in depth beyond
+/// the facade's own terminal-session refusal).
+pub async fn revoke_session_tokens(pool: &PgPool, session: Uuid) -> sqlx::Result<u64> {
+    let res = sqlx::query(
+        "update api_tokens set revoked_at = now()
+         where kind = 'session' and session_id = $1 and revoked_at is null",
+    )
+    .bind(session)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 // ─── Trigger invocations (Idempotency-Key) ────────────────────────────────
 
 #[derive(Debug)]
@@ -2727,6 +2742,78 @@ mod tests {
         let events = events_after(&pool, session.id, 0, 10).await.unwrap();
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].r#type, "agent.message");
+    }
+
+    #[tokio::test]
+    async fn session_token_revoke_is_terminal_and_extend_cannot_resurrect() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let policy = upsert_policy(
+            &pool,
+            tenant,
+            "test-token",
+            "name: test-token",
+            &serde_json::json!({"name": "test-token"}),
+        )
+        .await
+        .unwrap();
+        let agent = create_agent(&pool, tenant, "test-token-agent", None)
+            .await
+            .unwrap();
+        let rev = append_agent_revision(
+            &pool,
+            agent.id,
+            "codex",
+            "img:test",
+            "gpt-5.4-mini",
+            None,
+            policy.id,
+            &serde_json::json!({}),
+            None,
+            &serde_json::json!([]),
+        )
+        .await
+        .unwrap();
+        let session = create_session(
+            &pool,
+            tenant,
+            agent.id,
+            rev.id,
+            "autonomous",
+            "trusted",
+            "t",
+            &serde_json::json!({"kind":"none"}),
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let token = format!("fbx_sess_{}", Uuid::now_v7().simple());
+        create_session_token(&pool, tenant, session.id, &token, 3600)
+            .await
+            .unwrap();
+        assert_eq!(
+            session_for_token(&pool, &token).await.unwrap(),
+            Some(session.id)
+        );
+        // A live token extends.
+        assert!(extend_session_token(&pool, &token, 3600).await.unwrap());
+
+        // Terminal transition revokes it — the runner can no longer auth.
+        assert_eq!(revoke_session_tokens(&pool, session.id).await.unwrap(), 1);
+        assert_eq!(session_for_token(&pool, &token).await.unwrap(), None);
+        // And a renew can never resurrect a revoked token.
+        assert!(!extend_session_token(&pool, &token, 3600).await.unwrap());
+        // Revoking again is a no-op (idempotent).
+        assert_eq!(revoke_session_tokens(&pool, session.id).await.unwrap(), 0);
     }
 
     #[tokio::test]

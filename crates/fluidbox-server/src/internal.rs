@@ -749,13 +749,29 @@ pub struct RenewReq {
 fn default_renew_ttl() -> i64 {
     3 * 3600
 }
+/// A renew can never mint more than this much runway at once — a runner
+/// (compromised or buggy) can't extend its token past the server's control
+/// by asking for a huge TTL. Long agents renew repeatedly, each capped.
+const MAX_RENEW_TTL_SECS: i64 = 3 * 3600;
 
-/// Long-running agents renew their session token before it expires.
+/// Long-running agents renew their session token before it expires. Hardened:
+/// the requested TTL is server-capped, a terminal session is refused (its
+/// tokens are revoked on the terminal transition anyway), and a runner whose
+/// token was already revoked gets `renewed:false` (no resurrection).
 pub async fn token_renew(
     auth: SessionAuth,
     State(state): State<AppState>,
     Json(req): Json<RenewReq>,
 ) -> ApiResult<Json<Value>> {
-    let ok = fluidbox_db::extend_session_token(&state.pool, &auth.token, req.ttl_secs).await?;
-    Ok(Json(json!({ "renewed": ok })))
+    let session = fluidbox_db::get_session(&state.pool, auth.session_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if session.status_enum().is_terminal() {
+        return Err(ApiError::BadRequest(
+            "session is terminal — token cannot be renewed".into(),
+        ));
+    }
+    let ttl = req.ttl_secs.clamp(1, MAX_RENEW_TTL_SECS);
+    let ok = fluidbox_db::extend_session_token(&state.pool, &auth.token, ttl).await?;
+    Ok(Json(json!({ "renewed": ok, "ttl_secs": ttl })))
 }
