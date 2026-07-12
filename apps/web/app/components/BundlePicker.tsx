@@ -1,12 +1,13 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { apiGet, BundleRef, CapabilityBundle } from "../lib/api";
 
-/** Multi-select over the capability-bundle registry. Selection is EXPLICIT
- *  pins (name@version — §17 #7 made visible): a bundle already pinned keeps
- *  its version unless deliberately changed; newly checked names default to
- *  the latest version. Nothing floats. */
+/** Multi-select over the capability-bundle registry, rendered as pin cards.
+ *  Selection is EXPLICIT pins (name@version — §17 #7 made visible): a bundle
+ *  already pinned keeps its version unless deliberately changed; newly
+ *  checked names default to the latest version. Nothing floats. */
 export function BundlePicker({
   pins,
   onChange,
@@ -19,7 +20,7 @@ export function BundlePicker({
     apiGet<{ bundles: CapabilityBundle[] }>("/capabilities")
       .then((r) => setRegistry(r.bundles))
       .catch(() => {
-        /* offline handled by rail */
+        /* offline handled by sidebar */
       });
   }, []);
 
@@ -52,16 +53,20 @@ export function BundlePicker({
     return (
       <div className="field">
         <span className="lab">Capability bundles</span>
-        <span className="mut" style={{ fontSize: 12 }}>
-          none registered — connect one from the catalog on the Capabilities page
+        <span className="helper">
+          None registered yet — connect a tool from the{" "}
+          <Link href="/capabilities" className="link">
+            Capabilities store
+          </Link>{" "}
+          and it appears here.
         </span>
       </div>
     );
   }
   return (
     <div className="field">
-      <span className="lab">Capability bundles (exact pins — upgrading is a deliberate act)</span>
-      <div style={{ display: "grid", gap: 6 }}>
+      <span className="lab">Capability bundles — exact pins; upgrading is a deliberate act</span>
+      <div style={{ display: "grid", gap: 6, maxHeight: 340, overflowY: "auto", paddingRight: 2 }}>
         {names.map((name) => {
           const versions = byName.get(name)!;
           const latest = versions[0];
@@ -70,19 +75,14 @@ export function BundlePicker({
             ? (versions.find((v) => v.version === pin.version) ?? latest)
             : latest;
           return (
-            <label
-              key={name}
-              style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}
-            >
+            <label key={name} className={`cap-row ${pin ? "on" : ""}`}>
               <input type="checkbox" checked={!!pin} onChange={() => toggle(name)} />
-              <span className="mono" style={{ color: "var(--accent)" }}>
-                {name}
-              </span>
+              <span className="nm">{name}</span>
               {pin ? (
                 <select
                   className="inp"
-                  style={{ width: "auto", padding: "2px 6px", fontSize: 12 }}
                   value={pin.version}
+                  onClick={(e) => e.stopPropagation()}
                   onChange={(e) => setVersion(name, Number(e.target.value))}
                 >
                   {versions.map((v) => (
@@ -93,15 +93,17 @@ export function BundlePicker({
                   ))}
                 </select>
               ) : (
-                <span className="mut" style={{ fontSize: 12 }}>
+                <span className="faint" style={{ fontSize: 11.5 }}>
                   latest @{latest.version}
                 </span>
               )}
-              <span className="mut" style={{ fontSize: 11.5 }}>
+              <span className="meta">
                 {shown.tool_count} tool{shown.tool_count === 1 ? "" : "s"}
-                {shown.classes.length > 0
-                  ? ` · ${[...new Set(shown.classes)].join("+")}`
-                  : ""}
+                {[...new Set(shown.classes)].map((c) => (
+                  <span key={c} className={`badge ${c === "brokered" ? "brand" : ""}`}>
+                    {c}
+                  </span>
+                ))}
               </span>
             </label>
           );
