@@ -21,6 +21,16 @@ model_list:
     litellm_params:
       model: "anthropic/claude-*"
       api_key: os.environ/ANTHROPIC_API_KEY
+  # Codex (the second harness) → OpenAI over the Responses API. gpt-5.4-mini is
+  # the cheap default; the catch-all routes any gpt-5* id the app-server sends.
+  - model_name: gpt-5.4-mini
+    litellm_params:
+      model: openai/gpt-5.4-mini
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: "gpt-5*"
+    litellm_params:
+      model: "openai/gpt-5*"
+      api_key: os.environ/OPENAI_API_KEY
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY

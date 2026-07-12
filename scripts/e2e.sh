@@ -41,33 +41,36 @@ trap 'stop_server' EXIT
 start_server || exit 1
 ok "stack up (gateway + control plane)"
 
-say "PHASE 1/9 — live demo A"
+say "PHASE 1/10 — live demo A"
 bash "$ROOT/scripts/e2e-live.sh" || SUITE_FAIL=1
 
-say "PHASE 2/9 — governance plane"
+say "PHASE 2/10 — governance plane"
 bash "$ROOT/scripts/governance-e2e.sh" || SUITE_FAIL=1
 
-say "PHASE 3/9 — git workspaces"
+say "PHASE 3/10 — git workspaces"
 bash "$ROOT/scripts/e2e-git-workspace.sh" || SUITE_FAIL=1
 
-say "PHASE 4/9 — api triggers & signed callbacks"
+say "PHASE 4/10 — api triggers & signed callbacks"
 bash "$ROOT/scripts/e2e-trigger.sh" || SUITE_FAIL=1
 
-say "PHASE 5/9 — scheduled borrowing"
+say "PHASE 5/10 — scheduled borrowing"
 stop_server   # the schedule suite owns (and restarts) its own control plane
 bash "$ROOT/scripts/e2e-schedule.sh" || SUITE_FAIL=1
 
-say "PHASE 6/9 — github pr-review fan-out"
+say "PHASE 6/10 — github pr-review fan-out"
 bash "$ROOT/scripts/e2e-github.sh" || SUITE_FAIL=1
 
-say "PHASE 7/9 — capability & MCP catalog"
+say "PHASE 7/10 — capability & MCP catalog"
 bash "$ROOT/scripts/e2e-capabilities.sh" || SUITE_FAIL=1
 
-say "PHASE 8/9 — connector catalog & oauth custody"
+say "PHASE 8/10 — connector catalog & oauth custody"
 bash "$ROOT/scripts/e2e-connectors.sh" || SUITE_FAIL=1
 
-say "PHASE 9/9 — failure paths"
+say "PHASE 9/10 — failure paths"
 bash "$ROOT/scripts/e2e-failures.sh" || SUITE_FAIL=1
+
+say "PHASE 10/10 — codex (second harness)"
+bash "$ROOT/scripts/e2e-codex.sh" || SUITE_FAIL=1
 
 say "E2E RESULT"
 if [ "$SUITE_FAIL" = "0" ]; then
