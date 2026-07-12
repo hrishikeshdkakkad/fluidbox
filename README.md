@@ -14,6 +14,10 @@ Coding agents are powerful and unaccountable: they run with your credentials, on
 3. **Streams a live event timeline** over SSE while every tool call passes through a policy gate: allow, deny, or **pause for human approval** (or auto-decide under stricter guardrails in autonomous mode).
 4. **Ends with a diff and a cost report**, backed by an append-only, redaction-enforced ledger — prompts never touch the database, only digests, usage, and decisions.
 
+![A fluidbox run: the live timeline with policy decisions on every tool call, per-call model costs, and the frozen RunSpec](./docs/assets/run-detail.png)
+
+*A real run: the agent fixes a failing test inside a sandbox while every `Bash` and `Edit` call passes the policy gate, with cost metered per model call.*
+
 ## What's inside
 
 - **Policy engine** — YAML rules evaluated per tool call, with policy snapshots frozen per run and both original and rewritten verdicts recorded in autonomous mode.
