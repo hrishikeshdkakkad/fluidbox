@@ -100,14 +100,41 @@ fn dialect_error(dialect: Dialect, status: StatusCode, message: &str) -> Respons
         .unwrap()
 }
 
-/// Request-body screen, shared by both dialects:
-/// - the body's `model` MUST equal the frozen RunSpec model (422) — the
-///   facade never lets a sandbox pick its own model;
-/// - tool entries may only be CLIENT-executed types (custom tools). Server-
-///   executed tool types (web_search, computer use, code interpreter, MCP
-///   passthrough, …) would run outside the permission gate — rejected.
-///
-/// Allowlists come from what the two pinned SDKs actually send.
+/// Is a tool entry a CLIENT-executed (governed) tool for this dialect? Client
+/// tools run in the sandbox and cross the permission gate; server-executed
+/// tools (web_search, tool_search, file_search, computer use, code
+/// interpreter, MCP passthrough, image generation, …) run UPSTREAM, outside
+/// the gate — never allowed through. Allowlist, fail-closed: an unknown type
+/// is treated as server-executed.
+fn is_client_tool(dialect: Dialect, ty: Option<&str>) -> bool {
+    match dialect {
+        // Anthropic client tools carry no type or "custom"; anything
+        // versioned ("web_search_20250305", …) is server-executed.
+        Dialect::Anthropic => matches!(ty, None | Some("custom")),
+        // Codex's real tools (exec/shell, apply_patch, view_image, plan,
+        // goals) are "function" / "custom"; it ALSO bundles "web_search" /
+        // "tool_search" (server-executed) into every request by construction.
+        Dialect::OpenAi => matches!(ty, Some("function") | Some("custom")),
+    }
+}
+
+/// Remove every server-executed tool entry from `parsed.tools` in place,
+/// keeping only client-executed (governed) tools. Returns the count removed.
+/// The gate/policy still judge the client tools that remain; this only
+/// guarantees no UPSTREAM-executed tool survives into the request.
+fn strip_server_tools(dialect: Dialect, parsed: &mut Value) -> usize {
+    let Some(tools) = parsed.get_mut("tools").and_then(|t| t.as_array_mut()) else {
+        return 0;
+    };
+    let before = tools.len();
+    tools.retain(|t| is_client_tool(dialect, t.get("type").and_then(|x| x.as_str())));
+    before - tools.len()
+}
+
+/// Request-body screen (model pin + statelessness + Anthropic tool reject).
+/// Codex's server-executed tools are handled by STRIPPING (see
+/// `strip_server_tools`), not rejecting — codex bundles them into every
+/// request, so a reject would break every codex turn.
 fn validate_body(
     dialect: Dialect,
     frozen_model: &str,
@@ -120,25 +147,22 @@ fn validate_body(
             format!("model '{model}' does not match the run's frozen model '{frozen_model}'"),
         ));
     }
-    if let Some(tools) = parsed.get("tools").and_then(|t| t.as_array()) {
-        for t in tools {
-            let ty = t.get("type").and_then(|x| x.as_str());
-            let ok = match dialect {
-                // Anthropic client tools carry no type or "custom";
-                // anything versioned ("web_search_20250305", …) is a
-                // server-executed tool.
-                Dialect::Anthropic => matches!(ty, None | Some("custom")),
-                // Codex 0.144.1 sends "function" and (freeform) "custom".
-                Dialect::OpenAi => matches!(ty, Some("function") | Some("custom")),
-            };
-            if !ok {
-                return Err((
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    format!(
-                        "tool type '{}' is server-executed upstream and cannot cross the governed facade",
-                        ty.unwrap_or("<missing>")
-                    ),
-                ));
+    // Anthropic: a server-executed tool is misconfiguration (the Agent SDK
+    // never sends one unless explicitly asked) — reject LOUD. Codex: don't
+    // reject here; strip_server_tools sanitizes below.
+    if dialect == Dialect::Anthropic {
+        if let Some(tools) = parsed.get("tools").and_then(|t| t.as_array()) {
+            for t in tools {
+                let ty = t.get("type").and_then(|x| x.as_str());
+                if !is_client_tool(dialect, ty) {
+                    return Err((
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        format!(
+                            "tool type '{}' is server-executed upstream and cannot cross the governed facade",
+                            ty.unwrap_or("<missing>")
+                        ),
+                    ));
+                }
             }
         }
     }
@@ -280,10 +304,20 @@ pub async fn messages(
     // passes the model/tool screen under serde's last-wins read while an
     // upstream parser might honor the other occurrence — bypassing the model
     // pin and server-tool rejection. Re-serializing guarantees "what we
-    // validated" == "what we forward". Codex is additionally forced stateless.
+    // validated" == "what we forward". Codex is additionally forced stateless
+    // AND has its server-executed tools stripped (it bundles web_search /
+    // tool_search into EVERY request by construction; stripping keeps codex
+    // working while removing the ungoverned upstream capability — rejecting
+    // would break every codex turn).
     if dialect == Dialect::OpenAi {
         if let Some(obj) = parsed.as_object_mut() {
             obj.insert("store".into(), json!(false));
+        }
+        let stripped = strip_server_tools(dialect, &mut parsed);
+        if stripped > 0 {
+            tracing::debug!(
+                "facade: stripped {stripped} server-executed tool(s) from the codex request"
+            );
         }
     }
     let upstream_body: axum::body::Bytes = serde_json::to_vec(&parsed)
@@ -765,8 +799,9 @@ mod tests {
     }
 
     #[test]
-    fn server_executed_tools_are_rejected_client_tools_pass() {
-        // Anthropic: no type / "custom" = client tools.
+    fn anthropic_server_tools_rejected_client_tools_pass() {
+        // Anthropic: no type / "custom" = client tools; a server tool is
+        // misconfiguration → reject LOUD (the SDK never sends one unasked).
         let ok = json!({"model": "m", "tools": [
             {"name": "Bash", "input_schema": {}},
             {"type": "custom", "name": "Edit", "input_schema": {}}
@@ -776,20 +811,36 @@ mod tests {
             {"type": "web_search_20250305", "name": "web_search"}
         ]});
         assert!(validate_body(Dialect::Anthropic, "m", &bad).is_err());
+    }
 
-        // OpenAI: function/custom pass; hosted tools rejected.
-        let ok = json!({"model": "m", "tools": [
-            {"type": "function", "name": "shell"},
-            {"type": "custom", "name": "apply_patch"}
+    #[test]
+    fn openai_server_tools_are_stripped_not_rejected() {
+        // Codex bundles web_search/tool_search into EVERY request, so the
+        // facade must STRIP them (not reject) — the request itself validates.
+        let body = json!({"model": "m", "tools": [
+            {"type": "function", "name": "shell_command"},
+            {"type": "custom", "name": "apply_patch"},
+            {"type": "function", "name": "view_image"},
+            {"type": "web_search", "name": null},
+            {"type": "tool_search", "name": null}
         ]});
-        assert!(validate_body(Dialect::OpenAi, "m", &ok).is_ok());
-        for hosted in ["web_search", "file_search", "code_interpreter", "computer_use_preview", "mcp", "local_shell"] {
-            let bad = json!({"model": "m", "tools": [{"type": hosted}]});
-            assert!(
-                validate_body(Dialect::OpenAi, "m", &bad).is_err(),
-                "hosted tool '{hosted}' must be rejected"
-            );
-        }
+        assert!(validate_body(Dialect::OpenAi, "m", &body).is_ok(), "codex body validates");
+        let mut parsed = body.clone();
+        let stripped = strip_server_tools(Dialect::OpenAi, &mut parsed);
+        assert_eq!(stripped, 2, "web_search + tool_search stripped");
+        let kept: Vec<&str> = parsed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(kept, vec!["function", "custom", "function"]);
+        // An unknown/future server tool type is stripped too (fail-closed).
+        let mut p2 = json!({"tools": [{"type": "image_generation"}, {"type":"function","name":"x"}]});
+        assert_eq!(strip_server_tools(Dialect::OpenAi, &mut p2), 1);
+        // A body with no tools array is a no-op.
+        let mut none = json!({"model": "m"});
+        assert_eq!(strip_server_tools(Dialect::OpenAi, &mut none), 0);
     }
 
     #[test]
