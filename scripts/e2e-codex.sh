@@ -14,7 +14,7 @@
 set -uo pipefail
 source "$(dirname "$0")/e2e-lib.sh"
 load_env
-require_cmd docker psql python3 curl cargo node
+require_cmd docker python3 curl cargo   # node/psql run inside the container, not host-side
 H="authorization: Bearer $FLUIDBOX_ADMIN_TOKEN"
 SB="$(cd "$(dirname "$0")/.." && pwd)/scratch-codex"
 rm -rf "$SB"; mkdir -p "$SB"
@@ -37,16 +37,21 @@ new_codex_session() { # autonomy trust -> session id
     -d "{\"agent\":\"codex-fixer\",\"task\":\"codex probe\",\"repo\":{\"kind\":\"none\"},\"autonomous\":$1,\"trust_tier\":\"$2\"}" \
     "$API/v1/sessions" | j "['session']['id']"
 }
-tok_for() { # session -> token  (grab FAST + kill: the codex container fails at
-  # the model (no gpt key in tier-1) and terminalizes/revokes quickly).
-  local sid=$1 cid
+tok_for() { # session -> token. Read the token from the container env, then
+  # FORCE-REMOVE the container so the real supervisor can't reach the (keyless)
+  # model and terminalize/revoke the session before our probes run. `docker rm
+  # -f` stops+removes in ANY state; a plain `docker kill` no-ops on a container
+  # still in 'created', letting the supervisor boot and revoke the token.
+  local sid=$1 cid tok
   for _ in $(seq 1 100); do
     cid=$(docker ps -a --filter "label=fluidbox.session=$sid" --format '{{.ID}}' | head -1)
     [ -n "$cid" ] && break; sleep 0.15
   done
   [ -z "$cid" ] && { echo ""; return; }
-  docker kill "$cid" >/dev/null 2>&1  # silence the real supervisor before it can /result
-  docker inspect "$cid" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^FLUIDBOX_SESSION_TOKEN=' | head -1 | cut -d= -f2-
+  tok=$(docker inspect "$cid" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+        | grep '^FLUIDBOX_SESSION_TOKEN=' | head -1 | cut -d= -f2-)
+  docker rm -f "$cid" >/dev/null 2>&1
+  echo "$tok"
 }
 perm() { curl -s -X POST -H "authorization: Bearer $1" -H 'content-type: application/json' -d "$3" "$API/internal/sessions/$2/permission"; }
 facade() { # token suffix body -> "HTTP <code>"
@@ -70,7 +75,8 @@ BAD=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "$H" -H 'content-type: a
 S=$(new_codex_session true trusted); T=$(tok_for "$S")
 [ -n "$T" ] && ok "codex sandbox launched; got session token" || { no "no codex session token"; }
 if [ -n "$T" ]; then
-  docker kill "$(docker ps -q --filter "label=fluidbox.session=$S" | head -1)" >/dev/null 2>&1  # silence the real supervisor
+  # (tok_for already force-removed the container, so the real supervisor can't
+  # race our probes to /result.)
 
   # canonical Bash verdicts (exactly what the supervisor posts)
   D=$(perm "$T" "$S" '{"tool_call_id":"c1","tool":"Bash","input":{"command":"git status","cwd":"/workspace"}}' | j "['decision']")
@@ -97,11 +103,15 @@ fi
 # ReadOnly trust tier (fork PR analog) — a fresh codex session frozen ReadOnly
 S2=$(new_codex_session true read_only); T2=$(tok_for "$S2")
 if [ -n "$T2" ]; then
-  docker kill "$(docker ps -q --filter "label=fluidbox.session=$S2" | head -1)" >/dev/null 2>&1
   D=$(perm "$T2" "$S2" '{"tool_call_id":"r1","tool":"Bash","input":{"command":"git diff","cwd":"/workspace"}}' | j "['decision']")
   [ "$D" = "allow" ] && ok "ReadOnly: canonical Bash{git diff} → allow" || no "ReadOnly git diff got $D"
   D=$(perm "$T2" "$S2" '{"tool_call_id":"r2","tool":"MultiEdit","input":{"edits":[{"file_path":"x"}]}}' | j "['decision']")
   [ "$D" = "deny" ] && ok "ReadOnly: canonical MultiEdit → deny (trust tier)" || no "ReadOnly MultiEdit got $D"
+else
+  # No else-guard here previously → a token-grab miss silently dropped both
+  # trust-tier assertions and the phase still printed "0 failed" (vacuous
+  # green in the default no-key path). Record a failure instead.
+  no "no ReadOnly codex session token — trust-tier probes could not run"
 fi
 
 # ═══ TIER 0 — protocol replay: real supervisor, fake codex, real gate ══════
@@ -117,5 +127,14 @@ else
 fi
 
 say "RESULT"
+# Tripwire against silent assertion shrinkage. The else-guards above already
+# turn a token-grab miss into a recorded failure; this floor ALSO catches an
+# assertion line that gets accidentally dropped or skipped. It's a FLOOR (>=),
+# so adding assertions never trips it; it sits below the happy no-key count
+# (16) and above any token-miss remnant.
+EXPECTED_MIN=15
+ran=$((pass + fail))
+[ "$ran" -ge "$EXPECTED_MIN" ] && ok "assertion-count tripwire ($ran ran ≥ $EXPECTED_MIN)" \
+  || no "only $ran assertions ran (< $EXPECTED_MIN) — silent shrinkage"
 printf "  \033[1;32m%d passed\033[0m, \033[1;31m%d failed\033[0m\n" "$pass" "$fail"
 exit $(( fail > 0 ? 1 : 0 ))

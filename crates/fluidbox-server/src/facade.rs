@@ -167,13 +167,36 @@ fn validate_body(
         }
     }
     if dialect == Dialect::OpenAi {
-        // Statelessness screen: the facade never lets upstream conversation
-        // state substitute for the audited request body.
-        for field in ["previous_response_id", "conversation"] {
+        // Statelessness screen: the facade never lets UPSTREAM server-side
+        // state substitute for the audited request body. `store=false` is
+        // forced below, so a reference to stored state is either dead (this
+        // run stored nothing) or reaches shared-account state OUTSIDE this run
+        // on the master credential — refuse it. Covers response chaining
+        // (`previous_response_id`), conversation state (`conversation`), and
+        // stored prompt templates (`prompt` = {id, version, variables}).
+        for field in ["previous_response_id", "conversation", "prompt"] {
             if parsed.get(field).map(|v| !v.is_null()).unwrap_or(false) {
                 return Err((
                     StatusCode::UNPROCESSABLE_ENTITY,
                     format!("'{field}' is not supported: the facade is stateless (store=false)"),
+                ));
+            }
+        }
+        // An `input` array may carry `{type:"item_reference", id:…}` elements
+        // that pull in a prior response's items by id — the array-level twin
+        // of `previous_response_id`. Reject any such reference: codex re-sends
+        // full inline input under store=false (proven by previous_response_id
+        // already being refused without breaking it), so a legitimate
+        // stateless turn never contains one.
+        if let Some(items) = parsed.get("input").and_then(|v| v.as_array()) {
+            if items
+                .iter()
+                .any(|it| it.get("type").and_then(|t| t.as_str()) == Some("item_reference"))
+            {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "input 'item_reference' is not supported: the facade is stateless (store=false)"
+                        .into(),
                 ));
             }
         }
@@ -867,12 +890,29 @@ mod tests {
         assert!(validate_body(Dialect::OpenAi, "m", &bad).is_err());
         let bad = json!({"model": "m", "background": true});
         assert!(validate_body(Dialect::OpenAi, "m", &bad).is_err());
+        // Stored prompt template reference — reaches shared-account state.
+        let bad = json!({"model": "m", "prompt": {"id": "pmpt_abc"}});
+        assert!(validate_body(Dialect::OpenAi, "m", &bad).is_err());
+        // input[] item_reference — the array-level previous_response_id.
+        let bad = json!({"model": "m", "input": [
+            {"type": "message", "role": "user", "content": "hi"},
+            {"type": "item_reference", "id": "item_xyz"}
+        ]});
+        assert!(validate_body(Dialect::OpenAi, "m", &bad).is_err());
         // null is as-absent (serde default emission).
-        let ok = json!({"model": "m", "previous_response_id": null});
+        let ok = json!({"model": "m", "previous_response_id": null, "prompt": null});
+        assert!(validate_body(Dialect::OpenAi, "m", &ok).is_ok());
+        // A NORMAL stateless codex turn (inline message input, no references)
+        // must still pass — the screen only rejects upstream-state pulls.
+        let ok = json!({"model": "m", "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "do the task"}]},
+            {"type": "function_call_output", "call_id": "c1", "output": "ok"}
+        ]});
         assert!(validate_body(Dialect::OpenAi, "m", &ok).is_ok());
         // The same fields are fine for the anthropic dialect (it never
-        // sends them; screen is per-dialect).
-        let ok = json!({"model": "m"});
+        // sends them; screen is per-dialect). `prompt` is not a reserved
+        // Anthropic field, so its presence must not trip the Anthropic path.
+        let ok = json!({"model": "m", "prompt": {"id": "x"}});
         assert!(validate_body(Dialect::Anthropic, "m", &ok).is_ok());
     }
 
