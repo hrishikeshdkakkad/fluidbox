@@ -44,6 +44,12 @@ neon-setup:
 db:
     psql "$DATABASE_URL"
 
+# Remove e2e/test cruft from the DB (sessions, test agents, subscriptions,
+# schedules, bundles). Preserves the tenant, policies, connections, and the
+# seed agents. DRY-RUN by default; pass `apply` to commit. See scripts/db-clean.sh.
+db-clean *ARGS:
+    bash scripts/db-clean.sh {{ARGS}}
+
 # ── Quality ──────────────────────────────────────────────────────────────
 
 fmt:
