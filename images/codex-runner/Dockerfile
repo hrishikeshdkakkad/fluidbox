@@ -15,7 +15,7 @@
 #
 # BUILD CONTEXT = images/ (shared with the claude runner). Build with:
 #   docker build -t <img> -f images/codex-runner/Dockerfile images
-FROM node:24-bookworm-slim
+FROM node:26-bookworm-slim
 
 # Coding toolchain. (No gosu: there is no runtime privilege drop — see above.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
