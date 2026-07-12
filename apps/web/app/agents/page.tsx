@@ -15,6 +15,13 @@ import {
 } from "../lib/api";
 import { BundlePicker } from "../components/BundlePicker";
 import { HarnessPicker } from "../components/HarnessPicker";
+
+// Per-harness models (a claude model on a codex revision would 422 at run
+// time). Switching the harness re-defaults the model to the first entry.
+const REV_MODELS: Record<string, string[]> = {
+  "claude-agent-sdk": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-4-8"],
+  codex: ["gpt-5.4-mini", "gpt-5.4", "gpt-5.6-sol"],
+};
 import { LoadingRows, ModalShell, PageHead, short } from "../components/bits";
 import {
   WorkspacePicker,
@@ -405,14 +412,22 @@ function AddRevision({
     >
       <div className="field">
         <span className="lab">Harness</span>
-        <HarnessPicker value={harness} onChange={setHarness} />
+        <HarnessPicker
+          value={harness}
+          onChange={(h) => {
+            setHarness(h);
+            setModel(REV_MODELS[h]?.[0] ?? ""); // never carry a cross-harness model
+          }}
+        />
       </div>
       <label className="field">
         <span className="lab">Model</span>
         <select className="inp" value={model} onChange={(e) => setModel(e.target.value)}>
-          <option value="claude-haiku-4-5">claude-haiku-4-5</option>
-          <option value="claude-sonnet-5">claude-sonnet-5</option>
-          <option value="claude-opus-4-8">claude-opus-4-8</option>
+          {(REV_MODELS[harness] ?? []).map((m) => (
+            <option key={m} value={m}>
+              {m}
+            </option>
+          ))}
         </select>
       </label>
       <label className="field">

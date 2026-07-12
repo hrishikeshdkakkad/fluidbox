@@ -116,7 +116,10 @@ mod tests {
             Some("fluidbox-codex-runner:dev")
         );
         assert_eq!(default_runner_image("nope", &cfg), None);
-        assert_eq!(default_model("claude-agent-sdk", &cfg), Some("claude-haiku-4-5"));
+        assert_eq!(
+            default_model("claude-agent-sdk", &cfg),
+            Some("claude-haiku-4-5")
+        );
         assert_eq!(default_model("codex", &cfg), Some("gpt-5.4-mini"));
         assert_eq!(default_model("nope", &cfg), None);
     }
@@ -137,7 +140,10 @@ mod tests {
                     "http://host.docker.internal:8787/internal/llm".to_string()
                 ),
                 ("ANTHROPIC_API_KEY".to_string(), "fbx_sess_abc".to_string()),
-                ("ANTHROPIC_MODEL".to_string(), "claude-haiku-4-5".to_string()),
+                (
+                    "ANTHROPIC_MODEL".to_string(),
+                    "claude-haiku-4-5".to_string()
+                ),
             ]
         );
     }

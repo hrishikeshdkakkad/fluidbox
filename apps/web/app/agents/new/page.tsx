@@ -19,23 +19,22 @@ import {
   draftToInput,
 } from "../../components/WorkspacePicker";
 
-const MODELS = [
-  {
-    id: "claude-haiku-4-5",
-    name: "Haiku 4.5",
-    hint: "Fast and inexpensive — the default for most agents.",
-  },
-  {
-    id: "claude-sonnet-5",
-    name: "Sonnet 5",
-    hint: "Balanced depth and speed for harder tasks.",
-  },
-  {
-    id: "claude-opus-4-8",
-    name: "Opus 4.8",
-    hint: "Deepest reasoning; slowest and priciest.",
-  },
-];
+// Models are per-harness — a claude model on a codex agent (or vice versa) is
+// never valid. Switching the harness re-defaults the model to that harness's
+// first entry (the server would 422 a cross-harness model anyway).
+const MODELS_BY_HARNESS: Record<string, { id: string; name: string; hint: string }[]> = {
+  "claude-agent-sdk": [
+    { id: "claude-haiku-4-5", name: "Haiku 4.5", hint: "Fast and inexpensive — the default for most agents." },
+    { id: "claude-sonnet-5", name: "Sonnet 5", hint: "Balanced depth and speed for harder tasks." },
+    { id: "claude-opus-4-8", name: "Opus 4.8", hint: "Deepest reasoning; slowest and priciest." },
+  ],
+  codex: [
+    { id: "gpt-5.4-mini", name: "GPT-5.4 mini", hint: "Fast and inexpensive — the codex default." },
+    { id: "gpt-5.4", name: "GPT-5.4", hint: "Balanced depth and speed." },
+    { id: "gpt-5.6-sol", name: "GPT-5.6 sol", hint: "Deepest reasoning; slowest and priciest." },
+  ],
+};
+const defaultModelFor = (h: string) => MODELS_BY_HARNESS[h]?.[0]?.id ?? "";
 
 export default function NewAgent() {
   const router = useRouter();
@@ -122,7 +121,13 @@ export default function NewAgent() {
             <div className="sectitle" style={{ marginTop: 0 }}>
               Harness
             </div>
-            <HarnessPicker value={harness} onChange={setHarness} />
+            <HarnessPicker
+              value={harness}
+              onChange={(h) => {
+                setHarness(h);
+                setModel(defaultModelFor(h)); // never carry a cross-harness model
+              }}
+            />
             <p className="helper" style={{ margin: "8px 0 0" }}>
               The brain that runs inside the sandbox. Every harness speaks the same runner
               contract, so policy, approvals, and the audit ledger work identically.
@@ -134,7 +139,7 @@ export default function NewAgent() {
               Model
             </div>
             <div className="opt-grid">
-              {MODELS.map((m) => (
+              {(MODELS_BY_HARNESS[harness] ?? []).map((m) => (
                 <button
                   key={m.id}
                   type="button"

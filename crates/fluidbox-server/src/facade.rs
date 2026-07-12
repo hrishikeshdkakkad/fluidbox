@@ -242,8 +242,14 @@ pub async fn messages(
     let totals = fluidbox_db::usage_totals(&state.pool, session_id).await?;
     if let Some(max_cost) = run_spec.budgets.max_cost_usd {
         if totals.cost_usd >= max_cost {
-            trigger_budget_stop(&state, session_id, "max_cost_usd", max_cost, totals.cost_usd)
-                .await;
+            trigger_budget_stop(
+                &state,
+                session_id,
+                "max_cost_usd",
+                max_cost,
+                totals.cost_usd,
+            )
+            .await;
             return Ok(dialect_error(
                 dialect,
                 StatusCode::BAD_REQUEST,
@@ -773,9 +779,15 @@ mod tests {
         );
         assert_eq!(resolve_suffix(Dialect::Anthropic, ""), Some("v1/messages"));
         // The master-key proxy hole: arbitrary suffixes must die.
-        assert_eq!(resolve_suffix(Dialect::Anthropic, "v1/chat/completions"), None);
+        assert_eq!(
+            resolve_suffix(Dialect::Anthropic, "v1/chat/completions"),
+            None
+        );
         assert_eq!(resolve_suffix(Dialect::Anthropic, "key/info"), None);
-        assert_eq!(resolve_suffix(Dialect::Anthropic, "v1/messages/../key/info"), None);
+        assert_eq!(
+            resolve_suffix(Dialect::Anthropic, "v1/messages/../key/info"),
+            None
+        );
         assert_eq!(resolve_suffix(Dialect::Anthropic, "v1/responses"), None);
         // Codex: responses only — no anthropic paths, no empty legacy map.
         assert_eq!(
@@ -824,7 +836,10 @@ mod tests {
             {"type": "web_search", "name": null},
             {"type": "tool_search", "name": null}
         ]});
-        assert!(validate_body(Dialect::OpenAi, "m", &body).is_ok(), "codex body validates");
+        assert!(
+            validate_body(Dialect::OpenAi, "m", &body).is_ok(),
+            "codex body validates"
+        );
         let mut parsed = body.clone();
         let stripped = strip_server_tools(Dialect::OpenAi, &mut parsed);
         assert_eq!(stripped, 2, "web_search + tool_search stripped");
@@ -836,7 +851,8 @@ mod tests {
             .collect();
         assert_eq!(kept, vec!["function", "custom", "function"]);
         // An unknown/future server tool type is stripped too (fail-closed).
-        let mut p2 = json!({"tools": [{"type": "image_generation"}, {"type":"function","name":"x"}]});
+        let mut p2 =
+            json!({"tools": [{"type": "image_generation"}, {"type":"function","name":"x"}]});
         assert_eq!(strip_server_tools(Dialect::OpenAi, &mut p2), 1);
         // A body with no tools array is a no-op.
         let mut none = json!({"model": "m"});
@@ -869,9 +885,10 @@ mod tests {
             lines.push(l.to_string())
         });
         assert!(lines.is_empty(), "no complete line yet");
-        dec.feed(b"pleted\",\"response\":{\"usage\":{\"input_tokens\":10,", &mut |l: &str| {
-            lines.push(l.to_string())
-        });
+        dec.feed(
+            b"pleted\",\"response\":{\"usage\":{\"input_tokens\":10,",
+            &mut |l: &str| lines.push(l.to_string()),
+        );
         assert!(lines.is_empty());
         dec.feed(
             b"\"output_tokens\":5}}}\n\ndata: [DONE]\n",
@@ -927,9 +944,10 @@ mod tests {
     fn sse_decoder_finish_flushes_unterminated_tail() {
         let mut dec = SseLineDecoder::default();
         let mut lines: Vec<String> = Vec::new();
-        dec.feed(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}", &mut |l: &str| {
-            lines.push(l.to_string())
-        });
+        dec.feed(
+            b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}",
+            &mut |l: &str| lines.push(l.to_string()),
+        );
         assert!(lines.is_empty());
         dec.finish(|l: &str| lines.push(l.to_string()));
         assert_eq!(lines.len(), 1);
@@ -1019,7 +1037,12 @@ mod tests {
         .unwrap();
         let d = parse_usage_json(Dialect::Anthropic, &anthropic).unwrap();
         assert_eq!(
-            (d.input_tokens, d.output_tokens, d.cache_read_tokens, d.cache_write_tokens),
+            (
+                d.input_tokens,
+                d.output_tokens,
+                d.cache_read_tokens,
+                d.cache_write_tokens
+            ),
             (5, 6, 7, 8)
         );
         let openai = serde_json::to_vec(&json!({
@@ -1028,6 +1051,9 @@ mod tests {
         }))
         .unwrap();
         let d = parse_usage_json(Dialect::OpenAi, &openai).unwrap();
-        assert_eq!((d.input_tokens, d.cache_read_tokens, d.output_tokens), (60, 40, 9));
+        assert_eq!(
+            (d.input_tokens, d.cache_read_tokens, d.output_tokens),
+            (60, 40, 9)
+        );
     }
 }

@@ -2923,10 +2923,12 @@ mod tests {
         let cur = get_approval(&pool, row.id).await.unwrap().unwrap();
         assert_eq!(cur.status, "auto_allowed");
         // A decided intent can no longer be promoted into an approval.
-        assert!(promote_intent_to_pending(&pool, row.id, None, "once", "Bash", 600)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            promote_intent_to_pending(&pool, row.id, None, "once", "Bash", 600)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // The approval lifecycle rides the SAME row when promotion wins.
         let (row2, _) =

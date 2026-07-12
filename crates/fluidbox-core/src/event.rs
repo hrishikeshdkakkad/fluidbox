@@ -217,16 +217,16 @@ pub struct Redactor {
 impl Default for Redactor {
     fn default() -> Self {
         let raw = [
-            r"sk-ant-[A-Za-z0-9_\-]{8,}",     // Anthropic keys / oauth tokens
-            r"sk-proj-[A-Za-z0-9_\-]{16,}",   // OpenAI project keys (hyphenated — not caught below)
-            r"sk-[A-Za-z0-9]{20,}",           // OpenAI-style keys
+            r"sk-ant-[A-Za-z0-9_\-]{8,}",       // Anthropic keys / oauth tokens
+            r"sk-proj-[A-Za-z0-9_\-]{16,}", // OpenAI project keys (hyphenated — not caught below)
+            r"sk-[A-Za-z0-9]{20,}",         // OpenAI-style keys
             r"fbx_(sess|trig)_[A-Za-z0-9]{8,}", // fluidbox session / trigger tokens
-            r"ghp_[A-Za-z0-9]{20,}",          // GitHub PAT
-            r"github_pat_[A-Za-z0-9_]{20,}",  // GitHub fine-grained PAT
-            r"gho_[A-Za-z0-9]{20,}",          // GitHub OAuth
-            r"AKIA[0-9A-Z]{16}",              // AWS access key id
+            r"ghp_[A-Za-z0-9]{20,}",        // GitHub PAT
+            r"github_pat_[A-Za-z0-9_]{20,}", // GitHub fine-grained PAT
+            r"gho_[A-Za-z0-9]{20,}",        // GitHub OAuth
+            r"AKIA[0-9A-Z]{16}",            // AWS access key id
             r"xox[baprs]-[A-Za-z0-9\-]{10,}", // Slack tokens
-            r"npg_[A-Za-z0-9]{8,}",           // Neon passwords
+            r"npg_[A-Za-z0-9]{8,}",         // Neon passwords
             r"(?i)bearer\s+[A-Za-z0-9\._\-]{16,}",
             r"postgres(ql)?://[^\s:]+:[^@\s]+@", // connection-string passwords
         ];
@@ -366,13 +366,22 @@ mod tests {
         // plain `sk-[alnum]{20,}` rule does NOT catch (it stops at the first
         // hyphen). The explicit rule must.
         let s = r.scrub_text("OPENAI_API_KEY=sk-proj-AbCd1234_EfGh5678-IjKl9012MnOp done");
-        assert!(!s.contains("sk-proj-AbCd1234"), "openai project key leaked: {s}");
+        assert!(
+            !s.contains("sk-proj-AbCd1234"),
+            "openai project key leaked: {s}"
+        );
         assert!(s.contains("‹redacted›"));
         // The fluidbox session token (which IS the sandbox's fake key) and a
         // trigger token must never survive into the ledger if they leak into
         // a summary or agent message.
         let s = r.scrub_text("token fbx_sess_0a1b2c3d4e5f6a7b and fbx_trig_deadbeefcafe0000");
-        assert!(!s.contains("fbx_sess_0a1b2c3d"), "session token leaked: {s}");
-        assert!(!s.contains("fbx_trig_deadbeef"), "trigger token leaked: {s}");
+        assert!(
+            !s.contains("fbx_sess_0a1b2c3d"),
+            "session token leaked: {s}"
+        );
+        assert!(
+            !s.contains("fbx_trig_deadbeef"),
+            "trigger token leaked: {s}"
+        );
     }
 }
