@@ -83,31 +83,50 @@ export function WorkspacePicker({
   }, []);
 
   useEffect(() => {
-    setRepos([]);
-    setRepoErr("");
-    if (draft.mode !== "git" || !draft.connectionId) return;
-    apiGet<{ repos: Repo[] }>(`/connections/${draft.connectionId}/repos?per_page=100`)
-      .then((r) => setRepos(r.repos))
-      .catch((e) => setRepoErr(String(e)));
+    const refresh = window.setTimeout(() => {
+      setRepos([]);
+      setRepoErr("");
+      if (draft.mode !== "git" || !draft.connectionId) return;
+      apiGet<{ repos: Repo[] }>(`/connections/${draft.connectionId}/repos?per_page=100`)
+        .then((r) => setRepos(r.repos))
+        .catch((e) => setRepoErr(String(e)));
+    }, 0);
+    return () => clearTimeout(refresh);
   }, [draft.mode, draft.connectionId]);
 
   const set = (patch: Partial<WorkspaceDraft>) => onChange({ ...draft, ...patch });
 
+  const modes: { value: WorkspaceDraft["mode"]; label: string }[] = [
+    ...(defaultOptionLabel
+      ? [{ value: "default" as const, label: defaultOptionLabel }]
+      : []),
+    { value: "scratch", label: "Scratch" },
+    { value: "local", label: "Local path" },
+    { value: "git", label: "Git repository" },
+  ];
+
   return (
     <>
-      <label className="field">
+      <div className="field">
         <span className="lab">Workspace</span>
-        <select
-          className="inp"
-          value={draft.mode}
-          onChange={(e) => set({ mode: e.target.value as WorkspaceDraft["mode"] })}
-        >
-          {defaultOptionLabel && <option value="default">{defaultOptionLabel}</option>}
-          <option value="scratch">scratch (empty sandbox)</option>
-          <option value="local">local path (copied)</option>
-          <option value="git">git repository (cloned control-plane-side)</option>
-        </select>
-      </label>
+        <div className="seg">
+          {modes.map((m) => (
+            <button
+              key={m.value}
+              type="button"
+              className={draft.mode === m.value ? "on" : ""}
+              onClick={() => set({ mode: m.value })}
+            >
+              {m.label}
+            </button>
+          ))}
+        </div>
+        {draft.mode === "scratch" && (
+          <p className="helper" style={{ margin: "6px 0 0" }}>
+            An empty sandbox — nothing is mounted.
+          </p>
+        )}
+      </div>
 
       {draft.mode === "local" && (
         <label className="field">

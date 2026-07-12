@@ -1,6 +1,14 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+// Capabilities = tools agents can CALL during a run (design §8.3): sandbox
+// stdio servers baked into the runner image, and brokered MCP servers the
+// control plane calls with sealed credentials. Distinct from Integrations
+// (platforms agents work ON — repos, events, publishing).
+
+import { Suspense, useCallback, useEffect, useRef, useState } from "react";
+import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
+import { Check, KeyRound, Package, Plus, Puzzle, Search, ShieldCheck } from "lucide-react";
 import {
   apiGet,
   apiPost,
@@ -9,186 +17,127 @@ import {
   CatalogEntry,
   Connection,
 } from "../lib/api";
-import { PageHead } from "../components/bits";
+import { LoadingRows, ModalShell, PageHead } from "../components/bits";
 
-const EXAMPLE = `[
-  {
-    "class": "sandbox",
-    "name": "ws",
-    "command": "node",
-    "args": ["/opt/fluidbox-runner/servers/workspace-info.mjs"],
-    "tools": [
-      { "name": "workspace_file_count", "description": "Count files in the workspace",
-        "input_schema": { "type": "object", "properties": {} } },
-      { "name": "workspace_grep_count", "description": "Count lines containing a pattern",
-        "input_schema": { "type": "object", "properties": { "pattern": { "type": "string" } },
-                          "required": ["pattern"] } }
-    ]
-  },
-  {
-    "class": "brokered",
-    "name": "kb",
-    "url": "https://mcp.example.com/mcp",
-    "connection_id": "<mcp_http connection id, omit if the server needs no credential>"
-  }
-]`;
+type Tab = "store" | "bundles" | "connections";
 
-export default function Capabilities() {
-  const [bundles, setBundles] = useState<CapabilityBundle[]>([]);
+export default function CapabilitiesPage() {
+  return (
+    <Suspense fallback={null}>
+      <Capabilities />
+    </Suspense>
+  );
+}
+
+function Capabilities() {
+  const router = useRouter();
+  const params = useSearchParams();
+  const tab = ((params.get("tab") as Tab) || "store") as Tab;
+  const setTab = (t: Tab) =>
+    router.replace(t === "store" ? "/capabilities" : `/capabilities?tab=${t}`);
+
   const [catalog, setCatalog] = useState<CatalogEntry[]>([]);
-  const [showNew, setShowNew] = useState(false);
+  const [bundles, setBundles] = useState<CapabilityBundle[]>([]);
+  const [connections, setConnections] = useState<Connection[]>([]);
   const [connecting, setConnecting] = useState<CatalogEntry | null>(null);
+  const [showBundle, setShowBundle] = useState(false);
+  const [err, setErr] = useState("");
+  const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
-    try {
-      const r = await apiGet<{ bundles: CapabilityBundle[] }>("/capabilities");
-      setBundles(r.bundles);
-    } catch {
-      /* offline handled by rail */
-    }
-    try {
-      const c = await apiGet<{ connectors: CatalogEntry[] }>("/catalog");
-      setCatalog(c.connectors);
-    } catch {
-      /* offline handled by rail */
-    }
+    const results = await Promise.allSettled([
+      apiGet<{ connectors: CatalogEntry[] }>("/catalog"),
+      apiGet<{ bundles: CapabilityBundle[] }>("/capabilities"),
+      apiGet<{ connections: Connection[] }>("/connections"),
+    ]);
+    if (results[0].status === "fulfilled") setCatalog(results[0].value.connectors);
+    if (results[1].status === "fulfilled") setBundles(results[1].value.bundles);
+    if (results[2].status === "fulfilled") setConnections(results[2].value.connections);
+    setLoading(false);
   }, []);
 
   useEffect(() => {
-    load();
+    const first = window.setTimeout(() => void load(), 0);
+    // Returning from an OAuth consent tab should show the new state.
+    window.addEventListener("focus", load);
+    return () => {
+      clearTimeout(first);
+      window.removeEventListener("focus", load);
+    };
   }, [load]);
+
+  const act = async (fn: () => Promise<void>) => {
+    setErr("");
+    try {
+      await fn();
+      load();
+    } catch (e) {
+      setErr(String(e));
+    }
+  };
+
+  const revoke = (id: string) => act(async () => void (await apiPost(`/connections/${id}/revoke`, {})));
+  // Popup blockers void the gesture across an await — open synchronously.
+  const reconnectOauth = (id: string) => {
+    const tabRef = window.open("", "_blank");
+    act(async () => {
+      try {
+        const r = await apiPost<{ authorize_url: string }>(`/connections/${id}/oauth/start`, {});
+        if (tabRef) tabRef.location.href = r.authorize_url;
+        else window.location.href = r.authorize_url;
+      } catch (e) {
+        tabRef?.close();
+        throw e;
+      }
+    });
+  };
+
+  // Tool-server credentials only — git platform connections live on the
+  // Integrations page.
+  const toolConnections = connections.filter(
+    (c) => c.provider === "mcp_http" && c.status !== "revoked"
+  );
 
   return (
     <>
       <PageHead
-        eyebrow="registry"
         title="Capabilities"
-        sub="Versioned bundles of MCP servers agents may attach. Registration photographs each server's tool schemas (brokered: discovered; sandbox: declared) — runs freeze that snapshot, and the permission gate judges every call. Attach ≠ allow."
-        right={
-          <button className="btn primary" onClick={() => setShowNew(true)}>
-            + Register bundle
-          </button>
-        }
+        sub="Tools your agents can call during a run. Connect a service once — every call still passes the permission gate. Attach ≠ allow."
       />
 
-      {catalog.length > 0 && (
-        <div className="panel" style={{ marginBottom: 16 }}>
-          <div className="eyebrow" style={{ marginTop: 0 }}>
-            add from catalog
-          </div>
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(auto-fill, minmax(230px, 1fr))",
-              gap: 10,
-            }}
-          >
-            {catalog.map((e) => (
-              <button
-                key={e.slug}
-                onClick={() => setConnecting(e)}
-                style={{
-                  textAlign: "left",
-                  background: "transparent",
-                  border: "1px solid var(--line)",
-                  borderRadius: 8,
-                  padding: "10px 12px",
-                  cursor: "pointer",
-                  color: "inherit",
-                  font: "inherit",
-                }}
-              >
-                <div className="spread" style={{ alignItems: "baseline" }}>
-                  <span style={{ fontFamily: "var(--font-mono)", fontSize: 14 }}>
-                    {e.icon ? `${e.icon} ` : ""}
-                    {e.name}
-                  </span>
-                  <span
-                    className={`autopill ${e.tier === "verified" ? "supervised" : "autonomous"}`}
-                  >
-                    {e.tier}
-                  </span>
-                </div>
-                <div className="mut" style={{ fontSize: 11.5, marginTop: 4, minHeight: 30 }}>
-                  {e.description || ""}
-                </div>
-                <div className="mut mono" style={{ fontSize: 10.5, marginTop: 6 }}>
-                  {e.auth_mode === "none"
-                    ? "no credential"
-                    : e.auth_mode === "api_key"
-                      ? "api key"
-                      : "oauth"}
-                  {e.categories.length > 0 ? ` · ${e.categories.join(", ")}` : ""}
-                  {e.connection?.status === "active" || (e.auth_mode === "none" && e.bundle) ? (
-                    <span style={{ color: "var(--accent)" }}> · ✓ connected</span>
-                  ) : e.connection ? (
-                    <span className="err" style={{ background: "none", padding: 0 }}>
-                      {" "}
-                      · {e.connection.status}
-                    </span>
-                  ) : null}
-                  {e.bundle ? ` · ${e.bundle.name}@${e.bundle.version}` : ""}
-                </div>
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
-
-      <div className="panel">
-        {bundles.length === 0 ? (
-          <div className="empty">
-            no capability bundles — register one, then attach it on an agent revision
-          </div>
-        ) : (
-          <div className="rows">
-            {bundles.map((b) => (
-              <div
-                key={b.id}
-                className="row"
-                style={{ gridTemplateColumns: "220px 1fr auto", alignItems: "center" }}
-              >
-                <span className="mono" style={{ color: "var(--accent)" }}>
-                  {b.name}@{b.version}
-                </span>
-                <span className="task">
-                  {b.description || "—"}
-                  <span className="mut" style={{ marginLeft: 8, fontSize: 12 }}>
-                    {b.server_count} server{b.server_count === 1 ? "" : "s"} · {b.tool_count} tool
-                    {b.tool_count === 1 ? "" : "s"}
-                  </span>
-                  <span
-                    className="mut mono"
-                    style={{ display: "block", fontSize: 11, marginTop: 2 }}
-                  >
-                    {b.definition_digest.slice(0, 24)}…
-                  </span>
-                </span>
-                <span className="chips">
-                  {[...new Set(b.classes)].map((c) => (
-                    <span
-                      key={c}
-                      className={`autopill ${c === "sandbox" ? "supervised" : "autonomous"}`}
-                    >
-                      {c}
-                    </span>
-                  ))}
-                </span>
-              </div>
-            ))}
-          </div>
-        )}
+      <div className="tabs">
+        <button className={`tab ${tab === "store" ? "active" : ""}`} onClick={() => setTab("store")}>
+          Store
+        </button>
+        <button className={`tab ${tab === "bundles" ? "active" : ""}`} onClick={() => setTab("bundles")}>
+          Bundles
+          <span className="n">{bundles.length}</span>
+        </button>
+        <button
+          className={`tab ${tab === "connections" ? "active" : ""}`}
+          onClick={() => setTab("connections")}
+        >
+          Connections
+          <span className="n">{toolConnections.length}</span>
+        </button>
       </div>
 
-      {showNew && (
-        <NewBundle
-          onClose={() => setShowNew(false)}
-          onCreated={() => {
-            setShowNew(false);
-            load();
-          }}
+      {err && <div className="err" style={{ marginBottom: 10 }}>{err}</div>}
+
+      {loading ? (
+        <div className="panel"><LoadingRows /></div>
+      ) : tab === "store" ? (
+        <Store catalog={catalog} onOpen={setConnecting} />
+      ) : tab === "bundles" ? (
+        <BundlesTab bundles={bundles} onRegister={() => setShowBundle(true)} />
+      ) : (
+        <ToolConnections
+          connections={toolConnections}
+          onRevoke={revoke}
+          onReconnect={reconnectOauth}
         />
       )}
+
       {connecting && (
         <ConnectCatalog
           entry={connecting}
@@ -198,9 +147,298 @@ export default function Capabilities() {
           }}
         />
       )}
+      {showBundle && (
+        <NewBundle
+          onClose={() => setShowBundle(false)}
+          onCreated={() => {
+            setShowBundle(false);
+            load();
+          }}
+        />
+      )}
     </>
   );
 }
+
+/* ─── Store ──────────────────────────────────────────────────────────── */
+
+function Store({
+  catalog,
+  onOpen,
+}: {
+  catalog: CatalogEntry[];
+  onOpen: (e: CatalogEntry) => void;
+}) {
+  const [q, setQ] = useState("");
+  const [cat, setCat] = useState<string | null>(null);
+
+  const categories = [...new Set(catalog.flatMap((e) => e.categories))].sort();
+  const shown = catalog.filter((e) => {
+    if (cat && !e.categories.includes(cat)) return false;
+    if (!q.trim()) return true;
+    const hay = `${e.name} ${e.slug} ${e.description || ""} ${e.categories.join(" ")}`.toLowerCase();
+    return hay.includes(q.trim().toLowerCase());
+  });
+
+  return (
+    <>
+      <div className="storebar">
+        <div className="search">
+          <Search />
+          <input
+            className="inp"
+            placeholder="Search tools…"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+          />
+        </div>
+        {categories.length > 0 && (
+          <div className="chipset">
+            <button className={`fchip ${cat === null ? "on" : ""}`} onClick={() => setCat(null)}>
+              All
+            </button>
+            {categories.map((c) => (
+              <button
+                key={c}
+                className={`fchip ${cat === c ? "on" : ""}`}
+                onClick={() => setCat(cat === c ? null : c)}
+              >
+                {c}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {shown.length === 0 ? (
+        <div className="panel">
+          <div className="empty">
+            <Puzzle />
+            <div>{catalog.length === 0 ? "The catalog is empty." : "No tools match."}</div>
+          </div>
+        </div>
+      ) : (
+        <div className="store-grid">
+          {shown.map((e) => (
+            <StoreCard key={e.slug} entry={e} onOpen={() => onOpen(e)} />
+          ))}
+        </div>
+      )}
+
+      <p className="helper" style={{ marginTop: 14 }}>
+        These are tools agents use <i>inside</i> a run. To run agents <i>on</i> a repository —
+        clone a branch, react to pull requests, publish reviews — connect GitHub under{" "}
+        <Link href="/integrations" className="link">
+          Integrations
+        </Link>
+        .
+      </p>
+    </>
+  );
+}
+
+function StoreCard({ entry, onOpen }: { entry: CatalogEntry; onOpen: () => void }) {
+  const connected =
+    entry.connection?.status === "active" || (entry.auth_mode === "none" && !!entry.bundle);
+  const attention = !!entry.connection && entry.connection.status !== "active" && !connected;
+
+  return (
+    <button className="store-card" onClick={onOpen}>
+      <div className="top">
+        <span className="store-icon">{entry.icon || <Puzzle />}</span>
+        <div style={{ minWidth: 0 }}>
+          <div className="nm">{entry.name}</div>
+          <div style={{ marginTop: 2 }}>
+            {entry.tier === "verified" ? (
+              <span className="badge brand">
+                <ShieldCheck size={11} /> verified
+              </span>
+            ) : (
+              <span className="badge">{entry.tier}</span>
+            )}
+          </div>
+        </div>
+      </div>
+      <div className="desc">{entry.description || ""}</div>
+      <div className="foot">
+        <span>
+          {entry.auth_mode === "none"
+            ? "No credential"
+            : entry.auth_mode === "api_key"
+              ? "API key"
+              : "OAuth"}
+          {entry.bundle ? ` · v${entry.bundle.version}` : ""}
+        </span>
+        {connected ? (
+          <span className="state ok">
+            <Check /> Connected
+          </span>
+        ) : attention ? (
+          <span className="state err">{entry.connection!.status}</span>
+        ) : (
+          <span className="state" style={{ color: "var(--ink)" }}>
+            Connect
+          </span>
+        )}
+      </div>
+    </button>
+  );
+}
+
+/* ─── Bundles ────────────────────────────────────────────────────────── */
+
+function BundlesTab({
+  bundles,
+  onRegister,
+}: {
+  bundles: CapabilityBundle[];
+  onRegister: () => void;
+}) {
+  return (
+    <>
+      <div className="spread" style={{ marginBottom: 12 }}>
+        <span className="helper" style={{ maxWidth: 620 }}>
+          Bundles are versioned snapshots of a server&apos;s tools, photographed at
+          registration. Runs freeze the exact pinned version — and attaching a bundle never
+          bypasses the permission gate.
+        </span>
+        <button className="btn" onClick={onRegister}>
+          <Plus /> Register bundle
+        </button>
+      </div>
+      <div className="panel">
+        {bundles.length === 0 ? (
+          <div className="empty">
+            <Package />
+            <div>No bundles yet — connecting from the Store registers one automatically.</div>
+          </div>
+        ) : (
+          <div className="rows">
+            <div className="thead" style={{ gridTemplateColumns: "200px 1fr 130px 110px" }}>
+              <span>Bundle</span>
+              <span>Description</span>
+              <span>Contents</span>
+              <span>Classes</span>
+            </div>
+            {bundles.map((b) => (
+              <div key={b.id} className="row" style={{ gridTemplateColumns: "200px 1fr 130px 110px" }}>
+                <span className="mono" style={{ fontSize: 12, color: "var(--accent)" }}>
+                  {b.name}@{b.version}
+                </span>
+                <span className="task">
+                  {b.description || "—"}
+                  <span className="faint mono" style={{ display: "block", fontSize: 11, marginTop: 2 }}>
+                    {b.definition_digest.slice(0, 24)}…
+                  </span>
+                </span>
+                <span className="meta">
+                  {b.server_count} server{b.server_count === 1 ? "" : "s"} · {b.tool_count} tool
+                  {b.tool_count === 1 ? "" : "s"}
+                </span>
+                <span className="chips">
+                  {[...new Set(b.classes)].map((c) => (
+                    <span key={c} className={`badge ${c === "brokered" ? "brand" : ""}`}>
+                      {c}
+                    </span>
+                  ))}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+/* ─── Tool-server connections (mcp_http credentials) ─────────────────── */
+
+function ToolConnections({
+  connections,
+  onRevoke,
+  onReconnect,
+}: {
+  connections: Connection[];
+  onRevoke: (id: string) => void;
+  onReconnect: (id: string) => void;
+}) {
+  return (
+    <>
+      <div className="panel">
+        {connections.length === 0 ? (
+          <div className="empty">
+            <KeyRound />
+            <div>No tool credentials yet — connect something from the Store.</div>
+          </div>
+        ) : (
+          <div className="rows">
+            {connections.map((c) => (
+              <div
+                key={c.id}
+                className="row"
+                style={{ gridTemplateColumns: "1fr auto auto", alignItems: "center" }}
+              >
+                <span className="task">
+                  {c.display_name}
+                  <span className="chips" style={{ display: "inline-flex", marginLeft: 8, verticalAlign: "middle" }}>
+                    {c.auth_kind === "oauth" ? (
+                      <span className="chip">
+                        oauth{c.oauth?.client_id_source ? ` · ${c.oauth.client_id_source}` : ""}
+                      </span>
+                    ) : (
+                      <span className="chip">api key</span>
+                    )}
+                    {c.metadata?.header_name && <span className="chip">header {c.metadata.header_name}</span>}
+                  </span>
+                  {c.oauth?.scopes && c.oauth.scopes.length > 0 && (
+                    <span className="faint" style={{ marginLeft: 8, fontSize: 12 }}>
+                      scopes: {c.oauth.scopes.join(", ")}
+                    </span>
+                  )}
+                  {c.metadata?.base_url && (
+                    <span className="faint mono" style={{ display: "block", fontSize: 11.5, marginTop: 2 }}>
+                      {c.metadata.base_url}
+                    </span>
+                  )}
+                  {c.status === "error" && c.oauth?.error && (
+                    <span className="err" style={{ display: "block", fontSize: 11.5, marginTop: 2 }}>
+                      {c.oauth.error}
+                    </span>
+                  )}
+                </span>
+                {c.status === "active" ? (
+                  <span className="badge ok">active</span>
+                ) : c.status === "pending" ? (
+                  <span className="badge warn">pending</span>
+                ) : (
+                  <span className="badge err">{c.status}</span>
+                )}
+                <span style={{ display: "flex", gap: 6 }}>
+                  {c.status === "active" ? (
+                    <button className="btn ghost sm danger" onClick={() => onRevoke(c.id)}>
+                      Revoke
+                    </button>
+                  ) : c.auth_kind === "oauth" ? (
+                    <button className="btn ghost sm" onClick={() => onReconnect(c.id)}>
+                      Reconnect
+                    </button>
+                  ) : null}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+      <p className="helper" style={{ marginTop: 10 }}>
+        Credentials for brokered tool servers. The control plane holds them sealed and makes
+        the calls itself — a credential never enters a sandbox. Tokens are audience-bound to
+        the server&apos;s base URL.
+      </p>
+    </>
+  );
+}
+
+/* ─── Connect-from-catalog modal ─────────────────────────────────────── */
 
 function ConnectCatalog({ entry, onClose }: { entry: CatalogEntry; onClose: () => void }) {
   const [token, setToken] = useState("");
@@ -232,7 +470,7 @@ function ConnectCatalog({ entry, onClose }: { entry: CatalogEntry; onClose: () =
         if (c?.status === "active") {
           if (pollTimer.current) clearInterval(pollTimer.current);
           setWaiting(false);
-          setDone("connected — the bundle was registered with the fresh credential");
+          setDone("Connected — the bundle was registered with the fresh credential.");
         }
       } catch {
         /* keep polling */
@@ -246,7 +484,7 @@ function ConnectCatalog({ entry, onClose }: { entry: CatalogEntry; onClose: () =
     setBusy(true);
     try {
       await apiPost(`/connections/${conn.id}/revoke`, {});
-      setDone("disconnected — the credential is revoked; Connect again any time");
+      setDone("Disconnected — the credential is revoked. Connect again any time.");
       setBusy(false);
     } catch (e) {
       setErr(String(e));
@@ -259,10 +497,7 @@ function ConnectCatalog({ entry, onClose }: { entry: CatalogEntry; onClose: () =
     setErr("");
     setBusy(true);
     try {
-      const r = await apiPost<{ authorize_url: string }>(
-        `/connections/${conn.id}/oauth/start`,
-        {}
-      );
+      const r = await apiPost<{ authorize_url: string }>(`/connections/${conn.id}/oauth/start`, {});
       window.open(r.authorize_url, "_blank", "noopener");
       setBusy(false);
       watchUntilActive(conn.id);
@@ -277,8 +512,8 @@ function ConnectCatalog({ entry, onClose }: { entry: CatalogEntry; onClose: () =
     if (entry.auth_mode === "api_key" && !token.trim()) {
       setErr(
         entry.auth_hints.composite
-          ? `paste the credential as ${entry.auth_hints.composite}`
-          : "a token is required"
+          ? `Paste the credential as ${entry.auth_hints.composite}.`
+          : "A token is required."
       );
       return;
     }
@@ -293,8 +528,8 @@ function ConnectCatalog({ entry, onClose }: { entry: CatalogEntry; onClose: () =
       if (entry.auth_mode !== "oauth") {
         setDone(
           r.bundle
-            ? `bundle ${r.bundle.name}@${r.bundle.version} registered — attach it on an agent revision`
-            : "connected"
+            ? `Bundle ${r.bundle.name}@${r.bundle.version} registered — attach it on an agent revision.`
+            : "Connected."
         );
         setBusy(false);
         return;
@@ -311,175 +546,182 @@ function ConnectCatalog({ entry, onClose }: { entry: CatalogEntry; onClose: () =
   };
 
   return (
-    <div className="overlay" onClick={onClose}>
-      <div className="panel modal" onClick={(e) => e.stopPropagation()}>
-        <div className="mh">
-          <div>
-            <div className="eyebrow" style={{ margin: 0 }}>
-              connect from catalog · {entry.tier}
-            </div>
-            <div style={{ fontFamily: "var(--font-mono)", fontSize: 15, marginTop: 4 }}>
-              {entry.icon ? `${entry.icon} ` : ""}
-              {entry.name}
+    <ModalShell
+      title={`${entry.icon ? `${entry.icon} ` : ""}${entry.name}`}
+      sub={entry.tier === "verified" ? "Verified connector" : `${entry.tier} connector`}
+      onClose={onClose}
+    >
+      <p className="note" style={{ marginTop: 0 }}>
+        {entry.description}
+        {entry.egress.length > 0 && (
+          <span className="faint mono" style={{ display: "block", fontSize: 11, marginTop: 4 }}>
+            egress: {entry.egress.join(", ")}
+          </span>
+        )}
+      </p>
+      {entry.tool_hints.length > 0 && (
+        <p className="helper">
+          Suggested policy seeds (hints only — your policy stays the judge):{" "}
+          {entry.tool_hints.map((h) => `${h.pattern} → ${h.action}`).join(" · ")}
+        </p>
+      )}
+      {done ? (
+        <>
+          <div className="empty" style={{ padding: "18px 0" }}>
+            <Check />
+            <div>{done}</div>
+          </div>
+          <div className="spread">
+            <span />
+            <button className="btn primary" onClick={onClose}>
+              Done
+            </button>
+          </div>
+        </>
+      ) : waiting ? (
+        <div className="empty" style={{ padding: "18px 0" }}>
+          Waiting for authorization in the opened tab…
+        </div>
+      ) : isConnected ? (
+        <>
+          <div className="empty" style={{ padding: "18px 0" }}>
+            <Check />
+            <div>
+              Connected
+              {entry.bundle
+                ? ` — bundle ${entry.bundle.name}@${entry.bundle.version} is registered and attachable.`
+                : " — no bundle registered yet (use Register bundle with this connection)."}
             </div>
           </div>
-          <button className="btn ghost sm" onClick={onClose}>
-            esc
-          </button>
-        </div>
-        <div className="mb">
-          <p className="mut" style={{ fontSize: 12.5, marginTop: 0 }}>
-            {entry.description}
-            {entry.egress.length > 0 && (
-              <span className="mono" style={{ display: "block", fontSize: 11, marginTop: 4 }}>
-                egress: {entry.egress.join(", ")}
-              </span>
+          {err && <div className="err">{err}</div>}
+          <div className="spread" style={{ marginTop: 16 }}>
+            <span className="helper">
+              {entry.auth_mode === "none"
+                ? "Registering again appends the next bundle version."
+                : "Disconnecting revokes the credential; frozen runs keep their snapshots."}
+            </span>
+            {entry.auth_mode === "none" ? (
+              <button className="btn primary" onClick={submit} disabled={busy}>
+                Register again
+              </button>
+            ) : (
+              <button className="btn ghost sm danger" onClick={disconnect} disabled={busy}>
+                Disconnect
+              </button>
             )}
-          </p>
-          {entry.tool_hints.length > 0 && (
-            <p className="mut" style={{ fontSize: 11.5 }}>
-              Suggested policy seeds (untrusted hints — your policy stays the judge):{" "}
-              {entry.tool_hints.map((h) => `${h.pattern} → ${h.action}`).join(" · ")}
-            </p>
+          </div>
+        </>
+      ) : needsReattention && conn ? (
+        <>
+          <div className="empty" style={{ padding: "18px 0" }}>
+            Connection is {conn.status}
+            {conn.status === "error"
+              ? " — the credential needs re-consent."
+              : " — authorization was never completed."}
+          </div>
+          {err && <div className="err">{err}</div>}
+          <div className="spread" style={{ marginTop: 16 }}>
+            <button className="btn ghost sm danger" onClick={disconnect} disabled={busy}>
+              Disconnect
+            </button>
+            {conn.auth_kind === "oauth" ? (
+              <button className="btn primary" onClick={reconnect} disabled={busy}>
+                Reconnect
+              </button>
+            ) : (
+              <span />
+            )}
+          </div>
+        </>
+      ) : (
+        <>
+          {entry.auth_mode === "api_key" && (
+            <label className="field">
+              <span className="lab">
+                {entry.auth_hints.composite
+                  ? `Credential (${entry.auth_hints.composite})`
+                  : "API key"}
+                {entry.auth_hints.key_url ? ` — from ${entry.auth_hints.key_url}` : ""}
+              </span>
+              <input
+                className="inp mono"
+                type="password"
+                placeholder={entry.auth_hints.placeholder || ""}
+                value={token}
+                onChange={(e) => setToken(e.target.value)}
+              />
+            </label>
           )}
-          {done ? (
+          {entry.auth_mode === "oauth" && (
             <>
-              <div className="empty" style={{ padding: "18px 0" }}>
-                ✓ {done}
-              </div>
-              <div className="spread">
-                <span />
-                <button className="btn primary" onClick={onClose}>
-                  Done
-                </button>
-              </div>
-            </>
-          ) : waiting ? (
-            <div className="empty" style={{ padding: "18px 0" }}>
-              waiting for authorization in the opened tab…
-            </div>
-          ) : isConnected ? (
-            <>
-              <div className="empty" style={{ padding: "18px 0" }}>
-                ✓ connected
-                {entry.bundle
-                  ? ` — bundle ${entry.bundle.name}@${entry.bundle.version} is registered and attachable`
-                  : " — no bundle registered yet (use + Register bundle with this connection)"}
-              </div>
-              {err && <div className="err">{err}</div>}
-              <div className="spread" style={{ marginTop: 16 }}>
-                <span className="mut" style={{ fontSize: 12 }}>
-                  {entry.auth_mode === "none"
-                    ? "re-registering appends the next bundle version"
-                    : "disconnecting revokes the credential; frozen runs keep their snapshots"}
-                </span>
-                {entry.auth_mode === "none" ? (
-                  <button className="btn primary" onClick={submit} disabled={busy}>
-                    Register again
-                  </button>
-                ) : (
-                  <button className="btn ghost sm" onClick={disconnect} disabled={busy}>
-                    Disconnect
-                  </button>
-                )}
-              </div>
-            </>
-          ) : needsReattention && conn ? (
-            <>
-              <div className="empty" style={{ padding: "18px 0" }}>
-                connection is {conn.status}
-                {conn.status === "error"
-                  ? " — the credential needs re-consent"
-                  : " — authorization was never completed"}
-              </div>
-              {err && <div className="err">{err}</div>}
-              <div className="spread" style={{ marginTop: 16 }}>
-                <button className="btn ghost sm" onClick={disconnect} disabled={busy}>
-                  Disconnect
-                </button>
-                {conn.auth_kind === "oauth" ? (
-                  <button className="btn primary" onClick={reconnect} disabled={busy}>
-                    Reconnect
-                  </button>
-                ) : (
-                  <span />
-                )}
-              </div>
-            </>
-          ) : (
-            <>
-              {entry.auth_mode === "api_key" && (
-                <label className="field">
-                  <span className="lab">
-                    {entry.auth_hints.composite
-                      ? `Credential (${entry.auth_hints.composite})`
-                      : "API key"}
-                    {entry.auth_hints.key_url ? ` — from ${entry.auth_hints.key_url}` : ""}
-                  </span>
-                  <input
-                    className="inp mono"
-                    type="password"
-                    placeholder={entry.auth_hints.placeholder || ""}
-                    value={token}
-                    onChange={(e) => setToken(e.target.value)}
-                  />
-                </label>
-              )}
-              {entry.auth_mode === "oauth" && (
-                <>
-                  <p className="mut" style={{ fontSize: 12.5 }}>
-                    Connecting opens the provider&apos;s consent page once. fluidbox then
-                    custodies a rotating refresh token (sealed at rest) and mints short-lived
-                    access tokens at call time — nothing ever enters a sandbox.
-                  </p>
-                  <label className="field">
-                    <span className="lab">Pre-registered client id (optional)</span>
-                    <input
-                      className="inp mono"
-                      value={clientId}
-                      onChange={(e) => setClientId(e.target.value)}
-                      placeholder="leave empty to use CIMD/DCR"
-                    />
-                  </label>
-                  <label className="field">
-                    <span className="lab">Client secret (optional, confidential clients)</span>
-                    <input
-                      className="inp mono"
-                      type="password"
-                      value={clientSecret}
-                      onChange={(e) => setClientSecret(e.target.value)}
-                    />
-                  </label>
-                </>
-              )}
+              <p className="helper">
+                Connecting opens the provider&apos;s consent page once. fluidbox then custodies a
+                rotating refresh token (sealed at rest) and mints short-lived access tokens at
+                call time — nothing ever enters a sandbox.
+              </p>
               <label className="field">
-                <span className="lab">Display name (optional)</span>
+                <span className="lab">Pre-registered client id (optional)</span>
                 <input
-                  className="inp"
-                  value={displayName}
-                  onChange={(e) => setDisplayName(e.target.value)}
+                  className="inp mono"
+                  value={clientId}
+                  onChange={(e) => setClientId(e.target.value)}
+                  placeholder="Leave empty to use CIMD/DCR"
                 />
               </label>
-              {err && <div className="err">{err}</div>}
-              <div className="spread" style={{ marginTop: 16 }}>
-                <span className="mut" style={{ fontSize: 12 }}>
-                  {entry.auth_mode === "none"
-                    ? "registers the bundle immediately (photograph now)"
-                    : entry.auth_mode === "api_key"
-                      ? "the key is sealed at rest and proven by the photograph"
-                      : "you will be redirected to authorize once"}
-                </span>
-                <button className="btn primary" onClick={submit} disabled={busy}>
-                  {busy ? "connecting…" : "Connect"}
-                </button>
-              </div>
+              <label className="field">
+                <span className="lab">Client secret (optional, confidential clients)</span>
+                <input
+                  className="inp mono"
+                  type="password"
+                  value={clientSecret}
+                  onChange={(e) => setClientSecret(e.target.value)}
+                />
+              </label>
             </>
           )}
-        </div>
-      </div>
-    </div>
+          <label className="field">
+            <span className="lab">Display name (optional)</span>
+            <input className="inp" value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
+          </label>
+          {err && <div className="err">{err}</div>}
+          <div className="spread" style={{ marginTop: 16 }}>
+            <span className="helper">
+              {entry.auth_mode === "none"
+                ? "Registers the bundle immediately."
+                : entry.auth_mode === "api_key"
+                  ? "The key is sealed at rest and proven by registration."
+                  : "You will be redirected to authorize once."}
+            </span>
+            <button className="btn primary" onClick={submit} disabled={busy}>
+              {busy ? "Connecting…" : "Connect"}
+            </button>
+          </div>
+        </>
+      )}
+    </ModalShell>
   );
 }
+
+/* ─── Register custom bundle ─────────────────────────────────────────── */
+
+const BUNDLE_EXAMPLE = `[
+  {
+    "class": "sandbox",
+    "name": "ws",
+    "command": "node",
+    "args": ["/opt/fluidbox-runner/servers/workspace-info.mjs"],
+    "tools": [
+      { "name": "workspace_file_count", "description": "Count files in the workspace",
+        "input_schema": { "type": "object", "properties": {} } }
+    ]
+  },
+  {
+    "class": "brokered",
+    "name": "kb",
+    "url": "https://mcp.example.com/mcp",
+    "connection_id": "<mcp_http connection id, omit if the server needs no credential>"
+  }
+]`;
 
 function NewBundle({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
   const [name, setName] = useState("");
@@ -491,14 +733,14 @@ function NewBundle({ onClose, onCreated }: { onClose: () => void; onCreated: () 
   const submit = async () => {
     setErr("");
     if (!name.trim()) {
-      setErr("name is required");
+      setErr("A name is required.");
       return;
     }
     let parsed: unknown;
     try {
       parsed = JSON.parse(servers);
     } catch (e) {
-      setErr(`servers is not valid JSON: ${String(e)}`);
+      setErr(`Servers is not valid JSON: ${String(e)}`);
       return;
     }
     setBusy(true);
@@ -516,66 +758,41 @@ function NewBundle({ onClose, onCreated }: { onClose: () => void; onCreated: () 
   };
 
   return (
-    <div className="overlay" onClick={onClose}>
-      <div className="panel modal" onClick={(e) => e.stopPropagation()}>
-        <div className="mh">
-          <div>
-            <div className="eyebrow" style={{ margin: 0 }}>
-              register bundle version
-            </div>
-            <div style={{ fontFamily: "var(--font-mono)", fontSize: 15, marginTop: 4 }}>
-              append-only, like agent revisions
-            </div>
-          </div>
-          <button className="btn ghost sm" onClick={onClose}>
-            esc
-          </button>
-        </div>
-        <div className="mb">
-          <p className="mut" style={{ fontSize: 12.5, marginTop: 0 }}>
-            Registering an existing name appends the next version; pinned attachments keep the old
-            one (§17 #7). Brokered servers are contacted NOW to photograph their tools — declare
-            tools only for sandbox servers. Credentials come from mcp_http connections; they are
-            never stored here and never enter a sandbox.
-          </p>
-          <label className="field">
-            <span className="lab">Name</span>
-            <input
-              className="inp mono"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="kb-tools"
-            />
-          </label>
-          <label className="field">
-            <span className="lab">Description (optional)</span>
-            <input
-              className="inp"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-            />
-          </label>
-          <label className="field">
-            <span className="lab">Servers (JSON array)</span>
-            <textarea
-              className="inp mono"
-              style={{ minHeight: 180, fontSize: 11.5 }}
-              value={servers}
-              onChange={(e) => setServers(e.target.value)}
-              placeholder={EXAMPLE}
-            />
-          </label>
-          {err && <div className="err">{err}</div>}
-          <div className="spread" style={{ marginTop: 16 }}>
-            <span className="mut" style={{ fontSize: 12 }}>
-              brokered servers are discovered &amp; validated before storage
-            </span>
-            <button className="btn primary" onClick={submit} disabled={busy}>
-              {busy ? "photographing…" : "Register"}
-            </button>
-          </div>
-        </div>
+    <ModalShell
+      title="Register bundle version"
+      sub="Append-only, like agent revisions — registering an existing name appends the next version."
+      onClose={onClose}
+    >
+      <p className="helper" style={{ marginTop: 0 }}>
+        Brokered servers are contacted now to photograph their tools — declare tools only for
+        sandbox servers. Credentials come from mcp_http connections; they are never stored here
+        and never enter a sandbox.
+      </p>
+      <label className="field">
+        <span className="lab">Name</span>
+        <input className="inp mono" value={name} onChange={(e) => setName(e.target.value)} placeholder="kb-tools" />
+      </label>
+      <label className="field">
+        <span className="lab">Description (optional)</span>
+        <input className="inp" value={description} onChange={(e) => setDescription(e.target.value)} />
+      </label>
+      <label className="field">
+        <span className="lab">Servers (JSON array)</span>
+        <textarea
+          className="inp mono"
+          style={{ minHeight: 180, fontSize: 11.5 }}
+          value={servers}
+          onChange={(e) => setServers(e.target.value)}
+          placeholder={BUNDLE_EXAMPLE}
+        />
+      </label>
+      {err && <div className="err">{err}</div>}
+      <div className="spread" style={{ marginTop: 16 }}>
+        <span className="helper">Brokered servers are discovered &amp; validated before storage.</span>
+        <button className="btn primary" onClick={submit} disabled={busy}>
+          {busy ? "Photographing…" : "Register"}
+        </button>
       </div>
-    </div>
+    </ModalShell>
   );
 }

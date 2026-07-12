@@ -1,33 +1,48 @@
-import type { Metadata } from "next";
-import { IBM_Plex_Sans, IBM_Plex_Mono } from "next/font/google";
+import type { Metadata, Viewport } from "next";
+import { Geist, Geist_Mono, Newsreader } from "next/font/google";
 import "./globals.css";
-import { Rail } from "./components/Rail";
+import { Sidebar } from "./components/Sidebar";
 
-const plexSans = IBM_Plex_Sans({
-  variable: "--font-plex-sans",
+const geistSans = Geist({
+  variable: "--font-geist-sans",
   subsets: ["latin"],
-  weight: ["400", "500", "600"],
 });
 
-const plexMono = IBM_Plex_Mono({
-  variable: "--font-plex-mono",
+const geistMono = Geist_Mono({
+  variable: "--font-geist-mono",
   subsets: ["latin"],
-  weight: ["400", "500", "600"],
+});
+
+const newsreader = Newsreader({
+  variable: "--font-newsreader",
+  subsets: ["latin"],
+  weight: ["400", "500"],
 });
 
 export const metadata: Metadata = {
-  title: "fluidbox — control plane",
-  description: "Govern AI coding agents in disposable sandboxes.",
+  title: {
+    default: "fluidbox — control plane",
+    template: "%s · fluidbox",
+  },
+  description: "Run AI coding agents in governed, disposable sandboxes.",
+};
+
+export const viewport: Viewport = {
+  colorScheme: "light",
+  themeColor: "#f5f4f0",
 };
 
 export default function RootLayout({
   children,
 }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="en" className={`${plexSans.variable} ${plexMono.variable}`}>
+    <html
+      lang="en"
+      className={`${geistSans.variable} ${geistMono.variable} ${newsreader.variable}`}
+    >
       <body>
         <div className="shell">
-          <Rail />
+          <Sidebar />
           <main className="main">{children}</main>
         </div>
       </body>
