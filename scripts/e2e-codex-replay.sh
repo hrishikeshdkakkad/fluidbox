@@ -19,8 +19,8 @@ rno(){ printf "    \033[1;31m✗\033[0m %s\n" "$1"; rf=$((rf+1)); }
 # NDJSON and record every {decision} reply the supervisor sends back.
 cat > "$SB/replay/fake-codex" <<'FAKE'
 #!/usr/bin/env node
+import fs from "node:fs";
 if (process.argv[2] !== "app-server") { console.log("codex-cli 0.144.1"); process.exit(0); }
-const fs = require("fs");
 const OUT = process.env.FAKE_OUT || "/out/replies.jsonl";
 let buf = "", nextId = 100;
 const send = (o) => process.stdout.write(JSON.stringify(o) + "\n");
@@ -70,14 +70,15 @@ function finish() {
 FAKE
 chmod +x "$SB/replay/fake-codex"
 : > "$SB/replay/replies.jsonl"
+chmod -R 0777 "$SB/replay"  # the runner uid (10001) writes replies to /out
 
 # A codex session (for a real token + a ledger to assert against). Kill the
 # orchestrator's real container; we run our OWN with the fake codex.
 SID=$(curl -s -X POST -H "$H" -H 'content-type: application/json' \
   -d '{"agent":"codex-fixer","task":"replay","repo":{"kind":"none"},"autonomous":true}' "$API/v1/sessions" | j "['session']['id']")
-for _ in $(seq 1 30); do C=$(docker ps --filter "label=fluidbox.session=$SID" --format '{{.ID}}' | head -1); [ -n "$C" ] && break; sleep 1; done
+for _ in $(seq 1 100); do C=$(docker ps -a --filter "label=fluidbox.session=$SID" --format '{{.ID}}' | head -1); [ -n "$C" ] && break; sleep 0.15; done
+docker kill "$C" >/dev/null 2>&1  # kill FAST before the real supervisor terminalizes the session
 TOK=$(docker inspect "$C" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | grep '^FLUIDBOX_SESSION_TOKEN=' | cut -d= -f2-)
-docker kill "$C" >/dev/null 2>&1
 [ -n "$TOK" ] || { rno "no session token for replay"; exit 1; }
 
 # Run the real supervisor in a manual container: fake codex shadows the real
@@ -102,15 +103,15 @@ dec(){ grep "\"label\":\"$1\"" "$R" | head -1 | python3 -c "import sys,json;prin
 
 # the move destination reached the gate (canonical MultiEdit ledgered with .env)
 EV=$(curl -s -H "$H" "$API/v1/sessions/$SID/events?limit=500")
-echo "$EV" | python3 -c "
+LEDGER=$(echo "$EV" | python3 -c "
 import sys,json; evs=json.load(sys.stdin)['events']
 req=[e['payload']['data'] for e in evs if e['type']=='tool.requested']
 bash=[r for r in req if r.get('tool')=='Bash']
 me=[r for r in req if r.get('tool')=='MultiEdit']
-# canonical Bash names present; the move-dest .env visible in a MultiEdit summary
-print('BASH' if bash else 'NOBASH')
-print('MOVEDEST' if any('.env' in (r.get('summary') or '') for r in me) else 'NOMOVEDEST')
-" | { read a; read b; [ "$a" = "BASH" ] && rok "canonical Bash tool.requested ledgered" || rno "no canonical Bash in ledger"; [ "$b" = "MOVEDEST" ] && rok "move destination (/workspace/.env) reached the gate" || rno "move dest not in ledger"; }
+print(('BASH ' if bash else '')+('MOVEDEST' if any('.env' in (r.get('summary') or '') for r in me) else ''))
+")
+echo "$LEDGER" | grep -q BASH && rok "canonical Bash tool.requested ledgered" || rno "no canonical Bash in ledger"
+echo "$LEDGER" | grep -q MOVEDEST && rok "move destination (/workspace/.env) reached the gate" || rno "move dest not in ledger"
 
 printf "  replay: \033[1;32m%d passed\033[0m, \033[1;31m%d failed\033[0m\n" "$rp" "$rf"
 exit $(( rf > 0 ? 1 : 0 ))
