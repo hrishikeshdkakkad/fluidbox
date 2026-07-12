@@ -218,7 +218,9 @@ impl Default for Redactor {
     fn default() -> Self {
         let raw = [
             r"sk-ant-[A-Za-z0-9_\-]{8,}",     // Anthropic keys / oauth tokens
+            r"sk-proj-[A-Za-z0-9_\-]{16,}",   // OpenAI project keys (hyphenated — not caught below)
             r"sk-[A-Za-z0-9]{20,}",           // OpenAI-style keys
+            r"fbx_(sess|trig)_[A-Za-z0-9]{8,}", // fluidbox session / trigger tokens
             r"ghp_[A-Za-z0-9]{20,}",          // GitHub PAT
             r"github_pat_[A-Za-z0-9_]{20,}",  // GitHub fine-grained PAT
             r"gho_[A-Za-z0-9]{20,}",          // GitHub OAuth
@@ -355,5 +357,22 @@ mod tests {
         let r = Redactor::default();
         let s = r.scrub_text("postgresql://user:supersecret@host/db");
         assert!(!s.contains("supersecret"));
+    }
+
+    #[test]
+    fn redactor_scrubs_openai_project_keys_and_session_tokens() {
+        let r = Redactor::default();
+        // OpenAI project keys are hyphenated after `sk-proj-`, which the
+        // plain `sk-[alnum]{20,}` rule does NOT catch (it stops at the first
+        // hyphen). The explicit rule must.
+        let s = r.scrub_text("OPENAI_API_KEY=sk-proj-AbCd1234_EfGh5678-IjKl9012MnOp done");
+        assert!(!s.contains("sk-proj-AbCd1234"), "openai project key leaked: {s}");
+        assert!(s.contains("‹redacted›"));
+        // The fluidbox session token (which IS the sandbox's fake key) and a
+        // trigger token must never survive into the ledger if they leak into
+        // a summary or agent message.
+        let s = r.scrub_text("token fbx_sess_0a1b2c3d4e5f6a7b and fbx_trig_deadbeefcafe0000");
+        assert!(!s.contains("fbx_sess_0a1b2c3d"), "session token leaked: {s}");
+        assert!(!s.contains("fbx_trig_deadbeef"), "trigger token leaked: {s}");
     }
 }
