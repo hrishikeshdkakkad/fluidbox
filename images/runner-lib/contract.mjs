@@ -102,11 +102,12 @@ export class RunnerClient {
     this.env = env;
     this.heartbeatTimer = null;
     this.renewTimer = null;
-    // TTL-aware renewal: the server mints ~3h tokens and caps each renew at
-    // ~3h, so renew every 90 min — comfortably ahead of expiry even across a
-    // long supervised approval wait, and a no-op (renewed:false) once the
-    // session goes terminal (the server revokes tokens then).
-    this.renewIntervalMs = 90 * 60 * 1000;
+    // Renewal cadence: the server mints ~3h tokens and caps each renew at 3h,
+    // so a 45-min success cadence keeps ≥2 full failed cycles of runway; a
+    // transient failure reschedules in 2 min (well before any deadline), not
+    // a full interval later.
+    this.renewOkMs = 45 * 60 * 1000;
+    this.renewRetryMs = 2 * 60 * 1000;
   }
 
   sessionBase() {
@@ -130,12 +131,18 @@ export class RunnerClient {
         clearTimeout(timer);
         if (!res.ok) {
           const text = await res.text().catch(() => "");
-          throw new Error(`${url} → HTTP ${res.status}: ${text}`);
+          const err = new Error(`${url} → HTTP ${res.status}: ${text}`);
+          err.status = res.status;
+          throw err;
         }
         return res.status === 204 ? null : await res.json().catch(() => null);
       } catch (e) {
         clearTimeout(timer);
-        if (attempt >= retries) throw e;
+        // A 4xx will never succeed on retry — surface it immediately (a
+        // revoked token, a terminal session, a bad request). Only network /
+        // 5xx errors are worth retrying.
+        const clientError = e.status >= 400 && e.status < 500;
+        if (clientError || attempt >= retries) throw e;
         await sleep(Math.min(2000 * (attempt + 1), 8000));
       }
     }
@@ -177,28 +184,43 @@ export class RunnerClient {
   }
 
   /// Renew the session token ahead of expiry so a long autonomous run never
-  /// loses its facade/gateway access mid-flight. Independent of the heartbeat
-  /// and never coupled to an approval wait. Stops on its own once the server
-  /// reports the token can no longer be renewed (terminal session).
+  /// loses its facade/gateway access mid-flight. A SELF-RESCHEDULING loop
+  /// (not a fixed interval): an immediate startup renew removes mint-to-launch
+  /// skew, a success reschedules at the 45-min cadence, a transient failure
+  /// reschedules in 2 min (well before the deadline), and a terminal (400) or
+  /// revoked/unauthorized (401/403) response stops it PERMANENTLY — the run
+  /// is over. Independent of the heartbeat and never coupled to an approval
+  /// wait; the timer is unref'd so it never keeps the process alive.
   startTokenRenew() {
     const url = `${this.env.CONTROL.replace(/\/$/, "")}/internal/token/renew`;
-    this.renewTimer = setInterval(async () => {
+    const schedule = (ms) => {
+      this.renewTimer = setTimeout(tick, ms);
+      this.renewTimer.unref?.();
+    };
+    const tick = async () => {
       try {
-        const res = await this.#post(url, { ttl_secs: 3 * 3600 }, { retries: 2 });
+        const res = await this.#post(url, { ttl_secs: 3 * 3600 }, { retries: 1 });
         if (res && res.renewed === false) {
-          // Terminal or revoked — nothing left to renew.
-          this.stopTokenRenew();
+          this.stopTokenRenew(); // revoked in a race — nothing left to renew
+          return;
         }
+        schedule(this.renewOkMs);
       } catch (e) {
-        console.error("fluidbox-runner: token renew failed (will retry):", e.message);
+        if (e.status === 400 || e.status === 401 || e.status === 403) {
+          // Terminal session or revoked token — the run is over. Stop.
+          this.stopTokenRenew();
+          return;
+        }
+        console.error("fluidbox-runner: token renew failed (retrying soon):", e.message);
+        schedule(this.renewRetryMs);
       }
-    }, this.renewIntervalMs);
-    this.renewTimer.unref?.();
+    };
+    schedule(0); // immediate startup renew
   }
 
   stopTokenRenew() {
     if (this.renewTimer) {
-      clearInterval(this.renewTimer);
+      clearTimeout(this.renewTimer);
       this.renewTimer = null;
     }
   }
@@ -211,11 +233,24 @@ export class RunnerClient {
   }
 
   async postResult(outcome, summary) {
-    await this.#post(
-      `${this.sessionBase()}/result`,
-      { outcome, summary: (summary || "").slice(0, 4000) },
-      { retries: 5 },
-    );
+    try {
+      await this.#post(
+        `${this.sessionBase()}/result`,
+        { outcome, summary: (summary || "").slice(0, 4000) },
+        { retries: 5 },
+      );
+    } catch (e) {
+      // A revoked/unauthorized token at result time means the session already
+      // went terminal — which is exactly what /result achieves. The first
+      // POST lands with a live token and terminalizes the run; only a
+      // lost-response RETRY can arrive after the terminal-transition revoke.
+      // Treat that as an ack so a completed run's exit code never flips to 1.
+      if (e.status === 401 || e.status === 403) {
+        console.error("fluidbox-runner: /result token revoked — session already terminal, ack");
+        return;
+      }
+      throw e;
+    }
   }
 }
 
