@@ -37,10 +37,15 @@ new_codex_session() { # autonomy trust -> session id
     -d "{\"agent\":\"codex-fixer\",\"task\":\"codex probe\",\"repo\":{\"kind\":\"none\"},\"autonomous\":$1,\"trust_tier\":\"$2\"}" \
     "$API/v1/sessions" | j "['session']['id']"
 }
-tok_for() { # session -> token
+tok_for() { # session -> token  (grab FAST + kill: the codex container fails at
+  # the model (no gpt key in tier-1) and terminalizes/revokes quickly).
   local sid=$1 cid
-  for _ in $(seq 1 30); do cid=$(docker ps --filter "label=fluidbox.session=$sid" --format '{{.ID}}' | head -1); [ -n "$cid" ] && break; sleep 1; done
+  for _ in $(seq 1 100); do
+    cid=$(docker ps -a --filter "label=fluidbox.session=$sid" --format '{{.ID}}' | head -1)
+    [ -n "$cid" ] && break; sleep 0.15
+  done
   [ -z "$cid" ] && { echo ""; return; }
+  docker kill "$cid" >/dev/null 2>&1  # silence the real supervisor before it can /result
   docker inspect "$cid" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^FLUIDBOX_SESSION_TOKEN=' | head -1 | cut -d= -f2-
 }
 perm() { curl -s -X POST -H "authorization: Bearer $1" -H 'content-type: application/json' -d "$3" "$API/internal/sessions/$2/permission"; }

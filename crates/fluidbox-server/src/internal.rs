@@ -679,6 +679,17 @@ fn summarize(tool: &str, input: &Value) -> String {
     if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
         return cmd.chars().take(200).collect();
     }
+    // MultiEdit / codex apply_patch: list the edited file paths (so the
+    // timeline + audit show WHICH files — incl. a move destination).
+    if let Some(edits) = input.get("edits").and_then(|v| v.as_array()) {
+        let paths: Vec<&str> = edits
+            .iter()
+            .filter_map(|e| e.get("file_path").and_then(|v| v.as_str()))
+            .collect();
+        if !paths.is_empty() {
+            return format!("{tool}: {}", paths.join(", ")).chars().take(200).collect();
+        }
+    }
     for k in ["file_path", "path", "pattern"] {
         if let Some(s) = input.get(k).and_then(|v| v.as_str()) {
             return format!("{tool}: {s}");
