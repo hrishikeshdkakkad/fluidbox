@@ -12,6 +12,7 @@ mod error;
 mod events;
 mod facade;
 mod github_app;
+mod harness;
 mod internal;
 mod ledger;
 mod oauth;

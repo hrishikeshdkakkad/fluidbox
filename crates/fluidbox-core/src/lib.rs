@@ -2,7 +2,9 @@
 //!
 //! No I/O lives here: the state machine, the canonical event schema, the
 //! policy engine (including autonomy resolution), redaction, usage/cost
-//! types, and the extension traits (`ExecutionProvider`, `Harness`).
+//! types, and the execution-provider extension trait (`ExecutionProvider`).
+//! There is deliberately no `Harness` trait — a harness is a runner image
+//! implementing the HTTP runner contract (see `fluidbox-server::harness`).
 
 pub mod capability;
 pub mod event;

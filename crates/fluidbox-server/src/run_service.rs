@@ -91,6 +91,17 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
                 ))
             })?,
     };
+    // Fail closed at zero spend: a RunSpec only ever freezes a harness the
+    // registry knows. Rows predating harness validation (or edited out of
+    // band) refuse here rather than launching an image with no contract.
+    if !crate::harness::is_known(&rev.harness) {
+        return Err(ApiError::UnprocessableEntity(format!(
+            "revision harness '{}' is not a known harness ({})",
+            rev.harness,
+            crate::harness::KNOWN.join(", ")
+        )));
+    }
+
     let policy_row = fluidbox_db::get_policy(&state.pool, rev.policy_id)
         .await?
         .ok_or_else(|| ApiError::Internal("revision policy missing".into()))?;

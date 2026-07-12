@@ -22,6 +22,10 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub sandbox_image: String,
     pub default_model: String,
+    /// Runner image for `codex` agents (the second harness).
+    pub codex_sandbox_image: String,
+    /// Default model for `codex` agents (the haiku-analog cost directive).
+    pub default_codex_model: String,
     /// Facade upstream: LiteLLM (default) or api.anthropic.com (fallback).
     pub llm_upstream_url: String,
     /// Key the facade presents to LiteLLM. For the direct-Anthropic fallback
@@ -75,6 +79,10 @@ impl Config {
                 .unwrap_or_else(|_| "fluidbox-sandbox-runner:dev".into()),
             default_model: get("FLUIDBOX_DEFAULT_MODEL")
                 .unwrap_or_else(|_| "claude-haiku-4-5".into()),
+            codex_sandbox_image: get("FLUIDBOX_CODEX_SANDBOX_IMAGE")
+                .unwrap_or_else(|_| "fluidbox-codex-runner:dev".into()),
+            default_codex_model: get("FLUIDBOX_DEFAULT_CODEX_MODEL")
+                .unwrap_or_else(|_| "gpt-5.4-mini".into()),
             llm_upstream_url: upstream,
             llm_upstream_key: upstream_key,
             llm_upstream_is_anthropic: is_anthropic,
