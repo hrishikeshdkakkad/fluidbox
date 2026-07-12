@@ -17,6 +17,7 @@
 // token as a fake provider key; the real key lives only in the gateway.
 
 import crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -29,11 +30,12 @@ export function requireEnv(k) {
   return v;
 }
 
-// Absolute path of the shims inside every runner image (both Dockerfiles copy
-// runner-lib/ here). Passed to the harness's MCP wiring.
-export const RUNNER_LIB_DIR = "/opt/fluidbox-runner/lib";
-export const BROKER_SHIM = `${RUNNER_LIB_DIR}/broker-shim.mjs`;
-export const SANDBOX_GATE_SHIM = `${RUNNER_LIB_DIR}/sandbox-gate-shim.mjs`;
+// Shim paths, derived from THIS module's own location — so they resolve
+// correctly no matter where each image installs the lib (the claude image at
+// /opt/fluidbox-runner/lib, the codex image at /opt/fluidbox-codex/lib).
+export const RUNNER_LIB_DIR = fileURLToPath(new URL(".", import.meta.url)).replace(/\/$/, "");
+export const BROKER_SHIM = fileURLToPath(new URL("./broker-shim.mjs", import.meta.url));
+export const SANDBOX_GATE_SHIM = fileURLToPath(new URL("./sandbox-gate-shim.mjs", import.meta.url));
 
 /// Parse the shared FLUIDBOX_* env into one object. CAPABILITIES is the
 /// FROZEN manifest (the control plane already stripped broker internals — no
@@ -173,6 +175,13 @@ export class RunnerClient {
           timeoutMs: 12 * 60 * 1000,
         });
       } catch (e) {
+        // A terminal 401/403 means the session is gone (token revoked on the
+        // terminal transition) — retrying forever would hang the runner. Treat
+        // it as a hard DENY and stop.
+        if (e.status === 401 || e.status === 403) {
+          console.error("fluidbox-runner: permission rejected (session terminal) — deny");
+          return { decision: "deny", message: "session is not active" };
+        }
         console.error(`fluidbox-runner: permission attempt ${attempt} failed:`, e.message);
         await sleep(Math.min(2000 * (attempt + 1), 10000));
       }
