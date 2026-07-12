@@ -4,7 +4,7 @@
 # BUILD CONTEXT = images/ (shared with the codex runner), so this Dockerfile
 # reaches both sandbox-runner/ and the shared runner-lib/. Build with:
 #   docker build -t <img> -f images/sandbox-runner/Dockerfile images
-FROM node:24-bookworm-slim
+FROM node:26-bookworm-slim
 
 # Toolchain the agent needs to actually do coding work.
 RUN apt-get update && apt-get install -y --no-install-recommends \
