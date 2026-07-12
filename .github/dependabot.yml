@@ -15,6 +15,11 @@ updates:
     groups:
       web-minor-patch:
         update-types: ["minor", "patch"]
+    ignore:
+      # Keep @types/node aligned with the runtime major used in CI and the
+      # runner images — type-only bumps past the runtime invite phantom APIs.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: /
@@ -27,3 +32,8 @@ updates:
       - /images/codex-runner
     schedule:
       interval: weekly
+    ignore:
+      # Runner images track Node LTS; CI does not build these images, so a
+      # major base bump needs a local `just e2e` pass — take them manually.
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]
