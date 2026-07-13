@@ -32,14 +32,15 @@ Coding agents are powerful and unaccountable: they run with your credentials, on
 
 ## Quickstart
 
-Prerequisites: [Rust](https://rustup.rs) (stable), [Docker](https://docs.docker.com/get-docker/), [just](https://github.com/casey/just), [pnpm](https://pnpm.io), and a free [Neon](https://neon.tech) Postgres database.
+Prerequisites: [Rust](https://rustup.rs) (stable), [Docker](https://docs.docker.com/get-docker/), [just](https://github.com/casey/just), [pnpm](https://pnpm.io) + Node 24, and a free [Neon](https://neon.tech) account (or any direct-connection Postgres).
 
 ```bash
 git clone https://github.com/hrishikeshdkakkad/fluidbox.git
 cd fluidbox
-cp .env.example .env        # fill in DATABASE_URL, ANTHROPIC_API_KEY, tokens
-just neon-setup             # or bring your own Postgres (direct connection string)
-just sandbox-build          # build the sandbox runner image
+just setup                  # checks tools, writes .env with generated secrets, wires the
+                            # dashboard, installs deps, builds the sandbox runner image
+just neon-setup             # provisions a free Neon Postgres and writes DATABASE_URL into .env
+$EDITOR .env                # add your ANTHROPIC_API_KEY — the one secret setup can't generate
 just dev                    # LiteLLM gateway + Rust server + dashboard
 ```
 
@@ -49,7 +50,19 @@ Then open <http://localhost:3000>, or drive a run from the CLI:
 cargo run -p fluidbox-cli -- run --repo /path/to/repo --task "fix the failing test"
 ```
 
-Every knob is documented inline in [`.env.example`](./.env.example).
+Something not working? **`just doctor`** checks every documented gotcha (pooled vs direct connection string, loopback bind, credential key shape, missing images, dashboard token sync) and prints the exact fix for anything wrong. Every knob is documented inline in [`.env.example`](./.env.example).
+
+### Everyday commands
+
+| Command | What it does |
+|---------|--------------|
+| `just dev` | LiteLLM gateway + Rust server + dashboard, one ctrl-c stops all |
+| `just doctor` | validate the local environment; every ✗ prints its fix |
+| `just check` | the full quality bar: fmt + clippy `-D warnings` + tests + web build |
+| `just e2e` | full acceptance suite (owns port 8787 — stop `just dev` first) |
+| `just db` / `just db-clean` | psql into the database / prune e2e cruft (dry-run by default) |
+| `just sandbox-build` / `just codex-build` | rebuild the runner images after editing `images/` |
+| `just policy-sync` | push `policies/*.yaml` to the running control plane |
 
 ## Architecture
 

@@ -35,16 +35,21 @@ These are locked project decisions, not style preferences:
 ```bash
 git clone https://github.com/hrishikeshdkakkad/fluidbox.git
 cd fluidbox
-cp .env.example .env    # every variable is documented inline
-just neon-setup         # provisions a Neon project, prints the DIRECT connection string
-just sandbox-build      # build the Claude sandbox runner image
+just setup              # tools check → .env with generated secrets → dashboard env
+                        # (apps/web/.env.local) → pnpm install → sandbox runner image
+just neon-setup         # provisions a Neon project, writes the DIRECT string into .env
+$EDITOR .env            # add ANTHROPIC_API_KEY (optional — live phases self-skip without it)
 just dev                # LiteLLM gateway + Rust server + dashboard
 ```
 
-Environment gotchas that cost real debugging time are documented in `.env.example` — read the comments before changing values. The two most common traps:
+`just setup` is idempotent — re-run it anytime; it only fills placeholders and never overwrites values you set. When anything misbehaves, run **`just doctor`**: it validates every documented gotcha and prints the exact fix per failure.
+
+The traps doctor checks for (all documented inline in `.env.example`):
 
 - `DATABASE_URL` must be the **direct** (non-`-pooler`) Neon connection string. PgBouncer transaction mode breaks sqlx prepared statements and `LISTEN/NOTIFY`.
 - `FLUIDBOX_BIND` must stay `0.0.0.0:8787` — sandboxes reach the control plane through `host.docker.internal`, which cannot reach a loopback bind.
+- `FLUIDBOX_CREDENTIAL_KEY` must decode to 32 bytes, or Connections and event ingress are silently disabled.
+- The dashboard proxy reads `FLUIDBOX_ADMIN_TOKEN` from `apps/web/.env.local` (injected server-side, never exposed to the browser) — if it drifts from `.env`, every dashboard request 401s. `just setup` keeps the two in sync.
 
 ## Quality bar
 
@@ -58,8 +63,10 @@ just e2e      # full acceptance suite — run it if you touched the permission/a
 Notes:
 
 - `cargo test -p fluidbox-core` is fast and needs no database.
-- `cargo test -p fluidbox-db` (and the workspace run) hit a real Postgres via `DATABASE_URL`; the tests **self-skip** when it's absent, so a missing database won't fail you locally — but write DB tests so they keep that property.
-- `just e2e` owns the full stack (needs port 8787 free — stop `just dev` first). The live-agent phase self-skips without `ANTHROPIC_API_KEY`.
+- `cargo test -p fluidbox-db` (and the workspace run) hit a real Postgres via `DATABASE_URL`; the tests **self-skip** when it's absent, so a missing database won't fail you locally — but write DB tests so they keep that property. Two consequences worth knowing:
+  - Cargo doesn't read `.env`, so export it first: `set -a; source .env; set +a`. A DB test run that finishes in well under a second skipped; a real run takes noticeably longer.
+  - **Stop the dev server before DB tests** — its scheduler worker fires test subscriptions' due schedules against the same database and pollutes assertions.
+- `just e2e` owns the full stack (needs port 8787 free — stop `just dev` first). The live-agent phase self-skips without `ANTHROPIC_API_KEY`; the codex live tier self-skips without `OPENAI_API_KEY`. Afterwards, `just db-clean` prunes the run history and test fixtures the suite leaves behind (dry-run by default; `just db-clean apply` commits).
 - Behavior changes need tests. Bug fixes need a regression test that fails without the fix.
 
 ## Making changes
