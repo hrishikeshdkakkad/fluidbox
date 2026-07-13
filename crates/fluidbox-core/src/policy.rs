@@ -792,3 +792,240 @@ tools:
         .is_err());
     }
 }
+
+/// Property tests: the security invariants the example-based tests above pin
+/// point-wise, asserted over generated policies and adversarial inputs.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use crate::spec::Autonomy;
+    use proptest::prelude::*;
+    use serde_json::json;
+
+    fn arb_action() -> impl Strategy<Value = RuleAction> {
+        prop_oneof![
+            Just(RuleAction::Allow),
+            Just(RuleAction::Approve),
+            Just(RuleAction::Deny),
+        ]
+    }
+
+    fn arb_fallback() -> impl Strategy<Value = AutonomousFallback> {
+        prop_oneof![
+            Just(AutonomousFallback::Deny),
+            Just(AutonomousFallback::Allow)
+        ]
+    }
+
+    /// Tool names as agents actually send them, plus arbitrary unknown ones.
+    fn arb_tool() -> impl Strategy<Value = String> {
+        prop_oneof![
+            prop::sample::select(vec![
+                "Read",
+                "Glob",
+                "Grep",
+                "LS",
+                "Bash",
+                "Edit",
+                "Write",
+                "MultiEdit",
+                "WebFetch",
+                "mcp__kb__search",
+                "mcp__ws__file_count",
+            ])
+            .prop_map(str::to_string),
+            "[A-Za-z][A-Za-z0-9_]{0,16}",
+        ]
+    }
+
+    /// Match patterns: exact names, `prefix*` wildcards, or the universal `*`.
+    fn arb_pattern() -> impl Strategy<Value = String> {
+        prop_oneof![
+            arb_tool(),
+            "[A-Za-z][A-Za-z0-9_]{0,6}".prop_map(|p| format!("{p}*")),
+            Just("*".to_string()),
+        ]
+    }
+
+    fn arb_shell() -> impl Strategy<Value = ShellRules> {
+        (
+            prop::collection::vec(
+                prop::sample::select(vec!["ls", "git status", "pytest", "python3", "rm"])
+                    .prop_map(str::to_string),
+                0..3,
+            ),
+            prop::collection::vec(
+                prop::sample::select(vec![r"rm\s+-rf\s+/", r"\bcurl\b", r"\bwget\b"])
+                    .prop_map(str::to_string),
+                0..3,
+            ),
+            arb_action(),
+        )
+            .prop_map(|(allow_prefixes, deny_regex, on_no_match)| ShellRules {
+                allow_prefixes,
+                deny_regex,
+                on_no_match,
+            })
+    }
+
+    fn arb_rule() -> impl Strategy<Value = ToolRule> {
+        (
+            prop::collection::vec(arb_pattern(), 1..3),
+            arb_action(),
+            prop::option::of(arb_shell()),
+            prop::bool::ANY,
+            prop::option::of(arb_fallback()),
+        )
+            .prop_map(|(m, action, shell, with_paths, on_autonomous)| ToolRule {
+                r#match: m,
+                action,
+                risk: None,
+                paths: with_paths.then(|| PathRules {
+                    allow: vec!["/workspace/**".into()],
+                    deny: vec!["**/.env".into()],
+                }),
+                shell,
+                on_autonomous,
+                approval_ttl_secs: None,
+                approval_scope: None,
+            })
+    }
+
+    fn arb_policy() -> impl Strategy<Value = Policy> {
+        (
+            prop::collection::vec(arb_rule(), 0..5),
+            arb_action(),
+            arb_fallback(),
+        )
+            .prop_map(|(tools, default_action, on_approval_rule)| Policy {
+                name: "prop".into(),
+                defaults: PolicyDefaults {
+                    tool_action: default_action,
+                },
+                egress: Egress::default(),
+                budgets: crate::spec::Budgets::default(),
+                approvals: ApprovalSettings::default(),
+                autonomy: AutonomySettings {
+                    permitted: true,
+                    on_approval_rule,
+                },
+                tools,
+            })
+    }
+
+    /// Arbitrary printable inputs in the shapes the gate actually receives.
+    fn arb_input() -> impl Strategy<Value = serde_json::Value> {
+        prop_oneof![
+            "[ -~]{0,40}".prop_map(|c| json!({ "command": c })),
+            "[ -~]{0,40}".prop_map(|p| json!({ "file_path": p })),
+            Just(json!({})),
+        ]
+    }
+
+    fn req(tool: String, input: serde_json::Value) -> ToolCallRequest {
+        ToolCallRequest { tool, input }
+    }
+
+    proptest! {
+        /// Invariant #6 (autonomous ≠ ungoverned, but also ≠ stuck): an
+        /// autonomous evaluation NEVER surfaces RequireApproval — the engine
+        /// rewrites it before it can leave, so an unattended run cannot hang
+        /// waiting for a human that isn't there.
+        #[test]
+        fn autonomous_never_requires_approval(
+            p in arb_policy(), tool in arb_tool(), input in arb_input()
+        ) {
+            let out = p.evaluate(&req(tool, input), Autonomy::Autonomous);
+            let requires_approval = matches!(out.effective, Verdict::RequireApproval { .. });
+            prop_assert!(!requires_approval);
+        }
+
+        /// Autonomy resolution touches EXACTLY the approval verdicts: Allow
+        /// and Deny pass through untouched, approvals are rewritten with the
+        /// flag set, and the supervised verdict is always preserved as
+        /// `original` (both are ledgered — the audit trail sees the truth).
+        #[test]
+        fn autonomy_rewrites_exactly_the_approvals(
+            p in arb_policy(), tool in arb_tool(), input in arb_input()
+        ) {
+            let supervised = p.evaluate(&req(tool.clone(), input.clone()), Autonomy::Supervised);
+            let autonomous = p.evaluate(&req(tool, input), Autonomy::Autonomous);
+            prop_assert_eq!(&autonomous.original, &supervised.effective);
+            match supervised.effective {
+                Verdict::RequireApproval { .. } => {
+                    prop_assert!(autonomous.autonomy_rewritten);
+                    let resolved = matches!(
+                        autonomous.effective,
+                        Verdict::Allow | Verdict::Deny { .. }
+                    );
+                    prop_assert!(resolved);
+                }
+                other => {
+                    prop_assert!(!autonomous.autonomy_rewritten);
+                    prop_assert_eq!(autonomous.effective, other);
+                }
+            }
+        }
+
+        /// The read-only trust tier fails safe against injection: ANY shell
+        /// metacharacter anywhere in the command defeats prefix reasoning and
+        /// must deny, no matter what the command otherwise looks like.
+        #[test]
+        fn read_only_tier_denies_any_metacharacter(
+            prefix in "[ -~]{0,20}", suffix in "[ -~]{0,20}",
+            meta in prop::sample::select(vec![';', '|', '&', '`', '$', '(', ')', '<', '>', '\n'])
+        ) {
+            let cmd = format!("{prefix}{meta}{suffix}");
+            let r = req("Bash".into(), json!({ "command": cmd }));
+            prop_assert!(read_only_denial(&r).is_some());
+        }
+
+        /// The read-only tier is an ALLOWLIST: any tool not explicitly listed
+        /// (and not Bash, which has its own prefix path) is denied — new or
+        /// unknown tools are read-only-unsafe by default.
+        #[test]
+        fn read_only_tier_denies_unlisted_tools(tool in "[A-Za-z][A-Za-z0-9_]{0,16}") {
+            prop_assume!(tool != "Bash" && !READ_SAFE_TOOLS.contains(&tool.as_str()));
+            let denied = read_only_denial(&req(tool, json!({}))).is_some();
+            prop_assert!(denied);
+        }
+
+        /// Shell prefix matching is token-bounded: `p` matches itself and
+        /// `p <anything>`, but never `p` glued to more word characters —
+        /// "git status" must not cover "git statusx".
+        #[test]
+        fn prefix_match_is_token_bounded(
+            p in "[a-z]{1,8}( [a-z]{1,8})?", glued in "[a-zA-Z0-9_-]{1,8}", rest in "[ -~]{0,20}"
+        ) {
+            let exact = prefix_matches(&p, &p);
+            let spaced = prefix_matches(&p, &format!("{p} {rest}"));
+            let glued_on = prefix_matches(&p, &format!("{p}{glued}"));
+            prop_assert!(exact);
+            prop_assert!(spaced);
+            prop_assert!(!glued_on);
+        }
+
+        /// First match wins: a deny rule prepended for the exact tool always
+        /// decides, regardless of everything below it.
+        #[test]
+        fn first_matching_rule_decides(
+            p in arb_policy(), tool in arb_tool(), input in arb_input()
+        ) {
+            let mut p2 = p;
+            p2.tools.insert(0, ToolRule {
+                r#match: vec![tool.clone()],
+                action: RuleAction::Deny,
+                risk: None,
+                paths: None,
+                shell: None,
+                on_autonomous: None,
+                approval_ttl_secs: None,
+                approval_scope: None,
+            });
+            let out = p2.evaluate(&req(tool, input), Autonomy::Supervised);
+            let denied = matches!(out.effective, Verdict::Deny { .. });
+            prop_assert!(denied);
+            prop_assert_eq!(out.matched_rule, Some(0));
+        }
+    }
+}

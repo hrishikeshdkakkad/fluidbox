@@ -1,0 +1,103 @@
+name: release
+
+# Publishes the four fluidbox images to GHCR. Runs ONLY on version tags or a
+# manual dispatch — never automatically on PRs/pushes. Free for public repos;
+# no model credentials are involved anywhere in this workflow.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # Build each image natively per architecture (no QEMU — a QEMU'd release
+  # cargo build takes the better part of an hour) and push by digest.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [server, web, sandbox-runner, codex-runner]
+        platform:
+          - { os: ubuntu-latest, arch: amd64 }
+          - { os: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.platform.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: resolve dockerfile + context
+        id: target
+        run: |
+          case "${{ matrix.image }}" in
+            server)         echo "file=deploy/server.Dockerfile" >> "$GITHUB_OUTPUT"; echo "context=." >> "$GITHUB_OUTPUT" ;;
+            web)            echo "file=deploy/web.Dockerfile"    >> "$GITHUB_OUTPUT"; echo "context=." >> "$GITHUB_OUTPUT" ;;
+            sandbox-runner) echo "file=images/sandbox-runner/Dockerfile" >> "$GITHUB_OUTPUT"; echo "context=images" >> "$GITHUB_OUTPUT" ;;
+            codex-runner)   echo "file=images/codex-runner/Dockerfile"   >> "$GITHUB_OUTPUT"; echo "context=images" >> "$GITHUB_OUTPUT" ;;
+          esac
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: build + push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ steps.target.outputs.context }}
+          file: ${{ steps.target.outputs.file }}
+          platforms: linux/${{ matrix.platform.arch }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ github.repository_owner }}/fluidbox-${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.platform.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.platform.arch }}
+      - name: export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.image }}-${{ matrix.platform.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Stitch the per-arch digests into one multi-arch manifest per image.
+  publish:
+    needs: build
+    strategy:
+      matrix:
+        image: [server, web, sandbox-runner, codex-runner]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: digests-${{ matrix.image }}-*
+          merge-multiple: true
+          path: /tmp/digests
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/fluidbox-${{ matrix.image }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha
+            type=raw,value=latest
+      - name: create manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ github.repository_owner }}/fluidbox-${{ matrix.image }}@sha256:%s ' *)
+      - name: inspect
+        run: docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ github.repository_owner }}/fluidbox-${{ matrix.image }}:latest

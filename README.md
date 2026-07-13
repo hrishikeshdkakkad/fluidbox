@@ -30,7 +30,20 @@ Coding agents are powerful and unaccountable: they run with your credentials, on
 - **Connector catalog + OAuth** — connect external services with PKCE, resource indicators, and dynamic client registration; refresh tokens sealed at rest with atomic rotation.
 - **Dashboard** — a Next.js UI (presentation-only; all logic lives in the Rust API).
 
-## Quickstart
+## Try it with Docker (no toolchain needed)
+
+Published images + a bundled Postgres — one pull, one up:
+
+```bash
+git clone https://github.com/hrishikeshdkakkad/fluidbox.git && cd fluidbox
+docker compose -f deploy/docker-compose.eval.yml --profile runners pull
+ANTHROPIC_API_KEY=sk-ant-... docker compose -f deploy/docker-compose.eval.yml up -d
+open http://localhost:3000
+```
+
+This is the eval configuration (well-known admin token, no webhook ingress) — for hacking on fluidbox, use the dev quickstart below.
+
+## Quickstart (dev)
 
 Prerequisites: [Rust](https://rustup.rs) (stable), [Docker](https://docs.docker.com/get-docker/), [just](https://github.com/casey/just), [pnpm](https://pnpm.io) + Node 24, and a free [Neon](https://neon.tech) account (or any direct-connection Postgres).
 
@@ -82,6 +95,12 @@ Something not working? **`just doctor`** checks every documented gotcha (pooled 
 
 - [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) — how a run flows, the security model, and the extension seams.
 - [`PLAN.md`](./PLAN.md) — the authoritative design document: north star, convergence invariants, milestones.
+
+### Guides
+
+- [Writing policies](./docs/guides/policies.md) — the YAML rules, verdicts, autonomy fallbacks, and what the engine guarantees.
+- [Triggers, schedules & signed results](./docs/guides/triggers.md) — borrow the agent from an API, a cron, or a webhook, and verify the signed outcome.
+- [Capabilities (MCP tools)](./docs/guides/capabilities.md) — sandbox vs brokered tools, bundle pinning, and the connector catalog.
 
 ### Repository layout
 
