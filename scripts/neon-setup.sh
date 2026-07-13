@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Provision the fluidbox Neon project and print the DIRECT connection string.
+# Provision the fluidbox Neon project and wire the DIRECT connection string
+# into .env (written automatically when DATABASE_URL is still the placeholder;
+# printed otherwise so an existing value is never clobbered).
 #
 # Usage: ./scripts/neon-setup.sh [project-name]
 # Requires: node/npx. Authenticates via browser OAuth on first use.
 # If your account belongs to multiple orgs, set NEON_ORG_ID.
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT_NAME="${1:-fluidbox}"
 NEON="npx -y neonctl@latest"
 ORG_FLAG=()
@@ -44,7 +47,31 @@ case "$DIRECT_URL" in
   *-pooler*) echo "ERROR: got a pooled connection string; fluidbox needs the direct endpoint." >&2; exit 1;;
 esac
 
-echo
-echo "DATABASE_URL=$DIRECT_URL"
-echo
-echo "Put that line into .env."
+current=""
+[ -f "$ROOT/.env" ] && current=$(grep -m1 '^DATABASE_URL=' "$ROOT/.env" | cut -d= -f2- || true)
+case "$current" in
+  ""|*ep-xxx*)
+    if [ -f "$ROOT/.env" ]; then
+      node -e "
+        const fs = require('fs'), path = '$ROOT/.env', url = process.argv[1];
+        const src = fs.readFileSync(path, 'utf8');
+        const out = /^DATABASE_URL=/m.test(src)
+          ? src.replace(/^DATABASE_URL=.*$/m, 'DATABASE_URL=' + url)
+          : src + '\nDATABASE_URL=' + url + '\n';
+        fs.writeFileSync(path, out);
+      " "$DIRECT_URL"
+      echo "→ wrote DATABASE_URL into .env"
+    else
+      echo
+      echo "DATABASE_URL=$DIRECT_URL"
+      echo
+      echo "No .env yet — run 'just setup' first, or put that line into .env yourself."
+    fi
+    ;;
+  *)
+    echo
+    echo "DATABASE_URL=$DIRECT_URL"
+    echo
+    echo ".env already has a DATABASE_URL you set — left untouched. Paste the line above to switch."
+    ;;
+esac
