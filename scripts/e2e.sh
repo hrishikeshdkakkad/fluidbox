@@ -32,11 +32,15 @@ docker build -q -t "$FLUIDBOX_SANDBOX_IMAGE" \
   -f "$ROOT/images/sandbox-runner/Dockerfile" "$ROOT/images" >/dev/null || exit 1
 echo "building server + cli"
 cargo build -q -p fluidbox-server -p fluidbox-cli || exit 1
-docker compose -f "$ROOT/deploy/docker-compose.dev.yml" up -d litellm >/dev/null 2>&1 || true
-for _ in $(seq 1 40); do
-  curl -fsS -m 2 http://127.0.0.1:4000/health/liveliness >/dev/null 2>&1 && break
-  sleep 0.5
-done
+# The gateway only serves live model tiers — skip the pull/boot entirely
+# when they're disabled (CI runs with E2E_SKIP_LIVE=1 and no keys).
+if [ "${E2E_SKIP_LIVE:-0}" != "1" ]; then
+  docker compose -f "$ROOT/deploy/docker-compose.dev.yml" up -d litellm >/dev/null 2>&1 || true
+  for _ in $(seq 1 40); do
+    curl -fsS -m 2 http://127.0.0.1:4000/health/liveliness >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+fi
 trap 'stop_server' EXIT
 start_server || exit 1
 ok "stack up (gateway + control plane)"

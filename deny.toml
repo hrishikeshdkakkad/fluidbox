@@ -1,0 +1,43 @@
+# cargo-deny configuration — the supply-chain gate (`cargo deny check`, run in CI).
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# RUSTSEC advisories fail the build unless explicitly ignored WITH a reason.
+ignore = [
+    # rsa's Marvin timing sidechannel (via jsonwebtoken's RS256, used to mint
+    # GitHub App JWTs). No fixed rsa release exists yet. Accepted because the
+    # signing key is OUR app's own key, signing happens control-plane-side on
+    # operator-initiated flows, and no untrusted party can drive or precisely
+    # time signing operations. Re-evaluate when rsa 0.10 ships.
+    { id = "RUSTSEC-2023-0071", reason = "no patched rsa release; control-plane-side signing with our own key, not attacker-timeable" },
+]
+
+[licenses]
+# Permissive-only allowlist, matched to the current tree. Anything new that
+# isn't on this list (or is copyleft) fails CI and forces a conscious call.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[bans]
+# Duplicate crate versions are a fact of life in this tree (RustCrypto 0.10/0.11
+# straddle); surface them as warnings, not failures.
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

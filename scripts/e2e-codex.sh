@@ -120,8 +120,8 @@ bash "$(dirname "$0")/e2e-codex-replay.sh" "$SB" && ok "supervisor protocol-repl
 
 # ═══ TIER 2 — live §12 demo (self-skips without OPENAI_API_KEY) ═════════════
 say "TIER 2 — live codex run (§12)"
-if [ -z "${OPENAI_API_KEY:-}" ]; then
-  ok "SKIP live tier — OPENAI_API_KEY not set (by design)"
+if [ "${E2E_SKIP_LIVE:-0}" = "1" ] || [ -z "${OPENAI_API_KEY:-}" ]; then
+  ok "SKIP live tier — E2E_SKIP_LIVE=${E2E_SKIP_LIVE:-0} / OPENAI_API_KEY $([ -n "${OPENAI_API_KEY:-}" ] && echo set || echo unset) (live spend is opt-in by design)"
 else
   bash "$(dirname "$0")/e2e-codex-live.sh" && ok "live codex run completed + governed" || no "live codex run FAILED"
 fi
