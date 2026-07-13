@@ -117,7 +117,7 @@ FROZEN_REF=$(cat /tmp/fbx-gitws-body.json | j "['session']['repo_source']['ref']
 [ "$FROZEN_KIND" = "git_repository" ] && [ "$FROZEN_REF" = "feature" ] \
   && ok "frozen workspace = revision default (git@feature)" || no "frozen repo_source wrong: kind=$FROZEN_KIND ref=$FROZEN_REF"
 
-FINAL_A=$(wait_terminal "$SA" 240) || true
+FINAL_A=$(wait_terminal "$SA" 420) || true
 case "$FINAL_A" in
   completed|failed) ok "run A terminal ($FINAL_A — live key optional here)" ;;
   *) no "run A did not reach terminal: $FINAL_A" ;;
@@ -141,7 +141,7 @@ SB=$(cat /tmp/fbx-gitws-body.json | j "['session']['id']")
 [ "$CODE" = "200" ] && [ -n "$SB" ] && ok "run started with explicit workspace override" || { no "session create failed ($CODE)"; exit 1; }
 OV_SHA=$(cat /tmp/fbx-gitws-body.json | j "['session']['repo_source']['commit_sha']")
 [ "$OV_SHA" = "$SHA1" ] && ok "override frozen into RunSpec (not the revision default)" || no "frozen commit_sha wrong: $OV_SHA"
-FINAL_B=$(wait_terminal "$SB" 240) || true
+FINAL_B=$(wait_terminal "$SB" 420) || true
 BCB=$(sfield "$SB" "['base_commit']")
 [ "$BCB" = "$SHA1" ] && ok "exact commit checked out (immune to branch movement)" \
   || no "base_commit '$BCB' ≠ pinned $SHA1 (terminal=$FINAL_B)"

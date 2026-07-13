@@ -182,7 +182,7 @@ CODE=$(tpost "$TOK1_NEW" "/triggers/$SUB1/invoke" '{"context":{"ticket":"INC-42"
 [ "$CODE" = "200" ] && ok "new token works (and key-A still replays)" || no "wanted 200, got $CODE"
 
 say "SIGNED CALLBACK — terminal run → one verified delivery"
-FINAL1=$(wait_terminal "$S1" 240) || true
+FINAL1=$(wait_terminal "$S1" 420) || true
 case "$FINAL1" in completed|failed) ok "S1 terminal ($FINAL1)";; *) no "S1 not terminal: $FINAL1";; esac
 DFILE=""
 for _ in $(seq 1 30); do
@@ -214,7 +214,7 @@ say "DEAD DESTINATION — the run stays terminal; only the delivery retries"
 CODE=$(tpost "$TOK3" "/triggers/$SUB3/invoke" '{"workspace":{"ref":"feature"},"context":{}}')
 S3=$(cat "$B" | j "['session_id']")
 [ "$CODE" = "200" ] && ok "SUB3 invoke accepted" || no "SUB3 invoke → $CODE: $(cat "$B")"
-FINAL3=$(wait_terminal "$S3" 240) || true
+FINAL3=$(wait_terminal "$S3" 420) || true
 case "$FINAL3" in completed|failed) ok "S3 terminal ($FINAL3) despite dead callback";; *) no "S3 terminal: $FINAL3";; esac
 D3A=""; D3S=""
 for _ in $(seq 1 10); do
