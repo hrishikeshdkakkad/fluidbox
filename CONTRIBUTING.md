@@ -60,6 +60,8 @@ just check    # cargo fmt + clippy -D warnings + cargo test + web build — must
 just e2e      # full acceptance suite — run it if you touched the permission/approval/trigger path
 ```
 
+CI runs all of that against a real Postgres **plus** the no-model e2e suite (it builds both runner images) and `cargo deny check` (advisories + licenses; config in `deny.toml`). The live model tiers never run in CI — they cost real credits and stay a local, maintainer-triggered concern (`just e2e` with keys in `.env`).
+
 Notes:
 
 - `cargo test -p fluidbox-core` is fast and needs no database.
