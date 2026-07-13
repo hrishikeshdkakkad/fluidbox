@@ -166,7 +166,7 @@ class Gh(http.server.BaseHTTPRequestHandler):
 http.server.HTTPServer(("127.0.0.1", port), Gh).serve_forever()
 PYEOF
 GH_PID=$!
-trap 'kill $MCP_PID $GH_PID 2>/dev/null; stop_server' EXIT
+trap 'kill $MCP_PID $GH_PID ${LLM_STALL_PID:-} 2>/dev/null; stop_server' EXIT
 sleep 0.5
 
 # ── file:// fixtures ──────────────────────────────────────────────────────
@@ -376,6 +376,29 @@ send_event() { # payload-file delivery-id → http code (body in $B)
     -H "$CT" -H "x-github-delivery: $2" -H "x-github-event: pull_request" \
     -H "x-hub-signature-256: sha256=$sig" -d "$body"
 }
+# Keep the four event-derived runners ALIVE through the token probes below:
+# without a reachable model upstream their SDKs crash at nondeterministic
+# speed and the watchdog removes the containers before the probes can read
+# the session tokens (CI flakes 29222410561 / 29224265638). An accept-and-
+# stall stub on :4000 blocks their model call instead — killed again right
+# after extraction so later phases keep fail-fast semantics. No-op when a
+# real gateway is already serving (local dev).
+LLM_STALL_PID=""
+if ! curl -fsS -m 1 http://127.0.0.1:4000/health/liveliness >/dev/null 2>&1; then
+  python3 - >/dev/null 2>&1 <<'PYSTALL' &
+import http.server, socketserver, time
+class Stall(http.server.BaseHTTPRequestHandler):
+    def _stall(self):
+        time.sleep(600)
+    do_GET = do_POST = _stall
+    def log_message(self, *args):
+        pass
+socketserver.ThreadingTCPServer.allow_reuse_address = True
+socketserver.ThreadingTCPServer(("127.0.0.1", 4000), Stall).serve_forever()
+PYSTALL
+  LLM_STALL_PID=$!
+fi
+
 P_OPEN=$(pr_payload acme/site 500 1 "$HEAD1" 500)
 CODE=$(send_event "$P_OPEN" "cap-open-1")
 N=$(python3 -c "import json;print(len(json.load(open('$B'))['dispatched']))" 2>/dev/null)
@@ -439,6 +462,7 @@ wait "$PROBE_A" "$PROBE_B" "$PROBE_N"
 TA=$(cat "$PROBE_DIR/a"); TB=$(cat "$PROBE_DIR/b"); TN=$(cat "$PROBE_DIR/n")
 rm -rf "$PROBE_DIR"
 docker kill "$(docker ps -a --filter "label=fluidbox.session=$SC" --format '{{.ID}}' | head -1)" >/dev/null 2>&1
+[ -n "$LLM_STALL_PID" ] && kill "$LLM_STALL_PID" 2>/dev/null && LLM_STALL_PID=""
 if [ -n "$TA" ] && [ -n "$TB" ] && [ -n "$TN" ]; then
   ok "session tokens extracted; runners killed (we drive the contract)"
 else
