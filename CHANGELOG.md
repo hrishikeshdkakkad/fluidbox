@@ -6,7 +6,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **`just setup`** — one-command idempotent bootstrap for a fresh clone: tools check, `.env` with generated secrets (`FLUIDBOX_ADMIN_TOKEN`, `FLUIDBOX_CREDENTIAL_KEY`, `LITELLM_MASTER_KEY`), dashboard env (`apps/web/.env.local`) kept in sync, `pnpm install`, and the sandbox runner image build. Only fills placeholders — never overwrites values you set.
+- **`just doctor`** — environment preflight (#13): validates every documented gotcha (pooled vs direct `DATABASE_URL`, loopback `FLUIDBOX_BIND`, credential key shape, missing runner images, dashboard token drift, missing web deps) and prints the exact fix per failure; exits non-zero only on hard failures, never echoes secret values.
+
+### Changed
+
+- `just neon-setup` now writes the DIRECT connection string into `.env` when `DATABASE_URL` is still the placeholder (an existing value is never clobbered).
+- README quickstart, CONTRIBUTING dev setup, and the dashboard README (`apps/web/README.md`) rewritten around the `just setup` → `just neon-setup` → `just dev` flow.
 
 ## [0.1.0] — 2026-07-12
 

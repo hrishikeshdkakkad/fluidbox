@@ -1,36 +1,33 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# fluidbox dashboard
 
-## Getting Started
+The Next.js UI for the fluidbox control plane. **Presentation-only by hard constraint** — every decision (policy, approvals, budgets, run lifecycle) lives in the Rust API; this app renders state and forwards intents.
 
-First, run the development server:
+## How it talks to the control plane
+
+The browser never holds credentials. All API traffic goes through the server-side proxy at [`app/api/fluidbox/[...path]/route.ts`](./app/api/fluidbox/%5B...path%5D/route.ts), which forwards to the Rust server and injects the admin token from the environment:
+
+| Variable (in `apps/web/.env.local`) | Purpose |
+|---|---|
+| `FLUIDBOX_API_URL` | where the control plane listens (default `http://127.0.0.1:8787`) |
+| `FLUIDBOX_ADMIN_TOKEN` | bearer token for `/v1`, injected server-side — must match the repo-root `.env` |
+
+`.env.local` is gitignored and **written for you by `just setup`** (run from the repo root), which keeps the token in sync with `.env`. If the dashboard suddenly 401s on everything, the token has drifted — re-run `just setup`, or `just doctor` to confirm.
+
+## Developing
+
+Use **pnpm**, never npm (npm's ERESOLVE errors here are a red herring).
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+pnpm install       # just setup does this too
+pnpm dev           # dashboard only — the control plane must already be running
+just dev           # (from the repo root) gateway + server + dashboard together
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open <http://localhost:3000>. Top-level routes: Runs `/` (home, with the approvals attention strip), Agents `/agents`, Capabilities `/capabilities`, Integrations `/integrations`, Automations `/automations`, Settings — run detail lives at `/sessions/{id}`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Gotchas
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- **Never run `pnpm build` while `pnpm dev` is serving** — it corrupts the dev `.next` cache (stale CSS). Typecheck with `npx tsc --noEmit` instead, or restart dev after building.
+- Pages that read `useSearchParams` (the tabbed pages) must stay wrapped in `<Suspense>` or the static build fails.
+- This Next.js version has breaking changes vs. its predecessors — check `node_modules/next/dist/docs/` before assuming an API (see [`AGENTS.md`](./AGENTS.md)).
+- Capabilities (tools an agent calls in-run, permission-gated) and Integrations (platforms agents work *on*: repo cloning, webhooks, publishing) are **different concepts** even when the same service appears in both — don't merge the pages.
