@@ -407,8 +407,10 @@ FROZEN_EV=$(pq "select count(*) from events where session_id='$SA' and type='cap
 # ── The gate: availability (frozen set) then policy — probed for real ─────
 say "GATE — the ONE permission gate: frozen availability, then policy"
 token_for() { # session → token (kills the runner so probes own the contract)
+  # 120s window: four event-derived runs launch containers concurrently, and
+  # a 2-core CI runner can take >30s to get the first one up.
   local sid=$1 cid tok=""
-  for _ in $(seq 1 30); do
+  for _ in $(seq 1 120); do
     cid=$(docker ps -a --filter "label=fluidbox.session=$sid" --format '{{.ID}}' | head -1)
     [ -n "$cid" ] && { tok=$(docker inspect "$cid" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^FLUIDBOX_SESSION_TOKEN=' | cut -d= -f2-); break; }
     sleep 1
@@ -426,7 +428,7 @@ broke() { # session token id tool input
 }
 TA=$(token_for "$SA"); TB=$(token_for "$SB"); TN=$(token_for "$SN")
 docker kill "$(docker ps -a --filter "label=fluidbox.session=$SC" --format '{{.ID}}' | head -1)" >/dev/null 2>&1
-[ -n "$TA" ] && [ -n "$TB" ] && [ -n "$TN" ] && ok "session tokens extracted; runners killed (we drive the contract)" || { no "no tokens"; exit 1; }
+[ -n "$TA" ] && [ -n "$TB" ] && [ -n "$TN" ] && ok "session tokens extracted; runners killed (we drive the contract)" || { no "no tokens (A:${TA:+ok}${TA:-missing} B:${TB:+ok}${TB:-missing} N:${TN:+ok}${TN:-missing})"; exit 1; }
 
 D=$(perm "$SA" "$TA" g1 "mcp__kb__kb_search" '{"query":"x"}' | j "['decision']")
 [ "$D" = "allow" ] && ok "A: mcp__kb__kb_search → allow (attached + policy allows)" || no "kb_search: $D"
