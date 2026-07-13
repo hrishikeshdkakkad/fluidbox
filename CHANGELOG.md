@@ -8,6 +8,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ### Added
 
+- **CI now tells the truth** — the rust job runs against a real Postgres service (the DB tests no longer silently self-skip), a new `e2e` job builds both runner images and runs the full no-model acceptance suite on every PR (closes the vacuous-green gap of #14), and `cargo deny check` (advisories/licenses/bans/sources, `deny.toml`) gates the supply chain. Live model tiers stay local/manual — CI never spends credits. Coverage (lcov artifact) runs on main pushes.
+- **Property tests for the policy engine** — generated-input invariants in `fluidbox-core`: an autonomous run can never surface `RequireApproval`, autonomy rewrites exactly the approval verdicts (original always ledgered), the read-only tier denies any shell metacharacter and any unlisted tool, shell prefixes are token-bounded, first match wins.
+- **Try-it-with-Docker distribution** — `deploy/server.Dockerfile` + `deploy/web.Dockerfile` (Next standalone output), a `release` workflow publishing multi-arch images to GHCR on version tags or manual dispatch, and `deploy/docker-compose.eval.yml`: bundled Postgres + LiteLLM + server + dashboard in one `docker compose up`.
+- **User guides** (`docs/guides/`) — writing policies, triggers/schedules/signed results (with the HMAC verification recipe and a pinned test vector), and capabilities (sandbox vs brokered MCP tools, pinning, the connector catalog).
+- **`ROADMAP.md`** — the public distillation of `PLAN.md` §7.
+
 - **`just setup`** — one-command idempotent bootstrap for a fresh clone: tools check, `.env` with generated secrets (`FLUIDBOX_ADMIN_TOKEN`, `FLUIDBOX_CREDENTIAL_KEY`, `LITELLM_MASTER_KEY`), dashboard env (`apps/web/.env.local`) kept in sync, `pnpm install`, and the sandbox runner image build. Only fills placeholders — never overwrites values you set.
 - **`just doctor`** — environment preflight (#13): validates every documented gotcha (pooled vs direct `DATABASE_URL`, loopback `FLUIDBOX_BIND`, credential key shape, missing runner images, dashboard token drift, missing web deps) and prints the exact fix per failure; exits non-zero only on hard failures, never echoes secret values.
 
