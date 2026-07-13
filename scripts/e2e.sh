@@ -32,14 +32,22 @@ docker build -q -t "$FLUIDBOX_SANDBOX_IMAGE" \
   -f "$ROOT/images/sandbox-runner/Dockerfile" "$ROOT/images" >/dev/null || exit 1
 echo "building server + cli"
 cargo build -q -p fluidbox-server -p fluidbox-cli || exit 1
-# The gateway only serves live model tiers — skip the pull/boot entirely
-# when they're disabled (CI runs with E2E_SKIP_LIVE=1 and no keys).
+# The gateway only serves live model tiers. In no-live mode it is taken OFF
+# :4000 entirely — two load-bearing consequences:
+#   1. NO-SPEND GUARANTEE: even with real keys in .env nothing can reach a
+#      model — live spend is strictly opt-in.
+#   2. CI PARITY: keyless runners fail fast on connection-refused exactly
+#      like in CI, so the no-model phases exercise the same lifecycle
+#      locally that they will in the e2e CI job. (The capability phase
+#      scopes its own stall stub around its token probes.)
 if [ "${E2E_SKIP_LIVE:-0}" != "1" ]; then
   docker compose -f "$ROOT/deploy/docker-compose.dev.yml" up -d litellm >/dev/null 2>&1 || true
   for _ in $(seq 1 40); do
     curl -fsS -m 2 http://127.0.0.1:4000/health/liveliness >/dev/null 2>&1 && break
     sleep 0.5
   done
+else
+  docker compose -f "$ROOT/deploy/docker-compose.dev.yml" stop litellm >/dev/null 2>&1 || true
 fi
 trap 'stop_server' EXIT
 start_server || exit 1
