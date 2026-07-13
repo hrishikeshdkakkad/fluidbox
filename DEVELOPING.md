@@ -11,6 +11,8 @@ Hard constraints (from PLAN.md, non-negotiable): fluidbox-authored backend is 10
 ## Commands
 
 ```bash
+just setup          # fresh-clone bootstrap (idempotent): .env + secrets, apps/web/.env.local, pnpm install, runner image
+just doctor         # preflight — validates every env gotcha below and prints the exact fix
 just dev            # LiteLLM gateway + server + dashboard together
 just server         # Rust control plane only (migrations auto-run on boot)
 just web            # dashboard only (Next.js, port 3000)

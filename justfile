@@ -6,6 +6,15 @@ default:
 
 # ── Dev ──────────────────────────────────────────────────────────────────
 
+# One-command bootstrap for a fresh clone (idempotent): tools check, .env +
+# generated secrets, dashboard env, pnpm install, runner image, then doctor.
+setup:
+    bash scripts/setup.sh
+
+# Validate the local environment; every ✗/⚠ prints its exact fix.
+doctor:
+    bash scripts/doctor.sh
+
 # Everything: LiteLLM gateway + server + web (ctrl-c stops all)
 dev:
     just gateway-up
@@ -36,7 +45,7 @@ codex-build:
 
 # ── Database ─────────────────────────────────────────────────────────────
 
-# Provision a Neon project and print the DIRECT connection string
+# Provision a Neon project and write the DIRECT connection string into .env
 neon-setup:
     ./scripts/neon-setup.sh
 
