@@ -407,13 +407,14 @@ FROZEN_EV=$(pq "select count(*) from events where session_id='$SA' and type='cap
 # ── The gate: availability (frozen set) then policy — probed for real ─────
 say "GATE — the ONE permission gate: frozen availability, then policy"
 token_for() { # session → token (kills the runner so probes own the contract)
-  # 120s window: four event-derived runs launch containers concurrently, and
-  # a 2-core CI runner can take >30s to get the first one up.
+  # The token must be read from the container env BEFORE the keyless runner
+  # fails fast and gets reaped (container removed) — poll tightly, and kill
+  # the runner the moment it's seen. 120s ceiling for slow CI runners.
   local sid=$1 cid tok=""
-  for _ in $(seq 1 120); do
+  for _ in $(seq 1 240); do
     cid=$(docker ps -a --filter "label=fluidbox.session=$sid" --format '{{.ID}}' | head -1)
     [ -n "$cid" ] && { tok=$(docker inspect "$cid" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^FLUIDBOX_SESSION_TOKEN=' | cut -d= -f2-); break; }
-    sleep 1
+    sleep 0.5
   done
   [ -n "$cid" ] && docker kill "$cid" >/dev/null 2>&1
   echo "$tok"
@@ -426,9 +427,29 @@ broke() { # session token id tool input
   curl -s -X POST -H "authorization: Bearer $2" -H "$CT" \
     -d "{\"tool_call_id\":\"$3\",\"tool\":\"$4\",\"input\":$5}" "$API/internal/sessions/$1/tools/call"
 }
-TA=$(token_for "$SA"); TB=$(token_for "$SB"); TN=$(token_for "$SN")
+# Probe the three runners in PARALLEL: sequentially scanning A→B→N loses
+# the race against fail-fast-and-reap on slow CI runners (a probe only has
+# to beat the reaping of ITS OWN runner). Explicit pids — a bare `wait`
+# would block on the phase's background fake servers.
+PROBE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fbx-cap-probe.XXXXXX")
+token_for "$SA" >"$PROBE_DIR/a" & PROBE_A=$!
+token_for "$SB" >"$PROBE_DIR/b" & PROBE_B=$!
+token_for "$SN" >"$PROBE_DIR/n" & PROBE_N=$!
+wait "$PROBE_A" "$PROBE_B" "$PROBE_N"
+TA=$(cat "$PROBE_DIR/a"); TB=$(cat "$PROBE_DIR/b"); TN=$(cat "$PROBE_DIR/n")
+rm -rf "$PROBE_DIR"
 docker kill "$(docker ps -a --filter "label=fluidbox.session=$SC" --format '{{.ID}}' | head -1)" >/dev/null 2>&1
-[ -n "$TA" ] && [ -n "$TB" ] && [ -n "$TN" ] && ok "session tokens extracted; runners killed (we drive the contract)" || { no "no tokens (A:${TA:+ok}${TA:-missing} B:${TB:+ok}${TB:-missing} N:${TN:+ok}${TN:-missing})"; exit 1; }
+if [ -n "$TA" ] && [ -n "$TB" ] && [ -n "$TN" ]; then
+  ok "session tokens extracted; runners killed (we drive the contract)"
+else
+  # Verdicts only — NEVER token values.
+  no "no tokens (A:$([ -n "$TA" ] && echo ok || echo missing) B:$([ -n "$TB" ] && echo ok || echo missing) N:$([ -n "$TN" ] && echo ok || echo missing))"
+  echo "  containers with a fluidbox.session label:"
+  docker ps -a --filter "label=fluidbox.session" --format '  {{.ID}} {{.Status}} {{.Label "fluidbox.session"}}' | head -10
+  echo "  last server log lines:"
+  tail -20 "$SERVER_LOG" | sed 's/^/    /'
+  exit 1
+fi
 
 D=$(perm "$SA" "$TA" g1 "mcp__kb__kb_search" '{"query":"x"}' | j "['decision']")
 [ "$D" = "allow" ] && ok "A: mcp__kb__kb_search → allow (attached + policy allows)" || no "kb_search: $D"
