@@ -138,6 +138,14 @@ pub(crate) fn bundle_json(row: &fluidbox_db::CapabilityBundleRow) -> Value {
                         "class": s.class_str(),
                         "tool_count": s.tools().len(),
                         "tools_digest": tools_digest(s.tools()),
+                        // Photographed tool list (name + description) for the
+                        // dashboard preview — the input schemas stay out to
+                        // keep the payload light; the digest above anchors
+                        // integrity.
+                        "tools": s.tools().iter().map(|t| json!({
+                            "name": t.name,
+                            "description": t.description,
+                        })).collect::<Vec<_>>(),
                     })
                 })
                 .collect::<Vec<_>>()
