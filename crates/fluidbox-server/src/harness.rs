@@ -39,6 +39,83 @@ pub fn default_model<'a>(harness: &str, cfg: &'a Config) -> Option<&'a str> {
     }
 }
 
+/// A model offered for a harness, for the dashboard picker. `id` is what
+/// freezes into the RunSpec and what the facade pins at call time.
+pub struct HarnessModel {
+    pub id: &'static str,
+    pub display_name: &'static str,
+    pub hint: &'static str,
+}
+
+/// Human label for a harness id (KNOWN order = display order).
+pub fn display_name(harness: &str) -> &'static str {
+    match harness {
+        CLAUDE_AGENT_SDK => "Claude Agent SDK",
+        CODEX => "Codex",
+        _ => "",
+    }
+}
+
+/// One-line description of a harness for the dashboard picker.
+pub fn hint(harness: &str) -> &'static str {
+    match harness {
+        CLAUDE_AGENT_SDK => "Claude Code in the sandbox — live timeline, gated tools, approvals.",
+        CODEX => "OpenAI Codex on the same governed runner contract.",
+        _ => "",
+    }
+}
+
+/// The models fluidbox supports for a harness — the SINGLE server-side source
+/// of truth the dashboard reads via `GET /v1/harnesses`, replacing the
+/// hardcoded, drift-prone frontend lists. Plain match, like the rest of the
+/// registry (a third harness is one more arm).
+pub fn models(harness: &str) -> &'static [HarnessModel] {
+    match harness {
+        CLAUDE_AGENT_SDK => &[
+            HarnessModel {
+                id: "claude-haiku-4-5",
+                display_name: "Claude Haiku 4.5",
+                hint: "Fastest and cheapest — the default.",
+            },
+            HarnessModel {
+                id: "claude-sonnet-5",
+                display_name: "Claude Sonnet 5",
+                hint: "Balanced speed and capability.",
+            },
+            HarnessModel {
+                id: "claude-opus-4-8",
+                display_name: "Claude Opus 4.8",
+                hint: "Most capable for hard agentic coding.",
+            },
+        ],
+        CODEX => &[
+            HarnessModel {
+                id: "gpt-5.4-mini",
+                display_name: "GPT-5.4 mini",
+                hint: "Fastest and cheapest — the default.",
+            },
+            HarnessModel {
+                id: "gpt-5.4",
+                display_name: "GPT-5.4",
+                hint: "Balanced speed and capability.",
+            },
+            HarnessModel {
+                id: "gpt-5.6-sol",
+                display_name: "GPT-5.6 Sol",
+                hint: "Most capable.",
+            },
+        ],
+        _ => &[],
+    }
+}
+
+/// Whether a model id is offered for a harness. The gate that turns a
+/// harness/model mismatch into a clean 422 at agent-write time instead of a
+/// murky failure at the first model call.
+pub fn model_belongs(harness: &str, model: &str) -> bool {
+    models(harness).iter().any(|m| m.id == model)
+}
+
 /// Per-harness env extras beyond the generic `FLUIDBOX_*` block.
 ///
 /// claude-agent-sdk: the Anthropic trio — base URL pointed at the LLM facade,
@@ -152,5 +229,26 @@ mod tests {
     fn codex_and_unknown_get_no_extras() {
         assert!(runner_env("codex", "http://c", "t", "m").is_empty());
         assert!(runner_env("mystery", "http://c", "t", "m").is_empty());
+    }
+
+    #[test]
+    fn config_default_models_belong_to_their_harness() {
+        let cfg = test_cfg();
+        // The shipped defaults MUST be members of their model list — the
+        // /harnesses endpoint reports them as `default_model` and inherited
+        // models skip the belongs check on that assumption.
+        assert!(model_belongs(CLAUDE_AGENT_SDK, &cfg.default_model));
+        assert!(model_belongs(CODEX, &cfg.default_codex_model));
+    }
+
+    #[test]
+    fn model_belongs_is_per_harness() {
+        assert!(model_belongs(CLAUDE_AGENT_SDK, "claude-opus-4-8"));
+        assert!(model_belongs(CODEX, "gpt-5.6-sol"));
+        // Cross-harness models are rejected — the murky-failure gap.
+        assert!(!model_belongs(CLAUDE_AGENT_SDK, "gpt-5.4"));
+        assert!(!model_belongs(CODEX, "claude-opus-4-8"));
+        assert!(!model_belongs(CLAUDE_AGENT_SDK, "made-up-model"));
+        assert!(models("nope").is_empty());
     }
 }

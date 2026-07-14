@@ -805,6 +805,18 @@ pub async fn create_catalog_entry(
     .await
 }
 
+/// Delete a catalog entry by slug. Used to roll back a just-created custom
+/// (BYO) entry when its one-shot connect fails — custom entries are untrusted
+/// reference data with no dependents until a bundle references them, so a
+/// hard delete is safe. Returns the number of rows removed.
+pub async fn delete_catalog_entry(pool: &PgPool, slug: &str) -> sqlx::Result<u64> {
+    let r = sqlx::query("delete from connector_catalog where slug = $1")
+        .bind(slug)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
 /// The only reader of the sealed credential. Returns None unless the
 /// connection exists AND is active — a revoked connection can never again
 /// produce a credential.

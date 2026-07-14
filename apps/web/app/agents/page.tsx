@@ -15,15 +15,7 @@ import {
 } from "../lib/api";
 import { BundlePicker } from "../components/BundlePicker";
 import { HarnessPicker } from "../components/HarnessPicker";
-
-// Per-harness models. Switching the harness re-defaults the model to the
-// first entry. UI convenience only: the server validates the harness id but
-// does NOT check the model belongs to the harness, so a mismatched model
-// fails (murkily) at model-call time, not with a clean 422.
-const REV_MODELS: Record<string, string[]> = {
-  "claude-agent-sdk": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-4-8"],
-  codex: ["gpt-5.4-mini", "gpt-5.4", "gpt-5.6-sol"],
-};
+import { useHarnesses, modelsFor, defaultModelFor } from "../lib/harnesses";
 import { LoadingRows, ModalShell, PageHead, short } from "../components/bits";
 import {
   WorkspacePicker,
@@ -375,6 +367,7 @@ function AddRevision({
   onClose: () => void;
   onAdded: () => void;
 }) {
+  const harnesses = useHarnesses();
   const [harness, setHarness] = useState(current?.harness || "claude-agent-sdk");
   const [model, setModel] = useState(current?.model || "claude-haiku-4-5");
   const [systemPrompt, setSystemPrompt] = useState(current?.system_prompt || "");
@@ -415,19 +408,20 @@ function AddRevision({
       <div className="field">
         <span className="lab">Harness</span>
         <HarnessPicker
+          harnesses={harnesses}
           value={harness}
           onChange={(h) => {
             setHarness(h);
-            setModel(REV_MODELS[h]?.[0] ?? ""); // never carry a cross-harness model
+            setModel(defaultModelFor(harnesses, h)); // never carry a cross-harness model
           }}
         />
       </div>
       <label className="field">
         <span className="lab">Model</span>
         <select className="inp" value={model} onChange={(e) => setModel(e.target.value)}>
-          {(REV_MODELS[harness] ?? []).map((m) => (
-            <option key={m} value={m}>
-              {m}
+          {modelsFor(harnesses, harness).map((m) => (
+            <option key={m.id} value={m.id}>
+              {m.display_name}
             </option>
           ))}
         </select>

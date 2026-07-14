@@ -305,7 +305,7 @@ as_admin() { curl -s -X POST -d "${2:-{\}}" "http://127.0.0.1:$AS_PORT/admin/$1"
 export FLUIDBOX_PUBLIC_URL="http://127.0.0.1:8787"
 # Rerun hygiene: custom catalog slugs are DB-unique and the API is
 # deliberately create-only — drop this suite's previous test entries.
-psql "$DATABASE_URL" -qc "delete from connector_catalog where tier='custom' and slug like 'fx-%'" 2>/dev/null
+psql "$DATABASE_URL" -qc "delete from connector_catalog where tier='custom' and (slug like 'fx-%' or slug like 'byo-%')" 2>/dev/null
 start_server || exit 1
 ok "stack up (control plane + fake sentry :$SN_PORT + fake oauth AS/MCP :$AS_PORT)"
 
@@ -439,6 +439,73 @@ docker inspect "$CID_SN" --format '{{range .Config.Env}}{{println .}}{{end}}' | 
   && no "api key found in sandbox env!" || ok "api key never entered the sandbox env"
 curl -s -H "$H" "$API/v1/sessions/$SID_SN" | grep -q "$SN_KEY" && no "api key in RunSpec!" || ok "api key not in the frozen RunSpec"
 curl -s -H "$H" "$API/v1/sessions/$SID_SN/events?limit=500" | grep -q "$SN_KEY" && no "api key in ledger!" || ok "api key not in the ledger"
+
+# ── BRING YOUR OWN MCP — probe (non-committing) + one-shot connect ─────────
+say "BYO MCP — probe detects auth, one-shot connect reuses the catalog seams"
+
+# Probe the OAuth-backed fake (401 → PRM → AS metadata) → oauth, no secrets.
+CODE=$(post "/mcp/probe" "{\"url\":\"http://127.0.0.1:$AS_PORT/mcp\"}")
+[ "$CODE" = "200" ] && [ "$(jb "['auth_mode']")" = "oauth" ] && [ "$(jb "['oauth_available']")" = "True" ] \
+  && ok "probe(oauth server) → auth_mode=oauth, oauth_available (no commitment, nothing stored)" \
+  || no "probe oauth → $CODE: $(cat "$B")"
+[ -n "$(jb "['oauth']['authorization_endpoint']")" ] && ok "probe surfaces the non-secret AS summary (authorization_endpoint)" || no "no AS summary"
+grep -qiE "client_secret|refresh|acc-|rt-" "$B" && no "secret material in probe response!" || ok "probe response carries no secrets"
+
+# Probe the Sentry fake (401, no discoverable AS) → api_key.
+CODE=$(post "/mcp/probe" "{\"url\":\"http://127.0.0.1:$SN_PORT/mcp\"}")
+[ "$CODE" = "200" ] && [ "$(jb "['auth_mode']")" = "api_key" ] \
+  && ok "probe(static-key server) → auth_mode=api_key (401 + no AS metadata)" || no "probe api_key → $CODE: $(cat "$B")"
+
+# Probe a dead port → reachable=false (an error, distinct from a 401 signal).
+CODE=$(post "/mcp/probe" "{\"url\":\"http://127.0.0.1:1/mcp\"}")
+[ "$CODE" = "200" ] && [ "$(jb "['reachable']")" = "False" ] \
+  && ok "probe(unreachable) → reachable=false (not confused with an auth signal)" || no "probe unreachable → $CODE: $(cat "$B")"
+
+# One-shot BYO connect (api_key) — custom entry + connection + photograph in
+# ONE call, reusing the catalog seams. The name IS the derived slug here.
+BYO="byo-sentry-$$"
+CODE=$(post "/mcp/servers" "{\"url\":\"http://127.0.0.1:$SN_PORT/mcp\",\"name\":\"$BYO\",
+  \"auth_mode\":\"api_key\",\"token\":\"$SN_KEY\",\"header_name\":\"Sentry-Bearer\",\"scheme\":\"\"}")
+[ "$CODE" = "200" ] && ok "one-shot BYO connect → 200 (entry + connection + bundle in one call)" || { no "byo connect → $CODE: $(cat "$B")"; exit 1; }
+[ "$(jb "['slug']")" = "$BYO" ] && ok "slug derived server-side ($BYO)" || no "slug: $(jb "['slug']")"
+[ "$(pq "select tier from connector_catalog where slug='$BYO'")" = "custom" ] && ok "BYO server became a tier=custom catalog entry (reuse-the-catalog)" || no "no custom catalog row"
+grep -q "sn_find_issues" "$B" && ok "connect response previews the PHOTOGRAPHED tools (sn_find_issues)" || no "no tool preview in connect response: $(cat "$B")"
+grep -q "$SN_KEY" "$B" && no "api key echoed in BYO connect response!" || ok "api key not in the BYO connect response"
+
+# Tool preview API: GET /capabilities/{id} now returns per-server tool lists.
+BID=$(get "/capabilities" | python3 -c "
+import sys, json
+bs = [b for b in json.load(sys.stdin)['bundles'] if b['name'] == '$BYO']
+print(bs[0]['id'] if bs else '')")
+PREV=$(get "/capabilities/$BID" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+ts = [t for s in d.get('servers', []) for t in s.get('tools', [])]
+print('ok' if any(t.get('name') and 'description' in t for t in ts) else 'no')")
+[ "$PREV" = "ok" ] && ok "GET /capabilities/{id} exposes per-server tools (name + description) for the UI preview" || no "no tool preview in bundle detail"
+
+# Orphan cleanup: a refused key rolls BOTH the connection AND the custom entry.
+BYO_BAD="byo-bad-$$"
+CODE=$(post "/mcp/servers" "{\"url\":\"http://127.0.0.1:$SN_PORT/mcp\",\"name\":\"$BYO_BAD\",
+  \"auth_mode\":\"api_key\",\"token\":\"wrong-key\",\"header_name\":\"Sentry-Bearer\",\"scheme\":\"\"}")
+[ "$CODE" = "400" ] && ok "BYO connect with a bad key → 400 (photograph is the proof-of-life)" || no "bad byo → $CODE"
+[ "$(pq "select count(*) from connector_catalog where slug='$BYO_BAD'")" = "0" ] \
+  && ok "failed BYO connect left NO orphan catalog entry (rolled back)" || no "orphan custom entry survived!"
+
+# ── HARNESS + MODEL — the authoritative catalog and the belongs-check ──────
+say "HARNESS/MODEL — server is the source of truth; mismatch is a clean 422"
+HARN=$(get "/harnesses")
+echo "$HARN" | python3 -c "
+import sys, json
+hs = {h['id']: h for h in json.load(sys.stdin)['harnesses']}
+ok = ('claude-agent-sdk' in hs and 'codex' in hs
+      and any(m['id'] == 'claude-opus-4-8' for m in hs['claude-agent-sdk']['models'])
+      and any(m['id'] == 'gpt-5.4-mini' for m in hs['codex']['models']))
+sys.exit(0 if ok else 1)" && ok "GET /harnesses lists claude + codex with their model catalogs" || no "harnesses shape wrong: $HARN"
+CODE=$(post "/agents" "{\"name\":\"byo-mismatch-$$\",\"policy\":\"conn-e2e\",\"harness\":\"codex\",\"model\":\"claude-opus-4-8\"}")
+[ "$CODE" = "422" ] && ok "codex + a claude model → 422 (caught at agent-write time, not murkily at call time)" || no "model mismatch → $CODE: $(cat "$B")"
+CODE=$(post "/agents" "{\"name\":\"byo-match-$$\",\"policy\":\"conn-e2e\",\"harness\":\"codex\",\"model\":\"gpt-5.4-mini\"}")
+[ "$CODE" = "200" ] && ok "codex + a codex model → 200 (valid pair accepted)" || no "valid pair → $CODE: $(cat "$B")"
 
 # ── INC 2: the OAuth dance (DCR mode first) ───────────────────────────────
 say "OAUTH DANCE — 401 → PRM → AS metadata → PKCE+resource → callback → sealed rotating refresh"

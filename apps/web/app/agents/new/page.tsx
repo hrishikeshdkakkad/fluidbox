@@ -9,6 +9,7 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Check, Play } from "lucide-react";
 import { apiPost, BundleRef } from "../../lib/api";
+import { useHarnesses, modelsFor, defaultModelFor } from "../../lib/harnesses";
 import { PageHead } from "../../components/bits";
 import { BundlePicker } from "../../components/BundlePicker";
 import { HarnessPicker } from "../../components/HarnessPicker";
@@ -20,27 +21,13 @@ import {
 } from "../../components/WorkspacePicker";
 
 // Models are per-harness — a claude model on a codex agent (or vice versa) is
-// never valid. Switching the harness re-defaults the model to that harness's
-// first entry. This is a UI convenience: the server validates only that the
-// harness id is known and pins model==RunSpec.model at the facade — it does
-// NOT check the model belongs to the harness, so a mismatched model would
-// fail (murkily) at model-call time, not with a clean 422.
-const MODELS_BY_HARNESS: Record<string, { id: string; name: string; hint: string }[]> = {
-  "claude-agent-sdk": [
-    { id: "claude-haiku-4-5", name: "Haiku 4.5", hint: "Fast and inexpensive — the default for most agents." },
-    { id: "claude-sonnet-5", name: "Sonnet 5", hint: "Balanced depth and speed for harder tasks." },
-    { id: "claude-opus-4-8", name: "Opus 4.8", hint: "Deepest reasoning; slowest and priciest." },
-  ],
-  codex: [
-    { id: "gpt-5.4-mini", name: "GPT-5.4 mini", hint: "Fast and inexpensive — the codex default." },
-    { id: "gpt-5.4", name: "GPT-5.4", hint: "Balanced depth and speed." },
-    { id: "gpt-5.6-sol", name: "GPT-5.6 sol", hint: "Deepest reasoning; slowest and priciest." },
-  ],
-};
-const defaultModelFor = (h: string) => MODELS_BY_HARNESS[h]?.[0]?.id ?? "";
+// never valid. The harness + model catalog is the server's (GET /harnesses),
+// and the server now rejects a mismatched model with a clean 422 at
+// agent-write time. Switching the harness re-defaults the model.
 
 export default function NewAgent() {
   const router = useRouter();
+  const harnesses = useHarnesses();
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [harness, setHarness] = useState("claude-agent-sdk");
@@ -125,10 +112,11 @@ export default function NewAgent() {
               Harness
             </div>
             <HarnessPicker
+              harnesses={harnesses}
               value={harness}
               onChange={(h) => {
                 setHarness(h);
-                setModel(defaultModelFor(h)); // never carry a cross-harness model
+                setModel(defaultModelFor(harnesses, h)); // never carry a cross-harness model
               }}
             />
             <p className="helper" style={{ margin: "8px 0 0" }}>
@@ -142,7 +130,7 @@ export default function NewAgent() {
               Model
             </div>
             <div className="opt-grid">
-              {(MODELS_BY_HARNESS[harness] ?? []).map((m) => (
+              {modelsFor(harnesses, harness).map((m) => (
                 <button
                   key={m.id}
                   type="button"
@@ -150,7 +138,7 @@ export default function NewAgent() {
                   onClick={() => setModel(m.id)}
                 >
                   <span className="t">
-                    {m.name}
+                    {m.display_name}
                     {model === m.id && <Check />}
                   </span>
                   <div className="id">{m.id}</div>

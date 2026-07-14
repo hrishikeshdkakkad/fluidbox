@@ -2,37 +2,26 @@
 
 // Which agent brain runs inside the sandbox. Harnesses implement the same
 // runner contract (canUseTool → /permission, events, heartbeats, /result),
-// so governance is identical across them — only the brain changes. Offer
-// exactly what the control plane can run today; announced ones render as
-// disabled cards so the extension point is visible.
+// so governance is identical across them — only the brain changes. The list
+// (and each harness's models) comes from the control plane via GET /harnesses
+// — the server is the single source of truth. Announced-but-unavailable
+// harnesses render as disabled cards so the extension point stays visible.
 
 import { Check } from "lucide-react";
-
-export const HARNESSES = [
-  {
-    id: "claude-agent-sdk",
-    name: "Claude Agent SDK",
-    hint: "Claude Code in the sandbox — live timeline, gated tools, approvals.",
-    available: true,
-  },
-  {
-    id: "codex",
-    name: "Codex",
-    hint: "OpenAI Codex on the same governed runner contract.",
-    available: true,
-  },
-];
+import { HarnessInfo } from "../lib/api";
 
 export function HarnessPicker({
+  harnesses,
   value,
   onChange,
 }: {
+  harnesses: HarnessInfo[];
   value: string;
   onChange: (id: string) => void;
 }) {
   return (
     <div className="opt-grid">
-      {HARNESSES.map((h) => (
+      {harnesses.map((h) => (
         <button
           key={h.id}
           type="button"
@@ -42,7 +31,7 @@ export function HarnessPicker({
           title={h.available ? undefined : "Not available yet"}
         >
           <span className="t">
-            {h.name}
+            {h.display_name}
             {value === h.id ? <Check /> : !h.available ? <span className="badge">soon</span> : null}
           </span>
           <div className="id">{h.id}</div>

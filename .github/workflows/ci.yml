@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The e2e job (below) is manual-only — it builds both runner images and
+  # drives a full stack for up to 45 min, which burns real Actions minutes on
+  # every push. Trigger it by hand from the Actions tab (or `gh workflow run
+  # ci.yml --ref <branch>`) when you actually want the acceptance run.
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -77,7 +82,12 @@ jobs:
   # (base-image bumps can't be vacuously green — closes the #14 gap) and
   # drives the real stack over HTTP. Live tiers are skipped — CI never
   # spends model credits; run `just e2e` locally with keys for those.
+  #
+  # MANUAL-ONLY: this job costs real Actions minutes (two image builds + a
+  # 45-min stack), so it does NOT run on pull_request or push — only when
+  # dispatched by hand. The cheap gates (rust/web/deny) still run on every PR.
   e2e:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     services:

@@ -199,6 +199,70 @@ export interface CatalogConnectResult {
   bundle?: { name: string; version: number };
   connection?: Connection;
   authorize_url?: string;
+  /** Photographed servers/tools (none/api_key connects). */
+  servers?: BundleServer[];
+}
+
+/** One photographed tool (name + description; schema stays server-side). */
+export interface ToolPreview {
+  name: string;
+  description: string;
+}
+
+/** A server inside a bundle detail (GET /capabilities/{id}). */
+export interface BundleServer {
+  name: string;
+  class: "sandbox" | "brokered";
+  tool_count: number;
+  tools_digest: string;
+  tools: ToolPreview[];
+}
+
+/** GET /capabilities/{id} — the full bundle with per-server tool lists. */
+export interface BundleDetail {
+  bundle: CapabilityBundle;
+  servers: BundleServer[];
+}
+
+/** POST /mcp/probe response — non-committing auth + tool detection. */
+export interface ProbeResult {
+  url: string;
+  transport: string;
+  reachable: boolean;
+  auth_mode: "none" | "api_key" | "oauth";
+  oauth_available: boolean;
+  static_possible: boolean;
+  tools_preview: ToolPreview[];
+  oauth: { issuer?: string; authorization_endpoint?: string; scopes_supported?: string[] } | null;
+  auth_hints: { header_name?: string; scheme?: string };
+  notes: string[];
+}
+
+/** POST /mcp/servers response (fields vary by auth_mode, + derived slug). */
+export interface AddServerResult {
+  slug?: string;
+  bundle?: { name: string; version: number };
+  servers?: BundleServer[];
+  connection?: Connection;
+  authorize_url?: string;
+}
+
+/** One model offered for a harness (GET /harnesses). */
+export interface HarnessModel {
+  id: string;
+  display_name: string;
+  hint: string;
+}
+
+/** GET /harnesses entry — the supported harness + model catalog (server is
+ *  the single source of truth; the frontend no longer hardcodes models). */
+export interface HarnessInfo {
+  id: string;
+  display_name: string;
+  hint: string;
+  available: boolean;
+  default_model: string | null;
+  models: HarnessModel[];
 }
 
 /** Where a LEGACY (hand-pasted) github_app connection receives provider

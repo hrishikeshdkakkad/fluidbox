@@ -143,6 +143,17 @@ pub async fn create(
     State(state): State<AppState>,
     Json(req): Json<CreateEntry>,
 ) -> ApiResult<Json<Value>> {
+    let row = create_entry_row(&state, &req).await?;
+    Ok(Json(json!({ "connector": row })))
+}
+
+/// Shared body of `POST /v1/catalog` — validates a custom-entry request and
+/// inserts the (tier-forced-custom) row. Reused by the one-shot BYO flow
+/// (`add_custom`) so a pasted URL and a raw catalog POST land identically.
+async fn create_entry_row(
+    state: &AppState,
+    req: &CreateEntry,
+) -> ApiResult<fluidbox_db::ConnectorCatalogRow> {
     let slug = req.slug.trim();
     if !valid_slug(slug) {
         return Err(ApiError::BadRequest(
@@ -222,7 +233,7 @@ pub async fn create(
         req.sandbox_launch.as_ref(),
     )
     .await?;
-    Ok(Json(json!({ "connector": row })))
+    Ok(row)
 }
 
 #[derive(Deserialize)]
@@ -258,6 +269,18 @@ pub async fn connect(
     let entry = fluidbox_db::get_catalog_by_slug(&state.pool, &slug)
         .await?
         .ok_or(ApiError::NotFound)?;
+    connect_entry(&state, entry, req).await
+}
+
+/// The three-branch connect body (none / api_key / oauth), factored out of the
+/// HTTP handler so the one-shot BYO flow (`add_custom`) drives the identical
+/// path: connection creation, credential rollback on photograph failure, the
+/// photograph, and the OAuth dance all live here unchanged.
+async fn connect_entry(
+    state: &AppState,
+    entry: fluidbox_db::ConnectorCatalogRow,
+    req: ConnectReq,
+) -> ApiResult<Json<Value>> {
     let bundle_name = req
         .bundle_name
         .as_deref()
@@ -270,7 +293,7 @@ pub async fn connect(
         "none" => {
             let server = authless_server(&entry)?;
             let row = crate::capabilities::register_bundle(
-                &state,
+                state,
                 &bundle_name,
                 entry.description.as_deref(),
                 vec![server],
@@ -312,7 +335,7 @@ pub async fn connect(
                 client_id: None,
                 client_secret: None,
             };
-            let created = crate::connections::create_mcp_http_connection(&state, create).await?;
+            let created = crate::connections::create_mcp_http_connection(state, create).await?;
             let connection_id = created.id;
             let server = CapabilityServer::Brokered {
                 name: entry.slug.clone(),
@@ -322,17 +345,23 @@ pub async fn connect(
                 tools: Vec::new(),
             };
             match crate::capabilities::register_bundle(
-                &state,
+                state,
                 &bundle_name,
                 entry.description.as_deref(),
                 vec![server],
             )
             .await
             {
-                Ok(row) => Ok(Json(json!({
-                    "connection": created,
-                    "bundle": crate::capabilities::bundle_json(&row)["bundle"],
-                }))),
+                Ok(row) => {
+                    // Return the photographed servers/tools too so the wizard's
+                    // success screen can show what was discovered.
+                    let bj = crate::capabilities::bundle_json(&row);
+                    Ok(Json(json!({
+                        "connection": created,
+                        "bundle": bj["bundle"],
+                        "servers": bj["servers"],
+                    })))
+                }
                 Err(e) => {
                     // The photograph is the credential's proof-of-life; a
                     // refused key must not leave a dangling connection.
@@ -420,7 +449,7 @@ pub async fn connect(
                 },
             )
             .await?;
-            let authorize_url = crate::oauth::start_dance(&state, row.id).await?;
+            let authorize_url = crate::oauth::start_dance(state, row.id).await?;
             Ok(Json(json!({
                 "connection": row,
                 "authorize_url": authorize_url,
@@ -472,6 +501,298 @@ fn authless_server(entry: &fluidbox_db::ConnectorCatalogRow) -> ApiResult<Capabi
     })
 }
 
+// ─── Bring-your-own-MCP: probe + one-shot connect ─────────────────────────
+
+#[derive(Deserialize)]
+pub struct ProbeReq {
+    pub url: String,
+}
+
+/// `POST /v1/mcp/probe` — NON-COMMITTING auth + tool detection for a pasted
+/// MCP URL. Persists nothing and sends no secret. Credential-free discovery
+/// distinguishes an authless server (tools come back — display-only preview)
+/// from one that wants a credential (401); on 401 we walk `oauth::discover`
+/// to tell OAuth from a static API key. Ambiguity (a server that accepts
+/// both) is surfaced via `oauth_available` + `static_possible` + `notes`,
+/// never guessed silently.
+pub async fn probe(
+    _: Admin,
+    State(state): State<AppState>,
+    Json(req): Json<ProbeReq>,
+) -> ApiResult<Json<Value>> {
+    let url = req.url.trim();
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|_| ApiError::BadRequest("a valid http(s) url is required".into()))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ApiError::BadRequest("url must be http(s)".into()));
+    }
+    let mut notes: Vec<String> = Vec::new();
+    match crate::broker::probe_tools(&state, url).await {
+        crate::broker::ProbeOutcome::Tools(tools) => {
+            // Display-only preview (capped at the core per-server tool cap of
+            // 64); the authoritative photograph still runs at connect.
+            let preview: Vec<Value> = tools
+                .iter()
+                .take(64)
+                .map(|t| json!({ "name": t.name, "description": t.description }))
+                .collect();
+            Ok(Json(json!({
+                "url": url,
+                "transport": "streamable_http",
+                "reachable": true,
+                "auth_mode": "none",
+                "oauth_available": false,
+                "static_possible": false,
+                "tools_preview": preview,
+                "oauth": Value::Null,
+                "auth_hints": {},
+                "notes": notes,
+            })))
+        }
+        crate::broker::ProbeOutcome::Unauthorized => {
+            match crate::oauth::discover(&state, url).await {
+                Ok(meta) => {
+                    notes.push(
+                    "This server also returned 401 to an anonymous request, so a static API key may work too — pick 'API key' instead if you have one.".into(),
+                );
+                    Ok(Json(json!({
+                        "url": url,
+                        "transport": "streamable_http",
+                        "reachable": true,
+                        "auth_mode": "oauth",
+                        "oauth_available": true,
+                        "static_possible": true,
+                        "tools_preview": [],
+                        // Non-secret AS summary only — no client/registration material.
+                        "oauth": {
+                            "issuer": meta.issuer,
+                            "authorization_endpoint": meta.authorization_endpoint,
+                            "scopes_supported": meta.scopes_supported,
+                        },
+                        "auth_hints": {},
+                        "notes": notes,
+                    })))
+                }
+                Err(e) => {
+                    notes.push(format!(
+                    "No OAuth authorization server was discoverable ({e}); assuming a static API key."
+                ));
+                    Ok(Json(json!({
+                        "url": url,
+                        "transport": "streamable_http",
+                        "reachable": true,
+                        "auth_mode": "api_key",
+                        "oauth_available": false,
+                        "static_possible": true,
+                        "tools_preview": [],
+                        "oauth": Value::Null,
+                        "auth_hints": { "scheme": "Bearer" },
+                        "notes": notes,
+                    })))
+                }
+            }
+        }
+        crate::broker::ProbeOutcome::Unreachable(msg) => {
+            notes.push(msg);
+            Ok(Json(json!({
+                "url": url,
+                "transport": "streamable_http",
+                "reachable": false,
+                "auth_mode": "api_key",
+                "oauth_available": false,
+                "static_possible": true,
+                "tools_preview": [],
+                "oauth": Value::Null,
+                "auth_hints": { "scheme": "Bearer" },
+                "notes": notes,
+            })))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct AddCustomReq {
+    pub url: String,
+    pub name: String,
+    /// none | api_key | oauth (default none).
+    #[serde(default)]
+    pub auth_mode: Option<String>,
+    /// api_key: the raw secret (Basic-composite connectors: `email:api_token`).
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// api_key: custom header name (default `authorization`) + scheme
+    /// (`Bearer` | `Basic` | "" for a bare token).
+    #[serde(default)]
+    pub header_name: Option<String>,
+    #[serde(default)]
+    pub scheme: Option<String>,
+    /// oauth: extra scopes + optional pre-registered client identity.
+    #[serde(default)]
+    pub scopes: Option<Vec<String>>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+}
+
+/// `POST /v1/mcp/servers` — the one-shot "bring your own MCP server" flow: a
+/// pasted URL becomes a `tier=custom` catalog entry AND is connected in one
+/// call, reusing `create_entry_row` + `connect_entry` verbatim. For the
+/// none/api_key branches a failed connect rolls the just-created entry back so
+/// no orphan card survives; for oauth the entry MUST persist (the callback
+/// re-fetches it by `catalog_slug` to auto-register the bundle).
+pub async fn add_custom(
+    _: Admin,
+    State(state): State<AppState>,
+    Json(req): Json<AddCustomReq>,
+) -> ApiResult<Json<Value>> {
+    let url = req.url.trim();
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|_| ApiError::BadRequest("a valid http(s) url is required".into()))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ApiError::BadRequest("url must be http(s)".into()));
+    }
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::BadRequest("name is required".into()));
+    }
+    let auth_mode = req.auth_mode.as_deref().unwrap_or("none");
+    if !matches!(auth_mode, "none" | "api_key" | "oauth") {
+        return Err(ApiError::BadRequest(
+            "auth_mode must be none, api_key, or oauth".into(),
+        ));
+    }
+    let host = parsed.host_str().unwrap_or("mcp");
+    let slug = derive_slug(&state, host, name).await?;
+
+    // api_key custom header/scheme ride the entry's auth_hints — exactly the
+    // shape connect_entry's api_key branch reads (Sentry's custom header etc.).
+    let mut auth_hints = json!({});
+    if auth_mode == "api_key" {
+        if let Some(h) = req
+            .header_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            auth_hints["header_name"] = json!(h);
+        }
+        // Scheme is tri-state and an EXPLICIT "" is meaningful (the Sentry
+        // "bare token" shape), so only an ABSENT field falls through to the
+        // Bearer default — never trim an empty string away. This mirrors
+        // `create_mcp_http_connection`, which stores "" and defaults to
+        // Bearer only when nothing is passed.
+        if let Some(s) = req.scheme.as_deref().map(str::trim) {
+            auth_hints["scheme"] = json!(s);
+        }
+    }
+
+    let create = CreateEntry {
+        slug: slug.clone(),
+        name: name.to_string(),
+        icon: req.icon.clone(),
+        description: req.description.clone(),
+        categories: None,
+        url: Some(url.to_string()),
+        transport: Some("streamable_http".into()),
+        auth_mode: Some(auth_mode.to_string()),
+        auth_hints: Some(auth_hints),
+        scopes: Some(json!(req.scopes.clone().unwrap_or_default())),
+        egress: None,
+        tool_hints: None,
+        sandbox_launch: None,
+    };
+    let entry = create_entry_row(&state, &create).await?;
+
+    let connect_req = ConnectReq {
+        display_name: req.display_name.clone(),
+        token: req.token.clone(),
+        bundle_name: None,
+        client_id: req.client_id.clone(),
+        client_secret: req.client_secret.clone(),
+        scopes: req.scopes.clone(),
+    };
+
+    let with_slug = |mut out: Json<Value>| {
+        if let Some(o) = out.0.as_object_mut() {
+            o.insert("slug".into(), json!(slug));
+        }
+        out
+    };
+
+    // Every branch keeps the entry on SUCCESS (it becomes the custom Store
+    // card; for OAuth the callback re-fetches it by slug to auto-register) and
+    // rolls it back on FAILURE — including a failed OAuth dance (a discover /
+    // insert / start_dance error means no callback is ever coming, so the
+    // entry would otherwise orphan exactly like a refused api_key).
+    match connect_entry(&state, entry, connect_req).await {
+        Ok(out) => Ok(with_slug(out)),
+        Err(e) => {
+            if let Err(del) = fluidbox_db::delete_catalog_entry(&state.pool, &slug).await {
+                tracing::warn!(
+                    "BYO connect for '{slug}' failed ({e}); entry rollback also failed: {del}"
+                );
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Slugify to the strict alias/bundle charset (`[a-z0-9-]`, no underscores —
+/// `mcp__<alias>__<tool>` must parse). Collapses runs of other chars to a
+/// single hyphen and caps length to leave room for a dedup suffix.
+fn slugify(s: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for c in s.chars() {
+        let lc = c.to_ascii_lowercase();
+        if lc.is_ascii_lowercase() || lc.is_ascii_digit() {
+            out.push(lc);
+            prev_dash = false;
+        } else if !out.is_empty() && !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let trimmed: String = out.trim_matches('-').chars().take(58).collect();
+    trimmed.trim_end_matches('-').to_string()
+}
+
+/// Derive a UNIQUE catalog slug from the server name (host as fallback),
+/// appending `-2`, `-3`, … on collision.
+async fn derive_slug(state: &AppState, host: &str, name: &str) -> ApiResult<String> {
+    let mut base = slugify(name);
+    if !valid_slug(&base) {
+        base = slugify(host);
+    }
+    if !valid_slug(&base) {
+        base = "mcp-server".to_string();
+    }
+    for n in 0u32..1000 {
+        let cand = if n == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{}", n + 1)
+        };
+        if valid_slug(&cand)
+            && fluidbox_db::get_catalog_by_slug(&state.pool, &cand)
+                .await?
+                .is_none()
+        {
+            return Ok(cand);
+        }
+    }
+    Err(ApiError::Conflict(
+        "could not derive a unique slug for this server".into(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,5 +807,26 @@ mod tests {
         assert!(!valid_slug(""));
         assert!(!valid_slug("UPPER"));
         assert!(!valid_slug(&"x".repeat(65)));
+    }
+
+    #[test]
+    fn slugify_produces_valid_slugs_without_underscores() {
+        assert_eq!(slugify("My Cool Server"), "my-cool-server");
+        assert_eq!(slugify("mcp.example.com"), "mcp-example-com");
+        assert_eq!(slugify("Under_Score"), "under-score"); // '_' → hyphen, never kept
+        assert_eq!(slugify("  --Trim!!--  "), "trim");
+        assert_eq!(slugify("a__b___c"), "a-b-c"); // runs collapse
+                                                  // A name of only punctuation slugifies to empty → caller falls back.
+        assert_eq!(slugify("!!!"), "");
+        // Every non-empty result is a valid alias/bundle slug.
+        for s in ["My Cool Server", "mcp.example.com", "Under_Score", "123abc"] {
+            let out = slugify(s);
+            assert!(
+                out.is_empty() || valid_slug(&out),
+                "slugify({s:?}) = {out:?}"
+            );
+        }
+        // Long input is capped with room left for a `-NN` dedup suffix.
+        assert!(slugify(&"x".repeat(200)).len() <= 58);
     }
 }
