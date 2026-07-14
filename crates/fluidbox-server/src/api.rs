@@ -315,6 +315,48 @@ fn harness_defaults<'a>(
     }
 }
 
+/// Reject an EXPLICIT model that doesn't belong to the harness — a clean 422
+/// before anything persists, instead of a murky failure at the first model
+/// call. Inherited/default models are trusted (a shipped default is always a
+/// member of its list, pinned by a harness unit test).
+fn validate_model(harness_id: &str, model: &str) -> Result<(), ApiError> {
+    if harness::model_belongs(harness_id, model) {
+        return Ok(());
+    }
+    let valid: Vec<&str> = harness::models(harness_id).iter().map(|m| m.id).collect();
+    Err(ApiError::UnprocessableEntity(format!(
+        "model '{model}' is not valid for harness '{harness_id}' (valid: {})",
+        valid.join(", ")
+    )))
+}
+
+/// `GET /v1/harnesses` — the supported harness + model catalog. The SINGLE
+/// source of truth for the dashboard's harness/model pickers (the frontend no
+/// longer hardcodes model lists).
+pub async fn list_harnesses(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let harnesses: Vec<Value> = harness::KNOWN
+        .iter()
+        .map(|&id| {
+            json!({
+                "id": id,
+                "display_name": harness::display_name(id),
+                "hint": harness::hint(id),
+                "available": true,
+                "default_model": harness::default_model(id, &state.cfg),
+                "models": harness::models(id)
+                    .iter()
+                    .map(|m| json!({
+                        "id": m.id,
+                        "display_name": m.display_name,
+                        "hint": m.hint,
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "harnesses": harnesses })))
+}
+
 /// add_revision inheritance for image/model: explicit wins; on a harness
 /// SWITCH the previous harness's value is not inherited — it re-defaults to
 /// the new harness's default (a claude image/model on a codex revision is
@@ -341,6 +383,9 @@ pub async fn create_agent(
     // leave a revision-less agent behind.
     let harness_id = req.harness.as_deref().unwrap_or(harness::CLAUDE_AGENT_SDK);
     let (default_image, default_model) = harness_defaults(harness_id, &state.cfg)?;
+    if let Some(m) = req.model.as_deref() {
+        validate_model(harness_id, m)?;
+    }
 
     let agent = fluidbox_db::create_agent(
         &state.pool,
@@ -431,6 +476,9 @@ pub async fn add_revision(
         .or(latest.as_ref().map(|r| r.harness.as_str()))
         .unwrap_or(harness::CLAUDE_AGENT_SDK);
     let (default_image, default_model) = harness_defaults(harness_id, &state.cfg)?;
+    if let Some(m) = req.model.as_deref() {
+        validate_model(harness_id, m)?;
+    }
     let harness_changed = latest
         .as_ref()
         .map(|r| r.harness != harness_id)

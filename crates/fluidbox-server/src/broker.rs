@@ -600,6 +600,33 @@ pub async fn photograph_brokered(
         .map_err(|e| ApiError::BadRequest(format!("capability server '{name}': {e}")))
 }
 
+/// The three outcomes of a NON-COMMITTING, credential-free probe of a remote
+/// MCP endpoint. `Unauthorized` (a clean 401) is a *signal* the server wants
+/// auth — the wizard branches on it; `Unreachable` is a genuine error. This
+/// distinction is exactly why the probe rides the private `discover_tools`
+/// (which surfaces `CallErr::Unauthorized`) rather than `discover_tools_auth`
+/// (which collapses a 401 into an opaque credential-rejection message).
+pub enum ProbeOutcome {
+    /// Authless server — these tools are for DISPLAY only, never persisted;
+    /// the authoritative photograph still happens at connect.
+    Tools(Vec<ToolSnapshot>),
+    /// The server answered 401 — it wants a credential (api_key or oauth).
+    Unauthorized,
+    /// Not reachable / not a well-behaved MCP endpoint (message for `notes`).
+    Unreachable(String),
+}
+
+/// Credential-free discovery for the pre-connect probe. Persists nothing and
+/// sends no secret. Reuses all of `discover_tools`' paging/SSE/handshake-retry
+/// logic; bounded by `MCP_TIMEOUT` per request.
+pub async fn probe_tools(state: &AppState, url: &str) -> ProbeOutcome {
+    match discover_tools(state, url, None).await {
+        Ok(tools) => ProbeOutcome::Tools(tools),
+        Err(CallErr::Unauthorized) => ProbeOutcome::Unauthorized,
+        Err(CallErr::Other(m)) => ProbeOutcome::Unreachable(m),
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
