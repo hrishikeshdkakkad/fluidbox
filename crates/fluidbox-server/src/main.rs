@@ -175,6 +175,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/catalog", get(catalog::list).post(catalog::create))
         .route("/catalog/{slug}", get(catalog::get))
         .route("/catalog/{slug}/connect", post(catalog::connect))
+        // Bring-your-own MCP: a non-committing probe (paste a URL → detect
+        // auth + preview tools) and a one-shot connect (custom catalog entry
+        // + connect in one call). Both ride the existing catalog seams.
+        .route("/mcp/probe", post(catalog::probe))
+        .route("/mcp/servers", post(catalog::add_custom))
+        // The supported harness + model catalog (single source of truth for
+        // the dashboard pickers).
+        .route("/harnesses", get(api::list_harnesses))
         .route(
             "/connections/{id}/deliveries",
             get(events::connection_deliveries),

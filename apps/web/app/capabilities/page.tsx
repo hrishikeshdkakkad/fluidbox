@@ -8,16 +8,28 @@
 import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Check, KeyRound, Package, Plus, Puzzle, Search, ShieldCheck } from "lucide-react";
+import {
+  Check,
+  ChevronDown,
+  ChevronRight,
+  KeyRound,
+  Package,
+  Plus,
+  Puzzle,
+  Search,
+  ShieldCheck,
+} from "lucide-react";
 import {
   apiGet,
   apiPost,
+  BundleDetail,
   CapabilityBundle,
   CatalogConnectResult,
   CatalogEntry,
   Connection,
 } from "../lib/api";
 import { LoadingRows, ModalShell, PageHead } from "../components/bits";
+import { AddServerWizard } from "./AddServerWizard";
 
 type Tab = "store" | "bundles" | "connections";
 
@@ -41,6 +53,7 @@ function Capabilities() {
   const [connections, setConnections] = useState<Connection[]>([]);
   const [connecting, setConnecting] = useState<CatalogEntry | null>(null);
   const [showBundle, setShowBundle] = useState(false);
+  const [showWizard, setShowWizard] = useState(false);
   const [err, setErr] = useState("");
   const [loading, setLoading] = useState(true);
 
@@ -127,7 +140,7 @@ function Capabilities() {
       {loading ? (
         <div className="panel"><LoadingRows /></div>
       ) : tab === "store" ? (
-        <Store catalog={catalog} onOpen={setConnecting} />
+        <Store catalog={catalog} onOpen={setConnecting} onAddOwn={() => setShowWizard(true)} />
       ) : tab === "bundles" ? (
         <BundlesTab bundles={bundles} onRegister={() => setShowBundle(true)} />
       ) : (
@@ -156,6 +169,14 @@ function Capabilities() {
           }}
         />
       )}
+      {showWizard && (
+        <AddServerWizard
+          onClose={() => {
+            setShowWizard(false);
+            load();
+          }}
+        />
+      )}
     </>
   );
 }
@@ -165,9 +186,11 @@ function Capabilities() {
 function Store({
   catalog,
   onOpen,
+  onAddOwn,
 }: {
   catalog: CatalogEntry[];
   onOpen: (e: CatalogEntry) => void;
+  onAddOwn: () => void;
 }) {
   const [q, setQ] = useState("");
   const [cat, setCat] = useState<string | null>(null);
@@ -210,19 +233,14 @@ function Store({
         )}
       </div>
 
-      {shown.length === 0 ? (
-        <div className="panel">
-          <div className="empty">
-            <Puzzle />
-            <div>{catalog.length === 0 ? "The catalog is empty." : "No tools match."}</div>
-          </div>
-        </div>
-      ) : (
-        <div className="store-grid">
-          {shown.map((e) => (
-            <StoreCard key={e.slug} entry={e} onOpen={() => onOpen(e)} />
-          ))}
-        </div>
+      <div className="store-grid">
+        <AddOwnCard onClick={onAddOwn} />
+        {shown.map((e) => (
+          <StoreCard key={e.slug} entry={e} onOpen={() => onOpen(e)} />
+        ))}
+      </div>
+      {shown.length === 0 && catalog.length > 0 && (
+        <p className="helper" style={{ marginTop: 10 }}>No connectors match.</p>
       )}
 
       <p className="helper" style={{ marginTop: 14 }}>
@@ -285,7 +303,116 @@ function StoreCard({ entry, onOpen }: { entry: CatalogEntry; onOpen: () => void 
   );
 }
 
+function AddOwnCard({ onClick }: { onClick: () => void }) {
+  return (
+    <button className="store-card" onClick={onClick} style={{ borderStyle: "dashed" }}>
+      <div className="top">
+        <span className="store-icon">
+          <Plus />
+        </span>
+        <div style={{ minWidth: 0 }}>
+          <div className="nm">Add your own server</div>
+          <div style={{ marginTop: 2 }}>
+            <span className="badge">bring your own MCP</span>
+          </div>
+        </div>
+      </div>
+      <div className="desc">
+        Paste a URL — we detect the auth, preview the tools, and register it in one step.
+      </div>
+      <div className="foot">
+        <span>Remote (HTTP) MCP</span>
+        <span className="state" style={{ color: "var(--ink)" }}>
+          Add
+        </span>
+      </div>
+    </button>
+  );
+}
+
 /* ─── Bundles ────────────────────────────────────────────────────────── */
+
+// One bundle row, click to expand and lazily fetch its photographed tools
+// (GET /capabilities/{id}) — the list endpoint stays light (counts only).
+function BundleRow({ b }: { b: CapabilityBundle }) {
+  const [open, setOpen] = useState(false);
+  const [detail, setDetail] = useState<BundleDetail | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const toggle = async () => {
+    const next = !open;
+    setOpen(next);
+    if (next && !detail) {
+      setLoading(true);
+      try {
+        setDetail(await apiGet<BundleDetail>(`/capabilities/${b.id}`));
+      } catch {
+        /* leave detail null; the row still shows counts */
+      }
+      setLoading(false);
+    }
+  };
+
+  return (
+    <>
+      <div
+        className="row"
+        style={{ gridTemplateColumns: "200px 1fr 130px 110px", cursor: "pointer" }}
+        onClick={toggle}
+      >
+        <span className="mono" style={{ fontSize: 12, color: "var(--accent)", display: "flex", alignItems: "center", gap: 4 }}>
+          {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+          {b.name}@{b.version}
+        </span>
+        <span className="task">
+          {b.description || "—"}
+          <span className="faint mono" style={{ display: "block", fontSize: 11, marginTop: 2 }}>
+            {b.definition_digest.slice(0, 24)}…
+          </span>
+        </span>
+        <span className="meta">
+          {b.server_count} server{b.server_count === 1 ? "" : "s"} · {b.tool_count} tool
+          {b.tool_count === 1 ? "" : "s"}
+        </span>
+        <span className="chips">
+          {[...new Set(b.classes)].map((c) => (
+            <span key={c} className={`badge ${c === "brokered" ? "brand" : ""}`}>
+              {c}
+            </span>
+          ))}
+        </span>
+      </div>
+      {open && (
+        <div style={{ padding: "4px 12px 12px 22px" }}>
+          {loading ? (
+            <span className="faint" style={{ fontSize: 12 }}>Loading tools…</span>
+          ) : detail && detail.servers.length > 0 ? (
+            detail.servers.map((s) => (
+              <div key={s.name} style={{ marginBottom: 8 }}>
+                <span className="mono" style={{ fontSize: 12 }}>
+                  {s.name}{" "}
+                  <span className={`badge ${s.class === "brokered" ? "brand" : ""}`}>{s.class}</span>
+                </span>
+                {s.tools.length === 0 ? (
+                  <div className="faint" style={{ fontSize: 12, marginTop: 2 }}>No tools.</div>
+                ) : (
+                  s.tools.map((t) => (
+                    <div key={t.name} style={{ fontSize: 12, marginTop: 2 }}>
+                      <span className="mono" style={{ color: "var(--accent)" }}>{t.name}</span>
+                      {t.description ? <span className="faint"> — {t.description}</span> : null}
+                    </div>
+                  ))
+                )}
+              </div>
+            ))
+          ) : (
+            <span className="faint" style={{ fontSize: 12 }}>No tool details.</span>
+          )}
+        </div>
+      )}
+    </>
+  );
+}
 
 function BundlesTab({
   bundles,
@@ -321,28 +448,7 @@ function BundlesTab({
               <span>Classes</span>
             </div>
             {bundles.map((b) => (
-              <div key={b.id} className="row" style={{ gridTemplateColumns: "200px 1fr 130px 110px" }}>
-                <span className="mono" style={{ fontSize: 12, color: "var(--accent)" }}>
-                  {b.name}@{b.version}
-                </span>
-                <span className="task">
-                  {b.description || "—"}
-                  <span className="faint mono" style={{ display: "block", fontSize: 11, marginTop: 2 }}>
-                    {b.definition_digest.slice(0, 24)}…
-                  </span>
-                </span>
-                <span className="meta">
-                  {b.server_count} server{b.server_count === 1 ? "" : "s"} · {b.tool_count} tool
-                  {b.tool_count === 1 ? "" : "s"}
-                </span>
-                <span className="chips">
-                  {[...new Set(b.classes)].map((c) => (
-                    <span key={c} className={`badge ${c === "brokered" ? "brand" : ""}`}>
-                      {c}
-                    </span>
-                  ))}
-                </span>
-              </div>
+              <BundleRow key={b.id} b={b} />
             ))}
           </div>
         )}
