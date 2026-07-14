@@ -882,6 +882,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
+name = "fluidbox-catalog-import"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "fluidbox-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "fluidbox-cli"
 version = "0.1.0"
 dependencies = [
@@ -2341,6 +2353,7 @@ checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",
