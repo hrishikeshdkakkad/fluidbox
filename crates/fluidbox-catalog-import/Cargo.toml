@@ -21,3 +21,6 @@ serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
 anyhow.workspace = true
+# Registry ingest is an at-generate-time HTTP page walk. `blocking` keeps the
+# CLI synchronous; reqwest is already in the workspace graph so this is cached.
+reqwest = { workspace = true, features = ["blocking"] }

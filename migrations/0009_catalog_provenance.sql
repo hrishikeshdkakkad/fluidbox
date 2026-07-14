@@ -16,9 +16,11 @@ alter table connector_catalog
     add column provenance jsonb not null default '{"source":"fluidbox"}';
 
 -- 'rest_action' joins the transport vocabulary as a REFERENCE-ONLY shape
--- (plan D3): an open-connector provider is a REST-API Action, not a hosted MCP
--- endpoint, so it imports as a browsable card whose Connect is refused until
--- the deferred REST action executor lands. There is deliberately no CHECK
--- constraint on transport — connectability is enforced at Connect
--- (catalog.rs), and the dashboard derives a `connectable` flag from transport.
--- No data changes here; existing rows stay streamable_http / stdio.
+-- (plan D3): an imported row with no hosted MCP endpoint to photograph — a
+-- packaged-only MCP Registry server, or an open-connector REST provider —
+-- imports as a browsable card whose Connect is refused until the matching
+-- executor/packaging lands. There is deliberately no CHECK constraint on
+-- transport — connectability is enforced at Connect (catalog.rs), and the
+-- dashboard derives a `connectable` flag from transport. No data changes here;
+-- existing rows stay streamable_http / stdio. (MCP Registry entries that DO
+-- expose a streamable-http remote import as normal streamable_http and connect.)

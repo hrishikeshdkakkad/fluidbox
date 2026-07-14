@@ -731,9 +731,8 @@ function ConnectCatalog({ entry, onClose }: { entry: CatalogEntry; onClose: () =
         <>
           <div className="empty" style={{ padding: "18px 0" }}>
             <div>
-              Reference only — this connector was imported for discovery. Connecting it needs a
-              REST action executor that isn&apos;t available yet, so there&apos;s nothing to
-              attach today.
+              Reference only — this connector was imported for discovery. It has no hosted MCP
+              endpoint fluidbox can attach yet, so there&apos;s nothing to connect today.
             </div>
           </div>
           <div className="spread" style={{ marginTop: 16 }}>

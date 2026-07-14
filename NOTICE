@@ -10,23 +10,29 @@ Third-party attributions
 Connector catalog reference data (community tier)
 -------------------------------------------------
 The connector catalog MAY include community-tier reference rows derived from
-provider metadata published by:
+server/provider metadata published by two upstream catalogs:
 
-    open-connector — https://github.com/oomol-lab/open-connector
+    MCP Registry — https://github.com/modelcontextprotocol/registry   (PRIMARY)
+    Copyright (c) the Model Context Protocol authors and contributors
+    Licensed under the Apache License, Version 2.0
+
+    open-connector — https://github.com/oomol-lab/open-connector       (SUPPLEMENT)
     Copyright (c) oomol-lab and contributors
     Licensed under the Apache License, Version 2.0
+
     https://www.apache.org/licenses/LICENSE-2.0
 
 These rows are imported as UNTRUSTED reference data by the offline tool in
 crates/fluidbox-catalog-import (see
 docs/superpowers/plans/2026-07-14-connector-catalog-bulk-import.md). Each such
 row records its origin in its `provenance` column
-({"source":"open-connector","source_ref":"<pinned commit>", ...}), and the
-generated migration header records the exact upstream commit it was produced
-from. No open-connector source code is vendored, executed, or linked; only
-factual provider metadata (names, descriptions, categories, auth types, and
-scopes) is redistributed, with attribution, per the Apache-2.0 license.
+({"source":"mcp-registry"|"open-connector","source_ref":"<pinned cursor/commit>",
+"upstream_id":"...", ...}), and the generated migration header records the exact
+upstream snapshot/commit it was produced from. No upstream source code is
+vendored, executed, or linked; only factual metadata (names, descriptions,
+categories, remote URLs, auth types, and scopes) is redistributed, with
+attribution, per the Apache-2.0 license.
 
 The default checked-in catalog ships only fluidbox-curated (verified) rows;
-an open-connector import migration is merged separately and is gated on the
-attribution/legal review noted in the plan (D7 / open question O1).
+an import migration is merged separately and is gated on the attribution/legal
+review noted in the plan (D8 / open question O1).

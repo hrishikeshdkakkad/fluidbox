@@ -88,15 +88,23 @@ policy-sync:
 
 # ── Connector catalog import (offline dev tool) ──────────────────────────
 #
-# Regenerate the append-only connector-catalog import migration from a PINNED
-# open-connector checkout (Apache-2.0; see NOTICE). Clone + pin + generate its
-# catalog JSON first, then point SRC at it and pass the exact commit:
+# Regenerate the append-only connector-catalog import migration from the
+# official MCP Registry (PRIMARY, connectable breadth) + optionally a pinned
+# open-connector checkout (SUPPLEMENT, REST-only reference cards). Both
+# Apache-2.0 (see NOTICE). Every row is untrusted, community-tier, and
+# provenance-tagged; same pins → identical SQL.
 #
-#   git -C ../open-connector rev-parse HEAD          # the pin
+# Registry only (live paging), pinned by date/cursor:
+#   just catalog-import-registry 2026-07-14 migrations/0010_catalog_import.sql
+#
+# Full control (Registry snapshot + open-connector), see the binary's --help:
+#   git -C ../open-connector rev-parse HEAD          # the oc pin
 #   (cd ../open-connector && npm ci && npm run generate:catalog)
-#   just catalog-import ../open-connector <commit> migrations/0010_catalog_import.sql
-#
-# Deterministic: same commit → identical SQL. Every row is untrusted,
-# community-tier, provenance-tagged; REST-only providers import reference-only.
-catalog-import SRC SHA OUT="migrations/0010_catalog_import.sql":
-    cargo run -p fluidbox-catalog-import -- --src {{SRC}} --sha {{SHA}} --out {{OUT}}
+#   cargo run -p fluidbox-catalog-import -- \
+#     --registry-url https://registry.modelcontextprotocol.io --registry-ref 2026-07-14 \
+#     --open-connector ../open-connector --oc-sha <commit> \
+#     --out migrations/0010_catalog_import.sql
+catalog-import-registry REF OUT="migrations/0010_catalog_import.sql":
+    cargo run -p fluidbox-catalog-import -- \
+      --registry-url https://registry.modelcontextprotocol.io \
+      --registry-ref {{REF}} --out {{OUT}}

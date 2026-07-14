@@ -1,165 +1,203 @@
-# Connector catalog bulk import — breadth from open-connector as untrusted reference data
+# Connector catalog bulk import — breadth from the MCP Registry (primary) + open-connector (supplement), as untrusted reference data
 
-**Date:** 2026-07-14 · **Author:** capabilities review (`claude/mcp-capabilities-review`)
+**Date:** 2026-07-14 · rev 2 · **Author:** capabilities review (`claude/connector-catalog-bulk-import-plan`)
 **Parent:** `docs/superpowers/plans/2026-07-11-phase5-5-connector-catalog-oauth.md` (the catalog + OAuth slice)
-**Source under evaluation:** [`oomol-lab/open-connector`](https://github.com/oomol-lab/open-connector) (Apache-2.0)
+**Sources under evaluation:**
+- [`modelcontextprotocol/registry`](https://github.com/modelcontextprotocol/registry) — the official MCP Registry (Apache-2.0) · **PRIMARY**
+- [`oomol-lab/open-connector`](https://github.com/oomol-lab/open-connector) (Apache-2.0) · **SUPPLEMENT** (REST-only long tail)
 
-**Status (2026-07-14):** increments 1–3 IMPLEMENTED — schema + guard (migration 0009,
-Connect refusal, `connectable` decoration, `custom`-provenance for API entries), the
-offline importer (`crates/fluidbox-catalog-import`, `just catalog-import`) with fixture
-tests, and attribution (`NOTICE`). Increment 4 (the generated 1k-row payload) stays
-deferred: it needs a pinned open-connector checkout + legal sign-off (O1) and applies
-against real Neon. One refinement landed vs D6: the generated upsert predicate is
-`provenance->>'source' = 'open-connector'` (refresh ONLY prior imports) rather than
-`<> 'fluidbox'` — strictly safer, it also protects a user's `custom` BYO entries from
-being overwritten by an import.
+**Prior art / threat model:** [Invariant Labs `mcp-scan`](https://invariantlabs.ai/blog/introducing-mcp-scan) — coined "tool poisoning" and "rug pull"; its "tool pinning" (hash tool descriptions, alarm on drift) IS our `tools_digest` + frozen-photograph model. Cited as the recognized mitigation our poison screen implements.
+
+**Status (2026-07-14):** increments 1–3 IMPLEMENTED — schema + guard (migration 0009, Connect refusal, `connectable` decoration, dashboard "Reference only" badge), the two-source importer (`crates/fluidbox-catalog-import`, `just catalog-import-registry`) with 18 fixture tests, and attribution (`NOTICE`). The importer pages the live MCP Registry (or a pinned snapshot) as primary + an open-connector checkout as supplement, screens every string, and emits a deterministic append-only migration. Increment 4 (the generated payload) stays deferred: it needs a pinned snapshot + legal sign-off (O1) and applies against real Neon. One refinement vs D6: the generated upsert predicate is `provenance->>'source' in ('mcp-registry','open-connector')` (refresh ONLY prior imports) rather than `<> 'fluidbox'` — strictly safer, it also protects a user's `custom` BYO entries.
 
 ## 1. Problem
 
 The connector catalog (`connector_catalog`, migration `0007`) ships **7 hand-curated
-entries** (GitHub, Stripe, Linear, Sentry, Atlassian, Notion, workspace-info). The
-security model around it is deep — photograph rule, definition digests, poison screen,
-frozen-set gate, audience-bound brokered credentials — but the **breadth is thin**, and
-adding an entry today is manual SQL curation.
+entries**. The security model around it is deep — photograph rule, definition digests,
+poison screen, frozen-set gate, audience-bound brokered credentials — but the **breadth is
+thin**, and adding an entry is manual SQL curation.
 
-open-connector is an open-source "Composio alternative" whose entire value is **breadth**:
-1,000+ providers and 10,000+ prebuilt Actions declared in `src/providers/<service>/definition.ts`.
-It is a data asset we can learn from without taking a code dependency. This plan imports
-that breadth into `connector_catalog` as **untrusted reference rows**, so the dashboard
-Store goes from 7 cards to hundreds overnight — while every existing invariant holds.
+We want breadth **now**, as **untrusted reference rows**, without a code dependency and
+without touching the gate / RunSpec / photograph. Two public catalogs supply it, at
+different value:
 
-### 1.1 The load-bearing tension (read this before anything else)
+- **The official MCP Registry is the high-value source.** It is the canonical, community
+  registry (backed by Anthropic, GitHub, PulseMCP, Microsoft), Apache-2.0, with a live
+  paginated REST API, and — critically — **its entries are real MCP servers, many exposing
+  remote streamable-http URLs that are DIRECTLY CONNECTABLE through our existing broker /
+  photograph path today.** Its `server.json` is the same shape our `ServerIdentity` struct
+  already mirrors (reverse-DNS name, version, package coords).
+- **open-connector is the long-tail supplement.** Its 1,000+ providers are REST-API Actions,
+  not MCP servers, so they import as *reference-only* and cannot Connect until the separate,
+  deferred `RestAction` executor lands. Valuable for coverage of SaaS that has no MCP server
+  yet, but strictly secondary to the Registry for *connectable* breadth.
 
-**open-connector providers are REST-API Actions, not MCP servers.** Its runtime turns a
-REST endpoint into an agent-callable Action and executes it itself (proxy/executor).
-fluidbox's catalog, by contrast, only knows two connectable shapes:
+### 1.1 The connectability split (read this before anything else)
+
+fluidbox's catalog knows two **connectable** shapes:
 
 - `transport='streamable_http'` + `url` → a **remote MCP endpoint** the broker photographs.
 - `transport='stdio'` + `sandbox_launch` → an **in-image MCP server** (declared tools).
 
-A generic open-connector provider is **neither**. It has no hosted MCP endpoint to
-photograph and no in-image server. So importing its metadata gives us a **browsable card**,
-but pressing **Connect** cannot succeed under today's model — there is nothing to
-photograph. Only the minority of providers that *also* expose a hosted MCP endpoint
-(GitHub, Stripe, Linear, Notion, Sentry, Atlassian, …) are connectable now.
+Mapping each source onto that:
 
-This is not a blocker; it is the correct scope boundary. open-connector solves the exact
-same problem internally with its `catalogOnly` vs `locallyExecutable` status split. We
-adopt the same honesty: **import buys discovery breadth; connectability for REST-only
-providers waits on the separate, deferred `CapabilityServer::RestAction` class** (the
-"REST Action" learning from the capabilities review; out of scope here). When that
-class lands, these reference rows light up with a one-line executor change — no re-import.
+| Source | Entry kind | Imports as | Connectable now? |
+|---|---|---|---|
+| MCP Registry | `remotes[].type = streamable-http` (remote URL) | `streamable_http` + `url` | **Yes** — existing broker path |
+| MCP Registry | `packages[]` only (npm/pypi/docker, no remote) | `rest_action` reference (see D3) | No — needs local/stdio launch we don't package |
+| open-connector | REST-API provider | `rest_action` reference | No — needs deferred `RestAction` executor |
+
+So: **the Registry gives connectable breadth immediately; packaged-only Registry entries and
+all open-connector entries import as honest reference cards** (mirroring open-connector's own
+`catalogOnly` vs `locallyExecutable` split, and the Registry's own remote-vs-package
+distinction). When a stdio-packaging path and/or the `RestAction` class land, those reference
+rows light up with no re-import.
 
 ## 2. Non-negotiables (inherited constraints)
 
 - **Catalog rows are UNTRUSTED reference data.** `tool_hints` are policy-default seeds for
   display/suggestion only; the permission gate (`internal.rs::decide_tool_call`) stays the
   judge. Nothing enforces off catalog data. (Phase 5.5 framing, unchanged.)
-- **No boot-sync, no runtime seed file.** The only sanctioned checked-in artifact for
-  catalog content is **migration SQL** (Phase 5.5 settle #2). The importer is an *offline*
-  developer tool that regenerates a migration; the server never fetches open-connector at
-  boot or runtime.
+- **No boot-sync, no runtime seed file.** The only sanctioned checked-in artifact for catalog
+  content is **migration SQL** (Phase 5.5 settle #2). The importer is an *offline* developer
+  tool that regenerates a migration; the server never fetches the Registry or open-connector
+  at boot or runtime. (The Registry API is hit only by the offline importer, at generate time.)
 - **No gate change, no RunSpec/freeze change, no photograph change.** `run_service::create_run`
-  is untouched. Import only adds rows to a reference table.
+  is untouched. Import only adds rows to a reference table. **Connect still photographs each
+  server fresh** — imported tool metadata is never trusted as the frozen set.
 - **Tier honesty.** The `/v1/catalog` API forces `tier='custom'` because verified/community
   are curation judgements the API cannot self-award. Imported rows are third-party curation,
-  not ours → they are **`community`** tier, set by the migration (not via the API).
-- **Backend stays 100% Rust; dashboard stays presentation-only.** The importer is a small
-  Rust binary/xtask; no TypeScript enters the backend. (We read open-connector's `.ts`
-  definitions as *input data*, not as code we run.)
+  not ours → they are **`community`** tier, set by the migration (not via the API). The
+  original 7 curated `verified` rows are never overwritten (D6).
+- **Backend stays 100% Rust; dashboard stays presentation-only.** The importer is a small Rust
+  binary/xtask; no TypeScript enters the backend. (open-connector `.ts` definitions and the
+  Registry JSON are read as *input data*, never executed.)
 
 ## 3. Decision record
 
-- **D1 — Import at PROVIDER granularity, not Action granularity.** We import ~1,000 provider
-  rows, NOT 10,000 actions. Catalog rows never stored per-tool schemas (tools are
-  photographed at connect); they hold provider-level metadata + coarse `tool_hints` globs.
-  This keeps the migration to ~1k INSERTs (fine) and matches the existing shape exactly.
+- **D0 — Two sources, one importer, Registry first.** The importer pulls the MCP Registry
+  first (connectable breadth) and open-connector second (REST-only supplement), de-duplicating
+  by canonical identity (D6). Each row records which source it came from (D4). The Registry is
+  authoritative on collision (a real MCP server beats a REST-only card for the same service).
 
-- **D2 — Output is a generated migration, pinned to an open-connector commit.** The importer
-  reads a **pinned** open-connector checkout (commit SHA recorded in the migration header,
-  LiteLLM-digest-pinning culture) and emits `migrations/00NN_catalog_import.sql`. Re-running
-  against a newer pin produces the *next* migration (append-only; we never rewrite `0007`).
+- **D1 — Import at PROVIDER/SERVER granularity, not Action granularity.** ~hundreds–thousand
+  rows, NOT 10,000 actions. Catalog rows never stored per-tool schemas (tools are photographed
+  at connect); they hold server-level metadata + coarse `tool_hints` globs. Keeps the migration
+  diff-reviewable and matches the existing row shape exactly.
 
-- **D3 — A new `transport='rest_action'` marks reference-only rows.** REST-only providers
-  import with `transport='rest_action'`, `url` = their API base (informational), and
-  **Connect refuses them** with a clear "not yet connectable — needs the REST action
-  executor" message (mirrors open-connector's `catalogOnly`). Providers with a known hosted
-  MCP endpoint import as normal `streamable_http` + `url` and Connect works today. The
-  dashboard derives a `connectable` boolean from `transport` so the Store can badge cards.
+- **D2 — Output is a generated migration, pinned.** The importer records the Registry snapshot
+  cursor/date and the open-connector commit SHA in the migration header (LiteLLM-digest-pinning
+  culture) and emits `migrations/00NN_catalog_import.sql`. Re-running against a newer snapshot
+  produces the *next* migration (append-only; we never rewrite `0007`).
 
-- **D4 — Provenance is a first-class column.** Add `provenance jsonb` (`{source, source_ref,
-  imported_at, upstream_id}`). Reference rows are auditable and refreshable; a future
-  re-import can diff by `(source, upstream_id)`. Curated `verified` rows (the original 7)
-  carry `provenance = {"source":"fluidbox"}` and are never overwritten by an import.
+- **D3 — A `transport='rest_action'` marks reference-only rows.** Non-connectable imports
+  (open-connector REST providers; packaged-only Registry entries with no remote URL) get
+  `transport='rest_action'`, `url` = informational base if any, and **Connect refuses them**
+  with a clear "reference-only — not yet connectable" message. `list` derives
+  `"connectable": transport != 'rest_action'` so the Store badges cards. Registry entries WITH
+  a remote streamable-http URL import as normal `streamable_http` + `url` and Connect works today.
 
-- **D5 — Import runs the poison screen.** Names, descriptions, and `tool_hints` notes are
-  model-/operator-visible strings from an external source. The importer runs the SAME
-  objective lint as capability registration (`fluidbox_core::capability::lint_text`:
-  control/zero-width/bidi/ANSI rejection, length caps) over every imported string and
-  **drops** any offending provider (logged), never smuggling it in. This is the "poison
-  screen at the door" applied to reference data too.
+- **D4 — Provenance is a first-class column.** `provenance jsonb` =
+  `{"source": "mcp-registry" | "open-connector" | "fluidbox", "source_ref": "<cursor|sha>",
+  "upstream_id": "<server.json name | provider dir>", "status": "<registry status>"}`.
+  Reference rows are auditable and refreshable; a future re-import diffs by
+  `(source, upstream_id)`. The curated 7 carry `{"source":"fluidbox"}` and are import-immune.
 
-- **D6 — Idempotent upsert by slug; curated rows win.** The migration uses
-  `insert … on conflict (slug) do update … where connector_catalog.provenance->>'source' <> 'fluidbox'`
-  — an import can refresh a prior import but can **never** clobber a hand-curated verified
-  entry (GitHub stays GitHub). Slug collisions between two imported providers get a numeric
-  suffix (reuse `catalog.rs::derive_slug` logic).
+- **D5 — Import runs the poison screen (the mcp-scan-recognized mitigation).** Names,
+  descriptions, and `tool_hints` notes are model-/operator-visible strings from external
+  sources. The importer runs the SAME objective lint as capability registration
+  (`fluidbox_core::capability::lint_text`: control/zero-width/bidi/ANSI rejection, length caps)
+  over every imported string and **drops** any offending entry (logged). This is the poison
+  screen at the door, applied to reference data — the static-analysis half of what mcp-scan
+  does; the digest/rug-pull half is already covered by the photograph at Connect.
 
-- **D7 — Attribution retained (Apache-2.0).** open-connector is Apache-2.0. We keep a
-  `NOTICE`/attribution entry crediting oomol-lab, record `source_ref` (commit) in
-  provenance, and note the license in the migration header. Factual API metadata (names,
-  endpoints, scopes) carries thin copyright, but their descriptions/curation may not — Apache-2.0
-  permits reuse with attribution, so we attribute rather than paraphrase. Legal sign-off is
-  an explicit gate before the generated migration is merged (§8, open question O1).
+- **D6 — Idempotent upsert by canonical identity; curated rows win; Registry beats open-connector.**
+  The migration uses `insert … on conflict (slug) do update … where
+  connector_catalog.provenance->>'source' <> 'fluidbox'` — an import can refresh a prior import
+  but never clobbers a hand-curated verified entry (GitHub stays GitHub). When both sources
+  describe the same service, the Registry (connectable) row wins the slug; the open-connector
+  row is dropped (logged). Cross-source slug collisions between distinct services get a numeric
+  suffix (reuse `catalog.rs::derive_slug`).
 
-## 4. Field mapping (open-connector `definition.ts` → `connector_catalog`)
+- **D7 — Registry `status` is honored.** `server.json` carries a status (`active` /
+  `deprecated` / …). Only `active` entries import; non-active are skipped (logged) and recorded
+  nowhere. A later re-import naturally drops a server that went deprecated (append-only migration
+  can `on conflict … do update set … ` to flip it to `rest_action`+note, or we simply stop
+  refreshing it — O2).
+
+- **D8 — Attribution retained (both Apache-2.0).** Keep a `NOTICE`/attribution entry crediting
+  the MCP Registry (Anthropic et al.) and oomol-lab; record `source_ref` in provenance; note
+  both licenses in the migration header. Apache-2.0 permits reuse with attribution, so we
+  attribute rather than paraphrase. Legal sign-off gates the payload migration merge (O1).
+
+## 4. Field mapping
+
+### 4.1 MCP Registry `server.json` → `connector_catalog` (PRIMARY)
+
+Sample entry shape (verified against the live API,
+`GET https://registry.modelcontextprotocol.io/v0/servers?limit=&cursor=`):
+
+```json
+{ "server": { "name": "ac.inference.sh/mcp", "title": "inference.sh",
+    "description": "Run 150+ AI apps…", "version": "1.0.0",
+    "remotes": [{ "type": "streamable-http", "url": "https://api.inference.sh/mcp" }] },
+  "_meta": { "io.modelcontextprotocol.registry/official": { "status": "active", … } } }
+```
 
 | catalog column | source | notes |
 |---|---|---|
-| `slug` | provider dir name, slugified | `catalog.rs::slugify`; must satisfy alias charset `[a-z0-9-]` (no `_`) |
-| `name` | provider `displayName`/`name` | linted (D5) |
-| `icon` | provider icon if present | short glyph only; else null |
-| `description` | provider description | linted, length-capped |
-| `categories` | provider category/tags | jsonb array of strings |
-| `tier` | — | forced `'community'` in migration (D4/tier honesty) |
-| `url` | hosted MCP endpoint if known, else API base | connectable only when a real MCP endpoint |
-| `transport` | derived | `streamable_http` if hosted MCP known; else `rest_action` (D3) |
+| `slug` | `server.title` or last path segment of `name`, slugified | `catalog.rs::slugify`; alias charset `[a-z0-9-]` |
+| `name` | `server.title` \|\| `server.name` | linted (D5) |
+| `description` | `server.description` | linted, length-capped |
+| `url` | first `remotes[]` where `type` ∈ {streamable-http, http} | present ⇒ **connectable** |
+| `transport` | derived | `streamable_http` if a remote URL exists; else `rest_action` (packaged-only) |
+| `auth_mode` | `none` by default; `remotes[].headers`/probe hints if present | most remotes are OAuth/none; Connect's probe still decides (unchanged) |
+| `categories` | none in server.json → `[]` | Registry has no category taxonomy; leave empty or infer from name |
+| `tier` | — | forced `'community'` |
+| `provenance` | — | `{source:"mcp-registry", upstream_id:server.name, source_ref:<cursor/date>, status}` |
+| `sandbox_launch` | — | null (we don't auto-package npm/pypi Registry entries this pass) |
+
+Notably the Registry has **no scopes/egress/tool_hints taxonomy**; those import empty and get
+the coarse default hint seed (§4.3). Egress host is derived from the remote URL.
+
+### 4.2 open-connector `definition.ts` → `connector_catalog` (SUPPLEMENT, unchanged from rev 1)
+
+| catalog column | source | notes |
+|---|---|---|
+| `slug` | provider dir name, slugified | alias charset |
+| `name` / `description` / `icon` | provider fields | linted |
+| `categories` | provider category/tags | jsonb array |
+| `url` | API base | informational only |
+| `transport` | — | always `rest_action` (never a hosted MCP endpoint) |
 | `auth_mode` | provider auth type | `oauth2`→`oauth`, `api_key`→`api_key`, `no_auth`→`none` |
-| `auth_hints` | auth field metadata | `{scheme?, header_name?, composite?, key_url?, placeholder?}`; sane defaults |
+| `auth_hints` | auth field metadata | `{scheme?, header_name?, composite?, key_url?, placeholder?}` |
 | `scopes` | union of Actions' `requiredScopes` | de-duplicated jsonb array |
-| `egress` | host(s) from base URL | informational host list for the card |
-| `tool_hints` | derived from Action `readOnly`/method | coarse globs: read/GET → `allow`, write → `approve` (see §4.1) |
-| `sandbox_launch` | — | always null (imported providers are never in-image) |
-| `provenance` | — | `{"source":"open-connector","source_ref":"<sha>","upstream_id":"<dir>"}` |
+| `egress` | host(s) from base URL | informational |
+| `tool_hints` | derived from Action read/write | coarse globs (§4.3) |
+| `provenance` | — | `{source:"open-connector", upstream_id:dir, source_ref:<sha>}` |
 
-### 4.1 tool_hints seeding (genuinely useful enrichment)
+### 4.3 tool_hints seeding (both sources)
 
-open-connector Action metadata distinguishes read vs write (HTTP method,
-`readOnly`/`providerPermissions`). We fold that into a coarse **policy-default display seed**:
+A coarse, display-only policy-default posture (the gate never reads it):
 `{"pattern":"mcp__<slug>__*get*","action":"allow"}`, `…*list*/*search* → allow`, catch-all
-`mcp__<slug>__* → approve`. This is exactly the shape the 7 curated entries already use, and
-it is **display/suggestion only** — the gate never reads it. It gives every imported card a
-sensible default posture instead of a blank one.
+`mcp__<slug>__* → approve`. open-connector's read/write Action metadata refines it where
+available; Registry entries just get the default. Matches the shape the 7 curated entries use.
 
 ## 5. Importer design (the offline tool)
 
-- **Location:** `crates/xtask` (or `scripts/`) — a dev-only Rust binary `catalog-import`,
-  NOT part of the server crate graph. Invoked as `just catalog-import --src <path-to-open-connector> --out migrations/00NN_catalog_import.sql`.
-- **Input:** a **pinned local checkout** of open-connector (the SHA is an argument and is
-  written into the migration header). We do not fetch at build time; the operator clones/pins.
-- **Parse:** open-connector definitions are TypeScript. We do **not** execute them. Two options,
-  in preference order:
-  1. **Their generated catalog JSON** — open-connector emits `catalog/apps` via `npm run
-     generate:catalog`. Parsing that JSON is robust and avoids TS parsing entirely. **Primary path.**
-  2. Fallback: a thin regex/AST extraction over `definition.ts` for the handful of fields we
-     need, if the generated JSON is unavailable. Lower fidelity; documented as best-effort.
-- **Transform:** apply §4 mapping + §4.1 hint seeding.
-- **Screen:** apply D5 lint; drop-and-log offenders; drop providers missing required fields
-  (name, auth_mode).
-- **Emit:** deterministic, sorted-by-slug `INSERT … ON CONFLICT` SQL (D6). Deterministic
-  ordering keeps the migration diff-reviewable and reproducible.
-- **Reproducibility:** same source SHA → byte-identical migration (no timestamps in row
-  bodies; `imported_at` uses the migration's own `now()` at apply time, not generation time).
+- **Location:** `crates/xtask` (or `scripts/`) — a dev-only Rust binary `catalog-import`, NOT
+  in the server crate graph. `just catalog-import --registry --open-connector <path> --out migrations/00NN_catalog_import.sql`.
+- **MCP Registry ingest:** page `GET /v0/servers?limit=100&cursor=…` following `nextCursor` to
+  exhaustion; keep `status=active`; map §4.1. This is a network fetch **at generate time only**,
+  pinned by recording the run date/final cursor in the migration header.
+- **open-connector ingest:** read a **pinned local checkout**; prefer its generated
+  `catalog/apps` JSON (`npm run generate:catalog`) over parsing `.ts`; map §4.2. SHA in header.
+- **Merge:** Registry first, then open-connector; drop open-connector rows whose service already
+  has a Registry row (D6); suffix distinct-service slug collisions.
+- **Screen:** apply D5 lint; drop-and-log offenders and entries missing required fields.
+- **Emit:** deterministic, sorted-by-slug `INSERT … ON CONFLICT` SQL (D6). No timestamps in row
+  bodies (`imported_at` uses the migration's `now()` at apply time) → same inputs = byte-identical
+  migration, diff-reviewable.
 
 ## 6. Schema changes (one small migration, ahead of the generated one)
 
@@ -168,75 +206,75 @@ sensible default posture instead of a blank one.
 ```sql
 alter table connector_catalog
   add column provenance jsonb not null default '{"source":"fluidbox"}';
-
 -- 'rest_action' joins the transport vocabulary as a REFERENCE-ONLY shape.
 -- (No check constraint on transport today; Connect enforces connectability.)
 ```
 
-Then `catalog.rs::connect_entry` gains a guard at the top:
+`catalog.rs::connect_entry` gains a top guard:
 
 ```rust
 if entry.transport == "rest_action" {
     return Err(ApiError::BadRequest(
-        "this connector is reference-only (imported catalog entry); \
-         a REST action executor is required to connect it — not yet available".into(),
+        "this connector is reference-only (imported catalog entry); it is not yet \
+         connectable from fluidbox".into(),
     ));
 }
 ```
 
-And `catalog.rs::list` decoration adds a derived `"connectable": entry.transport != "rest_action"`
-so the dashboard badges Store cards without embedding logic. `ConnectorCatalogRow` gains
-`pub provenance: Value`.
+`catalog.rs::list` decoration adds derived `"connectable": entry.transport != "rest_action"`;
+`ConnectorCatalogRow` gains `pub provenance: Value`.
 
 ## 7. Testing acceptance
 
-- **Importer unit tests:** a fixture open-connector JSON with (a) an oauth2 provider,
-  (b) an api_key provider with a custom header, (c) a no_auth provider, (d) a poisoned
-  description (must be dropped), (e) a slug collision (must suffix) → assert emitted SQL rows.
-- **Migration test** (extends `fluidbox-db` lib tests, real Neon): after the generated
-  migration applies, `list_catalog` returns ≥ N rows; the original 7 curated verified rows
-  are **unchanged** (provenance still `fluidbox`, tier still `verified`); a spot-checked
-  imported row has `tier='community'`, `provenance.source='open-connector'`.
-- **Connect guard test:** `connect` on a `rest_action` entry returns 400 with the
-  reference-only message; `connect` on an imported entry that DOES have a hosted MCP endpoint
-  still photographs (reuses existing api_key/oauth paths).
-- **e2e (`scripts/e2e`) catalog assertions:** the connector-catalog block asserts the Store
-  lists both verified and community tiers and that a reference-only card reports
-  `connectable=false`. Keep `events.rs`/`run_service.rs` grep-clean (no new provider names).
-- **`just check`** green (fmt + clippy -D warnings + test + web build).
+- **Importer unit tests (fixtures, no network):** a captured Registry page (one streamable-http
+  remote → connectable; one packaged-only → `rest_action`; one `status=deprecated` → dropped)
+  and an open-connector JSON (oauth / api_key+custom-header / no_auth / poisoned-description →
+  dropped / slug collision → suffixed) → assert emitted SQL rows and drops.
+- **Merge test:** a service present in BOTH sources yields ONE row, `source=mcp-registry`,
+  `transport=streamable_http`.
+- **Migration test (`fluidbox-db`, real Neon):** after apply, `list_catalog` returns ≥ N rows;
+  the original 7 verified rows are unchanged (provenance `fluidbox`, tier `verified`); a
+  Registry row is `community` + `streamable_http` + `connectable`; an open-connector row is
+  `community` + `rest_action`.
+- **Connect guard test:** `connect` on a `rest_action` entry → 400 reference-only; `connect` on
+  an imported streamable-http entry still photographs via the existing api_key/oauth paths.
+- **e2e catalog assertions:** Store lists verified + community tiers and reports
+  `connectable` correctly for both a Registry and a reference row. `events.rs`/`run_service.rs`
+  stay grep-clean (no new provider names).
+- **`just check`** green.
 
 ## 8. Rollout increments
 
-1. **Schema + guard** (§6): `provenance` column, `rest_action` transport handling, Connect
-   guard, `connectable` decoration. Small, self-contained, shippable alone.
-2. **Importer tool** (§5) with fixture tests. Produces a migration but we don't merge a
-   1k-row one yet.
-3. **Attribution + legal gate** (D7 / O1): `NOTICE` entry, license note; sign-off.
-4. **Generated import migration** merged: the actual breadth lands. Reviewable because it's
-   deterministic, sorted, and every row is `community`/provenanced.
-
-Increment 1 is valuable on its own (it makes the catalog import-ready and honest about
-connectability); 4 is the payload.
+1. **Schema + guard** (§6): `provenance` column, `rest_action` handling, Connect guard,
+   `connectable` decoration. Self-contained, shippable alone.
+2. **Importer tool** (§5) — Registry + open-connector ingest, fixture tests. Produces a
+   migration; not merged yet.
+3. **Attribution + legal gate** (D8 / O1): `NOTICE`, license notes; sign-off.
+4. **Generated import migration merged** — the breadth lands. The **Registry slice is the
+   connectable payload**; the open-connector slice is reference breadth.
 
 ## 9. Explicitly out of scope
 
-- **`CapabilityServer::RestAction` executor** — the thing that makes REST-only entries
-  actually connectable. Separate plan; this import is designed to dovetail with it (D3) but
-  does not depend on or deliver it.
-- **Running open-connector as a brokered MCP server.** Rejected in the review: its MCP
-  surface is 4 meta-tools (`search_actions`/`execute_action`/…), so the photograph would
-  freeze `execute_action` and collapse per-tool governance, and credentials would live in a
-  second custodian. Direct violation of §8.3 and the credential-inversion invariant.
-- **Per-Action schema import.** We import provider rows, not 10k action schemas (D1).
+- **`CapabilityServer::RestAction` executor** — makes REST-only rows connectable. Separate plan;
+  this import dovetails with it (D3) but neither delivers nor depends on it.
+- **Auto-packaging npm/pypi/docker Registry entries as stdio in-image servers** — would make
+  packaged-only Registry rows connectable, but pulling third-party packages into the runner
+  image is a supply-chain decision of its own. Deferred; those rows import as `rest_action` now.
+- **Running the Registry / open-connector as a live brokered MCP server.** Rejected: collapses
+  per-tool governance to a meta-tool and adds a second credential custodian (violates §8.3 +
+  the credential-inversion invariant).
+- **Per-Action / per-tool schema import.** We import server rows, not tool schemas (D1); Connect
+  photographs the real tools.
 
 ## 10. Open questions
 
-- **O1 (legal):** confirm Apache-2.0 attribution is sufficient for redistributing the
-  curated metadata + descriptions in a migration, or whether we paraphrase descriptions.
-  Blocks increment 4, not 1–3.
-- **O2 (refresh cadence):** how often do we re-pin and re-import? Proposal: manual, on demand,
-  each producing a new append-only migration. No automation (respects no-boot-sync).
-- **O3 (hosted-MCP discovery):** the set of providers that also expose a hosted MCP endpoint
-  (→ `streamable_http`, connectable now) is small and moves. Proposal: maintain a tiny
-  hand-kept allowlist mapping `slug → mcp_url` inside the importer; everything else imports as
-  `rest_action`. Keeps connectable-now honest without guessing.
+- **O1 (legal):** confirm Apache-2.0 attribution suffices to redistribute Registry + open-connector
+  metadata/descriptions verbatim in a migration, else paraphrase. Blocks increment 4 only.
+- **O2 (refresh cadence):** manual, on-demand re-pin → new append-only migration; no automation
+  (respects no-boot-sync). How do we retire rows for servers that leave/deprecate on the Registry?
+  Proposal: a refresh flips them to `rest_action` + a `status:"deprecated"` provenance note
+  rather than deleting (keeps slug/dedup history continuous).
+- **O3 (auth detection for Registry remotes):** most remotes are OAuth or authless, but
+  `server.json` doesn't always declare it. Proposal: import `auth_mode='none'` and rely on the
+  existing non-committing **probe** (`/v1/mcp/probe`) at Connect to detect 401 → OAuth vs api_key
+  — no guessing at import time.
