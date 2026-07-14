@@ -85,3 +85,18 @@ e2e:
 # in-flight runs keep their frozen snapshot).
 policy-sync:
     bash scripts/policy-sync.sh
+
+# ── Connector catalog import (offline dev tool) ──────────────────────────
+#
+# Regenerate the append-only connector-catalog import migration from a PINNED
+# open-connector checkout (Apache-2.0; see NOTICE). Clone + pin + generate its
+# catalog JSON first, then point SRC at it and pass the exact commit:
+#
+#   git -C ../open-connector rev-parse HEAD          # the pin
+#   (cd ../open-connector && npm ci && npm run generate:catalog)
+#   just catalog-import ../open-connector <commit> migrations/0010_catalog_import.sql
+#
+# Deterministic: same commit → identical SQL. Every row is untrusted,
+# community-tier, provenance-tagged; REST-only providers import reference-only.
+catalog-import SRC SHA OUT="migrations/0010_catalog_import.sql":
+    cargo run -p fluidbox-catalog-import -- --src {{SRC}} --sha {{SHA}} --out {{OUT}}

@@ -4,6 +4,16 @@
 **Parent:** `docs/superpowers/plans/2026-07-11-phase5-5-connector-catalog-oauth.md` (the catalog + OAuth slice)
 **Source under evaluation:** [`oomol-lab/open-connector`](https://github.com/oomol-lab/open-connector) (Apache-2.0)
 
+**Status (2026-07-14):** increments 1–3 IMPLEMENTED — schema + guard (migration 0009,
+Connect refusal, `connectable` decoration, `custom`-provenance for API entries), the
+offline importer (`crates/fluidbox-catalog-import`, `just catalog-import`) with fixture
+tests, and attribution (`NOTICE`). Increment 4 (the generated 1k-row payload) stays
+deferred: it needs a pinned open-connector checkout + legal sign-off (O1) and applies
+against real Neon. One refinement landed vs D6: the generated upsert predicate is
+`provenance->>'source' = 'open-connector'` (refresh ONLY prior imports) rather than
+`<> 'fluidbox'` — strictly safer, it also protects a user's `custom` BYO entries from
+being overwritten by an import.
+
 ## 1. Problem
 
 The connector catalog (`connector_catalog`, migration `0007`) ships **7 hand-curated

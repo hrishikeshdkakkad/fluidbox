@@ -738,6 +738,11 @@ pub struct ConnectorCatalogRow {
     pub egress: Value,
     pub tool_hints: Value,
     pub sandbox_launch: Option<Value>,
+    /// {source, source_ref?, upstream_id?, imported_at?}. Curated seed rows
+    /// carry {"source":"fluidbox"} and are never overwritten by an import
+    /// (plan D4/D6). Imported reference rows carry the open-connector source
+    /// + pinned commit so a future re-import can diff by (source, upstream_id).
+    pub provenance: Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -780,11 +785,18 @@ pub async fn create_catalog_entry(
     tool_hints: &Value,
     sandbox_launch: Option<&Value>,
 ) -> sqlx::Result<ConnectorCatalogRow> {
+    // tier AND provenance are forced 'custom': verified/community are curation
+    // judgements the API cannot self-award, and a 'custom' provenance keeps a
+    // user's BYO entry distinguishable from both the fluidbox seed and an
+    // open-connector import (the generated import upsert only ever refreshes
+    // rows whose provenance.source = 'open-connector' — see the importer).
     sqlx::query_as(
         "insert into connector_catalog
            (id, slug, name, icon, description, categories, tier, url, transport,
-            auth_mode, auth_hints, scopes, egress, tool_hints, sandbox_launch)
-         values ($1,$2,$3,$4,$5,$6,'custom',$7,$8,$9,$10,$11,$12,$13,$14)
+            auth_mode, auth_hints, scopes, egress, tool_hints, sandbox_launch,
+            provenance)
+         values ($1,$2,$3,$4,$5,$6,'custom',$7,$8,$9,$10,$11,$12,$13,$14,
+                 '{\"source\":\"custom\"}')
          returning *",
     )
     .bind(Uuid::now_v7())
@@ -3884,6 +3896,15 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(row.tier, "custom", "API entries can't self-award tiers");
+        assert_eq!(
+            row.provenance["source"], "custom",
+            "API entries carry a 'custom' provenance, distinct from seed + import"
+        );
+        // The curated seed rows keep the fluidbox provenance the 0009 backfill
+        // gave them — the import upsert predicate keys off exactly this, so an
+        // import can never clobber a hand-curated verified entry.
+        let gh = get_catalog_by_slug(&pool, "github").await.unwrap().unwrap();
+        assert_eq!(gh.provenance["source"], "fluidbox");
         // Slugs are unique — re-insert conflicts.
         assert!(create_catalog_entry(
             &pool,

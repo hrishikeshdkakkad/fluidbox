@@ -6,6 +6,7 @@ members = [
     "crates/fluidbox-provider",
     "crates/fluidbox-server",
     "crates/fluidbox-cli",
+    "crates/fluidbox-catalog-import",
 ]
 
 [workspace.package]
