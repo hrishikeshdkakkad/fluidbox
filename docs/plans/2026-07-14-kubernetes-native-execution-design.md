@@ -160,6 +160,8 @@ Trait mapping, method by method:
   `Exited(exit code from containerStatuses[0].state.terminated)`; API 404 ⇒
   `Gone`. Classification uses the **typed** `kube::Error::Api(status.code ==
   404)` — no string matching (an explicit improvement over the Docker impl).
+  Phase `Pending` is a state Docker never surfaces and needs its own
+  handling — see §4.4.
 - `terminate(handle)` → delete with a short grace period (e.g. 10s),
   tolerate 404. No network teardown step exists.
 - `list_orphans()` → label-selector list; parse `fluidbox.io/session` back
@@ -306,7 +308,64 @@ the policy denies, and pass the control-plane Service's **ClusterIP**
 Documented as a values toggle because some CNIs also need DNS for the
 Service VIP path.
 
-### 4.4 What explicitly does NOT change
+### 4.4 Scheduling, capacity, and queueing
+
+"Scheduler" means two different things here; the design needs both named.
+
+**Pod placement — provided by Kubernetes; we do not build one.**
+kube-scheduler bin-packs sandbox pods from their `resources.requests`; the
+chart's `nodeSelector`/`tolerations`/`priorityClassName` values steer
+placement (dedicated sandbox node pools, spot/preemptible pools). Elasticity
+is the standard loop: Pending sandbox pods are exactly what
+cluster-autoscaler/Karpenter consume to add nodes — sizing `requests`
+honestly is the whole integration. (fluidbox's existing `scheduler.rs` is
+unrelated — that is cron-style *time* scheduling of trigger subscriptions
+and is untouched by this design.)
+
+**Run admission — a real gap this design must close.** Today
+`create_run → spawn_run → provision` runs immediately with unbounded global
+concurrency (the per-subscription `concurrency_policy` dedups runs of one
+subscription; it is not a capacity gate). Docker absorbs this by
+oversubscribing the host. Kubernetes does not: a full cluster leaves the pod
+**`Pending`**, and tracing the current watchdog shows the failure mode — the
+session is already `running`, heartbeats never arrive, but the stale-
+heartbeat rule only fails a session whose sandbox is *dead*
+(`Exited`/`Gone`), and a Pending pod is neither. The run hangs until a
+wall-clock budget reaps it, or forever without one. `ImagePullBackOff` has
+the same shape.
+
+Closing it, in two steps:
+
+- **K1 — fail fast and honestly (required for correctness):**
+  - `state()` distinguishes Pending: a new `SandboxState::Starting` variant
+    (small trait addition; Docker never returns it, so its match arms are
+    trivial). The watchdog treats a session whose sandbox has been
+    `Starting` past a **provision deadline** (default ~5 min, config) as
+    launch-failed: terminate the pod, fail the session with the pod's
+    actual condition (`Unschedulable: insufficient memory`,
+    `ImagePullBackOff: <image>`) so the timeline says *why*.
+  - Terminal image errors (`ErrImagePull`/`ImagePullBackOff` with a
+    non-transient reason, `CreateContainerConfigError`) fail immediately
+    rather than waiting out the deadline.
+- **K2 — a DB-backed admission queue (provider-agnostic, benefits Docker
+  too):** a `max_concurrent_runs` deployment setting; runs beyond it wait in
+  a queued state and an admission worker in the server starts them FIFO
+  (per-tenant fairness later) as terminal transitions free slots. This stays
+  inside the single-status-writer invariant — it is one more worker beside
+  the budget sweeper, with the queue visible in the existing API/dashboard
+  rather than only as inscrutable Pending pods. Backpressure (queue) and
+  elasticity (autoscaler) compose: the queue caps spend, the autoscaler
+  absorbs bursts under the cap.
+
+**Kueue (K8s-native job queueing) — considered, deferred.** Kueue's pod
+integration could gate sandbox admission cluster-side, but it splits queue
+truth between the cluster and Postgres (the dashboard would need to read
+Kueue state), adds a controller dependency, and its fairness/quota model
+duplicates what a 50-line DB admission worker gives us with full audit
+visibility. Reconsider only alongside a K3 operator, where cluster-side
+admission is already in play.
+
+### 4.5 What explicitly does NOT change
 
 The internal gateway, LLM facade, permission gate, approvals, ledger,
 capability broker, trigger/schedule/event spines, and both runner images are
@@ -531,15 +590,16 @@ this is K8s-specific; it is future work the chart should not pretend away.
 ## 10. Phasing
 
 - **K1 — provider + chart + e2e**: refactors §6 (1–6), `KubernetesProvider`
-  (RWX mode), Helm chart §7, `just k8s-up` / `just k8s-e2e` on kind, docs.
+  (RWX mode), Pending/image-error fail-fast + provision deadline (§4.4),
+  Helm chart §7, `just k8s-up` / `just k8s-e2e` on kind, docs.
   *Converges by:* nothing above the trait changes; every §2 invariant
   preserved; Docker path untouched (`FLUIDBOX_EXECUTION_PROVIDER` defaults
   `docker`).
 - **K2 — hardening + portability**: gVisor/Kata RuntimeClass toggle,
   ResourceQuota/LimitRange, runner-image pre-pull DaemonSet, DNS lockdown
-  (§4.3), archive workspace mode + `pods/exec` diff capture (§5.2),
-  `readOnlyRootFilesystem` with explicit writable emptyDirs, kubelet
-  `podPidsLimit` guidance.
+  (§4.3), admission queue + autoscaler guidance (§4.4), archive workspace
+  mode + `pods/exec` diff capture (§5.2), `readOnlyRootFilesystem` with
+  explicit writable emptyDirs, kubelet `podPidsLimit` guidance.
 - **K3 (optional) — operator/CRDs**: per §8 charter only; reassess demand
   first.
 - **Synergy with M2 (Lambda MicroVMs):** K1's refactors are M2
@@ -558,3 +618,6 @@ this is K8s-specific; it is future work the chart should not pretend away.
 3. kind e2e scope: which of the e2e tiers run in CI on kind vs remain
    Docker-only (candidate: the full `just e2e` stays Docker; a governance +
    live-demo subset runs on kind).
+4. Whether `SandboxState::Starting` (§4.4) should also carry a
+   machine-readable reason (unschedulable vs image pull) or leave the reason
+   to the failure message — decided when the watchdog rule is implemented.
