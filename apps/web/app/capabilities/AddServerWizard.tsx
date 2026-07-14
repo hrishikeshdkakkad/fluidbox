@@ -9,7 +9,6 @@
 
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { Check, Puzzle, Wand2 } from "lucide-react";
 import {
   apiGet,
   apiPost,
@@ -59,7 +58,15 @@ function ToolList({ tools }: { tools: ToolPreview[] }) {
   );
 }
 
-export function AddServerWizard({ onClose }: { onClose: () => void }) {
+export function AddServerWizard({
+  onClose,
+  embedded = false,
+  onCompleted,
+}: {
+  onClose: () => void;
+  embedded?: boolean;
+  onCompleted?: (bundle: { name: string; version: number } | null) => void;
+}) {
   const [step, setStep] = useState<Step>("url");
   const [url, setUrl] = useState("");
   const [probing, setProbing] = useState(false);
@@ -203,12 +210,13 @@ export function AddServerWizard({ onClose }: { onClose: () => void }) {
         ? "This server uses OAuth — you'll sign in once and we custody a rotating token, sealed."
         : "This server needs an API key — it's sealed at rest and proven by registration.";
 
-  return (
-    <ModalShell
-      title="Add your own MCP server"
-      sub="Paste a URL — we detect the auth, preview the tools, and register it."
-      onClose={onClose}
-    >
+  const finish = () => {
+    onCompleted?.(doneBundle);
+    onClose();
+  };
+
+  const content = (
+    <>
       {step === "url" && (
         <>
           <label className="field">
@@ -229,7 +237,7 @@ export function AddServerWizard({ onClose }: { onClose: () => void }) {
           <div className="spread" style={{ marginTop: 16 }}>
             <span className="helper">Only remote (HTTP) MCP servers here.</span>
             <button className="btn primary" onClick={detect} disabled={probing}>
-              <Wand2 /> {probing ? "Detecting…" : "Detect"}
+              {probing ? "Detecting…" : "Detect"}
             </button>
           </div>
         </>
@@ -364,24 +372,24 @@ export function AddServerWizard({ onClose }: { onClose: () => void }) {
       {step === "done" && (
         <>
           <div className="empty" style={{ padding: "18px 0" }}>
-            <Check />
             <div>{doneMsg}</div>
           </div>
           {doneTools.length > 0 && (
             <div className="field">
               <span className="lab">
-                <Puzzle size={12} style={{ verticalAlign: "middle", marginRight: 4 }} />
                 Photographed tools ({doneTools.length})
               </span>
               <ToolList tools={doneTools} />
             </div>
           )}
           <div className="spread" style={{ marginTop: 16 }}>
-            <Link href="/agents/new" className="btn ghost sm">
-              Attach on an agent →
-            </Link>
-            <button className="btn primary" onClick={onClose}>
-              Done
+            {!embedded && (
+              <Link href="/?action=new-agent#configuration" className="btn ghost sm">
+                Attach on an agent
+              </Link>
+            )}
+            <button className="btn primary" onClick={finish}>
+              {embedded ? "Use this capability" : "Done"}
             </button>
           </div>
           {doneBundle && (
@@ -392,6 +400,32 @@ export function AddServerWizard({ onClose }: { onClose: () => void }) {
           )}
         </>
       )}
+    </>
+  );
+
+  if (embedded) {
+    return (
+      <section className="embedded-connector" aria-label="Connect an MCP server">
+        <div className="embedded-connector-head">
+          <div>
+            <span className="section-kicker">Capability setup</span>
+            <h3>Add an MCP server</h3>
+            <p>Detect its authentication, connect it, and attach the resulting bundle without leaving this flow.</p>
+          </div>
+          <button className="btn ghost sm" type="button" onClick={onClose}>Back to capabilities</button>
+        </div>
+        {content}
+      </section>
+    );
+  }
+
+  return (
+    <ModalShell
+      title="Add your own MCP server"
+      sub="Paste a URL — we detect the auth, preview the tools, and register it."
+      onClose={onClose}
+    >
+      {content}
     </ModalShell>
   );
 }

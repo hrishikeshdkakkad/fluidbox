@@ -11,9 +11,13 @@ import { apiGet, BundleRef, CapabilityBundle } from "../lib/api";
 export function BundlePicker({
   pins,
   onChange,
+  refreshKey = 0,
+  onAddServer,
 }: {
   pins: BundleRef[];
   onChange: (pins: BundleRef[]) => void;
+  refreshKey?: number;
+  onAddServer?: () => void;
 }) {
   const [registry, setRegistry] = useState<CapabilityBundle[]>([]);
   useEffect(() => {
@@ -22,7 +26,7 @@ export function BundlePicker({
       .catch(() => {
         /* offline handled by sidebar */
       });
-  }, []);
+  }, [refreshKey]);
 
   // The list is (name, version desc) ordered — group to versions per name.
   const byName = new Map<string, CapabilityBundle[]>();
@@ -54,18 +58,24 @@ export function BundlePicker({
       <div className="field">
         <span className="lab">Capability bundles</span>
         <span className="helper">
-          None registered yet — connect a tool from the{" "}
-          <Link href="/capabilities" className="link">
-            Capabilities store
-          </Link>{" "}
-          and it appears here.
+          None registered yet. Connect an MCP server to photograph its tools into a versioned bundle.
         </span>
+        {onAddServer ? (
+          <button className="btn" type="button" onClick={onAddServer}>Connect an MCP server</button>
+        ) : (
+          <Link href="/capabilities" className="btn">Open capabilities</Link>
+        )}
       </div>
     );
   }
   return (
     <div className="field">
-      <span className="lab">Capability bundles — exact pins; upgrading is a deliberate act</span>
+      <div className="bundle-picker-head">
+        <span className="lab">Capability bundles — exact version pins</span>
+        {onAddServer && (
+          <button className="btn ghost sm" type="button" onClick={onAddServer}>Connect new MCP</button>
+        )}
+      </div>
       <div style={{ display: "grid", gap: 6, maxHeight: 340, overflowY: "auto", paddingRight: 2 }}>
         {names.map((name) => {
           const versions = byName.get(name)!;

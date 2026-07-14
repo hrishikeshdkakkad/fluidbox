@@ -1,34 +1,52 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { Suspense, useCallback, useEffect, useState } from "react";
 import Link from "next/link";
-import { ArrowRight, Inbox, Pause, Play, Plus, ShieldCheck } from "lucide-react";
+import { useSearchParams } from "next/navigation";
 import {
   apiGet,
   apiPost,
+  Approval,
   isTerminal,
   Session,
-  Agent,
-  Revision,
-  Approval,
   workspaceLabel,
 } from "./lib/api";
-import { Pill, AutoPill, ModalShell, LoadingRows, short, timeAgo } from "./components/bits";
+import { AutomationPanel } from "./components/AutomationPanel";
+import { ResourceOverview } from "./components/ResourceOverview";
+import { AddServerWizard } from "./capabilities/AddServerWizard";
+import {
+  MintedAutomation,
+  RunComposer,
+  RunMode,
+  ShowAutomationSecrets,
+} from "./components/RunComposer";
+import { AutoPill, LoadingRows, Pill, short, timeAgo } from "./components/bits";
+
+type OperateView = "history" | "automations";
 
 export default function Runs() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [approvals, setApprovals] = useState<Approval[]>([]);
-  const [showNew, setShowNew] = useState(false);
+  const [view, setView] = useState<OperateView>("history");
+  const [composerMode, setComposerMode] = useState<RunMode | null>(null);
+  const [agentComposer, setAgentComposer] = useState(false);
+  const [showCapabilityWizard, setShowCapabilityWizard] = useState(false);
+  const [minted, setMinted] = useState<MintedAutomation | null>(null);
+  const [automationCount, setAutomationCount] = useState<number | null>(null);
+  const [automationRefresh, setAutomationRefresh] = useState(0);
+  const [resourceRefresh, setResourceRefresh] = useState(0);
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
     try {
-      const r = await apiGet<{ sessions: Session[] }>("/sessions?limit=50");
-      setSessions(r.sessions);
-      const a = await apiGet<{ approvals: Approval[] }>("/approvals");
-      setApprovals(a.approvals);
+      const [sessionResponse, approvalResponse] = await Promise.all([
+        apiGet<{ sessions: Session[] }>("/sessions?limit=50"),
+        apiGet<{ approvals: Approval[] }>("/approvals"),
+      ]);
+      setSessions(sessionResponse.sessions);
+      setApprovals(approvalResponse.approvals);
     } catch {
-      /* offline handled by sidebar */
+      /* The sidebar reports control-plane connectivity. */
     } finally {
       setLoading(false);
     }
@@ -36,67 +54,86 @@ export default function Runs() {
 
   useEffect(() => {
     const first = window.setTimeout(() => void load(), 0);
-    const t = setInterval(load, 2500);
+    const timer = setInterval(load, 2500);
     return () => {
       clearTimeout(first);
-      clearInterval(t);
+      clearInterval(timer);
     };
   }, [load]);
 
-  const decide = async (id: string, decision: string) => {
-    await apiPost(`/approvals/${id}/decision`, { decision, decided_by: "dashboard" });
-    load();
+  const selectView = (nextView: OperateView) => {
+    setView(nextView);
+    const nextUrl = nextView === "automations" ? "/?view=automations" : "/";
+    window.history.replaceState({}, "", nextUrl);
   };
 
-  const active = sessions.filter((s) => !isTerminal(s.status)).length;
-  const done = sessions.filter((s) => s.status === "completed").length;
-  const terminal = sessions.filter((s) => isTerminal(s.status)).length;
+  const decide = async (id: string, decision: string) => {
+    await apiPost(`/approvals/${id}/decision`, { decision, decided_by: "dashboard" });
+    void load();
+  };
+
+  const active = sessions.filter((session) => !isTerminal(session.status)).length;
+  const done = sessions.filter((session) => session.status === "completed").length;
+  const terminal = sessions.filter((session) => isTerminal(session.status)).length;
   const completionRate = terminal > 0 ? `${Math.round((done / terminal) * 100)}%` : "—";
 
   return (
     <>
-      <section className="home-hero">
-        <div className="home-copy">
-          <div className="home-kicker">
-            <span className="signal" /> Governed execution, live
-          </div>
-          <h1>
-            Agents at work,
-            <br />
-            <em>under your control.</em>
-          </h1>
-          <p>
-            Launch work in isolated sandboxes, intervene when policy asks, and keep a
-            complete record of what happened.
-          </p>
+      <Suspense fallback={null}>
+        <QueryActions
+          setView={setView}
+          setComposerMode={setComposerMode}
+          setAgentComposer={setAgentComposer}
+          setShowCapabilityWizard={setShowCapabilityWizard}
+        />
+      </Suspense>
+      <header className="dashboard-header">
+        <div>
+          <h1>Overview</h1>
+          <p>Configure, automate, and monitor governed agent runs.</p>
         </div>
-        <button className="btn primary hero-action" onClick={() => setShowNew(true)}>
-          <Plus /> Start a run
+        <button className="btn primary" type="button" onClick={() => setComposerMode("once")}>
+          New Run
         </button>
+      </header>
+
+      <section className="overview-panel panel" aria-labelledby="operations-summary-heading">
+        <div className="overview-panel-head">
+          <div>
+            <h2 id="operations-summary-heading">Operations</h2>
+            <p>Current activity across manual runs and automations.</p>
+          </div>
+          <span className="overview-status"><span className="signal" /> Operational</span>
+        </div>
+        <div className="ops-strip" aria-label="Run summary">
+          <div className="ops-metric">
+            <span className="metric-label">Active</span>
+            <strong>{active}</strong>
+            <small>{active === 1 ? "sandbox running" : "sandboxes running"}</small>
+          </div>
+          <div className={`ops-metric ${approvals.length ? "attention" : ""}`}>
+            <span className="metric-label">Needs Review</span>
+            <strong>{approvals.length}</strong>
+            <small>{approvals.length ? "decision required" : "no pending decisions"}</small>
+          </div>
+          <div className="ops-metric">
+            <span className="metric-label">Completed</span>
+            <strong>{done}</strong>
+            <small>recent runs</small>
+          </div>
+          <div className="ops-metric">
+            <span className="metric-label">Success Rate</span>
+            <strong>{completionRate}</strong>
+            <small>terminal runs</small>
+          </div>
+        </div>
       </section>
 
-      <section className="ops-strip" aria-label="Run summary">
-        <div className="ops-metric">
-          <span className="metric-label">Active now</span>
-          <strong>{active}</strong>
-          <small>{active === 1 ? "sandbox in progress" : "sandboxes in progress"}</small>
-        </div>
-        <div className={`ops-metric ${approvals.length ? "attention" : ""}`}>
-          <span className="metric-label">Needs review</span>
-          <strong>{approvals.length}</strong>
-          <small>{approvals.length ? "your decision is required" : "nothing waiting on you"}</small>
-        </div>
-        <div className="ops-metric">
-          <span className="metric-label">Completed</span>
-          <strong>{done}</strong>
-          <small>across recent history</small>
-        </div>
-        <div className="ops-metric">
-          <span className="metric-label">Completion rate</span>
-          <strong>{completionRate}</strong>
-          <small>of terminal runs</small>
-        </div>
-      </section>
+      <ResourceOverview
+        refreshKey={resourceRefresh}
+        onCreateAgent={() => setAgentComposer(true)}
+        onAddCapability={() => setShowCapabilityWizard(true)}
+      />
 
       {approvals.length > 0 && (
         <section className="attention-section">
@@ -108,32 +145,30 @@ export default function Runs() {
             <span className="section-note">Policy paused these runs before acting.</span>
           </div>
           <div className="attention-list">
-            {approvals.map((a) => (
-              <div className="approval" key={a.id}>
-                <span className="icon">
-                  <Pause size={16} />
-                </span>
+            {approvals.map((approval) => (
+              <div className="approval" key={approval.id}>
+                <span className="approval-label">Review</span>
                 <div className="txt">
                   <div className="h">
-                    Waiting for you{a.risk ? ` · ${a.risk}` : ""} · expires{" "}
-                    {new Date(a.expires_at).toLocaleTimeString()}
+                    Waiting for you{approval.risk ? ` · ${approval.risk}` : ""} · expires{" "}
+                    {new Date(approval.expires_at).toLocaleTimeString()}
                   </div>
                   <div className="d">
-                    <b className="mono">{a.tool}</b>{" "}
-                    <span className="mono mut">{a.summary}</span>{" "}
-                    <Link href={`/sessions/${a.session_id}`} className="link mono" style={{ fontSize: 12 }}>
-                      {short(a.session_id)}
+                    <b className="mono">{approval.tool}</b>{" "}
+                    <span className="mono mut">{approval.summary}</span>{" "}
+                    <Link href={`/sessions/${approval.session_id}`} className="link mono approval-session-link">
+                      {short(approval.session_id)}
                     </Link>
                   </div>
                 </div>
                 <div className="acts">
-                  <button className="btn human sm" onClick={() => decide(a.id, "approved_once")}>
+                  <button className="btn human sm" type="button" onClick={() => decide(approval.id, "approved_once")}>
                     Approve once
                   </button>
-                  <button className="btn sm" onClick={() => decide(a.id, "approved_session")}>
+                  <button className="btn sm" type="button" onClick={() => decide(approval.id, "approved_session")}>
                     Whole session
                   </button>
-                  <button className="btn sm ghost danger" onClick={() => decide(a.id, "denied")}>
+                  <button className="btn sm ghost danger" type="button" onClick={() => decide(approval.id, "denied")}>
                     Deny
                   </button>
                 </div>
@@ -143,170 +178,164 @@ export default function Runs() {
         </section>
       )}
 
-      <div className="section-heading recent-heading">
-        <div>
-          <span className="section-kicker">Workspace activity</span>
-          <h2>Recent runs</h2>
-        </div>
-        <span className="section-note">{sessions.length} in recent history</span>
+      <div className="tabs operate-tabs" id="operations" role="tablist" aria-label="Runs and automations">
+        <button
+          className={`tab ${view === "history" ? "active" : ""}`}
+          type="button"
+          role="tab"
+          aria-selected={view === "history"}
+          onClick={() => selectView("history")}
+        >
+          Run history <span className="n">{sessions.length}</span>
+        </button>
+        <button
+          className={`tab ${view === "automations" ? "active" : ""}`}
+          type="button"
+          role="tab"
+          aria-selected={view === "automations"}
+          onClick={() => selectView("automations")}
+        >
+          Automations {automationCount !== null && <span className="n">{automationCount}</span>}
+        </button>
       </div>
 
-      <div className="run-list">
-        {loading ? (
-          <LoadingRows />
-        ) : sessions.length === 0 ? (
-          <div className="launch-empty">
-            <div className="empty-mark"><Inbox /></div>
+      {view === "history" ? (
+        <section className="operate-view" role="tabpanel">
+          <div className="section-heading recent-heading">
             <div>
-              <h3>Your workspace is ready.</h3>
-              <p>Start with a task, or create a reusable agent with its own tools and policy.</p>
+              <span className="section-kicker">Every invocation</span>
+              <h2>Run history</h2>
             </div>
-            <div className="empty-actions">
-              <button className="btn primary" onClick={() => setShowNew(true)}>
-                <Play /> Start a run
-              </button>
-              <Link className="btn" href="/agents/new">
-                Create an agent <ArrowRight />
-              </Link>
-            </div>
+            <span className="section-note">Manual and automated runs share one timeline.</span>
           </div>
-        ) : (
-          <div className="run-rows">
-            {sessions.map((s) => (
-              <Link key={s.id} href={`/sessions/${s.id}`} className="run-row">
-                <span className={`run-glyph ${s.status}`}><ShieldCheck /></span>
-                <span className="run-copy">
-                  <strong>{s.task}</strong>
-                  <small>
-                    <span className="mono">{short(s.id)}</span>
-                    <span>·</span>
-                    <span>{s.trigger?.kind || "manual"}</span>
-                    {s.repo_source && <><span>·</span><span>{workspaceLabel(s.repo_source)}</span></>}
-                  </small>
-                </span>
-                <span className="run-status">
-                  <Pill status={s.status} />
-                  {s.autonomy === "autonomous" && <AutoPill autonomy={s.autonomy} />}
-                </span>
-                <span className="run-time">
-                  {timeAgo(s.created_at)}
-                </span>
-                <ArrowRight className="run-arrow" />
-              </Link>
-            ))}
+
+          <div className="run-list">
+            {loading ? (
+              <LoadingRows />
+            ) : sessions.length === 0 ? (
+              <div className="launch-empty">
+                <div>
+                  <h3>Your workspace is ready.</h3>
+                  <p>Configure a run now; you can launch it once or add an automation before saving.</p>
+                </div>
+                <div className="empty-actions">
+                  <button className="btn primary" type="button" onClick={() => setComposerMode("once")}>
+                    Configure a run
+                  </button>
+                  <button className="btn" type="button" onClick={() => setAgentComposer(true)}>
+                    Create an agent
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="run-rows">
+                {sessions.map((session) => (
+                  <Link key={session.id} href={`/sessions/${session.id}`} className="run-row">
+                    <span className="run-copy">
+                      <strong>{session.task}</strong>
+                      <small>
+                        <span className="mono">{short(session.id)}</span>
+                        <span>·</span>
+                        <span>{session.trigger?.kind || "manual"}</span>
+                        {session.repo_source && (
+                          <><span>·</span><span>{workspaceLabel(session.repo_source)}</span></>
+                        )}
+                      </small>
+                    </span>
+                    <span className="run-status">
+                      <Pill status={session.status} />
+                      {session.autonomy === "autonomous" && <AutoPill autonomy={session.autonomy} />}
+                    </span>
+                    <span className="run-time">{timeAgo(session.created_at)}</span>
+                  </Link>
+                ))}
+              </div>
+            )}
           </div>
-        )}
-      </div>
-      {showNew && <NewRun onClose={() => setShowNew(false)} onCreated={load} />}
+        </section>
+      ) : (
+        <div className="operate-view" role="tabpanel">
+          <AutomationPanel
+            onNew={() => setComposerMode("automation")}
+            refreshKey={automationRefresh}
+            onCountChange={setAutomationCount}
+          />
+        </div>
+      )}
+
+      {composerMode && (
+        <RunComposer
+          initialMode={composerMode}
+          onClose={() => setComposerMode(null)}
+          onRunCreated={() => {
+            setComposerMode(null);
+            selectView("history");
+            void load();
+          }}
+          onAutomationCreated={(automation) => {
+            setComposerMode(null);
+            setMinted(automation);
+            setAutomationRefresh((current) => current + 1);
+            selectView("automations");
+          }}
+        />
+      )}
+
+      {agentComposer && (
+        <RunComposer
+          agentOnly
+          onClose={() => setAgentComposer(false)}
+          onRunCreated={() => {}}
+          onAutomationCreated={() => {}}
+          onAgentCreated={() => {
+            setAgentComposer(false);
+            setResourceRefresh((current) => current + 1);
+          }}
+        />
+      )}
+
+      {showCapabilityWizard && (
+        <AddServerWizard
+          onClose={() => {
+            setShowCapabilityWizard(false);
+            setResourceRefresh((current) => current + 1);
+          }}
+        />
+      )}
+
+      {minted && <ShowAutomationSecrets minted={minted} onClose={() => setMinted(null)} />}
     </>
   );
 }
 
-function NewRun({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
-  const [agents, setAgents] = useState<Agent[]>([]);
-  const [agent, setAgent] = useState("claude-fixer");
-  const [task, setTask] = useState("");
-  const [agentDefault, setAgentDefault] = useState("scratch");
-  const [autonomous, setAutonomous] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
+function QueryActions({
+  setView,
+  setComposerMode,
+  setAgentComposer,
+  setShowCapabilityWizard,
+}: {
+  setView: React.Dispatch<React.SetStateAction<OperateView>>;
+  setComposerMode: React.Dispatch<React.SetStateAction<RunMode | null>>;
+  setAgentComposer: React.Dispatch<React.SetStateAction<boolean>>;
+  setShowCapabilityWizard: React.Dispatch<React.SetStateAction<boolean>>;
+}) {
+  const params = useSearchParams();
+  const query = params.toString();
 
   useEffect(() => {
-    apiGet<{ agents: Agent[] }>("/agents").then((r) => setAgents(r.agents)).catch(() => {});
-  }, []);
+    const requestedView = params.get("view");
+    const action = params.get("action");
+    if (requestedView === "automations") setView("automations");
+    if (action === "new-agent") setAgentComposer(true);
+    if (action === "add-capability") setShowCapabilityWizard(true);
+    if (action === "new-run") setComposerMode("once");
 
-  // Show what "agent default" resolves to for the selected agent.
-  useEffect(() => {
-    const a = agents.find((x) => x.name === agent);
-    if (!a) return;
-    apiGet<{ revisions: Revision[] }>(`/agents/${a.id}`)
-      .then((r) => setAgentDefault(workspaceLabel(r.revisions[0]?.default_workspace)))
-      .catch(() => setAgentDefault("scratch"));
-  }, [agent, agents]);
-
-  const submit = async () => {
-    setErr("");
-    if (!task.trim()) {
-      setErr("A task is required.");
-      return;
+    if (action) {
+      const consumed = new URLSearchParams(query);
+      consumed.delete("action");
+      window.history.replaceState({}, "", consumed.size > 0 ? `/?${consumed}` : "/");
     }
-    setBusy(true);
-    try {
-      // The workspace comes from the agent's revision (set when composing
-      // the agent); per-run overrides remain an API affordance.
-      await apiPost("/sessions", { agent, task, autonomous });
-      onCreated();
-      onClose();
-    } catch (e) {
-      setErr(String(e));
-      setBusy(false);
-    }
-  };
+  }, [params, query, setAgentComposer, setComposerMode, setShowCapabilityWizard, setView]);
 
-  return (
-    <ModalShell
-      title="New run"
-      sub="Describe the outcome. Fluidbox will provision a fresh sandbox and freeze the run specification before work begins."
-      onClose={onClose}
-      wide
-    >
-      <label className="field">
-        <span className="lab">What should the agent accomplish?</span>
-        <textarea
-          className="inp run-task-input"
-          placeholder="For example: review the latest pull request, identify the regression, and prepare a safe patch…"
-          value={task}
-          onChange={(e) => setTask(e.target.value)}
-        />
-      </label>
-
-      <div className="run-config-grid">
-        <label className="field">
-          <span className="lab">Agent</span>
-          <select className="inp" value={agent} onChange={(e) => setAgent(e.target.value)}>
-            {agents.map((a) => (
-              <option key={a.id} value={a.name}>
-                {a.name}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        <div className="field">
-          <span className="lab">Workspace</span>
-          <div className="read-only-field">
-            <span className="mono">{agentDefault}</span>
-            <small>Inherited from agent</small>
-          </div>
-        </div>
-      </div>
-
-      <button
-        type="button"
-        className={`toggle mode-card ${autonomous ? "on" : ""}`}
-        onClick={() => setAutonomous((v) => !v)}
-        style={{ marginBottom: 6 }}
-        aria-pressed={autonomous}
-      >
-        <span className="sw" />
-        <span>
-          <strong>{autonomous ? "Autonomous run" : "Supervised run"}</strong>
-          <span className="faint mode-description">
-            {autonomous
-              ? "Policy fallback decides risky actions without waiting for a person."
-              : "Risky actions pause and wait for your approval."}
-          </span>
-        </span>
-      </button>
-
-      {err && <div className="err">{err}</div>}
-
-      <div className="modal-footer">
-        <span className="helper">The agent’s revision, tools, policy, and workspace are frozen at launch.</span>
-        <button className="btn primary" onClick={submit} disabled={busy}>
-          <Play /> {busy ? "Starting…" : "Start run"}
-        </button>
-      </div>
-    </ModalShell>
-  );
+  return null;
 }

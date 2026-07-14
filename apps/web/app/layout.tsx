@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
-import { Geist, Geist_Mono, Newsreader } from "next/font/google";
+import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+import "./geist.css";
 import { Sidebar } from "./components/Sidebar";
 
 const geistSans = Geist({
@@ -13,12 +14,6 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
-const newsreader = Newsreader({
-  variable: "--font-newsreader",
-  subsets: ["latin"],
-  weight: ["400", "500"],
-});
-
 export const metadata: Metadata = {
   title: {
     default: "fluidbox — control plane",
@@ -28,8 +23,8 @@ export const metadata: Metadata = {
 };
 
 export const viewport: Viewport = {
-  colorScheme: "light",
-  themeColor: "#f5f4f0",
+  colorScheme: "dark",
+  themeColor: "#000000",
 };
 
 export default function RootLayout({
@@ -38,7 +33,7 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} ${newsreader.variable}`}
+      className={`${geistSans.variable} ${geistMono.variable} dark dark-theme`}
     >
       <body>
         <div className="shell">

@@ -1,128 +1,82 @@
 "use client";
 
-import { usePathname } from "next/navigation";
 import Link from "next/link";
+import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
-import { Activity, Bot, Cable, Menu, Puzzle, Settings, X, Zap } from "lucide-react";
 import { apiGet } from "../lib/api";
 
-const NAV = [
-  {
-    label: "Operate",
-    items: [
-      { href: "/", label: "Runs", Icon: Activity, badge: true },
-      { href: "/automations", label: "Automations", Icon: Zap },
-    ],
-  },
-  {
-    label: "Build",
-    items: [
-      { href: "/agents", label: "Agents", Icon: Bot },
-      { href: "/capabilities", label: "Capabilities", Icon: Puzzle },
-      { href: "/integrations", label: "Integrations", Icon: Cable },
-    ],
-  },
-];
-
+/**
+ * The component name remains Sidebar to keep the layout seam stable, but the
+ * product navigation is now a compact masthead. The dashboard owns the
+ * information architecture; this shell only provides global context.
+ */
 export function Sidebar() {
-  const path = usePathname();
+  const pathname = usePathname();
   const [pending, setPending] = useState(0);
   const [online, setOnline] = useState(true);
-  const [menuOpen, setMenuOpen] = useState(false);
 
   useEffect(() => {
     let alive = true;
     const poll = async () => {
       try {
-        const r = await apiGet<{ approvals: unknown[] }>("/approvals");
+        const response = await apiGet<{ approvals: unknown[] }>("/approvals");
         if (alive) {
-          setPending(r.approvals.length);
+          setPending(response.approvals.length);
           setOnline(true);
         }
       } catch {
         if (alive) setOnline(false);
       }
     };
-    poll();
-    const t = setInterval(poll, 4000);
+    void poll();
+    const timer = setInterval(poll, 4000);
     return () => {
       alive = false;
-      clearInterval(t);
+      clearInterval(timer);
     };
   }, []);
 
-  const isActive = (href: string) =>
-    href === "/" ? path === "/" || path.startsWith("/sessions") : path.startsWith(href);
+  const resourcesActive = ["/agents", "/capabilities", "/integrations"].some(
+    (route) => pathname.startsWith(route)
+  );
+  const activityActive = ["/sessions", "/automations"].some(
+    (route) => pathname.startsWith(route)
+  );
 
   return (
-    <nav className={`rail ${menuOpen ? "open" : ""}`} aria-label="Primary navigation">
-      <div className="rail-head">
-        <Link href="/" className="brand" onClick={() => setMenuOpen(false)}>
-          <span className="mark">
-            <i />
-            <i />
-            <i />
-            <i />
-          </span>
-          <span className="name">fluidbox</span>
+    <header className="topbar">
+      <div className="topbar-inner">
+        <Link href="/" className="brand masthead-brand">
+          <span className="wordmark">fluidbox</span>
+          <span className="product-label">control plane</span>
         </Link>
-        <button
-          className="mobile-menu"
-          type="button"
-          aria-label={menuOpen ? "Close navigation" : "Open navigation"}
-          aria-expanded={menuOpen}
-          onClick={() => setMenuOpen((current) => !current)}
-        >
-          {menuOpen ? <X /> : <Menu />}
-        </button>
-      </div>
 
-      <div className="nav-body">
-        <div className="workspace-context" aria-label="Current workspace">
-          <span className="workspace-avatar">F</span>
-          <span>
-            <strong>Fluidbox Cloud</strong>
-            <small>Default workspace</small>
-          </span>
-        </div>
-
-        {NAV.map((group) => (
-          <div className="nav-group" key={group.label}>
-            <div className="nav-label">{group.label}</div>
-            <div className="nav-items">
-              {group.items.map(({ href, label, Icon, badge }) => (
-                <Link
-                  key={href}
-                  href={href}
-                  className={`navlink ${isActive(href) ? "active" : ""}`}
-                  aria-current={isActive(href) ? "page" : undefined}
-                  onClick={() => setMenuOpen(false)}
-                >
-                  <Icon strokeWidth={1.7} />
-                  {label}
-                  {badge && pending > 0 && <span className="count">{pending}</span>}
-                </Link>
-              ))}
-            </div>
-          </div>
-        ))}
-
-        <div className="foot">
-          <Link
-            href="/settings"
-            className={`navlink ${isActive("/settings") ? "active" : ""}`}
-            aria-current={isActive("/settings") ? "page" : undefined}
-            onClick={() => setMenuOpen(false)}
-          >
-            <Settings strokeWidth={1.7} />
+        <nav className="masthead-nav" aria-label="Primary navigation">
+          <Link className={pathname === "/" ? "active" : ""} href="/">
+            Overview
+          </Link>
+          <Link className={resourcesActive ? "active" : ""} href="/#configuration">
+            Resources
+          </Link>
+          <Link className={activityActive ? "active" : ""} href="/#operations">
+            Activity
+            {pending > 0 && <span className="masthead-count">{pending}</span>}
+          </Link>
+          <Link className={pathname === "/settings" ? "active" : ""} href="/settings">
             Settings
           </Link>
-          <div className="system-state">
+        </nav>
+
+        <div className="masthead-actions">
+          <div className="masthead-state" title={online ? "Control plane online" : "Control plane offline"}>
             <span className={`signal ${online ? "" : "down"}`} />
-            <span>{online ? "All systems operational" : "Control plane offline"}</span>
+            <span>{online ? "Operational" : "Offline"}</span>
           </div>
+          <Link className="topbar-action" href="/?action=new-run">
+            New Run
+          </Link>
         </div>
       </div>
-    </nav>
+    </header>
   );
 }
