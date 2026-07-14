@@ -5,19 +5,49 @@
 // hardcodes model lists; a mismatched model is caught server-side with a
 // clean 422 at agent-write time.
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { apiGet, HarnessInfo } from "./api";
 
-export function useHarnesses(): HarnessInfo[] {
+export interface HarnessCatalog {
+  harnesses: HarnessInfo[];
+  loading: boolean;
+  error: string;
+  reload: () => void;
+}
+
+export function useHarnesses(): HarnessCatalog {
   const [harnesses, setHarnesses] = useState<HarnessInfo[]>([]);
-  useEffect(() => {
-    apiGet<{ harnesses: HarnessInfo[] }>("/harnesses")
-      .then((r) => setHarnesses(r.harnesses))
-      .catch(() => {
-        /* leave empty; the pickers render nothing until it loads */
-      });
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [request, setRequest] = useState(0);
+
+  const reload = useCallback(() => {
+    setLoading(true);
+    setError("");
+    setRequest((current) => current + 1);
   }, []);
-  return harnesses;
+
+  useEffect(() => {
+    let active = true;
+    apiGet<{ harnesses: HarnessInfo[] }>("/harnesses")
+      .then((response) => {
+        if (active) setHarnesses(response.harnesses);
+      })
+      .catch((reason) => {
+        if (active) {
+          setHarnesses([]);
+          setError(`Runtime catalog unavailable. ${String(reason)}`);
+        }
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [request]);
+
+  return { harnesses, loading, error, reload };
 }
 
 /** The models offered for a harness id (empty if unknown/not loaded). */

@@ -7,7 +7,6 @@
 // — the server is the single source of truth. Announced-but-unavailable
 // harnesses render as disabled cards so the extension point stays visible.
 
-import { Check } from "lucide-react";
 import { HarnessInfo } from "../lib/api";
 
 export function HarnessPicker({
@@ -32,7 +31,11 @@ export function HarnessPicker({
         >
           <span className="t">
             {h.display_name}
-            {value === h.id ? <Check /> : !h.available ? <span className="badge">soon</span> : null}
+            {value === h.id ? (
+              <span className="selected-label">Selected</span>
+            ) : !h.available ? (
+              <span className="badge">soon</span>
+            ) : null}
           </span>
           <div className="id">{h.id}</div>
           <div className="d">{h.hint}</div>

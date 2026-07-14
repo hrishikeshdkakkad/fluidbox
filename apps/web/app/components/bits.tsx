@@ -2,7 +2,6 @@
 
 import React, { useEffect, useId, useRef } from "react";
 import Link from "next/link";
-import { ChevronRight } from "lucide-react";
 
 export function Pill({ status }: { status: string }) {
   const label = status.replace(/_/g, " ");
@@ -44,7 +43,7 @@ export function PageHead({
             {crumbs.map((c) => (
               <React.Fragment key={c.href}>
                 <Link href={c.href}>{c.label}</Link>
-                <ChevronRight size={12} />
+                <span aria-hidden>/</span>
               </React.Fragment>
             ))}
           </div>
@@ -72,7 +71,12 @@ export function ModalShell({
   wide?: boolean;
 }) {
   const modalRef = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
   const titleId = useId();
+
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
 
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
@@ -83,7 +87,7 @@ export function ModalShell({
     focusable?.focus();
 
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape") onCloseRef.current();
       if (event.key !== "Tab" || !modal) return;
       const elements = Array.from(
         modal.querySelectorAll<HTMLElement>(
@@ -107,7 +111,7 @@ export function ModalShell({
       document.removeEventListener("keydown", onKeyDown);
       previous?.focus();
     };
-  }, [onClose]);
+  }, []);
 
   return (
     <div className="overlay" onClick={onClose}>
