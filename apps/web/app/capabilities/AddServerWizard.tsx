@@ -112,20 +112,41 @@ export function AddServerWizard({ onClose }: { onClose: () => void }) {
   const flattenTools = (servers: BundleServer[] | undefined): ToolPreview[] =>
     (servers ?? []).flatMap((s) => s.tools);
 
+  const stopPolling = () => {
+    if (pollTimer.current) clearInterval(pollTimer.current);
+    setWaiting(false);
+  };
+
+  // Watch the connection until the OAuth callback flips it active. A failed
+  // dance sets status='error' (invalid_grant etc.), so we stop and surface it
+  // rather than spin forever; and we cap the wait so an abandoned tab doesn't
+  // leave the wizard hanging. Without a connection id there's nothing to poll.
   const watchUntilActive = (connId?: string) => {
+    if (!connId) {
+      setErr("The server didn't return a connection to track — try again.");
+      return;
+    }
     setWaiting(true);
+    let waited = 0;
+    const MAX_WAIT = 300; // seconds
     pollTimer.current = setInterval(async () => {
+      waited += 2;
       try {
         const list = await apiGet<{ connections: Connection[] }>("/connections");
         const c = list.connections.find((x) => x.id === connId);
         if (c?.status === "active") {
-          if (pollTimer.current) clearInterval(pollTimer.current);
-          setWaiting(false);
+          stopPolling();
           setDoneMsg("Connected — the bundle was registered with the fresh credential.");
           setStep("done");
+        } else if (c?.status === "error") {
+          stopPolling();
+          setErr("Authorization didn't complete — the sign-in was refused. You can try again.");
+        } else if (waited >= MAX_WAIT) {
+          stopPolling();
+          setErr("Timed out waiting for authorization. Finish the sign-in in the opened tab, then retry.");
         }
       } catch {
-        /* keep polling */
+        /* transient list failure — keep polling until MAX_WAIT */
       }
     }, 2000);
   };

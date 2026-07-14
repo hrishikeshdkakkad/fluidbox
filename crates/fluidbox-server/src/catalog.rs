@@ -683,12 +683,12 @@ pub async fn add_custom(
         {
             auth_hints["header_name"] = json!(h);
         }
-        if let Some(s) = req
-            .scheme
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
+        // Scheme is tri-state and an EXPLICIT "" is meaningful (the Sentry
+        // "bare token" shape), so only an ABSENT field falls through to the
+        // Bearer default — never trim an empty string away. This mirrors
+        // `create_mcp_http_connection`, which stores "" and defaults to
+        // Bearer only when nothing is passed.
+        if let Some(s) = req.scheme.as_deref().map(str::trim) {
             auth_hints["scheme"] = json!(s);
         }
     }
@@ -726,18 +726,19 @@ pub async fn add_custom(
         out
     };
 
-    if auth_mode == "oauth" {
-        // Keep the entry — the OAuth callback needs it to auto-register.
-        return connect_entry(&state, entry, connect_req)
-            .await
-            .map(with_slug);
-    }
+    // Every branch keeps the entry on SUCCESS (it becomes the custom Store
+    // card; for OAuth the callback re-fetches it by slug to auto-register) and
+    // rolls it back on FAILURE — including a failed OAuth dance (a discover /
+    // insert / start_dance error means no callback is ever coming, so the
+    // entry would otherwise orphan exactly like a refused api_key).
     match connect_entry(&state, entry, connect_req).await {
         Ok(out) => Ok(with_slug(out)),
         Err(e) => {
-            fluidbox_db::delete_catalog_entry(&state.pool, &slug)
-                .await
-                .ok();
+            if let Err(del) = fluidbox_db::delete_catalog_entry(&state.pool, &slug).await {
+                tracing::warn!(
+                    "BYO connect for '{slug}' failed ({e}); entry rollback also failed: {del}"
+                );
+            }
             Err(e)
         }
     }
