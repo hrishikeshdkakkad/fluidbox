@@ -9,26 +9,21 @@ import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
-  Check,
   ChevronDown,
   ChevronRight,
-  KeyRound,
-  Package,
-  Plus,
-  Puzzle,
   Search,
-  ShieldCheck,
 } from "lucide-react";
 import {
   apiGet,
   apiPost,
   BundleDetail,
+  BundleServer,
   CapabilityBundle,
   CatalogConnectResult,
   CatalogEntry,
   Connection,
 } from "../lib/api";
-import { LoadingRows, ModalShell, PageHead } from "../components/bits";
+import { GitHubMark, LoadingRows, ModalShell, PageHead } from "../components/bits";
 import { AddServerWizard } from "./AddServerWizard";
 
 type Tab = "store" | "bundles" | "connections";
@@ -195,28 +190,40 @@ function Store({
   const [q, setQ] = useState("");
   const [cat, setCat] = useState<string | null>(null);
 
-  const categories = [...new Set(catalog.flatMap((e) => e.categories))].sort();
+  const categories = [...new Set(catalog.flatMap((e) => e.categories.map(canonicalCategory)))].sort();
   const shown = catalog.filter((e) => {
-    if (cat && !e.categories.includes(cat)) return false;
+    if (cat && !e.categories.map(canonicalCategory).includes(cat)) return false;
     if (!q.trim()) return true;
     const hay = `${e.name} ${e.slug} ${e.description || ""} ${e.categories.join(" ")}`.toLowerCase();
     return hay.includes(q.trim().toLowerCase());
   });
+  const grouped = shown.reduce<Map<string, CatalogEntry[]>>((groups, entry) => {
+    const category = canonicalCategory(entry.categories[0] || "custom");
+    const entries = groups.get(category) || [];
+    entries.push(entry);
+    groups.set(category, entries);
+    return groups;
+  }, new Map());
 
   return (
     <>
-      <div className="storebar">
-        <div className="search">
-          <Search />
-          <input
-            className="inp"
-            placeholder="Search tools…"
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-          />
+      <div className="connector-toolbar">
+        <div className="storebar">
+          <div className="search">
+            <Search />
+            <input
+              className="inp"
+              placeholder="Search connectors…"
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+            />
+          </div>
+          <button className="btn primary connector-add" type="button" onClick={onAddOwn}>
+            New Connector
+          </button>
         </div>
         {categories.length > 0 && (
-          <div className="chipset">
+          <div className="chipset connector-filters" aria-label="Connector categories">
             <button className={`fchip ${cat === null ? "on" : ""}`} onClick={() => setCat(null)}>
               All
             </button>
@@ -226,17 +233,26 @@ function Store({
                 className={`fchip ${cat === c ? "on" : ""}`}
                 onClick={() => setCat(cat === c ? null : c)}
               >
-                {c}
+                {formatCategory(c)}
               </button>
             ))}
           </div>
         )}
       </div>
 
-      <div className="store-grid">
-        <AddOwnCard onClick={onAddOwn} />
-        {shown.map((e) => (
-          <StoreCard key={e.slug} entry={e} onOpen={() => onOpen(e)} />
+      <div className="connector-groups">
+        {[...grouped.entries()].map(([category, entries]) => (
+          <section className="connector-group" key={category}>
+            <div className="connector-group-head">
+              <h2>{formatCategory(category)}</h2>
+              <span>{entries.length}</span>
+            </div>
+            <div className="connector-grid">
+              {entries.map((entry) => (
+                <StoreCard key={entry.slug} entry={entry} onOpen={() => onOpen(entry)} />
+              ))}
+            </div>
+          </section>
         ))}
       </div>
       {shown.length === 0 && catalog.length > 0 && (
@@ -264,25 +280,15 @@ function StoreCard({ entry, onOpen }: { entry: CatalogEntry; onOpen: () => void 
   const referenceOnly = entry.connectable === false;
 
   return (
-    <button className="store-card" onClick={onOpen}>
-      <div className="top">
-        <span className="store-icon">{entry.icon || <Puzzle />}</span>
-        <div style={{ minWidth: 0 }}>
-          <div className="nm">{entry.name}</div>
-          <div style={{ marginTop: 2 }}>
-            {entry.tier === "verified" ? (
-              <span className="badge brand">
-                <ShieldCheck size={11} /> verified
-              </span>
-            ) : (
-              <span className="badge">{entry.tier}</span>
-            )}
-          </div>
-        </div>
-      </div>
-      <div className="desc">{entry.description || ""}</div>
-      <div className="foot">
-        <span>
+    <button className="connector-card" type="button" onClick={onOpen}>
+      <ConnectorMark entry={entry} />
+      <span className="connector-card-copy">
+        <span className="connector-card-title">
+          <span className="nm">{entry.name}</span>
+          {entry.tier !== "verified" && <span className="badge">{entry.tier}</span>}
+        </span>
+        <span className="desc">{entry.description || "Connect this service as a governed run capability."}</span>
+        <span className="connector-card-meta">
           {entry.auth_mode === "none"
             ? "No credential"
             : entry.auth_mode === "api_key"
@@ -290,10 +296,10 @@ function StoreCard({ entry, onOpen }: { entry: CatalogEntry; onOpen: () => void 
               : "OAuth"}
           {entry.bundle ? ` · v${entry.bundle.version}` : ""}
         </span>
+      </span>
+      <span className="connector-card-action">
         {connected ? (
-          <span className="state ok">
-            <Check /> Connected
-          </span>
+          <span className="state ok">Connected</span>
         ) : attention ? (
           <span className="state err">{entry.connection!.status}</span>
         ) : referenceOnly ? (
@@ -301,43 +307,91 @@ function StoreCard({ entry, onOpen }: { entry: CatalogEntry; onOpen: () => void 
             Reference only
           </span>
         ) : (
-          <span className="state" style={{ color: "var(--ink)" }}>
-            Connect
-          </span>
+          <span className="state">Connect</span>
         )}
-      </div>
+      </span>
     </button>
   );
 }
 
-function AddOwnCard({ onClick }: { onClick: () => void }) {
+function ConnectorMark({ entry }: { entry: CatalogEntry }) {
+  const tone = [
+    "atlassian",
+    "github",
+    "linear",
+    "notion",
+    "sentry",
+    "stripe",
+    "workspace",
+  ].includes(entry.slug) ? entry.slug : "custom";
+  const initials = entry.name
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0])
+    .join("")
+    .toUpperCase();
+
   return (
-    <button className="store-card" onClick={onClick} style={{ borderStyle: "dashed" }}>
-      <div className="top">
-        <span className="store-icon">
-          <Plus />
-        </span>
-        <div style={{ minWidth: 0 }}>
-          <div className="nm">Add your own server</div>
-          <div style={{ marginTop: 2 }}>
-            <span className="badge">bring your own MCP</span>
-          </div>
-        </div>
-      </div>
-      <div className="desc">
-        Paste a URL — we detect the auth, preview the tools, and register it in one step.
-      </div>
-      <div className="foot">
-        <span>Remote (HTTP) MCP</span>
-        <span className="state" style={{ color: "var(--ink)" }}>
-          Add
-        </span>
-      </div>
-    </button>
+    <span className={`connector-mark connector-mark-${tone}`} aria-hidden="true">
+      {entry.slug === "github" ? <GitHubMark size={21} /> : <span>{initials || "C"}</span>}
+    </span>
   );
+}
+
+function formatCategory(category: string) {
+  const names: Record<string, string> = {
+    "project-mgmt": "Project management",
+    dev: "Developer",
+    docs: "Knowledge",
+    payments: "Finance",
+    observability: "Operations",
+    workspace: "Workspace",
+    custom: "Custom",
+  };
+  return names[category] || category.replaceAll("-", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function canonicalCategory(category: string) {
+  const aliases: Record<string, string> = {
+    dev: "developer",
+    vcs: "developer",
+    docs: "knowledge",
+    payments: "finance",
+    observability: "operations",
+  };
+  return aliases[category] || category;
 }
 
 /* ─── Bundles ────────────────────────────────────────────────────────── */
+
+// The photographed tool list of a bundle, grouped by server. Shared by the
+// Bundles tab and the connector modal so the two renderings never drift.
+function ServerTools({ servers }: { servers: BundleServer[] }) {
+  return (
+    <>
+      {servers.map((s) => (
+        <div key={s.name} className="tool-group">
+          <div className="tool-group-head">
+            <span>{s.name}</span>
+            <span className={`badge ${s.class === "brokered" ? "brand" : ""}`}>{s.class}</span>
+            <span className="tool-group-count">{s.tools.length}</span>
+          </div>
+          {s.tools.length === 0 ? (
+            <div className="tool-empty">No tools.</div>
+          ) : (
+            s.tools.map((t) => (
+              <div key={t.name} className="tool-row">
+                <span className="tool-name">{t.name}</span>
+                {t.description ? <span className="tool-desc">{t.description}</span> : null}
+              </div>
+            ))
+          )}
+        </div>
+      ))}
+    </>
+  );
+}
 
 // One bundle row, click to expand and lazily fetch its photographed tools
 // (GET /capabilities/{id}) — the list endpoint stays light (counts only).
@@ -392,28 +446,17 @@ function BundleRow({ b }: { b: CapabilityBundle }) {
       {open && (
         <div style={{ padding: "4px 12px 12px 22px" }}>
           {loading ? (
-            <span className="faint" style={{ fontSize: 12 }}>Loading tools…</span>
+            <div className="tool-list">
+              <div className="tool-loading">Loading tools…</div>
+            </div>
           ) : detail && detail.servers.length > 0 ? (
-            detail.servers.map((s) => (
-              <div key={s.name} style={{ marginBottom: 8 }}>
-                <span className="mono" style={{ fontSize: 12 }}>
-                  {s.name}{" "}
-                  <span className={`badge ${s.class === "brokered" ? "brand" : ""}`}>{s.class}</span>
-                </span>
-                {s.tools.length === 0 ? (
-                  <div className="faint" style={{ fontSize: 12, marginTop: 2 }}>No tools.</div>
-                ) : (
-                  s.tools.map((t) => (
-                    <div key={t.name} style={{ fontSize: 12, marginTop: 2 }}>
-                      <span className="mono" style={{ color: "var(--accent)" }}>{t.name}</span>
-                      {t.description ? <span className="faint"> — {t.description}</span> : null}
-                    </div>
-                  ))
-                )}
-              </div>
-            ))
+            <div className="tool-list">
+              <ServerTools servers={detail.servers} />
+            </div>
           ) : (
-            <span className="faint" style={{ fontSize: 12 }}>No tool details.</span>
+            <div className="tool-list">
+              <div className="tool-empty">No tool details.</div>
+            </div>
           )}
         </div>
       )}
@@ -437,13 +480,12 @@ function BundlesTab({
           bypasses the permission gate.
         </span>
         <button className="btn" onClick={onRegister}>
-          <Plus /> Register bundle
+          Register bundle
         </button>
       </div>
       <div className="panel">
         {bundles.length === 0 ? (
           <div className="empty">
-            <Package />
             <div>No bundles yet — connecting from the Store registers one automatically.</div>
           </div>
         ) : (
@@ -480,7 +522,6 @@ function ToolConnections({
       <div className="panel">
         {connections.length === 0 ? (
           <div className="empty">
-            <KeyRound />
             <div>No tool credentials yet — connect something from the Store.</div>
           </div>
         ) : (
@@ -562,7 +603,15 @@ function ConnectCatalog({ entry, onClose }: { entry: CatalogEntry; onClose: () =
   const [err, setErr] = useState("");
   const [done, setDone] = useState("");
   const [waiting, setWaiting] = useState(false);
+  const [toolDetail, setToolDetail] = useState<BundleDetail | null>(null);
+  const [toolsErr, setToolsErr] = useState(false);
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const conn = entry.connection;
+  const isConnected = conn?.status === "active" || (entry.auth_mode === "none" && !!entry.bundle);
+  const needsReattention = !!conn && conn.status !== "active" && !isConnected;
+  const bundleId = entry.bundle?.id;
+  const toolsLoading = isConnected && !!bundleId && !toolDetail && !toolsErr;
 
   useEffect(() => {
     return () => {
@@ -570,9 +619,23 @@ function ConnectCatalog({ entry, onClose }: { entry: CatalogEntry; onClose: () =
     };
   }, []);
 
-  const conn = entry.connection;
-  const isConnected = conn?.status === "active" || (entry.auth_mode === "none" && !!entry.bundle);
-  const needsReattention = !!conn && conn.status !== "active" && !isConnected;
+  // A connected bundle already holds its photographed tool schemas — fetch them
+  // once and render them in the modal so the tools are visible here, not only in
+  // the Bundles tab (design 2026-07-14). Pure presentation: no logic, just the API.
+  useEffect(() => {
+    if (!isConnected || !bundleId) return;
+    let cancelled = false;
+    apiGet<BundleDetail>(`/capabilities/${bundleId}`)
+      .then((d) => {
+        if (!cancelled) setToolDetail(d);
+      })
+      .catch(() => {
+        if (!cancelled) setToolsErr(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isConnected, bundleId]);
   // Imported `rest_action` cards are reference-only until the REST action
   // executor lands — Connect is refused server-side, so don't offer it here.
   const referenceOnly = entry.connectable === false;
@@ -663,28 +726,44 @@ function ConnectCatalog({ entry, onClose }: { entry: CatalogEntry; onClose: () =
 
   return (
     <ModalShell
-      title={`${entry.icon ? `${entry.icon} ` : ""}${entry.name}`}
+      title={entry.name}
       sub={entry.tier === "verified" ? "Verified connector" : `${entry.tier} connector`}
       onClose={onClose}
     >
-      <p className="note" style={{ marginTop: 0 }}>
-        {entry.description}
-        {entry.egress.length > 0 && (
-          <span className="faint mono" style={{ display: "block", fontSize: 11, marginTop: 4 }}>
-            egress: {entry.egress.join(", ")}
-          </span>
-        )}
-      </p>
-      {entry.tool_hints.length > 0 && (
-        <p className="helper">
-          Suggested policy seeds (hints only — your policy stays the judge):{" "}
-          {entry.tool_hints.map((h) => `${h.pattern} → ${h.action}`).join(" · ")}
-        </p>
+      <p className="connector-lead">{entry.description}</p>
+      {(entry.egress.length > 0 || entry.tool_hints.length > 0) && (
+        <div className="connector-meta">
+          {entry.egress.length > 0 && (
+            <div className="meta-row">
+              <span className="meta-label">Egress</span>
+              <div className="egress-list">
+                {entry.egress.map((h) => (
+                  <span key={h} className="egress-chip">
+                    {h}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+          {entry.tool_hints.length > 0 && (
+            <div className="meta-row">
+              <span className="meta-label">Policy hints — your policy decides</span>
+              <div className="hint-list">
+                {entry.tool_hints.map((h) => (
+                  <div key={h.pattern} className="hint-row">
+                    <span className="hint-pattern">{h.pattern}</span>
+                    <span className="hint-arrow">→</span>
+                    <span className={`hint-action ${h.action}`}>{h.action}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
       )}
       {done ? (
         <>
           <div className="empty" style={{ padding: "18px 0" }}>
-            <Check />
             <div>{done}</div>
           </div>
           <div className="spread">
@@ -700,17 +779,50 @@ function ConnectCatalog({ entry, onClose }: { entry: CatalogEntry; onClose: () =
         </div>
       ) : isConnected ? (
         <>
-          <div className="empty" style={{ padding: "18px 0" }}>
-            <Check />
-            <div>
-              Connected
-              {entry.bundle
-                ? ` — bundle ${entry.bundle.name}@${entry.bundle.version} is registered and attachable.`
-                : " — no bundle registered yet (use Register bundle with this connection)."}
-            </div>
+          <div className="connector-status">
+            <span className="status-dot" />
+            <span>Connected</span>
+            {entry.bundle ? (
+              <span className="bundle-chip">
+                {entry.bundle.name}@{entry.bundle.version}
+              </span>
+            ) : (
+              <span className="faint" style={{ fontSize: 12, fontWeight: 400 }}>
+                no bundle registered yet
+              </span>
+            )}
           </div>
+          {entry.bundle && (
+            <div className="tool-section">
+              <div className="tool-section-head">
+                <h4>Tools</h4>
+                {toolDetail && (
+                  <span className="tool-count">
+                    {toolDetail.servers.reduce((n, s) => n + s.tools.length, 0)} agents can call
+                  </span>
+                )}
+              </div>
+              {toolsLoading ? (
+                <div className="tool-list">
+                  <div className="tool-loading">Loading tools…</div>
+                </div>
+              ) : toolsErr ? (
+                <div className="tool-list">
+                  <div className="tool-empty">Couldn&apos;t load tools.</div>
+                </div>
+              ) : toolDetail && toolDetail.servers.length > 0 ? (
+                <div className="tool-list">
+                  <ServerTools servers={toolDetail.servers} />
+                </div>
+              ) : (
+                <div className="tool-list">
+                  <div className="tool-empty">No tools.</div>
+                </div>
+              )}
+            </div>
+          )}
           {err && <div className="err">{err}</div>}
-          <div className="spread" style={{ marginTop: 16 }}>
+          <div className="spread" style={{ marginTop: 18 }}>
             <span className="helper">
               {entry.auth_mode === "none"
                 ? "Registering again appends the next bundle version."

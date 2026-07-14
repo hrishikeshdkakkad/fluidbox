@@ -6,7 +6,6 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
-import { Check, KeyRound, Plus } from "lucide-react";
 import {
   apiGet,
   apiPost,
@@ -189,7 +188,7 @@ export default function Integrations() {
                   </span>
                   {r.status === "active" ? (
                     <span className="badge ok">
-                      <Check size={11} /> active
+                      active
                     </span>
                   ) : (
                     <span className="badge warn">{r.status}</span>
@@ -227,7 +226,7 @@ export default function Integrations() {
                 onChange={(e) => setOrg(e.target.value)}
               />
               <button className="btn sm" onClick={setupApp}>
-                <Plus /> New app
+                New app
               </button>
             </span>
           </div>
@@ -320,7 +319,7 @@ export default function Integrations() {
           .
         </span>
         <button className="btn ghost sm" onClick={() => setShowManual(true)}>
-          <KeyRound /> Add manually
+          Add manually
         </button>
       </div>
 

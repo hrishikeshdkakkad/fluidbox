@@ -3,6 +3,9 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
   // Self-contained server bundle for the Docker image (deploy/web.Dockerfile).
   output: "standalone",
+  // Product reviews happen against the local dev stack; keep the workspace
+  // free of framework chrome while still surfacing compile/runtime errors.
+  devIndicators: false,
   // The 2026-07 IA consolidation moved pages around; keep old URLs working
   // (bookmarks, muscle memory). Capabilities (agent tools) and Integrations
   // (platforms agents work on) are deliberately separate pages.

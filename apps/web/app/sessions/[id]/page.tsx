@@ -2,7 +2,6 @@
 
 import { use, useEffect, useRef, useState, useCallback } from "react";
 import Link from "next/link";
-import { Pause } from "lucide-react";
 import {
   apiGet,
   apiPost,
@@ -137,9 +136,7 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
       {/* Approval banners */}
       {pending.map((a) => (
         <div className="approval" key={a.id} style={{ marginBottom: 14 }}>
-          <span className="icon">
-            <Pause size={16} />
-          </span>
+          <span className="approval-label">Review</span>
           <div className="txt">
             <div className="h">Waiting for you{a.risk ? ` · ${a.risk}` : ""}</div>
             <div className="d">
@@ -359,7 +356,7 @@ function TimelineItem({ ev }: { ev: EventRow }) {
       tag = "decision";
       body = (
         <>
-          {v === "allow" ? "✓ allowed" : "✗ denied"}{" "}
+          {v === "allow" ? "Allowed" : "Denied"}{" "}
           <span className="mut">({s("source")})</span>
           {s("original_verdict") ? <span className="mut"> · was {s("original_verdict")}</span> : null}
         </>
