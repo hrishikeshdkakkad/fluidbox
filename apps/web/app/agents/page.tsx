@@ -3,7 +3,7 @@
 import { Suspense, useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Bot, ChevronDown, ChevronRight, Plus, Search as SearchIcon } from "lucide-react";
+import { ChevronDown, ChevronRight, Search as SearchIcon } from "lucide-react";
 import {
   apiGet,
   apiPost,
@@ -82,8 +82,8 @@ function Agents() {
         sub="Versioned recipes and the policies that govern them. Editing appends an immutable revision — running sessions keep their frozen spec."
         right={
           tab === "agents" ? (
-            <Link className="btn primary" href="/agents/new">
-              <Plus /> New agent
+            <Link className="btn primary" href="/?action=new-agent#configuration">
+              New agent
             </Link>
           ) : undefined
         }
@@ -139,11 +139,10 @@ function Agents() {
             <LoadingRows />
           ) : agents.length === 0 ? (
             <div className="empty">
-              <Bot />
               <div>No agents yet.</div>
               <div className="act">
-                <Link className="btn" href="/agents/new">
-                  <Plus /> Create your first agent
+                <Link className="btn" href="/?action=new-agent#configuration">
+                  Create your first agent
                 </Link>
               </div>
             </div>
@@ -212,7 +211,7 @@ function Agents() {
                         </div>
                       ))}
                       <button className="btn sm" style={{ marginTop: 12 }} onClick={() => setAddRev(a.id)}>
-                        <Plus /> Add revision
+                        Add revision
                       </button>
                     </div>
                   )}
@@ -334,8 +333,7 @@ function PoliciesTab() {
             <div className="mono" style={{ fontSize: 12.5 }}>
               {validity && (
                 <span style={{ color: validity.ok ? "var(--green)" : "var(--red)" }}>
-                  {validity.ok ? "✓ " : "✗ "}
-                  {validity.msg}
+                  {validity.ok ? "Valid: " : "Invalid: "}{validity.msg}
                 </span>
               )}
             </div>
@@ -344,7 +342,7 @@ function PoliciesTab() {
                 Validate
               </button>
               <button className="btn primary" onClick={save}>
-                {saved ? "✓ Saved" : "Save version"}
+                {saved ? "Saved" : "Save version"}
               </button>
             </div>
           </div>
@@ -367,7 +365,7 @@ function AddRevision({
   onClose: () => void;
   onAdded: () => void;
 }) {
-  const harnesses = useHarnesses();
+  const { harnesses, loading: harnessesLoading, error: harnessesError, reload: reloadHarnesses } = useHarnesses();
   const [harness, setHarness] = useState(current?.harness || "claude-agent-sdk");
   const [model, setModel] = useState(current?.model || "claude-haiku-4-5");
   const [systemPrompt, setSystemPrompt] = useState(current?.system_prompt || "");
@@ -407,14 +405,23 @@ function AddRevision({
     >
       <div className="field">
         <span className="lab">Harness</span>
-        <HarnessPicker
-          harnesses={harnesses}
-          value={harness}
-          onChange={(h) => {
-            setHarness(h);
-            setModel(defaultModelFor(harnesses, h)); // never carry a cross-harness model
-          }}
-        />
+        {harnessesLoading ? (
+          <span className="helper">Loading runtime catalog…</span>
+        ) : harnessesError ? (
+          <div className="catalog-state error-state">
+            <span>{harnessesError}</span>
+            <button className="btn sm" type="button" onClick={reloadHarnesses}>Retry</button>
+          </div>
+        ) : (
+          <HarnessPicker
+            harnesses={harnesses}
+            value={harness}
+            onChange={(h) => {
+              setHarness(h);
+              setModel(defaultModelFor(harnesses, h)); // never carry a cross-harness model
+            }}
+          />
+        )}
       </div>
       <label className="field">
         <span className="lab">Model</span>
@@ -440,7 +447,7 @@ function AddRevision({
       {err && <div className="err">{err}</div>}
       <div className="spread" style={{ marginTop: 14 }}>
         <span className="helper">Inherits harness · policy · image · budgets.</span>
-        <button className="btn primary" onClick={submit} disabled={busy}>
+        <button className="btn primary" onClick={submit} disabled={busy || harnessesLoading || !!harnessesError}>
           {busy ? "Appending…" : "Append revision"}
         </button>
       </div>
