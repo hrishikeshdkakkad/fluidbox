@@ -392,3 +392,89 @@ fn registry_page_parses_and_paginates() {
     assert_eq!(page.servers.len(), 1);
     assert_eq!(page.metadata.next_cursor.as_deref(), Some("a/b:1.0.0"));
 }
+
+// ─── snapshot shape disambiguation ────────────────────────────────────────
+
+fn snapshot_entry() -> Value {
+    json!({
+        "server": { "name": "a/b", "title": "AB", "version": "1.0.0",
+                    "remotes": [{ "type": "streamable-http", "url": "https://ab.test/mcp" }] },
+        "_meta": official("active", true)
+    })
+}
+
+#[test]
+fn snapshot_parses_a_single_page() {
+    let text = serde_json::to_string(&json!({
+        "servers": [snapshot_entry()],
+        "metadata": { "nextCursor": null, "count": 1 }
+    }))
+    .unwrap();
+    let entries = parse_registry_snapshot(&text).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].server.name, "a/b");
+}
+
+#[test]
+fn snapshot_parses_an_array_of_pages() {
+    let text = serde_json::to_string(&json!([
+        { "servers": [snapshot_entry()], "metadata": {} },
+        { "servers": [snapshot_entry()], "metadata": {} },
+    ]))
+    .unwrap();
+    let entries = parse_registry_snapshot(&text).unwrap();
+    assert_eq!(entries.len(), 2, "both pages' servers are flattened");
+}
+
+#[test]
+fn snapshot_parses_a_bare_entry_array() {
+    // Regression: every RegistryPage field is defaulted, so a bare entry array
+    // ALSO parses as Vec<RegistryPage> with empty servers. It must be
+    // disambiguated as entries FIRST, or the import silently sees zero servers.
+    let text = serde_json::to_string(&json!([snapshot_entry()])).unwrap();
+    let entries = parse_registry_snapshot(&text).unwrap();
+    assert_eq!(
+        entries.len(),
+        1,
+        "a bare entry array must yield its entries, not zero"
+    );
+    assert_eq!(entries[0].server.name, "a/b");
+}
+
+#[test]
+fn snapshot_rejects_a_non_snapshot_shape() {
+    assert!(parse_registry_snapshot("{\"nope\":true}").is_err());
+    assert!(parse_registry_snapshot("not json").is_err());
+}
+
+// ─── slug/host edge cases ─────────────────────────────────────────────────
+
+#[test]
+fn over_long_registry_name_drops_the_server() {
+    let long = "x".repeat(200);
+    let out = build(
+        &[entry(json!({
+            "server": { "name": "long/srv", "title": long, "version": "1.0.0",
+                        "remotes": [{ "type": "streamable-http", "url": "https://l.test/mcp" }] },
+            "_meta": official("active", true)
+        }))],
+        vec![],
+        &pins(),
+    );
+    assert!(out.rows.is_empty(), "a 200-char card name must not import");
+    assert!(out.dropped[0].reason.contains("exceeds"));
+}
+
+#[test]
+fn ipv6_host_keeps_its_brackets() {
+    let out = build(
+        &[entry(json!({
+            "server": { "name": "v6/srv", "title": "V6", "version": "1.0.0",
+                        "remotes": [{ "type": "streamable-http", "url": "https://[2001:db8::1]:8080/mcp" }] },
+            "_meta": official("active", true)
+        }))],
+        vec![],
+        &pins(),
+    );
+    assert_eq!(out.rows[0].egress, vec!["[2001:db8::1]"]);
+}

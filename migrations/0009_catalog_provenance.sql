@@ -10,8 +10,10 @@
 -- Provenance is a first-class, auditable column (plan D4). The curated seed
 -- rows from 0007 carry {"source":"fluidbox"} and are NEVER overwritten by an
 -- import — the idempotent upsert in the generated migration keys off exactly
--- this predicate (`provenance->>'source' <> 'fluidbox'`), so a re-import can
--- refresh a prior import but can never clobber a hand-curated verified entry.
+-- this predicate (`provenance->>'source' in ('mcp-registry','open-connector')`,
+-- i.e. it refreshes ONLY rows that were themselves imported), so a re-import
+-- can refresh a prior import but can never clobber a hand-curated fluidbox seed
+-- OR a user's custom ({"source":"custom"}) BYO entry.
 alter table connector_catalog
     add column provenance jsonb not null default '{"source":"fluidbox"}';
 

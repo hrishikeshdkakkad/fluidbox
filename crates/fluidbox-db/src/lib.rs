@@ -740,8 +740,9 @@ pub struct ConnectorCatalogRow {
     pub sandbox_launch: Option<Value>,
     /// {source, source_ref?, upstream_id?, imported_at?}. Curated seed rows
     /// carry {"source":"fluidbox"} and are never overwritten by an import
-    /// (plan D4/D6). Imported reference rows carry the open-connector source
-    /// + pinned commit so a future re-import can diff by (source, upstream_id).
+    /// (plan D4/D6). Imported reference rows carry an import source
+    /// ("mcp-registry" | "open-connector") + pinned snapshot/commit so a future
+    /// re-import can diff by (source, upstream_id).
     pub provenance: Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -788,8 +789,9 @@ pub async fn create_catalog_entry(
     // tier AND provenance are forced 'custom': verified/community are curation
     // judgements the API cannot self-award, and a 'custom' provenance keeps a
     // user's BYO entry distinguishable from both the fluidbox seed and an
-    // open-connector import (the generated import upsert only ever refreshes
-    // rows whose provenance.source = 'open-connector' — see the importer).
+    // import (the generated import upsert only ever refreshes rows whose
+    // provenance.source is an import source — 'mcp-registry' or 'open-connector'
+    // — so it can never clobber this custom row; see the importer).
     sqlx::query_as(
         "insert into connector_catalog
            (id, slug, name, icon, description, categories, tier, url, transport,

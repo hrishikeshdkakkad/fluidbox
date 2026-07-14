@@ -21,7 +21,7 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use fluidbox_catalog_import::{
-    build, emit_migration, OcProvider, Pins, RegistryEntry, RegistryPage,
+    build, emit_migration, parse_registry_snapshot, OcProvider, Pins, RegistryEntry, RegistryPage,
 };
 use std::path::{Path, PathBuf};
 
@@ -186,21 +186,14 @@ fn fetch_registry(base: &str, limit: u32) -> Result<Vec<RegistryEntry>> {
 }
 
 /// Read a captured Registry snapshot: a single page `{servers:[…]}`, an array
-/// of pages, or a bare array of server entries.
+/// of pages, or a bare array of server entries. Shape disambiguation lives in
+/// the library (`parse_registry_snapshot`) so it is unit-tested.
 fn read_registry_snapshot(path: &Path) -> Result<Vec<RegistryEntry>> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading Registry snapshot {}", path.display()))?;
-    if let Ok(page) = serde_json::from_str::<RegistryPage>(&text) {
-        if !page.servers.is_empty() {
-            return Ok(page.servers);
-        }
-    }
-    if let Ok(pages) = serde_json::from_str::<Vec<RegistryPage>>(&text) {
-        return Ok(pages.into_iter().flat_map(|p| p.servers).collect());
-    }
-    let entries: Vec<RegistryEntry> = serde_json::from_str(&text)
-        .context("Registry snapshot is not a page, an array of pages, or an array of entries")?;
-    Ok(entries)
+    parse_registry_snapshot(&text)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("parsing Registry snapshot {}", path.display()))
 }
 
 /// Read a pinned open-connector checkout's generated catalog JSON.

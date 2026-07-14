@@ -26,6 +26,22 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// A card name is a short label. `lint_text`'s 32 KiB cap is far too loose for
+/// a Store-card title, so an over-long (or newline-laden) upstream name is
+/// dropped rather than imported verbatim to blow out the dashboard grid. Drop,
+/// not truncate — the importer never silently mutates upstream reference text.
+const MAX_NAME_CHARS: usize = 120;
+
+/// Screen a mapped card `name`: reject the poison screen AND an over-long
+/// label (the caller drops the whole entry on `Err`).
+fn screen_name(name: &str) -> Result<(), String> {
+    lint_text("name", name)?;
+    if name.chars().count() > MAX_NAME_CHARS {
+        return Err(format!("name exceeds {MAX_NAME_CHARS} chars"));
+    }
+    Ok(())
+}
+
 // ─── MCP Registry `GET /v0/servers` shape (verified against the live API) ──
 // { "servers": [ { "server": {...}, "_meta": {...} } ], "metadata": { nextCursor, count } }
 
@@ -53,6 +69,32 @@ pub struct RegistryEntry {
     pub server: RegistryServer,
     #[serde(rename = "_meta", default)]
     pub meta: Value,
+}
+
+/// Parse a captured Registry snapshot in any of the three shapes we accept: a
+/// single page `{servers:[…]}`, a bare array of server entries `[{server,…}]`,
+/// or an array of pages `[{servers:[…]},…]`.
+///
+/// Order matters: every `RegistryPage` field is defaulted, so a bare entry
+/// array ALSO deserializes as `Vec<RegistryPage>` (with every page's `servers`
+/// empty). The bare-entry array must therefore be disambiguated BEFORE the
+/// page array — a `RegistryEntry` requires `server`, so a page array can never
+/// mis-parse as entries, making the ordering one-directional and safe.
+pub fn parse_registry_snapshot(text: &str) -> Result<Vec<RegistryEntry>, String> {
+    if let Ok(page) = serde_json::from_str::<RegistryPage>(text) {
+        if !page.servers.is_empty() {
+            return Ok(page.servers);
+        }
+    }
+    if let Ok(entries) = serde_json::from_str::<Vec<RegistryEntry>>(text) {
+        return Ok(entries);
+    }
+    match serde_json::from_str::<Vec<RegistryPage>>(text) {
+        Ok(pages) => Ok(pages.into_iter().flat_map(|p| p.servers).collect()),
+        Err(_) => {
+            Err("snapshot is not a page, an array of pages, or an array of entries".to_string())
+        }
+    }
 }
 
 /// The `server.json` document (parsed leniently — unused fields default).
@@ -288,7 +330,7 @@ fn map_registry_server(
     if name.is_empty() {
         return Err("registry server has no name/title".into());
     }
-    lint_text("name", &name)?;
+    screen_name(&name)?;
 
     let description = match s.description.as_deref().map(str::trim) {
         Some(d) if !d.is_empty() => {
@@ -307,7 +349,7 @@ fn map_registry_server(
     if !valid_slug(&base) {
         return Err("could not derive a valid slug".into());
     }
-    let slug = dedup_slug(base, seen);
+    let slug = dedup_slug(base, seen).ok_or("slug suffix space exhausted")?;
 
     // Connectable iff a remote streamable-http/http endpoint exists; else a
     // reference-only card with the website (or first remote) as informational.
@@ -399,7 +441,7 @@ fn map_oc_provider(
     if name.is_empty() {
         return Err("provider has no usable name".into());
     }
-    lint_text("name", &name)?;
+    screen_name(&name)?;
 
     let description = match p.description.as_deref().map(str::trim) {
         Some(d) if !d.is_empty() => {
@@ -432,7 +474,7 @@ fn map_oc_provider(
     if registry_slugs.contains(&base) {
         return Err("superseded by an MCP Registry entry for the same slug".into());
     }
-    let slug = dedup_slug(base, seen);
+    let slug = dedup_slug(base, seen).ok_or("slug suffix space exhausted")?;
 
     // open-connector providers are REST-API Actions — never a hosted MCP
     // endpoint — so they are ALWAYS reference-only (plan §4.2).
@@ -524,12 +566,21 @@ fn default_tool_hints(slug: &str) -> Value {
 }
 
 /// Best-effort host extraction (dep-free — a url crate has no place in a build
-/// tool). Strips scheme, path, userinfo, and port.
+/// tool). Strips scheme, path, userinfo, and port, and preserves a bracketed
+/// IPv6 literal (`[::1]:8080` → `[::1]`) instead of truncating it at the colon.
 fn host_of(url: &str) -> Option<String> {
     let after = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-    let host = after.split(['/', '?', '#']).next().unwrap_or("");
-    let host = host.rsplit('@').next().unwrap_or(host);
-    let host = host.split(':').next().unwrap_or(host);
+    let authority = after.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        // IPv6 literal: keep everything through the closing bracket.
+        match rest.split_once(']') {
+            Some((inner, _)) => format!("[{inner}]"),
+            None => authority.to_string(),
+        }
+    } else {
+        authority.split(':').next().unwrap_or(authority).to_string()
+    };
     let host = host.trim().trim_end_matches('.');
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
@@ -565,17 +616,21 @@ fn slugify(s: &str) -> String {
 }
 
 /// Reserve a unique slug in the batch, appending `-2`, `-3`, … on collision.
-fn dedup_slug(base: String, seen: &mut BTreeSet<String>) -> String {
+/// Returns `None` if the suffix space is exhausted — the caller must DROP the
+/// entry rather than emit a duplicate slug, which would make the generated
+/// `INSERT … ON CONFLICT DO UPDATE` fail at apply time ("cannot affect row a
+/// second time"). Unreachable in practice; fail honest rather than silently.
+fn dedup_slug(base: String, seen: &mut BTreeSet<String>) -> Option<String> {
     if seen.insert(base.clone()) {
-        return base;
+        return Some(base);
     }
     for n in 2..10_000u32 {
         let cand = format!("{base}-{n}");
         if cand.len() <= 64 && seen.insert(cand.clone()) {
-            return cand;
+            return Some(cand);
         }
     }
-    base
+    None
 }
 
 // ─── SQL emission ─────────────────────────────────────────────────────────
