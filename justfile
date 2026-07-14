@@ -85,3 +85,26 @@ e2e:
 # in-flight runs keep their frozen snapshot).
 policy-sync:
     bash scripts/policy-sync.sh
+
+# ── Connector catalog import (offline dev tool) ──────────────────────────
+#
+# Regenerate the append-only connector-catalog import migration from the
+# official MCP Registry (PRIMARY, connectable breadth) + optionally a pinned
+# open-connector checkout (SUPPLEMENT, REST-only reference cards). Both
+# Apache-2.0 (see NOTICE). Every row is untrusted, community-tier, and
+# provenance-tagged; same pins → identical SQL.
+#
+# Registry only (live paging), pinned by date/cursor:
+#   just catalog-import-registry 2026-07-14 migrations/0010_catalog_import.sql
+#
+# Full control (Registry snapshot + open-connector), see the binary's --help:
+#   git -C ../open-connector rev-parse HEAD          # the oc pin
+#   (cd ../open-connector && npm ci && npm run generate:catalog)
+#   cargo run -p fluidbox-catalog-import -- \
+#     --registry-url https://registry.modelcontextprotocol.io --registry-ref 2026-07-14 \
+#     --open-connector ../open-connector --oc-sha <commit> \
+#     --out migrations/0010_catalog_import.sql
+catalog-import-registry REF OUT="migrations/0010_catalog_import.sql":
+    cargo run -p fluidbox-catalog-import -- \
+      --registry-url https://registry.modelcontextprotocol.io \
+      --registry-ref {{REF}} --out {{OUT}}

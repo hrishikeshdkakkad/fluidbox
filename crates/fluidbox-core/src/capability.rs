@@ -186,7 +186,12 @@ fn valid_tool_name(s: &str) -> bool {
 /// Bits ANSI/zero-width concealment). Control characters, ANSI escapes,
 /// zero-width characters, and bidi overrides have no business in a tool
 /// description — reject the registration outright.
-fn lint_text(field: &str, s: &str) -> Result<(), String> {
+///
+/// Public so the offline connector-catalog importer applies the IDENTICAL
+/// screen to every model-/operator-visible string it lifts from an external
+/// source (names, descriptions, hint notes) — the "poison screen at the door"
+/// extended to untrusted reference data (bulk-import plan D5).
+pub fn lint_text(field: &str, s: &str) -> Result<(), String> {
     if s.chars().count() > MAX_DESCRIPTION_CHARS {
         return Err(format!("{field} exceeds {MAX_DESCRIPTION_CHARS} chars"));
     }

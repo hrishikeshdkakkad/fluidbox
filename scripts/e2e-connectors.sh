@@ -372,6 +372,11 @@ print(d.get('$1', {}).get('$2', ''))"; }
 [ "$(cfield github tier)" = "verified" ] && echo "$CAT" | grep -q "mcp__github__" \
   && ok "github seed carries untrusted tool_hints (policy-default seeds)" || no "github seed wrong"
 [ -z "$(cfield slack auth_mode)" ] && ok "no slack seed (deferred to Phase 7 — settle #3)" || no "slack seed exists!"
+# Every curated seed is a real connectable transport (streamable_http/stdio),
+# so the derived `connectable` decoration is true; imported `rest_action`
+# reference cards (bulk-import increment 4) will report false here instead.
+[ "$(cfield github connectable)" = "True" ] && [ "$(cfield workspace-info connectable)" = "True" ] \
+  && ok "catalog decorates entries with a derived connectable flag" || no "connectable decoration missing"
 
 CODE=$(post "/catalog" "{\"slug\":\"Bad_Slug\",\"name\":\"x\",\"url\":\"http://127.0.0.1:$SN_PORT/mcp\"}")
 [ "$CODE" = "400" ] && ok "bad slug → 400 (must fit alias+bundle charset)" || no "bad slug → $CODE"
