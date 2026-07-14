@@ -174,7 +174,7 @@ export interface CatalogEntry {
   categories: string[];
   tier: string; // verified | community | custom
   url: string | null;
-  transport: string; // streamable_http | stdio
+  transport: string; // streamable_http | stdio | rest_action (reference-only)
   auth_mode: "none" | "api_key" | "oauth";
   auth_hints: {
     header_name?: string;
@@ -192,6 +192,9 @@ export interface CatalogEntry {
    *  covering this entry, and the latest bundle named after the slug. */
   connection: { id: string; status: string; auth_kind: string } | null;
   bundle: { id: string; name: string; version: number } | null;
+  /** Derived server-side: false for imported `rest_action` reference cards
+   *  whose Connect is refused until the REST action executor lands. */
+  connectable?: boolean;
 }
 
 /** POST /catalog/{slug}/connect response (fields vary by auth_mode). */

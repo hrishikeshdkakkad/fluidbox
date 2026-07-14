@@ -259,6 +259,9 @@ function StoreCard({ entry, onOpen }: { entry: CatalogEntry; onOpen: () => void 
   const connected =
     entry.connection?.status === "active" || (entry.auth_mode === "none" && !!entry.bundle);
   const attention = !!entry.connection && entry.connection.status !== "active" && !connected;
+  // Imported `rest_action` cards are reference-only: browsable, but Connect is
+  // refused until the REST action executor lands (bulk-import plan D3).
+  const referenceOnly = entry.connectable === false;
 
   return (
     <button className="store-card" onClick={onOpen}>
@@ -293,6 +296,10 @@ function StoreCard({ entry, onOpen }: { entry: CatalogEntry; onOpen: () => void 
           </span>
         ) : attention ? (
           <span className="state err">{entry.connection!.status}</span>
+        ) : referenceOnly ? (
+          <span className="state" style={{ color: "var(--muted)" }}>
+            Reference only
+          </span>
         ) : (
           <span className="state" style={{ color: "var(--ink)" }}>
             Connect
@@ -566,6 +573,9 @@ function ConnectCatalog({ entry, onClose }: { entry: CatalogEntry; onClose: () =
   const conn = entry.connection;
   const isConnected = conn?.status === "active" || (entry.auth_mode === "none" && !!entry.bundle);
   const needsReattention = !!conn && conn.status !== "active" && !isConnected;
+  // Imported `rest_action` cards are reference-only until the REST action
+  // executor lands — Connect is refused server-side, so don't offer it here.
+  const referenceOnly = entry.connectable === false;
 
   const watchUntilActive = (connId?: string) => {
     setWaiting(true);
@@ -715,6 +725,24 @@ function ConnectCatalog({ entry, onClose }: { entry: CatalogEntry; onClose: () =
                 Disconnect
               </button>
             )}
+          </div>
+        </>
+      ) : referenceOnly ? (
+        <>
+          <div className="empty" style={{ padding: "18px 0" }}>
+            <div>
+              Reference only — this connector was imported for discovery. It has no hosted MCP
+              endpoint fluidbox can attach yet, so there&apos;s nothing to connect today.
+            </div>
+          </div>
+          <div className="spread" style={{ marginTop: 16 }}>
+            <span className="helper">
+              Imported, untrusted reference data ({entry.tier}). Its tool hints are display-only —
+              your policy stays the judge.
+            </span>
+            <button className="btn ghost" onClick={onClose}>
+              Close
+            </button>
           </div>
         </>
       ) : needsReattention && conn ? (

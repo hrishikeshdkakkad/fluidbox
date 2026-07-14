@@ -34,6 +34,16 @@ fn valid_slug(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
 
+/// Whether pressing Connect on an entry can succeed under today's model.
+/// `rest_action` entries are REFERENCE-ONLY imports — a browsable card with no
+/// hosted MCP endpoint to photograph (a packaged-only MCP Registry server, or an
+/// open-connector REST provider) — so Connect is refused until the matching
+/// executor/packaging lands (bulk-import plan D3). Everything else
+/// (streamable_http remote, stdio in-image) connects normally.
+fn is_connectable(transport: &str) -> bool {
+    transport != "rest_action"
+}
+
 /// List entries DECORATED with their live state — which non-revoked
 /// connection already covers the entry (matched by exact base_url) and the
 /// latest bundle named after the slug. Pure presentation derivation, done
@@ -50,6 +60,9 @@ pub async fn list(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Val
             if let Some(o) = v.as_object_mut() {
                 o.insert("connection".into(), entry_connection(r, &conns));
                 o.insert("bundle".into(), entry_bundle(r, &bundles));
+                // Derived server-side so the Store can badge reference-only
+                // cards without embedding any logic in the dashboard.
+                o.insert("connectable".into(), json!(is_connectable(&r.transport)));
             }
             v
         })
@@ -281,6 +294,16 @@ async fn connect_entry(
     entry: fluidbox_db::ConnectorCatalogRow,
     req: ConnectReq,
 ) -> ApiResult<Json<Value>> {
+    // Reference-only rows (imported reference data) have no hosted MCP endpoint
+    // to photograph — refuse Connect with a clear message rather than
+    // manufacture a broken bundle (bulk-import plan D3).
+    if !is_connectable(&entry.transport) {
+        return Err(ApiError::BadRequest(
+            "this connector is reference-only (imported catalog entry); it is not \
+             yet connectable from fluidbox"
+                .into(),
+        ));
+    }
     let bundle_name = req
         .bundle_name
         .as_deref()
@@ -796,6 +819,13 @@ async fn derive_slug(state: &AppState, host: &str, name: &str) -> ApiResult<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_rest_action_is_reference_only() {
+        assert!(is_connectable("streamable_http"));
+        assert!(is_connectable("stdio"));
+        assert!(!is_connectable("rest_action"));
+    }
 
     #[test]
     fn slugs_must_fit_alias_and_bundle_charsets() {

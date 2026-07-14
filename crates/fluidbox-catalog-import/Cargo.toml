@@ -1,0 +1,26 @@
+[package]
+name = "fluidbox-catalog-import"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# DEV-ONLY offline tool: regenerates an append-only catalog-import migration
+# from a pinned open-connector checkout. Deliberately NOT a dependency of the
+# server crate graph — it never runs at boot or at request time, and the
+# server never fetches open-connector. It reuses fluidbox-core ONLY for the
+# poison screen (lint_text), so the same objective lint guards imported
+# reference strings that guards capability registration.
+
+[[bin]]
+name = "catalog-import"
+path = "src/main.rs"
+
+[dependencies]
+fluidbox-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+# Registry ingest is an at-generate-time HTTP page walk. `blocking` keeps the
+# CLI synchronous; reqwest is already in the workspace graph so this is cached.
+reqwest = { workspace = true, features = ["blocking"] }
