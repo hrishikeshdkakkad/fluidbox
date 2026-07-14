@@ -1,6 +1,11 @@
 # fluidbox — Kubernetes-native execution (posture evaluation + phased design)
 
-Status: rev 1 (design only — no code this round) · 2026-07-14
+Status: rev 2 (design only — no code this round) · 2026-07-14
+Rev 2: adds the prior-art survey (§3 — agent-sandbox, ARC, Tekton, Kueue,
+Cilium, managed isolation runtimes, commercial platforms) and folds its
+findings into §5.3 (FQDN egress), §5.4 (Kueue/scheduling gates), §6.1
+(PVC-sharing lesson), §9 (operator question reset to "adopt agent-sandbox,
+never build own CRDs"), §10 (isolation bar per cloud), §11 (phasing).
 Slice name: **Phases K1–K3** (parallel track to M2 Lambda MicroVMs; shares its
 trait prerequisites)
 Parent design: `PLAN.md` §2 (convergence invariants), §6.2 (seams), §6.6
@@ -14,8 +19,9 @@ bollard, sibling containers over the local socket). This document evaluates
 the entire posture for Kubernetes-native operation and lays out a phased
 path: **K1** a `KubernetesProvider` behind the existing `ExecutionProvider`
 seam plus a Helm chart and kind-based e2e; **K2** isolation/perf hardening;
-**K3** an *optional* operator/CRD layer, evaluated honestly and recommended
-*against* as a day-one investment.
+**K3** an *optional* CRD-backed step — which, per the prior-art survey
+(§3), should mean evaluating **kubernetes-sigs/agent-sandbox** as a
+backend, never building fluidbox-branded CRDs.
 
 The headline finding of the audit: the architecture is already ~90%
 substrate-agnostic. The runner contract is env + one HTTP origin; workspace
@@ -102,14 +108,112 @@ module in the same crate.
   `provider/src/workspace.rs`): the credentialed git fetch never enters the
   sandbox; the diff is `git add -A && git diff --binary <base>` on the
   control plane's own view of the workspace. On K8s this ports unchanged
-  under the RWX-volume decision (§5).
+  under the RWX-volume decision (§6).
 - **`SandboxHandle` is serializable jsonb** persisted per session — reattach
   after restart already assumes no live client. A pod handle fits the same
   shape as a container handle.
 - **Orphan sweep + watchdog** drive the provider only through
   `list_orphans()` / `state()` / `terminate()` — all trait methods.
 
-## 3. Approaches considered
+## 3. Prior art — how this problem is solved in the wild
+
+Surveyed 2026-07-14 (links in §13). Four families of systems run
+disposable/untrusted workloads on Kubernetes; each teaches something
+specific.
+
+### 3.1 kubernetes-sigs/agent-sandbox (SIG Apps) — the direct analog
+
+A CNCF subproject building exactly this category: a **`Sandbox` CRD** (one
+stateful, singleton, pod-backed workload with stable identity) plus
+extension CRDs — `SandboxTemplate` (reusable pod templates), `SandboxClaim`
+(allocate a sandbox, optionally from a pool), and **`SandboxWarmPool`**
+(pre-warmed sandboxes adopted at claim time for ~200 ms allocation; the
+roadmap targets 50 ms). Isolation backends: **gVisor and Kata Containers**
+first-class. Roadmap items that rhyme with fluidbox's needs: claim-time
+NetworkPolicy attach (L4/L7 egress allowlists), auto suspend/resume,
+scale-to-zero, per-claim identity binding. Google is the main sponsor;
+Python/TS/Go SDKs in progress; API is **v1alpha1**.
+
+Implications for fluidbox, honestly weighed:
+
+- It **validates the K1 shape**: pod-per-sandbox, template + securityContext
+  hardening, runtime-class isolation ladder, warm pools for latency.
+- It is a **candidate future backend**, not a K1 dependency: the API is
+  alpha; its center of gravity is *long-lived stateful singletons with
+  stable identity* (interactive agents, notebooks), while fluidbox runs are
+  *batch-shaped disposables* whose lifecycle is owned by an external control
+  plane. Two semantic checks are required before adoption: (a) pod-failure
+  behavior — a controller that *recreates* the backing pod (VM-like
+  semantics) would violate the exactly-once runner contract (the CRD's
+  `Finished/PodFailed` condition suggests terminal semantics exist, but this
+  must be verified against the controller, not the types); (b) warm-pool
+  adoption bakes env at pool-creation time — fluidbox injects per-run env
+  (session token, task), so warm pools require a runner-contract change
+  (bootstrap-fetch identity instead of env-injected identity).
+- Sequencing consequence: **fluidbox should never build its own sandbox
+  CRDs** (the K3 question changes from "build an operator?" to "adopt
+  agent-sandbox as a provider backend?"). See §8.
+
+### 3.2 CI systems — the closest *production-hardened* analog
+
+Pod-per-untrusted-job is a decade-old solved problem in CI, and the
+convergent lessons are sharp:
+
+- **GitHub Actions Runner Controller (ARC)**: an ephemeral runner pod per
+  job, registered with a **JIT token** minted per pod (the exact analog of
+  fluidbox's per-session token), a listener that long-polls the job queue
+  and scales an `EphemeralRunnerSet` — i.e. queueing lives in the *service*,
+  the cluster only sees already-admitted work. This is the same shape as
+  fluidbox's DB-side admission queue (§5.4).
+- **Tekton**: shares PVC workspaces across task pods and paid for it — the
+  "affinity assistant" exists solely to co-schedule pods sharing an RWO PVC
+  onto one node, grew per-workspace/per-pipelinerun modes, AZ-conflict
+  rules, and a TEP (0135) of fixes. The industry lesson: **sharing
+  filesystems across pods is the hard path**; do it only with genuine RWX
+  storage, and know why you need it.
+- **GitLab Runner (k8s executor) / Buildkite / Argo Workflows**: the
+  mainstream alternative — **no shared filesystem at all**. GitLab clones
+  *inside* the build pod with a short-lived job token; Argo passes state
+  between pods through an **artifact store (S3/GCS)**. fluidbox
+  deliberately rejects clone-in-pod (an in-sandbox credential is readable by
+  the agent that starts seconds later — the control-plane-side fetch is a
+  trust-model invariant, not a convenience), which is why RWX (§6.1) and
+  archive push/pull (§6.2) are our two shapes, and why archive is the
+  industry-mainstream one.
+
+### 3.3 Commercial agent-sandbox platforms — the isolation bar
+
+E2B (Firecracker microVMs, ~125 ms starts), Modal (gVisor), Daytona
+(Docker/Kata/gVisor per workload), Azure Container Apps **dynamic sessions**
+(Hyper-V-isolated session pools; Microsoft reports 400k+ sessions/day for
+Copilot). Convergent properties: **kernel-level isolation (microVM or
+user-space kernel), warm pools for latency, egress off by default, no
+shared filesystems**. On managed Kubernetes the same ladder is directly
+available: **GKE Sandbox (gVisor — default on Autopilot)**, **AKS Pod
+Sandboxing (Kata/MSHV)**; **EKS has no native equivalent** (BYO Kata/gVisor
+node pools). This grounds §10's RuntimeClass recommendation in what the
+commercial bar already is — shared-kernel + cap-drop is the floor, not the
+target, for hostile-code workloads.
+
+### 3.4 Queueing and egress — the native primitives
+
+- **Kueue** (k8s-native job queueing) admits **plain pods** via **scheduling
+  gates** (pods created immediately but ungated only on admission), with
+  ClusterQueue quotas, fair sharing, and preemption. Scheduling gates
+  themselves are a stable core primitive fluidbox could use independently.
+  The §5.4 recommendation (DB-side queue) stands for K2 — fluidbox needs
+  queue visibility in its own API and has a single-writer invariant — but
+  Kueue is the correct integration point if per-team cluster quotas ever
+  need to bind *cluster-side* (K3 territory, and ARC's service-side
+  queueing precedent says it may never be needed).
+- **Vanilla NetworkPolicy is L3/L4 only** — it cannot express "allow
+  `api.github.com`". **Cilium `toFQDNs`** policies (DNS-proxy-derived,
+  identity-based) are the production pattern for domain allowlists on
+  egress. fluidbox's policy YAML already has `egress.mode:
+  none|proxy-only|allowlist` — **structurally unenforceable today**; on a
+  Cilium cluster it becomes enforceable per-sandbox (§5.3, K2).
+
+## 4. Approaches considered
 
 **A. `KubernetesProvider` behind the existing trait, Helm-deployed control
 plane (chosen, K1).** Sandboxes become pods created directly by the server
@@ -129,7 +233,7 @@ the DB is the source of truth." CR `status` would either mirror the DB
 the invariant and moves governance state out of Postgres, where the gapless
 ledger, approvals, and budgets live). The watchdog/budget/approval loops
 cannot move into an operator without duplicating the governance plane.
-Retained as an *optional* K3 layer with a narrowed charter (§8).
+Retained as an *optional* K3 layer with a narrowed charter (§9).
 
 **C. Virtual-kubelet / Job-based execution.** A `Job` wrapper adds
 completion and backoff-retry semantics we must disable anyway (a runner must
@@ -137,18 +241,18 @@ run exactly once; retries would replay an agent against a half-mutated
 workspace and duplicate ledger streams). Bare pods with
 `restartPolicy: Never` express the actual contract. Rejected.
 
-## 4. K1 — `KubernetesProvider` design
+## 5. K1 — `KubernetesProvider` design
 
-### 4.1 Object mapping
+### 5.1 Object mapping
 
 | fluidbox concept | Kubernetes object |
 |---|---|
 | Sandbox | one **Pod**, `restartPolicy: Never`, in a dedicated sandbox namespace |
 | Sandbox identity | pod name `fluidbox-<session_id>`; labels `fluidbox.io/session=<uuid>`, `fluidbox.io/managed=true` |
 | `SandboxHandle` | `runtime: "kubernetes"`, `external_id: <pod name>`, `attrs: {namespace, uid}` — the pod **uid** guards reattach against name reuse |
-| Per-session bridge network | **nothing per-session** — one static NetworkPolicy by label covers all sandboxes (§4.3) |
+| Per-session bridge network | **nothing per-session** — one static NetworkPolicy by label covers all sandboxes (§5.3) |
 | Orphan sweep | `list pods -l fluidbox.io/managed=true` in the sandbox namespace |
-| 2 GiB / cap-drop hardening | `resources.limits` + pod `securityContext` (§4.2) |
+| 2 GiB / cap-drop hardening | `resources.limits` + pod `securityContext` (§5.2) |
 
 Trait mapping, method by method:
 
@@ -167,7 +271,7 @@ Trait mapping, method by method:
 - `list_orphans()` → label-selector list; parse `fluidbox.io/session` back
   to a `Uuid`, rebuild handles from pod name/uid. Same reap-even-without-DB
   property as Docker's label sweep.
-- `runtime_name()` → `"kubernetes"`; new `health()` (§6) → an API
+- `runtime_name()` → `"kubernetes"`; new `health()` (§7) → an API
   self-subject review or a namespaced pods `list` with `limit=1`.
 
 Client construction: `kube::Client::try_default()` — resolves the in-cluster
@@ -175,7 +279,7 @@ ServiceAccount when the server runs as a pod, or the local kubeconfig when a
 dev runs `just server` on the host against kind. One code path, both
 topologies.
 
-### 4.2 Sandbox Pod spec (sketch)
+### 5.2 Sandbox Pod spec (sketch)
 
 ```yaml
 apiVersion: v1
@@ -193,7 +297,7 @@ spec:
   securityContext:
     runAsNonRoot: true
     runAsUser: 10001                    # both runner images already use 10001
-    fsGroup: 10001                      # RWX volume writability (§5)
+    fsGroup: 10001                      # RWX volume writability (§6)
     seccompProfile: { type: RuntimeDefault }
   containers:
     - name: runner
@@ -233,7 +337,7 @@ Notes:
   restricted-compliant by construction, so admission becomes a regression
   tripwire, not a burden.
 
-### 4.3 Networking
+### 5.3 Networking
 
 **Sandbox → control plane.** The server is a ClusterIP Service;
 `FLUIDBOX_PUBLIC_CONTROL_URL=http://fluidbox-server.fluidbox.svc.cluster.local:8787`
@@ -308,7 +412,23 @@ the policy denies, and pass the control-plane Service's **ClusterIP**
 Documented as a values toggle because some CNIs also need DNS for the
 Service VIP path.
 
-### 4.4 Scheduling, capacity, and queueing
+**K2 — enforcing `egress.mode: allowlist` structurally (Cilium).** The
+policy YAML already speaks `egress.mode: none|proxy-only|allowlist`, but
+nothing today can *enforce* an allowlist — vanilla NetworkPolicy is L3/L4
+and cannot express "allow `api.github.com`". On clusters running Cilium,
+**`CiliumNetworkPolicy` `toFQDNs`** rules (the CNI's DNS proxy observes
+resolutions and derives per-identity IP allowances) make the policy's
+allowlist mode real: the provider renders the frozen policy's egress
+allowlist into a per-session CiliumNetworkPolicy at provision time and
+deletes it at teardown — the first per-session network object in the
+design, justified because it carries per-run policy. CNI-dependent,
+values-gated (`egress.fqdnAllowlist.enabled`), and the RunSpec snapshot
+already carries the policy, so no schema change. On non-Cilium clusters
+`allowlist` continues to degrade to `none` (deny), which is the fail-safe
+direction. This is a capability the Docker provider structurally cannot
+offer — worth naming as a reason K8s is the better long-term home.
+
+### 5.4 Scheduling, capacity, and queueing
 
 "Scheduler" means two different things here; the design needs both named.
 
@@ -357,15 +477,23 @@ Closing it, in two steps:
   elasticity (autoscaler) compose: the queue caps spend, the autoscaler
   absorbs bursts under the cap.
 
-**Kueue (K8s-native job queueing) — considered, deferred.** Kueue's pod
-integration could gate sandbox admission cluster-side, but it splits queue
-truth between the cluster and Postgres (the dashboard would need to read
-Kueue state), adds a controller dependency, and its fairness/quota model
-duplicates what a 50-line DB admission worker gives us with full audit
-visibility. Reconsider only alongside a K3 operator, where cluster-side
-admission is already in play.
+**Kueue (K8s-native job queueing) — considered, deferred.** Kueue's
+plain-pod integration is more capable than a first glance suggests: it
+admits bare pods via **scheduling gates** (the pod is created immediately
+with a `kueue.x-k8s.io/admission` gate; the scheduler ignores it until
+Kueue ungates it on quota admission), with ClusterQueue quotas, fair
+sharing, and preemption. Two facts still favor the DB queue for fluidbox:
+(a) queue truth must live where the dashboard, API, and audit trail live —
+Postgres (with Kueue, "why is my run waiting?" is answered by a CR the
+control plane doesn't own); (b) ARC — the closest production analog —
+reaches the same conclusion and queues in the *service*, admitting to the
+cluster only work that should run now. Note that **scheduling gates
+themselves are a stable core primitive** fluidbox could adopt without Kueue
+if pre-creating gated pods ever becomes useful (e.g. to pre-pull images
+during queue wait). Reconsider Kueue only if per-team *cluster-side* quota
+enforcement becomes a requirement (K3 territory).
 
-### 4.5 What explicitly does NOT change
+### 5.5 What explicitly does NOT change
 
 The internal gateway, LLM facade, permission gate, approvals, ledger,
 capability broker, trigger/schedule/event spines, and both runner images are
@@ -375,9 +503,9 @@ preserved by construction: fresh pod per run, same runner contract, same
 capability/permission/containment layering (containment strictly improves),
 model access still via the facade.
 
-## 5. Workspace delivery — RWX volume (K1), archive seam (K2)
+## 6. Workspace delivery — RWX volume (K1), archive seam (K2)
 
-### 5.1 RWX mode (chosen)
+### 6.1 RWX mode (chosen)
 
 `FLUIDBOX_DATA_DIR` lives on a ReadWriteMany PVC mounted into the server pod
 (e.g. at `/data`); each sandbox pod mounts the same PVC with
@@ -408,6 +536,19 @@ Storage classes per target:
 | generic | NFS provisioner | the lowest common denominator |
 | kind (dev/e2e) | single-node: a `hostPath`-backed PV with RWX declared | RWX is only a *claim* on kind; with one node it is honest enough for e2e |
 
+A prior-art caution (§3.2) worth restating here: Tekton is the big
+production system that shares PVC workspaces across pods, and it needed an
+entire subsystem (the affinity assistant, three co-scheduling modes, AZ
+conflict rules) to make *RWO* sharing survivable. fluidbox avoids that trap
+only by requiring **genuine RWX** storage — there is no co-scheduling
+fallback in this design on purpose (co-scheduling every sandbox onto the
+server's node would recreate the single-machine posture K8s is meant to
+end). Where real RWX isn't available, the answer is archive mode (§6.2),
+not affinity tricks. The rest of the industry (GitLab, Buildkite, Argo)
+shares nothing and moves archives/artifacts instead — fluidbox lands there
+too eventually; RWX is the low-risk first step because it keeps
+`materialize`/`capture_diff` byte-identical.
+
 Gotchas the chart and docs must carry:
 
 - **uid 10001 writability**: `fsGroup: 10001` on the sandbox pod plus the
@@ -424,7 +565,7 @@ Gotchas the chart and docs must carry:
   periodic janitor for dirs orphaned by crashes already exists in spirit via
   `keep_workspaces` debugging flag semantics — no new mechanism.
 
-### 5.2 Archive mode (designed now, built in K2)
+### 6.2 Archive mode (designed now, built in K2)
 
 For clusters without workable RWX storage:
 
@@ -444,10 +585,10 @@ For clusters without workable RWX storage:
   records "(diff unavailable)" exactly as the current capture-failure path
   does; a dead sandbox can never mutate session state (delivery invariant
   unchanged).
-- RBAC cost: archive mode adds `pods/exec` to the server's Role (§7). RWX
+- RBAC cost: archive mode adds `pods/exec` to the server's Role (§8). RWX
   mode does not need it — one more reason RWX ships first.
 
-## 6. Rust refactors required above the provider (the complete list)
+## 7. Rust refactors required above the provider (the complete list)
 
 1. **Trait object**: `AppState.provider: Arc<dyn ExecutionProvider>`
    (`state.rs:44`); `main.rs` selects the impl from
@@ -458,7 +599,7 @@ For clusters without workable RWX storage:
    instead of `"docker": docker_ok`. (Docker impl delegates to `ping()`.)
 3. **Orchestrator network mode** (`orchestrator.rs:150`): comes from the
    provider/config, not a hard-coded `HostDev`.
-4. **Workspace path plumbing**: session-relative dir on the spec (§5.1).
+4. **Workspace path plumbing**: session-relative dir on the spec (§6.1).
 5. **Config**: new keys `FLUIDBOX_EXECUTION_PROVIDER`,
    `FLUIDBOX_K8S_NAMESPACE`, `FLUIDBOX_K8S_WORKSPACE_PVC`, optional
    scheduling/imagePull values; `absolute()`'s comment updated (it remains
@@ -472,7 +613,7 @@ run_service, deliveries — compiles against the trait and does not change.
 These same refactors (1–4) are prerequisites for M2's
 `LambdaMicrovmProvider`; K1 pays them once.
 
-## 7. Deploy artifacts — Helm chart + kind e2e
+## 8. Deploy artifacts — Helm chart + kind e2e
 
 ```
 deploy/helm/fluidbox/
@@ -482,7 +623,7 @@ deploy/helm/fluidbox/
 │                                # sandbox {namespace, pvc, limits, scheduling},
 │                                # networkPolicy toggles, dns lockdown (K2)
 └── templates/
-    ├── server-deployment.yaml   # 1 replica, strategy: Recreate (§9)
+    ├── server-deployment.yaml   # 1 replica, strategy: Recreate (§10)
     ├── server-service.yaml      # ClusterIP :8787
     ├── server-rbac.yaml         # SA + Role/RoleBinding in the SANDBOX ns:
     │                            #   pods: create/get/list/watch/delete ONLY
@@ -490,7 +631,7 @@ deploy/helm/fluidbox/
     ├── web-deployment.yaml, web-service.yaml, ingress.yaml
     ├── litellm-deployment.yaml, litellm-service.yaml
     ├── sandbox-namespace.yaml   # PSA restricted labels
-    ├── networkpolicies.yaml     # §4.3 pair + litellm ingress-from-server
+    ├── networkpolicies.yaml     # §5.3 pair + litellm ingress-from-server
     ├── workspaces-pvc.yaml      # RWX
     ├── secrets.yaml             # admin token, credential key, litellm master
     │                            # key; ANTHROPIC/OPENAI keys ONLY in litellm's
@@ -502,7 +643,7 @@ Custody notes: the server's ServiceAccount is the **only** cluster identity
 in the system, and its Role is namespaced to the sandbox namespace with the
 five pod verbs — it cannot read Secrets, touch its own namespace's objects,
 or escalate. Sandbox pods run with `automountServiceAccountToken: false`
-(§4.2): a compromised agent holds a session token and nothing else, same as
+(§5.2): a compromised agent holds a session token and nothing else, same as
 today.
 
 **kind bootstrap + e2e**: `just k8s-up` (create kind cluster, `kind load
@@ -513,7 +654,7 @@ tiers unchanged — they drive HTTP APIs and are provider-blind). The GitHub
 seams (`FLUIDBOX_GITHUB_API_URL`, `FLUIDBOX_GITHUB_CLONE_BASE`) work in-pod
 exactly as they do on the host.
 
-## 8. Operator/CRD evaluation (the honest part)
+## 9. Operator/CRD evaluation (the honest part)
 
 What a CRD layer would look like: an `AgentRun` (or `Sandbox`) CRD; the
 server creates a CR per run; a controller reconciles the pod from the CR and
@@ -543,24 +684,45 @@ writes pod-level status back to CR `status`.
   leader-election — real operational surface for a system that already has
   exactly-once orchestration through the DB.
 
-**Recommendation:** provider-first (K1/K2); operator **deferred to K3 and
-only if a concrete demand materializes** (kubectl UX, per-team quota
-admission, or multi-cluster). When built, its charter is narrowed so the
-invariants survive:
+**The research finding that resets this question (§3.1): the ecosystem is
+already building the CRD layer.** kubernetes-sigs/agent-sandbox is a SIG
+Apps project shipping exactly the `Sandbox`/`SandboxTemplate`/
+`SandboxClaim`/`SandboxWarmPool` CRDs a fluidbox operator would otherwise
+invent, with gVisor/Kata backends and a roadmap (claim-time NetworkPolicy
+attach, suspend/resume, sub-100 ms claims) that overlaps fluidbox's K2/K3
+wants. Building a proprietary fluidbox CRD in that landscape would be
+strategic malpractice: it would carry all the costs above *and* diverge
+from the emerging standard.
 
-- the CR is a **provision-request/observation object only** — the server
-  remains the sole writer of session status in Postgres; CR status is
-  explicitly documented as a *projection*, never consulted by the control
-  plane;
-- alternatively (cheaper, K3a): keep pods provider-created and add only the
-  **observability projection** — a controller-less "status reflector" or
-  simply richer pod labels/annotations plus `kubectl` column definitions;
-- ownerReferences GC can be had *without* an operator: the provider sets an
-  ownerReference from the sandbox pod to a per-session ConfigMap (or to the
-  CR in K3), so bulk cleanup is one delete. Orphan-sweep remains the
-  authoritative reaper either way.
+**Recommendation (revised in light of §3):** provider-first (K1/K2);
+**never build fluidbox-branded sandbox CRDs**. K3, if demand materializes,
+is an **agent-sandbox backend evaluation**, not an operator build:
 
-## 9. Security posture comparison + HA/scale notes
+- shape: a third `FLUIDBOX_EXECUTION_PROVIDER=agent-sandbox` arm whose
+  `provision()` creates a `SandboxClaim` (warm-pool-backed) instead of a
+  Pod — the provider seam absorbs it exactly as it absorbs Docker vs K8s;
+  the server remains the sole writer of session status in Postgres, and the
+  CR is a provision-request object, which is agent-sandbox's own model
+  (claims adopt sandboxes; the consumer watches conditions);
+- adoption gates (verify before committing): (a) **pod-failure semantics**
+  — the controller must surface `Finished/PodFailed` terminally rather
+  than recreating the pod VM-style, or fluidbox's exactly-once runner
+  contract breaks; (b) **per-run env** — warm-pool sandboxes bake env at
+  pool-creation, so adopting warm pools requires the runner contract to
+  gain a bootstrap-fetch step (pod starts neutral, fetches session
+  identity from the control plane using a one-time claim token) — a real
+  contract change to design deliberately, not back into; (c) API maturity
+  (v1alpha1 today) and the "Decouple API from Runtime" KEP landing;
+- what it buys when adopted: warm-pool cold-start elimination, managed
+  gVisor/Kata wiring, claim-time NetworkPolicy attach, suspend/resume for
+  long-running agents (the same feature M2 wants from MicroVMs — worth a
+  cost/benefit comparison against Lambda MicroVMs at that point);
+- meanwhile, the cheap wins stand alone: ownerReferences GC without any
+  operator (pod → per-session ConfigMap owner, bulk cleanup is one
+  delete), richer pod labels + `kubectl` column definitions for fleet
+  visibility. Orphan-sweep remains the authoritative reaper either way.
+
+## 10. Security posture comparison + HA/scale notes
 
 | Dimension | Docker today | K8s (this design) |
 |---|---|---|
@@ -573,6 +735,18 @@ invariants survive:
 | Multi-tenancy | none (one daemon) | namespace + quota + PSA per deployment; per-tenant node pools possible |
 | Cold start | image already on host | **worse**: node-local image pulls — mitigation: pre-pull DaemonSet for runner images (K2), digest-pinned |
 | Workspace I/O | local disk | **worse** on RWX (EFS/Filestore latency) — accepted K1 cost; archive mode (K2) restores node-local I/O |
+
+**Where the isolation ladder actually is per target** (from §3.3): GKE has
+**GKE Sandbox** (managed gVisor; the default on Autopilot), AKS has **Pod
+Sandboxing** (Kata on the Microsoft hypervisor), **EKS has no managed
+equivalent** — Kata/gVisor node pools are BYO there. The commercial
+agent-sandbox platforms (E2B/Modal/Daytona/Azure dynamic sessions) all run
+kernel-level isolation (microVM or user-space kernel) as their *baseline*
+for hostile code, which is the right way to read this design's K1 posture:
+shared-kernel + cap-drop + seccomp is the floor that matches today's Docker
+provider, and the K2 RuntimeClass toggle is not gold-plating — it is
+catching up to the published bar for this workload class. The chart's
+values should make gVisor-on-GKE and Kata-on-AKS one-line enables.
 
 **HA/scale.** Recommend **`replicas: 1` + `strategy: Recreate`** for the
 server in K1, honestly documented: per-run orchestrator tasks
@@ -587,37 +761,81 @@ provisioning steps idempotently), (b) `pg_notify`-backed approval wakeups
 replacing the in-process `Notify`, (c) sweep intervals tightened. None of
 this is K8s-specific; it is future work the chart should not pretend away.
 
-## 10. Phasing
+## 11. Phasing
 
-- **K1 — provider + chart + e2e**: refactors §6 (1–6), `KubernetesProvider`
-  (RWX mode), Pending/image-error fail-fast + provision deadline (§4.4),
-  Helm chart §7, `just k8s-up` / `just k8s-e2e` on kind, docs.
+- **K1 — provider + chart + e2e**: refactors §7 (1–6), `KubernetesProvider`
+  (RWX mode), Pending/image-error fail-fast + provision deadline (§5.4),
+  Helm chart §8, `just k8s-up` / `just k8s-e2e` on kind, docs.
   *Converges by:* nothing above the trait changes; every §2 invariant
   preserved; Docker path untouched (`FLUIDBOX_EXECUTION_PROVIDER` defaults
   `docker`).
-- **K2 — hardening + portability**: gVisor/Kata RuntimeClass toggle,
+- **K2 — hardening + portability**: gVisor/Kata RuntimeClass toggle
+  (one-line enables for GKE Sandbox / AKS Pod Sandboxing),
   ResourceQuota/LimitRange, runner-image pre-pull DaemonSet, DNS lockdown
-  (§4.3), admission queue + autoscaler guidance (§4.4), archive workspace
-  mode + `pods/exec` diff capture (§5.2), `readOnlyRootFilesystem` with
-  explicit writable emptyDirs, kubelet `podPidsLimit` guidance.
-- **K3 (optional) — operator/CRDs**: per §8 charter only; reassess demand
-  first.
+  (§5.3), Cilium `toFQDNs` enforcement of `egress.mode: allowlist` (§5.3),
+  admission queue + autoscaler guidance (§5.4), archive workspace mode +
+  `pods/exec` diff capture (§6.2), `readOnlyRootFilesystem` with explicit
+  writable emptyDirs, kubelet `podPidsLimit` guidance.
+- **K3 (optional) — agent-sandbox backend evaluation**: per §9 (revised) —
+  a `SandboxClaim`-based provider arm with warm pools and suspend/resume,
+  gated on the adoption checks (pod-failure semantics, bootstrap-fetch
+  runner contract, API maturity). No fluidbox-branded CRDs, ever.
 - **Synergy with M2 (Lambda MicroVMs):** K1's refactors are M2
   prerequisites (trait object, `health()`, network-mode plumbing,
   session-relative workspace path); K2's archive mode is the same
   "archive push instead of bind mount" shape M2 needs. The tracks share a
   seam, not a schedule.
 
-## 11. Open questions (deliberately deferred to implementation)
+## 12. Open questions (deliberately deferred to implementation)
 
-1. Exact shape of the workspace-path spec change (§5.1) — sibling field vs
+1. Exact shape of the workspace-path spec change (§6.1) — sibling field vs
    re-specification of `workspace_host_dir`.
 2. Whether `NetworkMode` gains a third variant (`Cluster`) or the K8s
-   provider simply ignores the existing two (§4.3 decides behavior, not
+   provider simply ignores the existing two (§5.3 decides behavior, not
    naming).
 3. kind e2e scope: which of the e2e tiers run in CI on kind vs remain
    Docker-only (candidate: the full `just e2e` stays Docker; a governance +
    live-demo subset runs on kind).
-4. Whether `SandboxState::Starting` (§4.4) should also carry a
+4. Whether `SandboxState::Starting` (§5.4) should also carry a
    machine-readable reason (unschedulable vs image pull) or leave the reason
    to the failure message — decided when the watchdog rule is implemented.
+5. The agent-sandbox adoption gates (§9): verify the controller's
+   pod-failure semantics against its source (the `Finished/PodFailed`
+   condition suggests terminal handling, but recreate-on-node-failure would
+   break exactly-once), and design the bootstrap-fetch runner-contract
+   change before any warm-pool work.
+
+## 13. References (research survey, 2026-07-14)
+
+Prior art (§3):
+
+- kubernetes-sigs/agent-sandbox — repo, roadmap, CRD sources:
+  <https://github.com/kubernetes-sigs/agent-sandbox> ·
+  <https://agent-sandbox.sigs.k8s.io/docs/> ·
+  ["Running Agents on Kubernetes with Agent Sandbox" (kubernetes.io blog,
+  2026-03-20)](https://kubernetes.io/blog/2026/03/20/running-agents-on-kubernetes-with-agent-sandbox/) ·
+  [Google Open Source blog announcement](https://opensource.googleblog.com/2025/11/unleashing-autonomous-ai-agents-why-kubernetes-needs-a-new-standard-for-agent-execution.html) ·
+  [Northflank: Agent Sandbox in production](https://northflank.com/blog/agent-sandbox-on-kubernetes)
+- Actions Runner Controller (ephemeral runner pods, JIT tokens,
+  service-side queueing):
+  [gha-runner-scale-set architecture](https://github.com/actions/actions-runner-controller/blob/master/docs/gha-runner-scale-set-controller/README.md) ·
+  [GitHub docs](https://docs.github.com/en/actions/concepts/runners/actions-runner-controller)
+- Tekton workspaces / affinity assistant (the PVC-sharing lesson):
+  [workspaces docs](https://tekton.dev/docs/pipelines/workspaces/) ·
+  [TEP-0135 co-scheduling](https://github.com/tektoncd/community/blob/main/teps/0135-coscheduling-pipelinerun-pods.md) ·
+  [issue #3545 (multi-PVC scheduling failure)](https://github.com/tektoncd/pipeline/issues/3545)
+- Kueue plain-pods via scheduling gates:
+  [Run Plain Pods](https://kueue.sigs.k8s.io/docs/tasks/run/plain_pods/) ·
+  [KEP-976](https://github.com/kubernetes-sigs/kueue/blob/main/keps/976-plain-pods/README.md)
+- Cilium DNS-aware egress (`toFQDNs`):
+  [Locking Down External Access with DNS-Based Policies](https://docs.cilium.io/en/latest/security/dns/)
+- Managed isolation runtimes:
+  [GKE Sandbox (gVisor)](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/sandbox-pods) ·
+  AKS Pod Sandboxing (Kata/MSHV) ·
+  [agent-sandbox Kata example](https://agent-sandbox.sigs.k8s.io/docs/use-cases/examples/kata-containers/)
+- Commercial agent-sandbox platforms (isolation + warm-pool bar):
+  [Azure Container Apps dynamic sessions](https://learn.microsoft.com/en-us/azure/container-apps/sessions)
+  (Hyper-V session pools; 400k+ sessions/day for Copilot) ·
+  [Modal on sandbox products](https://modal.com/blog/top-code-agent-sandbox-products) ·
+  [Northflank: sandboxes on Kubernetes](https://northflank.com/blog/sandboxes-on-kubernetes) ·
+  [Daytona vs E2B](https://northflank.com/blog/daytona-vs-e2b-ai-code-execution-sandboxes)
