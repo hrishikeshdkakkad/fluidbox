@@ -240,16 +240,22 @@ pub struct AutonomySummary {
     pub deny_overrides: usize,
 }
 
-/// Can this rule ever produce a RequireApproval verdict? Mirrors `apply_rule`:
-/// the verdict comes from `rule.action` OR, for shell-constrained rules, from
-/// `shell.on_no_match`. A rule with an unconditional allow/deny action can
-/// never approve, so an `on_autonomous` on it is dead config.
+/// Can this rule ever produce a RequireApproval verdict? Mirrors the THREE
+/// routes in `apply_rule`. A rule that can never approve makes its
+/// `on_autonomous` dead config — counting it would claim an exception that can
+/// never fire.
 fn can_require_approval(rule: &ToolRule) -> bool {
+    // Shell constraints short-circuit apply_rule: it returns from inside that
+    // branch on every path, so `paths` is dead for a shell rule.
+    if let Some(sh) = &rule.shell {
+        return rule.action == RuleAction::Approve || sh.on_no_match == RuleAction::Approve;
+    }
+    // A non-empty paths.allow escalates out-of-tree paths to a human via a
+    // HARDCODED Approve in apply_rule, whatever the rule's action says.
+    if rule.paths.as_ref().is_some_and(|p| !p.allow.is_empty()) {
+        return true;
+    }
     rule.action == RuleAction::Approve
-        || rule
-            .shell
-            .as_ref()
-            .is_some_and(|s| s.on_no_match == RuleAction::Approve)
 }
 
 impl Policy {
@@ -396,7 +402,11 @@ impl Policy {
                         .all(|p| paths.allow.iter().any(|g| glob_hit(g, p)));
                 if !all_allowed {
                     // Outside the allowed tree → escalate to a human rather
-                    // than brick the run.
+                    // than brick the run. NOTE: this hardcoded Approve is a
+                    // route to RequireApproval INDEPENDENT of `rule.action` —
+                    // `can_require_approval` mirrors it. Adding another route
+                    // to RequireApproval means updating that mirror too, or
+                    // `autonomy_summary` will undercount live overrides.
                     return self.finish(RuleAction::Approve, Some(rule), &req.tool, None);
                 }
             }
@@ -793,10 +803,14 @@ tools:
         assert_eq!(s.deny_overrides, 0);
     }
 
-    /// Only rules that can actually REACH RequireApproval may be counted. The seed
-    /// policy's Bash rule is `action: allow` + `shell.on_no_match: approve` — a
-    /// naive `action == Approve` test would MISS an on_autonomous added there and
-    /// undercount in the dangerous direction.
+    /// Only rules that can actually REACH RequireApproval may be counted, via all
+    /// THREE routes in `apply_rule`. The seed policy's Bash rule pairs
+    /// `action: allow` with `shell.on_no_match: approve`, and its Edit/Write rule
+    /// pairs `action: allow` with a `paths.allow` tree (out-of-tree paths hit a
+    /// hardcoded Approve) — a naive `action == Approve` test would MISS an
+    /// on_autonomous added to either and undercount in the dangerous direction.
+    /// Conversely, `shell` short-circuits `paths`, so a rule carrying both must be
+    /// judged by `shell` alone or we overcount.
     #[test]
     fn autonomy_summary_counts_only_reachable_overrides() {
         let yaml = r#"
@@ -820,12 +834,25 @@ tools:
   - match: ["WebFetch"]
     action: deny
     on_autonomous: deny
+  # reachable via paths.allow escalation (apply_rule hardcodes Approve) -> COUNTED
+  - match: ["Write"]
+    action: allow
+    paths: { allow: ["/workspace/**"] }
+    on_autonomous: allow
+  # shell short-circuits apply_rule, so paths is dead here; on_no_match is
+  # allow-not-approve and action is allow -> NOT counted
+  - match: ["BashOutput"]
+    action: allow
+    shell: { on_no_match: allow }
+    paths: { allow: ["/workspace/**"] }
+    on_autonomous: allow
 "#;
         let p = Policy::parse_yaml(yaml).expect("parses");
         let s = p.autonomy_summary();
         assert_eq!(
-            s.allow_overrides, 2,
-            "Bash (shell on_no_match) + mcp__* (action)"
+            s.allow_overrides, 3,
+            "Bash (shell on_no_match) + mcp__* (action) + Write (paths.allow escalation); \
+             BashOutput's paths is dead behind its shell short-circuit"
         );
         assert_eq!(
             s.deny_overrides, 0,
