@@ -149,7 +149,9 @@ export function workspaceLabel(ws: WorkspaceSpec | null | undefined): string {
 
 export interface Connection {
   id: string;
-  provider: string; // github (PAT) | github_app | mcp_http
+  /** Wire value, server-controlled. See ConnectionProvider for the ones this
+   *  client has classified; unknown values fail safe (neither git nor tool). */
+  provider: string;
   external_account_id: string;
   display_name: string;
   granted_scopes: string[];
@@ -180,6 +182,42 @@ export interface Connection {
   } | null;
   created_at: string;
 }
+
+/** Every connection provider this dashboard has classified. The server is the
+ *  source of truth for what exists; this union states what we have decided
+ *  about. Adding a member without adding it to PROVIDER_CLASS is a build
+ *  failure — that is the point. */
+export type ConnectionProvider = "github" | "github_app" | "mcp_http";
+
+/** Which surface a provider belongs to.
+ *
+ *    git  — can back a workspace checkout (repositories, refs, commits).
+ *    tool — a credential the BROKER calls during a run. It has no repositories.
+ *
+ *  This Record is the only place the rule lives. It replaces four hand-rolled
+ *  predicates that each re-derived it from a prose comment; WorkspacePicker
+ *  forgot, which is how mcp_http reached the git picker.
+ *
+ *  It is an allowlist BY CONSTRUCTION: Record<ConnectionProvider, …> requires
+ *  every union member as a key, so adding `slack` (Phase 7) fails the build
+ *  until someone classifies it. The old `provider !== "mcp_http"` form would
+ *  have silently admitted slack to the repo picker instead. */
+const PROVIDER_CLASS: Record<ConnectionProvider, "git" | "tool"> = {
+  github: "git",
+  github_app: "git",
+  mcp_http: "tool",
+};
+
+/** Can this connection back a git workspace checkout?
+ *
+ *  A provider the server knows but this client does not is neither git nor
+ *  tool: it stays out of every picker rather than defaulting into one. */
+export const isGitConnection = (c: Connection): boolean =>
+  PROVIDER_CLASS[c.provider as ConnectionProvider] === "git";
+
+/** Is this a brokered tool-server credential? The mirror of isGitConnection. */
+export const isToolConnection = (c: Connection): boolean =>
+  PROVIDER_CLASS[c.provider as ConnectionProvider] === "tool";
 
 /** One connector-catalog entry (untrusted reference data; tool_hints are
  *  policy-default seeds — the permission gate stays the judge). */
