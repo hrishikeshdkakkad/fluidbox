@@ -714,6 +714,25 @@ pub async fn put_policy_override(
             "'{tool}' is not a known tool — overrides take exact canonical or mcp__* names"
         )));
     }
+    // `mcp__*` is a NAMESPACE, not a roster: the name shape alone proves
+    // nothing exists. A blanket `mcp__*` rule (the seed has one) resolves any
+    // invented name to an overridable row, so without this the override lands
+    // in the column for a tool that no bundle photographed — consulted FIRST by
+    // every future evaluation, yet rendered by no page (the matrix lists only
+    // canonical + currently-attached tools). Attach that bundle later and the
+    // tool arrives pre-decided, invisible, never re-decided. So a write must
+    // pass the same roster the matrix is drawn from.
+    if fluidbox_core::tools::is_mcp(&tool)
+        && !fluidbox_db::policy_mcp_tools(&state.pool, state.tenant_id, row.id)
+            .await?
+            .iter()
+            .any(|t| t == &tool)
+    {
+        return Err(ApiError::BadRequest(format!(
+            "'{tool}' is not among the MCP tools this policy's agents can call — attach a \
+             capability bundle providing it before setting a permission for it"
+        )));
+    }
     let status = policy
         .tool_matrix(std::slice::from_ref(&tool))
         .pop()

@@ -477,6 +477,43 @@ export interface AutonomySummary {
   deny_overrides: number;
 }
 
+/** Mirrors `policy::PolicyDefaults`: the verdict when no rule matches. Already
+ *  visible as the matrix's `default` rows. */
+export interface PolicyDefaults {
+  tool_action: PolicyAction;
+}
+
+/** Mirrors `spec::Budgets`. Every cap is an `Option` in Rust, so an unset one
+ *  arrives as `null` — meaning this policy imposes no ceiling of that kind, not
+ *  zero. These are a CEILING: an agent revision and each run may only tighten
+ *  them (`Budgets::tightened_by`). */
+export interface Budgets {
+  max_wall_clock_secs: number | null;
+  max_tokens: number | null;
+  max_cost_usd: number | null;
+  max_tool_calls: number | null;
+}
+
+/** `policy::ApprovalScope` — how far one human decision reaches. */
+export type ApprovalScope = "once" | "session";
+
+/** `policy::TimeoutAction`. One variant today: an unanswered approval denies.
+ *  Human absence narrows permissions, never widens them. */
+export type TimeoutAction = "deny";
+
+export interface ApprovalSettings {
+  default_ttl_secs: number;
+  scope: ApprovalScope;
+  timeout_action: TimeoutAction;
+}
+
+/** `policy::EgressMode` — kebab-case on the wire. */
+export type EgressMode = "none" | "proxy-only" | "allowlist";
+
+export interface Egress {
+  mode: EgressMode;
+}
+
 /** GET /policies list row. */
 export interface PolicySummary {
   id: string;
@@ -492,10 +529,10 @@ export interface PolicyDetail {
   policy: { id: string; name: string; version: number; updated_at: string };
   agents_using: number;
   autonomy_summary: AutonomySummary;
-  defaults: { tool_action: PolicyAction };
-  budgets: Record<string, number>;
-  approvals: { default_ttl_secs: number; scope: string; timeout_action: string };
-  egress: { mode: string };
+  defaults: PolicyDefaults;
+  budgets: Budgets;
+  approvals: ApprovalSettings;
+  egress: Egress;
   matrix: MatrixRow[];
 }
 

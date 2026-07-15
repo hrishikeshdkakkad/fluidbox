@@ -7,6 +7,7 @@ import { use, useCallback, useEffect, useState } from "react";
 import { apiDelete, apiGet, apiPut, PolicyAction, PolicyDetail } from "../../lib/api";
 import { PageHead } from "../../components/bits";
 import { PermissionMatrix } from "../../components/PermissionMatrix";
+import { PolicyLimits } from "../../components/PolicyLimits";
 
 export default function PolicyDetailPage({ params }: { params: Promise<{ name: string }> }) {
   const { name } = use(params);
@@ -101,6 +102,16 @@ export default function PolicyDetailPage({ params }: { params: Promise<{ name: s
           they cannot be reduced to a single choice.
         </p>
         <PermissionMatrix rows={detail.matrix} busy={busy} onSet={onSet} onClear={onClear} />
+      </div>
+
+      {/* The third question a policy answers, after "can it run unattended" and
+          "what may it do": what can it spend. */}
+      <div className="panel pad">
+        <PolicyLimits
+          budgets={detail.budgets}
+          approvals={detail.approvals}
+          egress={detail.egress}
+        />
       </div>
     </>
   );

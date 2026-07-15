@@ -173,6 +173,19 @@ CODE=$(put "/policies/$GOV/overrides/NotARealTool" '{"action":"allow"}')
 [ "$CODE" = "400" ] && ok "unknown tool → 400 (overrides take exact canonical or mcp__* names)" \
   || no "wanted 400, got $CODE: $(cat "$GB")"
 
+# 5b. `mcp__*` is a NAMESPACE, not a roster — the name shape alone proves
+# nothing exists. Such an override would be consulted FIRST by every future
+# evaluation while the matrix (canonical + currently-attached tools only)
+# rendered no row for it: a permission granted once, invisibly, and never
+# re-decided when the bundle finally arrives. The write must pass the same
+# roster the matrix is drawn from.
+CODE=$(put "/policies/$GOV/overrides/mcp__nonexistent__tool" '{"action":"allow"}')
+[ "$CODE" = "400" ] \
+  && ok "unattached mcp tool → 400 (an override no page could render never lands)" \
+  || no "wanted 400, got $CODE: $(cat "$GB")"
+grep -q "MCP tools this policy" "$GB" \
+  && ok "…and the refusal names the roster, not the name shape" || no "refusal body: $(cat "$GB")"
+
 # 6. The one click a human makes.
 CODE=$(put "/policies/$GOV/overrides/WebFetch" '{"action":"allow"}')
 [ "$CODE" = "200" ] && ok "PUT override WebFetch=allow → 200 (unconditional rows are safe to control)" \

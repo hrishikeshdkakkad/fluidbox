@@ -7,8 +7,9 @@
 import { MatrixRow, PolicyAction, RuleConstraints } from "../lib/api";
 
 /** The policy engine's vocabulary, in the product's words. "approve" means the
- *  run pauses and waits for a human, so it reads as "Ask". */
-const VERB: Record<PolicyAction, string> = {
+ *  run pauses and waits for a human, so it reads as "Ask". Exported so every
+ *  governance surface says the same word for the same verdict. */
+export const VERB: Record<PolicyAction, string> = {
   allow: "Allow",
   approve: "Ask",
   deny: "Deny",
