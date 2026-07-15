@@ -1,6 +1,7 @@
 # Run-composer pickers: unleak the connection lists, one row vocabulary, `+ new` in place
 
-Status: design approved 2026-07-15. Not yet planned or built.
+Status: SHIPPED 2026-07-15 (branch claude/run-composer-pickers, PR #42).
+Verified end-to-end in a live browser; see the implementation plan's Task 10 Step 4.
 Scope: `apps/web` only. No Rust changes, no migrations, no API changes.
 
 ## 1. The problem
@@ -48,17 +49,43 @@ already on the roadmap.
 `lib/api.ts` already hosts connection predicates (`needsManualIngress`, `:289`).
 Add the provider rule there and delete the hand-rolled copies:
 
-```ts
-/** Providers that can back a git workspace checkout. mcp_http is a tool
- *  credential the broker calls — it has no repos, and neither will slack
- *  (Phase 7). Allowlist, not an mcp_http denylist: a new provider stays out
- *  of git pickers until someone deliberately adds it here. */
-export const isGitConnection = (c: Connection) =>
-  c.provider === "github" || c.provider === "github_app";
+**As shipped**, this went further than a pair of predicates. Keying a `Record`
+by the provider union makes the rule *unforgettable* rather than merely
+centralised:
 
-/** Tool-server credentials — brokered MCP. The mirror of isGitConnection. */
-export const isToolConnection = (c: Connection) => c.provider === "mcp_http";
+```ts
+export type ConnectionProvider = "github" | "github_app" | "mcp_http";
+
+/** Allowlist BY CONSTRUCTION: Record<ConnectionProvider, …> requires every
+ *  union member as a key, so adding `slack` (Phase 7) fails the BUILD until
+ *  someone classifies it git-or-tool. */
+const PROVIDER_CLASS: Record<ConnectionProvider, "git" | "tool"> = {
+  github: "git",
+  github_app: "git",
+  mcp_http: "tool",
+};
+
+/** Unknown wire values (server ahead of this client) are neither: they stay
+ *  out of every picker rather than defaulting into one. */
+export const isGitConnection = (c: Connection): boolean =>
+  PROVIDER_CLASS[c.provider as ConnectionProvider] === "git";
+export const isToolConnection = (c: Connection): boolean =>
+  PROVIDER_CLASS[c.provider as ConnectionProvider] === "tool";
 ```
+
+**Verified, not assumed.** Adding `"slack"` to the union and running `tsc`:
+
+```
+error TS2741: Property 'slack' is missing in type
+'{ github: "git"; github_app: "git"; mcp_http: "tool"; }'
+but required in type 'Record<ConnectionProvider, "git" | "tool">'.
+```
+
+This is strictly stronger than the unit test the spec originally called for: a
+test asserting `isGitConnection(slack) === false` can be skipped, deleted, or
+simply never written for the *next* provider. A compile error cannot. Both
+exist — the test documents intent, the Record enforces it — and `pnpm build`
+already runs inside `just check`.
 
 Call sites converted: `WorkspacePicker.tsx:81` (the fix), plus
 `integrations/page.tsx:111` and `capabilities/page.tsx:105` (removing the
