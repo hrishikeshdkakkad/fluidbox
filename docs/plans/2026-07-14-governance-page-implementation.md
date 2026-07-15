@@ -769,13 +769,18 @@ Claude-Session: https://claude.ai/code/session_017mfjJE5FKtgc1rNvSZVVb9"
 
 - [ ] **Step 1: Write the failing test**
 
-Add to `crates/fluidbox-db`'s `mod tests` (follow the existing DB-test skip pattern in that file — the tests self-skip when `DATABASE_URL` is absent):
+Add to `crates/fluidbox-db`'s `mod tests` (line ~2706). It self-skips without
+`DATABASE_URL`, exactly like every other test in that module:
 
 ```rust
 #[tokio::test]
 async fn upsert_preserves_managed_overrides() {
-    let Some(pool) = test_pool().await else { return };
-    let tenant = test_tenant(&pool).await;
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let pool = connect(&url).await.expect("connect");
+    let tenant = ensure_default_tenant(&pool).await.unwrap();
     let yaml = "name: ov-test\ntools: []\n";
     let policy = fluidbox_core::policy::Policy::parse_yaml(yaml).unwrap();
     let parsed = serde_json::to_value(&policy).unwrap();
@@ -992,26 +997,53 @@ Claude-Session: https://claude.ai/code/session_017mfjJE5FKtgc1rNvSZVVb9"
 - [ ] **Step 1: Write the failing test**
 
 ```rust
+/// Only the LATEST revision governs future runs, so only it may count toward a
+/// policy's blast radius. Uses fresh policy names, so the shared default tenant's
+/// other agents cannot perturb the counts.
 #[tokio::test]
 async fn policy_agents_using_counts_only_latest_revisions() {
-    let Some(pool) = test_pool().await else { return };
-    let tenant = test_tenant(&pool).await;
-    // Uses whatever agent/revision helpers this module's other tests use.
-    // An agent counts only if its LATEST revision points at the policy.
-    let (policy_a, policy_b) = seed_two_policies(&pool, tenant).await;
-    let agent = seed_agent_with_policy(&pool, tenant, policy_a).await;
-    assert_eq!(policy_agents_using(&pool, tenant, policy_a).await.unwrap(), 1);
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let pool = connect(&url).await.expect("connect");
+    let tenant = ensure_default_tenant(&pool).await.unwrap();
 
-    // Append a revision moving the agent to policy_b: A drops to 0, B goes to 1.
-    seed_revision_with_policy(&pool, tenant, agent, policy_b).await;
-    assert_eq!(policy_agents_using(&pool, tenant, policy_a).await.unwrap(), 0);
-    assert_eq!(policy_agents_using(&pool, tenant, policy_b).await.unwrap(), 1);
+    let mk = |name: &str| format!("name: {name}\ntools: []\n");
+    let (ya, yb) = (mk("pau-a"), mk("pau-b"));
+    let pa = upsert_policy(
+        &pool, tenant, "pau-a", &ya,
+        &serde_json::to_value(fluidbox_core::policy::Policy::parse_yaml(&ya).unwrap()).unwrap(),
+    ).await.unwrap();
+    let pb = upsert_policy(
+        &pool, tenant, "pau-b", &yb,
+        &serde_json::to_value(fluidbox_core::policy::Policy::parse_yaml(&yb).unwrap()).unwrap(),
+    ).await.unwrap();
+
+    let agent = create_agent(&pool, tenant, "pau-agent", None).await.unwrap();
+    let budgets = serde_json::json!({});
+    let pins = serde_json::json!([]);
+    let rev = |policy_id| {
+        append_agent_revision(
+            &pool, agent.id, "claude-agent-sdk", "img", "claude-haiku-4-5", None,
+            policy_id, &budgets, None, &pins,
+        )
+    };
+
+    rev(pa.id).await.unwrap();
+    assert_eq!(policy_agents_using(&pool, tenant, pa.id).await.unwrap(), 1);
+    assert_eq!(policy_agents_using(&pool, tenant, pb.id).await.unwrap(), 0);
+
+    // Append a revision moving the agent to policy B: A drops to 0, B goes to 1.
+    rev(pb.id).await.unwrap();
+    assert_eq!(policy_agents_using(&pool, tenant, pa.id).await.unwrap(), 0);
+    assert_eq!(policy_agents_using(&pool, tenant, pb.id).await.unwrap(), 1);
 }
 ```
 
-> If `seed_*` helpers do not already exist in this module's tests, write them
-> inline in the test as plain `sqlx::query` inserts against `agents` /
-> `agent_revisions`, mirroring the columns used by `create_revision`.
+> `create_agent` upserts on `(tenant, name)` and `append_agent_revision` appends,
+> so the test is re-runnable: it re-establishes A as the latest revision before
+> asserting.
 
 - [ ] **Step 2: Run test to verify it fails**
 
