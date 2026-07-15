@@ -2534,6 +2534,17 @@ fieldset.seg:disabled label {
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 8px;
 }
+/* Single-column scrolling container for .opt / .cap-row lists too long for
+   .opt-grid's auto-fit columns (repositories: up to 100). Promoted from
+   BundlePicker's inline style so the repo list and the bundle list share one
+   container. */
+.opt-list {
+  display: grid;
+  gap: 6px;
+  max-height: 340px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
 .opt {
   text-align: left;
   background: var(--bg);
