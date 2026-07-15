@@ -227,6 +227,31 @@ pub struct EvaluationOutcome {
     pub matched_rule: Option<usize>,
 }
 
+/// A display-ready summary of a policy's autonomy posture. Facts only — the
+/// API emits these; the dashboard phrases them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutonomySummary {
+    pub permitted: bool,
+    pub default_fallback: AutonomousFallback,
+    /// Rules overriding the fallback to `allow`, counted ONLY where the rule
+    /// can actually reach RequireApproval.
+    pub allow_overrides: usize,
+    /// Same, for `deny`.
+    pub deny_overrides: usize,
+}
+
+/// Can this rule ever produce a RequireApproval verdict? Mirrors `apply_rule`:
+/// the verdict comes from `rule.action` OR, for shell-constrained rules, from
+/// `shell.on_no_match`. A rule with an unconditional allow/deny action can
+/// never approve, so an `on_autonomous` on it is dead config.
+fn can_require_approval(rule: &ToolRule) -> bool {
+    rule.action == RuleAction::Approve
+        || rule
+            .shell
+            .as_ref()
+            .is_some_and(|s| s.on_no_match == RuleAction::Approve)
+}
+
 impl Policy {
     pub fn parse_yaml(yaml: &str) -> Result<Policy, String> {
         let p: Policy = serde_yaml::from_str(yaml).map_err(|e| e.to_string())?;
@@ -256,6 +281,27 @@ impl Policy {
             }
         }
         Ok(())
+    }
+
+    pub fn autonomy_summary(&self) -> AutonomySummary {
+        let mut allow_overrides = 0;
+        let mut deny_overrides = 0;
+        for rule in &self.tools {
+            if !can_require_approval(rule) {
+                continue;
+            }
+            match rule.on_autonomous {
+                Some(AutonomousFallback::Allow) => allow_overrides += 1,
+                Some(AutonomousFallback::Deny) => deny_overrides += 1,
+                None => {}
+            }
+        }
+        AutonomySummary {
+            permitted: self.autonomy.permitted,
+            default_fallback: self.autonomy.on_approval_rule,
+            allow_overrides,
+            deny_overrides,
+        }
     }
 
     pub fn evaluate(&self, req: &ToolCallRequest, autonomy: Autonomy) -> EvaluationOutcome {
@@ -733,6 +779,58 @@ tools:
         assert_eq!(p.budgets.max_tokens, Some(1_000_000));
         assert_eq!(p.budgets.max_cost_usd, Some(2.5));
         assert_eq!(p.budgets.max_tool_calls, Some(100));
+    }
+
+    #[test]
+    fn autonomy_summary_of_the_seed_policy() {
+        let yaml = include_str!("../../../policies/default.yaml");
+        let p = Policy::parse_yaml(yaml).expect("seed policy parses");
+        let s = p.autonomy_summary();
+        assert!(s.permitted);
+        assert_eq!(s.default_fallback, AutonomousFallback::Deny);
+        // The seed policy carries no rule-level on_autonomous overrides.
+        assert_eq!(s.allow_overrides, 0);
+        assert_eq!(s.deny_overrides, 0);
+    }
+
+    /// Only rules that can actually REACH RequireApproval may be counted. The seed
+    /// policy's Bash rule is `action: allow` + `shell.on_no_match: approve` — a
+    /// naive `action == Approve` test would MISS an on_autonomous added there and
+    /// undercount in the dangerous direction.
+    #[test]
+    fn autonomy_summary_counts_only_reachable_overrides() {
+        let yaml = r#"
+name: t
+autonomy: { permitted: true, on_approval_rule: deny }
+tools:
+  # reachable via shell.on_no_match -> COUNTED
+  - match: ["Bash"]
+    action: allow
+    shell: { on_no_match: approve }
+    on_autonomous: allow
+  # reachable via action -> COUNTED
+  - match: ["mcp__*"]
+    action: approve
+    on_autonomous: allow
+  # dead config: unconditional allow can never require approval -> NOT counted
+  - match: ["Read"]
+    action: allow
+    on_autonomous: allow
+  # dead config: unconditional deny -> NOT counted
+  - match: ["WebFetch"]
+    action: deny
+    on_autonomous: deny
+"#;
+        let p = Policy::parse_yaml(yaml).expect("parses");
+        let s = p.autonomy_summary();
+        assert_eq!(
+            s.allow_overrides, 2,
+            "Bash (shell on_no_match) + mcp__* (action)"
+        );
+        assert_eq!(
+            s.deny_overrides, 0,
+            "the deny override sits on an unreachable rule"
+        );
     }
 
     #[test]
