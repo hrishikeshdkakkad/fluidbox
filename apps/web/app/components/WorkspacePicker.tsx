@@ -90,6 +90,7 @@ export function WorkspacePicker({
   const [registrations, setRegistrations] = useState<GithubAppRegistration[]>([]);
   const [repos, setRepos] = useState<Repo[]>([]);
   const [repoErr, setRepoErr] = useState("");
+  const [reposLoading, setReposLoading] = useState(false);
   const [repoFilter, setRepoFilter] = useState("");
   const [flowErr, setFlowErr] = useState("");
   const [org, setOrg] = useState("");
@@ -145,10 +146,19 @@ export function WorkspacePicker({
     const refresh = window.setTimeout(() => {
       setRepos([]);
       setRepoErr("");
-      if (draft.mode !== "git" || !draft.connectionId) return;
+      if (draft.mode !== "git" || !draft.connectionId) {
+        setReposLoading(false);
+        return;
+      }
+      // The fetch round-trips to GitHub. Track it explicitly: an empty `repos`
+      // means BOTH "in flight" and "genuinely none", and telling someone their
+      // App sees no repositories while we are still asking would send them off
+      // to install one they already have.
+      setReposLoading(true);
       apiGet<{ repos: Repo[] }>(`/connections/${draft.connectionId}/repos?per_page=100`)
         .then((r) => setRepos(r.repos))
-        .catch((e) => setRepoErr(String(e)));
+        .catch((e) => setRepoErr(String(e)))
+        .finally(() => setReposLoading(false));
     }, 0);
     return () => clearTimeout(refresh);
   }, [draft.mode, draft.connectionId]);
@@ -281,6 +291,8 @@ export function WorkspacePicker({
               <span className="lab">Repository</span>
               {repoErr ? (
                 <div className="err">{repoErr}</div>
+              ) : reposLoading ? (
+                <span className="helper">Loading repositories…</span>
               ) : repos.length === 0 ? (
                 <span className="helper">
                   No repositories visible to this connection
