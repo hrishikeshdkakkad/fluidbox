@@ -13,7 +13,9 @@ import {
   Connection,
   GithubAppRegistration,
   ingressPath,
+  isGitConnection,
 } from "../lib/api";
+import { openVia } from "../lib/github-flows";
 import { GitHubMark, ModalShell, PageHead } from "../components/bits";
 
 export default function Integrations() {
@@ -55,38 +57,27 @@ export default function Integrations() {
     }
   };
 
-  // Browsers void the click gesture across an await (popup blockers eat a
-  // late window.open) — open the tab synchronously, then point it at the
-  // URL the API returns.
-  const openVia = (getUrl: () => Promise<string>) => {
-    const tab = window.open("", "_blank");
-    act(async () => {
-      try {
-        const url = await getUrl();
-        if (tab) tab.location.href = url;
-        else window.location.href = url;
-      } catch (e) {
-        tab?.close();
-        throw e;
-      }
-    });
-  };
-
-  // The manifest dance: the server mints a one-time flow; the browser tab
-  // we open is what gets bound to it (cookie), then continues to GitHub.
+  // The manifest dance: the server mints a one-time flow; the browser tab we
+  // open is what gets bound to it (cookie), then continues to GitHub.
+  // act() invokes its fn synchronously, so openVia's window.open stays inside
+  // the click gesture — a late window.open gets eaten by popup blockers.
   const setupApp = () =>
-    openVia(async () => {
-      const r = await apiPost<{ go_url: string }>("/github/app/manifest/start", {
-        organization: org.trim() || null,
-      });
-      return r.go_url;
-    });
+    act(() =>
+      openVia(async () => {
+        const r = await apiPost<{ go_url: string }>("/github/app/manifest/start", {
+          organization: org.trim() || null,
+        });
+        return r.go_url;
+      })
+    );
 
   const connectGithub = (regId: string) =>
-    openVia(async () => {
-      const r = await apiPost<{ go_url: string }>(`/github/app/${regId}/install/start`, {});
-      return r.go_url;
-    });
+    act(() =>
+      openVia(async () => {
+        const r = await apiPost<{ go_url: string }>(`/github/app/${regId}/install/start`, {});
+        return r.go_url;
+      })
+    );
 
   const syncReg = (regId: string) =>
     act(async () => {
@@ -106,11 +97,7 @@ export default function Integrations() {
   // Revoked rows are history, not workspace (the DB keeps them).
   const visibleRegs = registrations.filter((r) => r.status !== "revoked");
   const activeRegs = visibleRegs.filter((r) => r.status === "active");
-  // Git platform connections only — mcp_http tool credentials live on the
-  // Capabilities page.
-  const gitConnections = connections.filter(
-    (c) => c.provider !== "mcp_http" && c.status !== "revoked"
-  );
+  const gitConnections = connections.filter((c) => isGitConnection(c) && c.status !== "revoked");
 
   return (
     <>

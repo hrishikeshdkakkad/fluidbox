@@ -463,13 +463,27 @@ export function RunComposer({
             )}
 
             {agentChoice === "existing" ? (
-              <label className="field">
+              <div className="field">
                 <span className="lab">Agent</span>
-                <select className="inp" value={selectedAgentName} onChange={(event) => setSelectedAgentName(event.target.value)}>
-                  {agents.map((candidate) => <option key={candidate.id} value={candidate.name}>{candidate.name}</option>)}
-                </select>
+                <div className="opt-grid">
+                  {agents.map((candidate) => (
+                    <button
+                      key={candidate.id}
+                      type="button"
+                      className={`opt ${selectedAgentName === candidate.name ? "on" : ""}`}
+                      onClick={() => setSelectedAgentName(candidate.name)}
+                    >
+                      <span className="t">
+                        {candidate.name}
+                        {selectedAgentName === candidate.name && (
+                          <span className="selected-label">Selected</span>
+                        )}
+                      </span>
+                    </button>
+                  ))}
+                </div>
                 <span className="field-hint">Changes below append a new revision; active runs keep their original frozen revision.</span>
-              </label>
+              </div>
             ) : (
               <div className="agent-creator-grid">
                 <label className="field">

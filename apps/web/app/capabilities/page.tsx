@@ -22,6 +22,7 @@ import {
   CatalogConnectResult,
   CatalogEntry,
   Connection,
+  isToolConnection,
 } from "../lib/api";
 import { GitHubMark, LoadingRows, ModalShell, PageHead } from "../components/bits";
 import { AddServerWizard } from "./AddServerWizard";
@@ -100,11 +101,7 @@ function Capabilities() {
     });
   };
 
-  // Tool-server credentials only — git platform connections live on the
-  // Integrations page.
-  const toolConnections = connections.filter(
-    (c) => c.provider === "mcp_http" && c.status !== "revoked"
-  );
+  const toolConnections = connections.filter((c) => isToolConnection(c) && c.status !== "revoked");
 
   return (
     <>

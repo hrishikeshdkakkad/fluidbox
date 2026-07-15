@@ -71,6 +71,7 @@ test:
     cargo test --workspace
 
 check: fmt lint test
+    cd apps/web && pnpm test
     cd apps/web && pnpm build
 
 # ── E2E acceptance ───────────────────────────────────────────────────────
