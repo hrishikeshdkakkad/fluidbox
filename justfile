@@ -53,11 +53,20 @@ neon-setup:
 db:
     psql "$DATABASE_URL"
 
-# Remove e2e/test cruft from the DB (sessions, test agents, subscriptions,
-# schedules, bundles). Preserves the tenant, policies, connections, and the
-# seed agents. DRY-RUN by default; pass `apply` to commit. See scripts/db-clean.sh.
+# RESET the DB to seed state — drops ALL sessions, ALL capability bundles
+# (including real ones like `cloudflare`) and every agent outside the keep-list.
+# Preserves the tenant, policies, connections, and registrations. This is a big
+# hammer: for removing only test residue, use `db-clean-tests` instead.
+# DRY-RUN by default; pass `apply` to commit. See scripts/db-clean.sh.
 db-clean *ARGS:
     bash scripts/db-clean.sh {{ARGS}}
+
+# Remove ONLY test-suite residue (fixture agents + their sessions, pmt-bundle-*)
+# by EXACT name — safe to run against a DB with real work in it. Run this after
+# any sanctioned `just check` / `just e2e`, which write fixtures into the real
+# tenant. DRY-RUN by default; pass `apply` to commit. See scripts/db-clean-tests.sh.
+db-clean-tests *ARGS:
+    bash scripts/db-clean-tests.sh {{ARGS}}
 
 # ── Quality ──────────────────────────────────────────────────────────────
 
