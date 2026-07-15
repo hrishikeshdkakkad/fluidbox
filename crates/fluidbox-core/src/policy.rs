@@ -256,6 +256,61 @@ pub struct AutonomySummary {
     pub deny_overrides: usize,
 }
 
+/// The display-only constraint payload of a conditional rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ConstraintSummary {
+    #[serde(default)]
+    pub paths_allow: Vec<String>,
+    #[serde(default)]
+    pub paths_deny: Vec<String>,
+    #[serde(default)]
+    pub shell_allow_prefixes: Vec<String>,
+    #[serde(default)]
+    pub shell_deny_regex: Vec<String>,
+    #[serde(default)]
+    pub shell_on_no_match: Option<RuleAction>,
+}
+
+/// What the policy says about ONE exact tool, resolved statically.
+///
+/// `Conditional` exists because `evaluate` takes a ToolCallRequest WITH INPUT:
+/// a rule carrying `paths`/`shell` yields different verdicts for different
+/// paths/commands, so no flat Allow/Ask/Deny can represent it. Such rows are
+/// display-only — offering a control would let one click delete
+/// `paths.deny: **/.env`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ToolStatus {
+    Unconditional {
+        action: RuleAction,
+        rule: Option<usize>,
+    },
+    Conditional {
+        action: RuleAction,
+        rule: usize,
+        constraints: ConstraintSummary,
+    },
+    Default {
+        action: RuleAction,
+    },
+    Overridden {
+        action: RuleAction,
+        underlying: Box<ToolStatus>,
+    },
+}
+
+impl ToolStatus {
+    /// Only unconditional rows may be overridden from the UI. The server
+    /// enforces this too — never the UI alone.
+    pub fn is_overridable(&self) -> bool {
+        match self {
+            ToolStatus::Unconditional { .. } | ToolStatus::Default { .. } => true,
+            ToolStatus::Overridden { underlying, .. } => underlying.is_overridable(),
+            ToolStatus::Conditional { .. } => false,
+        }
+    }
+}
+
 /// Can this rule ever produce a RequireApproval verdict? Mirrors the THREE
 /// routes in `apply_rule`. A rule that can never approve makes its
 /// `on_autonomous` dead config — counting it would claim an exception that can
@@ -361,6 +416,59 @@ impl Policy {
             default_fallback: self.autonomy.on_approval_rule,
             allow_overrides,
             deny_overrides,
+        }
+    }
+
+    /// Resolve each tool's status against this policy. Reuses `tool_matches` — the
+    /// matcher `evaluate_supervised` uses — so the page and the gate can never
+    /// disagree about which rule wins.
+    pub fn tool_matrix(&self, tools: &[String]) -> Vec<(String, ToolStatus)> {
+        tools
+            .iter()
+            .map(|t| (t.clone(), self.tool_status(t)))
+            .collect()
+    }
+
+    fn tool_status(&self, tool: &str) -> ToolStatus {
+        if let Some(o) = self.managed_overrides.iter().find(|o| o.tool == tool) {
+            return ToolStatus::Overridden {
+                action: o.action,
+                underlying: Box::new(self.base_tool_status(tool)),
+            };
+        }
+        self.base_tool_status(tool)
+    }
+
+    fn base_tool_status(&self, tool: &str) -> ToolStatus {
+        for (i, rule) in self.tools.iter().enumerate() {
+            if !rule.r#match.iter().any(|m| tool_matches(m, tool)) {
+                continue;
+            }
+            let conditional = rule.paths.is_some() || rule.shell.is_some();
+            if !conditional {
+                return ToolStatus::Unconditional {
+                    action: rule.action,
+                    rule: Some(i),
+                };
+            }
+            let mut c = ConstraintSummary::default();
+            if let Some(p) = &rule.paths {
+                c.paths_allow = p.allow.clone();
+                c.paths_deny = p.deny.clone();
+            }
+            if let Some(s) = &rule.shell {
+                c.shell_allow_prefixes = s.allow_prefixes.clone();
+                c.shell_deny_regex = s.deny_regex.clone();
+                c.shell_on_no_match = Some(s.on_no_match);
+            }
+            return ToolStatus::Conditional {
+                action: rule.action,
+                rule: i,
+                constraints: c,
+            };
+        }
+        ToolStatus::Default {
+            action: self.defaults.tool_action,
         }
     }
 
@@ -1216,6 +1324,104 @@ tools:
         });
         let err = p.validate().expect_err("one decision per tool");
         assert!(err.contains("duplicate"), "{err}");
+    }
+
+    /// The seed policy is the fixture because it exercises every case.
+    #[test]
+    fn tool_matrix_of_the_seed_policy() {
+        let yaml = include_str!("../../../policies/default.yaml");
+        let p = Policy::parse_yaml(yaml).expect("seed policy parses");
+        let names: Vec<String> = [
+            "Read",
+            "Edit",
+            "Bash",
+            "WebFetch",
+            "mcp__cloudflare__kv_list",
+            "Frobnicate",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let m: std::collections::HashMap<String, ToolStatus> =
+            p.tool_matrix(&names).into_iter().collect();
+
+        // Unconditional rules are safe to control.
+        assert!(matches!(
+            m["Read"],
+            ToolStatus::Unconditional {
+                action: RuleAction::Allow,
+                ..
+            }
+        ));
+        assert!(matches!(
+            m["WebFetch"],
+            ToolStatus::Unconditional {
+                action: RuleAction::Deny,
+                ..
+            }
+        ));
+        assert!(matches!(
+            m["mcp__cloudflare__kv_list"],
+            ToolStatus::Unconditional {
+                action: RuleAction::Approve,
+                ..
+            }
+        ));
+
+        // Conditional rules must NOT be flattened: "Edit -> Allow" is false (it is
+        // allow-in-/workspace, deny-for-.env, ask-elsewhere).
+        match &m["Edit"] {
+            ToolStatus::Conditional { constraints, .. } => {
+                assert!(constraints
+                    .paths_allow
+                    .iter()
+                    .any(|g| g.contains("/workspace")));
+                assert!(constraints.paths_deny.iter().any(|g| g.contains(".env")));
+            }
+            other => panic!("Edit must be Conditional, got {other:?}"),
+        }
+        match &m["Bash"] {
+            ToolStatus::Conditional { constraints, .. } => {
+                assert_eq!(constraints.shell_on_no_match, Some(RuleAction::Approve));
+            }
+            other => panic!("Bash must be Conditional (shell), got {other:?}"),
+        }
+
+        // Nothing matched -> defaults.tool_action.
+        assert!(matches!(
+            m["Frobnicate"],
+            ToolStatus::Default {
+                action: RuleAction::Approve
+            }
+        ));
+    }
+
+    #[test]
+    fn tool_matrix_reports_overrides_over_the_underlying_status() {
+        let yaml = include_str!("../../../policies/default.yaml");
+        let mut p = Policy::parse_yaml(yaml).expect("parses");
+        p.managed_overrides.push(ToolOverride {
+            tool: "mcp__cloudflare__kv_list".into(),
+            action: RuleAction::Allow,
+        });
+        let m: std::collections::HashMap<String, ToolStatus> = p
+            .tool_matrix(&["mcp__cloudflare__kv_list".to_string()])
+            .into_iter()
+            .collect();
+        match &m["mcp__cloudflare__kv_list"] {
+            ToolStatus::Overridden { action, underlying } => {
+                assert_eq!(*action, RuleAction::Allow);
+                // The page shows what clearing the override would restore.
+                assert!(matches!(
+                    **underlying,
+                    ToolStatus::Unconditional {
+                        action: RuleAction::Approve,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected Overridden, got {other:?}"),
+        }
     }
 }
 
