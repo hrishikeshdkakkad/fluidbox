@@ -19,6 +19,9 @@ pub struct Policy {
     pub autonomy: AutonomySettings,
     #[serde(default)]
     pub tools: Vec<ToolRule>,
+    /// See `ToolOverride`. Populated from the DB column, never from YAML.
+    #[serde(default)]
+    pub managed_overrides: Vec<ToolOverride>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +160,19 @@ pub struct ToolRule {
     pub approval_ttl_secs: Option<u64>,
     #[serde(default)]
     pub approval_scope: Option<ApprovalScope>,
+}
+
+/// A UI-owned, per-tool decision. Consulted BEFORE `tools` — an explicit
+/// decision about one tool beats the general rules without reordering anything
+/// the user authored. NEVER present in authored YAML: it is stored in its own
+/// `policies.managed_overrides` column and merged into `parsed`.
+///
+/// `tool` is an EXACT name (never a matcher) — a wildcard here would be an
+/// un-reviewable blanket rule authored by a click.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOverride {
+    pub tool: String,
+    pub action: RuleAction,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -344,6 +360,13 @@ impl Policy {
     }
 
     fn evaluate_supervised(&self, req: &ToolCallRequest) -> (Verdict, Option<usize>) {
+        // A managed override is an explicit decision about ONE exact tool; it
+        // wins over the general rules. Exact equality (never `tool_matches`)
+        // keeps a click from authoring a wildcard. No rule index: the override
+        // replaced the rule, so the rule's on_autonomous must not apply.
+        if let Some(o) = self.managed_overrides.iter().find(|o| o.tool == req.tool) {
+            return (self.finish(o.action, None, &req.tool, None), None);
+        }
         for (i, rule) in self.tools.iter().enumerate() {
             if !rule.r#match.iter().any(|m| tool_matches(m, &req.tool)) {
                 continue;
@@ -916,6 +939,79 @@ tools:
         )
         .is_err());
     }
+
+    /// An explicit per-tool decision beats the general rules by construction —
+    /// without reordering anything the user authored.
+    #[test]
+    fn managed_override_precedes_the_general_rules() {
+        let yaml = r#"
+name: t
+defaults: { tool_action: approve }
+tools:
+  - match: ["mcp__*"]
+    action: approve
+"#;
+        let mut p = Policy::parse_yaml(yaml).expect("parses");
+        let tool = "mcp__cloudflare__kv_namespaces_list";
+        // Baseline: the wildcard rule asks.
+        assert!(matches!(
+            p.evaluate(&req(tool, json!({})), Autonomy::Supervised)
+                .effective,
+            Verdict::RequireApproval { .. }
+        ));
+        // With an override, it allows — and no rule index is reported, because the
+        // override replaced the rule (its on_autonomous no longer applies).
+        p.managed_overrides.push(ToolOverride {
+            tool: tool.into(),
+            action: RuleAction::Allow,
+        });
+        let out = p.evaluate(&req(tool, json!({})), Autonomy::Supervised);
+        assert_eq!(out.effective, Verdict::Allow);
+        assert_eq!(out.matched_rule, None);
+        // A sibling tool is untouched by the override.
+        assert!(matches!(
+            p.evaluate(
+                &req("mcp__cloudflare__kv_namespace_create", json!({})),
+                Autonomy::Supervised
+            )
+            .effective,
+            Verdict::RequireApproval { .. }
+        ));
+    }
+
+    /// Overrides are exact-name only: a click must never author a blanket rule.
+    #[test]
+    fn managed_override_does_not_wildcard_match() {
+        let yaml = r#"
+name: t
+defaults: { tool_action: approve }
+tools:
+  - match: ["mcp__*"]
+    action: approve
+"#;
+        let mut p = Policy::parse_yaml(yaml).expect("parses");
+        p.managed_overrides.push(ToolOverride {
+            tool: "mcp__*".into(),
+            action: RuleAction::Allow,
+        });
+        // The literal string "mcp__*" is not a matcher — a real tool must not hit it.
+        assert!(matches!(
+            p.evaluate(
+                &req("mcp__cloudflare__kv_namespaces_list", json!({})),
+                Autonomy::Supervised
+            )
+            .effective,
+            Verdict::RequireApproval { .. }
+        ));
+    }
+
+    /// Policies stored before this column existed must deserialize unchanged.
+    #[test]
+    fn managed_overrides_defaults_to_empty_for_existing_policies() {
+        let yaml = "name: t\ntools: []\n";
+        let p = Policy::parse_yaml(yaml).expect("parses");
+        assert!(p.managed_overrides.is_empty());
+    }
 }
 
 /// Property tests: the security invariants the example-based tests above pin
@@ -1035,6 +1131,7 @@ mod proptests {
                     on_approval_rule,
                 },
                 tools,
+                managed_overrides: Vec::new(),
             })
     }
 
