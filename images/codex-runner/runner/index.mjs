@@ -12,6 +12,10 @@
 //   - initialize → initialized → thread/start → turn/start.
 //   - approvals fire as item/{commandExecution,fileChange,permissions}/requestApproval;
 //     reply {decision:"accept"|"decline"} (NEVER acceptForSession).
+//   - MCP TOOL CALLS are approved separately, as mcpServer/elicitation/request
+//     with _meta.codex_approval_kind=="mcp_tool_call", fired BEFORE the stdio
+//     child is touched; reply {action:"accept"|"decline", content, _meta}.
+//     (item/tool/call is codex's DYNAMIC-tool channel — MCP never uses it.)
 //   - model egress: a custom [model_providers] pointed at the facade (HTTP
 //     POST /v1/responses, session token as the bearer).
 
@@ -174,8 +178,19 @@ async function handleServerRequest(msg) {
       rpcSend({ id, result: { answers: {} } });
       return;
     case "mcpServer/elicitation/request":
-      // MCP elicitation — decline (MCP is gated by the shims, not codex).
-      rpcSend({ id, result: { action: "decline" } });
+      // An MCP tool-call approval for a server we wired → accept; the shim +
+      // the control-plane gate are the authority (see mcpToolCallAutoAllow).
+      // content:null is valid because the requestedSchema carries no
+      // properties. _meta:null deliberately DROPS codex's
+      // persist:["session","always"] hint — every call re-asks, so every call
+      // crosses the gate. A cached "always" would let later calls skip it.
+      if (mcpToolCallAutoAllow(params)) {
+        rpcSend({ id, result: { action: "accept", content: null, _meta: null } });
+        return;
+      }
+      // Any other elicitation (interactive input, a server we never attached)
+      // — decline. We are headless and nothing else is shim-gated.
+      rpcSend({ id, result: { action: "decline", content: null, _meta: null } });
       return;
     // Legacy exec/patch approvals do not fire on the v2 surface, but if they
     // ever did, their decision enum is ReviewDecision ("denied", not
@@ -320,6 +335,31 @@ function mcpServersConfig() {
     }
   }
   return servers;
+}
+
+// The MCP servers WE wired into codex — derived from the same frozen manifest
+// that builds the thread config, so the auto-allow set can never drift from
+// the set actually attached.
+const WIRED_MCP_SERVERS = new Set(Object.keys(mcpServersConfig()));
+
+// Codex asks approval for EVERY MCP tool call as an elicitation carrying
+// `_meta.codex_approval_kind == "mcp_tool_call"` (verified against codex
+// 0.144.1; it fires BEFORE the stdio child is touched). That prompt is
+// redundant: the shims force every MCP call through the control-plane gate
+// (/internal/sessions/{id}/tools/call), which is the real authority — the
+// same inversion as the Claude runner's brokered auto-allow in canUseTool.
+// Declining it rejects the call INSIDE codex, before the shim, so the gate
+// never sees it ("user rejected MCP tool call", zero tool.requested events).
+//
+// Auto-allow is scoped to the servers we wired: codex's own prompt is only
+// redundant for servers that actually terminate in a shim. Anything else —
+// an unknown server, a non-tool-call elicitation — still declines.
+export function mcpToolCallAutoAllow(params, wired = WIRED_MCP_SERVERS) {
+  return (
+    params?._meta?.codex_approval_kind === "mcp_tool_call" &&
+    typeof params?.serverName === "string" &&
+    wired.has(params.serverName)
+  );
 }
 
 // ─── Lifecycle ────────────────────────────────────────────────────────────
