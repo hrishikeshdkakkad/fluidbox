@@ -7,7 +7,7 @@ use crate::orchestrator;
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::Json;
-use fluidbox_core::policy::Policy;
+use fluidbox_core::policy::{Policy, RuleAction, ToolOverride};
 use fluidbox_core::spec::{
     Autonomy, Budgets, CheckoutMode, InvocationContext, InvocationKind, WorkspaceSpec,
 };
@@ -635,12 +635,29 @@ pub async fn upsert_policy(
     State(state): State<AppState>,
     Json(req): Json<UpsertPolicy>,
 ) -> ApiResult<Json<Value>> {
-    let policy = Policy::parse_yaml(&req.yaml).map_err(ApiError::UnprocessableEntity)?;
+    let mut policy = Policy::parse_yaml(&req.yaml).map_err(ApiError::UnprocessableEntity)?;
     if policy.name != req.name {
         return Err(ApiError::BadRequest(
             "policy name must match yaml `name`".into(),
         ));
     }
+    // The authored yaml is never the policy that RUNS: the overrides live in
+    // their own column and are re-merged into every republished `parsed`. So
+    // validate the merged result, not the yaml — otherwise `shell.deny_regex`
+    // added to a rule that already carries an override would be silently dead
+    // (overrides are consulted BEFORE the rules) while the page still shows it.
+    //
+    // Assign, never append: `managed_overrides` is `#[serde(default)]`, so yaml
+    // could author one, and the column — the only sanctioned writer, `[]` for a
+    // policy that does not exist yet — is the truth `parsed` must agree with.
+    let existing = fluidbox_db::get_policy_by_name(&state.pool, state.tenant_id, &req.name).await?;
+    policy.managed_overrides = match &existing {
+        Some(row) => serde_json::from_value(row.managed_overrides.clone())
+            .map_err(|e| ApiError::Internal(format!("bad stored overrides: {e}")))?,
+        None => Vec::new(),
+    };
+    policy.validate().map_err(ApiError::UnprocessableEntity)?;
+
     let parsed = serde_json::to_value(&policy)?;
     let row =
         fluidbox_db::upsert_policy(&state.pool, state.tenant_id, &req.name, &req.yaml, &parsed)
@@ -658,6 +675,94 @@ pub async fn validate_policy(_: Admin, Json(req): Json<ValidatePolicy>) -> ApiRe
         Ok(p) => Ok(Json(json!({ "valid": true, "name": p.name }))),
         Err(e) => Err(ApiError::UnprocessableEntity(e)),
     }
+}
+
+#[derive(Deserialize)]
+pub struct SetOverride {
+    pub action: RuleAction,
+}
+
+/// The override write raced a policy delete: the pre-check found the row, the
+/// write did not. A vanished policy is a 404, not a 500.
+fn policy_gone(e: sqlx::Error) -> ApiError {
+    match e {
+        sqlx::Error::RowNotFound => ApiError::NotFound,
+        other => ApiError::Db(other),
+    }
+}
+
+/// The server enforces what the UI renders — never the UI alone. A conditional
+/// rule's verdict depends on the path touched or the command run, so a flat
+/// action cannot express it and flattening it would delete the rule's
+/// paths.deny / shell constraints.
+pub async fn put_policy_override(
+    _: Admin,
+    State(state): State<AppState>,
+    Path((name, tool)): Path<(String, String)>,
+    Json(req): Json<SetOverride>,
+) -> ApiResult<Json<Value>> {
+    let row = fluidbox_db::get_policy_by_name(&state.pool, state.tenant_id, &name)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let mut policy: Policy = serde_json::from_value(row.parsed.clone())
+        .map_err(|e| ApiError::Internal(format!("bad stored policy: {e}")))?;
+
+    // Exact names only — a wildcard override would be an un-reviewable blanket
+    // rule authored by a click.
+    if !fluidbox_core::tools::is_canonical(&tool) && !fluidbox_core::tools::is_mcp(&tool) {
+        return Err(ApiError::BadRequest(format!(
+            "'{tool}' is not a known tool — overrides take exact canonical or mcp__* names"
+        )));
+    }
+    let status = policy
+        .tool_matrix(std::slice::from_ref(&tool))
+        .pop()
+        .map(|(_, s)| s)
+        .ok_or_else(|| ApiError::Internal("tool_matrix returned no row".into()))?;
+    if !status.is_overridable() {
+        return Err(ApiError::BadRequest(format!(
+            "'{tool}' is governed by a conditional rule (paths/shell); its verdict depends on \
+             the path touched or command run, so it cannot be set to a single action"
+        )));
+    }
+
+    // Fail-closed backstop. The checks above give a precise 400 for the one
+    // click a human makes; `validate()` is the invariant the ENGINE keeps, so
+    // run it against the merged policy that would actually be persisted —
+    // nothing reaches the column that `validate()` would refuse on the sync
+    // path. Replace, never append: one decision per tool.
+    policy.managed_overrides.retain(|o| o.tool != tool);
+    policy.managed_overrides.push(ToolOverride {
+        tool: tool.clone(),
+        action: req.action,
+    });
+    policy.validate().map_err(ApiError::BadRequest)?;
+
+    let row =
+        fluidbox_db::set_policy_override(&state.pool, state.tenant_id, &name, &tool, req.action)
+            .await
+            .map_err(policy_gone)?;
+    Ok(Json(
+        json!({ "policy": { "name": row.name, "version": row.version } }),
+    ))
+}
+
+pub async fn delete_policy_override(
+    _: Admin,
+    State(state): State<AppState>,
+    Path((name, tool)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    fluidbox_db::get_policy_by_name(&state.pool, state.tenant_id, &name)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    // Clearing only ever REMOVES an override, so the merged policy it leaves
+    // behind is a subset of one that already validated — nothing to re-check.
+    let row = fluidbox_db::clear_policy_override(&state.pool, state.tenant_id, &name, &tool)
+        .await
+        .map_err(policy_gone)?;
+    Ok(Json(
+        json!({ "policy": { "name": row.name, "version": row.version } }),
+    ))
 }
 
 // ─── Sessions ─────────────────────────────────────────────────────────────
