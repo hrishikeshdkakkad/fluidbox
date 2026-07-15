@@ -377,6 +377,108 @@ pub async fn get_policy_by_name(
         .await
 }
 
+/// Agents whose LATEST revision uses this policy — the blast radius an override
+/// header must state. An older revision pointing here does not count: only the
+/// latest revision governs future runs, so only it is at stake in an edit.
+pub async fn policy_agents_using(
+    pool: &PgPool,
+    tenant: Uuid,
+    policy_id: Uuid,
+) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "select count(*) from agents a
+          where a.tenant_id = $1
+            and (
+              select r.policy_id from agent_revisions r
+               where r.agent_id = a.id
+               order by r.rev desc
+               limit 1
+            ) = $2",
+    )
+    .bind(tenant)
+    .bind(policy_id)
+    .fetch_one(pool)
+    .await
+}
+
+/// The union of `mcp__<server>__<tool>` names from the capability bundles pinned
+/// on the LATEST revision of every agent using this policy. This is what makes a
+/// connected server's photographed tools appear in the matrix without anyone
+/// typing them. Sorted and deduplicated: two agents may pin the same bundle.
+///
+/// Reads the pins' bundle ids rather than resolving `name`/`version` — the pin is
+/// exact by construction (§17 #7), so the id IS the photograph the frozen RunSpec
+/// will carry.
+pub async fn policy_mcp_tools(
+    pool: &PgPool,
+    tenant: Uuid,
+    policy_id: Uuid,
+) -> sqlx::Result<Vec<String>> {
+    let pins: Vec<Value> = sqlx::query_scalar(
+        "select r.capability_bundles from agents a
+           join lateral (
+             select * from agent_revisions r2
+              where r2.agent_id = a.id order by r2.rev desc limit 1
+           ) r on true
+          where a.tenant_id = $1 and r.policy_id = $2",
+    )
+    .bind(tenant)
+    .bind(policy_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut ids: Vec<Uuid> = Vec::new();
+    for p in &pins {
+        let Some(arr) = p.as_array() else { continue };
+        for r in arr {
+            if let Some(id) = r
+                .get("id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok())
+            {
+                ids.push(id);
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Tenant-scoped: a pin can never reach across a tenant boundary.
+    let defs: Vec<Value> = sqlx::query_scalar(
+        "select definition from capability_bundles where tenant_id = $1 and id = any($2)",
+    )
+    .bind(tenant)
+    .bind(&ids)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out: Vec<String> = Vec::new();
+    for def in &defs {
+        let Some(servers) = def.get("servers").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for s in servers {
+            let Some(server) = s.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(tools) = s.get("tools").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for t in tools {
+                if let Some(tool) = t.get("name").and_then(|v| v.as_str()) {
+                    out.push(format!("mcp__{server}__{tool}"));
+                }
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
 // ─── Agents & revisions ───────────────────────────────────────────────────
 
 pub async fn create_agent(
@@ -4219,5 +4321,155 @@ mod tests {
         let overrides: Vec<fluidbox_core::policy::ToolOverride> =
             serde_json::from_value(row.managed_overrides.clone()).unwrap();
         assert!(overrides.is_empty());
+    }
+
+    /// Only the LATEST revision governs future runs, so only it may count toward a
+    /// policy's blast radius. Uses fresh policy names, so the shared default tenant's
+    /// other agents cannot perturb the counts.
+    #[tokio::test]
+    async fn policy_agents_using_counts_only_latest_revisions() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let tenant = ensure_default_tenant(&pool).await.unwrap();
+
+        let mk = |name: &str| format!("name: {name}\ntools: []\n");
+        let (ya, yb) = (mk("pau-a"), mk("pau-b"));
+        let pa = upsert_policy(
+            &pool,
+            tenant,
+            "pau-a",
+            &ya,
+            &serde_json::to_value(fluidbox_core::policy::Policy::parse_yaml(&ya).unwrap()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let pb = upsert_policy(
+            &pool,
+            tenant,
+            "pau-b",
+            &yb,
+            &serde_json::to_value(fluidbox_core::policy::Policy::parse_yaml(&yb).unwrap()).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let agent = create_agent(&pool, tenant, "pau-agent", None)
+            .await
+            .unwrap();
+        let budgets = serde_json::json!({});
+        let pins = serde_json::json!([]);
+        let rev = |policy_id| {
+            append_agent_revision(
+                &pool,
+                agent.id,
+                "claude-agent-sdk",
+                "img",
+                "claude-haiku-4-5",
+                None,
+                policy_id,
+                &budgets,
+                None,
+                &pins,
+            )
+        };
+
+        rev(pa.id).await.unwrap();
+        assert_eq!(policy_agents_using(&pool, tenant, pa.id).await.unwrap(), 1);
+        assert_eq!(policy_agents_using(&pool, tenant, pb.id).await.unwrap(), 0);
+
+        // Append a revision moving the agent to policy B: A drops to 0, B goes to 1.
+        rev(pb.id).await.unwrap();
+        assert_eq!(policy_agents_using(&pool, tenant, pa.id).await.unwrap(), 0);
+        assert_eq!(policy_agents_using(&pool, tenant, pb.id).await.unwrap(), 1);
+    }
+
+    /// The matrix's MCP rows come from what the agents on this policy can actually
+    /// call: the union of the photographed tools in the bundles pinned on their
+    /// LATEST revisions — sorted, and deduplicated across agents sharing a bundle.
+    #[tokio::test]
+    async fn policy_mcp_tools_unions_pinned_bundle_tools() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let tenant = ensure_default_tenant(&pool).await.unwrap();
+
+        let yaml = "name: pmt-policy\ntools: []\n";
+        let policy = upsert_policy(
+            &pool,
+            tenant,
+            "pmt-policy",
+            yaml,
+            &serde_json::to_value(fluidbox_core::policy::Policy::parse_yaml(yaml).unwrap())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Tools are declared out of alphabetical order: the union must sort them.
+        let bundle_name = format!("pmt-bundle-{}", Uuid::now_v7());
+        let def = serde_json::json!({"servers": [{
+            "class": "brokered", "name": "beta",
+            "tools": [
+                {"name": "zeta", "description": "d", "input_schema": {"type": "object"}},
+                {"name": "alpha", "description": "d", "input_schema": {"type": "object"}}
+            ]
+        }]});
+        let bundle =
+            create_capability_bundle(&pool, tenant, &bundle_name, None, &def, "sha256:pmt")
+                .await
+                .unwrap();
+        let pins = serde_json::json!([
+            { "id": bundle.id, "name": bundle.name, "version": bundle.version }
+        ]);
+
+        // Two agents share the bundle: the union deduplicates across them.
+        let budgets = serde_json::json!({});
+        for name in ["pmt-agent-a", "pmt-agent-b"] {
+            let agent = create_agent(&pool, tenant, name, None).await.unwrap();
+            append_agent_revision(
+                &pool,
+                agent.id,
+                "claude-agent-sdk",
+                "img",
+                "claude-haiku-4-5",
+                None,
+                policy.id,
+                &budgets,
+                None,
+                &pins,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            policy_mcp_tools(&pool, tenant, policy.id).await.unwrap(),
+            vec![
+                "mcp__beta__alpha".to_string(),
+                "mcp__beta__zeta".to_string()
+            ]
+        );
+
+        // A policy nobody's latest revision points at contributes no tools.
+        let empty_yaml = "name: pmt-empty\ntools: []\n";
+        let empty = upsert_policy(
+            &pool,
+            tenant,
+            "pmt-empty",
+            empty_yaml,
+            &serde_json::to_value(fluidbox_core::policy::Policy::parse_yaml(empty_yaml).unwrap())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(policy_mcp_tools(&pool, tenant, empty.id)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }
