@@ -117,6 +117,21 @@ a {
 .faint {
   color: var(--ink-3);
 }
+/* For text that names a control for a screen reader but would be redundant on
+   screen — a radio group's <legend>, say. Hidden from sight, never from the
+   accessibility tree (`display: none` and `visibility: hidden` remove it from
+   both). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
 
 /* ─── Shell ──────────────────────────────────────────────────────────── */
 
@@ -2151,7 +2166,9 @@ textarea.inp.code {
   padding: 2px;
   gap: 2px;
 }
-.seg button {
+.seg button,
+.seg label {
+  position: relative;
   border: none;
   background: none;
   color: var(--ink-2);
@@ -2169,9 +2186,37 @@ textarea.inp.code {
   width: 13px;
   height: 13px;
 }
-.seg button.on {
+.seg button.on,
+.seg label.on {
   background: var(--raised);
   color: var(--ink);
+}
+
+/* A `.seg` whose options are mutually exclusive is a <fieldset> of radios (the
+   permission matrix). The radio is invisible but NOT hidden: it stays focusable
+   and keeps its role, and it covers its <label> so the two share one hit
+   target. It draws no dot of its own — the label's `.on` background is the
+   selected state — but it is a real box, so the global *:focus-visible ring
+   lands on the option the user is actually on. */
+fieldset.seg {
+  min-inline-size: 0;
+}
+.seg label input[type="radio"] {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  appearance: none;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+fieldset.seg:disabled label,
+fieldset.seg:disabled label input[type="radio"] {
+  cursor: default;
+}
+fieldset.seg:disabled label {
+  opacity: 0.5;
 }
 
 /* ─── Modal ──────────────────────────────────────────────────────────── */
@@ -3849,10 +3894,6 @@ select.inp {
   gap: 8px;
   font-size: 11.5px;
   white-space: nowrap;
-}
-.matrix .seg button:disabled {
-  opacity: 0.5;
-  cursor: default;
 }
 
 @media (max-width: 720px) {

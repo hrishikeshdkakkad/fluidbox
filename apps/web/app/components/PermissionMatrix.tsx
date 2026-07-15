@@ -165,20 +165,38 @@ function Row({
             {describe(status.constraints, status.action)}
           </span>
         ) : configurable ? (
-          <div className="seg" role="group" aria-label={`Permission for ${row.tool}`}>
+          // Three mutually exclusive options, so: a real radio group. Native
+          // radios are what make the control honest to a screen reader —
+          // exclusivity, "1 of 3", and arrow-key navigation are the browser's,
+          // not ours. The <legend> names the group and is hidden visually only;
+          // `.seg` keeps the look, with each <label> as one option.
+          <fieldset className="seg" disabled={busy}>
+            <legend className="sr-only">Permission for {row.tool}</legend>
             {ACTIONS.map((action) => (
-              <button
-                key={action}
-                type="button"
-                className={status.action === action ? "on" : ""}
-                aria-pressed={status.action === action}
-                disabled={busy}
-                onClick={() => onSet(row.tool, action)}
-              >
+              <label key={action} className={status.action === action ? "on" : ""}>
+                <input
+                  type="radio"
+                  name={`perm-${row.tool}`}
+                  value={action}
+                  checked={status.action === action}
+                  // Choosing what is already in force must not write anything:
+                  // a PUT here would mint an override with an identical action,
+                  // bumping the policy version and flipping this row's tail
+                  // from "policy default" to "Overridden" — a global change the
+                  // click never asked for. `status.action` is the server's
+                  // resolved verdict, so this compares, it never re-derives.
+                  // (An overridden row re-selecting its own action is likewise
+                  // a no-op; the tail's "clear" button is what reverts it.)
+                  // A radio fires no change event when re-picked, so this is
+                  // belt-and-braces — the invariant should not rest on that.
+                  onChange={() => {
+                    if (status.action !== action) onSet(row.tool, action);
+                  }}
+                />
                 {VERB[action]}
-              </button>
+              </label>
             ))}
-          </div>
+          </fieldset>
         ) : (
           <span className="matrix-fixed">{VERB[status.action]}</span>
         )}
