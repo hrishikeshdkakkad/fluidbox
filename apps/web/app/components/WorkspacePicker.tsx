@@ -5,7 +5,7 @@
 // clone-URL derivation, and credential handling live in the Rust API.
 
 import { useEffect, useState } from "react";
-import { apiGet, Connection, Repo, WorkspaceSpec } from "../lib/api";
+import { apiGet, Connection, isGitConnection, Repo, WorkspaceSpec } from "../lib/api";
 
 export interface WorkspaceDraft {
   mode: "default" | "scratch" | "local" | "git";
@@ -78,7 +78,11 @@ export function WorkspacePicker({
 
   useEffect(() => {
     apiGet<{ connections: Connection[] }>("/connections")
-      .then((r) => setConnections(r.connections.filter((c) => c.status === "active")))
+      // isGitConnection, not `!== "mcp_http"`: this list feeds a git checkout,
+      // so a provider stays out until it is deliberately classified as git.
+      .then((r) =>
+        setConnections(r.connections.filter((c) => c.status === "active" && isGitConnection(c)))
+      )
       .catch(() => {});
   }, []);
 
