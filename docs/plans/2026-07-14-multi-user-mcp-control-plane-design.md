@@ -104,11 +104,12 @@ The broker shim is therefore an MCP server façade to the harness. It forwards a
     │  Connector catalog                                           │
     │  Connection registry + KMS-backed credential custody         │
     │  Agent definitions + connection requirements                 │
-    │  Run creation + frozen RunSpec + connection bindings         │
+    │  Run creation + frozen RunSpec + resource bindings           │
     │  Policy / approvals / audit                                  │
     └──────────────────────────────┬───────────────────────────────┘
                                    │
-                                   │ schemas + aliases + run token
+                                   │ schemas + aliases +
+                                   │ audience-scoped run credentials
                                    │ never upstream URL or credential
                                    ▼
     ┌──────────────────────────────────────────────────────────────┐
@@ -122,14 +123,15 @@ The broker shim is therefore an MCP server façade to the harness. It forwards a
     └──────────────────────────────┬───────────────────────────────┘
                                    │
                                    │ internal HTTPS
-                                   │ run-scoped token + tool intent
+                                   │ tool-intent credential + tool intent
                                    ▼
     ┌──────────────────────────────────────────────────────────────┐
     │ Governed MCP egress plane                                   │
     │                                                              │
     │  Session authentication                                      │
-    │  Frozen-set check → trust tier → policy → approval → budget  │
-    │  Connection status / generation check                        │
+    │  Intent → budget → frozen set → schema → trust tier →        │
+    │  policy → approval → execution claim                          │
+    │  Connection status / generation / membership check            │
     │  OAuth access-token mint or static-secret resolution         │
     │  Per-run upstream MCP client/session                          │
     │  Egress proxy, SSRF controls, rate limits, circuit breakers  │
@@ -235,7 +237,9 @@ The following objects must be independent.
 
 ### Connector definition
 
-Scope: global reference catalog.
+Scope: curated definitions are global reference data; **custom definitions
+are tenant-scoped** and governed by RBAC. One tenant admitting a custom
+endpoint must never make it visible or bindable to another tenant.
 
 Contains:
 
@@ -370,7 +374,7 @@ contract:
 
 Scope: exactly one run.
 
-Run creation resolves each requirement to an authorized concrete connection before model spend or sandbox provisioning.
+Run creation resolves each requirement to an authorized resource binding — its authority source explicit and frozen — before model spend or sandbox provisioning.
 
 **The binding model is not MCP-only (settled).** The same identity question —
 *whose credential executes this?* — exists for the git workspace fetch and
@@ -392,26 +396,35 @@ or `ResultDestination`.
 
 A connection may satisfy multiple slots, but each slot gets independent
 purpose/resource authorization: GitHub clone access does not automatically
-imply comment/check publishing. Public repositories and destinations that
-need no credential use an explicitly credentialless binding (never an
-implicit missing one). Signed-webhook secrets remain subscription-owned; they
-are not forced into `integration_connections`.
+imply comment/check publishing.
+
+The binding's authority source is a tagged union — a nullable
+`connection_id` cannot represent all three legitimate cases:
+
+    authority_kind = connection          # an integration_connections grant
+                   | subscription_secret # signed-webhook/callback secrets,
+                                         #   which stay subscription-owned
+                   | none                # explicitly credentialless (public
+                                         #   repo, open destination) — never
+                                         #   an implicit missing value
 
 Required fields:
 
     tenant_id
     run_id
     requirement_slot
-    slot_kind        # mcp | workspace_fetch | result_publish
-    connection_id    # null for explicitly credentialless bindings
-    connection_owner_type
-    connection_owner_user_id
-    authorization_generation
+    slot_kind          # mcp | workspace_fetch | result_publish
+    authority_kind     # connection | subscription_secret | none
+    authority_id       # connection or secret reference; null for none
+    authority_generation
+    connection_owner_type       # connection kind only
+    connection_owner_user_id    # connection kind only
     connection_tool_snapshot_version   # mcp slots only
     effective_tools_json               # mcp slots only
     effective_tools_digest             # mcp slots only
-    resource_scope                     # repo/ref/target authority for this slot
-    resolved_by_user_id
+    resource_scope     # frozen repo/ref/target/destination for this slot
+    resolved_by_principal_kind  # user | trigger | schedule | webhook | system
+    resolved_by_principal_id
     binding_mode
     created_at
 
@@ -584,8 +597,11 @@ consumption must be a server-side row — store a state hash/nonce with
 `consumed_at`; an AEAD-sealed but stateless value is replayable. The state
 row must bind: expected issuer, authorization/token endpoints (or a metadata
 digest), client registration, canonical resource URI, redirect URI, tenant,
-initiating user, connection, authorization generation, PKCE challenge,
-nonce, and expiry. Binding the discovered endpoints at start-time closes
+initiating user, connection, authorization generation, the PKCE **verifier**
+(stored encrypted or by secret reference — the challenge alone cannot
+perform the token exchange) plus the `S256` method/challenge for
+verification, nonce, and expiry. Binding the discovered endpoints at
+start-time closes
 authorization-server mix-up attacks and discovery-change races between start
 and callback.
 
@@ -622,18 +638,26 @@ Freeze the logical authorization grant and generation, not access-token bytes.
 
 Run immutability does not override emergency revocation.
 
-Before every brokered call, check:
+Before **every credentialed use of a run resource binding** — a brokered MCP
+call, a workspace fetch, or a result publish — check, immediately before
+secret access:
 
-- connection status;
+- connection/authority status;
 - authorization generation;
 - for user-owned connections, **unconditionally** that the owner still holds
   an active tenant membership and any delegation remains valid (never "where
   applicable");
 - that the invoking principal — or the triggering subscription/token
-  authority — is still valid before new privileged work; and
+  authority — is still valid before new privileged work;
+- the exact frozen resource scope for that slot; and
 - tenant ownership.
 
 Revoking a connection immediately prevents future secret reads and fails active-run calls visibly.
+
+Git fetch credentials must not follow cross-origin redirects and must not
+reach submodule or LFS endpoints without a separate admission decision and
+binding — a clone of an admitted repo is not authority over arbitrary hosts
+its metadata points at.
 
 ## Tenant and application authentication
 
@@ -669,9 +693,10 @@ depend on every pooled connection carrying the right `SET LOCAL` context.
 
 Defense in depth on top:
 
-- Postgres row-level security, enabled with a non-`BYPASSRLS` API role;
-  global workers use a separate audited role with explicit tenant
-  resolution;
+- Postgres row-level security, enabled with a non-`BYPASSRLS` API role that
+  also does **not own the tables** (owners bypass RLS by default) — use a
+  non-owner runtime role or `FORCE ROW LEVEL SECURITY`; global workers use
+  a separate audited role with explicit tenant resolution;
 - composite tenant foreign keys — `(tenant_id, id)` unique keys and FKs are
   **mandatory** for all tenant-owned relationships, not "where practical"
   (today's UUID-only FKs cannot relationally guarantee a session's tenant
@@ -711,7 +736,8 @@ The sandbox receives:
 - workspace;
 - frozen tool schemas;
 - connection aliases;
-- run-scoped fluidbox token; and
+- audience-scoped run credentials (LLM, tool-intent, and runner-control,
+  each reaching only its own endpoints); and
 - tool results.
 
 It never receives:
@@ -826,6 +852,13 @@ Require a durable execution record keyed by
 
 - Only the claim winner may send upstream; duplicates wait for or return the
   stored result/status.
+- The guarantee is **at most one fluidbox dispatch attempt** per claim —
+  true exactly-once side effects are not achievable over MCP; ambiguity is
+  surfaced, never hidden.
+- Stale-claim recovery: if a worker dies while `claimed`, the claim moves to
+  `ambiguous` unless there is positive proof the request was never sent
+  (e.g., a durable pre-send/dispatch boundary). `failed_before_send`
+  requires that positive proof; it is never inferred.
 - An `ambiguous` outcome is never automatically reclaimed.
 - The claim is taken **conditional on the session still being nonterminal**,
   in the same transaction/row-lock order as cancellation — a run cancelled
@@ -960,8 +993,16 @@ Separately, the per-run budget check itself is raceable: the facade checks
 accumulated usage before forwarding and records usage only after completion,
 so concurrent requests can all pass the same remaining budget. Because agent
 harnesses legitimately issue parallel model calls (subagents), do NOT
-serialize requests per session as the primary fix; atomically **reserve** a
-conservative maximum before forwarding and reconcile after completion.
+serialize requests per session as the primary fix. Instead:
+
+- take a durable, request-ID-keyed atomic **reservation** of a conservative
+  maximum before forwarding, with a finite enforced ceiling on concurrent
+  reservations;
+- reconcile only from authoritative usage reported by the gateway;
+- release a reservation only when non-dispatch is positively proven; and
+- on crash/timeout with unknown provider usage, retain the conservative
+  charge until reconciliation — never assume zero.
+
 Tenant virtual keys are a backstop, not a fix, for this race.
 
 ## Current production gaps
@@ -1192,8 +1233,10 @@ The following are release-blocking invariants:
 3. A sandbox can reach only the internal fluidbox run gateway in hosted mode.
 4. The model chooses only among tools frozen into its run.
 5. Model choice never selects or changes a connection.
-6. Run creation resolves every required connection before model spend.
-7. A run binds to one logical authorization generation per connection slot.
+6. Run creation resolves every requirement to an explicit authority source
+   (connection, subscription secret, or none) before model spend.
+7. Every credential-bearing slot pins one logical authorization generation;
+   `none` slots carry no generation.
 8. The approver identity never replaces the credential owner.
 9. Every upstream call rechecks live revoke/status state.
 10. Every database lookup is tenant-scoped at the query boundary.
@@ -1307,7 +1350,8 @@ Implement:
 - reusable OAuth client registration objects;
 - one-time server-side OAuth state rows binding issuer, endpoints/metadata
   digest, client registration, resource, tenant, user, connection,
-  generation, PKCE challenge, nonce, and expiry;
+  generation, the encrypted PKCE verifier + S256 challenge, nonce, and
+  expiry;
 - distributed refresh serialization;
 - atomic refresh-token rotation;
 - generation-aware token caches;
@@ -1351,13 +1395,16 @@ Acceptance:
 - authorization is included on every upstream request;
 - denied calls never initialize or contact the upstream server;
 - no write call is blindly replayed after timeout;
-- a duplicated allowed intent executes upstream exactly once;
+- a duplicated allowed intent results in **at most one fluidbox dispatch
+  attempt**, with ambiguity explicit and never silently retried;
 - a run cancelled during an approval wait never executes the late-approved
   call;
 - agent code cannot reach runner-control endpoints with the LLM or
   tool-intent credential; and
-- two replicas deciding/executing concurrently produce no duplicate side
-  effects (approvals, deliveries, lifecycle transitions).
+- two replicas deciding/executing concurrently produce at most one dispatch
+  per approval/delivery/lifecycle transition, with at-least-once deliveries
+  covered by provider idempotency, deterministic-marker reconciliation, or
+  receiver dedup.
 
 ### Phase F — scale, reliability, and rollout
 
@@ -1372,6 +1419,8 @@ Load-test:
 - upstream 401/404/429/5xx behavior;
 - slow approvals;
 - broker restart during active sessions;
+- parallel model calls across replicas that must not overspend per-run
+  budgets (reservation race test);
 - database failover; and
 - tenant-isolation fuzz/negative cases.
 
@@ -1478,7 +1527,7 @@ Three replicas can handle 300 users without a microservice explosion. Secret dec
 
     Define agent revision
       + connection requirements
-      + allowed tool subset
+      + required tool subset
               │
               ▼
     User or trigger invokes agent
@@ -1487,22 +1536,29 @@ Three replicas can handle 300 users without a microservice explosion. Secret dec
     Authenticate principal and tenant
               │
               ▼
-    Resolve each requirement to an authorized connection
+    Resolve each requirement to an authorized resource binding
+      (connection, subscription secret, or explicitly credentialless)
               │
               ▼
     Freeze RunSpec, resource bindings, and tool snapshots
               │
               ▼
-    Provision fresh sandbox with aliases, schemas, and run token only
+    Provision fresh sandbox with aliases, schemas, and
+      audience-scoped run credentials only
               │
               ▼
     Model emits a tool-call intent
               │
               ▼
-    Control plane authenticates and gates the intent
+    Control plane gates the intent
+      (intent → budget → frozen set → schema → trust tier
+       → policy → approval)
               │
               ▼
-    Broker rechecks connection status/generation
+    Execution claim taken, conditional on nonterminal session
+              │
+              ▼
+    Broker rechecks authority status/generation/membership/scope
               │
               ▼
     Broker resolves token and initializes per-run upstream MCP session
@@ -1519,7 +1575,7 @@ If any identity, connection, ownership, snapshot, policy, or tenant mapping is m
 
 This design is complete when the following sentence is mechanically true:
 
-> A shared fluidbox agent can be invoked by any authorized user or trigger, while every MCP call is executed through the exact personal, delegated, or organization connection frozen for that run; the sandbox receives only the permitted tool interface and result, never the remote credential or direct external network authority.
+> A shared fluidbox agent can be invoked by any authorized user or trigger, while every MCP call, workspace fetch, and result publish is executed through the exact personal, delegated, organization, subscription-secret, or explicitly credentialless authority frozen into that run's resource bindings; the sandbox receives only the permitted tool interface and result — never a remote credential, a connection identity, or direct external network authority. Each MCP execution claim causes at most one fluidbox dispatch attempt, with ambiguity surfaced rather than retried; result publishing remains at-least-once, made safe by provider idempotency, deterministic-marker reconciliation, or receiver dedup.
 
 ## Revision history
 
@@ -1552,6 +1608,14 @@ the code by both reviewers. Changes:
   OAuth state binding (invariant 20), per-tenant LiteLLM virtual keys and
   the facade budget-reservation fix (Gap 14), and the full 2025-11-25
   conformance contract (Gap 8).
+- Final consistency pass: binding authority became a tagged union
+  (`connection | subscription_secret | none`) with principal-typed
+  resolvers; live revalidation extended to every binding consumer (incl.
+  git redirect/submodule/LFS scoping); PKCE **verifier** custody in the
+  state row; "exactly once" replaced with at-most-one-dispatch + stale-claim
+  → ambiguous recovery; budget reservations made durable and
+  request-ID-keyed; custom connector definitions tenant-scoped; RLS
+  requires a non-owner role or `FORCE ROW LEVEL SECURITY`.
 
 **v1 (2026-07-14)** — initial proposal.
 

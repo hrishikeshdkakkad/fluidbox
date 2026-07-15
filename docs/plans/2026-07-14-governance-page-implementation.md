@@ -775,6 +775,24 @@ Claude-Session: https://claude.ai/code/session_017mfjJE5FKtgc1rNvSZVVb9"
 
 **This is the one place the separate-column design bites** (design §4.7): `upsert_policy` rebuilds `parsed` from YAML alone, so without the merge the next `just policy-sync` silently drops every override.
 
+> **CARRY-FORWARD FROM TASK 3'S REVIEW — do not skip.** Task 3 added an invariant to
+> `Policy::validate()` that refuses an override targeting a conditional (`paths`/`shell`)
+> rule. That check is currently **dead on every production path**: `parse_yaml` only sees
+> authored YAML, which never carries overrides. It only fires when something validates the
+> **merged** policy. So every path here that produces a merged policy must
+> `parse_yaml → assign managed_overrides → validate() → serialize` and refuse on error.
+> If you merge without re-validating, Task 3's entire fix is inert and `just policy-sync`
+> will happily ship a policy whose `shell.deny_regex` can never fire.
+>
+> Assign `managed_overrides`, never append — it is a known serde field, so YAML could
+> author one and appending would create a duplicate.
+>
+> This is `fluidbox-db`, which cannot return an `ApiError`. Do the merge+validate in the
+> **API layer** (`api::upsert_policy`, and the override write/clear handlers in Task 8),
+> keeping the `fluidbox-db` functions as the storage primitives. Where the plan below shows
+> SQL doing the `parsed` rebuild, the validated Policy value from the API layer is the
+> source of truth for what gets written.
+
 **Files:**
 - Create: `migrations/0010_policy_managed_overrides.sql`
 - Modify: `crates/fluidbox-db/src/lib.rs`

@@ -267,12 +267,37 @@ are refused with `400` — the server enforces the rule the UI renders, never th
 Each write recomputes `parsed` (= base ++ overrides) and bumps `version`. Version++ per
 click is honest, if noisy.
 
-### 4.7 `upsert_policy` must merge overrides — the one place this bites
+### 4.7 `upsert_policy` must merge overrides AND validate the merged policy
 
 `upsert_policy` currently rebuilds `parsed` from YAML alone. It must now read the existing
 `managed_overrides` and merge them into `parsed`, or **the next `just policy-sync` silently
 drops every override**. This is the single sharp edge of the separate-column design and
 gets an explicit regression test (§6).
+
+**Merging is not enough — the merged policy must be `validate()`d before it is written.**
+`Policy::validate()` refuses an override that targets a conditional rule (added 2026-07-14,
+`786d81b`), but `parse_yaml` only ever sees the AUTHORED yaml, which never carries
+overrides. So on every production path the invariant iterates zero times unless something
+validates the *merged* artifact. Without that call the following is silent and permanent:
+
+1. Rule `- match: ["Bash"], action: approve` is unconditional; an admin overrides Bash → allow.
+2. Someone later commits `shell: { deny_regex: ["curl .* | sh"] }` onto that Bash rule and runs `just policy-sync`.
+3. The merge re-attaches the override; the override is consulted first; **the deny-regex never fires again** — while the page still displays it.
+
+Therefore every path that constructs a merged policy — `upsert_policy` and the override
+`PUT`/`DELETE` — must `parse_yaml → assign managed_overrides → validate() → serialize`, and
+refuse on error. **The API's write-time conditional check (§4.6) is NOT redundant with
+this**: it returns a good 400 on a single click, while `validate()` is the fail-closed
+backstop on every path, including ones not yet written. Both layers stay.
+
+The merge must **assign** `managed_overrides`, not append: `managed_overrides` is a known
+serde field, so YAML authoring it would deserialize, and appending would turn a
+YAML-authored duplicate into a confusing hard sync failure.
+
+A cost worth naming: `policy-sync` is repo/CI-driven, so this rejection is caused by DB
+state the YAML author cannot see in the repo. That is inherent to the separate-column
+design, and it is why the error names the exact tool and rule, and why `GET
+/v1/policies/{name}` surfacing live overrides (§4.8) is a requirement rather than polish.
 
 ### 4.8 Dashboard (presentation-only)
 
