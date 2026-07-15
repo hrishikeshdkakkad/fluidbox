@@ -263,6 +263,12 @@ pub struct ConstraintSummary {
     pub paths_allow: Vec<String>,
     #[serde(default)]
     pub paths_deny: Vec<String>,
+    /// The verdict for a path OUTSIDE `paths_allow`. `apply_rule` hardcodes an
+    /// escalation to a human there, so this is `Some(RuleAction::Approve)`
+    /// whenever `paths_allow` is non-empty — it exists so the UI can state the
+    /// "asks elsewhere" clause without re-deriving apply_rule's constant.
+    #[serde(default)]
+    pub paths_on_no_match: Option<RuleAction>,
     #[serde(default)]
     pub shell_allow_prefixes: Vec<String>,
     #[serde(default)]
@@ -286,6 +292,12 @@ pub enum ToolStatus {
         rule: Option<usize>,
     },
     Conditional {
+        /// The rule's CONSTRAINT-SATISFIED action — what happens when the
+        /// constraints are MET (for shell, the allow-prefix-hit branch; NOT
+        /// `shell_on_no_match`), NOT this tool's effective verdict. A row
+        /// headlined "Bash → Allow" off this field would be a lie: the same
+        /// rule denies on a deny_regex hit and asks on `shell_on_no_match`.
+        /// Read it only alongside `constraints`.
         action: RuleAction,
         rule: usize,
         constraints: ConstraintSummary,
@@ -455,6 +467,11 @@ impl Policy {
             if let Some(p) = &rule.paths {
                 c.paths_allow = p.allow.clone();
                 c.paths_deny = p.deny.clone();
+                // Mirrors `apply_rule`: a non-empty allow list escalates
+                // out-of-tree paths to a human via a hardcoded Approve. An
+                // EMPTY allow list skips that guard entirely — the rule falls
+                // through to `rule.action`, so there is no clause to state.
+                c.paths_on_no_match = (!p.allow.is_empty()).then_some(RuleAction::Approve);
             }
             if let Some(s) = &rule.shell {
                 c.shell_allow_prefixes = s.allow_prefixes.clone();
@@ -1377,6 +1394,10 @@ tools:
                     .iter()
                     .any(|g| g.contains("/workspace")));
                 assert!(constraints.paths_deny.iter().any(|g| g.contains(".env")));
+                // The third clause. `apply_rule` hardcodes an escalation for a
+                // path outside `paths_allow`; the UI must be able to SAY that
+                // without re-deriving the constant in TypeScript.
+                assert_eq!(constraints.paths_on_no_match, Some(RuleAction::Approve));
             }
             other => panic!("Edit must be Conditional, got {other:?}"),
         }
@@ -1394,6 +1415,44 @@ tools:
                 action: RuleAction::Approve
             }
         ));
+    }
+
+    /// `paths_on_no_match` describes a guard that only EXISTS when `allow` is
+    /// non-empty. A deny-only rule skips it and falls through to `rule.action`,
+    /// so reporting an escalation there would invent a clause the engine never
+    /// runs. Pinned against `evaluate` so the summary can't drift from the gate.
+    #[test]
+    fn deny_only_paths_report_no_escalation_because_the_guard_is_skipped() {
+        let yaml = r#"
+name: t
+defaults: { tool_action: approve }
+tools:
+  - match: ["Write"]
+    action: allow
+    paths:
+      deny: ["**/.env"]
+"#;
+        let p = Policy::parse_yaml(yaml).expect("parses");
+        let m: std::collections::HashMap<String, ToolStatus> =
+            p.tool_matrix(&["Write".to_string()]).into_iter().collect();
+        match &m["Write"] {
+            ToolStatus::Conditional { constraints, .. } => {
+                assert!(constraints.paths_allow.is_empty());
+                assert_eq!(constraints.paths_deny, vec!["**/.env".to_string()]);
+                assert_eq!(constraints.paths_on_no_match, None);
+            }
+            other => panic!("Write must be Conditional (paths), got {other:?}"),
+        }
+        // Why None is the truth: an arbitrary out-of-tree path is ALLOWED here
+        // (rule.action), never escalated — there is no "asks elsewhere" clause.
+        assert_eq!(
+            p.evaluate(
+                &req("Write", json!({ "file_path": "/etc/anywhere.txt" })),
+                Autonomy::Supervised
+            )
+            .effective,
+            Verdict::Allow
+        );
     }
 
     #[test]
