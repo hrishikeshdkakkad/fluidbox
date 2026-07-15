@@ -37,7 +37,13 @@ pub struct PolicyRow {
     pub name: String,
     pub version: i32,
     pub yaml_source: String,
+    /// The EFFECTIVE policy: base yaml ++ `managed_overrides`. This — not
+    /// `managed_overrides` — is what `run_service` freezes into a RunSpec, so
+    /// every write to the overrides column must republish this.
     pub parsed: Value,
+    /// UI-owned per-tool decisions (`Vec<fluidbox_core::policy::ToolOverride>`),
+    /// kept out of the git-owned `yaml_source`. See migration 0010.
+    pub managed_overrides: Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -211,6 +217,15 @@ pub async fn ensure_default_tenant(pool: &PgPool) -> sqlx::Result<Uuid> {
 
 // ─── Policies ─────────────────────────────────────────────────────────────
 
+/// Upsert a policy's AUTHORED yaml. Existing `managed_overrides` are preserved
+/// and merged back into `parsed` — without this, the next `just policy-sync`
+/// would silently drop every decision made in the Governance page.
+///
+/// Storage primitive: it merges, it does not judge. A caller that changes the
+/// base rules under an existing override must `Policy::validate()` the merged
+/// result BEFORE calling (the API layer does), because an override targeting a
+/// rule that just grew `paths`/`shell` is invalid and cannot be caught here —
+/// `fluidbox-db` has no error type to refuse with.
 pub async fn upsert_policy(
     pool: &PgPool,
     tenant: Uuid,
@@ -223,7 +238,9 @@ pub async fn upsert_policy(
          values ($1, $2, $3, $4, $5)
          on conflict (tenant_id, name) do update
            set yaml_source = excluded.yaml_source,
-               parsed = excluded.parsed,
+               parsed = jsonb_set(
+                 excluded.parsed, '{managed_overrides}', policies.managed_overrides, true
+               ),
                version = policies.version + 1,
                updated_at = now()
          returning *",
@@ -233,6 +250,74 @@ pub async fn upsert_policy(
     .bind(name)
     .bind(yaml_source)
     .bind(parsed)
+    .fetch_one(pool)
+    .await
+}
+
+/// Upsert ONE exact-name override, replacing any existing decision for that
+/// tool. Bumps `version` and republishes `parsed`.
+pub async fn set_policy_override(
+    pool: &PgPool,
+    tenant: Uuid,
+    name: &str,
+    tool: &str,
+    action: fluidbox_core::policy::RuleAction,
+) -> sqlx::Result<PolicyRow> {
+    let entry = serde_json::json!([{ "tool": tool, "action": action }]);
+    write_policy_overrides(pool, tenant, name, tool, &entry).await
+}
+
+/// Remove ONE override; the tool falls back to whatever the base rules say.
+/// Bumps `version` and republishes `parsed`.
+pub async fn clear_policy_override(
+    pool: &PgPool,
+    tenant: Uuid,
+    name: &str,
+    tool: &str,
+) -> sqlx::Result<PolicyRow> {
+    write_policy_overrides(pool, tenant, name, tool, &serde_json::json!([])).await
+}
+
+/// Drop every override for `tool`, then append `append` (a jsonb ARRAY — one
+/// entry to set, empty to clear). Set and clear are the same write: filter out
+/// the tool's old decision, optionally add the new one.
+///
+/// ONE statement, because `parsed` and `managed_overrides` disagreeing — even
+/// between two round-trips — means a run evaluating a policy that no longer
+/// exists. `run_service` reads `parsed`; an override written only to the column
+/// would look saved in the UI and never fire.
+async fn write_policy_overrides(
+    pool: &PgPool,
+    tenant: Uuid,
+    name: &str,
+    tool: &str,
+    append: &Value,
+) -> sqlx::Result<PolicyRow> {
+    sqlx::query_as(
+        "with target as (
+           select id,
+                  coalesce(
+                    (select jsonb_agg(e)
+                       from jsonb_array_elements(managed_overrides) e
+                      where e->>'tool' <> $3),
+                    '[]'::jsonb
+                  ) || $4::jsonb as overrides
+             from policies
+            where tenant_id = $1 and name = $2
+         )
+         update policies p
+            set managed_overrides = t.overrides,
+                parsed = jsonb_set(p.parsed, '{managed_overrides}', t.overrides, true),
+                version = p.version + 1,
+                updated_at = now()
+           from target t
+          where p.id = t.id
+         returning p.*",
+    )
+    .bind(tenant)
+    .bind(name)
+    .bind(tool)
+    .bind(append)
     .fetch_one(pool)
     .await
 }
@@ -290,6 +375,108 @@ pub async fn get_policy_by_name(
         .bind(name)
         .fetch_optional(pool)
         .await
+}
+
+/// Agents whose LATEST revision uses this policy — the blast radius an override
+/// header must state. An older revision pointing here does not count: only the
+/// latest revision governs future runs, so only it is at stake in an edit.
+pub async fn policy_agents_using(
+    pool: &PgPool,
+    tenant: Uuid,
+    policy_id: Uuid,
+) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "select count(*) from agents a
+          where a.tenant_id = $1
+            and (
+              select r.policy_id from agent_revisions r
+               where r.agent_id = a.id
+               order by r.rev desc
+               limit 1
+            ) = $2",
+    )
+    .bind(tenant)
+    .bind(policy_id)
+    .fetch_one(pool)
+    .await
+}
+
+/// The union of `mcp__<server>__<tool>` names from the capability bundles pinned
+/// on the LATEST revision of every agent using this policy. This is what makes a
+/// connected server's photographed tools appear in the matrix without anyone
+/// typing them. Sorted and deduplicated: two agents may pin the same bundle.
+///
+/// Reads the pins' bundle ids rather than resolving `name`/`version` — the pin is
+/// exact by construction (§17 #7), so the id IS the photograph the frozen RunSpec
+/// will carry.
+pub async fn policy_mcp_tools(
+    pool: &PgPool,
+    tenant: Uuid,
+    policy_id: Uuid,
+) -> sqlx::Result<Vec<String>> {
+    let pins: Vec<Value> = sqlx::query_scalar(
+        "select r.capability_bundles from agents a
+           join lateral (
+             select * from agent_revisions r2
+              where r2.agent_id = a.id order by r2.rev desc limit 1
+           ) r on true
+          where a.tenant_id = $1 and r.policy_id = $2",
+    )
+    .bind(tenant)
+    .bind(policy_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut ids: Vec<Uuid> = Vec::new();
+    for p in &pins {
+        let Some(arr) = p.as_array() else { continue };
+        for r in arr {
+            if let Some(id) = r
+                .get("id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok())
+            {
+                ids.push(id);
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Tenant-scoped: a pin can never reach across a tenant boundary.
+    let defs: Vec<Value> = sqlx::query_scalar(
+        "select definition from capability_bundles where tenant_id = $1 and id = any($2)",
+    )
+    .bind(tenant)
+    .bind(&ids)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out: Vec<String> = Vec::new();
+    for def in &defs {
+        let Some(servers) = def.get("servers").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for s in servers {
+            let Some(server) = s.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(tools) = s.get("tools").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for t in tools {
+                if let Some(tool) = t.get("name").and_then(|v| v.as_str()) {
+                    out.push(format!("mcp__{server}__{tool}"));
+                }
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
 }
 
 // ─── Agents & revisions ───────────────────────────────────────────────────
@@ -4051,5 +4238,238 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+    }
+
+    /// `just policy-sync` force-pushes the AUTHORED yaml. It must not take the
+    /// Governance page's per-tool decisions with it — and `parsed` (what
+    /// `run_service` actually evaluates) must carry them on every write.
+    #[tokio::test]
+    async fn upsert_preserves_managed_overrides() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let yaml = "name: ov-test\ntools: []\n";
+        let policy = fluidbox_core::policy::Policy::parse_yaml(yaml).unwrap();
+        let parsed = serde_json::to_value(&policy).unwrap();
+        upsert_policy(&pool, tenant, "ov-test", yaml, &parsed)
+            .await
+            .unwrap();
+        // Reset any override left behind by a previous (or crashed) run.
+        clear_policy_override(&pool, tenant, "ov-test", "mcp__x__y")
+            .await
+            .unwrap();
+
+        set_policy_override(
+            &pool,
+            tenant,
+            "ov-test",
+            "mcp__x__y",
+            fluidbox_core::policy::RuleAction::Allow,
+        )
+        .await
+        .unwrap();
+
+        // A policy-sync re-push of the SAME yaml must not drop the override.
+        let row = upsert_policy(&pool, tenant, "ov-test", yaml, &parsed)
+            .await
+            .unwrap();
+        let overrides: Vec<fluidbox_core::policy::ToolOverride> =
+            serde_json::from_value(row.managed_overrides.clone()).unwrap();
+        assert_eq!(overrides.len(), 1, "policy-sync dropped the override");
+        assert_eq!(overrides[0].tool, "mcp__x__y");
+
+        // …and `parsed` must carry it, because run_service evaluates from `parsed`.
+        let effective: fluidbox_core::policy::Policy =
+            serde_json::from_value(row.parsed.clone()).unwrap();
+        assert_eq!(effective.managed_overrides.len(), 1);
+        assert_eq!(
+            effective.managed_overrides[0].action,
+            fluidbox_core::policy::RuleAction::Allow
+        );
+
+        // Re-setting the SAME tool replaces, never duplicates.
+        let row = set_policy_override(
+            &pool,
+            tenant,
+            "ov-test",
+            "mcp__x__y",
+            fluidbox_core::policy::RuleAction::Deny,
+        )
+        .await
+        .unwrap();
+        let effective: fluidbox_core::policy::Policy =
+            serde_json::from_value(row.parsed.clone()).unwrap();
+        assert_eq!(effective.managed_overrides.len(), 1);
+        assert_eq!(
+            effective.managed_overrides[0].action,
+            fluidbox_core::policy::RuleAction::Deny
+        );
+
+        clear_policy_override(&pool, tenant, "ov-test", "mcp__x__y")
+            .await
+            .unwrap();
+        let row = get_policy_by_name(&pool, tenant, "ov-test")
+            .await
+            .unwrap()
+            .unwrap();
+        let effective: fluidbox_core::policy::Policy =
+            serde_json::from_value(row.parsed.clone()).unwrap();
+        assert!(effective.managed_overrides.is_empty());
+        let overrides: Vec<fluidbox_core::policy::ToolOverride> =
+            serde_json::from_value(row.managed_overrides.clone()).unwrap();
+        assert!(overrides.is_empty());
+    }
+
+    /// Only the LATEST revision governs future runs, so only it may count toward a
+    /// policy's blast radius. Uses fresh policy names, so the shared default tenant's
+    /// other agents cannot perturb the counts.
+    #[tokio::test]
+    async fn policy_agents_using_counts_only_latest_revisions() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let tenant = ensure_default_tenant(&pool).await.unwrap();
+
+        let mk = |name: &str| format!("name: {name}\ntools: []\n");
+        let (ya, yb) = (mk("pau-a"), mk("pau-b"));
+        let pa = upsert_policy(
+            &pool,
+            tenant,
+            "pau-a",
+            &ya,
+            &serde_json::to_value(fluidbox_core::policy::Policy::parse_yaml(&ya).unwrap()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let pb = upsert_policy(
+            &pool,
+            tenant,
+            "pau-b",
+            &yb,
+            &serde_json::to_value(fluidbox_core::policy::Policy::parse_yaml(&yb).unwrap()).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let agent = create_agent(&pool, tenant, "pau-agent", None)
+            .await
+            .unwrap();
+        let budgets = serde_json::json!({});
+        let pins = serde_json::json!([]);
+        let rev = |policy_id| {
+            append_agent_revision(
+                &pool,
+                agent.id,
+                "claude-agent-sdk",
+                "img",
+                "claude-haiku-4-5",
+                None,
+                policy_id,
+                &budgets,
+                None,
+                &pins,
+            )
+        };
+
+        rev(pa.id).await.unwrap();
+        assert_eq!(policy_agents_using(&pool, tenant, pa.id).await.unwrap(), 1);
+        assert_eq!(policy_agents_using(&pool, tenant, pb.id).await.unwrap(), 0);
+
+        // Append a revision moving the agent to policy B: A drops to 0, B goes to 1.
+        rev(pb.id).await.unwrap();
+        assert_eq!(policy_agents_using(&pool, tenant, pa.id).await.unwrap(), 0);
+        assert_eq!(policy_agents_using(&pool, tenant, pb.id).await.unwrap(), 1);
+    }
+
+    /// The matrix's MCP rows come from what the agents on this policy can actually
+    /// call: the union of the photographed tools in the bundles pinned on their
+    /// LATEST revisions — sorted, and deduplicated across agents sharing a bundle.
+    #[tokio::test]
+    async fn policy_mcp_tools_unions_pinned_bundle_tools() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let tenant = ensure_default_tenant(&pool).await.unwrap();
+
+        let yaml = "name: pmt-policy\ntools: []\n";
+        let policy = upsert_policy(
+            &pool,
+            tenant,
+            "pmt-policy",
+            yaml,
+            &serde_json::to_value(fluidbox_core::policy::Policy::parse_yaml(yaml).unwrap())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Tools are declared out of alphabetical order: the union must sort them.
+        let bundle_name = format!("pmt-bundle-{}", Uuid::now_v7());
+        let def = serde_json::json!({"servers": [{
+            "class": "brokered", "name": "beta",
+            "tools": [
+                {"name": "zeta", "description": "d", "input_schema": {"type": "object"}},
+                {"name": "alpha", "description": "d", "input_schema": {"type": "object"}}
+            ]
+        }]});
+        let bundle =
+            create_capability_bundle(&pool, tenant, &bundle_name, None, &def, "sha256:pmt")
+                .await
+                .unwrap();
+        let pins = serde_json::json!([
+            { "id": bundle.id, "name": bundle.name, "version": bundle.version }
+        ]);
+
+        // Two agents share the bundle: the union deduplicates across them.
+        let budgets = serde_json::json!({});
+        for name in ["pmt-agent-a", "pmt-agent-b"] {
+            let agent = create_agent(&pool, tenant, name, None).await.unwrap();
+            append_agent_revision(
+                &pool,
+                agent.id,
+                "claude-agent-sdk",
+                "img",
+                "claude-haiku-4-5",
+                None,
+                policy.id,
+                &budgets,
+                None,
+                &pins,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            policy_mcp_tools(&pool, tenant, policy.id).await.unwrap(),
+            vec![
+                "mcp__beta__alpha".to_string(),
+                "mcp__beta__zeta".to_string()
+            ]
+        );
+
+        // A policy nobody's latest revision points at contributes no tools.
+        let empty_yaml = "name: pmt-empty\ntools: []\n";
+        let empty = upsert_policy(
+            &pool,
+            tenant,
+            "pmt-empty",
+            empty_yaml,
+            &serde_json::to_value(fluidbox_core::policy::Policy::parse_yaml(empty_yaml).unwrap())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(policy_mcp_tools(&pool, tenant, empty.id)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }
