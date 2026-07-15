@@ -3732,3 +3732,142 @@ select.inp {
     padding-left: 0;
   }
 }
+
+/* ─── Governance ─────────────────────────────────────────────────────── */
+
+.policy-rows {
+  display: flex;
+  flex-direction: column;
+}
+.policy-row {
+  padding: 15px 18px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 16px;
+  border-bottom: 1px solid var(--border);
+  transition: background 0.15s ease;
+  color: inherit;
+}
+.policy-row:last-child {
+  border-bottom: 0;
+}
+.policy-row:hover {
+  background: var(--surface-hover);
+}
+.policy-row:hover .run-arrow {
+  color: var(--ink);
+  transform: translateX(2px);
+}
+.policy-row-main {
+  min-width: 0;
+}
+.policy-row-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13.5px;
+}
+.policy-row-sub {
+  margin-top: 3px;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.policy-row-agents {
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* A change to a policy applies immediately, to every future run of every agent
+   on it. The blast radius leads the page rather than footnoting it. */
+.blast-radius {
+  margin-bottom: 16px;
+  padding: 11px 14px;
+  border: 1px solid var(--border-strong);
+  border-left: 2px solid var(--amber);
+  border-radius: var(--radius);
+  background: var(--amber-tint);
+  color: var(--ink);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.matrix-group .sectitle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.matrix {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.matrix-row {
+  display: grid;
+  grid-template-columns: minmax(0, 240px) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+  min-height: 44px;
+}
+.matrix-row:last-child {
+  border-bottom: 0;
+}
+.matrix-row:hover {
+  background: var(--surface-hover);
+}
+.matrix-tool {
+  font-size: 12px;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.matrix-verdict {
+  min-width: 0;
+}
+/* A conditional rule is stated, never offered as a control: its verdict
+   depends on the path touched or the command run. */
+.matrix-conditional {
+  font-size: 12px;
+  color: var(--ink-2);
+  line-height: 1.55;
+  display: block;
+  cursor: help;
+}
+.matrix-fixed {
+  font-size: 12.5px;
+  color: var(--ink-2);
+}
+.matrix-tail {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.matrix .seg button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+@media (max-width: 720px) {
+  .matrix-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+    padding: 12px;
+  }
+  .matrix-tail {
+    justify-content: flex-start;
+  }
+  .policy-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .policy-row .run-arrow {
+    display: none;
+  }
+}

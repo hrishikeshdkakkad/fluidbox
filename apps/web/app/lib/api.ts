@@ -20,6 +20,24 @@ export async function apiPost<T = unknown>(path: string, body: unknown): Promise
   return text ? JSON.parse(text) : ({} as T);
 }
 
+export async function apiPut<T = unknown>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(text || `${res.status}`);
+  return text ? JSON.parse(text) : ({} as T);
+}
+
+export async function apiDelete<T = unknown>(path: string): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, { method: "DELETE" });
+  const text = await res.text();
+  if (!res.ok) throw new Error(text || `${res.status}`);
+  return text ? JSON.parse(text) : ({} as T);
+}
+
 export function streamUrl(sessionId: string): string {
   return `${BASE}/sessions/${sessionId}/events/stream`;
 }
@@ -403,6 +421,82 @@ export interface EventRow {
   actor: string;
   payload: { type?: string; data?: Record<string, unknown> };
   occurred_at: string;
+}
+
+// ─── Governance ───────────────────────────────────────────────────────────
+// The control plane resolves every verdict below and sends the answer. None of
+// it is re-derived here: the dashboard renders policy, it never computes it.
+
+/** A permission verdict as the policy engine reports it. Displayed as
+ *  Allow / Ask / Deny — "approve" means the run pauses for a human. */
+export type PolicyAction = "allow" | "approve" | "deny";
+
+/** Why a rule's verdict depends on more than the tool name: the path touched
+ *  or the command run. `paths_on_no_match` / `shell_on_no_match` carry the
+ *  fallback verdict — render them, never restate them in TypeScript. */
+export interface RuleConstraints {
+  paths_allow: string[];
+  paths_deny: string[];
+  paths_on_no_match: PolicyAction | null;
+  shell_allow_prefixes: string[];
+  shell_deny_regex: string[];
+  shell_on_no_match: PolicyAction | null;
+}
+
+/** Internally tagged on `status`. A `conditional` rule carries path/shell
+ *  constraints, so no single action can express it — such rows are shown as a
+ *  sentence and never as a control. Setting one would flatten the rule and
+ *  drop its constraints (e.g. `paths.deny: **\/.env`); the server refuses the
+ *  same override with a 400, and the UI must not offer what it will refuse. */
+export type ToolStatus =
+  | { status: "unconditional"; action: PolicyAction; rule: number }
+  | {
+      status: "conditional";
+      action: PolicyAction;
+      rule: number;
+      constraints: RuleConstraints;
+    }
+  | { status: "default"; action: PolicyAction }
+  | { status: "overridden"; action: PolicyAction; underlying: ToolStatus };
+
+/** One row of the resolved permission matrix (GET /policies/{name}).
+ *  `group` is set for canonical tools; for `mcp__*` rows it is null and
+ *  `server` carries the grouping key instead. */
+export interface MatrixRow {
+  tool: string;
+  group: string | null;
+  server: string | null;
+  overridable: boolean;
+  status: ToolStatus;
+}
+
+export interface AutonomySummary {
+  permitted: boolean;
+  default_fallback: "allow" | "deny";
+  allow_overrides: number;
+  deny_overrides: number;
+}
+
+/** GET /policies list row. */
+export interface PolicySummary {
+  id: string;
+  name: string;
+  version: number;
+  updated_at: string;
+  agents_using: number;
+  autonomy_summary: AutonomySummary;
+}
+
+/** GET /policies/{name} — the fully-resolved policy behind a run. */
+export interface PolicyDetail {
+  policy: { id: string; name: string; version: number; updated_at: string };
+  agents_using: number;
+  autonomy_summary: AutonomySummary;
+  defaults: { tool_action: PolicyAction };
+  budgets: Record<string, number>;
+  approvals: { default_ttl_secs: number; scope: string; timeout_action: string };
+  egress: { mode: string };
+  matrix: MatrixRow[];
 }
 
 export const TERMINAL = ["completed", "failed", "cancelled", "budget_exceeded"];
