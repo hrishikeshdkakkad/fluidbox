@@ -9,6 +9,8 @@ import {
   CapabilityBundle,
   Connection,
   GithubAppRegistration,
+  isGitConnection,
+  isToolConnection,
 } from "../lib/api";
 import { LoadingRows } from "./bits";
 
@@ -79,10 +81,10 @@ export function ResourceOverview({
   };
 
   const activeConnections = snapshot.connections.filter(
-    (connection) => connection.status === "active" && connection.provider !== "mcp_http"
+    (connection) => connection.status === "active" && isGitConnection(connection)
   );
   const activeToolConnections = snapshot.connections.filter(
-    (connection) => connection.status === "active" && connection.provider === "mcp_http"
+    (connection) => connection.status === "active" && isToolConnection(connection)
   );
   const activeRegistrations = snapshot.registrations.filter(
     (registration) => registration.status === "active"
