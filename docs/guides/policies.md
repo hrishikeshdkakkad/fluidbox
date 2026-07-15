@@ -55,6 +55,7 @@ tools:                   # ORDERED rules; first rule whose `match` hits wins
 
 ## Evaluation semantics (what the engine guarantees)
 
+- **Managed overrides come first.** A per-tool override set from the Governance page (`policies.managed_overrides`) is consulted *before* `tools` — an explicit decision about one tool beats the general rules, without reordering anything you authored. Overrides are exact-name only, never wildcards, and are never written into your YAML.
 - **First match wins.** Rules are checked top-down; the first rule whose `match` list hits the tool name decides. Order your specific rules above your broad ones.
 - **Shell rules:** `deny_regex` is checked before `allow_prefixes` — a deny match is final (`ls && curl evil` is denied even though `ls` is allowed). Prefixes are **token-boundary** matched: `git status` matches `git status -sb` but never `git statusx`. Anything that hits neither gets `on_no_match`.
 - **Path rules:** any `deny` glob match is a hard deny. If `allow` globs are set and a touched path falls outside them, the call **escalates to approval** rather than failing the run.
@@ -80,5 +81,24 @@ just policy-sync
 ```
 
 An agent revision names its policy; the policy's `budgets` are a ceiling the revision and each run may only tighten. Autonomy is chosen per run (`"autonomous": true` on `POST /v1/sessions`) or per trigger subscription — a policy with `autonomy.permitted: false` refuses those outright.
+
+## Per-tool overrides (the Governance page)
+
+The YAML above is the **base policy** and stays git-owned: `just policy-sync` force-pushes it, and nothing in the dashboard ever rewrites it (your comments survive). Per-tool decisions made in the UI live in a separate `managed_overrides` column and survive a re-sync.
+
+```bash
+# set one tool's action (allow | approve | deny)
+curl -s -X PUT localhost:8787/v1/policies/default/overrides/mcp__cloudflare__kv_namespaces_list \
+  -H "authorization: Bearer $FLUIDBOX_ADMIN_TOKEN" -H "content-type: application/json" \
+  -d '{"action": "allow"}'
+
+# clear it — the tool falls back to whatever the base rules say
+curl -s -X DELETE localhost:8787/v1/policies/default/overrides/mcp__cloudflare__kv_namespaces_list \
+  -H "authorization: Bearer $FLUIDBOX_ADMIN_TOKEN"
+```
+
+Only tools whose matching rule is **unconditional** can be overridden. A rule carrying `paths` or `shell` (e.g. `Edit`, `Bash` in the seed policy) is conditional — its verdict depends on the path touched or the command run, so a flat Allow/Ask/Deny cannot express it and the server refuses the write. That is deliberate: it keeps a single click from deleting `paths.deny: **/.env`.
+
+An override moves the **policy** verdict only. Trust tier (fork-PR read-only), budgets, and frozen-capability availability are all enforced above policy in the gate and are unreachable from the UI. Overrides affect **future** runs only — in-flight runs keep their frozen snapshot.
 
 The seed policy ([`policies/default.yaml`](../../policies/default.yaml)) is a good starting point: read-only tools allowed, workspace-scoped writes, a shell classifier derived from observed agent behavior (rationale in its comments), exfil/destructive commands denied, everything else paused for a human. Its exact semantics are pinned by the `seed_policy_semantics` test in `fluidbox-core`.
