@@ -19,6 +19,9 @@ pub struct Policy {
     pub autonomy: AutonomySettings,
     #[serde(default)]
     pub tools: Vec<ToolRule>,
+    /// See `ToolOverride`. Populated from the DB column, never from YAML.
+    #[serde(default)]
+    pub managed_overrides: Vec<ToolOverride>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +162,19 @@ pub struct ToolRule {
     pub approval_scope: Option<ApprovalScope>,
 }
 
+/// A UI-owned, per-tool decision. Consulted BEFORE `tools` — an explicit
+/// decision about one tool beats the general rules without reordering anything
+/// the user authored. NEVER present in authored YAML: it is stored in its own
+/// `policies.managed_overrides` column and merged into `parsed`.
+///
+/// `tool` is an EXACT name (never a matcher) — a wildcard here would be an
+/// un-reviewable blanket rule authored by a click.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOverride {
+    pub tool: String,
+    pub action: RuleAction,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PathRules {
     #[serde(default)]
@@ -227,6 +243,104 @@ pub struct EvaluationOutcome {
     pub matched_rule: Option<usize>,
 }
 
+/// A display-ready summary of a policy's autonomy posture. Facts only — the
+/// API emits these; the dashboard phrases them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutonomySummary {
+    pub permitted: bool,
+    pub default_fallback: AutonomousFallback,
+    /// Rules overriding the fallback to `allow`, counted ONLY where the rule
+    /// can actually reach RequireApproval.
+    pub allow_overrides: usize,
+    /// Same, for `deny`.
+    pub deny_overrides: usize,
+}
+
+/// The display-only constraint payload of a conditional rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ConstraintSummary {
+    #[serde(default)]
+    pub paths_allow: Vec<String>,
+    #[serde(default)]
+    pub paths_deny: Vec<String>,
+    /// The verdict for a path OUTSIDE `paths_allow`. `apply_rule` hardcodes an
+    /// escalation to a human there, so this is `Some(RuleAction::Approve)`
+    /// whenever `paths_allow` is non-empty — it exists so the UI can state the
+    /// "asks elsewhere" clause without re-deriving apply_rule's constant.
+    #[serde(default)]
+    pub paths_on_no_match: Option<RuleAction>,
+    #[serde(default)]
+    pub shell_allow_prefixes: Vec<String>,
+    #[serde(default)]
+    pub shell_deny_regex: Vec<String>,
+    #[serde(default)]
+    pub shell_on_no_match: Option<RuleAction>,
+}
+
+/// What the policy says about ONE exact tool, resolved statically.
+///
+/// `Conditional` exists because `evaluate` takes a ToolCallRequest WITH INPUT:
+/// a rule carrying `paths`/`shell` yields different verdicts for different
+/// paths/commands, so no flat Allow/Ask/Deny can represent it. Such rows are
+/// display-only — offering a control would let one click delete
+/// `paths.deny: **/.env`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ToolStatus {
+    Unconditional {
+        action: RuleAction,
+        rule: Option<usize>,
+    },
+    Conditional {
+        /// The rule's CONSTRAINT-SATISFIED action — what happens when the
+        /// constraints are MET (for shell, the allow-prefix-hit branch; NOT
+        /// `shell_on_no_match`), NOT this tool's effective verdict. A row
+        /// headlined "Bash → Allow" off this field would be a lie: the same
+        /// rule denies on a deny_regex hit and asks on `shell_on_no_match`.
+        /// Read it only alongside `constraints`.
+        action: RuleAction,
+        rule: usize,
+        constraints: ConstraintSummary,
+    },
+    Default {
+        action: RuleAction,
+    },
+    Overridden {
+        action: RuleAction,
+        underlying: Box<ToolStatus>,
+    },
+}
+
+impl ToolStatus {
+    /// Only unconditional rows may be overridden from the UI. The server
+    /// enforces this too — never the UI alone.
+    pub fn is_overridable(&self) -> bool {
+        match self {
+            ToolStatus::Unconditional { .. } | ToolStatus::Default { .. } => true,
+            ToolStatus::Overridden { underlying, .. } => underlying.is_overridable(),
+            ToolStatus::Conditional { .. } => false,
+        }
+    }
+}
+
+/// Can this rule ever produce a RequireApproval verdict? Mirrors the THREE
+/// routes in `apply_rule`. A rule that can never approve makes its
+/// `on_autonomous` dead config — counting it would claim an exception that can
+/// never fire.
+fn can_require_approval(rule: &ToolRule) -> bool {
+    // Shell constraints short-circuit apply_rule: it returns from inside that
+    // branch on every path, so `paths` is dead for a shell rule.
+    if let Some(sh) = &rule.shell {
+        return rule.action == RuleAction::Approve || sh.on_no_match == RuleAction::Approve;
+    }
+    // A non-empty paths.allow escalates out-of-tree paths to a human via a
+    // HARDCODED Approve in apply_rule, whatever the rule's action says.
+    if rule.paths.as_ref().is_some_and(|p| !p.allow.is_empty()) {
+        return true;
+    }
+    rule.action == RuleAction::Approve
+}
+
 impl Policy {
     pub fn parse_yaml(yaml: &str) -> Result<Policy, String> {
         let p: Policy = serde_yaml::from_str(yaml).map_err(|e| e.to_string())?;
@@ -255,7 +369,124 @@ impl Policy {
                 }
             }
         }
+        // Managed overrides. The ENGINE keeps these invariants, not the write
+        // path: an override is stored once but re-merged into EVERY later
+        // policy version, so a `paths`/`shell` constraint added to a rule
+        // afterwards would be silently erased by an override that was valid
+        // when written — a dead constraint that still DISPLAYS. Refusing the
+        // whole policy here makes that impossible to reach.
+        let mut seen: Vec<&str> = Vec::new();
+        for (i, o) in self.managed_overrides.iter().enumerate() {
+            if o.tool.contains('*') {
+                return Err(format!(
+                    "managed_overrides[{i}]: tool {:?} is a wildcard — overrides name one exact tool; a matcher here is permanently-dead config",
+                    o.tool
+                ));
+            }
+            if seen.contains(&o.tool.as_str()) {
+                return Err(format!(
+                    "managed_overrides[{i}]: duplicate override for tool {:?} — one decision per tool",
+                    o.tool
+                ));
+            }
+            seen.push(&o.tool);
+            // First-match-wins, exactly as `evaluate_supervised` walks them:
+            // only the rule the engine would actually reach decides whether
+            // this tool is conditional. A conditional rule shadowed by an
+            // earlier one is irrelevant.
+            if let Some(rule) = self
+                .tools
+                .iter()
+                .find(|r| r.r#match.iter().any(|m| tool_matches(m, &o.tool)))
+            {
+                if rule.paths.is_some() || rule.shell.is_some() {
+                    return Err(format!(
+                        "managed_overrides[{i}]: managed override for '{}' targets a conditional rule (match: {:?}) — a rule carrying paths/shell cannot be reduced to a single action; clear the override before adding path/shell constraints to that rule",
+                        o.tool, rule.r#match
+                    ));
+                }
+            }
+        }
         Ok(())
+    }
+
+    pub fn autonomy_summary(&self) -> AutonomySummary {
+        let mut allow_overrides = 0;
+        let mut deny_overrides = 0;
+        for rule in &self.tools {
+            if !can_require_approval(rule) {
+                continue;
+            }
+            match rule.on_autonomous {
+                Some(AutonomousFallback::Allow) => allow_overrides += 1,
+                Some(AutonomousFallback::Deny) => deny_overrides += 1,
+                None => {}
+            }
+        }
+        AutonomySummary {
+            permitted: self.autonomy.permitted,
+            default_fallback: self.autonomy.on_approval_rule,
+            allow_overrides,
+            deny_overrides,
+        }
+    }
+
+    /// Resolve each tool's status against this policy. Reuses `tool_matches` — the
+    /// matcher `evaluate_supervised` uses — so the page and the gate can never
+    /// disagree about which rule wins.
+    pub fn tool_matrix(&self, tools: &[String]) -> Vec<(String, ToolStatus)> {
+        tools
+            .iter()
+            .map(|t| (t.clone(), self.tool_status(t)))
+            .collect()
+    }
+
+    fn tool_status(&self, tool: &str) -> ToolStatus {
+        if let Some(o) = self.managed_overrides.iter().find(|o| o.tool == tool) {
+            return ToolStatus::Overridden {
+                action: o.action,
+                underlying: Box::new(self.base_tool_status(tool)),
+            };
+        }
+        self.base_tool_status(tool)
+    }
+
+    fn base_tool_status(&self, tool: &str) -> ToolStatus {
+        for (i, rule) in self.tools.iter().enumerate() {
+            if !rule.r#match.iter().any(|m| tool_matches(m, tool)) {
+                continue;
+            }
+            let conditional = rule.paths.is_some() || rule.shell.is_some();
+            if !conditional {
+                return ToolStatus::Unconditional {
+                    action: rule.action,
+                    rule: Some(i),
+                };
+            }
+            let mut c = ConstraintSummary::default();
+            if let Some(p) = &rule.paths {
+                c.paths_allow = p.allow.clone();
+                c.paths_deny = p.deny.clone();
+                // Mirrors `apply_rule`: a non-empty allow list escalates
+                // out-of-tree paths to a human via a hardcoded Approve. An
+                // EMPTY allow list skips that guard entirely — the rule falls
+                // through to `rule.action`, so there is no clause to state.
+                c.paths_on_no_match = (!p.allow.is_empty()).then_some(RuleAction::Approve);
+            }
+            if let Some(s) = &rule.shell {
+                c.shell_allow_prefixes = s.allow_prefixes.clone();
+                c.shell_deny_regex = s.deny_regex.clone();
+                c.shell_on_no_match = Some(s.on_no_match);
+            }
+            return ToolStatus::Conditional {
+                action: rule.action,
+                rule: i,
+                constraints: c,
+            };
+        }
+        ToolStatus::Default {
+            action: self.defaults.tool_action,
+        }
     }
 
     pub fn evaluate(&self, req: &ToolCallRequest, autonomy: Autonomy) -> EvaluationOutcome {
@@ -292,6 +523,13 @@ impl Policy {
     }
 
     fn evaluate_supervised(&self, req: &ToolCallRequest) -> (Verdict, Option<usize>) {
+        // A managed override is an explicit decision about ONE exact tool; it
+        // wins over the general rules. Exact equality (never `tool_matches`)
+        // keeps a click from authoring a wildcard. No rule index: the override
+        // replaced the rule, so the rule's on_autonomous must not apply.
+        if let Some(o) = self.managed_overrides.iter().find(|o| o.tool == req.tool) {
+            return (self.finish(o.action, None, &req.tool, None), None);
+        }
         for (i, rule) in self.tools.iter().enumerate() {
             if !rule.r#match.iter().any(|m| tool_matches(m, &req.tool)) {
                 continue;
@@ -350,7 +588,11 @@ impl Policy {
                         .all(|p| paths.allow.iter().any(|g| glob_hit(g, p)));
                 if !all_allowed {
                     // Outside the allowed tree → escalate to a human rather
-                    // than brick the run.
+                    // than brick the run. NOTE: this hardcoded Approve is a
+                    // route to RequireApproval INDEPENDENT of `rule.action` —
+                    // `can_require_approval` mirrors it. Adding another route
+                    // to RequireApproval means updating that mirror too, or
+                    // `autonomy_summary` will undercount live overrides.
                     return self.finish(RuleAction::Approve, Some(rule), &req.tool, None);
                 }
             }
@@ -736,6 +978,75 @@ tools:
     }
 
     #[test]
+    fn autonomy_summary_of_the_seed_policy() {
+        let yaml = include_str!("../../../policies/default.yaml");
+        let p = Policy::parse_yaml(yaml).expect("seed policy parses");
+        let s = p.autonomy_summary();
+        assert!(s.permitted);
+        assert_eq!(s.default_fallback, AutonomousFallback::Deny);
+        // The seed policy carries no rule-level on_autonomous overrides.
+        assert_eq!(s.allow_overrides, 0);
+        assert_eq!(s.deny_overrides, 0);
+    }
+
+    /// Only rules that can actually REACH RequireApproval may be counted, via all
+    /// THREE routes in `apply_rule`. The seed policy's Bash rule pairs
+    /// `action: allow` with `shell.on_no_match: approve`, and its Edit/Write rule
+    /// pairs `action: allow` with a `paths.allow` tree (out-of-tree paths hit a
+    /// hardcoded Approve) — a naive `action == Approve` test would MISS an
+    /// on_autonomous added to either and undercount in the dangerous direction.
+    /// Conversely, `shell` short-circuits `paths`, so a rule carrying both must be
+    /// judged by `shell` alone or we overcount.
+    #[test]
+    fn autonomy_summary_counts_only_reachable_overrides() {
+        let yaml = r#"
+name: t
+autonomy: { permitted: true, on_approval_rule: deny }
+tools:
+  # reachable via shell.on_no_match -> COUNTED
+  - match: ["Bash"]
+    action: allow
+    shell: { on_no_match: approve }
+    on_autonomous: allow
+  # reachable via action -> COUNTED
+  - match: ["mcp__*"]
+    action: approve
+    on_autonomous: allow
+  # dead config: unconditional allow can never require approval -> NOT counted
+  - match: ["Read"]
+    action: allow
+    on_autonomous: allow
+  # dead config: unconditional deny -> NOT counted
+  - match: ["WebFetch"]
+    action: deny
+    on_autonomous: deny
+  # reachable via paths.allow escalation (apply_rule hardcodes Approve) -> COUNTED
+  - match: ["Write"]
+    action: allow
+    paths: { allow: ["/workspace/**"] }
+    on_autonomous: allow
+  # shell short-circuits apply_rule, so paths is dead here; on_no_match is
+  # allow-not-approve and action is allow -> NOT counted
+  - match: ["BashOutput"]
+    action: allow
+    shell: { on_no_match: allow }
+    paths: { allow: ["/workspace/**"] }
+    on_autonomous: allow
+"#;
+        let p = Policy::parse_yaml(yaml).expect("parses");
+        let s = p.autonomy_summary();
+        assert_eq!(
+            s.allow_overrides, 3,
+            "Bash (shell on_no_match) + mcp__* (action) + Write (paths.allow escalation); \
+             BashOutput's paths is dead behind its shell short-circuit"
+        );
+        assert_eq!(
+            s.deny_overrides, 0,
+            "the deny override sits on an unreachable rule"
+        );
+    }
+
+    #[test]
     fn read_only_tier_permits_reading_only() {
         let allow = |tool: &str, input: Value| {
             assert_eq!(
@@ -790,6 +1101,386 @@ tools:
             "name: x\ntools:\n  - match: [Bash]\n    action: allow\n    shell:\n      deny_regex: [\"(\"]"
         )
         .is_err());
+    }
+
+    /// An explicit per-tool decision beats the general rules by construction —
+    /// without reordering anything the user authored.
+    #[test]
+    fn managed_override_precedes_the_general_rules() {
+        let yaml = r#"
+name: t
+defaults: { tool_action: approve }
+tools:
+  - match: ["mcp__*"]
+    action: approve
+"#;
+        let mut p = Policy::parse_yaml(yaml).expect("parses");
+        let tool = "mcp__cloudflare__kv_namespaces_list";
+        // Baseline: the wildcard rule asks.
+        assert!(matches!(
+            p.evaluate(&req(tool, json!({})), Autonomy::Supervised)
+                .effective,
+            Verdict::RequireApproval { .. }
+        ));
+        // With an override, it allows — and no rule index is reported, because the
+        // override replaced the rule (its on_autonomous no longer applies).
+        p.managed_overrides.push(ToolOverride {
+            tool: tool.into(),
+            action: RuleAction::Allow,
+        });
+        let out = p.evaluate(&req(tool, json!({})), Autonomy::Supervised);
+        assert_eq!(out.effective, Verdict::Allow);
+        assert_eq!(out.matched_rule, None);
+        // A sibling tool is untouched by the override.
+        assert!(matches!(
+            p.evaluate(
+                &req("mcp__cloudflare__kv_namespace_create", json!({})),
+                Autonomy::Supervised
+            )
+            .effective,
+            Verdict::RequireApproval { .. }
+        ));
+    }
+
+    /// Overrides are exact-name only: a click must never author a blanket rule.
+    #[test]
+    fn managed_override_does_not_wildcard_match() {
+        let yaml = r#"
+name: t
+defaults: { tool_action: approve }
+tools:
+  - match: ["mcp__*"]
+    action: approve
+"#;
+        let mut p = Policy::parse_yaml(yaml).expect("parses");
+        p.managed_overrides.push(ToolOverride {
+            tool: "mcp__*".into(),
+            action: RuleAction::Allow,
+        });
+        // The literal string "mcp__*" is not a matcher — a real tool must not hit it.
+        assert!(matches!(
+            p.evaluate(
+                &req("mcp__cloudflare__kv_namespaces_list", json!({})),
+                Autonomy::Supervised
+            )
+            .effective,
+            Verdict::RequireApproval { .. }
+        ));
+    }
+
+    /// Policies stored before this column existed must deserialize unchanged.
+    #[test]
+    fn managed_overrides_defaults_to_empty_for_existing_policies() {
+        let yaml = "name: t\ntools: []\n";
+        let p = Policy::parse_yaml(yaml).expect("parses");
+        assert!(p.managed_overrides.is_empty());
+    }
+
+    /// An override REPLACES the rule, so the replaced rule's `on_autonomous`
+    /// must not survive it: the autonomy fallback resolves to the policy
+    /// default. This is what `matched_rule = None` buys — were the override
+    /// branch to report `Some(i)`, this run would silently ALLOW.
+    #[test]
+    fn managed_override_resolves_autonomy_to_the_policy_default_not_the_replaced_rule() {
+        let yaml = r#"
+name: t
+defaults: { tool_action: approve }
+autonomy: { permitted: true, on_approval_rule: deny }
+tools:
+  - match: ["Bash"]
+    action: approve
+    on_autonomous: allow
+"#;
+        let mut p = Policy::parse_yaml(yaml).expect("parses");
+        // Baseline: the rule's own on_autonomous carries an autonomous run.
+        assert_eq!(
+            p.evaluate(&req("Bash", json!({"command": "ls"})), Autonomy::Autonomous)
+                .effective,
+            Verdict::Allow
+        );
+        // The override replaces that rule — so its on_autonomous: allow goes
+        // with it, and the policy default (deny) governs.
+        p.managed_overrides.push(ToolOverride {
+            tool: "Bash".into(),
+            action: RuleAction::Approve,
+        });
+        p.validate()
+            .expect("unconditional rule: the override is valid");
+        let out = p.evaluate(&req("Bash", json!({"command": "ls"})), Autonomy::Autonomous);
+        assert_eq!(out.matched_rule, None);
+        assert!(out.autonomy_rewritten);
+        assert!(
+            matches!(out.effective, Verdict::Deny { .. }),
+            "override must fall back to the policy default (deny), not the replaced rule's \
+             on_autonomous (allow); got {:?}",
+            out.effective
+        );
+    }
+
+    /// The engine — not the write path — keeps the conditional-rule invariant.
+    /// A `shell` constraint committed to a rule AFTER an override was stored
+    /// would otherwise never fire, silently and forever.
+    #[test]
+    fn managed_override_on_a_shell_constrained_rule_is_rejected() {
+        let yaml = r#"
+name: t
+tools:
+  - match: ["Bash"]
+    action: approve
+    shell:
+      deny_regex: ["curl .* \\| sh"]
+"#;
+        let mut p = Policy::parse_yaml(yaml).expect("parses");
+        p.managed_overrides.push(ToolOverride {
+            tool: "Bash".into(),
+            action: RuleAction::Allow,
+        });
+        let err = p.validate().expect_err("a shell rule cannot be flattened");
+        assert!(err.contains("'Bash'"), "names the tool: {err}");
+        assert!(err.contains(r#"["Bash"]"#), "names the rule: {err}");
+        assert!(err.contains("conditional rule"), "{err}");
+    }
+
+    /// Same invariant, via `paths` — and through a wildcard rule matcher, to
+    /// pin that the check uses the engine's matcher rather than equality.
+    #[test]
+    fn managed_override_on_a_paths_constrained_rule_is_rejected() {
+        let yaml = r#"
+name: t
+tools:
+  - match: ["Edit", "Write*"]
+    action: allow
+    paths:
+      allow: ["/workspace/**"]
+"#;
+        let mut p = Policy::parse_yaml(yaml).expect("parses");
+        p.managed_overrides.push(ToolOverride {
+            tool: "WriteNotebook".into(),
+            action: RuleAction::Allow,
+        });
+        let err = p.validate().expect_err("a paths rule cannot be flattened");
+        assert!(err.contains("'WriteNotebook'"), "{err}");
+        assert!(err.contains("conditional rule"), "{err}");
+    }
+
+    /// First-match-wins: a conditional rule the engine can NEVER reach for this
+    /// tool (an earlier rule shadows it) must not trip the check. Rejecting
+    /// here would refuse a policy whose override erases nothing.
+    #[test]
+    fn managed_override_ignores_a_conditional_rule_shadowed_by_an_earlier_one() {
+        let yaml = r#"
+name: t
+tools:
+  - match: ["Bash"]
+    action: approve
+  - match: ["Bash"]
+    action: approve
+    shell:
+      deny_regex: ["curl .* \\| sh"]
+"#;
+        let mut p = Policy::parse_yaml(yaml).expect("parses");
+        p.managed_overrides.push(ToolOverride {
+            tool: "Bash".into(),
+            action: RuleAction::Allow,
+        });
+        // The shell rule is dead for Bash — evaluate_supervised stops at rule 0.
+        p.validate()
+            .expect("only the FIRST matching rule decides conditionality");
+    }
+
+    /// The common, legitimate case must keep working: an override on a rule
+    /// carrying no paths/shell erases no constraint.
+    #[test]
+    fn managed_override_on_an_unconditional_rule_validates() {
+        let yaml = r#"
+name: t
+defaults: { tool_action: approve }
+tools:
+  - match: ["mcp__*"]
+    action: approve
+"#;
+        let mut p = Policy::parse_yaml(yaml).expect("parses");
+        p.managed_overrides.push(ToolOverride {
+            tool: "mcp__cloudflare__kv_namespaces_list".into(),
+            action: RuleAction::Allow,
+        });
+        // A tool no rule matches at all is fine too — nothing to erase.
+        p.managed_overrides.push(ToolOverride {
+            tool: "SomeNewTool".into(),
+            action: RuleAction::Deny,
+        });
+        p.validate().expect("unconditional rules take overrides");
+    }
+
+    /// A wildcard override is permanently-dead config: `evaluate_supervised`
+    /// matches overrides by exact equality, so it could only ever fire for a
+    /// tool literally named `mcp__*`. Refuse it at the door.
+    #[test]
+    fn managed_override_with_a_wildcard_tool_is_rejected() {
+        let mut p = Policy::parse_yaml("name: t\ntools: []\n").expect("parses");
+        p.managed_overrides.push(ToolOverride {
+            tool: "mcp__*".into(),
+            action: RuleAction::Allow,
+        });
+        let err = p.validate().expect_err("overrides are exact names only");
+        assert!(err.contains("wildcard"), "{err}");
+    }
+
+    /// Uniqueness is asserted in the design; `.find()` silently resolves
+    /// first-wins, which makes a second entry a lie about what is enforced.
+    #[test]
+    fn duplicate_managed_override_tools_are_rejected() {
+        let mut p = Policy::parse_yaml("name: t\ntools: []\n").expect("parses");
+        p.managed_overrides.push(ToolOverride {
+            tool: "Bash".into(),
+            action: RuleAction::Allow,
+        });
+        p.managed_overrides.push(ToolOverride {
+            tool: "Bash".into(),
+            action: RuleAction::Deny,
+        });
+        let err = p.validate().expect_err("one decision per tool");
+        assert!(err.contains("duplicate"), "{err}");
+    }
+
+    /// The seed policy is the fixture because it exercises every case.
+    #[test]
+    fn tool_matrix_of_the_seed_policy() {
+        let yaml = include_str!("../../../policies/default.yaml");
+        let p = Policy::parse_yaml(yaml).expect("seed policy parses");
+        let names: Vec<String> = [
+            "Read",
+            "Edit",
+            "Bash",
+            "WebFetch",
+            "mcp__cloudflare__kv_list",
+            "Frobnicate",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let m: std::collections::HashMap<String, ToolStatus> =
+            p.tool_matrix(&names).into_iter().collect();
+
+        // Unconditional rules are safe to control.
+        assert!(matches!(
+            m["Read"],
+            ToolStatus::Unconditional {
+                action: RuleAction::Allow,
+                ..
+            }
+        ));
+        assert!(matches!(
+            m["WebFetch"],
+            ToolStatus::Unconditional {
+                action: RuleAction::Deny,
+                ..
+            }
+        ));
+        assert!(matches!(
+            m["mcp__cloudflare__kv_list"],
+            ToolStatus::Unconditional {
+                action: RuleAction::Approve,
+                ..
+            }
+        ));
+
+        // Conditional rules must NOT be flattened: "Edit -> Allow" is false (it is
+        // allow-in-/workspace, deny-for-.env, ask-elsewhere).
+        match &m["Edit"] {
+            ToolStatus::Conditional { constraints, .. } => {
+                assert!(constraints
+                    .paths_allow
+                    .iter()
+                    .any(|g| g.contains("/workspace")));
+                assert!(constraints.paths_deny.iter().any(|g| g.contains(".env")));
+                // The third clause. `apply_rule` hardcodes an escalation for a
+                // path outside `paths_allow`; the UI must be able to SAY that
+                // without re-deriving the constant in TypeScript.
+                assert_eq!(constraints.paths_on_no_match, Some(RuleAction::Approve));
+            }
+            other => panic!("Edit must be Conditional, got {other:?}"),
+        }
+        match &m["Bash"] {
+            ToolStatus::Conditional { constraints, .. } => {
+                assert_eq!(constraints.shell_on_no_match, Some(RuleAction::Approve));
+            }
+            other => panic!("Bash must be Conditional (shell), got {other:?}"),
+        }
+
+        // Nothing matched -> defaults.tool_action.
+        assert!(matches!(
+            m["Frobnicate"],
+            ToolStatus::Default {
+                action: RuleAction::Approve
+            }
+        ));
+    }
+
+    /// `paths_on_no_match` describes a guard that only EXISTS when `allow` is
+    /// non-empty. A deny-only rule skips it and falls through to `rule.action`,
+    /// so reporting an escalation there would invent a clause the engine never
+    /// runs. Pinned against `evaluate` so the summary can't drift from the gate.
+    #[test]
+    fn deny_only_paths_report_no_escalation_because_the_guard_is_skipped() {
+        let yaml = r#"
+name: t
+defaults: { tool_action: approve }
+tools:
+  - match: ["Write"]
+    action: allow
+    paths:
+      deny: ["**/.env"]
+"#;
+        let p = Policy::parse_yaml(yaml).expect("parses");
+        let m: std::collections::HashMap<String, ToolStatus> =
+            p.tool_matrix(&["Write".to_string()]).into_iter().collect();
+        match &m["Write"] {
+            ToolStatus::Conditional { constraints, .. } => {
+                assert!(constraints.paths_allow.is_empty());
+                assert_eq!(constraints.paths_deny, vec!["**/.env".to_string()]);
+                assert_eq!(constraints.paths_on_no_match, None);
+            }
+            other => panic!("Write must be Conditional (paths), got {other:?}"),
+        }
+        // Why None is the truth: an arbitrary out-of-tree path is ALLOWED here
+        // (rule.action), never escalated — there is no "asks elsewhere" clause.
+        assert_eq!(
+            p.evaluate(
+                &req("Write", json!({ "file_path": "/etc/anywhere.txt" })),
+                Autonomy::Supervised
+            )
+            .effective,
+            Verdict::Allow
+        );
+    }
+
+    #[test]
+    fn tool_matrix_reports_overrides_over_the_underlying_status() {
+        let yaml = include_str!("../../../policies/default.yaml");
+        let mut p = Policy::parse_yaml(yaml).expect("parses");
+        p.managed_overrides.push(ToolOverride {
+            tool: "mcp__cloudflare__kv_list".into(),
+            action: RuleAction::Allow,
+        });
+        let m: std::collections::HashMap<String, ToolStatus> = p
+            .tool_matrix(&["mcp__cloudflare__kv_list".to_string()])
+            .into_iter()
+            .collect();
+        match &m["mcp__cloudflare__kv_list"] {
+            ToolStatus::Overridden { action, underlying } => {
+                assert_eq!(*action, RuleAction::Allow);
+                // The page shows what clearing the override would restore.
+                assert!(matches!(
+                    **underlying,
+                    ToolStatus::Unconditional {
+                        action: RuleAction::Approve,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected Overridden, got {other:?}"),
+        }
     }
 }
 
@@ -910,6 +1601,7 @@ mod proptests {
                     on_approval_rule,
                 },
                 tools,
+                managed_overrides: Vec::new(),
             })
     }
 

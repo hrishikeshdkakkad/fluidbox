@@ -25,7 +25,7 @@ mod state;
 mod triggers;
 mod workers;
 
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::Router;
 use state::{AppStateInner, ApprovalRegistry};
 use std::sync::Arc;
@@ -112,6 +112,11 @@ async fn main() -> anyhow::Result<()> {
             get(api::list_policies).post(api::upsert_policy),
         )
         .route("/policies/validate", post(api::validate_policy))
+        .route("/policies/{name}", get(api::get_policy))
+        .route(
+            "/policies/{name}/overrides/{tool}",
+            put(api::put_policy_override).delete(api::delete_policy_override),
+        )
         .route(
             "/sessions",
             get(api::list_sessions).post(api::create_session),
