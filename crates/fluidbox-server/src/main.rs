@@ -112,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
             get(api::list_policies).post(api::upsert_policy),
         )
         .route("/policies/validate", post(api::validate_policy))
+        .route("/policies/{name}", get(api::get_policy))
         .route(
             "/sessions",
             get(api::list_sessions).post(api::create_session),

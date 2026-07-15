@@ -546,8 +546,82 @@ pub async fn add_revision(
 // ─── Policies ─────────────────────────────────────────────────────────────
 
 pub async fn list_policies(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    let policies = fluidbox_db::list_policies(&state.pool, state.tenant_id).await?;
-    Ok(Json(json!({ "policies": policies })))
+    let rows = fluidbox_db::list_policies(&state.pool, state.tenant_id).await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let policy: Policy = serde_json::from_value(row.parsed.clone())
+            .map_err(|e| ApiError::Internal(format!("bad stored policy: {e}")))?;
+        let agents_using =
+            fluidbox_db::policy_agents_using(&state.pool, state.tenant_id, row.id).await?;
+        out.push(json!({
+            "id": row.id,
+            "name": row.name,
+            "version": row.version,
+            "updated_at": row.updated_at,
+            "autonomy_summary": policy.autonomy_summary(),
+            "agents_using": agents_using,
+        }));
+    }
+    Ok(Json(json!({ "policies": out })))
+}
+
+/// The Governance page's detail payload. The dashboard renders this verbatim —
+/// it never parses YAML and never resolves policy semantics.
+pub async fn get_policy(
+    _: Admin,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let row = fluidbox_db::get_policy_by_name(&state.pool, state.tenant_id, &name)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let policy: Policy = serde_json::from_value(row.parsed.clone())
+        .map_err(|e| ApiError::Internal(format!("bad stored policy: {e}")))?;
+
+    let mut names: Vec<String> = fluidbox_core::tools::CANONICAL
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    names.extend(fluidbox_db::policy_mcp_tools(&state.pool, state.tenant_id, row.id).await?);
+
+    let matrix: Vec<Value> = policy
+        .tool_matrix(&names)
+        .into_iter()
+        .map(|(tool, status)| {
+            let group = fluidbox_core::tools::CANONICAL
+                .iter()
+                .find(|t| t.name == tool)
+                .map(|t| serde_json::to_value(t.group).unwrap_or(Value::Null))
+                .unwrap_or(Value::Null);
+            let server = tool
+                .strip_prefix("mcp__")
+                .and_then(|r| r.split_once("__"))
+                .map(|(s, _)| s.to_string());
+            json!({
+                "tool": tool,
+                "group": group,
+                "server": server,
+                "overridable": status.is_overridable(),
+                "status": status,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "policy": {
+            "id": row.id,
+            "name": row.name,
+            "version": row.version,
+            "updated_at": row.updated_at,
+        },
+        "agents_using": fluidbox_db::policy_agents_using(&state.pool, state.tenant_id, row.id).await?,
+        "autonomy_summary": policy.autonomy_summary(),
+        "defaults": policy.defaults,
+        "budgets": policy.budgets,
+        "approvals": policy.approvals,
+        "egress": policy.egress,
+        "matrix": matrix,
+    })))
 }
 
 #[derive(Deserialize)]
