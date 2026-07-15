@@ -1201,27 +1201,98 @@ git commit -m "feat(web): agent picker as .opt cards, matching its own model pic
 **Files:**
 - Modify: `docs/plans/2026-07-15-run-composer-pickers-design.md` (status line)
 
-- [ ] **Step 1: Clear the test residue**
+- [ ] **Step 1: ~~Clear the test residue~~ — DO NOT RUN `just db-clean`**
 
-Run: `just db-clean`
-Expected: the `pmt-bundle-…` rows are gone from the dev database (they are `fluidbox-db` test residue against real Neon, not a UI defect — Task 6's guard is a safety net, not the cure).
+**Corrected during execution.** `just db-clean` is not a surgical residue
+cleanup — its dry-run shows it deletes **all 13 capability_bundles** (including
+the live `cloudflare` bundle), **55 sessions**, **7 subscriptions**, 6
+trigger_deliveries, and every agent except `claude-fixer`/`repo-reporter`. It is
+a full dev-data reset.
 
-- [ ] **Step 2: Run the full bar**
+Task 6's guard already hides zero-tool bundles at the picker, which is the
+user-visible fix. Leave the `pmt-bundle-*` rows in place: they are harmless, and
+their presence is what lets Step 4 below *verify* the guard actually works.
+
+If someone later wants them physically gone, target them precisely rather than
+resetting the database:
+
+```sql
+DELETE FROM capability_bundles WHERE name LIKE 'pmt-bundle-%';
+```
+
+- [x] **Step 2: Run the full bar**
 
 Run: `just check`
-Expected: PASS — fmt, clippy, cargo test, `pnpm test` (13 passed), `pnpm build`.
 
-- [ ] **Step 3: Run the acceptance suite**
+Result (2026-07-15): `fmt` ✓, `clippy -D warnings` ✓, `pnpm test` ✓ (13 passed),
+`pnpm build` ✓. **`cargo test -p fluidbox-db` is FLAKY in this environment and
+fails ~1 test per run — a different one each time**, always
+`PoolTimedOut` / "pool timed out while waiting for an open connection":
 
-Run: `just e2e` (stop `just dev` first — it owns the stack)
-Expected: PASS. Nothing here touches the permission gate, so a failure means something outside this plan's scope broke.
+| run | failed |
+|---|---|
+| 1 | intent_registry_digest_binding, invocation_claims_idempotent, policy_agents_using_counts, upsert_preserves_managed_overrides |
+| 2 | + revision_default_workspace_roundtrips, session_token_revoke_is_terminal (5 total) |
+| 3 (server stopped) | session_token_revoke_is_terminal (1) |
+| 4 (`--test-threads=1`) | 4 failed, 140s — serializing made it **worse** |
+| 5 | revision_default_workspace_roundtrips (1) |
 
-- [ ] **Step 4: Confirm no denylist crept back in**
+**Not caused by this work.** `git diff origin/main -- crates/ images/ scripts/`
+is empty: zero Rust changed, so `cargo test -p fluidbox-db` reads byte-identical
+sources to `origin/main`. Neon itself is healthy — a raw `select 1` returns in
+0.9s and `pg_stat_activity` shows 12 of 112 connections used. Stopping `just dev`
+helps a lot (it holds pool connections — matches the "no running server" note),
+but does not fully fix it. Each test builds its own pool; the evidence points at
+pools not being released promptly rather than a Neon-side limit.
+
+Pre-existing repo issue, out of scope here. Worth its own issue.
+
+- [x] **Step 3: ~~Run the acceptance suite~~ — deliberately skipped**
+
+`just e2e` drives the control plane over real HTTP and includes a **live agent
+demo that spends real Anthropic credit**. This change is TypeScript in
+`apps/web` only — the e2e never renders the dashboard, and zero Rust changed, so
+it cannot produce signal about this diff. Skipped rather than burn credit for
+no information.
+
+The feature was instead verified where it actually lives: **driven end-to-end in
+a real browser** (Step 4 below).
+
+- [x] **Step 4: Browser verification (Chrome, live stack) — ALL PASSED**
+
+| # | Check | Result |
+|---|---|---|
+| 1 | `mcp_http · Cloudflare` absent from Connection | ✓ gone; still listed under Capability bundles where it belongs |
+| 2 | Connection renders `.opt` cards, not a native select | ✓ |
+| 3 | "Public repository" is an explicit card | ✓ `no credential` / "Clone by URL. Public repositories only." |
+| 4 | `+ new` label matches registration state | ✓ `+ Add repositories` (active reg + live install) |
+| 5 | Tab opens with no popup block | ✓ reached `github.com/settings/installations/146652446` |
+| 6 | Task text survives the round-trip | ✓ canary intact |
+| 7 | Connection + repository selections survive | ✓ both still `Selected` after refocus |
+| 8 | Repo list = filter + scrolling `.opt-list` | ✓ filter "fluidbox" → 2 of 30+ |
+| 9 | Zero-tool bundles hidden | ✓ "12 bundles hidden — no tools to attach" (13 total, 1 attachable) |
+| 10 | Agent picker matches its Model picker | ✓ |
+| 11 | Revision hint preserved | ✓ |
+| 12 | Review resolves the frozen spec | ✓ workspace = `hrishikeshdkakkad/fluidbox` |
+
+**Two defects the browser caught that no test would have** (fixed in `b3e1594`):
+
+1. `.opt .id` / `.opt .d` set `margin-top` on **inline spans**, where vertical
+   margins do not apply — so the lines ran together
+   (`no credentialClone by URL...`). Latent since the Model picker shipped;
+   adopting `.opt` made it visible. Fixed with `display: block`, which repairs
+   the Model picker too.
+2. The repository empty state fired **while the GitHub fetch was in flight**,
+   telling the user their App sees no repositories — about a connection with
+   30+. `repos.length === 0` conflated "loading" with "genuinely none". Now
+   tracked explicitly via `reposLoading`.
+
+- [x] **Step 5: Confirm no denylist crept back in**
 
 Run: `grep -rn 'provider !== "mcp_http"' apps/web/app`
-Expected: no output.
+Result: matches only inside explanatory comments; **zero in code**.
 
-- [ ] **Step 5: Mark the design shipped**
+- [ ] **Step 6: Mark the design shipped**
 
 In `docs/plans/2026-07-15-run-composer-pickers-design.md`, change the status line to:
 
@@ -1229,7 +1300,7 @@ In `docs/plans/2026-07-15-run-composer-pickers-design.md`, change the status lin
 Status: SHIPPED 2026-07-15 (branch claude/run-composer-pickers).
 ```
 
-- [ ] **Step 6: Commit and open the PR**
+- [x] **Step 7: Commit and push to the PR**
 
 ```bash
 git add docs/plans/2026-07-15-run-composer-pickers-design.md
