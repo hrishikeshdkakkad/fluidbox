@@ -13,6 +13,7 @@ import {
   Connection,
   GithubAppRegistration,
   ingressPath,
+  isGitConnection,
 } from "../lib/api";
 import { GitHubMark, ModalShell, PageHead } from "../components/bits";
 
@@ -106,11 +107,7 @@ export default function Integrations() {
   // Revoked rows are history, not workspace (the DB keeps them).
   const visibleRegs = registrations.filter((r) => r.status !== "revoked");
   const activeRegs = visibleRegs.filter((r) => r.status === "active");
-  // Git platform connections only — mcp_http tool credentials live on the
-  // Capabilities page.
-  const gitConnections = connections.filter(
-    (c) => c.provider !== "mcp_http" && c.status !== "revoked"
-  );
+  const gitConnections = connections.filter((c) => isGitConnection(c) && c.status !== "revoked");
 
   return (
     <>
