@@ -302,6 +302,44 @@ impl Policy {
                 }
             }
         }
+        // Managed overrides. The ENGINE keeps these invariants, not the write
+        // path: an override is stored once but re-merged into EVERY later
+        // policy version, so a `paths`/`shell` constraint added to a rule
+        // afterwards would be silently erased by an override that was valid
+        // when written — a dead constraint that still DISPLAYS. Refusing the
+        // whole policy here makes that impossible to reach.
+        let mut seen: Vec<&str> = Vec::new();
+        for (i, o) in self.managed_overrides.iter().enumerate() {
+            if o.tool.contains('*') {
+                return Err(format!(
+                    "managed_overrides[{i}]: tool {:?} is a wildcard — overrides name one exact tool; a matcher here is permanently-dead config",
+                    o.tool
+                ));
+            }
+            if seen.contains(&o.tool.as_str()) {
+                return Err(format!(
+                    "managed_overrides[{i}]: duplicate override for tool {:?} — one decision per tool",
+                    o.tool
+                ));
+            }
+            seen.push(&o.tool);
+            // First-match-wins, exactly as `evaluate_supervised` walks them:
+            // only the rule the engine would actually reach decides whether
+            // this tool is conditional. A conditional rule shadowed by an
+            // earlier one is irrelevant.
+            if let Some(rule) = self
+                .tools
+                .iter()
+                .find(|r| r.r#match.iter().any(|m| tool_matches(m, &o.tool)))
+            {
+                if rule.paths.is_some() || rule.shell.is_some() {
+                    return Err(format!(
+                        "managed_overrides[{i}]: managed override for '{}' targets a conditional rule (match: {:?}) — a rule carrying paths/shell cannot be reduced to a single action; clear the override before adding path/shell constraints to that rule",
+                        o.tool, rule.r#match
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1011,6 +1049,173 @@ tools:
         let yaml = "name: t\ntools: []\n";
         let p = Policy::parse_yaml(yaml).expect("parses");
         assert!(p.managed_overrides.is_empty());
+    }
+
+    /// An override REPLACES the rule, so the replaced rule's `on_autonomous`
+    /// must not survive it: the autonomy fallback resolves to the policy
+    /// default. This is what `matched_rule = None` buys — were the override
+    /// branch to report `Some(i)`, this run would silently ALLOW.
+    #[test]
+    fn managed_override_resolves_autonomy_to_the_policy_default_not_the_replaced_rule() {
+        let yaml = r#"
+name: t
+defaults: { tool_action: approve }
+autonomy: { permitted: true, on_approval_rule: deny }
+tools:
+  - match: ["Bash"]
+    action: approve
+    on_autonomous: allow
+"#;
+        let mut p = Policy::parse_yaml(yaml).expect("parses");
+        // Baseline: the rule's own on_autonomous carries an autonomous run.
+        assert_eq!(
+            p.evaluate(&req("Bash", json!({"command": "ls"})), Autonomy::Autonomous)
+                .effective,
+            Verdict::Allow
+        );
+        // The override replaces that rule — so its on_autonomous: allow goes
+        // with it, and the policy default (deny) governs.
+        p.managed_overrides.push(ToolOverride {
+            tool: "Bash".into(),
+            action: RuleAction::Approve,
+        });
+        p.validate()
+            .expect("unconditional rule: the override is valid");
+        let out = p.evaluate(&req("Bash", json!({"command": "ls"})), Autonomy::Autonomous);
+        assert_eq!(out.matched_rule, None);
+        assert!(out.autonomy_rewritten);
+        assert!(
+            matches!(out.effective, Verdict::Deny { .. }),
+            "override must fall back to the policy default (deny), not the replaced rule's \
+             on_autonomous (allow); got {:?}",
+            out.effective
+        );
+    }
+
+    /// The engine — not the write path — keeps the conditional-rule invariant.
+    /// A `shell` constraint committed to a rule AFTER an override was stored
+    /// would otherwise never fire, silently and forever.
+    #[test]
+    fn managed_override_on_a_shell_constrained_rule_is_rejected() {
+        let yaml = r#"
+name: t
+tools:
+  - match: ["Bash"]
+    action: approve
+    shell:
+      deny_regex: ["curl .* \\| sh"]
+"#;
+        let mut p = Policy::parse_yaml(yaml).expect("parses");
+        p.managed_overrides.push(ToolOverride {
+            tool: "Bash".into(),
+            action: RuleAction::Allow,
+        });
+        let err = p.validate().expect_err("a shell rule cannot be flattened");
+        assert!(err.contains("'Bash'"), "names the tool: {err}");
+        assert!(err.contains(r#"["Bash"]"#), "names the rule: {err}");
+        assert!(err.contains("conditional rule"), "{err}");
+    }
+
+    /// Same invariant, via `paths` — and through a wildcard rule matcher, to
+    /// pin that the check uses the engine's matcher rather than equality.
+    #[test]
+    fn managed_override_on_a_paths_constrained_rule_is_rejected() {
+        let yaml = r#"
+name: t
+tools:
+  - match: ["Edit", "Write*"]
+    action: allow
+    paths:
+      allow: ["/workspace/**"]
+"#;
+        let mut p = Policy::parse_yaml(yaml).expect("parses");
+        p.managed_overrides.push(ToolOverride {
+            tool: "WriteNotebook".into(),
+            action: RuleAction::Allow,
+        });
+        let err = p.validate().expect_err("a paths rule cannot be flattened");
+        assert!(err.contains("'WriteNotebook'"), "{err}");
+        assert!(err.contains("conditional rule"), "{err}");
+    }
+
+    /// First-match-wins: a conditional rule the engine can NEVER reach for this
+    /// tool (an earlier rule shadows it) must not trip the check. Rejecting
+    /// here would refuse a policy whose override erases nothing.
+    #[test]
+    fn managed_override_ignores_a_conditional_rule_shadowed_by_an_earlier_one() {
+        let yaml = r#"
+name: t
+tools:
+  - match: ["Bash"]
+    action: approve
+  - match: ["Bash"]
+    action: approve
+    shell:
+      deny_regex: ["curl .* \\| sh"]
+"#;
+        let mut p = Policy::parse_yaml(yaml).expect("parses");
+        p.managed_overrides.push(ToolOverride {
+            tool: "Bash".into(),
+            action: RuleAction::Allow,
+        });
+        // The shell rule is dead for Bash — evaluate_supervised stops at rule 0.
+        p.validate()
+            .expect("only the FIRST matching rule decides conditionality");
+    }
+
+    /// The common, legitimate case must keep working: an override on a rule
+    /// carrying no paths/shell erases no constraint.
+    #[test]
+    fn managed_override_on_an_unconditional_rule_validates() {
+        let yaml = r#"
+name: t
+defaults: { tool_action: approve }
+tools:
+  - match: ["mcp__*"]
+    action: approve
+"#;
+        let mut p = Policy::parse_yaml(yaml).expect("parses");
+        p.managed_overrides.push(ToolOverride {
+            tool: "mcp__cloudflare__kv_namespaces_list".into(),
+            action: RuleAction::Allow,
+        });
+        // A tool no rule matches at all is fine too — nothing to erase.
+        p.managed_overrides.push(ToolOverride {
+            tool: "SomeNewTool".into(),
+            action: RuleAction::Deny,
+        });
+        p.validate().expect("unconditional rules take overrides");
+    }
+
+    /// A wildcard override is permanently-dead config: `evaluate_supervised`
+    /// matches overrides by exact equality, so it could only ever fire for a
+    /// tool literally named `mcp__*`. Refuse it at the door.
+    #[test]
+    fn managed_override_with_a_wildcard_tool_is_rejected() {
+        let mut p = Policy::parse_yaml("name: t\ntools: []\n").expect("parses");
+        p.managed_overrides.push(ToolOverride {
+            tool: "mcp__*".into(),
+            action: RuleAction::Allow,
+        });
+        let err = p.validate().expect_err("overrides are exact names only");
+        assert!(err.contains("wildcard"), "{err}");
+    }
+
+    /// Uniqueness is asserted in the design; `.find()` silently resolves
+    /// first-wins, which makes a second entry a lie about what is enforced.
+    #[test]
+    fn duplicate_managed_override_tools_are_rejected() {
+        let mut p = Policy::parse_yaml("name: t\ntools: []\n").expect("parses");
+        p.managed_overrides.push(ToolOverride {
+            tool: "Bash".into(),
+            action: RuleAction::Allow,
+        });
+        p.managed_overrides.push(ToolOverride {
+            tool: "Bash".into(),
+            action: RuleAction::Deny,
+        });
+        let err = p.validate().expect_err("one decision per tool");
+        assert!(err.contains("duplicate"), "{err}");
     }
 }
 
