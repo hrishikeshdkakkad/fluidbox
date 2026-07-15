@@ -37,7 +37,13 @@ pub struct PolicyRow {
     pub name: String,
     pub version: i32,
     pub yaml_source: String,
+    /// The EFFECTIVE policy: base yaml ++ `managed_overrides`. This — not
+    /// `managed_overrides` — is what `run_service` freezes into a RunSpec, so
+    /// every write to the overrides column must republish this.
     pub parsed: Value,
+    /// UI-owned per-tool decisions (`Vec<fluidbox_core::policy::ToolOverride>`),
+    /// kept out of the git-owned `yaml_source`. See migration 0010.
+    pub managed_overrides: Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -211,6 +217,15 @@ pub async fn ensure_default_tenant(pool: &PgPool) -> sqlx::Result<Uuid> {
 
 // ─── Policies ─────────────────────────────────────────────────────────────
 
+/// Upsert a policy's AUTHORED yaml. Existing `managed_overrides` are preserved
+/// and merged back into `parsed` — without this, the next `just policy-sync`
+/// would silently drop every decision made in the Governance page.
+///
+/// Storage primitive: it merges, it does not judge. A caller that changes the
+/// base rules under an existing override must `Policy::validate()` the merged
+/// result BEFORE calling (the API layer does), because an override targeting a
+/// rule that just grew `paths`/`shell` is invalid and cannot be caught here —
+/// `fluidbox-db` has no error type to refuse with.
 pub async fn upsert_policy(
     pool: &PgPool,
     tenant: Uuid,
@@ -223,7 +238,9 @@ pub async fn upsert_policy(
          values ($1, $2, $3, $4, $5)
          on conflict (tenant_id, name) do update
            set yaml_source = excluded.yaml_source,
-               parsed = excluded.parsed,
+               parsed = jsonb_set(
+                 excluded.parsed, '{managed_overrides}', policies.managed_overrides, true
+               ),
                version = policies.version + 1,
                updated_at = now()
          returning *",
@@ -233,6 +250,74 @@ pub async fn upsert_policy(
     .bind(name)
     .bind(yaml_source)
     .bind(parsed)
+    .fetch_one(pool)
+    .await
+}
+
+/// Upsert ONE exact-name override, replacing any existing decision for that
+/// tool. Bumps `version` and republishes `parsed`.
+pub async fn set_policy_override(
+    pool: &PgPool,
+    tenant: Uuid,
+    name: &str,
+    tool: &str,
+    action: fluidbox_core::policy::RuleAction,
+) -> sqlx::Result<PolicyRow> {
+    let entry = serde_json::json!([{ "tool": tool, "action": action }]);
+    write_policy_overrides(pool, tenant, name, tool, &entry).await
+}
+
+/// Remove ONE override; the tool falls back to whatever the base rules say.
+/// Bumps `version` and republishes `parsed`.
+pub async fn clear_policy_override(
+    pool: &PgPool,
+    tenant: Uuid,
+    name: &str,
+    tool: &str,
+) -> sqlx::Result<PolicyRow> {
+    write_policy_overrides(pool, tenant, name, tool, &serde_json::json!([])).await
+}
+
+/// Drop every override for `tool`, then append `append` (a jsonb ARRAY — one
+/// entry to set, empty to clear). Set and clear are the same write: filter out
+/// the tool's old decision, optionally add the new one.
+///
+/// ONE statement, because `parsed` and `managed_overrides` disagreeing — even
+/// between two round-trips — means a run evaluating a policy that no longer
+/// exists. `run_service` reads `parsed`; an override written only to the column
+/// would look saved in the UI and never fire.
+async fn write_policy_overrides(
+    pool: &PgPool,
+    tenant: Uuid,
+    name: &str,
+    tool: &str,
+    append: &Value,
+) -> sqlx::Result<PolicyRow> {
+    sqlx::query_as(
+        "with target as (
+           select id,
+                  coalesce(
+                    (select jsonb_agg(e)
+                       from jsonb_array_elements(managed_overrides) e
+                      where e->>'tool' <> $3),
+                    '[]'::jsonb
+                  ) || $4::jsonb as overrides
+             from policies
+            where tenant_id = $1 and name = $2
+         )
+         update policies p
+            set managed_overrides = t.overrides,
+                parsed = jsonb_set(p.parsed, '{managed_overrides}', t.overrides, true),
+                version = p.version + 1,
+                updated_at = now()
+           from target t
+          where p.id = t.id
+         returning p.*",
+    )
+    .bind(tenant)
+    .bind(name)
+    .bind(tool)
+    .bind(append)
     .fetch_one(pool)
     .await
 }
@@ -4051,5 +4136,88 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+    }
+
+    /// `just policy-sync` force-pushes the AUTHORED yaml. It must not take the
+    /// Governance page's per-tool decisions with it — and `parsed` (what
+    /// `run_service` actually evaluates) must carry them on every write.
+    #[tokio::test]
+    async fn upsert_preserves_managed_overrides() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let yaml = "name: ov-test\ntools: []\n";
+        let policy = fluidbox_core::policy::Policy::parse_yaml(yaml).unwrap();
+        let parsed = serde_json::to_value(&policy).unwrap();
+        upsert_policy(&pool, tenant, "ov-test", yaml, &parsed)
+            .await
+            .unwrap();
+        // Reset any override left behind by a previous (or crashed) run.
+        clear_policy_override(&pool, tenant, "ov-test", "mcp__x__y")
+            .await
+            .unwrap();
+
+        set_policy_override(
+            &pool,
+            tenant,
+            "ov-test",
+            "mcp__x__y",
+            fluidbox_core::policy::RuleAction::Allow,
+        )
+        .await
+        .unwrap();
+
+        // A policy-sync re-push of the SAME yaml must not drop the override.
+        let row = upsert_policy(&pool, tenant, "ov-test", yaml, &parsed)
+            .await
+            .unwrap();
+        let overrides: Vec<fluidbox_core::policy::ToolOverride> =
+            serde_json::from_value(row.managed_overrides.clone()).unwrap();
+        assert_eq!(overrides.len(), 1, "policy-sync dropped the override");
+        assert_eq!(overrides[0].tool, "mcp__x__y");
+
+        // …and `parsed` must carry it, because run_service evaluates from `parsed`.
+        let effective: fluidbox_core::policy::Policy =
+            serde_json::from_value(row.parsed.clone()).unwrap();
+        assert_eq!(effective.managed_overrides.len(), 1);
+        assert_eq!(
+            effective.managed_overrides[0].action,
+            fluidbox_core::policy::RuleAction::Allow
+        );
+
+        // Re-setting the SAME tool replaces, never duplicates.
+        let row = set_policy_override(
+            &pool,
+            tenant,
+            "ov-test",
+            "mcp__x__y",
+            fluidbox_core::policy::RuleAction::Deny,
+        )
+        .await
+        .unwrap();
+        let effective: fluidbox_core::policy::Policy =
+            serde_json::from_value(row.parsed.clone()).unwrap();
+        assert_eq!(effective.managed_overrides.len(), 1);
+        assert_eq!(
+            effective.managed_overrides[0].action,
+            fluidbox_core::policy::RuleAction::Deny
+        );
+
+        clear_policy_override(&pool, tenant, "ov-test", "mcp__x__y")
+            .await
+            .unwrap();
+        let row = get_policy_by_name(&pool, tenant, "ov-test")
+            .await
+            .unwrap()
+            .unwrap();
+        let effective: fluidbox_core::policy::Policy =
+            serde_json::from_value(row.parsed.clone()).unwrap();
+        assert!(effective.managed_overrides.is_empty());
+        let overrides: Vec<fluidbox_core::policy::ToolOverride> =
+            serde_json::from_value(row.managed_overrides.clone()).unwrap();
+        assert!(overrides.is_empty());
     }
 }
