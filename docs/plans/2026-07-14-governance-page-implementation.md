@@ -255,10 +255,22 @@ tools:
   - match: ["WebFetch"]
     action: deny
     on_autonomous: deny
+  # reachable via paths.allow escalation (apply_rule hardcodes Approve) -> COUNTED
+  - match: ["Write"]
+    action: allow
+    paths: { allow: ["/workspace/**"] }
+    on_autonomous: allow
+  # shell short-circuits apply_rule, so paths is dead here; on_no_match is
+  # allow-not-approve and action is allow -> NOT counted (guards overcounting)
+  - match: ["BashOutput"]
+    action: allow
+    shell: { on_no_match: allow }
+    paths: { allow: ["/workspace/**"] }
+    on_autonomous: allow
 "#;
     let p = Policy::parse_yaml(yaml).expect("parses");
     let s = p.autonomy_summary();
-    assert_eq!(s.allow_overrides, 2, "Bash (shell on_no_match) + mcp__* (action)");
+    assert_eq!(s.allow_overrides, 3, "Bash (shell on_no_match) + mcp__* (action) + Write (paths.allow)");
     assert_eq!(s.deny_overrides, 0, "the deny override sits on an unreachable rule");
 }
 ```
@@ -286,16 +298,24 @@ pub struct AutonomySummary {
     pub deny_overrides: usize,
 }
 
-/// Can this rule ever produce a RequireApproval verdict? Mirrors `apply_rule`:
-/// the verdict comes from `rule.action` OR, for shell-constrained rules, from
-/// `shell.on_no_match`. A rule with an unconditional allow/deny action can
-/// never approve, so an `on_autonomous` on it is dead config.
+/// Can this rule ever produce a RequireApproval verdict? Mirrors the THREE
+/// routes in `apply_rule`. A rule that can never approve makes its
+/// `on_autonomous` dead config — counting it would claim an exception that can
+/// never fire.
 fn can_require_approval(rule: &ToolRule) -> bool {
+    // Shell constraints short-circuit apply_rule: it returns from inside that
+    // branch on every path, so `paths` is dead for a shell rule. Returning
+    // early (not OR-ing all three) is what stops a rule carrying BOTH from
+    // being overcounted.
+    if let Some(sh) = &rule.shell {
+        return rule.action == RuleAction::Approve || sh.on_no_match == RuleAction::Approve;
+    }
+    // A non-empty paths.allow escalates out-of-tree paths to a human via a
+    // HARDCODED Approve in apply_rule, whatever the rule's action says.
+    if rule.paths.as_ref().is_some_and(|p| !p.allow.is_empty()) {
+        return true;
+    }
     rule.action == RuleAction::Approve
-        || rule
-            .shell
-            .as_ref()
-            .is_some_and(|s| s.on_no_match == RuleAction::Approve)
 }
 ```
 

@@ -191,19 +191,38 @@ pub struct AutonomySummary {
 }
 ```
 
-`*_overrides` count only rules that can actually reach `RequireApproval`, mirroring
-`apply_rule`:
+`*_overrides` count only rules that can actually reach `RequireApproval`. There are
+**three** routes in `apply_rule`, and the mirror must cover all of them:
 
 ```rust
-rule.action == RuleAction::Approve
-  || rule.shell.as_ref().is_some_and(|s| s.on_no_match == RuleAction::Approve)
+fn can_require_approval(rule: &ToolRule) -> bool {
+    // Shell constraints short-circuit apply_rule — it returns from inside that
+    // branch on every path, so `paths` is dead for a shell rule. Returning early
+    // (rather than OR-ing all three) is what stops a rule carrying BOTH from
+    // being overcounted.
+    if let Some(sh) = &rule.shell {
+        return rule.action == RuleAction::Approve || sh.on_no_match == RuleAction::Approve;
+    }
+    // A non-empty paths.allow escalates out-of-tree paths to a human via a
+    // HARDCODED Approve in apply_rule, whatever the rule's action says.
+    if rule.paths.as_ref().is_some_and(|p| !p.allow.is_empty()) {
+        return true;
+    }
+    rule.action == RuleAction::Approve
+}
 ```
 
-A rule carrying `on_autonomous` under an unconditional `allow`/`deny` action is dead config
-and is not counted — counting it would claim an exception that can never fire. The seed
-policy's `Bash` rule (`action: allow` + `shell.on_no_match: approve`) is exactly why the
-naive `action == Approve` test is wrong: it would miss an `on_autonomous` added there,
-undercounting in the dangerous direction.
+A rule carrying `on_autonomous` under a genuinely unconditional `allow`/`deny` is dead
+config and is not counted — counting it would claim an exception that can never fire.
+
+The seed policy contains **both** traps. Its `Bash` rule (`action: allow` +
+`shell.on_no_match: approve`) is why a naive `action == Approve` test is wrong. Its `Edit`
+rule (`action: allow` + `paths.allow: ["/workspace/**"]`) is why covering only `action` and
+`shell` is *still* wrong: `apply_rule` returns a hardcoded `finish(RuleAction::Approve,
+Some(rule), …)` for an out-of-tree path, so an `on_autonomous: allow` there would silently
+auto-permit writes outside the workspace on an unattended run while the page reported "no
+exceptions". Both misses undercount in the dangerous direction. (Caught in review,
+2026-07-14 — the two-route version shipped and was corrected in `c52a47b`.)
 
 ### 4.4 Which tools the page shows
 
