@@ -291,7 +291,6 @@ pub fn spawn_netpol_gate(state: AppState) {
         let sandbox_ns =
             std::env::var("FLUIDBOX_K8S_NAMESPACE").unwrap_or_else(|_| "fluidbox-sandboxes".into());
 
-        let mut tick = tokio::time::interval(Duration::from_secs(6 * 3600));
         loop {
             let internal_ip =
                 fluidbox_provider_k8s::netpol::resolve_service_clusterip(&ns, &internal_svc)
@@ -321,13 +320,19 @@ pub fn spawn_netpol_gate(state: AppState) {
                         tracing::warn!("netpol gate: NOT verified ({r:?}) — runs blocked");
                     }
                 }
-                _ => tracing::warn!(
-                    "netpol gate: could not resolve Service ClusterIPs; runs stay gated"
-                ),
+                _ => {
+                    // Fail closed like the probe branch: an unresolvable
+                    // Service is NOT continued proof of enforcement — a
+                    // previously-true gate must not coast on stale evidence.
+                    state.netpol_verified.store(false, Ordering::SeqCst);
+                    tracing::warn!(
+                        "netpol gate: could not resolve Service ClusterIPs; runs stay gated"
+                    );
+                }
             }
             // Once enforced, re-check every 6h; while unverified, retry sooner.
             if state.netpol_verified.load(Ordering::SeqCst) {
-                tick.tick().await;
+                tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
             } else {
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }

@@ -84,9 +84,17 @@ impl KubernetesProvider {
     /// reused the name. Foreground propagation reaps the Secret via its
     /// ownerReference. Idempotent (404 = already gone).
     async fn delete_pod(&self, name: &str, uid: Option<&str>) -> Result<(), ProviderError> {
+        // L10: a delete without a UID precondition could remove a same-named
+        // pod that is not ours. Handles always carry UIDs today — refuse the
+        // unguarded form rather than ever racing a name reuse.
+        let Some(uid) = uid else {
+            return Err(ProviderError::Other(format!(
+                "refusing unguarded delete of pod {name}: no uid precondition"
+            )));
+        };
         let dp = DeleteParams {
-            preconditions: uid.map(|u| Preconditions {
-                uid: Some(u.to_string()),
+            preconditions: Some(Preconditions {
+                uid: Some(uid.to_string()),
                 resource_version: None,
             }),
             propagation_policy: Some(PropagationPolicy::Foreground),
@@ -308,6 +316,18 @@ impl ExecutionProvider for KubernetesProvider {
             });
         };
         let name = &handle.external_id;
+
+        // L10 defense-in-depth: the pod behind this name must still be OUR
+        // object before we exec into it — `state()` UID-guards and maps a
+        // mismatched/absent pod to Unknown.
+        if let Ok(SandboxStatus::Unknown { reason }) = self.state(handle).await {
+            return Ok(CollectedArtifacts::Missing {
+                reason: format!(
+                    "pod identity unverified before collection: {}",
+                    reason.unwrap_or_else(|| "unknown".into())
+                ),
+            });
+        }
 
         // Compute the diff in the collector container (pristine baseline +
         // final worktree, scrubbed git), then stream the finished file.
