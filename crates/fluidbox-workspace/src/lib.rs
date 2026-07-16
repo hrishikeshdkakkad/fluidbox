@@ -1,12 +1,32 @@
-//! Control-plane-side workspace materialization and diff capture.
+//! fluidbox-workspace — the workspace lifecycle both execution providers
+//! share: control-plane-side materialization, the pristine `.git` baseline,
+//! and hardened terminal diff collection.
 //!
-//! This runs during the session's `initializing` phase, BEFORE the agent
-//! starts. The credentialed fetch (git URL) never happens inside the
-//! sandbox — the agent only ever sees a copy bind-mounted at /workspace.
+//! Materialization runs during the session's `initializing` phase, BEFORE
+//! the agent starts. The credentialed fetch (git URL) never happens inside
+//! the sandbox — the agent only ever sees a copy of the tree.
+//!
+//! Collection (see [`collect`]) NEVER executes git against agent-controlled
+//! `.git` state, on any provider: it reconstructs a throwaway repository
+//! from the pristine baseline saved here at materialization time.
+//!
+//! This crate deliberately has no bollard/kube dependencies (it is shared
+//! by every provider), and `fluidbox-core` stays I/O-free (git subprocess
+//! I/O lives here — settled Q13 of the 2026-07-15 design).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use uuid::Uuid;
+
+pub mod collect;
+
+pub use collect::{collect_diff, CollectedDiff, CollectionOutcome, DiffCaps};
+
+/// Directory (under the per-session workspace root) holding the pristine
+/// copy of the materialized `.git` — saved before the agent ever runs,
+/// never mounted into the sandbox, and the ONLY `.git` state collection
+/// will execute against.
+pub const BASELINE_DIR: &str = "baseline-git";
 
 pub struct MaterializedWorkspace {
     pub host_dir: PathBuf,
@@ -81,6 +101,26 @@ fn count_files(dir: &Path) -> u64 {
     n
 }
 
+pub fn session_workspace_root(data_dir: &Path, session: Uuid) -> PathBuf {
+    data_dir.join("workspaces").join(session.to_string())
+}
+
+/// Save the pristine baseline: a full copy of the just-materialized `.git`,
+/// beside the workspace (outside anything a sandbox ever sees). Collection
+/// reconstructs its throwaway repo from THIS, so agent mutations to the
+/// workspace's own `.git` (config, hooks, attributes) are never executed.
+fn save_pristine_baseline(repo: &Path) -> Result<(), WorkspaceError> {
+    let root = repo
+        .parent()
+        .ok_or_else(|| WorkspaceError::Invalid("workspace repo has no parent".into()))?;
+    let baseline = root.join(BASELINE_DIR);
+    if baseline.exists() {
+        std::fs::remove_dir_all(&baseline)?;
+    }
+    copy_dir_all(&repo.join(".git"), &baseline)?;
+    Ok(())
+}
+
 /// Materialize a local directory into an isolated per-session workspace.
 /// Uses a git-tracked copy so we can diff at the end; the original tree is
 /// never touched.
@@ -92,10 +132,7 @@ pub fn materialize_local(
     if !source.exists() {
         return Err(WorkspaceError::NoSource(source.display().to_string()));
     }
-    let dest = data_dir
-        .join("workspaces")
-        .join(session.to_string())
-        .join("repo");
+    let dest = session_workspace_root(data_dir, session).join("repo");
     std::fs::create_dir_all(&dest)?;
 
     // Copy contents (excluding any existing .git so we control history).
@@ -123,15 +160,13 @@ pub fn materialize_local(
     );
     let base_commit = run_git(&dest, &["rev-parse", "HEAD"]).ok();
 
+    save_pristine_baseline(&dest)?;
+
     Ok(MaterializedWorkspace {
         file_count: count_files(&dest),
         host_dir: dest,
         base_commit,
     })
-}
-
-fn session_workspace_root(data_dir: &Path, session: Uuid) -> PathBuf {
-    data_dir.join("workspaces").join(session.to_string())
 }
 
 fn validate_clone_url(url: &str) -> Result<(), WorkspaceError> {
@@ -277,6 +312,9 @@ fn fetch_and_checkout(
     let _ = std::fs::write(dest.join(".git/info/exclude"), LOCAL_EXCLUDES);
 
     let base_commit = run_git(dest, &["rev-parse", "HEAD"]).ok();
+
+    save_pristine_baseline(dest)?;
+
     Ok(MaterializedWorkspace {
         file_count: count_files(dest),
         host_dir: dest.to_path_buf(),
@@ -284,8 +322,9 @@ fn fetch_and_checkout(
     })
 }
 
-/// Remove a session's workspace directory. Idempotent: missing dir is fine.
-/// Only ever touches `<data_dir>/workspaces/<session>` by construction.
+/// Remove a session's workspace directory (repo + baseline + collection
+/// scratch). Idempotent: missing dir is fine. Only ever touches
+/// `<data_dir>/workspaces/<session>` by construction.
 pub fn cleanup_workspace(data_dir: &Path, session: Uuid) -> Result<(), WorkspaceError> {
     let root = session_workspace_root(data_dir, session);
     match std::fs::remove_dir_all(&root) {
@@ -293,20 +332,6 @@ pub fn cleanup_workspace(data_dir: &Path, session: Uuid) -> Result<(), Workspace
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
     }
-}
-
-/// Capture the agent's changes as a binary-safe unified diff artifact.
-pub fn capture_diff(host_dir: &Path, base_commit: Option<&str>) -> Result<String, WorkspaceError> {
-    // Stage everything the agent produced, then diff against the base.
-    run_git(host_dir, &["add", "-A"])?;
-    let base = base_commit.unwrap_or("HEAD");
-    // Use --binary so the diff can be applied; --no-color for a clean artifact.
-    let diff = run_git(host_dir, &["diff", "--binary", "--no-color", base])?;
-    if !diff.is_empty() {
-        return Ok(diff);
-    }
-    // Fall back to a cached diff (in case the agent already committed).
-    run_git(host_dir, &["diff", "--binary", "--no-color", base, "HEAD"])
 }
 
 fn copy_tree(src: &Path, dst: &Path) -> Result<(), WorkspaceError> {
@@ -321,6 +346,28 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(), WorkspaceError> {
         if from.is_dir() {
             std::fs::create_dir_all(&to)?;
             copy_tree(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Full recursive copy INCLUDING dotfiles and `.git` internals (used for the
+/// baseline). Symlinks are not followed (skipped): the baseline only needs
+/// git's own object/ref/config files, which git never writes as symlinks.
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), WorkspaceError> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let meta = std::fs::symlink_metadata(&from)?;
+        if meta.is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            copy_dir_all(&from, &to)?;
         } else {
             std::fs::copy(&from, &to)?;
         }
@@ -353,6 +400,17 @@ mod tests {
         (format!("file://{}", src.display()), first, head)
     }
 
+    fn collect(ws: &MaterializedWorkspace, base: Option<&str>) -> CollectionOutcome {
+        collect_diff(ws.host_dir.parent().unwrap(), base, &DiffCaps::default())
+    }
+
+    fn diff_of(out: CollectionOutcome) -> String {
+        match out {
+            CollectionOutcome::Diff(d) => d.patch,
+            CollectionOutcome::Missing { reason } => panic!("expected diff, missing: {reason}"),
+        }
+    }
+
     #[test]
     fn materialize_git_default_head() {
         let tmp = std::env::temp_dir().join(format!("fbx-git-test-{}", Uuid::now_v7()));
@@ -368,10 +426,18 @@ mod tests {
         );
         // The sandbox copy has no remote to push to.
         assert_eq!(run_git(&ws.host_dir, &["remote"]).unwrap(), "");
+        // The pristine baseline exists beside the repo.
+        assert!(ws
+            .host_dir
+            .parent()
+            .unwrap()
+            .join(BASELINE_DIR)
+            .join("HEAD")
+            .exists());
 
-        // Diff capture works over the real cloned history.
+        // Diff capture works over the pristine baseline.
         std::fs::write(ws.host_dir.join("a.txt"), "three\n").unwrap();
-        let diff = capture_diff(&ws.host_dir, ws.base_commit.as_deref()).unwrap();
+        let diff = diff_of(collect(&ws, ws.base_commit.as_deref()));
         assert!(diff.contains("three"));
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -514,7 +580,7 @@ mod tests {
         std::fs::write(ws.host_dir.join("a.txt"), "hello world\n").unwrap();
         std::fs::write(ws.host_dir.join("b.txt"), "new\n").unwrap();
 
-        let diff = capture_diff(&ws.host_dir, ws.base_commit.as_deref()).unwrap();
+        let diff = diff_of(collect(&ws, ws.base_commit.as_deref()));
         assert!(diff.contains("a.txt"));
         assert!(diff.contains("b.txt"));
         assert!(diff.contains("hello world"));

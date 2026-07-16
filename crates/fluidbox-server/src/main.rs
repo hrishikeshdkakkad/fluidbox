@@ -27,10 +27,25 @@ mod workers;
 
 use axum::routing::{get, post, put};
 use axum::Router;
+use fluidbox_core::traits::ExecutionProvider;
 use state::{AppStateInner, ApprovalRegistry};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
+
+/// Select the execution backend from `FLUIDBOX_PROVIDER` (default `docker`).
+/// Dual-provider permanence (settled Q17): Docker is always available; the
+/// Kubernetes provider is added beside it in Phase 1.
+fn build_provider(cfg: &config::Config) -> anyhow::Result<Arc<dyn ExecutionProvider>> {
+    match cfg.provider.as_str() {
+        "docker" => Ok(Arc::new(fluidbox_provider::DockerProvider::connect(
+            cfg.data_dir.clone(),
+        )?)),
+        other => anyhow::bail!(
+            "FLUIDBOX_PROVIDER='{other}' is not available in this build (known: docker)"
+        ),
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -62,9 +77,14 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    let provider = fluidbox_provider::DockerProvider::connect()?;
-    if let Err(e) = provider.ping().await {
-        tracing::warn!("docker ping failed ({e}); sandboxes will not launch until docker is up");
+    let provider = build_provider(&cfg)?;
+    if let Err(e) = provider.healthcheck().await {
+        tracing::warn!(
+            "provider '{}' health probe failed ({e}); sandboxes will not launch until it is reachable",
+            provider.runtime_name()
+        );
+    } else {
+        tracing::info!("execution provider: {}", provider.runtime_name());
     }
 
     let events_tx = fluidbox_db::spawn_listener(cfg.database_url.clone());
@@ -82,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
     let state: state::AppState = Arc::new(AppStateInner {
         tenant_id: seed.tenant_id,
         redactor: fluidbox_core::event::Redactor::default(),
-        provider: Arc::new(provider),
+        provider,
         approvals: ApprovalRegistry::default(),
         events_tx,
         http: reqwest::Client::builder()
