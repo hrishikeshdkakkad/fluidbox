@@ -870,13 +870,20 @@ pub async fn result(
     {
         // TOCTOU: a racing driver may have terminalized (revoking the token)
         // after our status read — a lost-response /result retry must get its
-        // idempotent 200, never a fatal 401 the runner treats as failure.
-        if let Ok(Some(s)) = fluidbox_db::get_session(&state.pool, session_id).await {
-            if s.status_enum().is_terminal() {
+        // idempotent 200. Unknown state must be RETRYABLE (503): the runner
+        // treats 4xx as final, so a transient read error returned as 401
+        // would convert a completed run into a runner-side failure.
+        match fluidbox_db::get_session(&state.pool, session_id).await {
+            Ok(Some(s)) if s.status_enum().is_terminal() => {
                 return Ok(Json(json!({ "ok": true, "note": "already terminal" })));
             }
+            Ok(_) => return Err(ApiError::Unauthorized),
+            Err(_) => {
+                return Err(ApiError::ServiceUnavailable(
+                    "session state unavailable; retry".into(),
+                ))
+            }
         }
-        return Err(ApiError::Unauthorized);
     }
     // Persist the finalization intent BEFORE ACKing — and NEVER ACK success
     // when it did not persist: the runner exits on ok:true, and with no

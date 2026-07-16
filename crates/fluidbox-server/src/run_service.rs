@@ -169,20 +169,38 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
                         // The replacement must not proceed unless the old
                         // run's cancellation durably persisted: a healthy old
                         // run with no wall-clock budget would otherwise
-                        // coexist with its replacement indefinitely. The
-                        // caller (webhook/scheduler retry) re-invokes.
-                        if orchestrator::cancel(
-                            state,
-                            s.id,
-                            "replaced by a newer invocation of this subscription",
-                        )
-                        .await
-                            == orchestrator::FinalizeStart::DbError
-                        {
-                            return Err(crate::error::ApiError::ServiceUnavailable(format!(
-                                "could not persist cancellation of running session {} for replace; retry",
+                        // coexist with its replacement indefinitely. Retry
+                        // the transient case inline; if it still will not
+                        // persist, record a SKIP — the vocabulary schedulers
+                        // and event dispatch already handle — rather than an
+                        // error they would treat as a permanently lost
+                        // firing.
+                        let mut persisted = false;
+                        for _ in 0..3u32 {
+                            match orchestrator::cancel(
+                                state,
+                                s.id,
+                                "replaced by a newer invocation of this subscription",
+                            )
+                            .await
+                            {
+                                orchestrator::FinalizeStart::DbError => {
+                                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                }
+                                _ => {
+                                    persisted = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !persisted {
+                            tracing::warn!(
+                                "replace: cancel intent for {} not persisted; skipping this invocation",
                                 s.id
-                            )));
+                            );
+                            return Ok(RunCreation::SkippedOverlap {
+                                running_session_id: s.id,
+                            });
                         }
                     }
                 }
