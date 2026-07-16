@@ -14,6 +14,8 @@ on:
       - "deploy/helm/**"
       - "deploy/workspaced.Dockerfile"
       - ".github/workflows/k8s.yml"
+      - ".github/k8s-ci-postgres.yaml"
+      - ".github/kind-calico.yaml"
   schedule:
     - cron: "0 7 * * *"   # nightly heavy tier
   workflow_dispatch: {}
@@ -60,27 +62,42 @@ jobs:
           for i in fluidbox-workspaced:dev fluidbox-server:dev fluidbox-sandbox-runner:dev; do
             kind load docker-image --name fluidbox "$i"
           done
+      - name: in-cluster Postgres (throwaway) — the server migrates on boot
+        run: |
+          # A stub DATABASE_URL leaves the server in CrashLoopBackOff and masks
+          # every later assertion; the tier needs a real database behind the
+          # readiness probe. Ephemeral postgres:16, emptyDir, CI-only.
+          kubectl create namespace fluidbox
+          kubectl apply -f .github/k8s-ci-postgres.yaml
+          kubectl -n fluidbox rollout status deploy/postgres --timeout=180s
       - name: install chart + a throwaway credential Secret
         run: |
-          kubectl create namespace fluidbox
           kubectl -n fluidbox create secret generic fluidbox-secrets \
-            --from-literal=DATABASE_URL=postgres://stub \
+            --from-literal=DATABASE_URL="postgres://fluidbox:fluidbox-ci@postgres.fluidbox.svc.cluster.local:5432/fluidbox?sslmode=disable" \
             --from-literal=FLUIDBOX_ADMIN_TOKEN=ci-admin \
             --from-literal=FLUIDBOX_CREDENTIAL_KEY="$(printf 'ab%.0s' {1..32})" \
             --from-literal=LITELLM_MASTER_KEY=ci \
             --from-literal=ANTHROPIC_API_KEY=ci
+          # --wait gates on the server readiness probe (/v1/health) — a red
+          # install must FAIL this step, never be masked.
           helm install fluidbox deploy/helm/fluidbox -n fluidbox \
             -f deploy/helm/fluidbox/values/kind.yaml \
             --set web.enabled=false --set litellm.enabled=false \
-            --wait --timeout 120s || true
+            --wait --timeout 300s
       - name: netpol enforcement probe (the P3 assertion) — must PASS on Calico
         run: |
           # Both Services back a healthy server pod, so reachability is known
-          # independently of policy; the probe proves +:8788 / -:8787.
-          helm test fluidbox -n fluidbox --timeout 120s
+          # independently of policy; the probe proves +:8788 / -:8787. Targets
+          # are resolved at test time by the resolver Job (fresh-install safe).
+          helm test fluidbox -n fluidbox --timeout 300s
       - name: dump on failure
         if: failure()
         run: |
           kubectl -n fluidbox get pods,svc,networkpolicy -o wide || true
-          kubectl -n fluidbox-sandboxes get pods,networkpolicy -o wide || true
+          kubectl -n fluidbox-sandboxes get pods,networkpolicy,configmaps -o wide || true
+          kubectl -n fluidbox get events --sort-by=.lastTimestamp | tail -40 || true
           kubectl -n fluidbox logs deploy/fluidbox-fluidbox-server --tail=100 || true
+          kubectl -n fluidbox logs deploy/postgres --tail=30 || true
+          kubectl -n fluidbox logs job/fluidbox-fluidbox-netpol-resolver --tail=50 || true
+          kubectl -n fluidbox-sandboxes logs fluidbox-fluidbox-netpol-probe --tail=50 || true
+          kubectl -n fluidbox-sandboxes describe pod fluidbox-fluidbox-netpol-probe || true

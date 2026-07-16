@@ -11,7 +11,7 @@ Status legend: `[ ]` open · `[x]` fixed · `[-]` won't fix (record why)
 
 ## High severity (merge blockers)
 
-- [ ] **H1. The kind-calico CI tier has never passed — two independent causes.**
+- [x] **H1. The kind-calico CI tier has never passed — two independent causes.** *(fixed: fix/k8s-ci-green — in-cluster postgres:16 + `--wait` without `|| true`; probe targets resolved at test time by a resolver Job → ConfigMap → env)*
   Evidence: all runs of `k8s.yml` red at the probe step, incl. PR #47's latest (run 29483550211: server `CrashLoopBackOff`, "failed to lookup address information"; probe pod `Error`).
   - (a) `.github/workflows/k8s.yml:87` seeds `DATABASE_URL=postgres://stub` → server exits on DNS → no ready endpoints → positive probe leg can never connect; `helm install … || true` masks the install timeout.
   - (b) `deploy/helm/fluidbox/templates/tests/netpol-probe.yaml:14-15` resolves ClusterIPs via `lookup` at **install render time**; Helm stores rendered test hooks in the release and `helm test` re-executes them without re-rendering → on a fresh install both IPs are baked empty and the probe exits 1 before testing anything.
