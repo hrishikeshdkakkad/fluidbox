@@ -1,7 +1,7 @@
 # fluidbox — multi-user MCP control plane and brokered sandbox design
 
 **Date:** 2026-07-14  
-**Status:** FINALIZED v2 (2026-07-14) after joint adversarial review by Claude (Fable 5) and Codex (GPT-5.6-sol, max reasoning); current brokered-MCP foundation exists, multi-user tenancy is not implemented  
+**Status:** FINALIZED v3 (2026-07-16) — v2 after joint adversarial review by Claude (Fable 5) and Codex (GPT-5.6-sol, max reasoning), v3 after an independent post-finalization review (Claude, Fable 5) re-verifying every current-state claim against the code and the ratified MCP `2025-11-25` changelog; current brokered-MCP foundation exists, multi-user tenancy is not implemented  
 **Audience:** fluidbox maintainers, security reviewers, and engineers implementing hosted multi-user support  
 **Relationship to other docs:** `PLAN.md` remains authoritative for product invariants and milestone direction. `docs/ARCHITECTURE.md` describes the current run path. `docs/guides/capabilities.md` documents the currently shipped capability-bundle behavior. This document defines the target connection, tenancy, and MCP-session architecture for a hosted deployment with approximately 300 users.
 
@@ -225,7 +225,10 @@ whether a probed tool exists in its frozen set):
 8. waits for or applies the approval decision;
 9. takes the execution claim, conditional on the session still being
    nonterminal (target state; see Gap 11);
-10. rechecks the connection's live status, generation, and owner membership;
+10. rechecks the connection's live status (current — the broker fresh-reads
+    the row and refuses non-`active`; `broker.rs`), plus its authorization
+    generation and owner membership (target state — neither field exists
+    yet; Phases B/C);
 11. resolves the credential; and
 12. calls upstream `tools/call`.
 
@@ -256,6 +259,12 @@ It contains no user credential and grants no authority.
 
 Catalog data remains untrusted reference data. A catalog entry being displayed or marked curated does not bypass connection verification, tool-schema validation, policy, or approval.
 
+Migration note: today's `connector_catalog` is a global, tenant-less table
+whose custom rows were admitted by the single boot tenant. Hosted bring-up
+backfills every existing custom row to a concrete owning tenant (curated
+rows stay global); a custom row that cannot be attributed is disabled,
+never inherited by every tenant.
+
 ### Connection
 
 Scope: one organization or one user inside an organization.
@@ -284,6 +293,8 @@ Required identity and authority fields:
 
 `authorization_generation` changes when reconnecting would change the logical account, issuer, audience, or grant. Ordinary refresh-token rotation remains inside the same generation.
 
+**Generation determination is fail-closed.** Deciding "same account" requires a positively proven external account identity, and arbitrary MCP servers are not obligated to expose one. When identity cannot be proven identical across a reauthorization, the generation bumps — in-flight runs bound to the old generation fail closed. "Probably the same account" never preserves a generation.
+
 ### Connection tool snapshot
 
 Scope: one version of one connection's discovered surface.
@@ -299,6 +310,12 @@ Required fields:
     discovered_at
 
 Snapshots are append-only. Reauthorization or a deliberate refresh may create a new snapshot, but an in-flight run never gains newly advertised tools.
+
+Binding may enforce an optional per-connector or per-tenant maximum snapshot
+age; a too-stale snapshot fails binding visibly ("refresh required") rather
+than resolving against a surface the upstream may long since have changed.
+The default is no age limit — staleness is a UX concern, not a safety one,
+because a vanished tool already fails visibly at call time.
 
 ### Fate of capability bundles (settled)
 
@@ -408,6 +425,11 @@ The binding's authority source is a tagged union — a nullable
                                          #   repo, open destination) — never
                                          #   an implicit missing value
 
+`subscription_secret` authorities version too: rotating a subscription's
+signing or callback secret bumps its `authority_generation` exactly as a
+connection reauthorization does — invariant 7 spans every credential-bearing
+authority kind, not only connections.
+
 Required fields:
 
     tenant_id
@@ -422,7 +444,13 @@ Required fields:
     connection_tool_snapshot_version   # mcp slots only
     effective_tools_json               # mcp slots only
     effective_tools_digest             # mcp slots only
-    resource_scope     # frozen repo/ref/target/destination for this slot
+    resource_scope     # frozen repo/ref/target/destination for this slot.
+                       #   workspace_fetch / result_publish: mechanically
+                       #   enforced on every use. mcp: records the
+                       #   connection's frozen resource_selection and is
+                       #   enforced by the upstream grant — fluidbox never
+                       #   re-derives resources from tool arguments (that
+                       #   is the policy layer's job)
     resolved_by_principal_kind  # user | trigger | schedule | webhook | system
     resolved_by_principal_id
     binding_mode
@@ -440,6 +468,11 @@ Suggested key:
 
     tenant_id + run_id + run_resource_binding_id + server_id
 
+(`server_id` earns its place only where a connector definition's endpoint
+template fans one connection out to multiple concrete servers; for
+single-endpoint connectors it is redundant with the binding — harmless, and
+kept for the templated case.)
+
 Contains:
 
 - negotiated protocol version;
@@ -448,7 +481,7 @@ Contains:
 - creation and expiry timestamps; and
 - worker ownership or routing metadata if server-to-client streaming is supported.
 
-An upstream MCP session must never be shared across users or runs. HTTP/TLS connection pools may be shared because they are transport optimization, not authorization or MCP session state.
+An upstream MCP session must never be shared across users or runs. HTTP/TLS connection pools may be shared only because nothing identity-bearing rides them — a requirement (invariant 22), not an observation: shared clients disable cookie stores and any connection-scoped authentication caching. One upstream `Set-Cookie` landing in a shared jar would turn "transport optimization" into cross-tenant session state.
 
 ## Binding rules
 
@@ -536,7 +569,10 @@ The model, approval handler, and broker may not dynamically replace a run's reso
   connection. Self-approval is allowed within these rules; four-eyes approval
   can later be a policy option.
 - `approver`, `admin`, and `owner` roles receive `approval.decide_org`: they
-  may approve visible runs using organization-owned connections.
+  may approve visible runs whose call authority is an organization-owned
+  connection or a `subscription_secret` — every non-personal arm of the
+  authority union. `approval.decide_org` implies `runs.read_all`: a role
+  whose purpose is deciding approvals can always see the run it must judge.
 - No tenant role — including admin — implicitly authorizes positive approval
   under another user's **personal** connection. Since unattended personal
   delegation is omitted in v1, Bob can never approve a call executing under
@@ -550,9 +586,11 @@ The model, approval handler, and broker may not dynamically replace a run's reso
 
 Every session, event, artifact, approval, and SSE query enforces `run.read`:
 users can read their own runs; trigger principals only the runs created by
-that exact token; subscription managers their subscription's runs; and
-memberships with `runs.read_all` all tenant runs. Connection ownership and
-agent authorship alone do not grant timeline access.
+that exact token; holders of `subscriptions.manage` (admin and owner by
+default) the runs of subscriptions they manage; and memberships with
+`runs.read_all` — which `approval.decide_org` implies — all tenant runs.
+Connection ownership and agent authorship alone do not grant timeline
+access.
 
 ## Personal connection example
 
@@ -584,8 +622,8 @@ A nightly schedule using this agent cannot use an `invoking_user` rule because n
 4. It discovers authorization-server metadata through RFC 8414 or OIDC.
 5. It resolves a pre-registered, CIMD, or DCR OAuth client identity.
 6. It creates authorization-code + PKCE parameters with RFC 8707 `resource=`.
-7. The opaque state binds tenant, initiating user, connection, PKCE verifier, redirect URI, nonce, and expiry.
-8. The callback consumes that state exactly once.
+7. The opaque state binds tenant, initiating user, connection, PKCE verifier, redirect URI, nonce, expiry, and the initiating browser session (per-flow cookie; see below).
+8. The callback consumes that state exactly once — and only from the browser that initiated the flow.
 9. The control plane exchanges the code and seals the rotating refresh token.
 10. It initializes an MCP client and photographs `tools/list`.
 11. The connection becomes active.
@@ -605,6 +643,18 @@ start-time closes
 authorization-server mix-up attacks and discovery-change races between start
 and callback.
 
+**The callback must also prove the completing browser started the flow.**
+One-time consumption alone does not stop cross-user grant injection: an
+attacker starts Connect on their own pending connection, lures a victim into
+consenting on the authorization server, and the victim's browser completes
+the attacker's flow — sealing the victim's refresh token into the attacker's
+connection. The flow completed exactly once, just by the wrong human. Reuse
+the GitHub App flows' defense verbatim: a per-flow `HttpOnly` cookie minted
+at start whose hash sits inside the one-time claim predicate — a leaked
+authorization URL can then neither complete nor burn the flow — and show the
+connected external account for human confirmation before the connection
+activates.
+
 ### OAuth client identity versus user grant
 
 OAuth client registration and end-user grants are different objects.
@@ -622,7 +672,7 @@ Per-tenant OAuth client registrations provide stronger blast-radius isolation bu
 
 ### Machine-to-machine authorization
 
-Organization service connections may use the MCP OAuth client-credentials extension when supported. Prefer asymmetric JWT assertions when mature and interoperable; support client secrets only as a compatibility path.
+Organization service connections may use the MCP OAuth client-credentials extension (SEP-1046) where the upstream supports it — noting SEP-1046 is not part of the ratified `2025-11-25` revision, so by this design's own no-candidate-semantics rule (Gap 8) that work is gated on ratification status. Prefer asymmetric JWT assertions when mature and interoperable; support client secrets only as a compatibility path.
 
 ### Token rotation
 
@@ -649,7 +699,9 @@ secret access:
   applicable");
 - that the invoking principal — or the triggering subscription/token
   authority — is still valid before new privileged work;
-- the exact frozen resource scope for that slot; and
+- the exact frozen resource scope for that slot (mechanically for
+  `workspace_fetch`/`result_publish`; for `mcp` the scope records the
+  frozen resource_selection, enforced by the upstream grant); and
 - tenant ownership.
 
 Revoking a connection immediately prevents future secret reads and fails active-run calls visibly.
@@ -765,6 +817,8 @@ Required controls:
 - route through an egress proxy or network firewall;
 - bind credentials to canonical resource URI and base path;
 - restrict custom headers so they cannot overwrite MCP transport headers;
+- keep shared HTTP clients ambient-state-free — no cookie jar, no cached
+  per-host authentication (invariant 22);
 - rate-limit per tenant, user, connection, and upstream host;
 - circuit-break unhealthy upstreams; and
 - log destination identity and digest without tokens or payloads.
@@ -848,10 +902,20 @@ upstream and execute a write multiple times.
 Require a durable execution record keyed by
 `(tenant_id, run_id, tool_call_id, input_digest)` with states:
 
-    claimed → succeeded | failed_before_send | ambiguous
+    claimed → succeeded | failed_upstream | failed_before_send | ambiguous
+
+`succeeded` and `failed_upstream` are both completed dispatches with a
+definitive upstream outcome — `failed_upstream` is a real response proving
+execution was attempted and rejected (an HTTP error status, JSON-RPC error,
+or `isError` result). Classifying a definitive upstream failure as
+`ambiguous` is wrong (the outcome is proven); as `failed_before_send`,
+false (it was sent).
 
 - Only the claim winner may send upstream; duplicates wait for or return the
-  stored result/status.
+  stored outcome. Every terminal claim durably stores at least status,
+  result digest, and `isError` — the duplicate-return contract depends on
+  it; faithful replay of sensitive result bodies may additionally use
+  encrypted short-lived storage.
 - The guarantee is **at most one fluidbox dispatch attempt** per claim —
   true exactly-once side effects are not achievable over MCP; ambiguity is
   surfaced, never hidden.
@@ -860,18 +924,26 @@ Require a durable execution record keyed by
   (e.g., a durable pre-send/dispatch boundary). `failed_before_send`
   requires that positive proof; it is never inferred.
 - An `ambiguous` outcome is never automatically reclaimed.
+- `failed_before_send` IS re-claimable — the positive never-sent proof is
+  exactly what makes a fresh dispatch attempt safe. `succeeded` and
+  `failed_upstream` are terminal; duplicates adopt the stored outcome,
+  never re-execute.
 - The claim is taken **conditional on the session still being nonterminal**,
   in the same transaction/row-lock order as cancellation — a run cancelled
   or budget-terminated during a minutes-long approval wait must not execute
   when the approval finally lands. Once a request is in flight, cancellation
   cannot guarantee recall; ledger that case explicitly.
-- If faithful response replay is required, sensitive successful results may
-  need encrypted short-lived storage.
 
 Arguments are validated server-side against the frozen input schema (with
 depth/size/resource bounds; external `$ref` resolution rejected — only
 self-contained local references) before trust-tier and policy evaluation.
-The sandbox is untrusted; model-side validation proves nothing.
+The validator selects its JSON Schema dialect from the snapshot's negotiated
+protocol version (`2025-11-25` defaults to JSON Schema 2020-12, SEP-1613); a
+`2025-06-18`-era snapshot is never validated under 2020-12 semantics. A
+schema rejection is ledgered as a gate denial but surfaces to the model as a
+tool-execution-error-shaped result (SEP-1303), so the harness self-corrects
+instead of stalling on a protocol error. The sandbox is untrusted;
+model-side validation proves nothing.
 
 ### Retry semantics
 
@@ -879,6 +951,7 @@ MCP `tools/call` does not generally guarantee exactly-once side effects.
 
 - Never blind-retry a call after an ambiguous network failure.
 - A reactive retry after HTTP 401 is safe only because authentication rejection proves the tool did not execute.
+- An insufficient-scope challenge (`WWW-Authenticate`, SEP-835 incremental consent) is terminal for the call and marks the connection "reconnect with more scopes" for its owner. The broker never auto-escalates a frozen grant.
 - Use upstream idempotency keys when a connector/tool explicitly supports them.
 - Ledger ambiguous outcomes as such and let policy, user, or model decide whether to retry.
 
@@ -950,6 +1023,9 @@ optimizations only.
    missed-notification backstop. The canonical `approval.decided` ledger
    event is emitted once — by the decision transaction or a uniquely keyed
    transactional outbox — never independently by each awakened waiter.
+   (Today each waiter emits its own copy, so two handlers re-attached to
+   one pending row already double-ledger inside a single process — a
+   current bug the outbox fixes, not merely a multi-replica concern.)
 2. **Orchestrator single-status-writer.** Use a claim/lease column —
    `orchestrator_owner_id`, `orchestrator_lease_until`, monotonically
    increasing `orchestrator_epoch` — not a Postgres advisory lock (tied to
@@ -1078,7 +1154,12 @@ Required for hosted multi-tenant use:
 - per-tenant data-encryption keys or an equivalent isolation boundary;
 - key versioning and rotation;
 - auditable decrypt permission;
-- broker-only decrypt role; and
+- broker-only decrypt role;
+- an explicit re-seal migration off `FLUIDBOX_CREDENTIAL_KEY`: dual-read
+  (legacy-unseal, KMS-reseal) over every sealed row — connections, GitHub
+  App private keys, webhook and subscription delivery secrets — resumable,
+  count-parity verified, the legacy key retired only after 100% re-seal
+  (rotating the key without this step orphans every stored credential); and
 - tested disaster recovery.
 
 ### Gap 6: local-dev network mode
@@ -1110,7 +1191,10 @@ Required:
 - redirect validation;
 - DNS rebinding protection;
 - egress proxy;
-- private-endpoint admission policy; and
+- private-endpoint admission policy;
+- the same IP/redirect/DNS validation applied to workspace clone URLs — a
+  credentialless (`authority: none`) fetch of a "public" repo still
+  executes from the control plane and is still egress; and
 - tenant-specific destination allowlists where needed.
 
 ### Gap 8: minimal/stateless-first MCP client
@@ -1137,6 +1221,9 @@ Required (the 2025-11-25 conformance contract):
   scanner is not one);
 - validate HTTP content types, JSON-RPC versions/IDs, and negotiated server
   capabilities;
+- select the JSON Schema dialect for all frozen-schema validation from the
+  snapshot's protocol version (`2025-11-25` ⇒ JSON Schema 2020-12,
+  SEP-1613);
 - respond with JSON-RPC errors to unsupported server requests rather than
   silently ignoring requests that may block the server;
 - preserve `outputSchema` and `structuredContent`, or explicitly reject
@@ -1201,7 +1288,9 @@ Current state:
 
 Required: server-side argument validation against the frozen schema with
 depth/size bounds and no external `$ref` resolution, before trust-tier and
-policy evaluation.
+policy evaluation; the dialect selected by the snapshot's protocol version;
+rejections surfaced to the model as tool-execution errors (SEP-1303), never
+protocol errors.
 
 ### Gap 13: process-local lifecycle and delivery workers
 
@@ -1254,10 +1343,15 @@ The following are release-blocking invariants:
 19. Sandbox credentials are audience-scoped; the runner-control credential
     is unreachable from agent-executed code.
 20. OAuth state is a one-time server-side record bound to issuer, client,
-    resource, tenant, user, and PKCE context — never a stateless sealed
-    value.
+    resource, tenant, user, PKCE context, and the initiating browser
+    session (per-flow cookie hash inside the claim predicate) — never a
+    stateless sealed value, and never completable by a browser that did
+    not start the flow.
 21. Workspace fetch and result publishing resolve through run resource
     bindings, never a connection ID carried in user-controlled input.
+22. Shared upstream HTTP transport carries no ambient state — no cookie
+    jars, no cached per-host authentication; every request's authority
+    comes from its binding resolution alone.
 
 ## Implementation sequence
 
@@ -1327,7 +1421,9 @@ Implement:
 - personal/org/explicit binding modes;
 - capability-bundle migration (bundles retained for sandbox tools only;
   legacy brokered attachments rediscovered into snapshots; pinned
-  subscriptions repointed; historical RunSpecs untouched); and
+  subscriptions repointed; historical RunSpecs untouched);
+- connector-catalog custom-row tenant backfill (curated rows stay global;
+  unattributable custom rows are disabled); and
 - connection-use authorization UI.
 
 Acceptance:
@@ -1350,21 +1446,30 @@ Implement:
 - reusable OAuth client registration objects;
 - one-time server-side OAuth state rows binding issuer, endpoints/metadata
   digest, client registration, resource, tenant, user, connection,
-  generation, the encrypted PKCE verifier + S256 challenge, nonce, and
-  expiry;
+  generation, the encrypted PKCE verifier + S256 challenge, nonce, expiry,
+  and the initiating browser session (per-flow HttpOnly cookie hash inside
+  the claim predicate, exactly as the GitHub App flows already do);
 - distributed refresh serialization;
 - atomic refresh-token rotation;
 - generation-aware token caches;
 - revoke and membership-change eviction;
+- the legacy-key → KMS re-seal migration (dual-read, resumable,
+  count-parity verified);
 - per-tenant LiteLLM virtual keys (master key confined to provisioning); and
-- machine-to-machine organization connections.
+- machine-to-machine organization connections (gated on SEP-1046
+  ratification).
 
 Acceptance:
 
 - concurrent refresh from multiple replicas produces one valid rotation;
 - revoke prevents cache hits and secret reads immediately;
 - callback cannot activate another user's connection;
-- connection account change increments generation; and
+- a callback completed by a browser that did not initiate the flow fails
+  closed and does not burn the state row;
+- connection account change increments generation — as does any
+  reauthorization whose account identity cannot be proven identical;
+- every legacy-sealed credential is re-sealed under KMS with count parity
+  before the legacy key is retired; and
 - old-generation active runs fail closed.
 
 ### Phase E — broker and network hardening
@@ -1378,8 +1483,10 @@ Implement:
 - SSRF-safe endpoint validation;
 - per-run MCP session manager and the 2025-11-25 conformance contract
   (Gap 8);
-- server-side argument-schema enforcement (Gap 12);
-- durable execution claims with nonterminal-session condition (Gap 11);
+- server-side argument-schema enforcement (Gap 12; dialect per snapshot,
+  SEP-1303 error surfacing);
+- durable execution claims with the nonterminal-session condition and the
+  four-state outcome model (Gap 11);
 - approval `pg_notify` wakeups, orchestrator leases with epoch fencing, and
   delivery claims (Gap 13);
 - per-run LLM budget reservation (Gap 14);
@@ -1395,6 +1502,10 @@ Acceptance:
 - authorization is included on every upstream request;
 - denied calls never initialize or contact the upstream server;
 - no write call is blindly replayed after timeout;
+- a definitive upstream error lands as `failed_upstream`, never `ambiguous`,
+  and only `failed_before_send` is ever re-claimed;
+- an insufficient-scope challenge fails the call and marks the connection
+  for reconnect without automatic scope escalation;
 - a duplicated allowed intent results in **at most one fluidbox dispatch
   attempt**, with ambiguity explicit and never silently retried;
 - a run cancelled during an approval wait never executes the late-approved
@@ -1578,6 +1689,48 @@ This design is complete when the following sentence is mechanically true:
 > A shared fluidbox agent can be invoked by any authorized user or trigger, while every MCP call, workspace fetch, and result publish is executed through the exact personal, delegated, organization, subscription-secret, or explicitly credentialless authority frozen into that run's resource bindings; the sandbox receives only the permitted tool interface and result — never a remote credential, a connection identity, or direct external network authority. Each MCP execution claim causes at most one fluidbox dispatch attempt, with ambiguity surfaced rather than retried; result publishing remains at-least-once, made safe by provider idempotency, deterministic-marker reconciliation, or receiver dedup.
 
 ## Revision history
+
+**v3 (2026-07-16)** — independent post-finalization review (Claude, Fable 5).
+Every v2 current-state claim was re-verified against the code (all accurate;
+one mislabel fixed) and against the ratified MCP `2025-11-25` changelog.
+Changes:
+
+- OAuth connect callbacks bind to the initiating browser session — a
+  per-flow `HttpOnly` cookie whose hash sits inside the one-time state
+  claim predicate, as the GitHub App flows already do — closing cross-user
+  grant injection (an attacker-initiated flow completed by a lured victim
+  would otherwise seal the victim's refresh token into the attacker's
+  connection). Invariant 20 extended; Phase D updated.
+- Generation determination made fail-closed: a reauthorization whose
+  external account identity cannot be positively proven identical always
+  bumps `authorization_generation`.
+- Execution claims gained a fourth terminal state (`failed_upstream` — a
+  definitive upstream error is a completed dispatch, not ambiguity),
+  explicit reclaim semantics (`failed_before_send` re-claimable, terminal
+  states never), and a mandatory stored-outcome minimum (status, result
+  digest, `isError`).
+- Approval RBAC covers `subscription_secret` authorities via
+  `approval.decide_org`, which now implies `runs.read_all`; "subscription
+  managers" defined as `subscriptions.manage` holders; subscription-secret
+  rotation bumps its `authority_generation` (invariant 7 coverage).
+- Two missing migrations added: connector-catalog custom-row tenant
+  backfill (Phase C) and the legacy-key → KMS re-seal path (Phase D) —
+  without the latter, the Phase D cutover orphans every sealed credential.
+- Shared upstream HTTP transport must be ambient-state-free (no cookie
+  jars, no cached per-host authentication) — new invariant 22.
+- `2025-11-25` alignment: JSON Schema dialect selected per snapshot
+  protocol version (SEP-1613); schema rejections surface as tool-execution
+  errors (SEP-1303); insufficient-scope challenges (SEP-835) are terminal
+  reconnect signals, never auto-escalation; M2M client-credentials
+  explicitly gated on SEP-1046 ratification (not in the ratified revision).
+- `resource_scope` semantics split by slot kind: mechanical enforcement for
+  `workspace_fetch`/`result_publish`; a grant-enforced record for `mcp`.
+- Current-state fix: gate step 10 rechecks only live connection status
+  today; generation and owner-membership rechecks are target state.
+- Smaller: optional snapshot max-age at binding, clone-URL egress
+  validation for `authority: none` fetches, `server_id` justified for
+  templated endpoints only, duplicate `approval.decided` emission noted as
+  a current single-process bug the outbox fixes.
 
 **v2 (2026-07-14)** — joint adversarial review by Claude (Fable 5) and Codex
 (GPT-5.6-sol, max reasoning). All current-state claims were verified against
