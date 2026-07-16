@@ -52,7 +52,21 @@ pub struct Config {
     /// Feeds the OAuth redirect_uri and the CIMD client_id document — both
     /// are fetched by parties that can't use host.docker.internal.
     pub public_url: String,
+    /// Execution backend: `docker` (default) or `kubernetes`. Selects which
+    /// `ExecutionProvider` `AppState.provider` holds. Dual-provider permanence
+    /// (settled Q17): Docker is never replaced.
+    pub provider: String,
+    /// Sandbox network mode, config-derived instead of hardcoded
+    /// (`host-dev` default; `hardened` = zero external egress). Was pinned to
+    /// HostDev at `orchestrator.rs:150`.
+    pub network_mode: fluidbox_core::traits::NetworkMode,
 }
+
+/// Serialized runner-env ceiling: env injection is the v1 config channel
+/// (authenticated fetch is the designated v1.1 follow-up), and Kubernetes
+/// caps a Secret/env at ~1 MiB. 512 KiB leaves headroom and fails a bloated
+/// run closed at zero model spend rather than at an opaque kubelet error.
+pub const MAX_RUNNER_ENV_BYTES: usize = 512 * 1024;
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
@@ -104,6 +118,13 @@ impl Config {
                 .unwrap_or_else(|_| "http://127.0.0.1:8787".into())
                 .trim_end_matches('/')
                 .to_string(),
+            provider: get("FLUIDBOX_PROVIDER")
+                .unwrap_or_else(|_| "docker".into())
+                .to_lowercase(),
+            network_mode: get("FLUIDBOX_NETWORK_MODE")
+                .ok()
+                .and_then(|s| fluidbox_core::traits::NetworkMode::parse(&s.to_lowercase()))
+                .unwrap_or_default(),
         })
     }
 }

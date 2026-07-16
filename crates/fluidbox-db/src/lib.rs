@@ -1762,6 +1762,168 @@ pub async fn heartbeat(pool: &PgPool, id: Uuid) -> sqlx::Result<()> {
     Ok(())
 }
 
+// ─── Durable finalization intent (K8s design 2026-07-15, migration 0011) ──
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FinalizationRow {
+    pub session_id: Uuid,
+    pub outcome: String,
+    pub summary: Option<String>,
+    pub reason: Option<String>,
+    pub needs_quiesce: bool,
+    pub quiesce_deadline: Option<DateTime<Utc>>,
+    pub claimed_at: Option<DateTime<Utc>>,
+    pub attempts: i32,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Persist the intent to finalize a session (idempotent). Returns true iff
+/// THIS call created the row — the first writer wins the outcome; a racing
+/// second caller (e.g. /result and the wall-clock sweeper firing together)
+/// gets false and defers to the recorded intent.
+#[allow(clippy::too_many_arguments)]
+pub async fn begin_finalization(
+    pool: &PgPool,
+    session: Uuid,
+    outcome: &str,
+    summary: Option<&str>,
+    reason: Option<&str>,
+    needs_quiesce: bool,
+    quiesce_deadline: Option<DateTime<Utc>>,
+) -> sqlx::Result<bool> {
+    let r = sqlx::query(
+        "insert into session_finalizations
+           (session_id, outcome, summary, reason, needs_quiesce, quiesce_deadline)
+         values ($1,$2,$3,$4,$5,$6)
+         on conflict (session_id) do nothing",
+    )
+    .bind(session)
+    .bind(outcome)
+    .bind(summary)
+    .bind(reason)
+    .bind(needs_quiesce)
+    .bind(quiesce_deadline)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected() == 1)
+}
+
+pub async fn get_finalization(
+    pool: &PgPool,
+    session: Uuid,
+) -> sqlx::Result<Option<FinalizationRow>> {
+    sqlx::query_as("select * from session_finalizations where session_id = $1")
+        .bind(session)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Claim a finalization for driving: succeeds when the row is unclaimed OR its
+/// claim went stale (the previous driver crashed). Bumps `attempts` and stamps
+/// `claimed_at`. A concurrent driver that loses the CAS gets None and backs
+/// off — the finalizing→terminal transition is the ultimate single-winner
+/// gate regardless, so a double-claim can never double-finalize.
+pub async fn claim_finalization(
+    pool: &PgPool,
+    session: Uuid,
+    stale_secs: i64,
+) -> sqlx::Result<Option<FinalizationRow>> {
+    sqlx::query_as(
+        "update session_finalizations
+            set claimed_at = now(), attempts = attempts + 1
+          where session_id = $1
+            and (claimed_at is null or claimed_at < now() - make_interval(secs => $2))
+          returning *",
+    )
+    .bind(session)
+    .bind(stale_secs as f64)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Sessions with a persisted finalization intent whose session is still
+/// winding down (cancelling/finalizing) — the restart-recovery + orphan sweep
+/// worklist. Ordered oldest-first so a backlog drains fairly.
+pub async fn pending_finalizations(pool: &PgPool) -> sqlx::Result<Vec<Uuid>> {
+    let rows: Vec<(Uuid,)> = sqlx::query_as(
+        "select f.session_id from session_finalizations f
+           join sessions s on s.id = f.session_id
+          where s.status in ('cancelling','finalizing')
+          order by f.created_at asc",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+pub async fn delete_finalization(pool: &PgPool, session: Uuid) -> sqlx::Result<()> {
+    sqlx::query("delete from session_finalizations where session_id = $1")
+        .bind(session)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// ─── Cross-replica OAuth refresh serialization (K8s design 2026-07-15) ─────
+
+/// Stable 64-bit advisory-lock key from a connection id. Postgres advisory
+/// locks are keyed on `bigint`; we fold the uuid's leading 8 bytes.
+pub fn oauth_lock_key(connection_id: Uuid) -> i64 {
+    let b = connection_id.as_bytes();
+    i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+}
+
+/// Take a transaction-scoped Postgres advisory lock keyed on a connection id,
+/// on `tx`. Serializes OAuth refresh-token rotation ACROSS control-plane
+/// replicas (a second replica can no longer double-rotate a refresh token
+/// into `invalid_grant`) — replacing reliance on the in-process mutex. The
+/// lock releases automatically when `tx` is committed or dropped, so the
+/// caller holds `tx` across the refresh HTTP round-trip and the rotation
+/// write, then commits.
+pub async fn acquire_oauth_lock(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    connection_id: Uuid,
+) -> sqlx::Result<()> {
+    sqlx::query("select pg_advisory_xact_lock($1)")
+        .bind(oauth_lock_key(connection_id))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Idempotent artifact write: a crash-retry during finalization must not
+/// accumulate duplicate diff rows. Replaces any existing (session, kind, name).
+pub async fn upsert_artifact(
+    pool: &PgPool,
+    session: Uuid,
+    kind: &str,
+    name: &str,
+    content: &str,
+    content_type: &str,
+) -> sqlx::Result<ArtifactRow> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("delete from artifacts where session_id = $1 and kind = $2 and name = $3")
+        .bind(session)
+        .bind(kind)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+    let row: ArtifactRow = sqlx::query_as(
+        "insert into artifacts (id, session_id, kind, name, content, content_type)
+         values ($1,$2,$3,$4,$5,$6) returning *",
+    )
+    .bind(Uuid::now_v7())
+    .bind(session)
+    .bind(kind)
+    .bind(name)
+    .bind(content)
+    .bind(content_type)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
 // ─── Events (append-only; Redacted enforced at the type level) ────────────
 
 pub async fn append_event(pool: &PgPool, event: Redacted<EventEnvelope>) -> sqlx::Result<i64> {
