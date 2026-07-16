@@ -96,7 +96,16 @@ async fn main() -> anyhow::Result<()> {
         if let (Some(svc), Some(ns)) = (&cfg.internal_service, &cfg.internal_service_namespace) {
             match fluidbox_provider_k8s::netpol::resolve_service_clusterip(ns, svc).await {
                 Ok(Some(ip)) => {
-                    cfg.public_control_url = format!("http://{ip}:8788");
+                    // Port derives from the internal bind (never hardcoded);
+                    // IPv6 ClusterIPs need brackets in a URL authority.
+                    let port = cfg
+                        .internal_bind
+                        .rsplit(':')
+                        .next()
+                        .unwrap_or("8788")
+                        .to_string();
+                    let host = if ip.contains(':') { format!("[{ip}]") } else { ip };
+                    cfg.public_control_url = format!("http://{host}:{port}");
                     tracing::info!("resolved internal control URL: {}", cfg.public_control_url);
                 }
                 _ => tracing::warn!(
@@ -286,11 +295,16 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
-    // Public listener (:8787) — /v1 + oauth + well-known, AND /internal for the
-    // single-host Docker path (bearer auth separates the planes there).
-    let public_app = Router::new()
-        .nest("/v1", public)
-        .nest("/internal", internal.clone())
+    // Public listener (:8787) — /v1 + oauth + well-known. /internal rides it
+    // ONLY on the single-host Docker path (bearer auth separates the planes
+    // there). On Kubernetes the sandbox plane is exclusively the :8788
+    // listener: route absence is stronger than bearer auth, and a chart
+    // Ingress routing '/' must never expose /internal to the internet (M8).
+    let mut public_root = Router::new().nest("/v1", public);
+    if !is_k8s {
+        public_root = public_root.nest("/internal", internal.clone());
+    }
+    let public_app = public_root
         // CIMD (spec 2025-11-25): this document's URL IS our OAuth
         // client_id; authorization servers fetch it — public by nature.
         .route("/.well-known/fluidbox-client.json", get(oauth::cimd_doc))
