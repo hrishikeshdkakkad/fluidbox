@@ -1,0 +1,16 @@
+apiVersion: v2
+name: fluidbox
+description: A control plane that runs AI coding agents in governed, disposable Kubernetes sandboxes
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/hrishikeshdkakkad/fluidbox
+sources:
+  - https://github.com/hrishikeshdkakkad/fluidbox
+keywords:
+  - ai-agents
+  - sandbox
+  - governance
+  - kubernetes
+maintainers:
+  - name: Hrishikesh Kakkad

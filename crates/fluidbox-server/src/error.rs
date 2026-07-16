@@ -19,6 +19,10 @@ pub enum ApiError {
     /// unreachable — the caller's request was fine. 502, not 400.
     #[error("{0}")]
     Upstream(String),
+    /// The control plane isn't ready to admit the request yet (e.g. the
+    /// Kubernetes netpol enforcement probe hasn't passed). 503.
+    #[error("{0}")]
+    ServiceUnavailable(String),
     #[error(transparent)]
     Db(#[from] sqlx::Error),
     #[error("{0}")]
@@ -36,6 +40,7 @@ impl IntoResponse for ApiError {
                 (StatusCode::UNPROCESSABLE_ENTITY, self.to_string())
             }
             ApiError::Upstream(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
+            ApiError::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             ApiError::Db(e) => {
                 tracing::error!("db error: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())

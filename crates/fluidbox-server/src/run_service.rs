@@ -69,6 +69,21 @@ pub enum RunCreation {
 }
 
 pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreation> {
+    // Netpol run-gate (Kubernetes): refuse to admit a run until the CNI is
+    // proven to enforce NetworkPolicy. Fails closed — a non-enforcing cluster
+    // never runs an agent with unverified sandbox isolation.
+    if state.cfg.require_enforced_netpol
+        && !state
+            .netpol_verified
+            .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(ApiError::ServiceUnavailable(
+            "sandbox network isolation is not yet verified on this cluster — \
+             runs are blocked until the NetworkPolicy enforcement probe passes"
+                .into(),
+        ));
+    }
+
     // Resolve agent by id or name.
     let agent = match Uuid::parse_str(&req.agent) {
         Ok(id) => fluidbox_db::get_agent(&state.pool, id).await?,

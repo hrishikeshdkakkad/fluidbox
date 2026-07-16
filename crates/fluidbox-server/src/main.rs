@@ -83,6 +83,25 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
+    let mut cfg = cfg;
+    // Kubernetes zeroEgress: the runner reaches the control plane by the
+    // internal Service's ClusterIP (no DNS). Resolve it at boot and override
+    // the control URL, unless one was set explicitly.
+    let is_k8s = matches!(cfg.provider.as_str(), "kubernetes" | "k8s");
+    if is_k8s && std::env::var("FLUIDBOX_PUBLIC_CONTROL_URL").is_err() {
+        if let (Some(svc), Some(ns)) = (&cfg.internal_service, &cfg.internal_service_namespace) {
+            match fluidbox_provider_k8s::netpol::resolve_service_clusterip(ns, svc).await {
+                Ok(Some(ip)) => {
+                    cfg.public_control_url = format!("http://{ip}:8788");
+                    tracing::info!("resolved internal control URL: {}", cfg.public_control_url);
+                }
+                _ => tracing::warn!(
+                    "could not resolve internal Service {svc} ClusterIP; runner control URL may need DNS"
+                ),
+            }
+        }
+    }
+
     let provider = build_provider(&cfg).await?;
     if let Err(e) = provider.healthcheck().await {
         tracing::warn!(
@@ -117,6 +136,9 @@ async fn main() -> anyhow::Result<()> {
         sealer,
         connector_tokens: Default::default(),
         oauth_locks: Default::default(),
+        // Docker needs no netpol gate; Kubernetes starts unverified and the
+        // worker below flips it once the CNI is proven to enforce policy.
+        netpol_verified: std::sync::atomic::AtomicBool::new(!is_k8s),
         pool,
         cfg,
     });
@@ -124,6 +146,9 @@ async fn main() -> anyhow::Result<()> {
     // Boot-time housekeeping + background workers.
     workers::boot_orphan_sweep(state.clone()).await;
     workers::spawn_all(state.clone());
+    if is_k8s {
+        workers::spawn_netpol_gate(state.clone());
+    }
     deliveries::spawn_worker(state.clone());
     scheduler::spawn_worker(state.clone());
 

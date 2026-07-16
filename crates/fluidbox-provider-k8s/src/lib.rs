@@ -30,6 +30,7 @@ use uuid::Uuid;
 
 pub mod config;
 pub mod manifest;
+pub mod netpol;
 
 use config::K8sConfig;
 use manifest::{
