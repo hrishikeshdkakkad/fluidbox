@@ -1734,6 +1734,24 @@ a.row:hover,
 .pill.awaiting_approval .dot {
   background: var(--amber);
 }
+/* Wind-down states: the run is finishing (collecting its diff) or cancelling.
+   Amber like awaiting_approval, with the running dot's pulse to read as
+   in-progress rather than terminal. */
+.pill.cancelling,
+.pill.finalizing {
+  color: var(--amber);
+}
+.pill.cancelling .dot,
+.pill.finalizing .dot {
+  background: var(--amber);
+  animation: blink 1.4s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pill.cancelling .dot,
+  .pill.finalizing .dot {
+    animation: none;
+  }
+}
 .pill.completed {
   color: var(--green);
 }

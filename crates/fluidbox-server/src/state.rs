@@ -1,7 +1,7 @@
 use crate::config::Config;
 use chrono::{DateTime, Utc};
 use fluidbox_core::event::Redactor;
-use fluidbox_provider::DockerProvider;
+use fluidbox_core::traits::ExecutionProvider;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,7 +41,10 @@ pub struct AppStateInner {
     pub pool: PgPool,
     pub tenant_id: Uuid,
     pub redactor: Redactor,
-    pub provider: Arc<DockerProvider>,
+    /// The active execution backend (Docker default, Kubernetes optional) —
+    /// a trait object so `FLUIDBOX_PROVIDER` selects at boot without any call
+    /// site knowing which backend it drives.
+    pub provider: Arc<dyn ExecutionProvider>,
     pub approvals: ApprovalRegistry,
     /// LISTEN/NOTIFY wakeups (session_id, seq) for SSE fanout.
     pub events_tx: broadcast::Sender<(Uuid, i64)>,

@@ -271,10 +271,13 @@ pub async fn health() -> Json<Value> {
 
 pub async fn health_ready(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     sqlx::query("select 1").execute(&state.pool).await?;
-    let docker_ok = state.provider.ping().await.is_ok();
-    Ok(Json(
-        json!({ "status": "ready", "db": true, "docker": docker_ok }),
-    ))
+    let provider_ok = state.provider.healthcheck().await.is_ok();
+    Ok(Json(json!({
+        "status": "ready",
+        "db": true,
+        "provider": state.provider.runtime_name(),
+        "provider_ok": provider_ok,
+    })))
 }
 
 // ─── Agents & revisions ───────────────────────────────────────────────────
