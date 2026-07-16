@@ -122,3 +122,8 @@ netpol:
   requireEnforced: true
   # The probe image (needs a TCP client; busybox has nc/wget).
   probeImage: busybox:1.36
+  # The helm-test resolver image (needs curl + a shell): reads the two Service
+  # ClusterIPs at TEST time and hands them to the probe via ConfigMap. Helm
+  # stores rendered test hooks in the release, so render-time resolution is
+  # empty on a fresh install — see templates/tests/netpol-probe.yaml.
+  resolverImage: curlimages/curl:8.14.1
