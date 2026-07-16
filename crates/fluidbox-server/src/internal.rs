@@ -754,6 +754,35 @@ pub async fn events(
     Ok(Json(json!({ "seq": seq })))
 }
 
+/// `GET /internal/sessions/{id}/workspace` — the immutable workspace archive
+/// the sandbox's init container pulls (Kubernetes transport). The session is
+/// derived from the BEARER TOKEN, not the path `{id}` (informational, like
+/// every other internal route). The archive is credential-free and
+/// digest-verified by the init container before unpack; serving it grants the
+/// pod nothing it couldn't already reach with the token it holds.
+pub async fn workspace_archive(
+    auth: SessionAuth,
+    State(state): State<AppState>,
+) -> ApiResult<axum::response::Response> {
+    use axum::response::IntoResponse;
+    // A terminal/winding-down session's archive is moot (the run is over).
+    let session = fluidbox_db::get_session(&state.pool, auth.session_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if session.status_enum().is_terminal() {
+        return Err(ApiError::BadRequest("session is not active".into()));
+    }
+    let path = crate::orchestrator::archive_path(&state.cfg.data_dir, auth.session_id);
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|_| ApiError::NotFound)?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/gzip")],
+        bytes,
+    )
+        .into_response())
+}
+
 pub async fn heartbeat(auth: SessionAuth, State(state): State<AppState>) -> ApiResult<Json<Value>> {
     fluidbox_db::heartbeat(&state.pool, auth.session_id).await?;
     // Quiesce channel (the ONLY runner-contract change in the K8s design):

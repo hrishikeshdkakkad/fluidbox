@@ -27,7 +27,35 @@ pub struct SandboxSpec {
     /// optimization; archive-based providers pull an immutable archive
     /// instead).
     pub workspace_host_dir: Option<String>,
+    /// Immutable archive descriptor for archive-transport providers
+    /// (Kubernetes). None for host-dir providers (Docker).
+    pub workspace_archive: Option<WorkspaceArchive>,
+    /// Independent wall-clock brake for the sandbox object itself
+    /// (`activeDeadlineSeconds` on Kubernetes), so a runner keeps no local
+    /// compute if the control plane is down. None = installation default.
+    pub active_deadline_secs: Option<u64>,
     pub network: NetworkMode,
+}
+
+/// How a provider hands the workspace to the sandbox. Host-dir providers bind
+/// mount; archive providers pull an immutable digest-verified archive the
+/// control plane packed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceTransport {
+    HostDir,
+    Archive,
+}
+
+/// The control-plane-packed workspace archive an archive-transport provider's
+/// init container pulls, verifies (size + digest), and unpacks.
+#[derive(Debug, Clone)]
+pub struct WorkspaceArchive {
+    /// Internal-listener URL the init container GETs with the session token.
+    pub url: String,
+    pub sha256: String,
+    pub len: u64,
+    /// Diff base the collector uses (the materialized HEAD).
+    pub base_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -144,6 +172,12 @@ pub trait ExecutionProvider: Send + Sync {
     /// Non-fatal readiness probe: is the runtime reachable? Feeds boot
     /// logging and /health/ready — never gates startup.
     async fn healthcheck(&self) -> Result<(), ProviderError>;
+    /// How this provider expects the workspace delivered — lets the
+    /// orchestrator pack an archive only when the backend needs one, without
+    /// knowing which backend it drives.
+    fn workspace_transport(&self) -> WorkspaceTransport {
+        WorkspaceTransport::HostDir
+    }
     fn runtime_name(&self) -> &'static str;
 }
 
