@@ -32,13 +32,20 @@ pub struct K8sConfig {
     pub node_selector: Vec<(String, String)>,
     pub tolerations: Vec<Toleration>,
     pub priority_class_name: Option<String>,
+    /// `imagePullSecrets` names for private runner/collector/probe images in
+    /// the sandbox namespace (the Secret must exist there).
+    pub image_pull_secrets: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct Toleration {
+    #[serde(default)]
     pub key: Option<String>,
+    #[serde(default)]
     pub operator: Option<String>,
+    #[serde(default)]
     pub value: Option<String>,
+    #[serde(default)]
     pub effect: Option<String>,
 }
 
@@ -71,8 +78,9 @@ impl K8sConfig {
             volume_size_limit: get("FLUIDBOX_K8S_VOLUME_SIZE_LIMIT")
                 .unwrap_or_else(|| "10Gi".into()),
             node_selector: parse_kv(get("FLUIDBOX_K8S_NODE_SELECTOR")),
-            tolerations: Vec::new(),
+            tolerations: parse_tolerations(get("FLUIDBOX_K8S_TOLERATIONS")),
             priority_class_name: get("FLUIDBOX_K8S_PRIORITY_CLASS"),
+            image_pull_secrets: parse_list(get("FLUIDBOX_K8S_IMAGE_PULL_SECRETS")),
         }
     }
 }
@@ -84,4 +92,60 @@ fn parse_kv(s: Option<String>) -> Vec<(String, String)> {
         .filter_map(|p| p.split_once('='))
         .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
         .collect()
+}
+
+/// Parse a comma-separated list into trimmed, non-empty names
+/// (`imagePullSecrets`).
+fn parse_list(s: Option<String>) -> Vec<String> {
+    let Some(s) = s else { return Vec::new() };
+    s.split(',')
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect()
+}
+
+/// Parse `tolerations` from a JSON array of `{key,operator,value,effect}`
+/// objects — the shape Helm produces from `values.sandbox.tolerations` via
+/// `toJson`, and the exact shape `build_pod` serializes back. A missing,
+/// empty, or unparseable value yields no tolerations (fail-open on the hint,
+/// never a boot crash — the placement is advisory scheduling, not security).
+fn parse_tolerations(s: Option<String>) -> Vec<Toleration> {
+    let Some(s) = s.filter(|v| !v.trim().is_empty()) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&s).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tolerations_parse_from_json_array() {
+        let json = r#"[
+            {"key":"dedicated","operator":"Equal","value":"fluidbox","effect":"NoSchedule"},
+            {"operator":"Exists","effect":"NoExecute"}
+        ]"#;
+        let t = parse_tolerations(Some(json.to_string()));
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0].key.as_deref(), Some("dedicated"));
+        assert_eq!(t[0].value.as_deref(), Some("fluidbox"));
+        assert_eq!(t[0].effect.as_deref(), Some("NoSchedule"));
+        assert_eq!(t[1].key, None);
+        assert_eq!(t[1].operator.as_deref(), Some("Exists"));
+    }
+
+    #[test]
+    fn tolerations_empty_or_garbage_is_empty() {
+        assert!(parse_tolerations(None).is_empty());
+        assert!(parse_tolerations(Some("   ".into())).is_empty());
+        assert!(parse_tolerations(Some("not json".into())).is_empty());
+    }
+
+    #[test]
+    fn pull_secrets_parse_comma_list() {
+        assert_eq!(parse_list(Some("a, b ,c".into())), vec!["a", "b", "c"]);
+        assert!(parse_list(Some(" , ".into())).is_empty());
+        assert!(parse_list(None).is_empty());
+    }
 }
