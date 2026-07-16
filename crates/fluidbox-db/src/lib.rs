@@ -1727,15 +1727,18 @@ pub async fn transition_session(
     Ok(Some((current, updated)))
 }
 
-/// Attach the sandbox handle — REFUSED (returns false) once the session is
-/// terminal, so a provisioning race can never attach a live sandbox to a
-/// session that crash-recovery already terminalized (which nothing would
-/// ever reap). The status set mirrors `SessionStatus::is_terminal`.
+/// Attach the sandbox handle — REFUSED (returns false) unless the session is
+/// still in an ACTIVE (pre-wind-down) state: a finalizer that raced
+/// provisioning owns the session from the moment it enters wind-down, and a
+/// late handle would attach a live sandbox to a session that recovery may
+/// already have collected or terminalized (which nothing would ever reap).
+/// The caller must terminate the sandbox on refusal. The status set mirrors
+/// `SessionStatus::accepts_work`.
 pub async fn set_sandbox_handle(pool: &PgPool, id: Uuid, handle: &Value) -> sqlx::Result<bool> {
     let r = sqlx::query(
         "update sessions set sandbox_handle = $2, updated_at = now()
           where id = $1
-            and status not in ('completed','failed','cancelled','budget_exceeded')",
+            and status in ('created','provisioning','initializing','running','awaiting_approval')",
     )
     .bind(id)
     .bind(handle)
@@ -2633,16 +2636,38 @@ pub struct ResultDeliveryRow {
     pub updated_at: DateTime<Utc>,
 }
 
-/// True if any result-delivery rows exist for the session. Enqueue is not
-/// idempotent by itself (no unique key on session/destination), so the
-/// claim-serialized finalization reconciler checks this before re-enqueueing
-/// after the terminal-commit → enqueue crash window.
-pub async fn result_deliveries_exist(pool: &PgPool, session: Uuid) -> sqlx::Result<bool> {
-    let (exists,): (bool,) =
-        sqlx::query_as("select exists(select 1 from result_deliveries where session_id = $1)")
-            .bind(session)
-            .fetch_one(pool)
-            .await?;
+/// True if a delivery row exists for this session AND destination — the
+/// per-destination idempotency check both enqueue paths (the terminal
+/// transition and the claim-serialized reconciler) run before inserting:
+/// a crash after destination A but before destination B is healed by
+/// enqueueing exactly B, never duplicating A, and "some rows exist" is
+/// never mistaken for "all destinations enqueued".
+pub async fn result_delivery_exists_for(
+    pool: &PgPool,
+    session: Uuid,
+    destination: &Value,
+) -> sqlx::Result<bool> {
+    let (exists,): (bool,) = sqlx::query_as(
+        "select exists(select 1 from result_deliveries
+           where session_id = $1 and destination = $2)",
+    )
+    .bind(session)
+    .bind(destination)
+    .fetch_one(pool)
+    .await?;
+    Ok(exists)
+}
+
+/// True if the session already has a `run.result` ledger event — the
+/// reconciler's exactly-once guard (emit-if-missing under the finalize
+/// claim, which serializes drivers).
+pub async fn has_run_result_event(pool: &PgPool, session: Uuid) -> sqlx::Result<bool> {
+    let (exists,): (bool,) = sqlx::query_as(
+        "select exists(select 1 from events where session_id = $1 and type = 'run.result')",
+    )
+    .bind(session)
+    .fetch_one(pool)
+    .await?;
     Ok(exists)
 }
 
@@ -3259,10 +3284,22 @@ mod tests {
         transition_session(&pool, fenced.id, SessionStatus::Finalizing, None)
             .await
             .unwrap();
+        // Wind-down owns the session: a provisioning race may no longer
+        // attach a handle.
+        let attached_winddown = set_sandbox_handle(
+            &pool,
+            fenced.id,
+            &serde_json::json!({"external_id":"tw","uid":"uw"}),
+        )
+        .await
+        .unwrap();
         transition_session(&pool, fenced.id, SessionStatus::Failed, None)
             .await
             .unwrap();
+        // Terminal + intent = cleanup still owed: recovery must see it.
+        let pending_while_terminal = pending_finalizations(&pool).await.unwrap();
         delete_finalization(&pool, fenced.id).await.unwrap();
+        let pending_after_release = pending_finalizations(&pool).await.unwrap();
         let post_terminal = begin_finalization(&pool, fenced.id, "cancelled", None, None, true, 30)
             .await
             .unwrap();
@@ -3317,6 +3354,18 @@ mod tests {
             first_fence,
             BeginFinalization::Persisted { created: true, .. }
         ));
+        assert!(
+            !attached_winddown,
+            "a winding-down session must refuse a late sandbox handle"
+        );
+        assert!(
+            pending_while_terminal.contains(&fenced.id),
+            "recovery must see intents on TERMINAL sessions (cleanup owed)"
+        );
+        assert!(
+            !pending_after_release.contains(&fenced.id),
+            "a released intent leaves the recovery worklist"
+        );
         assert!(
             matches!(post_terminal, BeginFinalization::AlreadyTerminal),
             "a terminal session must fence intent re-creation"

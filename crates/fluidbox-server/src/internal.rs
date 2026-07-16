@@ -160,18 +160,31 @@ async fn decide_tool_call(
                 let session_id = session.id;
                 let state2 = state.clone();
                 tokio::spawn(async move {
-                    // Forced stop (runner live → quiesce first). A DbError
-                    // start here has no same-channel retry — the deny below
-                    // already went out — but the runner's exit then posts
-                    // /result and the wall-clock sweeper backstops; both
-                    // re-enter the durable path.
-                    let _ = orchestrator::finalize_forced(
-                        &state2,
-                        session_id,
-                        "budget_exceeded",
-                        "tool-call budget exceeded",
-                    )
-                    .await;
+                    // Forced stop (runner live → quiesce first). The deny
+                    // verdict below is already out, so this task retries with
+                    // backoff — a budget-less runner that makes no further
+                    // request has no other same-channel driver.
+                    for attempt in 0..5u32 {
+                        match orchestrator::finalize_forced(
+                            &state2,
+                            session_id,
+                            "budget_exceeded",
+                            "tool-call budget exceeded",
+                        )
+                        .await
+                        {
+                            orchestrator::FinalizeStart::DbError => {
+                                tokio::time::sleep(std::time::Duration::from_secs(
+                                    10u64 << attempt.min(3),
+                                ))
+                                .await;
+                            }
+                            _ => return,
+                        }
+                    }
+                    tracing::error!(
+                        "tool-call budget finalize for {session_id} did not persist after retries"
+                    );
                 });
                 return Ok(GateDecision::deny("tool-call budget exceeded"));
             }
@@ -855,6 +868,14 @@ pub async fn result(
         .await?
         .is_none()
     {
+        // TOCTOU: a racing driver may have terminalized (revoking the token)
+        // after our status read — a lost-response /result retry must get its
+        // idempotent 200, never a fatal 401 the runner treats as failure.
+        if let Ok(Some(s)) = fluidbox_db::get_session(&state.pool, session_id).await {
+            if s.status_enum().is_terminal() {
+                return Ok(Json(json!({ "ok": true, "note": "already terminal" })));
+            }
+        }
         return Err(ApiError::Unauthorized);
     }
     // Persist the finalization intent BEFORE ACKing — and NEVER ACK success

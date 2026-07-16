@@ -41,7 +41,21 @@ async fn recover_finalizations(state: &AppState) {
         Ok(ids) => {
             for id in ids {
                 tracing::info!("resuming interrupted finalization for {id}");
-                orchestrator::drive_finalization(state, id).await;
+                // Bounded so one hung drive cannot starve the rest of the
+                // backlog (this worker is serial). An abandoned drive's
+                // claim goes stale and is retried; 300 s comfortably covers
+                // the worst healthy path (quiesce 30 + exit-wait 30 +
+                // collect 120 + terminate 60) while staying under the 420 s
+                // claim window, so drivers never overlap.
+                if tokio::time::timeout(
+                    Duration::from_secs(300),
+                    orchestrator::drive_finalization(state, id),
+                )
+                .await
+                .is_err()
+                {
+                    tracing::warn!("finalization drive for {id} timed out; will retry");
+                }
             }
         }
         Err(e) => tracing::warn!("finalization recovery query failed: {e}"),

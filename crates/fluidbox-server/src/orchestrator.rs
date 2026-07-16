@@ -86,11 +86,12 @@ async fn transition(state: &AppState, id: Uuid, next: SessionStatus, reason: Opt
                     tracing::warn!("revoke_session_tokens {id} failed: {e}");
                 }
                 // Publication is decoupled: enqueue rows; the delivery worker
-                // owns retries. This is the ONLY enqueue point — every exit
-                // path funnels through here — and it fires on terminal entry,
-                // which is now reachable ONLY from `finalizing`, so the diff
-                // artifact is already stored when delivery is enqueued.
-                crate::deliveries::enqueue_for_session(state, id).await;
+                // owns retries. Fires on terminal entry — reachable ONLY from
+                // `finalizing`, so the diff artifact is already stored when
+                // delivery is enqueued. A partial/failed enqueue here is
+                // healed by the terminal reconciler (per-destination
+                // idempotent) before the intent is ever released.
+                let _ = crate::deliveries::enqueue_for_session(state, id).await;
             }
             true
         }
@@ -375,7 +376,7 @@ pub async fn drive_finalization(state: &AppState, id: Uuid) {
             session.status_enum(),
         ) {
             WinddownStep::Reconcile => {
-                finish_terminal_cleanup(state, &session).await;
+                finish_terminal_cleanup(state, &session, &intent).await;
                 return;
             }
             WinddownStep::Malformed => {
@@ -400,12 +401,14 @@ pub async fn drive_finalization(state: &AppState, id: Uuid) {
                 }
             }
             WinddownStep::AwaitQuiesce(deadline) => {
-                if let Some(handle) = session_handle(&session) {
-                    let exited = wait_runner_exit(state, &handle, deadline).await;
-                    if !exited {
-                        skip_collection = true; // never collect a racing worktree
-                    }
-                }
+                // Overwrite, never latch: a transient Finalizing-transition
+                // failure loops back here, and a runner that exited by the
+                // re-check must CLEAR an earlier skip verdict — a sticky flag
+                // would discard a now-safe diff as quiesce_timeout.
+                skip_collection = match session_handle(&session) {
+                    Some(handle) => !wait_runner_exit(state, &handle, deadline).await,
+                    None => false,
+                };
                 transition(
                     state,
                     id,
@@ -422,11 +425,47 @@ pub async fn drive_finalization(state: &AppState, id: Uuid) {
     }
 }
 
+/// The stored handle, distinguishing "never had one" from "stored but
+/// unparseable" — the latter must NOT read as "sandbox gone" (a live
+/// sandbox could hide behind garbage JSON).
+enum StoredHandle {
+    None,
+    Unparseable,
+    Handle(SandboxHandle),
+}
+
+fn session_handle_state(session: &SessionRow) -> StoredHandle {
+    match &session.sandbox_handle {
+        None => StoredHandle::None,
+        Some(j) => match serde_json::from_value::<SandboxHandle>(j.clone()) {
+            Ok(h) => StoredHandle::Handle(h),
+            Err(_) => StoredHandle::Unparseable,
+        },
+    }
+}
+
 fn session_handle(session: &SessionRow) -> Option<SandboxHandle> {
-    session
-        .sandbox_handle
-        .clone()
-        .and_then(|j| serde_json::from_value(j).ok())
+    match session_handle_state(session) {
+        StoredHandle::Handle(h) => Some(h),
+        _ => None,
+    }
+}
+
+/// Provider-truth fallback for sessions whose stored handle is absent or
+/// unparseable: `list_managed` finds the sandbox by its session label, so a
+/// cancel that raced provisioning (the handle not yet persisted — Docker
+/// starts the container BEFORE `provision` returns) still gets waited on and
+/// reaped instead of having its live worktree collected. `Err` is a provider
+/// failure — the caller must treat the sandbox state as UNKNOWN and retry,
+/// never as "gone".
+async fn discover_handle(state: &AppState, id: Uuid) -> Result<Option<SandboxHandle>, ()> {
+    match tokio::time::timeout(PROBE_TIMEOUT, state.provider.list_managed()).await {
+        Ok(Ok(managed)) => Ok(managed
+            .into_iter()
+            .find(|(sid, _)| *sid == id)
+            .map(|(_, h)| h)),
+        _ => Err(()),
+    }
 }
 
 /// Poll until the runner container is no longer live or the deadline passes;
@@ -513,7 +552,24 @@ async fn collect_and_terminalize(
             // writing — bounded wait for runner-container exit on EVERY
             // collect path, then collect; still live at the bound records
             // missing (a torn diff must not become the audit artifact).
-            let handle = session_handle(&session);
+            // A missing/unparseable stored handle is NOT "gone": Docker
+            // starts the container before `provision` returns, so a finalize
+            // that raced provisioning must consult provider truth
+            // (list_managed by session label) before touching the worktree.
+            let handle = match session_handle_state(&session) {
+                StoredHandle::Handle(h) => Some(h),
+                StoredHandle::None | StoredHandle::Unparseable => {
+                    match discover_handle(state, id).await {
+                        Ok(h) => h,
+                        Err(()) => {
+                            tracing::warn!(
+                                "sandbox discovery for {id} failed — retrying next drive"
+                            );
+                            return;
+                        }
+                    }
+                }
+            };
             let runner_gone = match &handle {
                 Some(h) => {
                     let deadline = chrono::Utc::now() + chrono::Duration::seconds(EXIT_WAIT_SECS);
@@ -587,21 +643,11 @@ async fn collect_and_terminalize(
         "budget_exceeded" => SessionStatus::BudgetExceeded,
         _ => SessionStatus::Failed,
     };
-    // The single-winner gate: delivery enqueue rides this transition, and
-    // ONLY the winning driver records RunResult — re-drives must not
-    // duplicate ledger events.
+    // The single-winner gate: delivery enqueue rides this transition;
+    // RunResult and the rest of the terminal side effects are reconciled
+    // exactly-once by the cleanup below (emit-if-missing under the claim).
     if transition(state, id, terminal, intent.reason.as_deref()).await {
-        ledger::record(
-            state,
-            id,
-            Actor::Harness,
-            EventBody::RunResult {
-                outcome: intent.outcome.clone(),
-                summary: intent.summary.clone(),
-            },
-        )
-        .await;
-        finish_terminal_cleanup(state, &session).await;
+        finish_terminal_cleanup(state, &session, intent).await;
     } else {
         // The transition did not apply. If another driver already
         // terminalized, cleanup may still be owed; a transient failure
@@ -609,7 +655,7 @@ async fn collect_and_terminalize(
         // workspace, archive, and sandbox) are NEVER destroyed on this path.
         match fluidbox_db::get_session(&state.pool, id).await {
             Ok(Some(s)) if s.status_enum().is_terminal() => {
-                finish_terminal_cleanup(state, &s).await;
+                finish_terminal_cleanup(state, &s, intent).await;
             }
             _ => {}
         }
@@ -625,36 +671,51 @@ async fn collect_and_terminalize(
 /// terminal-commit → side-effects crash gap (`transition` normally does
 /// revoke + enqueue; a crash between the UPDATE and those calls leaves them
 /// owed — this reconciler re-runs them).
-async fn finish_terminal_cleanup(state: &AppState, session: &SessionRow) {
+async fn finish_terminal_cleanup(
+    state: &AppState,
+    session: &SessionRow,
+    intent: &fluidbox_db::FinalizationRow,
+) {
     let id = session.id;
+    // Exactly-once RunResult: emitted only after a CONFIRMED terminal
+    // transition, and emit-if-missing under the claim — a crash between the
+    // terminal commit and the emit is healed here, and a re-drive after a
+    // successful emit skips it.
+    match fluidbox_db::has_run_result_event(&state.pool, id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            ledger::record(
+                state,
+                id,
+                Actor::Harness,
+                EventBody::RunResult {
+                    outcome: intent.outcome.clone(),
+                    summary: intent.summary.clone(),
+                },
+            )
+            .await;
+        }
+        Err(e) => {
+            tracing::warn!("terminal reconcile {id}: run.result check failed: {e}");
+            return;
+        }
+    }
     if let Err(e) = fluidbox_db::revoke_session_tokens(&state.pool, id).await {
         tracing::warn!("terminal reconcile {id}: token revoke failed: {e}");
         return;
     }
     // Delivery enqueue is owed only when the RunSpec names destinations.
+    // enqueue_for_session is per-destination idempotent and returns true only
+    // when EVERY destination has a row — partial success (destination A
+    // enqueued, B failed) must not be mistaken for complete reconciliation.
     let wants_delivery = serde_json::from_value::<RunSpec>(session.run_spec.clone())
         .map(|rs| !rs.result_destinations.is_empty())
         .unwrap_or(false);
-    if wants_delivery {
-        match fluidbox_db::result_deliveries_exist(&state.pool, id).await {
-            Ok(true) => {}
-            Ok(false) => {
-                crate::deliveries::enqueue_for_session(state, id).await;
-                // enqueue logs per-destination failures; confirm before the
-                // intent may ever be released.
-                match fluidbox_db::result_deliveries_exist(&state.pool, id).await {
-                    Ok(true) => {}
-                    _ => {
-                        tracing::warn!("terminal reconcile {id}: delivery enqueue incomplete");
-                        return;
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("terminal reconcile {id}: delivery check failed: {e}");
-                return;
-            }
-        }
+    if wants_delivery && !crate::deliveries::enqueue_for_session(state, id).await {
+        tracing::warn!(
+            "terminal reconcile {id}: delivery enqueue incomplete — retrying next drive"
+        );
+        return;
     }
     // Reap MUST succeed (or the sandbox be verifiably gone) before the
     // workspace, archive, and intent go away — especially on Docker, where
@@ -801,12 +862,19 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
         fluidbox_db::set_sandbox_handle(&state.pool, session_id, &serde_json::to_value(&handle)?)
             .await?;
     if !attached {
-        // The session went terminal while we were provisioning (crash
-        // recovery, or a cancel that finalized a handle-less session) —
-        // nothing owns this sandbox, so kill it now rather than leak it
-        // until the next boot sweep.
-        let _ = state.provider.terminate(&handle).await;
-        anyhow::bail!("session went terminal during provisioning; sandbox reaped");
+        // The session entered wind-down or terminal while we were
+        // provisioning — the finalizer owns it now. Best-effort immediate
+        // kill; if this terminate fails, the finalizer's discovery-reap
+        // (list_managed by session label) retries until the sandbox is
+        // verifiably gone, so nothing rides on this call succeeding.
+        if let Err(e) = state.provider.terminate(&handle).await {
+            tracing::warn!(
+                "late-provision terminate for {session_id} failed ({e}); finalizer discovery will reap"
+            );
+        }
+        anyhow::bail!(
+            "session left active state during provisioning; sandbox handed to the finalizer"
+        );
     }
 
     // initializing → running (traffic is now expected)
@@ -1065,12 +1133,17 @@ async fn connection_auth_header(state: &AppState, connection_id: Uuid) -> anyhow
     crate::connectors::fetch_auth_header(state, &conn).await
 }
 
+/// How long one terminate attempt may run — keeps every finalizer phase
+/// individually bounded so the worst healthy drive stays far inside the
+/// 420 s claim window (no driver overlap by construction).
+const TERMINATE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Tear down the sandbox for a session. Idempotent — both providers treat
 /// already-gone as success — so Err means the provider could NOT confirm
 /// teardown: finalizer callers must stop (not destroy evidence or release
-/// the intent) and retry. An unparseable handle returns Ok (it can never be
-/// terminated through the provider; the boot orphan sweep's label scan is
-/// the backstop) rather than wedging the intent forever.
+/// the intent) and retry. A missing or unparseable stored handle consults
+/// provider truth (`list_managed` by session label) — a live sandbox must
+/// never survive because its handle was lost or is garbage.
 pub async fn reap(state: &AppState, id: Uuid) -> Result<(), ()> {
     let session = match fluidbox_db::get_session(&state.pool, id).await {
         Ok(Some(s)) => s,
@@ -1080,13 +1153,27 @@ pub async fn reap(state: &AppState, id: Uuid) -> Result<(), ()> {
             return Err(());
         }
     };
-    let Some(handle) = session_handle(&session) else {
-        return Ok(());
+    let handle = match session_handle_state(&session) {
+        StoredHandle::Handle(h) => Some(h),
+        StoredHandle::None | StoredHandle::Unparseable => match discover_handle(state, id).await {
+            Ok(h) => h,
+            Err(()) => {
+                tracing::warn!("reap {id}: sandbox discovery failed — retrying");
+                return Err(());
+            }
+        },
     };
-    match state.provider.terminate(&handle).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
+    let Some(handle) = handle else {
+        return Ok(()); // verifiably gone (provider truth, not a parse quirk)
+    };
+    match tokio::time::timeout(TERMINATE_TIMEOUT, state.provider.terminate(&handle)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
             tracing::warn!("reap {id}: {e}");
+            Err(())
+        }
+        Err(_) => {
+            tracing::warn!("reap {id}: terminate timed out");
             Err(())
         }
     }
