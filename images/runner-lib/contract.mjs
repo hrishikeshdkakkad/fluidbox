@@ -122,14 +122,30 @@ export class RunnerClient {
   /// Register the harness abort callback fired when the control plane asks the
   /// run to quiesce (cancellation). Called at most once. The callback should
   /// stop the agent loop and let the process exit 0 without posting /result.
+  /// A quiesce that arrived BEFORE registration (heartbeats start first in
+  /// some harnesses) is replayed here — never swallowed.
   onQuiesce(cb) {
     this.quiesceCb = cb;
+    if (this.quiesced && cb) {
+      console.error("fluidbox-runner: replaying quiesce received before handler registration");
+      try {
+        cb();
+      } catch (e) {
+        console.error("fluidbox-runner: quiesce callback threw:", e?.message || e);
+      }
+    }
   }
 
   #maybeQuiesce(res) {
     if (this.quiesced || !res || res.action !== "quiesce") return;
+    // Latching without a handler would swallow the cancel permanently: the
+    // next heartbeat re-delivers, and onQuiesce replays if we latch later.
     this.quiesced = true;
     console.error("fluidbox-runner: control plane requested quiesce — stopping agent");
+    if (!this.quiesceCb) {
+      console.error("fluidbox-runner: quiesce before handler registration; will replay on registration");
+      return;
+    }
     try {
       this.quiesceCb?.();
     } catch (e) {
