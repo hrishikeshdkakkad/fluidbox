@@ -110,6 +110,31 @@ export class RunnerClient {
     // a full interval later.
     this.renewOkMs = 45 * 60 * 1000;
     this.renewRetryMs = 2 * 60 * 1000;
+    // Quiesce (the sole additive runner-contract field): the heartbeat
+    // response carries {"action":"quiesce"} once the control plane cancels the
+    // run. We invoke the harness-registered abort callback ONCE, which stops
+    // the agent and exits WITHOUT posting /result (the cancel finalizer owns
+    // the outcome). Registered via onQuiesce(); harness-specific, one place.
+    this.quiesceCb = null;
+    this.quiesced = false;
+  }
+
+  /// Register the harness abort callback fired when the control plane asks the
+  /// run to quiesce (cancellation). Called at most once. The callback should
+  /// stop the agent loop and let the process exit 0 without posting /result.
+  onQuiesce(cb) {
+    this.quiesceCb = cb;
+  }
+
+  #maybeQuiesce(res) {
+    if (this.quiesced || !res || res.action !== "quiesce") return;
+    this.quiesced = true;
+    console.error("fluidbox-runner: control plane requested quiesce — stopping agent");
+    try {
+      this.quiesceCb?.();
+    } catch (e) {
+      console.error("fluidbox-runner: quiesce callback threw:", e?.message || e);
+    }
   }
 
   sessionBase() {
@@ -190,7 +215,9 @@ export class RunnerClient {
 
   startHeartbeat() {
     this.heartbeatTimer = setInterval(() => {
-      this.#post(`${this.sessionBase()}/heartbeat`, {}, { retries: 1 }).catch(() => {});
+      this.#post(`${this.sessionBase()}/heartbeat`, {}, { retries: 1 })
+        .then((res) => this.#maybeQuiesce(res))
+        .catch(() => {});
     }, 10000);
     this.heartbeatTimer.unref?.();
   }

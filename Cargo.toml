@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/fluidbox-core",
     "crates/fluidbox-db",
+    "crates/fluidbox-workspace",
     "crates/fluidbox-provider",
     "crates/fluidbox-server",
     "crates/fluidbox-cli",
@@ -18,6 +19,7 @@ repository = "https://github.com/hrishikeshdkakkad/fluidbox"
 [workspace.dependencies]
 fluidbox-core = { path = "crates/fluidbox-core" }
 fluidbox-db = { path = "crates/fluidbox-db" }
+fluidbox-workspace = { path = "crates/fluidbox-workspace" }
 fluidbox-provider = { path = "crates/fluidbox-provider" }
 
 anyhow = "1"

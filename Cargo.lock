@@ -957,6 +957,7 @@ dependencies = [
  "bollard",
  "chrono",
  "fluidbox-core",
+ "fluidbox-workspace",
  "futures",
  "serde",
  "serde_json",
@@ -981,6 +982,7 @@ dependencies = [
  "fluidbox-core",
  "fluidbox-db",
  "fluidbox-provider",
+ "fluidbox-workspace",
  "futures",
  "getrandom 0.3.4",
  "hex",
@@ -998,6 +1000,17 @@ dependencies = [
  "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "fluidbox-workspace"
+version = "0.1.0"
+dependencies = [
+ "fluidbox-core",
+ "hex",
+ "sha2 0.11.0",
+ "thiserror",
  "uuid",
 ]
 

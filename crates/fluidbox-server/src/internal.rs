@@ -490,9 +490,10 @@ pub async fn permission(
     let session = fluidbox_db::get_session(&state.pool, auth.session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    // A terminal session never gets a fresh decision — the primary guard,
-    // independent of token revocation (which is best-effort defense in depth).
-    if session.status_enum().is_terminal() {
+    // A terminal OR winding-down session never gets a fresh decision — the
+    // primary guard, independent of token revocation (which is best-effort
+    // defense in depth). A run being finalized/cancelled admits no new tools.
+    if !session.status_enum().accepts_work() {
         return Ok(Json(json!({
             "decision": "deny",
             "message": "session is not active",
@@ -542,7 +543,7 @@ pub async fn tool_call(
     let session = fluidbox_db::get_session(&state.pool, auth.session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if session.status_enum().is_terminal() {
+    if !session.status_enum().accepts_work() {
         return Err(ApiError::BadRequest("session is not active".into()));
     }
     let run_spec: RunSpec = serde_json::from_value(session.run_spec.clone())
@@ -755,7 +756,16 @@ pub async fn events(
 
 pub async fn heartbeat(auth: SessionAuth, State(state): State<AppState>) -> ApiResult<Json<Value>> {
     fluidbox_db::heartbeat(&state.pool, auth.session_id).await?;
-    Ok(Json(json!({ "ok": true })))
+    // Quiesce channel (the ONLY runner-contract change in the K8s design):
+    // once a session enters `cancelling`, its heartbeat response carries
+    // {"action":"quiesce"} — the runner stops the agent and exits WITHOUT
+    // posting /result, so the cancel finalizer collects a settled worktree.
+    // Level-triggered: every heartbeat repeats it until the runner exits.
+    let action = match fluidbox_db::get_session(&state.pool, auth.session_id).await? {
+        Some(s) if s.status_enum() == SessionStatus::Cancelling => Some("quiesce"),
+        _ => None,
+    };
+    Ok(Json(json!({ "ok": true, "action": action })))
 }
 
 #[derive(Deserialize)]
@@ -786,8 +796,15 @@ pub async fn result(
     let session = fluidbox_db::get_session(&state.pool, session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if session.status_enum().is_terminal() {
+    let st = session.status_enum();
+    if st.is_terminal() {
         return Ok(Json(json!({ "ok": true, "note": "already terminal" })));
+    }
+    // Already winding down: a cancel (or a prior /result) owns finalization —
+    // ACK idempotently and let it complete. A quiesced runner shouldn't even
+    // reach here, but a racing /result must never override the cancel outcome.
+    if st.is_winding_down() {
+        return Ok(Json(json!({ "ok": true, "note": "finalizing" })));
     }
     // Non-terminal: the token must still be live to drive a finalize (revoke
     // only happens on terminal, so this is the ordinary first-post path).
@@ -797,10 +814,10 @@ pub async fn result(
     {
         return Err(ApiError::Unauthorized);
     }
-    let state2 = state.clone();
-    tokio::spawn(async move {
-        orchestrator::finalize(&state2, &session, &res.outcome, res.summary.as_deref()).await;
-    });
+    // Persist the finalization intent and enter `finalizing` BEFORE ACKing
+    // (fixes the lossy ACK-then-`tokio::spawn`): a crash after this point is
+    // recovered by the finalize worker. `finalize` spawns the driver itself.
+    orchestrator::finalize(&state, &session, &res.outcome, res.summary.as_deref()).await;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -829,9 +846,9 @@ pub async fn token_renew(
     let session = fluidbox_db::get_session(&state.pool, auth.session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if session.status_enum().is_terminal() {
+    if !session.status_enum().accepts_work() {
         return Err(ApiError::BadRequest(
-            "session is terminal — token cannot be renewed".into(),
+            "session is not active — token cannot be renewed".into(),
         ));
     }
     let ttl = req.ttl_secs.clamp(1, MAX_RENEW_TTL_SECS);

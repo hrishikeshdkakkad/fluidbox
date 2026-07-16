@@ -243,7 +243,9 @@ pub async fn messages(
     let session = fluidbox_db::get_session(&state.pool, session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if session.status_enum().is_terminal() {
+    // No model spend for a terminal OR winding-down run — the budget stop and
+    // the finalizer both rely on the facade refusing once a run is over.
+    if !session.status_enum().accepts_work() {
         return Ok(dialect_error(
             shape_hint(&rest),
             StatusCode::BAD_REQUEST,
