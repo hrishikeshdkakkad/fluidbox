@@ -152,6 +152,7 @@ mod tests {
     fn test_cfg() -> Config {
         Config {
             bind: String::new(),
+            internal_bind: String::new(),
             database_url: String::new(),
             admin_token: String::new(),
             public_control_url: String::new(),

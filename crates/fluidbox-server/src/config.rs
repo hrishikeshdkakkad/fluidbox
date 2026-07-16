@@ -15,6 +15,12 @@ fn absolute(p: &str) -> PathBuf {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind: String,
+    /// The sandbox-facing internal listener (:8788). Serves ONLY `/internal/*`
+    /// (runner contract, workspace archive, LLM facade) — never `/v1`. Route
+    /// absence is stronger than bearer auth alone: a sandbox that reaches this
+    /// bind is immune to any future `/v1` auth regression (design 2026-07-15,
+    /// §"Dual listener"). The public bind still serves both for Docker.
+    pub internal_bind: String,
     pub database_url: String,
     pub admin_token: String,
     /// URL sandboxes use to reach this control plane (e.g. host.docker.internal).
@@ -82,6 +88,7 @@ impl Config {
         };
         Ok(Config {
             bind: get("FLUIDBOX_BIND").unwrap_or_else(|_| "127.0.0.1:8787".into()),
+            internal_bind: get("FLUIDBOX_INTERNAL_BIND").unwrap_or_else(|_| "0.0.0.0:8788".into()),
             database_url: get("DATABASE_URL")
                 .map_err(|_| anyhow::anyhow!("DATABASE_URL is required"))?,
             admin_token: get("FLUIDBOX_ADMIN_TOKEN")

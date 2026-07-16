@@ -58,8 +58,8 @@ pub enum CollectionOutcome {
 }
 
 /// Collect the agent's changes from a session workspace root
-/// (`<data_dir>/workspaces/<sid>`), diffing the final `repo/` worktree
-/// against `base_commit` using ONLY the pristine baseline's `.git`.
+/// (`<data_dir>/workspaces/<sid>`) laid out as `repo/` + `baseline-git/` —
+/// the Docker host-dir layout. Delegates to [`collect_diff_at`].
 pub fn collect_diff(
     workspace_root: &Path,
     base_commit: Option<&str>,
@@ -67,7 +67,23 @@ pub fn collect_diff(
 ) -> CollectionOutcome {
     let repo = workspace_root.join("repo");
     let baseline = workspace_root.join(BASELINE_DIR);
-    if !repo.is_dir() {
+    let scratch_root = workspace_root.to_path_buf();
+    collect_diff_at(&repo, &baseline, &scratch_root, base_commit, caps)
+}
+
+/// Collect a diff from explicit worktree + pristine-baseline paths, using a
+/// scratch dir under `scratch_root`. This is the layout-agnostic core: the
+/// Docker path passes `<root>/repo` + `<root>/baseline-git`; the in-pod
+/// collector passes `/workspace` + `/collector/baseline` (different mounts,
+/// same hardened engine).
+pub fn collect_diff_at(
+    worktree: &Path,
+    baseline: &Path,
+    scratch_root: &Path,
+    base_commit: Option<&str>,
+    caps: &DiffCaps,
+) -> CollectionOutcome {
+    if !worktree.is_dir() {
         return CollectionOutcome::Missing {
             reason: "workspace worktree missing (never materialized, or already cleaned)".into(),
         };
@@ -78,7 +94,7 @@ pub fn collect_diff(
                 .into(),
         };
     }
-    match collect_inner(workspace_root, &repo, &baseline, base_commit, caps) {
+    match collect_inner(scratch_root, worktree, baseline, base_commit, caps) {
         Ok(diff) => CollectionOutcome::Diff(diff),
         Err(e) => CollectionOutcome::Missing {
             reason: format!("collection failed: {e}"),
@@ -87,15 +103,15 @@ pub fn collect_diff(
 }
 
 fn collect_inner(
-    workspace_root: &Path,
+    scratch_root: &Path,
     worktree: &Path,
     baseline: &Path,
     base_commit: Option<&str>,
     caps: &DiffCaps,
 ) -> Result<CollectedDiff, WorkspaceError> {
-    // Scratch space lives INSIDE the session root (cleaned with it) but
-    // outside repo/ (never visible to any sandbox transport).
-    let scratch = workspace_root.join("collect-tmp");
+    // Scratch space lives INSIDE the scratch root (cleaned with it) but
+    // outside the worktree (never visible to any sandbox transport).
+    let scratch = scratch_root.join("collect-tmp");
     if scratch.exists() {
         std::fs::remove_dir_all(&scratch)?;
     }

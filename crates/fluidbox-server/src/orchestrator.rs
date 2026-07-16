@@ -377,6 +377,7 @@ async fn collect_and_terminalize(
         if let Err(e) = fluidbox_workspace::cleanup_workspace(&state.cfg.data_dir, id) {
             tracing::warn!("workspace cleanup failed for {id}: {e}");
         }
+        delete_archive(&state.cfg.data_dir, id);
     }
     fluidbox_db::delete_finalization(&state.pool, id).await.ok();
 }
@@ -462,7 +463,7 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
     // provisioning → initializing (workspace materialization, control-plane
     // side, BEFORE the agent starts — a bad repo fails here at zero model spend)
     transition(&state, session_id, SessionStatus::Initializing, None).await;
-    let workspace_dir = materialize_workspace(&state, session_id, &run_spec).await?;
+    let (workspace_dir, base_commit) = materialize_workspace(&state, session_id, &run_spec).await?;
 
     let control_url = state.cfg.public_control_url.clone();
     let env = build_runner_env(&run_spec, &control_url, session_id, &session_token);
@@ -478,11 +479,27 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
         );
     }
 
+    // Archive-transport providers (Kubernetes) pull an immutable, credential-
+    // free archive the control plane packs here. Host-dir providers (Docker)
+    // bind mount and skip this. Authority stays control-plane-side either way.
+    let workspace_archive = if state.provider.workspace_transport()
+        == fluidbox_core::traits::WorkspaceTransport::Archive
+    {
+        match &workspace_dir {
+            Some(_) => Some(pack_and_store_archive(&state, session_id, base_commit.clone()).await?),
+            None => None,
+        }
+    } else {
+        None
+    };
+
     let sandbox_spec = SandboxSpec {
         session_id,
         image: run_spec.runner_image.clone(),
         env,
         workspace_host_dir: workspace_dir.as_ref().map(|p| p.display().to_string()),
+        workspace_archive,
+        active_deadline_secs: run_spec.budgets.max_wall_clock_secs,
         network: state.cfg.network_mode,
     };
 
@@ -554,6 +571,57 @@ pub fn serialized_env_len(env: &[(String, String)]) -> usize {
     env.iter().map(|(k, v)| k.len() + v.len() + 2).sum()
 }
 
+/// The on-disk archive path for a session (PVC-backed in Kubernetes; survives
+/// a `Recreate` upgrade so init can still pull after a control-plane restart).
+pub fn archive_path(data_dir: &std::path::Path, session_id: Uuid) -> PathBuf {
+    data_dir
+        .join("archives")
+        .join(format!("{session_id}.tar.gz"))
+}
+
+/// Pack the materialized workspace into an immutable archive, store it, and
+/// return the descriptor the init container verifies. The archive URL is on
+/// the INTERNAL listener (the pod reaches it with the session token it already
+/// holds — nothing new becomes reachable).
+async fn pack_and_store_archive(
+    state: &AppState,
+    session_id: Uuid,
+    base_commit: Option<String>,
+) -> anyhow::Result<fluidbox_core::traits::WorkspaceArchive> {
+    let data_dir = state.cfg.data_dir.clone();
+    let dest = archive_path(&data_dir, session_id);
+    let packed = tokio::task::spawn_blocking(move || {
+        let root = fluidbox_workspace::session_workspace_root(&data_dir, session_id);
+        let packed = fluidbox_workspace::pack_workspace(&root)?;
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dest, &packed.bytes)?;
+        Ok::<_, anyhow::Error>(packed)
+    })
+    .await??;
+
+    // The pod pulls from the internal control URL (the same base the runner
+    // uses for every other internal call).
+    let url = format!(
+        "{}/internal/sessions/{}/workspace",
+        state.cfg.public_control_url.trim_end_matches('/'),
+        session_id
+    );
+    Ok(fluidbox_core::traits::WorkspaceArchive {
+        url,
+        sha256: packed.sha256,
+        len: packed.len,
+        base_commit,
+    })
+}
+
+/// Delete a session's stored archive (idempotent). Called at finalize; a TTL
+/// sweep is the backstop.
+pub fn delete_archive(data_dir: &std::path::Path, session_id: Uuid) {
+    let _ = std::fs::remove_file(archive_path(data_dir, session_id));
+}
+
 pub fn env_size_breakdown(env: &[(String, String)]) -> String {
     let mut parts: Vec<(usize, &str)> = env
         .iter()
@@ -605,7 +673,7 @@ async fn materialize_workspace(
     state: &AppState,
     session_id: Uuid,
     run_spec: &RunSpec,
-) -> anyhow::Result<Option<PathBuf>> {
+) -> anyhow::Result<(Option<PathBuf>, Option<String>)> {
     let data_dir = state.cfg.data_dir.clone();
     let (ws, repo, r#ref) = match &run_spec.workspace {
         WorkspaceSpec::LocalCopy { path } => {
@@ -676,7 +744,7 @@ async fn materialize_workspace(
         },
     )
     .await;
-    Ok(Some(ws.host_dir))
+    Ok((Some(ws.host_dir), ws.base_commit))
 }
 
 /// Resolve a connection into an `Authorization` header value for git fetch
