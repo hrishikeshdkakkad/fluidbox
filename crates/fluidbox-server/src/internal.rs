@@ -783,11 +783,12 @@ pub async fn workspace_archive(
     State(state): State<AppState>,
 ) -> ApiResult<axum::response::Response> {
     use axum::response::IntoResponse;
-    // A terminal/winding-down session's archive is moot (the run is over).
+    // A terminal/winding-down session's archive is moot (the run is over) —
+    // gate on accepts_work(), like every sibling internal endpoint.
     let session = fluidbox_db::get_session(&state.pool, auth.session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if session.status_enum().is_terminal() {
+    if !session.status_enum().accepts_work() {
         return Err(ApiError::BadRequest("session is not active".into()));
     }
     let path = crate::orchestrator::archive_path(&state.cfg.data_dir, auth.session_id);
