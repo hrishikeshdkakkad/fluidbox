@@ -25,10 +25,10 @@ pub struct PackedArchive {
 }
 
 /// Pack a session workspace root (`repo/` + `baseline-git/`) into a gzip'd
-/// tar. Symlinks inside the tree are followed as their target contents would
-/// bloat/loop; git never stores its own metadata as symlinks, and a worktree
-/// symlink is materialized as a regular entry on unpack — the extractor
-/// rejects any that escape.
+/// tar. `follow_symlinks(false)` stores each symlink as a symlink ENTRY (the
+/// target string), never dereferencing it — so an in-tree relative link
+/// survives the round-trip and the extractor decides per entry whether the
+/// target stays inside the root, rejecting any that escape.
 pub fn pack_workspace(session_root: &Path) -> Result<PackedArchive, WorkspaceError> {
     let mut gz = GzEncoder::new(Vec::new(), Compression::default());
     {
@@ -110,13 +110,33 @@ pub fn unpack_archive(
         let safe = safe_join(&canon_dest, &path)?;
 
         let etype = entry.header().entry_type();
-        // Reject links outright — a symlink or hardlink is the classic escape,
-        // and the workspace transport never needs one.
-        if etype.is_symlink() || etype.is_hard_link() {
+        // Hardlinks never cross this transport — a distinct escape class from
+        // an in-tree symlink, refused unconditionally.
+        if etype.is_hard_link() {
             return Err(WorkspaceError::Invalid(format!(
-                "archive contains a link entry ({}) — refused",
+                "archive contains a hard-link entry ({}) — refused",
                 path.display()
             )));
+        }
+        // Symlinks are extracted as real symlinks IFF their target, resolved
+        // lexically against the link's own parent directory, stays inside the
+        // root (H4: tracked in-tree symlinks are common — monorepos, dotfiles
+        // — and Docker runs them fine). Escaping or absolute targets refuse.
+        if etype.is_symlink() {
+            let target = entry
+                .link_name()
+                .map_err(|e| WorkspaceError::Invalid(format!("symlink target read: {e}")))?
+                .ok_or_else(|| {
+                    WorkspaceError::Invalid(format!("symlink '{}' has no target", path.display()))
+                })?
+                .into_owned();
+            ensure_symlink_in_root(&path, &target)?;
+            if let Some(parent) = safe.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            create_symlink(&target, &safe)?;
+            written += 1;
+            continue;
         }
         if etype.is_dir() {
             std::fs::create_dir_all(&safe)?;
@@ -160,6 +180,60 @@ fn safe_join(base: &Path, rel: &Path) -> Result<PathBuf, WorkspaceError> {
         }
     }
     Ok(out)
+}
+
+/// Refuse a symlink whose target would resolve outside the extraction root.
+/// `link_rel` is the entry's own path relative to dest; `target` is the raw
+/// link contents. Resolution is purely lexical against the directory the link
+/// lives in — no filesystem access, so a dangling in-tree target (legal in
+/// git) is fine; only a target that climbs above the root or is absolute
+/// fails. `depth` tracks levels below the root: the link's parent directory
+/// is the starting depth, each normal component descends, each `..` ascends,
+/// and dropping below zero means the target escaped.
+fn ensure_symlink_in_root(link_rel: &Path, target: &Path) -> Result<(), WorkspaceError> {
+    let escape = || {
+        WorkspaceError::Invalid(format!(
+            "symlink '{}' -> '{}' escapes the workspace root — refused",
+            link_rel.display(),
+            target.display()
+        ))
+    };
+    let mut depth: i64 = link_rel
+        .parent()
+        .map(|p| {
+            p.components()
+                .filter(|c| matches!(c, Component::Normal(_)))
+                .count() as i64
+        })
+        .unwrap_or(0);
+    for comp in target.components() {
+        match comp {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err(escape());
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return Err(escape()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &Path, at: &Path) -> Result<(), WorkspaceError> {
+    std::os::unix::fs::symlink(target, at)
+        .map_err(|e| WorkspaceError::Invalid(format!("create symlink {}: {e}", at.display())))
+}
+
+#[cfg(not(unix))]
+fn create_symlink(_target: &Path, at: &Path) -> Result<(), WorkspaceError> {
+    Err(WorkspaceError::Invalid(format!(
+        "symlink extraction is unsupported on this platform ({})",
+        at.display()
+    )))
 }
 
 #[cfg(test)]
@@ -252,6 +326,90 @@ mod tests {
         let packed = pack_workspace(&root).unwrap();
         let dest = tmp.join("out");
         assert!(unpack_archive(&packed.bytes, &dest, 4 * 1024).is_err());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// H4: a repo with a tracked in-tree relative symlink (monorepos,
+    /// dotfiles) must round-trip as a REAL symlink — Docker runs it fine, so
+    /// the K8s provider must too. `materialize_git` does a real checkout, so
+    /// these are common.
+    #[cfg(unix)]
+    #[test]
+    fn unpack_creates_intree_relative_symlink() {
+        let tmp = std::env::temp_dir().join(format!("fbx-arch-symok-{}", Uuid::now_v7()));
+        let root = tmp.join("ws");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/a.txt"), "hello\n").unwrap();
+        // repo/link -> src/a.txt (relative, resolves inside the tree)
+        std::os::unix::fs::symlink("src/a.txt", repo.join("link")).unwrap();
+
+        let packed = pack_workspace(&root).unwrap();
+        let dest = tmp.join("out");
+        unpack_archive(&packed.bytes, &dest, 100 * 1024 * 1024).unwrap();
+
+        let link = dest.join("repo/link");
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "link must extract as a symlink"
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), Path::new("src/a.txt"));
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "hello\n");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// H4 must not open an escape hatch: a symlink whose target leaves the
+    /// dest root — through `..` climbs or an absolute path — is still refused,
+    /// evaluated lexically against the link's own parent (no fs access).
+    #[test]
+    fn unpack_rejects_escaping_symlink_targets() {
+        for (path, target) in [
+            ("repo/link", "../../etc/passwd"), // climbs above dest
+            ("repo/link", "/etc/passwd"),      // absolute
+            ("link", ".."),                    // the dest root's parent
+            ("repo/sub/link", "../../../x"),   // deep climb past root
+        ] {
+            let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+            {
+                let mut b = tar::Builder::new(&mut gz);
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_size(0);
+                header.set_link_name(target).unwrap();
+                header.set_cksum();
+                b.append_data(&mut header, path, std::io::empty()).unwrap();
+                b.finish().unwrap();
+            }
+            let bytes = gz.finish().unwrap();
+            let tmp = std::env::temp_dir().join(format!("fbx-arch-symbad-{}", Uuid::now_v7()));
+            assert!(
+                unpack_archive(&bytes, &tmp, 1024 * 1024).is_err(),
+                "must reject escaping symlink {path} -> {target}"
+            );
+            std::fs::remove_dir_all(&tmp).ok();
+        }
+    }
+
+    /// Hardlinks remain refused unconditionally — the transport never needs
+    /// one and a hardlink is a distinct escape class from an in-tree symlink.
+    #[test]
+    fn unpack_still_rejects_hardlink() {
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut b = tar::Builder::new(&mut gz);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Link);
+            header.set_size(0);
+            header.set_link_name("repo/a.txt").unwrap();
+            header.set_cksum();
+            b.append_data(&mut header, "repo/hard", std::io::empty())
+                .unwrap();
+            b.finish().unwrap();
+        }
+        let bytes = gz.finish().unwrap();
+        let tmp = std::env::temp_dir().join(format!("fbx-arch-hard-{}", Uuid::now_v7()));
+        assert!(unpack_archive(&bytes, &tmp, 1024 * 1024).is_err());
         std::fs::remove_dir_all(&tmp).ok();
     }
 }
