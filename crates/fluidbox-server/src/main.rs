@@ -56,6 +56,10 @@ async fn build_provider(cfg: &config::Config) -> anyhow::Result<Arc<dyn Executio
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
+    // kube-rs (rustls 0.23) needs a process-level CryptoProvider; the workspace
+    // has multiple rustls backends in-tree, so pick ring explicitly or the
+    // Kubernetes client panics on first TLS use. No-op for the Docker path.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
