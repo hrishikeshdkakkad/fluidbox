@@ -44,10 +44,20 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A finalization claim older than this is re-drivable (the previous driver
 /// crashed). Derived from the worst healthy path — quiesce wait (30 s) +
-/// exit wait (30 s) + collection (120 s) + bounded probes and DB writes —
-/// with generous headroom: an overlapping second driver can overwrite
-/// evidence, so a healthy driver must never be raced.
+/// exit wait (30 s) + collection (120 s) + terminate (60 s) + bounded probes
+/// and DB writes — and every driver entry point is itself time-boxed at
+/// 300 s, so two drivers can never overlap and overwrite evidence.
 const FINALIZE_CLAIM_STALE_SECS: i64 = 420;
+
+/// A finalize whose session has NO stored handle may be racing provisioning:
+/// Docker creates and starts the container BEFORE `provision` returns, and
+/// discovery is only a snapshot (the container may appear a moment later).
+/// Collection therefore waits this long after the intent landed — enough for
+/// the provisioning path to either persist the handle or hit the attach
+/// fence (which terminates the orphan) — before trusting "no sandbox".
+/// Applies only when a diff is expected (a pre-launch failure with no
+/// workspace never waits).
+const PROVISION_SETTLE_SECS: i64 = 120;
 
 /// Terminal artifact collection is bounded: a hostile or huge worktree can
 /// waste the cap, never wedge `finalizing`.
@@ -260,7 +270,13 @@ async fn begin_finalize(state: &AppState, id: Uuid, params: FinalizeParams<'_>) 
 
     let state2 = state.clone();
     tokio::spawn(async move {
-        drive_finalization(&state2, id).await;
+        // Same bound as the recovery worker: EVERY driver entry point is
+        // time-boxed well under the 420 s claim, so two drivers can never
+        // overlap and overwrite each other's evidence.
+        let _ = tokio::time::timeout(Duration::from_secs(300), async {
+            drive_finalization(&state2, id).await;
+        })
+        .await;
     });
     FinalizeStart::Persisted { created }
 }
@@ -554,10 +570,23 @@ async fn collect_and_terminalize(
             // missing (a torn diff must not become the audit artifact).
             // A missing/unparseable stored handle is NOT "gone": Docker
             // starts the container before `provision` returns, so a finalize
-            // that raced provisioning must consult provider truth
-            // (list_managed by session label) before touching the worktree.
+            // that raced provisioning first lets provisioning settle (the
+            // attach fence terminates the orphan), then consults provider
+            // truth (list_managed by session label) before touching the
+            // worktree.
             let handle = match session_handle_state(&session) {
                 StoredHandle::Handle(h) => Some(h),
+                StoredHandle::None
+                    if expected_diff
+                        && chrono::Utc::now()
+                            < intent.created_at
+                                + chrono::Duration::seconds(PROVISION_SETTLE_SECS) =>
+                {
+                    tracing::info!(
+                        "collect for {id} deferred: no stored handle yet (provisioning may be in flight)"
+                    );
+                    return;
+                }
                 StoredHandle::None | StoredHandle::Unparseable => {
                     match discover_handle(state, id).await {
                         Ok(h) => h,
@@ -665,7 +694,7 @@ async fn collect_and_terminalize(
 /// Terminal-side effects + cleanup, re-driven under the claim until ALL of it
 /// succeeds — only then is the intent released (it is the retry ticket).
 /// Everything here is idempotent: token revocation is an UPDATE, delivery
-/// enqueue is guarded by `result_deliveries_exist` (and this path is
+/// enqueue is per-destination idempotent (and this path is
 /// claim-serialized), both providers' terminate treat already-gone as
 /// success, and the file removals tolerate absence. Also closes the
 /// terminal-commit → side-effects crash gap (`transition` normally does
@@ -694,6 +723,18 @@ async fn finish_terminal_cleanup(
                 },
             )
             .await;
+            // `record` swallows append failures — VERIFY before the intent
+            // may ever be released, or a failed append loses the event
+            // forever (exactly-once requires at-least-once first).
+            match fluidbox_db::has_run_result_event(&state.pool, id).await {
+                Ok(true) => {}
+                _ => {
+                    tracing::warn!(
+                        "terminal reconcile {id}: run.result append unverified — retrying next drive"
+                    );
+                    return;
+                }
+            }
         }
         Err(e) => {
             tracing::warn!("terminal reconcile {id}: run.result check failed: {e}");
@@ -815,8 +856,12 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
     .await?;
 
     // provisioning → initializing (workspace materialization, control-plane
-    // side, BEFORE the agent starts — a bad repo fails here at zero model spend)
-    transition(&state, session_id, SessionStatus::Initializing, None).await;
+    // side, BEFORE the agent starts — a bad repo fails here at zero model
+    // spend). A refused transition means a finalizer took ownership (cancel,
+    // watchdog): stop BEFORE materializing or provisioning anything.
+    if !transition(&state, session_id, SessionStatus::Initializing, None).await {
+        anyhow::bail!("session left active state before workspace init");
+    }
     let (workspace_dir, base_commit) = materialize_workspace(&state, session_id, &run_spec).await?;
 
     let control_url = state.cfg.public_control_url.clone();
