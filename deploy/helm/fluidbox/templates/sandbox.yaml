@@ -1,0 +1,109 @@
+{{- $sandboxNs := .Values.sandbox.namespace -}}
+{{- if .Values.sandbox.create }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $sandboxNs }}
+  labels:
+    {{- include "fluidbox.labels" . | nindent 4 }}
+    # Enforce the restricted Pod Security Standard on every sandbox Pod.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+{{- end }}
+---
+# Default-deny BOTH directions in the sandbox namespace: nothing may connect TO
+# a sandbox, and a sandbox may reach nothing except what the profile below
+# explicitly allows.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fluidbox-sandbox-default-deny
+  namespace: {{ $sandboxNs }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+# Egress profile. zeroEgress (default): control-plane internal Service :8788
+# ONLY, no DNS (DNS is an exfiltration channel and the only destination a
+# sandbox needs is fluidbox). The internal Service's backend pods are matched
+# by label; kube-proxy DNATs the ClusterIP to them.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fluidbox-sandbox-egress
+  namespace: {{ $sandboxNs }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{ "fluidbox.dev/managed" }}: "true"
+  policyTypes: ["Egress"]
+  egress:
+    # Always: the control-plane internal listener (:8788) — runner contract,
+    # workspace archive, LLM facade.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "fluidbox.name" . }}
+              app.kubernetes.io/component: server
+      ports:
+        - { protocol: TCP, port: 8788 }
+    {{- if or (eq .Values.sandbox.egressProfile "restrictedEgress") (eq .Values.sandbox.egressProfile "permissive") }}
+    # restrictedEgress / permissive also allow kube-dns (documented as
+    # "restricted", not "zero" — recursive DNS is an exfiltration channel).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    {{- end }}
+    {{- if eq .Values.sandbox.egressProfile "permissive" }}
+    # permissive (DEV ONLY, carries NO production guarantee): 0.0.0.0/0 minus
+    # the metadata endpoint and private/cluster CIDRs.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.0.0/16
+              - 169.254.169.254/32
+              {{- range .Values.sandbox.privateCidrs }}
+              - {{ . }}
+              {{- end }}
+    {{- end }}
+---
+{{- if .Values.sandbox.quota.enabled }}
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: fluidbox-sandbox-quota
+  namespace: {{ $sandboxNs }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+spec:
+  hard:
+    pods: {{ .Values.sandbox.quota.pods | quote }}
+    requests.cpu: {{ .Values.sandbox.quota.requestsCpu | quote }}
+    requests.memory: {{ .Values.sandbox.quota.requestsMemory | quote }}
+---
+{{- end }}
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: fluidbox-sandbox-limits
+  namespace: {{ $sandboxNs }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: {{ .Values.sandbox.resources.limits.cpu | quote }}
+        memory: {{ .Values.sandbox.resources.limits.memory | quote }}
+      defaultRequest:
+        cpu: {{ .Values.sandbox.resources.requests.cpu | quote }}
+        memory: {{ .Values.sandbox.resources.requests.memory | quote }}

@@ -15,6 +15,18 @@ setup:
 doctor:
     bash scripts/doctor.sh
 
+# Local Kubernetes dev: kind + Calico + image load + helm-install guidance.
+k8s-dev:
+    bash scripts/k8s-dev.sh
+
+# K8s preflight (kube context, StorageClass, enforcing CNI, credential Secret).
+k8s-doctor NS="fluidbox":
+    bash scripts/k8s-doctor.sh {{NS}}
+
+# Build the in-pod workspace collector image.
+collector-build:
+    docker build -t ${FLUIDBOX_COLLECTOR_IMAGE:-fluidbox-workspaced:dev} -f deploy/workspaced.Dockerfile .
+
 # Everything: LiteLLM gateway + server + web (ctrl-c stops all)
 dev:
     just gateway-up

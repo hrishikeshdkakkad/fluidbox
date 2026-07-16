@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [server, web, sandbox-runner, codex-runner]
+        image: [server, web, sandbox-runner, codex-runner, workspaced]
         platform:
           - { os: ubuntu-latest, arch: amd64 }
           - { os: ubuntu-24.04-arm, arch: arm64 }
@@ -37,6 +37,7 @@ jobs:
             web)            echo "file=deploy/web.Dockerfile"    >> "$GITHUB_OUTPUT"; echo "context=." >> "$GITHUB_OUTPUT" ;;
             sandbox-runner) echo "file=images/sandbox-runner/Dockerfile" >> "$GITHUB_OUTPUT"; echo "context=images" >> "$GITHUB_OUTPUT" ;;
             codex-runner)   echo "file=images/codex-runner/Dockerfile"   >> "$GITHUB_OUTPUT"; echo "context=images" >> "$GITHUB_OUTPUT" ;;
+            workspaced)     echo "file=deploy/workspaced.Dockerfile" >> "$GITHUB_OUTPUT"; echo "context=." >> "$GITHUB_OUTPUT" ;;
           esac
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
@@ -71,7 +72,7 @@ jobs:
     needs: build
     strategy:
       matrix:
-        image: [server, web, sandbox-runner, codex-runner]
+        image: [server, web, sandbox-runner, codex-runner, workspaced]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
@@ -101,3 +102,18 @@ jobs:
             $(printf '${{ env.REGISTRY }}/${{ github.repository_owner }}/fluidbox-${{ matrix.image }}@sha256:%s ' *)
       - name: inspect
         run: docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ github.repository_owner }}/fluidbox-${{ matrix.image }}:latest
+
+  # Publish the Helm chart as an OCI artifact to GHCR alongside the images.
+  chart:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: package + push chart (OCI)
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+          helm package deploy/helm/fluidbox --destination /tmp/chart
+          helm push /tmp/chart/fluidbox-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts

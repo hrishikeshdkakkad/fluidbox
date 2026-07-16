@@ -204,7 +204,12 @@ mod tests {
         // whatever produced the tar). Test it directly against the classic
         // escapes an adversarial archive would carry.
         let base = Path::new("/data/ws");
-        for bad in ["../escape.txt", "a/../../etc/passwd", "/etc/passwd", "/../x"] {
+        for bad in [
+            "../escape.txt",
+            "a/../../etc/passwd",
+            "/etc/passwd",
+            "/../x",
+        ] {
             assert!(
                 safe_join(base, Path::new(bad)).is_err(),
                 "must reject escaping path '{bad}'"
