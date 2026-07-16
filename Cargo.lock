@@ -1221,6 +1221,7 @@ dependencies = [
  "hmac 0.13.0",
  "jsonwebtoken",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "serde_yaml",
