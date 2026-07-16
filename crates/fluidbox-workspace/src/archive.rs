@@ -91,6 +91,15 @@ pub fn unpack_archive(
     max_total_bytes: u64,
 ) -> Result<u64, WorkspaceError> {
     std::fs::create_dir_all(dest)?;
+    // Fresh-destination precondition (fail-closed): the two-phase containment
+    // assumes the file/dir phase writes into a symlink-free tree. A re-run over
+    // a DIRTY dest — e.g. an init container re-executing on a Pod restart, where
+    // the runner may have planted symlinks into the surviving emptyDir — must
+    // not let phase 1 follow a stale link out of the root. Clear the contents
+    // first (not `dest` itself, which is a mount point), removing symlinks as
+    // links; propagate any error rather than extracting into dirty state.
+    clear_dir_contents(dest)
+        .map_err(|e| WorkspaceError::Invalid(format!("clear dest {}: {e}", dest.display())))?;
     let canon_dest = std::fs::canonicalize(dest)?;
     let gz = GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(gz);
@@ -205,6 +214,30 @@ fn place_symlinks(canon_dest: &Path, deferred: &[(PathBuf, PathBuf)]) -> u64 {
         }
     }
     kept
+}
+
+/// Remove every entry INSIDE `dir` (not `dir` itself — it may be a mount
+/// point), deleting a symlink as a link rather than following it to its
+/// target. Fail-closed: any error propagates so a caller never proceeds over
+/// residual state. Used to enforce the fresh-destination precondition of the
+/// extractor and the in-pod copy on a lifecycle replay.
+pub fn clear_dir_contents(dir: &Path) -> std::io::Result<()> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in rd {
+        let path = entry?.path();
+        // symlink_metadata: never follow — a symlinked dir is unlinked, not
+        // recursed into (which would delete its target's contents).
+        if std::fs::symlink_metadata(&path)?.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
 }
 
 /// Join `rel` under `base`, rejecting anything that would escape (absolute
@@ -513,6 +546,58 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Codex batch-3v3 finding 2: unpack over a DIRTY dest (an init container
+    /// re-executing over the surviving emptyDir) must clear it first, so a
+    /// runner-planted `repo -> outside` symlink can't make the file phase
+    /// write through it.
+    #[cfg(unix)]
+    #[test]
+    fn unpack_clears_stale_destination_symlink() {
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut b = tar::Builder::new(&mut gz);
+            let mut d = tar::Header::new_gnu();
+            d.set_entry_type(tar::EntryType::Directory);
+            d.set_mode(0o755);
+            d.set_size(0);
+            d.set_cksum();
+            b.append_data(&mut d, "repo/", std::io::empty()).unwrap();
+            let content = b"fresh";
+            let mut f = tar::Header::new_gnu();
+            f.set_entry_type(tar::EntryType::Regular);
+            f.set_size(content.len() as u64);
+            f.set_cksum();
+            b.append_data(&mut f, "repo/pwn", &content[..]).unwrap();
+            b.finish().unwrap();
+        }
+        let bytes = gz.finish().unwrap();
+
+        let base = std::env::temp_dir().join(format!("fbx-arch-stale-{}", Uuid::now_v7()));
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("canary"), "ORIGINAL\n").unwrap();
+        let dest = base.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        // Runner planted a symlink where a real dir entry will land.
+        std::os::unix::fs::symlink(&outside, dest.join("repo")).unwrap();
+
+        unpack_archive(&bytes, &dest, 10 * 1024 * 1024).unwrap();
+
+        assert!(
+            dest.join("repo/pwn").is_file(),
+            "fresh file lands inside dest"
+        );
+        assert!(
+            !outside.join("pwn").exists(),
+            "must not write through the stale destination symlink"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("canary")).unwrap(),
+            "ORIGINAL\n"
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// Hardlinks remain refused unconditionally — the transport never needs

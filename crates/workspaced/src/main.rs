@@ -247,6 +247,12 @@ fn fetch(url: &str, token: &str, expected_len: u64) -> Result<Vec<u8>, String> {
 /// rather than left to escape. `canonicalize` — following the FULL target
 /// chain — is the sole containment judge.
 fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    // Fresh-destination precondition (fail-closed): on an init re-execution the
+    // surviving emptyDir may hold runner-planted symlinks; clear dst's contents
+    // (symlinks as links) so the copy phase can't follow a stale link out of
+    // the root.
+    std::fs::create_dir_all(dst)?;
+    fluidbox_workspace::clear_dir_contents(dst)?;
     let mut symlinks: Vec<(PathBuf, PathBuf)> = Vec::new();
     copy_files(src, dst, &mut symlinks)?;
     place_symlinks(dst, &symlinks);
@@ -338,13 +344,17 @@ mod tests {
         std::fs::write(src.join("a.txt"), "hi\n").unwrap();
         std::os::unix::fs::symlink("a.txt", src.join("link")).unwrap();
         std::os::unix::fs::symlink("../a.txt", src.join("sub/uplink")).unwrap();
-        // Points above the copy root → must be dropped, not escape /workspace.
-        std::os::unix::fs::symlink("../../etc/passwd", src.join("escape")).unwrap();
+        // A REAL file outside the copy root — the escaping links must resolve
+        // to it (so canonicalize succeeds and proves containment) yet be
+        // dropped. Deterministic, unlike a target that merely dangles.
+        std::fs::write(base.join("secret.txt"), "SECRET\n").unwrap();
+        // Points above the copy root → dropped.
+        std::os::unix::fs::symlink("../secret.txt", src.join("escape")).unwrap();
         // Codex batch-3v2 counterexample: a symlinked component in the target.
-        // `anchor -> .`, `leak -> anchor/../etc/passwd` resolves to /etc/passwd
-        // via the anchor link — lexical math accepts it; canonicalize refuses.
+        // `anchor -> .`, `leak -> anchor/../secret.txt` resolves OUT via anchor
+        // — lexical math accepts it; canonicalize refuses.
         std::os::unix::fs::symlink(".", src.join("anchor")).unwrap();
-        std::os::unix::fs::symlink("anchor/../../etc/passwd", src.join("leak")).unwrap();
+        std::os::unix::fs::symlink("anchor/../secret.txt", src.join("leak")).unwrap();
 
         let dst = base.join("workspace");
         copy_tree(&src, &dst).unwrap();
@@ -366,12 +376,61 @@ mod tests {
             "in-tree ../ symlink must be preserved"
         );
         assert!(std::fs::read_to_string(src.join("a.txt")).is_ok());
+        // The escaping links resolved to the REAL outside file yet were dropped.
         for bad in ["escape", "leak"] {
             assert!(
                 std::fs::symlink_metadata(dst.join(bad)).is_err(),
                 "escaping symlink {bad} must be dropped"
             );
         }
+        assert_eq!(
+            std::fs::read_to_string(base.join("secret.txt")).unwrap(),
+            "SECRET\n",
+            "the outside file must be untouched"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Codex batch-3v3 finding 1: an init re-execution over a DIRTY /workspace
+    /// (the emptyDir survives Pod restarts) must not let the copy phase follow
+    /// a runner-planted symlink out of the root. `copy_tree` clears dst's
+    /// contents first, so copying a regular `seed` writes a fresh file instead
+    /// of overwriting the outside canary through the stale link.
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_clears_stale_destination_symlink() {
+        let base = std::env::temp_dir().join(format!("fbx-copystale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("seed"), "fresh\n").unwrap();
+
+        // Outside canary + a dirty dst where the runner planted `seed` as a
+        // symlink pointing at it.
+        std::fs::write(base.join("canary"), "ORIGINAL\n").unwrap();
+        let dst = base.join("workspace");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::os::unix::fs::symlink(base.join("canary"), dst.join("seed")).unwrap();
+
+        copy_tree(&src, &dst).unwrap();
+
+        // The planted link is gone; seed is a real file; the canary is intact.
+        assert!(
+            !std::fs::symlink_metadata(dst.join("seed"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "stale destination symlink must be cleared"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("seed")).unwrap(),
+            "fresh\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("canary")).unwrap(),
+            "ORIGINAL\n",
+            "copy must not follow the stale link and overwrite the canary"
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 }
