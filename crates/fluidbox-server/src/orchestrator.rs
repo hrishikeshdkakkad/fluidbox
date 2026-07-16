@@ -558,7 +558,13 @@ async fn collect_and_terminalize(
         }
     };
 
-    if !have_real_diff {
+    // Collection itself is gated on `expected_diff`: a session that never
+    // had a workspace/sandbox has nothing to collect BY DEFINITION, and a
+    // finalize racing mid-materialization (base_commit/started_at/handle all
+    // still unset) must not read — or store a "diff" of — a half-written
+    // workspace. The launch path stops at its ownership checks; anything it
+    // already wrote is removed by terminal cleanup.
+    if !have_real_diff && expected_diff {
         if skip_collection {
             if record_missing_once("quiesce_timeout".into()).await.is_err() {
                 return;
@@ -577,14 +583,18 @@ async fn collect_and_terminalize(
             let handle = match session_handle_state(&session) {
                 StoredHandle::Handle(h) => Some(h),
                 StoredHandle::None
-                    if expected_diff
-                        && chrono::Utc::now()
-                            < intent.created_at
-                                + chrono::Duration::seconds(PROVISION_SETTLE_SECS) =>
+                    if chrono::Utc::now()
+                        < intent.created_at + chrono::Duration::seconds(PROVISION_SETTLE_SECS) =>
                 {
                     tracing::info!(
                         "collect for {id} deferred: no stored handle yet (provisioning may be in flight)"
                     );
+                    // A deliberate wait, not a failure: release the claim so
+                    // the finalize worker retries at its cadence instead of
+                    // waiting out the 420 s stale window.
+                    fluidbox_db::release_finalization_claim(&state.pool, id)
+                        .await
+                        .ok();
                     return;
                 }
                 StoredHandle::None | StoredHandle::Unparseable => {
@@ -864,6 +874,15 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
     }
     let (workspace_dir, base_commit) = materialize_workspace(&state, session_id, &run_spec).await?;
 
+    // Ownership gate AFTER materialization, BEFORE anything else is created
+    // (the K8s archive write included): a finalizer that took the session
+    // while we copied may already have run terminal cleanup and released its
+    // intent — the loser must remove what IT created or nothing ever will.
+    if !launch_ownership(&state, session_id).await? {
+        abandon_launch(&state, session_id);
+        anyhow::bail!("session ownership lost during workspace init; launch abandoned");
+    }
+
     let control_url = state.cfg.public_control_url.clone();
     let env = build_runner_env(&run_spec, &control_url, session_id, &session_token);
 
@@ -902,6 +921,13 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
         network: state.cfg.network_mode,
     };
 
+    // Ownership re-check immediately before creating a sandbox: a finalizer
+    // that took the session during archive packing must find no container to
+    // race (the attach fence below catches the residual instants).
+    if !launch_ownership(&state, session_id).await? {
+        abandon_launch(&state, session_id);
+        anyhow::bail!("session ownership lost before provisioning; launch abandoned");
+    }
     let handle = state.provider.provision(&sandbox_spec).await?;
     let attached =
         fluidbox_db::set_sandbox_handle(&state.pool, session_id, &serde_json::to_value(&handle)?)
@@ -917,6 +943,7 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
                 "late-provision terminate for {session_id} failed ({e}); finalizer discovery will reap"
             );
         }
+        abandon_launch(&state, session_id);
         anyhow::bail!(
             "session left active state during provisioning; sandbox handed to the finalizer"
         );
@@ -1165,6 +1192,53 @@ async fn materialize_workspace(
     )
     .await;
     Ok((Some(ws.host_dir), ws.base_commit))
+}
+
+/// Is this session still ours to launch? Ownership is the ABSENCE of a
+/// finalization intent (the single source of truth — it commits BEFORE the
+/// wind-down transition, so a status-only check has a gap) on a session
+/// still in an active state. Transient read errors are retried here: a
+/// blip must not fail a healthy, fully materialized run.
+async fn launch_ownership(state: &AppState, id: Uuid) -> anyhow::Result<bool> {
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        let session = match fluidbox_db::get_session(&state.pool, id).await {
+            Ok(Some(s)) => s,
+            Ok(None) => return Ok(false),
+            Err(e) => {
+                last_err = Some(e.into());
+                continue;
+            }
+        };
+        if !session.status_enum().accepts_work() {
+            return Ok(false);
+        }
+        match fluidbox_db::get_finalization(&state.pool, id).await {
+            Ok(Some(_)) => return Ok(false),
+            Ok(None) => return Ok(true),
+            Err(e) => {
+                last_err = Some(e.into());
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("ownership read failed")))
+}
+
+/// Best-effort cleanup of a launch this task lost: the finalizer that owns
+/// the session may already have run terminal cleanup and released its
+/// intent, so the loser must remove what IT created (workspace, archive) or
+/// nothing ever will.
+fn abandon_launch(state: &AppState, id: Uuid) {
+    if state.cfg.keep_workspaces {
+        return;
+    }
+    if let Err(e) = fluidbox_workspace::cleanup_workspace(&state.cfg.data_dir, id) {
+        tracing::warn!("abandoned-launch workspace cleanup for {id}: {e}");
+    }
+    let _ = delete_archive(&state.cfg.data_dir, id);
 }
 
 /// Resolve a connection into an `Authorization` header value for git fetch

@@ -226,7 +226,12 @@ async fn budget_sweeper(state: AppState) {
             if over.is_none() {
                 if let Some(max) = run_spec.budgets.max_tool_calls {
                     if let Ok(n) = fluidbox_db::tool_call_count(&state.pool, s.id).await {
-                        if n as u64 >= max {
+                        // STRICTLY greater — the gate permits exactly `max`
+                        // calls (it denies at used > max, with the current
+                        // call's intent already counted); firing at >= would
+                        // kill a session whose max-th call is legitimately
+                        // mid-flight.
+                        if n as u64 > max {
                             over = Some("max_tool_calls");
                         }
                     }
