@@ -157,14 +157,19 @@ async fn decide_tool_call(
                     },
                 )
                 .await;
-                let session_clone = session.clone();
+                let session_id = session.id;
                 let state2 = state.clone();
                 tokio::spawn(async move {
-                    orchestrator::finalize(
+                    // Forced stop (runner live → quiesce first). A DbError
+                    // start here has no same-channel retry — the deny below
+                    // already went out — but the runner's exit then posts
+                    // /result and the wall-clock sweeper backstops; both
+                    // re-enter the durable path.
+                    let _ = orchestrator::finalize_forced(
                         &state2,
-                        &session_clone,
+                        session_id,
                         "budget_exceeded",
-                        Some("tool-call budget exceeded"),
+                        "tool-call budget exceeded",
                     )
                     .await;
                 });
@@ -830,10 +835,19 @@ pub async fn result(
         return Ok(Json(json!({ "ok": true, "note": "already terminal" })));
     }
     // Already winding down: a cancel (or a prior /result) owns finalization —
-    // ACK idempotently and let it complete. A quiesced runner shouldn't even
-    // reach here, but a racing /result must never override the cancel outcome.
+    // but ONLY if its intent actually persisted. A wind-down state WITHOUT an
+    // intent is the stranded-wedge shape (nothing for recovery to drive);
+    // fall through and (re)persist one instead of falsely ACKing.
     if st.is_winding_down() {
-        return Ok(Json(json!({ "ok": true, "note": "finalizing" })));
+        match fluidbox_db::get_finalization(&state.pool, session_id).await {
+            Ok(Some(_)) => return Ok(Json(json!({ "ok": true, "note": "finalizing" }))),
+            Ok(None) => {}
+            Err(_) => {
+                return Err(ApiError::ServiceUnavailable(
+                    "finalization state unavailable; retry".into(),
+                ))
+            }
+        }
     }
     // Non-terminal: the token must still be live to drive a finalize (revoke
     // only happens on terminal, so this is the ordinary first-post path).
@@ -843,11 +857,23 @@ pub async fn result(
     {
         return Err(ApiError::Unauthorized);
     }
-    // Persist the finalization intent and enter `finalizing` BEFORE ACKing
-    // (fixes the lossy ACK-then-`tokio::spawn`): a crash after this point is
-    // recovered by the finalize worker. `finalize` spawns the driver itself.
-    orchestrator::finalize(&state, &session, &res.outcome, res.summary.as_deref()).await;
-    Ok(Json(json!({ "ok": true })))
+    // Persist the finalization intent BEFORE ACKing — and NEVER ACK success
+    // when it did not persist: the runner exits on ok:true, and with no
+    // durable intent the watchdog would later record this completed run as
+    // failed. The runner contract retries /result on 5xx.
+    use orchestrator::FinalizeStart;
+    match orchestrator::finalize_reported(&state, session_id, &res.outcome, res.summary.as_deref())
+        .await
+    {
+        FinalizeStart::Persisted { .. } => Ok(Json(json!({ "ok": true }))),
+        FinalizeStart::AlreadyTerminal => {
+            Ok(Json(json!({ "ok": true, "note": "already terminal" })))
+        }
+        FinalizeStart::Missing => Err(ApiError::NotFound),
+        FinalizeStart::DbError => Err(ApiError::ServiceUnavailable(
+            "finalization intent not persisted; retry".into(),
+        )),
+    }
 }
 
 #[derive(Deserialize)]
