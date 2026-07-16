@@ -9,6 +9,7 @@ fluidbox-core.workspace = true
 fluidbox-db.workspace = true
 fluidbox-workspace.workspace = true
 fluidbox-provider.workspace = true
+fluidbox-provider-k8s.workspace = true
 axum.workspace = true
 tower-http.workspace = true
 tokio.workspace = true

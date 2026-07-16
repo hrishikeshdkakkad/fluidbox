@@ -5,6 +5,8 @@ members = [
     "crates/fluidbox-db",
     "crates/fluidbox-workspace",
     "crates/fluidbox-provider",
+    "crates/fluidbox-provider-k8s",
+    "crates/workspaced",
     "crates/fluidbox-server",
     "crates/fluidbox-cli",
     "crates/fluidbox-catalog-import",
@@ -21,6 +23,7 @@ fluidbox-core = { path = "crates/fluidbox-core" }
 fluidbox-db = { path = "crates/fluidbox-db" }
 fluidbox-workspace = { path = "crates/fluidbox-workspace" }
 fluidbox-provider = { path = "crates/fluidbox-provider" }
+fluidbox-provider-k8s = { path = "crates/fluidbox-provider-k8s" }
 
 anyhow = "1"
 thiserror = "2"
