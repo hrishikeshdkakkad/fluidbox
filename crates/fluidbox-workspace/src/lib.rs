@@ -18,9 +18,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use uuid::Uuid;
 
+pub mod archive;
 pub mod collect;
 
-pub use collect::{collect_diff, CollectedDiff, CollectionOutcome, DiffCaps};
+pub use archive::{pack_workspace, unpack_archive, verify_archive, PackedArchive};
+pub use collect::{collect_diff, collect_diff_at, CollectedDiff, CollectionOutcome, DiffCaps};
 
 /// Directory (under the per-session workspace root) holding the pristine
 /// copy of the materialized `.git` — saved before the agent ever runs,

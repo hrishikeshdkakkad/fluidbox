@@ -12,3 +12,8 @@ thiserror = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 uuid = { workspace = true }
+# tar + gzip give a compressed, digest-verified archive with hardened,
+# auditable-in-one-place extraction. gzip (miniz_oxide, pure Rust) over zstd
+# keeps the collector a trivially static musl binary — no zstd-sys C toolchain.
+tar = "0.4"
+flate2 = "1"

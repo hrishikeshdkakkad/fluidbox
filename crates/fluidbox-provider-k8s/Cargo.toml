@@ -1,0 +1,27 @@
+[package]
+name = "fluidbox-provider-k8s"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "fluidbox Kubernetes ExecutionProvider — one bare Pod per run via kube-rs"
+
+[dependencies]
+fluidbox-core = { workspace = true }
+fluidbox-workspace = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+kube = { version = "4", default-features = false, features = [
+    "client",
+    "runtime",
+    "rustls-tls",
+    "ws",
+] }
+k8s-openapi = { version = "0.28", features = ["latest"] }
