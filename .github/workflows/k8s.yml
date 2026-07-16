@@ -1,0 +1,86 @@
+name: k8s-provider
+
+# Provider conformance (design 2026-07-15, Phase 3). Three tiers:
+#   unit    — mocked-kube manifest/status/parse assertions (every PR, seconds)
+#   kind    — kind + Calico: chart install + the netpol enforcement probe
+#             (every PR touching the K8s surface; minutes, no 1.5 GB images)
+#   nightly — reserved for the real runner images + demo A on the provider
+on:
+  pull_request:
+    paths:
+      - "crates/fluidbox-provider-k8s/**"
+      - "crates/fluidbox-workspace/**"
+      - "crates/workspaced/**"
+      - "deploy/helm/**"
+      - "deploy/workspaced.Dockerfile"
+      - ".github/workflows/k8s.yml"
+  schedule:
+    - cron: "0 7 * * *"   # nightly heavy tier
+  workflow_dispatch: {}
+
+jobs:
+  # Mocked-kube unit tier: manifest assembly (token-never-leaks, security
+  # baseline, ownerRef), runner-status mapping, archive hardening, diff parse.
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: "clippy, rustfmt"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy -p fluidbox-provider-k8s -p fluidbox-workspace -p workspaced --all-targets -- -D warnings
+      - run: cargo test -p fluidbox-provider-k8s -p fluidbox-workspace -p workspaced
+
+  # kind + Calico (NOT kindnet — kindnet does not enforce NetworkPolicy). The
+  # netpol probe is the load-bearing assertion: it proves enforcement, and the
+  # boot run-gate depends on it. A tiny contract-stub runner keeps images small.
+  kind-calico:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: fluidbox
+          config: .github/kind-calico.yaml
+      - name: install Calico
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/calico.yaml
+          kubectl -n kube-system rollout status ds/calico-node --timeout=240s
+      - name: build + load collector + a tiny contract-stub runner
+        run: |
+          docker build -q -t fluidbox-workspaced:dev -f deploy/workspaced.Dockerfile .
+          docker build -q -t fluidbox-server:dev -f deploy/server.Dockerfile .
+          # A stub runner: the netpol/chart tier does not exercise the agent
+          # loop, so a minimal image keeps CI off the 1.5 GB production images.
+          printf 'FROM busybox:1.36\nUSER 10001:10001\nENTRYPOINT ["sleep","3600"]\n' > /tmp/stub.Dockerfile
+          docker build -q -t fluidbox-sandbox-runner:dev -f /tmp/stub.Dockerfile /tmp
+          for i in fluidbox-workspaced:dev fluidbox-server:dev fluidbox-sandbox-runner:dev; do
+            kind load docker-image --name fluidbox "$i"
+          done
+      - name: install chart + a throwaway credential Secret
+        run: |
+          kubectl create namespace fluidbox
+          kubectl -n fluidbox create secret generic fluidbox-secrets \
+            --from-literal=DATABASE_URL=postgres://stub \
+            --from-literal=FLUIDBOX_ADMIN_TOKEN=ci-admin \
+            --from-literal=FLUIDBOX_CREDENTIAL_KEY="$(printf 'ab%.0s' {1..32})" \
+            --from-literal=LITELLM_MASTER_KEY=ci \
+            --from-literal=ANTHROPIC_API_KEY=ci
+          helm install fluidbox deploy/helm/fluidbox -n fluidbox \
+            -f deploy/helm/fluidbox/values/kind.yaml \
+            --set web.enabled=false --set litellm.enabled=false \
+            --wait --timeout 120s || true
+      - name: netpol enforcement probe (the P3 assertion) — must PASS on Calico
+        run: |
+          # Both Services back a healthy server pod, so reachability is known
+          # independently of policy; the probe proves +:8788 / -:8787.
+          helm test fluidbox -n fluidbox --timeout 120s
+      - name: dump on failure
+        if: failure()
+        run: |
+          kubectl -n fluidbox get pods,svc,networkpolicy -o wide || true
+          kubectl -n fluidbox-sandboxes get pods,networkpolicy -o wide || true
+          kubectl -n fluidbox logs deploy/fluidbox-fluidbox-server --tail=100 || true
