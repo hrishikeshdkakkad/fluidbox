@@ -1,0 +1,12 @@
+# Google GKE. Dataplane V2 (Cilium) enforces NetworkPolicy natively (the
+# recommended mode; Autopilot is always DPv2). Classic dataplane needs
+# --enable-network-policy. standard-rwo is the default StorageClass. GKE
+# Sandbox (gVisor) node pools give hard isolation.
+server:
+  archivePvc:
+    storageClass: standard-rwo
+sandbox:
+  egressProfile: zeroEgress
+  runtimeClassName: ""        # set "gvisor" on GKE Sandbox node pools
+netpol:
+  requireEnforced: true
