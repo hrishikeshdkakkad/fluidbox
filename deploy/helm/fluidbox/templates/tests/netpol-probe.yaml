@@ -1,0 +1,75 @@
+{{- /*
+  Release certification (design 2026-07-15, §"Verified enforcement"): a probe
+  Pod in the sandbox namespace, under the default-deny + egress policy and
+  carrying the sandbox `fluidbox.dev/managed` label, MUST reach the internal
+  Service :8788 (positive) and MUST NOT reach the public Service :8787
+  (negative). Both Services back the same healthy server pod, so reachability
+  is known independently of policy — no external-IP false pass.
+
+  ClusterIPs are resolved via `lookup` (live at `helm test` time), so the probe
+  needs no DNS — it works under zeroEgress. `helm lint`/`template` see empty
+  strings (lookup is inert then); the probe only runs during `helm test`.
+*/ -}}
+{{- $internal := (lookup "v1" "Service" .Release.Namespace (include "fluidbox.internalServiceName" .)) -}}
+{{- $public := (lookup "v1" "Service" .Release.Namespace (include "fluidbox.serverName" .)) -}}
+{{- $internalIp := "" -}}
+{{- $publicIp := "" -}}
+{{- if $internal }}{{- $internalIp = $internal.spec.clusterIP -}}{{- end }}
+{{- if $public }}{{- $publicIp = $public.spec.clusterIP -}}{{- end }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "fluidbox.fullname" . }}-netpol-probe
+  namespace: {{ .Values.sandbox.namespace }}
+  labels:
+    {{- include "fluidbox.labels" . | nindent 4 }}
+    # The sandbox label so the egress NetworkPolicy applies to the probe too.
+    fluidbox.dev/managed: "true"
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  {{- with .Values.sandbox.runtimeClassName }}
+  runtimeClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.sandbox.nodeSelector }}
+  nodeSelector: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.sandbox.tolerations }}
+  tolerations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: {{ .Values.sandbox.runAsUser }}
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: probe
+      image: {{ .Values.netpol.probeImage | quote }}
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -u
+          INT_IP="{{ $internalIp }}"
+          PUB_IP="{{ $publicIp }}"
+          if [ -z "$INT_IP" ] || [ -z "$PUB_IP" ]; then
+            echo "FAIL: could not resolve Service ClusterIPs (run via 'helm test')"; exit 1
+          fi
+          echo "probe: internal=$INT_IP:8788  public=$PUB_IP:8787"
+          # POSITIVE: the internal listener must be reachable.
+          if nc -z -w 4 "$INT_IP" 8788; then
+            echo "OK positive: internal :8788 reachable"
+          else
+            echo "FAIL positive: internal :8788 UNREACHABLE (egress policy too tight, or server down)"; exit 1
+          fi
+          # NEGATIVE: the public listener must be BLOCKED by NetworkPolicy.
+          if nc -z -w 4 "$PUB_IP" 8787; then
+            echo "FAIL negative: public :8787 REACHABLE — the CNI is NOT enforcing NetworkPolicy"; exit 1
+          else
+            echo "OK negative: public :8787 blocked (policy enforced)"
+          fi
+          echo "PASS: NetworkPolicy enforced (+:8788 -:8787)"
