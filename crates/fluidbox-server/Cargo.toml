@@ -36,3 +36,6 @@ chacha20poly1305.workspace = true
 base64.workspace = true
 jsonwebtoken.workspace = true
 async-stream = "0.3"
+# kube-rs pulls rustls 0.23, which needs a process-level CryptoProvider chosen
+# explicitly when several backends are in the tree (sqlx = ring). Install ring.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
