@@ -1728,17 +1728,21 @@ pub async fn transition_session(
 }
 
 /// Attach the sandbox handle — REFUSED (returns false) unless the session is
-/// still in an ACTIVE (pre-wind-down) state: a finalizer that raced
-/// provisioning owns the session from the moment it enters wind-down, and a
-/// late handle would attach a live sandbox to a session that recovery may
-/// already have collected or terminalized (which nothing would ever reap).
-/// The caller must terminate the sandbox on refusal. The status set mirrors
-/// `SessionStatus::accepts_work`.
+/// still in an ACTIVE (pre-wind-down) state AND no finalization intent
+/// exists: the intent is the single source of truth for ownership, and it
+/// commits BEFORE the wind-down transition — a status-only fence would let a
+/// launch attach a live sandbox inside that gap, which recovery may already
+/// be collecting or terminalizing (and would then never reap). The caller
+/// must terminate the sandbox on refusal. `begin_finalization` holds the
+/// session row lock across its insert, so this UPDATE serializes against it:
+/// attach-first means the intent's snapshot sees the handle; intent-first
+/// means this refuses. The status set mirrors `SessionStatus::accepts_work`.
 pub async fn set_sandbox_handle(pool: &PgPool, id: Uuid, handle: &Value) -> sqlx::Result<bool> {
     let r = sqlx::query(
         "update sessions set sandbox_handle = $2, updated_at = now()
           where id = $1
-            and status in ('created','provisioning','initializing','running','awaiting_approval')",
+            and status in ('created','provisioning','initializing','running','awaiting_approval')
+            and not exists (select 1 from session_finalizations f where f.session_id = $1)",
     )
     .bind(id)
     .bind(handle)
@@ -1925,6 +1929,17 @@ pub async fn pending_finalizations(pool: &PgPool) -> sqlx::Result<Vec<Uuid>> {
             .fetch_all(pool)
             .await?;
     Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// Release a driver's claim early — for DELIBERATE deferrals (e.g. the
+/// provisioning settle window), so the finalize worker retries at its own
+/// cadence instead of waiting out the stale-claim threshold.
+pub async fn release_finalization_claim(pool: &PgPool, session: Uuid) -> sqlx::Result<()> {
+    sqlx::query("update session_finalizations set claimed_at = null where session_id = $1")
+        .bind(session)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn delete_finalization(pool: &PgPool, session: Uuid) -> sqlx::Result<()> {
@@ -3275,6 +3290,14 @@ mod tests {
         // (the crash-between-persist-and-transition window).
         let pending_while_active = pending_finalizations(&pool).await.unwrap();
 
+        // Claim semantics: one holder at a time; an early release (the
+        // deliberate settle-defer path) re-opens it immediately, without
+        // waiting out the stale threshold.
+        let claim1 = claim_finalization(&pool, racer.id, 420).await.unwrap();
+        let claim_held = claim_finalization(&pool, racer.id, 420).await.unwrap();
+        release_finalization_claim(&pool, racer.id).await.unwrap();
+        let claim_after_release = claim_finalization(&pool, racer.id, 420).await.unwrap();
+
         // Fence session: persist an intent, terminalize legally, release the
         // intent, then try to re-create it and to attach a handle late.
         let first_fence =
@@ -3349,6 +3372,15 @@ mod tests {
         assert!(
             pending_while_active.contains(&racer.id),
             "recovery must scan intents on ACTIVE sessions"
+        );
+        assert!(claim1.is_some(), "first claim must succeed");
+        assert!(
+            claim_held.is_none(),
+            "a held claim must not be re-claimable"
+        );
+        assert!(
+            claim_after_release.is_some(),
+            "an early-released claim must be immediately re-claimable"
         );
         assert!(matches!(
             first_fence,

@@ -117,6 +117,25 @@ async fn fire_one(state: &AppState, sched: &ScheduleRow) {
                     );
                     advance(state, sched, fire_time, next, None).await;
                 }
+                Ok(RunCreation::ReplaceUnpersisted { running_session_id }) => {
+                    // Transient replace failure: record a visible skip and
+                    // advance — the NEXT tick fires fresh (unlike an error,
+                    // which would mark this firing permanently lost).
+                    fluidbox_db::mark_invocation_skipped(
+                        &state.pool,
+                        invocation_id,
+                        "replace_cancel_unpersisted",
+                    )
+                    .await
+                    .ok();
+                    tracing::warn!(
+                        "schedule {}: {} skipped (cancel of {} not persisted; next tick retries)",
+                        sched.id,
+                        key,
+                        running_session_id
+                    );
+                    advance(state, sched, fire_time, next, None).await;
+                }
                 Err(e) => {
                     // A failed firing is recorded, not retried — retrying a
                     // config error every tick would loop forever.

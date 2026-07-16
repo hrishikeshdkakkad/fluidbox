@@ -861,10 +861,15 @@ pub async fn create_session(
     .await?;
     let session = match created {
         crate::run_service::RunCreation::Created(s) => *s,
-        // Manual runs carry no subscription — unreachable, but honest.
+        // Manual runs carry no subscription — both unreachable, but honest.
         crate::run_service::RunCreation::SkippedOverlap { running_session_id } => {
             return Err(ApiError::Conflict(format!(
                 "skipped: run {running_session_id} is still active (concurrency_policy=skip_if_running)"
+            )))
+        }
+        crate::run_service::RunCreation::ReplaceUnpersisted { running_session_id } => {
+            return Err(ApiError::ServiceUnavailable(format!(
+                "could not persist cancellation of running session {running_session_id} for replace; retry"
             )))
         }
     };
