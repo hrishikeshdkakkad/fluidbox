@@ -65,7 +65,7 @@ Status legend: `[ ]` open · `[x]` fixed · `[-]` won't fix (record why)
   `runner_status` falls through phase `Unknown`/stale statuses to `Pending`/`Running`; `metadata.deletion_timestamp` never consulted → `sandbox_dead` stays false with stale heartbeats; a budget-less run hangs indefinitely.
   **Fix:** map node-loss/Unknown/deletion-in-progress to `SandboxStatus::Unknown`.
 
-- [ ] **M8. Public listener still serves `/internal`; chart Ingress exposes it to the internet.**
+- [x] **M8. Public listener still serves `/internal`; chart Ingress exposes it to the internet.** *(fixed: fix/k8s-listener-hardening — `/internal` mounts on the public router only for non-Kubernetes providers; on K8s the sandbox plane is exclusively the :8788 listener)*
   Deliberate for Docker single-host, but on K8s it undercuts the design's "route absence is stronger than bearer auth" rationale (`main.rs` public router nests `internal.clone()`; `templates/ingress.yaml` routes `/` to :8787).
   **Fix:** make mounting `/internal` on the public router conditional (off for `provider=kubernetes`).
 
@@ -79,14 +79,14 @@ Status legend: `[ ]` open · `[x]` fixed · `[-]` won't fix (record why)
 
 ## Low severity
 
-- [ ] **L1.** `workspace_archive` gates on `is_terminal()` while its comment (and every sibling endpoint) says `accepts_work()` (`internal.rs:768-772`).
+- [x] **L1.** `workspace_archive` gates on `is_terminal()` while its comment (and every sibling endpoint) says `accepts_work()` (`internal.rs:768-772`). *(fixed: gate is now `accepts_work()`)*
 - [ ] **L2.** Netpol gate: ClusterIP-resolution failure branch doesn't clear a previously-true gate yet keeps the 6-hour interval (`workers.rs:250-256`) — inconsistent with the probe branch (which stores `false`); `interval`'s immediate first tick = one redundant probe.
 - [ ] **L3.** `delete_archive`'s "TTL sweep is the backstop" comment references a sweep that doesn't exist; archives kept until terminal cleanup (design said delete-after-init-consumed); crash after terminal transition but before `remove_file` leaks the archive permanently.
 - [ ] **L4.** Untrue/garbled comments: `pack_workspace` says symlinks "are followed" while code sets `follow_symlinks(false)` (ties to H4); `exec_collect` claims exit codes are surfaced (ties to M2).
-- [ ] **L5.** `FLUIDBOX_INTERNAL_BIND` defaults to `0.0.0.0:8788` even for `provider=docker` local dev — new LAN-exposed listener by default.
+- [x] **L5.** `FLUIDBOX_INTERNAL_BIND` defaults to `0.0.0.0:8788` even for `provider=docker` local dev — new LAN-exposed listener by default. *(fixed: default is provider-aware — `127.0.0.1:8788` for docker, `0.0.0.0:8788` for kubernetes; explicit env still wins)*
 - [x] **L6.** `await_quiesce` checks the deadline before ever probing state (`orchestrator.rs:277-280`) — crash-recovery with an expired deadline records `quiesce_timeout` even when the runner exited cleanly in time; one `state()` check first rescues the diff. *(fixed: `wait_runner_exit` probes first, every probe individually bounded (5 s) so a hung provider call can't overrun the claim, which was raised 180→420 s to cover the worst healthy path)*
 - [x] **L7.** `finalize()` passes `summary` as both summary and status reason. *(fixed: named `FinalizeParams` with distinct fields; `/result` → `finalize_reported` (summary, no reason); every budget path → `finalize_forced` (reason, no summary) — the budget string no longer lands as a fake summary.md artifact)*
-- [ ] **L8.** `main.rs:99` hardcodes `:8788` in the resolved ClusterIP URL rather than deriving from config; URL also unbracketed for IPv6 ClusterIPs (breaks IPv6-primary clusters).
+- [x] **L8.** `main.rs:99` hardcodes `:8788` in the resolved ClusterIP URL rather than deriving from config; URL also unbracketed for IPv6 ClusterIPs (breaks IPv6-primary clusters). *(fixed: port derives from `internal_bind`; IPv6 hosts bracketed)*
 - [ ] **L9.** K8s pre-launch failures with a materialized workspace record a noise `(diff unavailable: no sandbox handle…)` artifact where Docker records "(no changes)" (`expected_diff` keys off `base_commit`).
 - [ ] **L10.** UID hardening: `delete_pod` accepts `uid=None` (unguarded delete); exec collection never re-checks pod UID. Defense-in-depth only — handles always carry UIDs today.
 - [ ] **L11.** Claude runner: heartbeats start (`index.mjs:62`) before `onQuiesce` registers (`:126`), and `contract.mjs` latches `quiesced=true` even with a null callback — a cancel in that seconds-wide window is permanently swallowed (codex-runner registers first; safe). Fix: register before `startHeartbeat`, or replay on registration.
