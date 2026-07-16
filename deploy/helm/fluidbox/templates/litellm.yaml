@@ -48,7 +48,13 @@ spec:
       imagePullSecrets: {{- toYaml . | nindent 8 }}
       {{- end }}
       securityContext:
+        # The upstream LiteLLM image declares a non-numeric root USER, so the
+        # kubelet can't verify non-root from runAsNonRoot alone — pin a numeric
+        # uid (the image runs fine as an arbitrary uid).
         runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: litellm
