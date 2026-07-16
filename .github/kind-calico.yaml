@@ -1,0 +1,7 @@
+# kind cluster for the K8s CI tier: Calico, NOT kindnet (kindnet does not
+# enforce NetworkPolicy, so the netpol probe would correctly fail on it).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  disableDefaultCNI: true
+  podSubnet: "192.168.0.0/16"
