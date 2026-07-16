@@ -190,8 +190,56 @@ async fn budget_sweeper(state: AppState) {
                             "wall-clock budget exceeded",
                         )
                         .await;
+                        continue;
                     }
                 }
+            }
+
+            // Token / cost / tool-call budgets, from the same DB truth the
+            // facade and permission gate read. Those enforce inline, but
+            // their finalize starts ride detached in-memory retries — this
+            // sweep is the crash-durable driver, and the only one for an
+            // idle runner that makes no further requests. Thresholds mirror
+            // the inline checks exactly (>=).
+            let mut over: Option<&'static str> = None;
+            if run_spec.budgets.max_tokens.is_some() || run_spec.budgets.max_cost_usd.is_some() {
+                if let Ok(totals) = fluidbox_db::usage_totals(&state.pool, s.id).await {
+                    if let Some(max) = run_spec.budgets.max_cost_usd {
+                        if totals.cost_usd >= max {
+                            over = Some("max_cost_usd");
+                        }
+                    }
+                    if over.is_none() {
+                        if let Some(max) = run_spec.budgets.max_tokens {
+                            let used = (totals.input_tokens
+                                + totals.output_tokens
+                                + totals.cache_read_tokens
+                                + totals.cache_write_tokens)
+                                as u64;
+                            if used >= max {
+                                over = Some("max_tokens");
+                            }
+                        }
+                    }
+                }
+            }
+            if over.is_none() {
+                if let Some(max) = run_spec.budgets.max_tool_calls {
+                    if let Ok(n) = fluidbox_db::tool_call_count(&state.pool, s.id).await {
+                        if n as u64 >= max {
+                            over = Some("max_tool_calls");
+                        }
+                    }
+                }
+            }
+            if let Some(which) = over {
+                let _ = orchestrator::finalize_forced(
+                    &state,
+                    s.id,
+                    "budget_exceeded",
+                    &format!("{which} budget exceeded"),
+                )
+                .await;
             }
         }
     }
