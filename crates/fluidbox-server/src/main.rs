@@ -34,15 +34,21 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 /// Select the execution backend from `FLUIDBOX_PROVIDER` (default `docker`).
-/// Dual-provider permanence (settled Q17): Docker is always available; the
-/// Kubernetes provider is added beside it in Phase 1.
-fn build_provider(cfg: &config::Config) -> anyhow::Result<Arc<dyn ExecutionProvider>> {
+/// Dual-provider permanence (settled Q17): Docker and Kubernetes are co-equal
+/// backends behind the same trait, selected per deployment.
+async fn build_provider(cfg: &config::Config) -> anyhow::Result<Arc<dyn ExecutionProvider>> {
     match cfg.provider.as_str() {
         "docker" => Ok(Arc::new(fluidbox_provider::DockerProvider::connect(
             cfg.data_dir.clone(),
         )?)),
+        "kubernetes" | "k8s" => {
+            let k8s_cfg = fluidbox_provider_k8s::config::K8sConfig::from_env();
+            Ok(Arc::new(
+                fluidbox_provider_k8s::KubernetesProvider::connect(k8s_cfg).await?,
+            ))
+        }
         other => anyhow::bail!(
-            "FLUIDBOX_PROVIDER='{other}' is not available in this build (known: docker)"
+            "FLUIDBOX_PROVIDER='{other}' is not available in this build (known: docker, kubernetes)"
         ),
     }
 }
@@ -77,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    let provider = build_provider(&cfg)?;
+    let provider = build_provider(&cfg).await?;
     if let Err(e) = provider.healthcheck().await {
         tracing::warn!(
             "provider '{}' health probe failed ({e}); sandboxes will not launch until it is reachable",
@@ -223,6 +229,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/triggers/{id}/invoke", post(triggers::invoke))
         .route("/triggers/{id}/runs/{sid}", get(triggers::poll_run));
 
+    // The internal plane (runner contract, workspace archive, LLM facade).
+    // internal::permission etc. extract SessionAuth themselves; the path {id}
+    // is informational (the token binds the session).
     let internal = Router::new()
         .route("/sessions/{id}/permission", post(internal::permission))
         // Brokered tools (design §8.3 class 2): intent in, governed result
@@ -231,33 +240,56 @@ async fn main() -> anyhow::Result<()> {
         .route("/sessions/{id}/events", post(internal::events))
         .route("/sessions/{id}/heartbeat", post(internal::heartbeat))
         .route("/sessions/{id}/result", post(internal::result))
+        // The immutable workspace archive the Kubernetes init container pulls
+        // (session from the bearer token; credential-free, digest-verified).
+        .route("/sessions/{id}/workspace", get(internal::workspace_archive))
         .route("/token/renew", post(internal::token_renew))
         .route("/llm-usage", post(callback::litellm_usage))
         // The Agent SDK appends /v1/messages (and possibly count_tokens) to
         // ANTHROPIC_BASE_URL=<control>/internal/llm.
         .route("/llm/{*rest}", post(facade::messages));
 
-    // Note: internal::permission etc. extract SessionAuth themselves; the
-    // path {id} is informational (the token binds the session).
-    let app = Router::new()
+    let trace_layer = || {
+        TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<axum::body::Body>| {
+            // Method + PATH only — never the query string: OAuth
+            // `code`/`state` and GitHub flow tokens ride queries.
+            tracing::debug_span!("http", method = %req.method(), path = %req.uri().path())
+        })
+    };
+
+    // Public listener (:8787) — /v1 + oauth + well-known, AND /internal for the
+    // single-host Docker path (bearer auth separates the planes there).
+    let public_app = Router::new()
         .nest("/v1", public)
-        .nest("/internal", internal)
+        .nest("/internal", internal.clone())
         // CIMD (spec 2025-11-25): this document's URL IS our OAuth
         // client_id; authorization servers fetch it — public by nature.
         .route("/.well-known/fluidbox-client.json", get(oauth::cimd_doc))
-        // Method + PATH only — never the query string: OAuth `code`/`state`
-        // and the GitHub flow tokens ride queries and must not reach logs.
-        .layer(
-            TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<axum::body::Body>| {
-                tracing::debug_span!("http", method = %req.method(), path = %req.uri().path())
-            }),
-        )
+        .layer(trace_layer())
         .layer(CorsLayer::permissive())
         .with_state(state.clone());
 
-    let listener = tokio::net::TcpListener::bind(&state.cfg.bind).await?;
-    tracing::info!("fluidbox listening on http://{}", state.cfg.bind);
+    // Internal listener (:8788) — /internal ONLY, no /v1 route exists. This is
+    // the sandbox-facing plane on Kubernetes (the internal Service targets it);
+    // route absence means a sandbox cannot reach /v1 at the TCP level.
+    let internal_app = Router::new()
+        .nest("/internal", internal)
+        .layer(trace_layer())
+        .with_state(state.clone());
+
+    let public_listener = tokio::net::TcpListener::bind(&state.cfg.bind).await?;
+    let internal_listener = tokio::net::TcpListener::bind(&state.cfg.internal_bind).await?;
+    tracing::info!("fluidbox public  listening on http://{}", state.cfg.bind);
+    tracing::info!(
+        "fluidbox internal listening on http://{} (/internal only)",
+        state.cfg.internal_bind
+    );
     tracing::info!("default agent: {}", seed.default_agent);
-    axum::serve(listener, app).await?;
+
+    // Serve both planes; if either listener falls over, the process exits.
+    tokio::select! {
+        r = axum::serve(public_listener, public_app) => r?,
+        r = axum::serve(internal_listener, internal_app) => r?,
+    }
     Ok(())
 }
