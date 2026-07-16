@@ -192,6 +192,75 @@ async fn approval_expiry(state: AppState) {
     }
 }
 
+/// Kubernetes netpol run-gate (design 2026-07-15): probe that the CNI enforces
+/// NetworkPolicy (+:8788 / -:8787) before admitting runs, and re-check
+/// periodically. FAILS CLOSED — `netpol_verified` stays false until proven.
+pub fn spawn_netpol_gate(state: AppState) {
+    tokio::spawn(async move {
+        use std::sync::atomic::Ordering;
+        // The public service pairs with the internal one by Helm naming.
+        let Some(internal_svc) = state.cfg.internal_service.clone() else {
+            tracing::warn!(
+                "netpol gate: no internal Service configured; cannot verify — runs stay gated"
+            );
+            return;
+        };
+        let ns = state
+            .cfg
+            .internal_service_namespace
+            .clone()
+            .unwrap_or_default();
+        let public_svc = internal_svc
+            .strip_suffix("-internal")
+            .map(|p| format!("{p}-server"))
+            .unwrap_or_else(|| internal_svc.clone());
+        let sandbox_ns =
+            std::env::var("FLUIDBOX_K8S_NAMESPACE").unwrap_or_else(|_| "fluidbox-sandboxes".into());
+
+        let mut tick = tokio::time::interval(Duration::from_secs(6 * 3600));
+        loop {
+            let internal_ip =
+                fluidbox_provider_k8s::netpol::resolve_service_clusterip(&ns, &internal_svc)
+                    .await
+                    .ok()
+                    .flatten();
+            let public_ip =
+                fluidbox_provider_k8s::netpol::resolve_service_clusterip(&ns, &public_svc)
+                    .await
+                    .ok()
+                    .flatten();
+            match (internal_ip, public_ip) {
+                (Some(i), Some(p)) => {
+                    let r = fluidbox_provider_k8s::netpol::verify_netpol(
+                        &sandbox_ns,
+                        &state.cfg.netpol_probe_image,
+                        &i,
+                        &p,
+                    )
+                    .await;
+                    use fluidbox_provider_k8s::netpol::NetpolResult;
+                    let ok = r == NetpolResult::Enforced;
+                    state.netpol_verified.store(ok, Ordering::SeqCst);
+                    if ok {
+                        tracing::info!("netpol gate: enforcement verified (+:8788 -:8787)");
+                    } else {
+                        tracing::warn!("netpol gate: NOT verified ({r:?}) — runs blocked");
+                    }
+                }
+                _ => tracing::warn!(
+                    "netpol gate: could not resolve Service ClusterIPs; runs stay gated"
+                ),
+            }
+            // Once enforced, re-check every 6h; while unverified, retry sooner.
+            if state.netpol_verified.load(Ordering::SeqCst) {
+                tick.tick().await;
+            } else {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        }
+    });
+}
+
 /// Restart-recoverable finalize driver: re-drives any session stuck in
 /// `cancelling`/`finalizing` with a persisted intent whose driver died
 /// (stale claim). The claim in `drive_finalization` makes this idempotent —

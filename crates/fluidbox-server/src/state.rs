@@ -62,6 +62,10 @@ pub struct AppStateInner {
     /// concurrent brokered calls must mint ONE new refresh token, not race
     /// each other into invalid_grant (Notion keeps ≤2 valid).
     pub oauth_locks: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
+    /// Kubernetes netpol run-gate: false until a probe proves the CNI enforces
+    /// NetworkPolicy. `create_run` refuses while false + require_enforced_netpol
+    /// (fails closed). Always true for Docker (a different isolation model).
+    pub netpol_verified: std::sync::atomic::AtomicBool,
 }
 
 pub type AppState = Arc<AppStateInner>;

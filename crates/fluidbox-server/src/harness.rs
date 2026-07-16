@@ -172,6 +172,10 @@ mod tests {
             public_url: String::new(),
             provider: "docker".into(),
             network_mode: fluidbox_core::traits::NetworkMode::HostDev,
+            require_enforced_netpol: false,
+            netpol_probe_image: "busybox:1.36".into(),
+            internal_service: None,
+            internal_service_namespace: None,
         }
     }
 
