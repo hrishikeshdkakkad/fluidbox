@@ -18,6 +18,8 @@ tracing = { workspace = true }
 futures = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 kube = { version = "4", default-features = false, features = [
     "client",
     "runtime",

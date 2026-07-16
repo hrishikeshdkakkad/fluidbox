@@ -161,17 +161,23 @@ fn collect_inner(
             )));
         }
 
-        let bytes = diff.stdout;
         let truncated = diff.stdout_truncated;
+        // The stored artifact is the lossy-UTF-8 patch text. Integrity metadata
+        // MUST describe those exact stored bytes, NOT the raw git stdout: the
+        // collector's `stream` consumer verifies the received body against this
+        // header, so any raw/stored divergence (git output with invalid UTF-8)
+        // would otherwise make every such diff fail verification. When git
+        // output is valid UTF-8 — the common case — the two are identical.
+        let patch = String::from_utf8_lossy(&diff.stdout).into_owned();
         let sha256 = {
             use sha2::{Digest, Sha256};
             let mut h = Sha256::new();
-            h.update(&bytes);
+            h.update(patch.as_bytes());
             format!("sha256:{}", hex::encode(h.finalize()))
         };
         Ok(CollectedDiff {
-            bytes: bytes.len() as u64,
-            patch: String::from_utf8_lossy(&bytes).into_owned(),
+            bytes: patch.len() as u64,
+            patch,
             truncated,
             sha256,
         })
@@ -452,6 +458,42 @@ mod tests {
                 assert!(reason.contains("worktree"), "reason: {reason}");
             }
             CollectionOutcome::Diff(_) => panic!("must not report a diff with no worktree"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// M2: the integrity header (`bytes`/`sha256`) must describe the EXACT
+    /// stored artifact bytes — the lossy-UTF-8 patch that gets written — not
+    /// the raw git stdout. Otherwise the collector's `stream` consumer, which
+    /// verifies the received body against this header, would reject every diff
+    /// whose git output contained invalid UTF-8. A new tracked text file with
+    /// invalid UTF-8 (no NUL → git treats it as text and emits the raw bytes)
+    /// forces the raw/stored divergence.
+    #[test]
+    fn diff_integrity_describes_stored_bytes_not_raw() {
+        let (tmp, ws) = fixture();
+        std::fs::write(ws.host_dir.join("bad.txt"), [0xff, 0xfe, b'\n']).unwrap();
+        match collect_diff(
+            root_of(&ws),
+            ws.base_commit.as_deref(),
+            &DiffCaps::default(),
+        ) {
+            CollectionOutcome::Diff(d) => {
+                assert!(
+                    d.patch.contains('\u{FFFD}'),
+                    "precondition: lossy replacement must have occurred; patch: {:?}",
+                    d.patch
+                );
+                assert_eq!(
+                    d.bytes,
+                    d.patch.len() as u64,
+                    "bytes must describe the stored patch, not raw git stdout"
+                );
+                use sha2::{Digest, Sha256};
+                let want = format!("sha256:{}", hex::encode(Sha256::digest(d.patch.as_bytes())));
+                assert_eq!(d.sha256, want, "sha256 must be over the stored patch bytes");
+            }
+            CollectionOutcome::Missing { reason } => panic!("unexpected missing: {reason}"),
         }
         std::fs::remove_dir_all(&tmp).ok();
     }
