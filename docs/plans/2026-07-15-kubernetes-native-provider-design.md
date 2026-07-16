@@ -1,13 +1,13 @@
 # fluidbox — Kubernetes-native execution provider and cluster deployability design
 
 **Date:** 2026-07-15
-**Status:** FINALIZED v1.1 (2026-07-15) after joint adversarial review by Claude (Fable 5) and Codex (GPT-5.6-sol, max reasoning); v1.1 adds the dual-provider permanence directive (settled Q17 — Kubernetes is additive; Docker is never replaced). Docker provider is the only shipped execution backend, Kubernetes support is not implemented
+**Status:** FINALIZED v1.2 (2026-07-15) after joint adversarial review by Claude (Fable 5) and Codex (GPT-5.6-sol, max reasoning); v1.1 added the dual-provider permanence directive (settled Q17 — Kubernetes is additive; Docker is never replaced); v1.2 added the operator-experience section (setup journeys, `just k8s-dev`/`k8s-doctor`, per-cloud values presets incl. DigitalOcean DOKS, probe-fails-closed as the portability arbiter). Docker provider is the only shipped execution backend, Kubernetes support is not implemented
 **Audience:** fluidbox maintainers, security reviewers, and engineers implementing the Kubernetes provider and Helm packaging
 **Relationship to other docs:** `PLAN.md` remains authoritative for product invariants and milestone direction (§2 convergence invariants bind every decision here; §6.2 defines the `ExecutionProvider` seam this design fills). `docs/ARCHITECTURE.md` describes the current Docker run path. `docs/plans/2026-07-14-multi-user-mcp-control-plane-design.md` defines the multi-user architecture; this design is orthogonal to it and lands first (user decision 2026-07-15).
 
 ## Executive verdict
 
-fluidbox can become deployable on any conformant Kubernetes cluster — EKS, AKS, GKE, kind — without changing a single runner image, without weakening any §2 invariant, and while *strengthening* two security properties that are weak today (hostile-`.git` diff collection and sandbox egress).
+fluidbox can become deployable on any conformant Kubernetes cluster — EKS, AKS, GKE, DigitalOcean DOKS, kind, or anything else with an enforcing CNI — without changing a single runner image, without weakening any §2 invariant, and while *strengthening* two security properties that are weak today (hostile-`.git` diff collection and sandbox egress).
 
 The hard problem is not the provider API. The existing `ExecutionProvider` trait (`crates/fluidbox-core/src/traits.rs:53-61`) was designed for this move, `SandboxHandle` is already serializable jsonb, and the runner contract is transport-agnostic bearer-token HTTP with no host or IP assumptions. The hard problems are the three places where the control plane and the sandbox silently share a machine:
 
@@ -29,7 +29,8 @@ This design must deliver:
 - diff capture that never executes git against agent-controlled `.git` state, on either provider;
 - a unified, durable, restart-recoverable terminal finalizer for all terminal paths (result, cancel, fail, watchdog);
 - hardened-by-default sandbox networking (zero external egress) with runtime *verification* that the cluster's CNI actually enforces NetworkPolicy;
-- a Helm chart deploying control plane + dashboard (+ optional LiteLLM) on EKS/AKS/GKE/kind, with per-cloud isolation recipes (`runtimeClassName`);
+- a Helm chart deploying control plane + dashboard (+ optional LiteLLM) on EKS/AKS/GKE/DOKS/kind — and any conformant cluster — with per-cloud values presets and isolation recipes (`runtimeClassName`);
+- a first-class operator experience for every journey: the existing `just setup → just dev` local Docker path unchanged, a `just k8s-dev` kind flow for local Kubernetes testing, a one-command `helm install` from the OCI registry for clouds, and a `just k8s-doctor` preflight mirroring `just doctor`;
 - **dual-provider permanence**: Docker remains a first-class, permanently supported execution backend — for local development and for single-host production via docker-compose — with Kubernetes added alongside it behind the same trait, selected per deployment by `FLUIDBOX_PROVIDER` (default `docker`); both providers meet the same conformance bar (demo A + full e2e) at every phase;
 - a CI story that catches provider regressions on PRs without pulling 1.5 GB images.
 
@@ -275,6 +276,47 @@ Chart contents:
 
 Release plumbing (`.github/workflows/release.yml`): add the collector image to the multi-arch build matrix; publish the chart as an OCI artifact to GHCR.
 
+## Setup and deployment journeys (operator experience)
+
+Four journeys, two providers. The first two are **unchanged by this epic** (dual-provider permanence, settled Q17); the last two are new Phase 2 deliverables.
+
+| Journey | Provider | Path |
+|---|---|---|
+| Local dev & quick tests | Docker | `just setup` → `just neon-setup` → add key → `just dev` — **the golden path, untouched** |
+| Single-host try-it / small prod | Docker | `deploy/docker-compose.eval.yml` — **stays a maintained deployment mode** |
+| Local Kubernetes (develop/test the K8s path) | Kubernetes | kind + Calico via `just k8s-dev` |
+| Managed cloud | Kubernetes | `helm install fluidbox oci://ghcr.io/<owner>/charts/fluidbox -f values/<cloud>.yaml` |
+
+### Local dev stays Docker (nothing to install)
+
+`FLUIDBOX_PROVIDER` defaults to `docker`; a fresh clone never needs kubectl, helm, or a cluster. `just setup`, `just doctor`, `just dev`, and `just e2e` behave exactly as today. Contributors who never touch the Kubernetes provider never see Kubernetes.
+
+### Local Kubernetes: `just k8s-dev` (kind)
+
+For developing the provider itself and for users who want to trial the K8s path without a cloud account:
+
+1. `just k8s-dev` — creates a kind cluster with **Calico** (kind's default kindnet does NOT enforce NetworkPolicy; the boot probe would correctly block runs on it), builds or pulls the images (`kind load` for local builds, GHCR digests otherwise), `helm install`s with `values/kind.yaml`, port-forwards 8787/3000.
+2. `just k8s-doctor` — the K8s twin of `just doctor`: kubectl context sanity, CNI enforcement probe, default StorageClass present (PVC), helm version, image pullability, Neon reachability from in-cluster. Prints the exact fix per failure, same discipline as `doctor.sh`.
+
+This kind flow is also exactly what CI runs (Phase 3), so "works in `just k8s-dev`" ≈ "works in CI".
+
+### Managed clouds: one generic recipe + per-cloud values presets
+
+Generic steps (documented once): provision a cluster with an **enforcing CNI** → create the fluidbox namespace + existing Secrets (DATABASE_URL to Neon/direct-Postgres, admin token, credential key, LiteLLM keys) → `helm install` from the OCI registry with the cloud's values preset → boot probe verifies enforcement before any run is admitted → point DNS/Ingress and set `FLUIDBOX_PUBLIC_URL` (CIMD + GitHub App webhooks light up) → connect GitHub. Images ship public on GHCR (multi-arch), so no pull secret is needed unless mirroring privately.
+
+Per-cloud matrix (each row becomes a `values/<cloud>.yaml` preset + a docs page):
+
+| Cloud | NetworkPolicy reality | PVC storage | Hard isolation | Notes |
+|---|---|---|---|---|
+| **EKS** (AWS) | VPC CNI does NOT enforce by default — enable the VPC CNI network-policy agent, or install Calico/Cilium. The boot probe fails closed either way. | EBS CSI addon (gp3) — often NOT preinstalled; needs IRSA/pod-identity for the addon | none managed (self-managed gVisor nodes documented) | NLB/ALB ingress; runner-image mirror to ECR optional |
+| **AKS** (Azure) | choose a policy engine at cluster creation (Azure NPM / Cilium dataplane / Calico) | default `managed-csi` StorageClass works | Kata pools: `runtimeClassName: kata-mshv-vm-isolation` | app-routing or nginx ingress |
+| **GKE** (Google) | Dataplane V2 (Cilium) enforces natively — the recommended mode; classic dataplane needs `--enable-network-policy`. Autopilot works (always DPv2). | default `standard-rwo` works | GKE Sandbox (gVisor) node pools: `runtimeClassName: gvisor` | GCLB ingress |
+| **DOKS** (DigitalOcean) | Cilium is the default CNI — NetworkPolicy enforced out of the box, zero extra setup | default `do-block-storage` works | none (runc tier) | DO Load Balancer via Service annotations; the simplest managed-cloud story |
+| **kind / dev** | install Calico (kindnet doesn't enforce) | `local-path` | none | the CI reference environment |
+| **anything conformant** | any enforcing CNI — the probe is the arbiter, not the vendor list | any default RWO StorageClass | optional `runtimeClassName` | the design deliberately uses no bleeding-edge APIs (ordinary init containers, not native sidecars) precisely so old-ish clusters in their support window work |
+
+The probe-fails-closed design is what makes the vendor list *advisory* rather than load-bearing: fluidbox does not trust that a cloud enforces policy — it proves it at boot, so "etc." clouds (OVH, Scaleway, Hetzner, on-prem RKE2/k3s) are supported by construction, not by enumeration.
+
 ## Convergence-invariant cross-check (PLAN.md §2)
 
 | Invariant | Mechanism here |
@@ -316,8 +358,9 @@ Each phase lands green through `just check`; e2e and DB-backed tests are execute
 
 1. The chart as specified (server/web/optional LiteLLM/Services/Ingress/sandbox namespace/PSA/NetworkPolicies/RBAC/quota/PVC/values).
 2. Egress profiles incl. ClusterIP injection for `zeroEgress`; netpol probe as helm test AND boot-time run-gate (`FLUIDBOX_REQUIRE_ENFORCED_NETPOL`, default true).
-3. Per-cloud install docs: EKS / AKS / GKE / kind — runtimeClassName recipes, CNI enforcement notes, ingress + `FLUIDBOX_PUBLIC_URL`, registry/imagePullSecrets, Neon connectivity.
-4. Collector image + OCI chart publish in `release.yml`.
+3. Per-cloud values presets `values/{eks,aks,gke,doks,kind}.yaml` + install docs (EKS / AKS / GKE / DigitalOcean DOKS / kind / generic-conformant) — CNI enforcement steps, StorageClass, runtimeClassName recipes, ingress + `FLUIDBOX_PUBLIC_URL`, registry/imagePullSecrets, Neon connectivity.
+4. DX tooling: `just k8s-dev` (kind + Calico + image load + helm install + port-forward) and `just k8s-doctor` (kubectl context, CNI enforcement probe, StorageClass, helm, image pullability, in-cluster Neon reachability — exact-fix output like `doctor.sh`). Local Docker flow (`just setup/doctor/dev/e2e`) untouched.
+5. Collector image + OCI chart publish in `release.yml`.
 
 ### Phase 3 — CI + conformance
 
