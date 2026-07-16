@@ -66,6 +66,15 @@ pub enum RunCreation {
     SkippedOverlap {
         running_session_id: Uuid,
     },
+    /// concurrency_policy = replace, but the old run's cancellation intent
+    /// could not be durably persisted (transient DB failure survived the
+    /// inline retries). Nothing was created and nothing is terminal about
+    /// this: API invokes release their idempotency claim and 503 (caller
+    /// retries); schedules/events record a visible skip (their next firing
+    /// retries naturally).
+    ReplaceUnpersisted {
+        running_session_id: Uuid,
+    },
 }
 
 pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreation> {
@@ -195,10 +204,10 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
                         }
                         if !persisted {
                             tracing::warn!(
-                                "replace: cancel intent for {} not persisted; skipping this invocation",
+                                "replace: cancel intent for {} not persisted after retries",
                                 s.id
                             );
-                            return Ok(RunCreation::SkippedOverlap {
+                            return Ok(RunCreation::ReplaceUnpersisted {
                                 running_session_id: s.id,
                             });
                         }
