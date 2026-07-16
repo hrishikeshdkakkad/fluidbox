@@ -239,16 +239,25 @@ fn fetch(url: &str, token: &str, expected_len: u64) -> Result<Vec<u8>, String> {
 
 /// Recursive copy including dotfiles + `.git` internals. In-tree symlinks are
 /// PRESERVED (H4: a tracked symlink must reach the runner's /workspace exactly
-/// as Docker's bind mount delivers it). A symlink is recreated only if its
-/// target still resolves within `dst_root`; because relocating `repo/` to
-/// /workspace shrinks the root the extractor validated against, a link that
-/// pointed outside `repo/` (into the baseline, say) is dropped rather than left
-/// to escape.
+/// as Docker's bind mount delivers it), using the same two-phase approach as
+/// the archive extractor: copy every real file/dir first, then create the
+/// symlinks and keep only those that `canonicalize` inside `dst`. Relocating
+/// `repo/` to /workspace shrinks the root the extractor validated against, so
+/// a link that pointed outside `repo/` (into the baseline, say) is dropped
+/// rather than left to escape. `canonicalize` — following the FULL target
+/// chain — is the sole containment judge.
 fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
-    copy_tree_into(src, dst, dst)
+    let mut symlinks: Vec<(PathBuf, PathBuf)> = Vec::new();
+    copy_files(src, dst, &mut symlinks)?;
+    place_symlinks(dst, &symlinks);
+    Ok(())
 }
 
-fn copy_tree_into(src: &Path, dst: &Path, dst_root: &Path) -> std::io::Result<()> {
+fn copy_files(
+    src: &Path,
+    dst: &Path,
+    symlinks: &mut Vec<(PathBuf, PathBuf)>,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -256,9 +265,9 @@ fn copy_tree_into(src: &Path, dst: &Path, dst_root: &Path) -> std::io::Result<()
         let to = dst.join(entry.file_name());
         let meta = std::fs::symlink_metadata(&from)?;
         if meta.is_symlink() {
-            copy_symlink(&from, &to, dst_root)?;
+            symlinks.push((to, std::fs::read_link(&from)?));
         } else if meta.is_dir() {
-            copy_tree_into(&from, &to, dst_root)?;
+            copy_files(&from, &to, symlinks)?;
         } else {
             std::fs::copy(&from, &to)?;
         }
@@ -266,40 +275,42 @@ fn copy_tree_into(src: &Path, dst: &Path, dst_root: &Path) -> std::io::Result<()
     Ok(())
 }
 
-/// Recreate one symlink under the new root, preserving it iff its target
-/// resolves within `dst_root`. The containment walk is shared with the archive
-/// extractor (`fluidbox_workspace::target_within_root`); the real starting
-/// depth comes from canonicalizing the link's (already-created) parent dir.
+/// Create the collected symlinks, then keep only those that resolve inside
+/// `dst_root` (per `canonicalize`, following the whole chain). Parent must
+/// already exist and resolve in-root, so creation never writes through an
+/// escaping link.
 #[cfg(unix)]
-fn copy_symlink(from: &Path, to: &Path, dst_root: &Path) -> std::io::Result<()> {
-    let target = std::fs::read_link(from)?;
-    let contained = (|| {
-        let canon_root = std::fs::canonicalize(dst_root).ok()?;
-        let canon_parent = std::fs::canonicalize(to.parent()?).ok()?;
-        let rel = canon_parent.strip_prefix(&canon_root).ok()?;
-        let depth = rel
-            .components()
-            .filter(|c| matches!(c, std::path::Component::Normal(_)))
-            .count() as i64;
-        Some(fluidbox_workspace::target_within_root(depth, &target))
-    })()
-    .unwrap_or(false);
-    if contained {
-        std::os::unix::fs::symlink(&target, to)?;
-    } else {
-        eprintln!(
-            "workspaced: dropping symlink {} -> {} (target escapes the workspace root)",
-            to.display(),
-            target.display()
-        );
+fn place_symlinks(dst_root: &Path, symlinks: &[(PathBuf, PathBuf)]) {
+    let Ok(canon_root) = std::fs::canonicalize(dst_root) else {
+        return;
+    };
+    let mut created: Vec<PathBuf> = Vec::new();
+    for (to, target) in symlinks {
+        let Some(parent) = to.parent() else { continue };
+        match std::fs::canonicalize(parent) {
+            Ok(cp) if cp.starts_with(&canon_root) => {}
+            _ => continue,
+        }
+        if std::os::unix::fs::symlink(target, to).is_ok() {
+            created.push(to.clone());
+        }
     }
-    Ok(())
+    for to in created {
+        match std::fs::canonicalize(&to) {
+            Ok(real) if real.starts_with(&canon_root) => {}
+            _ => {
+                eprintln!(
+                    "workspaced: dropping symlink {} (target escapes the workspace root)",
+                    to.display()
+                );
+                std::fs::remove_file(&to).ok();
+            }
+        }
+    }
 }
 
 #[cfg(not(unix))]
-fn copy_symlink(_from: &Path, _to: &Path, _dst_root: &Path) -> std::io::Result<()> {
-    Ok(())
-}
+fn place_symlinks(_dst_root: &Path, _symlinks: &[(PathBuf, PathBuf)]) {}
 
 fn oneline(s: &str) -> String {
     s.chars()
@@ -329,6 +340,11 @@ mod tests {
         std::os::unix::fs::symlink("../a.txt", src.join("sub/uplink")).unwrap();
         // Points above the copy root → must be dropped, not escape /workspace.
         std::os::unix::fs::symlink("../../etc/passwd", src.join("escape")).unwrap();
+        // Codex batch-3v2 counterexample: a symlinked component in the target.
+        // `anchor -> .`, `leak -> anchor/../etc/passwd` resolves to /etc/passwd
+        // via the anchor link — lexical math accepts it; canonicalize refuses.
+        std::os::unix::fs::symlink(".", src.join("anchor")).unwrap();
+        std::os::unix::fs::symlink("anchor/../../etc/passwd", src.join("leak")).unwrap();
 
         let dst = base.join("workspace");
         copy_tree(&src, &dst).unwrap();
@@ -350,10 +366,12 @@ mod tests {
             "in-tree ../ symlink must be preserved"
         );
         assert!(std::fs::read_to_string(src.join("a.txt")).is_ok());
-        assert!(
-            std::fs::symlink_metadata(dst.join("escape")).is_err(),
-            "escaping symlink must be dropped"
-        );
+        for bad in ["escape", "leak"] {
+            assert!(
+                std::fs::symlink_metadata(dst.join(bad)).is_err(),
+                "escaping symlink {bad} must be dropped"
+            );
+        }
         std::fs::remove_dir_all(&base).ok();
     }
 }

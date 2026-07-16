@@ -5,9 +5,11 @@
 //! worktree, its `.git`, and the pristine `baseline-git/`), records byte size
 //! and SHA-256, and serves it on the internal listener. The pod's init
 //! container pulls it, verifies size and digest, and unpacks it with a
-//! HARDENED extractor. Extraction policy lives HERE, in one auditable place,
-//! rejecting absolute paths, parent-dir traversal, and symlinks or hardlinks
-//! that escape the root.
+//! HARDENED extractor. Extraction policy lives HERE, in one auditable place:
+//! it refuses absolute paths, parent-dir traversal in entry paths, and every
+//! hardlink; symlinks are extracted only if they `canonicalize` INSIDE the
+//! root (the kernel resolves the whole chain), and any that escape or dangle
+//! are dropped.
 
 use crate::WorkspaceError;
 use flate2::read::GzDecoder;
@@ -97,6 +99,13 @@ pub fn unpack_archive(
 
     let mut written: u64 = 0;
     let mut total: u64 = 0;
+    // Symlinks are DEFERRED to a second phase. A symlink target can route
+    // through OTHER symlinks, which no lexical/depth analysis can resolve —
+    // only the kernel can. So we extract every real file/dir first (a
+    // dependency-free, symlink-free tree), then create the symlinks and
+    // validate each with `canonicalize`, which resolves the FULL chain and is
+    // the sole containment authority. See `place_symlinks`.
+    let mut deferred: Vec<(PathBuf, PathBuf)> = Vec::new();
     for entry in archive
         .entries()
         .map_err(|e| WorkspaceError::Invalid(format!("read archive: {e}")))?
@@ -118,12 +127,6 @@ pub fn unpack_archive(
                 path.display()
             )));
         }
-        // Symlinks are extracted as real symlinks IFF their target stays
-        // inside the root (H4: tracked in-tree symlinks are common — monorepos,
-        // dotfiles — and Docker runs them fine). The containment check resolves
-        // the link's REAL parent, so an earlier in-tree symlink that became a
-        // parent component can't be traversed out of the root; see
-        // `unpack_symlink`.
         if etype.is_symlink() {
             let target = entry
                 .link_name()
@@ -132,8 +135,7 @@ pub fn unpack_archive(
                     WorkspaceError::Invalid(format!("symlink '{}' has no target", path.display()))
                 })?
                 .into_owned();
-            unpack_symlink(&canon_dest, &safe, &path, &target)?;
-            written += 1;
+            deferred.push((safe, target));
             continue;
         }
         if etype.is_dir() {
@@ -157,7 +159,52 @@ pub fn unpack_archive(
             .map_err(|e| WorkspaceError::Invalid(format!("unpack {}: {e}", path.display())))?;
         written += 1;
     }
+
+    written += place_symlinks(&canon_dest, &deferred);
     Ok(written)
+}
+
+/// Create the deferred symlink entries under `canon_dest`, then keep only
+/// those that resolve INSIDE the root. Two phases matter:
+///
+/// - Create-time: the link's parent must already exist (from the file/dir
+///   phase) AND canonicalize inside the root. We never `create_dir_all`
+///   through an unvalidated path, so creation can't write outside the root.
+/// - Validate-time (after all links exist, so chains resolve): `canonicalize`
+///   each link — the kernel follows the entire target chain, including symlink
+///   components a lexical check would miss. Anything resolving outside the
+///   root, or dangling, is removed. `canonicalize` is the ONLY containment
+///   judge; there is no hand-rolled path arithmetic.
+///
+/// Returns the count of symlinks kept.
+fn place_symlinks(canon_dest: &Path, deferred: &[(PathBuf, PathBuf)]) -> u64 {
+    let mut created: Vec<PathBuf> = Vec::new();
+    for (safe, target) in deferred {
+        let Some(parent) = safe.parent() else {
+            continue;
+        };
+        if !parent.exists() {
+            continue; // no dir entry shipped the parent → drop
+        }
+        match std::fs::canonicalize(parent) {
+            Ok(cp) if cp.starts_with(canon_dest) => {}
+            _ => continue, // parent missing or escapes → drop, never create through it
+        }
+        if create_symlink(target, safe).is_ok() {
+            created.push(safe.clone());
+        }
+    }
+    let mut kept = 0u64;
+    for safe in created {
+        match std::fs::canonicalize(&safe) {
+            Ok(real) if real.starts_with(canon_dest) => kept += 1,
+            _ => {
+                // Escapes the root, or dangling — the kernel says so; drop it.
+                std::fs::remove_file(&safe).ok();
+            }
+        }
+    }
+    kept
 }
 
 /// Join `rel` under `base`, rejecting anything that would escape (absolute
@@ -178,78 +225,6 @@ fn safe_join(base: &Path, rel: &Path) -> Result<PathBuf, WorkspaceError> {
         }
     }
     Ok(out)
-}
-
-/// Extract one symlink entry, refusing any whose target escapes the root.
-///
-/// The subtlety a purely lexical check misses (and a real escape it would
-/// permit): an earlier symlink entry can become a *parent component* of this
-/// one, so the entry's lexical path no longer reflects where it actually
-/// lands. We therefore resolve the link's **real** parent with `canonicalize`
-/// (which follows any already-extracted in-tree symlink), require it to stay
-/// within `canon_dest`, and count the target's `..` ascents against that real
-/// depth. Because every accepted symlink is thereby proven to resolve within
-/// the root, any later file/dir entry that traverses one also stays within the
-/// root — so the file/dir paths need no extra check beyond `safe_join`.
-///
-/// A dangling in-tree target (legal in git) is fine — only a target that
-/// climbs above the root, or is absolute, fails.
-fn unpack_symlink(
-    canon_dest: &Path,
-    safe: &Path,
-    entry_path: &Path,
-    target: &Path,
-) -> Result<(), WorkspaceError> {
-    let escape = || {
-        WorkspaceError::Invalid(format!(
-            "symlink '{}' -> '{}' escapes the workspace root — refused",
-            entry_path.display(),
-            target.display()
-        ))
-    };
-    if target.is_absolute() {
-        return Err(escape());
-    }
-    // Materialize the parent (through already-validated, in-root symlinks
-    // only) so we can resolve its true location.
-    let parent = safe.parent().unwrap_or(canon_dest);
-    std::fs::create_dir_all(parent)?;
-    let canon_parent = std::fs::canonicalize(parent)
-        .map_err(|e| WorkspaceError::Invalid(format!("resolve symlink parent: {e}")))?;
-    let rel = canon_parent
-        .strip_prefix(canon_dest)
-        .map_err(|_| escape())?;
-    let depth: i64 = rel
-        .components()
-        .filter(|c| matches!(c, Component::Normal(_)))
-        .count() as i64;
-    if !target_within_root(depth, target) {
-        return Err(escape());
-    }
-    create_symlink(target, safe)
-}
-
-/// Walk a relative symlink `target` starting from `depth` levels below the
-/// root; return false if it ascends above the root (a `..` past depth 0) or is
-/// absolute (a leading root/prefix component). Shared by the archive extractor
-/// and the in-pod `copy_tree` so the containment rule is defined exactly once;
-/// each caller supplies its own real (canonicalized) starting depth.
-pub fn target_within_root(depth: i64, target: &Path) -> bool {
-    let mut depth = depth;
-    for comp in target.components() {
-        match comp {
-            Component::Normal(_) => depth += 1,
-            Component::CurDir => {}
-            Component::ParentDir => {
-                depth -= 1;
-                if depth < 0 {
-                    return false;
-                }
-            }
-            Component::RootDir | Component::Prefix(_) => return false,
-        }
-    }
-    true
 }
 
 #[cfg(unix)]
@@ -328,7 +303,9 @@ mod tests {
     }
 
     #[test]
-    fn unpack_rejects_symlink() {
+    fn unpack_drops_absolute_symlink() {
+        // An absolute-target symlink resolves outside the root; `canonicalize`
+        // says so, and it is DROPPED (the rest of the archive still extracts).
         let mut gz = GzEncoder::new(Vec::new(), Compression::default());
         {
             let mut b = tar::Builder::new(&mut gz);
@@ -343,7 +320,11 @@ mod tests {
         }
         let bytes = gz.finish().unwrap();
         let tmp = std::env::temp_dir().join(format!("fbx-arch-sym-{}", Uuid::now_v7()));
-        assert!(unpack_archive(&bytes, &tmp, 1024 * 1024).is_err());
+        assert!(unpack_archive(&bytes, &tmp, 1024 * 1024).is_ok());
+        assert!(
+            std::fs::symlink_metadata(tmp.join("link")).is_err(),
+            "absolute symlink must be dropped, not created"
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -390,46 +371,75 @@ mod tests {
     }
 
     /// H4 must not open an escape hatch: a symlink whose target leaves the
-    /// dest root — through `..` climbs or an absolute path — is still refused,
-    /// evaluated lexically against the link's own parent (no fs access).
-    #[test]
-    fn unpack_rejects_escaping_symlink_targets() {
-        for (path, target) in [
-            ("repo/link", "../../etc/passwd"), // climbs above dest
-            ("repo/link", "/etc/passwd"),      // absolute
-            ("link", ".."),                    // the dest root's parent
-            ("repo/sub/link", "../../../x"),   // deep climb past root
-        ] {
-            let mut gz = GzEncoder::new(Vec::new(), Compression::default());
-            {
-                let mut b = tar::Builder::new(&mut gz);
-                let mut header = tar::Header::new_gnu();
-                header.set_entry_type(tar::EntryType::Symlink);
-                header.set_size(0);
-                header.set_link_name(target).unwrap();
-                header.set_cksum();
-                b.append_data(&mut header, path, std::io::empty()).unwrap();
-                b.finish().unwrap();
-            }
-            let bytes = gz.finish().unwrap();
-            let tmp = std::env::temp_dir().join(format!("fbx-arch-symbad-{}", Uuid::now_v7()));
-            assert!(
-                unpack_archive(&bytes, &tmp, 1024 * 1024).is_err(),
-                "must reject escaping symlink {path} -> {target}"
-            );
-            std::fs::remove_dir_all(&tmp).ok();
-        }
-    }
-
-    /// Security regression (Codex, batch-3 review): a lexical-only containment
-    /// check permits a symlinked-parent traversal. Entry 1 makes `repo/a`
-    /// resolve to dest; entry 2 (`repo/a/root -> ../..`) would then create a
-    /// symlink at the resolved location pointing ABOVE dest; entry 3 writes a
-    /// file through it, escaping. The real-parent (`canonicalize`) check must
-    /// refuse entry 2, and nothing may be written outside dest.
+    /// dest root — through `..` climbs or an absolute path — is dropped, while
+    /// a legitimate in-tree link in the SAME archive survives. `canonicalize`
+    /// is the judge, so this holds even when the target routes through another
+    /// symlink component (Codex batch-3v2 review counterexample:
+    /// `pivot -> ..`, `escape -> pivot/..`).
     #[cfg(unix)]
     #[test]
-    fn unpack_refuses_symlinked_parent_traversal() {
+    fn unpack_drops_escaping_symlinks_keeps_good() {
+        fn sym(b: &mut tar::Builder<&mut GzEncoder<Vec<u8>>>, path: &str, target: &str) {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_size(0);
+            h.set_link_name(target).unwrap();
+            h.set_cksum();
+            b.append_data(&mut h, path, std::io::empty()).unwrap();
+        }
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut b = tar::Builder::new(&mut gz);
+            let mut d = tar::Header::new_gnu();
+            d.set_entry_type(tar::EntryType::Directory);
+            d.set_mode(0o755);
+            d.set_size(0);
+            d.set_cksum();
+            b.append_data(&mut d, "repo/", std::io::empty()).unwrap();
+            let content = b"hi\n";
+            let mut f = tar::Header::new_gnu();
+            f.set_entry_type(tar::EntryType::Regular);
+            f.set_size(content.len() as u64);
+            f.set_cksum();
+            b.append_data(&mut f, "repo/good.txt", &content[..])
+                .unwrap();
+            // Legit in-tree link — must survive.
+            sym(&mut b, "repo/good_link", "good.txt");
+            // Escapers — must all be dropped.
+            sym(&mut b, "repo/abs", "/etc/passwd");
+            sym(&mut b, "repo/up", "../../etc/passwd");
+            // Symlinked-component escape (the counterexample lexical math misses).
+            sym(&mut b, "repo/pivot", "..");
+            sym(&mut b, "repo/escape", "pivot/..");
+            b.finish().unwrap();
+        }
+        let bytes = gz.finish().unwrap();
+        let tmp = std::env::temp_dir().join(format!("fbx-arch-symbad-{}", Uuid::now_v7()));
+        assert!(unpack_archive(&bytes, &tmp, 10 * 1024 * 1024).is_ok());
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("repo/good_link")).unwrap(),
+            "hi\n",
+            "legit in-tree symlink must survive"
+        );
+        for bad in ["repo/abs", "repo/up", "repo/escape"] {
+            assert!(
+                std::fs::symlink_metadata(tmp.join(bad)).is_err(),
+                "escaping symlink {bad} must be dropped"
+            );
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Security regression (Codex, batch-3 review): a symlinked-parent
+    /// traversal. Entry 1 makes `repo/a` resolve to dest; entry 2
+    /// (`repo/a/root -> ../..`) points above dest; entry 3 writes a file
+    /// through it. The two-phase extractor creates files first (so `repo/a`
+    /// becomes a real dir and the symlinks collide/drop) and never writes
+    /// through a symlink — nothing may land outside dest.
+    #[cfg(unix)]
+    #[test]
+    fn unpack_contains_symlinked_parent_traversal() {
         fn sym(b: &mut tar::Builder<&mut GzEncoder<Vec<u8>>>, path: &str, target: &str) {
             let mut h = tar::Header::new_gnu();
             h.set_entry_type(tar::EntryType::Symlink);
@@ -478,7 +488,7 @@ mod tests {
             }
         }
         assert!(!escaped, "file escaped dest via symlinked parent");
-        assert!(res.is_err(), "symlinked-parent traversal must be refused");
+        assert!(res.is_ok(), "extraction stays contained (drops the links)");
         std::fs::remove_dir_all(&base).ok();
     }
 
