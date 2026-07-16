@@ -3415,42 +3415,62 @@ mod tests {
         )
         .await
         .unwrap();
-        sqlx::query("update sessions set updated_at = now() - interval '20 minutes' where id = $1")
+        let backdate =
+            "update sessions set updated_at = now() - interval '20 minutes' where id = $1";
+        sqlx::query(backdate)
             .bind(stale.id)
             .execute(&pool)
             .await
             .unwrap();
 
-        let ids: Vec<Uuid> = stale_nonstarted_sessions(&pool, 15)
+        let sweep_created: Vec<Uuid> = stale_nonstarted_sessions(&pool, 15)
             .await
             .unwrap()
             .iter()
             .map(|s| s.id)
             .collect();
-        assert!(ids.contains(&stale.id), "old created session must be swept");
-        assert!(!ids.contains(&fresh.id), "fresh session must not be swept");
 
-        // Terminal sessions are never swept even when old.
+        // The wind-down machine owns terminal entry: the pre-epic direct
+        // created→failed edge must be REFUSED (Ok(None)), and terminalization
+        // goes through finalizing. Neither a winding-down nor a terminal
+        // session may be swept, however old.
         use fluidbox_core::state::SessionStatus;
-        transition_session(&pool, stale.id, SessionStatus::Failed, Some("test"))
-            .await
-            .unwrap();
-        sqlx::query("update sessions set updated_at = now() - interval '20 minutes' where id = $1")
+        let direct_terminal =
+            transition_session(&pool, stale.id, SessionStatus::Failed, Some("test"))
+                .await
+                .unwrap();
+        let to_finalizing =
+            transition_session(&pool, stale.id, SessionStatus::Finalizing, Some("test"))
+                .await
+                .unwrap();
+        sqlx::query(backdate)
             .bind(stale.id)
             .execute(&pool)
             .await
             .unwrap();
-        let ids: Vec<Uuid> = stale_nonstarted_sessions(&pool, 15)
+        let sweep_finalizing: Vec<Uuid> = stale_nonstarted_sessions(&pool, 15)
             .await
             .unwrap()
             .iter()
             .map(|s| s.id)
             .collect();
-        assert!(
-            !ids.contains(&stale.id),
-            "terminal session must not be swept"
-        );
+        let to_failed = transition_session(&pool, stale.id, SessionStatus::Failed, Some("test"))
+            .await
+            .unwrap();
+        sqlx::query(backdate)
+            .bind(stale.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let sweep_terminal: Vec<Uuid> = stale_nonstarted_sessions(&pool, 15)
+            .await
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .collect();
 
+        // Fixtures out BEFORE the assertions — a failed assertion must not
+        // leak sessions into the shared tenant.
         for id in [fresh.id, stale.id] {
             sqlx::query("delete from sessions where id = $1")
                 .bind(id)
@@ -3458,6 +3478,32 @@ mod tests {
                 .await
                 .unwrap();
         }
+
+        assert!(
+            sweep_created.contains(&stale.id),
+            "old created session must be swept"
+        );
+        assert!(
+            !sweep_created.contains(&fresh.id),
+            "fresh session must not be swept"
+        );
+        assert!(
+            direct_terminal.is_none(),
+            "created→failed must be refused (no active→terminal edge)"
+        );
+        assert!(
+            to_finalizing.is_some(),
+            "created→finalizing must be legal (crash recovery finalizes from anywhere)"
+        );
+        assert!(
+            !sweep_finalizing.contains(&stale.id),
+            "winding-down session must not be swept"
+        );
+        assert!(to_failed.is_some(), "finalizing→failed must be legal");
+        assert!(
+            !sweep_terminal.contains(&stale.id),
+            "terminal session must not be swept"
+        );
     }
 
     #[tokio::test]
