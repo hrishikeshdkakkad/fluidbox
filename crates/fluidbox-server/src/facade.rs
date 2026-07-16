@@ -547,8 +547,16 @@ async fn trigger_budget_stop(
         let state2 = state.clone();
         let reason = format!("{budget} budget exceeded");
         tokio::spawn(async move {
-            crate::orchestrator::finalize(&state2, &session, "budget_exceeded", Some(&reason))
-                .await;
+            // Forced stop (runner is live → quiesce first). A DbError start
+            // is inherently retried: the facade re-enforces the budget on
+            // the runner's next request while the session stays active.
+            let _ = crate::orchestrator::finalize_forced(
+                &state2,
+                session.id,
+                "budget_exceeded",
+                &reason,
+            )
+            .await;
         });
     }
 }
