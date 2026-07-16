@@ -879,7 +879,7 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
     // while we copied may already have run terminal cleanup and released its
     // intent — the loser must remove what IT created or nothing ever will.
     if !launch_ownership(&state, session_id).await? {
-        abandon_launch(&state, session_id);
+        abandon_launch(&state, session_id).await;
         anyhow::bail!("session ownership lost during workspace init; launch abandoned");
     }
 
@@ -925,7 +925,7 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
     // that took the session during archive packing must find no container to
     // race (the attach fence below catches the residual instants).
     if !launch_ownership(&state, session_id).await? {
-        abandon_launch(&state, session_id);
+        abandon_launch(&state, session_id).await;
         anyhow::bail!("session ownership lost before provisioning; launch abandoned");
     }
     let handle = state.provider.provision(&sandbox_spec).await?;
@@ -943,7 +943,7 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
                 "late-provision terminate for {session_id} failed ({e}); finalizer discovery will reap"
             );
         }
-        abandon_launch(&state, session_id);
+        abandon_launch(&state, session_id).await;
         anyhow::bail!(
             "session left active state during provisioning; sandbox handed to the finalizer"
         );
@@ -1227,13 +1227,25 @@ async fn launch_ownership(state: &AppState, id: Uuid) -> anyhow::Result<bool> {
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("ownership read failed")))
 }
 
-/// Best-effort cleanup of a launch this task lost: the finalizer that owns
-/// the session may already have run terminal cleanup and released its
-/// intent, so the loser must remove what IT created (workspace, archive) or
-/// nothing ever will.
-fn abandon_launch(state: &AppState, id: Uuid) {
+/// Best-effort cleanup of a launch this task lost — but ONLY when no
+/// finalization intent survives: a live intent means the finalizer still
+/// owns collection (Docker reads the host workspace!) and its own terminal
+/// cleanup removes everything afterward. Deleting under a live intent would
+/// destroy the very evidence the finalizer is about to collect (a fast
+/// runner that posted /result before its handle attached would lose its
+/// patch). Only a fully reconciled session (terminal, intent released)
+/// leaves the loser's debris with no other owner.
+async fn abandon_launch(state: &AppState, id: Uuid) {
     if state.cfg.keep_workspaces {
         return;
+    }
+    match fluidbox_db::get_finalization(&state.pool, id).await {
+        Ok(None) => {}
+        Ok(Some(_)) => return, // the finalizer owns collection + cleanup
+        Err(e) => {
+            tracing::warn!("abandon_launch {id}: intent read failed ({e}); leaving files");
+            return;
+        }
     }
     if let Err(e) = fluidbox_workspace::cleanup_workspace(&state.cfg.data_dir, id) {
         tracing::warn!("abandoned-launch workspace cleanup for {id}: {e}");
