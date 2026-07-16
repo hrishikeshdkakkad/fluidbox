@@ -906,8 +906,18 @@ pub async fn cancel_session(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let ok = orchestrator::cancel(&state, id, "cancelled by user").await;
-    Ok(Json(json!({ "cancelled": ok })))
+    use orchestrator::FinalizeStart;
+    match orchestrator::cancel(&state, id, "cancelled by user").await {
+        FinalizeStart::Persisted { created } => Ok(Json(json!({ "cancelled": created }))),
+        FinalizeStart::AlreadyTerminal | FinalizeStart::Missing => {
+            Ok(Json(json!({ "cancelled": false })))
+        }
+        // The intent did not persist — a 200 here would tell the user the
+        // run is being cancelled when nothing durable says so.
+        FinalizeStart::DbError => Err(ApiError::ServiceUnavailable(
+            "cancellation not persisted; retry".into(),
+        )),
+    }
 }
 
 #[derive(Deserialize)]

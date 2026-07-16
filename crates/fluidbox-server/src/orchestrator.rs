@@ -31,9 +31,23 @@ const SESSION_TOKEN_TTL_SECS: i64 = 3 * 3600;
 /// worktree is never collected — the diff is recorded `artifact_missing`.
 const QUIESCE_DEADLINE_SECS: i64 = 30;
 
+/// Bounded wait for the runner container to exit before terminal collection
+/// on paths where no cooperative quiesce ran — the design's "await
+/// runner-container termination → collect" applies to EVERY path (M1), and
+/// a live worktree is never read (a torn diff must not become the
+/// authoritative audit artifact).
+const EXIT_WAIT_SECS: i64 = 30;
+
+/// Every provider `state()` probe inside the finalizer is individually
+/// bounded so one hung provider call can never overrun the claim.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A finalization claim older than this is re-drivable (the previous driver
-/// crashed). Comfortably above the collection + quiesce budget below.
-const FINALIZE_CLAIM_STALE_SECS: i64 = 180;
+/// crashed). Derived from the worst healthy path — quiesce wait (30 s) +
+/// exit wait (30 s) + collection (120 s) + bounded probes and DB writes —
+/// with generous headroom: an overlapping second driver can overwrite
+/// evidence, so a healthy driver must never be raced.
+const FINALIZE_CLAIM_STALE_SECS: i64 = 420;
 
 /// Terminal artifact collection is bounded: a hostile or huge worktree can
 /// waste the cap, never wedge `finalizing`.
@@ -88,23 +102,79 @@ async fn transition(state: &AppState, id: Uuid, next: SessionStatus, reason: Opt
     }
 }
 
-/// Terminal completion (runner `/result`, wall-clock budget, tool-call
-/// budget). Collects the diff before terminalizing; no quiesce (the runner
-/// already stopped, or is being stopped without needing a clean worktree
-/// beyond what it left).
-pub async fn finalize(
-    state: &AppState,
-    session: &SessionRow,
-    outcome: &str,
-    summary: Option<&str>,
-) {
-    begin_finalize(state, session.id, outcome, summary, summary, false).await;
+/// What a finalize entry point achieved — callers key their ACK/retry off
+/// this. `DbError` means the intent was NOT durably persisted: the caller
+/// must surface a retryable error (a 5xx to the runner), never a success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizeStart {
+    /// Intent durably persisted (`created` iff by this call); driver kicked.
+    Persisted {
+        created: bool,
+    },
+    AlreadyTerminal,
+    Missing,
+    DbError,
 }
 
-/// Terminal failure. Same durable path — a failed run now STILL collects
-/// whatever the agent produced (fixes live defect #1: `fail()` used to reap
-/// with no diff).
-pub async fn fail(state: &AppState, id: Uuid, reason: &str) {
+/// The named request shape all entry points reduce to (summary and reason
+/// are distinct fields on the intent row — never the same string twice).
+struct FinalizeParams<'a> {
+    outcome: &'a str,
+    summary: Option<&'a str>,
+    reason: Option<&'a str>,
+    want_quiesce: bool,
+}
+
+/// The runner reported its own result (`/result`): it is exiting by
+/// contract, so no quiesce — the universal exit-wait before collection
+/// covers the shutdown tail.
+pub async fn finalize_reported(
+    state: &AppState,
+    id: Uuid,
+    outcome: &str,
+    summary: Option<&str>,
+) -> FinalizeStart {
+    begin_finalize(
+        state,
+        id,
+        FinalizeParams {
+            outcome,
+            summary,
+            reason: None,
+            want_quiesce: false, // the runner exits on its own after /result
+        },
+    )
+    .await
+}
+
+/// The control plane is stopping a run the runner did not end itself
+/// (wall-clock / token / cost / tool-call budgets): the runner is LIVE, so
+/// it must be told to stop (quiesce via its heartbeat) and given the
+/// deadline BEFORE collection — Docker enforces no pod deadline, and a
+/// still-writing worktree must never be collected.
+pub async fn finalize_forced(
+    state: &AppState,
+    id: Uuid,
+    outcome: &str,
+    reason: &str,
+) -> FinalizeStart {
+    begin_finalize(
+        state,
+        id,
+        FinalizeParams {
+            outcome,
+            summary: None,
+            reason: Some(reason),
+            want_quiesce: true,
+        },
+    )
+    .await
+}
+
+/// Terminal failure. Same durable path — a failed run still collects
+/// whatever the agent produced, after the runner stopped (quiesce for live
+/// runners; pre-launch/dead sessions skip it via the locked snapshot).
+pub async fn fail(state: &AppState, id: Uuid, reason: &str) -> FinalizeStart {
     ledger::record(
         state,
         id,
@@ -114,88 +184,98 @@ pub async fn fail(state: &AppState, id: Uuid, reason: &str) {
         },
     )
     .await;
-    begin_finalize(state, id, "failed", None, Some(reason), false).await;
+    begin_finalize(
+        state,
+        id,
+        FinalizeParams {
+            outcome: "failed",
+            summary: None,
+            reason: Some(reason),
+            want_quiesce: true,
+        },
+    )
+    .await
 }
 
 /// Cancel a session (admin action, or a `replace` concurrency policy). Rides
 /// the durable finalizer WITH quiesce: the runner is asked (via its heartbeat
 /// response) to stop and NOT post `/result`, we wait up to 30 s for a clean
-/// worktree, then collect. Returns true if cancellation was initiated (the
-/// terminal `cancelled` lands asynchronously after collection).
-pub async fn cancel(state: &AppState, id: Uuid, reason: &str) -> bool {
-    let Ok(Some(session)) = fluidbox_db::get_session(&state.pool, id).await else {
-        return false;
-    };
-    let st = session.status_enum();
-    if st.is_terminal() || st.is_winding_down() {
-        return false;
-    }
-    begin_finalize(state, id, "cancelled", None, Some(reason), true).await
-}
-
-/// Persist the terminal intent, enter the matching wind-down state, and kick
-/// the driver. Idempotent: a racing second caller (e.g. `/result` and the
-/// wall-clock sweeper) sees the intent already recorded and defers.
-async fn begin_finalize(
-    state: &AppState,
-    id: Uuid,
-    outcome: &str,
-    summary: Option<&str>,
-    reason: Option<&str>,
-    want_quiesce: bool,
-) -> bool {
-    let Ok(Some(session)) = fluidbox_db::get_session(&state.pool, id).await else {
-        return false;
-    };
-    let st = session.status_enum();
-    if st.is_terminal() {
-        return false;
-    }
-
-    // Quiesce only makes sense while a runner is actually live to receive the
-    // heartbeat signal; otherwise go straight to collection.
-    let quiesce = want_quiesce
-        && matches!(st, SessionStatus::Running | SessionStatus::AwaitingApproval)
-        && session.sandbox_handle.is_some();
-    let (winddown, deadline) = if quiesce {
-        (
-            SessionStatus::Cancelling,
-            Some(chrono::Utc::now() + chrono::Duration::seconds(QUIESCE_DEADLINE_SECS)),
-        )
-    } else {
-        (SessionStatus::Finalizing, None)
-    };
-
-    // Persist intent BEFORE any ACK / state change (the /result-lossiness fix).
-    // A DB error here must NOT leave the session winding down without a durable
-    // intent — the recovery worker joins on `session_finalizations`, so an
-    // intent-less `finalizing` session would strand forever. Fail closed:
-    // don't transition; the caller/watchdog can retry.
-    let created = match fluidbox_db::begin_finalization(
-        &state.pool,
+/// worktree, then collect. `Persisted { created: true }` means THIS call
+/// recorded the cancellation; a lost race means some other outcome already
+/// owns the run — callers must not report "cancelled" then.
+pub async fn cancel(state: &AppState, id: Uuid, reason: &str) -> FinalizeStart {
+    begin_finalize(
+        state,
         id,
-        outcome,
-        summary,
-        reason,
-        quiesce,
-        deadline,
+        FinalizeParams {
+            outcome: "cancelled",
+            summary: None,
+            reason: Some(reason),
+            want_quiesce: true,
+        },
     )
     .await
-    {
-        Ok(c) => c,
+}
+
+/// Persist the terminal intent (transactionally, under the session row lock),
+/// enter the wind-down state THE WINNING INTENT implies, and kick the driver.
+/// Idempotent: a racing second caller receives the winner's row and derives
+/// everything from it — its own outcome/quiesce arguments are discarded.
+async fn begin_finalize(state: &AppState, id: Uuid, params: FinalizeParams<'_>) -> FinalizeStart {
+    use fluidbox_db::BeginFinalization as B;
+    let begun = fluidbox_db::begin_finalization(
+        &state.pool,
+        id,
+        params.outcome,
+        params.summary,
+        params.reason,
+        params.want_quiesce,
+        QUIESCE_DEADLINE_SECS,
+    )
+    .await;
+    let (row, created, status) = match begun {
+        Ok(B::Persisted {
+            row,
+            created,
+            session_status,
+        }) => (row, created, session_status),
+        Ok(B::AlreadyTerminal) => return FinalizeStart::AlreadyTerminal,
+        Ok(B::Missing) => return FinalizeStart::Missing,
         Err(e) => {
+            // Fail closed: no durable intent → no wind-down transition and no
+            // success ACK. The recovery worker joins on `session_finalizations`,
+            // so an intent-less wind-down state would strand forever.
             tracing::error!("begin_finalization {id} failed, not winding down: {e}");
-            return false;
+            return FinalizeStart::DbError;
         }
     };
 
-    // If the session is already winding down (a retry, or the other of a
-    // /result+cancel race), don't re-transition — just make sure a driver runs.
-    if !st.is_winding_down() {
-        transition(state, id, winddown, reason).await;
+    // Enter the wind-down state the WINNING row implies (never this caller's
+    // arguments — the /result⇄cancel race fix). Failure here is fine: the
+    // driver re-materializes the state from the intent.
+    if SessionStatus::parse(&status).is_some_and(|s| !s.is_winding_down()) {
+        enter_winddown(state, id, &row).await;
     }
 
-    if quiesce && created {
+    let state2 = state.clone();
+    tokio::spawn(async move {
+        drive_finalization(&state2, id).await;
+    });
+    FinalizeStart::Persisted { created }
+}
+
+/// Apply the wind-down state an intent implies — `Cancelling` iff the intent
+/// wants quiesce (the runner's heartbeat channel keys off that status) —
+/// emitting `QuiesceRequested` only when Cancelling actually LANDS, wherever
+/// that happens (first caller or crash recovery). Derives only from the row.
+async fn enter_winddown(state: &AppState, id: Uuid, intent: &fluidbox_db::FinalizationRow) -> bool {
+    let target = if intent.needs_quiesce {
+        SessionStatus::Cancelling
+    } else {
+        SessionStatus::Finalizing
+    };
+    let applied = transition(state, id, target, intent.reason.as_deref()).await;
+    if applied && intent.needs_quiesce {
         ledger::record(
             state,
             id,
@@ -206,18 +286,59 @@ async fn begin_finalize(
         )
         .await;
     }
-
-    let state2 = state.clone();
-    tokio::spawn(async move {
-        drive_finalization(&state2, id).await;
-    });
-    true
+    applied
 }
 
-/// Drive one session's finalization to a terminal state. Claim-guarded (so
-/// only one driver acts at a time) and idempotent (the `finalizing→terminal`
-/// transition is the single-winner gate). Safe to call repeatedly — the
-/// recovery worker calls it for any interrupted finalization.
+/// The next wind-down action, derived EXCLUSIVELY from the persisted intent
+/// and the current status (H5: a caller that lost the intent race acts on
+/// the winner's row, never its own arguments). Pure — the race matrix is
+/// unit-tested below without a database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WinddownStep {
+    /// Apply active → Cancelling (the intent wants quiesce; the runner's
+    /// heartbeat channel keys off that status).
+    EnterCancelling,
+    /// Apply active/Cancelling → Finalizing (no quiesce owed, or it resolved).
+    EnterFinalizing,
+    /// Wait for runner exit until the intent's deadline, then Finalizing.
+    AwaitQuiesce(chrono::DateTime<chrono::Utc>),
+    /// The intent wants quiesce but carries no deadline — malformed; leave it
+    /// for retry/alerting, NEVER treat as an already-expired deadline (the
+    /// old instant-timeout bug that discarded completed runs' diffs).
+    Malformed,
+    /// Already Finalizing → collect and terminalize.
+    Collect,
+    /// Already terminal → terminal-side effects + cleanup are still owed.
+    Reconcile,
+}
+
+fn plan_step(
+    needs_quiesce: bool,
+    deadline: Option<chrono::DateTime<chrono::Utc>>,
+    status: SessionStatus,
+) -> WinddownStep {
+    use SessionStatus::*;
+    if status.is_terminal() {
+        return WinddownStep::Reconcile;
+    }
+    match (status, needs_quiesce) {
+        (Finalizing, _) => WinddownStep::Collect,
+        (Cancelling, true) => match deadline {
+            Some(d) => WinddownStep::AwaitQuiesce(d),
+            None => WinddownStep::Malformed,
+        },
+        (Cancelling, false) => WinddownStep::EnterFinalizing,
+        (_, true) => WinddownStep::EnterCancelling,
+        (_, false) => WinddownStep::EnterFinalizing,
+    }
+}
+
+/// Drive one session's finalization to a terminal state — and its terminal
+/// cleanup to completion. Claim-guarded (one driver at a time), idempotent,
+/// and safe to call repeatedly: every early return leaves the intent in
+/// place, and the finalize worker re-drives it. Transient DB errors NEVER
+/// release the intent — only a session that verifiably does not exist, or a
+/// fully reconciled terminal session, does.
 pub async fn drive_finalization(state: &AppState, id: Uuid) {
     let claimed = fluidbox_db::claim_finalization(&state.pool, id, FINALIZE_CLAIM_STALE_SECS).await;
     let intent = match claimed {
@@ -229,65 +350,120 @@ pub async fn drive_finalization(state: &AppState, id: Uuid) {
         }
     };
 
-    let Ok(Some(session)) = fluidbox_db::get_session(&state.pool, id).await else {
-        fluidbox_db::delete_finalization(&state.pool, id).await.ok();
-        return;
-    };
-    if session.status_enum().is_terminal() {
-        fluidbox_db::delete_finalization(&state.pool, id).await.ok();
-        return;
-    }
-
-    // Cancelling → wait for the runner to quiesce (or the deadline), then
-    // enter the collection phase.
     let mut skip_collection = false;
-    if session.status_enum() == SessionStatus::Cancelling {
-        let timed_out = await_quiesce(state, &session, intent.quiesce_deadline).await;
-        if timed_out {
-            skip_collection = true; // never collect a racing worktree
-        }
-        transition(
-            state,
-            id,
-            SessionStatus::Finalizing,
-            intent.reason.as_deref(),
-        )
-        .await;
-    }
+    // Each arm either returns or strictly advances the machine
+    // (active → Cancelling → Finalizing → collect/terminal → reconciled);
+    // the bound is a belt against status flapping ever regressing.
+    for _ in 0..6 {
+        let session = match fluidbox_db::get_session(&state.pool, id).await {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                // Verifiably gone (not a transient error) — nothing left to
+                // reconcile; release the intent.
+                fluidbox_db::delete_finalization(&state.pool, id).await.ok();
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("drive_finalization {id}: session read failed: {e}");
+                return; // transient — leave the intent for the next drive
+            }
+        };
 
-    collect_and_terminalize(state, id, &intent, skip_collection).await;
+        match plan_step(
+            intent.needs_quiesce,
+            intent.quiesce_deadline,
+            session.status_enum(),
+        ) {
+            WinddownStep::Reconcile => {
+                finish_terminal_cleanup(state, &session).await;
+                return;
+            }
+            WinddownStep::Malformed => {
+                tracing::error!(
+                    "finalization intent for {id} wants quiesce but has no deadline — malformed; leaving for retry"
+                );
+                return;
+            }
+            WinddownStep::EnterCancelling | WinddownStep::EnterFinalizing => {
+                // Re-materialize the wind-down state the intent implies
+                // (covers the crash-between-persist-and-transition window).
+                // On failure the loop re-reads: a racing writer may have
+                // moved the session (fine — plan again); a transient DB
+                // error leaves the intent for the next drive.
+                if !enter_winddown(state, id, &intent).await {
+                    match fluidbox_db::get_session(&state.pool, id).await {
+                        Ok(Some(s))
+                            if s.status_enum().is_winding_down()
+                                || s.status_enum().is_terminal() => {} // progressed — re-plan
+                        _ => return,
+                    }
+                }
+            }
+            WinddownStep::AwaitQuiesce(deadline) => {
+                if let Some(handle) = session_handle(&session) {
+                    let exited = wait_runner_exit(state, &handle, deadline).await;
+                    if !exited {
+                        skip_collection = true; // never collect a racing worktree
+                    }
+                }
+                transition(
+                    state,
+                    id,
+                    SessionStatus::Finalizing,
+                    intent.reason.as_deref(),
+                )
+                .await;
+            }
+            WinddownStep::Collect => {
+                collect_and_terminalize(state, id, &intent, skip_collection).await;
+                return;
+            }
+        }
+    }
 }
 
-/// Block until the runner's sandbox is no longer live (clean quiesce) or the
-/// deadline passes. Returns true on timeout.
-async fn await_quiesce(
-    state: &AppState,
-    session: &SessionRow,
-    deadline: Option<chrono::DateTime<chrono::Utc>>,
-) -> bool {
-    let deadline = deadline.unwrap_or_else(chrono::Utc::now);
-    let handle: Option<SandboxHandle> = session
+fn session_handle(session: &SessionRow) -> Option<SandboxHandle> {
+    session
         .sandbox_handle
         .clone()
-        .and_then(|j| serde_json::from_value(j).ok());
-    let Some(handle) = handle else {
-        return false; // no sandbox to wait on
-    };
+        .and_then(|j| serde_json::from_value(j).ok())
+}
+
+/// Poll until the runner container is no longer live or the deadline passes;
+/// returns true iff the runner exited. Probes FIRST — crash recovery with an
+/// already-expired deadline still gets one look (the runner may have exited
+/// in time; L6) — and each probe is individually bounded so a hung provider
+/// call cannot overrun the finalize claim.
+async fn wait_runner_exit(
+    state: &AppState,
+    handle: &SandboxHandle,
+    deadline: chrono::DateTime<chrono::Utc>,
+) -> bool {
     loop {
-        if chrono::Utc::now() >= deadline {
-            return true;
-        }
-        match state.provider.state(&handle).await {
-            Ok(st) if !st.is_live() => return false, // runner exited
+        match tokio::time::timeout(PROBE_TIMEOUT, state.provider.state(handle)).await {
+            Ok(Ok(st)) if !st.is_live() => return true,
             _ => {}
         }
-        tokio::time::sleep(Duration::from_millis(750)).await;
+        let remaining = deadline - chrono::Utc::now();
+        if remaining <= chrono::Duration::zero() {
+            return false;
+        }
+        let nap = remaining.num_milliseconds().clamp(50, 750) as u64;
+        tokio::time::sleep(Duration::from_millis(nap)).await;
     }
 }
 
-/// Collect the diff (unless skipped), store the artifact or an explicit
-/// `artifact_missing`, then make the single terminal transition, reap, and
-/// clear the intent.
+/// The prefix `record_missing` stores — also the evidence guard's test for
+/// "only a missing-marker, not a real diff" (missing → collected upgrades on
+/// retry are allowed; the reverse never is).
+const MISSING_DIFF_PREFIX: &str = "(diff unavailable";
+
+/// Collect the diff (unless skipped or already collected), store the
+/// artifact or an explicit `artifact_missing`, make the single terminal
+/// transition, then reconcile terminal side effects + cleanup. Every
+/// persistence failure leaves the intent in place and returns — the finalize
+/// worker re-drives; NOTHING destructive happens before the terminal
+/// transition is confirmed.
 async fn collect_and_terminalize(
     state: &AppState,
     id: Uuid,
@@ -304,64 +480,106 @@ async fn collect_and_terminalize(
         || session.base_commit.is_some()
         || session.sandbox_handle.is_some();
 
-    if skip_collection {
-        record_missing(state, id, "quiesce_timeout").await;
-    } else {
-        let handle: Option<SandboxHandle> = session
-            .sandbox_handle
-            .clone()
-            .and_then(|j| serde_json::from_value(j).ok());
-        let ctx = CollectContext {
-            session_id: id,
-            base_commit: session.base_commit.clone(),
-        };
-        let collected = tokio::time::timeout(
-            COLLECT_TIMEOUT,
-            state.provider.collect_artifacts(handle.as_ref(), &ctx),
-        )
-        .await;
-        match collected {
-            Ok(Ok(CollectedArtifacts::Collected(arts))) => {
-                store_collected(state, id, arts).await;
+    // Evidence guard: a re-driven finalization must never regress what a
+    // previous drive stored. A real diff (including "(no changes)") is
+    // final; a missing-marker may be upgraded by a successful re-collection
+    // but never re-recorded.
+    let stored = match fluidbox_db::diff_artifact_content(&state.pool, id).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("diff artifact read failed for {id}: {e} — retrying next drive");
+            return;
+        }
+    };
+    let have_real_diff = stored
+        .as_deref()
+        .is_some_and(|c| !c.starts_with(MISSING_DIFF_PREFIX));
+    let have_any_diff = stored.is_some();
+    let record_missing_once = |reason: String| async move {
+        if expected_diff && !have_any_diff {
+            record_missing(state, id, &reason).await
+        } else {
+            Ok(())
+        }
+    };
+
+    if !have_real_diff {
+        if skip_collection {
+            if record_missing_once("quiesce_timeout".into()).await.is_err() {
+                return;
             }
-            Ok(Ok(CollectedArtifacts::Missing { reason })) => {
-                if expected_diff {
-                    record_missing(state, id, &reason).await;
+        } else {
+            // M1, universal: never read a worktree the runner may still be
+            // writing — bounded wait for runner-container exit on EVERY
+            // collect path, then collect; still live at the bound records
+            // missing (a torn diff must not become the audit artifact).
+            let handle = session_handle(&session);
+            let runner_gone = match &handle {
+                Some(h) => {
+                    let deadline = chrono::Utc::now() + chrono::Duration::seconds(EXIT_WAIT_SECS);
+                    wait_runner_exit(state, h, deadline).await
                 }
-            }
-            Ok(Err(e)) => {
-                if expected_diff {
-                    record_missing(state, id, &format!("collector error: {e}")).await;
+                None => true,
+            };
+            if !runner_gone {
+                if record_missing_once("runner_still_live".into())
+                    .await
+                    .is_err()
+                {
+                    return;
                 }
-            }
-            Err(_) => {
-                if expected_diff {
-                    record_missing(state, id, "collection_timeout").await;
+            } else {
+                let ctx = CollectContext {
+                    session_id: id,
+                    base_commit: session.base_commit.clone(),
+                };
+                let collected = tokio::time::timeout(
+                    COLLECT_TIMEOUT,
+                    state.provider.collect_artifacts(handle.as_ref(), &ctx),
+                )
+                .await;
+                let stored_ok = match collected {
+                    Ok(Ok(CollectedArtifacts::Collected(arts))) => {
+                        store_collected(state, id, arts).await
+                    }
+                    Ok(Ok(CollectedArtifacts::Missing { reason })) => {
+                        record_missing_once(reason).await
+                    }
+                    Ok(Err(e)) => record_missing_once(format!("collector error: {e}")).await,
+                    Err(_) => record_missing_once("collection_timeout".into()).await,
+                };
+                if stored_ok.is_err() {
+                    tracing::warn!("artifact persistence failed for {id} — retrying next drive");
+                    return;
                 }
             }
         }
     }
 
-    // Summary artifact (unchanged shape).
+    // Summary — MUST land before the terminal transition: terminalizing
+    // destroys the retry path (the intent is released after cleanup), so a
+    // swallowed write here would lose the summary forever.
     if let Some(s) = intent.summary.as_deref() {
-        fluidbox_db::set_result_summary(&state.pool, id, s)
+        if fluidbox_db::set_result_summary(&state.pool, id, s)
             .await
-            .ok();
-        fluidbox_db::upsert_artifact(&state.pool, id, "summary", "summary.md", s, "text/markdown")
-            .await
-            .ok();
+            .is_err()
+        {
+            return;
+        }
+        if fluidbox_db::upsert_artifact(
+            &state.pool,
+            id,
+            "summary",
+            "summary.md",
+            s,
+            "text/markdown",
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
     }
-
-    ledger::record(
-        state,
-        id,
-        Actor::Harness,
-        EventBody::RunResult {
-            outcome: intent.outcome.clone(),
-            summary: intent.summary.clone(),
-        },
-    )
-    .await;
 
     let terminal = match intent.outcome.as_str() {
         "completed" => SessionStatus::Completed,
@@ -369,15 +587,90 @@ async fn collect_and_terminalize(
         "budget_exceeded" => SessionStatus::BudgetExceeded,
         _ => SessionStatus::Failed,
     };
-    // The single-winner gate: delivery enqueue rides this transition.
-    transition(state, id, terminal, intent.reason.as_deref()).await;
+    // The single-winner gate: delivery enqueue rides this transition, and
+    // ONLY the winning driver records RunResult — re-drives must not
+    // duplicate ledger events.
+    if transition(state, id, terminal, intent.reason.as_deref()).await {
+        ledger::record(
+            state,
+            id,
+            Actor::Harness,
+            EventBody::RunResult {
+                outcome: intent.outcome.clone(),
+                summary: intent.summary.clone(),
+            },
+        )
+        .await;
+        finish_terminal_cleanup(state, &session).await;
+    } else {
+        // The transition did not apply. If another driver already
+        // terminalized, cleanup may still be owed; a transient failure
+        // leaves the intent for the next drive. H2: the intent (and the
+        // workspace, archive, and sandbox) are NEVER destroyed on this path.
+        match fluidbox_db::get_session(&state.pool, id).await {
+            Ok(Some(s)) if s.status_enum().is_terminal() => {
+                finish_terminal_cleanup(state, &s).await;
+            }
+            _ => {}
+        }
+    }
+}
 
-    reap(state, id).await;
+/// Terminal-side effects + cleanup, re-driven under the claim until ALL of it
+/// succeeds — only then is the intent released (it is the retry ticket).
+/// Everything here is idempotent: token revocation is an UPDATE, delivery
+/// enqueue is guarded by `result_deliveries_exist` (and this path is
+/// claim-serialized), both providers' terminate treat already-gone as
+/// success, and the file removals tolerate absence. Also closes the
+/// terminal-commit → side-effects crash gap (`transition` normally does
+/// revoke + enqueue; a crash between the UPDATE and those calls leaves them
+/// owed — this reconciler re-runs them).
+async fn finish_terminal_cleanup(state: &AppState, session: &SessionRow) {
+    let id = session.id;
+    if let Err(e) = fluidbox_db::revoke_session_tokens(&state.pool, id).await {
+        tracing::warn!("terminal reconcile {id}: token revoke failed: {e}");
+        return;
+    }
+    // Delivery enqueue is owed only when the RunSpec names destinations.
+    let wants_delivery = serde_json::from_value::<RunSpec>(session.run_spec.clone())
+        .map(|rs| !rs.result_destinations.is_empty())
+        .unwrap_or(false);
+    if wants_delivery {
+        match fluidbox_db::result_deliveries_exist(&state.pool, id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                crate::deliveries::enqueue_for_session(state, id).await;
+                // enqueue logs per-destination failures; confirm before the
+                // intent may ever be released.
+                match fluidbox_db::result_deliveries_exist(&state.pool, id).await {
+                    Ok(true) => {}
+                    _ => {
+                        tracing::warn!("terminal reconcile {id}: delivery enqueue incomplete");
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("terminal reconcile {id}: delivery check failed: {e}");
+                return;
+            }
+        }
+    }
+    // Reap MUST succeed (or the sandbox be verifiably gone) before the
+    // workspace, archive, and intent go away — especially on Docker, where
+    // nothing else ever kills the container.
+    if reap(state, id).await.is_err() {
+        return;
+    }
     if !state.cfg.keep_workspaces {
         if let Err(e) = fluidbox_workspace::cleanup_workspace(&state.cfg.data_dir, id) {
-            tracing::warn!("workspace cleanup failed for {id}: {e}");
+            tracing::warn!("workspace cleanup failed for {id}: {e} — retrying next drive");
+            return;
         }
-        delete_archive(&state.cfg.data_dir, id);
+        if let Err(e) = delete_archive(&state.cfg.data_dir, id) {
+            tracing::warn!("archive removal failed for {id}: {e} — retrying next drive");
+            return;
+        }
     }
     fluidbox_db::delete_finalization(&state.pool, id).await.ok();
 }
@@ -386,7 +679,7 @@ async fn store_collected(
     state: &AppState,
     id: Uuid,
     arts: Vec<fluidbox_core::traits::CollectedArtifact>,
-) {
+) -> sqlx::Result<()> {
     for a in arts {
         // A clean worktree is a real (empty) result, not a missing diff — the
         // artifact contract keeps a diff row on every collected run.
@@ -397,8 +690,7 @@ async fn store_collected(
                 (a.content.clone(), a.content_type.clone())
             };
         fluidbox_db::upsert_artifact(&state.pool, id, &a.kind, &a.name, &content, &content_type)
-            .await
-            .ok();
+            .await?;
         ledger::record(
             state,
             id,
@@ -413,19 +705,19 @@ async fn store_collected(
         )
         .await;
     }
+    Ok(())
 }
 
-async fn record_missing(state: &AppState, id: Uuid, reason: &str) {
+async fn record_missing(state: &AppState, id: Uuid, reason: &str) -> sqlx::Result<()> {
     fluidbox_db::upsert_artifact(
         &state.pool,
         id,
         "diff",
         "changes.patch",
-        &format!("(diff unavailable: {reason})"),
+        &format!("{MISSING_DIFF_PREFIX}: {reason})"),
         "text/plain",
     )
-    .await
-    .ok();
+    .await?;
     ledger::record(
         state,
         id,
@@ -436,6 +728,7 @@ async fn record_missing(state: &AppState, id: Uuid, reason: &str) {
         },
     )
     .await;
+    Ok(())
 }
 
 async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
@@ -504,8 +797,17 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
     };
 
     let handle = state.provider.provision(&sandbox_spec).await?;
-    fluidbox_db::set_sandbox_handle(&state.pool, session_id, &serde_json::to_value(&handle)?)
-        .await?;
+    let attached =
+        fluidbox_db::set_sandbox_handle(&state.pool, session_id, &serde_json::to_value(&handle)?)
+            .await?;
+    if !attached {
+        // The session went terminal while we were provisioning (crash
+        // recovery, or a cancel that finalized a handle-less session) —
+        // nothing owns this sandbox, so kill it now rather than leak it
+        // until the next boot sweep.
+        let _ = state.provider.terminate(&handle).await;
+        anyhow::bail!("session went terminal during provisioning; sandbox reaped");
+    }
 
     // initializing → running (traffic is now expected)
     transition(&state, session_id, SessionStatus::Running, None).await;
@@ -616,10 +918,15 @@ async fn pack_and_store_archive(
     })
 }
 
-/// Delete a session's stored archive (idempotent). Called at finalize; a TTL
-/// sweep is the backstop.
-pub fn delete_archive(data_dir: &std::path::Path, session_id: Uuid) {
-    let _ = std::fs::remove_file(archive_path(data_dir, session_id));
+/// Delete a session's stored archive. Absence is success (idempotent);
+/// any other failure surfaces so the terminal reconciler retries instead of
+/// leaking the archive permanently.
+pub fn delete_archive(data_dir: &std::path::Path, session_id: Uuid) -> std::io::Result<()> {
+    match std::fs::remove_file(archive_path(data_dir, session_id)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 pub fn env_size_breakdown(env: &[(String, String)]) -> String {
@@ -758,15 +1065,29 @@ async fn connection_auth_header(state: &AppState, connection_id: Uuid) -> anyhow
     crate::connectors::fetch_auth_header(state, &conn).await
 }
 
-/// Tear down the sandbox for a session (idempotent).
-pub async fn reap(state: &AppState, id: Uuid) {
-    if let Ok(Some(session)) = fluidbox_db::get_session(&state.pool, id).await {
-        if let Some(handle_json) = session.sandbox_handle {
-            if let Ok(handle) = serde_json::from_value::<SandboxHandle>(handle_json) {
-                if let Err(e) = state.provider.terminate(&handle).await {
-                    tracing::warn!("reap {id}: {e}");
-                }
-            }
+/// Tear down the sandbox for a session. Idempotent — both providers treat
+/// already-gone as success — so Err means the provider could NOT confirm
+/// teardown: finalizer callers must stop (not destroy evidence or release
+/// the intent) and retry. An unparseable handle returns Ok (it can never be
+/// terminated through the provider; the boot orphan sweep's label scan is
+/// the backstop) rather than wedging the intent forever.
+pub async fn reap(state: &AppState, id: Uuid) -> Result<(), ()> {
+    let session = match fluidbox_db::get_session(&state.pool, id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            tracing::warn!("reap {id}: session read failed: {e}");
+            return Err(());
+        }
+    };
+    let Some(handle) = session_handle(&session) else {
+        return Ok(());
+    };
+    match state.provider.terminate(&handle).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            tracing::warn!("reap {id}: {e}");
+            Err(())
         }
     }
 }
@@ -774,4 +1095,95 @@ pub async fn reap(state: &AppState, id: Uuid) {
 fn uuid_token() -> String {
     // 32 hex chars of entropy from a v4 uuid (no extra deps).
     Uuid::new_v4().simple().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluidbox_core::state::SessionStatus::*;
+
+    fn dl() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() + chrono::Duration::seconds(30)
+    }
+
+    /// H5's poster race: /result wins the intent (no quiesce, NULL deadline);
+    /// the losing cancel still parked the session in Cancelling. The plan
+    /// must go straight to Finalizing — never an instant quiesce timeout
+    /// that discards a completed run's diff.
+    #[test]
+    fn result_wins_cancel_loses_goes_straight_to_finalizing() {
+        assert_eq!(
+            plan_step(false, None, Cancelling),
+            WinddownStep::EnterFinalizing
+        );
+    }
+
+    /// Cancel's intent persisted but the server crashed before the
+    /// Cancelling transition landed: recovery re-materializes the quiesce
+    /// path from the row, whatever active state the session is in.
+    #[test]
+    fn crash_before_transition_rematerializes_cancelling() {
+        for st in [
+            Created,
+            Provisioning,
+            Initializing,
+            Running,
+            AwaitingApproval,
+        ] {
+            assert_eq!(
+                plan_step(true, Some(dl()), st),
+                WinddownStep::EnterCancelling
+            );
+        }
+    }
+
+    #[test]
+    fn quiesce_intent_in_cancelling_waits_until_its_deadline() {
+        let d = dl();
+        assert_eq!(
+            plan_step(true, Some(d), Cancelling),
+            WinddownStep::AwaitQuiesce(d)
+        );
+    }
+
+    /// A quiesce intent without a deadline is malformed — leave it for
+    /// retry, never treat it as an already-expired deadline.
+    #[test]
+    fn quiesce_without_deadline_is_malformed_not_instant_timeout() {
+        assert_eq!(plan_step(true, None, Cancelling), WinddownStep::Malformed);
+    }
+
+    /// Completed/failed intents recovered in any active state skip quiesce.
+    #[test]
+    fn no_quiesce_intent_enters_finalizing_from_any_active_state() {
+        for st in [
+            Created,
+            Provisioning,
+            Initializing,
+            Running,
+            AwaitingApproval,
+        ] {
+            assert_eq!(plan_step(false, None, st), WinddownStep::EnterFinalizing);
+        }
+    }
+
+    #[test]
+    fn finalizing_collects_regardless_of_intent_shape() {
+        assert_eq!(
+            plan_step(true, Some(dl()), Finalizing),
+            WinddownStep::Collect
+        );
+        assert_eq!(plan_step(false, None, Finalizing), WinddownStep::Collect);
+    }
+
+    /// Terminal sessions with a surviving intent owe cleanup (the crash gap
+    /// between the terminal commit and its side effects) — never a
+    /// re-finalize, never a release without reconciling.
+    #[test]
+    fn terminal_with_intent_reconciles_cleanup() {
+        for st in [Completed, Failed, Cancelled, BudgetExceeded] {
+            assert_eq!(plan_step(true, Some(dl()), st), WinddownStep::Reconcile);
+            assert_eq!(plan_step(false, None, st), WinddownStep::Reconcile);
+        }
+    }
 }

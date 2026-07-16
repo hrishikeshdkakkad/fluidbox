@@ -17,11 +17,11 @@ Status legend: `[ ]` open · `[x]` fixed · `[-]` won't fix (record why)
   - (b) `deploy/helm/fluidbox/templates/tests/netpol-probe.yaml:14-15` resolves ClusterIPs via `lookup` at **install render time**; Helm stores rendered test hooks in the release and `helm test` re-executes them without re-rendering → on a fresh install both IPs are baked empty and the probe exits 1 before testing anything.
   - **Fix:** run a throwaway in-cluster Postgres and wait for server readiness; resolve probe targets at execution time (DNS in the test pod, or runtime query); drop the `|| true`.
 
-- [ ] **H2. Failed terminal transition still deletes the recovery intent — permanent wedge in `finalizing`.**
+- [x] **H2. Failed terminal transition still deletes the recovery intent — permanent wedge in `finalizing`.** *(fixed: fix/k8s-finalizer-durability — nothing destructive before the terminal transition is confirmed; cleanup re-driven under the claim until it all succeeds; intent deleted LAST; transient `get_session` errors no longer delete the intent)*
   `crates/fluidbox-server/src/orchestrator.rs:373` (`collect_and_terminalize`) ignores `transition()`'s return, then reaps the sandbox, deletes workspace + archive, and `delete_finalization`s. A transient DB error on the `finalizing → terminal` UPDATE leaves the session in `finalizing` forever: `pending_finalizations` joins on the now-deleted intent row and the watchdog ignores wind-down states.
   **Fix:** delete the intent (and do destructive cleanup) only after the terminal transition is confirmed; otherwise leave the intent for the finalize worker to re-drive.
 
-- [ ] **H3. `/result` ACKs success when intent persistence fails — the lossy-ACK bug survives on the error path.**
+- [x] **H3. `/result` ACKs success when intent persistence fails — the lossy-ACK bug survives on the error path.** *(fixed: typed `FinalizeStart`; `/result` 503s on `DbError` (runner retries), 404s on missing; winding-down ACK now requires an intent to actually exist — an intent-less wind-down state falls through and re-persists)*
   `crates/fluidbox-server/src/internal.rs:846-850` awaits `orchestrator::finalize`, but `begin_finalize` swallows the `begin_finalization` DB error (logs, returns false) and the handler returns `{"ok": true}` regardless. The runner exits; no intent, no wind-down; the watchdog later fails the session — a completed run with a summary is recorded **failed**.
   **Fix:** return a retryable 5xx when the intent wasn't durably persisted (the runner contract already retries `/result`).
 
@@ -29,7 +29,7 @@ Status legend: `[ ]` open · `[x]` fixed · `[-]` won't fix (record why)
   `crates/fluidbox-workspace/src/archive.rs:36` packs symlinks as entries (`follow_symlinks(false)` — correct per tar-rs guidance), but `unpack_archive` (archive.rs:112-120) rejects **every** link entry → `workspaced init` fails → run dies at init. `materialize_git` does a real checkout, so tracked symlinks are common (monorepos, dotfiles). Docker runs the same repo fine — a provider-conformance break.
   **Fix:** extract symlinks whose lexically-normalized target stays inside the workspace root; keep rejecting absolute/`..`-escaping targets and hardlinks. Add a symlink-repo fixture to the conformance tests.
 
-- [ ] **H5. Cancel⇄result races/crash gaps apply the wrong wind-down semantics — losing caller uses its own state instead of the persisted intent's.**
+- [x] **H5. Cancel⇄result races/crash gaps apply the wrong wind-down semantics — losing caller uses its own state instead of the persisted intent's.** *(fixed: `begin_finalization` is one transaction under the session row lock returning the WINNING row; losers derive everything from it; `plan_step` keys quiesce off `intent.needs_quiesce` with the row's deadline (quiesce-without-deadline = malformed/retry, never instant timeout); `pending_finalizations` is status-blind so recovery sees intents on active AND terminal sessions)*
   Root causes: `begin_finalize` computes `winddown`/quiesce from its own arguments after losing the `on conflict do nothing` insert (`orchestrator.rs:174-195`); `drive_finalization` keys quiesce off session status rather than `intent.needs_quiesce` (`orchestrator.rs:241-245`); intent insert + transition are non-atomic and recovery only scans wind-down statuses.
   - `/result` wins, racing cancel loses but still transitions to `Cancelling` → driver runs `await_quiesce` with the completed intent's **NULL deadline** → `unwrap_or_else(now)` = instant "timeout" → collection skipped → **completed run loses its diff** to `artifact_missing(quiesce_timeout)`.
   - Cancel inserts `needs_quiesce=true`, server crashes before the `Cancelling` transition → runner never receives quiesce; a later budget/result caller drives the recorded cancellation without quiescing.
@@ -37,7 +37,7 @@ Status legend: `[ ]` open · `[x]` fixed · `[-]` won't fix (record why)
 
 ## Medium severity
 
-- [ ] **M1. Budget/fail finalizations collect from a live, still-writing worktree.**
+- [x] **M1. Budget/fail finalizations collect from a live, still-writing worktree.** *(fixed: budget/fail paths are `finalize_forced` — they persist `needs_quiesce=true` so a live runner is told to stop via its heartbeat before collection (Docker enforces no pod deadline); plus a universal bounded exit-wait on EVERY collect path; still-live at the bound records `artifact_missing(runner_still_live)` — a torn diff is never collected)*
   Design doc's "unified sequence for ALL terminal paths" includes "await runner-container termination → collect"; `SandboxStatus::is_live` doc agrees — but only the Cancelling path waits. `workers.rs:165` (budget) and `fail()` collect immediately; a runner mid-`Bash` yields a torn diff stored as the authoritative audit artifact.
   **Fix:** extend the quiesce/await step to all paths with a live sandbox (bounded wait for `!is_live()`).
 
@@ -84,8 +84,8 @@ Status legend: `[ ]` open · `[x]` fixed · `[-]` won't fix (record why)
 - [ ] **L3.** `delete_archive`'s "TTL sweep is the backstop" comment references a sweep that doesn't exist; archives kept until terminal cleanup (design said delete-after-init-consumed); crash after terminal transition but before `remove_file` leaks the archive permanently.
 - [ ] **L4.** Untrue/garbled comments: `pack_workspace` says symlinks "are followed" while code sets `follow_symlinks(false)` (ties to H4); `exec_collect` claims exit codes are surfaced (ties to M2).
 - [ ] **L5.** `FLUIDBOX_INTERNAL_BIND` defaults to `0.0.0.0:8788` even for `provider=docker` local dev — new LAN-exposed listener by default.
-- [ ] **L6.** `await_quiesce` checks the deadline before ever probing state (`orchestrator.rs:277-280`) — crash-recovery with an expired deadline records `quiesce_timeout` even when the runner exited cleanly in time; one `state()` check first rescues the diff.
-- [ ] **L7.** `finalize()` passes `summary` as both summary and status reason.
+- [x] **L6.** `await_quiesce` checks the deadline before ever probing state (`orchestrator.rs:277-280`) — crash-recovery with an expired deadline records `quiesce_timeout` even when the runner exited cleanly in time; one `state()` check first rescues the diff. *(fixed: `wait_runner_exit` probes first, every probe individually bounded (5 s) so a hung provider call can't overrun the claim, which was raised 180→420 s to cover the worst healthy path)*
+- [x] **L7.** `finalize()` passes `summary` as both summary and status reason. *(fixed: named `FinalizeParams` with distinct fields; `/result` → `finalize_reported` (summary, no reason); every budget path → `finalize_forced` (reason, no summary) — the budget string no longer lands as a fake summary.md artifact)*
 - [ ] **L8.** `main.rs:99` hardcodes `:8788` in the resolved ClusterIP URL rather than deriving from config; URL also unbracketed for IPv6 ClusterIPs (breaks IPv6-primary clusters).
 - [ ] **L9.** K8s pre-launch failures with a materialized workspace record a noise `(diff unavailable: no sandbox handle…)` artifact where Docker records "(no changes)" (`expected_diff` keys off `base_commit`).
 - [ ] **L10.** UID hardening: `delete_pod` accepts `uid=None` (unguarded delete); exec collection never re-checks pod UID. Defense-in-depth only — handles always carry UIDs today.

@@ -166,12 +166,22 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
                 }
                 ConcurrencyPolicy::Replace => {
                     for s in &active {
-                        orchestrator::cancel(
+                        // Best-effort: a transient persistence failure must
+                        // not block the replacing run (the watchdog and the
+                        // next invocation converge) — but never silently.
+                        if orchestrator::cancel(
                             state,
                             s.id,
                             "replaced by a newer invocation of this subscription",
                         )
-                        .await;
+                        .await
+                            == orchestrator::FinalizeStart::DbError
+                        {
+                            tracing::warn!(
+                                "replace: cancel intent for {} not persisted; proceeding",
+                                s.id
+                            );
+                        }
                     }
                 }
                 ConcurrencyPolicy::Allow => unreachable!(),

@@ -86,8 +86,10 @@ async fn watchdog(state: AppState) {
                         // Confirm the sandbox is actually gone before failing.
                         if sandbox_dead(&state, &s.sandbox_handle).await {
                             tracing::warn!("watchdog: {} heartbeat stale + sandbox dead", s.id);
-                            orchestrator::fail(&state, s.id, "sandbox died (stale heartbeat)")
-                                .await;
+                            // A DbError start is retried by the next tick.
+                            let _ =
+                                orchestrator::fail(&state, s.id, "sandbox died (stale heartbeat)")
+                                    .await;
                         }
                     }
                 }
@@ -104,7 +106,8 @@ async fn watchdog(state: AppState) {
                         s.status,
                         STALE_LAUNCH_MINS
                     );
-                    orchestrator::fail(
+                    // A DbError start is retried by the next tick.
+                    let _ = orchestrator::fail(
                         &state,
                         s.id,
                         "stalled before launch (control plane interrupted)",
@@ -162,11 +165,15 @@ async fn budget_sweeper(state: AppState) {
                             },
                         )
                         .await;
-                        orchestrator::finalize(
+                        // Forced stop: the runner is live and must be told to
+                        // quiesce before collection. A DbError start is
+                        // retried by the next sweep tick (the session is
+                        // still active until the intent lands).
+                        let _ = orchestrator::finalize_forced(
                             &state,
-                            &s,
+                            s.id,
                             "budget_exceeded",
-                            Some("wall-clock budget exceeded"),
+                            "wall-clock budget exceeded",
                         )
                         .await;
                     }
