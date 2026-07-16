@@ -1731,24 +1731,45 @@ pub async fn transition_session(
 /// still in an ACTIVE (pre-wind-down) state AND no finalization intent
 /// exists: the intent is the single source of truth for ownership, and it
 /// commits BEFORE the wind-down transition — a status-only fence would let a
-/// launch attach a live sandbox inside that gap, which recovery may already
-/// be collecting or terminalizing (and would then never reap). The caller
-/// must terminate the sandbox on refusal. `begin_finalization` holds the
-/// session row lock across its insert, so this UPDATE serializes against it:
-/// attach-first means the intent's snapshot sees the handle; intent-first
-/// means this refuses. The status set mirrors `SessionStatus::accepts_work`.
+/// launch attach a live sandbox inside that gap. The caller must terminate
+/// the sandbox on refusal.
+///
+/// Deliberately a lock-then-check-then-update TRANSACTION, not one UPDATE:
+/// a single statement's `not exists` subquery keeps the command snapshot
+/// even after blocking on `begin_finalization`'s session row lock (Postgres
+/// re-checks only the target tuple on unblock), so it could attach past a
+/// just-committed intent. Taking the same row lock first and reading the
+/// intent in a SECOND statement gets a fresh snapshot that must see it.
 pub async fn set_sandbox_handle(pool: &PgPool, id: Uuid, handle: &Value) -> sqlx::Result<bool> {
-    let r = sqlx::query(
-        "update sessions set sandbox_handle = $2, updated_at = now()
-          where id = $1
-            and status in ('created','provisioning','initializing','running','awaiting_approval')
-            and not exists (select 1 from session_finalizations f where f.session_id = $1)",
-    )
-    .bind(id)
-    .bind(handle)
-    .execute(pool)
-    .await?;
-    Ok(r.rows_affected() == 1)
+    use fluidbox_core::state::SessionStatus;
+    let mut tx = pool.begin().await?;
+    let locked: Option<(String,)> =
+        sqlx::query_as("select status from sessions where id = $1 for update")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((status,)) = locked else {
+        return Ok(false);
+    };
+    let active = SessionStatus::parse(&status).is_some_and(|s| s.accepts_work());
+    if !active {
+        return Ok(false);
+    }
+    let (intent_exists,): (bool,) =
+        sqlx::query_as("select exists(select 1 from session_finalizations where session_id = $1)")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if intent_exists {
+        return Ok(false);
+    }
+    sqlx::query("update sessions set sandbox_handle = $2, updated_at = now() where id = $1")
+        .bind(id)
+        .bind(handle)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 pub async fn set_base_commit(pool: &PgPool, id: Uuid, commit: &str) -> sqlx::Result<()> {
@@ -3304,6 +3325,16 @@ mod tests {
             begin_finalization(&pool, fenced.id, "failed", None, Some("t"), false, 30)
                 .await
                 .unwrap();
+        // The gap that matters: intent committed, wind-down transition NOT
+        // yet applied — the session status still accepts work, but the
+        // intent alone must fence a late attach.
+        let attached_intent_gap = set_sandbox_handle(
+            &pool,
+            fenced.id,
+            &serde_json::json!({"external_id":"tg","uid":"ug"}),
+        )
+        .await
+        .unwrap();
         transition_session(&pool, fenced.id, SessionStatus::Finalizing, None)
             .await
             .unwrap();
@@ -3386,6 +3417,10 @@ mod tests {
             first_fence,
             BeginFinalization::Persisted { created: true, .. }
         ));
+        assert!(
+            !attached_intent_gap,
+            "a committed intent must fence attach BEFORE the wind-down transition lands"
+        );
         assert!(
             !attached_winddown,
             "a winding-down session must refuse a late sandbox handle"
