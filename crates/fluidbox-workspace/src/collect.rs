@@ -456,16 +456,16 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// H4 end-to-end: an agent-created in-tree symlink must survive the
-    /// archive transport (pack→unpack — the control-plane→pod path the K8s
-    /// provider uses) AND appear in the collected diff, matching Docker, which
-    /// runs symlinked repos fine. Regression guard for "any repo with a
-    /// tracked symlink can never run on the K8s provider".
+    /// H4 (archive transport + collection halves): an in-tree symlink present
+    /// in the worktree survives pack→unpack (the control-plane→pod archive
+    /// transport) AND appears in the collected diff (git mode 120000), matching
+    /// Docker. The `cmd_init`→`copy_tree`→/workspace half is covered by
+    /// `workspaced`'s `copy_tree_preserves_intree_symlink_and_drops_escaping`.
     #[cfg(unix)]
     #[test]
     fn symlink_survives_pack_unpack_and_appears_in_diff() {
         let (tmp, ws) = fixture();
-        // Agent adds an in-tree relative symlink to the worktree.
+        // A tracked in-tree relative symlink in the worktree.
         std::os::unix::fs::symlink("a.txt", ws.host_dir.join("link")).unwrap();
 
         // Pack the session root (repo/ + baseline-git/) and unpack it into a
