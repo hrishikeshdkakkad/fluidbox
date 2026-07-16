@@ -1,18 +1,24 @@
 //! Background workers: heartbeat watchdog, budget sweeper (wall-clock),
-//! approval expiry, and boot-time orphan reaping.
+//! approval expiry, the restart-recoverable finalize driver, and boot-time
+//! orphan reaping.
 
 use crate::orchestrator;
 use crate::state::AppState;
 use fluidbox_core::spec::RunSpec;
-use fluidbox_core::traits::{ExecutionProvider, SandboxHandle, SandboxState};
+use fluidbox_core::traits::SandboxHandle;
 use std::time::Duration;
 
-/// Reap any sandboxes labelled ours that have no matching live session (or
-/// whose session is already terminal). Runs once at boot.
+/// Reap any sandboxes the provider manages that have no matching live session
+/// (or whose session is already terminal), and resume any finalization the
+/// control plane was driving when it went down. Runs once at boot.
 pub async fn boot_orphan_sweep(state: AppState) {
-    match state.provider.list_orphans().await {
-        Ok(orphans) => {
-            for (session_id, handle) in orphans {
+    // Resume interrupted finalizations FIRST, so a crash mid-collect finishes
+    // (and reaps its own sandbox) before the orphan sweep would kill it.
+    recover_finalizations(&state).await;
+
+    match state.provider.list_managed().await {
+        Ok(managed) => {
+            for (session_id, handle) in managed {
                 let terminal = match fluidbox_db::get_session(&state.pool, session_id).await {
                     Ok(Some(s)) => s.status_enum().is_terminal(),
                     _ => true, // unknown session → orphan
@@ -27,10 +33,26 @@ pub async fn boot_orphan_sweep(state: AppState) {
     }
 }
 
+/// Re-drive every session that has a persisted finalization intent but hasn't
+/// reached terminal — the restart-recovery + crashed-driver path. Claim-
+/// guarded in `drive_finalization`, so this never double-finalizes.
+async fn recover_finalizations(state: &AppState) {
+    match fluidbox_db::pending_finalizations(&state.pool).await {
+        Ok(ids) => {
+            for id in ids {
+                tracing::info!("resuming interrupted finalization for {id}");
+                orchestrator::drive_finalization(state, id).await;
+            }
+        }
+        Err(e) => tracing::warn!("finalization recovery query failed: {e}"),
+    }
+}
+
 pub fn spawn_all(state: AppState) {
     tokio::spawn(watchdog(state.clone()));
     tokio::spawn(budget_sweeper(state.clone()));
-    tokio::spawn(approval_expiry(state));
+    tokio::spawn(approval_expiry(state.clone()));
+    tokio::spawn(finalize_worker(state));
 }
 
 /// A healthy orchestrator moves created → provisioning → initializing in
@@ -100,10 +122,12 @@ async fn sandbox_dead(state: &AppState, handle_json: &Option<serde_json::Value>)
     let Ok(handle) = serde_json::from_value::<SandboxHandle>(json.clone()) else {
         return true;
     };
-    matches!(
-        state.provider.state(&handle).await,
-        Ok(SandboxState::Exited(_)) | Ok(SandboxState::Gone)
-    )
+    match state.provider.state(&handle).await {
+        Ok(st) => !st.is_live(),
+        // A transient provider error is NOT proof of death — leave it for the
+        // next tick rather than failing a possibly-live session.
+        Err(_) => false,
+    }
 }
 
 /// Enforce wall-clock budgets (token/cost budgets are enforced inline in the
@@ -165,5 +189,17 @@ async fn approval_expiry(state: AppState) {
             }
             Err(e) => tracing::warn!("approval expiry sweep failed: {e}"),
         }
+    }
+}
+
+/// Restart-recoverable finalize driver: re-drives any session stuck in
+/// `cancelling`/`finalizing` with a persisted intent whose driver died
+/// (stale claim). The claim in `drive_finalization` makes this idempotent —
+/// a healthy in-progress finalization is never disturbed.
+async fn finalize_worker(state: AppState) {
+    let mut tick = tokio::time::interval(Duration::from_secs(20));
+    loop {
+        tick.tick().await;
+        recover_finalizations(&state).await;
     }
 }

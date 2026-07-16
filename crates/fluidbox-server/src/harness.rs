@@ -169,6 +169,8 @@ mod tests {
             github_clone_base: String::new(),
             keep_workspaces: false,
             public_url: String::new(),
+            provider: "docker".into(),
+            network_mode: fluidbox_core::traits::NetworkMode::HostDev,
         }
     }
 
