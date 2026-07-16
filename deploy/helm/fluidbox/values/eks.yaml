@@ -1,0 +1,15 @@
+# AWS EKS. Trap #1: the VPC CNI does NOT enforce NetworkPolicy by default —
+# enable the VPC CNI network-policy agent (aws-node ENABLE_NETWORK_POLICY=true)
+# or install Calico/Cilium. The boot probe + helm test fail closed either way.
+# Trap #2: the EBS CSI addon is often NOT preinstalled and needs IRSA/pod-
+# identity; PVCs stay Pending without it. Use a gp3 StorageClass.
+server:
+  archivePvc:
+    storageClass: gp3
+sandbox:
+  egressProfile: zeroEgress
+  runtimeClassName: ""        # none managed on EKS (self-managed gVisor documented)
+netpol:
+  requireEnforced: true
+# NLB via a Service annotation is the usual ingress; or use the AWS Load
+# Balancer Controller with an Ingress. Point FLUIDBOX_PUBLIC_URL at its origin.

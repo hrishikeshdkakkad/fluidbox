@@ -66,6 +66,15 @@ pub struct Config {
     /// (`host-dev` default; `hardened` = zero external egress). Was pinned to
     /// HostDev at `orchestrator.rs:150`.
     pub network_mode: fluidbox_core::traits::NetworkMode,
+    /// Block runs until a probe proves the CNI enforces NetworkPolicy
+    /// (Kubernetes only; fails closed). Default true; `false` is dev-only.
+    pub require_enforced_netpol: bool,
+    /// The probe image used by the boot-time netpol run-gate.
+    pub netpol_probe_image: String,
+    /// The server's own internal Service (name, namespace) — resolved to a
+    /// ClusterIP at boot for the runner's no-DNS control URL under zeroEgress.
+    pub internal_service: Option<String>,
+    pub internal_service_namespace: Option<String>,
 }
 
 /// Serialized runner-env ceiling: env injection is the v1 config channel
@@ -132,6 +141,17 @@ impl Config {
                 .ok()
                 .and_then(|s| fluidbox_core::traits::NetworkMode::parse(&s.to_lowercase()))
                 .unwrap_or_default(),
+            require_enforced_netpol: get("FLUIDBOX_REQUIRE_ENFORCED_NETPOL")
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(true),
+            netpol_probe_image: get("FLUIDBOX_NETPOL_PROBE_IMAGE")
+                .unwrap_or_else(|_| "busybox:1.36".into()),
+            internal_service: get("FLUIDBOX_INTERNAL_SERVICE")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            internal_service_namespace: get("FLUIDBOX_INTERNAL_SERVICE_NAMESPACE")
+                .ok()
+                .filter(|s| !s.is_empty()),
         })
     }
 }

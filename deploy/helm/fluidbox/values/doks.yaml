@@ -1,0 +1,10 @@
+# DigitalOcean DOKS — the simplest managed story. Cilium is the default CNI, so
+# NetworkPolicy is enforced out of the box (zero extra setup). do-block-storage
+# is the default StorageClass.
+server:
+  archivePvc:
+    storageClass: do-block-storage
+sandbox:
+  egressProfile: zeroEgress
+netpol:
+  requireEnforced: true
