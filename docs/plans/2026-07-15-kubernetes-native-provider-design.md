@@ -1,7 +1,7 @@
 # fluidbox — Kubernetes-native execution provider and cluster deployability design
 
 **Date:** 2026-07-15
-**Status:** FINALIZED v1 (2026-07-15) after joint adversarial review by Claude (Fable 5) and Codex (GPT-5.6-sol, max reasoning); Docker provider is the only shipped execution backend, Kubernetes support is not implemented
+**Status:** FINALIZED v1.1 (2026-07-15) after joint adversarial review by Claude (Fable 5) and Codex (GPT-5.6-sol, max reasoning); v1.1 adds the dual-provider permanence directive (settled Q17 — Kubernetes is additive; Docker is never replaced). Docker provider is the only shipped execution backend, Kubernetes support is not implemented
 **Audience:** fluidbox maintainers, security reviewers, and engineers implementing the Kubernetes provider and Helm packaging
 **Relationship to other docs:** `PLAN.md` remains authoritative for product invariants and milestone direction (§2 convergence invariants bind every decision here; §6.2 defines the `ExecutionProvider` seam this design fills). `docs/ARCHITECTURE.md` describes the current Docker run path. `docs/plans/2026-07-14-multi-user-mcp-control-plane-design.md` defines the multi-user architecture; this design is orthogonal to it and lands first (user decision 2026-07-15).
 
@@ -17,6 +17,8 @@ The hard problem is not the provider API. The existing `ExecutionProvider` trait
 
 The design replaces all three with cluster-native mechanisms — an immutable archive pull, an in-pod collector with a pristine baseline, and Service networking — and packages the result as a Helm chart with hardened-by-default, *verified* network policy. Because the collection and finalizer fixes also repair live bugs in the Docker path (`fail()` captures no diff; cancel races result delivery; `/result` finalization is a lossy `tokio::spawn`), they land first as a Docker-only preparatory phase.
 
+**This epic is additive, not a migration (user directive 2026-07-15).** The Docker provider is never replaced, deprecated, or demoted: it remains a permanently supported, co-equal execution backend for local development AND single-host production deployments (the docker-compose path stays a maintained deployment mode). `FLUIDBOX_PROVIDER` selects between `docker` (default) and `kubernetes`; both providers sit behind the same trait, share the same `fluidbox-workspace` collection semantics, and must pass the same conformance bar (demo A + the full e2e suite) at every phase boundary.
+
 ## Goals
 
 This design must deliver:
@@ -28,11 +30,12 @@ This design must deliver:
 - a unified, durable, restart-recoverable terminal finalizer for all terminal paths (result, cancel, fail, watchdog);
 - hardened-by-default sandbox networking (zero external egress) with runtime *verification* that the cluster's CNI actually enforces NetworkPolicy;
 - a Helm chart deploying control plane + dashboard (+ optional LiteLLM) on EKS/AKS/GKE/kind, with per-cloud isolation recipes (`runtimeClassName`);
-- Docker remaining the first-class local-dev provider behind the same trait;
+- **dual-provider permanence**: Docker remains a first-class, permanently supported execution backend — for local development and for single-host production via docker-compose — with Kubernetes added alongside it behind the same trait, selected per deployment by `FLUIDBOX_PROVIDER` (default `docker`); both providers meet the same conformance bar (demo A + full e2e) at every phase;
 - a CI story that catches provider regressions on PRs without pulling 1.5 GB images.
 
-## Non-goals for v1
+## Non-goals for v1 (and one permanent non-goal)
 
+- **Replacing or deprecating the Docker provider — permanent non-goal.** Kubernetes support never retires Docker. The docker-compose deployment path, the Docker e2e phases, and `FLUIDBOX_PROVIDER=docker` as the default all remain maintained indefinitely. Any future change that would break the Docker path is out of bounds for this epic and its follow-ups.
 - **Egress proxy for sandboxes.** Deferred until brokered git-writes (§17 #4 of the capability design) create the need. v1 ships zero-egress and dev-only permissive profiles.
 - **kubernetes-sigs/agent-sandbox CRD backend.** Deliberately deferred (see Settled questions Q1). Revisit as an optional second Kubernetes provider if warm-pool latency becomes a demonstrated need.
 - **Warm pools / pre-provisioned sandboxes.** Cold-start latency of a pod (~1-5 s + image pull) is acceptable for fluidbox's run shape (minutes-scale agent runs).
@@ -346,6 +349,7 @@ Joint review: Claude (Fable 5) proposed; Codex (GPT-5.6-sol, max reasoning, read
 14. **Helm vs operator → Helm.** An operator duplicates the orchestrator or forces a run CRD; neither warranted. LiteLLM external-by-default, optional in-chart digest-pinned.
 15. **CI → mocked-kube unit tier + kind/Calico PR job with a stub runner; heavy images nightly.** envtest-style fakes can't exercise kubelet/init/emptyDir/exec/CNI; 1.5 GB `kind load` on every PR rejected.
 16. **Sequencing → Phase 0 (Docker-side hardening) first.** It fixes live defects and prevents debugging Kubernetes transport and diff correctness simultaneously.
+17. **Provider strategy → dual-provider, additive (user directive, 2026-07-15).** Kubernetes is a second provider beside Docker, never a replacement. Docker stays the default (`FLUIDBOX_PROVIDER=docker`), stays production-supported on single hosts via docker-compose, and stays conformance-tested (its e2e phases run unchanged at every phase boundary). Trait v2 and the `fluidbox-workspace` extraction exist precisely so both providers share one semantics with two transports.
 
 ## Risks and trade-offs
 
@@ -358,7 +362,7 @@ Joint review: Claude (Fable 5) proposed; Codex (GPT-5.6-sol, max reasoning, read
 
 ## Acceptance statement
 
-This design is accepted when: demo A (the live agent acceptance run) passes unchanged against `FLUIDBOX_PROVIDER=kubernetes` on a kind+Calico cluster and at least one managed cloud (EKS or GKE), with the hardened `zeroEgress` profile verified by the boot probe, the diff artifact produced by the collector path, `just check` green throughout, and the Docker path exhibiting the same unified finalizer + hardened collection semantics (Phase 0) with its e2e suite green.
+This design is accepted when: demo A (the live agent acceptance run) passes unchanged against `FLUIDBOX_PROVIDER=kubernetes` on a kind+Calico cluster and at least one managed cloud (EKS or GKE), with the hardened `zeroEgress` profile verified by the boot probe, the diff artifact produced by the collector path, `just check` green throughout, **and the Docker provider fully intact**: the same unified finalizer + hardened collection semantics (Phase 0), the full existing e2e suite green on `FLUIDBOX_PROVIDER=docker`, and the docker-compose deployment path still working — Kubernetes support lands beside Docker, never in place of it.
 
 ## References
 
