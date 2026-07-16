@@ -547,16 +547,29 @@ async fn trigger_budget_stop(
         let state2 = state.clone();
         let reason = format!("{budget} budget exceeded");
         tokio::spawn(async move {
-            // Forced stop (runner is live → quiesce first). A DbError start
-            // is inherently retried: the facade re-enforces the budget on
-            // the runner's next request while the session stays active.
-            let _ = crate::orchestrator::finalize_forced(
-                &state2,
-                session.id,
-                "budget_exceeded",
-                &reason,
-            )
-            .await;
+            // Forced stop (runner is live → quiesce first). Retried with
+            // backoff: the facade re-enforces on the runner's next request,
+            // but an idle runner makes none — this task must converge alone.
+            for attempt in 0..5u32 {
+                match crate::orchestrator::finalize_forced(
+                    &state2,
+                    session.id,
+                    "budget_exceeded",
+                    &reason,
+                )
+                .await
+                {
+                    crate::orchestrator::FinalizeStart::DbError => {
+                        tokio::time::sleep(std::time::Duration::from_secs(10u64 << attempt.min(3)))
+                            .await;
+                    }
+                    _ => return,
+                }
+            }
+            tracing::error!(
+                "budget finalize for {} did not persist after retries",
+                session.id
+            );
         });
     }
 }

@@ -166,9 +166,11 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
                 }
                 ConcurrencyPolicy::Replace => {
                     for s in &active {
-                        // Best-effort: a transient persistence failure must
-                        // not block the replacing run (the watchdog and the
-                        // next invocation converge) — but never silently.
+                        // The replacement must not proceed unless the old
+                        // run's cancellation durably persisted: a healthy old
+                        // run with no wall-clock budget would otherwise
+                        // coexist with its replacement indefinitely. The
+                        // caller (webhook/scheduler retry) re-invokes.
                         if orchestrator::cancel(
                             state,
                             s.id,
@@ -177,10 +179,10 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
                         .await
                             == orchestrator::FinalizeStart::DbError
                         {
-                            tracing::warn!(
-                                "replace: cancel intent for {} not persisted; proceeding",
+                            return Err(crate::error::ApiError::ServiceUnavailable(format!(
+                                "could not persist cancellation of running session {} for replace; retry",
                                 s.id
-                            );
+                            )));
                         }
                     }
                 }
