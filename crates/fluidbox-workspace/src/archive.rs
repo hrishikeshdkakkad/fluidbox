@@ -118,10 +118,12 @@ pub fn unpack_archive(
                 path.display()
             )));
         }
-        // Symlinks are extracted as real symlinks IFF their target, resolved
-        // lexically against the link's own parent directory, stays inside the
-        // root (H4: tracked in-tree symlinks are common — monorepos, dotfiles
-        // — and Docker runs them fine). Escaping or absolute targets refuse.
+        // Symlinks are extracted as real symlinks IFF their target stays
+        // inside the root (H4: tracked in-tree symlinks are common — monorepos,
+        // dotfiles — and Docker runs them fine). The containment check resolves
+        // the link's REAL parent, so an earlier in-tree symlink that became a
+        // parent component can't be traversed out of the root; see
+        // `unpack_symlink`.
         if etype.is_symlink() {
             let target = entry
                 .link_name()
@@ -130,11 +132,7 @@ pub fn unpack_archive(
                     WorkspaceError::Invalid(format!("symlink '{}' has no target", path.display()))
                 })?
                 .into_owned();
-            ensure_symlink_in_root(&path, &target)?;
-            if let Some(parent) = safe.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            create_symlink(&target, &safe)?;
+            unpack_symlink(&canon_dest, &safe, &path, &target)?;
             written += 1;
             continue;
         }
@@ -182,30 +180,62 @@ fn safe_join(base: &Path, rel: &Path) -> Result<PathBuf, WorkspaceError> {
     Ok(out)
 }
 
-/// Refuse a symlink whose target would resolve outside the extraction root.
-/// `link_rel` is the entry's own path relative to dest; `target` is the raw
-/// link contents. Resolution is purely lexical against the directory the link
-/// lives in — no filesystem access, so a dangling in-tree target (legal in
-/// git) is fine; only a target that climbs above the root or is absolute
-/// fails. `depth` tracks levels below the root: the link's parent directory
-/// is the starting depth, each normal component descends, each `..` ascends,
-/// and dropping below zero means the target escaped.
-fn ensure_symlink_in_root(link_rel: &Path, target: &Path) -> Result<(), WorkspaceError> {
+/// Extract one symlink entry, refusing any whose target escapes the root.
+///
+/// The subtlety a purely lexical check misses (and a real escape it would
+/// permit): an earlier symlink entry can become a *parent component* of this
+/// one, so the entry's lexical path no longer reflects where it actually
+/// lands. We therefore resolve the link's **real** parent with `canonicalize`
+/// (which follows any already-extracted in-tree symlink), require it to stay
+/// within `canon_dest`, and count the target's `..` ascents against that real
+/// depth. Because every accepted symlink is thereby proven to resolve within
+/// the root, any later file/dir entry that traverses one also stays within the
+/// root — so the file/dir paths need no extra check beyond `safe_join`.
+///
+/// A dangling in-tree target (legal in git) is fine — only a target that
+/// climbs above the root, or is absolute, fails.
+fn unpack_symlink(
+    canon_dest: &Path,
+    safe: &Path,
+    entry_path: &Path,
+    target: &Path,
+) -> Result<(), WorkspaceError> {
     let escape = || {
         WorkspaceError::Invalid(format!(
             "symlink '{}' -> '{}' escapes the workspace root — refused",
-            link_rel.display(),
+            entry_path.display(),
             target.display()
         ))
     };
-    let mut depth: i64 = link_rel
-        .parent()
-        .map(|p| {
-            p.components()
-                .filter(|c| matches!(c, Component::Normal(_)))
-                .count() as i64
-        })
-        .unwrap_or(0);
+    if target.is_absolute() {
+        return Err(escape());
+    }
+    // Materialize the parent (through already-validated, in-root symlinks
+    // only) so we can resolve its true location.
+    let parent = safe.parent().unwrap_or(canon_dest);
+    std::fs::create_dir_all(parent)?;
+    let canon_parent = std::fs::canonicalize(parent)
+        .map_err(|e| WorkspaceError::Invalid(format!("resolve symlink parent: {e}")))?;
+    let rel = canon_parent
+        .strip_prefix(canon_dest)
+        .map_err(|_| escape())?;
+    let depth: i64 = rel
+        .components()
+        .filter(|c| matches!(c, Component::Normal(_)))
+        .count() as i64;
+    if !target_within_root(depth, target) {
+        return Err(escape());
+    }
+    create_symlink(target, safe)
+}
+
+/// Walk a relative symlink `target` starting from `depth` levels below the
+/// root; return false if it ascends above the root (a `..` past depth 0) or is
+/// absolute (a leading root/prefix component). Shared by the archive extractor
+/// and the in-pod `copy_tree` so the containment rule is defined exactly once;
+/// each caller supplies its own real (canonicalized) starting depth.
+pub fn target_within_root(depth: i64, target: &Path) -> bool {
+    let mut depth = depth;
     for comp in target.components() {
         match comp {
             Component::Normal(_) => depth += 1,
@@ -213,13 +243,13 @@ fn ensure_symlink_in_root(link_rel: &Path, target: &Path) -> Result<(), Workspac
             Component::ParentDir => {
                 depth -= 1;
                 if depth < 0 {
-                    return Err(escape());
+                    return false;
                 }
             }
-            Component::RootDir | Component::Prefix(_) => return Err(escape()),
+            Component::RootDir | Component::Prefix(_) => return false,
         }
     }
-    Ok(())
+    true
 }
 
 #[cfg(unix)]
@@ -389,6 +419,90 @@ mod tests {
             );
             std::fs::remove_dir_all(&tmp).ok();
         }
+    }
+
+    /// Security regression (Codex, batch-3 review): a lexical-only containment
+    /// check permits a symlinked-parent traversal. Entry 1 makes `repo/a`
+    /// resolve to dest; entry 2 (`repo/a/root -> ../..`) would then create a
+    /// symlink at the resolved location pointing ABOVE dest; entry 3 writes a
+    /// file through it, escaping. The real-parent (`canonicalize`) check must
+    /// refuse entry 2, and nothing may be written outside dest.
+    #[cfg(unix)]
+    #[test]
+    fn unpack_refuses_symlinked_parent_traversal() {
+        fn sym(b: &mut tar::Builder<&mut GzEncoder<Vec<u8>>>, path: &str, target: &str) {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_size(0);
+            h.set_link_name(target).unwrap();
+            h.set_cksum();
+            b.append_data(&mut h, path, std::io::empty()).unwrap();
+        }
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut b = tar::Builder::new(&mut gz);
+            let mut d = tar::Header::new_gnu();
+            d.set_entry_type(tar::EntryType::Directory);
+            d.set_mode(0o755);
+            d.set_size(0);
+            d.set_cksum();
+            b.append_data(&mut d, "repo/", std::io::empty()).unwrap();
+            sym(&mut b, "repo/a", "..");
+            sym(&mut b, "repo/a/root", "../..");
+            let content = b"PWNED";
+            let mut f = tar::Header::new_gnu();
+            f.set_entry_type(tar::EntryType::Regular);
+            f.set_size(content.len() as u64);
+            f.set_cksum();
+            b.append_data(&mut f, "repo/a/root/workspace/pwn", &content[..])
+                .unwrap();
+            b.finish().unwrap();
+        }
+        let bytes = gz.finish().unwrap();
+
+        let base = std::env::temp_dir().join(format!("fbx-arch-esc-{}", Uuid::now_v7()));
+        // Nest dest so that if the escape DID fire (pre-fix), the written file
+        // lands under `base` and cleanup still removes it.
+        let dest = base.join("l1").join("l2").join("root");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let res = unpack_archive(&bytes, &dest, 10 * 1024 * 1024);
+
+        // No `pwn` may exist anywhere under base OUTSIDE dest.
+        let mut escaped = false;
+        for entry in walkdir(&base) {
+            if entry.file_name().and_then(|n| n.to_str()) == Some("pwn")
+                && !entry.starts_with(&dest)
+            {
+                escaped = true;
+            }
+        }
+        assert!(!escaped, "file escaped dest via symlinked parent");
+        assert!(res.is_err(), "symlinked-parent traversal must be refused");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // Tiny recursive lister for the escape test (no dev-dep for one test).
+    fn walkdir(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                // symlink_metadata: don't follow (an escaping symlink dir would
+                // otherwise recurse out of the tree).
+                if let Ok(m) = std::fs::symlink_metadata(&p) {
+                    if m.is_dir() {
+                        stack.push(p.clone());
+                    }
+                }
+                out.push(p);
+            }
+        }
+        out
     }
 
     /// Hardlinks remain refused unconditionally — the transport never needs
