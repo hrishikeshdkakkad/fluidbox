@@ -92,13 +92,14 @@ Status legend: `[ ]` open · `[x]` fixed · `[-]` won't fix (record why)
 - [ ] **L11.** Claude runner: heartbeats start (`index.mjs:62`) before `onQuiesce` registers (`:126`), and `contract.mjs` latches `quiesced=true` even with a null callback — a cancel in that seconds-wide window is permanently swallowed (codex-runner registers first; safe). Fix: register before `startHeartbeat`, or replay on registration.
 - [ ] **L12.** Chart Ingress routes `/` to the API server while NOTES.txt tells the operator that URL is the dashboard; web Service unreachable via the chart's Ingress.
 - [ ] **L13.** Test-coverage gaps (beyond H1): no symlink-repo fixture (H4), no cancel⇄result race test (H5), no truncated-exec-stream test (M2), no values→PodSpec chart test (M3).
+- [ ] **L14.** *(found during batch 1)* `fluidbox-db` test `stale_nonstarted_sweep_finds_only_old_prelaunch_sessions` (lib.rs:3435) still drives the pre-epic direct `Created→Failed` edge; Phase 0's wind-down machine made terminal reachable only via `Finalizing` (state.rs:113), so `transition_session` no-ops (`Ok(None)`), the session stays `created`, and the "terminal session must not be swept" assertion fails deterministically whenever the DB tests actually run (they need `DATABASE_URL`; CI never has it, so CI can't see this). Test-only defect — the watchdog's real fail path rides `orchestrator::fail` → finalize. Fix alongside batch 2, which owns these semantics. The test also leaks its two `stale-test` sessions on panic (cleanup lines sit after the assertion); `just db-clean-tests` (#46) is the designed remedy.
 
 ---
 
 ## Suggested fix batches (one `fix/*` PR into the release branch each, matching #58/#59 precedent)
 
 1. **`fix/k8s-ci-green`** — H1 (in-cluster Postgres + runtime probe resolution + drop `|| true`). Do this first: it turns CI into a real check for everything after.
-2. **`fix/k8s-finalizer-durability`** — H2, H3, H5, M1, L6, L7 (+ the H5 intent-atomicity: derive everything from the winning intent row; recovery scans active-status intents). One coherent workstream — all in `begin_finalize`/`drive_finalization`/`collect_and_terminalize`/`/result`.
+2. **`fix/k8s-finalizer-durability`** — H2, H3, H5, M1, L6, L7, L14 (+ the H5 intent-atomicity: derive everything from the winning intent row; recovery scans active-status intents). One coherent workstream — all in `begin_finalize`/`drive_finalization`/`collect_and_terminalize`/`/result`.
 3. **`fix/k8s-symlink-archive`** — H4 + L4(pack comment) + symlink conformance fixture.
 4. **`fix/k8s-collect-integrity`** — M2 (+ compute header sha/bytes over stored bytes; wire `--offset` retry) + L4(exec comment).
 5. **`fix/k8s-helm-wiring`** — M3, M9, M10, L12 (+ chart test).

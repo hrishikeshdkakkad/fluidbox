@@ -15,7 +15,8 @@ Work through `docs/reviews/2026-07-16-pr47-k8s-review-findings.md` batch by batc
 
 ## Hard rules (non-negotiable)
 
-1. **NEVER run DB-backed or e2e tests unprompted.** `just e2e`, `scripts/governance-e2e.sh`, and anything requiring `source .env` hit REAL Neon and spend REAL Anthropic money — I trigger those myself. Never `set -a; source .env` before tests. Plain `just check` is safe (the DB test self-skips without `DATABASE_URL` exported).
+1. **NEVER run DB-backed or e2e tests unprompted.** `just e2e`, `scripts/governance-e2e.sh`, and anything requiring `source .env` hit REAL Neon and spend REAL Anthropic money — I trigger those myself. Never `set -a; source .env` before tests. ~~Plain `just check` is safe (the DB test self-skips without `DATABASE_URL` exported).~~
+   **⚠ Correction (2026-07-16, batch 1):** `justfile:1` sets `set dotenv-load := true`, so EVERY `just` recipe — including `just check` — loads `.env` and the fluidbox-db tests RUN against real Neon on a machine with a populated `.env`. Batch 1 tripped this and hit the pre-existing L14 test failure (fixtures leaked; `just db-clean-tests` is the remedy, maintainer-triggered). Use the explicit equivalents instead, which never load `.env`: `cargo fmt --all --check` && `cargo clippy --workspace --all-targets -- -D warnings` && `cargo test --workspace` && `(cd apps/web && pnpm test && pnpm build)`.
 2. **Never merge PRs and never push to `main`.** Open PRs into `release/kubernetes-native-provider` and hand back. `main` is PR-only via ruleset.
 3. **Dual-provider permanence:** nothing may break the Docker provider or the docker-compose path. Any shared-code change (orchestrator, workers, internal, fluidbox-workspace) must keep Docker semantics intact.
 4. One PR per batch, batches in the doc's order. If the previous batch's PR is unmerged when you start the next, branch off the previous fix branch and say so in the PR body.
