@@ -6,21 +6,199 @@
   (negative). Both Services back the same healthy server pod, so reachability
   is known independently of policy — no external-IP false pass.
 
-  ClusterIPs are resolved via `lookup` (live at `helm test` time), so the probe
-  needs no DNS — it works under zeroEgress. `helm lint`/`template` see empty
-  strings (lookup is inert then); the probe only runs during `helm test`.
+  Target resolution happens at TEST time, not render time: Helm renders test
+  hooks at install/upgrade and stores them in the release, and `helm test`
+  re-executes the STORED manifests without re-rendering — so a render-time
+  `lookup` is baked empty on a fresh install (the Services do not exist yet
+  when the hooks render). The probe itself cannot resolve anything either:
+  default-deny in the sandbox namespace blocks DNS and the apiserver. The one
+  runtime channel into a zero-egress pod is the kubelet, so a resolver Job
+  (release namespace, full egress, RBAC scoped to exactly two Services and one
+  ConfigMap) reads the ClusterIPs from the API and patches them into a
+  ConfigMap the probe consumes as env.
+
+  Helm executes test hooks sequentially by weight, waiting on each:
+    -5 ServiceAccount → -4 Roles + placeholder ConfigMap → -3 RoleBindings →
+    -2 resolver Job (writes the IPs) → 0 probe Pod (consumes them).
 */ -}}
-{{- $internal := (lookup "v1" "Service" .Release.Namespace (include "fluidbox.internalServiceName" .)) -}}
-{{- $public := (lookup "v1" "Service" .Release.Namespace (include "fluidbox.serverName" .)) -}}
-{{- $internalIp := "" -}}
-{{- $publicIp := "" -}}
-{{- if $internal }}{{- $internalIp = $internal.spec.clusterIP -}}{{- end }}
-{{- if $public }}{{- $publicIp = $public.spec.clusterIP -}}{{- end }}
+{{- $fullname := include "fluidbox.fullname" . -}}
+{{- $sandboxNs := .Values.sandbox.namespace -}}
+{{- $resolver := printf "%s-netpol-resolver" $fullname -}}
+{{- $targetsCm := printf "%s-netpol-probe-targets" $fullname -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $resolver }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $resolver }}-services
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-weight": "-4"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    resourceNames:
+      - {{ include "fluidbox.internalServiceName" . | quote }}
+      - {{ include "fluidbox.serverName" . | quote }}
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $resolver }}-targets
+  namespace: {{ $sandboxNs }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-weight": "-4"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: [{{ $targetsCm | quote }}]
+    verbs: ["get", "patch"]
+---
+# Placeholder the resolver patches; hook-managed so every `helm test` starts
+# clean and nothing lingers after success. ClusterIPs are not secrets — the
+# server injects the same value into every sandbox env.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $targetsCm }}
+  namespace: {{ $sandboxNs }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-weight": "-4"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+data:
+  internalIp: ""
+  publicIp: ""
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $resolver }}-services
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-weight": "-3"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $resolver }}-services
+subjects:
+  - kind: ServiceAccount
+    name: {{ $resolver }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $resolver }}-targets
+  namespace: {{ $sandboxNs }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-weight": "-3"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $resolver }}-targets
+subjects:
+  - kind: ServiceAccount
+    name: {{ $resolver }}
+    namespace: {{ .Release.Namespace }}
+---
+# Runs in the RELEASE namespace (no egress restrictions) and talks to the
+# apiserver via the always-injected KUBERNETES_SERVICE_* env — no DNS needed.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $resolver }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-weight": "-2"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 90
+  template:
+    metadata:
+      labels: {{- include "fluidbox.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ $resolver }}
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        # curlimages/curl ships user 100 (curl_user).
+        runAsUser: 100
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: resolve
+          image: {{ .Values.netpol.resolverImage | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 64Mi }
+          env:
+            - { name: RELEASE_NS, value: {{ .Release.Namespace | quote }} }
+            - { name: SANDBOX_NS, value: {{ $sandboxNs | quote }} }
+            - { name: INTERNAL_SVC, value: {{ include "fluidbox.internalServiceName" . | quote }} }
+            - { name: PUBLIC_SVC, value: {{ include "fluidbox.serverName" . | quote }} }
+            - { name: TARGETS_CM, value: {{ $targetsCm | quote }} }
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              SA=/var/run/secrets/kubernetes.io/serviceaccount
+              TOKEN="$(cat "$SA/token")"
+              case "$KUBERNETES_SERVICE_HOST" in
+                *:*) HOST="[$KUBERNETES_SERVICE_HOST]" ;;
+                *)   HOST="$KUBERNETES_SERVICE_HOST" ;;
+              esac
+              API="https://$HOST:${KUBERNETES_SERVICE_PORT:-443}"
+              k() { curl -sSf --cacert "$SA/ca.crt" -H "Authorization: Bearer $TOKEN" "$@"; }
+              ip() {
+                k "$API/api/v1/namespaces/$RELEASE_NS/services/$1" \
+                  | sed -n 's/.*"clusterIP"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1
+              }
+              INT_IP="$(ip "$INTERNAL_SVC")"
+              PUB_IP="$(ip "$PUBLIC_SVC")"
+              if [ -z "$INT_IP" ] || [ -z "$PUB_IP" ]; then
+                echo "FAIL: could not resolve Service ClusterIPs (internal='$INT_IP' public='$PUB_IP')"
+                exit 1
+              fi
+              echo "resolved internal=$INT_IP public=$PUB_IP"
+              k -X PATCH -H "Content-Type: application/merge-patch+json" \
+                -d "{\"data\":{\"internalIp\":\"$INT_IP\",\"publicIp\":\"$PUB_IP\"}}" \
+                "$API/api/v1/namespaces/$SANDBOX_NS/configmaps/$TARGETS_CM" >/dev/null
+              echo "targets published to $SANDBOX_NS/$TARGETS_CM"
+---
 apiVersion: v1
 kind: Pod
 metadata:
-  name: {{ include "fluidbox.fullname" . }}-netpol-probe
-  namespace: {{ .Values.sandbox.namespace }}
+  name: {{ $fullname }}-netpol-probe
+  namespace: {{ $sandboxNs }}
   labels:
     {{- include "fluidbox.labels" . | nindent 4 }}
     # The sandbox label so the egress NetworkPolicy applies to the probe too.
@@ -50,14 +228,19 @@ spec:
       securityContext:
         allowPrivilegeEscalation: false
         capabilities: { drop: ["ALL"] }
+      env:
+        # Written by the resolver Job moments earlier; delivered by the
+        # kubelet, so they arrive despite zero egress.
+        - name: INT_IP
+          valueFrom: { configMapKeyRef: { name: {{ $targetsCm }}, key: internalIp } }
+        - name: PUB_IP
+          valueFrom: { configMapKeyRef: { name: {{ $targetsCm }}, key: publicIp } }
       command: ["/bin/sh", "-c"]
       args:
         - |
           set -u
-          INT_IP="{{ $internalIp }}"
-          PUB_IP="{{ $publicIp }}"
           if [ -z "$INT_IP" ] || [ -z "$PUB_IP" ]; then
-            echo "FAIL: could not resolve Service ClusterIPs (run via 'helm test')"; exit 1
+            echo "FAIL: probe targets unresolved (resolver Job did not publish)"; exit 1
           fi
           echo "probe: internal=$INT_IP:8788  public=$PUB_IP:8787"
           # POSITIVE: the internal listener must be reachable.
