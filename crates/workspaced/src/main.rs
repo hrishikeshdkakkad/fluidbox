@@ -237,10 +237,18 @@ fn fetch(url: &str, token: &str, expected_len: u64) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-/// Recursive copy including dotfiles + `.git` internals; symlinks are skipped
-/// (the archive extractor already rejected any, so this only sees regular
-/// files/dirs).
+/// Recursive copy including dotfiles + `.git` internals. In-tree symlinks are
+/// PRESERVED (H4: a tracked symlink must reach the runner's /workspace exactly
+/// as Docker's bind mount delivers it). A symlink is recreated only if its
+/// target still resolves within `dst_root`; because relocating `repo/` to
+/// /workspace shrinks the root the extractor validated against, a link that
+/// pointed outside `repo/` (into the baseline, say) is dropped rather than left
+/// to escape.
 fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    copy_tree_into(src, dst, dst)
+}
+
+fn copy_tree_into(src: &Path, dst: &Path, dst_root: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -248,14 +256,48 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
         let to = dst.join(entry.file_name());
         let meta = std::fs::symlink_metadata(&from)?;
         if meta.is_symlink() {
-            continue;
-        }
-        if meta.is_dir() {
-            copy_tree(&from, &to)?;
+            copy_symlink(&from, &to, dst_root)?;
+        } else if meta.is_dir() {
+            copy_tree_into(&from, &to, dst_root)?;
         } else {
             std::fs::copy(&from, &to)?;
         }
     }
+    Ok(())
+}
+
+/// Recreate one symlink under the new root, preserving it iff its target
+/// resolves within `dst_root`. The containment walk is shared with the archive
+/// extractor (`fluidbox_workspace::target_within_root`); the real starting
+/// depth comes from canonicalizing the link's (already-created) parent dir.
+#[cfg(unix)]
+fn copy_symlink(from: &Path, to: &Path, dst_root: &Path) -> std::io::Result<()> {
+    let target = std::fs::read_link(from)?;
+    let contained = (|| {
+        let canon_root = std::fs::canonicalize(dst_root).ok()?;
+        let canon_parent = std::fs::canonicalize(to.parent()?).ok()?;
+        let rel = canon_parent.strip_prefix(&canon_root).ok()?;
+        let depth = rel
+            .components()
+            .filter(|c| matches!(c, std::path::Component::Normal(_)))
+            .count() as i64;
+        Some(fluidbox_workspace::target_within_root(depth, &target))
+    })()
+    .unwrap_or(false);
+    if contained {
+        std::os::unix::fs::symlink(&target, to)?;
+    } else {
+        eprintln!(
+            "workspaced: dropping symlink {} -> {} (target escapes the workspace root)",
+            to.display(),
+            target.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn copy_symlink(_from: &Path, _to: &Path, _dst_root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -264,4 +306,54 @@ fn oneline(s: &str) -> String {
         .map(|c| if c.is_whitespace() { ' ' } else { c })
         .take(200)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// H4 (K8s path): `cmd_init` copies the extracted `repo/` into /workspace
+    /// via `copy_tree`, which previously SKIPPED symlinks — so a tracked
+    /// in-tree symlink never reached the runner even after the extractor
+    /// created it. `copy_tree` must now preserve in-tree links and drop only
+    /// those whose target escapes the new (smaller) /workspace root.
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_preserves_intree_symlink_and_drops_escaping() {
+        let base = std::env::temp_dir().join(format!("fbx-copytree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), "hi\n").unwrap();
+        std::os::unix::fs::symlink("a.txt", src.join("link")).unwrap();
+        std::os::unix::fs::symlink("../a.txt", src.join("sub/uplink")).unwrap();
+        // Points above the copy root → must be dropped, not escape /workspace.
+        std::os::unix::fs::symlink("../../etc/passwd", src.join("escape")).unwrap();
+
+        let dst = base.join("workspace");
+        copy_tree(&src, &dst).unwrap();
+
+        let link = dst.join("link");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "in-tree symlink must be preserved"
+        );
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "hi\n");
+        assert!(
+            std::fs::symlink_metadata(dst.join("sub/uplink"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "in-tree ../ symlink must be preserved"
+        );
+        assert!(std::fs::read_to_string(src.join("a.txt")).is_ok());
+        assert!(
+            std::fs::symlink_metadata(dst.join("escape")).is_err(),
+            "escaping symlink must be dropped"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
 }
