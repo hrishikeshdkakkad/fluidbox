@@ -1048,6 +1048,7 @@ pub async fn session_approvals(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Decision {
     /// approved_once | approved_session | denied
     pub decision: String,
@@ -1077,9 +1078,10 @@ pub async fn decide_approval(
         let session = fluidbox_db::get_session(&state.pool, scope, approval.session_id)
             .await?
             .ok_or(ApiError::NotFound)?;
-        let own =
-            principal.user_id().is_some() && session.invoked_by_user_id == principal.user_id();
-        if !own {
+        // `approval.decide_own` covers only credentialless calls on a run the
+        // member invoked; brokered (`mcp__*`) calls are org authority and need
+        // decide_org (parent design lines 564-579).
+        if !rbac::can_decide_own(&principal, session.invoked_by_user_id, &approval.tool) {
             return Err(ApiError::Forbidden(
                 "deciding this approval requires approver, admin, or owner".into(),
             ));

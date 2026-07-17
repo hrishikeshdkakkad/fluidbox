@@ -9,6 +9,7 @@
 use crate::auth::Principal;
 use crate::error::ApiError;
 use fluidbox_db::SessionRow;
+use uuid::Uuid;
 
 pub fn has_role(principal: &Principal, role: &str) -> bool {
     principal.roles().iter().any(|r| r == role)
@@ -23,6 +24,17 @@ fn any_role(principal: &Principal, roles: &[&str]) -> bool {
 /// roles. Implies [`can_read_all_runs`] (you can always see the run you judge).
 pub fn can_decide_org(principal: &Principal) -> bool {
     principal.is_operator() || any_role(principal, &["approver", "admin", "owner"])
+}
+
+/// May a plain member self-approve this approval under `approval.decide_own`
+/// (parent design lines 564-579)? Only when the caller invoked the run AND the
+/// call is credentialless: members may self-approve credentialless calls, but
+/// every brokered MCP call carries org authority in Phase B and needs
+/// `decide_org`. Brokered tools all wear the canonical `mcp__<server>__<tool>`
+/// prefix; sandbox/builtin tools (Bash, Edit, …) are credentialless by
+/// construction.
+pub fn can_decide_own(principal: &Principal, invoked_by: Option<Uuid>, tool: &str) -> bool {
+    principal.user_id().is_some() && invoked_by == principal.user_id() && !tool.starts_with("mcp__")
 }
 
 /// May read every run in the tenant (`runs.read_all`) — implied by
@@ -127,6 +139,28 @@ mod tests {
         assert!(can_manage_subscriptions(&p));
         assert!(can_mutate_resources(&p));
         assert!(!can_manage_org(&p));
+    }
+
+    #[test]
+    fn member_self_approves_only_credentialless_calls() {
+        let p = user(&["member"]);
+        let mine = p.user_id();
+        let other = Some(Uuid::now_v7());
+        // Own run + credentialless (builtin) tool → allowed.
+        assert!(can_decide_own(&p, mine, "Bash"));
+        assert!(can_decide_own(&p, mine, "Edit"));
+        // Own run + brokered MCP call → denied (org authority, needs decide_org).
+        assert!(!can_decide_own(&p, mine, "mcp__github__create_issue"));
+        // Someone else's run → denied regardless of tool.
+        assert!(!can_decide_own(&p, other, "Bash"));
+    }
+
+    #[test]
+    fn operator_has_no_own_user_so_decide_own_is_moot() {
+        // Operator authorizes via can_decide_org; decide_own never applies
+        // (no user identity to match the run's invoker).
+        let p = operator();
+        assert!(!can_decide_own(&p, None, "Bash"));
     }
 
     #[test]
