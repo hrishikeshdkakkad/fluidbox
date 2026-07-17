@@ -61,7 +61,7 @@ Statuses: **shipped** = enforced on `main` today; **Phase B–F** = the phase th
 | Attack | Control | Status |
 |---|---|---|
 | Exfiltrate an upstream credential from the sandbox | Credentials never enter the sandbox (invariants 1, 2): LLM key swapped at the facade, git credentials control-plane-side via ephemeral `GIT_CONFIG_*`, MCP credentials used only by the broker | shipped |
-| Reach the internet / LiteLLM / metadata endpoints directly | `zeroEgress` NetworkPolicy (only `:8788`; no DNS), boot-gate-proven enforcement, no service-account token in the pod (invariant 3) | shipped (Kubernetes provider) |
+| Reach the internet / LiteLLM / metadata endpoints directly | `zeroEgress` NetworkPolicy (only `:8788`; no DNS), boot-gate-proven enforcement, no service-account token in the pod (invariant 3) | shipped (Kubernetes provider; subject to the accepted EKS pod-start enforcement window below) |
 | Call a tool outside the frozen set, or a rug-pulled/drifted tool | Frozen-set availability check at the gate — drifted or vanished tools are denied (`source=capability`); a live upstream tools-list change never mutates an in-flight run (invariant 14) | shipped |
 | Choose *whose* credential executes a tool | The model chooses only among frozen tools; bindings are frozen at run creation; the broker resolves the credential solely from the authenticated session's binding (invariants 4, 5) | shipped for today's attached connections; full binding model Phase C |
 | Bypass the permission callback (autonomy modes) | The callback stays wired in both modes — never the SDK's `bypassPermissions`; autonomous mode rewrites `RequireApproval` to the policy fallback inside `evaluate()`, ledgering both verdicts | shipped |
@@ -75,7 +75,7 @@ Statuses: **shipped** = enforced on `main` today; **Phase B–F** = the phase th
 
 | Attack | Control | Status |
 |---|---|---|
-| Poisoned tool names/descriptions (ANSI, zero-width, injection copy) | Registration-time screening at the photograph; tool metadata, arguments, and results are untrusted input end to end (invariant 13) | shipped |
+| Poisoned tool names/descriptions (ANSI, zero-width, injection copy) | Names and schemas are screened and validated at the registration photograph; descriptions, annotations, arguments, and results are untrusted input end to end (invariant 13) | shipped |
 | Schema rug-pull between registration and run | Snapshots append-only; runs execute against their frozen schemas and digests | shipped |
 | Malicious arguments accepted because the schema is only advertised | Server-side argument validation against the frozen schema (bounded depth/size, no external `$ref`), dialect per snapshot protocol version, rejections surfaced as tool-execution errors (Gap 12, invariant 17) | **Phase E** |
 | Cross-user/run session bleed via `MCP-Session-Id` or cookies | Per-run upstream sessions, never shared (invariant 11); authorization header on every request; shared HTTP transport is ambient-state-free — no cookie jars, no cached per-host auth (invariant 22) | **Phase E** (per-run session manager; conformance contract, Gap 8) |
@@ -99,10 +99,10 @@ Statuses: **shipped** = enforced on `main` today; **Phase B–F** = the phase th
 
 | Attack | Control | Status |
 |---|---|---|
-| Forged webhook creates runs | HMAC against the connection's sealed secret is the authentication; nothing stored before verification | shipped |
+| Forged webhook creates runs | HMAC is the authentication — against the connection's sealed secret, or the GitHub App registration's sealed secret on the App-level ingress path; nothing stored before verification | shipped |
 | Replayed webhook duplicates fan-out | Two DB-unique dedup levels bound to the session insert in one transaction — retries heal, never duplicate | shipped |
 | Login CSRF / forced login into an attacker's session | Session replacement is never silent: `pending_login_switches` one-time browser-bound confirmation (cookie hash inside the claim predicate, 120 s expiry, current-session equality in the predicate) | **Phase B** |
-| Replayed / attacker-completed OAuth or login callback | One-time server-side state rows; per-flow `HttpOnly` cookie hash inside the one-time claim predicate — a leaked authorization URL can neither complete nor burn a flow (invariant 20; GitHub App flows shipped, login Phase B, connector OAuth Phase D) | shipped (GitHub App) / **Phase B** (login) / **Phase D** (connector OAuth) |
+| Replayed / attacker-completed OAuth or login callback | One-time server-side state rows; per-flow `HttpOnly` cookie hash inside the one-time claim predicate — a leaked authorization URL can neither complete nor burn a flow. Invariant 20 itself governs connector OAuth's full binding set; the GitHub App and login flows use the same one-time cookie-hash claim **mechanism** with their own, flow-appropriate binding sets | shipped (GitHub App) / **Phase B** (login) / **Phase D** (connector OAuth, invariant 20) |
 | Cross-user grant injection (victim's consent seals into attacker's connection) | The completing browser must prove it started the flow — same cookie-hash predicate; connected account shown for human confirmation before activation | **Phase D** |
 | CSRF against cookie-authenticated APIs | Custom header + `Origin` check on every cookie-authenticated non-GET; `CorsLayer::permissive()` removed in the same change; GET writes limited to the enumerated protocol-forced flows, each with its own one-time claims | **Phase B** |
 | SSRF via crafted endpoints, discovery documents, redirects, or DNS rebinding | Admission address-class rules enforced at resolution time on every fetch; redirect re-validation; egress proxy | **Phase E** (Gap 7); policy stated now in the [admission policy](connector-admission-policy.md) |
@@ -156,9 +156,10 @@ A compromised org IdP mints valid identities **for that organization only** — 
 | **Bootstrap owner shared-email**: if two distinct IdP subjects share the armed verified email, the first to log in wins | Email is not an identity; the operator armed a specific address deliberately; the audit row records the winning `sub`; re-arming is one break-glass call away |
 | **IdP-side-only deactivation window**: an actively-used session survives until its absolute expiry (default 7 d) if the org deactivates the user only at the IdP | Stated honestly (identity design, Lifecycle): sliding idle expiry bounds only inactive sessions. Operators needing tighter bounds lower the absolute TTL or deactivate in fluidbox (immediate cascade) |
 | **At-most-once dispatch, not exactly-once**: an ambiguous upstream outcome stays ambiguous | True exactly-once side effects are not achievable over MCP; ambiguity is surfaced to policy/user/model, never hidden or blindly retried |
-| **VPC CNI standard-mode pod-start window** (EKS): a just-created pod is briefly fail-open until eBPF programs | Observed live; strict mode starves system pods (worse). The boot gate and long-lived probes are the authoritative enforcement signals; the window is milliseconds-scale at pod start, before the runner executes untrusted output |
-| **Approval `approval.decided` double-emission** inside one process | A current known bug (each awakened waiter emits a copy); the transactional-outbox fix rides the Phase E statelessness work |
+| **VPC CNI standard-mode pod-start window** (EKS): a just-created pod is briefly fail-open until the node agent programs its eBPF rules | Observed live on EKS; strict mode is worse (it starves system pods). No duration or ordering guarantee relative to runner startup is claimed — the boot gate and long-lived probes are the authoritative enforcement signals, and the shipped isolation row above is qualified by this window |
 | **Result delivery is at-least-once** | Receivers dedup on `x-fluidbox-delivery`; provider idempotency / deterministic markers cover the crash window between remote creation and recording |
+
+Not a residual: the **approval `approval.decided` double-emission** inside one process is a *current known defect* with an assigned fix — the transactional outbox in the Phase E statelessness work (Gap 13) — not an accepted post-mitigation risk.
 
 ## Gap register
 
