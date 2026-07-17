@@ -4558,6 +4558,8 @@ name = "workspaced"
 version = "0.1.0"
 dependencies = [
  "fluidbox-workspace",
+ "hex",
+ "sha2 0.11.0",
  "ureq",
 ]
 

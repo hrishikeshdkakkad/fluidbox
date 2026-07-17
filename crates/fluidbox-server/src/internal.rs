@@ -810,14 +810,12 @@ pub async fn workspace_archive(
 
 pub async fn heartbeat(auth: SessionAuth, State(state): State<AppState>) -> ApiResult<Json<Value>> {
     fluidbox_db::heartbeat(&state.pool, auth.session_id).await?;
-    // Delete-after-init (L3): heartbeats come from the runner container,
-    // which only starts after the init container consumed the archive — the
-    // single-use transport is done, so reclaim it now instead of at terminal
-    // cleanup. Idempotent (and a no-op for host-dir providers like Docker,
-    // which never store one).
-    if state.provider.workspace_transport() == fluidbox_core::traits::WorkspaceTransport::Archive {
-        orchestrator::delete_archive(&state.cfg.data_dir, auth.session_id);
-    }
+    // Deliberately NO eager archive deletion here: Kubernetes documents that
+    // init containers may re-execute (pod-infrastructure restart), and a
+    // re-executed `workspaced init` re-fetches the archive — deleting it on
+    // the first runner heartbeat would 404 that fetch and fail an otherwise
+    // recoverable pod. The archive lives until terminal cleanup; the TTL
+    // sweep is the leak backstop (L3).
     // Quiesce channel (the ONLY runner-contract change in the K8s design):
     // once a session enters `cancelling`, its heartbeat response carries
     // {"action":"quiesce"} — the runner stops the agent and exits WITHOUT

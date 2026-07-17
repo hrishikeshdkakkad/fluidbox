@@ -105,15 +105,22 @@ pub fn pack_workspace(session_root: &Path) -> Result<PackedArchive, WorkspaceErr
 
 /// Pack a session workspace root STREAMING to `dest` (`GzEncoder<File>` — the
 /// archive never lives in RAM), digesting as it writes and failing cleanly if
-/// the compressed size would exceed `max_bytes`. On any error the partial
-/// file is removed, so an over-cap or torn archive can never be served.
+/// the compressed size would exceed `max_bytes`. The write is ATOMIC: it goes
+/// to `<dest>.partial` and renames into place only on success, so a reader
+/// (or a TTL sweep racing a slow pack) can never observe a half-written
+/// archive under the served name. On any error the partial is removed.
 pub fn pack_workspace_to_file(
     session_root: &Path,
     dest: &Path,
     max_bytes: u64,
 ) -> Result<StoredArchive, WorkspaceError> {
-    let file = std::fs::File::create(dest)
-        .map_err(|e| WorkspaceError::Invalid(format!("create {}: {e}", dest.display())))?;
+    let partial = {
+        let mut os = dest.as_os_str().to_owned();
+        os.push(".partial");
+        PathBuf::from(os)
+    };
+    let file = std::fs::File::create(&partial)
+        .map_err(|e| WorkspaceError::Invalid(format!("create {}: {e}", partial.display())))?;
     let sink = HashingWriter {
         inner: std::io::BufWriter::new(file),
         hasher: Sha256::new(),
@@ -122,13 +129,18 @@ pub fn pack_workspace_to_file(
     };
     let result = write_tar_gz(session_root, sink).and_then(|mut sink| {
         std::io::Write::flush(&mut sink)
-            .map_err(|e| WorkspaceError::Invalid(format!("flush {}: {e}", dest.display())))?;
+            .map_err(|e| WorkspaceError::Invalid(format!("flush {}: {e}", partial.display())))?;
         Ok(sink)
     });
-    let sink = match result {
+    let finish = result.and_then(|sink| {
+        std::fs::rename(&partial, dest)
+            .map_err(|e| WorkspaceError::Invalid(format!("rename into {}: {e}", dest.display())))?;
+        Ok(sink)
+    });
+    let sink = match finish {
         Ok(sink) => sink,
         Err(e) => {
-            let _ = std::fs::remove_file(dest);
+            let _ = std::fs::remove_file(&partial);
             return Err(e);
         }
     };
@@ -162,12 +174,24 @@ pub fn verify_archive(
     Ok(())
 }
 
+/// Hardened unpack from an in-memory archive (tests/fixtures). Production
+/// callers stream from disk via `unpack_archive_reader` — same policy, no
+/// whole-archive buffer.
+pub fn unpack_archive(
+    bytes: &[u8],
+    dest: &Path,
+    max_total_bytes: u64,
+) -> Result<u64, WorkspaceError> {
+    unpack_archive_reader(bytes, dest, max_total_bytes)
+}
+
 /// Hardened unpack: every entry path is validated to stay inside `dest`
 /// (no absolute paths, no `..`, no symlink/hardlink escaping the root), and a
 /// total-size ceiling bounds a decompression bomb. Returns the number of
-/// entries written.
-pub fn unpack_archive(
-    bytes: &[u8],
+/// entries written. Takes any `Read` so the init container can stream the
+/// archive straight off disk instead of holding it in RAM (M4's pod half).
+pub fn unpack_archive_reader(
+    bytes: impl std::io::Read,
     dest: &Path,
     max_total_bytes: u64,
 ) -> Result<u64, WorkspaceError> {
@@ -426,13 +450,18 @@ mod tests {
 
         assert_eq!(stored.sha256, in_mem.sha256);
         assert_eq!(stored.len, in_mem.len);
+        // The write is atomic: only the final name remains, never a .partial
+        // a concurrent GET or the TTL sweep could observe half-written.
+        assert!(!std::path::PathBuf::from(format!("{}.partial", dest.display())).exists());
         let on_disk = std::fs::read(&dest).unwrap();
         assert_eq!(on_disk.len() as u64, stored.len);
         verify_archive(&on_disk, stored.len, &stored.sha256).unwrap();
 
-        // And it still unpacks.
+        // And it still unpacks — via the streaming reader path (what the
+        // init container uses), not just the in-memory slice path.
         let out = tmp.join("out");
-        unpack_archive(&on_disk, &out, 100 * 1024 * 1024).unwrap();
+        let file = std::fs::File::open(&dest).unwrap();
+        unpack_archive_reader(file, &out, 100 * 1024 * 1024).unwrap();
         assert_eq!(
             std::fs::read_to_string(out.join("repo/a.txt")).unwrap(),
             "hello\n"
@@ -458,7 +487,8 @@ mod tests {
             "error must name the cap: {err}"
         );
         assert!(
-            !dest.exists(),
+            !dest.exists()
+                && !std::path::PathBuf::from(format!("{}.partial", dest.display())).exists(),
             "a partial over-cap archive must not be left behind"
         );
         std::fs::remove_dir_all(&tmp).ok();

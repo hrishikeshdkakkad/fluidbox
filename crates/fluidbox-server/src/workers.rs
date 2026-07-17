@@ -60,12 +60,21 @@ pub fn spawn_all(state: AppState) {
     tokio::spawn(finalize_worker(state));
 }
 
-/// The stored-archive leak backstop (L3): archives are single-use init
-/// transport, deleted on the first runner heartbeat and again at finalize —
+/// The stored-archive leak backstop (L3): archives are deleted at finalize —
 /// this sweep reclaims the crash windows (pre-launch death, or a crash after
-/// the terminal transition but before `delete_archive`).
+/// the terminal transition but before `delete_archive`). The TTL is floored
+/// at 6 h so a mis-set value can never race an archive a live session still
+/// needs (init re-execution re-fetches it for the pod's whole lifetime).
+const ARCHIVE_TTL_FLOOR_SECS: u64 = 6 * 3600;
+
 async fn archive_ttl_sweep(state: AppState) {
-    let ttl = Duration::from_secs(state.cfg.archive_ttl_secs);
+    let configured = state.cfg.archive_ttl_secs;
+    let ttl = Duration::from_secs(configured.max(ARCHIVE_TTL_FLOOR_SECS));
+    if configured < ARCHIVE_TTL_FLOOR_SECS {
+        tracing::warn!(
+            "FLUIDBOX_ARCHIVE_TTL_SECS={configured} is below the {ARCHIVE_TTL_FLOOR_SECS}s floor; using the floor"
+        );
+    }
     let mut tick = tokio::time::interval(Duration::from_secs(3600));
     loop {
         tick.tick().await;
