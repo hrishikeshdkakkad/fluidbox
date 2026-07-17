@@ -1,0 +1,71 @@
+# Ephemeral EKS cluster for the fluidbox Kubernetes-native-provider acceptance
+# (design docs/plans/2026-07-15-kubernetes-native-provider-design.md §"Acceptance
+# statement"). Everything is tagged fluidbox-ephemeral=true and lives in ONE
+# eksctl CloudFormation stack family (eksctl-fluidbox-eks-*) so
+# `eksctl delete cluster` (scripts/eks-teardown.sh) reclaims it atomically.
+#
+# Two documented EKS traps are handled inline:
+#   Trap #1 (NetworkPolicy NOT enforced by default): the vpc-cni addon is
+#     configured with enableNetworkPolicy=true, so the aws-eks-nodeagent eBPF
+#     agent enforces NetworkPolicy. The fluidbox boot probe + helm test fail
+#     closed either way ("verify, don't assume", design settled-Q8).
+#   Trap #2 (no default StorageClass / EBS CSI not preinstalled): the
+#     aws-ebs-csi-driver addon is installed with IRSA (ebsCSIController). A gp3
+#     StorageClass is applied post-create (values/eks.yaml pins storageClass: gp3),
+#     else the archive PVC stays Pending.
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: fluidbox-eks
+  region: us-east-1
+  version: "1.33"
+  tags:
+    fluidbox-ephemeral: "true"
+    purpose: fluidbox-k8s-provider-acceptance
+
+# IRSA: required for the EBS CSI driver's wellKnownPolicies below.
+iam:
+  withOIDC: true
+
+# Two AZs (EKS minimum). NOTE (2026-07-17 acceptance): us-east-1a nodes failed
+# to bring up the aws-node IPAM (ipamd hung on "Checking for IPAM connectivity",
+# node NotReady) — an AZ-specific problem, not fluidbox. Pin the nodegroup to a
+# known-good AZ (below) and prefer 1b/1c for the subnets.
+availabilityZones:
+  - us-east-1b
+  - us-east-1c
+
+vpc:
+  nat:
+    gateway: Single   # one NAT gateway; eksctl deletes it with the cluster stack
+
+addons:
+  - name: vpc-cni
+    # Trap #1: turn on the network-policy enforcement agent. Keep the DEFAULT
+    # "standard" enforcing mode. Do NOT set NETWORK_POLICY_ENFORCING_MODE=strict:
+    # strict starves system pods (CoreDNS, EBS CSI) of IMDS/API access during
+    # startup, cascading into DNS + PVC-provisioning failures. Enforcement is
+    # real in standard mode; the fluidbox boot gate confirms it (2026-07-17).
+    configurationValues: |-
+      enableNetworkPolicy: "true"
+  - name: kube-proxy
+  - name: coredns
+  - name: aws-ebs-csi-driver
+    # Trap #2: IRSA role with AmazonEBSCSIDriverPolicy (needs withOIDC above).
+    wellKnownPolicies:
+      ebsCSIController: true
+
+managedNodeGroups:
+  - name: ng-1
+    amiFamily: AmazonLinux2023   # supports the netpol eBPF nodeagent
+    instanceType: t3.medium      # smallest viable; 2 vCPU / 4 GiB
+    availabilityZones:           # pin to a known-good AZ (see AZ note above)
+      - us-east-1b
+    desiredCapacity: 2
+    minSize: 2
+    maxSize: 2
+    volumeSize: 40               # gp3 root; headroom for the ~1.5 GiB runner image
+    volumeType: gp3
+    tags:
+      fluidbox-ephemeral: "true"
