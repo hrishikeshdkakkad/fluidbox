@@ -249,10 +249,10 @@ fn fetch(url: &str, token: &str, expected_len: u64) -> Result<Vec<u8>, String> {
 fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
     // Fresh-destination precondition (fail-closed): on an init re-execution the
     // surviving emptyDir may hold runner-planted symlinks; clear dst's contents
-    // (symlinks as links) so the copy phase can't follow a stale link out of
-    // the root.
-    std::fs::create_dir_all(dst)?;
+    // FIRST (which refuses a symlinked `dst` itself, so we never copy through a
+    // symlink to outside), THEN ensure a real dir.
     fluidbox_workspace::clear_dir_contents(dst)?;
+    std::fs::create_dir_all(dst)?;
     let mut symlinks: Vec<(PathBuf, PathBuf)> = Vec::new();
     copy_files(src, dst, &mut symlinks)?;
     place_symlinks(dst, &symlinks);
