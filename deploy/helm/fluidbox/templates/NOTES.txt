@@ -15,7 +15,8 @@ NetworkPolicy gate: requireEnforced={{ .Values.netpol.requireEnforced }}
 
 2. Reach the dashboard + API:
 {{- if .Values.ingress.enabled }}
-     https://{{ .Values.ingress.host }}
+     https://{{ .Values.ingress.host }}{{ if not .Values.web.enabled }}      (API — web.enabled=false){{ else }}         (dashboard){{ end }}
+     https://{{ .Values.ingress.host }}/v1      (API)
 {{- else }}
      kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "fluidbox.serverName" . }} 8787:8787
      kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "fluidbox.webName" . }} 3000:3000

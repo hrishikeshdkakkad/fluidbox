@@ -33,3 +33,45 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
 {{- "" -}}
 {{- end -}}
 {{- end -}}
+
+{{/* Image ref for a structured image ({repository, tag, digest}): a digest
+     pin renders repository@sha256:… (the ":" of repo:tag is WRONG for
+     digests), else repository:tag with the tag defaulting to the chart
+     appVersion — `helm package --app-version` at release time binds the
+     packaged chart to the images that release published. Call with
+     (dict "image" .Values.images.server "ctx" $). */}}
+{{- define "fluidbox.imageRef" -}}
+{{- if .image.digest -}}
+{{- printf "%s@%s" .image.repository .image.digest -}}
+{{- else -}}
+{{- printf "%s:%s" .image.repository (.image.tag | default .ctx.Chart.AppVersion) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Full ref for a flat image value (sandboxRunner/codexRunner/collector):
+     any non-empty value (tag or @sha256 ref) passes through verbatim; "" is
+     the official GHCR image at the chart appVersion. Call with
+     (dict "value" .Values.images.collector "name" "workspaced" "ctx" $). */}}
+{{- define "fluidbox.flatImage" -}}
+{{- if .value -}}
+{{- .value -}}
+{{- else -}}
+{{- printf "ghcr.io/hrishikeshdkakkad/fluidbox-%s:%s" .name .ctx.Chart.AppVersion -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Comma-joined pull-secret NAMES for FLUIDBOX_K8S_IMAGE_PULL_SECRETS (the
+     provider recreates the [{name: …}] refs on sandbox + probe pods). */}}
+{{- define "fluidbox.pullSecretNames" -}}
+{{- $names := list -}}
+{{- range .Values.images.pullSecrets -}}{{- $names = append $names .name -}}{{- end -}}
+{{- join "," $names -}}
+{{- end -}}
+
+{{/* values.sandbox.nodeSelector as k1=v1,k2=v2 for FLUIDBOX_K8S_NODE_SELECTOR
+     (template `range` iterates map keys sorted, so the output is stable). */}}
+{{- define "fluidbox.sandboxNodeSelector" -}}
+{{- $sel := list -}}
+{{- range $k, $v := .Values.sandbox.nodeSelector -}}{{- $sel = append $sel (printf "%s=%s" $k $v) -}}{{- end -}}
+{{- join "," $sel -}}
+{{- end -}}

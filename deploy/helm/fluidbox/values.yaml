@@ -8,21 +8,31 @@ nameOverride: ""
 fullnameOverride: ""
 
 images:
-  # Production deployments SHOULD pin by digest (image@sha256:…). Tags shown
-  # for readability.
+  # Defaults bind to the chart's appVersion — release.yml packages the chart
+  # with --app-version <tag>, so an OOTB `helm install` from the OCI registry
+  # pulls exactly the images that release published. Production SHOULD pin by
+  # digest: set digest: "sha256:…" (takes precedence over tag).
   server:
     repository: ghcr.io/hrishikeshdkakkad/fluidbox-server
-    tag: "dev"
+    tag: ""            # "" → .Chart.AppVersion
+    digest: ""         # "sha256:…" — rendered as repository@digest
     pullPolicy: IfNotPresent
   web:
     repository: ghcr.io/hrishikeshdkakkad/fluidbox-web
-    tag: "dev"
+    tag: ""
+    digest: ""
     pullPolicy: IfNotPresent
-  # The sandbox runner images (run UNMODIFIED as pods) and the collector.
-  sandboxRunner: ghcr.io/hrishikeshdkakkad/fluidbox-sandbox-runner:dev
-  codexRunner: ghcr.io/hrishikeshdkakkad/fluidbox-codex-runner:dev
-  collector: ghcr.io/hrishikeshdkakkad/fluidbox-workspaced:dev
-  # imagePullSecrets for private registries (mirroring to ECR/GCR/ACR).
+  # The sandbox runner images (run UNMODIFIED as pods) and the collector —
+  # FULL refs (repo:tag or repo@sha256:…), passed to the provider verbatim.
+  # "" → the official GHCR image at the chart appVersion.
+  sandboxRunner: ""
+  codexRunner: ""
+  collector: ""
+  # imagePullSecrets for private registries (mirroring to ECR/GCR/ACR), as
+  # [{name: …}]. Applied to the Deployments AND — by name, via
+  # FLUIDBOX_K8S_IMAGE_PULL_SECRETS — to sandbox + netpol-probe pods:
+  # imagePullSecrets are namespace-local, so copies of the Secrets must exist
+  # in the SANDBOX namespace too.
   pullSecrets: []
 
 # The Secret (in the release namespace) holding every credential, referenced
@@ -105,6 +115,8 @@ sandbox:
     requestsCpu: "10"
     requestsMemory: "20Gi"
   nodeSelector: {}
+  # Toleration objects ({key, operator, value, effect}); other fields (e.g.
+  # tolerationSeconds) are not propagated to sandbox pods.
   tolerations: []
   priorityClassName: ""
   # CIDRs excepted from the `permissive` profile (metadata + cluster internals).
