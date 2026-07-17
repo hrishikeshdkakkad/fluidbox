@@ -88,19 +88,14 @@ pub struct Config {
     /// Browser-session sliding idle window (seconds). The idle bump is always
     /// `least(now() + idle, absolute_expires_at)`.
     pub session_idle_secs: i64,
-    /// Browser-session hard cap (seconds). Consumed by the Task-5 login mint.
-    #[allow(dead_code)]
+    /// Browser-session hard cap (seconds). Consumed by the login session mint.
     pub session_absolute_secs: i64,
     /// Max age of a cached OIDC discovery document / JWKS before re-fetch.
-    /// Consumed by Task 5 (defined here so config lives in one change).
-    #[allow(dead_code)]
     pub oidc_discovery_max_age_secs: i64,
-    /// Permitted clock skew when validating ID-token time claims (Task 5).
-    #[allow(dead_code)]
+    /// Permitted clock skew when validating ID-token time claims.
     pub oidc_clock_skew_secs: i64,
     /// Minimum interval between a browser session's re-authorization checks on
-    /// a long-lived stream (Task 5); clamped to at most 60s (the re-auth bound).
-    #[allow(dead_code)]
+    /// a long-lived stream; clamped to at most 60s (the re-auth bound).
     pub session_reauth_secs: i64,
 }
 
