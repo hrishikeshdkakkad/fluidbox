@@ -1,9 +1,9 @@
 # fluidbox — multi-user MCP control plane and brokered sandbox design
 
 **Date:** 2026-07-14  
-**Status:** FINALIZED v3 (2026-07-16) — v2 after joint adversarial review by Claude (Fable 5) and Codex (GPT-5.6-sol, max reasoning), v3 after an independent post-finalization review (Claude, Fable 5) re-verifying every current-state claim against the code and the ratified MCP `2025-11-25` changelog; current brokered-MCP foundation exists, multi-user tenancy is not implemented  
+**Status:** FINALIZED v4 (2026-07-17) — v2 after joint adversarial review by Claude (Fable 5) and Codex (GPT-5.6-sol, max reasoning), v3 after an independent post-finalization review (Claude, Fable 5) re-verifying every current-state claim against the code and the ratified MCP `2025-11-25` changelog, v4 after re-baselining every current-state claim against `main` (`c967192`, post the Kubernetes-native provider epic, PR #47) and adding the companion identity design; current brokered-MCP foundation exists, multi-user tenancy is not implemented  
 **Audience:** fluidbox maintainers, security reviewers, and engineers implementing hosted multi-user support  
-**Relationship to other docs:** `PLAN.md` remains authoritative for product invariants and milestone direction. `docs/ARCHITECTURE.md` describes the current run path. `docs/guides/capabilities.md` documents the currently shipped capability-bundle behavior. This document defines the target connection, tenancy, and MCP-session architecture for a hosted deployment with approximately 300 users.
+**Relationship to other docs:** `PLAN.md` remains authoritative for product invariants and milestone direction. `docs/ARCHITECTURE.md` describes the current run path. `docs/guides/capabilities.md` documents the currently shipped capability-bundle behavior. `docs/plans/2026-07-15-kubernetes-native-provider-design.md` and `docs/reviews/2026-07-17-eks-acceptance.md` describe the shipped Kubernetes execution substrate this design now builds on. **`docs/plans/2026-07-17-idp-agnostic-identity-design.md` is the companion document designing Phase B's per-organization, IdP-agnostic identity layer.** This document defines the target connection, tenancy, and MCP-session architecture for a hosted deployment with approximately 300 users.
 
 ## Executive verdict
 
@@ -674,6 +674,22 @@ Per-tenant OAuth client registrations provide stronger blast-radius isolation bu
 
 Organization service connections may use the MCP OAuth client-credentials extension (SEP-1046) where the upstream supports it — noting SEP-1046 is not part of the ratified `2025-11-25` revision, so by this design's own no-candidate-semantics rule (Gap 8) that work is gated on ratification status. Prefer asymmetric JWT assertions when mature and interoperable; support client secrets only as a compatibility path.
 
+### Enterprise-managed authorization (SEP-990, target state)
+
+SEP-990 — Enterprise-Managed Authorization — has been ratified and gone
+stable since v3 listed it only as a reference. Under EMA the organization's
+identity provider, not each MCP server, makes the authorization decision:
+the client obtains an Identity Assertion JWT Authorization Grant (ID-JAG)
+from the IdP via RFC 8693 token exchange and presents it to the MCP
+server's authorization server as an RFC 7523 assertion — no per-server
+consent redirect. For fluidbox this is the future bridge between the
+per-organization login IdP (companion identity doc) and connection-grant
+acquisition: one SSO login could mint many upstream MCP grants under IdP
+policy. Target state only: the identity layer reserves the token-custody
+seam (`user_sessions`) for it, and nothing in v1 builds it. IdP support is
+emerging (Okta Cross App Access first); adoption is gated per connector on
+its authorization server's support, exactly as SEP-1046 is.
+
 ### Token rotation
 
 Freeze the logical authorization grant and generation, not access-token bytes.
@@ -802,7 +818,7 @@ It never receives:
 - OAuth client secret; or
 - tenant encryption key.
 
-The current local Docker `HostDev` network is not a hosted security boundary because general egress is constrained by policy rather than structurally denied. Hosted execution must use the hardened network path or an equivalent MicroVM/VPC isolation design.
+The Docker `HostDev` network remains a local-dev convenience, never a hosted security boundary. The hardened path now exists (v4): under the Kubernetes provider, `NetworkMode` is config-derived (`FLUIDBOX_NETWORK_MODE`; the chart sets `hardened`), the sandbox namespace carries a default-deny Ingress+Egress NetworkPolicy whose default `zeroEgress` profile allows only the control-plane internal listener on `:8788` (no DNS, no public route), and a boot-time gate blocks run admission until a probe proves enforcement (`+:8788 −:8787`). Hosted execution uses this path or an equivalent MicroVM/VPC isolation design; what Gap 6 still owes is workload identity/mTLS on top of the run bearer token.
 
 ### Broker egress
 
@@ -984,12 +1000,12 @@ Planning assumptions, to be replaced with observed pilot data:
 
 The 1,500 connection records and associated snapshots are trivial for Postgres. Active sandbox compute, LLM provider quotas, remote MCP quotas, and audit/event volume will become limiting before the connection table does.
 
-The current Docker provider's 2 GiB per-container cap implies:
+A 2 GiB per-run memory cap implies:
 
     45 concurrent runs → 90 GiB memory-cap envelope
     300 concurrent runs → 600 GiB memory-cap envelope
 
-Actual memory utilization may be lower, but hosted capacity must schedule sandboxes across multiple hosts or a MicroVM provider.
+Actual memory utilization may be lower. The Kubernetes provider (shipped) already schedules one pod per run across cluster nodes with namespace `ResourceQuota`/`LimitRange` caps and optional `runtimeClassName` (gVisor/Kata) MicroVM-grade isolation tiers; the Docker provider stays single-host local-dev.
 
 ### Recommended deployment shape
 
@@ -999,7 +1015,8 @@ For the initial 300-seat deployment:
 - a horizontally scalable MCP egress-worker pool with a dedicated secret-access identity;
 - shared highly available Postgres;
 - Postgres advisory/row locks or Redis for distributed refresh singleflight;
-- a multi-host or MicroVM sandbox fleet;
+- the Kubernetes sandbox fleet (shipped: per-run pods, zeroEgress network
+  policies, optional gVisor/Kata runtime classes);
 - an egress proxy/firewall;
 - per-tenant and per-connection concurrency limits;
 - per-upstream circuit breakers;
@@ -1007,6 +1024,14 @@ For the initial 300-seat deployment:
 - queue-backed provisioning and terminal delivery work.
 
 The Rust monolith does not need to be split into many microservices merely because there are 300 users. It does need logically separated authority and, ideally, a separately deployable broker worker identity so the dashboard/API surface cannot read every connector secret.
+
+Reality check (v4): the shipped Helm chart (v0.2.0) deliberately settles v1 as
+**single replica + `Recreate`** — multi-replica was a non-goal of the
+Kubernetes epic — and the workspace-archive `ReadWriteOnce` PVC is the first
+hard blocker to running two servers. The two-to-three-replica shape above is
+therefore a Phase F target, not the current deployment: reaching it requires
+moving archive storage off the RWO volume (object storage or RWX) *and* the
+statelessness inventory below.
 
 ### Multi-replica statelessness inventory
 
@@ -1032,7 +1057,12 @@ optimizations only.
    one DB connection; fragile under pool reconnects and Neon scale-to-zero;
    poorly observable). Every lifecycle mutation and external side effect
    carries the epoch as a fencing token. Advisory locks remain acceptable
-   for short OAuth-refresh critical sections.
+   for short OAuth-refresh critical sections. In-repo prior art (v4): the
+   Kubernetes epic added a session-scoped finalization claim with time-based
+   stale-claim takeover and an adopt-or-terminate reconcile whose provider
+   mutations are UID-preconditioned — the same claim discipline this item
+   asks for at replica scope; the replica lease + epoch fencing itself is
+   still net-new.
 3. **Result deliveries.** The current worker is an explicitly single-process
    sequential loop with no row claim (`deliveries.rs`). Claims must fence
    the external side effect, not merely the final status update. A lease
@@ -1093,7 +1123,9 @@ Current state:
 
 Required:
 
-- OIDC/session authentication;
+- per-organization, IdP-agnostic OIDC/session authentication — designed in
+  full in the companion doc
+  `docs/plans/2026-07-17-idp-agnostic-identity-design.md`;
 - organizations and memberships;
 - role and connection-use authorization;
 - tenant-scoped Rust extractors and DB methods; and
@@ -1157,25 +1189,42 @@ Required for hosted multi-tenant use:
 - broker-only decrypt role;
 - an explicit re-seal migration off `FLUIDBOX_CREDENTIAL_KEY`: dual-read
   (legacy-unseal, KMS-reseal) over every sealed row — connections, GitHub
-  App private keys, webhook and subscription delivery secrets — resumable,
+  App private keys, webhook and subscription delivery secrets, and the
+  identity layer's sealed families (`org_idp_configs.client_secret_sealed`,
+  `login_flows.pkce_verifier_sealed`,
+  `user_sessions.refresh_token_sealed`) — resumable,
   count-parity verified, the legacy key retired only after 100% re-seal
   (rotating the key without this step orphans every stored credential); and
 - tested disaster recovery.
 
-### Gap 6: local-dev network mode
+### Gap 6: workload identity (network hardening largely shipped)
 
-Current state:
+Current state (re-baselined v4, post the Kubernetes-native provider epic):
 
-- orchestrator provisions `NetworkMode::HostDev`;
-- general sandbox egress is not structurally blocked.
+- `NetworkMode` is config-derived (`FLUIDBOX_NETWORK_MODE`): Docker local-dev
+  defaults `HostDev`; the Helm chart sets `hardened`;
+- under the Kubernetes provider, sandbox egress IS structurally blocked — a
+  default-deny Ingress+Egress NetworkPolicy on the sandbox namespace, with
+  the default `zeroEgress` profile allowing only the control-plane internal
+  listener on `:8788` (no DNS, no public route);
+- `/internal` is absent from the public `:8787` listener under Kubernetes
+  (route absence, not authorization); a separate internal listener serves
+  `:8788` only;
+- enforcement is proven by automated negative tests: a boot-time netpol gate
+  that blocks run admission until a probe proves `+:8788 −:8787`, a Helm
+  test probe, and CI (kind + Calico);
+- sandbox pods mount no service-account token
+  (`automountServiceAccountToken: false`), and the run token rides an
+  immutable pod-owned Secret rather than a PodSpec literal.
 
-Required:
+Still required:
 
-- hardened per-run network;
-- internal-only control-plane route;
-- no public default route;
-- workload identity or mTLS in addition to run bearer tokens; and
-- automated negative egress tests.
+- workload identity or mTLS in addition to run bearer tokens
+  (authentication to the internal gateway is still solely the per-session
+  bearer); and
+- equivalent structural guarantees for any non-Kubernetes hosted substrate
+  (the Docker `HostDev` path remains local-dev only, never a hosted
+  boundary).
 
 ### Gap 7: SSRF exposure from custom endpoints
 
@@ -1387,7 +1436,11 @@ Implement:
 - users;
 - organizations;
 - memberships and roles;
-- OIDC/session authentication;
+- the per-organization, IdP-agnostic identity layer per the companion doc
+  (org-scoped users keyed `(tenant, idp_config, subject)`, per-org OIDC
+  configs, invariant-20 login flows, server-side sessions, personal API
+  tokens, break-glass bootstrap; migration `0012` — main's series ends at
+  `0011_finalization_intent`);
 - principal variants (user, trigger, schedule, webhook, system worker) with
   a `Principal` extractor;
 - approval RBAC (`approval.decide_own` / `approval.decide_org`) and
@@ -1404,8 +1457,17 @@ Acceptance:
 - workers cannot fall back to a default tenant;
 - every API/event/artifact route proves tenant ownership;
 - approval decisions derive the approver from the principal (no
-  request-supplied `decided_by`); and
-- a trigger token can poll only runs it created.
+  request-supplied `decided_by`);
+- a trigger token can poll only runs it created;
+- an OIDC round-trip passes against a conformant issuer (Keycloak or Dex in
+  CI), with replayed, wrong-browser, and expired login flows all refused;
+- the signing-algorithm allowlist rejects `none`/HS256; multi-audience
+  tokens require `azp`; `nonce` and `at_hash` are enforced;
+- a deactivated membership is refused on its next request and its personal
+  API tokens die with it;
+- break-glass bootstrap mints exactly one first owner and is idempotent
+  thereafter; and
+- with no IdP configured, single-admin mode behaves exactly as today.
 
 ### Phase C — connection ownership and run binding
 
@@ -1690,6 +1752,42 @@ This design is complete when the following sentence is mechanically true:
 
 ## Revision history
 
+**v4 (2026-07-17)** — re-baseline against `main` (`c967192`) after the
+Kubernetes-native provider epic (PR #47, EKS-verified, chart v0.2.0), plus
+the companion identity design. No settled decision changed. Drift fixes:
+
+- Gap 6 re-scoped: hosted network hardening is largely SHIPPED under the
+  Kubernetes provider (config-derived `NetworkMode`, default-deny
+  `zeroEgress` NetworkPolicy with no DNS, `/internal` absent from the public
+  listener, boot-time netpol gate blocking run admission, Helm/CI negative
+  probes, no pod service-account token, run token via immutable owned
+  Secret). Remaining: workload identity/mTLS.
+- Scale model reconciled with settled reality: the shipped chart is
+  single-replica + `Recreate` with a `ReadWriteOnce` archive PVC as the
+  first multi-replica blocker; "multi-host or MicroVM fleet" superseded by
+  the Kubernetes scheduler + `runtimeClassName` (gVisor/Kata) tiers.
+  Multi-replica becomes an explicit Phase F target.
+- Statelessness inventory: noted the epic's session-scoped finalization
+  claim (stale-claim takeover) and UID-preconditioned reconcile as in-repo
+  prior art for the orchestrator-lease item.
+- Every other v3 current-state claim re-verified as still accurate on
+  `main` (gate order, broker behavior, delivery worker, facade budget race,
+  stateless OAuth state, capability bundles, boot tenant, approval
+  double-ledger bug).
+- **Phase B's "OIDC/session authentication" is now fully designed** in the
+  companion doc `2026-07-17-idp-agnostic-identity-design.md`: per-organization
+  IdP-agnostic OIDC (any conformant issuer), invariant-20 login-flow rows
+  reusing the GitHub App cookie-hash claim pattern, org-scoped users,
+  server-side sessions, personal API tokens, and admin-token break-glass.
+  Phase B implement/acceptance bullets updated; Gap 5/Phase D re-seal scope
+  now names the identity layer's sealed families; migration numbering noted
+  (main ends at `0011`, identity takes `0012`).
+- SEP-990 (Enterprise-Managed Authorization) ratified and stable since v3:
+  added as an explicit target-state subsection (ID-JAG via RFC 8693 →
+  RFC 7523) bridging the login IdP to connection-grant acquisition.
+- References updated (Kubernetes provider design, EKS acceptance, companion
+  identity doc).
+
 **v3 (2026-07-16)** — independent post-finalization review (Claude, Fable 5).
 Every v2 current-state claim was re-verified against the code (all accurate;
 one mislabel fixed) and against the ratified MCP `2025-11-25` changelog.
@@ -1779,6 +1877,9 @@ the code by both reviewers. Changes:
 - [PLAN.md](../../PLAN.md)
 - [Architecture](../ARCHITECTURE.md)
 - [Capabilities guide](../guides/capabilities.md)
+- [IdP-agnostic identity design (companion, Phase B)](2026-07-17-idp-agnostic-identity-design.md)
+- [Kubernetes-native provider design](2026-07-15-kubernetes-native-provider-design.md)
+- [EKS live acceptance](../reviews/2026-07-17-eks-acceptance.md)
 - [Capability registry](../../crates/fluidbox-server/src/capabilities.rs)
 - [Run capability resolution](../../crates/fluidbox-server/src/run_service.rs)
 - [Sandbox capability manifest](../../crates/fluidbox-server/src/orchestrator.rs)
