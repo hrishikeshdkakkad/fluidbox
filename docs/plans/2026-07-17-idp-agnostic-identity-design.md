@@ -1,7 +1,7 @@
 # fluidbox — IdP-agnostic, per-organization identity layer
 
 **Date:** 2026-07-17
-**Status:** FINALIZED v3 (2026-07-17) — v2 and v3 produced by two adversarial review rounds with Codex (gpt-5.6-sol, max reasoning); companion to the multi-user MCP control plane design (Phase B input); nothing here is implemented
+**Status:** FINALIZED v4 (2026-07-17) — v2–v4 produced by three adversarial review rounds with Codex (gpt-5.6-sol, max reasoning); companion to the multi-user MCP control plane design (Phase B input); nothing here is implemented
 **Audience:** fluidbox maintainers and engineers implementing Phase B (identity and tenant enforcement)
 **Relationship to other docs:** `docs/plans/2026-07-14-multi-user-mcp-control-plane-design.md` (v4) defines the multi-user architecture this layer authenticates; its Phase B references this document. `docs/plans/2026-07-11-github-seamless-connect-design.md` defined the one-time browser-flow pattern this design reuses. `PLAN.md` remains authoritative for product invariants.
 
@@ -138,8 +138,9 @@ references it. Row-level security is added as depth; `TenantScope`
 repository signatures remain the primary control.
 
 Migration order: `tenants` alterations → `org_idp_configs` → `users` →
-`org_memberships` → `login_flows` → `user_sessions` → `auth_audit_log` →
-`api_tokens` alterations (each FK target exists before its referrer).
+`org_memberships` → `login_flows` → `user_sessions` →
+`pending_login_switches` → `auth_audit_log` → `api_tokens` alterations
+(each FK target exists before its referrer).
 
 ### `tenants` (extended in place)
 
@@ -332,11 +333,13 @@ binding, IdP context) is different. There is no refresh-token column
 ### `pending_login_switches` (one-time session-replacement confirmations)
 
     id                  uuid primary key
-    tenant_id           uuid not null
+    tenant_id           uuid not null       -- the NEW login's organization
     idp_config_id       uuid not null       -- config + generation of the NEW login
     new_membership_id   uuid not null       -- the verified identity awaiting confirmation
     new_user_id         uuid not null
-    replaced_session_id uuid not null       -- the live session being replaced
+    replaced_tenant_id  uuid not null       -- the CURRENT session's organization
+    replaced_session_id uuid not null       -- (may differ from tenant_id: org switch)
+    redirect_to         text not null       -- copied from the claimed login flow
     browser_hash        text not null       -- sha256 of a fresh confirmation-cookie nonce
     acr text, amr text[], auth_time timestamptz   -- carried from the verified ID token
     consumed_at         timestamptz
@@ -347,17 +350,31 @@ binding, IdP context) is different. There is no refresh-token column
       references org_memberships (tenant_id, id, user_id) on delete cascade
     foreign key (tenant_id, idp_config_id)
       references org_idp_configs (tenant_id, id) on delete cascade
+    foreign key (replaced_tenant_id, replaced_session_id)
+      references user_sessions (tenant_id, id) on delete cascade
 
 When a callback verifies a NEW identity while the browser holds a live
 session for a *different* user or organization, the flow does not end in a
-session — it ends in this row plus a fresh `__Host-`-prefixed confirmation
-cookie, and renders the confirmation page. The confirming POST atomically
-claims the row (cookie hash inside the one-time predicate, exactly like
-`login_flows`), rechecks config-active and membership-active, revokes the
-replaced session, and mints the new one — all in one transaction. No
-form-carried identity is ever trusted, no consumed flow is reused, and an
-expired or issuer-migrated pending switch fails closed (the migration swap
-cancels these rows too).
+session — it ends in this row plus a fresh confirmation cookie
+(`__Host-fbx_switch_{id}=<nonce>; HttpOnly; SameSite=Lax; Secure;
+Path=/`), and renders the confirmation page (which POSTs same-origin to
+`/v1/auth/switch/{id}`). **An org switch is deliberately a cross-tenant
+transition, and the schema says so:** the row carries both tenants, and
+the replaced session is composite-FK'd in its own tenant. Resolving the
+confirmation cookie is the second — and last — credential-like bootstrap
+exception to single-tenant scoping: it accepts only the server-computed
+cookie hash, atomically returns BOTH tenant contexts, and the dual-tenant
+mutation runs through one narrowly named repository method (with explicit
+RLS treatment), never a generic UUID lookup. The claiming UPDATE's
+predicate requires the cookie hash, unexpired/unconsumed state, AND that
+the browser's currently presented live session equals
+`(replaced_tenant_id, replaced_session_id)` and is still valid; the same
+transaction rechecks config- and membership-active, revokes the replaced
+session, mints the new one, and redirects only from the row's stored
+`redirect_to`. No form-carried identity or redirect is ever trusted, no
+consumed flow is reused, and an expired, declined, or issuer-migrated
+pending switch fails closed keeping the original session (the migration
+swap and config disable cancel these rows too).
 
 ### `auth_audit_log`
 
@@ -444,7 +461,7 @@ IdP. (Users are org-scoped rows, so there is no global identity to switch.)
 
 **One stable redirect URI for every org's IdP client:**
 `{FLUIDBOX_PUBLIC_URL}/v1/auth/callback`. The sealed `state` parameter —
-built with the existing `seal_state` helper but a login-specific payload —
+built by the new typed login-state helper on the same sealing primitives —
 carries `{purpose: "login", v: 1, flow_id, tenant_id, idp_config_id, exp}`,
 so a single callback route serves every issuer. The typed
 `purpose`/version fields keep login states and connector states mutually
@@ -522,10 +539,13 @@ capped):
 6. Map claims per `claim_mappings`; apply `require_email_verified`.
 7. **Transaction B — provisioning and session mint, config-locked:**
    `select … from org_idp_configs where tenant_id=$t and id=$config and
-   status='active' for share` (the issuer-migration swap takes
-   `FOR UPDATE` on the org's config rows, so B serializes against it —
-   a swap that commits first makes B fail closed; B holding the share
-   lock delays the swap until the session exists to be revoked). Inside
+   status='active' for update`. The lock is exclusive from the start — a
+   share-then-upgrade pattern would deadlock between two concurrent
+   logins that both reach the bootstrap-claim UPDATE — and it is the
+   same lock the issuer-migration swap takes, so the two serialize: a
+   swap that commits first makes B fail closed; a B holding the lock
+   delays the swap until the session exists to be revoked. Logins within
+   one org serialize on this row; acceptable at login volume. Inside
    the same transaction: JIT provision — upsert `users` on
    `(tenant_id, idp_config_id, subject)` (refresh
    email/name/`last_login_at`); upsert `org_memberships` with mapped
@@ -536,18 +556,23 @@ capped):
 9. **Session replacement is never silent.** If the browser presents a
    valid existing `__Host-fbx_web` session for a *different* user or
    organization, B does not mint a session — it inserts a
-   `pending_login_switches` row (bound to the verified new identity, the
-   replaced session, the config generation, and a fresh confirmation
-   cookie's hash), commits, sets the confirmation cookie, and renders
-   the same-origin confirmation page. The confirming POST
-   (CSRF-protected) atomically claims that row — cookie hash inside the
-   one-time predicate — rechecks config- and membership-active, revokes
-   the replaced session, and mints the new one in a single transaction.
-   Decline, expiry (120 s), or an intervening issuer migration fails
-   closed and keeps the original session. This closes
+   `pending_login_switches` row (both tenants, the verified new
+   identity, the replaced session composite-FK'd in its own tenant, the
+   config generation, the validated `redirect_to`, and a fresh
+   confirmation cookie's hash), commits, sets
+   `__Host-fbx_switch_{id}`, and renders the same-origin confirmation
+   page. The confirming POST (CSRF-protected) atomically claims that
+   row — cookie hash inside the one-time predicate, which also requires
+   the browser's currently presented session to equal the row's
+   replaced session and still be valid — rechecks config- and
+   membership-active, revokes the replaced session, mints the new one,
+   and redirects from the row's stored `redirect_to`, all in one
+   transaction (the dual-tenant repository exception in the table
+   section). Decline, expiry (120 s), or an intervening issuer
+   migration fails closed and keeps the original session. This closes
    forced-login/session-substitution via attacker-initiated top-level
-   navigation without trusting form-carried identity or reusing a
-   consumed flow.
+   navigation without trusting form-carried identity, a form-carried
+   redirect, or a consumed flow.
 10. Otherwise B mints the session directly: token `fbx_web_<hex>`, sha256
     stored in `user_sessions` with the membership triple, IdP context
     (`idp_config_id`, `acr`/`amr`/`auth_time`), and
@@ -565,7 +590,7 @@ web app's environment), never inferred per request:
 | Mode | Proxy behavior |
 |---|---|
 | `admin` (local/dev, no IdPs) | Today's behavior: inject `Bearer FLUIDBOX_ADMIN_TOKEN` server-side. No login UI. |
-| `sso` (hosted) | **Cookie passthrough only:** forward fluidbox cookies (allowlist: `__Host-fbx_web`, `__Host-fbx_login_*`), forward the CSRF header and the normalized `Origin`, propagate every `Set-Cookie` response header separately, support GET/POST/PUT/PATCH/DELETE. The admin token is **not present in the web app's environment at all** — there is nothing to fall back to. |
+| `sso` (hosted) | **Cookie passthrough only:** forward fluidbox cookies (allowlist: `__Host-fbx_web`, `__Host-fbx_login_*`, `__Host-fbx_switch_*`), forward the CSRF header and the normalized `Origin`, propagate every `Set-Cookie` response header separately, support GET/POST/PUT/PATCH/DELETE. The admin token is **not present in the web app's environment at all** — there is nothing to fall back to. |
 
 A hosted deployment therefore cannot leak operator authority on a missing
 or invalid cookie: the failure mode is 401, not admin. IdP-less
@@ -606,12 +631,15 @@ today's `get_session`/`get_connection`/`events_after` are UUID-only. Phase
 B refactors **all tenant-owned repositories and worker call sites**, not
 just the new identity tables — replacing `state.tenant_id` reads with
 `principal.tenant_id` does not repair an unscoped SQL query underneath.
-The one narrow exception: credential resolution (session cookie, PAT,
-trigger, runner token) necessarily starts tenant-less — it accepts only a
-server-computed token digest, atomically returns the row **with** its
-tenant and live membership, and constructs the `TenantScope` from that.
-Nothing else may bootstrap a scope, and a browser-supplied tenant never
-does.
+Exactly two narrow exceptions exist. First, credential resolution
+(session cookie, PAT, trigger, runner token) necessarily starts
+tenant-less — it accepts only a server-computed token digest, atomically
+returns the row **with** its tenant and live membership, and constructs
+the `TenantScope` from that. Second, pending-switch confirmation
+resolution (the cross-tenant org switch) accepts only the server-computed
+confirmation-cookie hash and returns **both** tenant contexts for the one
+narrowly named dual-tenant method. Nothing else may bootstrap a scope,
+and a browser-supplied tenant never does.
 
 **CSRF — scoped to cookie authentication only:** requests authenticating
 via the `__Host-fbx_web` cookie (a `BrowserSession` context) require, on
@@ -651,21 +679,26 @@ IdP), on an explicit, fully audited surface:
   successful login whose **verified** normalized email equals the armed
   value wins, decided atomically:
 
-      -- inside the login transaction, after JIT provisioning:
+      -- inside transaction B (config row already locked FOR UPDATE):
       update org_idp_configs
-         set bootstrap_owner_email = null
+         set bootstrap_owner_email = null,
+             bootstrap_owner_expires_at = null
        where tenant_id = $t and id = $config
          and bootstrap_owner_email = $normalized_email
-         and not exists (select 1 from org_memberships m
-                          where m.tenant_id = $t
-                            and m.status = 'active'
-                            and 'owner' = any(m.roles))
-       returning id;
+       returning (bootstrap_owner_expires_at > now()) as was_unexpired;
 
-  One row returned ⇒ this login (and only this login) promotes its
-  membership to `owner`, in the same transaction, with the audit row.
-  Note the `status = 'active'` filter: a deactivated ex-owner never
-  blocks recovery. **Arming cannot go latent:**
+  A matching arm is ALWAYS consumed by this single-winner UPDATE; what
+  follows is a three-way decision inside the same transaction (owner
+  reads are consistent because every owner-role mutation serializes on
+  the config lock):
+
+  - consumed, `was_unexpired`, and no **active** owner exists ⇒ this
+    login (and only this login) promotes its membership to `owner`, with
+    the audit row — a deactivated ex-owner never blocks recovery;
+  - consumed but expired, or an active owner exists ⇒ the promotion is
+    refused and the now-cleared arm is audited as reject-and-consume;
+  - no row returned ⇒ nothing was armed for this email; no bootstrap
+    mutation. **Arming cannot go latent:**
   - arming is **rejected while an active owner exists** (the operator
     must deactivate the owner first — a deliberate, audited sequence,
     never a standing trap);
@@ -689,8 +722,9 @@ IdP), on an explicit, fully audited surface:
   {email}` re-arms `bootstrap_owner_email` — refused while an active
   owner exists, and armed with the standard expiry.
 
-Every action above — accepted **and rejected** — writes `auth_audit_log`
-in the same transaction as its mutation, with `actor_kind='operator'`.
+Every action above is audited with `actor_kind='operator'`: accepted
+mutations and their audit rows commit atomically; rejected attempts are
+audited in a separate transaction committed after the rollback.
 
 ## Machine access: personal API tokens
 
@@ -753,11 +787,11 @@ in the same transaction as its mutation, with `actor_kind='operator'`.
      subjects are not portable across issuers).
   3. Mid-migration logins fail closed at both phases: the flow claim
      (transaction A) requires `c.status = 'active'`, and the
-     provisioning/session transaction (B) re-verifies it under
-     `FOR SHARE` — which serializes against this swap's `FOR UPDATE`.
-     A swap that commits first makes B fail; a B that holds the share
-     lock delays the swap until its session exists and is then revoked
-     by it. No old-generation session survives the swap's commit.
+     provisioning/session transaction (B) re-verifies it under the same
+     `FOR UPDATE` row lock this swap takes — the two serialize. A swap
+     that commits first makes B fail; a B that holds the lock delays
+     the swap until its session exists and is then revoked by it. No
+     old-generation session survives the swap's commit.
 
 ## Fail-closed edges
 
@@ -775,9 +809,10 @@ in the same transaction as its mutation, with `actor_kind='operator'`.
   config. Exactly **one** forced refresh is attempted when no compatible
   key is found **or when signature verification fails with a cached key**
   (a same-`kid` rotation looks like the latter); after that forced
-  refresh, failure is terminal for the login. Key matching requires
-  `kid` + `alg` + `kty` (+ `use`/`key_ops` when present); multiple
-  ambiguous candidates ⇒ refuse. Unknown `kid`s are negative-cached
+  refresh, failure is terminal for the login. Key matching, when the
+  token carries a `kid`, requires `kid` + `alg` + `kty`
+  (+ `use`/`key_ops` when present); multiple ambiguous candidates ⇒
+  refuse. Unknown `kid`s are negative-cached
   briefly (bounds junk-`kid` refresh storms without blocking a real
   rotation, which enters via the signature-failure path). Last-known-good
   JWKS persists until its explicit expiry. JWKS documents are bounded in
@@ -856,8 +891,9 @@ Documented for operators; anything meeting this floor works:
    single-admin mode is unchanged; the hosted browser proxy has no
    operator credential to fall back to.
 9. Break-glass actions ride the operator credential on an explicit
-   surface; every attempt (accepted or rejected) is audited in the same
-   transaction as its mutation.
+   surface; accepted mutations and their audit rows commit atomically,
+   and rejected attempts are audited in a committed transaction after
+   rollback.
 10. IdP config identity (`issuer`, `client_id`, `generation`) is
     immutable; issuer migration is a staged atomic swap — and config
     disable a reversible transition — each of which cancels the config's
@@ -878,13 +914,15 @@ doc. Implementation order inside Phase B:
    repository methods.
 2. **The full repository refactor:** every tenant-owned `fluidbox-db`
    method gains a `TenantScope` signature (not only the new identity
-   families); workers carry explicit tenant context; the
-   credential-resolution bootstrap exception is the single tenant-less
-   entry point. Replace `state.tenant_id` reads with
-   `principal.tenant_id` behind the `Principal` resolver.
-3. `/v1/auth/*` routes (entry page, start, callback, logout, tokens)
-   using `openidconnect` for verification and the flows/claims machinery
-   above; remove `CorsLayer::permissive()` in the same change.
+   families); workers carry explicit tenant context; the two
+   bootstrap exceptions (credential resolution; pending-switch
+   confirmation) are the only tenant-less entry points. Replace
+   `state.tenant_id` reads with `principal.tenant_id` behind the
+   `Principal` resolver.
+3. `/v1/auth/*` routes (entry page, start, callback, switch
+   confirmation, logout, tokens) using `openidconnect` for verification
+   and the flows/claims machinery above; remove `CorsLayer::permissive()`
+   in the same change.
 4. `/v1/admin/orgs*` bootstrap + break-glass surface (staged IdP
    activation, single-winner owner claim, transactional audit).
 5. Dashboard: login redirect page, static `FLUIDBOX_WEB_MODE` proxy
@@ -916,6 +954,29 @@ doc. Implementation order inside Phase B:
    revisit only if per-role metadata (grantor, expiry) becomes real.
 
 ## Revision history
+
+**v4 (2026-07-17)** — Codex round 3 (gpt-5.6-sol, max reasoning): the
+round-2 approval set verified; two High and three smaller residuals
+fixed. The pending switch is now an explicitly **cross-tenant** object:
+`replaced_tenant_id` + composite FK to `user_sessions`, both tenant
+contexts returned by the cookie-hash bootstrap exception (the second and
+last credential-like exception to single-tenant scoping), the claim
+predicate binding the currently presented live session, the validated
+`redirect_to` stored in the row (never form-carried), the confirmation
+cookie named and attributed (`__Host-fbx_switch_{id}`), and the
+dual-tenant mutation confined to one narrowly named repository method.
+The bootstrap SQL now matches its prose: consume-on-match single-winner
+UPDATE clearing both arm and expiry, a three-way decision
+(promote / reject-and-consume when expired or owner-blocked / no-op),
+and transaction B locks the config `FOR UPDATE` from the start (a
+share-then-upgrade would deadlock two concurrent bootstrap-matching
+logins) — the migration-swap interleaving analysis updated to match.
+The two stale audit statements (break-glass section, invariant 9) now
+carry the accepted-atomic / rejected-after-rollback split. Low fixes:
+the routing section credits the new typed login-state helper (not the
+hard-coded `seal_state`), `pending_login_switches` joined the migration
+order, and JWKS key matching is conditional on a `kid` being present.
+No parent-doc changes were required.
 
 **v3 (2026-07-17)** — Codex round 2 (gpt-5.6-sol, max reasoning): 12 of
 17 round-1 findings verified RESOLVED, 5 PARTIAL, 7 new defects — all
