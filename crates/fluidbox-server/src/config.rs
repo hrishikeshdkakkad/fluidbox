@@ -75,6 +75,12 @@ pub struct Config {
     /// ClusterIP at boot for the runner's no-DNS control URL under zeroEgress.
     pub internal_service: Option<String>,
     pub internal_service_namespace: Option<String>,
+    /// Compressed workspace-archive ceiling: packing streams to disk and a
+    /// run whose archive would exceed this fails cleanly at zero model spend.
+    pub max_archive_bytes: u64,
+    /// TTL for the stored-archive sweep (the leak backstop). The archive is
+    /// single-use init transport — anything older than this is a leak.
+    pub archive_ttl_secs: u64,
 }
 
 /// Serialized runner-env ceiling: env injection is the v1 config channel
@@ -163,6 +169,42 @@ impl Config {
             internal_service_namespace: get("FLUIDBOX_INTERNAL_SERVICE_NAMESPACE")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            max_archive_bytes: parse_u64_env(
+                "FLUIDBOX_MAX_ARCHIVE_BYTES",
+                get("FLUIDBOX_MAX_ARCHIVE_BYTES").ok(),
+                2 * 1024 * 1024 * 1024, // 2 GiB
+            )?,
+            archive_ttl_secs: parse_u64_env(
+                "FLUIDBOX_ARCHIVE_TTL_SECS",
+                get("FLUIDBOX_ARCHIVE_TTL_SECS").ok(),
+                24 * 3600,
+            )?,
         })
+    }
+}
+
+/// Safety-relevant numeric knobs FAIL BOOT on a malformed value: a typo in an
+/// intended lower archive cap must not silently widen it to the default.
+fn parse_u64_env(name: &str, raw: Option<String>, default: u64) -> anyhow::Result<u64> {
+    match raw.filter(|v| !v.is_empty()) {
+        None => Ok(default),
+        Some(v) => v
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{name}='{v}' is not a valid u64: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safety_caps_fail_boot_on_malformed_values() {
+        assert_eq!(parse_u64_env("X", None, 7).unwrap(), 7);
+        assert_eq!(parse_u64_env("X", Some(String::new()), 7).unwrap(), 7);
+        assert_eq!(parse_u64_env("X", Some("42".into()), 7).unwrap(), 42);
+        // A typo'd cap must be a boot error, never a silent fallback to the
+        // (possibly much wider) default.
+        assert!(parse_u64_env("X", Some("2GiB".into()), 7).is_err());
     }
 }

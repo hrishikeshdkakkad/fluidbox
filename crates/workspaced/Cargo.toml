@@ -15,3 +15,6 @@ fluidbox-workspace = { workspace = true }
 # ureq: a small blocking HTTP client (rustls) for the init archive pull — no
 # async runtime pulled into a one-shot init container.
 ureq = { version = "2", default-features = false, features = ["tls"] }
+# Hash-while-downloading: the archive streams to disk, never into RAM.
+sha2 = { workspace = true }
+hex = { workspace = true }

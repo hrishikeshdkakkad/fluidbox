@@ -176,6 +176,8 @@ mod tests {
             netpol_probe_image: "busybox:1.36".into(),
             internal_service: None,
             internal_service_namespace: None,
+            max_archive_bytes: 2 * 1024 * 1024 * 1024,
+            archive_ttl_secs: 24 * 3600,
         }
     }
 

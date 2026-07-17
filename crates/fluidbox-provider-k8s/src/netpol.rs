@@ -9,6 +9,7 @@
 //!   in the sandbox namespace proves the CNI enforces the policy (+:8788 /
 //!   -:8787) before any run is admitted. FAILS CLOSED.
 
+use crate::config::K8sConfig;
 use k8s_openapi::api::core::v1::{Pod, Service};
 use kube::api::{Api, DeleteParams, PostParams};
 use kube::Client;
@@ -40,12 +41,47 @@ pub async fn resolve_service_clusterip(
         .filter(|ip| !ip.is_empty() && ip != "None"))
 }
 
+/// Pure probe-Pod assembly (no cluster I/O — unit-tested like `manifest`).
+/// The probe carries the SANDBOX placement + pull secrets (gate parity):
+/// NetworkPolicy enforcement is per-node CNI agent, so a probe scheduled on a
+/// different pool than sandboxes certifies the wrong nodes (M3); a private
+/// probe image needs the same pull secrets in the sandbox namespace (M10).
+/// The managed label makes the sandbox egress policy apply to the probe.
+pub fn build_probe_pod(
+    cfg: &K8sConfig,
+    name: &str,
+    probe_image: &str,
+    script: &str,
+) -> serde_json::Value {
+    let mut pod_spec = serde_json::json!({
+        "restartPolicy": "Never",
+        "automountServiceAccountToken": false,
+        "activeDeadlineSeconds": 60,
+        "securityContext": { "runAsNonRoot": true, "runAsUser": cfg.run_as_user,
+            "seccompProfile": { "type": "RuntimeDefault" } },
+        "containers": [{
+            "name": "probe",
+            "image": probe_image,
+            "command": ["/bin/sh", "-c", script],
+            "securityContext": { "allowPrivilegeEscalation": false,
+                "capabilities": { "drop": ["ALL"] } },
+        }],
+    });
+    crate::manifest::apply_cluster_policy(&mut pod_spec, cfg);
+    serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": name, "labels": { crate::manifest::LABEL_MANAGED: "true" } },
+        "spec": pod_spec,
+    })
+}
+
 /// Launch a probe Pod in the sandbox namespace (sandbox label so the egress
 /// policy applies) that MUST reach the internal Service :8788 and MUST NOT
 /// reach the public Service :8787, then map its terminal phase to a verdict.
 /// Cleans up the probe Pod on every path.
 pub async fn verify_netpol(
-    sandbox_namespace: &str,
+    cfg: &K8sConfig,
     probe_image: &str,
     internal_ip: &str,
     public_ip: &str,
@@ -54,7 +90,7 @@ pub async fn verify_netpol(
         Ok(c) => c,
         Err(_) => return NetpolResult::ProbeError,
     };
-    let pods: Api<Pod> = Api::namespaced(client, sandbox_namespace);
+    let pods: Api<Pod> = Api::namespaced(client, &cfg.namespace);
     let name = "fluidbox-netpol-probe";
     // Idempotent: clear a stale probe from a prior boot.
     let _ = pods.delete(name, &DeleteParams::default()).await;
@@ -67,28 +103,11 @@ pub async fn verify_netpol(
         int = internal_ip,
         pub = public_ip,
     );
-    let manifest: Pod = match serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": { "name": name, "labels": { "fluidbox.dev/managed": "true" } },
-        "spec": {
-            "restartPolicy": "Never",
-            "automountServiceAccountToken": false,
-            "activeDeadlineSeconds": 60,
-            "securityContext": { "runAsNonRoot": true, "runAsUser": 10001,
-                "seccompProfile": { "type": "RuntimeDefault" } },
-            "containers": [{
-                "name": "probe",
-                "image": probe_image,
-                "command": ["/bin/sh", "-c", script],
-                "securityContext": { "allowPrivilegeEscalation": false,
-                    "capabilities": { "drop": ["ALL"] } },
-            }],
-        },
-    })) {
-        Ok(p) => p,
-        Err(_) => return NetpolResult::ProbeError,
-    };
+    let manifest: Pod =
+        match serde_json::from_value(build_probe_pod(cfg, name, probe_image, &script)) {
+            Ok(p) => p,
+            Err(_) => return NetpolResult::ProbeError,
+        };
 
     if pods
         .create(&PostParams::default(), &manifest)
@@ -142,4 +161,70 @@ pub async fn verify_netpol(
 
     let _ = pods.delete(name, &DeleteParams::default()).await;
     verdict
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{K8sConfig, Toleration};
+
+    fn cfg() -> K8sConfig {
+        K8sConfig::from_env()
+    }
+
+    #[test]
+    fn probe_pod_carries_sandbox_placement_and_pull_secrets() {
+        // Gate parity (M3/M10): the probe must schedule exactly where sandbox
+        // pods schedule, or the verdict certifies the wrong node pool.
+        let mut c = cfg();
+        c.run_as_user = 12345;
+        c.runtime_class_name = Some("gvisor".into());
+        c.priority_class_name = Some("sandbox-low".into());
+        c.node_selector = vec![("pool".into(), "sandbox".into())];
+        c.tolerations = vec![Toleration {
+            key: Some("dedicated".into()),
+            operator: Some("Equal".into()),
+            value: Some("fluidbox".into()),
+            effect: Some("NoSchedule".into()),
+            toleration_seconds: None,
+        }];
+        c.image_pull_secrets = vec!["regcred".into()];
+
+        let pod = build_probe_pod(&c, "probe-x", "busybox:1.36", "echo hi");
+        let spec = &pod["spec"];
+        assert_eq!(spec["runtimeClassName"], "gvisor");
+        assert_eq!(spec["priorityClassName"], "sandbox-low");
+        assert_eq!(spec["nodeSelector"]["pool"], "sandbox");
+        assert_eq!(spec["tolerations"][0]["key"], "dedicated");
+        assert_eq!(spec["tolerations"][0]["effect"], "NoSchedule");
+        assert_eq!(spec["imagePullSecrets"][0]["name"], "regcred");
+        // The sandbox uid baseline, not a hardcoded one.
+        assert_eq!(spec["securityContext"]["runAsUser"], 12345);
+        assert_eq!(spec["containers"][0]["image"], "busybox:1.36");
+        assert_eq!(pod["metadata"]["name"], "probe-x");
+        // The managed label makes the sandbox egress policy apply to the probe.
+        assert_eq!(
+            pod["metadata"]["labels"][crate::manifest::LABEL_MANAGED],
+            "true"
+        );
+    }
+
+    #[test]
+    fn probe_pod_omits_unset_placement() {
+        let pod = build_probe_pod(&cfg(), "probe-x", "busybox:1.36", "echo hi");
+        let spec = &pod["spec"];
+        for key in [
+            "runtimeClassName",
+            "priorityClassName",
+            "nodeSelector",
+            "tolerations",
+            "imagePullSecrets",
+        ] {
+            assert!(spec.get(key).is_none(), "{key} should be absent");
+        }
+        // Baseline invariants survive.
+        assert_eq!(spec["restartPolicy"], "Never");
+        assert_eq!(spec["automountServiceAccountToken"], false);
+        assert_eq!(spec["securityContext"]["runAsNonRoot"], true);
+    }
 }

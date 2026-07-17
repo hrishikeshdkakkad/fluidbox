@@ -161,17 +161,23 @@ fn collect_inner(
             )));
         }
 
-        let bytes = diff.stdout;
         let truncated = diff.stdout_truncated;
+        // The stored artifact is the lossy-UTF-8 patch text. Integrity metadata
+        // MUST describe those exact stored bytes, NOT the raw git stdout: the
+        // collector's `stream` consumer verifies the received body against this
+        // header, so any raw/stored divergence (git output with invalid UTF-8)
+        // would otherwise make every such diff fail verification. When git
+        // output is valid UTF-8 — the common case — the two are identical.
+        let patch = String::from_utf8_lossy(&diff.stdout).into_owned();
         let sha256 = {
             use sha2::{Digest, Sha256};
             let mut h = Sha256::new();
-            h.update(&bytes);
+            h.update(patch.as_bytes());
             format!("sha256:{}", hex::encode(h.finalize()))
         };
         Ok(CollectedDiff {
-            bytes: bytes.len() as u64,
-            patch: String::from_utf8_lossy(&bytes).into_owned(),
+            bytes: patch.len() as u64,
+            patch,
             truncated,
             sha256,
         })
@@ -452,6 +458,87 @@ mod tests {
                 assert!(reason.contains("worktree"), "reason: {reason}");
             }
             CollectionOutcome::Diff(_) => panic!("must not report a diff with no worktree"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// M2: the integrity header (`bytes`/`sha256`) must describe the EXACT
+    /// stored artifact bytes — the lossy-UTF-8 patch that gets written — not
+    /// the raw git stdout. Otherwise the collector's `stream` consumer, which
+    /// verifies the received body against this header, would reject every diff
+    /// whose git output contained invalid UTF-8. A new tracked text file with
+    /// invalid UTF-8 (no NUL → git treats it as text and emits the raw bytes)
+    /// forces the raw/stored divergence.
+    #[test]
+    fn diff_integrity_describes_stored_bytes_not_raw() {
+        let (tmp, ws) = fixture();
+        std::fs::write(ws.host_dir.join("bad.txt"), [0xff, 0xfe, b'\n']).unwrap();
+        match collect_diff(
+            root_of(&ws),
+            ws.base_commit.as_deref(),
+            &DiffCaps::default(),
+        ) {
+            CollectionOutcome::Diff(d) => {
+                assert!(
+                    d.patch.contains('\u{FFFD}'),
+                    "precondition: lossy replacement must have occurred; patch: {:?}",
+                    d.patch
+                );
+                assert_eq!(
+                    d.bytes,
+                    d.patch.len() as u64,
+                    "bytes must describe the stored patch, not raw git stdout"
+                );
+                use sha2::{Digest, Sha256};
+                let want = format!("sha256:{}", hex::encode(Sha256::digest(d.patch.as_bytes())));
+                assert_eq!(d.sha256, want, "sha256 must be over the stored patch bytes");
+            }
+            CollectionOutcome::Missing { reason } => panic!("unexpected missing: {reason}"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// H4 (archive transport + collection halves): an in-tree symlink present
+    /// in the worktree survives pack→unpack (the control-plane→pod archive
+    /// transport) AND appears in the collected diff (git mode 120000), matching
+    /// Docker. The `cmd_init`→`copy_tree`→/workspace half is covered by
+    /// `workspaced`'s `copy_tree_preserves_intree_symlink_and_drops_escaping`.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_survives_pack_unpack_and_appears_in_diff() {
+        let (tmp, ws) = fixture();
+        // A tracked in-tree relative symlink in the worktree.
+        std::os::unix::fs::symlink("a.txt", ws.host_dir.join("link")).unwrap();
+
+        // Pack the session root (repo/ + baseline-git/) and unpack it into a
+        // fresh "pod" dir — exactly the control-plane→pod workspace transport.
+        let packed = crate::pack_workspace(root_of(&ws)).unwrap();
+        let pod = tmp.join("pod");
+        crate::unpack_archive(&packed.bytes, &pod, 100 * 1024 * 1024).unwrap();
+        assert!(
+            std::fs::symlink_metadata(pod.join("repo/link"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink must survive the archive transport as a real symlink"
+        );
+
+        // Collection against the reconstructed tree sees the new symlink
+        // (git records symlinks as mode 120000) — not a crash, not a loss.
+        match collect_diff(&pod, ws.base_commit.as_deref(), &DiffCaps::default()) {
+            CollectionOutcome::Diff(d) => {
+                assert!(
+                    d.patch.contains("link"),
+                    "diff lost the symlink: {}",
+                    d.patch
+                );
+                assert!(
+                    d.patch.contains("120000"),
+                    "symlink not recorded as a symlink: {}",
+                    d.patch
+                );
+            }
+            CollectionOutcome::Missing { reason } => panic!("unexpected missing: {reason}"),
         }
         std::fs::remove_dir_all(&tmp).ok();
     }
