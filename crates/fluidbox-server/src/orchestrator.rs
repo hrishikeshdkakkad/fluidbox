@@ -304,13 +304,25 @@ async fn collect_and_terminalize(
         || session.base_commit.is_some()
         || session.sandbox_handle.is_some();
 
+    // A PRESENT-but-unreadable handle is schema drift, not "no sandbox":
+    // passing None to the provider would collect the untouched control-plane
+    // workspace copy and could store a false "(no changes)" over real agent
+    // work. Record the failure honestly instead.
+    let (handle, handle_unreadable): (Option<SandboxHandle>, bool) = match &session.sandbox_handle {
+        None => (None, false),
+        Some(j) => match serde_json::from_value(j.clone()) {
+            Ok(h) => (Some(h), false),
+            Err(e) => {
+                tracing::error!("session {id} has an unreadable sandbox_handle: {e}");
+                (None, true)
+            }
+        },
+    };
     if skip_collection {
         record_missing(state, id, "quiesce_timeout").await;
+    } else if handle_unreadable {
+        record_missing(state, id, "sandbox handle unreadable (schema drift?)").await;
     } else {
-        let handle: Option<SandboxHandle> = session
-            .sandbox_handle
-            .clone()
-            .and_then(|j| serde_json::from_value(j).ok());
         let ctx = CollectContext {
             session_id: id,
             base_commit: session.base_commit.clone(),
@@ -589,14 +601,16 @@ async fn pack_and_store_archive(
     base_commit: Option<String>,
 ) -> anyhow::Result<fluidbox_core::traits::WorkspaceArchive> {
     let data_dir = state.cfg.data_dir.clone();
+    let max_bytes = state.cfg.max_archive_bytes;
     let dest = archive_path(&data_dir, session_id);
+    // Streamed to disk (GzEncoder<File>) — the archive never lives in RAM,
+    // and the size cap fails the run HERE, before any sandbox or model spend.
     let packed = tokio::task::spawn_blocking(move || {
         let root = fluidbox_workspace::session_workspace_root(&data_dir, session_id);
-        let packed = fluidbox_workspace::pack_workspace(&root)?;
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&dest, &packed.bytes)?;
+        let packed = fluidbox_workspace::pack_workspace_to_file(&root, &dest, max_bytes)?;
         Ok::<_, anyhow::Error>(packed)
     })
     .await??;
@@ -616,10 +630,79 @@ async fn pack_and_store_archive(
     })
 }
 
-/// Delete a session's stored archive (idempotent). Called at finalize; a TTL
-/// sweep is the backstop.
+/// Delete a session's stored archive (idempotent). Called at finalize; the
+/// periodic TTL sweep (`workers::archive_ttl_sweep`) is the backstop for the
+/// crash window between the terminal transition and this call. NOT called on
+/// heartbeats: init containers may legitimately re-execute and re-fetch.
 pub fn delete_archive(data_dir: &std::path::Path, session_id: Uuid) {
-    let _ = std::fs::remove_file(archive_path(data_dir, session_id));
+    if let Err(e) = std::fs::remove_file(archive_path(data_dir, session_id)) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("archive delete for {session_id} failed: {e}");
+        }
+    }
+}
+
+/// List stored archives (incl. orphaned `.partial`s) whose mtime is older
+/// than `ttl` — sweep CANDIDATES only. Deletion is decided by the caller
+/// against SESSION STATE: age alone must never kill an archive a long-budget
+/// run could still re-fetch on an init re-execution. Failures are LOGGED,
+/// never silent — a persistent PVC error would otherwise retain a leak with
+/// no operational evidence.
+pub fn stale_archive_candidates(
+    data_dir: &std::path::Path,
+    ttl: std::time::Duration,
+) -> Vec<PathBuf> {
+    let dir = data_dir.join("archives");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        // No archives ever stored (e.g. the Docker provider): quiet no-op.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            tracing::warn!("archive TTL sweep cannot read {}: {e}", dir.display());
+            return Vec::new();
+        }
+    };
+    let now = std::time::SystemTime::now();
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("archive TTL sweep cannot stat {}: {e}", path.display());
+                continue;
+            }
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let mtime = match meta.modified() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("archive TTL sweep: no mtime for {}: {e}", path.display());
+                continue;
+            }
+        };
+        // A future-dated mtime (clock skew) reads as fresh — conservative.
+        let stale = now
+            .duration_since(mtime)
+            .map(|age| age >= ttl)
+            .unwrap_or(false);
+        if stale {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// The session a stored archive belongs to, from its `{uuid}.tar.gz`
+/// (or `.partial`) filename. None = not an archive this server named.
+pub fn archive_session_id(path: &std::path::Path) -> Option<Uuid> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name
+        .strip_suffix(".tar.gz.partial")
+        .or_else(|| name.strip_suffix(".tar.gz"))?;
+    Uuid::parse_str(stem).ok()
 }
 
 pub fn env_size_breakdown(env: &[(String, String)]) -> String {
@@ -774,4 +857,51 @@ pub async fn reap(state: &AppState, id: Uuid) {
 fn uuid_token() -> String {
     // 32 hex chars of entropy from a v4 uuid (no extra deps).
     Uuid::new_v4().simple().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ttl_sweep_removes_only_stale_archives() {
+        let tmp = std::env::temp_dir().join(format!("fbx-ttl-{}", uuid::Uuid::now_v7()));
+        let archives = tmp.join("archives");
+        std::fs::create_dir_all(&archives).unwrap();
+        let sid = uuid::Uuid::now_v7();
+        std::fs::write(archives.join(format!("{sid}.tar.gz")), b"x").unwrap();
+        std::fs::write(archives.join("b.tar.gz"), b"y").unwrap();
+
+        // A generous TTL keeps fresh archives.
+        assert!(stale_archive_candidates(&tmp, std::time::Duration::from_secs(3600)).is_empty());
+        assert!(archives.join("b.tar.gz").exists());
+
+        // TTL zero: everything with mtime <= now is a candidate — nothing is
+        // DELETED here; the worker decides against session state.
+        let mut candidates = stale_archive_candidates(&tmp, std::time::Duration::ZERO);
+        candidates.sort();
+        assert_eq!(candidates.len(), 2);
+        assert!(archives.join("b.tar.gz").exists());
+
+        // A missing archives dir (Docker provider) is a quiet no-op.
+        assert!(stale_archive_candidates(&tmp.join("nope"), std::time::Duration::ZERO).is_empty());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn archive_filenames_map_back_to_their_session() {
+        let sid = uuid::Uuid::now_v7();
+        let p = std::path::PathBuf::from(format!("/data/archives/{sid}.tar.gz"));
+        assert_eq!(archive_session_id(&p), Some(sid));
+        let partial = std::path::PathBuf::from(format!("/data/archives/{sid}.tar.gz.partial"));
+        assert_eq!(archive_session_id(&partial), Some(sid));
+        assert_eq!(
+            archive_session_id(std::path::Path::new("/data/archives/junk.tar.gz")),
+            None
+        );
+        assert_eq!(
+            archive_session_id(std::path::Path::new("/data/archives/notatar")),
+            None
+        );
+    }
 }

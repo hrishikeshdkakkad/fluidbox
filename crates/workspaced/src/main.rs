@@ -22,9 +22,7 @@
 //! the init container). Extraction + diff policy live in `fluidbox-workspace`,
 //! auditable in one place and shared with the Docker provider.
 
-use fluidbox_workspace::{
-    collect_diff_at, unpack_archive, verify_archive, CollectionOutcome, DiffCaps,
-};
+use fluidbox_workspace::{collect_diff_at, unpack_archive_reader, CollectionOutcome, DiffCaps};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -91,16 +89,23 @@ fn cmd_init() -> Result<(), String> {
     let collector = collector_dir();
 
     eprintln!("workspaced init: fetching archive ({expected_len} bytes)");
-    let bytes = fetch(&url, &token, expected_len)?;
-    verify_archive(&bytes, expected_len, &expected_sha).map_err(|e| e.to_string())?;
+    // Stream to the collector volume (disk-backed emptyDir), hashing as it
+    // lands — the archive never sits in init-container RAM (M4's pod half:
+    // a near-cap archive used to consume the whole container memory limit).
+    let archive_file = collector.join("archive.tar.gz");
+    std::fs::create_dir_all(&collector).map_err(|e| e.to_string())?;
+    fetch_to_file(&url, &token, expected_len, &expected_sha, &archive_file)?;
 
     // Unpack into a collector-local staging dir (same volume → cheap rename
-    // for the baseline; cross-volume copy for the worktree).
+    // for the baseline; cross-volume copy for the worktree), streaming off
+    // the verified file.
     let stage = collector.join("unpack");
     if stage.exists() {
         std::fs::remove_dir_all(&stage).ok();
     }
-    unpack_archive(&bytes, &stage, MAX_UNPACK_BYTES).map_err(|e| e.to_string())?;
+    let f = std::io::BufReader::new(std::fs::File::open(&archive_file).map_err(|e| e.to_string())?);
+    unpack_archive_reader(f, &stage, MAX_UNPACK_BYTES).map_err(|e| e.to_string())?;
+    std::fs::remove_file(&archive_file).ok();
 
     // repo/ (worktree incl. its .git) → /workspace (the runner's tree).
     let repo = stage.join("repo");
@@ -220,21 +225,61 @@ fn cmd_stream() -> Result<(), String> {
     Ok(())
 }
 
-/// GET the archive with the session token, bounding the body at the declared
-/// length (+slack) so a lying Content-Length can't exhaust memory.
-fn fetch(url: &str, token: &str, expected_len: u64) -> Result<Vec<u8>, String> {
-    let resp = ureq::get(url)
+/// GET the archive with the session token, STREAMING it to `dest` while
+/// hashing — never buffered in RAM. The body is bounded at the declared
+/// length (+slack) so a lying server can't exhaust the volume, and size +
+/// digest are verified against the RunSpec-carried expectations before Ok.
+/// No overall deadline (a large archive on a modest link outlives any fixed
+/// budget; the Pod's activeDeadlineSeconds bounds all of init) — but a
+/// STALLED connection dies on the per-read timeout.
+fn fetch_to_file(
+    url: &str,
+    token: &str,
+    expected_len: u64,
+    expected_sha: &str,
+    dest: &Path,
+) -> Result<(), String> {
+    use sha2::Digest;
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(10))
+        .timeout_read(std::time::Duration::from_secs(60))
+        .build();
+    let resp = agent
+        .get(url)
         .set("authorization", &format!("Bearer {token}"))
-        .timeout(std::time::Duration::from_secs(120))
         .call()
         .map_err(|e| format!("archive GET failed: {e}"))?;
-    let cap = expected_len.saturating_add(1024) as usize;
-    let mut buf = Vec::with_capacity(expected_len as usize);
-    resp.into_reader()
-        .take(cap as u64)
-        .read_to_end(&mut buf)
-        .map_err(|e| format!("archive read failed: {e}"))?;
-    Ok(buf)
+    let mut reader = resp.into_reader().take(expected_len.saturating_add(1024));
+    let file =
+        std::fs::File::create(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
+    let mut out = std::io::BufWriter::new(file);
+    let mut hasher = sha2::Sha256::new();
+    let mut len: u64 = 0;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| format!("archive read failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        out.write_all(&buf[..n])
+            .map_err(|e| format!("archive write failed: {e}"))?;
+        len += n as u64;
+    }
+    out.flush()
+        .map_err(|e| format!("archive flush failed: {e}"))?;
+    if len != expected_len {
+        let _ = std::fs::remove_file(dest);
+        return Err(format!("archive size {len} != expected {expected_len}"));
+    }
+    let got = format!("sha256:{}", hex::encode(hasher.finalize()));
+    if got != expected_sha {
+        let _ = std::fs::remove_file(dest);
+        return Err("archive digest mismatch — refusing to unpack".into());
+    }
+    Ok(())
 }
 
 /// Recursive copy including dotfiles + `.git` internals. In-tree symlinks are
