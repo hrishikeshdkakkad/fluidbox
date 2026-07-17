@@ -45,9 +45,14 @@ impl FromRequestParts<AppState> for Admin {
 
 /// Scoped trigger-token authentication. The token's entire authority is its
 /// subscription: it can invoke that subscription and poll the runs it
-/// created — it can never satisfy `Admin` or `SessionAuth`.
+/// created — it can never satisfy `Admin` or `SessionAuth`. `scope` is the
+/// subscription's owning tenant, resolved alongside the token (the "bootstrap
+/// exception" — token resolution keys on the sha256, then hands back a verified
+/// tenant), so trigger handlers scope every DB call to the real tenant rather
+/// than `state.tenant_id`.
 pub struct TriggerAuth {
     pub subscription_id: Uuid,
+    pub scope: TenantScope,
 }
 
 impl FromRequestParts<AppState> for TriggerAuth {
@@ -58,14 +63,12 @@ impl FromRequestParts<AppState> for TriggerAuth {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let token = bearer(parts).ok_or(ApiError::Unauthorized)?;
-        // Task 2 resolves the tenant alongside the subscription; the trigger
-        // handlers (triggers.rs) are Task 3 and still key off state.tenant_id,
-        // so `TriggerAuth` carries only the subscription for now.
         let auth = fluidbox_db::subscription_for_token(&state.pool, &token)
             .await?
             .ok_or(ApiError::Unauthorized)?;
         Ok(TriggerAuth {
             subscription_id: auth.subscription_id,
+            scope: TenantScope::assume(auth.tenant_id),
         })
     }
 }

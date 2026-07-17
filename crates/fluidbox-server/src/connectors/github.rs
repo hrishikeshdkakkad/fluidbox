@@ -336,7 +336,8 @@ async fn unsealed_credential(
         .sealer
         .as_ref()
         .ok_or("FLUIDBOX_CREDENTIAL_KEY not configured")?;
-    let sealed = fluidbox_db::connection_credential_sealed(&state.pool, conn.id)
+    let scope = fluidbox_db::TenantScope::assume(conn.tenant_id);
+    let sealed = fluidbox_db::connection_credential_sealed(&state.pool, scope, conn.id)
         .await
         .map_err(|e| format!("credential lookup failed: {e}"))?
         .ok_or("connection is not active (revoked or missing)")?;
@@ -355,9 +356,12 @@ pub async fn installation_token(
     state: &AppState,
     conn: &IntegrationConnectionRow,
 ) -> Result<String, String> {
+    // The passed-in connection row is already resolved and trusted; its own
+    // tenant scopes the re-read and the registration lookup.
+    let scope = fluidbox_db::TenantScope::assume(conn.tenant_id);
     // The caller's row may be stale (revoked/suspended out from under a
     // cached token) — re-read status from the database first.
-    let conn = fluidbox_db::get_connection(&state.pool, conn.id)
+    let conn = fluidbox_db::get_connection(&state.pool, scope, conn.id)
         .await
         .map_err(|e| format!("connection lookup failed: {e}"))?
         .ok_or("connection is gone")?;
@@ -369,10 +373,9 @@ pub async fn installation_token(
     }
     let registration = match conn.registration_id {
         Some(rid) => {
-            let reg = fluidbox_db::get_github_app_registration(&state.pool, rid)
+            let reg = fluidbox_db::get_github_app_registration(&state.pool, scope, rid)
                 .await
                 .map_err(|e| format!("registration lookup failed: {e}"))?
-                .filter(|r| r.tenant_id == conn.tenant_id)
                 .ok_or("github app registration is missing — reconnect GitHub")?;
             if reg.status != "active" {
                 return Err(format!(
@@ -398,10 +401,11 @@ pub async fn installation_token(
                 .sealer
                 .as_ref()
                 .ok_or("FLUIDBOX_CREDENTIAL_KEY not configured")?;
-            let sealed = fluidbox_db::github_app_registration_pem_sealed(&state.pool, reg.id)
-                .await
-                .map_err(|e| format!("registration key lookup failed: {e}"))?
-                .ok_or("github app registration key unavailable — recreate the app")?;
+            let sealed =
+                fluidbox_db::github_app_registration_pem_sealed(&state.pool, scope, reg.id)
+                    .await
+                    .map_err(|e| format!("registration key lookup failed: {e}"))?
+                    .ok_or("github app registration key unavailable — recreate the app")?;
             let app_id = reg
                 .app_id
                 .clone()
@@ -729,9 +733,10 @@ pub async fn publish(
 /// checks REQUIRE it, and comments carry attribution in their content.
 async fn app_connection(
     state: &AppState,
+    scope: fluidbox_db::TenantScope,
     connection_id: uuid::Uuid,
 ) -> Result<IntegrationConnectionRow, String> {
-    let conn = fluidbox_db::get_connection(&state.pool, connection_id)
+    let conn = fluidbox_db::get_connection(&state.pool, scope, connection_id)
         .await
         .map_err(|e| format!("connection lookup failed: {e}"))?
         .ok_or("destination connection is missing")?;
@@ -793,7 +798,7 @@ async fn publish_pr_comment(
     let sub_id = ctx.subscription_id.ok_or(
         "comment publishing requires a subscription (stable identity is per subscription)",
     )?;
-    let conn = app_connection(state, connection_id).await?;
+    let conn = app_connection(state, ctx.scope, connection_id).await?;
     let token = installation_token(state, &conn).await?;
     let auth = format!("Bearer {token}");
     let resource_key = format!("{repository}#{pr_number}");
@@ -803,10 +808,15 @@ async fn publish_pr_comment(
 
     // §17 #3: one stable comment per (subscription, PR) — update it in
     // place; recreate only if it was deleted out from under us.
-    if let Some(existing) =
-        fluidbox_db::get_external_result(&state.pool, sub_id, "github_pr_comment", &resource_key)
-            .await
-            .map_err(|e| format!("external result lookup failed: {e}"))?
+    if let Some(existing) = fluidbox_db::get_external_result(
+        &state.pool,
+        ctx.scope,
+        sub_id,
+        "github_pr_comment",
+        &resource_key,
+    )
+    .await
+    .map_err(|e| format!("external result lookup failed: {e}"))?
     {
         let (status, body, _) = api(
             state,
@@ -827,6 +837,7 @@ async fn publish_pr_comment(
                 .unwrap_or_default();
             fluidbox_db::upsert_external_result(
                 &state.pool,
+                ctx.scope,
                 sub_id,
                 "github_pr_comment",
                 &resource_key,
@@ -864,6 +875,7 @@ async fn publish_pr_comment(
     let url = body["html_url"].as_str().unwrap_or("").to_string();
     fluidbox_db::upsert_external_result(
         &state.pool,
+        ctx.scope,
         sub_id,
         "github_pr_comment",
         &resource_key,
@@ -885,7 +897,7 @@ async fn publish_check(
     head_sha: &str,
     ctx: &super::PublishContext,
 ) -> Result<super::PublishOutcome, String> {
-    let conn = app_connection(state, connection_id).await?;
+    let conn = app_connection(state, ctx.scope, connection_id).await?;
     let token = installation_token(state, &conn).await?;
     // Stable name per subscription; one run per head SHA (that's how
     // commit-attached checks version — §17 #3).
@@ -1187,6 +1199,7 @@ o+rncG5hSLaqG1A2w8vlQ3BS7Q==
     #[test]
     fn comment_body_is_attributable_and_flags_failures() {
         let ctx = super::super::PublishContext {
+            scope: fluidbox_db::TenantScope::assume(Uuid::now_v7()),
             session_id: Uuid::now_v7(),
             subscription_id: Some(Uuid::now_v7()),
             subscription_name: "security-review".into(),

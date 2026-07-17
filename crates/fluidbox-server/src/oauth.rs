@@ -417,9 +417,14 @@ async fn resolve_client(
     // any other: sealed, never echoed.
     if let Some(secret) = v["client_secret"].as_str() {
         if let Some(sealer) = &state.sealer {
-            fluidbox_db::set_connection_client_secret(&state.pool, conn_id, &sealer.seal(secret))
-                .await
-                .map_err(|e| format!("failed to store client secret: {e}"))?;
+            fluidbox_db::set_connection_client_secret(
+                &state.pool,
+                fluidbox_db::TenantScope::assume(state.tenant_id),
+                conn_id,
+                &sealer.seal(secret),
+            )
+            .await
+            .map_err(|e| format!("failed to store client secret: {e}"))?;
         }
     }
     Ok((client_id, "dcr".to_string()))
@@ -440,9 +445,9 @@ fn sealer(state: &AppState) -> ApiResult<&Sealer> {
 /// connection), then mint the PKCE pair and return the authorize URL.
 pub async fn start_dance(state: &AppState, conn_id: Uuid) -> ApiResult<String> {
     let sealer_ref = sealer(state)?;
-    let conn = fluidbox_db::get_connection(&state.pool, conn_id)
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let conn = fluidbox_db::get_connection(&state.pool, scope, conn_id)
         .await?
-        .filter(|c| c.tenant_id == state.tenant_id)
         .ok_or(ApiError::NotFound)?;
     if conn.auth_kind != "oauth" {
         return Err(ApiError::BadRequest(
@@ -499,7 +504,7 @@ pub async fn start_dance(state: &AppState, conn_id: Uuid) -> ApiResult<String> {
     // re-registers a DCR client if the public URL later moves.
     o.insert("redirect_uri".into(), json!(redirect_uri(state)));
     o.insert("scopes".into(), json!(scopes));
-    fluidbox_db::update_connection_oauth(&state.pool, conn.id, &oauth).await?;
+    fluidbox_db::update_connection_oauth(&state.pool, scope, conn.id, &oauth).await?;
 
     let verifier = random_urlsafe();
     let state_param = seal_state(sealer_ref, conn.id, &verifier);
@@ -617,10 +622,12 @@ async fn complete_dance(
     code: &str,
 ) -> Result<String, String> {
     let sealer_ref = state.sealer.as_ref().ok_or("credential key missing")?;
-    let conn = fluidbox_db::get_connection(&state.pool, conn_id)
+    // The sealed `state` param is the auth; the callback runs at the handler
+    // boundary, so bridge the boot tenant (Task 4 plumbs the state's tenant).
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let conn = fluidbox_db::get_connection(&state.pool, scope, conn_id)
         .await
         .map_err(|e| format!("connection lookup failed: {e}"))?
-        .filter(|c| c.tenant_id == state.tenant_id)
         .ok_or("connection not found")?;
     if conn.status == "revoked" {
         return Err("connection was revoked — create a new one".into());
@@ -653,7 +660,7 @@ async fn complete_dance(
         .timeout(HTTP_TIMEOUT)
         .header("content-type", "application/x-www-form-urlencoded")
         .body(form_body(&form));
-    if let Some(sealed) = fluidbox_db::connection_client_secret_sealed(&state.pool, conn.id)
+    if let Some(sealed) = fluidbox_db::connection_client_secret_sealed(&state.pool, scope, conn.id)
         .await
         .map_err(|e| format!("client secret lookup failed: {e}"))?
     {
@@ -703,6 +710,7 @@ async fn complete_dance(
     }
     fluidbox_db::activate_connection_oauth(
         &state.pool,
+        scope,
         conn.id,
         &sealer_ref.seal(refresh),
         &clean,
@@ -814,7 +822,10 @@ async fn refresh_access_token(
         .sealer
         .as_ref()
         .ok_or("FLUIDBOX_CREDENTIAL_KEY not configured")?;
-    let sealed = fluidbox_db::connection_credential_sealed(&state.pool, conn.id)
+    // The connection row is already resolved and trusted (the broker fetched it
+    // under the run's scope); derive the scope from its own tenant.
+    let scope = fluidbox_db::TenantScope::assume(conn.tenant_id);
+    let sealed = fluidbox_db::connection_credential_sealed(&state.pool, scope, conn.id)
         .await
         .map_err(|e| format!("credential lookup failed: {e}"))?
         .ok_or("connection is not active — reconnect it in Connections")?;
@@ -846,9 +857,10 @@ async fn refresh_access_token(
         .timeout(HTTP_TIMEOUT)
         .header("content-type", "application/x-www-form-urlencoded")
         .body(form_body(&form));
-    if let Some(sealed_secret) = fluidbox_db::connection_client_secret_sealed(&state.pool, conn.id)
-        .await
-        .map_err(|e| format!("client secret lookup failed: {e}"))?
+    if let Some(sealed_secret) =
+        fluidbox_db::connection_client_secret_sealed(&state.pool, scope, conn.id)
+            .await
+            .map_err(|e| format!("client secret lookup failed: {e}"))?
     {
         let secret = sealer_ref
             .open(&sealed_secret)
@@ -866,6 +878,7 @@ async fn refresh_access_token(
         if err == "invalid_grant" || err == "invalid_client" {
             fluidbox_db::mark_connection_error(
                 &state.pool,
+                scope,
                 conn.id,
                 &format!("{err} during token refresh — re-authorize this connection"),
             )
@@ -887,6 +900,7 @@ async fn refresh_access_token(
         if new_refresh != refresh
             && !fluidbox_db::rotate_connection_refresh(
                 &state.pool,
+                scope,
                 conn.id,
                 &sealer_ref.seal(new_refresh),
             )

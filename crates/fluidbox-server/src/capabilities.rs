@@ -65,11 +65,14 @@ pub async fn register_bundle(
     }
     // Structural validation first (aliases, sandbox declarations, lint)…
     def.validate().map_err(ApiError::BadRequest)?;
+    // The photograph runs at the admin/catalog handler boundary — bridge the
+    // boot tenant for its brokered credential resolution.
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
     // …then the photograph: connect to each brokered server with its sealed
     // credential and freeze what tools/list returns.
     for server in &mut def.servers {
         if server.is_brokered() {
-            let tools = broker::photograph_brokered(state, server).await?;
+            let tools = broker::photograph_brokered(state, scope, server).await?;
             let CapabilityServer::Brokered { tools: slot, .. } = server else {
                 unreachable!()
             };
@@ -86,7 +89,7 @@ pub async fn register_bundle(
     let digest = definition_digest(&def);
     Ok(fluidbox_db::create_capability_bundle(
         &state.pool,
-        state.tenant_id,
+        scope,
         name,
         description,
         &serde_json::to_value(&def)?,
@@ -108,7 +111,8 @@ pub async fn create(
 }
 
 pub async fn list(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    let rows = fluidbox_db::list_capability_bundles(&state.pool, state.tenant_id).await?;
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let rows = fluidbox_db::list_capability_bundles(&state.pool, scope).await?;
     let bundles: Vec<Value> = rows.iter().map(summary_json).collect();
     Ok(Json(json!({ "bundles": bundles })))
 }
@@ -118,9 +122,9 @@ pub async fn get(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let row = fluidbox_db::get_capability_bundle(&state.pool, id)
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let row = fluidbox_db::get_capability_bundle(&state.pool, scope, id)
         .await?
-        .filter(|b| b.tenant_id == state.tenant_id)
         .ok_or(ApiError::NotFound)?;
     Ok(Json(bundle_json(&row)))
 }

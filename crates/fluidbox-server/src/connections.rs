@@ -157,7 +157,7 @@ async fn create_mcp_http(state: &AppState, req: CreateConnection) -> ApiResult<J
                 .map(|s| sealer.seal(s));
             let row = fluidbox_db::create_connection(
                 &state.pool,
-                state.tenant_id,
+                fluidbox_db::TenantScope::assume(state.tenant_id),
                 &req.provider,
                 &host,
                 req.display_name.as_deref().unwrap_or(&host),
@@ -241,7 +241,7 @@ pub(crate) async fn create_mcp_http_connection(
     let sealed = sealer.seal(token);
     Ok(fluidbox_db::create_connection(
         &state.pool,
-        state.tenant_id,
+        fluidbox_db::TenantScope::assume(state.tenant_id),
         "mcp_http",
         &host,
         req.display_name.as_deref().unwrap_or(&host),
@@ -270,7 +270,7 @@ async fn create_github_pat(state: &AppState, req: CreateConnection) -> ApiResult
     let sealed = sealer.seal(token);
     let row = fluidbox_db::create_connection(
         &state.pool,
-        state.tenant_id,
+        fluidbox_db::TenantScope::assume(state.tenant_id),
         &req.provider,
         &account_id,
         req.display_name.as_deref().unwrap_or(&login),
@@ -320,7 +320,7 @@ async fn create_github_app(state: &AppState, req: CreateConnection) -> ApiResult
     let sealed_webhook = sealer.seal(&webhook_secret);
     let row = match fluidbox_db::create_connection(
         &state.pool,
-        state.tenant_id,
+        fluidbox_db::TenantScope::assume(state.tenant_id),
         &req.provider,
         &installation_id,
         req.display_name
@@ -353,7 +353,8 @@ async fn create_github_app(state: &AppState, req: CreateConnection) -> ApiResult
 }
 
 pub async fn list(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    let connections = fluidbox_db::list_connections(&state.pool, state.tenant_id).await?;
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let connections = fluidbox_db::list_connections(&state.pool, scope).await?;
     Ok(Json(json!({ "connections": connections })))
 }
 
@@ -362,7 +363,8 @@ pub async fn revoke(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let row = fluidbox_db::revoke_connection(&state.pool, id)
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let row = fluidbox_db::revoke_connection(&state.pool, scope, id)
         .await?
         .ok_or_else(|| ApiError::Conflict("connection not found or already revoked".into()))?;
     // A cached installation/access token must not outlive the revocation.
@@ -380,9 +382,9 @@ pub async fn approve(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let conn = fluidbox_db::get_connection(&state.pool, id)
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let conn = fluidbox_db::get_connection(&state.pool, scope, id)
         .await?
-        .filter(|c| c.tenant_id == state.tenant_id)
         .ok_or(ApiError::NotFound)?;
     if conn.provider != "github_app" || conn.registration_id.is_none() {
         return Err(ApiError::BadRequest(
@@ -394,10 +396,11 @@ pub async fn approve(
     }
     let reg = fluidbox_db::get_github_app_registration(
         &state.pool,
+        scope,
         conn.registration_id.expect("checked above"),
     )
     .await?
-    .filter(|r| r.tenant_id == state.tenant_id && r.status == "active")
+    .filter(|r| r.status == "active")
     .ok_or_else(|| {
         ApiError::Conflict("the github app registration is not active — reconnect GitHub".into())
     })?;
@@ -406,7 +409,7 @@ pub async fn approve(
     // covers live rows) — surface a decision, not a 500.
     if let Some(other) = fluidbox_db::get_github_app_connection_by_installation(
         &state.pool,
-        state.tenant_id,
+        scope,
         &conn.external_account_id,
     )
     .await?
@@ -430,6 +433,7 @@ pub async fn approve(
     let to = if suspended { "suspended" } else { "active" };
     let row = match fluidbox_db::set_connection_status(
         &state.pool,
+        scope,
         conn.id,
         to,
         &["pending", "revoked", "suspended", "error"],
@@ -449,6 +453,7 @@ pub async fn approve(
     // After the transition — the refresh skips revoked rows by design.
     fluidbox_db::refresh_connection_metadata(
         &state.pool,
+        scope,
         row.id,
         &crate::github_app::installation_display(&reg, login),
         &crate::github_app::installation_metadata(&reg, &conn.external_account_id, login),
@@ -460,10 +465,11 @@ pub async fn approve(
     // cascade either already caught our row (later writer) or we revert it
     // here (we were the later writer). Either interleaving converges on
     // revoked.
-    let reg_now = fluidbox_db::get_github_app_registration(&state.pool, reg.id).await?;
+    let reg_now = fluidbox_db::get_github_app_registration(&state.pool, scope, reg.id).await?;
     if reg_now.map(|r| r.status != "active").unwrap_or(true) {
         fluidbox_db::set_connection_status(
             &state.pool,
+            scope,
             conn.id,
             "revoked",
             &["active", "suspended"],
@@ -475,7 +481,7 @@ pub async fn approve(
             "the github app registration was revoked during approval".into(),
         ));
     }
-    let row = fluidbox_db::get_connection(&state.pool, row.id)
+    let row = fluidbox_db::get_connection(&state.pool, scope, row.id)
         .await?
         .ok_or_else(|| ApiError::Conflict("connection changed state underneath".into()))?;
     Ok(Json(json!({ "connection": row })))
@@ -503,9 +509,9 @@ pub async fn repos(
     Path(id): Path<Uuid>,
     Query(q): Query<ReposQuery>,
 ) -> ApiResult<Json<Value>> {
-    let conn = fluidbox_db::get_connection(&state.pool, id)
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let conn = fluidbox_db::get_connection(&state.pool, scope, id)
         .await?
-        .filter(|c| c.tenant_id == state.tenant_id)
         .ok_or(ApiError::NotFound)?;
     if conn.status != "active" {
         return Err(ApiError::Conflict(format!(

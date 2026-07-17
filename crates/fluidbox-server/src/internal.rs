@@ -662,7 +662,8 @@ pub async fn tool_call(
     // Resolution failure is an execution failure, not a policy denial —
     // visibly ledgered either way.
     let started = std::time::Instant::now();
-    let outcome = crate::broker::call_tool_auth(&state, srv, tool_name, &req.input).await;
+    let outcome =
+        crate::broker::call_tool_auth(&state, auth.scope, srv, tool_name, &req.input).await;
     let latency_ms = started.elapsed().as_millis() as u64;
     match outcome {
         Ok((content, is_error)) => {

@@ -15,7 +15,11 @@
 //! belongs to, never a bypass of the scoped surface.
 
 use crate::approval_cols;
-use crate::{ApprovalRow, SessionRow};
+use crate::{
+    ApprovalRow, IntegrationConnectionRow, ResultDeliveryRow, ScheduleRow, SessionRow,
+    TriggerSubscriptionRow,
+};
+use crate::{CONNECTION_COLS, SUBSCRIPTION_COLS};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -30,6 +34,45 @@ pub async fn get_session(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<Session
         .bind(id)
         .fetch_optional(pool)
         .await
+}
+
+/// Load a connection by id with NO tenant predicate — the cross-tenant loader
+/// for the UNAUTHENTICATED webhook ingress path (`POST /v1/ingress/...`), which
+/// receives a bare connection id in the URL and no principal: the webhook
+/// signature (verified against the connection's sealed secret) IS the auth, and
+/// the connection's own `tenant_id` becomes the operative scope for the rest of
+/// the delivery spine. Request handlers must use the scoped
+/// [`get_connection`](crate::get_connection). Selects the same explicit column
+/// list (never the sealed credential).
+pub async fn get_connection(
+    pool: &PgPool,
+    id: Uuid,
+) -> sqlx::Result<Option<IntegrationConnectionRow>> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "select {CONNECTION_COLS} from integration_connections where id = $1"
+    )))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Load a trigger subscription by id with NO tenant predicate — the
+/// cross-tenant loader for the scheduler, which holds only a bare
+/// subscription id sourced from the global `due_schedules` scan. The returned
+/// row carries `tenant_id`, from which the scheduler builds the `TenantScope`
+/// for every subsequent scoped call (claim_invocation, mark_invocation_skipped,
+/// create_run, advance_schedule). Request handlers must use the scoped
+/// [`get_trigger_subscription`](crate::get_trigger_subscription).
+pub async fn get_trigger_subscription(
+    pool: &PgPool,
+    id: Uuid,
+) -> sqlx::Result<Option<TriggerSubscriptionRow>> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "select {SUBSCRIPTION_COLS} from trigger_subscriptions where id = $1"
+    )))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
 }
 
 pub async fn sessions_in_status(pool: &PgPool, statuses: &[&str]) -> sqlx::Result<Vec<SessionRow>> {
@@ -99,6 +142,45 @@ pub async fn expire_stale_approvals(pool: &PgPool) -> sqlx::Result<Vec<ApprovalR
          returning ",
         approval_cols!()
     ))
+    .fetch_all(pool)
+    .await
+}
+
+/// Due work for the (single, sequential) scheduler worker — a cross-tenant
+/// global scan, like the other system-worker queries. No row locking: there
+/// is one scheduler task per server and firings are awaited one at a time. A
+/// disabled subscription's schedule is not due and does NOT advance:
+/// re-enabling turns the gap into a missed-run case, exactly like an outage.
+/// Each row carries its subscription; the caller resolves the owning tenant
+/// (via `get_trigger_subscription`) before firing through `create_run`.
+pub async fn due_schedules(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<ScheduleRow>> {
+    sqlx::query_as(
+        "select sc.* from schedules sc
+         join trigger_subscriptions sub on sub.id = sc.subscription_id
+         where sc.next_fire_at is not null and sc.next_fire_at <= now() and sub.enabled
+         order by sc.next_fire_at limit $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Due work for the (single, sequential) delivery worker — a cross-tenant
+/// global scan. No row locking: there is one worker task per server and
+/// attempts are awaited one at a time, so a row can never be attempted twice
+/// concurrently. Delivery is at-least-once by design — receivers dedup on the
+/// delivery id. Each row carries its session; the caller derives the owning
+/// tenant from it before touching any scoped repository.
+pub async fn due_result_deliveries(
+    pool: &PgPool,
+    limit: i64,
+) -> sqlx::Result<Vec<ResultDeliveryRow>> {
+    sqlx::query_as(
+        "select * from result_deliveries
+         where status = 'pending' and next_attempt_at <= now()
+         order by next_attempt_at limit $1",
+    )
+    .bind(limit)
     .fetch_all(pool)
     .await
 }

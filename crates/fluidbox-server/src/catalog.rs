@@ -50,9 +50,10 @@ fn is_connectable(transport: &str) -> bool {
 /// server-side so the dashboard stays logic-free; overridden bundle names
 /// deliberately don't count as "this entry's bundle".
 pub async fn list(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
     let rows = fluidbox_db::list_catalog(&state.pool).await?;
-    let conns = fluidbox_db::list_connections(&state.pool, state.tenant_id).await?;
-    let bundles = fluidbox_db::list_capability_bundles(&state.pool, state.tenant_id).await?;
+    let conns = fluidbox_db::list_connections(&state.pool, scope).await?;
+    let bundles = fluidbox_db::list_capability_bundles(&state.pool, scope).await?;
     let connectors: Vec<Value> = rows
         .iter()
         .map(|r| {
@@ -388,9 +389,13 @@ async fn connect_entry(
                 Err(e) => {
                     // The photograph is the credential's proof-of-life; a
                     // refused key must not leave a dangling connection.
-                    fluidbox_db::revoke_connection(&state.pool, connection_id)
-                        .await
-                        .ok();
+                    fluidbox_db::revoke_connection(
+                        &state.pool,
+                        fluidbox_db::TenantScope::assume(state.tenant_id),
+                        connection_id,
+                    )
+                    .await
+                    .ok();
                     Err(match e {
                         ApiError::BadRequest(m) => ApiError::BadRequest(format!(
                             "the server rejected this credential (connection rolled back): {m}"
@@ -454,7 +459,7 @@ async fn connect_entry(
                 .unwrap_or_else(|| "mcp".into());
             let row = fluidbox_db::create_connection(
                 &state.pool,
-                state.tenant_id,
+                fluidbox_db::TenantScope::assume(state.tenant_id),
                 "mcp_http",
                 &host,
                 req.display_name.as_deref().unwrap_or(&entry.name),

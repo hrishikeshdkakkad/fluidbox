@@ -15,8 +15,10 @@ use fluidbox_core::capability::{
 use fluidbox_core::policy::Policy;
 use fluidbox_core::schedule::ConcurrencyPolicy;
 use fluidbox_core::spec::{
-    Autonomy, Budgets, InvocationContext, ResultDestination, RunSpec, TrustTier, WorkspaceSpec,
+    Autonomy, Budgets, InvocationContext, InvocationKind, ResultDestination, RunSpec, TrustTier,
+    WorkspaceSpec,
 };
+use fluidbox_db::TenantScope;
 use uuid::Uuid;
 
 pub enum RevisionSelector {
@@ -48,6 +50,10 @@ pub struct CreateRun {
     /// add a bundle the revision lacks.
     pub capability_selection: Option<Vec<String>>,
     pub invocation: InvocationContext,
+    /// The authenticated user who initiated this run, when one exists (admin/UI
+    /// path once identity lands). None for operator-token, trigger, schedule,
+    /// and webhook invocations. Stamped onto `sessions.invoked_by_user_id`.
+    pub invoked_by_user_id: Option<Uuid>,
     pub result_destinations: Vec<ResultDestination>,
     /// Idempotency claim bound atomically with session creation (same DB
     /// transaction) — a crash can never leave a created run unclaimed, so a
@@ -77,7 +83,11 @@ pub enum RunCreation {
     },
 }
 
-pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreation> {
+pub async fn create_run(
+    state: &AppState,
+    scope: TenantScope,
+    req: CreateRun,
+) -> ApiResult<RunCreation> {
     // Netpol run-gate (Kubernetes): refuse to admit a run until the CNI is
     // proven to enforce NetworkPolicy. Fails closed — a non-enforcing cluster
     // never runs an agent with unverified sandbox isolation.
@@ -93,19 +103,18 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
         ));
     }
 
-    // Resolve agent by id or name.
+    // Resolve agent by id or name — SQL-scoped to the caller's tenant.
     let agent = match Uuid::parse_str(&req.agent) {
-        Ok(id) => fluidbox_db::get_agent(&state.pool, id).await?,
-        Err(_) => fluidbox_db::get_agent_by_name(&state.pool, state.tenant_id, &req.agent).await?,
+        Ok(id) => fluidbox_db::get_agent(&state.pool, scope, id).await?,
+        Err(_) => fluidbox_db::get_agent_by_name(&state.pool, scope, &req.agent).await?,
     }
-    .filter(|a| a.tenant_id == state.tenant_id)
     .ok_or_else(|| ApiError::BadRequest(format!("unknown agent '{}'", req.agent)))?;
 
     let rev = match req.revision {
-        RevisionSelector::Latest => fluidbox_db::latest_revision(&state.pool, agent.id)
+        RevisionSelector::Latest => fluidbox_db::latest_revision(&state.pool, scope, agent.id)
             .await?
             .ok_or_else(|| ApiError::BadRequest("agent has no revisions".into()))?,
-        RevisionSelector::Pinned(id) => fluidbox_db::get_revision(&state.pool, id)
+        RevisionSelector::Pinned(id) => fluidbox_db::get_revision(&state.pool, scope, id)
             .await?
             .filter(|r| r.agent_id == agent.id)
             .ok_or_else(|| {
@@ -126,7 +135,7 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
         )));
     }
 
-    let policy_row = fluidbox_db::get_policy(&state.pool, rev.policy_id)
+    let policy_row = fluidbox_db::get_policy(&state.pool, scope, rev.policy_id)
         .await?
         .ok_or_else(|| ApiError::Internal("revision policy missing".into()))?;
     let policy: Policy = serde_json::from_value(policy_row.parsed.clone())
@@ -143,9 +152,8 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
     // §17 #5 concurrency policy and the §3.5 capability keep-list below.
     let subscription = match req.invocation.subscription_id {
         Some(sub_id) => Some(
-            fluidbox_db::get_trigger_subscription(&state.pool, sub_id)
+            fluidbox_db::get_trigger_subscription(&state.pool, scope, sub_id)
                 .await?
-                .filter(|s| s.tenant_id == state.tenant_id)
                 .ok_or_else(|| {
                     ApiError::Internal("invocation references a missing subscription".into())
                 })?,
@@ -164,7 +172,8 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
             ))
         })?;
         if concurrency != ConcurrencyPolicy::Allow {
-            let active = fluidbox_db::active_subscription_sessions(&state.pool, sub.id).await?;
+            let active =
+                fluidbox_db::active_subscription_sessions(&state.pool, scope, sub.id).await?;
             match concurrency {
                 ConcurrencyPolicy::SkipIfRunning => {
                     if let Some(s) = active.first() {
@@ -243,9 +252,8 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
         ..
     } = &workspace
     {
-        let active = fluidbox_db::get_connection(&state.pool, *cid)
+        let active = fluidbox_db::get_connection(&state.pool, scope, *cid)
             .await?
-            .filter(|c| c.tenant_id == state.tenant_id)
             .map(|c| c.status == "active")
             .unwrap_or(false);
         if !active {
@@ -260,6 +268,7 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
     // snapshots. Narrowing removes, never adds.
     let capabilities = frozen_capabilities(
         state,
+        scope,
         &rev,
         subscription.as_ref(),
         req.capability_selection.as_deref(),
@@ -309,9 +318,28 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
         )));
     }
 
+    // Who invoked this run (design "tenant/user audit fields"), derived from the
+    // invocation kind create_run already computes: a directly-authenticated
+    // principal on the admin/UI path is a "user" when their id is known, else an
+    // "operator" (today's shared admin token / no-identity path); a trigger-token
+    // invoke is a "trigger"; a schedule tick is a "schedule"; a connector webhook
+    // is a "webhook". `invoked_by_user_id` is None until identity plumbs it in.
+    let invoked_by_kind = match req.invocation.kind {
+        InvocationKind::Manual => {
+            if req.invoked_by_user_id.is_some() {
+                "user"
+            } else {
+                "operator"
+            }
+        }
+        InvocationKind::Api => "trigger",
+        InvocationKind::Schedule => "schedule",
+        InvocationKind::Event => "webhook",
+    };
+
     let session = fluidbox_db::create_session(
         &state.pool,
-        state.tenant_id,
+        scope,
         agent.id,
         rev.id,
         req.autonomy.as_str(),
@@ -321,6 +349,8 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
         &serde_json::to_value(&run_spec)?,
         &serde_json::to_value(&effective_budgets)?,
         Some(&serde_json::to_value(&req.invocation)?),
+        Some(invoked_by_kind),
+        req.invoked_by_user_id,
         req.bound_invocation,
         req.bound_dispatch,
     )
@@ -375,6 +405,7 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
 /// run BEFORE any model spend.
 async fn frozen_capabilities(
     state: &AppState,
+    scope: TenantScope,
     rev: &fluidbox_db::AgentRevisionRow,
     subscription: Option<&fluidbox_db::TriggerSubscriptionRow>,
     manual_keep: Option<&[String]>,
@@ -390,11 +421,9 @@ async fn frozen_capabilities(
         .map_err(|e| ApiError::Internal(format!("bad stored capability pins: {e}")))?;
     let mut bundles = Vec::with_capacity(refs.len());
     for r in refs {
-        let row = fluidbox_db::get_capability_bundle(&state.pool, r.id)
+        let row = fluidbox_db::get_capability_bundle(&state.pool, scope, r.id)
             .await?
-            .filter(|b| {
-                b.tenant_id == state.tenant_id && b.name == r.name && b.version == r.version
-            })
+            .filter(|b| b.name == r.name && b.version == r.version)
             .ok_or_else(|| {
                 ApiError::Internal(format!(
                     "pinned capability bundle {}@{} is missing",
@@ -439,9 +468,8 @@ async fn frozen_capabilities(
                 ..
             } = server
             {
-                let active = fluidbox_db::get_connection(&state.pool, *cid)
+                let active = fluidbox_db::get_connection(&state.pool, scope, *cid)
                     .await?
-                    .filter(|c| c.tenant_id == state.tenant_id)
                     .map(|c| c.status == "active")
                     .unwrap_or(false);
                 if !active {
