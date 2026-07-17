@@ -103,7 +103,7 @@ fn cmd_init() -> Result<(), String> {
     if stage.exists() {
         std::fs::remove_dir_all(&stage).ok();
     }
-    let f = std::fs::File::open(&archive_file).map_err(|e| e.to_string())?;
+    let f = std::io::BufReader::new(std::fs::File::open(&archive_file).map_err(|e| e.to_string())?);
     unpack_archive_reader(f, &stage, MAX_UNPACK_BYTES).map_err(|e| e.to_string())?;
     std::fs::remove_file(&archive_file).ok();
 
