@@ -157,16 +157,34 @@ async fn decide_tool_call(
                     },
                 )
                 .await;
-                let session_clone = session.clone();
+                let session_id = session.id;
                 let state2 = state.clone();
                 tokio::spawn(async move {
-                    orchestrator::finalize(
-                        &state2,
-                        &session_clone,
-                        "budget_exceeded",
-                        Some("tool-call budget exceeded"),
-                    )
-                    .await;
+                    // Forced stop (runner live → quiesce first). The deny
+                    // verdict below is already out, so this task retries with
+                    // backoff — a budget-less runner that makes no further
+                    // request has no other same-channel driver.
+                    for attempt in 0..5u32 {
+                        match orchestrator::finalize_forced(
+                            &state2,
+                            session_id,
+                            "budget_exceeded",
+                            "tool-call budget exceeded",
+                        )
+                        .await
+                        {
+                            orchestrator::FinalizeStart::DbError => {
+                                tokio::time::sleep(std::time::Duration::from_secs(
+                                    10u64 << attempt.min(3),
+                                ))
+                                .await;
+                            }
+                            _ => return,
+                        }
+                    }
+                    tracing::error!(
+                        "tool-call budget finalize for {session_id} did not persist after retries"
+                    );
                 });
                 return Ok(GateDecision::deny("tool-call budget exceeded"));
             }
@@ -766,11 +784,12 @@ pub async fn workspace_archive(
 ) -> ApiResult<axum::response::Response> {
     use axum::response::IntoResponse;
     use tokio::io::AsyncReadExt;
-    // A terminal/winding-down session's archive is moot (the run is over).
+    // A terminal/winding-down session's archive is moot (the run is over) —
+    // gate on accepts_work(), like every sibling internal endpoint.
     let session = fluidbox_db::get_session(&state.pool, auth.session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if session.status_enum().is_terminal() {
+    if !session.status_enum().accepts_work() {
         return Err(ApiError::BadRequest("session is not active".into()));
     }
     let path = crate::orchestrator::archive_path(&state.cfg.data_dir, auth.session_id);
@@ -861,10 +880,19 @@ pub async fn result(
         return Ok(Json(json!({ "ok": true, "note": "already terminal" })));
     }
     // Already winding down: a cancel (or a prior /result) owns finalization —
-    // ACK idempotently and let it complete. A quiesced runner shouldn't even
-    // reach here, but a racing /result must never override the cancel outcome.
+    // but ONLY if its intent actually persisted. A wind-down state WITHOUT an
+    // intent is the stranded-wedge shape (nothing for recovery to drive);
+    // fall through and (re)persist one instead of falsely ACKing.
     if st.is_winding_down() {
-        return Ok(Json(json!({ "ok": true, "note": "finalizing" })));
+        match fluidbox_db::get_finalization(&state.pool, session_id).await {
+            Ok(Some(_)) => return Ok(Json(json!({ "ok": true, "note": "finalizing" }))),
+            Ok(None) => {}
+            Err(_) => {
+                return Err(ApiError::ServiceUnavailable(
+                    "finalization state unavailable; retry".into(),
+                ))
+            }
+        }
     }
     // Non-terminal: the token must still be live to drive a finalize (revoke
     // only happens on terminal, so this is the ordinary first-post path).
@@ -872,13 +900,40 @@ pub async fn result(
         .await?
         .is_none()
     {
-        return Err(ApiError::Unauthorized);
+        // TOCTOU: a racing driver may have terminalized (revoking the token)
+        // after our status read — a lost-response /result retry must get its
+        // idempotent 200. Unknown state must be RETRYABLE (503): the runner
+        // treats 4xx as final, so a transient read error returned as 401
+        // would convert a completed run into a runner-side failure.
+        match fluidbox_db::get_session(&state.pool, session_id).await {
+            Ok(Some(s)) if s.status_enum().is_terminal() => {
+                return Ok(Json(json!({ "ok": true, "note": "already terminal" })));
+            }
+            Ok(_) => return Err(ApiError::Unauthorized),
+            Err(_) => {
+                return Err(ApiError::ServiceUnavailable(
+                    "session state unavailable; retry".into(),
+                ))
+            }
+        }
     }
-    // Persist the finalization intent and enter `finalizing` BEFORE ACKing
-    // (fixes the lossy ACK-then-`tokio::spawn`): a crash after this point is
-    // recovered by the finalize worker. `finalize` spawns the driver itself.
-    orchestrator::finalize(&state, &session, &res.outcome, res.summary.as_deref()).await;
-    Ok(Json(json!({ "ok": true })))
+    // Persist the finalization intent BEFORE ACKing — and NEVER ACK success
+    // when it did not persist: the runner exits on ok:true, and with no
+    // durable intent the watchdog would later record this completed run as
+    // failed. The runner contract retries /result on 5xx.
+    use orchestrator::FinalizeStart;
+    match orchestrator::finalize_reported(&state, session_id, &res.outcome, res.summary.as_deref())
+        .await
+    {
+        FinalizeStart::Persisted { .. } => Ok(Json(json!({ "ok": true }))),
+        FinalizeStart::AlreadyTerminal => {
+            Ok(Json(json!({ "ok": true, "note": "already terminal" })))
+        }
+        FinalizeStart::Missing => Err(ApiError::NotFound),
+        FinalizeStart::DbError => Err(ApiError::ServiceUnavailable(
+            "finalization intent not persisted; retry".into(),
+        )),
+    }
 }
 
 #[derive(Deserialize)]

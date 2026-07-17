@@ -101,9 +101,22 @@ impl Config {
         } else {
             get("LITELLM_MASTER_KEY").unwrap_or_default()
         };
+        let provider = get("FLUIDBOX_PROVIDER")
+            .unwrap_or_else(|_| "docker".into())
+            .to_lowercase();
+        let is_k8s_provider = matches!(provider.as_str(), "kubernetes" | "k8s");
         Ok(Config {
             bind: get("FLUIDBOX_BIND").unwrap_or_else(|_| "127.0.0.1:8787".into()),
-            internal_bind: get("FLUIDBOX_INTERNAL_BIND").unwrap_or_else(|_| "0.0.0.0:8788".into()),
+            // Only the Kubernetes plane needs a pod-reachable internal bind;
+            // Docker single-host dev must not grow a LAN-exposed listener by
+            // default (the runner reaches :8787 via host.docker.internal).
+            internal_bind: get("FLUIDBOX_INTERNAL_BIND").unwrap_or_else(|_| {
+                if is_k8s_provider {
+                    "0.0.0.0:8788".into()
+                } else {
+                    "127.0.0.1:8788".into()
+                }
+            }),
             database_url: get("DATABASE_URL")
                 .map_err(|_| anyhow::anyhow!("DATABASE_URL is required"))?,
             admin_token: get("FLUIDBOX_ADMIN_TOKEN")
@@ -140,9 +153,7 @@ impl Config {
                 .unwrap_or_else(|_| "http://127.0.0.1:8787".into())
                 .trim_end_matches('/')
                 .to_string(),
-            provider: get("FLUIDBOX_PROVIDER")
-                .unwrap_or_else(|_| "docker".into())
-                .to_lowercase(),
+            provider,
             network_mode: get("FLUIDBOX_NETWORK_MODE")
                 .ok()
                 .and_then(|s| fluidbox_core::traits::NetworkMode::parse(&s.to_lowercase()))

@@ -66,6 +66,15 @@ pub enum RunCreation {
     SkippedOverlap {
         running_session_id: Uuid,
     },
+    /// concurrency_policy = replace, but the old run's cancellation intent
+    /// could not be durably persisted (transient DB failure survived the
+    /// inline retries). Nothing was created and nothing is terminal about
+    /// this: API invokes release their idempotency claim and 503 (caller
+    /// retries); schedules/events record a visible skip (their next firing
+    /// retries naturally).
+    ReplaceUnpersisted {
+        running_session_id: Uuid,
+    },
 }
 
 pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreation> {
@@ -166,12 +175,42 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
                 }
                 ConcurrencyPolicy::Replace => {
                     for s in &active {
-                        orchestrator::cancel(
-                            state,
-                            s.id,
-                            "replaced by a newer invocation of this subscription",
-                        )
-                        .await;
+                        // The replacement must not proceed unless the old
+                        // run's cancellation durably persisted: a healthy old
+                        // run with no wall-clock budget would otherwise
+                        // coexist with its replacement indefinitely. Retry
+                        // the transient case inline; if it still will not
+                        // persist, record a SKIP — the vocabulary schedulers
+                        // and event dispatch already handle — rather than an
+                        // error they would treat as a permanently lost
+                        // firing.
+                        let mut persisted = false;
+                        for _ in 0..3u32 {
+                            match orchestrator::cancel(
+                                state,
+                                s.id,
+                                "replaced by a newer invocation of this subscription",
+                            )
+                            .await
+                            {
+                                orchestrator::FinalizeStart::DbError => {
+                                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                }
+                                _ => {
+                                    persisted = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !persisted {
+                            tracing::warn!(
+                                "replace: cancel intent for {} not persisted after retries",
+                                s.id
+                            );
+                            return Ok(RunCreation::ReplaceUnpersisted {
+                                running_session_id: s.id,
+                            });
+                        }
                     }
                 }
                 ConcurrencyPolicy::Allow => unreachable!(),
