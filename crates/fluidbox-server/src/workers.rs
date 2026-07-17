@@ -59,7 +59,21 @@ async fn recover_finalizations(state: &AppState) {
         Ok(ids) => {
             for id in ids {
                 tracing::info!("resuming interrupted finalization for {id}");
-                orchestrator::drive_finalization(state, id).await;
+                // Bounded so one hung drive cannot starve the rest of the
+                // backlog (this worker is serial). An abandoned drive's
+                // claim goes stale and is retried; 300 s comfortably covers
+                // the worst healthy path (quiesce 30 + exit-wait 30 +
+                // collect 120 + terminate 60) while staying under the 420 s
+                // claim window, so drivers never overlap.
+                if tokio::time::timeout(
+                    Duration::from_secs(300),
+                    orchestrator::drive_finalization(state, id),
+                )
+                .await
+                .is_err()
+                {
+                    tracing::warn!("finalization drive for {id} timed out; will retry");
+                }
             }
         }
         Err(e) => tracing::warn!("finalization recovery query failed: {e}"),
@@ -330,8 +344,10 @@ async fn watchdog(state: AppState) {
                         // Confirm the sandbox is actually gone before failing.
                         if sandbox_dead(&state, &s.sandbox_handle).await {
                             tracing::warn!("watchdog: {} heartbeat stale + sandbox dead", s.id);
-                            orchestrator::fail(&state, s.id, "sandbox died (stale heartbeat)")
-                                .await;
+                            // A DbError start is retried by the next tick.
+                            let _ =
+                                orchestrator::fail(&state, s.id, "sandbox died (stale heartbeat)")
+                                    .await;
                         }
                     }
                 }
@@ -348,7 +364,8 @@ async fn watchdog(state: AppState) {
                         s.status,
                         stale_launch_mins
                     );
-                    orchestrator::fail(
+                    // A DbError start is retried by the next tick.
+                    let _ = orchestrator::fail(
                         &state,
                         s.id,
                         "stalled before launch (control plane interrupted)",
@@ -406,15 +423,72 @@ async fn budget_sweeper(state: AppState) {
                             },
                         )
                         .await;
-                        orchestrator::finalize(
+                        // Forced stop: the runner is live and must be told to
+                        // quiesce before collection. A DbError start is
+                        // retried by the next sweep tick (the session is
+                        // still active until the intent lands).
+                        let _ = orchestrator::finalize_forced(
                             &state,
-                            &s,
+                            s.id,
                             "budget_exceeded",
-                            Some("wall-clock budget exceeded"),
+                            "wall-clock budget exceeded",
                         )
                         .await;
+                        continue;
                     }
                 }
+            }
+
+            // Token / cost / tool-call budgets, from the same DB truth the
+            // facade and permission gate read. Those enforce inline, but
+            // their finalize starts ride detached in-memory retries — this
+            // sweep is the crash-durable driver, and the only one for an
+            // idle runner that makes no further requests. Thresholds mirror
+            // the inline checks exactly (>=).
+            let mut over: Option<&'static str> = None;
+            if run_spec.budgets.max_tokens.is_some() || run_spec.budgets.max_cost_usd.is_some() {
+                if let Ok(totals) = fluidbox_db::usage_totals(&state.pool, s.id).await {
+                    if let Some(max) = run_spec.budgets.max_cost_usd {
+                        if totals.cost_usd >= max {
+                            over = Some("max_cost_usd");
+                        }
+                    }
+                    if over.is_none() {
+                        if let Some(max) = run_spec.budgets.max_tokens {
+                            let used = (totals.input_tokens
+                                + totals.output_tokens
+                                + totals.cache_read_tokens
+                                + totals.cache_write_tokens)
+                                as u64;
+                            if used >= max {
+                                over = Some("max_tokens");
+                            }
+                        }
+                    }
+                }
+            }
+            if over.is_none() {
+                if let Some(max) = run_spec.budgets.max_tool_calls {
+                    if let Ok(n) = fluidbox_db::tool_call_count(&state.pool, s.id).await {
+                        // STRICTLY greater — the gate permits exactly `max`
+                        // calls (it denies at used > max, with the current
+                        // call's intent already counted); firing at >= would
+                        // kill a session whose max-th call is legitimately
+                        // mid-flight.
+                        if n as u64 > max {
+                            over = Some("max_tool_calls");
+                        }
+                    }
+                }
+            }
+            if let Some(which) = over {
+                let _ = orchestrator::finalize_forced(
+                    &state,
+                    s.id,
+                    "budget_exceeded",
+                    &format!("{which} budget exceeded"),
+                )
+                .await;
             }
         }
     }
@@ -464,7 +538,6 @@ pub fn spawn_netpol_gate(state: AppState) {
         // provider itself reads.
         let k8s_cfg = fluidbox_provider_k8s::config::K8sConfig::from_env();
 
-        let mut tick = tokio::time::interval(Duration::from_secs(6 * 3600));
         loop {
             let internal_ip =
                 fluidbox_provider_k8s::netpol::resolve_service_clusterip(&ns, &internal_svc)
@@ -494,13 +567,19 @@ pub fn spawn_netpol_gate(state: AppState) {
                         tracing::warn!("netpol gate: NOT verified ({r:?}) — runs blocked");
                     }
                 }
-                _ => tracing::warn!(
-                    "netpol gate: could not resolve Service ClusterIPs; runs stay gated"
-                ),
+                _ => {
+                    // Fail closed like the probe branch: an unresolvable
+                    // Service is NOT continued proof of enforcement — a
+                    // previously-true gate must not coast on stale evidence.
+                    state.netpol_verified.store(false, Ordering::SeqCst);
+                    tracing::warn!(
+                        "netpol gate: could not resolve Service ClusterIPs; runs stay gated"
+                    );
+                }
             }
             // Once enforced, re-check every 6h; while unverified, retry sooner.
             if state.netpol_verified.load(Ordering::SeqCst) {
-                tick.tick().await;
+                tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
             } else {
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
