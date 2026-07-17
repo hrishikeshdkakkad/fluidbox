@@ -40,7 +40,7 @@ futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 axum = { version = "0.8", features = ["macros"] }
-tower-http = { version = "0.7", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["trace"] }
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls-ring-webpki",
@@ -73,3 +73,9 @@ base64 = "0.22"
 # v10 requires choosing exactly one crypto provider; rust_crypto keeps the
 # whole tree on the pure-Rust stack (rustls/RustCrypto), no C toolchain.
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+# IdP-agnostic OIDC login (Phase B). default-features=false = "bring your own
+# HTTP client": no bundled reqwest/native-tls — every OIDC fetch rides
+# `state.http` under our own SSRF policy, and the JWKS types + signature
+# primitives (CoreJsonWebKey/CoreJwsSigningAlgorithm/AccessTokenHash) come from
+# the base crate (RustCrypto backends, no C toolchain). MIT/Apache-2.0.
+openidconnect = { version = "4", default-features = false }

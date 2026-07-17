@@ -410,6 +410,39 @@ pub async fn update_idp_discovery_cache(
     Ok(res.rows_affected() == 1)
 }
 
+/// The sealed OIDC client secret for the token exchange — a narrow reader that
+/// mirrors `connection_client_secret_sealed`'s shape. `OrgIdpConfigRow`
+/// deliberately omits the sealed column, so the login callback fetches it only
+/// here, only when it needs to authenticate to the token endpoint.
+pub async fn idp_client_secret_sealed(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+) -> sqlx::Result<Option<Vec<u8>>> {
+    let row: Option<(Option<Vec<u8>>,)> = sqlx::query_as(
+        "select client_secret_sealed from org_idp_configs where tenant_id = $1 and id = $2",
+    )
+    .bind(scope.tenant_id())
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|(s,)| s))
+}
+
+/// Count a tenant's still-claimable login flows — the per-org outstanding-flow
+/// cap the start endpoint enforces to bound DB/IdP amplification from the
+/// unauthenticated login surface (design lines 852-854).
+pub async fn count_outstanding_login_flows(pool: &PgPool, scope: TenantScope) -> sqlx::Result<i64> {
+    let (n,): (i64,) = sqlx::query_as(
+        "select count(*) from login_flows
+         where tenant_id = $1 and consumed_at is null and expires_at > now()",
+    )
+    .bind(scope.tenant_id())
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
 // ─── login_flows ────────────────────────────────────────────────────────────
 
 /// Mint a one-time login flow with GC-on-insert (same discipline as
@@ -569,6 +602,35 @@ pub async fn resolve_web_session(
     .bind(idle_secs as f64)
     .fetch_optional(pool)
     .await
+}
+
+/// Is this browser session still authorized RIGHT NOW — not revoked, within
+/// both expiries, membership + tenant still active? Read-only and it does NOT
+/// bump idle (design lines 658-664: the bounded stream re-auth must not extend
+/// a session's life). Keyed on the session id under its verified scope.
+pub async fn web_session_live(
+    pool: &PgPool,
+    scope: TenantScope,
+    session_id: Uuid,
+) -> sqlx::Result<bool> {
+    let (live,): (bool,) = sqlx::query_as(
+        "select exists(
+           select 1 from user_sessions s
+           join org_memberships m
+             on m.tenant_id = s.tenant_id and m.id = s.membership_id and m.user_id = s.user_id
+           join tenants t on t.id = s.tenant_id
+           where s.tenant_id = $1 and s.id = $2
+             and s.revoked_at is null
+             and s.idle_expires_at > now()
+             and s.absolute_expires_at > now()
+             and m.status = 'active'
+             and t.status = 'active')",
+    )
+    .bind(scope.tenant_id())
+    .bind(session_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(live)
 }
 
 /// Revoke a single session (a row update, never a delete — the audit trail and
@@ -808,6 +870,380 @@ pub async fn set_membership_status(
     }
     tx.commit().await?;
     Ok(row)
+}
+
+// ─── Login provisioning (transaction B) ────────────────────────────────────
+
+/// The config + tenant state captured by transaction B's OPENING
+/// `select … for update`. The lock is exclusive from the start — a
+/// share-then-upgrade would deadlock two concurrent bootstrap-matching logins
+/// (design lines 540-544) — and this SAME lock serializes against the
+/// issuer-migration swap. `bootstrap_owner_expires_at` is captured HERE and
+/// nowhere else: the bootstrap decision's `was_unexpired` must read this
+/// pre-update value, never `UPDATE … RETURNING` (whose unqualified columns
+/// observe the post-update NULL — the v5 fix, design lines 692-696).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct LockedIdpConfig {
+    pub config_status: String,
+    pub tenant_status: String,
+    pub bootstrap_owner_email: Option<String>,
+    pub bootstrap_owner_expires_at: Option<DateTime<Utc>>,
+}
+
+/// Transaction B's opening lock: `for update of c` takes an exclusive row lock
+/// on the config alone (the joined `tenants` row is read-only), capturing the
+/// bootstrap arm + both statuses in one shot.
+pub async fn lock_idp_config_for_update(
+    conn: &mut sqlx::PgConnection,
+    scope: TenantScope,
+    id: Uuid,
+) -> sqlx::Result<Option<LockedIdpConfig>> {
+    sqlx::query_as(
+        "select c.status as config_status, t.status as tenant_status,
+                c.bootstrap_owner_email as bootstrap_owner_email,
+                c.bootstrap_owner_expires_at as bootstrap_owner_expires_at
+         from org_idp_configs c
+         join tenants t on t.id = c.tenant_id
+         where c.tenant_id = $1 and c.id = $2
+         for update of c",
+    )
+    .bind(scope.tenant_id())
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await
+}
+
+/// JIT-provision a user on the identity key `(tenant, idp_config, subject)`,
+/// refreshing display attributes + `last_login_at` on every login. Runs inside
+/// transaction B.
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_user(
+    conn: &mut sqlx::PgConnection,
+    scope: TenantScope,
+    idp_config_id: Uuid,
+    subject: &str,
+    email: Option<&str>,
+    email_normalized: Option<&str>,
+    email_verified: bool,
+    name: Option<&str>,
+) -> sqlx::Result<UserRow> {
+    sqlx::query_as(
+        "insert into users
+           (id, tenant_id, idp_config_id, subject, email, email_normalized, email_verified, name, last_login_at)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, now())
+         on conflict (tenant_id, idp_config_id, subject) do update
+         set email = excluded.email,
+             email_normalized = excluded.email_normalized,
+             email_verified = excluded.email_verified,
+             name = excluded.name,
+             last_login_at = now(),
+             updated_at = now()
+         returning *",
+    )
+    .bind(Uuid::now_v7())
+    .bind(scope.tenant_id())
+    .bind(idp_config_id)
+    .bind(subject)
+    .bind(email)
+    .bind(email_normalized)
+    .bind(email_verified)
+    .bind(name)
+    .fetch_one(&mut *conn)
+    .await
+}
+
+/// Upsert the membership with the mapped roles, but NEVER strip `owner` on a
+/// refresh (design line 553): if the existing row already holds `owner`, it is
+/// preserved regardless of the mapped set. Brand-new rows are `active`; an
+/// existing row's `status` is untouched (a deactivated membership stays
+/// deactivated so the caller refuses the login).
+pub async fn upsert_membership_preserving_owner(
+    conn: &mut sqlx::PgConnection,
+    scope: TenantScope,
+    user_id: Uuid,
+    roles: &[String],
+) -> sqlx::Result<OrgMembershipRow> {
+    sqlx::query_as(
+        "insert into org_memberships (id, tenant_id, user_id, roles, status)
+         values ($1, $2, $3, $4, 'active')
+         on conflict (tenant_id, user_id) do update
+         set roles = case
+               when 'owner' = any(org_memberships.roles)
+                 then (select array(select distinct e from unnest(excluded.roles || array['owner']) e))
+               else (select array(select distinct e from unnest(excluded.roles) e))
+             end,
+             updated_at = now()
+         returning *",
+    )
+    .bind(Uuid::now_v7())
+    .bind(scope.tenant_id())
+    .bind(user_id)
+    .bind(roles.to_vec())
+    .fetch_one(&mut *conn)
+    .await
+}
+
+/// Is there an ACTIVE owner in this org right now? The bootstrap decision reads
+/// this under the config `FOR UPDATE` lock, so owner reads are consistent.
+pub async fn active_owner_exists(
+    conn: &mut sqlx::PgConnection,
+    scope: TenantScope,
+) -> sqlx::Result<bool> {
+    let (exists,): (bool,) = sqlx::query_as(
+        "select exists(
+           select 1 from org_memberships
+           where tenant_id = $1 and status = 'active' and 'owner' = any(roles))",
+    )
+    .bind(scope.tenant_id())
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(exists)
+}
+
+/// The single-winner bootstrap-owner claim (design lines 683-690): clears BOTH
+/// arm and expiry where the armed email matches. Returns `Some(config_id)` iff
+/// exactly this login consumed the arm — a matching arm is ALWAYS consumed;
+/// the three-way promote/reject decision happens in the caller from the expiry
+/// captured by [`lock_idp_config_for_update`].
+pub async fn consume_bootstrap_arm(
+    conn: &mut sqlx::PgConnection,
+    scope: TenantScope,
+    config_id: Uuid,
+    normalized_email: &str,
+) -> sqlx::Result<Option<Uuid>> {
+    let row: Option<(Uuid,)> = sqlx::query_as(
+        "update org_idp_configs
+         set bootstrap_owner_email = null, bootstrap_owner_expires_at = null, updated_at = now()
+         where tenant_id = $1 and id = $2 and bootstrap_owner_email = $3
+         returning id",
+    )
+    .bind(scope.tenant_id())
+    .bind(config_id)
+    .bind(normalized_email)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(row.map(|(id,)| id))
+}
+
+/// Promote a membership to `owner` (bootstrap consumption winner). Idempotent
+/// and order-free — appends `owner` to the existing role set, deduped.
+pub async fn add_owner_role(
+    conn: &mut sqlx::PgConnection,
+    scope: TenantScope,
+    membership_id: Uuid,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "update org_memberships
+         set roles = (select array(select distinct e from unnest(roles || array['owner']) e)),
+             updated_at = now()
+         where tenant_id = $1 and id = $2",
+    )
+    .bind(scope.tenant_id())
+    .bind(membership_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Revoke one session inside transaction B (the same-user re-login refresh path
+/// revokes the old session and mints a new one in one commit).
+pub async fn revoke_user_session_conn(
+    conn: &mut sqlx::PgConnection,
+    scope: TenantScope,
+    id: Uuid,
+) -> sqlx::Result<bool> {
+    let res = sqlx::query(
+        "update user_sessions set revoked_at = now()
+         where tenant_id = $1 and id = $2 and revoked_at is null",
+    )
+    .bind(scope.tenant_id())
+    .bind(id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// Insert a one-time session-replacement confirmation (design lines 333-377),
+/// GC-on-insert like the login flows. Runs inside transaction B; the row's
+/// tenant is the NEW login's org, and the replaced session is composite-FK'd in
+/// ITS own tenant.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_pending_switch(
+    conn: &mut sqlx::PgConnection,
+    scope: TenantScope,
+    idp_config_id: Uuid,
+    new_membership_id: Uuid,
+    new_user_id: Uuid,
+    replaced_tenant_id: Uuid,
+    replaced_session_id: Uuid,
+    redirect_to: &str,
+    browser_hash: &str,
+    acr: Option<&str>,
+    amr: Option<&[String]>,
+    auth_time: Option<DateTime<Utc>>,
+) -> sqlx::Result<Uuid> {
+    sqlx::query(
+        "delete from pending_login_switches
+         where (consumed_at is null and expires_at < now())
+            or expires_at < now() - interval '7 days'",
+    )
+    .execute(&mut *conn)
+    .await?;
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "insert into pending_login_switches
+           (id, tenant_id, idp_config_id, new_membership_id, new_user_id,
+            replaced_tenant_id, replaced_session_id, redirect_to, browser_hash,
+            acr, amr, auth_time, expires_at)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                 now() + interval '120 seconds')",
+    )
+    .bind(id)
+    .bind(scope.tenant_id())
+    .bind(idp_config_id)
+    .bind(new_membership_id)
+    .bind(new_user_id)
+    .bind(replaced_tenant_id)
+    .bind(replaced_session_id)
+    .bind(redirect_to)
+    .bind(browser_hash)
+    .bind(acr)
+    .bind(amr.map(<[String]>::to_vec))
+    .bind(auth_time)
+    .execute(&mut *conn)
+    .await?;
+    Ok(id)
+}
+
+/// What [`claim_pending_switch`] yields: both tenant contexts, the new
+/// membership triple, and the freshly minted session token to set as the new
+/// `__Host-fbx_web` cookie. Not `Serialize` — it carries the plaintext token.
+#[derive(Debug, Clone)]
+pub struct SwitchClaim {
+    pub new_tenant_id: Uuid,
+    pub replaced_tenant_id: Uuid,
+    pub redirect_to: String,
+    pub new_session_token: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct SwitchClaimRow {
+    tenant_id: Uuid,
+    replaced_tenant_id: Uuid,
+    replaced_session_id: Uuid,
+    new_membership_id: Uuid,
+    new_user_id: Uuid,
+    idp_config_id: Uuid,
+    redirect_to: String,
+    acr: Option<String>,
+    amr: Option<Vec<String>>,
+    auth_time: Option<DateTime<Utc>>,
+}
+
+/// The dual-tenant one-time switch claim (design lines 355-377) — the second
+/// (and last) credential-like bootstrap exception to single-tenant scoping. It
+/// is deliberately ONE narrowly named method: the claiming UPDATE's predicate
+/// requires the confirmation-cookie hash, unconsumed/unexpired state, AND that
+/// the browser's currently-presented live `__Host-fbx_web` session equals the
+/// row's replaced `(tenant, session)` and is still valid; the same transaction
+/// rechecks config- and membership-active on the NEW org, revokes the replaced
+/// session, and mints the new one — atomically, or nothing. Every failure mode
+/// returns `None` (fail closed keeping the original session); the caller never
+/// trusts a form-carried identity or redirect.
+#[allow(clippy::too_many_arguments)]
+pub async fn claim_pending_switch(
+    pool: &PgPool,
+    switch_id: Uuid,
+    switch_browser_hash: &str,
+    current_session_token: &str,
+    new_token_plain: &str,
+    idle_secs: i64,
+    absolute_secs: i64,
+) -> sqlx::Result<Option<SwitchClaim>> {
+    let mut tx = pool.begin().await?;
+
+    // (1) Atomic claim binding the currently-presented live session.
+    let claimed: Option<SwitchClaimRow> = sqlx::query_as(
+        "update pending_login_switches ps set consumed_at = now()
+         from user_sessions cur
+         where ps.id = $1
+           and ps.browser_hash = $2
+           and ps.consumed_at is null
+           and ps.expires_at > now()
+           and cur.session_token_sha256 = $3
+           and cur.tenant_id = ps.replaced_tenant_id
+           and cur.id = ps.replaced_session_id
+           and cur.revoked_at is null
+           and cur.idle_expires_at > now()
+           and cur.absolute_expires_at > now()
+         returning ps.tenant_id, ps.replaced_tenant_id, ps.replaced_session_id,
+                   ps.new_membership_id, ps.new_user_id, ps.idp_config_id,
+                   ps.redirect_to, ps.acr, ps.amr, ps.auth_time",
+    )
+    .bind(switch_id)
+    .bind(switch_browser_hash)
+    .bind(sha256_hex(current_session_token))
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(row) = claimed else {
+        tx.rollback().await.ok();
+        return Ok(None);
+    };
+
+    // (2) Recheck config-active + membership-active + tenant-active on the NEW org.
+    let recheck = sqlx::query(
+        "select 1 from org_idp_configs c
+         join org_memberships m on m.tenant_id = c.tenant_id
+         join tenants t on t.id = c.tenant_id
+         where c.tenant_id = $1 and c.id = $2 and c.status = 'active'
+           and m.id = $3 and m.user_id = $4 and m.status = 'active'
+           and t.status = 'active'",
+    )
+    .bind(row.tenant_id)
+    .bind(row.idp_config_id)
+    .bind(row.new_membership_id)
+    .bind(row.new_user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if recheck.is_none() {
+        tx.rollback().await.ok();
+        return Ok(None);
+    }
+
+    // (3) Revoke the replaced session (in its OWN tenant).
+    sqlx::query(
+        "update user_sessions set revoked_at = now()
+         where tenant_id = $1 and id = $2 and revoked_at is null",
+    )
+    .bind(row.replaced_tenant_id)
+    .bind(row.replaced_session_id)
+    .execute(&mut *tx)
+    .await?;
+
+    // (4) Mint the new session under the NEW org.
+    mint_user_session(
+        &mut tx,
+        TenantScope::assume(row.tenant_id),
+        row.new_membership_id,
+        row.new_user_id,
+        row.idp_config_id,
+        new_token_plain,
+        row.acr.as_deref(),
+        row.amr.as_deref(),
+        row.auth_time,
+        None,
+        idle_secs,
+        absolute_secs,
+    )
+    .await?;
+
+    tx.commit().await?;
+    Ok(Some(SwitchClaim {
+        new_tenant_id: row.tenant_id,
+        replaced_tenant_id: row.replaced_tenant_id,
+        redirect_to: row.redirect_to,
+        new_session_token: new_token_plain.to_string(),
+    }))
 }
 
 // ─── Tests (run only when DATABASE_URL is set) ──────────────────────────────
@@ -1199,5 +1635,258 @@ mod tests {
             "DELETE must raise auth_audit_log is append-only"
         );
         tx.rollback().await.ok();
+    }
+
+    #[tokio::test]
+    async fn jit_upsert_idempotency_and_owner_preservation() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let slug = format!("t-{}", Uuid::now_v7().simple());
+        let org = create_org(&pool, &slug, None).await.unwrap();
+        let scope = TenantScope::assume(org.id);
+        let cfg = staged_config(&pool, scope).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        // Same subject twice → ONE user, fields refreshed, last_login_at bumped.
+        let u1 = upsert_user(
+            &mut conn,
+            scope,
+            cfg.id,
+            "sub-jit",
+            Some("A@Ex.com"),
+            Some("a@ex.com"),
+            true,
+            Some("Al"),
+        )
+        .await
+        .unwrap();
+        let u2 = upsert_user(
+            &mut conn,
+            scope,
+            cfg.id,
+            "sub-jit",
+            Some("A@Ex.com"),
+            Some("a@ex.com"),
+            true,
+            Some("Alice"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(u1.id, u2.id, "same identity key → one user row");
+        assert_eq!(u2.name.as_deref(), Some("Alice"), "display attrs refreshed");
+        assert!(u2.last_login_at.is_some());
+
+        // Membership upsert: promote to owner, then a refresh with a mapped set
+        // that omits owner MUST NOT strip it.
+        let m1 =
+            upsert_membership_preserving_owner(&mut conn, scope, u1.id, &["member".to_string()])
+                .await
+                .unwrap();
+        add_owner_role(&mut conn, scope, m1.id).await.unwrap();
+        let m2 =
+            upsert_membership_preserving_owner(&mut conn, scope, u1.id, &["admin".to_string()])
+                .await
+                .unwrap();
+        assert_eq!(m1.id, m2.id);
+        assert!(m2.roles.contains(&"owner".to_string()), "owner preserved");
+        assert!(
+            m2.roles.contains(&"admin".to_string()),
+            "mapped role applied"
+        );
+        drop(conn);
+
+        cleanup_tenant(&pool, org.id).await;
+    }
+
+    #[tokio::test]
+    async fn pending_switch_claim_lifecycle() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+
+        // The NEW login's org (config must be ACTIVE — the claim rechecks it).
+        let slug_new = format!("t-{}", Uuid::now_v7().simple());
+        let org_new = create_org(&pool, &slug_new, None).await.unwrap();
+        let scope_new = TenantScope::assume(org_new.id);
+        let cfg_new = staged_config(&pool, scope_new).await;
+        activate(&pool, cfg_new.id).await;
+        let (new_user, new_membership) =
+            seed_user_membership(&pool, scope_new, cfg_new.id, "new-sub").await;
+
+        // A SECOND org holds the CURRENT (to-be-replaced) session (org switch).
+        let slug_old = format!("t-{}", Uuid::now_v7().simple());
+        let org_old = create_org(&pool, &slug_old, None).await.unwrap();
+        let scope_old = TenantScope::assume(org_old.id);
+        let cfg_old = staged_config(&pool, scope_old).await;
+        let (old_user, old_membership) =
+            seed_user_membership(&pool, scope_old, cfg_old.id, "old-sub").await;
+
+        let current_token = "fbx_web_current";
+        let mut conn = pool.acquire().await.unwrap();
+        let current = mint_user_session(
+            &mut conn,
+            scope_old,
+            old_membership,
+            old_user,
+            cfg_old.id,
+            current_token,
+            None,
+            None,
+            None,
+            None,
+            3_600,
+            100_000,
+        )
+        .await
+        .unwrap();
+
+        let cookie = "cookie-nonce";
+        let bh = sha256_hex(cookie);
+        let switch_id = create_pending_switch(
+            &mut conn,
+            scope_new,
+            cfg_new.id,
+            new_membership,
+            new_user,
+            org_old.id,
+            current.id,
+            "/dashboard",
+            &bh,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // An EXPIRED switch (separate row) is refused.
+        let expired = create_pending_switch(
+            &mut conn,
+            scope_new,
+            cfg_new.id,
+            new_membership,
+            new_user,
+            org_old.id,
+            current.id,
+            "/x",
+            &sha256_hex("n2"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        sqlx::query("update pending_login_switches set expires_at = now() - interval '5 seconds' where id = $1")
+            .bind(expired)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            claim_pending_switch(
+                &pool,
+                expired,
+                &sha256_hex("n2"),
+                current_token,
+                "fbx_web_z",
+                3_600,
+                100_000
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "expired switch refused"
+        );
+
+        // Wrong cookie hash → refused (and NOT consumed).
+        assert!(
+            claim_pending_switch(
+                &pool,
+                switch_id,
+                "wronghash",
+                current_token,
+                "fbx_web_a",
+                3_600,
+                100_000
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "wrong cookie refused"
+        );
+        // Wrong current session (a token that is not the replaced session) → refused.
+        assert!(
+            claim_pending_switch(
+                &pool,
+                switch_id,
+                &bh,
+                "fbx_web_not_it",
+                "fbx_web_b",
+                3_600,
+                100_000
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "wrong current session refused"
+        );
+
+        // Happy path: old revoked + new minted atomically.
+        let new_token = "fbx_web_new";
+        let claim = claim_pending_switch(
+            &pool,
+            switch_id,
+            &bh,
+            current_token,
+            new_token,
+            3_600,
+            100_000,
+        )
+        .await
+        .unwrap()
+        .expect("claim succeeds");
+        assert_eq!(claim.new_tenant_id, org_new.id);
+        assert_eq!(claim.replaced_tenant_id, org_old.id);
+        assert_eq!(claim.redirect_to, "/dashboard");
+        // Old session revoked.
+        assert!(resolve_web_session(&pool, current_token, 3_600)
+            .await
+            .unwrap()
+            .is_none());
+        // New session minted in the NEW org.
+        let ns = resolve_web_session(&pool, new_token, 3_600)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ns.tenant_id, org_new.id);
+        assert_eq!(ns.membership_id, new_membership);
+
+        // Replay refused (already consumed) — and the original session (already
+        // revoked) can no longer satisfy the predicate anyway.
+        assert!(
+            claim_pending_switch(
+                &pool,
+                switch_id,
+                &bh,
+                new_token,
+                "fbx_web_c",
+                3_600,
+                100_000
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "replay refused"
+        );
+
+        // Clean the NEW org first (removes the switch rows + new session) so the
+        // OLD org's cascade-FK'd sessions delete cleanly.
+        cleanup_tenant(&pool, org_new.id).await;
+        cleanup_tenant(&pool, org_old.id).await;
     }
 }

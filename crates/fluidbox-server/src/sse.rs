@@ -2,7 +2,7 @@
 //! delivery source of truth. Immune to missed notifies and Neon scale-to-zero
 //! because a polling floor always re-checks the seq.
 
-use crate::auth::Principal;
+use crate::auth::{AuthContext, Principal};
 use crate::error::{ApiError, ApiResult};
 use crate::rbac;
 use crate::state::AppState;
@@ -21,13 +21,25 @@ pub async fn stream(
     headers: HeaderMap,
 ) -> ApiResult<impl IntoResponse> {
     // The handshake enforces run.read like any GET on the session's timeline;
-    // the CSRF/Origin gate ran in the `Principal` extractor. (Bounded periodic
-    // re-auth on the long-lived stream is a Task-5 follow-up — design 658-664.)
+    // the CSRF/Origin gate ran in the `Principal` extractor.
     let scope = principal.scope();
     let session = fluidbox_db::get_session(&state.pool, scope, id)
         .await?
         .ok_or(ApiError::NotFound)?;
     rbac::ensure_run_visible(&principal, &session)?;
+
+    // A cookie-authenticated stream re-authorizes on a bounded interval
+    // (design 658-664): the extractor runs once, so a revocation / deactivation
+    // / expiry after the handshake must terminate the stream. Bearer/operator
+    // streams are unaffected (`reauth` stays None).
+    let reauth: Option<uuid::Uuid> = match &principal {
+        Principal::User(u) => match &u.auth {
+            AuthContext::BrowserSession { session_id, .. } => Some(*session_id),
+            AuthContext::Pat { .. } => None,
+        },
+        Principal::Operator { .. } => None,
+    };
+    let reauth_every = Duration::from_secs(state.cfg.session_reauth_secs.max(1) as u64);
 
     // Resume from Last-Event-ID (the seq) if present.
     let mut last_seq: i64 = headers
@@ -63,7 +75,20 @@ pub async fn stream(
         }
 
         // Then follow: wake on NOTIFY, but re-poll on a floor so nothing is missed.
+        let mut last_reauth = std::time::Instant::now();
         loop {
+            // Bounded re-authorization for cookie-authenticated streams.
+            if let Some(sid) = reauth {
+                if last_reauth.elapsed() >= reauth_every {
+                    last_reauth = std::time::Instant::now();
+                    if !matches!(
+                        fluidbox_db::identity::web_session_live(&pool, scope, sid).await,
+                        Ok(true)
+                    ) {
+                        break; // revoked / expired / membership deactivated
+                    }
+                }
+            }
             let woke = tokio::select! {
                 r = rx.recv() => matches!(r, Ok((sid, _)) if sid == id) || r.is_err(),
                 _ = tokio::time::sleep(Duration::from_secs(2)) => true,

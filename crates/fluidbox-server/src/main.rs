@@ -15,6 +15,7 @@ mod github_app;
 mod harness;
 mod internal;
 mod ledger;
+mod login;
 mod oauth;
 mod orchestrator;
 mod rbac;
@@ -32,7 +33,6 @@ use axum::Router;
 use fluidbox_core::traits::ExecutionProvider;
 use state::{AppStateInner, ApprovalRegistry};
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 /// Select the execution backend from `FLUIDBOX_PROVIDER` (default `docker`).
@@ -155,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
         // Docker needs no netpol gate; Kubernetes starts unverified and the
         // worker below flips it once the CNI is proven to enforce policy.
         netpol_verified: std::sync::atomic::AtomicBool::new(!is_k8s),
+        oidc: Default::default(),
         pool,
         cfg,
     });
@@ -204,6 +205,17 @@ async fn main() -> anyhow::Result<()> {
         // mint a PAT); listing accepts either context.
         .route("/auth/tokens", get(tokens::list).post(tokens::mint))
         .route("/auth/tokens/{id}", delete(tokens::revoke))
+        // The IdP-agnostic OIDC login surface (Phase B, Task 5). The neutral
+        // entry page, per-org start, and the one stable callback are
+        // unauthenticated by design — the sealed `state` + per-flow cookie ARE
+        // the auth (same pattern as oauth/callback + github/app legs). switch
+        // and logout authenticate by the browser session cookie (CSRF applies).
+        .route("/auth/login", get(login::login_page))
+        .route("/auth/login/{slug}/start", get(login::start))
+        .route("/auth/callback", get(login::callback))
+        .route("/auth/switch/{id}", post(login::switch_confirm))
+        .route("/auth/logout", post(login::logout))
+        .route("/auth/me", get(login::me))
         .route(
             "/capabilities",
             get(capabilities::list).post(capabilities::create),
@@ -317,7 +329,12 @@ async fn main() -> anyhow::Result<()> {
         // client_id; authorization servers fetch it — public by nature.
         .route("/.well-known/fluidbox-client.json", get(oauth::cimd_doc))
         .layer(trace_layer())
-        .layer(CorsLayer::permissive())
+        // NO CORS layer (Phase B): the dashboard is a same-origin proxy
+        // (`/` → web, `/v1` → API, one origin), so cross-origin requests to
+        // `/v1` are never legitimate and no `Access-Control-*` grant should
+        // exist. The permissive layer removed here (design lines 649-653) was a
+        // cookie-auth CSRF footgun; browser writes now carry the
+        // `x-fluidbox-csrf` header + an Origin check instead.
         .with_state(state.clone());
 
     // Internal listener (:8788) — /internal ONLY, no /v1 route exists. This is
