@@ -140,6 +140,16 @@ pub fn runner_status(pod: &Pod) -> SandboxStatus {
         None => return SandboxStatus::Pending { reason: None },
     };
 
+    // Kubelet unreachable (node loss): phase Unknown means every container
+    // status below is a stale last-known snapshot — a frozen "running" must
+    // not keep the sandbox live forever. Checked BEFORE container statuses
+    // for exactly that reason (M7).
+    if status.phase.as_deref() == Some("Unknown") {
+        return SandboxStatus::Unknown {
+            reason: status.reason.clone().or(Some("pod phase Unknown".into())),
+        };
+    }
+
     // A waiting reason is fatal if it never self-resolves; the config-error
     // reason is special-cased behind the Secret-window grace (M6).
     let fatal = |reason: Option<&str>| {
@@ -214,11 +224,6 @@ pub fn runner_status(pod: &Pod) -> SandboxStatus {
         Some("Succeeded") => SandboxStatus::Terminated {
             exit_code: Some(0),
             reason: None,
-        },
-        // Kubelet unreachable (node loss): the state genuinely cannot be
-        // determined — Unknown, never a live Pending forever (M7).
-        Some("Unknown") => SandboxStatus::Unknown {
-            reason: status.reason.clone().or(Some("pod phase Unknown".into())),
         },
         _ => SandboxStatus::Pending {
             reason: status.reason.clone(),
@@ -350,39 +355,41 @@ impl ExecutionProvider for KubernetesProvider {
         ctx: &CollectContext,
     ) -> Result<CollectedArtifacts, ProviderError> {
         let Some(handle) = handle else {
-            // Pre-launch failure: no pod ever existed, so the control-plane
-            // copy of the materialized workspace is authoritative (and
-            // untouched). Collect it exactly like the host-dir provider so a
-            // pre-launch K8s failure records "(no changes)" — Docker parity,
-            // not artifact_missing noise (L9).
-            let data_dir = self.data_dir.clone();
-            let ctx = ctx.clone();
-            return tokio::task::spawn_blocking(move || collect_from_workspace(&data_dir, &ctx))
-                .await
-                .map_err(|e| ProviderError::Other(format!("collection task panicked: {e}")));
-        };
-        let name = &handle.external_id;
-
-        // 1. Compute the diff in the collector container (pristine baseline +
-        //    final worktree, scrubbed git), writing it to the collector-only
-        //    file. A non-zero exit means that file is untrustworthy → Missing.
-        if let Err(e) = self.exec_collect(name, &["workspaced", "diff"]).await {
-            return Ok(CollectedArtifacts::Missing {
-                reason: format!("collector diff exec failed: {e}"),
-            });
-        }
-        // 2. Stream the finished file, resuming from the byte offset already
-        //    received if the exec channel closes before the header's declared
-        //    length. parse_collected makes the final integrity call.
-        let raw = match self.collect_stream_with_resume(name).await {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                return Ok(CollectedArtifacts::Missing {
-                    reason: format!("collector stream exec failed: {e}"),
-                })
+            // No handle recorded. Two very different cases hide here (L9,
+            // Codex round 2):
+            //  (a) the crash window between provision() succeeding and the
+            //      handle landing — a pod EXISTS and its worktree is the
+            //      run's real output. Collect from it, never from the
+            //      control-plane copy (which would record a false
+            //      "(no changes)" over real agent work).
+            //  (b) the pod NEVER existed (pre-launch failure) — the
+            //      control-plane copy IS authoritative; collect it exactly
+            //      like the host-dir provider does ("(no changes)", not
+            //      artifact_missing noise).
+            // Distinguish by looking for the deterministically-named pod.
+            let name = object_name(ctx.session_id);
+            match self.pods.get_opt(&name).await {
+                Ok(Some(pod))
+                    if pod.labels().get(LABEL_SESSION).map(String::as_str)
+                        == Some(ctx.session_id.to_string().as_str()) =>
+                {
+                    return self.collect_via_exec(&name).await;
+                }
+                Ok(_) => {
+                    let data_dir = self.data_dir.clone();
+                    let ctx = ctx.clone();
+                    return tokio::task::spawn_blocking(move || {
+                        collect_from_workspace(&data_dir, &ctx)
+                    })
+                    .await
+                    .map_err(|e| ProviderError::Other(format!("collection task panicked: {e}")));
+                }
+                // Cannot tell whether a pod exists — never guess with a
+                // local diff that could contradict the pod's real worktree.
+                Err(e) => return Err(map_err(e)),
             }
         };
-        Ok(parse_collected(&raw))
+        self.collect_via_exec(&handle.external_id).await
     }
 
     async fn terminate(&self, handle: &SandboxHandle) -> Result<(), ProviderError> {
@@ -436,6 +443,32 @@ impl ExecutionProvider for KubernetesProvider {
 }
 
 impl KubernetesProvider {
+    /// The exec collection path: compute the diff in the collector container,
+    /// then stream the finished file with resume. Shared by the normal
+    /// handle-carrying path and the discovered-pod path (L9).
+    async fn collect_via_exec(&self, name: &str) -> Result<CollectedArtifacts, ProviderError> {
+        // 1. Compute the diff in the collector container (pristine baseline +
+        //    final worktree, scrubbed git), writing it to the collector-only
+        //    file. A non-zero exit means that file is untrustworthy → Missing.
+        if let Err(e) = self.exec_collect(name, &["workspaced", "diff"]).await {
+            return Ok(CollectedArtifacts::Missing {
+                reason: format!("collector diff exec failed: {e}"),
+            });
+        }
+        // 2. Stream the finished file, resuming from the byte offset already
+        //    received if the exec channel closes before the header's declared
+        //    length. parse_collected makes the final integrity call.
+        let raw = match self.collect_stream_with_resume(name).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return Ok(CollectedArtifacts::Missing {
+                    reason: format!("collector stream exec failed: {e}"),
+                })
+            }
+        };
+        Ok(parse_collected(&raw))
+    }
+
     /// Exec a command in the collector container and return its stdout. Used
     /// for `workspaced diff` (side-effecting; stdout ignored) and
     /// `workspaced stream` (the diff bytes).
@@ -811,6 +844,26 @@ mod tests {
             matches!(status, SandboxStatus::Unknown { .. }),
             "phase Unknown must map to Unknown, got {status:?}"
         );
+    }
+
+    #[test]
+    fn phase_unknown_wins_over_a_stale_running_container_status() {
+        // Node loss without a deletion timestamp: the apiserver keeps the
+        // LAST-REPORTED container statuses (running) while phase flips to
+        // Unknown — the stale snapshot must not keep the sandbox "live"
+        // forever (M7, Codex round 2).
+        let st = ContainerState {
+            running: Some(ContainerStateRunning::default()),
+            ..Default::default()
+        };
+        let mut pod = pod_with(Some(st), vec![]);
+        pod.status.as_mut().unwrap().phase = Some("Unknown".into());
+        let status = runner_status(&pod);
+        assert!(
+            matches!(status, SandboxStatus::Unknown { .. }),
+            "phase Unknown must override stale container statuses, got {status:?}"
+        );
+        assert!(!status.is_live());
     }
 
     #[test]
