@@ -258,7 +258,7 @@ pub async fn ensure_default_tenant(pool: &PgPool) -> sqlx::Result<Uuid> {
 /// `fluidbox-db` has no error type to refuse with.
 pub async fn upsert_policy(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
     name: &str,
     yaml_source: &str,
     parsed: &Value,
@@ -276,7 +276,7 @@ pub async fn upsert_policy(
          returning *",
     )
     .bind(Uuid::now_v7())
-    .bind(tenant)
+    .bind(scope.tenant_id())
     .bind(name)
     .bind(yaml_source)
     .bind(parsed)
@@ -288,24 +288,24 @@ pub async fn upsert_policy(
 /// tool. Bumps `version` and republishes `parsed`.
 pub async fn set_policy_override(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
     name: &str,
     tool: &str,
     action: fluidbox_core::policy::RuleAction,
 ) -> sqlx::Result<PolicyRow> {
     let entry = serde_json::json!([{ "tool": tool, "action": action }]);
-    write_policy_overrides(pool, tenant, name, tool, &entry).await
+    write_policy_overrides(pool, scope, name, tool, &entry).await
 }
 
 /// Remove ONE override; the tool falls back to whatever the base rules say.
 /// Bumps `version` and republishes `parsed`.
 pub async fn clear_policy_override(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
     name: &str,
     tool: &str,
 ) -> sqlx::Result<PolicyRow> {
-    write_policy_overrides(pool, tenant, name, tool, &serde_json::json!([])).await
+    write_policy_overrides(pool, scope, name, tool, &serde_json::json!([])).await
 }
 
 /// Drop every override for `tool`, then append `append` (a jsonb ARRAY — one
@@ -318,7 +318,7 @@ pub async fn clear_policy_override(
 /// would look saved in the UI and never fire.
 async fn write_policy_overrides(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
     name: &str,
     tool: &str,
     append: &Value,
@@ -344,7 +344,7 @@ async fn write_policy_overrides(
           where p.id = t.id
          returning p.*",
     )
-    .bind(tenant)
+    .bind(scope.tenant_id())
     .bind(name)
     .bind(tool)
     .bind(append)
@@ -357,12 +357,12 @@ async fn write_policy_overrides(
 /// version) are never clobbered by a later boot re-reading the disk YAML.
 pub async fn seed_policy_if_absent(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
     name: &str,
     yaml_source: &str,
     parsed: &Value,
 ) -> sqlx::Result<(PolicyRow, bool)> {
-    if let Some(existing) = get_policy_by_name(pool, tenant, name).await? {
+    if let Some(existing) = get_policy_by_name(pool, scope, name).await? {
         return Ok((existing, false));
     }
     let row = sqlx::query_as(
@@ -372,7 +372,7 @@ pub async fn seed_policy_if_absent(
          returning *",
     )
     .bind(Uuid::now_v7())
-    .bind(tenant)
+    .bind(scope.tenant_id())
     .bind(name)
     .bind(yaml_source)
     .bind(parsed)
@@ -381,27 +381,32 @@ pub async fn seed_policy_if_absent(
     Ok((row, true))
 }
 
-pub async fn list_policies(pool: &PgPool, tenant: Uuid) -> sqlx::Result<Vec<PolicyRow>> {
+pub async fn list_policies(pool: &PgPool, scope: TenantScope) -> sqlx::Result<Vec<PolicyRow>> {
     sqlx::query_as("select * from policies where tenant_id = $1 order by name")
-        .bind(tenant)
+        .bind(scope.tenant_id())
         .fetch_all(pool)
         .await
 }
 
-pub async fn get_policy(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<PolicyRow>> {
-    sqlx::query_as("select * from policies where id = $1")
+pub async fn get_policy(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+) -> sqlx::Result<Option<PolicyRow>> {
+    sqlx::query_as("select * from policies where id = $1 and tenant_id = $2")
         .bind(id)
+        .bind(scope.tenant_id())
         .fetch_optional(pool)
         .await
 }
 
 pub async fn get_policy_by_name(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
     name: &str,
 ) -> sqlx::Result<Option<PolicyRow>> {
     sqlx::query_as("select * from policies where tenant_id = $1 and name = $2")
-        .bind(tenant)
+        .bind(scope.tenant_id())
         .bind(name)
         .fetch_optional(pool)
         .await
@@ -412,7 +417,7 @@ pub async fn get_policy_by_name(
 /// latest revision governs future runs, so only it is at stake in an edit.
 pub async fn policy_agents_using(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
     policy_id: Uuid,
 ) -> sqlx::Result<i64> {
     sqlx::query_scalar(
@@ -425,7 +430,7 @@ pub async fn policy_agents_using(
                limit 1
             ) = $2",
     )
-    .bind(tenant)
+    .bind(scope.tenant_id())
     .bind(policy_id)
     .fetch_one(pool)
     .await
@@ -441,7 +446,7 @@ pub async fn policy_agents_using(
 /// will carry.
 pub async fn policy_mcp_tools(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
     policy_id: Uuid,
 ) -> sqlx::Result<Vec<String>> {
     let pins: Vec<Value> = sqlx::query_scalar(
@@ -452,7 +457,7 @@ pub async fn policy_mcp_tools(
            ) r on true
           where a.tenant_id = $1 and r.policy_id = $2",
     )
-    .bind(tenant)
+    .bind(scope.tenant_id())
     .bind(policy_id)
     .fetch_all(pool)
     .await?;
@@ -480,7 +485,7 @@ pub async fn policy_mcp_tools(
     let defs: Vec<Value> = sqlx::query_scalar(
         "select definition from capability_bundles where tenant_id = $1 and id = any($2)",
     )
-    .bind(tenant)
+    .bind(scope.tenant_id())
     .bind(&ids)
     .fetch_all(pool)
     .await?;
@@ -513,7 +518,7 @@ pub async fn policy_mcp_tools(
 
 pub async fn create_agent(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
     name: &str,
     description: Option<&str>,
 ) -> sqlx::Result<AgentRow> {
@@ -523,34 +528,39 @@ pub async fn create_agent(
          returning *",
     )
     .bind(Uuid::now_v7())
-    .bind(tenant)
+    .bind(scope.tenant_id())
     .bind(name)
     .bind(description)
     .fetch_one(pool)
     .await
 }
 
-pub async fn list_agents(pool: &PgPool, tenant: Uuid) -> sqlx::Result<Vec<AgentRow>> {
+pub async fn list_agents(pool: &PgPool, scope: TenantScope) -> sqlx::Result<Vec<AgentRow>> {
     sqlx::query_as("select * from agents where tenant_id = $1 order by name")
-        .bind(tenant)
+        .bind(scope.tenant_id())
         .fetch_all(pool)
         .await
 }
 
-pub async fn get_agent(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<AgentRow>> {
-    sqlx::query_as("select * from agents where id = $1")
+pub async fn get_agent(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+) -> sqlx::Result<Option<AgentRow>> {
+    sqlx::query_as("select * from agents where id = $1 and tenant_id = $2")
         .bind(id)
+        .bind(scope.tenant_id())
         .fetch_optional(pool)
         .await
 }
 
 pub async fn get_agent_by_name(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
     name: &str,
 ) -> sqlx::Result<Option<AgentRow>> {
     sqlx::query_as("select * from agents where tenant_id = $1 and name = $2")
-        .bind(tenant)
+        .bind(scope.tenant_id())
         .bind(name)
         .fetch_optional(pool)
         .await
@@ -563,6 +573,7 @@ pub async fn get_agent_by_name(
 #[allow(clippy::too_many_arguments)]
 pub async fn append_agent_revision(
     pool: &PgPool,
+    scope: TenantScope,
     agent_id: Uuid,
     harness: &str,
     runner_image: &str,
@@ -573,13 +584,16 @@ pub async fn append_agent_revision(
     default_workspace: Option<&Value>,
     capability_bundles: &Value,
 ) -> sqlx::Result<AgentRevisionRow> {
+    // Revisions carry no tenant column of their own; the tenant boundary is the
+    // parent agent — the insert only lands when the agent belongs to the scope.
     sqlx::query_as(
         "insert into agent_revisions
            (id, agent_id, rev, harness, runner_image, model, system_prompt, policy_id, budgets,
             default_workspace, capability_bundles)
-         values ($1, $2,
+         select $1, $2,
            coalesce((select max(rev) from agent_revisions where agent_id = $2), 0) + 1,
-           $3, $4, $5, $6, $7, $8, $9, $10)
+           $3, $4, $5, $6, $7, $8, $9, $10
+         where exists (select 1 from agents a where a.id = $2 and a.tenant_id = $11)
          returning *",
     )
     .bind(Uuid::now_v7())
@@ -592,32 +606,59 @@ pub async fn append_agent_revision(
     .bind(budgets)
     .bind(default_workspace)
     .bind(capability_bundles)
+    .bind(scope.tenant_id())
     .fetch_one(pool)
     .await
 }
 
 pub async fn latest_revision(
     pool: &PgPool,
+    scope: TenantScope,
     agent_id: Uuid,
 ) -> sqlx::Result<Option<AgentRevisionRow>> {
-    sqlx::query_as("select * from agent_revisions where agent_id = $1 order by rev desc limit 1")
-        .bind(agent_id)
-        .fetch_optional(pool)
-        .await
+    sqlx::query_as(
+        "select r.* from agent_revisions r
+         join agents a on a.id = r.agent_id
+         where r.agent_id = $1 and a.tenant_id = $2
+         order by r.rev desc limit 1",
+    )
+    .bind(agent_id)
+    .bind(scope.tenant_id())
+    .fetch_optional(pool)
+    .await
 }
 
-pub async fn list_revisions(pool: &PgPool, agent_id: Uuid) -> sqlx::Result<Vec<AgentRevisionRow>> {
-    sqlx::query_as("select * from agent_revisions where agent_id = $1 order by rev desc")
-        .bind(agent_id)
-        .fetch_all(pool)
-        .await
+pub async fn list_revisions(
+    pool: &PgPool,
+    scope: TenantScope,
+    agent_id: Uuid,
+) -> sqlx::Result<Vec<AgentRevisionRow>> {
+    sqlx::query_as(
+        "select r.* from agent_revisions r
+         join agents a on a.id = r.agent_id
+         where r.agent_id = $1 and a.tenant_id = $2
+         order by r.rev desc",
+    )
+    .bind(agent_id)
+    .bind(scope.tenant_id())
+    .fetch_all(pool)
+    .await
 }
 
-pub async fn get_revision(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<AgentRevisionRow>> {
-    sqlx::query_as("select * from agent_revisions where id = $1")
-        .bind(id)
-        .fetch_optional(pool)
-        .await
+pub async fn get_revision(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+) -> sqlx::Result<Option<AgentRevisionRow>> {
+    sqlx::query_as(
+        "select r.* from agent_revisions r
+         join agents a on a.id = r.agent_id
+         where r.id = $1 and a.tenant_id = $2",
+    )
+    .bind(id)
+    .bind(scope.tenant_id())
+    .fetch_optional(pool)
+    .await
 }
 
 // ─── Capability bundles (Phase 5: the registry) ───────────────────────────
@@ -627,7 +668,7 @@ pub async fn get_revision(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<AgentR
 /// construction, exactly like agent revisions.
 pub async fn create_capability_bundle(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
     name: &str,
     description: Option<&str>,
     definition: &Value,
@@ -643,7 +684,7 @@ pub async fn create_capability_bundle(
          returning *",
     )
     .bind(Uuid::now_v7())
-    .bind(tenant)
+    .bind(scope.tenant_id())
     .bind(name)
     .bind(description)
     .bind(definition)
@@ -654,37 +695,39 @@ pub async fn create_capability_bundle(
 
 pub async fn list_capability_bundles(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
 ) -> sqlx::Result<Vec<CapabilityBundleRow>> {
     sqlx::query_as(
         "select * from capability_bundles where tenant_id = $1
          order by name, version desc",
     )
-    .bind(tenant)
+    .bind(scope.tenant_id())
     .fetch_all(pool)
     .await
 }
 
 pub async fn get_capability_bundle(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<CapabilityBundleRow>> {
-    sqlx::query_as("select * from capability_bundles where id = $1")
+    sqlx::query_as("select * from capability_bundles where id = $1 and tenant_id = $2")
         .bind(id)
+        .bind(scope.tenant_id())
         .fetch_optional(pool)
         .await
 }
 
 pub async fn latest_capability_bundle(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
     name: &str,
 ) -> sqlx::Result<Option<CapabilityBundleRow>> {
     sqlx::query_as(
         "select * from capability_bundles where tenant_id = $1 and name = $2
          order by version desc limit 1",
     )
-    .bind(tenant)
+    .bind(scope.tenant_id())
     .bind(name)
     .fetch_optional(pool)
     .await
@@ -692,7 +735,7 @@ pub async fn latest_capability_bundle(
 
 pub async fn get_capability_bundle_version(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
     name: &str,
     version: i32,
 ) -> sqlx::Result<Option<CapabilityBundleRow>> {
@@ -700,7 +743,7 @@ pub async fn get_capability_bundle_version(
         "select * from capability_bundles
          where tenant_id = $1 and name = $2 and version = $3",
     )
-    .bind(tenant)
+    .bind(scope.tenant_id())
     .bind(name)
     .bind(version)
     .fetch_optional(pool)
@@ -743,7 +786,7 @@ impl ConnectionAuth<'static> {
 #[allow(clippy::too_many_arguments)]
 pub async fn create_connection(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
     provider: &str,
     external_account_id: &str,
     display_name: &str,
@@ -763,7 +806,7 @@ pub async fn create_connection(
          returning {CONNECTION_COLS}"
     )))
     .bind(Uuid::now_v7())
-    .bind(tenant)
+    .bind(scope.tenant_id())
     .bind(provider)
     .bind(external_account_id)
     .bind(display_name)
@@ -783,52 +826,62 @@ pub async fn create_connection(
 
 pub async fn list_connections(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
 ) -> sqlx::Result<Vec<IntegrationConnectionRow>> {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {CONNECTION_COLS} from integration_connections
          where tenant_id = $1 order by created_at desc"
     )))
-    .bind(tenant)
+    .bind(scope.tenant_id())
     .fetch_all(pool)
     .await
 }
 
 pub async fn get_connection(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<IntegrationConnectionRow>> {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "select {CONNECTION_COLS} from integration_connections where id = $1"
+        "select {CONNECTION_COLS} from integration_connections where id = $1 and tenant_id = $2"
     )))
     .bind(id)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await
 }
 
 pub async fn revoke_connection(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<IntegrationConnectionRow>> {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update integration_connections set status = 'revoked', updated_at = now()
-         where id = $1 and status <> 'revoked'
+         where id = $1 and status <> 'revoked' and tenant_id = $2
          returning {CONNECTION_COLS}"
     )))
     .bind(id)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await
 }
 
 /// Persist non-secret OAuth custody state (discovered endpoints, client
 /// identity, pending bundle) before the connection is activated.
-pub async fn update_connection_oauth(pool: &PgPool, id: Uuid, oauth: &Value) -> sqlx::Result<()> {
+pub async fn update_connection_oauth(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    oauth: &Value,
+) -> sqlx::Result<()> {
     sqlx::query(
         "update integration_connections set oauth = $2, updated_at = now()
-         where id = $1 and status <> 'revoked'",
+         where id = $1 and status <> 'revoked' and tenant_id = $3",
     )
     .bind(id)
     .bind(oauth)
+    .bind(scope.tenant_id())
     .execute(pool)
     .await
     .map(|_| ())
@@ -840,6 +893,7 @@ pub async fn update_connection_oauth(pool: &PgPool, id: Uuid, oauth: &Value) -> 
 /// (reconnect after invalid_grant) alike.
 pub async fn activate_connection_oauth(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
     sealed_refresh: &[u8],
     oauth: &Value,
@@ -849,13 +903,14 @@ pub async fn activate_connection_oauth(
         "update integration_connections
          set credential_sealed = $2, oauth = $3, granted_scopes = $4,
              status = 'active', updated_at = now()
-         where id = $1 and status <> 'revoked' and auth_kind = 'oauth'
+         where id = $1 and status <> 'revoked' and auth_kind = 'oauth' and tenant_id = $5
          returning {CONNECTION_COLS}"
     )))
     .bind(id)
     .bind(sealed_refresh)
     .bind(oauth)
     .bind(granted_scopes)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await
 }
@@ -865,15 +920,17 @@ pub async fn activate_connection_oauth(
 /// false when the row was revoked/errored underneath the caller.
 pub async fn rotate_connection_refresh(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
     sealed_new: &[u8],
 ) -> sqlx::Result<bool> {
     let r = sqlx::query(
         "update integration_connections set credential_sealed = $2, updated_at = now()
-         where id = $1 and status = 'active' and auth_kind = 'oauth'",
+         where id = $1 and status = 'active' and auth_kind = 'oauth' and tenant_id = $3",
     )
     .bind(id)
     .bind(sealed_new)
+    .bind(scope.tenant_id())
     .execute(pool)
     .await?;
     Ok(r.rows_affected() == 1)
@@ -883,15 +940,21 @@ pub async fn rotate_connection_refresh(
 /// needs human re-consent. Everything downstream fails closed off the
 /// status: `connection_credential_sealed` stops returning, run creation
 /// refuses, the broker surfaces "reconnect".
-pub async fn mark_connection_error(pool: &PgPool, id: Uuid, note: &str) -> sqlx::Result<()> {
+pub async fn mark_connection_error(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    note: &str,
+) -> sqlx::Result<()> {
     sqlx::query(
         "update integration_connections
          set status = 'error', updated_at = now(),
              oauth = jsonb_set(coalesce(oauth, '{}'::jsonb), '{error}', to_jsonb($2::text))
-         where id = $1 and status = 'active'",
+         where id = $1 and status = 'active' and tenant_id = $3",
     )
     .bind(id)
     .bind(note)
+    .bind(scope.tenant_id())
     .execute(pool)
     .await
     .map(|_| ())
@@ -901,15 +964,17 @@ pub async fn mark_connection_error(pool: &PgPool, id: Uuid, note: &str) -> sqlx:
 /// the caller; readable only via `connection_client_secret_sealed`.
 pub async fn set_connection_client_secret(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
     sealed: &[u8],
 ) -> sqlx::Result<()> {
     sqlx::query(
         "update integration_connections set client_secret_sealed = $2, updated_at = now()
-         where id = $1 and status <> 'revoked'",
+         where id = $1 and status <> 'revoked' and tenant_id = $3",
     )
     .bind(id)
     .bind(sealed)
+    .bind(scope.tenant_id())
     .execute(pool)
     .await
     .map(|_| ())
@@ -921,13 +986,15 @@ pub async fn set_connection_client_secret(
 /// non-revoked status qualifies.
 pub async fn connection_client_secret_sealed(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<Vec<u8>>> {
     let row = sqlx::query(
         "select client_secret_sealed from integration_connections
-         where id = $1 and status <> 'revoked'",
+         where id = $1 and status <> 'revoked' and tenant_id = $2",
     )
     .bind(id)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await?;
     Ok(row.and_then(|r| r.get::<Option<Vec<u8>>, _>("client_secret_sealed")))
@@ -1053,13 +1120,15 @@ pub async fn delete_catalog_entry(pool: &PgPool, slug: &str) -> sqlx::Result<u64
 /// produce a credential.
 pub async fn connection_credential_sealed(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<Vec<u8>>> {
     let row = sqlx::query(
         "select credential_sealed from integration_connections
-         where id = $1 and status = 'active'",
+         where id = $1 and status = 'active' and tenant_id = $2",
     )
     .bind(id)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|r| r.get::<Vec<u8>, _>("credential_sealed")))
@@ -1069,13 +1138,15 @@ pub async fn connection_credential_sealed(
 /// request). Active connections only — a revoked connection stops receiving.
 pub async fn connection_webhook_secret_sealed(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<Vec<u8>>> {
     let row = sqlx::query(
         "select webhook_secret_sealed from integration_connections
-         where id = $1 and status = 'active'",
+         where id = $1 and status = 'active' and tenant_id = $2",
     )
     .bind(id)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await?;
     Ok(row.and_then(|r| r.get::<Option<Vec<u8>>, _>("webhook_secret_sealed")))
@@ -1113,7 +1184,7 @@ const GH_REG_COLS: &str = "id, tenant_id, status, target_kind, target_org, app_i
 
 pub async fn create_github_app_registration(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
     target_kind: &str,
     target_org: Option<&str>,
 ) -> sqlx::Result<GithubAppRegistrationRow> {
@@ -1123,7 +1194,7 @@ pub async fn create_github_app_registration(
          returning {GH_REG_COLS}"
     )))
     .bind(Uuid::now_v7())
-    .bind(tenant)
+    .bind(scope.tenant_id())
     .bind(target_kind)
     .bind(target_org)
     .fetch_one(pool)
@@ -1132,25 +1203,27 @@ pub async fn create_github_app_registration(
 
 pub async fn list_github_app_registrations(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
 ) -> sqlx::Result<Vec<GithubAppRegistrationRow>> {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {GH_REG_COLS} from github_app_registrations
          where tenant_id = $1 order by created_at desc"
     )))
-    .bind(tenant)
+    .bind(scope.tenant_id())
     .fetch_all(pool)
     .await
 }
 
 pub async fn get_github_app_registration(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<GithubAppRegistrationRow>> {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "select {GH_REG_COLS} from github_app_registrations where id = $1"
+        "select {GH_REG_COLS} from github_app_registrations where id = $1 and tenant_id = $2"
     )))
     .bind(id)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await
 }
@@ -1161,6 +1234,7 @@ pub async fn get_github_app_registration(
 #[allow(clippy::too_many_arguments)]
 pub async fn activate_github_app_registration(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
     app_id: &str,
     slug: &str,
@@ -1177,7 +1251,7 @@ pub async fn activate_github_app_registration(
          set app_id = $2, slug = $3, name = $4, client_id = $5, html_url = $6,
              owner_login = $7, pem_sealed = $8, webhook_secret_sealed = $9,
              client_secret_sealed = $10, status = 'active', updated_at = now()
-         where id = $1 and status = 'pending'
+         where id = $1 and status = 'pending' and tenant_id = $11
          returning {GH_REG_COLS}"
     )))
     .bind(id)
@@ -1190,6 +1264,7 @@ pub async fn activate_github_app_registration(
     .bind(pem_sealed)
     .bind(webhook_secret_sealed)
     .bind(client_secret_sealed)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await
 }
@@ -1200,14 +1275,16 @@ pub async fn activate_github_app_registration(
 /// RESTRICT on purpose).
 pub async fn revoke_github_app_registration(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<Vec<Uuid>>> {
     let mut tx = pool.begin().await?;
     let reg = sqlx::query(
         "update github_app_registrations set status = 'revoked', updated_at = now()
-         where id = $1 and status <> 'revoked'",
+         where id = $1 and status <> 'revoked' and tenant_id = $2",
     )
     .bind(id)
+    .bind(scope.tenant_id())
     .execute(&mut *tx)
     .await?;
     if reg.rows_affected() == 0 {
@@ -1231,13 +1308,15 @@ pub async fn revoke_github_app_registration(
 /// produce a JWT.
 pub async fn github_app_registration_pem_sealed(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<Vec<u8>>> {
     let row = sqlx::query(
         "select pem_sealed from github_app_registrations
-         where id = $1 and status = 'active'",
+         where id = $1 and status = 'active' and tenant_id = $2",
     )
     .bind(id)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await?;
     Ok(row.and_then(|r| r.get::<Option<Vec<u8>>, _>("pem_sealed")))
@@ -1247,13 +1326,15 @@ pub async fn github_app_registration_pem_sealed(
 /// app-level ingress request).
 pub async fn github_app_registration_webhook_secret_sealed(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<Vec<u8>>> {
     let row = sqlx::query(
         "select webhook_secret_sealed from github_app_registrations
-         where id = $1 and status = 'active'",
+         where id = $1 and status = 'active' and tenant_id = $2",
     )
     .bind(id)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await?;
     Ok(row.and_then(|r| r.get::<Option<Vec<u8>>, _>("webhook_secret_sealed")))
@@ -1347,7 +1428,7 @@ pub async fn claim_github_app_flow(
 #[allow(clippy::too_many_arguments)]
 pub async fn create_github_app_connection_if_absent(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
     installation_id: &str,
     display_name: &str,
     metadata: &Value,
@@ -1368,7 +1449,7 @@ pub async fn create_github_app_connection_if_absent(
          returning {CONNECTION_COLS}"
     )))
     .bind(Uuid::now_v7())
-    .bind(tenant)
+    .bind(scope.tenant_id())
     .bind(installation_id)
     .bind(display_name)
     .bind(metadata)
@@ -1383,7 +1464,7 @@ pub async fn create_github_app_connection_if_absent(
 /// through the explicit approve path — never a second row).
 pub async fn get_github_app_connection_by_installation(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
     installation_id: &str,
 ) -> sqlx::Result<Option<IntegrationConnectionRow>> {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -1392,7 +1473,7 @@ pub async fn get_github_app_connection_by_installation(
          order by (status <> 'revoked') desc, created_at desc
          limit 1"
     )))
-    .bind(tenant)
+    .bind(scope.tenant_id())
     .bind(installation_id)
     .fetch_optional(pool)
     .await
@@ -1402,6 +1483,7 @@ pub async fn get_github_app_connection_by_installation(
 /// `allowed_from`. Returns the fresh row on success.
 pub async fn set_connection_status(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
     status: &str,
     allowed_from: &[&str],
@@ -1409,12 +1491,13 @@ pub async fn set_connection_status(
     let from: Vec<String> = allowed_from.iter().map(|s| s.to_string()).collect();
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update integration_connections set status = $2, updated_at = now()
-         where id = $1 and status = any($3)
+         where id = $1 and status = any($3) and tenant_id = $4
          returning {CONNECTION_COLS}"
     )))
     .bind(id)
     .bind(status)
     .bind(&from)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await
 }
@@ -1422,6 +1505,7 @@ pub async fn set_connection_status(
 /// Refresh the display metadata a setup/sync re-verification produced.
 pub async fn refresh_connection_metadata(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
     display_name: &str,
     metadata: &Value,
@@ -1429,11 +1513,12 @@ pub async fn refresh_connection_metadata(
     sqlx::query(
         "update integration_connections
          set display_name = $2, metadata = $3, updated_at = now()
-         where id = $1 and status <> 'revoked'",
+         where id = $1 and status <> 'revoked' and tenant_id = $4",
     )
     .bind(id)
     .bind(display_name)
     .bind(metadata)
+    .bind(scope.tenant_id())
     .execute(pool)
     .await
     .map(|_| ())
@@ -1482,7 +1567,7 @@ const SUBSCRIPTION_COLS: &str = "id, tenant_id, agent_id, name, trigger_kind, pi
 #[allow(clippy::too_many_arguments)]
 pub async fn create_trigger_subscription(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
     agent_id: Uuid,
     name: &str,
     trigger_kind: &str,
@@ -1512,7 +1597,7 @@ pub async fn create_trigger_subscription(
          returning {SUBSCRIPTION_COLS}"
     )))
     .bind(Uuid::now_v7())
-    .bind(tenant)
+    .bind(scope.tenant_id())
     .bind(agent_id)
     .bind(name)
     .bind(trigger_kind)
@@ -1539,54 +1624,60 @@ pub async fn create_trigger_subscription(
 /// candidate set.
 pub async fn list_event_subscriptions(
     pool: &PgPool,
+    scope: TenantScope,
     connection: Uuid,
 ) -> sqlx::Result<Vec<TriggerSubscriptionRow>> {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {SUBSCRIPTION_COLS} from trigger_subscriptions
-         where connection_id = $1 and trigger_kind = 'event' and enabled
+         where connection_id = $1 and trigger_kind = 'event' and enabled and tenant_id = $2
          order by created_at"
     )))
     .bind(connection)
+    .bind(scope.tenant_id())
     .fetch_all(pool)
     .await
 }
 
 pub async fn list_trigger_subscriptions(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
 ) -> sqlx::Result<Vec<TriggerSubscriptionRow>> {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {SUBSCRIPTION_COLS} from trigger_subscriptions
          where tenant_id = $1 order by created_at desc"
     )))
-    .bind(tenant)
+    .bind(scope.tenant_id())
     .fetch_all(pool)
     .await
 }
 
 pub async fn get_trigger_subscription(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<TriggerSubscriptionRow>> {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "select {SUBSCRIPTION_COLS} from trigger_subscriptions where id = $1"
+        "select {SUBSCRIPTION_COLS} from trigger_subscriptions where id = $1 and tenant_id = $2"
     )))
     .bind(id)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await
 }
 
 pub async fn set_trigger_subscription_enabled(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
     enabled: bool,
 ) -> sqlx::Result<Option<TriggerSubscriptionRow>> {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update trigger_subscriptions set enabled = $2, updated_at = now()
-         where id = $1 returning {SUBSCRIPTION_COLS}"
+         where id = $1 and tenant_id = $3 returning {SUBSCRIPTION_COLS}"
     )))
     .bind(id)
     .bind(enabled)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await
 }
@@ -1595,12 +1686,17 @@ pub async fn set_trigger_subscription_enabled(
 /// runs must still sign after a disable, so this does not require `enabled`.
 pub async fn subscription_callback_secret_sealed(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<Vec<u8>>> {
-    let row = sqlx::query("select callback_secret_sealed from trigger_subscriptions where id = $1")
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
+    let row = sqlx::query(
+        "select callback_secret_sealed from trigger_subscriptions
+         where id = $1 and tenant_id = $2",
+    )
+    .bind(id)
+    .bind(scope.tenant_id())
+    .fetch_optional(pool)
+    .await?;
     Ok(row.and_then(|r| r.get::<Option<Vec<u8>>, _>("callback_secret_sealed")))
 }
 
@@ -1609,7 +1705,7 @@ pub async fn subscription_callback_secret_sealed(
 #[allow(clippy::too_many_arguments)]
 pub async fn create_session(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
     agent_id: Uuid,
     agent_revision_id: Uuid,
     autonomy: &str,
@@ -1619,18 +1715,20 @@ pub async fn create_session(
     run_spec: &Value,
     budgets: &Value,
     trigger: Option<&Value>,
+    invoked_by_kind: Option<&str>,
+    invoked_by_user_id: Option<Uuid>,
     bind_invocation: Option<Uuid>,
     bind_dispatch: Option<Uuid>,
 ) -> sqlx::Result<SessionRow> {
     let mut tx = pool.begin().await?;
     let row: SessionRow = sqlx::query_as(
         "insert into sessions
-           (id, tenant_id, agent_id, agent_revision_id, autonomy, trust_tier, task, repo_source, run_spec, budgets, trigger)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+           (id, tenant_id, agent_id, agent_revision_id, autonomy, trust_tier, task, repo_source, run_spec, budgets, trigger, invoked_by_kind, invoked_by_user_id)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
          returning *",
     )
     .bind(Uuid::now_v7())
-    .bind(tenant)
+    .bind(scope.tenant_id())
     .bind(agent_id)
     .bind(agent_revision_id)
     .bind(autonomy)
@@ -1640,6 +1738,8 @@ pub async fn create_session(
     .bind(run_spec)
     .bind(budgets)
     .bind(trigger)
+    .bind(invoked_by_kind)
+    .bind(invoked_by_user_id)
     .fetch_one(&mut *tx)
     .await?;
     // Atomic claim bind: the run and its idempotency claim commit together,
@@ -2681,13 +2781,15 @@ pub enum InvocationClaim {
 /// after 60s so a dangling row can't wedge the key forever.
 pub async fn claim_invocation(
     pool: &PgPool,
+    scope: TenantScope,
     subscription: Uuid,
     idempotency_key: &str,
     request_digest: &str,
 ) -> sqlx::Result<InvocationClaim> {
     let inserted = sqlx::query(
         "insert into trigger_invocations (id, subscription_id, idempotency_key, request_digest)
-         values ($1, $2, $3, $4)
+         select $1, $2, $3, $4
+         where exists (select 1 from trigger_subscriptions where id = $2 and tenant_id = $5)
          on conflict (subscription_id, idempotency_key) do nothing
          returning id",
     )
@@ -2695,6 +2797,7 @@ pub async fn claim_invocation(
     .bind(subscription)
     .bind(idempotency_key)
     .bind(request_digest)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await?;
     if let Some(row) = inserted {
@@ -2704,10 +2807,12 @@ pub async fn claim_invocation(
     }
     let existing = sqlx::query(
         "select id, session_id, request_digest, skip_reason, created_at from trigger_invocations
-         where subscription_id = $1 and idempotency_key = $2",
+         where subscription_id = $1 and idempotency_key = $2
+           and exists (select 1 from trigger_subscriptions where id = $1 and tenant_id = $3)",
     )
     .bind(subscription)
     .bind(idempotency_key)
+    .bind(scope.tenant_id())
     .fetch_one(pool)
     .await?;
     if let Some(session_id) = existing.get::<Option<Uuid>, _>("session_id") {
@@ -2727,11 +2832,13 @@ pub async fn claim_invocation(
           where subscription_id = $1 and idempotency_key = $2
             and session_id is null and skip_reason is null
             and created_at < now() - interval '60 seconds'
+            and exists (select 1 from trigger_subscriptions where id = $1 and tenant_id = $4)
           returning id",
     )
     .bind(subscription)
     .bind(idempotency_key)
     .bind(request_digest)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await?;
     Ok(match takeover {
@@ -2747,15 +2854,20 @@ pub async fn claim_invocation(
 /// never be relabelled a skip.
 pub async fn mark_invocation_skipped(
     pool: &PgPool,
+    scope: TenantScope,
     invocation: Uuid,
     reason: &str,
 ) -> sqlx::Result<()> {
     sqlx::query(
         "update trigger_invocations set skip_reason = $2
-         where id = $1 and session_id is null",
+         where id = $1 and session_id is null
+           and exists (select 1 from trigger_subscriptions sub
+                       where sub.id = trigger_invocations.subscription_id
+                         and sub.tenant_id = $3)",
     )
     .bind(invocation)
     .bind(reason)
+    .bind(scope.tenant_id())
     .execute(pool)
     .await?;
     Ok(())
@@ -2773,16 +2885,19 @@ pub struct TriggerInvocationRow {
 
 pub async fn list_subscription_invocations(
     pool: &PgPool,
+    scope: TenantScope,
     subscription: Uuid,
     limit: i64,
 ) -> sqlx::Result<Vec<TriggerInvocationRow>> {
     sqlx::query_as(
         "select id, subscription_id, idempotency_key, session_id, skip_reason, created_at
          from trigger_invocations where subscription_id = $1
+           and exists (select 1 from trigger_subscriptions where id = $1 and tenant_id = $3)
          order by created_at desc limit $2",
     )
     .bind(subscription)
     .bind(limit)
+    .bind(scope.tenant_id())
     .fetch_all(pool)
     .await
 }
@@ -2790,42 +2905,56 @@ pub async fn list_subscription_invocations(
 /// Non-terminal runs of a subscription — the concurrency-policy input.
 pub async fn active_subscription_sessions(
     pool: &PgPool,
+    scope: TenantScope,
     subscription: Uuid,
 ) -> sqlx::Result<Vec<SessionRow>> {
     sqlx::query_as(
         "select s.* from sessions s
          join trigger_invocations i on i.session_id = s.id
-         where i.subscription_id = $1
+         where i.subscription_id = $1 and s.tenant_id = $2
            and s.status not in ('completed','failed','cancelled','budget_exceeded')
          order by s.created_at",
     )
     .bind(subscription)
+    .bind(scope.tenant_id())
     .fetch_all(pool)
     .await
 }
 
 /// Free a claim whose run creation failed, so an immediate retry can re-try.
-pub async fn release_invocation(pool: &PgPool, invocation: Uuid) -> sqlx::Result<()> {
-    sqlx::query("delete from trigger_invocations where id = $1 and session_id is null")
-        .bind(invocation)
-        .execute(pool)
-        .await?;
+pub async fn release_invocation(
+    pool: &PgPool,
+    scope: TenantScope,
+    invocation: Uuid,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "delete from trigger_invocations where id = $1 and session_id is null
+           and exists (select 1 from trigger_subscriptions sub
+                       where sub.id = trigger_invocations.subscription_id
+                         and sub.tenant_id = $2)",
+    )
+    .bind(invocation)
+    .bind(scope.tenant_id())
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
 pub async fn list_subscription_sessions(
     pool: &PgPool,
+    scope: TenantScope,
     subscription: Uuid,
     limit: i64,
 ) -> sqlx::Result<Vec<SessionRow>> {
     sqlx::query_as(
         "select s.* from sessions s
          join trigger_invocations i on i.session_id = s.id
-         where i.subscription_id = $1
+         where i.subscription_id = $1 and s.tenant_id = $3
          order by s.created_at desc limit $2",
     )
     .bind(subscription)
     .bind(limit)
+    .bind(scope.tenant_id())
     .fetch_all(pool)
     .await
 }
@@ -2833,17 +2962,20 @@ pub async fn list_subscription_sessions(
 /// Scopes the trigger-token polling endpoint to runs this subscription made.
 pub async fn subscription_owns_session(
     pool: &PgPool,
+    scope: TenantScope,
     subscription: Uuid,
     session: Uuid,
 ) -> sqlx::Result<bool> {
     let row = sqlx::query(
         "select exists(
-           select 1 from trigger_invocations
-           where subscription_id = $1 and session_id = $2
+           select 1 from trigger_invocations ti
+           join trigger_subscriptions sub on sub.id = ti.subscription_id
+           where ti.subscription_id = $1 and ti.session_id = $2 and sub.tenant_id = $3
          ) as owned",
     )
     .bind(subscription)
     .bind(session)
+    .bind(scope.tenant_id())
     .fetch_one(pool)
     .await?;
     Ok(row.get::<bool, _>("owned"))
@@ -2875,15 +3007,18 @@ pub struct ResultDeliveryRow {
 /// never mistaken for "all destinations enqueued".
 pub async fn result_delivery_exists_for(
     pool: &PgPool,
+    scope: TenantScope,
     session: Uuid,
     destination: &Value,
 ) -> sqlx::Result<bool> {
     let (exists,): (bool,) = sqlx::query_as(
         "select exists(select 1 from result_deliveries
-           where session_id = $1 and destination = $2)",
+           where session_id = $1 and destination = $2
+             and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $3))",
     )
     .bind(session)
     .bind(destination)
+    .bind(scope.tenant_id())
     .fetch_one(pool)
     .await?;
     Ok(exists)
@@ -2892,11 +3027,17 @@ pub async fn result_delivery_exists_for(
 /// True if the session already has a `run.result` ledger event — the
 /// reconciler's exactly-once guard (emit-if-missing under the finalize
 /// claim, which serializes drivers).
-pub async fn has_run_result_event(pool: &PgPool, session: Uuid) -> sqlx::Result<bool> {
+pub async fn has_run_result_event(
+    pool: &PgPool,
+    scope: TenantScope,
+    session: Uuid,
+) -> sqlx::Result<bool> {
     let (exists,): (bool,) = sqlx::query_as(
-        "select exists(select 1 from events where session_id = $1 and type = 'run.result')",
+        "select exists(select 1 from events where session_id = $1 and type = 'run.result'
+           and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $2))",
     )
     .bind(session)
+    .bind(scope.tenant_id())
     .fetch_one(pool)
     .await?;
     Ok(exists)
@@ -2904,44 +3045,32 @@ pub async fn has_run_result_event(pool: &PgPool, session: Uuid) -> sqlx::Result<
 
 pub async fn enqueue_result_delivery(
     pool: &PgPool,
+    scope: TenantScope,
     session: Uuid,
     subscription: Option<Uuid>,
     destination: &Value,
 ) -> sqlx::Result<ResultDeliveryRow> {
     sqlx::query_as(
         "insert into result_deliveries (id, session_id, subscription_id, destination)
-         values ($1, $2, $3, $4) returning *",
+         select $1, $2, $3, $4
+         where exists (select 1 from sessions s where s.id = $2 and s.tenant_id = $5)
+         returning *",
     )
     .bind(Uuid::now_v7())
     .bind(session)
     .bind(subscription)
     .bind(destination)
+    .bind(scope.tenant_id())
     .fetch_one(pool)
-    .await
-}
-
-/// Due work for the (single, sequential) delivery worker. No row locking:
-/// there is one worker task per server and attempts are awaited one at a
-/// time, so a row can never be attempted twice concurrently. Delivery is
-/// at-least-once by design — receivers dedup on the delivery id.
-pub async fn due_result_deliveries(
-    pool: &PgPool,
-    limit: i64,
-) -> sqlx::Result<Vec<ResultDeliveryRow>> {
-    sqlx::query_as(
-        "select * from result_deliveries
-         where status = 'pending' and next_attempt_at <= now()
-         order by next_attempt_at limit $1",
-    )
-    .bind(limit)
-    .fetch_all(pool)
     .await
 }
 
 /// Record one attempt. ok → delivered; failure → attempts+1 and either
 /// rescheduled (`retry_in_secs`) or terminally 'failed' at `max_attempts`.
+#[allow(clippy::too_many_arguments)]
 pub async fn mark_delivery_attempt(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
     ok: bool,
     error: Option<&str>,
@@ -2960,7 +3089,10 @@ pub async fn mark_delivery_attempt(
             payload_digest = coalesce($4, payload_digest),
             next_attempt_at = now() + make_interval(secs => $5),
             updated_at = now()
-         where id = $1 returning *",
+         where id = $1
+           and exists (select 1 from sessions s
+                       where s.id = result_deliveries.session_id and s.tenant_id = $7)
+         returning *",
     )
     .bind(id)
     .bind(ok)
@@ -2968,31 +3100,42 @@ pub async fn mark_delivery_attempt(
     .bind(payload_digest)
     .bind(retry_in_secs as f64)
     .bind(max_attempts)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await
 }
 
 pub async fn list_session_deliveries(
     pool: &PgPool,
+    scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<Vec<ResultDeliveryRow>> {
-    sqlx::query_as("select * from result_deliveries where session_id = $1 order by created_at")
-        .bind(session)
-        .fetch_all(pool)
-        .await
+    sqlx::query_as(
+        "select * from result_deliveries where session_id = $1
+           and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $2)
+         order by created_at",
+    )
+    .bind(session)
+    .bind(scope.tenant_id())
+    .fetch_all(pool)
+    .await
 }
 
 pub async fn list_subscription_deliveries(
     pool: &PgPool,
+    scope: TenantScope,
     subscription: Uuid,
     limit: i64,
 ) -> sqlx::Result<Vec<ResultDeliveryRow>> {
     sqlx::query_as(
         "select * from result_deliveries where subscription_id = $1
+           and exists (select 1 from trigger_subscriptions sub
+                       where sub.id = $1 and sub.tenant_id = $3)
          order by created_at desc limit $2",
     )
     .bind(subscription)
     .bind(limit)
+    .bind(scope.tenant_id())
     .fetch_all(pool)
     .await
 }
@@ -3014,6 +3157,7 @@ pub struct ScheduleRow {
 
 pub async fn create_schedule(
     pool: &PgPool,
+    scope: TenantScope,
     subscription: Uuid,
     cron: &str,
     timezone: &str,
@@ -3022,7 +3166,9 @@ pub async fn create_schedule(
 ) -> sqlx::Result<ScheduleRow> {
     sqlx::query_as(
         "insert into schedules (id, subscription_id, cron, timezone, next_fire_at, missed_run_policy)
-         values ($1, $2, $3, $4, $5, $6) returning *",
+         select $1, $2, $3, $4, $5, $6
+         where exists (select 1 from trigger_subscriptions where id = $2 and tenant_id = $7)
+         returning *",
     )
     .bind(Uuid::now_v7())
     .bind(subscription)
@@ -3030,43 +3176,37 @@ pub async fn create_schedule(
     .bind(timezone)
     .bind(next_fire_at)
     .bind(missed_run_policy)
+    .bind(scope.tenant_id())
     .fetch_one(pool)
     .await
 }
 
 pub async fn schedule_for_subscription(
     pool: &PgPool,
+    scope: TenantScope,
     subscription: Uuid,
 ) -> sqlx::Result<Option<ScheduleRow>> {
-    sqlx::query_as("select * from schedules where subscription_id = $1")
-        .bind(subscription)
-        .fetch_optional(pool)
-        .await
+    sqlx::query_as(
+        "select * from schedules where subscription_id = $1
+           and exists (select 1 from trigger_subscriptions sub
+                       where sub.id = $1 and sub.tenant_id = $2)",
+    )
+    .bind(subscription)
+    .bind(scope.tenant_id())
+    .fetch_optional(pool)
+    .await
 }
 
-pub async fn schedules_for_tenant(pool: &PgPool, tenant: Uuid) -> sqlx::Result<Vec<ScheduleRow>> {
+pub async fn schedules_for_tenant(
+    pool: &PgPool,
+    scope: TenantScope,
+) -> sqlx::Result<Vec<ScheduleRow>> {
     sqlx::query_as(
         "select sc.* from schedules sc
          join trigger_subscriptions sub on sub.id = sc.subscription_id
          where sub.tenant_id = $1",
     )
-    .bind(tenant)
-    .fetch_all(pool)
-    .await
-}
-
-/// Due work for the (single, sequential) scheduler worker — same no-locking
-/// contract as due_result_deliveries. A disabled subscription's schedule is
-/// not due and does NOT advance: re-enabling turns the gap into a
-/// missed-run case, exactly like a scheduler outage.
-pub async fn due_schedules(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<ScheduleRow>> {
-    sqlx::query_as(
-        "select sc.* from schedules sc
-         join trigger_subscriptions sub on sub.id = sc.subscription_id
-         where sc.next_fire_at is not null and sc.next_fire_at <= now() and sub.enabled
-         order by sc.next_fire_at limit $1",
-    )
-    .bind(limit)
+    .bind(scope.tenant_id())
     .fetch_all(pool)
     .await
 }
@@ -3076,6 +3216,7 @@ pub async fn due_schedules(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<Schedu
 /// unhandled fire time.
 pub async fn advance_schedule(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
     from: DateTime<Utc>,
     to: Option<DateTime<Utc>>,
@@ -3086,12 +3227,15 @@ pub async fn advance_schedule(
             next_fire_at = $2,
             last_fired_at = coalesce($3, last_fired_at),
             updated_at = now()
-         where id = $1 and next_fire_at = $4",
+         where id = $1 and next_fire_at = $4
+           and exists (select 1 from trigger_subscriptions sub
+                       where sub.id = schedules.subscription_id and sub.tenant_id = $5)",
     )
     .bind(id)
     .bind(to)
     .bind(fired_at)
     .bind(from)
+    .bind(scope.tenant_id())
     .execute(pool)
     .await?;
     Ok(res.rows_affected() > 0)
@@ -3099,7 +3243,7 @@ pub async fn advance_schedule(
 
 pub async fn create_trigger_token(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
     subscription: Uuid,
     token_plain: &str,
 ) -> sqlx::Result<()> {
@@ -3108,7 +3252,7 @@ pub async fn create_trigger_token(
          values ($1, $2, 'trigger', $3, $4)",
     )
     .bind(Uuid::now_v7())
-    .bind(tenant)
+    .bind(scope.tenant_id())
     .bind(subscription)
     .bind(sha256_hex(token_plain))
     .execute(pool)
@@ -3151,12 +3295,19 @@ pub async fn subscription_for_token(
 }
 
 /// Rotation support: kill every live token for the subscription.
-pub async fn revoke_trigger_tokens(pool: &PgPool, subscription: Uuid) -> sqlx::Result<u64> {
+pub async fn revoke_trigger_tokens(
+    pool: &PgPool,
+    scope: TenantScope,
+    subscription: Uuid,
+) -> sqlx::Result<u64> {
     let res = sqlx::query(
         "update api_tokens set revoked_at = now()
-         where kind = 'trigger' and subscription_id = $1 and revoked_at is null",
+         where kind = 'trigger' and subscription_id = $1 and revoked_at is null
+           and exists (select 1 from trigger_subscriptions sub
+                       where sub.id = $1 and sub.tenant_id = $2)",
     )
     .bind(subscription)
+    .bind(scope.tenant_id())
     .execute(pool)
     .await?;
     Ok(res.rows_affected())
@@ -3195,8 +3346,10 @@ pub struct TriggerDispatchRow {
 /// Level-1 dedup: store the delivery once; a retry returns the stored row
 /// with `fresh = false` and the caller re-walks dispatch (which is itself
 /// idempotent) — so a retry can only ever HEAL a partial fan-out.
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_trigger_delivery(
     pool: &PgPool,
+    scope: TenantScope,
     connection: Uuid,
     external_event_id: &str,
     event_type: &str,
@@ -3207,7 +3360,8 @@ pub async fn insert_trigger_delivery(
     let inserted: Option<TriggerDeliveryRow> = sqlx::query_as(
         "insert into trigger_deliveries
            (id, connection_id, external_event_id, event_type, payload, payload_digest, occurred_at)
-         values ($1,$2,$3,$4,$5,$6,$7)
+         select $1,$2,$3,$4,$5,$6,$7
+         where exists (select 1 from integration_connections c where c.id = $2 and c.tenant_id = $8)
          on conflict (connection_id, external_event_id) do nothing
          returning *",
     )
@@ -3218,16 +3372,19 @@ pub async fn insert_trigger_delivery(
     .bind(payload)
     .bind(payload_digest)
     .bind(occurred_at)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await?;
     if let Some(row) = inserted {
         return Ok((row, true));
     }
     let existing = sqlx::query_as(
-        "select * from trigger_deliveries where connection_id = $1 and external_event_id = $2",
+        "select * from trigger_deliveries where connection_id = $1 and external_event_id = $2
+           and exists (select 1 from integration_connections c where c.id = $1 and c.tenant_id = $3)",
     )
     .bind(connection)
     .bind(external_event_id)
+    .bind(scope.tenant_id())
     .fetch_one(pool)
     .await?;
     Ok((existing, false))
@@ -3240,18 +3397,22 @@ pub async fn insert_trigger_delivery(
 /// stealable (crashed creator); skipped/errored rows are terminal.
 pub async fn claim_trigger_dispatch(
     pool: &PgPool,
+    scope: TenantScope,
     delivery: Uuid,
     subscription: Uuid,
 ) -> sqlx::Result<Option<TriggerDispatchRow>> {
     let inserted: Option<TriggerDispatchRow> = sqlx::query_as(
         "insert into trigger_dispatches (id, delivery_id, subscription_id)
-         values ($1,$2,$3)
+         select $1,$2,$3
+         where exists (select 1 from trigger_subscriptions sub
+                       where sub.id = $3 and sub.tenant_id = $4)
          on conflict (delivery_id, subscription_id) do nothing
          returning *",
     )
     .bind(Uuid::now_v7())
     .bind(delivery)
     .bind(subscription)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await?;
     if inserted.is_some() {
@@ -3263,10 +3424,13 @@ pub async fn claim_trigger_dispatch(
           where delivery_id = $1 and subscription_id = $2
             and session_id is null and status = 'created'
             and created_at < now() - interval '60 seconds'
+            and exists (select 1 from trigger_subscriptions sub
+                        where sub.id = $2 and sub.tenant_id = $3)
           returning *",
     )
     .bind(delivery)
     .bind(subscription)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await
 }
@@ -3275,17 +3439,21 @@ pub async fn claim_trigger_dispatch(
 /// error). Guarded on session_id so a bound run can never be relabelled.
 pub async fn mark_dispatch_outcome(
     pool: &PgPool,
+    scope: TenantScope,
     dispatch: Uuid,
     status: &str,
     skip_reason: Option<&str>,
 ) -> sqlx::Result<()> {
     sqlx::query(
         "update trigger_dispatches set status = $2, skip_reason = $3
-         where id = $1 and session_id is null",
+         where id = $1 and session_id is null
+           and exists (select 1 from trigger_subscriptions sub
+                       where sub.id = trigger_dispatches.subscription_id and sub.tenant_id = $4)",
     )
     .bind(dispatch)
     .bind(status)
     .bind(skip_reason)
+    .bind(scope.tenant_id())
     .execute(pool)
     .await?;
     Ok(())
@@ -3293,25 +3461,36 @@ pub async fn mark_dispatch_outcome(
 
 pub async fn list_delivery_dispatches(
     pool: &PgPool,
+    scope: TenantScope,
     delivery: Uuid,
 ) -> sqlx::Result<Vec<TriggerDispatchRow>> {
-    sqlx::query_as("select * from trigger_dispatches where delivery_id = $1 order by created_at")
-        .bind(delivery)
-        .fetch_all(pool)
-        .await
+    sqlx::query_as(
+        "select * from trigger_dispatches where delivery_id = $1
+           and exists (select 1 from trigger_deliveries d
+                       join integration_connections c on c.id = d.connection_id
+                       where d.id = $1 and c.tenant_id = $2)
+         order by created_at",
+    )
+    .bind(delivery)
+    .bind(scope.tenant_id())
+    .fetch_all(pool)
+    .await
 }
 
 pub async fn list_connection_deliveries(
     pool: &PgPool,
+    scope: TenantScope,
     connection: Uuid,
     limit: i64,
 ) -> sqlx::Result<Vec<TriggerDeliveryRow>> {
     sqlx::query_as(
         "select * from trigger_deliveries where connection_id = $1
+           and exists (select 1 from integration_connections c where c.id = $1 and c.tenant_id = $3)
          order by received_at desc limit $2",
     )
     .bind(connection)
     .bind(limit)
+    .bind(scope.tenant_id())
     .fetch_all(pool)
     .await
 }
@@ -3332,23 +3511,28 @@ pub struct ExternalResultRow {
 
 pub async fn get_external_result(
     pool: &PgPool,
+    scope: TenantScope,
     subscription: Uuid,
     kind: &str,
     resource_key: &str,
 ) -> sqlx::Result<Option<ExternalResultRow>> {
     sqlx::query_as(
         "select * from external_results
-         where subscription_id = $1 and kind = $2 and resource_key = $3",
+         where subscription_id = $1 and kind = $2 and resource_key = $3
+           and exists (select 1 from trigger_subscriptions sub
+                       where sub.id = $1 and sub.tenant_id = $4)",
     )
     .bind(subscription)
     .bind(kind)
     .bind(resource_key)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await
 }
 
 pub async fn upsert_external_result(
     pool: &PgPool,
+    scope: TenantScope,
     subscription: Uuid,
     kind: &str,
     resource_key: &str,
@@ -3358,7 +3542,9 @@ pub async fn upsert_external_result(
     sqlx::query_as(
         "insert into external_results
            (id, subscription_id, kind, resource_key, external_id, external_url)
-         values ($1,$2,$3,$4,$5,$6)
+         select $1,$2,$3,$4,$5,$6
+         where exists (select 1 from trigger_subscriptions sub
+                       where sub.id = $2 and sub.tenant_id = $7)
          on conflict (subscription_id, kind, resource_key)
            do update set external_id = excluded.external_id,
                          external_url = excluded.external_url,
@@ -3371,6 +3557,7 @@ pub async fn upsert_external_result(
     .bind(resource_key)
     .bind(external_id)
     .bind(external_url)
+    .bind(scope.tenant_id())
     .fetch_one(pool)
     .await
 }
@@ -3438,18 +3625,19 @@ mod tests {
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
             &pool,
-            tenant,
+            scope,
             "test-finalize",
             "name: test-finalize",
             &serde_json::json!({"name": "test-finalize"}),
         )
         .await
         .unwrap();
-        let agent = create_agent(&pool, tenant, "test-finalize-agent", None)
+        let agent = create_agent(&pool, scope, "test-finalize-agent", None)
             .await
             .unwrap();
         let rev = append_agent_revision(
             &pool,
+            scope,
             agent.id,
             "claude-agent-sdk",
             "img:test",
@@ -3467,7 +3655,7 @@ mod tests {
         let mk = |title: &'static str| {
             create_session(
                 &pool,
-                tenant,
+                scope,
                 agent.id,
                 rev.id,
                 "supervised",
@@ -3476,6 +3664,8 @@ mod tests {
                 &repo,
                 &empty,
                 &empty,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -3718,18 +3908,19 @@ mod tests {
 
         let policy = upsert_policy(
             &pool,
-            tenant,
+            scope,
             "test-seq",
             "name: test-seq",
             &serde_json::json!({"name": "test-seq"}),
         )
         .await
         .unwrap();
-        let agent = create_agent(&pool, tenant, "test-seq-agent", None)
+        let agent = create_agent(&pool, scope, "test-seq-agent", None)
             .await
             .unwrap();
         let rev = append_agent_revision(
             &pool,
+            scope,
             agent.id,
             "claude-agent-sdk",
             "img:test",
@@ -3744,7 +3935,7 @@ mod tests {
         .unwrap();
         let session = create_session(
             &pool,
-            tenant,
+            scope,
             agent.id,
             rev.id,
             "supervised",
@@ -3753,6 +3944,8 @@ mod tests {
             &serde_json::json!({"kind":"none"}),
             &serde_json::json!({}),
             &serde_json::json!({}),
+            None,
+            None,
             None,
             None,
             None,
@@ -3800,18 +3993,19 @@ mod tests {
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
             &pool,
-            tenant,
+            scope,
             "test-token",
             "name: test-token",
             &serde_json::json!({"name": "test-token"}),
         )
         .await
         .unwrap();
-        let agent = create_agent(&pool, tenant, "test-token-agent", None)
+        let agent = create_agent(&pool, scope, "test-token-agent", None)
             .await
             .unwrap();
         let rev = append_agent_revision(
             &pool,
+            scope,
             agent.id,
             "codex",
             "img:test",
@@ -3826,7 +4020,7 @@ mod tests {
         .unwrap();
         let session = create_session(
             &pool,
-            tenant,
+            scope,
             agent.id,
             rev.id,
             "autonomous",
@@ -3835,6 +4029,8 @@ mod tests {
             &serde_json::json!({"kind":"none"}),
             &serde_json::json!({}),
             &serde_json::json!({}),
+            None,
+            None,
             None,
             None,
             None,
@@ -3892,18 +4088,19 @@ mod tests {
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
             &pool,
-            tenant,
+            scope,
             "test-intent",
             "name: test-intent",
             &serde_json::json!({"name": "test-intent"}),
         )
         .await
         .unwrap();
-        let agent = create_agent(&pool, tenant, "test-intent-agent", None)
+        let agent = create_agent(&pool, scope, "test-intent-agent", None)
             .await
             .unwrap();
         let rev = append_agent_revision(
             &pool,
+            scope,
             agent.id,
             "codex",
             "img:test",
@@ -3918,7 +4115,7 @@ mod tests {
         .unwrap();
         let session = create_session(
             &pool,
-            tenant,
+            scope,
             agent.id,
             rev.id,
             "supervised",
@@ -3927,6 +4124,8 @@ mod tests {
             &serde_json::json!({"kind":"none"}),
             &serde_json::json!({}),
             &serde_json::json!({}),
+            None,
+            None,
             None,
             None,
             None,
@@ -4030,18 +4229,19 @@ mod tests {
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
             &pool,
-            tenant,
+            scope,
             "test-stale",
             "name: test-stale",
             &serde_json::json!({"name": "test-stale"}),
         )
         .await
         .unwrap();
-        let agent = create_agent(&pool, tenant, "test-stale-agent", None)
+        let agent = create_agent(&pool, scope, "test-stale-agent", None)
             .await
             .unwrap();
         let rev = append_agent_revision(
             &pool,
+            scope,
             agent.id,
             "claude-agent-sdk",
             "img:test",
@@ -4058,7 +4258,7 @@ mod tests {
         let empty = serde_json::json!({});
         let fresh = create_session(
             &pool,
-            tenant,
+            scope,
             agent.id,
             rev.id,
             "supervised",
@@ -4070,12 +4270,14 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
         let stale = create_session(
             &pool,
-            tenant,
+            scope,
             agent.id,
             rev.id,
             "supervised",
@@ -4084,6 +4286,8 @@ mod tests {
             &repo,
             &empty,
             &empty,
+            None,
+            None,
             None,
             None,
             None,
@@ -4199,18 +4403,19 @@ mod tests {
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
             &pool,
-            tenant,
+            scope,
             "test-adopt",
             "name: test-adopt",
             &serde_json::json!({"name": "test-adopt"}),
         )
         .await
         .unwrap();
-        let agent = create_agent(&pool, tenant, "test-adopt-agent", None)
+        let agent = create_agent(&pool, scope, "test-adopt-agent", None)
             .await
             .unwrap();
         let rev = append_agent_revision(
             &pool,
+            scope,
             agent.id,
             "claude-agent-sdk",
             "img:test",
@@ -4227,7 +4432,7 @@ mod tests {
         let empty = serde_json::json!({});
         let s = create_session(
             &pool,
-            tenant,
+            scope,
             agent.id,
             rev.id,
             "supervised",
@@ -4236,6 +4441,8 @@ mod tests {
             &repo,
             &empty,
             &empty,
+            None,
+            None,
             None,
             None,
             None,
@@ -4294,11 +4501,12 @@ mod tests {
         };
         let pool = connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let scope = TenantScope::assume(tenant);
 
         let sealed = b"nonce||ciphertext-not-a-real-secret".to_vec();
         let conn = create_connection(
             &pool,
-            tenant,
+            scope,
             "github",
             "test-account-42",
             "test-connection",
@@ -4320,21 +4528,27 @@ mod tests {
             .contains("ciphertext-not-a-real-secret"));
 
         // Active connection yields the sealed bytes.
-        let got = connection_credential_sealed(&pool, conn.id)
+        let got = connection_credential_sealed(&pool, scope, conn.id)
             .await
             .unwrap()
             .expect("active connection has credential");
         assert_eq!(got, sealed);
 
         // Revocation is terminal for credential access.
-        let revoked = revoke_connection(&pool, conn.id).await.unwrap().unwrap();
+        let revoked = revoke_connection(&pool, scope, conn.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(revoked.status, "revoked");
-        assert!(connection_credential_sealed(&pool, conn.id)
+        assert!(connection_credential_sealed(&pool, scope, conn.id)
             .await
             .unwrap()
             .is_none());
         // Idempotent second revoke: no row to update.
-        assert!(revoke_connection(&pool, conn.id).await.unwrap().is_none());
+        assert!(revoke_connection(&pool, scope, conn.id)
+            .await
+            .unwrap()
+            .is_none());
 
         sqlx::query("delete from integration_connections where id = $1")
             .bind(conn.id)
@@ -4351,20 +4565,22 @@ mod tests {
         };
         let pool = connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
             &pool,
-            tenant,
+            scope,
             "test-trig",
             "name: test-trig",
             &serde_json::json!({"name": "test-trig"}),
         )
         .await
         .unwrap();
-        let agent = create_agent(&pool, tenant, "test-trig-agent", None)
+        let agent = create_agent(&pool, scope, "test-trig-agent", None)
             .await
             .unwrap();
         let _rev = append_agent_revision(
             &pool,
+            scope,
             agent.id,
             "claude-agent-sdk",
             "img:test",
@@ -4381,7 +4597,7 @@ mod tests {
         let sealed = b"nonce||not-a-real-secret".to_vec();
         let sub = create_trigger_subscription(
             &pool,
-            tenant,
+            scope,
             agent.id,
             "test-sub",
             "api",
@@ -4411,13 +4627,13 @@ mod tests {
         assert!(as_json.get("callback_secret_sealed").is_none());
 
         // The single secret reader returns the sealed bytes.
-        let got = subscription_callback_secret_sealed(&pool, sub.id)
+        let got = subscription_callback_secret_sealed(&pool, scope, sub.id)
             .await
             .unwrap();
         assert_eq!(got, Some(sealed));
 
         // Trigger tokens: hashed at rest, resolvable, revocable.
-        create_trigger_token(&pool, tenant, sub.id, "fbx_trig_testtoken123")
+        create_trigger_token(&pool, scope, sub.id, "fbx_trig_testtoken123")
             .await
             .unwrap();
         assert_eq!(
@@ -4434,7 +4650,7 @@ mod tests {
                 .map(|a| a.subscription_id),
             None
         );
-        let revoked = revoke_trigger_tokens(&pool, sub.id).await.unwrap();
+        let revoked = revoke_trigger_tokens(&pool, scope, sub.id).await.unwrap();
         assert_eq!(revoked, 1);
         assert_eq!(
             subscription_for_token(&pool, "fbx_trig_testtoken123")
@@ -4445,7 +4661,7 @@ mod tests {
         );
 
         // Enable toggle.
-        let off = set_trigger_subscription_enabled(&pool, sub.id, false)
+        let off = set_trigger_subscription_enabled(&pool, scope, sub.id, false)
             .await
             .unwrap()
             .unwrap();
@@ -4466,20 +4682,22 @@ mod tests {
         };
         let pool = connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
             &pool,
-            tenant,
+            scope,
             "test-idem",
             "name: test-idem",
             &serde_json::json!({"name": "test-idem"}),
         )
         .await
         .unwrap();
-        let agent = create_agent(&pool, tenant, "test-idem-agent", None)
+        let agent = create_agent(&pool, scope, "test-idem-agent", None)
             .await
             .unwrap();
         let rev = append_agent_revision(
             &pool,
+            scope,
             agent.id,
             "claude-agent-sdk",
             "img:test",
@@ -4494,7 +4712,7 @@ mod tests {
         .unwrap();
         let sub = create_trigger_subscription(
             &pool,
-            tenant,
+            scope,
             agent.id,
             "test-idem-sub",
             "api",
@@ -4518,7 +4736,7 @@ mod tests {
         .unwrap();
 
         // First claim wins.
-        let c1 = claim_invocation(&pool, sub.id, "key-1", "digest-a")
+        let c1 = claim_invocation(&pool, scope, sub.id, "key-1", "digest-a")
             .await
             .unwrap();
         let InvocationClaim::Claimed { invocation_id } = c1 else {
@@ -4527,7 +4745,7 @@ mod tests {
 
         // Same key while unbound → InFlight (a concurrent retry must wait).
         assert!(matches!(
-            claim_invocation(&pool, sub.id, "key-1", "digest-a")
+            claim_invocation(&pool, scope, sub.id, "key-1", "digest-a")
                 .await
                 .unwrap(),
             InvocationClaim::InFlight
@@ -4537,7 +4755,7 @@ mod tests {
         // the same key replays that session.
         let session = create_session(
             &pool,
-            tenant,
+            scope,
             agent.id,
             rev.id,
             "supervised",
@@ -4547,13 +4765,15 @@ mod tests {
             &serde_json::json!({}),
             &serde_json::json!({}),
             Some(&serde_json::json!({"kind":"api"})),
+            None,
+            None,
             Some(invocation_id),
             None,
         )
         .await
         .unwrap();
         assert_eq!(session.trigger, Some(serde_json::json!({"kind":"api"})));
-        let c3 = claim_invocation(&pool, sub.id, "key-1", "digest-a")
+        let c3 = claim_invocation(&pool, scope, sub.id, "key-1", "digest-a")
             .await
             .unwrap();
         match c3 {
@@ -4568,7 +4788,7 @@ mod tests {
         }
 
         // A released (failed-creation) claim frees the key immediately.
-        let c4 = claim_invocation(&pool, sub.id, "key-2", "digest-b")
+        let c4 = claim_invocation(&pool, scope, sub.id, "key-2", "digest-b")
             .await
             .unwrap();
         let InvocationClaim::Claimed {
@@ -4577,18 +4797,20 @@ mod tests {
         else {
             panic!()
         };
-        release_invocation(&pool, inv2).await.unwrap();
+        release_invocation(&pool, scope, inv2).await.unwrap();
         assert!(matches!(
-            claim_invocation(&pool, sub.id, "key-2", "digest-b")
+            claim_invocation(&pool, scope, sub.id, "key-2", "digest-b")
                 .await
                 .unwrap(),
             InvocationClaim::Claimed { .. }
         ));
 
-        assert!(subscription_owns_session(&pool, sub.id, session.id)
+        assert!(subscription_owns_session(&pool, scope, sub.id, session.id)
             .await
             .unwrap());
-        let listed = list_subscription_sessions(&pool, sub.id, 10).await.unwrap();
+        let listed = list_subscription_sessions(&pool, scope, sub.id, 10)
+            .await
+            .unwrap();
         assert!(listed.iter().any(|s| s.id == session.id));
 
         sqlx::query("delete from sessions where id = $1")
@@ -4611,12 +4833,13 @@ mod tests {
         };
         let pool = connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
-        let agent = create_agent(&pool, tenant, "test-sched-agent", None)
+        let scope = TenantScope::assume(tenant);
+        let agent = create_agent(&pool, scope, "test-sched-agent", None)
             .await
             .unwrap();
         let sub = create_trigger_subscription(
             &pool,
-            tenant,
+            scope,
             agent.id,
             &format!("test-sched-{}", Uuid::now_v7()),
             "schedule",
@@ -4642,41 +4865,45 @@ mod tests {
 
         // Overdue schedule → due; disabled subscription → not due.
         let past = Utc::now() - chrono::Duration::seconds(1);
-        let sched = create_schedule(&pool, sub.id, "*/5 * * * * *", "UTC", past, "skip")
+        let sched = create_schedule(&pool, scope, sub.id, "*/5 * * * * *", "UTC", past, "skip")
             .await
             .unwrap();
-        assert!(due_schedules(&pool, 50)
+        assert!(system_worker::due_schedules(&pool, 50)
             .await
             .unwrap()
             .iter()
             .any(|s| s.id == sched.id));
-        set_trigger_subscription_enabled(&pool, sub.id, false)
+        set_trigger_subscription_enabled(&pool, scope, sub.id, false)
             .await
             .unwrap();
-        assert!(!due_schedules(&pool, 50)
+        assert!(!system_worker::due_schedules(&pool, 50)
             .await
             .unwrap()
             .iter()
             .any(|s| s.id == sched.id));
-        set_trigger_subscription_enabled(&pool, sub.id, true)
+        set_trigger_subscription_enabled(&pool, scope, sub.id, true)
             .await
             .unwrap();
 
         // Deterministic fire key: claim once, mark skipped, replay the skip.
         let key = "sched:2026-07-10T00:00:00Z";
-        let claim = claim_invocation(&pool, sub.id, key, "d1").await.unwrap();
+        let claim = claim_invocation(&pool, scope, sub.id, key, "d1")
+            .await
+            .unwrap();
         let InvocationClaim::Claimed { invocation_id } = claim else {
             panic!("expected Claimed, got {claim:?}");
         };
-        mark_invocation_skipped(&pool, invocation_id, "missed")
+        mark_invocation_skipped(&pool, scope, invocation_id, "missed")
             .await
             .unwrap();
-        let again = claim_invocation(&pool, sub.id, key, "d1").await.unwrap();
+        let again = claim_invocation(&pool, scope, sub.id, key, "d1")
+            .await
+            .unwrap();
         let InvocationClaim::Skipped { reason } = again else {
             panic!("expected Skipped, got {again:?}");
         };
         assert_eq!(reason, "missed");
-        let inv = list_subscription_invocations(&pool, sub.id, 10)
+        let inv = list_subscription_invocations(&pool, scope, sub.id, 10)
             .await
             .unwrap();
         assert_eq!(inv.len(), 1);
@@ -4686,7 +4913,7 @@ mod tests {
         // CAS advance: succeeds from the processed fire time, then refuses.
         // (`stored` is read back so both sides carry Postgres µs precision.)
         use chrono::SubsecRound;
-        let stored = schedule_for_subscription(&pool, sub.id)
+        let stored = schedule_for_subscription(&pool, scope, sub.id)
             .await
             .unwrap()
             .unwrap()
@@ -4694,22 +4921,22 @@ mod tests {
             .unwrap();
         let future = (Utc::now() + chrono::Duration::seconds(60)).trunc_subsecs(6);
         assert!(
-            advance_schedule(&pool, sched.id, stored, Some(future), None)
+            advance_schedule(&pool, scope, sched.id, stored, Some(future), None)
                 .await
                 .unwrap()
         );
         assert!(
-            !advance_schedule(&pool, sched.id, stored, Some(future), None)
+            !advance_schedule(&pool, scope, sched.id, stored, Some(future), None)
                 .await
                 .unwrap()
         );
-        let row = schedule_for_subscription(&pool, sub.id)
+        let row = schedule_for_subscription(&pool, scope, sub.id)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(row.next_fire_at, Some(future));
         assert!(row.last_fired_at.is_none()); // skips never touch last_fired_at
-        assert!(!due_schedules(&pool, 50)
+        assert!(!system_worker::due_schedules(&pool, 50)
             .await
             .unwrap()
             .iter()
@@ -4731,20 +4958,22 @@ mod tests {
         };
         let pool = connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
             &pool,
-            tenant,
+            scope,
             "test-del",
             "name: test-del",
             &serde_json::json!({"name": "test-del"}),
         )
         .await
         .unwrap();
-        let agent = create_agent(&pool, tenant, "test-del-agent", None)
+        let agent = create_agent(&pool, scope, "test-del-agent", None)
             .await
             .unwrap();
         let rev = append_agent_revision(
             &pool,
+            scope,
             agent.id,
             "claude-agent-sdk",
             "img:test",
@@ -4759,7 +4988,7 @@ mod tests {
         .unwrap();
         let session = create_session(
             &pool,
-            tenant,
+            scope,
             agent.id,
             rev.id,
             "supervised",
@@ -4771,49 +5000,61 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
 
         let dest = serde_json::json!({"kind": "signed_webhook", "url": "http://127.0.0.1:1/cb"});
-        let d = enqueue_result_delivery(&pool, session.id, None, &dest)
+        let d = enqueue_result_delivery(&pool, scope, session.id, None, &dest)
             .await
             .unwrap();
         assert_eq!(d.status, "pending");
         assert_eq!(d.attempts, 0);
 
         // Due immediately.
-        let due = due_result_deliveries(&pool, 10).await.unwrap();
+        let due = system_worker::due_result_deliveries(&pool, 10)
+            .await
+            .unwrap();
         assert!(due.iter().any(|x| x.id == d.id));
 
         // Failure → still pending, attempts=1, pushed into the future (not due).
-        let after =
-            mark_delivery_attempt(&pool, d.id, false, Some("connection refused"), None, 30, 3)
-                .await
-                .unwrap()
-                .unwrap();
+        let after = mark_delivery_attempt(
+            &pool,
+            scope,
+            d.id,
+            false,
+            Some("connection refused"),
+            None,
+            30,
+            3,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!((after.status.as_str(), after.attempts), ("pending", 1));
-        assert!(!due_result_deliveries(&pool, 50)
+        assert!(!system_worker::due_result_deliveries(&pool, 50)
             .await
             .unwrap()
             .iter()
             .any(|x| x.id == d.id));
 
         // Exhausting attempts → failed, terminal for the delivery only.
-        mark_delivery_attempt(&pool, d.id, false, Some("refused"), None, 30, 3)
+        mark_delivery_attempt(&pool, scope, d.id, false, Some("refused"), None, 30, 3)
             .await
             .unwrap();
-        let last = mark_delivery_attempt(&pool, d.id, false, Some("refused"), None, 30, 3)
+        let last = mark_delivery_attempt(&pool, scope, d.id, false, Some("refused"), None, 30, 3)
             .await
             .unwrap()
             .unwrap();
         assert_eq!((last.status.as_str(), last.attempts), ("failed", 3));
 
         // Success path on a second delivery.
-        let d2 = enqueue_result_delivery(&pool, session.id, None, &dest)
+        let d2 = enqueue_result_delivery(&pool, scope, session.id, None, &dest)
             .await
             .unwrap();
-        let okd = mark_delivery_attempt(&pool, d2.id, true, None, Some("sha256:x"), 0, 3)
+        let okd = mark_delivery_attempt(&pool, scope, d2.id, true, None, Some("sha256:x"), 0, 3)
             .await
             .unwrap()
             .unwrap();
@@ -4821,7 +5062,9 @@ mod tests {
         assert!(okd.delivered_at.is_some());
         assert_eq!(okd.payload_digest.as_deref(), Some("sha256:x"));
 
-        let listed = list_session_deliveries(&pool, session.id).await.unwrap();
+        let listed = list_session_deliveries(&pool, scope, session.id)
+            .await
+            .unwrap();
         assert_eq!(listed.len(), 2);
 
         sqlx::query("delete from sessions where id = $1")
@@ -4839,16 +5082,17 @@ mod tests {
         };
         let pool = connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
             &pool,
-            tenant,
+            scope,
             "test-ws",
             "name: test-ws",
             &serde_json::json!({"name": "test-ws"}),
         )
         .await
         .unwrap();
-        let agent = create_agent(&pool, tenant, "test-ws-agent", None)
+        let agent = create_agent(&pool, scope, "test-ws-agent", None)
             .await
             .unwrap();
 
@@ -4859,6 +5103,7 @@ mod tests {
         });
         let rev = append_agent_revision(
             &pool,
+            scope,
             agent.id,
             "claude-agent-sdk",
             "img:test",
@@ -4876,6 +5121,7 @@ mod tests {
         // A revision without one stays None.
         let rev2 = append_agent_revision(
             &pool,
+            scope,
             agent.id,
             "claude-agent-sdk",
             "img:test",
@@ -4910,6 +5156,7 @@ mod tests {
         };
         let pool = connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let scope = TenantScope::assume(tenant);
         let name = format!("test-bundle-{}", Uuid::now_v7());
 
         let def_v1 = serde_json::json!({"servers": [{
@@ -4917,21 +5164,24 @@ mod tests {
             "args": ["/opt/x.mjs"],
             "tools": [{"name": "count", "description": "d", "input_schema": {"type": "object"}}]
         }]});
-        let v1 = create_capability_bundle(&pool, tenant, &name, Some("first"), &def_v1, "sha256:a")
+        let v1 = create_capability_bundle(&pool, scope, &name, Some("first"), &def_v1, "sha256:a")
             .await
             .unwrap();
         assert_eq!(v1.version, 1);
 
         // Publishing again appends version 2 — the v1 row never mutates.
-        let v2 = create_capability_bundle(&pool, tenant, &name, None, &def_v1, "sha256:b")
+        let v2 = create_capability_bundle(&pool, scope, &name, None, &def_v1, "sha256:b")
             .await
             .unwrap();
         assert_eq!(v2.version, 2);
         assert_ne!(v1.id, v2.id);
-        let v1_again = get_capability_bundle(&pool, v1.id).await.unwrap().unwrap();
+        let v1_again = get_capability_bundle(&pool, scope, v1.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(v1_again.definition_digest, "sha256:a");
         assert_eq!(
-            latest_capability_bundle(&pool, tenant, &name)
+            latest_capability_bundle(&pool, scope, &name)
                 .await
                 .unwrap()
                 .unwrap()
@@ -4939,7 +5189,7 @@ mod tests {
             v2.id
         );
         assert_eq!(
-            get_capability_bundle_version(&pool, tenant, &name, 1)
+            get_capability_bundle_version(&pool, scope, &name, 1)
                 .await
                 .unwrap()
                 .unwrap()
@@ -4950,19 +5200,20 @@ mod tests {
         // Revision pins (§17 #7) + subscription keep-list roundtrip as jsonb.
         let policy = upsert_policy(
             &pool,
-            tenant,
+            scope,
             "test-cap",
             "name: test-cap",
             &serde_json::json!({"name": "test-cap"}),
         )
         .await
         .unwrap();
-        let agent = create_agent(&pool, tenant, "test-cap-agent", None)
+        let agent = create_agent(&pool, scope, "test-cap-agent", None)
             .await
             .unwrap();
         let pins = serde_json::json!([{"id": v1.id, "name": name, "version": 1}]);
         let rev = append_agent_revision(
             &pool,
+            scope,
             agent.id,
             "claude-agent-sdk",
             "img:test",
@@ -4980,7 +5231,7 @@ mod tests {
         let keep = serde_json::json!([name]);
         let sub = create_trigger_subscription(
             &pool,
-            tenant,
+            scope,
             agent.id,
             &format!("test-cap-sub-{}", Uuid::now_v7()),
             "api",
@@ -5120,11 +5371,12 @@ mod tests {
         };
         let pool = connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let scope = TenantScope::assume(tenant);
 
         // Pending OAuth connection: no credential yet.
         let conn = create_connection(
             &pool,
-            tenant,
+            scope,
             "mcp_http",
             "mcp.example.test",
             "oauth-lifecycle-test",
@@ -5146,26 +5398,27 @@ mod tests {
         assert_eq!(conn.auth_kind, "oauth");
         assert_eq!(conn.status, "pending");
         // Pending = no credential, and the active-only reader refuses.
-        assert!(connection_credential_sealed(&pool, conn.id)
+        assert!(connection_credential_sealed(&pool, scope, conn.id)
             .await
             .unwrap()
             .is_none());
         // …but client identity IS readable while pending (the dance needs it).
         assert_eq!(
-            connection_client_secret_sealed(&pool, conn.id)
+            connection_client_secret_sealed(&pool, scope, conn.id)
                 .await
                 .unwrap()
                 .as_deref(),
             Some(b"sealed-client-secret".as_slice())
         );
         // Rotation refuses non-active rows.
-        assert!(!rotate_connection_refresh(&pool, conn.id, b"rt1")
+        assert!(!rotate_connection_refresh(&pool, scope, conn.id, b"rt1")
             .await
             .unwrap());
 
         // Callback exchange: seal refresh + activate.
         let row = activate_connection_oauth(
             &pool,
+            scope,
             conn.id,
             b"sealed-rt-1",
             &serde_json::json!({"resource": "https://mcp.example.test", "client_id": "c1"}),
@@ -5176,7 +5429,7 @@ mod tests {
         .unwrap();
         assert_eq!(row.status, "active");
         assert_eq!(
-            connection_credential_sealed(&pool, conn.id)
+            connection_credential_sealed(&pool, scope, conn.id)
                 .await
                 .unwrap()
                 .as_deref(),
@@ -5184,11 +5437,13 @@ mod tests {
         );
 
         // Rotation is one atomic overwrite; the old bytes are gone.
-        assert!(rotate_connection_refresh(&pool, conn.id, b"sealed-rt-2")
-            .await
-            .unwrap());
+        assert!(
+            rotate_connection_refresh(&pool, scope, conn.id, b"sealed-rt-2")
+                .await
+                .unwrap()
+        );
         assert_eq!(
-            connection_credential_sealed(&pool, conn.id)
+            connection_credential_sealed(&pool, scope, conn.id)
                 .await
                 .unwrap()
                 .as_deref(),
@@ -5197,16 +5452,19 @@ mod tests {
 
         // invalid_grant ⇒ error: the credential reader fails closed; the
         // error note lands in oauth jsonb for the dashboard.
-        mark_connection_error(&pool, conn.id, "invalid_grant: reconnect required")
+        mark_connection_error(&pool, scope, conn.id, "invalid_grant: reconnect required")
             .await
             .unwrap();
-        let row = get_connection(&pool, conn.id).await.unwrap().unwrap();
+        let row = get_connection(&pool, scope, conn.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(row.status, "error");
         assert!(row.oauth.unwrap()["error"]
             .as_str()
             .unwrap()
             .contains("invalid_grant"));
-        assert!(connection_credential_sealed(&pool, conn.id)
+        assert!(connection_credential_sealed(&pool, scope, conn.id)
             .await
             .unwrap()
             .is_none());
@@ -5214,6 +5472,7 @@ mod tests {
         // Reconnect path: activation works FROM error too.
         let row = activate_connection_oauth(
             &pool,
+            scope,
             conn.id,
             b"sealed-rt-3",
             &serde_json::json!({"resource": "https://mcp.example.test"}),
@@ -5242,20 +5501,21 @@ mod tests {
         };
         let pool = connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let scope = TenantScope::assume(tenant);
         let yaml = "name: ov-test\ntools: []\n";
         let policy = fluidbox_core::policy::Policy::parse_yaml(yaml).unwrap();
         let parsed = serde_json::to_value(&policy).unwrap();
-        upsert_policy(&pool, tenant, "ov-test", yaml, &parsed)
+        upsert_policy(&pool, scope, "ov-test", yaml, &parsed)
             .await
             .unwrap();
         // Reset any override left behind by a previous (or crashed) run.
-        clear_policy_override(&pool, tenant, "ov-test", "mcp__x__y")
+        clear_policy_override(&pool, scope, "ov-test", "mcp__x__y")
             .await
             .unwrap();
 
         set_policy_override(
             &pool,
-            tenant,
+            scope,
             "ov-test",
             "mcp__x__y",
             fluidbox_core::policy::RuleAction::Allow,
@@ -5264,7 +5524,7 @@ mod tests {
         .unwrap();
 
         // A policy-sync re-push of the SAME yaml must not drop the override.
-        let row = upsert_policy(&pool, tenant, "ov-test", yaml, &parsed)
+        let row = upsert_policy(&pool, scope, "ov-test", yaml, &parsed)
             .await
             .unwrap();
         let overrides: Vec<fluidbox_core::policy::ToolOverride> =
@@ -5284,7 +5544,7 @@ mod tests {
         // Re-setting the SAME tool replaces, never duplicates.
         let row = set_policy_override(
             &pool,
-            tenant,
+            scope,
             "ov-test",
             "mcp__x__y",
             fluidbox_core::policy::RuleAction::Deny,
@@ -5299,10 +5559,10 @@ mod tests {
             fluidbox_core::policy::RuleAction::Deny
         );
 
-        clear_policy_override(&pool, tenant, "ov-test", "mcp__x__y")
+        clear_policy_override(&pool, scope, "ov-test", "mcp__x__y")
             .await
             .unwrap();
-        let row = get_policy_by_name(&pool, tenant, "ov-test")
+        let row = get_policy_by_name(&pool, scope, "ov-test")
             .await
             .unwrap()
             .unwrap();
@@ -5325,12 +5585,13 @@ mod tests {
         };
         let pool = connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let scope = TenantScope::assume(tenant);
 
         let mk = |name: &str| format!("name: {name}\ntools: []\n");
         let (ya, yb) = (mk("pau-a"), mk("pau-b"));
         let pa = upsert_policy(
             &pool,
-            tenant,
+            scope,
             "pau-a",
             &ya,
             &serde_json::to_value(fluidbox_core::policy::Policy::parse_yaml(&ya).unwrap()).unwrap(),
@@ -5339,7 +5600,7 @@ mod tests {
         .unwrap();
         let pb = upsert_policy(
             &pool,
-            tenant,
+            scope,
             "pau-b",
             &yb,
             &serde_json::to_value(fluidbox_core::policy::Policy::parse_yaml(&yb).unwrap()).unwrap(),
@@ -5347,14 +5608,13 @@ mod tests {
         .await
         .unwrap();
 
-        let agent = create_agent(&pool, tenant, "pau-agent", None)
-            .await
-            .unwrap();
+        let agent = create_agent(&pool, scope, "pau-agent", None).await.unwrap();
         let budgets = serde_json::json!({});
         let pins = serde_json::json!([]);
         let rev = |policy_id| {
             append_agent_revision(
                 &pool,
+                scope,
                 agent.id,
                 "claude-agent-sdk",
                 "img",
@@ -5368,13 +5628,13 @@ mod tests {
         };
 
         rev(pa.id).await.unwrap();
-        assert_eq!(policy_agents_using(&pool, tenant, pa.id).await.unwrap(), 1);
-        assert_eq!(policy_agents_using(&pool, tenant, pb.id).await.unwrap(), 0);
+        assert_eq!(policy_agents_using(&pool, scope, pa.id).await.unwrap(), 1);
+        assert_eq!(policy_agents_using(&pool, scope, pb.id).await.unwrap(), 0);
 
         // Append a revision moving the agent to policy B: A drops to 0, B goes to 1.
         rev(pb.id).await.unwrap();
-        assert_eq!(policy_agents_using(&pool, tenant, pa.id).await.unwrap(), 0);
-        assert_eq!(policy_agents_using(&pool, tenant, pb.id).await.unwrap(), 1);
+        assert_eq!(policy_agents_using(&pool, scope, pa.id).await.unwrap(), 0);
+        assert_eq!(policy_agents_using(&pool, scope, pb.id).await.unwrap(), 1);
     }
 
     /// The matrix's MCP rows come from what the agents on this policy can actually
@@ -5388,11 +5648,12 @@ mod tests {
         };
         let pool = connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let scope = TenantScope::assume(tenant);
 
         let yaml = "name: pmt-policy\ntools: []\n";
         let policy = upsert_policy(
             &pool,
-            tenant,
+            scope,
             "pmt-policy",
             yaml,
             &serde_json::to_value(fluidbox_core::policy::Policy::parse_yaml(yaml).unwrap())
@@ -5410,10 +5671,9 @@ mod tests {
                 {"name": "alpha", "description": "d", "input_schema": {"type": "object"}}
             ]
         }]});
-        let bundle =
-            create_capability_bundle(&pool, tenant, &bundle_name, None, &def, "sha256:pmt")
-                .await
-                .unwrap();
+        let bundle = create_capability_bundle(&pool, scope, &bundle_name, None, &def, "sha256:pmt")
+            .await
+            .unwrap();
         let pins = serde_json::json!([
             { "id": bundle.id, "name": bundle.name, "version": bundle.version }
         ]);
@@ -5421,9 +5681,10 @@ mod tests {
         // Two agents share the bundle: the union deduplicates across them.
         let budgets = serde_json::json!({});
         for name in ["pmt-agent-a", "pmt-agent-b"] {
-            let agent = create_agent(&pool, tenant, name, None).await.unwrap();
+            let agent = create_agent(&pool, scope, name, None).await.unwrap();
             append_agent_revision(
                 &pool,
+                scope,
                 agent.id,
                 "claude-agent-sdk",
                 "img",
@@ -5439,7 +5700,7 @@ mod tests {
         }
 
         assert_eq!(
-            policy_mcp_tools(&pool, tenant, policy.id).await.unwrap(),
+            policy_mcp_tools(&pool, scope, policy.id).await.unwrap(),
             vec![
                 "mcp__beta__alpha".to_string(),
                 "mcp__beta__zeta".to_string()
@@ -5450,7 +5711,7 @@ mod tests {
         let empty_yaml = "name: pmt-empty\ntools: []\n";
         let empty = upsert_policy(
             &pool,
-            tenant,
+            scope,
             "pmt-empty",
             empty_yaml,
             &serde_json::to_value(fluidbox_core::policy::Policy::parse_yaml(empty_yaml).unwrap())
@@ -5458,7 +5719,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(policy_mcp_tools(&pool, tenant, empty.id)
+        assert!(policy_mcp_tools(&pool, scope, empty.id)
             .await
             .unwrap()
             .is_empty());
@@ -5487,18 +5748,19 @@ mod tests {
         // A full session fixture under B.
         let policy = upsert_policy(
             &pool,
-            org_b.id,
+            scope_b,
             "xt-policy",
             "name: xt",
             &serde_json::json!({"name":"xt"}),
         )
         .await
         .unwrap();
-        let agent = create_agent(&pool, org_b.id, "xt-agent", None)
+        let agent = create_agent(&pool, scope_b, "xt-agent", None)
             .await
             .unwrap();
         let rev = append_agent_revision(
             &pool,
+            scope_b,
             agent.id,
             "claude-agent-sdk",
             "img:test",
@@ -5513,7 +5775,7 @@ mod tests {
         .unwrap();
         let session = create_session(
             &pool,
-            org_b.id,
+            scope_b,
             agent.id,
             rev.id,
             "supervised",
@@ -5522,6 +5784,8 @@ mod tests {
             &serde_json::json!({"kind":"none"}),
             &serde_json::json!({}),
             &serde_json::json!({}),
+            None,
+            None,
             None,
             None,
             None,
@@ -5638,5 +5902,405 @@ mod tests {
             1,
             "tenant B sees its own pending approval"
         );
+    }
+
+    /// Cross-tenant isolation for AGENTS: an agent created under B is invisible
+    /// to A's scope at the database. Throwaway orgs; cleanup children-first
+    /// BEFORE the asserts so a failure never leaks fixtures.
+    #[tokio::test]
+    async fn tenant_scope_isolates_agents() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
+            .await
+            .unwrap();
+        let org_b = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
+            .await
+            .unwrap();
+        let scope_a = TenantScope::assume(org_a.id);
+        let scope_b = TenantScope::assume(org_b.id);
+
+        let agent = create_agent(&pool, scope_b, "xt-agent", None)
+            .await
+            .unwrap();
+
+        let read_a = get_agent(&pool, scope_a, agent.id).await.unwrap();
+        let read_b = get_agent(&pool, scope_b, agent.id).await.unwrap();
+
+        // Cleanup BEFORE the assertions, both orgs (tenant FKs are NO ACTION).
+        sqlx::query("delete from agents where tenant_id = $1")
+            .bind(org_b.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for id in [org_a.id, org_b.id] {
+            sqlx::query("delete from tenants where id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        assert!(read_a.is_none(), "tenant A must not read B's agent");
+        assert!(read_b.is_some(), "tenant B reads its own agent");
+    }
+
+    /// Cross-tenant isolation for POLICIES.
+    #[tokio::test]
+    async fn tenant_scope_isolates_policies() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
+            .await
+            .unwrap();
+        let org_b = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
+            .await
+            .unwrap();
+        let scope_a = TenantScope::assume(org_a.id);
+        let scope_b = TenantScope::assume(org_b.id);
+
+        let policy = upsert_policy(
+            &pool,
+            scope_b,
+            "xt-policy",
+            "name: xt",
+            &serde_json::json!({"name":"xt"}),
+        )
+        .await
+        .unwrap();
+
+        let read_a = get_policy(&pool, scope_a, policy.id).await.unwrap();
+        let read_b = get_policy(&pool, scope_b, policy.id).await.unwrap();
+
+        sqlx::query("delete from policies where tenant_id = $1")
+            .bind(org_b.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for id in [org_a.id, org_b.id] {
+            sqlx::query("delete from tenants where id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        assert!(read_a.is_none(), "tenant A must not read B's policy");
+        assert!(read_b.is_some(), "tenant B reads its own policy");
+    }
+
+    /// Cross-tenant isolation for CONNECTIONS: neither the row nor the sealed
+    /// credential is reachable across the tenant boundary.
+    #[tokio::test]
+    async fn tenant_scope_isolates_connections() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
+            .await
+            .unwrap();
+        let org_b = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
+            .await
+            .unwrap();
+        let scope_a = TenantScope::assume(org_a.id);
+        let scope_b = TenantScope::assume(org_b.id);
+
+        let conn = create_connection(
+            &pool,
+            scope_b,
+            "mcp_http",
+            "acct",
+            "disp",
+            Some(&[1, 2, 3]),
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            &serde_json::json!({"base_url":"https://x"}),
+            None,
+            ConnectionAuth::static_active(),
+        )
+        .await
+        .unwrap();
+
+        let get_a = get_connection(&pool, scope_a, conn.id).await.unwrap();
+        let cred_a = connection_credential_sealed(&pool, scope_a, conn.id)
+            .await
+            .unwrap();
+        let get_b = get_connection(&pool, scope_b, conn.id).await.unwrap();
+        let cred_b = connection_credential_sealed(&pool, scope_b, conn.id)
+            .await
+            .unwrap();
+
+        sqlx::query("delete from integration_connections where tenant_id = $1")
+            .bind(org_b.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for id in [org_a.id, org_b.id] {
+            sqlx::query("delete from tenants where id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        assert!(get_a.is_none(), "tenant A must not read B's connection");
+        assert!(
+            cred_a.is_none(),
+            "tenant A must not read B's sealed credential"
+        );
+        assert!(get_b.is_some(), "tenant B reads its own connection");
+        assert!(cred_b.is_some(), "tenant B reads its own sealed credential");
+    }
+
+    /// Cross-tenant isolation for TRIGGER SUBSCRIPTIONS.
+    #[tokio::test]
+    async fn tenant_scope_isolates_subscriptions() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
+            .await
+            .unwrap();
+        let org_b = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
+            .await
+            .unwrap();
+        let scope_a = TenantScope::assume(org_a.id);
+        let scope_b = TenantScope::assume(org_b.id);
+
+        let agent = create_agent(&pool, scope_b, "xt-agent", None)
+            .await
+            .unwrap();
+        let sub = create_trigger_subscription(
+            &pool,
+            scope_b,
+            agent.id,
+            "xt-sub",
+            "api",
+            None,
+            Some("do {{x}}"),
+            true,
+            false,
+            None,
+            "allow",
+            None,
+            None,
+            &serde_json::json!([]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let read_a = get_trigger_subscription(&pool, scope_a, sub.id)
+            .await
+            .unwrap();
+        let read_b = get_trigger_subscription(&pool, scope_b, sub.id)
+            .await
+            .unwrap();
+
+        // Children-first: subscriptions before agents.
+        for stmt in [
+            "delete from trigger_subscriptions where tenant_id = $1",
+            "delete from agents where tenant_id = $1",
+        ] {
+            sqlx::query(stmt)
+                .bind(org_b.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        for id in [org_a.id, org_b.id] {
+            sqlx::query("delete from tenants where id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        assert!(read_a.is_none(), "tenant A must not read B's subscription");
+        assert!(read_b.is_some(), "tenant B reads its own subscription");
+    }
+
+    /// Cross-tenant isolation for SCHEDULES (looked up via their subscription).
+    #[tokio::test]
+    async fn tenant_scope_isolates_schedules() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
+            .await
+            .unwrap();
+        let org_b = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
+            .await
+            .unwrap();
+        let scope_a = TenantScope::assume(org_a.id);
+        let scope_b = TenantScope::assume(org_b.id);
+
+        let agent = create_agent(&pool, scope_b, "xt-agent", None)
+            .await
+            .unwrap();
+        let sub = create_trigger_subscription(
+            &pool,
+            scope_b,
+            agent.id,
+            "xt-sub",
+            "schedule",
+            None,
+            Some("do {{x}}"),
+            true,
+            false,
+            None,
+            "allow",
+            None,
+            None,
+            &serde_json::json!([]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        create_schedule(
+            &pool,
+            scope_b,
+            sub.id,
+            "*/5 * * * * *",
+            "UTC",
+            chrono::Utc::now(),
+            "skip",
+        )
+        .await
+        .unwrap();
+
+        let read_a = schedule_for_subscription(&pool, scope_a, sub.id)
+            .await
+            .unwrap();
+        let read_b = schedule_for_subscription(&pool, scope_b, sub.id)
+            .await
+            .unwrap();
+
+        // Children-first: schedules (via subscription) → subscriptions → agents.
+        for stmt in [
+            "delete from schedules where subscription_id in (select id from trigger_subscriptions where tenant_id = $1)",
+            "delete from trigger_subscriptions where tenant_id = $1",
+            "delete from agents where tenant_id = $1",
+        ] {
+            sqlx::query(stmt).bind(org_b.id).execute(&pool).await.unwrap();
+        }
+        for id in [org_a.id, org_b.id] {
+            sqlx::query("delete from tenants where id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        assert!(read_a.is_none(), "tenant A must not read B's schedule");
+        assert!(read_b.is_some(), "tenant B reads its own schedule");
+    }
+
+    /// Cross-tenant isolation for EXTERNAL RESULTS (§17 #3 stable identity).
+    #[tokio::test]
+    async fn tenant_scope_isolates_external_results() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
+            .await
+            .unwrap();
+        let org_b = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
+            .await
+            .unwrap();
+        let scope_a = TenantScope::assume(org_a.id);
+        let scope_b = TenantScope::assume(org_b.id);
+
+        let agent = create_agent(&pool, scope_b, "xt-agent", None)
+            .await
+            .unwrap();
+        let sub = create_trigger_subscription(
+            &pool,
+            scope_b,
+            agent.id,
+            "xt-sub",
+            "api",
+            None,
+            Some("do {{x}}"),
+            true,
+            false,
+            None,
+            "allow",
+            None,
+            None,
+            &serde_json::json!([]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        upsert_external_result(
+            &pool,
+            scope_b,
+            sub.id,
+            "github_pr_comment",
+            "acme/x#1",
+            "999",
+            Some("https://u"),
+        )
+        .await
+        .unwrap();
+
+        let read_a = get_external_result(&pool, scope_a, sub.id, "github_pr_comment", "acme/x#1")
+            .await
+            .unwrap();
+        let read_b = get_external_result(&pool, scope_b, sub.id, "github_pr_comment", "acme/x#1")
+            .await
+            .unwrap();
+
+        // Children-first: external_results (via subscription) → subscriptions → agents.
+        for stmt in [
+            "delete from external_results where subscription_id in (select id from trigger_subscriptions where tenant_id = $1)",
+            "delete from trigger_subscriptions where tenant_id = $1",
+            "delete from agents where tenant_id = $1",
+        ] {
+            sqlx::query(stmt).bind(org_b.id).execute(&pool).await.unwrap();
+        }
+        for id in [org_a.id, org_b.id] {
+            sqlx::query("delete from tenants where id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            read_a.is_none(),
+            "tenant A must not read B's external result"
+        );
+        assert!(read_b.is_some(), "tenant B reads its own external result");
     }
 }

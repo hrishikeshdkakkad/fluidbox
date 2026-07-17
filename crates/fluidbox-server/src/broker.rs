@@ -81,6 +81,7 @@ pub fn valid_header_name(name: &str) -> bool {
 /// this phase adds to the broker's credential resolution.
 pub async fn brokered_auth(
     state: &AppState,
+    scope: fluidbox_db::TenantScope,
     server: &CapabilityServer,
 ) -> Result<Option<BrokeredAuth>, String> {
     let CapabilityServer::Brokered {
@@ -95,10 +96,9 @@ pub async fn brokered_auth(
     let Some(cid) = connection_id else {
         return Ok(None);
     };
-    let conn = fluidbox_db::get_connection(&state.pool, *cid)
+    let conn = fluidbox_db::get_connection(&state.pool, scope, *cid)
         .await
         .map_err(|e| format!("connection lookup failed: {e}"))?
-        .filter(|c| c.tenant_id == state.tenant_id)
         .ok_or_else(|| format!("capability server '{name}': connection {cid} is missing"))?;
     if conn.status != "active" {
         return Err(format!(
@@ -134,7 +134,7 @@ pub async fn brokered_auth(
         .sealer
         .as_ref()
         .ok_or("FLUIDBOX_CREDENTIAL_KEY not configured")?;
-    let sealed = fluidbox_db::connection_credential_sealed(&state.pool, *cid)
+    let sealed = fluidbox_db::connection_credential_sealed(&state.pool, scope, *cid)
         .await
         .map_err(|e| format!("credential lookup failed: {e}"))?
         .ok_or("connection is not active (revoked or missing)")?;
@@ -506,6 +506,7 @@ async fn call_tool(
 /// there is nothing to refresh.
 async fn reauth_after_401(
     state: &AppState,
+    scope: fluidbox_db::TenantScope,
     server: &CapabilityServer,
     auth: Option<BrokeredAuth>,
 ) -> Result<Option<BrokeredAuth>, String> {
@@ -513,7 +514,7 @@ async fn reauth_after_401(
         return Err("mcp server rejected the credential (HTTP 401)".into());
     };
     crate::oauth::invalidate_access(state, cid).await;
-    brokered_auth(state, server).await
+    brokered_auth(state, scope, server).await
 }
 
 fn server_url(server: &CapabilityServer) -> Result<&str, String> {
@@ -528,15 +529,16 @@ fn server_url(server: &CapabilityServer) -> Result<&str, String> {
 /// executed). This is the broker's public execution surface.
 pub async fn call_tool_auth(
     state: &AppState,
+    scope: fluidbox_db::TenantScope,
     server: &CapabilityServer,
     tool: &str,
     arguments: &Value,
 ) -> Result<(Value, bool), String> {
     let url = server_url(server)?;
-    let auth = brokered_auth(state, server).await?;
+    let auth = brokered_auth(state, scope, server).await?;
     match call_tool(state, url, auth.as_ref(), tool, arguments).await {
         Err(CallErr::Unauthorized) => {
-            let auth = reauth_after_401(state, server, auth).await?;
+            let auth = reauth_after_401(state, scope, server, auth).await?;
             call_tool(state, url, auth.as_ref(), tool, arguments)
                 .await
                 .map_err(CallErr::into_msg)
@@ -549,13 +551,14 @@ pub async fn call_tool_auth(
 /// the photograph.
 pub async fn discover_tools_auth(
     state: &AppState,
+    scope: fluidbox_db::TenantScope,
     server: &CapabilityServer,
 ) -> Result<Vec<ToolSnapshot>, String> {
     let url = server_url(server)?;
-    let auth = brokered_auth(state, server).await?;
+    let auth = brokered_auth(state, scope, server).await?;
     match discover_tools(state, url, auth.as_ref()).await {
         Err(CallErr::Unauthorized) => {
-            let auth = reauth_after_401(state, server, auth).await?;
+            let auth = reauth_after_401(state, scope, server, auth).await?;
             discover_tools(state, url, auth.as_ref())
                 .await
                 .map_err(CallErr::into_msg)
@@ -590,12 +593,13 @@ fn cap_content(content: Value) -> Value {
 /// (possibly credentialed) brokered server and photograph its tools.
 pub async fn photograph_brokered(
     state: &AppState,
+    scope: fluidbox_db::TenantScope,
     server: &CapabilityServer,
 ) -> ApiResult<Vec<ToolSnapshot>> {
     let CapabilityServer::Brokered { name, .. } = server else {
         return Err(ApiError::Internal("not a brokered server".into()));
     };
-    discover_tools_auth(state, server)
+    discover_tools_auth(state, scope, server)
         .await
         .map_err(|e| ApiError::BadRequest(format!("capability server '{name}': {e}")))
 }

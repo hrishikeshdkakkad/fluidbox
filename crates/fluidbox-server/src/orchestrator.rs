@@ -761,7 +761,7 @@ async fn finish_terminal_cleanup(
     // transition, and emit-if-missing under the claim — a crash between the
     // terminal commit and the emit is healed here, and a re-drive after a
     // successful emit skips it.
-    match fluidbox_db::has_run_result_event(&state.pool, id).await {
+    match fluidbox_db::has_run_result_event(&state.pool, scope, id).await {
         Ok(true) => {}
         Ok(false) => {
             ledger::record(
@@ -777,7 +777,7 @@ async fn finish_terminal_cleanup(
             // `record` swallows append failures — VERIFY before the intent
             // may ever be released, or a failed append loses the event
             // forever (exactly-once requires at-least-once first).
-            match fluidbox_db::has_run_result_event(&state.pool, id).await {
+            match fluidbox_db::has_run_result_event(&state.pool, scope, id).await {
                 Ok(true) => {}
                 _ => {
                     tracing::warn!(
@@ -1279,7 +1279,7 @@ async fn materialize_workspace(
             // dropped — it never reaches the RunSpec, sandbox env, ledger,
             // or artifacts.
             let auth_header = match connection_id {
-                Some(cid) => Some(connection_auth_header(state, *cid).await?),
+                Some(cid) => Some(connection_auth_header(state, scope, *cid).await?),
                 None => None,
             };
             let (url, rf, sha) = (clone_url.clone(), r#ref.clone(), commit_sha.clone());
@@ -1394,8 +1394,12 @@ async fn abandon_launch(state: &AppState, scope: TenantScope, id: Uuid) {
 /// via the provider's connector (PAT, or a minted App installation token).
 /// Fails closed: missing/revoked connection or missing key stops the run
 /// during `initializing` — before any model spend.
-async fn connection_auth_header(state: &AppState, connection_id: Uuid) -> anyhow::Result<String> {
-    let conn = fluidbox_db::get_connection(&state.pool, connection_id)
+async fn connection_auth_header(
+    state: &AppState,
+    scope: TenantScope,
+    connection_id: Uuid,
+) -> anyhow::Result<String> {
+    let conn = fluidbox_db::get_connection(&state.pool, scope, connection_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("connection {connection_id} not found"))?;
     crate::connectors::fetch_auth_header(state, &conn).await

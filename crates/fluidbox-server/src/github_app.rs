@@ -306,7 +306,8 @@ async fn registration_signing(
         .sealer
         .as_ref()
         .ok_or("FLUIDBOX_CREDENTIAL_KEY not configured")?;
-    let sealed = fluidbox_db::github_app_registration_pem_sealed(&state.pool, reg.id)
+    let scope = fluidbox_db::TenantScope::assume(reg.tenant_id);
+    let sealed = fluidbox_db::github_app_registration_pem_sealed(&state.pool, scope, reg.id)
         .await
         .map_err(|e| format!("registration key lookup failed: {e}"))?
         .ok_or("github app registration key unavailable — recreate the app")?;
@@ -369,6 +370,10 @@ async fn apply_verified_installation(
     };
     let display = installation_display(reg, account_login);
     let metadata = installation_metadata(reg, installation_id, account_login);
+    // The registration is the custody authority; its tenant scopes every
+    // connection mutation here (works for both admin setup and unauthenticated
+    // webhook/discovery callers, which resolve the registration first).
+    let scope = fluidbox_db::TenantScope::assume(reg.tenant_id);
     // Two attempts: losing the unique-index insert race re-enters the
     // existing-row path so the surviving row still gets FULL custody
     // validation and the caller's desired transition (e.g. a webhook's
@@ -376,7 +381,7 @@ async fn apply_verified_installation(
     for attempt in 0..2 {
         let existing = fluidbox_db::get_github_app_connection_by_installation(
             &state.pool,
-            state.tenant_id,
+            scope,
             installation_id,
         )
         .await
@@ -393,11 +398,17 @@ async fn apply_verified_installation(
                         .into(),
                 );
             }
-            fluidbox_db::refresh_connection_metadata(&state.pool, row.id, &display, &metadata)
-                .await
-                .map_err(|e| format!("metadata refresh failed: {e}"))?;
+            fluidbox_db::refresh_connection_metadata(
+                &state.pool,
+                scope,
+                row.id,
+                &display,
+                &metadata,
+            )
+            .await
+            .map_err(|e| format!("metadata refresh failed: {e}"))?;
             let updated = if row.status == desired {
-                fluidbox_db::get_connection(&state.pool, row.id)
+                fluidbox_db::get_connection(&state.pool, scope, row.id)
                     .await
                     .map_err(|e| format!("connection lookup failed: {e}"))?
             } else {
@@ -408,14 +419,14 @@ async fn apply_verified_installation(
                     _ => &["pending", "suspended", "error"],
                 };
                 if from.is_empty() {
-                    fluidbox_db::get_connection(&state.pool, row.id)
+                    fluidbox_db::get_connection(&state.pool, scope, row.id)
                         .await
                         .map_err(|e| format!("connection lookup failed: {e}"))?
                 } else {
-                    fluidbox_db::set_connection_status(&state.pool, row.id, desired, from)
+                    fluidbox_db::set_connection_status(&state.pool, scope, row.id, desired, from)
                         .await
                         .map_err(|e| format!("status transition failed: {e}"))?
-                        .or(fluidbox_db::get_connection(&state.pool, row.id)
+                        .or(fluidbox_db::get_connection(&state.pool, scope, row.id)
                             .await
                             .map_err(|e| format!("connection lookup failed: {e}"))?)
                 }
@@ -431,7 +442,7 @@ async fn apply_verified_installation(
         // (any status) — loop back through the existing-row path above.
         match fluidbox_db::create_github_app_connection_if_absent(
             &state.pool,
-            state.tenant_id,
+            scope,
             installation_id,
             &display,
             &metadata,
@@ -453,8 +464,8 @@ async fn apply_verified_installation(
 // ─── Admin API ────────────────────────────────────────────────────────────
 
 pub async fn list(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    let registrations =
-        fluidbox_db::list_github_app_registrations(&state.pool, state.tenant_id).await?;
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let registrations = fluidbox_db::list_github_app_registrations(&state.pool, scope).await?;
     Ok(Json(json!({ "registrations": registrations })))
 }
 
@@ -490,7 +501,7 @@ pub async fn manifest_start(
     };
     let registration = fluidbox_db::create_github_app_registration(
         &state.pool,
-        state.tenant_id,
+        fluidbox_db::TenantScope::assume(state.tenant_id),
         target_kind,
         target_org,
     )
@@ -518,10 +529,13 @@ pub async fn install_start(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     let sealer_ref = sealer(&state)?;
-    let reg = fluidbox_db::get_github_app_registration(&state.pool, id)
-        .await?
-        .filter(|r| r.tenant_id == state.tenant_id)
-        .ok_or(ApiError::NotFound)?;
+    let reg = fluidbox_db::get_github_app_registration(
+        &state.pool,
+        fluidbox_db::TenantScope::assume(state.tenant_id),
+        id,
+    )
+    .await?
+    .ok_or(ApiError::NotFound)?;
     if reg.status != "active" || reg.slug.is_none() {
         return Err(ApiError::Conflict(format!(
             "registration is {} — finish app creation first",
@@ -546,12 +560,12 @@ pub async fn revoke(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let reg = fluidbox_db::get_github_app_registration(&state.pool, id)
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let reg = fluidbox_db::get_github_app_registration(&state.pool, scope, id)
         .await?
-        .filter(|r| r.tenant_id == state.tenant_id)
         .ok_or(ApiError::NotFound)?;
     let Some(connection_ids) =
-        fluidbox_db::revoke_github_app_registration(&state.pool, reg.id).await?
+        fluidbox_db::revoke_github_app_registration(&state.pool, scope, reg.id).await?
     else {
         return Err(ApiError::Conflict("registration is already revoked".into()));
     };
@@ -573,9 +587,9 @@ pub async fn sync(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let reg = fluidbox_db::get_github_app_registration(&state.pool, id)
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let reg = fluidbox_db::get_github_app_registration(&state.pool, scope, id)
         .await?
-        .filter(|r| r.tenant_id == state.tenant_id)
         .ok_or(ApiError::NotFound)?;
     let (app_id, pem) = registration_signing(&state, &reg)
         .await
@@ -592,12 +606,9 @@ pub async fn sync(
         let iid = iid.to_string();
         let login = inst["account"]["login"].as_str().unwrap_or("unknown");
         let suspended = inst["suspended_at"].is_string();
-        let existing = fluidbox_db::get_github_app_connection_by_installation(
-            &state.pool,
-            state.tenant_id,
-            &iid,
-        )
-        .await?;
+        let existing =
+            fluidbox_db::get_github_app_connection_by_installation(&state.pool, scope, &iid)
+                .await?;
         if let Some(row) = &existing {
             if row.status == "revoked" {
                 conflicts.push(
@@ -666,9 +677,10 @@ pub async fn manifest_go(State(state): State<AppState>, Query(q): Query<GoParams
             return refusal("Something went wrong — try again from the dashboard.");
         }
     }
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
     let reg =
-        match fluidbox_db::get_github_app_registration(&state.pool, reg_id).await {
-            Ok(Some(r)) if r.tenant_id == state.tenant_id && r.status == "pending" => r,
+        match fluidbox_db::get_github_app_registration(&state.pool, scope, reg_id).await {
+            Ok(Some(r)) if r.status == "pending" => r,
             Ok(Some(r)) if r.status == "active" => return page(
                 StatusCode::OK,
                 "App already created",
@@ -786,8 +798,9 @@ pub async fn manifest_callback(
             return refusal("Something went wrong — try again from the dashboard.");
         }
     }
-    let reg = match fluidbox_db::get_github_app_registration(&state.pool, reg_id).await {
-        Ok(Some(r)) if r.tenant_id == state.tenant_id => r,
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let reg = match fluidbox_db::get_github_app_registration(&state.pool, scope, reg_id).await {
+        Ok(Some(r)) => r,
         _ => return refusal("Unknown registration."),
     };
     if reg.status != "pending" {
@@ -857,6 +870,7 @@ pub async fn manifest_callback(
     let client_sealed = conv.client_secret.as_deref().map(|s| sealer_ref.seal(s));
     let activated = fluidbox_db::activate_github_app_registration(
         &state.pool,
+        scope,
         reg.id,
         &conv.id.to_string(),
         &slug,
@@ -957,8 +971,9 @@ pub async fn install_go(State(state): State<AppState>, Query(q): Query<GoParams>
             return refusal("Something went wrong — try again from the dashboard.");
         }
     }
-    let reg = match fluidbox_db::get_github_app_registration(&state.pool, reg_id).await {
-        Ok(Some(r)) if r.tenant_id == state.tenant_id && r.status == "active" => r,
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let reg = match fluidbox_db::get_github_app_registration(&state.pool, scope, reg_id).await {
+        Ok(Some(r)) if r.status == "active" => r,
         _ => return refusal("Unknown or inactive registration."),
     };
     let Some(slug) = reg.slug.as_deref() else {
@@ -1060,8 +1075,9 @@ pub async fn setup(
             return refusal("Something went wrong — try again from the dashboard.");
         }
     }
-    let reg = match fluidbox_db::get_github_app_registration(&state.pool, id).await {
-        Ok(Some(r)) if r.tenant_id == state.tenant_id => r,
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let reg = match fluidbox_db::get_github_app_registration(&state.pool, scope, id).await {
+        Ok(Some(r)) => r,
         _ => return refusal("Unknown registration."),
     };
     let (app_id, pem) = match registration_signing(&state, &reg).await {
@@ -1124,24 +1140,30 @@ pub async fn app_ingress(
         )
             .into_response();
     };
-    let reg = match fluidbox_db::get_github_app_registration(&state.pool, registration_id).await {
-        Ok(Some(r)) if r.tenant_id == state.tenant_id && r.status == "active" => r,
-        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            tracing::error!("registration lookup failed: {e}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-    let sealed =
-        match fluidbox_db::github_app_registration_webhook_secret_sealed(&state.pool, reg.id).await
-        {
-            Ok(Some(s)) => s,
-            Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let reg =
+        match fluidbox_db::get_github_app_registration(&state.pool, scope, registration_id).await {
+            Ok(Some(r)) if r.status == "active" => r,
+            Ok(_) => return StatusCode::NOT_FOUND.into_response(),
             Err(e) => {
-                tracing::error!("webhook secret lookup failed: {e}");
+                tracing::error!("registration lookup failed: {e}");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
+    let sealed = match fluidbox_db::github_app_registration_webhook_secret_sealed(
+        &state.pool,
+        scope,
+        reg.id,
+    )
+    .await
+    {
+        Ok(Some(s)) => s,
+        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(e) => {
+            tracing::error!("webhook secret lookup failed: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
     let secret = match sealer_ref.open(&sealed) {
         Ok(s) => s,
         Err(e) => {
@@ -1183,7 +1205,7 @@ pub async fn app_ingress(
     };
     let conn = match fluidbox_db::get_github_app_connection_by_installation(
         &state.pool,
-        state.tenant_id,
+        scope,
         &installation_id.to_string(),
     )
     .await
@@ -1209,8 +1231,10 @@ pub async fn app_ingress(
         "sha256:{}",
         fluidbox_db::sha256_hex(std::str::from_utf8(&body).unwrap_or_default())
     );
-    match crate::events::process_delivery(&state, &conn, "github", &verified, &payload, &digest)
-        .await
+    match crate::events::process_delivery(
+        &state, scope, &conn, "github", &verified, &payload, &digest,
+    )
+    .await
     {
         Ok(json) => json.into_response(),
         Err(e) => e.into_response(),
@@ -1231,20 +1255,20 @@ async fn handle_lifecycle(
         L::Suspend { installation_id } => (*installation_id, "suspend"),
         L::Unsuspend { installation_id } => (*installation_id, "unsuspend"),
     };
+    // The registration is the custody authority; its tenant scopes every
+    // connection mutation this app-level lifecycle handler performs.
+    let scope = fluidbox_db::TenantScope::assume(reg.tenant_id);
     let iid_str = iid.to_string();
-    let existing = match fluidbox_db::get_github_app_connection_by_installation(
-        &state.pool,
-        state.tenant_id,
-        &iid_str,
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("connection lookup failed: {e}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
+    let existing =
+        match fluidbox_db::get_github_app_connection_by_installation(&state.pool, scope, &iid_str)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("connection lookup failed: {e}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
     // Rows owned by another custody path (legacy paste / other
     // registration) are never touched from this app's ingress.
     let owned = existing
@@ -1290,6 +1314,7 @@ async fn handle_lifecycle(
             Some(c) => {
                 let done = match fluidbox_db::set_connection_status(
                     &state.pool,
+                    scope,
                     c.id,
                     "revoked",
                     &["active", "pending", "suspended", "error"],
@@ -1322,13 +1347,18 @@ async fn handle_lifecycle(
                         } else {
                             ("active", &["suspended"])
                         };
-                        let changed =
-                            match fluidbox_db::set_connection_status(&state.pool, c.id, to, from)
-                                .await
-                            {
-                                Ok(row) => row.is_some(),
-                                Err(e) => return db500(e),
-                            };
+                        let changed = match fluidbox_db::set_connection_status(
+                            &state.pool,
+                            scope,
+                            c.id,
+                            to,
+                            from,
+                        )
+                        .await
+                        {
+                            Ok(row) => row.is_some(),
+                            Err(e) => return db500(e),
+                        };
                         if suspended {
                             crate::oauth::invalidate_access(state, c.id).await;
                         }
@@ -1338,6 +1368,7 @@ async fn handle_lifecycle(
                         // Installation vanished under us — treat as deleted.
                         if let Err(e) = fluidbox_db::set_connection_status(
                             &state.pool,
+                            scope,
                             c.id,
                             "revoked",
                             &["active", "pending", "suspended", "error"],
@@ -1354,6 +1385,7 @@ async fn handle_lifecycle(
                             // GitHub unreachable: fail toward closed.
                             if let Err(db) = fluidbox_db::set_connection_status(
                                 &state.pool,
+                                scope,
                                 c.id,
                                 "suspended",
                                 &["active"],
