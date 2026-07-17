@@ -1,7 +1,7 @@
 # fluidbox — IdP-agnostic, per-organization identity layer
 
 **Date:** 2026-07-17
-**Status:** FINALIZED v4 (2026-07-17) — v2–v4 produced by three adversarial review rounds with Codex (gpt-5.6-sol, max reasoning); companion to the multi-user MCP control plane design (Phase B input); nothing here is implemented
+**Status:** FINALIZED v5 (2026-07-17) — v2–v5 produced by four adversarial review rounds with Codex (gpt-5.6-sol, max reasoning); companion to the multi-user MCP control plane design (Phase B input); nothing here is implemented
 **Audience:** fluidbox maintainers and engineers implementing Phase B (identity and tenant enforcement)
 **Relationship to other docs:** `docs/plans/2026-07-14-multi-user-mcp-control-plane-design.md` (v4) defines the multi-user architecture this layer authenticates; its Phase B references this document. `docs/plans/2026-07-11-github-seamless-connect-design.md` defined the one-time browser-flow pattern this design reuses. `PLAN.md` remains authoritative for product invariants.
 
@@ -679,14 +679,21 @@ IdP), on an explicit, fully audited surface:
   successful login whose **verified** normalized email equals the armed
   value wins, decided atomically:
 
-      -- inside transaction B (config row already locked FOR UPDATE):
+      -- inside transaction B: the opening `select … for update` already
+      -- captured bootstrap_owner_email / bootstrap_owner_expires_at.
+      -- When the email matches, consume the arm:
       update org_idp_configs
          set bootstrap_owner_email = null,
              bootstrap_owner_expires_at = null
        where tenant_id = $t and id = $config
          and bootstrap_owner_email = $normalized_email
-       returning (bootstrap_owner_expires_at > now()) as was_unexpired;
+       returning id;
 
+  `was_unexpired` is computed from the expiry **captured by B's opening
+  locked SELECT** — never from `UPDATE … RETURNING`, whose unqualified
+  columns observe the post-update row (the expiry is already NULL there;
+  the naive `returning (bootstrap_owner_expires_at > now())` is always
+  NULL). The `FOR UPDATE` lock makes the captured value authoritative.
   A matching arm is ALWAYS consumed by this single-winner UPDATE; what
   follows is a three-way decision inside the same transaction (owner
   reads are consistent because every owner-role mutation serializes on
@@ -703,7 +710,8 @@ IdP), on an explicit, fully audited surface:
     must deactivate the owner first — a deliberate, audited sequence,
     never a standing trap);
   - an armed value **expires** (`bootstrap_owner_expires_at`, default
-    7 days) — an expired arm never matches;
+    7 days) — an expired arm never promotes (a matching expired arm is
+    deliberately consumed and audited);
   - a matching login that finds an active owner anyway (armed before the
     owner appeared) **clears the arm and refuses the promotion**
     (reject-and-consume, audited) rather than leaving it live; and
@@ -954,6 +962,17 @@ doc. Implementation order inside Phase B:
    revisit only if per-role metadata (grantor, expiry) becomes real.
 
 ## Revision history
+
+**v5 (2026-07-17)** — Codex round 4 (gpt-5.6-sol, max reasoning): all
+round-3 groups verified resolved except one newly introduced SQL defect,
+fixed here: the bootstrap decision's `was_unexpired` was computed in
+`UPDATE … RETURNING`, whose unqualified columns observe the post-update
+row — after the SET it is always NULL, so a fresh organization could
+never mint its first owner (fail-closed, but broken). The decision value
+now comes from the expiry captured by transaction B's opening
+`FOR UPDATE` SELECT, with the pitfall documented; "an expired arm never
+matches" corrected to "never promotes" (expired matches are deliberately
+consumed and audited).
 
 **v4 (2026-07-17)** — Codex round 3 (gpt-5.6-sol, max reasoning): the
 round-2 approval set verified; two High and three smaller residuals
