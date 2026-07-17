@@ -1666,13 +1666,18 @@ pub async fn sessions_in_status(pool: &PgPool, statuses: &[&str]) -> sqlx::Resul
 /// provisioning → initializing in seconds (initializing: minutes at worst
 /// for a big repo copy), so a stale row means the control plane died
 /// mid-launch and nothing owns the session anymore.
+///
+/// Age is measured from `created_at` — a timestamp NOTHING refreshes. It used
+/// to be `updated_at`, which every runner heartbeat bumps: a crash between
+/// runner start and `set_sandbox_handle` left a heartbeating `initializing`
+/// session this sweep could never age out (M5).
 pub async fn stale_nonstarted_sessions(
     pool: &PgPool,
     max_age_mins: i32,
 ) -> sqlx::Result<Vec<SessionRow>> {
     sqlx::query_as(
         "select * from sessions
-         where status = any($1) and updated_at < now() - make_interval(mins => $2)",
+         where status = any($1) and created_at < now() - make_interval(mins => $2)",
     )
     .bind(vec![
         "created".to_string(),
@@ -1734,6 +1739,25 @@ pub async fn set_sandbox_handle(pool: &PgPool, id: Uuid, handle: &Value) -> sqlx
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Adopt a DISCOVERED sandbox handle into a session atomically: only while no
+/// handle is stored AND the session is still in an active (pre-wind-down)
+/// status. The predicate is in the UPDATE itself, so the reconciler racing
+/// `run()`'s own `set_sandbox_handle`, a concurrent cancel, or a terminal
+/// transition can never overwrite a real handle or resurrect a closed
+/// session. Returns whether the adoption landed.
+pub async fn adopt_sandbox_handle(pool: &PgPool, id: Uuid, handle: &Value) -> sqlx::Result<bool> {
+    let res = sqlx::query(
+        "update sessions set sandbox_handle = $2, updated_at = now()
+         where id = $1 and sandbox_handle is null
+           and status in ('created','provisioning','initializing','running','awaiting_approval')",
+    )
+    .bind(id)
+    .bind(handle)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
 }
 
 pub async fn set_base_commit(pool: &PgPool, id: Uuid, commit: &str) -> sqlx::Result<()> {
@@ -3415,8 +3439,9 @@ mod tests {
         )
         .await
         .unwrap();
+        // The sweep keys off created_at (heartbeat-proof; M5) — backdate that.
         let backdate =
-            "update sessions set updated_at = now() - interval '20 minutes' where id = $1";
+            "update sessions set created_at = now() - interval '20 minutes' where id = $1";
         sqlx::query(backdate)
             .bind(stale.id)
             .execute(&pool)
@@ -3504,6 +3529,103 @@ mod tests {
             !sweep_terminal.contains(&stale.id),
             "terminal session must not be swept"
         );
+    }
+
+    #[tokio::test]
+    async fn adopt_sandbox_handle_is_guarded() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let policy = upsert_policy(
+            &pool,
+            tenant,
+            "test-adopt",
+            "name: test-adopt",
+            &serde_json::json!({"name": "test-adopt"}),
+        )
+        .await
+        .unwrap();
+        let agent = create_agent(&pool, tenant, "test-adopt-agent", None)
+            .await
+            .unwrap();
+        let rev = append_agent_revision(
+            &pool,
+            agent.id,
+            "claude-agent-sdk",
+            "img:test",
+            "claude-haiku-4-5",
+            None,
+            policy.id,
+            &serde_json::json!({}),
+            None,
+            &serde_json::json!([]),
+        )
+        .await
+        .unwrap();
+        let repo = serde_json::json!({"kind":"none"});
+        let empty = serde_json::json!({});
+        let s = create_session(
+            &pool,
+            tenant,
+            agent.id,
+            rev.id,
+            "supervised",
+            "trusted",
+            "adopt-test",
+            &repo,
+            &empty,
+            &empty,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let discovered =
+            serde_json::json!({"runtime":"kubernetes","external_id":"pod-x","attrs":{"uid":"u1"}});
+        let real =
+            serde_json::json!({"runtime":"kubernetes","external_id":"pod-x","attrs":{"uid":"u2"}});
+
+        // Active + handle-less → adoption lands.
+        let adopted = adopt_sandbox_handle(&pool, s.id, &discovered)
+            .await
+            .unwrap();
+        // A stored handle is never overwritten (run() won the race).
+        set_sandbox_handle(&pool, s.id, &real).await.unwrap();
+        let overwrote = adopt_sandbox_handle(&pool, s.id, &discovered)
+            .await
+            .unwrap();
+        let kept: (Value,) = sqlx::query_as("select sandbox_handle from sessions where id = $1")
+            .bind(s.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        // A winding-down session never re-acquires a handle.
+        sqlx::query(
+            "update sessions set sandbox_handle = null, status = 'finalizing' where id = $1",
+        )
+        .bind(s.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let resurrected = adopt_sandbox_handle(&pool, s.id, &discovered)
+            .await
+            .unwrap();
+
+        // Fixtures out BEFORE the assertions.
+        sqlx::query("delete from sessions where id = $1")
+            .bind(s.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(adopted, "active handle-less session must adopt");
+        assert!(!overwrote, "a stored handle must never be overwritten");
+        assert_eq!(kept.0["attrs"]["uid"], "u2", "run()'s handle must survive");
+        assert!(!resurrected, "a winding-down session must not adopt");
     }
 
     #[tokio::test]

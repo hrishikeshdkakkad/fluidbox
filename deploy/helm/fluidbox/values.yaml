@@ -107,6 +107,10 @@ sandbox:
   resources:
     requests: { cpu: "500m", memory: "1Gi", ephemeralStorage: "1Gi" }
     limits: { cpu: "2", memory: "2Gi", ephemeralStorage: "10Gi" }
+  # Applies to BOTH the workspace and collector emptyDirs. The collector
+  # volume transiently holds the compressed archive (≤ FLUIDBOX_MAX_ARCHIVE_
+  # BYTES, default 2Gi) PLUS the unpacked staging tree PLUS the baseline
+  # during init — size it for archive + ~2× the unpacked workspace.
   volumeSizeLimit: 10Gi
   # Namespace ResourceQuota + application concurrent-run limit.
   quota:
