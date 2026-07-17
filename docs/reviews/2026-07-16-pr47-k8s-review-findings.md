@@ -103,7 +103,7 @@ Status legend: `[ ]` open · `[x]` fixed · `[-]` won't fix (record why)
 - [ ] `just check` green on the release branch
 - [ ] `k8s.yml` kind-calico job green (first time ever) — including `helm test` passing on a **fresh** install
 - [ ] Full Docker e2e green (`FLUIDBOX_PROVIDER=docker`) — maintainer-triggered
-- [ ] Live EKS acceptance + teardown (still deferred per epic plan; design doc's acceptance statement requires demo A on kind **and** one managed cloud)
+- [x] Live EKS acceptance + teardown — **DONE 2026-07-17**. Demo A passed unchanged on `FLUIDBOX_PROVIDER=kubernetes` on EKS (collector-produced diff `a+b`→`a*b` + cost + isolation + pod/Secret GC + `finalizing` state); `zeroEgress` boot gate verified (`netpol gate: enforcement verified (+:8788 -:8787)`, enforcement independently confirmed by a long-lived probe); governance pause→approve→resume demonstrated; fully audited teardown proving **zero orphans**. Evidence: `docs/reviews/2026-07-17-eks-acceptance.md`. (EKS recipe finding: use VPC CNI **standard** enforcing mode — strict starves system pods; the chart's one-shot helm-test probe false-negatives on standard-mode fail-open, a documented chart follow-up.)
 - [ ] Symlinked-repo run passes on the K8s provider
 
 ## Appendix — refuted candidates (do NOT re-chase)
