@@ -23,13 +23,13 @@ Admission answers one question: **which remote MCP endpoints may the fluidbox br
 
 ## Endpoint admission requirements
 
-Both tiers must satisfy all of the following to be admissible for hosted use:
+Both tiers must satisfy all of the following to be admissible for hosted use. The single sanctioned exception to the address-class rule is the **specifically approved private-network connector** defined under [Private and enterprise endpoints](#private-and-enterprise-endpoints) — a specific, non-self-service approval; nothing else may target the forbidden ranges:
 
 | Requirement | Rule |
 |---|---|
 | Transport | Streamable HTTP MCP at a canonical resource URI (or endpoint template). |
 | TLS | HTTPS required in production. Plaintext HTTP exists only in local development. |
-| Address class | The resolved destination must not be private (RFC 1918), loopback, link-local, multicast, reserved, or a cloud-metadata address. Enforced at resolution time on **every** fetch, not just at admission (defends time-of-check/time-of-use and DNS-rebinding changes). |
+| Address class | The resolved destination must not be private (RFC 1918), loopback, link-local, multicast, reserved, or a cloud-metadata address — except through a specifically approved private-network connector (the sanctioned exception above). Enforced at resolution time on **every** fetch, not just at admission (defends time-of-check/time-of-use and DNS-rebinding changes). |
 | Redirects | Every redirect target is re-validated against the same rules. Credentials never follow a redirect off the admitted base. |
 | OAuth discovery | Where OAuth is used: RFC 9728 protected-resource metadata → RFC 8414/OIDC authorization-server metadata; authorization servers without PKCE S256 are refused; RFC 8707 `resource=` binds both legs. Discovery and metadata fetches obey the same SSRF rules as tool traffic. |
 | Headers | Connector-supplied custom headers are restricted: they can never overwrite MCP transport headers or the authorization header the broker manages. |
