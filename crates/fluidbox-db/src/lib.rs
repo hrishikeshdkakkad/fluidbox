@@ -11,7 +11,33 @@ use sqlx::postgres::{PgListener, PgPoolOptions};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+pub mod identity;
 pub mod seed;
+
+/// A verified tenant context. Constructible ONLY via [`TenantScope::assume`],
+/// which a caller may invoke only when it genuinely holds a verified tenant
+/// identity — an authenticated principal's tenant, a `tenant_id` read back
+/// from a DB row, the boot seed, or one of the two documented pre-auth
+/// bootstrap exceptions (the login callback's sealed-`state` tenant and the
+/// session-switch confirmation cookie). Every identity repository takes it
+/// right after the executor and carries its id into a `tenant_id = $n`
+/// predicate, so tenant isolation is a signature requirement, not a
+/// remember-to-filter convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TenantScope(Uuid);
+
+impl TenantScope {
+    /// Assert a verified tenant context. See the type docs for the (short)
+    /// set of callers permitted to do so — do NOT call this with a tenant id
+    /// the browser supplied.
+    pub fn assume(tenant_id: Uuid) -> Self {
+        Self(tenant_id)
+    }
+
+    pub fn tenant_id(&self) -> Uuid {
+        self.0
+    }
+}
 
 pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
     let pool = PgPoolOptions::new()
@@ -204,9 +230,12 @@ pub struct UsageTotals {
 
 pub async fn ensure_default_tenant(pool: &PgPool) -> sqlx::Result<Uuid> {
     let id = Uuid::now_v7();
+    // Migration 0012 made `slug` NOT NULL; the boot tenant owns slug 'default'.
+    // On a live DB the migration backfilled it already — this keeps a fresh DB
+    // and any hand-edited row converged.
     let row = sqlx::query(
-        "insert into tenants (id, name) values ($1, 'default')
-         on conflict (name) do update set name = excluded.name
+        "insert into tenants (id, name, slug) values ($1, 'default', 'default')
+         on conflict (name) do update set slug = excluded.slug
          returning id",
     )
     .bind(id)
