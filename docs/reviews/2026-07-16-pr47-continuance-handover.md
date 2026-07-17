@@ -1,0 +1,93 @@
+# Continuance handover — PR #47 fix series, batches 5–7
+
+**Written:** 2026-07-16, end of a long fix session. **Mission:** finish the
+PR #47 (`release/kubernetes-native-provider` → `main`) fix series — batches
+**5, 6, 7** from `docs/reviews/2026-07-16-pr47-k8s-review-findings.md` — until
+all High+Medium findings are `[x]` (or `[-]` with maintainer sign-off), each
+in its own stacked `fix/*` PR. Read the original workflow rules in
+`docs/reviews/2026-07-16-pr47-fix-handover.md` FIRST; they still bind.
+
+## State (what's done)
+
+- **#60 MERGED** to the release branch — batch 1 (H1 CI + L14).
+- **PR #61** batch 3 (`fix/k8s-symlink-archive`, tip `0e2ddc4`) — H4 symlink
+  support + L4-pack. Five Codex rounds; **canonicalize** is the sole
+  containment authority + fail-closed fresh-dest clearing. ACCEPTED with one
+  tracked residual **L15** (symlinked-*dest*-path hardening; NOT production-
+  reachable — fixed pod mounts; needs `openat2 RESOLVE_IN_ROOT`/`cap-std`, a
+  maintainer dependency decision — do NOT hand-roll it). Do not reopen H4.
+- **PR #62** batch 4 (`fix/k8s-collect-integrity`, stacked on #61) — M2
+  collect integrity + L4-exec. (Rebased 2026-07-16: #61 gained `1c6bc5c`
+  fixing a duplicated line from `0e2ddc4` that broke the build; tips moved.)
+- **Batch 2** (H2/H3/H5/M1/L6/L7 finalizer) is a SIBLING session's branch
+  `fix/k8s-finalizer-durability` (`4b9d162`, in the main checkout, not yet
+  PR'd). DO NOT touch it.
+- **Batch 5 COMPLETE** on `fix/k8s-helm-wiring` (PR #66, stacked on #62):
+  M3/M9/M10/L12 + the chart-assertions script; Codex round 2 hardened
+  toleration fidelity, digest validation, release binding, and ingress
+  pairing. See the findings doc for the full fix notes.
+
+All HIGH merge-blockers resolved (H1 #60, H4 #61, H2/H3/H5 in batch 2). The
+findings doc has live `[x]` checkboxes — flip them per batch, in the same PR.
+
+## Hard rules (unchanged)
+
+1. NEVER run DB-backed or e2e tests, and never `source .env`, unprompted.
+2. Never merge PRs, never push to `main`. Open stacked `fix/*` PRs; hand back.
+3. Dual-provider permanence: never break the Docker provider / docker-compose.
+4. One PR per batch, in the findings doc's batch order; each stacked on the
+   previous fix branch for a clean incremental diff.
+5. Every batch flips its findings checkboxes AND needs a fail-before/pass-after
+   test for each High/Medium fix (TDD).
+6. Codex adversarial pass on each batch's diff before hand-back (protocol in
+   the original handover). It found REAL escapes 5× on batch 3 — trust it,
+   but verify each claim at file:line yourself.
+
+## Gotchas learned THIS session (important)
+
+- **`just` loads `.env` (`set dotenv-load := true`)** → `just check` runs the
+  fluidbox-db suite against REAL Neon. Use the no-dotenv equivalents:
+  `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D
+  warnings`, `cargo test -p <crate>`. Confirm `DATABASE_URL` is unset first.
+- **Disk was 100% full mid-session.** Point cargo at the main target dir to
+  avoid duplicating the dep graph:
+  `export CARGO_TARGET_DIR=/Users/hrishikeshkakkad/Documents/infra/target CARGO_INCREMENTAL=0`.
+- **BRANCH-SLIP: I committed batch-3 fixes onto the batch-5 branch TWICE**
+  after a cascade left me on the wrong branch. ALWAYS `git branch --show-current`
+  before editing/committing. Fix via `git stash` → checkout right branch →
+  `stash pop`, or cherry-pick the misplaced commit and `reset --hard` the
+  source.
+- **Rebase cascade after changing a lower batch:** `git rebase --onto
+  <new-lower-tip> <old-lower-tip> <upper-branch>`, `--force-with-lease` push,
+  repeat up the stack. Conflicts appear in `collect.rs` (test region) and the
+  findings doc (checkbox lines) — keep BOTH sides' intent.
+- **Codex CLI:** `codex exec -c sandbox_mode="read-only" "$PROMPT" < /dev/null
+  > out.md 2> err.log`, run in BACKGROUND (max-reasoning turns exceed 1800s;
+  `< /dev/null` stops a stdin hang). Do NOT override the model.
+
+## Remaining work
+
+**Batch 5 `fix/k8s-helm-wiring` — DONE (PR #66; see the findings doc for the
+fix notes).**
+
+**Batch 6 `fix/k8s-archive-streaming` (M4, L3):** stream pack to disk
+(`GzEncoder<File>`), stream the HTTP response (`ReaderStream`), max-archive-
+bytes cap failing the run at zero model spend; real TTL sweep + delete-after-
+init; fix crash-window archive leak.
+
+**Batch 7 `fix/k8s-reconcile` (M5, M6, M7, L9):** periodic `list_managed`
+sweep that terminates terminal/unknown-session pods and ADOPTS handle-less
+pods (set handle after UID validation); launch-age off timestamps heartbeats
+can't refresh; M6 grace-window `CreateContainerConfigError`; M7 map node-loss/
+Unknown/deletion_timestamp → `SandboxStatus::Unknown`; L9 pre-launch-with-
+workspace records "(no changes)" like Docker.
+
+Plus remaining Lows (L1/L2/L5/L8/L10/L11) as a final `fix/k8s-cleanups` batch.
+
+## Merge order & done
+
+Children-first: #61 → #62 → 5 → 6 → 7 → then #47 → `main` (PR-only ruleset;
+`gh pr merge --admin`). Done when all H+M are `[x]`/signed-off, `just check`
+green on the release branch, kind-calico CI green, no Docker-path regression —
+then hand back for the maintainer's Docker e2e + live EKS acceptance + the #47
+merge. This handover doc + L15 can be deleted before batch 5's final PR.

@@ -19,9 +19,27 @@ pub async fn boot_orphan_sweep(state: AppState) {
     match state.provider.list_managed().await {
         Ok(managed) => {
             for (session_id, handle) in managed {
+                // Same discipline as the periodic reconcile: strict status
+                // parse (a status written by a NEWER deploy is not proof of
+                // death — a rollback restart must not kill its live pods),
+                // and a DB error skips rather than terminates.
                 let terminal = match fluidbox_db::get_session(&state.pool, session_id).await {
-                    Ok(Some(s)) => s.status_enum().is_terminal(),
-                    _ => true, // unknown session → orphan
+                    Ok(None) => true, // unknown session → orphan
+                    Ok(Some(s)) => match fluidbox_core::state::SessionStatus::parse(&s.status) {
+                        Some(st) => st.is_terminal(),
+                        None => {
+                            tracing::warn!(
+                                "boot sweep: session {session_id} has unknown status '{}' \
+                                     (newer deploy?); leaving its sandbox alone",
+                                s.status
+                            );
+                            false
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!("boot sweep: session lookup {session_id} failed: {e}");
+                        false
+                    }
                 };
                 if terminal {
                     tracing::info!("boot sweep: reaping orphan sandbox for {session_id}");
@@ -66,16 +84,242 @@ pub fn spawn_all(state: AppState) {
     tokio::spawn(watchdog(state.clone()));
     tokio::spawn(budget_sweeper(state.clone()));
     tokio::spawn(approval_expiry(state.clone()));
+    // Archive-transport providers only: host-dir providers (Docker) never
+    // store archives, so the sweep would scan an absent directory forever.
+    if state.provider.workspace_transport() == fluidbox_core::traits::WorkspaceTransport::Archive {
+        tokio::spawn(archive_ttl_sweep(state.clone()));
+    }
+    tokio::spawn(reconcile_managed(state.clone()));
     tokio::spawn(finalize_worker(state));
 }
 
-/// A healthy orchestrator moves created → provisioning → initializing in
-/// seconds (initializing: minutes at worst for a big repo copy). Older than
-/// this, the control plane died mid-launch and nothing owns the session.
-const STALE_LAUNCH_MINS: i32 = 15;
+/// What the periodic reconcile does with one managed sandbox (M5). Pure so
+/// the decision table is unit-testable.
+#[derive(Debug, PartialEq, Eq)]
+enum ReconcileAction {
+    /// Orphan (unknown session) or leak (terminal session): kill the sandbox.
+    Terminate,
+    /// Live session that lost the crash race between provision and
+    /// `set_sandbox_handle`: persist the handle so every sweeper sees it.
+    Adopt,
+    /// Healthy, or owned by the finalizer (winding down): never touch.
+    Leave,
+}
+
+/// What the reconciler could learn about a sandbox's session. `Unparseable`
+/// is distinct from `Missing` on purpose: an unknown status string means a
+/// NEWER deploy wrote it (statuses are unconstrained text by design) — an
+/// older replica must never read that as "dead" and kill a live sandbox.
+#[derive(Debug, PartialEq, Eq)]
+enum SessionLookup {
+    Missing,
+    Known(fluidbox_core::state::SessionStatus),
+    Unparseable,
+}
+
+fn reconcile_action(session: SessionLookup, has_handle: bool) -> ReconcileAction {
+    match session {
+        SessionLookup::Missing => ReconcileAction::Terminate,
+        SessionLookup::Unparseable => ReconcileAction::Leave,
+        SessionLookup::Known(s) if s.is_terminal() => ReconcileAction::Terminate,
+        // The finalizer owns winding-down sandboxes — collection may be in
+        // flight; it reaps on completion, and recovery re-drives it.
+        SessionLookup::Known(s) if s.is_winding_down() => ReconcileAction::Leave,
+        SessionLookup::Known(_) if !has_handle => ReconcileAction::Adopt,
+        SessionLookup::Known(_) => ReconcileAction::Leave,
+    }
+}
+
+/// Periodic managed-sandbox reconcile (M5) — the boot sweep, made continuous
+/// and adoption-capable. Closes two windows the boot-only sweep left open:
+/// a crash between `provision` and `set_sandbox_handle` produced a session
+/// invisible to EVERY sweeper at once (heartbeats refresh `updated_at`, the
+/// boot sweep skips live sessions, the budget sweeper needs `running`) with a
+/// pod nobody owned; and a cancel-during-provisioning reaped before the
+/// handle landed, leaking the pod until the next restart.
+async fn reconcile_managed(state: AppState) {
+    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        tick.tick().await;
+        let managed = match state.provider.list_managed().await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("reconcile: list_managed failed: {e}");
+                continue;
+            }
+        };
+        for (session_id, handle) in managed {
+            let session = match fluidbox_db::get_session(&state.pool, session_id).await {
+                Ok(s) => s,
+                // A transient DB error is NOT proof the session is unknown —
+                // unlike the boot sweep, a periodic worker must never kill a
+                // possibly-live sandbox on a blip. Next tick retries.
+                Err(e) => {
+                    tracing::warn!("reconcile: session lookup {session_id} failed: {e}");
+                    continue;
+                }
+            };
+            // STRICT status parse — never status_enum(), whose unparseable→
+            // Failed fallback would read a newer deploy's status as terminal.
+            let lookup = match &session {
+                None => SessionLookup::Missing,
+                Some(s) => match fluidbox_core::state::SessionStatus::parse(&s.status) {
+                    Some(st) => SessionLookup::Known(st),
+                    None => {
+                        tracing::warn!(
+                            "reconcile: session {session_id} has unknown status '{}' \
+                             (newer deploy?); leaving its sandbox alone",
+                            s.status
+                        );
+                        SessionLookup::Unparseable
+                    }
+                },
+            };
+            let has_handle = session
+                .as_ref()
+                .map(|s| s.sandbox_handle.is_some())
+                .unwrap_or(false);
+            let label = session
+                .as_ref()
+                .map(|s| s.status.clone())
+                .unwrap_or_else(|| "unknown".into());
+            match reconcile_action(lookup, has_handle) {
+                ReconcileAction::Leave => {}
+                ReconcileAction::Terminate => {
+                    tracing::info!(
+                        "reconcile: terminating sandbox {} (session {session_id}: {label})",
+                        handle.external_id,
+                    );
+                    let _ = state.provider.terminate(&handle).await;
+                }
+                ReconcileAction::Adopt => {
+                    // The handle from list_managed carries the LIVE object's
+                    // UID (validated there: session label, namespace, uid) —
+                    // every later mutation is preconditioned on it. The
+                    // adoption itself is a GUARDED update (handle still null,
+                    // status still active), so racing run()'s own
+                    // set_sandbox_handle, a concurrent cancel, or a terminal
+                    // transition can never be overwritten or resurrected.
+                    let Ok(v) = serde_json::to_value(&handle) else {
+                        continue;
+                    };
+                    match fluidbox_db::adopt_sandbox_handle(&state.pool, session_id, &v).await {
+                        Ok(true) => {
+                            tracing::warn!(
+                                "reconcile: adopted sandbox {} for handle-less session {session_id}",
+                                handle.external_id,
+                            );
+                            crate::ledger::record(
+                                &state,
+                                session_id,
+                                fluidbox_core::event::Actor::System,
+                                fluidbox_core::event::EventBody::AgentMessage {
+                                    role: "system".into(),
+                                    text: format!(
+                                        "sandbox adopted after control-plane interruption ({})",
+                                        handle.external_id.chars().take(48).collect::<String>()
+                                    ),
+                                },
+                            )
+                            .await;
+                        }
+                        Ok(false) => {} // Lost the race to run()/cancel — correct.
+                        Err(e) => {
+                            tracing::warn!("reconcile: adoption of {session_id} failed: {e}")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The stored-archive leak backstop (L3): archives are deleted at finalize —
+/// this sweep reclaims the crash windows (pre-launch death, or a crash after
+/// the terminal transition but before `delete_archive`). The TTL is floored
+/// at 6 h so a mis-set value can never race an archive a live session still
+/// needs (init re-execution re-fetches it for the pod's whole lifetime).
+const ARCHIVE_TTL_FLOOR_SECS: u64 = 6 * 3600;
+
+async fn archive_ttl_sweep(state: AppState) {
+    let configured = state.cfg.archive_ttl_secs;
+    let ttl = Duration::from_secs(configured.max(ARCHIVE_TTL_FLOOR_SECS));
+    if configured < ARCHIVE_TTL_FLOOR_SECS {
+        tracing::warn!(
+            "FLUIDBOX_ARCHIVE_TTL_SECS={configured} is below the {ARCHIVE_TTL_FLOOR_SECS}s floor; using the floor"
+        );
+    }
+    let mut tick = tokio::time::interval(Duration::from_secs(3600));
+    loop {
+        tick.tick().await;
+        let data_dir = state.cfg.data_dir.clone();
+        let candidates = tokio::task::spawn_blocking(move || {
+            orchestrator::stale_archive_candidates(&data_dir, ttl)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("archive TTL sweep task failed: {e}");
+            Vec::new()
+        });
+        let mut removed = 0usize;
+        for path in candidates {
+            // Age alone is not proof of leak: a run with a wall-clock budget
+            // longer than the TTL still needs its archive for a possible
+            // init re-execution. Only a terminal/unknown session's archive
+            // is reclaimable; a DB blip keeps the file for the next pass.
+            let deletable = match orchestrator::archive_session_id(&path) {
+                None => true, // not a name this server writes — reclaim
+                Some(sid) => match fluidbox_db::get_session(&state.pool, sid).await {
+                    Ok(None) => true,
+                    Ok(Some(s)) => match fluidbox_core::state::SessionStatus::parse(&s.status) {
+                        Some(st) => st.is_terminal(),
+                        None => false, // newer deploy's status — fail safe
+                    },
+                    Err(e) => {
+                        tracing::warn!("archive TTL sweep: session lookup failed: {e}");
+                        false
+                    }
+                },
+            };
+            if !deletable {
+                tracing::warn!(
+                    "archive TTL sweep: {} outlived the TTL but its session is still live; keeping",
+                    path.display()
+                );
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    tracing::info!("archive TTL sweep removed {}", path.display());
+                    removed += 1;
+                }
+                Err(e) => tracing::warn!("archive TTL sweep failed on {}: {e}", path.display()),
+            }
+        }
+        if removed > 0 {
+            tracing::info!("archive TTL sweep reclaimed {removed} stale archive(s)");
+        }
+    }
+}
+
+/// Launch age is measured from `created_at` — a timestamp heartbeats can NOT
+/// refresh (M5) — so this is an ABSOLUTE deadline for the whole launch
+/// (materialize + pack + provision), not a progress detector. 30 min covers
+/// a large repo comfortably; operators with outliers can raise it via
+/// `FLUIDBOX_STALE_LAUNCH_MINS`.
+fn stale_launch_mins() -> i32 {
+    // Floored at 5: zero/negative would make every prelaunch session "stale"
+    // and the 15 s watchdog would fail healthy launches instantly.
+    std::env::var("FLUIDBOX_STALE_LAUNCH_MINS")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .map(|v| v.max(5))
+        .unwrap_or(30)
+}
 
 /// Fail sessions whose sandbox died or whose heartbeat went stale.
 async fn watchdog(state: AppState) {
+    let stale_launch_mins = stale_launch_mins();
     let mut tick = tokio::time::interval(Duration::from_secs(15));
     loop {
         tick.tick().await;
@@ -111,14 +355,14 @@ async fn watchdog(state: AppState) {
         }
 
         // Sessions stuck before launch (created/provisioning/initializing).
-        match fluidbox_db::stale_nonstarted_sessions(&state.pool, STALE_LAUNCH_MINS).await {
+        match fluidbox_db::stale_nonstarted_sessions(&state.pool, stale_launch_mins).await {
             Ok(stale) => {
                 for s in stale {
                     tracing::warn!(
                         "watchdog: {} stalled in '{}' for >{}m — failing",
                         s.id,
                         s.status,
-                        STALE_LAUNCH_MINS
+                        stale_launch_mins
                     );
                     // A DbError start is retried by the next tick.
                     let _ = orchestrator::fail(
@@ -288,8 +532,11 @@ pub fn spawn_netpol_gate(state: AppState) {
             .strip_suffix("-internal")
             .map(|p| format!("{p}-server"))
             .unwrap_or_else(|| internal_svc.clone());
-        let sandbox_ns =
-            std::env::var("FLUIDBOX_K8S_NAMESPACE").unwrap_or_else(|_| "fluidbox-sandboxes".into());
+        // The probe must carry the SANDBOX placement (nodeSelector,
+        // tolerations, runtimeClass, priorityClass, pull secrets) so the gate
+        // certifies the pool sandboxes actually run on — same env the
+        // provider itself reads.
+        let k8s_cfg = fluidbox_provider_k8s::config::K8sConfig::from_env();
 
         loop {
             let internal_ip =
@@ -305,7 +552,7 @@ pub fn spawn_netpol_gate(state: AppState) {
             match (internal_ip, public_ip) {
                 (Some(i), Some(p)) => {
                     let r = fluidbox_provider_k8s::netpol::verify_netpol(
-                        &sandbox_ns,
+                        &k8s_cfg,
                         &state.cfg.netpol_probe_image,
                         &i,
                         &p,
@@ -349,5 +596,59 @@ async fn finalize_worker(state: AppState) {
     loop {
         tick.tick().await;
         recover_finalizations(&state).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluidbox_core::state::SessionStatus;
+
+    #[test]
+    fn reconcile_decision_table() {
+        use ReconcileAction::*;
+        use SessionLookup::*;
+        // Unknown session → the pod is an orphan: terminate.
+        assert_eq!(reconcile_action(Missing, false), Terminate);
+        assert_eq!(reconcile_action(Missing, true), Terminate);
+        // A session row whose status this binary cannot parse was written by
+        // a NEWER deploy — that is not proof of death. Never terminate on it
+        // (Codex round 2: status_enum's Failed fallback would have).
+        assert_eq!(reconcile_action(Unparseable, false), Leave);
+        assert_eq!(reconcile_action(Unparseable, true), Leave);
+        // Terminal session → the pod is a leak: terminate.
+        assert_eq!(
+            reconcile_action(Known(SessionStatus::Completed), true),
+            Terminate
+        );
+        assert_eq!(
+            reconcile_action(Known(SessionStatus::Cancelled), false),
+            Terminate
+        );
+        // Winding down → the finalizer owns the pod (collection may be in
+        // flight): never touch it here.
+        assert_eq!(
+            reconcile_action(Known(SessionStatus::Cancelling), true),
+            Leave
+        );
+        assert_eq!(
+            reconcile_action(Known(SessionStatus::Finalizing), false),
+            Leave
+        );
+        // Active session without a handle → the M5 crash window: adopt.
+        assert_eq!(
+            reconcile_action(Known(SessionStatus::Initializing), false),
+            Adopt
+        );
+        assert_eq!(
+            reconcile_action(Known(SessionStatus::Running), false),
+            Adopt
+        );
+        // Active session with its handle → healthy: leave.
+        assert_eq!(reconcile_action(Known(SessionStatus::Running), true), Leave);
+        assert_eq!(
+            reconcile_action(Known(SessionStatus::AwaitingApproval), true),
+            Leave
+        );
     }
 }
