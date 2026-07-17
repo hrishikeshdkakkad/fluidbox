@@ -56,6 +56,7 @@ pub async fn enqueue_for_session(state: &AppState, session_id: Uuid) -> bool {
     else {
         return false;
     };
+    let scope = TenantScope::assume(session.tenant_id);
     let Ok(run_spec) = serde_json::from_value::<RunSpec>(session.run_spec.clone()) else {
         return false;
     };
@@ -68,7 +69,9 @@ pub async fn enqueue_for_session(state: &AppState, session_id: Uuid) -> bool {
                 continue;
             }
         };
-        match fluidbox_db::result_delivery_exists_for(&state.pool, session_id, &dest_json).await {
+        match fluidbox_db::result_delivery_exists_for(&state.pool, scope, session_id, &dest_json)
+            .await
+        {
             Ok(true) => continue,
             Ok(false) => {}
             Err(e) => {
@@ -79,6 +82,7 @@ pub async fn enqueue_for_session(state: &AppState, session_id: Uuid) -> bool {
         }
         match fluidbox_db::enqueue_result_delivery(
             &state.pool,
+            scope,
             session_id,
             run_spec.invocation.subscription_id,
             &dest_json,
@@ -103,7 +107,8 @@ pub fn spawn_worker(state: AppState) {
         let mut tick = tokio::time::interval(Duration::from_secs(3));
         loop {
             tick.tick().await;
-            let due = match fluidbox_db::due_result_deliveries(&state.pool, 10).await {
+            let due = match fluidbox_db::system_worker::due_result_deliveries(&state.pool, 10).await
+            {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::warn!("delivery poll failed: {e}");
@@ -118,7 +123,22 @@ pub fn spawn_worker(state: AppState) {
 }
 
 async fn attempt(state: &AppState, d: &fluidbox_db::ResultDeliveryRow) {
-    let outcome = try_deliver(state, d).await;
+    // The delivery row carries only a session id; resolve the owning tenant
+    // (cross-tenant worker load) so the scoped calls below key off the right
+    // tenant. A vanished session (never happens — sessions are retained) leaves
+    // the row for the next tick rather than mutating cross-tenant state.
+    let Ok(Some(session)) =
+        fluidbox_db::system_worker::get_session(&state.pool, d.session_id).await
+    else {
+        tracing::warn!(
+            "delivery {}: session {} not found; skipping",
+            d.id,
+            d.session_id
+        );
+        return;
+    };
+    let scope = TenantScope::assume(session.tenant_id);
+    let outcome = try_deliver(state, d, &session).await;
     let (ok, err, digest, external_url) = match &outcome {
         Ok((digest, external_url)) => (true, None, Some(digest.as_str()), external_url.clone()),
         Err(e) => (false, Some(e.as_str()), None, None),
@@ -126,6 +146,7 @@ async fn attempt(state: &AppState, d: &fluidbox_db::ResultDeliveryRow) {
     let next_attempt = d.attempts + 1;
     let updated = fluidbox_db::mark_delivery_attempt(
         &state.pool,
+        scope,
         d.id,
         ok,
         err,
@@ -191,22 +212,17 @@ fn destination_label(dest: &Value) -> String {
 async fn try_deliver(
     state: &AppState,
     d: &fluidbox_db::ResultDeliveryRow,
+    session: &SessionRow,
 ) -> Result<(String, Option<String>), String> {
     let dest: ResultDestination = serde_json::from_value(d.destination.clone())
         .map_err(|e| format!("bad destination: {e}"))?;
-    // Delivery worker path: the delivery row carries only a session id — load
-    // cross-tenant, and every downstream call derives its scope from the row.
-    let session = fluidbox_db::system_worker::get_session(&state.pool, d.session_id)
-        .await
-        .map_err(|e| format!("session lookup failed: {e}"))?
-        .ok_or("session vanished")?;
     match &dest {
         ResultDestination::SignedWebhook { url } => {
-            let digest = deliver_signed_webhook(state, d, &session, url).await?;
+            let digest = deliver_signed_webhook(state, d, session, url).await?;
             Ok((digest, None))
         }
         _ => {
-            let ctx = publish_context(state, d, &session).await?;
+            let ctx = publish_context(state, d, session).await?;
             let outcome = crate::connectors::publish(state, &dest, &ctx).await?;
             Ok((
                 outcome.digest,
@@ -223,8 +239,9 @@ async fn publish_context(
     session: &SessionRow,
 ) -> Result<crate::connectors::PublishContext, String> {
     let run_spec: Option<RunSpec> = serde_json::from_value(session.run_spec.clone()).ok();
+    let scope = TenantScope::assume(session.tenant_id);
     let subscription_name = match d.subscription_id {
-        Some(sid) => fluidbox_db::get_trigger_subscription(&state.pool, sid)
+        Some(sid) => fluidbox_db::get_trigger_subscription(&state.pool, scope, sid)
             .await
             .map_err(|e| format!("subscription lookup failed: {e}"))?
             .map(|s| s.name)
@@ -236,6 +253,7 @@ async fn publish_context(
         _ => None,
     });
     Ok(crate::connectors::PublishContext {
+        scope: TenantScope::assume(session.tenant_id),
         session_id: session.id,
         subscription_id: d.subscription_id,
         subscription_name,
@@ -258,7 +276,8 @@ async fn deliver_signed_webhook(
     let sub_id = d
         .subscription_id
         .ok_or("delivery has no subscription (cannot resolve signing secret)")?;
-    let sealed = fluidbox_db::subscription_callback_secret_sealed(&state.pool, sub_id)
+    let scope = TenantScope::assume(session.tenant_id);
+    let sealed = fluidbox_db::subscription_callback_secret_sealed(&state.pool, scope, sub_id)
         .await
         .map_err(|e| format!("secret lookup failed: {e}"))?
         .ok_or("subscription has no callback secret")?;
