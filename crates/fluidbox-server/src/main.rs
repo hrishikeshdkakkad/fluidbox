@@ -44,7 +44,8 @@ async fn build_provider(cfg: &config::Config) -> anyhow::Result<Arc<dyn Executio
         "kubernetes" | "k8s" => {
             let k8s_cfg = fluidbox_provider_k8s::config::K8sConfig::from_env();
             Ok(Arc::new(
-                fluidbox_provider_k8s::KubernetesProvider::connect(k8s_cfg).await?,
+                fluidbox_provider_k8s::KubernetesProvider::connect(k8s_cfg, cfg.data_dir.clone())
+                    .await?,
             ))
         }
         other => anyhow::bail!(

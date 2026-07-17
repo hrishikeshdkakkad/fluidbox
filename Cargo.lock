@@ -1188,10 +1188,12 @@ dependencies = [
  "fluidbox-core",
  "fluidbox-workspace",
  "futures",
+ "hex",
  "k8s-openapi",
  "kube",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror",
  "tokio",
  "tracing",
@@ -4556,6 +4558,8 @@ name = "workspaced"
 version = "0.1.0"
 dependencies = [
  "fluidbox-workspace",
+ "hex",
+ "sha2 0.11.0",
  "ureq",
 ]
 
