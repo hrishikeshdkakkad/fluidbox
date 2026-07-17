@@ -205,6 +205,7 @@ pub(crate) fn apply_cluster_policy(pod_spec: &mut Value, cfg: &K8sConfig) {
             .iter()
             .map(|t| json!({
                 "key": t.key, "operator": t.operator, "value": t.value, "effect": t.effect,
+                "tolerationSeconds": t.toleration_seconds,
             }))
             .collect::<Vec<_>>());
     }
@@ -307,6 +308,23 @@ mod tests {
         // Three container roles: init + runner + collector.
         assert_eq!(pod["spec"]["initContainers"].as_array().unwrap().len(), 1);
         assert_eq!(pod["spec"]["containers"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pod_tolerations_carry_toleration_seconds() {
+        let mut c = cfg();
+        c.tolerations = vec![crate::config::Toleration {
+            key: Some("node.kubernetes.io/unreachable".into()),
+            operator: Some("Exists".into()),
+            value: None,
+            effect: Some("NoExecute".into()),
+            toleration_seconds: Some(120),
+        }];
+        let pod = build_pod(&spec(), &c);
+        let t = &pod["spec"]["tolerations"][0];
+        assert_eq!(t["effect"], "NoExecute");
+        // A dropped tolerationSeconds would mean "tolerate forever".
+        assert_eq!(t["tolerationSeconds"], 120);
     }
 
     #[test]
