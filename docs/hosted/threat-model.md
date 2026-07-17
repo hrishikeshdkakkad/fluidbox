@@ -1,0 +1,198 @@
+# Hosted threat model
+
+**Date:** 2026-07-17
+**Status:** Phase A deliverable of the multi-user MCP control plane epic (#28)
+**Authority:** [`../plans/2026-07-14-multi-user-mcp-control-plane-design.md`](../plans/2026-07-14-multi-user-mcp-control-plane-design.md) (v4, security invariants 1–22 and Gaps 1–14) and [`../plans/2026-07-17-idp-agnostic-identity-design.md`](../plans/2026-07-17-idp-agnostic-identity-design.md) (v5, identity invariants 1–12). Vulnerability reporting: [`SECURITY.md`](../../SECURITY.md).
+
+This threat model covers the hosted multi-user deployment (~300 seats). It is deliberately honest about time: fluidbox today is a single-tenant system with a documented gap register, and every mitigation below carries a **status** — `shipped` or the phase (B–F) that closes it. A row marked with a phase is a *known open risk* until that phase lands; hosted multi-tenant operation is not offered before Phases B–E close their rows.
+
+## Core assumption: the sandbox is compromised
+
+fluidbox does not try to prevent sandbox compromise — it **assumes** it. Prompt injection means the agent itself must be modeled as adversarial, and the agent executes arbitrary code by design. The security model therefore never depends on sandbox good behavior: everything of value is structurally unreachable from inside (no credentials, no upstream URLs, no general egress), and everything the sandbox *can* do passes the control plane's single decision gate. Capability ≠ permission ≠ containment: three independent layers, and weakening one never weakens the others.
+
+## Assets
+
+| # | Asset | Where it lives |
+|---|---|---|
+| A1 | Upstream connector credentials (OAuth refresh tokens, static API keys, GitHub App private keys, webhook/delivery secrets) | AEAD-sealed at rest (`seal.rs`, `FLUIDBOX_CREDENTIAL_KEY`); access tokens minted at call time, cached in memory only |
+| A2 | Identity secrets (IdP client secrets, PKCE verifiers, browser-session tokens, PATs) | Sealed columns; session/PAT secrets stored only as sha256 |
+| A3 | Tenant data (runs, event ledger, artifacts, workspace source code, connection metadata) | Postgres + workspace archive volume |
+| A4 | Model spend and compute (LLM budgets, sandbox capacity) | Facade budget stops; per-run budgets; LiteLLM keys |
+| A5 | Audit integrity (append-only ledger, auth audit log) | `append_event()` gapless sequences; `Redacted<EventEnvelope>`-only sink; INSERT/SELECT-only audit role |
+| A6 | Control-plane infrastructure secrets (`DATABASE_URL`, sealer key, admin token, LiteLLM master key) | Deployment Secret; never in sandboxes or the ledger |
+| A7 | External side-effect authority (the power to execute writes upstream: MCP writes, PR comments/checks, result callbacks) | Exercisable only through the gate + frozen run resource bindings |
+
+## Adversaries
+
+| # | Adversary | Capability assumed |
+|---|---|---|
+| T1 | Prompt-injected / misbehaving model | Full control of tool-call intents and sandbox-side output; reads everything in the sandbox |
+| T2 | Compromised sandbox workload | Arbitrary code execution inside the pod/container, including reading the process environment |
+| T3 | Malicious or compromised remote MCP server | Controls tool names/descriptions/schemas/results; can rug-pull, drift schemas, set cookies, redirect, stall streams |
+| T4 | Malicious tenant insider | A valid low-privilege membership in the organization |
+| T5 | Cross-tenant attacker | A valid membership in a *different* organization |
+| T6 | Unauthenticated network attacker | Can reach public endpoints: webhook ingress, login/OAuth callbacks, the ingress origin |
+| T7 | Stolen-credential holder | Possesses a leaked PAT, session cookie, trigger token, or authorization URL |
+| T8 | Compromised or rogue org IdP | Controls ID tokens for its own organization |
+| T9 | Malicious connector definition | A crafted custom endpoint/catalog entry used as an SSRF or exfiltration vehicle |
+| T10 | Operator error | Honest-but-fallible break-glass and configuration actions |
+
+## Trust boundaries
+
+The [network architecture](network-architecture.md) enumerates the edges; the boundaries that matter are:
+
+| # | Boundary | Crossing discipline |
+|---|---|---|
+| B1 | Browser ↔ control plane | `__Host-` cookies, CSRF header + `Origin` on cookie-authenticated non-GETs, one-time browser-bound flows, dual-credential rejection |
+| B2 | Sandbox ↔ internal gateway (`:8788`) | Per-run token(s); `zeroEgress` NetworkPolicy is the only route; every tool intent passes the single gate |
+| B3 | Control plane ↔ remote MCP endpoints | Broker-only egress; admission policy; audience-bound credentials; ambient-state-free transport |
+| B4 | Control plane ↔ per-org IdP | Discovery/JWKS/token fetches SSRF-validated; full ID-token verification; no DB transaction spans IdP I/O |
+| B5 | Webhook senders ↔ ingress | HMAC against sealed secrets is the authentication; verify-before-store; DB-unique dedup |
+| B6 | Tenant ↔ tenant (inside one deployment) | `TenantScope` repository methods (primary), composite `(tenant_id, id)` FKs, RLS as depth |
+| B7 | Control plane ↔ model gateway | Facade-only path; provider keys live only in LiteLLM; sandboxes cannot address it |
+| B8 | Operator ↔ deployment | Admin token confined to `/v1/admin/*` under `FLUIDBOX_REQUIRE_SSO=1`; transactional audit |
+
+## Scenarios and controls
+
+Statuses: **shipped** = enforced on `main` today; **Phase B–F** = the phase that closes it (open risk until then).
+
+### T1/T2 — the compromised sandbox and the model itself
+
+| Attack | Control | Status |
+|---|---|---|
+| Exfiltrate an upstream credential from the sandbox | Credentials never enter the sandbox (invariants 1, 2): LLM key swapped at the facade, git credentials control-plane-side via ephemeral `GIT_CONFIG_*`, MCP credentials used only by the broker | shipped |
+| Reach the internet / LiteLLM / metadata endpoints directly | `zeroEgress` NetworkPolicy (only `:8788`; no DNS), boot-gate-proven enforcement, no service-account token in the pod (invariant 3) | shipped (Kubernetes provider; subject to the accepted EKS pod-start enforcement window below) |
+| Call a tool outside the frozen set, or a rug-pulled/drifted tool | Frozen-set availability check at the gate — drifted or vanished tools are denied (`source=capability`); a live upstream tools-list change never mutates an in-flight run (invariant 14) | shipped |
+| Choose *whose* credential executes a tool | The model chooses only among frozen tools; bindings are frozen at run creation; the broker resolves the credential solely from the authenticated session's binding (invariants 4, 5) | shipped for today's attached connections; full binding model Phase C |
+| Bypass the permission callback (autonomy modes) | The callback stays wired in both modes — never the SDK's `bypassPermissions`; autonomous mode rewrites `RequireApproval` to the policy fallback inside `evaluate()`, ledgering both verdicts | shipped |
+| Impersonate runner-control actions (report results, heartbeats) after reading the process env | Today one bearer holds every audience — agent code **can** read it (Gap 10) | **Phase E**: audience-scoped credentials; runner-control unreachable from agent subprocesses |
+| Overspend the per-run LLM budget with parallel calls | Facade checks-then-records today — concurrent calls can pass the same remaining budget (Gap 14) | **Phase E**: durable request-ID-keyed reservations; **Phase D**: per-tenant LiteLLM virtual keys as the fairness backstop |
+| Replay a decided tool call to execute the write twice | Decision idempotency exists; execution idempotency does not yet (Gap 11) | **Phase E**: durable execution claims keyed `(tenant, run, tool_call_id, input_digest)`, at most one dispatch attempt (invariant 16) |
+| Execute a late-approved call after cancellation/budget termination | Terminality checked before the wait today, not before send | **Phase E**: claim conditional on nonterminal session (invariant 18) |
+| Poison the ledger with prompts/secrets | The sink accepts only `Redacted<EventEnvelope>` (constructible solely via the redactor) — digests, usage, cost only | shipped |
+
+### T3 — the malicious MCP server
+
+| Attack | Control | Status |
+|---|---|---|
+| Poisoned tool names/descriptions (ANSI, zero-width, injection copy) | Names and schemas are screened and validated at the registration photograph; descriptions, annotations, arguments, and results are untrusted input end to end (invariant 13) | shipped |
+| Schema rug-pull between registration and run | Snapshots append-only; runs execute against their frozen schemas and digests | shipped |
+| Malicious arguments accepted because the schema is only advertised | Server-side argument validation against the frozen schema (bounded depth/size, no external `$ref`), dialect per snapshot protocol version, rejections surfaced as tool-execution errors (Gap 12, invariant 17) | **Phase E** |
+| Cross-user/run session bleed via `MCP-Session-Id` or cookies | Per-run upstream sessions, never shared (invariant 11); authorization header on every request; shared HTTP transport is ambient-state-free — no cookie jars, no cached per-host auth (invariant 22) | **Phase E** (per-run session manager; conformance contract, Gap 8) |
+| Insufficient-scope challenge used to phish scope escalation | SEP-835 challenges are terminal for the call; the connection is marked "reconnect with more scopes" for its **owner**; the broker never auto-escalates a frozen grant | **Phase E** |
+| Blind retry of an ambiguous write | Ambiguous outcomes are ledgered as such and never blindly retried (invariant 15); only positively-proven `failed_before_send` is re-claimable | **Phase E** (claims); retry discipline shipped in broker behavior today |
+| Server-to-client requests (sampling/elicitation) abused to stall or socially engineer | Unsupported client capabilities are never advertised; such requests receive JSON-RPC errors (Gaps 8, 9 — the [compatibility matrix](product-compatibility-matrix.md) makes the boundary explicit) | boundary documented (this phase); conformance mechanics Phase E |
+
+### T4/T5 — insiders and cross-tenant attackers
+
+| Attack | Control | Status |
+|---|---|---|
+| Read or bind another user's personal connection | Connection ownership (`owner_type`, `owner_user_id`); binding verification; personal connections invisible to other members | **Phase C** |
+| Approve an action so it runs under someone else's credential | Approval permits the proposed action under the credential already frozen into the run — never the approver's (invariant 8); approvers need `approval.decide_own`/`approval.decide_org`; no role — including admin — authorizes approval under another user's personal connection in v1 | **Phase B/C** |
+| Read another tenant's runs/events/artifacts by UUID | `TenantScope` repository signatures (primary), composite tenant FKs, RLS as depth, cross-tenant negative test matrix; UUID unpredictability is not authorization (invariant 10) | **Phase B** (today: single-tenant, Gaps 1–2 — the hosted blocker) |
+| See tenant existence via login routing | The neutral entry page never enumerates organizations and answers identically for unknown and IdP-less slugs | **Phase B** |
+| A trigger token used beyond its subscription | Subscription-scoped, sha256-hashed tokens: invoke exactly one subscription, poll only runs it created; invoke overrides are opt-in and can only narrow | shipped |
+| A member reads runs they shouldn't | `run.read` visibility rules (own runs; token-created runs; `subscriptions.manage`; `runs.read_all`) on every session/event/artifact/approval/SSE query | **Phase B** |
+| Custom connector admitted by one tenant becomes bindable in another | Custom definitions tenant-scoped; unattributable legacy rows disabled at backfill | **Phase C** |
+
+### T6 — the unauthenticated network
+
+| Attack | Control | Status |
+|---|---|---|
+| Forged webhook creates runs | HMAC is the authentication — against the connection's sealed secret, or the GitHub App registration's sealed secret on the App-level ingress path; nothing stored before verification | shipped |
+| Replayed webhook duplicates fan-out | Two DB-unique dedup levels bound to the session insert in one transaction — retries heal, never duplicate | shipped |
+| Login CSRF / forced login into an attacker's session | Session replacement is never silent: `pending_login_switches` one-time browser-bound confirmation (cookie hash inside the claim predicate, 120 s expiry, current-session equality in the predicate) | **Phase B** |
+| Replayed / attacker-completed OAuth or login callback | One-time server-side state rows; per-flow `HttpOnly` cookie hash inside the one-time claim predicate — a leaked authorization URL can neither complete nor burn a flow. Invariant 20 itself governs connector OAuth's full binding set; the GitHub App and login flows use the same one-time cookie-hash claim **mechanism** with their own, flow-appropriate binding sets | shipped (GitHub App) / **Phase B** (login) / **Phase D** (connector OAuth, invariant 20) |
+| Cross-user grant injection (victim's consent seals into attacker's connection) | The completing browser must prove it started the flow — same cookie-hash predicate; connected account shown for human confirmation before activation | **Phase D** |
+| CSRF against cookie-authenticated APIs | Custom header + `Origin` check on every cookie-authenticated non-GET; `CorsLayer::permissive()` removed in the same change; GET writes limited to the enumerated protocol-forced flows, each with its own one-time claims | **Phase B** |
+| SSRF via crafted endpoints, discovery documents, redirects, or DNS rebinding | Admission address-class rules enforced at resolution time on every fetch; redirect re-validation; egress proxy | **Phase E** (Gap 7); policy stated now in the [admission policy](connector-admission-policy.md) |
+| Amplification via unauthenticated login/callback endpoints | Rate limits per IP and per org; caps on outstanding unconsumed flows; flow claims commit before any IdP I/O so slow IdPs cannot hold DB connections | **Phase B** |
+
+### T7 — stolen credentials
+
+| Attack | Control | Status |
+|---|---|---|
+| Stolen PAT self-replicates | A PAT can never mint, extend, or revoke PATs (including itself); TTL clamped (90 d default / 1 y max) | **Phase B** |
+| Stolen PAT outlives the person | Membership status and roles re-read on every use; deactivation kills sessions and PATs in one transaction | **Phase B** |
+| Stolen session cookie rides forever | Server-side session rows (revocable), sliding idle expiry capped by an absolute expiry, `__Host-` prefix, HttpOnly, SameSite=Lax; long-lived streams re-authorize on a ≤60 s interval | **Phase B** |
+| Stolen trigger token reaches the admin surface | Token kinds are mutually exclusive (relationally CHECK-enforced); trigger tokens never touch `/v1`-admin routes; the admin token can never invoke a trigger | shipped (kinds) / **Phase B** (CHECK shape) |
+| Leaked run session token used from outside | Reaching `:8788` requires being inside the sandbox network path; workload identity/mTLS additionally binds the caller | shipped (network) / **Phase E** (identity, Gap 6 remainder) |
+| Revoked connection's cached access token keeps working | Custody is DB-gated, not cache-gated: fresh status/generation reads before any cached token is served; revoke/membership-change evicts | shipped (GitHub custody pattern) / **Phase D** (generation-aware caches everywhere) |
+
+### T8 — the compromised IdP
+
+A compromised org IdP mints valid identities **for that organization only** — the blast radius is bounded by construction:
+
+| Attack | Control | Status |
+|---|---|---|
+| Forge identities in another org | Identity key is `(tenant_id, idp_config_id, subject)`; `iss` verified per token; `sub` never trusted across issuers | **Phase B** |
+| Mint the org's root authority from a claim | `owner` is never grantable from IdP claims absent explicit operator opt-in (`allow_owner_mapping`); bootstrap-owner promotion is a single-winner atomic claim requiring a verified email match, an unexpired arm, and no active owner | **Phase B** |
+| Symmetric-key forgery (`alg=HS256` with the shared client secret) | `none` and all symmetric algorithms rejected unconditionally; the allowlist can only narrow within the asymmetric set | **Phase B** |
+| Token substitution/replay across flows | Full verification: exact `iss`, `aud`+`azp` rules, `exp`/`iat`/`nbf` with bounded skew, `iat` bound to the flow's lifetime, `nonce` single-use, `at_hash` when present | **Phase B** |
+| Locked-out org after IdP death | Break-glass rides the operator admin token, independent of any IdP; issuer migration is a staged atomic swap that cancels old flows and revokes old sessions | **Phase B** |
+
+### T9/T10 — malicious definitions and operator error
+
+| Attack | Control | Status |
+|---|---|---|
+| Custom endpoint as an internal-network probe | Admission address rules; broker-only egress; private endpoints only via BYOC/relay/explicit approval | **Phase E** enforcement; policy stated now |
+| Catalog entry masquerading as trusted | Catalog is untrusted reference data; curated display bypasses no verification, policy, or approval | shipped |
+| Operator break-glass abuse or mistakes | Explicit `/v1/admin/*` surface; accepted mutations audit in the same transaction (fail together); rejected attempts audited after rollback; arming refused while an active owner exists; arms expire | **Phase B** |
+| Sealer-key loss orphans credentials | Documented today (reconnect after rotation); Phase D adds KMS envelope encryption and a resumable, count-parity-verified re-seal migration — the legacy key retires only at 100% | **Phase D** |
+| Gateway supply chain (the LiteLLM malware incident) | Image pinned by digest, never floating tags; private network only; replaceable below the governance plane — Rust owns identity, policy, budget decisions, and the canonical ledger | shipped |
+
+## Explicitly out of scope (assumed trusted)
+
+- **The substrate**: Kubernetes control plane, the enforcing CNI (though enforcement is *probed*, never assumed — runs stay blocked without proof), node kernels (optional gVisor/Kata runtime classes raise this tier), and the cloud provider.
+- **Neon Postgres** as a data custodian (TLS, direct connections; DB compromise is game over for A3/A5 by definition — mitigated by sealed credentials for A1/A2 and, from Phase D, KMS envelope keys).
+- **Model providers** (Anthropic/OpenAI) receiving prompts via the gateway.
+- **The org's own IdP within its org** — see T8: trusted *for its organization*, structurally unable to cross tenants.
+- Malicious code changes in fluidbox itself (supply chain of this repo; CI, review, and release signing are process controls outside this document).
+
+## Accepted residual risks (documented, not mitigated)
+
+| Residual | Rationale |
+|---|---|
+| **Bootstrap owner shared-email**: if two distinct IdP subjects share the armed verified email, the first to log in wins | Email is not an identity; the operator armed a specific address deliberately; the audit row records the winning `sub`; re-arming is one break-glass call away |
+| **IdP-side-only deactivation window**: an actively-used session survives until its absolute expiry (default 7 d) if the org deactivates the user only at the IdP | Stated honestly (identity design, Lifecycle): sliding idle expiry bounds only inactive sessions. Operators needing tighter bounds lower the absolute TTL or deactivate in fluidbox (immediate cascade) |
+| **At-most-once dispatch, not exactly-once**: an ambiguous upstream outcome stays ambiguous | True exactly-once side effects are not achievable over MCP; ambiguity is surfaced to policy/user/model, never hidden or blindly retried |
+| **VPC CNI standard-mode pod-start window** (EKS): a just-created pod is briefly fail-open until the node agent programs its eBPF rules | Observed live on EKS; strict mode is worse (it starves system pods). No duration or ordering guarantee relative to runner startup is claimed — the boot gate and long-lived probes are the authoritative enforcement signals, and the shipped isolation row above is qualified by this window |
+| **Result delivery is at-least-once** | Receivers dedup on `x-fluidbox-delivery`; provider idempotency / deterministic markers cover the crash window between remote creation and recording |
+
+Not a residual: the **approval `approval.decided` double-emission** inside one process is a *current known defect* with an assigned fix — the transactional outbox in the Phase E statelessness work (Gap 13) — not an accepted post-mitigation risk.
+
+## Gap register
+
+The parent design's production gaps, restated as the risk schedule this threat model depends on:
+
+| Gap | Summary | Closed by |
+|---|---|---|
+| 1 | Global admin authentication (no users/memberships/roles) | **B** |
+| 2 | One boot-selected tenant | **B** |
+| 3 | Capability bundle embeds a concrete connection | **C** |
+| 4 | Process-local OAuth locking | **D** |
+| 5 | One deployment credential key (no KMS envelope) | **D** |
+| 6 | Workload identity/mTLS on the internal gateway (network hardening itself largely shipped) | **E** |
+| 7 | SSRF boundary for custom endpoints/discovery | **E** |
+| 8 | Minimal/stateless-first MCP client (2025-11-25 conformance) | **E** |
+| 9 | Tools-only boundary implicit | **A** (documented — the [compatibility matrix](product-compatibility-matrix.md)); conformance tests **E** |
+| 10 | One sandbox bearer token holds every audience | **E** |
+| 11 | Decision idempotency without execution idempotency | **E** |
+| 12 | Frozen schemas advertised, not enforced | **E** |
+| 13 | Process-local lifecycle/delivery workers | **E/F** |
+| 14 | Per-run LLM budget race in the facade | **E** |
+
+## Verification
+
+Enforcement is proven, not asserted:
+
+- **Network**: the boot-time netpol gate (`+:8788 −:8787`) blocks run admission until enforcement is demonstrated; `helm test` re-certifies per release; CI runs kind + Calico.
+- **Tenancy (Phase B acceptance)**: cross-tenant negative test matrix; workers cannot fall back to a default tenant; OIDC round-trip against a real conformant issuer (Keycloak/Dex) with replayed, wrong-browser, and expired flows all refused; algorithm allowlist rejects `none`/HS256.
+- **Governance**: `scripts/governance-e2e.sh` drives verdicts, approval pause/resume, idempotency, and autonomous auto-deny over real HTTP; the e2e greps keep provider knowledge out of the event spine.
+- **Scale/failure (Phase F)**: load tests at 60/150/300 concurrent sandboxes, OAuth refresh storms, revocation during active runs, upstream 401/404/429/5xx, broker restarts, DB failover, and tenant-isolation fuzzing.
+
+## Related documents
+
+- [Product compatibility matrix](product-compatibility-matrix.md) — what is in and out of the supported surface
+- [Connector admission policy](connector-admission-policy.md) — the SSRF/admission boundary in policy form
+- [Hosted network architecture](network-architecture.md) — the planes and edges referenced by B1–B8
