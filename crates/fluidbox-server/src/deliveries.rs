@@ -41,18 +41,38 @@ pub fn sign_payload(secret: &str, timestamp: i64, body: &str) -> String {
 /// Called by the orchestrator on every transition into a terminal state.
 /// Failures here are logged, never propagated — result publication must not
 /// touch the run lifecycle (design §9).
-pub async fn enqueue_for_session(state: &AppState, session_id: Uuid) {
+/// Enqueue one delivery row per RunSpec destination, idempotently: each
+/// destination is check-then-insert (there is no unique key on the table),
+/// so a crash after destination A but before B is healed by enqueueing
+/// exactly B. Callers are never concurrent for one session — the terminal
+/// transition is single-winner and the reconciler runs under the finalize
+/// claim. Returns true iff EVERY destination now has a row: partial success
+/// must not be mistaken for complete reconciliation.
+pub async fn enqueue_for_session(state: &AppState, session_id: Uuid) -> bool {
     let Ok(Some(session)) = fluidbox_db::get_session(&state.pool, session_id).await else {
-        return;
+        return false;
     };
     let Ok(run_spec) = serde_json::from_value::<RunSpec>(session.run_spec.clone()) else {
-        return;
+        return false;
     };
+    let mut all_present = true;
     for dest in &run_spec.result_destinations {
         let dest_json = match serde_json::to_value(dest) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(_) => {
+                all_present = false;
+                continue;
+            }
         };
+        match fluidbox_db::result_delivery_exists_for(&state.pool, session_id, &dest_json).await {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::error!("delivery existence check for {session_id} failed: {e}");
+                all_present = false;
+                continue;
+            }
+        }
         match fluidbox_db::enqueue_result_delivery(
             &state.pool,
             session_id,
@@ -62,9 +82,13 @@ pub async fn enqueue_for_session(state: &AppState, session_id: Uuid) {
         .await
         {
             Ok(d) => tracing::info!("enqueued result delivery {} for {session_id}", d.id),
-            Err(e) => tracing::error!("enqueue delivery for {session_id} failed: {e}"),
+            Err(e) => {
+                tracing::error!("enqueue delivery for {session_id} failed: {e}");
+                all_present = false;
+            }
         }
     }
+    all_present
 }
 
 /// The delivery worker: single sequential loop (no locking needed — see

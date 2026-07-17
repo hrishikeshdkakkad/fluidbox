@@ -1,0 +1,229 @@
+{{- $fullname := include "fluidbox.fullname" . -}}
+{{- $sandboxNs := .Values.sandbox.namespace -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "fluidbox.serverName" . }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+---
+# The control plane is the only run controller (no operator, no CRD). It needs
+# to drive Pods + per-run Secrets in the sandbox namespace ONLY — nothing
+# cluster-scoped.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "fluidbox.serverName" . }}
+  namespace: {{ $sandboxNs }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec", "pods/log"]
+    verbs: ["create", "get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "fluidbox.serverName" . }}
+  namespace: {{ $sandboxNs }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "fluidbox.serverName" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "fluidbox.serverName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# The control plane also reads its OWN internal Service's ClusterIP at boot so
+# the runner reaches it with no DNS (zeroEgress). Scoped to services/get here.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "fluidbox.serverName" . }}-self
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "fluidbox.serverName" . }}-self
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "fluidbox.serverName" . }}-self
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "fluidbox.serverName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "fluidbox.serverName" . }}-archives
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with .Values.server.archivePvc.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.server.archivePvc.size }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "fluidbox.serverName" . }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.server.replicas }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "fluidbox.name" . }}
+      app.kubernetes.io/component: server
+  template:
+    metadata:
+      labels:
+        {{- include "fluidbox.labels" . | nindent 8 }}
+        app.kubernetes.io/component: server
+    spec:
+      serviceAccountName: {{ include "fluidbox.serverName" . }}
+      {{- with .Values.images.pullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: server
+          image: {{ include "fluidbox.imageRef" (dict "image" .Values.images.server "ctx" $) | quote }}
+          imagePullPolicy: {{ .Values.images.server.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            readOnlyRootFilesystem: false
+          ports:
+            - { name: public, containerPort: 8787 }
+            - { name: internal, containerPort: 8788 }
+          env:
+            - { name: FLUIDBOX_BIND, value: "0.0.0.0:8787" }
+            - { name: FLUIDBOX_INTERNAL_BIND, value: "0.0.0.0:8788" }
+            - { name: FLUIDBOX_DATA_DIR, value: "/var/lib/fluidbox" }
+            - { name: FLUIDBOX_PROVIDER, value: "kubernetes" }
+            - { name: FLUIDBOX_K8S_NAMESPACE, value: {{ $sandboxNs | quote }} }
+            - { name: FLUIDBOX_COLLECTOR_IMAGE, value: {{ include "fluidbox.flatImage" (dict "value" .Values.images.collector "name" "workspaced" "ctx" $) | quote }} }
+            - { name: FLUIDBOX_SANDBOX_IMAGE, value: {{ include "fluidbox.flatImage" (dict "value" .Values.images.sandboxRunner "name" "sandbox-runner" "ctx" $) | quote }} }
+            - { name: FLUIDBOX_CODEX_SANDBOX_IMAGE, value: {{ include "fluidbox.flatImage" (dict "value" .Values.images.codexRunner "name" "codex-runner" "ctx" $) | quote }} }
+            {{- with .Values.sandbox.runtimeClassName }}
+            - { name: FLUIDBOX_K8S_RUNTIME_CLASS, value: {{ . | quote }} }
+            {{- end }}
+            # Sandbox pod baseline + placement: values.sandbox.* → the exact
+            # FLUIDBOX_K8S_* env K8sConfig::from_env reads (M3).
+            - { name: FLUIDBOX_K8S_RUN_AS_USER, value: {{ .Values.sandbox.runAsUser | quote }} }
+            - { name: FLUIDBOX_K8S_CPU_REQUEST, value: {{ .Values.sandbox.resources.requests.cpu | quote }} }
+            - { name: FLUIDBOX_K8S_MEM_REQUEST, value: {{ .Values.sandbox.resources.requests.memory | quote }} }
+            - { name: FLUIDBOX_K8S_EPHEMERAL_REQUEST, value: {{ .Values.sandbox.resources.requests.ephemeralStorage | quote }} }
+            - { name: FLUIDBOX_K8S_CPU_LIMIT, value: {{ .Values.sandbox.resources.limits.cpu | quote }} }
+            - { name: FLUIDBOX_K8S_MEM_LIMIT, value: {{ .Values.sandbox.resources.limits.memory | quote }} }
+            - { name: FLUIDBOX_K8S_EPHEMERAL_LIMIT, value: {{ .Values.sandbox.resources.limits.ephemeralStorage | quote }} }
+            - { name: FLUIDBOX_K8S_VOLUME_SIZE_LIMIT, value: {{ .Values.sandbox.volumeSizeLimit | quote }} }
+            {{- with .Values.sandbox.priorityClassName }}
+            - { name: FLUIDBOX_K8S_PRIORITY_CLASS, value: {{ . | quote }} }
+            {{- end }}
+            {{- if .Values.sandbox.nodeSelector }}
+            - { name: FLUIDBOX_K8S_NODE_SELECTOR, value: {{ include "fluidbox.sandboxNodeSelector" . | quote }} }
+            {{- end }}
+            {{- if .Values.sandbox.tolerations }}
+            - { name: FLUIDBOX_K8S_TOLERATIONS, value: {{ toJson .Values.sandbox.tolerations | quote }} }
+            {{- end }}
+            {{- if .Values.images.pullSecrets }}
+            # Names only — the provider recreates the refs on sandbox + probe
+            # pods; the Secrets themselves must exist in the sandbox namespace.
+            - { name: FLUIDBOX_K8S_IMAGE_PULL_SECRETS, value: {{ include "fluidbox.pullSecretNames" . | quote }} }
+            {{- end }}
+            - { name: FLUIDBOX_NETWORK_MODE, value: "hardened" }
+            - { name: FLUIDBOX_REQUIRE_ENFORCED_NETPOL, value: {{ .Values.netpol.requireEnforced | quote }} }
+            - { name: FLUIDBOX_NETPOL_PROBE_IMAGE, value: {{ .Values.netpol.probeImage | quote }} }
+            # Boot-resolve the internal Service ClusterIP → the runner's
+            # control URL (no DNS under zeroEgress).
+            - { name: FLUIDBOX_INTERNAL_SERVICE, value: {{ include "fluidbox.internalServiceName" . | quote }} }
+            - { name: FLUIDBOX_INTERNAL_SERVICE_NAMESPACE, value: {{ .Release.Namespace | quote }} }
+            {{- if .Values.server.publicControlUrl }}
+            - { name: FLUIDBOX_PUBLIC_CONTROL_URL, value: {{ .Values.server.publicControlUrl | quote }} }
+            {{- end }}
+            {{- with .Values.server.publicUrl }}
+            - { name: FLUIDBOX_PUBLIC_URL, value: {{ . | quote }} }
+            {{- end }}
+            {{- $up := include "fluidbox.llmUpstreamUrl" . }}
+            {{- with $up }}
+            - { name: LLM_UPSTREAM_URL, value: {{ . | quote }} }
+            {{- end }}
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.databaseUrl | quote }} } }
+            - name: FLUIDBOX_ADMIN_TOKEN
+              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.adminToken | quote }} } }
+            - name: FLUIDBOX_CREDENTIAL_KEY
+              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.credentialKey | quote }} } }
+            - name: LITELLM_MASTER_KEY
+              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.litellmMasterKey | quote }} } }
+            {{- with .Values.server.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - { name: archives, mountPath: /var/lib/fluidbox }
+          readinessProbe:
+            httpGet: { path: /v1/health, port: public }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources: {{- toYaml .Values.server.resources | nindent 12 }}
+      volumes:
+        - name: archives
+          persistentVolumeClaim:
+            claimName: {{ include "fluidbox.serverName" . }}-archives
+---
+# Public Service (:8787): dashboard + CLI + OAuth + webhooks. Ingress origin.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "fluidbox.serverName" . }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: {{ include "fluidbox.name" . }}
+    app.kubernetes.io/component: server
+  ports:
+    - { name: public, port: 8787, targetPort: public }
+---
+# Internal Service (:8788): the sandbox-facing plane (runner contract, archive,
+# LLM facade). NetworkPolicy allows sandbox→here; the runner's control URL is
+# this Service's ClusterIP (family-matched, stable across normal upgrades).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "fluidbox.internalServiceName" . }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: {{ include "fluidbox.name" . }}
+    app.kubernetes.io/component: server
+  ports:
+    - { name: internal, port: 8788, targetPort: internal }

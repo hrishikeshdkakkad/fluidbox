@@ -771,18 +771,36 @@ pub async fn ensure_access_token(
             return Ok(tok.clone());
         }
     }
+    // Two-level serialization of the refresh-token rotation:
+    //  1. an in-process mutex avoids self-racing within ONE control plane, and
+    //  2. a transaction-scoped Postgres advisory lock (keyed on the connection
+    //     id) serializes ACROSS replicas — a second control plane can no longer
+    //     double-rotate the refresh token into invalid_grant. The lock is held
+    //     for the whole refresh (HTTP + rotation write) and released on commit.
     let lock = {
         let mut locks = state.oauth_locks.lock().await;
         locks.entry(conn.id).or_default().clone()
     };
     let _guard = lock.lock().await;
-    // Double-check: another caller may have refreshed while we waited.
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| format!("oauth lock txn failed: {e}"))?;
+    fluidbox_db::acquire_oauth_lock(&mut tx, conn.id)
+        .await
+        .map_err(|e| format!("oauth advisory lock failed: {e}"))?;
+    // Double-check under both locks: another caller (here or on another
+    // replica) may have refreshed while we waited.
     if let Some((tok, exp)) = state.connector_tokens.lock().await.get(&conn.id) {
         if *exp - margin > Utc::now() {
             return Ok(tok.clone());
         }
     }
-    refresh_access_token(state, conn).await
+    let result = refresh_access_token(state, conn).await;
+    // Commit releases the advisory lock (a dropped/rolled-back tx would too).
+    tx.commit().await.ok();
+    result
 }
 
 /// One refresh-grant round trip. Rotation: a new refresh token atomically

@@ -1,0 +1,146 @@
+# fluidbox Helm values — hardened-by-default. Per-cloud presets in values/.
+#
+# The chart NEVER generates or stores credential material: DATABASE_URL, the
+# admin token, the credential key, and LiteLLM keys all come from an
+# existing Secret you create out-of-band (see existingSecret).
+
+nameOverride: ""
+fullnameOverride: ""
+
+images:
+  # Defaults bind to the chart's appVersion — release.yml packages the chart
+  # with --app-version <tag>, so an OOTB `helm install` from the OCI registry
+  # pulls exactly the images that release published. Production SHOULD pin by
+  # digest: set digest: "sha256:…" (takes precedence over tag).
+  server:
+    repository: ghcr.io/hrishikeshdkakkad/fluidbox-server
+    tag: ""            # "" → .Chart.AppVersion
+    digest: ""         # "sha256:…" — rendered as repository@digest
+    pullPolicy: IfNotPresent
+  web:
+    repository: ghcr.io/hrishikeshdkakkad/fluidbox-web
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  # The sandbox runner images (run UNMODIFIED as pods) and the collector —
+  # FULL refs (repo:tag or repo@sha256:…), passed to the provider verbatim.
+  # "" → the official GHCR image at the chart appVersion.
+  sandboxRunner: ""
+  codexRunner: ""
+  collector: ""
+  # imagePullSecrets for private registries (mirroring to ECR/GCR/ACR), as
+  # [{name: …}]. Applied to the Deployments AND — by name, via
+  # FLUIDBOX_K8S_IMAGE_PULL_SECRETS — to sandbox + netpol-probe pods:
+  # imagePullSecrets are namespace-local, so copies of the Secrets must exist
+  # in the SANDBOX namespace too.
+  pullSecrets: []
+
+# The Secret (in the release namespace) holding every credential, referenced
+# by key. The chart reads — never writes — these.
+existingSecret: fluidbox-secrets
+secretKeys:
+  databaseUrl: DATABASE_URL            # Neon DIRECT (non-pooler) connection string
+  adminToken: FLUIDBOX_ADMIN_TOKEN
+  credentialKey: FLUIDBOX_CREDENTIAL_KEY
+  litellmMasterKey: LITELLM_MASTER_KEY
+
+server:
+  # v1 is single-replica + Recreate (settled: multi-replica is a non-goal).
+  replicas: 1
+  # Browser/AS-facing base URL (Ingress origin) — feeds OAuth redirect_uri +
+  # CIMD + GitHub App webhooks. Set to your https origin in production.
+  publicUrl: ""
+  # The sandbox-facing internal control URL the runner + init container use.
+  # zeroEgress injects the internal Service ClusterIP here at render time; set
+  # explicitly to override.
+  publicControlUrl: ""
+  resources:
+    requests: { cpu: "250m", memory: "512Mi" }
+    limits: { cpu: "1", memory: "1Gi" }
+  # Archive PVC (survives Recreate upgrades so init can still pull).
+  archivePvc:
+    size: 10Gi
+    storageClass: ""     # "" = cluster default; per-cloud presets set gp3/managed-csi/…
+  extraEnv: []
+
+web:
+  enabled: true
+  replicas: 1
+  resources:
+    requests: { cpu: "100m", memory: "256Mi" }
+    limits: { cpu: "500m", memory: "512Mi" }
+
+# Bundled LiteLLM (digest-pinned, ClusterIP-only, unreachable from sandboxes).
+# External LiteLLM is the documented production default — keep this off in prod.
+litellm:
+  enabled: false
+  image: ghcr.io/berriai/litellm:main-stable
+  # Anthropic key for the gateway (from the existing Secret, referenced key).
+  anthropicKeySecretKey: ANTHROPIC_API_KEY
+  resources:
+    requests: { cpu: "250m", memory: "512Mi" }
+    limits: { cpu: "1", memory: "1Gi" }
+# External LiteLLM (production default): the facade upstream URL + master key.
+llm:
+  upstreamUrl: ""      # e.g. http://litellm.example:4000 ; empty + litellm.enabled uses the bundled one
+  # The facade authenticates upstream with LITELLM_MASTER_KEY from the Secret.
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: ""
+  tls: []
+
+# The sandbox plane.
+sandbox:
+  # Created by the chart unless it already exists (set create=false to reference).
+  namespace: fluidbox-sandboxes
+  create: true
+  # Egress profile: zeroEgress (default, production) | restrictedEgress | permissive.
+  # See templates/sandbox-networkpolicy.yaml.
+  egressProfile: zeroEgress
+  # Hard-isolation runtime class (gVisor/Kata). "" = the runc tier.
+  runtimeClassName: ""
+  # Pod security baseline.
+  runAsUser: 10001
+  resources:
+    requests: { cpu: "500m", memory: "1Gi", ephemeralStorage: "1Gi" }
+    limits: { cpu: "2", memory: "2Gi", ephemeralStorage: "10Gi" }
+  # Applies to BOTH the workspace and collector emptyDirs. The collector
+  # volume transiently holds the compressed archive (≤ FLUIDBOX_MAX_ARCHIVE_
+  # BYTES, default 2Gi) PLUS the unpacked staging tree PLUS the baseline
+  # during init — size it for archive + ~2× the unpacked workspace.
+  volumeSizeLimit: 10Gi
+  # Namespace ResourceQuota + application concurrent-run limit.
+  quota:
+    enabled: true
+    pods: "20"
+    requestsCpu: "10"
+    requestsMemory: "20Gi"
+  nodeSelector: {}
+  # Toleration objects: {key, operator, value, effect, tolerationSeconds} —
+  # exactly the Kubernetes Toleration fields; anything else is rejected (and
+  # warned about) rather than silently ignored.
+  tolerations: []
+  priorityClassName: ""
+  # CIDRs excepted from the `permissive` profile (metadata + cluster internals).
+  # Dev-only; production uses zeroEgress and never reads these.
+  privateCidrs:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+
+# Verified network enforcement (design 2026-07-15). The boot-time probe gates
+# runs until it proves the CNI enforces NetworkPolicy; the helm test probe
+# certifies a release. FAILS CLOSED — a non-enforcing CNI (kindnet, an EKS
+# cluster without the VPC CNI network-policy agent) blocks runs by design.
+netpol:
+  requireEnforced: true
+  # The probe image (needs a TCP client; busybox has nc/wget).
+  probeImage: busybox:1.36
+  # The helm-test resolver image (needs curl + a shell): reads the two Service
+  # ClusterIPs at TEST time and hands them to the probe via ConfigMap. Helm
+  # stores rendered test hooks in the release, so render-time resolution is
+  # empty on a fresh install — see templates/tests/netpol-probe.yaml.
+  resolverImage: curlimages/curl:8.14.1

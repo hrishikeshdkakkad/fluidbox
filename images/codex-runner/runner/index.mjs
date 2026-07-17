@@ -411,11 +411,27 @@ function spawnCodex() {
 }
 
 let shuttingDown = false;
+let quiesced = false;
 
 async function main() {
   await client.emit("harness", {
     type: "agent.message",
     data: { role: "system", text: `codex runner starting (autonomy=${env.AUTONOMY}, model=${MODEL})` },
+  });
+  // Cancellation quiesce (shared runner contract): on the heartbeat signal we
+  // interrupt the codex turn and finish WITHOUT posting /result — the control
+  // plane's cancel finalizer owns the terminal outcome and collects the diff.
+  client.onQuiesce(() => {
+    quiesced = true;
+    try {
+      if (threadId && turnId) {
+        rpcSend({ jsonrpc: "2.0", id: nextId++, method: "turn/interrupt", params: { threadId, turnId } });
+      }
+    } catch {
+      /* best effort */
+    }
+    turnDone = true;
+    finishRun();
   });
   client.startHeartbeat();
   client.startTokenRenew();
@@ -511,7 +527,7 @@ async function finishRun() {
   if (finished) return;
   finished = true;
   shuttingDown = true;
-  if (hadError) {
+  if (hadError && !quiesced) {
     await client.emit("harness", {
       type: "run.error",
       data: { message: String(hadError?.message || hadError) },
@@ -523,6 +539,12 @@ async function finishRun() {
     if (child && !child.killed) child.kill("SIGKILL");
   } catch {
     /* ignore */
+  }
+  // Quiesced (cancelled): exit WITHOUT posting /result — the cancel finalizer
+  // records the terminal outcome and collects the diff.
+  if (quiesced) {
+    console.error("fluidbox-codex: quiesced on cancel — exiting without /result");
+    process.exit(0);
   }
   try {
     await client.postResult(hadError ? "failed" : "completed", hadError ? String(hadError.message || hadError) : finalText);

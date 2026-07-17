@@ -100,6 +100,7 @@ async function main() {
 
   let finalText = "";
   let hadError = null;
+  let quiesced = false;
   try {
     const response = query({
       prompt: env.TASK,
@@ -119,7 +120,20 @@ async function main() {
       },
     });
 
+    // Cancellation quiesce: the control plane signals via the heartbeat
+    // response; we interrupt the SDK stream and exit WITHOUT posting /result,
+    // so the cancel finalizer owns the outcome and collects a settled tree.
+    client.onQuiesce(() => {
+      quiesced = true;
+      try {
+        response.interrupt?.();
+      } catch {
+        /* best effort; the break below stops iteration regardless */
+      }
+    });
+
     for await (const msg of response) {
+      if (quiesced) break;
       if (msg.type === "assistant") {
         const text = textFromMessage(msg);
         if (text.trim()) {
@@ -137,12 +151,24 @@ async function main() {
       }
     }
   } catch (e) {
-    hadError = e;
-    console.error("fluidbox-runner: query failed:", e);
-    await client.emit("harness", { type: "run.error", data: { message: String(e?.message || e) } });
+    if (quiesced) {
+      // An interrupt during quiesce surfaces as a throw — expected, not a
+      // failure. Fall through to the quiesce exit below.
+    } else {
+      hadError = e;
+      console.error("fluidbox-runner: query failed:", e);
+      await client.emit("harness", { type: "run.error", data: { message: String(e?.message || e) } });
+    }
   } finally {
     client.stopHeartbeat();
     client.stopTokenRenew();
+  }
+
+  // Quiesced (cancelled): exit WITHOUT posting /result — the control plane's
+  // cancel finalizer records the terminal outcome and collects the diff.
+  if (quiesced) {
+    console.error("fluidbox-runner: quiesced on cancel — exiting without /result");
+    process.exit(0);
   }
 
   try {

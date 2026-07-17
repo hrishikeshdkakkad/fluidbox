@@ -271,10 +271,13 @@ pub async fn health() -> Json<Value> {
 
 pub async fn health_ready(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     sqlx::query("select 1").execute(&state.pool).await?;
-    let docker_ok = state.provider.ping().await.is_ok();
-    Ok(Json(
-        json!({ "status": "ready", "db": true, "docker": docker_ok }),
-    ))
+    let provider_ok = state.provider.healthcheck().await.is_ok();
+    Ok(Json(json!({
+        "status": "ready",
+        "db": true,
+        "provider": state.provider.runtime_name(),
+        "provider_ok": provider_ok,
+    })))
 }
 
 // ─── Agents & revisions ───────────────────────────────────────────────────
@@ -858,10 +861,15 @@ pub async fn create_session(
     .await?;
     let session = match created {
         crate::run_service::RunCreation::Created(s) => *s,
-        // Manual runs carry no subscription — unreachable, but honest.
+        // Manual runs carry no subscription — both unreachable, but honest.
         crate::run_service::RunCreation::SkippedOverlap { running_session_id } => {
             return Err(ApiError::Conflict(format!(
                 "skipped: run {running_session_id} is still active (concurrency_policy=skip_if_running)"
+            )))
+        }
+        crate::run_service::RunCreation::ReplaceUnpersisted { running_session_id } => {
+            return Err(ApiError::ServiceUnavailable(format!(
+                "could not persist cancellation of running session {running_session_id} for replace; retry"
             )))
         }
     };
@@ -903,8 +911,18 @@ pub async fn cancel_session(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let ok = orchestrator::cancel(&state, id, "cancelled by user").await;
-    Ok(Json(json!({ "cancelled": ok })))
+    use orchestrator::FinalizeStart;
+    match orchestrator::cancel(&state, id, "cancelled by user").await {
+        FinalizeStart::Persisted { created } => Ok(Json(json!({ "cancelled": created }))),
+        FinalizeStart::AlreadyTerminal | FinalizeStart::Missing => {
+            Ok(Json(json!({ "cancelled": false })))
+        }
+        // The intent did not persist — a 200 here would tell the user the
+        // run is being cancelled when nothing durable says so.
+        FinalizeStart::DbError => Err(ApiError::ServiceUnavailable(
+            "cancellation not persisted; retry".into(),
+        )),
+    }
 }
 
 #[derive(Deserialize)]
