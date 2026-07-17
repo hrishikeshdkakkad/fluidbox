@@ -6,7 +6,7 @@ use crate::error::ApiResult;
 use crate::state::AppState;
 use fluidbox_core::event::{Actor, EventBody};
 use fluidbox_core::spec::{ResultDestination, RunSpec};
-use fluidbox_db::SessionRow;
+use fluidbox_db::{SessionRow, TenantScope};
 use serde_json::{json, Value};
 use std::time::Duration;
 use uuid::Uuid;
@@ -49,7 +49,11 @@ pub fn sign_payload(secret: &str, timestamp: i64, body: &str) -> String {
 /// claim. Returns true iff EVERY destination now has a row: partial success
 /// must not be mistaken for complete reconciliation.
 pub async fn enqueue_for_session(state: &AppState, session_id: Uuid) -> bool {
-    let Ok(Some(session)) = fluidbox_db::get_session(&state.pool, session_id).await else {
+    // Reconciler path: a bare session id arrives from the terminal transition;
+    // load cross-tenant, then the result-delivery calls (Task 3, UUID-only)
+    // key off the row.
+    let Ok(Some(session)) = fluidbox_db::system_worker::get_session(&state.pool, session_id).await
+    else {
         return false;
     };
     let Ok(run_spec) = serde_json::from_value::<RunSpec>(session.run_spec.clone()) else {
@@ -190,7 +194,9 @@ async fn try_deliver(
 ) -> Result<(String, Option<String>), String> {
     let dest: ResultDestination = serde_json::from_value(d.destination.clone())
         .map_err(|e| format!("bad destination: {e}"))?;
-    let session = fluidbox_db::get_session(&state.pool, d.session_id)
+    // Delivery worker path: the delivery row carries only a session id — load
+    // cross-tenant, and every downstream call derives its scope from the row.
+    let session = fluidbox_db::system_worker::get_session(&state.pool, d.session_id)
         .await
         .map_err(|e| format!("session lookup failed: {e}"))?
         .ok_or("session vanished")?;
@@ -300,9 +306,10 @@ pub async fn result_payload(
     delivery_id: Option<Uuid>,
     attempt: Option<i32>,
 ) -> ApiResult<Value> {
-    let usage = fluidbox_db::usage_totals(&state.pool, session.id).await?;
-    let tool_calls = fluidbox_db::tool_call_count(&state.pool, session.id).await?;
-    let artifacts = fluidbox_db::list_artifacts(&state.pool, session.id).await?;
+    let scope = TenantScope::assume(session.tenant_id);
+    let usage = fluidbox_db::usage_totals(&state.pool, scope, session.id).await?;
+    let tool_calls = fluidbox_db::tool_call_count(&state.pool, scope, session.id).await?;
+    let artifacts = fluidbox_db::list_artifacts(&state.pool, scope, session.id).await?;
     let run_spec: Option<RunSpec> = serde_json::from_value(session.run_spec.clone()).ok();
     Ok(json!({
         "event": "run.finished",

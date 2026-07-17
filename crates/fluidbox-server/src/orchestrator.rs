@@ -19,7 +19,7 @@ use fluidbox_core::event::{Actor, EventBody};
 use fluidbox_core::spec::{RunSpec, WorkspaceSpec};
 use fluidbox_core::state::SessionStatus;
 use fluidbox_core::traits::{CollectContext, CollectedArtifacts, SandboxHandle, SandboxSpec};
-use fluidbox_db::SessionRow;
+use fluidbox_db::{SessionRow, TenantScope};
 use std::path::PathBuf;
 use std::time::Duration;
 use uuid::Uuid;
@@ -73,8 +73,14 @@ pub fn spawn_run(state: AppState, session_id: Uuid) {
     });
 }
 
-async fn transition(state: &AppState, id: Uuid, next: SessionStatus, reason: Option<&str>) -> bool {
-    match fluidbox_db::transition_session(&state.pool, id, next, reason).await {
+async fn transition(
+    state: &AppState,
+    scope: TenantScope,
+    id: Uuid,
+    next: SessionStatus,
+    reason: Option<&str>,
+) -> bool {
+    match fluidbox_db::transition_session(&state.pool, scope, id, next, reason).await {
         Ok(Some((from, _))) => {
             ledger::record(
                 state,
@@ -92,7 +98,7 @@ async fn transition(state: &AppState, id: Uuid, next: SessionStatus, reason: Opt
                 // goes terminal so a still-running or leaked token can't reach
                 // the facade/gateway. The PRIMARY guard is each endpoint's own
                 // terminal/wind-down check.
-                if let Err(e) = fluidbox_db::revoke_session_tokens(&state.pool, id).await {
+                if let Err(e) = fluidbox_db::revoke_session_tokens(&state.pool, scope, id).await {
                     tracing::warn!("revoke_session_tokens {id} failed: {e}");
                 }
                 // Publication is decoupled: enqueue rows; the delivery worker
@@ -234,8 +240,19 @@ pub async fn cancel(state: &AppState, id: Uuid, reason: &str) -> FinalizeStart {
 /// everything from it — its own outcome/quiesce arguments are discarded.
 async fn begin_finalize(state: &AppState, id: Uuid, params: FinalizeParams<'_>) -> FinalizeStart {
     use fluidbox_db::BeginFinalization as B;
+    // Entry points carry only a bare session id; resolve its tenant once
+    // (cross-tenant loader) and scope every wind-down write to it.
+    let scope = match fluidbox_db::system_worker::get_session(&state.pool, id).await {
+        Ok(Some(s)) => TenantScope::assume(s.tenant_id),
+        Ok(None) => return FinalizeStart::Missing,
+        Err(e) => {
+            tracing::error!("begin_finalization {id} tenant resolve failed: {e}");
+            return FinalizeStart::DbError;
+        }
+    };
     let begun = fluidbox_db::begin_finalization(
         &state.pool,
+        scope,
         id,
         params.outcome,
         params.summary,
@@ -265,7 +282,7 @@ async fn begin_finalize(state: &AppState, id: Uuid, params: FinalizeParams<'_>) 
     // arguments — the /result⇄cancel race fix). Failure here is fine: the
     // driver re-materializes the state from the intent.
     if SessionStatus::parse(&status).is_some_and(|s| !s.is_winding_down()) {
-        enter_winddown(state, id, &row).await;
+        enter_winddown(state, scope, id, &row).await;
     }
 
     let state2 = state.clone();
@@ -285,13 +302,18 @@ async fn begin_finalize(state: &AppState, id: Uuid, params: FinalizeParams<'_>) 
 /// wants quiesce (the runner's heartbeat channel keys off that status) —
 /// emitting `QuiesceRequested` only when Cancelling actually LANDS, wherever
 /// that happens (first caller or crash recovery). Derives only from the row.
-async fn enter_winddown(state: &AppState, id: Uuid, intent: &fluidbox_db::FinalizationRow) -> bool {
+async fn enter_winddown(
+    state: &AppState,
+    scope: TenantScope,
+    id: Uuid,
+    intent: &fluidbox_db::FinalizationRow,
+) -> bool {
     let target = if intent.needs_quiesce {
         SessionStatus::Cancelling
     } else {
         SessionStatus::Finalizing
     };
-    let applied = transition(state, id, target, intent.reason.as_deref()).await;
+    let applied = transition(state, scope, id, target, intent.reason.as_deref()).await;
     if applied && intent.needs_quiesce {
         ledger::record(
             state,
@@ -357,7 +379,20 @@ fn plan_step(
 /// release the intent — only a session that verifiably does not exist, or a
 /// fully reconciled terminal session, does.
 pub async fn drive_finalization(state: &AppState, id: Uuid) {
-    let claimed = fluidbox_db::claim_finalization(&state.pool, id, FINALIZE_CLAIM_STALE_SECS).await;
+    // Recovery/terminal entry carries only a bare id (from the recovery worker
+    // or a spawned finalize). Resolve the owning tenant once via the
+    // cross-tenant loader; a finalization intent always has a session (FK), so
+    // None here means nothing is left to drive.
+    let scope = match fluidbox_db::system_worker::get_session(&state.pool, id).await {
+        Ok(Some(s)) => TenantScope::assume(s.tenant_id),
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("drive_finalization {id}: tenant resolve failed: {e}");
+            return;
+        }
+    };
+    let claimed =
+        fluidbox_db::claim_finalization(&state.pool, scope, id, FINALIZE_CLAIM_STALE_SECS).await;
     let intent = match claimed {
         Ok(Some(i)) => i,
         Ok(None) => return, // another driver owns it, or no intent — nothing to do
@@ -372,12 +407,14 @@ pub async fn drive_finalization(state: &AppState, id: Uuid) {
     // (active → Cancelling → Finalizing → collect/terminal → reconciled);
     // the bound is a belt against status flapping ever regressing.
     for _ in 0..6 {
-        let session = match fluidbox_db::get_session(&state.pool, id).await {
+        let session = match fluidbox_db::get_session(&state.pool, scope, id).await {
             Ok(Some(s)) => s,
             Ok(None) => {
                 // Verifiably gone (not a transient error) — nothing left to
                 // reconcile; release the intent.
-                fluidbox_db::delete_finalization(&state.pool, id).await.ok();
+                fluidbox_db::delete_finalization(&state.pool, scope, id)
+                    .await
+                    .ok();
                 return;
             }
             Err(e) => {
@@ -407,8 +444,8 @@ pub async fn drive_finalization(state: &AppState, id: Uuid) {
                 // On failure the loop re-reads: a racing writer may have
                 // moved the session (fine — plan again); a transient DB
                 // error leaves the intent for the next drive.
-                if !enter_winddown(state, id, &intent).await {
-                    match fluidbox_db::get_session(&state.pool, id).await {
+                if !enter_winddown(state, scope, id, &intent).await {
+                    match fluidbox_db::get_session(&state.pool, scope, id).await {
                         Ok(Some(s))
                             if s.status_enum().is_winding_down()
                                 || s.status_enum().is_terminal() => {} // progressed — re-plan
@@ -427,6 +464,7 @@ pub async fn drive_finalization(state: &AppState, id: Uuid) {
                 };
                 transition(
                     state,
+                    scope,
                     id,
                     SessionStatus::Finalizing,
                     intent.reason.as_deref(),
@@ -434,7 +472,7 @@ pub async fn drive_finalization(state: &AppState, id: Uuid) {
                 .await;
             }
             WinddownStep::Collect => {
-                collect_and_terminalize(state, id, &intent, skip_collection).await;
+                collect_and_terminalize(state, scope, id, &intent, skip_collection).await;
                 return;
             }
         }
@@ -521,11 +559,12 @@ const MISSING_DIFF_PREFIX: &str = "(diff unavailable";
 /// transition is confirmed.
 async fn collect_and_terminalize(
     state: &AppState,
+    scope: TenantScope,
     id: Uuid,
     intent: &fluidbox_db::FinalizationRow,
     skip_collection: bool,
 ) {
-    let Ok(Some(session)) = fluidbox_db::get_session(&state.pool, id).await else {
+    let Ok(Some(session)) = fluidbox_db::get_session(&state.pool, scope, id).await else {
         return;
     };
 
@@ -539,7 +578,7 @@ async fn collect_and_terminalize(
     // previous drive stored. A real diff (including "(no changes)") is
     // final; a missing-marker may be upgraded by a successful re-collection
     // but never re-recorded.
-    let stored = match fluidbox_db::diff_artifact_content(&state.pool, id).await {
+    let stored = match fluidbox_db::diff_artifact_content(&state.pool, scope, id).await {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("diff artifact read failed for {id}: {e} — retrying next drive");
@@ -552,7 +591,7 @@ async fn collect_and_terminalize(
     let have_any_diff = stored.is_some();
     let record_missing_once = |reason: String| async move {
         if expected_diff && !have_any_diff {
-            record_missing(state, id, &reason).await
+            record_missing(state, scope, id, &reason).await
         } else {
             Ok(())
         }
@@ -592,7 +631,7 @@ async fn collect_and_terminalize(
                     // A deliberate wait, not a failure: release the claim so
                     // the finalize worker retries at its cadence instead of
                     // waiting out the 420 s stale window.
-                    fluidbox_db::release_finalization_claim(&state.pool, id)
+                    fluidbox_db::release_finalization_claim(&state.pool, scope, id)
                         .await
                         .ok();
                     return;
@@ -635,7 +674,7 @@ async fn collect_and_terminalize(
                 .await;
                 let stored_ok = match collected {
                     Ok(Ok(CollectedArtifacts::Collected(arts))) => {
-                        store_collected(state, id, arts).await
+                        store_collected(state, scope, id, arts).await
                     }
                     Ok(Ok(CollectedArtifacts::Missing { reason })) => {
                         record_missing_once(reason).await
@@ -655,7 +694,7 @@ async fn collect_and_terminalize(
     // destroys the retry path (the intent is released after cleanup), so a
     // swallowed write here would lose the summary forever.
     if let Some(s) = intent.summary.as_deref() {
-        if fluidbox_db::set_result_summary(&state.pool, id, s)
+        if fluidbox_db::set_result_summary(&state.pool, scope, id, s)
             .await
             .is_err()
         {
@@ -663,6 +702,7 @@ async fn collect_and_terminalize(
         }
         if fluidbox_db::upsert_artifact(
             &state.pool,
+            scope,
             id,
             "summary",
             "summary.md",
@@ -685,14 +725,14 @@ async fn collect_and_terminalize(
     // The single-winner gate: delivery enqueue rides this transition;
     // RunResult and the rest of the terminal side effects are reconciled
     // exactly-once by the cleanup below (emit-if-missing under the claim).
-    if transition(state, id, terminal, intent.reason.as_deref()).await {
+    if transition(state, scope, id, terminal, intent.reason.as_deref()).await {
         finish_terminal_cleanup(state, &session, intent).await;
     } else {
         // The transition did not apply. If another driver already
         // terminalized, cleanup may still be owed; a transient failure
         // leaves the intent for the next drive. H2: the intent (and the
         // workspace, archive, and sandbox) are NEVER destroyed on this path.
-        match fluidbox_db::get_session(&state.pool, id).await {
+        match fluidbox_db::get_session(&state.pool, scope, id).await {
             Ok(Some(s)) if s.status_enum().is_terminal() => {
                 finish_terminal_cleanup(state, &s, intent).await;
             }
@@ -716,6 +756,7 @@ async fn finish_terminal_cleanup(
     intent: &fluidbox_db::FinalizationRow,
 ) {
     let id = session.id;
+    let scope = TenantScope::assume(session.tenant_id);
     // Exactly-once RunResult: emitted only after a CONFIRMED terminal
     // transition, and emit-if-missing under the claim — a crash between the
     // terminal commit and the emit is healed here, and a re-drive after a
@@ -751,7 +792,7 @@ async fn finish_terminal_cleanup(
             return;
         }
     }
-    if let Err(e) = fluidbox_db::revoke_session_tokens(&state.pool, id).await {
+    if let Err(e) = fluidbox_db::revoke_session_tokens(&state.pool, scope, id).await {
         tracing::warn!("terminal reconcile {id}: token revoke failed: {e}");
         return;
     }
@@ -771,7 +812,7 @@ async fn finish_terminal_cleanup(
     // Reap MUST succeed (or the sandbox be verifiably gone) before the
     // workspace, archive, and intent go away — especially on Docker, where
     // nothing else ever kills the container.
-    if reap(state, id).await.is_err() {
+    if reap(state, scope, id).await.is_err() {
         return;
     }
     if !state.cfg.keep_workspaces {
@@ -784,11 +825,14 @@ async fn finish_terminal_cleanup(
             return;
         }
     }
-    fluidbox_db::delete_finalization(&state.pool, id).await.ok();
+    fluidbox_db::delete_finalization(&state.pool, scope, id)
+        .await
+        .ok();
 }
 
 async fn store_collected(
     state: &AppState,
+    scope: TenantScope,
     id: Uuid,
     arts: Vec<fluidbox_core::traits::CollectedArtifact>,
 ) -> sqlx::Result<()> {
@@ -801,8 +845,16 @@ async fn store_collected(
             } else {
                 (a.content.clone(), a.content_type.clone())
             };
-        fluidbox_db::upsert_artifact(&state.pool, id, &a.kind, &a.name, &content, &content_type)
-            .await?;
+        fluidbox_db::upsert_artifact(
+            &state.pool,
+            scope,
+            id,
+            &a.kind,
+            &a.name,
+            &content,
+            &content_type,
+        )
+        .await?;
         ledger::record(
             state,
             id,
@@ -820,9 +872,15 @@ async fn store_collected(
     Ok(())
 }
 
-async fn record_missing(state: &AppState, id: Uuid, reason: &str) -> sqlx::Result<()> {
+async fn record_missing(
+    state: &AppState,
+    scope: TenantScope,
+    id: Uuid,
+    reason: &str,
+) -> sqlx::Result<()> {
     fluidbox_db::upsert_artifact(
         &state.pool,
+        scope,
         id,
         "diff",
         "changes.patch",
@@ -844,13 +902,16 @@ async fn record_missing(state: &AppState, id: Uuid, reason: &str) -> sqlx::Resul
 }
 
 async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
-    let session = fluidbox_db::get_session(&state.pool, session_id)
+    // Spawned with only a bare session id; resolve the owning tenant once via
+    // the cross-tenant loader, then scope every lifecycle write to it.
+    let session = fluidbox_db::system_worker::get_session(&state.pool, session_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("session vanished"))?;
+    let scope = TenantScope::assume(session.tenant_id);
     let run_spec: RunSpec = serde_json::from_value(session.run_spec.clone())?;
 
     // created → provisioning
-    if !transition(&state, session_id, SessionStatus::Provisioning, None).await {
+    if !transition(&state, scope, session_id, SessionStatus::Provisioning, None).await {
         anyhow::bail!("could not enter provisioning");
     }
 
@@ -858,7 +919,7 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
     let session_token = format!("fbx_sess_{}", uuid_token());
     fluidbox_db::create_session_token(
         &state.pool,
-        state.tenant_id,
+        scope,
         session_id,
         &session_token,
         SESSION_TOKEN_TTL_SECS,
@@ -869,17 +930,18 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
     // side, BEFORE the agent starts — a bad repo fails here at zero model
     // spend). A refused transition means a finalizer took ownership (cancel,
     // watchdog): stop BEFORE materializing or provisioning anything.
-    if !transition(&state, session_id, SessionStatus::Initializing, None).await {
+    if !transition(&state, scope, session_id, SessionStatus::Initializing, None).await {
         anyhow::bail!("session left active state before workspace init");
     }
-    let (workspace_dir, base_commit) = materialize_workspace(&state, session_id, &run_spec).await?;
+    let (workspace_dir, base_commit) =
+        materialize_workspace(&state, scope, session_id, &run_spec).await?;
 
     // Ownership gate AFTER materialization, BEFORE anything else is created
     // (the K8s archive write included): a finalizer that took the session
     // while we copied may already have run terminal cleanup and released its
     // intent — the loser must remove what IT created or nothing ever will.
-    if !launch_ownership(&state, session_id).await? {
-        abandon_launch(&state, session_id).await;
+    if !launch_ownership(&state, scope, session_id).await? {
+        abandon_launch(&state, scope, session_id).await;
         anyhow::bail!("session ownership lost during workspace init; launch abandoned");
     }
 
@@ -924,14 +986,18 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
     // Ownership re-check immediately before creating a sandbox: a finalizer
     // that took the session during archive packing must find no container to
     // race (the attach fence below catches the residual instants).
-    if !launch_ownership(&state, session_id).await? {
-        abandon_launch(&state, session_id).await;
+    if !launch_ownership(&state, scope, session_id).await? {
+        abandon_launch(&state, scope, session_id).await;
         anyhow::bail!("session ownership lost before provisioning; launch abandoned");
     }
     let handle = state.provider.provision(&sandbox_spec).await?;
-    let attached =
-        fluidbox_db::set_sandbox_handle(&state.pool, session_id, &serde_json::to_value(&handle)?)
-            .await?;
+    let attached = fluidbox_db::set_sandbox_handle(
+        &state.pool,
+        scope,
+        session_id,
+        &serde_json::to_value(&handle)?,
+    )
+    .await?;
     if !attached {
         // The session entered wind-down or terminal while we were
         // provisioning — the finalizer owns it now. Best-effort immediate
@@ -943,15 +1009,17 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
                 "late-provision terminate for {session_id} failed ({e}); finalizer discovery will reap"
             );
         }
-        abandon_launch(&state, session_id).await;
+        abandon_launch(&state, scope, session_id).await;
         anyhow::bail!(
             "session left active state during provisioning; sandbox handed to the finalizer"
         );
     }
 
     // initializing → running (traffic is now expected)
-    transition(&state, session_id, SessionStatus::Running, None).await;
-    fluidbox_db::heartbeat(&state.pool, session_id).await.ok();
+    transition(&state, scope, session_id, SessionStatus::Running, None).await;
+    fluidbox_db::heartbeat(&state.pool, scope, session_id)
+        .await
+        .ok();
 
     ledger::record(
         &state,
@@ -1186,6 +1254,7 @@ fn runner_capability_manifest(
 
 async fn materialize_workspace(
     state: &AppState,
+    scope: TenantScope,
     session_id: Uuid,
     run_spec: &RunSpec,
 ) -> anyhow::Result<(Option<PathBuf>, Option<String>)> {
@@ -1243,7 +1312,7 @@ async fn materialize_workspace(
     };
 
     if let Some(bc) = &ws.base_commit {
-        fluidbox_db::set_base_commit(&state.pool, session_id, bc)
+        fluidbox_db::set_base_commit(&state.pool, scope, session_id, bc)
             .await
             .ok();
     }
@@ -1267,13 +1336,13 @@ async fn materialize_workspace(
 /// wind-down transition, so a status-only check has a gap) on a session
 /// still in an active state. Transient read errors are retried here: a
 /// blip must not fail a healthy, fully materialized run.
-async fn launch_ownership(state: &AppState, id: Uuid) -> anyhow::Result<bool> {
+async fn launch_ownership(state: &AppState, scope: TenantScope, id: Uuid) -> anyhow::Result<bool> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..3u32 {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        let session = match fluidbox_db::get_session(&state.pool, id).await {
+        let session = match fluidbox_db::get_session(&state.pool, scope, id).await {
             Ok(Some(s)) => s,
             Ok(None) => return Ok(false),
             Err(e) => {
@@ -1284,7 +1353,7 @@ async fn launch_ownership(state: &AppState, id: Uuid) -> anyhow::Result<bool> {
         if !session.status_enum().accepts_work() {
             return Ok(false);
         }
-        match fluidbox_db::get_finalization(&state.pool, id).await {
+        match fluidbox_db::get_finalization(&state.pool, scope, id).await {
             Ok(Some(_)) => return Ok(false),
             Ok(None) => return Ok(true),
             Err(e) => {
@@ -1303,11 +1372,11 @@ async fn launch_ownership(state: &AppState, id: Uuid) -> anyhow::Result<bool> {
 /// runner that posted /result before its handle attached would lose its
 /// patch). Only a fully reconciled session (terminal, intent released)
 /// leaves the loser's debris with no other owner.
-async fn abandon_launch(state: &AppState, id: Uuid) {
+async fn abandon_launch(state: &AppState, scope: TenantScope, id: Uuid) {
     if state.cfg.keep_workspaces {
         return;
     }
-    match fluidbox_db::get_finalization(&state.pool, id).await {
+    match fluidbox_db::get_finalization(&state.pool, scope, id).await {
         Ok(None) => {}
         Ok(Some(_)) => return, // the finalizer owns collection + cleanup
         Err(e) => {
@@ -1343,8 +1412,8 @@ const TERMINATE_TIMEOUT: Duration = Duration::from_secs(60);
 /// the intent) and retry. A missing or unparseable stored handle consults
 /// provider truth (`list_managed` by session label) — a live sandbox must
 /// never survive because its handle was lost or is garbage.
-pub async fn reap(state: &AppState, id: Uuid) -> Result<(), ()> {
-    let session = match fluidbox_db::get_session(&state.pool, id).await {
+pub async fn reap(state: &AppState, scope: TenantScope, id: Uuid) -> Result<(), ()> {
+    let session = match fluidbox_db::get_session(&state.pool, scope, id).await {
         Ok(Some(s)) => s,
         Ok(None) => return Ok(()),
         Err(e) => {

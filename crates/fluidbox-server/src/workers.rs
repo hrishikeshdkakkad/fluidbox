@@ -6,6 +6,7 @@ use crate::orchestrator;
 use crate::state::AppState;
 use fluidbox_core::spec::RunSpec;
 use fluidbox_core::traits::SandboxHandle;
+use fluidbox_db::TenantScope;
 use std::time::Duration;
 
 /// Reap any sandboxes the provider manages that have no matching live session
@@ -23,24 +24,27 @@ pub async fn boot_orphan_sweep(state: AppState) {
                 // parse (a status written by a NEWER deploy is not proof of
                 // death — a rollback restart must not kill its live pods),
                 // and a DB error skips rather than terminates.
-                let terminal = match fluidbox_db::get_session(&state.pool, session_id).await {
-                    Ok(None) => true, // unknown session → orphan
-                    Ok(Some(s)) => match fluidbox_core::state::SessionStatus::parse(&s.status) {
-                        Some(st) => st.is_terminal(),
-                        None => {
-                            tracing::warn!(
-                                "boot sweep: session {session_id} has unknown status '{}' \
+                let terminal =
+                    match fluidbox_db::system_worker::get_session(&state.pool, session_id).await {
+                        Ok(None) => true, // unknown session → orphan
+                        Ok(Some(s)) => {
+                            match fluidbox_core::state::SessionStatus::parse(&s.status) {
+                                Some(st) => st.is_terminal(),
+                                None => {
+                                    tracing::warn!(
+                                        "boot sweep: session {session_id} has unknown status '{}' \
                                      (newer deploy?); leaving its sandbox alone",
-                                s.status
-                            );
+                                        s.status
+                                    );
+                                    false
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("boot sweep: session lookup {session_id} failed: {e}");
                             false
                         }
-                    },
-                    Err(e) => {
-                        tracing::warn!("boot sweep: session lookup {session_id} failed: {e}");
-                        false
-                    }
-                };
+                    };
                 if terminal {
                     tracing::info!("boot sweep: reaping orphan sandbox for {session_id}");
                     let _ = state.provider.terminate(&handle).await;
@@ -55,7 +59,7 @@ pub async fn boot_orphan_sweep(state: AppState) {
 /// reached terminal — the restart-recovery + crashed-driver path. Claim-
 /// guarded in `drive_finalization`, so this never double-finalizes.
 async fn recover_finalizations(state: &AppState) {
-    match fluidbox_db::pending_finalizations(&state.pool).await {
+    match fluidbox_db::system_worker::pending_finalizations(&state.pool).await {
         Ok(ids) => {
             for id in ids {
                 tracing::info!("resuming interrupted finalization for {id}");
@@ -149,16 +153,17 @@ async fn reconcile_managed(state: AppState) {
             }
         };
         for (session_id, handle) in managed {
-            let session = match fluidbox_db::get_session(&state.pool, session_id).await {
-                Ok(s) => s,
-                // A transient DB error is NOT proof the session is unknown —
-                // unlike the boot sweep, a periodic worker must never kill a
-                // possibly-live sandbox on a blip. Next tick retries.
-                Err(e) => {
-                    tracing::warn!("reconcile: session lookup {session_id} failed: {e}");
-                    continue;
-                }
-            };
+            let session =
+                match fluidbox_db::system_worker::get_session(&state.pool, session_id).await {
+                    Ok(s) => s,
+                    // A transient DB error is NOT proof the session is unknown —
+                    // unlike the boot sweep, a periodic worker must never kill a
+                    // possibly-live sandbox on a blip. Next tick retries.
+                    Err(e) => {
+                        tracing::warn!("reconcile: session lookup {session_id} failed: {e}");
+                        continue;
+                    }
+                };
             // STRICT status parse — never status_enum(), whose unparseable→
             // Failed fallback would read a newer deploy's status as terminal.
             let lookup = match &session {
@@ -203,7 +208,14 @@ async fn reconcile_managed(state: AppState) {
                     let Ok(v) = serde_json::to_value(&handle) else {
                         continue;
                     };
-                    match fluidbox_db::adopt_sandbox_handle(&state.pool, session_id, &v).await {
+                    // Adopt implies a Known session — scope to its own tenant.
+                    let Some(scope) = session.as_ref().map(|s| TenantScope::assume(s.tenant_id))
+                    else {
+                        continue;
+                    };
+                    match fluidbox_db::adopt_sandbox_handle(&state.pool, scope, session_id, &v)
+                        .await
+                    {
                         Ok(true) => {
                             tracing::warn!(
                                 "reconcile: adopted sandbox {} for handle-less session {session_id}",
@@ -269,17 +281,21 @@ async fn archive_ttl_sweep(state: AppState) {
             // is reclaimable; a DB blip keeps the file for the next pass.
             let deletable = match orchestrator::archive_session_id(&path) {
                 None => true, // not a name this server writes — reclaim
-                Some(sid) => match fluidbox_db::get_session(&state.pool, sid).await {
-                    Ok(None) => true,
-                    Ok(Some(s)) => match fluidbox_core::state::SessionStatus::parse(&s.status) {
-                        Some(st) => st.is_terminal(),
-                        None => false, // newer deploy's status — fail safe
-                    },
-                    Err(e) => {
-                        tracing::warn!("archive TTL sweep: session lookup failed: {e}");
-                        false
+                Some(sid) => {
+                    match fluidbox_db::system_worker::get_session(&state.pool, sid).await {
+                        Ok(None) => true,
+                        Ok(Some(s)) => {
+                            match fluidbox_core::state::SessionStatus::parse(&s.status) {
+                                Some(st) => st.is_terminal(),
+                                None => false, // newer deploy's status — fail safe
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("archive TTL sweep: session lookup failed: {e}");
+                            false
+                        }
                     }
-                },
+                }
             };
             if !deletable {
                 tracing::warn!(
@@ -323,7 +339,7 @@ async fn watchdog(state: AppState) {
     let mut tick = tokio::time::interval(Duration::from_secs(15));
     loop {
         tick.tick().await;
-        let active = match fluidbox_db::sessions_in_status(
+        let active = match fluidbox_db::system_worker::sessions_in_status(
             &state.pool,
             &["running", "awaiting_approval", "initializing"],
         )
@@ -355,7 +371,9 @@ async fn watchdog(state: AppState) {
         }
 
         // Sessions stuck before launch (created/provisioning/initializing).
-        match fluidbox_db::stale_nonstarted_sessions(&state.pool, stale_launch_mins).await {
+        match fluidbox_db::system_worker::stale_nonstarted_sessions(&state.pool, stale_launch_mins)
+            .await
+        {
             Ok(stale) => {
                 for s in stale {
                     tracing::warn!(
@@ -397,18 +415,22 @@ async fn budget_sweeper(state: AppState) {
     let mut tick = tokio::time::interval(Duration::from_secs(10));
     loop {
         tick.tick().await;
-        let active =
-            match fluidbox_db::sessions_in_status(&state.pool, &["running", "awaiting_approval"])
-                .await
-            {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
+        let active = match fluidbox_db::system_worker::sessions_in_status(
+            &state.pool,
+            &["running", "awaiting_approval"],
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
         let now = chrono::Utc::now();
         for s in active {
             let Ok(run_spec) = serde_json::from_value::<RunSpec>(s.run_spec.clone()) else {
                 continue;
             };
+            // Budget reads scope to the session's own tenant (from the fetched row).
+            let scope = TenantScope::assume(s.tenant_id);
             if let Some(max) = run_spec.budgets.max_wall_clock_secs {
                 if let Some(started) = s.started_at {
                     if (now - started).num_seconds() as u64 > max {
@@ -447,7 +469,7 @@ async fn budget_sweeper(state: AppState) {
             // the inline checks exactly (>=).
             let mut over: Option<&'static str> = None;
             if run_spec.budgets.max_tokens.is_some() || run_spec.budgets.max_cost_usd.is_some() {
-                if let Ok(totals) = fluidbox_db::usage_totals(&state.pool, s.id).await {
+                if let Ok(totals) = fluidbox_db::usage_totals(&state.pool, scope, s.id).await {
                     if let Some(max) = run_spec.budgets.max_cost_usd {
                         if totals.cost_usd >= max {
                             over = Some("max_cost_usd");
@@ -469,7 +491,7 @@ async fn budget_sweeper(state: AppState) {
             }
             if over.is_none() {
                 if let Some(max) = run_spec.budgets.max_tool_calls {
-                    if let Ok(n) = fluidbox_db::tool_call_count(&state.pool, s.id).await {
+                    if let Ok(n) = fluidbox_db::tool_call_count(&state.pool, scope, s.id).await {
                         // STRICTLY greater — the gate permits exactly `max`
                         // calls (it denies at used > max, with the current
                         // call's intent already counted); firing at >= would
@@ -499,7 +521,7 @@ async fn approval_expiry(state: AppState) {
     let mut tick = tokio::time::interval(Duration::from_secs(5));
     loop {
         tick.tick().await;
-        match fluidbox_db::expire_stale_approvals(&state.pool).await {
+        match fluidbox_db::system_worker::expire_stale_approvals(&state.pool).await {
             Ok(expired) => {
                 for a in expired {
                     state.approvals.wake(a.id).await;
