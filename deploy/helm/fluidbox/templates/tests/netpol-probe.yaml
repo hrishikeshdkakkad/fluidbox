@@ -218,6 +218,14 @@ spec:
   {{- with .Values.sandbox.tolerations }}
   tolerations: {{- toYaml . | nindent 4 }}
   {{- end }}
+  {{- with .Values.sandbox.priorityClassName }}
+  priorityClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.images.pullSecrets }}
+  # Same pool + same registry access as sandbox pods (gate parity); the
+  # Secrets must exist in the sandbox namespace.
+  imagePullSecrets: {{- toYaml . | nindent 4 }}
+  {{- end }}
   securityContext:
     runAsNonRoot: true
     runAsUser: {{ .Values.sandbox.runAsUser }}
