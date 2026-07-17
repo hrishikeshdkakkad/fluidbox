@@ -589,14 +589,16 @@ async fn pack_and_store_archive(
     base_commit: Option<String>,
 ) -> anyhow::Result<fluidbox_core::traits::WorkspaceArchive> {
     let data_dir = state.cfg.data_dir.clone();
+    let max_bytes = state.cfg.max_archive_bytes;
     let dest = archive_path(&data_dir, session_id);
+    // Streamed to disk (GzEncoder<File>) — the archive never lives in RAM,
+    // and the size cap fails the run HERE, before any sandbox or model spend.
     let packed = tokio::task::spawn_blocking(move || {
         let root = fluidbox_workspace::session_workspace_root(&data_dir, session_id);
-        let packed = fluidbox_workspace::pack_workspace(&root)?;
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&dest, &packed.bytes)?;
+        let packed = fluidbox_workspace::pack_workspace_to_file(&root, &dest, max_bytes)?;
         Ok::<_, anyhow::Error>(packed)
     })
     .await??;
@@ -616,10 +618,42 @@ async fn pack_and_store_archive(
     })
 }
 
-/// Delete a session's stored archive (idempotent). Called at finalize; a TTL
-/// sweep is the backstop.
+/// Delete a session's stored archive (idempotent). Called eagerly on the
+/// first runner heartbeat (init consumed it) and again at finalize; the
+/// periodic TTL sweep (`workers::archive_ttl_sweep`) is the backstop for the
+/// crash windows in between.
 pub fn delete_archive(data_dir: &std::path::Path, session_id: Uuid) {
     let _ = std::fs::remove_file(archive_path(data_dir, session_id));
+}
+
+/// Remove every stored archive whose mtime is older than `ttl`. The archive
+/// is single-use transport (the init container pulls it once) — anything this
+/// old is a leak: a pre-launch crash, or a crash after the terminal
+/// transition but before `delete_archive`. Returns how many were removed.
+pub fn sweep_stale_archives(data_dir: &std::path::Path, ttl: std::time::Duration) -> usize {
+    let dir = data_dir.join("archives");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0; // No archives ever stored (e.g. the Docker provider).
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let Ok(mtime) = meta.modified() else { continue };
+        let stale = now
+            .duration_since(mtime)
+            .map(|age| age >= ttl)
+            .unwrap_or(false);
+        if stale && std::fs::remove_file(&path).is_ok() {
+            tracing::info!("archive TTL sweep removed {}", path.display());
+            removed += 1;
+        }
+    }
+    removed
 }
 
 pub fn env_size_breakdown(env: &[(String, String)]) -> String {
@@ -774,4 +808,37 @@ pub async fn reap(state: &AppState, id: Uuid) {
 fn uuid_token() -> String {
     // 32 hex chars of entropy from a v4 uuid (no extra deps).
     Uuid::new_v4().simple().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ttl_sweep_removes_only_stale_archives() {
+        let tmp = std::env::temp_dir().join(format!("fbx-ttl-{}", uuid::Uuid::now_v7()));
+        let archives = tmp.join("archives");
+        std::fs::create_dir_all(&archives).unwrap();
+        std::fs::write(archives.join("a.tar.gz"), b"x").unwrap();
+        std::fs::write(archives.join("b.tar.gz"), b"y").unwrap();
+
+        // A generous TTL keeps fresh archives.
+        assert_eq!(
+            sweep_stale_archives(&tmp, std::time::Duration::from_secs(3600)),
+            0
+        );
+        assert!(archives.join("a.tar.gz").exists());
+
+        // TTL zero: everything with mtime <= now is stale.
+        assert_eq!(sweep_stale_archives(&tmp, std::time::Duration::ZERO), 2);
+        assert!(!archives.join("a.tar.gz").exists());
+        assert!(!archives.join("b.tar.gz").exists());
+
+        // A missing archives dir (Docker provider) is a quiet no-op.
+        assert_eq!(
+            sweep_stale_archives(&tmp.join("nope"), std::time::Duration::ZERO),
+            0
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
 }

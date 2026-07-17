@@ -52,7 +52,32 @@ pub fn spawn_all(state: AppState) {
     tokio::spawn(watchdog(state.clone()));
     tokio::spawn(budget_sweeper(state.clone()));
     tokio::spawn(approval_expiry(state.clone()));
+    // Archive-transport providers only: host-dir providers (Docker) never
+    // store archives, so the sweep would scan an absent directory forever.
+    if state.provider.workspace_transport() == fluidbox_core::traits::WorkspaceTransport::Archive {
+        tokio::spawn(archive_ttl_sweep(state.clone()));
+    }
     tokio::spawn(finalize_worker(state));
+}
+
+/// The stored-archive leak backstop (L3): archives are single-use init
+/// transport, deleted on the first runner heartbeat and again at finalize —
+/// this sweep reclaims the crash windows (pre-launch death, or a crash after
+/// the terminal transition but before `delete_archive`).
+async fn archive_ttl_sweep(state: AppState) {
+    let ttl = Duration::from_secs(state.cfg.archive_ttl_secs);
+    let mut tick = tokio::time::interval(Duration::from_secs(3600));
+    loop {
+        tick.tick().await;
+        let data_dir = state.cfg.data_dir.clone();
+        let removed =
+            tokio::task::spawn_blocking(move || orchestrator::sweep_stale_archives(&data_dir, ttl))
+                .await
+                .unwrap_or(0);
+        if removed > 0 {
+            tracing::info!("archive TTL sweep reclaimed {removed} stale archive(s)");
+        }
+    }
 }
 
 /// A healthy orchestrator moves created → provisioning → initializing in

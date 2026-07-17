@@ -22,7 +22,8 @@ pub mod archive;
 pub mod collect;
 
 pub use archive::{
-    clear_dir_contents, pack_workspace, unpack_archive, verify_archive, PackedArchive,
+    clear_dir_contents, pack_workspace, pack_workspace_to_file, unpack_archive, verify_archive,
+    PackedArchive, StoredArchive,
 };
 pub use collect::{collect_diff, collect_diff_at, CollectedDiff, CollectionOutcome, DiffCaps};
 
