@@ -618,22 +618,30 @@ async fn pack_and_store_archive(
     })
 }
 
-/// Delete a session's stored archive (idempotent). Called eagerly on the
-/// first runner heartbeat (init consumed it) and again at finalize; the
+/// Delete a session's stored archive (idempotent). Called at finalize; the
 /// periodic TTL sweep (`workers::archive_ttl_sweep`) is the backstop for the
-/// crash windows in between.
+/// crash window between the terminal transition and this call. NOT called on
+/// heartbeats: init containers may legitimately re-execute and re-fetch.
 pub fn delete_archive(data_dir: &std::path::Path, session_id: Uuid) {
     let _ = std::fs::remove_file(archive_path(data_dir, session_id));
 }
 
-/// Remove every stored archive whose mtime is older than `ttl`. The archive
-/// is single-use transport (the init container pulls it once) — anything this
-/// old is a leak: a pre-launch crash, or a crash after the terminal
-/// transition but before `delete_archive`. Returns how many were removed.
+/// Remove every stored archive whose mtime is older than `ttl` (incl. any
+/// orphaned `.partial` from a pack that died mid-write). Anything this old is
+/// a leak: a pre-launch crash, or a crash after the terminal transition but
+/// before `delete_archive`. Failures are LOGGED, never silent — a persistent
+/// PVC error would otherwise retain the leak with no operational evidence.
+/// Returns how many were removed.
 pub fn sweep_stale_archives(data_dir: &std::path::Path, ttl: std::time::Duration) -> usize {
     let dir = data_dir.join("archives");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return 0; // No archives ever stored (e.g. the Docker provider).
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        // No archives ever stored (e.g. the Docker provider): quiet no-op.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(e) => {
+            tracing::warn!("archive TTL sweep cannot read {}: {e}", dir.display());
+            return 0;
+        }
     };
     let now = std::time::SystemTime::now();
     let mut removed = 0;
@@ -644,13 +652,19 @@ pub fn sweep_stale_archives(data_dir: &std::path::Path, ttl: std::time::Duration
             continue;
         }
         let Ok(mtime) = meta.modified() else { continue };
+        // A future-dated mtime (clock skew) reads as fresh — conservative.
         let stale = now
             .duration_since(mtime)
             .map(|age| age >= ttl)
             .unwrap_or(false);
-        if stale && std::fs::remove_file(&path).is_ok() {
-            tracing::info!("archive TTL sweep removed {}", path.display());
-            removed += 1;
+        if stale {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    tracing::info!("archive TTL sweep removed {}", path.display());
+                    removed += 1;
+                }
+                Err(e) => tracing::warn!("archive TTL sweep failed on {}: {e}", path.display()),
+            }
         }
     }
     removed
