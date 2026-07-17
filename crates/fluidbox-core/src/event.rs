@@ -235,10 +235,10 @@ pub struct Redactor {
 impl Default for Redactor {
     fn default() -> Self {
         let raw = [
-            r"sk-ant-[A-Za-z0-9_\-]{8,}",       // Anthropic keys / oauth tokens
+            r"sk-ant-[A-Za-z0-9_\-]{8,}",           // Anthropic keys / oauth tokens
             r"sk-proj-[A-Za-z0-9_\-]{16,}", // OpenAI project keys (hyphenated — not caught below)
             r"sk-[A-Za-z0-9]{20,}",         // OpenAI-style keys
-            r"fbx_(sess|trig)_[A-Za-z0-9]{8,}", // fluidbox session / trigger tokens
+            r"fbx_(sess|trig|pat)_[A-Za-z0-9]{8,}", // fluidbox session / trigger / PAT tokens
             r"ghp_[A-Za-z0-9]{20,}",        // GitHub PAT
             r"github_pat_[A-Za-z0-9_]{20,}", // GitHub fine-grained PAT
             r"gho_[A-Za-z0-9]{20,}",        // GitHub OAuth

@@ -18,9 +18,10 @@
 //! run_service.rs stay provider-ignorant (the app-level ingress below
 //! resolves the connection, then calls the shared generic pipeline).
 
-use crate::auth::Admin;
+use crate::auth::Principal;
 use crate::connectors::github;
 use crate::error::{ApiError, ApiResult};
+use crate::rbac;
 use crate::seal::Sealer;
 use crate::state::AppState;
 use axum::body::Body;
@@ -463,8 +464,8 @@ async fn apply_verified_installation(
 
 // ─── Admin API ────────────────────────────────────────────────────────────
 
-pub async fn list(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+pub async fn list(principal: Principal, State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let scope = principal.scope();
     let registrations = fluidbox_db::list_github_app_registrations(&state.pool, scope).await?;
     Ok(Json(json!({ "registrations": registrations })))
 }
@@ -478,10 +479,16 @@ pub struct ManifestStart {
 }
 
 pub async fn manifest_start(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Json(req): Json<ManifestStart>,
 ) -> ApiResult<Json<Value>> {
+    if !rbac::can_mutate_resources(&principal) {
+        return Err(ApiError::Forbidden(
+            "managing GitHub App registrations requires admin or owner".into(),
+        ));
+    }
+    let scope = principal.scope();
     let sealer_ref = sealer(&state)?;
     let org = req
         .organization
@@ -499,13 +506,9 @@ pub async fn manifest_start(
         Some(o) => ("organization", Some(o)),
         None => ("personal", None),
     };
-    let registration = fluidbox_db::create_github_app_registration(
-        &state.pool,
-        fluidbox_db::TenantScope::assume(state.tenant_id),
-        target_kind,
-        target_org,
-    )
-    .await?;
+    let registration =
+        fluidbox_db::create_github_app_registration(&state.pool, scope, target_kind, target_org)
+            .await?;
     let flow = fluidbox_db::create_github_app_flow(
         &state.pool,
         registration.id,
@@ -524,18 +527,20 @@ pub async fn manifest_start(
 }
 
 pub async fn install_start(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
+    if !rbac::can_mutate_resources(&principal) {
+        return Err(ApiError::Forbidden(
+            "managing GitHub App registrations requires admin or owner".into(),
+        ));
+    }
+    let scope = principal.scope();
     let sealer_ref = sealer(&state)?;
-    let reg = fluidbox_db::get_github_app_registration(
-        &state.pool,
-        fluidbox_db::TenantScope::assume(state.tenant_id),
-        id,
-    )
-    .await?
-    .ok_or(ApiError::NotFound)?;
+    let reg = fluidbox_db::get_github_app_registration(&state.pool, scope, id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     if reg.status != "active" || reg.slug.is_none() {
         return Err(ApiError::Conflict(format!(
             "registration is {} — finish app creation first",
@@ -556,11 +561,16 @@ pub async fn install_start(
 /// Revoke the registration AND its child connections (one transaction),
 /// then evict their cached installation tokens.
 pub async fn revoke(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    if !rbac::can_mutate_resources(&principal) {
+        return Err(ApiError::Forbidden(
+            "managing GitHub App registrations requires admin or owner".into(),
+        ));
+    }
+    let scope = principal.scope();
     let reg = fluidbox_db::get_github_app_registration(&state.pool, scope, id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -583,11 +593,16 @@ pub async fn revoke(
 /// and pending rows activate. Revoked rows are never revived; rows owned by
 /// another custody path are surfaced as conflicts, never hijacked.
 pub async fn sync(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    if !rbac::can_mutate_resources(&principal) {
+        return Err(ApiError::Forbidden(
+            "managing GitHub App registrations requires admin or owner".into(),
+        ));
+    }
+    let scope = principal.scope();
     let reg = fluidbox_db::get_github_app_registration(&state.pool, scope, id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -1140,9 +1155,15 @@ pub async fn app_ingress(
         )
             .into_response();
     };
-    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    // Unauthenticated app-level ingress: the URL carries only a registration id
+    // and no principal — the HMAC against the registration's sealed secret IS
+    // the auth. Resolve the registration cross-tenant (UUID-only system-worker
+    // loader), then its own tenant becomes the operative scope for the rest of
+    // the delivery spine — exactly parallel to events.rs per-connection ingress.
     let reg =
-        match fluidbox_db::get_github_app_registration(&state.pool, scope, registration_id).await {
+        match fluidbox_db::system_worker::get_github_app_registration(&state.pool, registration_id)
+            .await
+        {
             Ok(Some(r)) if r.status == "active" => r,
             Ok(_) => return StatusCode::NOT_FOUND.into_response(),
             Err(e) => {
@@ -1150,6 +1171,7 @@ pub async fn app_ingress(
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
+    let scope = fluidbox_db::TenantScope::assume(reg.tenant_id);
     let sealed = match fluidbox_db::github_app_registration_webhook_secret_sealed(
         &state.pool,
         scope,

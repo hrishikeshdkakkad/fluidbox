@@ -3,8 +3,9 @@
 //! allows and nothing else. §17 #6 (settled): caller task/workspace
 //! overrides are opt-in per subscription, default OFF.
 
-use crate::auth::{Admin, TriggerAuth};
+use crate::auth::{Principal, TriggerAuth};
 use crate::error::{ApiError, ApiResult};
+use crate::rbac;
 use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
@@ -282,11 +283,16 @@ pub struct ScheduleInput {
 }
 
 pub async fn create(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Json(req): Json<CreateTrigger>,
 ) -> ApiResult<Json<Value>> {
-    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    if !rbac::can_manage_subscriptions(&principal) {
+        return Err(ApiError::Forbidden(
+            "managing trigger subscriptions requires admin or owner".into(),
+        ));
+    }
+    let scope = principal.scope();
     let name = req.name.trim();
     if name.is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
@@ -520,7 +526,7 @@ pub async fn create(
     };
     let workspace_value = match req.workspace {
         None => None,
-        Some(input) => match crate::api::resolve_workspace_input(&state, input).await? {
+        Some(input) => match crate::api::resolve_workspace_input(&state, scope, input).await? {
             WorkspaceSpec::Scratch => None,
             spec => Some(serde_json::to_value(&spec)?),
         },
@@ -621,8 +627,13 @@ pub async fn create(
     })))
 }
 
-pub async fn list(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+pub async fn list(principal: Principal, State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    if !rbac::can_manage_subscriptions(&principal) {
+        return Err(ApiError::Forbidden(
+            "viewing trigger subscriptions requires admin or owner".into(),
+        ));
+    }
+    let scope = principal.scope();
     let subscriptions = fluidbox_db::list_trigger_subscriptions(&state.pool, scope).await?;
     let schedules = fluidbox_db::schedules_for_tenant(&state.pool, scope).await?;
     Ok(Json(
@@ -631,11 +642,16 @@ pub async fn list(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Val
 }
 
 pub async fn get(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    if !rbac::can_manage_subscriptions(&principal) {
+        return Err(ApiError::Forbidden(
+            "viewing a trigger subscription requires admin or owner".into(),
+        ));
+    }
+    let scope = principal.scope();
     let sub = fluidbox_db::get_trigger_subscription(&state.pool, scope, id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -650,8 +666,12 @@ pub async fn get(
     })))
 }
 
-async fn set_enabled(state: &AppState, id: Uuid, enabled: bool) -> ApiResult<Json<Value>> {
-    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+async fn set_enabled(
+    state: &AppState,
+    scope: fluidbox_db::TenantScope,
+    id: Uuid,
+    enabled: bool,
+) -> ApiResult<Json<Value>> {
     let sub = fluidbox_db::get_trigger_subscription(&state.pool, scope, id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -662,28 +682,43 @@ async fn set_enabled(state: &AppState, id: Uuid, enabled: bool) -> ApiResult<Jso
 }
 
 pub async fn enable(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    set_enabled(&state, id, true).await
+    if !rbac::can_manage_subscriptions(&principal) {
+        return Err(ApiError::Forbidden(
+            "managing trigger subscriptions requires admin or owner".into(),
+        ));
+    }
+    set_enabled(&state, principal.scope(), id, true).await
 }
 
 pub async fn disable(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    set_enabled(&state, id, false).await
+    if !rbac::can_manage_subscriptions(&principal) {
+        return Err(ApiError::Forbidden(
+            "managing trigger subscriptions requires admin or owner".into(),
+        ));
+    }
+    set_enabled(&state, principal.scope(), id, false).await
 }
 
 /// Rotation: every live token dies, one new token is minted and returned once.
 pub async fn rotate_token(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    if !rbac::can_manage_subscriptions(&principal) {
+        return Err(ApiError::Forbidden(
+            "managing trigger subscriptions requires admin or owner".into(),
+        ));
+    }
+    let scope = principal.scope();
     let sub = fluidbox_db::get_trigger_subscription(&state.pool, scope, id)
         .await?
         .ok_or(ApiError::NotFound)?;

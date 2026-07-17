@@ -197,16 +197,24 @@ pub struct WebSessionAuth {
     pub email: Option<String>,
     pub name: Option<String>,
     pub idp_config_id: Uuid,
+    /// ID-token authentication context (verbatim, if the login carried it) — the
+    /// caller derives `authentication_strength` from these; presence proves
+    /// nothing on its own.
+    pub acr: Option<String>,
+    pub amr: Option<Vec<String>>,
+    pub auth_time: Option<DateTime<Utc>>,
     pub idle_expires_at: DateTime<Utc>,
     pub absolute_expires_at: DateTime<Utc>,
 }
 
 /// The joined result of resolving a PAT: the token plus its live membership
-/// (status + roles). The caller refuses a non-`active` membership.
+/// (status + roles) and tenant status. The caller refuses a non-`active`
+/// membership OR a non-`active` tenant (fail-closed, in one place).
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct PatAuth {
     pub token_id: Uuid,
     pub tenant_id: Uuid,
+    pub tenant_status: String,
     pub membership_id: Uuid,
     pub user_id: Uuid,
     pub roles: Vec<String>,
@@ -551,6 +559,7 @@ pub async fn resolve_web_session(
          returning
            s.id as session_id, s.tenant_id as tenant_id, s.membership_id as membership_id,
            s.user_id as user_id, s.idp_config_id as idp_config_id,
+           s.acr as acr, s.amr as amr, s.auth_time as auth_time,
            s.idle_expires_at as idle_expires_at, s.absolute_expires_at as absolute_expires_at,
            m.roles as roles, m.status as membership_status,
            u.email as email, u.name as name, u.status as user_status,
@@ -639,12 +648,13 @@ pub async fn mint_pat(
 pub async fn resolve_pat(pool: &PgPool, token_plain: &str) -> sqlx::Result<Option<PatAuth>> {
     sqlx::query_as(
         "update api_tokens tok set last_used_at = now()
-         from org_memberships m
+         from org_memberships m, tenants t
          where tok.kind = 'pat' and tok.token_sha256 = $1
            and tok.revoked_at is null
            and tok.expires_at > now()
            and m.tenant_id = tok.tenant_id and m.id = tok.membership_id and m.user_id = tok.user_id
-         returning tok.id as token_id, tok.tenant_id as tenant_id,
+           and t.id = tok.tenant_id
+         returning tok.id as token_id, tok.tenant_id as tenant_id, t.status as tenant_status,
                    tok.membership_id as membership_id, tok.user_id as user_id,
                    m.roles as roles, m.status as membership_status",
     )

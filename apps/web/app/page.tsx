@@ -68,7 +68,7 @@ export default function Runs() {
   };
 
   const decide = async (id: string, decision: string) => {
-    await apiPost(`/approvals/${id}/decision`, { decision, decided_by: "dashboard" });
+    await apiPost(`/approvals/${id}/decision`, { decision });
     void load();
   };
 

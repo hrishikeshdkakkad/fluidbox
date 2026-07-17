@@ -14,12 +14,14 @@
 //!   oauth   → pending connection + the oauth.rs dance; the callback
 //!             photographs with the freshly minted access token
 
-use crate::auth::Admin;
+use crate::auth::Principal;
 use crate::error::{ApiError, ApiResult};
+use crate::rbac;
 use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::Json;
 use fluidbox_core::capability::{CapabilityServer, ToolSnapshot};
+use fluidbox_db::TenantScope;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -49,8 +51,8 @@ fn is_connectable(transport: &str) -> bool {
 /// latest bundle named after the slug. Pure presentation derivation, done
 /// server-side so the dashboard stays logic-free; overridden bundle names
 /// deliberately don't count as "this entry's bundle".
-pub async fn list(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+pub async fn list(principal: Principal, State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let scope = principal.scope();
     let rows = fluidbox_db::list_catalog(&state.pool).await?;
     let conns = fluidbox_db::list_connections(&state.pool, scope).await?;
     let bundles = fluidbox_db::list_capability_bundles(&state.pool, scope).await?;
@@ -112,7 +114,7 @@ fn entry_bundle(
 }
 
 pub async fn get(
-    _: Admin,
+    _principal: Principal,
     State(state): State<AppState>,
     Path(slug): Path<String>,
 ) -> ApiResult<Json<Value>> {
@@ -153,10 +155,15 @@ pub struct CreateEntry {
 /// `POST /v1/catalog` — add a CUSTOM entry (the tier is forced server-side;
 /// verified/community are curation judgements the API cannot self-award).
 pub async fn create(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Json(req): Json<CreateEntry>,
 ) -> ApiResult<Json<Value>> {
+    if !rbac::can_mutate_resources(&principal) {
+        return Err(ApiError::Forbidden(
+            "adding catalog entries requires admin or owner".into(),
+        ));
+    }
     let row = create_entry_row(&state, &req).await?;
     Ok(Json(json!({ "connector": row })))
 }
@@ -275,15 +282,20 @@ pub struct ConnectReq {
 /// `POST /v1/catalog/{slug}/connect` — settle #4: one click from catalog
 /// entry to attachable bundle, branched on the entry's auth_mode.
 pub async fn connect(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(slug): Path<String>,
     Json(req): Json<ConnectReq>,
 ) -> ApiResult<Json<Value>> {
+    if !rbac::can_mutate_resources(&principal) {
+        return Err(ApiError::Forbidden(
+            "connecting a catalog entry requires admin or owner".into(),
+        ));
+    }
     let entry = fluidbox_db::get_catalog_by_slug(&state.pool, &slug)
         .await?
         .ok_or(ApiError::NotFound)?;
-    connect_entry(&state, entry, req).await
+    connect_entry(&state, principal.scope(), entry, req).await
 }
 
 /// The three-branch connect body (none / api_key / oauth), factored out of the
@@ -292,6 +304,7 @@ pub async fn connect(
 /// photograph, and the OAuth dance all live here unchanged.
 async fn connect_entry(
     state: &AppState,
+    scope: TenantScope,
     entry: fluidbox_db::ConnectorCatalogRow,
     req: ConnectReq,
 ) -> ApiResult<Json<Value>> {
@@ -318,6 +331,7 @@ async fn connect_entry(
             let server = authless_server(&entry)?;
             let row = crate::capabilities::register_bundle(
                 state,
+                scope,
                 &bundle_name,
                 entry.description.as_deref(),
                 vec![server],
@@ -359,7 +373,8 @@ async fn connect_entry(
                 client_id: None,
                 client_secret: None,
             };
-            let created = crate::connections::create_mcp_http_connection(state, create).await?;
+            let created =
+                crate::connections::create_mcp_http_connection(state, scope, create).await?;
             let connection_id = created.id;
             let server = CapabilityServer::Brokered {
                 name: entry.slug.clone(),
@@ -370,6 +385,7 @@ async fn connect_entry(
             };
             match crate::capabilities::register_bundle(
                 state,
+                scope,
                 &bundle_name,
                 entry.description.as_deref(),
                 vec![server],
@@ -389,13 +405,9 @@ async fn connect_entry(
                 Err(e) => {
                     // The photograph is the credential's proof-of-life; a
                     // refused key must not leave a dangling connection.
-                    fluidbox_db::revoke_connection(
-                        &state.pool,
-                        fluidbox_db::TenantScope::assume(state.tenant_id),
-                        connection_id,
-                    )
-                    .await
-                    .ok();
+                    fluidbox_db::revoke_connection(&state.pool, scope, connection_id)
+                        .await
+                        .ok();
                     Err(match e {
                         ApiError::BadRequest(m) => ApiError::BadRequest(format!(
                             "the server rejected this credential (connection rolled back): {m}"
@@ -459,7 +471,7 @@ async fn connect_entry(
                 .unwrap_or_else(|| "mcp".into());
             let row = fluidbox_db::create_connection(
                 &state.pool,
-                fluidbox_db::TenantScope::assume(state.tenant_id),
+                scope,
                 "mcp_http",
                 &host,
                 req.display_name.as_deref().unwrap_or(&entry.name),
@@ -477,7 +489,7 @@ async fn connect_entry(
                 },
             )
             .await?;
-            let authorize_url = crate::oauth::start_dance(state, row.id).await?;
+            let authorize_url = crate::oauth::start_dance(state, scope, row.id).await?;
             Ok(Json(json!({
                 "connection": row,
                 "authorize_url": authorize_url,
@@ -544,10 +556,15 @@ pub struct ProbeReq {
 /// both) is surfaced via `oauth_available` + `static_possible` + `notes`,
 /// never guessed silently.
 pub async fn probe(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Json(req): Json<ProbeReq>,
 ) -> ApiResult<Json<Value>> {
+    if !rbac::can_mutate_resources(&principal) {
+        return Err(ApiError::Forbidden(
+            "probing MCP servers requires admin or owner".into(),
+        ));
+    }
     let url = req.url.trim();
     let parsed = reqwest::Url::parse(url)
         .map_err(|_| ApiError::BadRequest("a valid http(s) url is required".into()))?;
@@ -676,10 +693,16 @@ pub struct AddCustomReq {
 /// no orphan card survives; for oauth the entry MUST persist (the callback
 /// re-fetches it by `catalog_slug` to auto-register the bundle).
 pub async fn add_custom(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Json(req): Json<AddCustomReq>,
 ) -> ApiResult<Json<Value>> {
+    if !rbac::can_mutate_resources(&principal) {
+        return Err(ApiError::Forbidden(
+            "adding a custom MCP server requires admin or owner".into(),
+        ));
+    }
+    let scope = principal.scope();
     let url = req.url.trim();
     let parsed = reqwest::Url::parse(url)
         .map_err(|_| ApiError::BadRequest("a valid http(s) url is required".into()))?;
@@ -759,7 +782,7 @@ pub async fn add_custom(
     // rolls it back on FAILURE — including a failed OAuth dance (a discover /
     // insert / start_dance error means no callback is ever coming, so the
     // entry would otherwise orphan exactly like a refused api_key).
-    match connect_entry(&state, entry, connect_req).await {
+    match connect_entry(&state, scope, entry, connect_req).await {
         Ok(out) => Ok(with_slug(out)),
         Err(e) => {
             if let Err(del) = fluidbox_db::delete_catalog_entry(&state.pool, &slug).await {

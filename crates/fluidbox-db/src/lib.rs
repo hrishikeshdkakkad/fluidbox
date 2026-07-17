@@ -167,6 +167,11 @@ pub struct SessionRow {
     pub last_heartbeat_at: Option<DateTime<Utc>>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    /// Who invoked this run (design "tenant/user audit fields"): the invocation
+    /// class, and the authenticated user id when one exists (None for
+    /// operator-token / trigger / schedule / webhook). Drives run visibility.
+    pub invoked_by_kind: Option<String>,
+    pub invoked_by_user_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1777,16 +1782,25 @@ pub async fn get_session(
         .await
 }
 
+/// List a tenant's sessions, newest first. `invoked_by` narrows to a single
+/// user's runs (the run-visibility rule for a plain member); `None` returns
+/// every session in the tenant (operator / `runs.read_all` holders).
 pub async fn list_sessions(
     pool: &PgPool,
     scope: TenantScope,
+    invoked_by: Option<Uuid>,
     limit: i64,
 ) -> sqlx::Result<Vec<SessionRow>> {
-    sqlx::query_as("select * from sessions where tenant_id = $1 order by created_at desc limit $2")
-        .bind(scope.tenant_id())
-        .bind(limit)
-        .fetch_all(pool)
-        .await
+    sqlx::query_as(
+        "select * from sessions
+         where tenant_id = $1 and ($2::uuid is null or invoked_by_user_id = $2)
+         order by created_at desc limit $3",
+    )
+    .bind(scope.tenant_id())
+    .bind(invoked_by)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
 }
 
 /// The single status writer. Validates the transition inside a transaction;
@@ -2466,6 +2480,28 @@ pub async fn session_approvals(
          order by requested_at desc"
     ))
     .bind(session)
+    .bind(scope.tenant_id())
+    .fetch_all(pool)
+    .await
+}
+
+/// The tenant-scoped approvals inbox (the org approval queue). The
+/// UUID-blind [`system_worker::pending_approvals`] serves the cross-tenant
+/// expiry sweep; this one is what a request handler shows an approver, and it
+/// never crosses a tenant boundary.
+pub async fn pending_approvals(
+    pool: &PgPool,
+    scope: TenantScope,
+) -> sqlx::Result<Vec<ApprovalRow>> {
+    sqlx::query_as(concat!(
+        "select ",
+        approval_cols!(),
+        " from approvals
+         where status = 'pending'
+           and exists (select 1 from sessions s
+                       where s.id = approvals.session_id and s.tenant_id = $1)
+         order by requested_at"
+    ))
     .bind(scope.tenant_id())
     .fetch_all(pool)
     .await

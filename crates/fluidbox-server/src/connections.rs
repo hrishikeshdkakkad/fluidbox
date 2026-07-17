@@ -15,13 +15,15 @@
 //! never present in any API response, RunSpec, sandbox, ledger, or artifact.
 //! Provider API shapes live in `connectors::github`, not here.
 
-use crate::auth::Admin;
+use crate::auth::Principal;
 use crate::connectors;
 use crate::error::{ApiError, ApiResult};
+use crate::rbac;
 use crate::seal::Sealer;
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::Json;
+use fluidbox_db::TenantScope;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -79,14 +81,20 @@ pub struct CreateConnection {
 }
 
 pub async fn create(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Json(req): Json<CreateConnection>,
 ) -> ApiResult<Json<Value>> {
+    if !rbac::can_mutate_resources(&principal) {
+        return Err(ApiError::Forbidden(
+            "creating connections requires admin or owner".into(),
+        ));
+    }
+    let scope = principal.scope();
     match req.provider.as_str() {
-        "github" => create_github_pat(&state, req).await,
-        "github_app" => create_github_app(&state, req).await,
-        "mcp_http" => create_mcp_http(&state, req).await,
+        "github" => create_github_pat(&state, scope, req).await,
+        "github_app" => create_github_app(&state, scope, req).await,
+        "mcp_http" => create_mcp_http(&state, scope, req).await,
         other => Err(ApiError::BadRequest(format!(
             "unsupported provider '{other}' (supported: github, github_app, mcp_http)"
         ))),
@@ -103,7 +111,11 @@ pub async fn create(
 /// secret now (optionally under a custom header/scheme — Sentry, Atlassian);
 /// `oauth` creates a PENDING row whose credential arrives from the
 /// authorization-code dance (`oauth.rs`) as a sealed rotating refresh token.
-async fn create_mcp_http(state: &AppState, req: CreateConnection) -> ApiResult<Json<Value>> {
+async fn create_mcp_http(
+    state: &AppState,
+    scope: TenantScope,
+    req: CreateConnection,
+) -> ApiResult<Json<Value>> {
     let base_url = req
         .base_url
         .as_deref()
@@ -117,7 +129,7 @@ async fn create_mcp_http(state: &AppState, req: CreateConnection) -> ApiResult<J
     }
     match req.auth_kind.as_deref().unwrap_or("static") {
         "static" => {
-            let row = create_mcp_http_connection(state, req).await?;
+            let row = create_mcp_http_connection(state, scope, req).await?;
             Ok(Json(json!({ "connection": row })))
         }
         "oauth" => {
@@ -157,7 +169,7 @@ async fn create_mcp_http(state: &AppState, req: CreateConnection) -> ApiResult<J
                 .map(|s| sealer.seal(s));
             let row = fluidbox_db::create_connection(
                 &state.pool,
-                fluidbox_db::TenantScope::assume(state.tenant_id),
+                scope,
                 &req.provider,
                 &host,
                 req.display_name.as_deref().unwrap_or(&host),
@@ -188,6 +200,7 @@ async fn create_mcp_http(state: &AppState, req: CreateConnection) -> ApiResult<J
 /// validates base_url + header/scheme, seals the secret, returns the row.
 pub(crate) async fn create_mcp_http_connection(
     state: &AppState,
+    scope: TenantScope,
     req: CreateConnection,
 ) -> ApiResult<fluidbox_db::IntegrationConnectionRow> {
     let base_url = req
@@ -241,7 +254,7 @@ pub(crate) async fn create_mcp_http_connection(
     let sealed = sealer.seal(token);
     Ok(fluidbox_db::create_connection(
         &state.pool,
-        fluidbox_db::TenantScope::assume(state.tenant_id),
+        scope,
         "mcp_http",
         &host,
         req.display_name.as_deref().unwrap_or(&host),
@@ -255,7 +268,11 @@ pub(crate) async fn create_mcp_http_connection(
     .await?)
 }
 
-async fn create_github_pat(state: &AppState, req: CreateConnection) -> ApiResult<Json<Value>> {
+async fn create_github_pat(
+    state: &AppState,
+    scope: TenantScope,
+    req: CreateConnection,
+) -> ApiResult<Json<Value>> {
     let token = req.token.as_deref().map(str::trim).unwrap_or_default();
     if token.is_empty() {
         return Err(ApiError::BadRequest("token is required".into()));
@@ -270,7 +287,7 @@ async fn create_github_pat(state: &AppState, req: CreateConnection) -> ApiResult
     let sealed = sealer.seal(token);
     let row = fluidbox_db::create_connection(
         &state.pool,
-        fluidbox_db::TenantScope::assume(state.tenant_id),
+        scope,
         &req.provider,
         &account_id,
         req.display_name.as_deref().unwrap_or(&login),
@@ -285,7 +302,11 @@ async fn create_github_pat(state: &AppState, req: CreateConnection) -> ApiResult
     Ok(Json(json!({ "connection": row })))
 }
 
-async fn create_github_app(state: &AppState, req: CreateConnection) -> ApiResult<Json<Value>> {
+async fn create_github_app(
+    state: &AppState,
+    scope: TenantScope,
+    req: CreateConnection,
+) -> ApiResult<Json<Value>> {
     let field = |v: &Option<String>, name: &str| -> ApiResult<String> {
         v.as_deref()
             .map(str::trim)
@@ -320,7 +341,7 @@ async fn create_github_app(state: &AppState, req: CreateConnection) -> ApiResult
     let sealed_webhook = sealer.seal(&webhook_secret);
     let row = match fluidbox_db::create_connection(
         &state.pool,
-        fluidbox_db::TenantScope::assume(state.tenant_id),
+        scope,
         &req.provider,
         &installation_id,
         req.display_name
@@ -352,18 +373,23 @@ async fn create_github_app(state: &AppState, req: CreateConnection) -> ApiResult
     ))
 }
 
-pub async fn list(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+pub async fn list(principal: Principal, State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let scope = principal.scope();
     let connections = fluidbox_db::list_connections(&state.pool, scope).await?;
     Ok(Json(json!({ "connections": connections })))
 }
 
 pub async fn revoke(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    if !rbac::can_mutate_resources(&principal) {
+        return Err(ApiError::Forbidden(
+            "revoking connections requires admin or owner".into(),
+        ));
+    }
+    let scope = principal.scope();
     let row = fluidbox_db::revoke_connection(&state.pool, scope, id)
         .await?
         .ok_or_else(|| ApiError::Conflict("connection not found or already revoked".into()))?;
@@ -378,11 +404,16 @@ pub async fn revoke(
 /// installation under the app JWT before any transition; the connection id
 /// (and its dedup history) stays continuous.
 pub async fn approve(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    if !rbac::can_mutate_resources(&principal) {
+        return Err(ApiError::Forbidden(
+            "approving connections requires admin or owner".into(),
+        ));
+    }
+    let scope = principal.scope();
     let conn = fluidbox_db::get_connection(&state.pool, scope, id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -504,12 +535,12 @@ fn default_per_page() -> u32 {
 /// Repository picker: the control plane lists what the connection can see.
 /// The credential never leaves the control plane.
 pub async fn repos(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(q): Query<ReposQuery>,
 ) -> ApiResult<Json<Value>> {
-    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let scope = principal.scope();
     let conn = fluidbox_db::get_connection(&state.pool, scope, id)
         .await?
         .ok_or(ApiError::NotFound)?;

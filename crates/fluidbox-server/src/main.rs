@@ -17,15 +17,17 @@ mod internal;
 mod ledger;
 mod oauth;
 mod orchestrator;
+mod rbac;
 mod run_service;
 mod scheduler;
 mod seal;
 mod sse;
 mod state;
+mod tokens;
 mod triggers;
 mod workers;
 
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
 use fluidbox_core::traits::ExecutionProvider;
 use state::{AppStateInner, ApprovalRegistry};
@@ -197,6 +199,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/sessions/{id}/deliveries", get(api::session_deliveries))
         .route("/approvals", get(api::approvals_inbox))
         .route("/approvals/{id}/decision", post(api::decide_approval))
+        // Personal access tokens (identity Phase B): machine access without a
+        // browser flow. Mint/revoke require a browser session (a PAT can never
+        // mint a PAT); listing accepts either context.
+        .route("/auth/tokens", get(tokens::list).post(tokens::mint))
+        .route("/auth/tokens/{id}", delete(tokens::revoke))
         .route(
             "/capabilities",
             get(capabilities::list).post(capabilities::create),
