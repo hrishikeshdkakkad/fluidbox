@@ -20,6 +20,24 @@ export async function apiPost<T = unknown>(path: string, body: unknown): Promise
   return text ? JSON.parse(text) : ({} as T);
 }
 
+export async function apiPut<T = unknown>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(text || `${res.status}`);
+  return text ? JSON.parse(text) : ({} as T);
+}
+
+export async function apiDelete<T = unknown>(path: string): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, { method: "DELETE" });
+  const text = await res.text();
+  if (!res.ok) throw new Error(text || `${res.status}`);
+  return text ? JSON.parse(text) : ({} as T);
+}
+
 export function streamUrl(sessionId: string): string {
   return `${BASE}/sessions/${sessionId}/events/stream`;
 }
@@ -131,7 +149,9 @@ export function workspaceLabel(ws: WorkspaceSpec | null | undefined): string {
 
 export interface Connection {
   id: string;
-  provider: string; // github (PAT) | github_app | mcp_http
+  /** Wire value, server-controlled. See ConnectionProvider for the ones this
+   *  client has classified; unknown values fail safe (neither git nor tool). */
+  provider: string;
   external_account_id: string;
   display_name: string;
   granted_scopes: string[];
@@ -162,6 +182,42 @@ export interface Connection {
   } | null;
   created_at: string;
 }
+
+/** Every connection provider this dashboard has classified. The server is the
+ *  source of truth for what exists; this union states what we have decided
+ *  about. Adding a member without adding it to PROVIDER_CLASS is a build
+ *  failure — that is the point. */
+export type ConnectionProvider = "github" | "github_app" | "mcp_http";
+
+/** Which surface a provider belongs to.
+ *
+ *    git  — can back a workspace checkout (repositories, refs, commits).
+ *    tool — a credential the BROKER calls during a run. It has no repositories.
+ *
+ *  This Record is the only place the rule lives. It replaces four hand-rolled
+ *  predicates that each re-derived it from a prose comment; WorkspacePicker
+ *  forgot, which is how mcp_http reached the git picker.
+ *
+ *  It is an allowlist BY CONSTRUCTION: Record<ConnectionProvider, …> requires
+ *  every union member as a key, so adding `slack` (Phase 7) fails the build
+ *  until someone classifies it. The old `provider !== "mcp_http"` form would
+ *  have silently admitted slack to the repo picker instead. */
+const PROVIDER_CLASS: Record<ConnectionProvider, "git" | "tool"> = {
+  github: "git",
+  github_app: "git",
+  mcp_http: "tool",
+};
+
+/** Can this connection back a git workspace checkout?
+ *
+ *  A provider the server knows but this client does not is neither git nor
+ *  tool: it stays out of every picker rather than defaulting into one. */
+export const isGitConnection = (c: Connection): boolean =>
+  PROVIDER_CLASS[c.provider as ConnectionProvider] === "git";
+
+/** Is this a brokered tool-server credential? The mirror of isGitConnection. */
+export const isToolConnection = (c: Connection): boolean =>
+  PROVIDER_CLASS[c.provider as ConnectionProvider] === "tool";
 
 /** One connector-catalog entry (untrusted reference data; tool_hints are
  *  policy-default seeds — the permission gate stays the judge). */
@@ -403,6 +459,119 @@ export interface EventRow {
   actor: string;
   payload: { type?: string; data?: Record<string, unknown> };
   occurred_at: string;
+}
+
+// ─── Governance ───────────────────────────────────────────────────────────
+// The control plane resolves every verdict below and sends the answer. None of
+// it is re-derived here: the dashboard renders policy, it never computes it.
+
+/** A permission verdict as the policy engine reports it. Displayed as
+ *  Allow / Ask / Deny — "approve" means the run pauses for a human. */
+export type PolicyAction = "allow" | "approve" | "deny";
+
+/** Why a rule's verdict depends on more than the tool name: the path touched
+ *  or the command run. `paths_on_no_match` / `shell_on_no_match` carry the
+ *  fallback verdict — render them, never restate them in TypeScript. */
+export interface RuleConstraints {
+  paths_allow: string[];
+  paths_deny: string[];
+  paths_on_no_match: PolicyAction | null;
+  shell_allow_prefixes: string[];
+  shell_deny_regex: string[];
+  shell_on_no_match: PolicyAction | null;
+}
+
+/** Internally tagged on `status`. A `conditional` rule carries path/shell
+ *  constraints, so no single action can express it — such rows are shown as a
+ *  sentence and never as a control. Setting one would flatten the rule and
+ *  drop its constraints (e.g. `paths.deny: **\/.env`); the server refuses the
+ *  same override with a 400, and the UI must not offer what it will refuse. */
+export type ToolStatus =
+  | { status: "unconditional"; action: PolicyAction; rule: number }
+  | {
+      status: "conditional";
+      action: PolicyAction;
+      rule: number;
+      constraints: RuleConstraints;
+    }
+  | { status: "default"; action: PolicyAction }
+  | { status: "overridden"; action: PolicyAction; underlying: ToolStatus };
+
+/** One row of the resolved permission matrix (GET /policies/{name}).
+ *  `group` is set for canonical tools; for `mcp__*` rows it is null and
+ *  `server` carries the grouping key instead. */
+export interface MatrixRow {
+  tool: string;
+  group: string | null;
+  server: string | null;
+  overridable: boolean;
+  status: ToolStatus;
+}
+
+export interface AutonomySummary {
+  permitted: boolean;
+  default_fallback: "allow" | "deny";
+  allow_overrides: number;
+  deny_overrides: number;
+}
+
+/** Mirrors `policy::PolicyDefaults`: the verdict when no rule matches. Already
+ *  visible as the matrix's `default` rows. */
+export interface PolicyDefaults {
+  tool_action: PolicyAction;
+}
+
+/** Mirrors `spec::Budgets`. Every cap is an `Option` in Rust, so an unset one
+ *  arrives as `null` — meaning this policy imposes no ceiling of that kind, not
+ *  zero. These are a CEILING: an agent revision and each run may only tighten
+ *  them (`Budgets::tightened_by`). */
+export interface Budgets {
+  max_wall_clock_secs: number | null;
+  max_tokens: number | null;
+  max_cost_usd: number | null;
+  max_tool_calls: number | null;
+}
+
+/** `policy::ApprovalScope` — how far one human decision reaches. */
+export type ApprovalScope = "once" | "session";
+
+/** `policy::TimeoutAction`. One variant today: an unanswered approval denies.
+ *  Human absence narrows permissions, never widens them. */
+export type TimeoutAction = "deny";
+
+export interface ApprovalSettings {
+  default_ttl_secs: number;
+  scope: ApprovalScope;
+  timeout_action: TimeoutAction;
+}
+
+/** `policy::EgressMode` — kebab-case on the wire. */
+export type EgressMode = "none" | "proxy-only" | "allowlist";
+
+export interface Egress {
+  mode: EgressMode;
+}
+
+/** GET /policies list row. */
+export interface PolicySummary {
+  id: string;
+  name: string;
+  version: number;
+  updated_at: string;
+  agents_using: number;
+  autonomy_summary: AutonomySummary;
+}
+
+/** GET /policies/{name} — the fully-resolved policy behind a run. */
+export interface PolicyDetail {
+  policy: { id: string; name: string; version: number; updated_at: string };
+  agents_using: number;
+  autonomy_summary: AutonomySummary;
+  defaults: PolicyDefaults;
+  budgets: Budgets;
+  approvals: ApprovalSettings;
+  egress: Egress;
+  matrix: MatrixRow[];
 }
 
 export const TERMINAL = ["completed", "failed", "cancelled", "budget_exceeded"];

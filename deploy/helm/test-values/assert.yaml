@@ -1,0 +1,34 @@
+# Distinctive values for deploy/helm/chart-assertions.sh — every value here
+# exists to be asserted in the rendered output (findings M3/M9/M10/L12; the
+# values→PodSpec test from L13). Not a deployable configuration.
+images:
+  server:
+    repository: ghcr.io/example/fluidbox-server
+    digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  web:
+    repository: ghcr.io/example/fluidbox-web
+    tag: "9.9.9"
+  sandboxRunner: ghcr.io/example/fluidbox-sandbox-runner@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  pullSecrets:
+    - name: regcred
+    - name: mirror-cred
+web:
+  enabled: true
+ingress:
+  enabled: true
+  host: fluidbox.example.com
+sandbox:
+  runAsUser: 12345
+  volumeSizeLimit: 42Gi
+  resources:
+    requests: { cpu: "750m", memory: "3Gi", ephemeralStorage: "2Gi" }
+    limits: { cpu: "3", memory: "6Gi", ephemeralStorage: "20Gi" }
+  nodeSelector:
+    pool: sandbox
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: fluidbox
+      effect: NoSchedule
+      tolerationSeconds: 300
+  priorityClassName: sandbox-low

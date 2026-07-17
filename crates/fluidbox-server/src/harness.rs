@@ -152,6 +152,7 @@ mod tests {
     fn test_cfg() -> Config {
         Config {
             bind: String::new(),
+            internal_bind: String::new(),
             database_url: String::new(),
             admin_token: String::new(),
             public_control_url: String::new(),
@@ -169,6 +170,14 @@ mod tests {
             github_clone_base: String::new(),
             keep_workspaces: false,
             public_url: String::new(),
+            provider: "docker".into(),
+            network_mode: fluidbox_core::traits::NetworkMode::HostDev,
+            require_enforced_netpol: false,
+            netpol_probe_image: "busybox:1.36".into(),
+            internal_service: None,
+            internal_service_namespace: None,
+            max_archive_bytes: 2 * 1024 * 1024 * 1024,
+            archive_ttl_secs: 24 * 3600,
         }
     }
 

@@ -1,0 +1,34 @@
+fluidbox is installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Execution provider: kubernetes (sandbox namespace: {{ .Values.sandbox.namespace }})
+Egress profile:     {{ .Values.sandbox.egressProfile }}{{ if eq .Values.sandbox.egressProfile "permissive" }}  ⚠ DEV ONLY — no production guarantee{{ end }}
+NetworkPolicy gate: requireEnforced={{ .Values.netpol.requireEnforced }}
+
+1. Verify the CNI actually enforces NetworkPolicy (REQUIRED before runs admit):
+
+     helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+
+   The probe must PASS (+:8788 -:8787). If it fails "negative: public :8787
+   REACHABLE", your CNI is not enforcing NetworkPolicy — install/enable an
+   enforcing CNI (Calico/Cilium, or the EKS VPC CNI network-policy agent).
+   With requireEnforced=true the control plane blocks runs until this passes.
+
+2. Reach the dashboard + API:
+{{- if .Values.ingress.enabled }}
+     https://{{ .Values.ingress.host }}{{ if not .Values.web.enabled }}      (API — web.enabled=false){{ else }}         (dashboard){{ end }}
+     https://{{ .Values.ingress.host }}/v1      (API)
+{{- else }}
+     kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "fluidbox.serverName" . }} 8787:8787
+{{- if .Values.web.enabled }}
+     kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "fluidbox.webName" . }} 3000:3000
+{{- end }}
+{{- end }}
+
+3. Credentials come from the existing Secret "{{ .Values.existingSecret }}"
+   (keys: {{ .Values.secretKeys.databaseUrl }}, {{ .Values.secretKeys.adminToken }},
+   {{ .Values.secretKeys.credentialKey }}, {{ .Values.secretKeys.litellmMasterKey }}).
+   The chart never generates or stores credential material.
+{{ if not .Values.server.publicUrl }}
+NOTE: server.publicUrl is unset — OAuth callbacks, CIMD, and GitHub App
+webhooks need it set to your https Ingress origin.
+{{- end }}

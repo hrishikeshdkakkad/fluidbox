@@ -113,6 +113,24 @@ pub enum EventBody {
     /// is the authoritative copy). `bundles` are "name@version" strings.
     #[serde(rename = "capability.frozen")]
     CapabilitiesFrozen { bundles: Vec<String>, tools: u64 },
+    /// Terminal artifact collection metadata — size/digest/truncation only,
+    /// never payloads (the artifact row holds the content).
+    #[serde(rename = "artifact.collected")]
+    ArtifactCollected {
+        kind: String,
+        name: String,
+        bytes: u64,
+        sha256: String,
+        truncated: bool,
+    },
+    /// EXPLICIT not-collected marker (design 2026-07-15): a diff that could
+    /// not be collected is never silently reported as "(no changes)".
+    #[serde(rename = "artifact.missing")]
+    ArtifactMissing { kind: String, reason: String },
+    /// Cancellation quiesce signal requested; delivered to the runner via
+    /// the heartbeat response ({"action":"quiesce"}).
+    #[serde(rename = "run.quiesce_requested")]
+    QuiesceRequested { deadline_secs: u64 },
     /// One brokered tool execution: the control plane turned the sealed
     /// credential server-side. Identity, status, latency, result digest —
     /// never inputs, outputs, or secrets.

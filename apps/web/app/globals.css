@@ -117,6 +117,21 @@ a {
 .faint {
   color: var(--ink-3);
 }
+/* For text that names a control for a screen reader but would be redundant on
+   screen — a radio group's <legend>, say. Hidden from sight, never from the
+   accessibility tree (`display: none` and `visibility: hidden` remove it from
+   both). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
 
 /* ─── Shell ──────────────────────────────────────────────────────────── */
 
@@ -1719,6 +1734,24 @@ a.row:hover,
 .pill.awaiting_approval .dot {
   background: var(--amber);
 }
+/* Wind-down states: the run is finishing (collecting its diff) or cancelling.
+   Amber like awaiting_approval, with the running dot's pulse to read as
+   in-progress rather than terminal. */
+.pill.cancelling,
+.pill.finalizing {
+  color: var(--amber);
+}
+.pill.cancelling .dot,
+.pill.finalizing .dot {
+  background: var(--amber);
+  animation: blink 1.4s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pill.cancelling .dot,
+  .pill.finalizing .dot {
+    animation: none;
+  }
+}
 .pill.completed {
   color: var(--green);
 }
@@ -2151,7 +2184,9 @@ textarea.inp.code {
   padding: 2px;
   gap: 2px;
 }
-.seg button {
+.seg button,
+.seg label {
+  position: relative;
   border: none;
   background: none;
   color: var(--ink-2);
@@ -2169,9 +2204,37 @@ textarea.inp.code {
   width: 13px;
   height: 13px;
 }
-.seg button.on {
+.seg button.on,
+.seg label.on {
   background: var(--raised);
   color: var(--ink);
+}
+
+/* A `.seg` whose options are mutually exclusive is a <fieldset> of radios (the
+   permission matrix). The radio is invisible but NOT hidden: it stays focusable
+   and keeps its role, and it covers its <label> so the two share one hit
+   target. It draws no dot of its own — the label's `.on` background is the
+   selected state — but it is a real box, so the global *:focus-visible ring
+   lands on the option the user is actually on. */
+fieldset.seg {
+  min-inline-size: 0;
+}
+.seg label input[type="radio"] {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  appearance: none;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+fieldset.seg:disabled label,
+fieldset.seg:disabled label input[type="radio"] {
+  cursor: default;
+}
+fieldset.seg:disabled label {
+  opacity: 0.5;
 }
 
 /* ─── Modal ──────────────────────────────────────────────────────────── */
@@ -2489,6 +2552,17 @@ textarea.inp.code {
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 8px;
 }
+/* Single-column scrolling container for .opt / .cap-row lists too long for
+   .opt-grid's auto-fit columns (repositories: up to 100). Promoted from
+   BundlePicker's inline style so the repo list and the bundle list share one
+   container. */
+.opt-list {
+  display: grid;
+  gap: 6px;
+  max-height: 340px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
 .opt {
   text-align: left;
   background: var(--bg);
@@ -2528,13 +2602,19 @@ textarea.inp.code {
   height: 13px;
   color: var(--accent);
 }
+/* display:block is load-bearing: these are spans, and vertical margins do not
+   apply to inline elements — the margin-top below was silently dropped, so
+   .id and .d ran together on one line (visible in the Model picker long
+   before the connection picker adopted this card). */
 .opt .id {
+  display: block;
   font-family: var(--font-mono);
   font-size: 10.5px;
   color: var(--ink-3);
   margin-top: 2px;
 }
 .opt .d {
+  display: block;
   font-size: 11.5px;
   margin-top: 4px;
   color: var(--ink-2);
@@ -3730,5 +3810,140 @@ select.inp {
   .connector-card-action {
     grid-column: 2;
     padding-left: 0;
+  }
+}
+
+/* ─── Governance ─────────────────────────────────────────────────────── */
+
+.policy-rows {
+  display: flex;
+  flex-direction: column;
+}
+.policy-row {
+  padding: 15px 18px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 16px;
+  border-bottom: 1px solid var(--border);
+  transition: background 0.15s ease;
+  color: inherit;
+}
+.policy-row:last-child {
+  border-bottom: 0;
+}
+.policy-row:hover {
+  background: var(--surface-hover);
+}
+.policy-row:hover .run-arrow {
+  color: var(--ink);
+  transform: translateX(2px);
+}
+.policy-row-main {
+  min-width: 0;
+}
+.policy-row-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13.5px;
+}
+.policy-row-sub {
+  margin-top: 3px;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.policy-row-agents {
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* A change to a policy applies immediately, to every future run of every agent
+   on it. The blast radius leads the page rather than footnoting it. */
+.blast-radius {
+  margin-bottom: 16px;
+  padding: 11px 14px;
+  border: 1px solid var(--border-strong);
+  border-left: 2px solid var(--amber);
+  border-radius: var(--radius);
+  background: var(--amber-tint);
+  color: var(--ink);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.matrix-group .sectitle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.matrix {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.matrix-row {
+  display: grid;
+  grid-template-columns: minmax(0, 240px) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+  min-height: 44px;
+}
+.matrix-row:last-child {
+  border-bottom: 0;
+}
+.matrix-row:hover {
+  background: var(--surface-hover);
+}
+.matrix-tool {
+  font-size: 12px;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.matrix-verdict {
+  min-width: 0;
+}
+/* A conditional rule is stated, never offered as a control: its verdict
+   depends on the path touched or the command run. */
+.matrix-conditional {
+  font-size: 12px;
+  color: var(--ink-2);
+  line-height: 1.55;
+  display: block;
+  cursor: help;
+}
+.matrix-fixed {
+  font-size: 12.5px;
+  color: var(--ink-2);
+}
+.matrix-tail {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+@media (max-width: 720px) {
+  .matrix-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+    padding: 12px;
+  }
+  .matrix-tail {
+    justify-content: flex-start;
+  }
+  .policy-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .policy-row .run-arrow {
+    display: none;
   }
 }
