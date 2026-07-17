@@ -96,6 +96,8 @@ Status legend: `[ ]` open · `[x]` fixed · `[-]` won't fix (record why)
 
 ---
 
+- [ ] **L15. (opened batch 3, Codex v4/v5)** The workspace extractor/copy is not fully symlink-safe against an **attacker-controlled destination path**. `clear_dir_contents`' guard checks only the final path component, so a symlinked ancestor (`parent_link/dest`), a trailing-slash spelling (`dest/`), or a TOCTOU swap between check and use can still make it operate through a symlink to outside the root. **Not production-reachable** — production `dest` is a fixed pod-spec mount (`/workspace`, `/collector/…`) the runner cannot re-point, and same-run + lifecycle-replay escapes (the real risks) ARE fixed. Closing this residual robustly needs kernel-enforced resolution (`openat2 RESOLVE_IN_ROOT` on Linux, or `cap-std`/`openat`) rather than more userspace path math — a dependency/platform decision for the maintainer. Five hand-rolled rounds proved userspace lexical guards are the wrong tool here.
+
 ## Suggested fix batches (one `fix/*` PR into the release branch each, matching #58/#59 precedent)
 
 1. **`fix/k8s-ci-green`** — H1 (in-cluster Postgres + runtime probe resolution + drop `|| true`). Do this first: it turns CI into a real check for everything after.
