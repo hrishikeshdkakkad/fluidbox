@@ -25,7 +25,7 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: web
-          image: "{{ .Values.images.web.repository }}:{{ .Values.images.web.tag }}"
+          image: {{ include "fluidbox.imageRef" (dict "image" .Values.images.web "ctx" $) | quote }}
           imagePullPolicy: {{ .Values.images.web.pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false
