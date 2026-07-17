@@ -237,10 +237,33 @@ fn fetch(url: &str, token: &str, expected_len: u64) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-/// Recursive copy including dotfiles + `.git` internals; symlinks are skipped
-/// (the archive extractor already rejected any, so this only sees regular
-/// files/dirs).
+/// Recursive copy including dotfiles + `.git` internals. In-tree symlinks are
+/// PRESERVED (H4: a tracked symlink must reach the runner's /workspace exactly
+/// as Docker's bind mount delivers it), using the same two-phase approach as
+/// the archive extractor: copy every real file/dir first, then create the
+/// symlinks and keep only those that `canonicalize` inside `dst`. Relocating
+/// `repo/` to /workspace shrinks the root the extractor validated against, so
+/// a link that pointed outside `repo/` (into the baseline, say) is dropped
+/// rather than left to escape. `canonicalize` — following the FULL target
+/// chain — is the sole containment judge.
 fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    // Fresh-destination precondition (fail-closed): on an init re-execution the
+    // surviving emptyDir may hold runner-planted symlinks; clear dst's contents
+    // FIRST (which refuses a symlinked `dst` itself, so we never copy through a
+    // symlink to outside), THEN ensure a real dir.
+    fluidbox_workspace::clear_dir_contents(dst)?;
+    std::fs::create_dir_all(dst)?;
+    let mut symlinks: Vec<(PathBuf, PathBuf)> = Vec::new();
+    copy_files(src, dst, &mut symlinks)?;
+    place_symlinks(dst, &symlinks);
+    Ok(())
+}
+
+fn copy_files(
+    src: &Path,
+    dst: &Path,
+    symlinks: &mut Vec<(PathBuf, PathBuf)>,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -248,10 +271,9 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
         let to = dst.join(entry.file_name());
         let meta = std::fs::symlink_metadata(&from)?;
         if meta.is_symlink() {
-            continue;
-        }
-        if meta.is_dir() {
-            copy_tree(&from, &to)?;
+            symlinks.push((to, std::fs::read_link(&from)?));
+        } else if meta.is_dir() {
+            copy_files(&from, &to, symlinks)?;
         } else {
             std::fs::copy(&from, &to)?;
         }
@@ -259,9 +281,156 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Create the collected symlinks, then keep only those that resolve inside
+/// `dst_root` (per `canonicalize`, following the whole chain). Parent must
+/// already exist and resolve in-root, so creation never writes through an
+/// escaping link.
+#[cfg(unix)]
+fn place_symlinks(dst_root: &Path, symlinks: &[(PathBuf, PathBuf)]) {
+    let Ok(canon_root) = std::fs::canonicalize(dst_root) else {
+        return;
+    };
+    let mut created: Vec<PathBuf> = Vec::new();
+    for (to, target) in symlinks {
+        let Some(parent) = to.parent() else { continue };
+        match std::fs::canonicalize(parent) {
+            Ok(cp) if cp.starts_with(&canon_root) => {}
+            _ => continue,
+        }
+        if std::os::unix::fs::symlink(target, to).is_ok() {
+            created.push(to.clone());
+        }
+    }
+    for to in created {
+        match std::fs::canonicalize(&to) {
+            Ok(real) if real.starts_with(&canon_root) => {}
+            _ => {
+                eprintln!(
+                    "workspaced: dropping symlink {} (target escapes the workspace root)",
+                    to.display()
+                );
+                std::fs::remove_file(&to).ok();
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn place_symlinks(_dst_root: &Path, _symlinks: &[(PathBuf, PathBuf)]) {}
+
 fn oneline(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_whitespace() { ' ' } else { c })
         .take(200)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// H4 (K8s path): `cmd_init` copies the extracted `repo/` into /workspace
+    /// via `copy_tree`, which previously SKIPPED symlinks — so a tracked
+    /// in-tree symlink never reached the runner even after the extractor
+    /// created it. `copy_tree` must now preserve in-tree links and drop only
+    /// those whose target escapes the new (smaller) /workspace root.
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_preserves_intree_symlink_and_drops_escaping() {
+        let base = std::env::temp_dir().join(format!("fbx-copytree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), "hi\n").unwrap();
+        std::os::unix::fs::symlink("a.txt", src.join("link")).unwrap();
+        std::os::unix::fs::symlink("../a.txt", src.join("sub/uplink")).unwrap();
+        // A REAL file outside the copy root — the escaping links must resolve
+        // to it (so canonicalize succeeds and proves containment) yet be
+        // dropped. Deterministic, unlike a target that merely dangles.
+        std::fs::write(base.join("secret.txt"), "SECRET\n").unwrap();
+        // Points above the copy root → dropped.
+        std::os::unix::fs::symlink("../secret.txt", src.join("escape")).unwrap();
+        // Codex batch-3v2 counterexample: a symlinked component in the target.
+        // `anchor -> .`, `leak -> anchor/../secret.txt` resolves OUT via anchor
+        // — lexical math accepts it; canonicalize refuses.
+        std::os::unix::fs::symlink(".", src.join("anchor")).unwrap();
+        std::os::unix::fs::symlink("anchor/../secret.txt", src.join("leak")).unwrap();
+
+        let dst = base.join("workspace");
+        copy_tree(&src, &dst).unwrap();
+
+        let link = dst.join("link");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "in-tree symlink must be preserved"
+        );
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "hi\n");
+        assert!(
+            std::fs::symlink_metadata(dst.join("sub/uplink"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "in-tree ../ symlink must be preserved"
+        );
+        assert!(std::fs::read_to_string(src.join("a.txt")).is_ok());
+        // The escaping links resolved to the REAL outside file yet were dropped.
+        for bad in ["escape", "leak"] {
+            assert!(
+                std::fs::symlink_metadata(dst.join(bad)).is_err(),
+                "escaping symlink {bad} must be dropped"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(base.join("secret.txt")).unwrap(),
+            "SECRET\n",
+            "the outside file must be untouched"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Codex batch-3v3 finding 1: an init re-execution over a DIRTY /workspace
+    /// (the emptyDir survives Pod restarts) must not let the copy phase follow
+    /// a runner-planted symlink out of the root. `copy_tree` clears dst's
+    /// contents first, so copying a regular `seed` writes a fresh file instead
+    /// of overwriting the outside canary through the stale link.
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_clears_stale_destination_symlink() {
+        let base = std::env::temp_dir().join(format!("fbx-copystale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("seed"), "fresh\n").unwrap();
+
+        // Outside canary + a dirty dst where the runner planted `seed` as a
+        // symlink pointing at it.
+        std::fs::write(base.join("canary"), "ORIGINAL\n").unwrap();
+        let dst = base.join("workspace");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::os::unix::fs::symlink(base.join("canary"), dst.join("seed")).unwrap();
+
+        copy_tree(&src, &dst).unwrap();
+
+        // The planted link is gone; seed is a real file; the canary is intact.
+        assert!(
+            !std::fs::symlink_metadata(dst.join("seed"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "stale destination symlink must be cleared"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("seed")).unwrap(),
+            "fresh\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("canary")).unwrap(),
+            "ORIGINAL\n",
+            "copy must not follow the stale link and overwrite the canary"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
 }

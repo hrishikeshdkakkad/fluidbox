@@ -456,6 +456,51 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// H4 (archive transport + collection halves): an in-tree symlink present
+    /// in the worktree survives pack→unpack (the control-plane→pod archive
+    /// transport) AND appears in the collected diff (git mode 120000), matching
+    /// Docker. The `cmd_init`→`copy_tree`→/workspace half is covered by
+    /// `workspaced`'s `copy_tree_preserves_intree_symlink_and_drops_escaping`.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_survives_pack_unpack_and_appears_in_diff() {
+        let (tmp, ws) = fixture();
+        // A tracked in-tree relative symlink in the worktree.
+        std::os::unix::fs::symlink("a.txt", ws.host_dir.join("link")).unwrap();
+
+        // Pack the session root (repo/ + baseline-git/) and unpack it into a
+        // fresh "pod" dir — exactly the control-plane→pod workspace transport.
+        let packed = crate::pack_workspace(root_of(&ws)).unwrap();
+        let pod = tmp.join("pod");
+        crate::unpack_archive(&packed.bytes, &pod, 100 * 1024 * 1024).unwrap();
+        assert!(
+            std::fs::symlink_metadata(pod.join("repo/link"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink must survive the archive transport as a real symlink"
+        );
+
+        // Collection against the reconstructed tree sees the new symlink
+        // (git records symlinks as mode 120000) — not a crash, not a loss.
+        match collect_diff(&pod, ws.base_commit.as_deref(), &DiffCaps::default()) {
+            CollectionOutcome::Diff(d) => {
+                assert!(
+                    d.patch.contains("link"),
+                    "diff lost the symlink: {}",
+                    d.patch
+                );
+                assert!(
+                    d.patch.contains("120000"),
+                    "symlink not recorded as a symlink: {}",
+                    d.patch
+                );
+            }
+            CollectionOutcome::Missing { reason } => panic!("unexpected missing: {reason}"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     #[test]
     fn deleted_and_added_files_appear() {
         let (tmp, ws) = fixture();
