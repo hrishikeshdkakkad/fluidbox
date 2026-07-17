@@ -37,6 +37,7 @@ use manifest::{
     build_pod, build_secret, object_name, COLLECTOR_CONTAINER, LABEL_MANAGED, LABEL_SESSION,
     RUNNER_CONTAINER,
 };
+use std::path::{Path, PathBuf};
 
 const RUNTIME: &str = "kubernetes";
 /// Diff artifacts are bounded at this many bytes over exec (the collector
@@ -51,23 +52,28 @@ pub struct KubernetesProvider {
     secrets: Api<Secret>,
     cfg: K8sConfig,
     namespace: String,
+    /// The control plane's data dir: pre-launch collection (no pod ever
+    /// existed) falls back to the locally-materialized workspace here, the
+    /// same transport Docker always uses (L9 parity).
+    data_dir: PathBuf,
 }
 
 impl KubernetesProvider {
     /// Connect using the ambient kube config (in-cluster ServiceAccount, or
     /// `~/.kube/config` for local dev). Fails if no cluster is reachable.
-    pub async fn connect(cfg: K8sConfig) -> anyhow::Result<Self> {
+    pub async fn connect(cfg: K8sConfig, data_dir: PathBuf) -> anyhow::Result<Self> {
         let client = Client::try_default().await?;
-        Ok(Self::with_client(client, cfg))
+        Ok(Self::with_client(client, cfg, data_dir))
     }
 
-    pub fn with_client(client: Client, cfg: K8sConfig) -> Self {
+    pub fn with_client(client: Client, cfg: K8sConfig, data_dir: PathBuf) -> Self {
         let namespace = cfg.namespace.clone();
         Self {
             pods: Api::namespaced(client.clone(), &namespace),
             secrets: Api::namespaced(client, &namespace),
             cfg,
             namespace,
+            data_dir,
         }
     }
 
@@ -111,13 +117,35 @@ fn map_err(e: impl std::fmt::Display) -> ProviderError {
     ProviderError::Other(e.to_string())
 }
 
+/// Grace for `CreateContainerConfigError`: Pod-first/Secret-second means the
+/// kubelet reports it TRANSIENTLY between Pod creation and the Secret landing
+/// (~1 s in practice) — by design, not misconfiguration. Only a config error
+/// persisting past this pod age is real (M6).
+pub const CONFIG_ERROR_GRACE_SECS: i64 = 120;
+
 /// Map a Pod to the structured status of its NAMED runner container (not Pod
 /// phase). Init failure surfaces as a terminated runner so the orchestrator
 /// fails the run; a still-pulling image is Pending with the reason.
 pub fn runner_status(pod: &Pod) -> SandboxStatus {
+    // Deletion in progress (reap, eviction, node-loss cleanup): the pod is
+    // going away and its container statuses may be stale snapshots from an
+    // unreachable kubelet — never report it live (M7).
+    if pod.metadata.deletion_timestamp.is_some() {
+        return SandboxStatus::Unknown {
+            reason: Some("pod deletion in progress".into()),
+        };
+    }
     let status = match &pod.status {
         Some(s) => s,
         None => return SandboxStatus::Pending { reason: None },
+    };
+
+    // A waiting reason is fatal if it never self-resolves; the config-error
+    // reason is special-cased behind the Secret-window grace (M6).
+    let fatal = |reason: Option<&str>| {
+        fatal_waiting(reason)
+            || (reason == Some("CreateContainerConfigError")
+                && pod_older_than(pod, CONFIG_ERROR_GRACE_SECS))
     };
 
     // An init container that terminated non-zero blocks the runner forever —
@@ -137,7 +165,7 @@ pub fn runner_status(pod: &Pod) -> SandboxStatus {
             }
             // Still waiting on an init container (e.g. image pull) → Pending.
             if let Some(w) = c.state.as_ref().and_then(|st| st.waiting.as_ref()) {
-                if fatal_waiting(w.reason.as_deref()) {
+                if fatal(w.reason.as_deref()) {
                     return SandboxStatus::Terminated {
                         exit_code: None,
                         reason: Some(format!(
@@ -163,7 +191,7 @@ pub fn runner_status(pod: &Pod) -> SandboxStatus {
                     };
                 }
                 if let Some(w) = &state.waiting {
-                    if fatal_waiting(w.reason.as_deref()) {
+                    if fatal(w.reason.as_deref()) {
                         return SandboxStatus::Terminated {
                             exit_code: None,
                             reason: w.reason.clone(),
@@ -187,22 +215,38 @@ pub fn runner_status(pod: &Pod) -> SandboxStatus {
             exit_code: Some(0),
             reason: None,
         },
+        // Kubelet unreachable (node loss): the state genuinely cannot be
+        // determined — Unknown, never a live Pending forever (M7).
+        Some("Unknown") => SandboxStatus::Unknown {
+            reason: status.reason.clone().or(Some("pod phase Unknown".into())),
+        },
         _ => SandboxStatus::Pending {
             reason: status.reason.clone(),
         },
     }
 }
 
+/// Pod age vs `creation_timestamp`. A missing timestamp (only synthetic pods
+/// in tests) counts as age zero — grace applies, nothing is killed early.
+fn pod_older_than(pod: &Pod, secs: i64) -> bool {
+    pod.metadata
+        .creation_timestamp
+        .as_ref()
+        .map(|t| k8s_openapi::jiff::Timestamp::now().as_second() - t.0.as_second() > secs)
+        .unwrap_or(false)
+}
+
 /// Waiting reasons that will never resolve on their own — a misconfigured
 /// image or config, distinct from an in-progress pull (`ContainerCreating`,
-/// `PodInitializing`, `ImagePull*` in progress).
+/// `PodInitializing`, `ImagePull*` in progress). `CreateContainerConfigError`
+/// is deliberately NOT here: Pod-first/Secret-second makes it transient by
+/// design, so it is graced in `runner_status` (M6).
 fn fatal_waiting(reason: Option<&str>) -> bool {
     matches!(
         reason,
         Some("ImagePullBackOff")
             | Some("ErrImagePull")
             | Some("InvalidImageName")
-            | Some("CreateContainerConfigError")
             | Some("CreateContainerError")
             | Some("RunContainerError")
     )
@@ -303,12 +347,19 @@ impl ExecutionProvider for KubernetesProvider {
     async fn collect_artifacts(
         &self,
         handle: Option<&SandboxHandle>,
-        _ctx: &CollectContext,
+        ctx: &CollectContext,
     ) -> Result<CollectedArtifacts, ProviderError> {
         let Some(handle) = handle else {
-            return Ok(CollectedArtifacts::Missing {
-                reason: "no sandbox handle (pod never provisioned)".into(),
-            });
+            // Pre-launch failure: no pod ever existed, so the control-plane
+            // copy of the materialized workspace is authoritative (and
+            // untouched). Collect it exactly like the host-dir provider so a
+            // pre-launch K8s failure records "(no changes)" — Docker parity,
+            // not artifact_missing noise (L9).
+            let data_dir = self.data_dir.clone();
+            let ctx = ctx.clone();
+            return tokio::task::spawn_blocking(move || collect_from_workspace(&data_dir, &ctx))
+                .await
+                .map_err(|e| ProviderError::Other(format!("collection task panicked: {e}")));
         };
         let name = &handle.external_id;
 
@@ -583,6 +634,34 @@ fn stream_target(raw: &[u8]) -> Option<(usize, u64)> {
     Some((nl + 1, bytes))
 }
 
+/// Collect from the CONTROL-PLANE copy of the workspace — the same transport
+/// (and the same shared collection engine) the Docker provider always uses.
+/// Only correct when no pod ever consumed/mutated anything, i.e. the
+/// no-handle pre-launch path (L9).
+fn collect_from_workspace(data_dir: &Path, ctx: &CollectContext) -> CollectedArtifacts {
+    let root = fluidbox_workspace::session_workspace_root(data_dir, ctx.session_id);
+    match fluidbox_workspace::collect_diff(
+        &root,
+        ctx.base_commit.as_deref(),
+        &fluidbox_workspace::DiffCaps::default(),
+    ) {
+        fluidbox_workspace::CollectionOutcome::Diff(d) => {
+            CollectedArtifacts::Collected(vec![CollectedArtifact {
+                kind: "diff".into(),
+                name: "changes.patch".into(),
+                content: d.patch,
+                content_type: "text/x-diff".into(),
+                truncated: d.truncated,
+                sha256: d.sha256,
+                bytes: d.bytes,
+            }])
+        }
+        fluidbox_workspace::CollectionOutcome::Missing { reason } => {
+            CollectedArtifacts::Missing { reason }
+        }
+    }
+}
+
 /// Build a Pod ObjectMeta helper (kept for symmetry / future adoption code).
 #[allow(dead_code)]
 fn meta(name: &str) -> ObjectMeta {
@@ -595,6 +674,7 @@ fn meta(name: &str) -> ObjectMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::INIT_CONTAINER;
     use k8s_openapi::api::core::v1::{
         ContainerState, ContainerStateRunning, ContainerStateTerminated, ContainerStateWaiting,
         ContainerStatus, PodStatus,
@@ -696,6 +776,129 @@ mod tests {
             runner_status(&pod_with(None, vec![init])),
             SandboxStatus::Terminated { .. }
         ));
+    }
+
+    #[test]
+    fn deleting_pod_maps_to_unknown_even_with_stale_running_status() {
+        // Node loss / eviction: deletionTimestamp lands while the (stale)
+        // container status still says running — the sandbox must stop
+        // reporting live so the watchdog can act (M7).
+        let st = ContainerState {
+            running: Some(ContainerStateRunning::default()),
+            ..Default::default()
+        };
+        let mut pod = pod_with(Some(st), vec![]);
+        pod.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::now(),
+            ));
+        let status = runner_status(&pod);
+        assert!(
+            matches!(status, SandboxStatus::Unknown { .. }),
+            "deleting pod must be Unknown, got {status:?}"
+        );
+        assert!(!status.is_live());
+    }
+
+    #[test]
+    fn phase_unknown_maps_to_unknown_not_pending() {
+        // Kubelet unreachable: phase Unknown with no container detail used to
+        // fall through to Pending — a live status — forever (M7).
+        let mut pod = pod_with(None, vec![]);
+        pod.status.as_mut().unwrap().phase = Some("Unknown".into());
+        let status = runner_status(&pod);
+        assert!(
+            matches!(status, SandboxStatus::Unknown { .. }),
+            "phase Unknown must map to Unknown, got {status:?}"
+        );
+    }
+
+    #[test]
+    fn config_error_is_graced_while_fresh_fatal_once_persistent() {
+        // Pod-first/Secret-second guarantees a CreateContainerConfigError
+        // window before the Secret lands — transient by design (M6). Fresh
+        // pod → Pending; persisting past the grace → fatal.
+        let waiting = ContainerState {
+            waiting: Some(ContainerStateWaiting {
+                reason: Some("CreateContainerConfigError".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let now = k8s_openapi::jiff::Timestamp::now();
+        let mut pod = pod_with(Some(waiting.clone()), vec![]);
+        pod.metadata.creation_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(now));
+        assert!(
+            matches!(runner_status(&pod), SandboxStatus::Pending { .. }),
+            "config error inside the Secret window must be Pending"
+        );
+
+        pod.metadata.creation_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::from_second(
+                    now.as_second() - (CONFIG_ERROR_GRACE_SECS + 60),
+                )
+                .unwrap(),
+            ));
+        assert!(
+            matches!(runner_status(&pod), SandboxStatus::Terminated { .. }),
+            "config error persisting past the grace must be fatal"
+        );
+
+        // The same grace applies on the init-container path.
+        let init = ContainerStatus {
+            name: INIT_CONTAINER.into(),
+            state: Some(waiting),
+            ..Default::default()
+        };
+        let mut pod = pod_with(None, vec![init]);
+        pod.metadata.creation_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(now));
+        assert!(matches!(runner_status(&pod), SandboxStatus::Pending { .. }));
+    }
+
+    #[test]
+    fn no_handle_collects_the_local_workspace_like_docker() {
+        // L9: a pre-launch failure with a materialized workspace must yield
+        // the same "(no changes)" a Docker run records — the control-plane
+        // copy is authoritative (no pod ever existed), not artifact noise.
+        let tmp = std::env::temp_dir().join(format!("fbx-k8s-l9-{}", Uuid::now_v7()));
+        let src = tmp.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), "hello\n").unwrap();
+        let data_dir = tmp.join("data");
+        let session_id = Uuid::now_v7();
+        let ws = fluidbox_workspace::materialize_local(&data_dir, session_id, &src).unwrap();
+
+        let ctx = CollectContext {
+            session_id,
+            base_commit: ws.base_commit.clone(),
+        };
+        match collect_from_workspace(&data_dir, &ctx) {
+            CollectedArtifacts::Collected(arts) => {
+                assert_eq!(arts.len(), 1);
+                assert_eq!(arts[0].kind, "diff");
+                assert!(
+                    arts[0].content.is_empty(),
+                    "untouched workspace must diff empty, got: {}",
+                    arts[0].content
+                );
+            }
+            CollectedArtifacts::Missing { reason } => panic!("unexpected missing: {reason}"),
+        }
+
+        // Never-materialized workspace stays Missing (suppressed upstream by
+        // expected_diff=false).
+        let ctx2 = CollectContext {
+            session_id: Uuid::now_v7(),
+            base_commit: None,
+        };
+        assert!(matches!(
+            collect_from_workspace(&data_dir, &ctx2),
+            CollectedArtifacts::Missing { .. }
+        ));
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     fn diff_sha(body: &[u8]) -> String {

@@ -57,7 +57,115 @@ pub fn spawn_all(state: AppState) {
     if state.provider.workspace_transport() == fluidbox_core::traits::WorkspaceTransport::Archive {
         tokio::spawn(archive_ttl_sweep(state.clone()));
     }
+    tokio::spawn(reconcile_managed(state.clone()));
     tokio::spawn(finalize_worker(state));
+}
+
+/// What the periodic reconcile does with one managed sandbox (M5). Pure so
+/// the decision table is unit-testable.
+#[derive(Debug, PartialEq, Eq)]
+enum ReconcileAction {
+    /// Orphan (unknown session) or leak (terminal session): kill the sandbox.
+    Terminate,
+    /// Live session that lost the crash race between provision and
+    /// `set_sandbox_handle`: persist the handle so every sweeper sees it.
+    Adopt,
+    /// Healthy, or owned by the finalizer (winding down): never touch.
+    Leave,
+}
+
+fn reconcile_action(
+    status: Option<fluidbox_core::state::SessionStatus>,
+    has_handle: bool,
+) -> ReconcileAction {
+    match status {
+        None => ReconcileAction::Terminate,
+        Some(s) if s.is_terminal() => ReconcileAction::Terminate,
+        // The finalizer owns winding-down sandboxes — collection may be in
+        // flight; it reaps on completion, and recovery re-drives it.
+        Some(s) if s.is_winding_down() => ReconcileAction::Leave,
+        Some(_) if !has_handle => ReconcileAction::Adopt,
+        Some(_) => ReconcileAction::Leave,
+    }
+}
+
+/// Periodic managed-sandbox reconcile (M5) — the boot sweep, made continuous
+/// and adoption-capable. Closes two windows the boot-only sweep left open:
+/// a crash between `provision` and `set_sandbox_handle` produced a session
+/// invisible to EVERY sweeper at once (heartbeats refresh `updated_at`, the
+/// boot sweep skips live sessions, the budget sweeper needs `running`) with a
+/// pod nobody owned; and a cancel-during-provisioning reaped before the
+/// handle landed, leaking the pod until the next restart.
+async fn reconcile_managed(state: AppState) {
+    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        tick.tick().await;
+        let managed = match state.provider.list_managed().await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("reconcile: list_managed failed: {e}");
+                continue;
+            }
+        };
+        for (session_id, handle) in managed {
+            let session = match fluidbox_db::get_session(&state.pool, session_id).await {
+                Ok(s) => s,
+                // A transient DB error is NOT proof the session is unknown —
+                // unlike the boot sweep, a periodic worker must never kill a
+                // possibly-live sandbox on a blip. Next tick retries.
+                Err(e) => {
+                    tracing::warn!("reconcile: session lookup {session_id} failed: {e}");
+                    continue;
+                }
+            };
+            let status = session.as_ref().map(|s| s.status_enum());
+            let has_handle = session
+                .as_ref()
+                .map(|s| s.sandbox_handle.is_some())
+                .unwrap_or(false);
+            match reconcile_action(status, has_handle) {
+                ReconcileAction::Leave => {}
+                ReconcileAction::Terminate => {
+                    tracing::info!(
+                        "reconcile: terminating sandbox {} (session {session_id}: {})",
+                        handle.external_id,
+                        status.map(|s| s.as_str()).unwrap_or("unknown"),
+                    );
+                    let _ = state.provider.terminate(&handle).await;
+                }
+                ReconcileAction::Adopt => {
+                    // The handle from list_managed carries the LIVE object's
+                    // UID (validated there: session label, namespace, uid) —
+                    // every later mutation is preconditioned on it.
+                    let Ok(v) = serde_json::to_value(&handle) else {
+                        continue;
+                    };
+                    if fluidbox_db::set_sandbox_handle(&state.pool, session_id, &v)
+                        .await
+                        .is_ok()
+                    {
+                        tracing::warn!(
+                            "reconcile: adopted sandbox {} for handle-less session {session_id}",
+                            handle.external_id,
+                        );
+                        crate::ledger::record(
+                            &state,
+                            session_id,
+                            fluidbox_core::event::Actor::System,
+                            fluidbox_core::event::EventBody::AgentMessage {
+                                role: "system".into(),
+                                text: format!(
+                                    "sandbox adopted after control-plane interruption ({})",
+                                    handle.external_id.chars().take(48).collect::<String>()
+                                ),
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The stored-archive leak backstop (L3): archives are deleted at finalize —
@@ -346,5 +454,50 @@ async fn finalize_worker(state: AppState) {
     loop {
         tick.tick().await;
         recover_finalizations(&state).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluidbox_core::state::SessionStatus;
+
+    #[test]
+    fn reconcile_decision_table() {
+        use ReconcileAction::*;
+        // Unknown session → the pod is an orphan: terminate.
+        assert_eq!(reconcile_action(None, false), Terminate);
+        assert_eq!(reconcile_action(None, true), Terminate);
+        // Terminal session → the pod is a leak: terminate.
+        assert_eq!(
+            reconcile_action(Some(SessionStatus::Completed), true),
+            Terminate
+        );
+        assert_eq!(
+            reconcile_action(Some(SessionStatus::Cancelled), false),
+            Terminate
+        );
+        // Winding down → the finalizer owns the pod (collection may be in
+        // flight): never touch it here.
+        assert_eq!(
+            reconcile_action(Some(SessionStatus::Cancelling), true),
+            Leave
+        );
+        assert_eq!(
+            reconcile_action(Some(SessionStatus::Finalizing), false),
+            Leave
+        );
+        // Active session without a handle → the M5 crash window: adopt.
+        assert_eq!(
+            reconcile_action(Some(SessionStatus::Initializing), false),
+            Adopt
+        );
+        assert_eq!(reconcile_action(Some(SessionStatus::Running), false), Adopt);
+        // Active session with its handle → healthy: leave.
+        assert_eq!(reconcile_action(Some(SessionStatus::Running), true), Leave);
+        assert_eq!(
+            reconcile_action(Some(SessionStatus::AwaitingApproval), true),
+            Leave
+        );
     }
 }
