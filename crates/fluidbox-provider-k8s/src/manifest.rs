@@ -169,7 +169,22 @@ pub fn build_pod(spec: &SandboxSpec, cfg: &K8sConfig) -> Value {
         ],
     });
 
-    // Cluster-policy scheduling knobs, applied only when set.
+    apply_cluster_policy(&mut pod_spec, cfg);
+
+    json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": name, "labels": labels(spec.session_id) },
+        "spec": pod_spec,
+    })
+}
+
+/// Cluster-policy scheduling + registry knobs shared by EVERY pod this
+/// provider creates in the sandbox namespace (sandbox pods and the netpol
+/// probe — the probe must land on the same pool or the gate certifies the
+/// wrong nodes). Applied only when set, so unset knobs stay absent rather
+/// than rendering as null/[].
+pub(crate) fn apply_cluster_policy(pod_spec: &mut Value, cfg: &K8sConfig) {
     if let Some(rc) = &cfg.runtime_class_name {
         pod_spec["runtimeClassName"] = json!(rc);
     }
@@ -190,16 +205,19 @@ pub fn build_pod(spec: &SandboxSpec, cfg: &K8sConfig) -> Value {
             .iter()
             .map(|t| json!({
                 "key": t.key, "operator": t.operator, "value": t.value, "effect": t.effect,
+                "tolerationSeconds": t.toleration_seconds,
             }))
             .collect::<Vec<_>>());
     }
-
-    json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": { "name": name, "labels": labels(spec.session_id) },
-        "spec": pod_spec,
-    })
+    // Private images: the referenced Secrets must exist in the SANDBOX
+    // namespace (imagePullSecrets are namespace-local).
+    if !cfg.image_pull_secrets.is_empty() {
+        pod_spec["imagePullSecrets"] = json!(cfg
+            .image_pull_secrets
+            .iter()
+            .map(|n| json!({ "name": n }))
+            .collect::<Vec<_>>());
+    }
 }
 
 fn active_deadline(spec: &SandboxSpec, cfg: &K8sConfig) -> i64 {
@@ -290,6 +308,38 @@ mod tests {
         // Three container roles: init + runner + collector.
         assert_eq!(pod["spec"]["initContainers"].as_array().unwrap().len(), 1);
         assert_eq!(pod["spec"]["containers"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pod_tolerations_carry_toleration_seconds() {
+        let mut c = cfg();
+        c.tolerations = vec![crate::config::Toleration {
+            key: Some("node.kubernetes.io/unreachable".into()),
+            operator: Some("Exists".into()),
+            value: None,
+            effect: Some("NoExecute".into()),
+            toleration_seconds: Some(120),
+        }];
+        let pod = build_pod(&spec(), &c);
+        let t = &pod["spec"]["tolerations"][0];
+        assert_eq!(t["effect"], "NoExecute");
+        // A dropped tolerationSeconds would mean "tolerate forever".
+        assert_eq!(t["tolerationSeconds"], 120);
+    }
+
+    #[test]
+    fn pod_carries_image_pull_secrets_only_when_configured() {
+        // Unset (the default env) → the field is absent entirely, not [].
+        let pod = build_pod(&spec(), &cfg());
+        assert!(pod["spec"].get("imagePullSecrets").is_none());
+
+        let mut c = cfg();
+        c.image_pull_secrets = vec!["regcred".into(), "mirror-cred".into()];
+        let pod = build_pod(&spec(), &c);
+        let refs = pod["spec"]["imagePullSecrets"].as_array().unwrap();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0]["name"], "regcred");
+        assert_eq!(refs[1]["name"], "mirror-cred");
     }
 
     #[test]
