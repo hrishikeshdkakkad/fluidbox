@@ -146,16 +146,6 @@ pub async fn pending_finalizations(pool: &PgPool) -> sqlx::Result<Vec<Uuid>> {
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
-pub async fn pending_approvals(pool: &PgPool) -> sqlx::Result<Vec<ApprovalRow>> {
-    sqlx::query_as(concat!(
-        "select ",
-        approval_cols!(),
-        " from approvals where status = 'pending' order by requested_at"
-    ))
-    .fetch_all(pool)
-    .await
-}
-
 pub async fn expire_stale_approvals(pool: &PgPool) -> sqlx::Result<Vec<ApprovalRow>> {
     sqlx::query_as(concat!(
         "update approvals set status = 'expired', decided_at = now(), decided_by = 'timeout'
