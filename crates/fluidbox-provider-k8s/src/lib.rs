@@ -369,13 +369,26 @@ impl ExecutionProvider for KubernetesProvider {
             // Distinguish by looking for the deterministically-named pod.
             let name = object_name(ctx.session_id);
             match self.pods.get_opt(&name).await {
-                Ok(Some(pod))
+                Ok(Some(pod)) => {
+                    // A pod under this session's deterministic name EXISTS.
+                    // Label match → it is ours: collect its worktree. Label
+                    // missing/mismatched → we cannot prove whose it is, and
+                    // the local fallback could contradict its real worktree —
+                    // record Missing honestly instead of guessing.
                     if pod.labels().get(LABEL_SESSION).map(String::as_str)
-                        == Some(ctx.session_id.to_string().as_str()) =>
-                {
-                    return self.collect_via_exec(&name).await;
+                        == Some(ctx.session_id.to_string().as_str())
+                    {
+                        return self.collect_via_exec(&name).await;
+                    }
+                    return Ok(CollectedArtifacts::Missing {
+                        reason: format!(
+                            "pod {name} exists without this session's label — refusing to guess"
+                        ),
+                    });
                 }
-                Ok(_) => {
+                Ok(None) => {
+                    // VERIFIED absence: no pod ever survived to run, so the
+                    // control-plane copy is authoritative (Docker parity).
                     let data_dir = self.data_dir.clone();
                     let ctx = ctx.clone();
                     return tokio::task::spawn_blocking(move || {
