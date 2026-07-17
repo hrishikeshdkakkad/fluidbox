@@ -126,7 +126,7 @@ Per-organization, IdP-agnostic OIDC (identity design v5). fluidbox is a generic 
 | JIT provisioning with claim→role mapping | **Supported (Phase B)** | `sub` is never mappable; `owner` never minted from IdP claims absent explicit operator opt-in. |
 | Personal API tokens (`fbx_pat_`) | **Supported (Phase B)** | Browser-session-minted only; a PAT can never mint/extend/revoke PATs; 90-day default TTL, 1-year max; membership rechecked on every use. |
 | Break-glass / bootstrap | **Supported (Phase B)** | The operator admin token on the explicit `/v1/admin/*` surface; single-winner first-owner claim; fully audited. |
-| Single-admin mode (no IdP configured) | **Supported (unchanged)** | Multi-user is derived per organization; with no active IdP config, today's admin-token behavior continues exactly. |
+| Single-admin mode (no IdP configured) | **Supported (unchanged)** | Multi-user is derived per organization, but the proxy's credential mode is static per deployment: in a local/dev deployment running `FLUIDBOX_WEB_MODE=admin`, today's admin-token behavior continues exactly. In a hosted `sso` deployment the proxy carries no admin token at all — IdP-less organizations there are reachable only through bearer-authenticated `/v1/admin/*` routes, never the browser. |
 | SAML | **Never (directly)** | SAML-only enterprises bridge via Dex/Keycloak on their side. |
 | Password store / MFA enforcement / account recovery | **Never** | The IdP owns authentication; fluidbox owns sessions and authorization. `acr`/`amr` are recorded; assurance is derived only from operator-configured mappings. |
 | SCIM provisioning; email-domain login routing | Deferred | JIT + slug URLs cover v1. |
@@ -144,7 +144,7 @@ All entry points converge on the same governed run path (`run_service::create_ru
 | Dashboard | User (browser session) | **Supported (Phase B)** — today via the admin-token proxy |
 | Authenticated API / CLI | User (PAT) | **Supported (Phase B)** |
 | API trigger (`POST /v1/triggers/{id}/invoke`) | Trigger token (subscription-scoped) | **Supported** — a trigger token can poll only the runs it created |
-| Webhook (`/v1/ingress/*`) | Webhook (signature-verified) | **Supported** — HMAC against the connection's sealed secret is the authentication |
+| Webhook (`/v1/ingress/*`) | Webhook (signature-verified) | **Supported** — HMAC is the authentication: against the connection's sealed secret, or the GitHub App registration's sealed secret on the App-level ingress path |
 | Schedule | Schedule principal | **Supported** — exactly-once firing via deterministic idempotency claims |
 
 Fork PRs freeze `TrustTier::ReadOnly` (all MCP tools stripped from the frozen set; enforced above policy and approvals — no approval escape).
@@ -162,7 +162,7 @@ Fork PRs freeze `TrustTier::ReadOnly` (all MCP tools stripped from the frozen se
 | Provider | Status | Role |
 |---|---|---|
 | Kubernetes (`FLUIDBOX_PROVIDER=kubernetes`) | **Supported — the hosted substrate** | Per-run pods in a sandbox namespace under a default-deny `zeroEgress` NetworkPolicy (only the internal control-plane listener `:8788`; no DNS, no public route); run admission gated on a boot-time probe proving enforcement (`FLUIDBOX_REQUIRE_ENFORCED_NETPOL=true`); optional `runtimeClassName` (gVisor/Kata) isolation tiers. See the [network architecture](network-architecture.md). |
-| Docker | **Supported — local-dev only** | Permanent (dual-provider permanence; it is never demoted and never a hosted boundary). The `HostDev` network mode is a local-dev convenience. |
+| Docker | **Supported — local development and single-host self-hosting** | Outside the hosted SaaS boundary. Permanent (dual-provider permanence; it is never demoted). The `HostDev` network mode is a local-dev convenience, never a hosted security boundary. |
 | Future substrates (e.g. MicroVM fleets) | Deferred | Must provide structural guarantees equivalent to the Kubernetes path before hosting runs (Gap 6). |
 
 ## Capability model (settled)

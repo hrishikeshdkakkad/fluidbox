@@ -9,7 +9,7 @@ Admission answers one question: **which remote MCP endpoints may the fluidbox br
 ## Principles
 
 1. **Admission ≠ authorization.** A connector definition contains no user credential and grants no authority. Catalog data — curated or custom — is untrusted reference data: being displayed, verified, or marked curated bypasses none of connection verification, tool-schema validation, policy evaluation, or approvals. The single decision gate remains the judge of every call.
-2. **Fail closed, visibly.** Anything that cannot be positively validated — an unreachable endpoint, a non-conformant discovery document, an unattributable custom row, an unresolvable identity across reauthorization — refuses loudly. Nothing is admitted, bound, or preserved on "probably fine."
+2. **Fail closed, visibly.** Anything that cannot be positively validated — an unreachable endpoint, a non-conformant discovery document, an unattributable custom row — refuses loudly. An account identity that cannot be proven identical across reauthorization does not refuse the reauthorization — it never *preserves* the authorization generation: the generation bumps and old-generation runs fail closed. Nothing is admitted, bound, or preserved on "probably fine."
 3. **The broker is the only MCP egress point.** No other component — and never a sandbox — contacts remote MCP endpoints. Every control below is enforced at that single chokepoint.
 
 ## Definition tiers
@@ -43,7 +43,7 @@ These are permanent boundary statements, not v1 deferrals:
 
 - **Arbitrary control-plane `stdio` execution — ever.** No user-supplied `npx`, shell, or installation commands run in the control-plane environment, regardless of tier, tenant, or role.
 - **Direct reach into a user's machine.** A process on a user's laptop cannot be a hosted connector. Supported alternatives: (1) expose it as an authenticated remote Streamable HTTP endpoint; (2) package a curated, signed, credential-free stdio server into the runner image; (3) run a customer-side outbound relay that brokers a private endpoint.
-- **Private-network scanning via custom endpoints.** Arbitrary custom URLs must never turn the hosted broker into a probe of internal address space — the address-class rules above are unconditional, and private **enterprise** endpoints go through the sanctioned options below instead.
+- **Private-network scanning via custom endpoints.** Arbitrary custom URLs must never turn the hosted broker into a probe of internal address space — the address-class rules admit no self-service exception; private **enterprise** endpoints use only the sanctioned options below.
 - **Credential audience escape.** A credential is bound to its connection's canonical resource URI and base path; the broker refuses to send it anywhere else.
 
 ## Private and enterprise endpoints
@@ -52,7 +52,7 @@ Endpoints that legitimately live on private networks use one of:
 
 1. **Customer-controlled deployment / BYOC** — the customer runs fluidbox where the endpoint is reachable;
 2. **A customer-side outbound relay** — the private endpoint dials out; the hosted broker never dials in; or
-3. **A specifically approved private-network connector** — an explicit, per-destination operator decision with its own review, never a general capability.
+3. **A specifically approved private-network connector** — approval is specific to the connector, never a general capability; the approval mechanics are deliberately not settled by this document.
 
 ## Sandbox stdio class
 
@@ -96,7 +96,7 @@ An admitted connector definition, by itself:
 - holds no credential and cannot be called;
 - appears in no run until an agent revision requires it **and** a run binding resolves a concrete, active, authorized connection for it;
 - confers no policy permission — the frozen set says what *exists* for a run; policy and approvals say what is *allowed*; the sandbox boundary says what is *impossible*; and
-- is never trusted content: names, descriptions, annotations, schemas, and results from any connector are untrusted input end to end (invariant 13).
+- is never trusted content: descriptions, annotations, arguments, and results from any connector are untrusted input end to end (invariant 13), and names and schemas are additionally screened and validated at the registration photograph.
 
 ## Related documents
 
