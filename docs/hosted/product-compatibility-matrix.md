@@ -24,7 +24,7 @@ Phase labels (B–F) refer to the parent design's implementation sequence.
 |---|---|
 | **Tools** (`tools/call`) over **Streamable HTTP** | The only supported upstream MCP primitive and transport. Every call passes the single decision gate (budget → frozen set → schema → trust tier → policy → approval → execution claim) before the upstream is contacted. |
 | Registration-time `tools/list` photograph | Discovery uses its own short-lived client session; names, descriptions, schemas, and annotations are validated (ANSI/zero-width screening, size bounds) and frozen into an append-only snapshot. If `nextCursor` remains after the discovery page cap, discovery **fails** rather than freezing a partial list (Gap 8). |
-| Protocol version `2025-11-25` | Offered at initialization; an explicit supported-version set is maintained; unsupported negotiation is rejected. Runtime negotiation must match the snapshot's protocol version unless an explicit compatibility adapter exists. `MCP-Protocol-Version` is sent on subsequent requests. |
+| Protocol version `2025-11-25` | Offered at initialization; an explicit supported-version set is maintained; unsupported negotiation is rejected. Runtime negotiation must match the snapshot's protocol version unless an explicit compatibility adapter exists. `MCP-Protocol-Version` is sent on subsequent requests. (Gap 8; Phase E — the current broker offers `2025-06-18` and initializes lazily.) |
 | Frozen-schema argument validation | Tool arguments are validated server-side against the frozen input schema (depth/size bounds, no external `$ref` resolution) before trust-tier and policy evaluation. The JSON Schema dialect follows the snapshot's protocol version (`2025-11-25` ⇒ JSON Schema 2020-12, SEP-1613). Rejections surface to the model as tool-execution errors (SEP-1303), never protocol errors. (Gap 12; Phase E.) |
 | Optional `MCP-Session-Id` | Persisted per run binding; treated as routing state, never authentication. The OAuth/static authorization header is sent on every upstream HTTP request. |
 | `outputSchema` / `structuredContent` | Preserved end to end, or the tool is explicitly rejected at registration — never silently dropped (Gap 8; the current snapshot/result path drops both, which Phase E closes). |
@@ -73,17 +73,17 @@ The four objects are independent (parent design, "The multi-user connection mode
 
 | Ownership | Status | Use |
 |---|---|---|
-| Personal connection (`owner_type = user`) | **Supported** | Interactive runs: dashboard, authenticated API. |
-| Organization service connection (`owner_type = organization`) | **Supported** | Schedules, webhooks, org-wide agents, GitHub App installations, unattended automation. |
+| Personal connection (`owner_type = user`) | **Supported (Phase C)** | Interactive runs: dashboard, authenticated API. (Today's connections are tenant-owned — Gap 3.) |
+| Organization service connection (`owner_type = organization`) | **Supported (Phase C)** | Schedules, webhooks, org-wide agents, GitHub App installations, unattended automation. |
 | Unattended **personal** delegation | **Deferred (not in v1)** | A schedule or webhook can never ride a personal connection in v1. Omitted until a concrete customer requirement demands it, with expiry/revocation/membership-loss semantics designed first. |
 
 ### Binding modes at run creation
 
 | Mode | Status | Rule |
 |---|---|---|
-| `invoking_user` | **Supported** | The authenticated invoking user's active personal connection. No unambiguous match ⇒ run creation fails before provisioning — never "latest connection" silently. |
-| Organization service | **Supported** | Administrator-managed org connection; the only mode available to schedules/webhooks (no interactive user exists). |
-| Explicit | **Supported** | Caller supplies a connection ID; fluidbox verifies tenant, caller authorization, requirement satisfaction, scopes, active status, and snapshot coverage. |
+| `invoking_user` | **Supported (Phase C)** | The authenticated invoking user's active personal connection. No unambiguous match ⇒ run creation fails before provisioning — never "latest connection" silently. |
+| Organization service | **Supported (Phase C)** | Administrator-managed org connection; the only mode available to schedules/webhooks (no interactive user exists). |
+| Explicit | **Supported (Phase C)** | Caller supplies a connection ID; fluidbox verifies tenant, caller authorization, requirement satisfaction, scopes, active status, and snapshot coverage. |
 | Delegated personal | **Deferred** | See above. |
 
 ### Requirement satisfaction (settled)
@@ -141,7 +141,7 @@ All entry points converge on the same governed run path (`run_service::create_ru
 
 | Entry point | Principal | Status |
 |---|---|---|
-| Dashboard | User (browser session) | **Supported** |
+| Dashboard | User (browser session) | **Supported (Phase B)** — today via the admin-token proxy |
 | Authenticated API / CLI | User (PAT) | **Supported (Phase B)** |
 | API trigger (`POST /v1/triggers/{id}/invoke`) | Trigger token (subscription-scoped) | **Supported** — a trigger token can poll only the runs it created |
 | Webhook (`/v1/ingress/*`) | Webhook (signature-verified) | **Supported** — HMAC against the connection's sealed secret is the authentication |

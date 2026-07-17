@@ -17,7 +17,7 @@ Admission answers one question: **which remote MCP endpoints may the fluidbox br
 | Tier | Scope | Admitted by | Notes |
 |---|---|---|---|
 | **Curated** | Global reference data, visible to all tenants | fluidbox operators (catalog is managed API-only; no seed file, no boot sync) | Curated entries carry the connector's canonical endpoint/template, transport, OAuth discovery expectations, authentication modes, verification tier, display metadata, optional tool hints, and egress classification. |
-| **Custom** | **Tenant-scoped** | The owning organization, governed by RBAC (an admin-tier action once Phase B lands roles) | One tenant admitting a custom endpoint must never make it visible or bindable to another tenant. Custom entries are forced to the `custom` verification tier. |
+| **Custom** | **Tenant-scoped** | The owning organization, governed by RBAC (which role gates admission is a Phase B/C implementation decision — deliberately not settled here) | One tenant admitting a custom endpoint must never make it visible or bindable to another tenant. Custom entries are forced to the `custom` verification tier. |
 
 **Migration note (settled, Phase C):** today's `connector_catalog` is a global, tenant-less table whose custom rows were admitted by the single boot tenant. Hosted bring-up backfills every existing custom row to a concrete owning tenant; curated rows stay global; a custom row that cannot be attributed is **disabled** — never inherited by every tenant.
 
