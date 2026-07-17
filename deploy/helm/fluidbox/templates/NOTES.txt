@@ -19,7 +19,9 @@ NetworkPolicy gate: requireEnforced={{ .Values.netpol.requireEnforced }}
      https://{{ .Values.ingress.host }}/v1      (API)
 {{- else }}
      kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "fluidbox.serverName" . }} 8787:8787
+{{- if .Values.web.enabled }}
      kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "fluidbox.webName" . }} 3000:3000
+{{- end }}
 {{- end }}
 
 3. Credentials come from the existing Secret "{{ .Values.existingSecret }}"

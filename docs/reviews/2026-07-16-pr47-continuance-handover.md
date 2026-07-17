@@ -16,16 +16,16 @@ in its own stacked `fix/*` PR. Read the original workflow rules in
   tracked residual **L15** (symlinked-*dest*-path hardening; NOT production-
   reachable — fixed pod mounts; needs `openat2 RESOLVE_IN_ROOT`/`cap-std`, a
   maintainer dependency decision — do NOT hand-roll it). Do not reopen H4.
-- **PR #62** batch 4 (`fix/k8s-collect-integrity`, tip `7c7de42`, stacked on
-  #61) — M2 collect integrity + L4-exec.
+- **PR #62** batch 4 (`fix/k8s-collect-integrity`, stacked on #61) — M2
+  collect integrity + L4-exec. (Rebased 2026-07-16: #61 gained `1c6bc5c`
+  fixing a duplicated line from `0e2ddc4` that broke the build; tips moved.)
 - **Batch 2** (H2/H3/H5/M1/L6/L7 finalizer) is a SIBLING session's branch
   `fix/k8s-finalizer-durability` (`4b9d162`, in the main checkout, not yet
   PR'd). DO NOT touch it.
-- **Batch 5 WIP** on `fix/k8s-helm-wiring` (stacked on #62): only
-  `crates/fluidbox-provider-k8s/src/config.rs` done so far — `Toleration`
-  now `Deserialize`s; `from_env` parses `FLUIDBOX_K8S_TOLERATIONS` (JSON
-  array) and `FLUIDBOX_K8S_IMAGE_PULL_SECRETS` (comma list); new
-  `image_pull_secrets` field; unit tests present.
+- **Batch 5 COMPLETE** on `fix/k8s-helm-wiring` (PR #66, stacked on #62):
+  M3/M9/M10/L12 + the chart-assertions script; Codex round 2 hardened
+  toleration fidelity, digest validation, release binding, and ingress
+  pairing. See the findings doc for the full fix notes.
 
 All HIGH merge-blockers resolved (H1 #60, H4 #61, H2/H3/H5 in batch 2). The
 findings doc has live `[x]` checkboxes — flip them per batch, in the same PR.

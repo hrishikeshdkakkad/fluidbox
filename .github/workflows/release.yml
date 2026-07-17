@@ -104,10 +104,13 @@ jobs:
         run: docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ github.repository_owner }}/fluidbox-${{ matrix.image }}:latest
 
   # Publish the Helm chart as an OCI artifact to GHCR alongside the images.
-  # Waits for the images: a chart must never land referencing images that
-  # failed to publish.
+  # Waits for the images, and runs ONLY on version-tag pushes: metadata-action
+  # emits the semver image tags exclusively for push-tag events, so any other
+  # trigger (workflow_dispatch included) would push a chart whose image refs
+  # were never published. Dispatch still builds/pushes images (latest + sha).
   chart:
     needs: publish
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -118,18 +121,14 @@ jobs:
       - name: package + push chart (OCI)
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
-          # On a version tag, bind the chart to this release: --app-version
-          # rewrites appVersion inside the package, and the image defaults
-          # render from .Chart.AppVersion — so the packaged chart pulls
-          # exactly the images this run published (M9).
-          case "$GITHUB_REF" in
-            refs/tags/v*)
-              VERSION="${GITHUB_REF_NAME#v}"
-              helm package deploy/helm/fluidbox --destination /tmp/chart \
-                --version "$VERSION" --app-version "$VERSION"
-              ;;
-            *)
-              helm package deploy/helm/fluidbox --destination /tmp/chart
-              ;;
-          esac
+          # Bind the chart to this release: --app-version rewrites appVersion
+          # inside the package, and the image defaults render from
+          # .Chart.AppVersion — so the packaged chart pulls exactly the images
+          # this run published (M9). Strip semver build metadata: '+' is not
+          # a legal image-tag character, so metadata-action's semver tag never
+          # carries it — the chart must reference what actually got pushed.
+          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION%%+*}"
+          helm package deploy/helm/fluidbox --destination /tmp/chart \
+            --version "$VERSION" --app-version "$VERSION"
           helm push /tmp/chart/fluidbox-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
