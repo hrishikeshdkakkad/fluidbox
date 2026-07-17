@@ -74,18 +74,27 @@ enum ReconcileAction {
     Leave,
 }
 
-fn reconcile_action(
-    status: Option<fluidbox_core::state::SessionStatus>,
-    has_handle: bool,
-) -> ReconcileAction {
-    match status {
-        None => ReconcileAction::Terminate,
-        Some(s) if s.is_terminal() => ReconcileAction::Terminate,
+/// What the reconciler could learn about a sandbox's session. `Unparseable`
+/// is distinct from `Missing` on purpose: an unknown status string means a
+/// NEWER deploy wrote it (statuses are unconstrained text by design) — an
+/// older replica must never read that as "dead" and kill a live sandbox.
+#[derive(Debug, PartialEq, Eq)]
+enum SessionLookup {
+    Missing,
+    Known(fluidbox_core::state::SessionStatus),
+    Unparseable,
+}
+
+fn reconcile_action(session: SessionLookup, has_handle: bool) -> ReconcileAction {
+    match session {
+        SessionLookup::Missing => ReconcileAction::Terminate,
+        SessionLookup::Unparseable => ReconcileAction::Leave,
+        SessionLookup::Known(s) if s.is_terminal() => ReconcileAction::Terminate,
         // The finalizer owns winding-down sandboxes — collection may be in
         // flight; it reaps on completion, and recovery re-drives it.
-        Some(s) if s.is_winding_down() => ReconcileAction::Leave,
-        Some(_) if !has_handle => ReconcileAction::Adopt,
-        Some(_) => ReconcileAction::Leave,
+        SessionLookup::Known(s) if s.is_winding_down() => ReconcileAction::Leave,
+        SessionLookup::Known(_) if !has_handle => ReconcileAction::Adopt,
+        SessionLookup::Known(_) => ReconcileAction::Leave,
     }
 }
 
@@ -118,49 +127,74 @@ async fn reconcile_managed(state: AppState) {
                     continue;
                 }
             };
-            let status = session.as_ref().map(|s| s.status_enum());
+            // STRICT status parse — never status_enum(), whose unparseable→
+            // Failed fallback would read a newer deploy's status as terminal.
+            let lookup = match &session {
+                None => SessionLookup::Missing,
+                Some(s) => match fluidbox_core::state::SessionStatus::parse(&s.status) {
+                    Some(st) => SessionLookup::Known(st),
+                    None => {
+                        tracing::warn!(
+                            "reconcile: session {session_id} has unknown status '{}' \
+                             (newer deploy?); leaving its sandbox alone",
+                            s.status
+                        );
+                        SessionLookup::Unparseable
+                    }
+                },
+            };
             let has_handle = session
                 .as_ref()
                 .map(|s| s.sandbox_handle.is_some())
                 .unwrap_or(false);
-            match reconcile_action(status, has_handle) {
+            let label = session
+                .as_ref()
+                .map(|s| s.status.clone())
+                .unwrap_or_else(|| "unknown".into());
+            match reconcile_action(lookup, has_handle) {
                 ReconcileAction::Leave => {}
                 ReconcileAction::Terminate => {
                     tracing::info!(
-                        "reconcile: terminating sandbox {} (session {session_id}: {})",
+                        "reconcile: terminating sandbox {} (session {session_id}: {label})",
                         handle.external_id,
-                        status.map(|s| s.as_str()).unwrap_or("unknown"),
                     );
                     let _ = state.provider.terminate(&handle).await;
                 }
                 ReconcileAction::Adopt => {
                     // The handle from list_managed carries the LIVE object's
                     // UID (validated there: session label, namespace, uid) —
-                    // every later mutation is preconditioned on it.
+                    // every later mutation is preconditioned on it. The
+                    // adoption itself is a GUARDED update (handle still null,
+                    // status still active), so racing run()'s own
+                    // set_sandbox_handle, a concurrent cancel, or a terminal
+                    // transition can never be overwritten or resurrected.
                     let Ok(v) = serde_json::to_value(&handle) else {
                         continue;
                     };
-                    if fluidbox_db::set_sandbox_handle(&state.pool, session_id, &v)
-                        .await
-                        .is_ok()
-                    {
-                        tracing::warn!(
-                            "reconcile: adopted sandbox {} for handle-less session {session_id}",
-                            handle.external_id,
-                        );
-                        crate::ledger::record(
-                            &state,
-                            session_id,
-                            fluidbox_core::event::Actor::System,
-                            fluidbox_core::event::EventBody::AgentMessage {
-                                role: "system".into(),
-                                text: format!(
-                                    "sandbox adopted after control-plane interruption ({})",
-                                    handle.external_id.chars().take(48).collect::<String>()
-                                ),
-                            },
-                        )
-                        .await;
+                    match fluidbox_db::adopt_sandbox_handle(&state.pool, session_id, &v).await {
+                        Ok(true) => {
+                            tracing::warn!(
+                                "reconcile: adopted sandbox {} for handle-less session {session_id}",
+                                handle.external_id,
+                            );
+                            crate::ledger::record(
+                                &state,
+                                session_id,
+                                fluidbox_core::event::Actor::System,
+                                fluidbox_core::event::EventBody::AgentMessage {
+                                    role: "system".into(),
+                                    text: format!(
+                                        "sandbox adopted after control-plane interruption ({})",
+                                        handle.external_id.chars().take(48).collect::<String>()
+                                    ),
+                                },
+                            )
+                            .await;
+                        }
+                        Ok(false) => {} // Lost the race to run()/cancel — correct.
+                        Err(e) => {
+                            tracing::warn!("reconcile: adoption of {session_id} failed: {e}")
+                        }
                     }
                 }
             }
@@ -236,13 +270,21 @@ async fn archive_ttl_sweep(state: AppState) {
     }
 }
 
-/// A healthy orchestrator moves created → provisioning → initializing in
-/// seconds (initializing: minutes at worst for a big repo copy). Older than
-/// this, the control plane died mid-launch and nothing owns the session.
-const STALE_LAUNCH_MINS: i32 = 15;
+/// Launch age is measured from `created_at` — a timestamp heartbeats can NOT
+/// refresh (M5) — so this is an ABSOLUTE deadline for the whole launch
+/// (materialize + pack + provision), not a progress detector. 30 min covers
+/// a large repo comfortably; operators with outliers can raise it via
+/// `FLUIDBOX_STALE_LAUNCH_MINS`.
+fn stale_launch_mins() -> i32 {
+    std::env::var("FLUIDBOX_STALE_LAUNCH_MINS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30)
+}
 
 /// Fail sessions whose sandbox died or whose heartbeat went stale.
 async fn watchdog(state: AppState) {
+    let stale_launch_mins = stale_launch_mins();
     let mut tick = tokio::time::interval(Duration::from_secs(15));
     loop {
         tick.tick().await;
@@ -276,14 +318,14 @@ async fn watchdog(state: AppState) {
         }
 
         // Sessions stuck before launch (created/provisioning/initializing).
-        match fluidbox_db::stale_nonstarted_sessions(&state.pool, STALE_LAUNCH_MINS).await {
+        match fluidbox_db::stale_nonstarted_sessions(&state.pool, stale_launch_mins).await {
             Ok(stale) => {
                 for s in stale {
                     tracing::warn!(
                         "watchdog: {} stalled in '{}' for >{}m — failing",
                         s.id,
                         s.status,
-                        STALE_LAUNCH_MINS
+                        stale_launch_mins
                     );
                     orchestrator::fail(
                         &state,
@@ -465,38 +507,47 @@ mod tests {
     #[test]
     fn reconcile_decision_table() {
         use ReconcileAction::*;
+        use SessionLookup::*;
         // Unknown session → the pod is an orphan: terminate.
-        assert_eq!(reconcile_action(None, false), Terminate);
-        assert_eq!(reconcile_action(None, true), Terminate);
+        assert_eq!(reconcile_action(Missing, false), Terminate);
+        assert_eq!(reconcile_action(Missing, true), Terminate);
+        // A session row whose status this binary cannot parse was written by
+        // a NEWER deploy — that is not proof of death. Never terminate on it
+        // (Codex round 2: status_enum's Failed fallback would have).
+        assert_eq!(reconcile_action(Unparseable, false), Leave);
+        assert_eq!(reconcile_action(Unparseable, true), Leave);
         // Terminal session → the pod is a leak: terminate.
         assert_eq!(
-            reconcile_action(Some(SessionStatus::Completed), true),
+            reconcile_action(Known(SessionStatus::Completed), true),
             Terminate
         );
         assert_eq!(
-            reconcile_action(Some(SessionStatus::Cancelled), false),
+            reconcile_action(Known(SessionStatus::Cancelled), false),
             Terminate
         );
         // Winding down → the finalizer owns the pod (collection may be in
         // flight): never touch it here.
         assert_eq!(
-            reconcile_action(Some(SessionStatus::Cancelling), true),
+            reconcile_action(Known(SessionStatus::Cancelling), true),
             Leave
         );
         assert_eq!(
-            reconcile_action(Some(SessionStatus::Finalizing), false),
+            reconcile_action(Known(SessionStatus::Finalizing), false),
             Leave
         );
         // Active session without a handle → the M5 crash window: adopt.
         assert_eq!(
-            reconcile_action(Some(SessionStatus::Initializing), false),
+            reconcile_action(Known(SessionStatus::Initializing), false),
             Adopt
         );
-        assert_eq!(reconcile_action(Some(SessionStatus::Running), false), Adopt);
-        // Active session with its handle → healthy: leave.
-        assert_eq!(reconcile_action(Some(SessionStatus::Running), true), Leave);
         assert_eq!(
-            reconcile_action(Some(SessionStatus::AwaitingApproval), true),
+            reconcile_action(Known(SessionStatus::Running), false),
+            Adopt
+        );
+        // Active session with its handle → healthy: leave.
+        assert_eq!(reconcile_action(Known(SessionStatus::Running), true), Leave);
+        assert_eq!(
+            reconcile_action(Known(SessionStatus::AwaitingApproval), true),
             Leave
         );
     }

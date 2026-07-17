@@ -304,13 +304,25 @@ async fn collect_and_terminalize(
         || session.base_commit.is_some()
         || session.sandbox_handle.is_some();
 
+    // A PRESENT-but-unreadable handle is schema drift, not "no sandbox":
+    // passing None to the provider would collect the untouched control-plane
+    // workspace copy and could store a false "(no changes)" over real agent
+    // work. Record the failure honestly instead.
+    let (handle, handle_unreadable): (Option<SandboxHandle>, bool) = match &session.sandbox_handle {
+        None => (None, false),
+        Some(j) => match serde_json::from_value(j.clone()) {
+            Ok(h) => (Some(h), false),
+            Err(e) => {
+                tracing::error!("session {id} has an unreadable sandbox_handle: {e}");
+                (None, true)
+            }
+        },
+    };
     if skip_collection {
         record_missing(state, id, "quiesce_timeout").await;
+    } else if handle_unreadable {
+        record_missing(state, id, "sandbox handle unreadable (schema drift?)").await;
     } else {
-        let handle: Option<SandboxHandle> = session
-            .sandbox_handle
-            .clone()
-            .and_then(|j| serde_json::from_value(j).ok());
         let ctx = CollectContext {
             session_id: id,
             base_commit: session.base_commit.clone(),
