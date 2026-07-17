@@ -75,6 +75,12 @@ pub struct Config {
     /// ClusterIP at boot for the runner's no-DNS control URL under zeroEgress.
     pub internal_service: Option<String>,
     pub internal_service_namespace: Option<String>,
+    /// Compressed workspace-archive ceiling: packing streams to disk and a
+    /// run whose archive would exceed this fails cleanly at zero model spend.
+    pub max_archive_bytes: u64,
+    /// TTL for the stored-archive sweep (the leak backstop). The archive is
+    /// single-use init transport — anything older than this is a leak.
+    pub archive_ttl_secs: u64,
 }
 
 /// Serialized runner-env ceiling: env injection is the v1 config channel
@@ -152,6 +158,14 @@ impl Config {
             internal_service_namespace: get("FLUIDBOX_INTERNAL_SERVICE_NAMESPACE")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            max_archive_bytes: get("FLUIDBOX_MAX_ARCHIVE_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2 * 1024 * 1024 * 1024), // 2 GiB
+            archive_ttl_secs: get("FLUIDBOX_ARCHIVE_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(24 * 3600),
         })
     }
 }
