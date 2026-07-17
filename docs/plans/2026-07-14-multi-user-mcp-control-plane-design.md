@@ -1191,8 +1191,8 @@ Required for hosted multi-tenant use:
   (legacy-unseal, KMS-reseal) over every sealed row — connections, GitHub
   App private keys, webhook and subscription delivery secrets, and the
   identity layer's sealed families (`org_idp_configs.client_secret_sealed`,
-  `login_flows.pkce_verifier_sealed`,
-  `user_sessions.refresh_token_sealed`) — resumable,
+  `login_flows.pkce_verifier_sealed`; refresh tokens are not stored in the
+  identity layer's v1) — resumable,
   count-parity verified, the legacy key retired only after 100% re-seal
   (rotating the key without this step orphans every stored credential); and
 - tested disaster recovery.
