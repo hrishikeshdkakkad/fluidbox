@@ -66,6 +66,10 @@ pub struct AppStateInner {
     /// NetworkPolicy. `create_run` refuses while false + require_enforced_netpol
     /// (fails closed). Always true for Docker (a different isolation model).
     pub netpol_verified: std::sync::atomic::AtomicBool,
+    /// OIDC login runtime: the generation-keyed JWKS cache (singleflight
+    /// refresh + negative-kid cache) and the fixed-window login rate counters.
+    /// In-memory, single-replica (v1); a restart re-seeds from the DB caches.
+    pub oidc: crate::login::OidcRuntime,
 }
 
 pub type AppState = Arc<AppStateInner>;
