@@ -214,8 +214,11 @@ pub fn spawn_netpol_gate(state: AppState) {
             .strip_suffix("-internal")
             .map(|p| format!("{p}-server"))
             .unwrap_or_else(|| internal_svc.clone());
-        let sandbox_ns =
-            std::env::var("FLUIDBOX_K8S_NAMESPACE").unwrap_or_else(|_| "fluidbox-sandboxes".into());
+        // The probe must carry the SANDBOX placement (nodeSelector,
+        // tolerations, runtimeClass, priorityClass, pull secrets) so the gate
+        // certifies the pool sandboxes actually run on — same env the
+        // provider itself reads.
+        let k8s_cfg = fluidbox_provider_k8s::config::K8sConfig::from_env();
 
         let mut tick = tokio::time::interval(Duration::from_secs(6 * 3600));
         loop {
@@ -232,7 +235,7 @@ pub fn spawn_netpol_gate(state: AppState) {
             match (internal_ip, public_ip) {
                 (Some(i), Some(p)) => {
                     let r = fluidbox_provider_k8s::netpol::verify_netpol(
-                        &sandbox_ns,
+                        &k8s_cfg,
                         &state.cfg.netpol_probe_image,
                         &i,
                         &p,

@@ -113,7 +113,7 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: server
-          image: "{{ .Values.images.server.repository }}:{{ .Values.images.server.tag }}"
+          image: {{ include "fluidbox.imageRef" (dict "image" .Values.images.server "ctx" $) | quote }}
           imagePullPolicy: {{ .Values.images.server.pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false
@@ -128,11 +128,35 @@ spec:
             - { name: FLUIDBOX_DATA_DIR, value: "/var/lib/fluidbox" }
             - { name: FLUIDBOX_PROVIDER, value: "kubernetes" }
             - { name: FLUIDBOX_K8S_NAMESPACE, value: {{ $sandboxNs | quote }} }
-            - { name: FLUIDBOX_COLLECTOR_IMAGE, value: {{ .Values.images.collector | quote }} }
-            - { name: FLUIDBOX_SANDBOX_IMAGE, value: {{ .Values.images.sandboxRunner | quote }} }
-            - { name: FLUIDBOX_CODEX_SANDBOX_IMAGE, value: {{ .Values.images.codexRunner | quote }} }
+            - { name: FLUIDBOX_COLLECTOR_IMAGE, value: {{ include "fluidbox.flatImage" (dict "value" .Values.images.collector "name" "workspaced" "ctx" $) | quote }} }
+            - { name: FLUIDBOX_SANDBOX_IMAGE, value: {{ include "fluidbox.flatImage" (dict "value" .Values.images.sandboxRunner "name" "sandbox-runner" "ctx" $) | quote }} }
+            - { name: FLUIDBOX_CODEX_SANDBOX_IMAGE, value: {{ include "fluidbox.flatImage" (dict "value" .Values.images.codexRunner "name" "codex-runner" "ctx" $) | quote }} }
             {{- with .Values.sandbox.runtimeClassName }}
             - { name: FLUIDBOX_K8S_RUNTIME_CLASS, value: {{ . | quote }} }
+            {{- end }}
+            # Sandbox pod baseline + placement: values.sandbox.* → the exact
+            # FLUIDBOX_K8S_* env K8sConfig::from_env reads (M3).
+            - { name: FLUIDBOX_K8S_RUN_AS_USER, value: {{ .Values.sandbox.runAsUser | quote }} }
+            - { name: FLUIDBOX_K8S_CPU_REQUEST, value: {{ .Values.sandbox.resources.requests.cpu | quote }} }
+            - { name: FLUIDBOX_K8S_MEM_REQUEST, value: {{ .Values.sandbox.resources.requests.memory | quote }} }
+            - { name: FLUIDBOX_K8S_EPHEMERAL_REQUEST, value: {{ .Values.sandbox.resources.requests.ephemeralStorage | quote }} }
+            - { name: FLUIDBOX_K8S_CPU_LIMIT, value: {{ .Values.sandbox.resources.limits.cpu | quote }} }
+            - { name: FLUIDBOX_K8S_MEM_LIMIT, value: {{ .Values.sandbox.resources.limits.memory | quote }} }
+            - { name: FLUIDBOX_K8S_EPHEMERAL_LIMIT, value: {{ .Values.sandbox.resources.limits.ephemeralStorage | quote }} }
+            - { name: FLUIDBOX_K8S_VOLUME_SIZE_LIMIT, value: {{ .Values.sandbox.volumeSizeLimit | quote }} }
+            {{- with .Values.sandbox.priorityClassName }}
+            - { name: FLUIDBOX_K8S_PRIORITY_CLASS, value: {{ . | quote }} }
+            {{- end }}
+            {{- if .Values.sandbox.nodeSelector }}
+            - { name: FLUIDBOX_K8S_NODE_SELECTOR, value: {{ include "fluidbox.sandboxNodeSelector" . | quote }} }
+            {{- end }}
+            {{- if .Values.sandbox.tolerations }}
+            - { name: FLUIDBOX_K8S_TOLERATIONS, value: {{ toJson .Values.sandbox.tolerations | quote }} }
+            {{- end }}
+            {{- if .Values.images.pullSecrets }}
+            # Names only — the provider recreates the refs on sandbox + probe
+            # pods; the Secrets themselves must exist in the sandbox namespace.
+            - { name: FLUIDBOX_K8S_IMAGE_PULL_SECRETS, value: {{ include "fluidbox.pullSecretNames" . | quote }} }
             {{- end }}
             - { name: FLUIDBOX_NETWORK_MODE, value: "hardened" }
             - { name: FLUIDBOX_REQUIRE_ENFORCED_NETPOL, value: {{ .Values.netpol.requireEnforced | quote }} }

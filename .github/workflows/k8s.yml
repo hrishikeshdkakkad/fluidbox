@@ -14,6 +14,9 @@ on:
       - "deploy/helm/**"
       - "deploy/workspaced.Dockerfile"
       - ".github/workflows/k8s.yml"
+      # The chart job asserts the appVersion-binding defaults release.yml
+      # relies on — run it when the release pipeline changes too.
+      - ".github/workflows/release.yml"
       - ".github/k8s-ci-postgres.yaml"
       - ".github/kind-calico.yaml"
   schedule:
@@ -34,6 +37,17 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy -p fluidbox-provider-k8s -p fluidbox-workspace -p workspaced --all-targets -- -D warnings
       - run: cargo test -p fluidbox-provider-k8s -p fluidbox-workspace -p workspaced
+
+  # Render-time chart assertions: values→PodSpec/env wiring (M3/M9/M10/L12),
+  # digest rendering, and lint+template for every per-cloud preset. Seconds,
+  # no cluster.
+  chart:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: deploy/helm/chart-assertions.sh
 
   # kind + Calico (NOT kindnet — kindnet does not enforce NetworkPolicy). The
   # netpol probe is the load-bearing assertion: it proves enforcement, and the

@@ -42,6 +42,9 @@ const RUNTIME: &str = "kubernetes";
 /// Diff artifacts are bounded at this many bytes over exec (the collector
 /// already caps them; this is the receive-side ceiling).
 const MAX_DIFF_BYTES: usize = 16 * 1024 * 1024;
+/// How many times a dropped collection stream may resume from its last byte
+/// before parse_collected's integrity check decides on what arrived.
+const MAX_STREAM_RESUMES: u32 = 4;
 
 pub struct KubernetesProvider {
     pods: Api<Pod>,
@@ -309,14 +312,18 @@ impl ExecutionProvider for KubernetesProvider {
         };
         let name = &handle.external_id;
 
-        // Compute the diff in the collector container (pristine baseline +
-        // final worktree, scrubbed git), then stream the finished file.
+        // 1. Compute the diff in the collector container (pristine baseline +
+        //    final worktree, scrubbed git), writing it to the collector-only
+        //    file. A non-zero exit means that file is untrustworthy → Missing.
         if let Err(e) = self.exec_collect(name, &["workspaced", "diff"]).await {
             return Ok(CollectedArtifacts::Missing {
                 reason: format!("collector diff exec failed: {e}"),
             });
         }
-        let raw = match self.exec_collect(name, &["workspaced", "stream"]).await {
+        // 2. Stream the finished file, resuming from the byte offset already
+        //    received if the exec channel closes before the header's declared
+        //    length. parse_collected makes the final integrity call.
+        let raw = match self.collect_stream_with_resume(name).await {
             Ok(bytes) => bytes,
             Err(e) => {
                 return Ok(CollectedArtifacts::Missing {
@@ -381,7 +388,14 @@ impl KubernetesProvider {
     /// Exec a command in the collector container and return its stdout. Used
     /// for `workspaced diff` (side-effecting; stdout ignored) and
     /// `workspaced stream` (the diff bytes).
+    ///
+    /// The remote exit code is read via `take_status()`: a non-zero exit
+    /// (transport OK, but the collector command itself failed) surfaces as an
+    /// Err rather than masquerading as an empty diff. stdout and stderr are
+    /// drained concurrently so a chatty stderr can't wedge the stdout read by
+    /// filling the mux buffer before the process can exit.
     async fn exec_collect(&self, pod: &str, cmd: &[&str]) -> Result<Vec<u8>, ProviderError> {
+        use tokio::io::AsyncReadExt;
         let ap = AttachParams::default()
             .container(COLLECTOR_CONTAINER)
             .stdout(true)
@@ -391,34 +405,102 @@ impl KubernetesProvider {
             .exec(pod, cmd.to_vec(), &ap)
             .await
             .map_err(map_err)?;
-        let mut buf = Vec::new();
-        if let Some(out) = proc.stdout() {
-            // Bounded read: the collector already caps the diff; this stops a
-            // runaway stream from exhausting control-plane memory. kube's exec
-            // streams are tokio AsyncRead.
-            use tokio::io::AsyncReadExt;
-            let mut limited = out.take(MAX_DIFF_BYTES as u64);
-            limited
-                .read_to_end(&mut buf)
-                .await
-                .map_err(|e| ProviderError::Other(format!("exec stdout read: {e}")))?;
+        // Take the status future BEFORE draining — join() drops it.
+        let status_fut = proc.take_status();
+        let stdout = proc.stdout();
+        let stderr = proc.stderr();
+        let mut stdout_buf = Vec::new();
+        let mut stderr_buf = Vec::new();
+        {
+            // Bounded reads: the collector already caps the diff; this stops a
+            // runaway stream from exhausting control-plane memory.
+            let read_out = async {
+                match stdout {
+                    Some(s) => {
+                        s.take(MAX_DIFF_BYTES as u64)
+                            .read_to_end(&mut stdout_buf)
+                            .await
+                    }
+                    None => Ok(0),
+                }
+            };
+            let read_err = async {
+                match stderr {
+                    Some(s) => s.take(64 * 1024).read_to_end(&mut stderr_buf).await,
+                    None => Ok(0),
+                }
+            };
+            let (ro, re) = tokio::join!(read_out, read_err);
+            ro.map_err(|e| ProviderError::Other(format!("exec stdout read: {e}")))?;
+            re.map_err(|e| ProviderError::Other(format!("exec stderr read: {e}")))?;
         }
-        // Surface a non-zero exec exit as an error (the collector's own
-        // failures are already encoded in the streamed header, but a transport
-        // failure should not masquerade as an empty diff).
-        let _ = proc.join().await;
-        Ok(buf)
+        let status = match status_fut {
+            Some(f) => f.await,
+            None => None,
+        };
+        proc.join().await.map_err(map_err)?;
+        // k8s exec Status: status="Success" on exit 0, "Failure" otherwise.
+        if status.as_ref().and_then(|s| s.status.as_deref()) == Some("Failure") {
+            let stderr_head: String = String::from_utf8_lossy(&stderr_buf)
+                .trim()
+                .chars()
+                .take(300)
+                .collect();
+            return Err(ProviderError::Other(format!(
+                "collector exec {cmd:?} exited non-zero{}{stderr_head}",
+                if stderr_head.is_empty() { "" } else { ": " },
+            )));
+        }
+        Ok(stdout_buf)
+    }
+
+    /// Stream the finished diff file, resuming on a short read. The `pods/exec`
+    /// channel can close cleanly mid-file; `workspaced stream --offset N`
+    /// re-emits from file byte N, so we append until we hold the header's
+    /// declared length or exhaust a bounded retry budget. parse_collected then
+    /// verifies the assembled bytes, so a still-short result is a visible
+    /// Missing rather than a silently truncated diff.
+    async fn collect_stream_with_resume(&self, name: &str) -> Result<Vec<u8>, ProviderError> {
+        let mut raw = self.exec_collect(name, &["workspaced", "stream"]).await?;
+        let Some((header_len, body_bytes)) = stream_target(&raw) else {
+            // A missing marker or unparseable header — nothing to resume.
+            return Ok(raw);
+        };
+        let target = header_len as u64 + body_bytes;
+        let mut attempts = 0u32;
+        while (raw.len() as u64) < target && attempts < MAX_STREAM_RESUMES {
+            attempts += 1;
+            let offset = raw.len() as u64; // next file byte we still need
+            let more = self
+                .exec_collect(
+                    name,
+                    &["workspaced", "stream", "--offset", &offset.to_string()],
+                )
+                .await?;
+            if more.is_empty() {
+                break; // no forward progress; let parse_collected judge the shortfall
+            }
+            raw.extend_from_slice(&more);
+        }
+        Ok(raw)
     }
 }
 
 /// Parse the collector's `fluidbox-diff v1 …` header + body into a
 /// `CollectedArtifacts`. The header distinguishes a real (possibly empty)
-/// diff from an explicit missing marker.
+/// diff from an explicit missing marker AND carries the byte count + digest
+/// of the stored body. The split is on RAW bytes so the body offset is exact,
+/// and an `ok` diff is verified against its header: a body of the wrong
+/// length (an exec stream that closed early) or the wrong digest (corruption
+/// in transit) becomes an explicit Missing, never a silently truncated diff.
 fn parse_collected(raw: &[u8]) -> CollectedArtifacts {
-    let text = String::from_utf8_lossy(raw);
-    let mut lines = text.splitn(2, '\n');
-    let header = lines.next().unwrap_or("");
-    let body = lines.next().unwrap_or("");
+    let Some(nl) = raw.iter().position(|&b| b == b'\n') else {
+        return CollectedArtifacts::Missing {
+            reason: "collector output missing/garbled header".into(),
+        };
+    };
+    let header = String::from_utf8_lossy(&raw[..nl]);
+    let body = &raw[nl + 1..];
     if !header.starts_with("fluidbox-diff v1") {
         return CollectedArtifacts::Missing {
             reason: "collector output missing/garbled header".into(),
@@ -431,19 +513,43 @@ fn parse_collected(raw: &[u8]) -> CollectedArtifacts {
     };
     match field("status") {
         Some("ok") => {
-            let bytes = field("bytes")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(body.len() as u64);
-            let sha256 = field("sha256").unwrap_or("").to_string();
+            let Some(expected_bytes) = field("bytes").and_then(|v| v.parse::<u64>().ok()) else {
+                return CollectedArtifacts::Missing {
+                    reason: "collector header missing a byte count".into(),
+                };
+            };
+            let expected_sha = field("sha256").unwrap_or("").to_string();
             let truncated = field("truncated") == Some("true");
+
+            // Integrity: length first (cheap), then digest. Either mismatch
+            // means the stored file and the received stream disagree — fail
+            // closed rather than store a partial diff as complete.
+            if body.len() as u64 != expected_bytes {
+                return CollectedArtifacts::Missing {
+                    reason: format!(
+                        "collector diff truncated in transit ({} of {expected_bytes} bytes)",
+                        body.len()
+                    ),
+                };
+            }
+            let got_sha = {
+                use sha2::{Digest, Sha256};
+                format!("sha256:{}", hex::encode(Sha256::digest(body)))
+            };
+            if got_sha != expected_sha {
+                return CollectedArtifacts::Missing {
+                    reason: "collector diff digest mismatch".into(),
+                };
+            }
+
             CollectedArtifacts::Collected(vec![CollectedArtifact {
                 kind: "diff".into(),
                 name: "changes.patch".into(),
-                content: body.to_string(),
+                content: String::from_utf8_lossy(body).into_owned(),
                 content_type: "text/x-diff".into(),
                 truncated,
-                sha256,
-                bytes,
+                sha256: expected_sha,
+                bytes: expected_bytes,
             }])
         }
         Some("missing") => CollectedArtifacts::Missing {
@@ -453,6 +559,28 @@ fn parse_collected(raw: &[u8]) -> CollectedArtifacts {
             reason: "collector reported an unknown status".into(),
         },
     }
+}
+
+/// From an assembled `fluidbox-diff v1 status=ok bytes=N …\n<body>` prefix,
+/// return `(header_len_including_newline, declared_body_bytes)` — the pieces
+/// the resume loop needs to know when it has the whole file. `None` for a
+/// missing/garbled/non-`ok` header (nothing to resume).
+fn stream_target(raw: &[u8]) -> Option<(usize, u64)> {
+    let nl = raw.iter().position(|&b| b == b'\n')?;
+    let header = std::str::from_utf8(&raw[..nl]).ok()?;
+    if !header.starts_with("fluidbox-diff v1") {
+        return None;
+    }
+    let field = |key: &str| {
+        header
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix(&format!("{key}=")))
+    };
+    if field("status") != Some("ok") {
+        return None;
+    }
+    let bytes = field("bytes")?.parse::<u64>().ok()?;
+    Some((nl + 1, bytes))
 }
 
 /// Build a Pod ObjectMeta helper (kept for symmetry / future adoption code).
@@ -570,19 +698,106 @@ mod tests {
         ));
     }
 
+    fn diff_sha(body: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("sha256:{}", hex::encode(Sha256::digest(body)))
+    }
+
+    fn framed(body: &[u8], truncated: bool) -> Vec<u8> {
+        let header = format!(
+            "fluidbox-diff v1 status=ok bytes={} sha256={} truncated={}\n",
+            body.len(),
+            diff_sha(body),
+            truncated
+        );
+        [header.into_bytes(), body.to_vec()].concat()
+    }
+
     #[test]
     fn parse_ok_diff() {
-        let raw =
-            b"fluidbox-diff v1 status=ok bytes=12 sha256=sha256:ab truncated=false\ndiff --git\n";
-        match parse_collected(raw) {
+        let body = b"diff --git a/x b/x\n+hi\n";
+        match parse_collected(&framed(body, false)) {
             CollectedArtifacts::Collected(a) => {
                 assert_eq!(a[0].kind, "diff");
                 assert!(a[0].content.contains("diff --git"));
-                assert_eq!(a[0].sha256, "sha256:ab");
+                assert_eq!(a[0].sha256, diff_sha(body));
+                assert_eq!(a[0].bytes, body.len() as u64);
                 assert!(!a[0].truncated);
             }
             _ => panic!("expected collected"),
         }
+    }
+
+    /// M2: a stream that closed early (exec channel dropped) delivers a body
+    /// SHORTER than the header advertises. It must surface as Missing, never
+    /// be stored as a complete diff.
+    #[test]
+    fn parse_short_body_is_missing_not_silent() {
+        let body = b"diff --git a/x b/x\n+a full line of content\n";
+        let header = format!(
+            "fluidbox-diff v1 status=ok bytes={} sha256={} truncated=false\n",
+            body.len(),
+            diff_sha(body)
+        );
+        // only half the body arrives
+        let raw = [header.into_bytes(), body[..body.len() / 2].to_vec()].concat();
+        match parse_collected(&raw) {
+            CollectedArtifacts::Missing { reason } => {
+                assert!(reason.contains("truncated"), "reason: {reason}");
+            }
+            _ => panic!("a short stream must not parse as a complete diff"),
+        }
+    }
+
+    /// M2: right length, wrong bytes (corruption in transit) → Missing.
+    #[test]
+    fn parse_corrupted_body_is_missing() {
+        let header = format!(
+            "fluidbox-diff v1 status=ok bytes=10 sha256={} truncated=false\n",
+            diff_sha(b"BBBBBBBBBB")
+        );
+        let raw = [header.into_bytes(), b"AAAAAAAAAA".to_vec()].concat();
+        match parse_collected(&raw) {
+            CollectedArtifacts::Missing { reason } => {
+                assert!(reason.contains("digest"), "reason: {reason}");
+            }
+            _ => panic!("a corrupted body must not parse as a valid diff"),
+        }
+    }
+
+    /// A body carrying invalid UTF-8 must still verify byte-exactly (the
+    /// digest is over raw bytes, not a lossy string).
+    #[test]
+    fn parse_verifies_non_utf8_body_byte_exactly() {
+        let body: &[u8] = &[b'+', 0xff, 0xfe, b'\n'];
+        match parse_collected(&framed(body, false)) {
+            CollectedArtifacts::Collected(a) => {
+                assert_eq!(a[0].bytes, body.len() as u64);
+                assert_eq!(a[0].sha256, diff_sha(body));
+            }
+            _ => panic!("expected collected"),
+        }
+    }
+
+    /// The resume loop keys off `stream_target`: an `ok` header yields the
+    /// byte offset past its newline and the declared body length; a missing
+    /// marker, a garbled header, or an `ok` header without a byte count all
+    /// yield None (nothing to resume — the byte assembly stops).
+    #[test]
+    fn stream_target_reads_ok_header_only() {
+        let body = b"diff --git a/x b/x\n+hi\n";
+        let raw = framed(body, false);
+        let nl = raw.iter().position(|&b| b == b'\n').unwrap();
+        assert_eq!(stream_target(&raw), Some((nl + 1, body.len() as u64)));
+        assert_eq!(
+            stream_target(b"fluidbox-diff v1 status=missing reason=x\n"),
+            None
+        );
+        assert_eq!(stream_target(b"garbage with no newline"), None);
+        assert_eq!(
+            stream_target(b"fluidbox-diff v1 status=ok sha256=x\nbody"),
+            None
+        );
     }
 
     #[test]
