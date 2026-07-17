@@ -90,16 +90,16 @@ pub fn unpack_archive(
     dest: &Path,
     max_total_bytes: u64,
 ) -> Result<u64, WorkspaceError> {
-    std::fs::create_dir_all(dest)?;
     // Fresh-destination precondition (fail-closed): the two-phase containment
     // assumes the file/dir phase writes into a symlink-free tree. A re-run over
     // a DIRTY dest — e.g. an init container re-executing on a Pod restart, where
     // the runner may have planted symlinks into the surviving emptyDir — must
-    // not let phase 1 follow a stale link out of the root. Clear the contents
-    // first (not `dest` itself, which is a mount point), removing symlinks as
-    // links; propagate any error rather than extracting into dirty state.
+    // not let phase 1 follow a stale link out of the root. Clear FIRST (which
+    // refuses a symlinked `dest` itself, so we never `create_dir_all` onto or
+    // `canonicalize` through a symlink to outside), THEN ensure a real dir.
     clear_dir_contents(dest)
         .map_err(|e| WorkspaceError::Invalid(format!("clear dest {}: {e}", dest.display())))?;
+    std::fs::create_dir_all(dest)?;
     let canon_dest = std::fs::canonicalize(dest)?;
     let gz = GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(gz);
@@ -222,12 +222,21 @@ fn place_symlinks(canon_dest: &Path, deferred: &[(PathBuf, PathBuf)]) -> u64 {
 /// residual state. Used to enforce the fresh-destination precondition of the
 /// extractor and the in-pod copy on a lifecycle replay.
 pub fn clear_dir_contents(dir: &Path) -> std::io::Result<()> {
-    let rd = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
+    // Never operate THROUGH a symlinked `dir` — `read_dir`/remove would touch
+    // the target's contents OUTSIDE our root (a destructive escape). Refuse
+    // fail-closed; only a real directory (or a missing one) is acceptable.
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to clear a symlinked directory",
+            ));
+        }
+        Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
-    };
-    for entry in rd {
+    }
+    for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
         // symlink_metadata: never follow — a symlinked dir is unlinked, not
         // recursed into (which would delete its target's contents).
@@ -597,6 +606,49 @@ mod tests {
             std::fs::read_to_string(outside.join("canary")).unwrap(),
             "ORIGINAL\n"
         );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Codex batch-3v4 finding (e): a `dest` that is itself a symlink to an
+    /// outside directory must be REFUSED, never cleared/extracted through — a
+    /// symlinked dest would otherwise delete the target's contents and treat
+    /// the outside dir as the root.
+    #[cfg(unix)]
+    #[test]
+    fn unpack_refuses_symlinked_dest() {
+        let base = std::env::temp_dir().join(format!("fbx-arch-symdest-{}", Uuid::now_v7()));
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("canary"), "ORIGINAL\n").unwrap();
+        let dest = base.join("dest");
+        std::os::unix::fs::symlink(&outside, &dest).unwrap();
+
+        // Any archive; it must not get far.
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut b = tar::Builder::new(&mut gz);
+            b.append_data(
+                &mut {
+                    let mut h = tar::Header::new_gnu();
+                    h.set_entry_type(tar::EntryType::Regular);
+                    h.set_size(1);
+                    h.set_cksum();
+                    h
+                },
+                "x",
+                &b"y"[..],
+            )
+            .unwrap();
+            b.finish().unwrap();
+        }
+        let bytes = gz.finish().unwrap();
+
+        assert!(
+            unpack_archive(&bytes, &dest, 1024 * 1024).is_err(),
+            "a symlinked dest must be refused"
+        );
+        assert!(outside.join("canary").exists(), "outside must be untouched");
+        assert!(!outside.join("x").exists());
         std::fs::remove_dir_all(&base).ok();
     }
 
