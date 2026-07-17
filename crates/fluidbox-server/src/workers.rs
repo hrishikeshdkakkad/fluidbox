@@ -19,9 +19,27 @@ pub async fn boot_orphan_sweep(state: AppState) {
     match state.provider.list_managed().await {
         Ok(managed) => {
             for (session_id, handle) in managed {
+                // Same discipline as the periodic reconcile: strict status
+                // parse (a status written by a NEWER deploy is not proof of
+                // death — a rollback restart must not kill its live pods),
+                // and a DB error skips rather than terminates.
                 let terminal = match fluidbox_db::get_session(&state.pool, session_id).await {
-                    Ok(Some(s)) => s.status_enum().is_terminal(),
-                    _ => true, // unknown session → orphan
+                    Ok(None) => true, // unknown session → orphan
+                    Ok(Some(s)) => match fluidbox_core::state::SessionStatus::parse(&s.status) {
+                        Some(st) => st.is_terminal(),
+                        None => {
+                            tracing::warn!(
+                                "boot sweep: session {session_id} has unknown status '{}' \
+                                     (newer deploy?); leaving its sandbox alone",
+                                s.status
+                            );
+                            false
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!("boot sweep: session lookup {session_id} failed: {e}");
+                        false
+                    }
                 };
                 if terminal {
                     tracing::info!("boot sweep: reaping orphan sandbox for {session_id}");
@@ -276,9 +294,12 @@ async fn archive_ttl_sweep(state: AppState) {
 /// a large repo comfortably; operators with outliers can raise it via
 /// `FLUIDBOX_STALE_LAUNCH_MINS`.
 fn stale_launch_mins() -> i32 {
+    // Floored at 5: zero/negative would make every prelaunch session "stale"
+    // and the 15 s watchdog would fail healthy launches instantly.
     std::env::var("FLUIDBOX_STALE_LAUNCH_MINS")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.parse::<i32>().ok())
+        .map(|v| v.max(5))
         .unwrap_or(30)
 }
 
