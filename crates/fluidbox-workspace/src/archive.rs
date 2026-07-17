@@ -222,9 +222,17 @@ fn place_symlinks(canon_dest: &Path, deferred: &[(PathBuf, PathBuf)]) -> u64 {
 /// residual state. Used to enforce the fresh-destination precondition of the
 /// extractor and the in-pod copy on a lifecycle replay.
 pub fn clear_dir_contents(dir: &Path) -> std::io::Result<()> {
-    // Never operate THROUGH a symlinked `dir` — `read_dir`/remove would touch
-    // the target's contents OUTSIDE our root (a destructive escape). Refuse
-    // fail-closed; only a real directory (or a missing one) is acceptable.
+    // Trusted-caller contract: `dir` is a caller-controlled path whose
+    // ancestors are not attacker-symlinks. In production this holds — `dir` is
+    // a fixed pod-spec mount (`/workspace`, `/collector/…`) the runner cannot
+    // re-point. The guard below refuses a `dir` whose FINAL component is a
+    // symlink; it does NOT resolve a symlinked ANCESTOR or a trailing-slash
+    // spelling, and it is not TOCTOU-safe (Codex batch-3v5). Fully symlink-safe
+    // extraction against an attacker-controlled destination path requires
+    // kernel-enforced resolution (`openat2 RESOLVE_IN_ROOT` on Linux, or the
+    // `cap-std`/`openat` crates) — tracked as a follow-up; not production-
+    // reachable today.
+    match std::fs::symlink_metadata(dir) {
     match std::fs::symlink_metadata(dir) {
         Ok(m) if m.file_type().is_symlink() => {
             return Err(std::io::Error::new(
