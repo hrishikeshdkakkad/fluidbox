@@ -1666,13 +1666,18 @@ pub async fn sessions_in_status(pool: &PgPool, statuses: &[&str]) -> sqlx::Resul
 /// provisioning → initializing in seconds (initializing: minutes at worst
 /// for a big repo copy), so a stale row means the control plane died
 /// mid-launch and nothing owns the session anymore.
+///
+/// Age is measured from `created_at` — a timestamp NOTHING refreshes. It used
+/// to be `updated_at`, which every runner heartbeat bumps: a crash between
+/// runner start and `set_sandbox_handle` left a heartbeating `initializing`
+/// session this sweep could never age out (M5).
 pub async fn stale_nonstarted_sessions(
     pool: &PgPool,
     max_age_mins: i32,
 ) -> sqlx::Result<Vec<SessionRow>> {
     sqlx::query_as(
         "select * from sessions
-         where status = any($1) and updated_at < now() - make_interval(mins => $2)",
+         where status = any($1) and created_at < now() - make_interval(mins => $2)",
     )
     .bind(vec![
         "created".to_string(),
@@ -1727,13 +1732,68 @@ pub async fn transition_session(
     Ok(Some((current, updated)))
 }
 
-pub async fn set_sandbox_handle(pool: &PgPool, id: Uuid, handle: &Value) -> sqlx::Result<()> {
+/// Attach the sandbox handle — REFUSED (returns false) unless the session is
+/// still in an ACTIVE (pre-wind-down) state AND no finalization intent
+/// exists: the intent is the single source of truth for ownership, and it
+/// commits BEFORE the wind-down transition — a status-only fence would let a
+/// launch attach a live sandbox inside that gap. The caller must terminate
+/// the sandbox on refusal.
+///
+/// Deliberately a lock-then-check-then-update TRANSACTION, not one UPDATE:
+/// a single statement's `not exists` subquery keeps the command snapshot
+/// even after blocking on `begin_finalization`'s session row lock (Postgres
+/// re-checks only the target tuple on unblock), so it could attach past a
+/// just-committed intent. Taking the same row lock first and reading the
+/// intent in a SECOND statement gets a fresh snapshot that must see it.
+pub async fn set_sandbox_handle(pool: &PgPool, id: Uuid, handle: &Value) -> sqlx::Result<bool> {
+    use fluidbox_core::state::SessionStatus;
+    let mut tx = pool.begin().await?;
+    let locked: Option<(String,)> =
+        sqlx::query_as("select status from sessions where id = $1 for update")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((status,)) = locked else {
+        return Ok(false);
+    };
+    let active = SessionStatus::parse(&status).is_some_and(|s| s.accepts_work());
+    if !active {
+        return Ok(false);
+    }
+    let (intent_exists,): (bool,) =
+        sqlx::query_as("select exists(select 1 from session_finalizations where session_id = $1)")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if intent_exists {
+        return Ok(false);
+    }
     sqlx::query("update sessions set sandbox_handle = $2, updated_at = now() where id = $1")
         .bind(id)
         .bind(handle)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-    Ok(())
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Adopt a DISCOVERED sandbox handle into a session atomically: only while no
+/// handle is stored AND the session is still in an active (pre-wind-down)
+/// status. The predicate is in the UPDATE itself, so the reconciler racing
+/// `run()`'s own `set_sandbox_handle`, a concurrent cancel, or a terminal
+/// transition can never overwrite a real handle or resurrect a closed
+/// session. Returns whether the adoption landed.
+pub async fn adopt_sandbox_handle(pool: &PgPool, id: Uuid, handle: &Value) -> sqlx::Result<bool> {
+    let res = sqlx::query(
+        "update sessions set sandbox_handle = $2, updated_at = now()
+         where id = $1 and sandbox_handle is null
+           and status in ('created','provisioning','initializing','running','awaiting_approval')",
+    )
+    .bind(id)
+    .bind(handle)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
 }
 
 pub async fn set_base_commit(pool: &PgPool, id: Uuid, commit: &str) -> sqlx::Result<()> {
@@ -1760,6 +1820,252 @@ pub async fn heartbeat(pool: &PgPool, id: Uuid) -> sqlx::Result<()> {
         .execute(pool)
         .await?;
     Ok(())
+}
+
+// ─── Durable finalization intent (K8s design 2026-07-15, migration 0011) ──
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FinalizationRow {
+    pub session_id: Uuid,
+    pub outcome: String,
+    pub summary: Option<String>,
+    pub reason: Option<String>,
+    pub needs_quiesce: bool,
+    pub quiesce_deadline: Option<DateTime<Utc>>,
+    pub claimed_at: Option<DateTime<Utc>>,
+    pub attempts: i32,
+    pub created_at: DateTime<Utc>,
+}
+
+/// The outcome of persisting a finalization intent.
+#[derive(Debug)]
+pub enum BeginFinalization {
+    /// The intent is durably persisted (by this call or a previous one).
+    /// `row` is the AUTHORITATIVE intent — a loser of the insert race
+    /// receives the winner's row and must derive every wind-down decision
+    /// (target state, quiesce, deadline) from it, never from its own
+    /// arguments. `session_status` is the status observed under the lock.
+    Persisted {
+        row: FinalizationRow,
+        created: bool,
+        session_status: String,
+    },
+    /// The session is already terminal — no intent may be (re)created.
+    AlreadyTerminal,
+    /// The session does not exist.
+    Missing,
+}
+
+/// Persist the intent to finalize a session (idempotent), in ONE transaction
+/// that locks the session row: the terminal check, the quiesce computation,
+/// and the insert all see the same snapshot, so a late caller can never
+/// recreate an intent after terminalization, and `needs_quiesce`/deadline
+/// always match the state they were derived from. Holding the session lock
+/// also fences the conflict→select read: terminalization (and the intent
+/// delete that follows it) updates the sessions row, so it cannot slip
+/// between our conflict and our read of the winning row. The first writer
+/// wins the outcome; a racing second caller receives the winner's row with
+/// `created: false` and defers to it.
+pub async fn begin_finalization(
+    pool: &PgPool,
+    session: Uuid,
+    outcome: &str,
+    summary: Option<&str>,
+    reason: Option<&str>,
+    want_quiesce: bool,
+    quiesce_deadline_secs: i64,
+) -> sqlx::Result<BeginFinalization> {
+    use fluidbox_core::state::SessionStatus;
+    let mut tx = pool.begin().await?;
+    let locked: Option<(String, Option<Value>)> =
+        sqlx::query_as("select status, sandbox_handle from sessions where id = $1 for update")
+            .bind(session)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((status, handle)) = locked else {
+        return Ok(BeginFinalization::Missing);
+    };
+    if SessionStatus::parse(&status).is_some_and(|s| s.is_terminal()) {
+        return Ok(BeginFinalization::AlreadyTerminal);
+    }
+    // Quiesce only makes sense while a runner is live to receive the
+    // heartbeat signal — computed from the LOCKED snapshot, not the caller's
+    // (possibly stale) read.
+    let quiesce = want_quiesce
+        && matches!(status.as_str(), "running" | "awaiting_approval")
+        && handle.is_some();
+    let deadline = quiesce.then(|| Utc::now() + chrono::Duration::seconds(quiesce_deadline_secs));
+    let inserted: Option<FinalizationRow> = sqlx::query_as(
+        "insert into session_finalizations
+           (session_id, outcome, summary, reason, needs_quiesce, quiesce_deadline)
+         values ($1,$2,$3,$4,$5,$6)
+         on conflict (session_id) do nothing
+         returning *",
+    )
+    .bind(session)
+    .bind(outcome)
+    .bind(summary)
+    .bind(reason)
+    .bind(quiesce)
+    .bind(deadline)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let (row, created) = match inserted {
+        Some(r) => (r, true),
+        None => (
+            sqlx::query_as("select * from session_finalizations where session_id = $1")
+                .bind(session)
+                .fetch_one(&mut *tx)
+                .await?,
+            false,
+        ),
+    };
+    tx.commit().await?;
+    Ok(BeginFinalization::Persisted {
+        row,
+        created,
+        session_status: status,
+    })
+}
+
+pub async fn get_finalization(
+    pool: &PgPool,
+    session: Uuid,
+) -> sqlx::Result<Option<FinalizationRow>> {
+    sqlx::query_as("select * from session_finalizations where session_id = $1")
+        .bind(session)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Claim a finalization for driving: succeeds when the row is unclaimed OR its
+/// claim went stale (the previous driver crashed). Bumps `attempts` and stamps
+/// `claimed_at`. A concurrent driver that loses the CAS gets None and backs
+/// off — the finalizing→terminal transition is the ultimate single-winner
+/// gate regardless, so a double-claim can never double-finalize.
+pub async fn claim_finalization(
+    pool: &PgPool,
+    session: Uuid,
+    stale_secs: i64,
+) -> sqlx::Result<Option<FinalizationRow>> {
+    sqlx::query_as(
+        "update session_finalizations
+            set claimed_at = now(), attempts = attempts + 1
+          where session_id = $1
+            and (claimed_at is null or claimed_at < now() - make_interval(secs => $2))
+          returning *",
+    )
+    .bind(session)
+    .bind(stale_secs as f64)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Every persisted finalization intent, oldest first — the restart-recovery
+/// worklist. Status-blind BY DESIGN: an intent whose session is still ACTIVE
+/// is the crash-between-persist-and-transition window (the wind-down state
+/// never landed), and an intent whose session is already TERMINAL is cleanup
+/// still owed (reap, workspace/archive removal, delivery reconciliation).
+/// Both must be re-driven; the intent row is deleted only once nothing is
+/// owed, so this list self-drains.
+pub async fn pending_finalizations(pool: &PgPool) -> sqlx::Result<Vec<Uuid>> {
+    let rows: Vec<(Uuid,)> =
+        sqlx::query_as("select session_id from session_finalizations order by created_at asc")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// Release a driver's claim early — for DELIBERATE deferrals (e.g. the
+/// provisioning settle window), so the finalize worker retries at its own
+/// cadence instead of waiting out the stale-claim threshold.
+pub async fn release_finalization_claim(pool: &PgPool, session: Uuid) -> sqlx::Result<()> {
+    sqlx::query("update session_finalizations set claimed_at = null where session_id = $1")
+        .bind(session)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn delete_finalization(pool: &PgPool, session: Uuid) -> sqlx::Result<()> {
+    sqlx::query("delete from session_finalizations where session_id = $1")
+        .bind(session)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// ─── Cross-replica OAuth refresh serialization (K8s design 2026-07-15) ─────
+
+/// Stable 64-bit advisory-lock key from a connection id. Postgres advisory
+/// locks are keyed on `bigint`; we fold the uuid's leading 8 bytes.
+pub fn oauth_lock_key(connection_id: Uuid) -> i64 {
+    let b = connection_id.as_bytes();
+    i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+}
+
+/// Take a transaction-scoped Postgres advisory lock keyed on a connection id,
+/// on `tx`. Serializes OAuth refresh-token rotation ACROSS control-plane
+/// replicas (a second replica can no longer double-rotate a refresh token
+/// into `invalid_grant`) — replacing reliance on the in-process mutex. The
+/// lock releases automatically when `tx` is committed or dropped, so the
+/// caller holds `tx` across the refresh HTTP round-trip and the rotation
+/// write, then commits.
+pub async fn acquire_oauth_lock(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    connection_id: Uuid,
+) -> sqlx::Result<()> {
+    sqlx::query("select pg_advisory_xact_lock($1)")
+        .bind(oauth_lock_key(connection_id))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Idempotent artifact write: a crash-retry during finalization must not
+/// accumulate duplicate diff rows. Replaces any existing (session, kind, name).
+/// The stored diff artifact's content, if any — the finalizer's evidence
+/// guard: a re-driven finalization must never overwrite a collected diff
+/// with an `artifact_missing` marker (missing → collected upgrades are fine).
+pub async fn diff_artifact_content(pool: &PgPool, session: Uuid) -> sqlx::Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "select content from artifacts where session_id = $1 and kind = 'diff' limit 1",
+    )
+    .bind(session)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(c,)| c))
+}
+
+pub async fn upsert_artifact(
+    pool: &PgPool,
+    session: Uuid,
+    kind: &str,
+    name: &str,
+    content: &str,
+    content_type: &str,
+) -> sqlx::Result<ArtifactRow> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("delete from artifacts where session_id = $1 and kind = $2 and name = $3")
+        .bind(session)
+        .bind(kind)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+    let row: ArtifactRow = sqlx::query_as(
+        "insert into artifacts (id, session_id, kind, name, content, content_type)
+         values ($1,$2,$3,$4,$5,$6) returning *",
+    )
+    .bind(Uuid::now_v7())
+    .bind(session)
+    .bind(kind)
+    .bind(name)
+    .bind(content)
+    .bind(content_type)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row)
 }
 
 // ─── Events (append-only; Redacted enforced at the type level) ────────────
@@ -2390,6 +2696,41 @@ pub struct ResultDeliveryRow {
     pub updated_at: DateTime<Utc>,
 }
 
+/// True if a delivery row exists for this session AND destination — the
+/// per-destination idempotency check both enqueue paths (the terminal
+/// transition and the claim-serialized reconciler) run before inserting:
+/// a crash after destination A but before destination B is healed by
+/// enqueueing exactly B, never duplicating A, and "some rows exist" is
+/// never mistaken for "all destinations enqueued".
+pub async fn result_delivery_exists_for(
+    pool: &PgPool,
+    session: Uuid,
+    destination: &Value,
+) -> sqlx::Result<bool> {
+    let (exists,): (bool,) = sqlx::query_as(
+        "select exists(select 1 from result_deliveries
+           where session_id = $1 and destination = $2)",
+    )
+    .bind(session)
+    .bind(destination)
+    .fetch_one(pool)
+    .await?;
+    Ok(exists)
+}
+
+/// True if the session already has a `run.result` ledger event — the
+/// reconciler's exactly-once guard (emit-if-missing under the finalize
+/// claim, which serializes drivers).
+pub async fn has_run_result_event(pool: &PgPool, session: Uuid) -> sqlx::Result<bool> {
+    let (exists,): (bool,) = sqlx::query_as(
+        "select exists(select 1 from events where session_id = $1 and type = 'run.result')",
+    )
+    .bind(session)
+    .fetch_one(pool)
+    .await?;
+    Ok(exists)
+}
+
 pub async fn enqueue_result_delivery(
     pool: &PgPool,
     session: Uuid,
@@ -2894,6 +3235,239 @@ mod tests {
     use super::*;
     use fluidbox_core::event::{Actor, EventBody, EventEnvelope, Redactor};
 
+    /// The durable-finalizer DB contract (PR #47 fix batch 2 — H3/H5):
+    /// single-winner intent under the session row lock, quiesce computed from
+    /// the LOCKED snapshot, losers receive the winner's row, recovery sees
+    /// intents on ACTIVE sessions, and a terminal session fences both intent
+    /// re-creation and late sandbox-handle attachment.
+    #[tokio::test]
+    async fn finalization_intent_is_transactional_and_single_winner() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let policy = upsert_policy(
+            &pool,
+            tenant,
+            "test-finalize",
+            "name: test-finalize",
+            &serde_json::json!({"name": "test-finalize"}),
+        )
+        .await
+        .unwrap();
+        let agent = create_agent(&pool, tenant, "test-finalize-agent", None)
+            .await
+            .unwrap();
+        let rev = append_agent_revision(
+            &pool,
+            agent.id,
+            "claude-agent-sdk",
+            "img:test",
+            "claude-haiku-4-5",
+            None,
+            policy.id,
+            &serde_json::json!({}),
+            None,
+            &serde_json::json!([]),
+        )
+        .await
+        .unwrap();
+        let repo = serde_json::json!({"kind":"none"});
+        let empty = serde_json::json!({});
+        let mk = |title: &'static str| {
+            create_session(
+                &pool,
+                tenant,
+                agent.id,
+                rev.id,
+                "supervised",
+                "trusted",
+                title,
+                &repo,
+                &empty,
+                &empty,
+                None,
+                None,
+                None,
+            )
+        };
+        let racer = mk("finalize-test race").await.unwrap();
+        let fenced = mk("finalize-test fence").await.unwrap();
+
+        use fluidbox_core::state::SessionStatus;
+        // Advance the race session to running with a handle so the locked
+        // snapshot computes a REAL quiesce for want_quiesce callers.
+        for st in [
+            SessionStatus::Provisioning,
+            SessionStatus::Initializing,
+            SessionStatus::Running,
+        ] {
+            transition_session(&pool, racer.id, st, None).await.unwrap();
+        }
+        let attached_active = set_sandbox_handle(
+            &pool,
+            racer.id,
+            &serde_json::json!({"external_id":"t","uid":"u"}),
+        )
+        .await
+        .unwrap();
+
+        // Genuinely concurrent: two connections race the insert under the
+        // row lock — a cancel (wants quiesce) against a /result (does not).
+        let (a, b) = tokio::join!(
+            begin_finalization(&pool, racer.id, "cancelled", None, Some("race"), true, 30),
+            begin_finalization(&pool, racer.id, "completed", Some("done"), None, false, 30),
+        );
+        let unpack = |r: sqlx::Result<BeginFinalization>| match r.unwrap() {
+            BeginFinalization::Persisted {
+                row,
+                created,
+                session_status,
+            } => (row, created, session_status),
+            other => panic!("expected Persisted, got {other:?}"),
+        };
+        let (row_a, created_a, status_a) = unpack(a);
+        let (row_b, created_b, status_b) = unpack(b);
+
+        // Recovery must see the intent while the session is still ACTIVE
+        // (the crash-between-persist-and-transition window).
+        let pending_while_active = pending_finalizations(&pool).await.unwrap();
+
+        // Claim semantics: one holder at a time; an early release (the
+        // deliberate settle-defer path) re-opens it immediately, without
+        // waiting out the stale threshold.
+        let claim1 = claim_finalization(&pool, racer.id, 420).await.unwrap();
+        let claim_held = claim_finalization(&pool, racer.id, 420).await.unwrap();
+        release_finalization_claim(&pool, racer.id).await.unwrap();
+        let claim_after_release = claim_finalization(&pool, racer.id, 420).await.unwrap();
+
+        // Fence session: persist an intent, terminalize legally, release the
+        // intent, then try to re-create it and to attach a handle late.
+        let first_fence =
+            begin_finalization(&pool, fenced.id, "failed", None, Some("t"), false, 30)
+                .await
+                .unwrap();
+        // The gap that matters: intent committed, wind-down transition NOT
+        // yet applied — the session status still accepts work, but the
+        // intent alone must fence a late attach.
+        let attached_intent_gap = set_sandbox_handle(
+            &pool,
+            fenced.id,
+            &serde_json::json!({"external_id":"tg","uid":"ug"}),
+        )
+        .await
+        .unwrap();
+        transition_session(&pool, fenced.id, SessionStatus::Finalizing, None)
+            .await
+            .unwrap();
+        // Wind-down owns the session: a provisioning race may no longer
+        // attach a handle.
+        let attached_winddown = set_sandbox_handle(
+            &pool,
+            fenced.id,
+            &serde_json::json!({"external_id":"tw","uid":"uw"}),
+        )
+        .await
+        .unwrap();
+        transition_session(&pool, fenced.id, SessionStatus::Failed, None)
+            .await
+            .unwrap();
+        // Terminal + intent = cleanup still owed: recovery must see it.
+        let pending_while_terminal = pending_finalizations(&pool).await.unwrap();
+        delete_finalization(&pool, fenced.id).await.unwrap();
+        let pending_after_release = pending_finalizations(&pool).await.unwrap();
+        let post_terminal = begin_finalization(&pool, fenced.id, "cancelled", None, None, true, 30)
+            .await
+            .unwrap();
+        let attached_terminal = set_sandbox_handle(
+            &pool,
+            fenced.id,
+            &serde_json::json!({"external_id":"t2","uid":"u2"}),
+        )
+        .await
+        .unwrap();
+        let missing = begin_finalization(&pool, Uuid::now_v7(), "failed", None, None, false, 30)
+            .await
+            .unwrap();
+
+        // Fixtures out BEFORE the assertions (session delete cascades to the
+        // surviving intent).
+        for id in [racer.id, fenced.id] {
+            sqlx::query("delete from sessions where id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        assert!(attached_active, "handle attach must succeed while active");
+        assert!(
+            created_a ^ created_b,
+            "exactly one racer creates the intent (created_a={created_a}, created_b={created_b})"
+        );
+        assert_eq!(
+            row_a.outcome, row_b.outcome,
+            "both racers must hold the WINNER's row"
+        );
+        assert_eq!(row_a.needs_quiesce, row_b.needs_quiesce);
+        let winner_is_cancel = row_a.outcome == "cancelled";
+        assert_eq!(
+            row_a.needs_quiesce, winner_is_cancel,
+            "quiesce comes from the winning intent, derived from the locked snapshot"
+        );
+        assert_eq!(
+            row_a.quiesce_deadline.is_some(),
+            winner_is_cancel,
+            "deadline exists iff the winner wanted quiesce"
+        );
+        assert_eq!(status_a, "running");
+        assert_eq!(status_b, "running");
+        assert!(
+            pending_while_active.contains(&racer.id),
+            "recovery must scan intents on ACTIVE sessions"
+        );
+        assert!(claim1.is_some(), "first claim must succeed");
+        assert!(
+            claim_held.is_none(),
+            "a held claim must not be re-claimable"
+        );
+        assert!(
+            claim_after_release.is_some(),
+            "an early-released claim must be immediately re-claimable"
+        );
+        assert!(matches!(
+            first_fence,
+            BeginFinalization::Persisted { created: true, .. }
+        ));
+        assert!(
+            !attached_intent_gap,
+            "a committed intent must fence attach BEFORE the wind-down transition lands"
+        );
+        assert!(
+            !attached_winddown,
+            "a winding-down session must refuse a late sandbox handle"
+        );
+        assert!(
+            pending_while_terminal.contains(&fenced.id),
+            "recovery must see intents on TERMINAL sessions (cleanup owed)"
+        );
+        assert!(
+            !pending_after_release.contains(&fenced.id),
+            "a released intent leaves the recovery worklist"
+        );
+        assert!(
+            matches!(post_terminal, BeginFinalization::AlreadyTerminal),
+            "a terminal session must fence intent re-creation"
+        );
+        assert!(
+            !attached_terminal,
+            "a terminal session must refuse a late sandbox handle"
+        );
+        assert!(matches!(missing, BeginFinalization::Missing));
+    }
+
     #[tokio::test]
     async fn append_event_assigns_gapless_seq_and_notifies() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
@@ -3253,42 +3827,63 @@ mod tests {
         )
         .await
         .unwrap();
-        sqlx::query("update sessions set updated_at = now() - interval '20 minutes' where id = $1")
+        // The sweep keys off created_at (heartbeat-proof; M5) — backdate that.
+        let backdate =
+            "update sessions set created_at = now() - interval '20 minutes' where id = $1";
+        sqlx::query(backdate)
             .bind(stale.id)
             .execute(&pool)
             .await
             .unwrap();
 
-        let ids: Vec<Uuid> = stale_nonstarted_sessions(&pool, 15)
+        let sweep_created: Vec<Uuid> = stale_nonstarted_sessions(&pool, 15)
             .await
             .unwrap()
             .iter()
             .map(|s| s.id)
             .collect();
-        assert!(ids.contains(&stale.id), "old created session must be swept");
-        assert!(!ids.contains(&fresh.id), "fresh session must not be swept");
 
-        // Terminal sessions are never swept even when old.
+        // The wind-down machine owns terminal entry: the pre-epic direct
+        // created→failed edge must be REFUSED (Ok(None)), and terminalization
+        // goes through finalizing. Neither a winding-down nor a terminal
+        // session may be swept, however old.
         use fluidbox_core::state::SessionStatus;
-        transition_session(&pool, stale.id, SessionStatus::Failed, Some("test"))
-            .await
-            .unwrap();
-        sqlx::query("update sessions set updated_at = now() - interval '20 minutes' where id = $1")
+        let direct_terminal =
+            transition_session(&pool, stale.id, SessionStatus::Failed, Some("test"))
+                .await
+                .unwrap();
+        let to_finalizing =
+            transition_session(&pool, stale.id, SessionStatus::Finalizing, Some("test"))
+                .await
+                .unwrap();
+        sqlx::query(backdate)
             .bind(stale.id)
             .execute(&pool)
             .await
             .unwrap();
-        let ids: Vec<Uuid> = stale_nonstarted_sessions(&pool, 15)
+        let sweep_finalizing: Vec<Uuid> = stale_nonstarted_sessions(&pool, 15)
             .await
             .unwrap()
             .iter()
             .map(|s| s.id)
             .collect();
-        assert!(
-            !ids.contains(&stale.id),
-            "terminal session must not be swept"
-        );
+        let to_failed = transition_session(&pool, stale.id, SessionStatus::Failed, Some("test"))
+            .await
+            .unwrap();
+        sqlx::query(backdate)
+            .bind(stale.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let sweep_terminal: Vec<Uuid> = stale_nonstarted_sessions(&pool, 15)
+            .await
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .collect();
 
+        // Fixtures out BEFORE the assertions — a failed assertion must not
+        // leak sessions into the shared tenant.
         for id in [fresh.id, stale.id] {
             sqlx::query("delete from sessions where id = $1")
                 .bind(id)
@@ -3296,6 +3891,129 @@ mod tests {
                 .await
                 .unwrap();
         }
+
+        assert!(
+            sweep_created.contains(&stale.id),
+            "old created session must be swept"
+        );
+        assert!(
+            !sweep_created.contains(&fresh.id),
+            "fresh session must not be swept"
+        );
+        assert!(
+            direct_terminal.is_none(),
+            "created→failed must be refused (no active→terminal edge)"
+        );
+        assert!(
+            to_finalizing.is_some(),
+            "created→finalizing must be legal (crash recovery finalizes from anywhere)"
+        );
+        assert!(
+            !sweep_finalizing.contains(&stale.id),
+            "winding-down session must not be swept"
+        );
+        assert!(to_failed.is_some(), "finalizing→failed must be legal");
+        assert!(
+            !sweep_terminal.contains(&stale.id),
+            "terminal session must not be swept"
+        );
+    }
+
+    #[tokio::test]
+    async fn adopt_sandbox_handle_is_guarded() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let policy = upsert_policy(
+            &pool,
+            tenant,
+            "test-adopt",
+            "name: test-adopt",
+            &serde_json::json!({"name": "test-adopt"}),
+        )
+        .await
+        .unwrap();
+        let agent = create_agent(&pool, tenant, "test-adopt-agent", None)
+            .await
+            .unwrap();
+        let rev = append_agent_revision(
+            &pool,
+            agent.id,
+            "claude-agent-sdk",
+            "img:test",
+            "claude-haiku-4-5",
+            None,
+            policy.id,
+            &serde_json::json!({}),
+            None,
+            &serde_json::json!([]),
+        )
+        .await
+        .unwrap();
+        let repo = serde_json::json!({"kind":"none"});
+        let empty = serde_json::json!({});
+        let s = create_session(
+            &pool,
+            tenant,
+            agent.id,
+            rev.id,
+            "supervised",
+            "trusted",
+            "adopt-test",
+            &repo,
+            &empty,
+            &empty,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let discovered =
+            serde_json::json!({"runtime":"kubernetes","external_id":"pod-x","attrs":{"uid":"u1"}});
+        let real =
+            serde_json::json!({"runtime":"kubernetes","external_id":"pod-x","attrs":{"uid":"u2"}});
+
+        // Active + handle-less → adoption lands.
+        let adopted = adopt_sandbox_handle(&pool, s.id, &discovered)
+            .await
+            .unwrap();
+        // A stored handle is never overwritten (run() won the race).
+        set_sandbox_handle(&pool, s.id, &real).await.unwrap();
+        let overwrote = adopt_sandbox_handle(&pool, s.id, &discovered)
+            .await
+            .unwrap();
+        let kept: (Value,) = sqlx::query_as("select sandbox_handle from sessions where id = $1")
+            .bind(s.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        // A winding-down session never re-acquires a handle.
+        sqlx::query(
+            "update sessions set sandbox_handle = null, status = 'finalizing' where id = $1",
+        )
+        .bind(s.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let resurrected = adopt_sandbox_handle(&pool, s.id, &discovered)
+            .await
+            .unwrap();
+
+        // Fixtures out BEFORE the assertions.
+        sqlx::query("delete from sessions where id = $1")
+            .bind(s.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(adopted, "active handle-less session must adopt");
+        assert!(!overwrote, "a stored handle must never be overwritten");
+        assert_eq!(kept.0["attrs"]["uid"], "u2", "run()'s handle must survive");
+        assert!(!resurrected, "a winding-down session must not adopt");
     }
 
     #[tokio::test]

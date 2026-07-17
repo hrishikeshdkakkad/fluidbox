@@ -27,14 +27,40 @@ mod workers;
 
 use axum::routing::{get, post, put};
 use axum::Router;
+use fluidbox_core::traits::ExecutionProvider;
 use state::{AppStateInner, ApprovalRegistry};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
+/// Select the execution backend from `FLUIDBOX_PROVIDER` (default `docker`).
+/// Dual-provider permanence (settled Q17): Docker and Kubernetes are co-equal
+/// backends behind the same trait, selected per deployment.
+async fn build_provider(cfg: &config::Config) -> anyhow::Result<Arc<dyn ExecutionProvider>> {
+    match cfg.provider.as_str() {
+        "docker" => Ok(Arc::new(fluidbox_provider::DockerProvider::connect(
+            cfg.data_dir.clone(),
+        )?)),
+        "kubernetes" | "k8s" => {
+            let k8s_cfg = fluidbox_provider_k8s::config::K8sConfig::from_env();
+            Ok(Arc::new(
+                fluidbox_provider_k8s::KubernetesProvider::connect(k8s_cfg, cfg.data_dir.clone())
+                    .await?,
+            ))
+        }
+        other => anyhow::bail!(
+            "FLUIDBOX_PROVIDER='{other}' is not available in this build (known: docker, kubernetes)"
+        ),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
+    // kube-rs (rustls 0.23) needs a process-level CryptoProvider; the workspace
+    // has multiple rustls backends in-tree, so pick ring explicitly or the
+    // Kubernetes client panics on first TLS use. No-op for the Docker path.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -62,9 +88,42 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    let provider = fluidbox_provider::DockerProvider::connect()?;
-    if let Err(e) = provider.ping().await {
-        tracing::warn!("docker ping failed ({e}); sandboxes will not launch until docker is up");
+    let mut cfg = cfg;
+    // Kubernetes zeroEgress: the runner reaches the control plane by the
+    // internal Service's ClusterIP (no DNS). Resolve it at boot and override
+    // the control URL, unless one was set explicitly.
+    let is_k8s = matches!(cfg.provider.as_str(), "kubernetes" | "k8s");
+    if is_k8s && std::env::var("FLUIDBOX_PUBLIC_CONTROL_URL").is_err() {
+        if let (Some(svc), Some(ns)) = (&cfg.internal_service, &cfg.internal_service_namespace) {
+            match fluidbox_provider_k8s::netpol::resolve_service_clusterip(ns, svc).await {
+                Ok(Some(ip)) => {
+                    // Port derives from the internal bind (never hardcoded);
+                    // IPv6 ClusterIPs need brackets in a URL authority.
+                    let port = cfg
+                        .internal_bind
+                        .rsplit(':')
+                        .next()
+                        .unwrap_or("8788")
+                        .to_string();
+                    let host = if ip.contains(':') { format!("[{ip}]") } else { ip };
+                    cfg.public_control_url = format!("http://{host}:{port}");
+                    tracing::info!("resolved internal control URL: {}", cfg.public_control_url);
+                }
+                _ => tracing::warn!(
+                    "could not resolve internal Service {svc} ClusterIP; runner control URL may need DNS"
+                ),
+            }
+        }
+    }
+
+    let provider = build_provider(&cfg).await?;
+    if let Err(e) = provider.healthcheck().await {
+        tracing::warn!(
+            "provider '{}' health probe failed ({e}); sandboxes will not launch until it is reachable",
+            provider.runtime_name()
+        );
+    } else {
+        tracing::info!("execution provider: {}", provider.runtime_name());
     }
 
     let events_tx = fluidbox_db::spawn_listener(cfg.database_url.clone());
@@ -82,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
     let state: state::AppState = Arc::new(AppStateInner {
         tenant_id: seed.tenant_id,
         redactor: fluidbox_core::event::Redactor::default(),
-        provider: Arc::new(provider),
+        provider,
         approvals: ApprovalRegistry::default(),
         events_tx,
         http: reqwest::Client::builder()
@@ -91,6 +150,9 @@ async fn main() -> anyhow::Result<()> {
         sealer,
         connector_tokens: Default::default(),
         oauth_locks: Default::default(),
+        // Docker needs no netpol gate; Kubernetes starts unverified and the
+        // worker below flips it once the CNI is proven to enforce policy.
+        netpol_verified: std::sync::atomic::AtomicBool::new(!is_k8s),
         pool,
         cfg,
     });
@@ -98,6 +160,9 @@ async fn main() -> anyhow::Result<()> {
     // Boot-time housekeeping + background workers.
     workers::boot_orphan_sweep(state.clone()).await;
     workers::spawn_all(state.clone());
+    if is_k8s {
+        workers::spawn_netpol_gate(state.clone());
+    }
     deliveries::spawn_worker(state.clone());
     scheduler::spawn_worker(state.clone());
 
@@ -203,6 +268,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/triggers/{id}/invoke", post(triggers::invoke))
         .route("/triggers/{id}/runs/{sid}", get(triggers::poll_run));
 
+    // The internal plane (runner contract, workspace archive, LLM facade).
+    // internal::permission etc. extract SessionAuth themselves; the path {id}
+    // is informational (the token binds the session).
     let internal = Router::new()
         .route("/sessions/{id}/permission", post(internal::permission))
         // Brokered tools (design §8.3 class 2): intent in, governed result
@@ -211,33 +279,61 @@ async fn main() -> anyhow::Result<()> {
         .route("/sessions/{id}/events", post(internal::events))
         .route("/sessions/{id}/heartbeat", post(internal::heartbeat))
         .route("/sessions/{id}/result", post(internal::result))
+        // The immutable workspace archive the Kubernetes init container pulls
+        // (session from the bearer token; credential-free, digest-verified).
+        .route("/sessions/{id}/workspace", get(internal::workspace_archive))
         .route("/token/renew", post(internal::token_renew))
         .route("/llm-usage", post(callback::litellm_usage))
         // The Agent SDK appends /v1/messages (and possibly count_tokens) to
         // ANTHROPIC_BASE_URL=<control>/internal/llm.
         .route("/llm/{*rest}", post(facade::messages));
 
-    // Note: internal::permission etc. extract SessionAuth themselves; the
-    // path {id} is informational (the token binds the session).
-    let app = Router::new()
-        .nest("/v1", public)
-        .nest("/internal", internal)
+    let trace_layer = || {
+        TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<axum::body::Body>| {
+            // Method + PATH only — never the query string: OAuth
+            // `code`/`state` and GitHub flow tokens ride queries.
+            tracing::debug_span!("http", method = %req.method(), path = %req.uri().path())
+        })
+    };
+
+    // Public listener (:8787) — /v1 + oauth + well-known. /internal rides it
+    // ONLY on the single-host Docker path (bearer auth separates the planes
+    // there). On Kubernetes the sandbox plane is exclusively the :8788
+    // listener: route absence is stronger than bearer auth, and a chart
+    // Ingress routing '/' must never expose /internal to the internet (M8).
+    let mut public_root = Router::new().nest("/v1", public);
+    if !is_k8s {
+        public_root = public_root.nest("/internal", internal.clone());
+    }
+    let public_app = public_root
         // CIMD (spec 2025-11-25): this document's URL IS our OAuth
         // client_id; authorization servers fetch it — public by nature.
         .route("/.well-known/fluidbox-client.json", get(oauth::cimd_doc))
-        // Method + PATH only — never the query string: OAuth `code`/`state`
-        // and the GitHub flow tokens ride queries and must not reach logs.
-        .layer(
-            TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<axum::body::Body>| {
-                tracing::debug_span!("http", method = %req.method(), path = %req.uri().path())
-            }),
-        )
+        .layer(trace_layer())
         .layer(CorsLayer::permissive())
         .with_state(state.clone());
 
-    let listener = tokio::net::TcpListener::bind(&state.cfg.bind).await?;
-    tracing::info!("fluidbox listening on http://{}", state.cfg.bind);
+    // Internal listener (:8788) — /internal ONLY, no /v1 route exists. This is
+    // the sandbox-facing plane on Kubernetes (the internal Service targets it);
+    // route absence means a sandbox cannot reach /v1 at the TCP level.
+    let internal_app = Router::new()
+        .nest("/internal", internal)
+        .layer(trace_layer())
+        .with_state(state.clone());
+
+    let public_listener = tokio::net::TcpListener::bind(&state.cfg.bind).await?;
+    let internal_listener = tokio::net::TcpListener::bind(&state.cfg.internal_bind).await?;
+    tracing::info!("fluidbox public  listening on http://{}", state.cfg.bind);
+    tracing::info!(
+        "fluidbox internal listening on http://{} (/internal only)",
+        state.cfg.internal_bind
+    );
     tracing::info!("default agent: {}", seed.default_agent);
-    axum::serve(listener, app).await?;
+
+    // Serve both planes; if either listener falls over, the process exits.
+    tokio::select! {
+        r = axum::serve(public_listener, public_app) => r?,
+        r = axum::serve(internal_listener, internal_app) => r?,
+    }
     Ok(())
 }

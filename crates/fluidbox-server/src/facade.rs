@@ -243,7 +243,9 @@ pub async fn messages(
     let session = fluidbox_db::get_session(&state.pool, session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if session.status_enum().is_terminal() {
+    // No model spend for a terminal OR winding-down run — the budget stop and
+    // the finalizer both rely on the facade refusing once a run is over.
+    if !session.status_enum().accepts_work() {
         return Ok(dialect_error(
             shape_hint(&rest),
             StatusCode::BAD_REQUEST,
@@ -545,8 +547,29 @@ async fn trigger_budget_stop(
         let state2 = state.clone();
         let reason = format!("{budget} budget exceeded");
         tokio::spawn(async move {
-            crate::orchestrator::finalize(&state2, &session, "budget_exceeded", Some(&reason))
-                .await;
+            // Forced stop (runner is live → quiesce first). Retried with
+            // backoff: the facade re-enforces on the runner's next request,
+            // but an idle runner makes none — this task must converge alone.
+            for attempt in 0..5u32 {
+                match crate::orchestrator::finalize_forced(
+                    &state2,
+                    session.id,
+                    "budget_exceeded",
+                    &reason,
+                )
+                .await
+                {
+                    crate::orchestrator::FinalizeStart::DbError => {
+                        tokio::time::sleep(std::time::Duration::from_secs(10u64 << attempt.min(3)))
+                            .await;
+                    }
+                    _ => return,
+                }
+            }
+            tracing::error!(
+                "budget finalize for {} did not persist after retries",
+                session.id
+            );
         });
     }
 }

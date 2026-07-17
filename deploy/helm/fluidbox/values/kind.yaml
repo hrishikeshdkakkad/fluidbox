@@ -1,0 +1,18 @@
+# kind (local / CI reference). kind's default kindnet does NOT enforce
+# NetworkPolicy — install Calico (the boot probe would correctly block runs on
+# kindnet). local-path is the default StorageClass. Images are `kind load`ed.
+images:
+  server: { repository: fluidbox-server, tag: dev, pullPolicy: IfNotPresent }
+  web: { repository: fluidbox-web, tag: dev, pullPolicy: IfNotPresent }
+  sandboxRunner: fluidbox-sandbox-runner:dev
+  codexRunner: fluidbox-codex-runner:dev
+  collector: fluidbox-workspaced:dev
+server:
+  archivePvc:
+    storageClass: standard      # kind's local-path default is named "standard"
+litellm:
+  enabled: true
+sandbox:
+  egressProfile: zeroEgress
+netpol:
+  requireEnforced: true

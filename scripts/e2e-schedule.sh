@@ -207,7 +207,12 @@ FINAL_C=$(wait_terminal "$SC1" 90) || true
 fake_running "$SC1"
 rewind "$SUBC" "now()"
 wait_trig "$SUBC" "len(d['sessions']) >= 2" 15 1 && ok "replace fired a new run" || no "no replacement run"
-[ "$(sfield "$SC1" "['status']")" = "cancelled" ] && ok "stale run cancelled" || no "stale run status: $(sfield "$SC1" "['status']")"
+# Cancel is asynchronous by design (K8s finalizer, 2026-07-15): it asks the
+# runner to quiesce and collects the diff BEFORE the terminal transition, so
+# the stale run reaches `cancelled` via cancelling→finalizing rather than
+# instantly. Wait for it to wind down instead of racing the drive.
+STALE_C=$(wait_terminal "$SC1" 60)
+[ "$STALE_C" = "cancelled" ] && ok "stale run cancelled" || no "stale run status: $STALE_C"
 sfield "$SC1" "['status_reason']" | grep -q "replaced" && ok "cancel reason names the replacement" || no "reason: $(sfield "$SC1" "['status_reason']")"
 
 say "MISSED skip — SUB D: a 10-minute gap records ONE skip and resumes the cadence"

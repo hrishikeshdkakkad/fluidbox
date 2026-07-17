@@ -1,0 +1,54 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "fluidbox.serverName" . }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    # Public plane only (:8787 API + the dashboard). The internal listener is
+    # NEVER exposed.
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          # The API plane: /v1 (dashboard proxy, CLI, OAuth callback, webhook
+          # ingress) + /.well-known (the CIMD client-id document).
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "fluidbox.serverName" . }}
+                port: { number: 8787 }
+          - path: /.well-known
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "fluidbox.serverName" . }}
+                port: { number: 8787 }
+          {{- if .Values.web.enabled }}
+          # Everything else is the dashboard — NOTES.txt sends operators here.
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "fluidbox.webName" . }}
+                port: { number: 3000 }
+          {{- else }}
+          # No dashboard deployed: the API is the origin.
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "fluidbox.serverName" . }}
+                port: { number: 8787 }
+          {{- end }}
+{{- end }}
