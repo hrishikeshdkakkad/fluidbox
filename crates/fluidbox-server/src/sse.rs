@@ -2,8 +2,9 @@
 //! delivery source of truth. Immune to missed notifies and Neon scale-to-zero
 //! because a polling floor always re-checks the seq.
 
-use crate::auth::Admin;
-use crate::error::ApiResult;
+use crate::auth::Principal;
+use crate::error::{ApiError, ApiResult};
+use crate::rbac;
 use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
@@ -14,11 +15,20 @@ use std::time::Duration;
 use uuid::Uuid;
 
 pub async fn stream(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> ApiResult<impl IntoResponse> {
+    // The handshake enforces run.read like any GET on the session's timeline;
+    // the CSRF/Origin gate ran in the `Principal` extractor. (Bounded periodic
+    // re-auth on the long-lived stream is a Task-5 follow-up — design 658-664.)
+    let scope = principal.scope();
+    let session = fluidbox_db::get_session(&state.pool, scope, id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    rbac::ensure_run_visible(&principal, &session)?;
+
     // Resume from Last-Event-ID (the seq) if present.
     let mut last_seq: i64 = headers
         .get("last-event-id")
@@ -28,7 +38,6 @@ pub async fn stream(
 
     let mut rx = state.events_tx.subscribe();
     let pool = state.pool.clone();
-    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
 
     let s = async_stream::stream! {
         // Immediately flush any backlog.

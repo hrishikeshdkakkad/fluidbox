@@ -9,7 +9,7 @@
 //! re-walks both and can therefore only HEAL a partial fan-out — never
 //! duplicate a run or a comment.
 
-use crate::auth::Admin;
+use crate::auth::Principal;
 use crate::connectors::{self, NormalizedEvent, VerifiedDelivery};
 use crate::error::{ApiError, ApiResult};
 use crate::run_service::{self, CreateRun, RevisionSelector, RunCreation};
@@ -328,11 +328,11 @@ fn subscription_matches(
 /// their per-subscription dispatch outcomes. Payloads stay out of the
 /// listing (the digest identifies them; the row keeps the full body).
 pub async fn connection_deliveries(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let scope = principal.scope();
     let conn = fluidbox_db::get_connection(&state.pool, scope, id)
         .await?
         .ok_or(ApiError::NotFound)?;
