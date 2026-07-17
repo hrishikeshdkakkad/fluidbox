@@ -16,10 +16,10 @@
 
 use crate::approval_cols;
 use crate::{
-    ApprovalRow, IntegrationConnectionRow, ResultDeliveryRow, ScheduleRow, SessionRow,
-    TriggerSubscriptionRow,
+    ApprovalRow, GithubAppRegistrationRow, IntegrationConnectionRow, ResultDeliveryRow,
+    ScheduleRow, SessionRow, TriggerSubscriptionRow,
 };
-use crate::{CONNECTION_COLS, SUBSCRIPTION_COLS};
+use crate::{CONNECTION_COLS, GH_REG_COLS, SUBSCRIPTION_COLS};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -69,6 +69,27 @@ pub async fn get_trigger_subscription(
 ) -> sqlx::Result<Option<TriggerSubscriptionRow>> {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {SUBSCRIPTION_COLS} from trigger_subscriptions where id = $1"
+    )))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Load a GitHub App registration by id with NO tenant predicate — the
+/// cross-tenant loader for the UNAUTHENTICATED app-level webhook ingress
+/// (`POST /v1/ingress/github/app/{registration_id}`), which receives a bare
+/// registration id in the URL and no principal: the HMAC against the
+/// registration's own sealed webhook secret IS the auth, and the
+/// registration's `tenant_id` becomes the operative scope for the rest of the
+/// delivery spine (exactly parallel to [`get_connection`] on the per-connection
+/// ingress). Request handlers must use the scoped
+/// [`get_github_app_registration`](crate::get_github_app_registration).
+pub async fn get_github_app_registration(
+    pool: &PgPool,
+    id: Uuid,
+) -> sqlx::Result<Option<GithubAppRegistrationRow>> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "select {GH_REG_COLS} from github_app_registrations where id = $1"
     )))
     .bind(id)
     .fetch_optional(pool)

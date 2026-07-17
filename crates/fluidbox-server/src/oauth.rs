@@ -23,8 +23,9 @@
 //! at `/.well-known/fluidbox-client.json`) → DCR (RFC 7591; minted
 //! client_id stored per connection, never re-registered per connect).
 
-use crate::auth::Admin;
+use crate::auth::Principal;
 use crate::error::{ApiError, ApiResult};
+use crate::rbac;
 use crate::seal::Sealer;
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
@@ -354,6 +355,7 @@ pub async fn discover(state: &AppState, mcp_url: &str) -> Result<AsMeta, String>
 /// Returns (client_id, source).
 async fn resolve_client(
     state: &AppState,
+    scope: fluidbox_db::TenantScope,
     conn_id: Uuid,
     oauth: &Value,
     meta: &AsMeta,
@@ -419,7 +421,7 @@ async fn resolve_client(
         if let Some(sealer) = &state.sealer {
             fluidbox_db::set_connection_client_secret(
                 &state.pool,
-                fluidbox_db::TenantScope::assume(state.tenant_id),
+                scope,
                 conn_id,
                 &sealer.seal(secret),
             )
@@ -443,9 +445,12 @@ fn sealer(state: &AppState) -> ApiResult<&Sealer> {
 /// Shared by the start endpoint and the catalog Connect flow: run discovery
 /// and client-identity resolution (idempotent — results persist on the
 /// connection), then mint the PKCE pair and return the authorize URL.
-pub async fn start_dance(state: &AppState, conn_id: Uuid) -> ApiResult<String> {
+pub async fn start_dance(
+    state: &AppState,
+    scope: fluidbox_db::TenantScope,
+    conn_id: Uuid,
+) -> ApiResult<String> {
     let sealer_ref = sealer(state)?;
-    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
     let conn = fluidbox_db::get_connection(&state.pool, scope, conn_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -469,7 +474,7 @@ pub async fn start_dance(state: &AppState, conn_id: Uuid) -> ApiResult<String> {
     let meta = discover(state, &resource)
         .await
         .map_err(ApiError::BadRequest)?;
-    let (client_id, client_source) = resolve_client(state, conn.id, &oauth, &meta)
+    let (client_id, client_source) = resolve_client(state, scope, conn.id, &oauth, &meta)
         .await
         .map_err(ApiError::BadRequest)?;
 
@@ -528,11 +533,16 @@ pub async fn start_dance(state: &AppState, conn_id: Uuid) -> ApiResult<String> {
 /// `POST /v1/connections/{id}/oauth/start` (admin) → `{authorize_url}`.
 /// Also the RECONNECT path: an errored connection redoes the dance in place.
 pub async fn start(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let authorize_url = start_dance(&state, id).await?;
+    if !rbac::can_mutate_resources(&principal) {
+        return Err(ApiError::Forbidden(
+            "starting an OAuth connection requires admin or owner".into(),
+        ));
+    }
+    let authorize_url = start_dance(&state, principal.scope(), id).await?;
     Ok(Json(json!({ "authorize_url": authorize_url })))
 }
 
@@ -622,13 +632,15 @@ async fn complete_dance(
     code: &str,
 ) -> Result<String, String> {
     let sealer_ref = state.sealer.as_ref().ok_or("credential key missing")?;
-    // The sealed `state` param is the auth; the callback runs at the handler
-    // boundary, so bridge the boot tenant (Task 4 plumbs the state's tenant).
-    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
-    let conn = fluidbox_db::get_connection(&state.pool, scope, conn_id)
+    // The AEAD-sealed `state` param carrying conn_id IS the auth (like a webhook
+    // signature) — this browser leg has no principal. Resolve the connection
+    // cross-tenant (UUID-only system-worker loader), then its OWN tenant is the
+    // operative scope for the exchange, exactly parallel to events.rs ingress.
+    let conn = fluidbox_db::system_worker::get_connection(&state.pool, conn_id)
         .await
         .map_err(|e| format!("connection lookup failed: {e}"))?
         .ok_or("connection not found")?;
+    let scope = fluidbox_db::TenantScope::assume(conn.tenant_id);
     if conn.status == "revoked" {
         return Err("connection was revoked — create a new one".into());
     }
@@ -743,6 +755,7 @@ async fn complete_dance(
     };
     match crate::capabilities::register_bundle(
         state,
+        scope,
         name,
         Some("Registered from the connector catalog"),
         vec![server],

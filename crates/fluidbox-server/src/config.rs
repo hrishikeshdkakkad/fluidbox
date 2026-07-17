@@ -81,6 +81,27 @@ pub struct Config {
     /// TTL for the stored-archive sweep (the leak backstop). The archive is
     /// single-use init transport — anything older than this is a leak.
     pub archive_ttl_secs: u64,
+    /// Confine the operator (admin) token to `/v1/admin/*` (`FLUIDBOX_REQUIRE_SSO`).
+    /// With it set, `Principal` refuses the admin token on data-plane routes —
+    /// a hosted deployment authorizes only verified user principals there.
+    pub require_sso: bool,
+    /// Browser-session sliding idle window (seconds). The idle bump is always
+    /// `least(now() + idle, absolute_expires_at)`.
+    pub session_idle_secs: i64,
+    /// Browser-session hard cap (seconds). Consumed by the Task-5 login mint.
+    #[allow(dead_code)]
+    pub session_absolute_secs: i64,
+    /// Max age of a cached OIDC discovery document / JWKS before re-fetch.
+    /// Consumed by Task 5 (defined here so config lives in one change).
+    #[allow(dead_code)]
+    pub oidc_discovery_max_age_secs: i64,
+    /// Permitted clock skew when validating ID-token time claims (Task 5).
+    #[allow(dead_code)]
+    pub oidc_clock_skew_secs: i64,
+    /// Minimum interval between a browser session's re-authorization checks on
+    /// a long-lived stream (Task 5); clamped to at most 60s (the re-auth bound).
+    #[allow(dead_code)]
+    pub session_reauth_secs: i64,
 }
 
 /// Serialized runner-env ceiling: env injection is the v1 config channel
@@ -179,6 +200,37 @@ impl Config {
                 get("FLUIDBOX_ARCHIVE_TTL_SECS").ok(),
                 24 * 3600,
             )?,
+            require_sso: get("FLUIDBOX_REQUIRE_SSO")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            session_idle_secs: parse_i64_env(
+                "FLUIDBOX_SESSION_IDLE_SECS",
+                get("FLUIDBOX_SESSION_IDLE_SECS").ok(),
+                8 * 3600, // 28800
+            )?,
+            session_absolute_secs: parse_i64_env(
+                "FLUIDBOX_SESSION_ABSOLUTE_SECS",
+                get("FLUIDBOX_SESSION_ABSOLUTE_SECS").ok(),
+                7 * 24 * 3600, // 604800
+            )?,
+            oidc_discovery_max_age_secs: parse_i64_env(
+                "FLUIDBOX_OIDC_DISCOVERY_MAX_AGE_SECS",
+                get("FLUIDBOX_OIDC_DISCOVERY_MAX_AGE_SECS").ok(),
+                3600,
+            )?,
+            oidc_clock_skew_secs: parse_i64_env(
+                "FLUIDBOX_OIDC_CLOCK_SKEW_SECS",
+                get("FLUIDBOX_OIDC_CLOCK_SKEW_SECS").ok(),
+                60,
+            )?,
+            // Clamp to the ≤60s re-auth bound (design lines 658-664): a larger
+            // value would widen the window a revoked session keeps a stream.
+            session_reauth_secs: parse_i64_env(
+                "FLUIDBOX_SESSION_REAUTH_SECS",
+                get("FLUIDBOX_SESSION_REAUTH_SECS").ok(),
+                60,
+            )?
+            .min(60),
         })
     }
 }
@@ -191,6 +243,16 @@ fn parse_u64_env(name: &str, raw: Option<String>, default: u64) -> anyhow::Resul
         Some(v) => v
             .parse()
             .map_err(|e| anyhow::anyhow!("{name}='{v}' is not a valid u64: {e}")),
+    }
+}
+
+/// Same fail-boot-on-malformed discipline for i64 duration knobs.
+fn parse_i64_env(name: &str, raw: Option<String>, default: i64) -> anyhow::Result<i64> {
+    match raw.filter(|v| !v.is_empty()) {
+        None => Ok(default),
+        Some(v) => v
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{name}='{v}' is not a valid i64: {e}")),
     }
 }
 
