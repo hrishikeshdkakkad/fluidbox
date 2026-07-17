@@ -236,6 +236,8 @@ helm test fluidbox --namespace fluidbox
 
 Start with the chart's annotated [`values.yaml`](./deploy/helm/fluidbox/values.yaml) and the EKS/GKE/AKS/DOKS/kind presets under [`deploy/helm/fluidbox/values/`](./deploy/helm/fluidbox/values). Production should pin image digests and supply credentials through the existing Secret; the chart never generates credential material.
 
+> **Full walkthrough → [Kubernetes deployment guide](./docs/guides/kubernetes.md).** Zero to a certified, run-serving cluster: the generic recipe, per-cloud setup and gotchas (EKS/GKE/AKS/DOKS), secrets, network-enforcement certification, verifying a run end to end, node sizing and cost, safe audited teardown, and a troubleshooting table — all from a live cloud acceptance.
+
 ## Repository map
 
 ```text
@@ -264,6 +266,7 @@ policies/                     versioned seed policy YAML
 - [Writing policies](./docs/guides/policies.md) — ordered rules, approvals, autonomy, and managed overrides.
 - [Triggers and schedules](./docs/guides/triggers.md) — scoped invocation, cron, callbacks, and GitHub events.
 - [MCP capabilities](./docs/guides/capabilities.md) — sandbox versus brokered tools, pinning, and connector custody.
+- [Kubernetes deployment guide](./docs/guides/kubernetes.md) — deploy to kind, EKS, GKE, AKS, or DOKS: recipe, per-cloud gotchas, certification, verifying a run, cost, and safe teardown.
 - [Kubernetes provider design](./docs/plans/2026-07-15-kubernetes-native-provider-design.md) — Pod lifecycle, network enforcement, archive transport, finalization, and reconciliation.
 
 ## Project status
