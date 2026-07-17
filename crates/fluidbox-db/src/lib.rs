@@ -1666,13 +1666,18 @@ pub async fn sessions_in_status(pool: &PgPool, statuses: &[&str]) -> sqlx::Resul
 /// provisioning → initializing in seconds (initializing: minutes at worst
 /// for a big repo copy), so a stale row means the control plane died
 /// mid-launch and nothing owns the session anymore.
+///
+/// Age is measured from `created_at` — a timestamp NOTHING refreshes. It used
+/// to be `updated_at`, which every runner heartbeat bumps: a crash between
+/// runner start and `set_sandbox_handle` left a heartbeating `initializing`
+/// session this sweep could never age out (M5).
 pub async fn stale_nonstarted_sessions(
     pool: &PgPool,
     max_age_mins: i32,
 ) -> sqlx::Result<Vec<SessionRow>> {
     sqlx::query_as(
         "select * from sessions
-         where status = any($1) and updated_at < now() - make_interval(mins => $2)",
+         where status = any($1) and created_at < now() - make_interval(mins => $2)",
     )
     .bind(vec![
         "created".to_string(),
@@ -3415,8 +3420,9 @@ mod tests {
         )
         .await
         .unwrap();
+        // The sweep keys off created_at (heartbeat-proof; M5) — backdate that.
         let backdate =
-            "update sessions set updated_at = now() - interval '20 minutes' where id = $1";
+            "update sessions set created_at = now() - interval '20 minutes' where id = $1";
         sqlx::query(backdate)
             .bind(stale.id)
             .execute(&pool)
