@@ -30,4 +30,5 @@ sandbox:
       operator: Equal
       value: fluidbox
       effect: NoSchedule
+      tolerationSeconds: 300
   priorityClassName: sandbox-low

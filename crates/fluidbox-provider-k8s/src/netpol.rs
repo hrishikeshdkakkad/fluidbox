@@ -186,6 +186,7 @@ mod tests {
             operator: Some("Equal".into()),
             value: Some("fluidbox".into()),
             effect: Some("NoSchedule".into()),
+            toleration_seconds: None,
         }];
         c.image_pull_secrets = vec!["regcred".into()];
 

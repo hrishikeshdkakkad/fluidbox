@@ -14,6 +14,9 @@ on:
       - "deploy/helm/**"
       - "deploy/workspaced.Dockerfile"
       - ".github/workflows/k8s.yml"
+      # The chart job asserts the appVersion-binding defaults release.yml
+      # relies on — run it when the release pipeline changes too.
+      - ".github/workflows/release.yml"
       - ".github/k8s-ci-postgres.yaml"
       - ".github/kind-calico.yaml"
   schedule:

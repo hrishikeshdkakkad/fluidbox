@@ -47,6 +47,10 @@ pub struct Toleration {
     pub value: Option<String>,
     #[serde(default)]
     pub effect: Option<String>,
+    /// Bounded-`NoExecute` support: dropping this on the floor would turn
+    /// "tolerate for N seconds" into "tolerate forever".
+    #[serde(default, rename = "tolerationSeconds")]
+    pub toleration_seconds: Option<i64>,
 }
 
 impl K8sConfig {
@@ -104,16 +108,36 @@ fn parse_list(s: Option<String>) -> Vec<String> {
         .collect()
 }
 
-/// Parse `tolerations` from a JSON array of `{key,operator,value,effect}`
-/// objects — the shape Helm produces from `values.sandbox.tolerations` via
-/// `toJson`, and the exact shape `build_pod` serializes back. A missing,
-/// empty, or unparseable value yields no tolerations (fail-open on the hint,
-/// never a boot crash — the placement is advisory scheduling, not security).
+/// Parse `tolerations` from a JSON array of
+/// `{key,operator,value,effect,tolerationSeconds}` objects — the shape Helm
+/// produces from `values.sandbox.tolerations` via `toJson`, and the exact
+/// shape `build_pod` serializes back. Salvaging: each element parses
+/// independently, so ONE malformed toleration is warned about and skipped
+/// instead of silently erasing the whole list (the placement is advisory
+/// scheduling, not security — never a boot crash, but never silent either).
 fn parse_tolerations(s: Option<String>) -> Vec<Toleration> {
     let Some(s) = s.filter(|v| !v.trim().is_empty()) else {
         return Vec::new();
     };
-    serde_json::from_str(&s).unwrap_or_default()
+    let elements: Vec<serde_json::Value> = match serde_json::from_str(&s) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("FLUIDBOX_K8S_TOLERATIONS is not a JSON array ({e}); ignoring it");
+            return Vec::new();
+        }
+    };
+    elements
+        .into_iter()
+        .filter_map(
+            |el| match serde_json::from_value::<Toleration>(el.clone()) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    tracing::warn!("skipping malformed toleration {el} ({e})");
+                    None
+                }
+            },
+        )
+        .collect()
 }
 
 #[cfg(test)]
@@ -124,15 +148,19 @@ mod tests {
     fn tolerations_parse_from_json_array() {
         let json = r#"[
             {"key":"dedicated","operator":"Equal","value":"fluidbox","effect":"NoSchedule"},
-            {"operator":"Exists","effect":"NoExecute"}
+            {"operator":"Exists","effect":"NoExecute","tolerationSeconds":300}
         ]"#;
         let t = parse_tolerations(Some(json.to_string()));
         assert_eq!(t.len(), 2);
         assert_eq!(t[0].key.as_deref(), Some("dedicated"));
         assert_eq!(t[0].value.as_deref(), Some("fluidbox"));
         assert_eq!(t[0].effect.as_deref(), Some("NoSchedule"));
+        assert_eq!(t[0].toleration_seconds, None);
         assert_eq!(t[1].key, None);
         assert_eq!(t[1].operator.as_deref(), Some("Exists"));
+        // tolerationSeconds survives the round-trip: dropping it would turn a
+        // BOUNDED NoExecute toleration into "tolerate forever" (Codex round 2).
+        assert_eq!(t[1].toleration_seconds, Some(300));
     }
 
     #[test]
@@ -140,6 +168,19 @@ mod tests {
         assert!(parse_tolerations(None).is_empty());
         assert!(parse_tolerations(Some("   ".into())).is_empty());
         assert!(parse_tolerations(Some("not json".into())).is_empty());
+    }
+
+    #[test]
+    fn tolerations_salvage_valid_elements_from_a_partly_bad_list() {
+        // One malformed element (numeric value — invalid per the K8s API)
+        // must not silently erase the OTHER, valid tolerations.
+        let json = r#"[
+            {"key":"dedicated","operator":"Equal","value":"fluidbox","effect":"NoSchedule"},
+            {"key":"bad","operator":"Equal","value":7,"effect":"NoSchedule"}
+        ]"#;
+        let t = parse_tolerations(Some(json.to_string()));
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].key.as_deref(), Some("dedicated"));
     }
 
     #[test]

@@ -32,6 +32,8 @@ grep -qF -- 'name: FLUIDBOX_K8S_TOLERATIONS' <<<"$server" \
   || fail "FLUIDBOX_K8S_TOLERATIONS env not rendered (M3)"
 grep -qF -- '\"key\":\"dedicated\"' <<<"$server" \
   || fail "tolerations JSON payload not rendered via toJson (M3)"
+grep -qF -- '\"tolerationSeconds\":300' <<<"$server" \
+  || fail "tolerationSeconds lost in the tolerations payload (M3 fidelity)"
 
 # M10: pull-secret names reach the provider (sandbox + probe pods).
 assert_env FLUIDBOX_K8S_IMAGE_PULL_SECRETS '"regcred,mirror-cred"'
@@ -70,18 +72,32 @@ grep -qF 'pool: sandbox' <<<"$probe" \
   || fail "helm-test probe missing sandbox nodeSelector (M3 parity)"
 
 # L12: with the dashboard enabled, / routes to the web Service and the API
-# stays reachable under /v1 (+ /.well-known for CIMD).
+# stays reachable under /v1 (+ /.well-known for CIMD). Assert the PAIRING
+# (path → backend), not just token presence — a swapped mapping must fail.
 ingress="$(render -f test-values/assert.yaml -s templates/ingress.yaml)"
-grep -qF 'path: /v1' <<<"$ingress" || fail "ingress missing /v1 → API route (L12)"
-grep -qF 'path: /.well-known' <<<"$ingress" || fail "ingress missing /.well-known route (L12)"
-grep -qF 'name: fluidbox-fluidbox-web' <<<"$ingress" \
-  || fail "ingress / does not route to the dashboard when web.enabled (L12)"
+pairs="$(awk '/- path:/ { p = $3 } /name:/ { if (p) print p, $2 }' <<<"$ingress")"
+assert_route() {
+  grep -qx -- "$1 $2" <<<"$pairs" || fail "ingress must route $1 → $2 (L12); got: $(tr '\n' ';' <<<"$pairs")"
+}
+assert_route "/v1" "fluidbox-fluidbox-server"
+assert_route "/.well-known" "fluidbox-fluidbox-server"
+assert_route "/" "fluidbox-fluidbox-web"
 # Without the dashboard, / falls back to the API.
 ingress_api="$(render -f test-values/assert.yaml --set web.enabled=false -s templates/ingress.yaml)"
-grep -qF 'name: fluidbox-fluidbox-web' <<<"$ingress_api" \
+pairs="$(awk '/- path:/ { p = $3 } /name:/ { if (p) print p, $2 }' <<<"$ingress_api")"
+grep -qF 'fluidbox-fluidbox-web' <<<"$pairs" \
   && fail "ingress routes to a web Service that is not deployed (L12)"
-grep -qF 'name: fluidbox-fluidbox-server' <<<"$ingress_api" \
-  || fail "ingress / must fall back to the API with web.enabled=false (L12)"
+assert_route "/" "fluidbox-fluidbox-server"
+
+# Hostile values must FAIL the render, not silently degrade.
+if render -f test-values/assert.yaml --set-string images.server.digest="deadbeef" \
+  -s templates/server.yaml >/dev/null 2>&1; then
+  fail "a malformed digest (missing sha256: prefix) must fail the render (M9)"
+fi
+if render -f test-values/assert.yaml --set-string sandbox.nodeSelector.pool="a=b" \
+  -s templates/server.yaml >/dev/null 2>&1; then
+  fail "a nodeSelector value containing '=' must fail the render (M3 encoding)"
+fi
 
 # ---------------------------------------------------------------------------
 # Every preset must lint and render.
