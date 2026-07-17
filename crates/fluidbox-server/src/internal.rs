@@ -765,6 +765,7 @@ pub async fn workspace_archive(
     State(state): State<AppState>,
 ) -> ApiResult<axum::response::Response> {
     use axum::response::IntoResponse;
+    use tokio::io::AsyncReadExt;
     // A terminal/winding-down session's archive is moot (the run is over).
     let session = fluidbox_db::get_session(&state.pool, auth.session_id)
         .await?
@@ -773,18 +774,50 @@ pub async fn workspace_archive(
         return Err(ApiError::BadRequest("session is not active".into()));
     }
     let path = crate::orchestrator::archive_path(&state.cfg.data_dir, auth.session_id);
-    let bytes = tokio::fs::read(&path)
+    // Streamed straight off disk — a large archive must never transit
+    // control-plane RAM (M4). The explicit Content-Length lets the client
+    // detect truncation cheaply; the init container's digest check remains
+    // the integrity authority.
+    let mut file = tokio::fs::File::open(&path)
         .await
         .map_err(|_| ApiError::NotFound)?;
+    let len = file.metadata().await.map_err(|_| ApiError::NotFound)?.len();
+    let stream = async_stream::stream! {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match file.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n])),
+                Err(e) => {
+                    yield Err(e);
+                    break;
+                }
+            }
+        }
+    };
     Ok((
-        [(axum::http::header::CONTENT_TYPE, "application/gzip")],
-        bytes,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/gzip".to_string(),
+            ),
+            (axum::http::header::CONTENT_LENGTH, len.to_string()),
+        ],
+        axum::body::Body::from_stream(stream),
     )
         .into_response())
 }
 
 pub async fn heartbeat(auth: SessionAuth, State(state): State<AppState>) -> ApiResult<Json<Value>> {
     fluidbox_db::heartbeat(&state.pool, auth.session_id).await?;
+    // Delete-after-init (L3): heartbeats come from the runner container,
+    // which only starts after the init container consumed the archive — the
+    // single-use transport is done, so reclaim it now instead of at terminal
+    // cleanup. Idempotent (and a no-op for host-dir providers like Docker,
+    // which never store one).
+    if state.provider.workspace_transport() == fluidbox_core::traits::WorkspaceTransport::Archive {
+        orchestrator::delete_archive(&state.cfg.data_dir, auth.session_id);
+    }
     // Quiesce channel (the ONLY runner-contract change in the K8s design):
     // once a session enters `cancelling`, its heartbeat response carries
     // {"action":"quiesce"} — the runner stops the agent and exits WITHOUT
