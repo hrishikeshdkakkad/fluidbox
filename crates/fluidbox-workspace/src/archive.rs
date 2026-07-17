@@ -233,7 +233,6 @@ pub fn clear_dir_contents(dir: &Path) -> std::io::Result<()> {
     // `cap-std`/`openat` crates) — tracked as a follow-up; not production-
     // reachable today.
     match std::fs::symlink_metadata(dir) {
-    match std::fs::symlink_metadata(dir) {
         Ok(m) if m.file_type().is_symlink() => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
