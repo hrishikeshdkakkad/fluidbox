@@ -115,8 +115,9 @@ sandbox:
     requestsCpu: "10"
     requestsMemory: "20Gi"
   nodeSelector: {}
-  # Toleration objects ({key, operator, value, effect}); other fields (e.g.
-  # tolerationSeconds) are not propagated to sandbox pods.
+  # Toleration objects: {key, operator, value, effect, tolerationSeconds} —
+  # exactly the Kubernetes Toleration fields; anything else is rejected (and
+  # warned about) rather than silently ignored.
   tolerations: []
   priorityClassName: ""
   # CIDRs excepted from the `permissive` profile (metadata + cluster internals).

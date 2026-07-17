@@ -129,6 +129,13 @@ jobs:
           # carries it — the chart must reference what actually got pushed.
           VERSION="${GITHUB_REF_NAME#v}"
           VERSION="${VERSION%%+*}"
+          # metadata-action only emits semver image tags for VALID SemVer —
+          # an invalid tag (e.g. v1.2.3+build_7) would publish images without
+          # a version tag while this chart references one. Fail loudly.
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "tag '$GITHUB_REF_NAME' is not valid SemVer; refusing to publish a chart referencing unpublished images" >&2
+            exit 1
+          fi
           helm package deploy/helm/fluidbox --destination /tmp/chart \
             --version "$VERSION" --app-version "$VERSION"
           helm push /tmp/chart/fluidbox-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts

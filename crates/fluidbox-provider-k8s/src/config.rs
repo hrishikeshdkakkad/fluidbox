@@ -37,7 +37,11 @@ pub struct K8sConfig {
     pub image_pull_secrets: Vec<String>,
 }
 
+/// `deny_unknown_fields`: a misspelled field (e.g. `tolerationSecond`)
+/// silently ignored would change scheduling semantics with no warning — the
+/// salvage loop in `parse_tolerations` rejects and WARNS instead.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Toleration {
     #[serde(default)]
     pub key: Option<String>,
@@ -181,6 +185,17 @@ mod tests {
         let t = parse_tolerations(Some(json.to_string()));
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].key.as_deref(), Some("dedicated"));
+    }
+
+    #[test]
+    fn tolerations_reject_unknown_fields_never_silently_ignore() {
+        // A MISSPELLED field (tolerationSecond) silently ignored would turn a
+        // bounded NoExecute toleration into "tolerate forever" with no
+        // warning — the element must be rejected (and warned about) instead.
+        let json = r#"[
+            {"operator":"Exists","effect":"NoExecute","tolerationSecond":300}
+        ]"#;
+        assert!(parse_tolerations(Some(json.to_string())).is_empty());
     }
 
     #[test]

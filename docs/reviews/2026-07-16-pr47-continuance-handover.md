@@ -67,19 +67,8 @@ findings doc has live `[x]` checkboxes — flip them per batch, in the same PR.
 
 ## Remaining work
 
-**Batch 5 `fix/k8s-helm-wiring` (M3, M9, M10, L12):** `build_pod` already
-consumes the full `K8sConfig`. Remaining: wire `values.sandbox.*` →
-`FLUIDBOX_K8S_*` env in `deploy/helm/fluidbox/templates/server.yaml`
-(resources, run_as_user, volume_size_limit, node_selector, priority_class,
-`FLUIDBOX_K8S_TOLERATIONS` via `toJson`, `FLUIDBOX_K8S_IMAGE_PULL_SECRETS`);
-apply `imagePullSecrets` to the sandbox PodSpec in `manifest.rs` and the
-boot-probe PodSpec in `netpol.rs`; give the netpol boot probe the sandbox
-placement (nodeSelector/tolerations/runtimeClass/priorityClass) — M3's gate-
-parity gap; M9: bind release tags/digests into the packaged chart + support
-`repo@sha256:` rendering; M10: pull-secret refs on both PodSpecs; L12: chart
-Ingress routes `/` to the API while NOTES.txt says dashboard — fix web routing.
-Add a values→PodSpec chart test (L13). Verify: `helm lint` + `helm template`
-each preset (kind/eks/gke/aks/doks).
+**Batch 5 `fix/k8s-helm-wiring` — DONE (PR #66; see the findings doc for the
+fix notes).**
 
 **Batch 6 `fix/k8s-archive-streaming` (M4, L3):** stream pack to disk
 (`GzEncoder<File>`), stream the HTTP response (`ReaderStream`), max-archive-
