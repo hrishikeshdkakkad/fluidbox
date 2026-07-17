@@ -38,6 +38,16 @@ export function BundlePicker({
   const names = [...byName.keys()];
   const pinOf = (name: string) => pins.find((p) => p.name === name);
 
+  // A zero-tool bundle contributes nothing to a run, so attaching one is
+  // always a mistake. They are almost always test residue: fluidbox-db's
+  // tests mint `pmt-bundle-<uuid>` against REAL Neon (see CLAUDE.md), so a
+  // dev database accumulates them. The cure is `just db-clean`; this is a
+  // guard. A pinned bundle stays visible even at zero tools — hiding
+  // something already attached would strand it.
+  const attachable = (name: string) => (byName.get(name)![0].tool_count ?? 0) > 0 || !!pinOf(name);
+  const shownNames = names.filter(attachable);
+  const hiddenCount = names.length - shownNames.length;
+
   const toggle = (name: string) => {
     const cur = pinOf(name);
     if (cur) {
@@ -76,8 +86,8 @@ export function BundlePicker({
           <button className="btn ghost sm" type="button" onClick={onAddServer}>Connect new MCP</button>
         )}
       </div>
-      <div style={{ display: "grid", gap: 6, maxHeight: 340, overflowY: "auto", paddingRight: 2 }}>
-        {names.map((name) => {
+      <div className="opt-list">
+        {shownNames.map((name) => {
           const versions = byName.get(name)!;
           const latest = versions[0];
           const pin = pinOf(name);
@@ -119,6 +129,11 @@ export function BundlePicker({
           );
         })}
       </div>
+      {hiddenCount > 0 && (
+        <p className="helper" style={{ margin: "6px 0 0" }}>
+          {hiddenCount} bundle{hiddenCount === 1 ? "" : "s"} hidden — no tools to attach.
+        </p>
+      )}
     </div>
   );
 }

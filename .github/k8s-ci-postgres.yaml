@@ -1,0 +1,52 @@
+# Throwaway in-cluster Postgres for the kind-calico CI tier ONLY. The server
+# refuses to serve without a reachable DATABASE_URL (it runs sqlx migrations on
+# boot), so the tier needs a real database — a stub hostname left the server in
+# CrashLoopBackOff and masked every assertion after it. Ephemeral by design:
+# emptyDir storage, throwaway credentials, never for any real deployment
+# (production is Neon, direct connection string).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: fluidbox
+  labels: { app: postgres }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - { name: POSTGRES_USER, value: fluidbox }
+            - { name: POSTGRES_PASSWORD, value: fluidbox-ci }
+            - { name: POSTGRES_DB, value: fluidbox }
+            # Subdirectory so initdb tolerates the emptyDir mount point.
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports:
+            - { containerPort: 5432 }
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "fluidbox", "-d", "fluidbox"]
+            initialDelaySeconds: 2
+            periodSeconds: 3
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: fluidbox
+  labels: { app: postgres }
+spec:
+  selector: { app: postgres }
+  ports:
+    - { port: 5432, targetPort: 5432 }

@@ -1,0 +1,19 @@
+# Trap #2: EKS ships no default StorageClass and the in-tree EBS provisioner is
+# gone, so the archive PVC stays Pending without this. values/eks.yaml pins
+# server.archivePvc.storageClass: gp3, so the class MUST be named "gp3".
+# WaitForFirstConsumer binds the volume in the AZ the pod lands on (avoids the
+# cross-AZ "volume in 1a, pod in 1b" bind failure). Applied post-cluster-create,
+# after the aws-ebs-csi-driver addon + IRSA are Active.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+parameters:
+  type: gp3
+  encrypted: "true"

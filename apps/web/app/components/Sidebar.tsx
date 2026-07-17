@@ -62,6 +62,9 @@ export function Sidebar() {
             Activity
             {pending > 0 && <span className="masthead-count">{pending}</span>}
           </Link>
+          <Link className={pathname.startsWith("/governance") ? "active" : ""} href="/governance">
+            Governance
+          </Link>
           <Link className={pathname === "/settings" ? "active" : ""} href="/settings">
             Settings
           </Link>

@@ -1,11 +1,13 @@
-//! fluidbox-provider — the Docker ExecutionProvider (M1).
+//! fluidbox-provider — the Docker ExecutionProvider (M1), the reference
+//! trait-v2 implementation and permanently-supported default backend.
 //!
 //! Sandboxes are plain containers, labelled so a boot-time sweep can reap
 //! orphans. The `SandboxHandle` persisted to the DB carries only the
 //! container id + network name, so the control plane can reattach after a
 //! restart. Workspace materialization is done control-plane-side (see
-//! `workspace`); the container only ever sees a copy bind-mounted at
-//! /workspace.
+//! `fluidbox_workspace`); the container only ever sees a copy bind-mounted at
+//! /workspace. Diff collection runs against the PRISTINE baseline via the
+//! shared `fluidbox-workspace` engine — never against the agent's `.git`.
 
 use async_trait::async_trait;
 use bollard::models::{ContainerCreateBody, HostConfig, NetworkCreateRequest};
@@ -15,24 +17,33 @@ use bollard::query_parameters::{
 };
 use bollard::Docker;
 use fluidbox_core::traits::{
-    ExecutionProvider, NetworkMode, ProviderError, SandboxHandle, SandboxSpec, SandboxState,
+    CollectContext, CollectedArtifact, CollectedArtifacts, ExecutionProvider, NetworkMode,
+    ProviderError, SandboxHandle, SandboxSpec, SandboxStatus,
 };
+use fluidbox_workspace::collect::{collect_diff, CollectionOutcome, DiffCaps};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use uuid::Uuid;
 
-pub mod workspace;
+/// Re-export so existing call sites (`fluidbox_provider::workspace::…`) keep
+/// working; the implementation now lives in the shared crate.
+pub use fluidbox_workspace as workspace;
 
 const SESSION_LABEL: &str = "fluidbox.session";
 const MANAGED_LABEL: &str = "fluidbox.managed";
 
 pub struct DockerProvider {
     docker: Docker,
+    /// `<data_dir>/workspaces` root, so `collect_artifacts` can find each
+    /// session's pristine baseline + worktree (Docker's collection transport
+    /// is the host dir, not `pods/exec`).
+    data_dir: PathBuf,
 }
 
 impl DockerProvider {
-    pub fn connect() -> anyhow::Result<Self> {
+    pub fn connect(data_dir: PathBuf) -> anyhow::Result<Self> {
         let docker = Docker::connect_with_local_defaults()?;
-        Ok(Self { docker })
+        Ok(Self { docker, data_dir })
     }
 
     pub async fn ping(&self) -> anyhow::Result<()> {
@@ -132,7 +143,7 @@ impl ExecutionProvider for DockerProvider {
         })
     }
 
-    async fn state(&self, handle: &SandboxHandle) -> Result<SandboxState, ProviderError> {
+    async fn state(&self, handle: &SandboxHandle) -> Result<SandboxStatus, ProviderError> {
         match self
             .docker
             .inspect_container(&handle.external_id, None::<InspectContainerOptions>)
@@ -141,14 +152,49 @@ impl ExecutionProvider for DockerProvider {
             Ok(info) => {
                 let st = info.state.unwrap_or_default();
                 if st.running.unwrap_or(false) {
-                    Ok(SandboxState::Running)
+                    Ok(SandboxStatus::Running)
                 } else {
-                    Ok(SandboxState::Exited(st.exit_code.unwrap_or(0)))
+                    Ok(SandboxStatus::Terminated {
+                        exit_code: st.exit_code,
+                        reason: st.error.filter(|e| !e.is_empty()),
+                    })
                 }
             }
-            Err(e) if e.to_string().contains("No such container") => Ok(SandboxState::Gone),
+            Err(e) if e.to_string().contains("No such container") => Ok(SandboxStatus::Unknown {
+                reason: Some("no such container".into()),
+            }),
             Err(e) => Err(map_err(e)),
         }
+    }
+
+    async fn collect_artifacts(
+        &self,
+        _handle: Option<&SandboxHandle>,
+        ctx: &CollectContext,
+    ) -> Result<CollectedArtifacts, ProviderError> {
+        // Docker's transport is the host workspace dir; the collection engine
+        // (pristine baseline + scrubbed git) is shared with every provider.
+        // Runs in a blocking pool: git subprocess + fs I/O.
+        let root = fluidbox_workspace::session_workspace_root(&self.data_dir, ctx.session_id);
+        let base = ctx.base_commit.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            collect_diff(&root, base.as_deref(), &DiffCaps::default())
+        })
+        .await
+        .map_err(|e| ProviderError::Other(format!("collection task panicked: {e}")))?;
+
+        Ok(match outcome {
+            CollectionOutcome::Diff(d) => CollectedArtifacts::Collected(vec![CollectedArtifact {
+                kind: "diff".into(),
+                name: "changes.patch".into(),
+                content: d.patch,
+                content_type: "text/x-diff".into(),
+                truncated: d.truncated,
+                sha256: d.sha256,
+                bytes: d.bytes,
+            }]),
+            CollectionOutcome::Missing { reason } => CollectedArtifacts::Missing { reason },
+        })
     }
 
     async fn terminate(&self, handle: &SandboxHandle) -> Result<(), ProviderError> {
@@ -171,7 +217,7 @@ impl ExecutionProvider for DockerProvider {
         Ok(())
     }
 
-    async fn list_orphans(&self) -> Result<Vec<(Uuid, SandboxHandle)>, ProviderError> {
+    async fn list_managed(&self) -> Result<Vec<(Uuid, SandboxHandle)>, ProviderError> {
         let mut filters: HashMap<String, Vec<String>> = HashMap::new();
         filters.insert("label".to_string(), vec![format!("{MANAGED_LABEL}=1")]);
         let opts = ListContainersOptionsBuilder::new()
@@ -207,6 +253,10 @@ impl ExecutionProvider for DockerProvider {
             ));
         }
         Ok(out)
+    }
+
+    async fn healthcheck(&self) -> Result<(), ProviderError> {
+        self.docker.ping().await.map(|_| ()).map_err(map_err)
     }
 
     fn runtime_name(&self) -> &'static str {

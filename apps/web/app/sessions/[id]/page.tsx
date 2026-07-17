@@ -451,6 +451,34 @@ function TimelineItem({ ev }: { ev: EventRow }) {
       );
       break;
     }
+    case "run.quiesce_requested":
+      tag = "cancel";
+      body = (
+        <span className="mut">
+          quiesce requested — waiting {s("deadline_secs")}s for the runner to stop
+        </span>
+      );
+      break;
+    case "artifact.collected":
+      tag = "artifact";
+      body = (
+        <>
+          collected <span className="em">{s("name")}</span>{" "}
+          <span className="mut">
+            ({s("bytes")} bytes{d.truncated ? ", truncated" : ""})
+          </span>
+        </>
+      );
+      break;
+    case "artifact.missing":
+      cls = "danger";
+      tag = "artifact";
+      body = (
+        <>
+          {s("kind")} not collected <span className="mut">· {s("reason")}</span>
+        </>
+      );
+      break;
   }
 
   return (

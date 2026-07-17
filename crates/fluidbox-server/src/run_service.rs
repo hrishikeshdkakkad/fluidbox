@@ -66,9 +66,33 @@ pub enum RunCreation {
     SkippedOverlap {
         running_session_id: Uuid,
     },
+    /// concurrency_policy = replace, but the old run's cancellation intent
+    /// could not be durably persisted (transient DB failure survived the
+    /// inline retries). Nothing was created and nothing is terminal about
+    /// this: API invokes release their idempotency claim and 503 (caller
+    /// retries); schedules/events record a visible skip (their next firing
+    /// retries naturally).
+    ReplaceUnpersisted {
+        running_session_id: Uuid,
+    },
 }
 
 pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreation> {
+    // Netpol run-gate (Kubernetes): refuse to admit a run until the CNI is
+    // proven to enforce NetworkPolicy. Fails closed — a non-enforcing cluster
+    // never runs an agent with unverified sandbox isolation.
+    if state.cfg.require_enforced_netpol
+        && !state
+            .netpol_verified
+            .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(ApiError::ServiceUnavailable(
+            "sandbox network isolation is not yet verified on this cluster — \
+             runs are blocked until the NetworkPolicy enforcement probe passes"
+                .into(),
+        ));
+    }
+
     // Resolve agent by id or name.
     let agent = match Uuid::parse_str(&req.agent) {
         Ok(id) => fluidbox_db::get_agent(&state.pool, id).await?,
@@ -151,12 +175,42 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
                 }
                 ConcurrencyPolicy::Replace => {
                     for s in &active {
-                        orchestrator::cancel(
-                            state,
-                            s.id,
-                            "replaced by a newer invocation of this subscription",
-                        )
-                        .await;
+                        // The replacement must not proceed unless the old
+                        // run's cancellation durably persisted: a healthy old
+                        // run with no wall-clock budget would otherwise
+                        // coexist with its replacement indefinitely. Retry
+                        // the transient case inline; if it still will not
+                        // persist, record a SKIP — the vocabulary schedulers
+                        // and event dispatch already handle — rather than an
+                        // error they would treat as a permanently lost
+                        // firing.
+                        let mut persisted = false;
+                        for _ in 0..3u32 {
+                            match orchestrator::cancel(
+                                state,
+                                s.id,
+                                "replaced by a newer invocation of this subscription",
+                            )
+                            .await
+                            {
+                                orchestrator::FinalizeStart::DbError => {
+                                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                }
+                                _ => {
+                                    persisted = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !persisted {
+                            tracing::warn!(
+                                "replace: cancel intent for {} not persisted after retries",
+                                s.id
+                            );
+                            return Ok(RunCreation::ReplaceUnpersisted {
+                                running_session_id: s.id,
+                            });
+                        }
                     }
                 }
                 ConcurrencyPolicy::Allow => unreachable!(),
@@ -233,6 +287,27 @@ pub async fn create_run(state: &AppState, req: CreateRun) -> ApiResult<RunCreati
         result_destinations: req.result_destinations.clone(),
         capabilities,
     };
+
+    // 512 KiB serialized runner-env ceiling (design 2026-07-15): env injection
+    // is the v1 config channel and a Kubernetes Secret caps ~1 MiB. Reject a
+    // bloated run at creation with a clear 422 + per-component diagnostics,
+    // rather than an opaque kubelet/daemon failure at launch. The estimate
+    // uses placeholder identity (tiny, bounded); `run()` re-checks for real.
+    let est_env = orchestrator::build_runner_env(
+        &run_spec,
+        &state.cfg.public_control_url,
+        Uuid::nil(),
+        "fbx_sess_00000000000000000000000000000000",
+    );
+    let env_bytes = orchestrator::serialized_env_len(&est_env);
+    if env_bytes > crate::config::MAX_RUNNER_ENV_BYTES {
+        return Err(ApiError::UnprocessableEntity(format!(
+            "runner environment is {env_bytes} bytes, over the {} byte ceiling — \
+             shorten the task/system prompt or narrow capabilities ({})",
+            crate::config::MAX_RUNNER_ENV_BYTES,
+            orchestrator::env_size_breakdown(&est_env),
+        )));
+    }
 
     let session = fluidbox_db::create_session(
         &state.pool,

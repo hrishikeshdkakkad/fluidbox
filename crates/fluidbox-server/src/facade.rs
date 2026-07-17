@@ -102,19 +102,33 @@ fn dialect_error(dialect: Dialect, status: StatusCode, message: &str) -> Respons
 
 /// Is a tool entry a CLIENT-executed (governed) tool for this dialect? Client
 /// tools run in the sandbox and cross the permission gate; server-executed
-/// tools (web_search, tool_search, file_search, computer use, code
-/// interpreter, MCP passthrough, image generation, …) run UPSTREAM, outside
-/// the gate — never allowed through. Allowlist, fail-closed: an unknown type
-/// is treated as server-executed.
-fn is_client_tool(dialect: Dialect, ty: Option<&str>) -> bool {
+/// tools (web_search, file_search, computer use, code interpreter, MCP
+/// passthrough, image generation, …) run UPSTREAM, outside the gate — never
+/// allowed through. Allowlist, fail-closed: an unknown type is treated as
+/// server-executed.
+fn is_client_tool(dialect: Dialect, tool: &Value) -> bool {
+    let ty = tool.get("type").and_then(|x| x.as_str());
     match dialect {
         // Anthropic client tools carry no type or "custom"; anything
         // versioned ("web_search_20250305", …) is server-executed.
         Dialect::Anthropic => matches!(ty, None | Some("custom")),
         // Codex's real tools (exec/shell, apply_patch, view_image, plan,
-        // goals) are "function" / "custom"; it ALSO bundles "web_search" /
-        // "tool_search" (server-executed) into every request by construction.
-        Dialect::OpenAi => matches!(ty, Some("function") | Some("custom")),
+        // goals) are "function" / "custom"; it ALSO bundles "web_search"
+        // (server-executed) into every request by construction.
+        Dialect::OpenAi => match ty {
+            Some("function") | Some("custom") => true,
+            // codex 0.144.1 ALWAYS defers MCP tools behind `tool_search`
+            // (`tool_search_always_defer_mcp_tools` is baked true, not
+            // configurable): the tool list carries this one entry instead of
+            // the MCP tools, codex executes the BM25 search LOCALLY
+            // (`execution:"client"`), and matches are inlined as ordinary
+            // `function` tools on the NEXT call. Stripping it hid every
+            // brokered/MCP tool from every codex run. Only the declared
+            // client-executed shape passes; execution stays governed — each
+            // actual MCP call still crosses the gate at /tools/call.
+            Some("tool_search") => tool.get("execution").and_then(|x| x.as_str()) == Some("client"),
+            _ => false,
+        },
     }
 }
 
@@ -127,7 +141,7 @@ fn strip_server_tools(dialect: Dialect, parsed: &mut Value) -> usize {
         return 0;
     };
     let before = tools.len();
-    tools.retain(|t| is_client_tool(dialect, t.get("type").and_then(|x| x.as_str())));
+    tools.retain(|t| is_client_tool(dialect, t));
     before - tools.len()
 }
 
@@ -153,8 +167,8 @@ fn validate_body(
     if dialect == Dialect::Anthropic {
         if let Some(tools) = parsed.get("tools").and_then(|t| t.as_array()) {
             for t in tools {
-                let ty = t.get("type").and_then(|x| x.as_str());
-                if !is_client_tool(dialect, ty) {
+                if !is_client_tool(dialect, t) {
+                    let ty = t.get("type").and_then(|x| x.as_str());
                     return Err((
                         StatusCode::UNPROCESSABLE_ENTITY,
                         format!(
@@ -229,7 +243,9 @@ pub async fn messages(
     let session = fluidbox_db::get_session(&state.pool, session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if session.status_enum().is_terminal() {
+    // No model spend for a terminal OR winding-down run — the budget stop and
+    // the finalizer both rely on the facade refusing once a run is over.
+    if !session.status_enum().accepts_work() {
         return Ok(dialect_error(
             shape_hint(&rest),
             StatusCode::BAD_REQUEST,
@@ -531,8 +547,29 @@ async fn trigger_budget_stop(
         let state2 = state.clone();
         let reason = format!("{budget} budget exceeded");
         tokio::spawn(async move {
-            crate::orchestrator::finalize(&state2, &session, "budget_exceeded", Some(&reason))
-                .await;
+            // Forced stop (runner is live → quiesce first). Retried with
+            // backoff: the facade re-enforces on the runner's next request,
+            // but an idle runner makes none — this task must converge alone.
+            for attempt in 0..5u32 {
+                match crate::orchestrator::finalize_forced(
+                    &state2,
+                    session.id,
+                    "budget_exceeded",
+                    &reason,
+                )
+                .await
+                {
+                    crate::orchestrator::FinalizeStart::DbError => {
+                        tokio::time::sleep(std::time::Duration::from_secs(10u64 << attempt.min(3)))
+                            .await;
+                    }
+                    _ => return,
+                }
+            }
+            tracing::error!(
+                "budget finalize for {} did not persist after retries",
+                session.id
+            );
         });
     }
 }
@@ -850,8 +887,8 @@ mod tests {
 
     #[test]
     fn openai_server_tools_are_stripped_not_rejected() {
-        // Codex bundles web_search/tool_search into EVERY request, so the
-        // facade must STRIP them (not reject) — the request itself validates.
+        // Codex bundles web_search into EVERY request, so the facade must
+        // STRIP server tools (not reject) — the request itself validates.
         let body = json!({"model": "m", "tools": [
             {"type": "function", "name": "shell_command"},
             {"type": "custom", "name": "apply_patch"},
@@ -865,7 +902,10 @@ mod tests {
         );
         let mut parsed = body.clone();
         let stripped = strip_server_tools(Dialect::OpenAi, &mut parsed);
-        assert_eq!(stripped, 2, "web_search + tool_search stripped");
+        assert_eq!(
+            stripped, 2,
+            "web_search + execution-less tool_search stripped"
+        );
         let kept: Vec<&str> = parsed["tools"]
             .as_array()
             .unwrap()
@@ -880,6 +920,39 @@ mod tests {
         // A body with no tools array is a no-op.
         let mut none = json!({"model": "m"});
         assert_eq!(strip_server_tools(Dialect::OpenAi, &mut none), 0);
+    }
+
+    #[test]
+    fn openai_client_executed_tool_search_survives_the_strip() {
+        // codex 0.144.1 always defers MCP tools behind `tool_search`
+        // (`tool_search_always_defer_mcp_tools` baked true) and executes the
+        // search LOCALLY (`execution:"client"`). Stripping that entry hid
+        // every brokered/MCP tool from codex runs — the model could never
+        // discover them. The client-executed shape must survive; web_search
+        // (upstream) and a server-executed tool_search must not.
+        let mut body = json!({"tools": [
+            {"type": "tool_search", "execution": "client", "description": "…"},
+            {"type": "tool_search", "execution": "server"},
+            {"type": "tool_search"},
+            {"type": "web_search", "external_web_access": true},
+            {"type": "function", "name": "shell_command"}
+        ]});
+        let stripped = strip_server_tools(Dialect::OpenAi, &mut body);
+        assert_eq!(
+            stripped, 3,
+            "server/execution-less tool_search + web_search stripped"
+        );
+        let kept: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(kept, vec!["tool_search", "function"]);
+        // Anthropic dialect is untouched by the codex carve-out: a
+        // client-executed tool_search is still not an Anthropic client tool.
+        let mut a = json!({"tools": [{"type": "tool_search", "execution": "client"}]});
+        assert_eq!(strip_server_tools(Dialect::Anthropic, &mut a), 1);
     }
 
     #[test]
