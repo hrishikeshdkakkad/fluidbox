@@ -18,6 +18,11 @@ use flate2::Compression;
 use sha2::{Digest, Sha256};
 use std::path::{Component, Path, PathBuf};
 
+/// Ceiling on deferred symlink entries per unpack — the only per-entry memory
+/// the streaming extractor accumulates. Far above any real repository, far
+/// below what would matter to a container memory limit.
+const MAX_SYMLINK_ENTRIES: usize = 100_000;
+
 /// A packed archive plus its integrity metadata. `sha256` is over the exact
 /// `bytes` the pod will download.
 pub struct PackedArchive {
@@ -242,6 +247,15 @@ pub fn unpack_archive_reader(
             )));
         }
         if etype.is_symlink() {
+            // The deferred list is the ONE per-entry memory accumulator left
+            // in the streaming extractor — bound it so a symlink-entry bomb
+            // (tiny compressed, millions of entries) can't OOM the init
+            // container the way the whole-archive buffer used to.
+            if deferred.len() >= MAX_SYMLINK_ENTRIES {
+                return Err(WorkspaceError::Invalid(format!(
+                    "archive exceeds the {MAX_SYMLINK_ENTRIES}-symlink ceiling"
+                )));
+            }
             let target = entry
                 .link_name()
                 .map_err(|e| WorkspaceError::Invalid(format!("symlink target read: {e}")))?
