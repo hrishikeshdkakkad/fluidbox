@@ -79,10 +79,49 @@ async fn archive_ttl_sweep(state: AppState) {
     loop {
         tick.tick().await;
         let data_dir = state.cfg.data_dir.clone();
-        let removed =
-            tokio::task::spawn_blocking(move || orchestrator::sweep_stale_archives(&data_dir, ttl))
-                .await
-                .unwrap_or(0);
+        let candidates = tokio::task::spawn_blocking(move || {
+            orchestrator::stale_archive_candidates(&data_dir, ttl)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("archive TTL sweep task failed: {e}");
+            Vec::new()
+        });
+        let mut removed = 0usize;
+        for path in candidates {
+            // Age alone is not proof of leak: a run with a wall-clock budget
+            // longer than the TTL still needs its archive for a possible
+            // init re-execution. Only a terminal/unknown session's archive
+            // is reclaimable; a DB blip keeps the file for the next pass.
+            let deletable = match orchestrator::archive_session_id(&path) {
+                None => true, // not a name this server writes — reclaim
+                Some(sid) => match fluidbox_db::get_session(&state.pool, sid).await {
+                    Ok(None) => true,
+                    Ok(Some(s)) => match fluidbox_core::state::SessionStatus::parse(&s.status) {
+                        Some(st) => st.is_terminal(),
+                        None => false, // newer deploy's status — fail safe
+                    },
+                    Err(e) => {
+                        tracing::warn!("archive TTL sweep: session lookup failed: {e}");
+                        false
+                    }
+                },
+            };
+            if !deletable {
+                tracing::warn!(
+                    "archive TTL sweep: {} outlived the TTL but its session is still live; keeping",
+                    path.display()
+                );
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    tracing::info!("archive TTL sweep removed {}", path.display());
+                    removed += 1;
+                }
+                Err(e) => tracing::warn!("archive TTL sweep failed on {}: {e}", path.display()),
+            }
+        }
         if removed > 0 {
             tracing::info!("archive TTL sweep reclaimed {removed} stale archive(s)");
         }
