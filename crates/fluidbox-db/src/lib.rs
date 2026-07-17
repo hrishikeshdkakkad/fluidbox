@@ -2486,9 +2486,9 @@ pub async fn session_approvals(
 }
 
 /// The tenant-scoped approvals inbox (the org approval queue). The
-/// UUID-blind [`system_worker::pending_approvals`] serves the cross-tenant
-/// expiry sweep; this one is what a request handler shows an approver, and it
-/// never crosses a tenant boundary.
+/// cross-tenant expiry sweep runs off [`system_worker::expire_stale_approvals`];
+/// this one is what a request handler shows an approver, and it never crosses a
+/// tenant boundary.
 pub async fn pending_approvals(
     pool: &PgPool,
     scope: TenantScope,
