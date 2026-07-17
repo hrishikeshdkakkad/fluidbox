@@ -18,6 +18,11 @@ use flate2::Compression;
 use sha2::{Digest, Sha256};
 use std::path::{Component, Path, PathBuf};
 
+/// Ceiling on deferred symlink entries per unpack — the only per-entry memory
+/// the streaming extractor accumulates. Far above any real repository, far
+/// below what would matter to a container memory limit.
+const MAX_SYMLINK_ENTRIES: usize = 100_000;
+
 /// A packed archive plus its integrity metadata. `sha256` is over the exact
 /// `bytes` the pod will download.
 pub struct PackedArchive {
@@ -26,13 +31,22 @@ pub struct PackedArchive {
     pub len: u64,
 }
 
-/// Pack a session workspace root (`repo/` + `baseline-git/`) into a gzip'd
-/// tar. `follow_symlinks(false)` stores each symlink as a symlink ENTRY (the
-/// target string), never dereferencing it — so an in-tree relative link
-/// survives the round-trip and the extractor decides per entry whether the
-/// target stays inside the root, rejecting any that escape.
-pub fn pack_workspace(session_root: &Path) -> Result<PackedArchive, WorkspaceError> {
-    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+/// A packed archive stored on disk (the production transport — the archive
+/// never lives in control-plane RAM). `sha256`/`len` describe the exact file.
+#[derive(Debug)]
+pub struct StoredArchive {
+    pub path: PathBuf,
+    pub sha256: String,
+    pub len: u64,
+}
+
+/// The ONE tar-assembly core (both packers ride it, so extraction policy and
+/// symlink handling can never diverge between them). `follow_symlinks(false)`
+/// stores each symlink as a symlink ENTRY (the target string), never
+/// dereferencing it — so an in-tree relative link survives the round-trip and
+/// the extractor decides per entry whether the target stays inside the root.
+fn write_tar_gz<W: std::io::Write>(session_root: &Path, sink: W) -> Result<W, WorkspaceError> {
+    let mut gz = GzEncoder::new(sink, Compression::default());
     {
         let mut builder = tar::Builder::new(&mut gz);
         builder.follow_symlinks(false);
@@ -51,12 +65,96 @@ pub fn pack_workspace(session_root: &Path) -> Result<PackedArchive, WorkspaceErr
             .finish()
             .map_err(|e| WorkspaceError::Invalid(format!("tar finish: {e}")))?;
     }
-    let bytes = gz
-        .finish()
-        .map_err(|e| WorkspaceError::Invalid(format!("gzip finish: {e}")))?;
+    gz.finish()
+        .map_err(|e| WorkspaceError::Invalid(format!("gzip finish: {e}")))
+}
+
+/// Counting + hashing + capping write adapter: digests and measures the
+/// compressed stream AS IT IS WRITTEN, and refuses the write that would push
+/// the archive over `max_bytes` — the pack fails without ever holding (or
+/// storing) an over-cap archive.
+struct HashingWriter<W: std::io::Write> {
+    inner: W,
+    hasher: Sha256,
+    len: u64,
+    max_bytes: u64,
+}
+
+impl<W: std::io::Write> std::io::Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.len.saturating_add(buf.len() as u64) > self.max_bytes {
+            return Err(std::io::Error::other(format!(
+                "workspace archive exceeds the {} byte cap",
+                self.max_bytes
+            )));
+        }
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.len += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Pack a session workspace root (`repo/` + `baseline-git/`) into a gzip'd
+/// tar held in memory. Test/fixture-sized use only — the production transport
+/// is `pack_workspace_to_file`, which never buffers the archive in RAM.
+pub fn pack_workspace(session_root: &Path) -> Result<PackedArchive, WorkspaceError> {
+    let bytes = write_tar_gz(session_root, Vec::new())?;
     let sha256 = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
     let len = bytes.len() as u64;
     Ok(PackedArchive { bytes, sha256, len })
+}
+
+/// Pack a session workspace root STREAMING to `dest` (`GzEncoder<File>` — the
+/// archive never lives in RAM), digesting as it writes and failing cleanly if
+/// the compressed size would exceed `max_bytes`. The write is ATOMIC: it goes
+/// to `<dest>.partial` and renames into place only on success, so a reader
+/// (or a TTL sweep racing a slow pack) can never observe a half-written
+/// archive under the served name. On any error the partial is removed.
+pub fn pack_workspace_to_file(
+    session_root: &Path,
+    dest: &Path,
+    max_bytes: u64,
+) -> Result<StoredArchive, WorkspaceError> {
+    let partial = {
+        let mut os = dest.as_os_str().to_owned();
+        os.push(".partial");
+        PathBuf::from(os)
+    };
+    let file = std::fs::File::create(&partial)
+        .map_err(|e| WorkspaceError::Invalid(format!("create {}: {e}", partial.display())))?;
+    let sink = HashingWriter {
+        inner: std::io::BufWriter::new(file),
+        hasher: Sha256::new(),
+        len: 0,
+        max_bytes,
+    };
+    let result = write_tar_gz(session_root, sink).and_then(|mut sink| {
+        std::io::Write::flush(&mut sink)
+            .map_err(|e| WorkspaceError::Invalid(format!("flush {}: {e}", partial.display())))?;
+        Ok(sink)
+    });
+    let finish = result.and_then(|sink| {
+        std::fs::rename(&partial, dest)
+            .map_err(|e| WorkspaceError::Invalid(format!("rename into {}: {e}", dest.display())))?;
+        Ok(sink)
+    });
+    let sink = match finish {
+        Ok(sink) => sink,
+        Err(e) => {
+            let _ = std::fs::remove_file(&partial);
+            return Err(e);
+        }
+    };
+    let sha256 = format!("sha256:{}", hex::encode(sink.hasher.finalize()));
+    Ok(StoredArchive {
+        path: dest.to_path_buf(),
+        sha256,
+        len: sink.len,
+    })
 }
 
 /// Verify `bytes` against an expected size and digest before unpacking —
@@ -81,12 +179,24 @@ pub fn verify_archive(
     Ok(())
 }
 
+/// Hardened unpack from an in-memory archive (tests/fixtures). Production
+/// callers stream from disk via `unpack_archive_reader` — same policy, no
+/// whole-archive buffer.
+pub fn unpack_archive(
+    bytes: &[u8],
+    dest: &Path,
+    max_total_bytes: u64,
+) -> Result<u64, WorkspaceError> {
+    unpack_archive_reader(bytes, dest, max_total_bytes)
+}
+
 /// Hardened unpack: every entry path is validated to stay inside `dest`
 /// (no absolute paths, no `..`, no symlink/hardlink escaping the root), and a
 /// total-size ceiling bounds a decompression bomb. Returns the number of
-/// entries written.
-pub fn unpack_archive(
-    bytes: &[u8],
+/// entries written. Takes any `Read` so the init container can stream the
+/// archive straight off disk instead of holding it in RAM (M4's pod half).
+pub fn unpack_archive_reader(
+    bytes: impl std::io::Read,
     dest: &Path,
     max_total_bytes: u64,
 ) -> Result<u64, WorkspaceError> {
@@ -137,6 +247,15 @@ pub fn unpack_archive(
             )));
         }
         if etype.is_symlink() {
+            // The deferred list is the ONE per-entry memory accumulator left
+            // in the streaming extractor — bound it so a symlink-entry bomb
+            // (tiny compressed, millions of entries) can't OOM the init
+            // container the way the whole-archive buffer used to.
+            if deferred.len() >= MAX_SYMLINK_ENTRIES {
+                return Err(WorkspaceError::Invalid(format!(
+                    "archive exceeds the {MAX_SYMLINK_ENTRIES}-symlink ceiling"
+                )));
+            }
             let target = entry
                 .link_name()
                 .map_err(|e| WorkspaceError::Invalid(format!("symlink target read: {e}")))?
@@ -322,6 +441,70 @@ mod tests {
             "hello\n"
         );
         assert!(dest.join(crate::BASELINE_DIR).join("HEAD").exists());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn pack_to_file_streams_and_matches_in_memory_pack() {
+        // The streaming packer must produce byte-identical output (same
+        // digest/len) to the in-memory one — one tar-assembly core, two sinks.
+        let tmp = std::env::temp_dir().join(format!("fbx-arch-{}", Uuid::now_v7()));
+        let root = tmp.join("ws");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join("a.txt"), "hello\n").unwrap();
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(root.join(crate::BASELINE_DIR)).unwrap();
+        std::fs::write(root.join(crate::BASELINE_DIR).join("HEAD"), "ref: x\n").unwrap();
+
+        let in_mem = pack_workspace(&root).unwrap();
+        let dest = tmp.join("archives").join("s.tar.gz");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        let stored = pack_workspace_to_file(&root, &dest, u64::MAX).unwrap();
+
+        assert_eq!(stored.sha256, in_mem.sha256);
+        assert_eq!(stored.len, in_mem.len);
+        // The write is atomic: only the final name remains, never a .partial
+        // a concurrent GET or the TTL sweep could observe half-written.
+        assert!(!std::path::PathBuf::from(format!("{}.partial", dest.display())).exists());
+        let on_disk = std::fs::read(&dest).unwrap();
+        assert_eq!(on_disk.len() as u64, stored.len);
+        verify_archive(&on_disk, stored.len, &stored.sha256).unwrap();
+
+        // And it still unpacks — via the streaming reader path (what the
+        // init container uses), not just the in-memory slice path.
+        let out = tmp.join("out");
+        let file = std::fs::File::open(&dest).unwrap();
+        unpack_archive_reader(file, &out, 100 * 1024 * 1024).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(out.join("repo/a.txt")).unwrap(),
+            "hello\n"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn pack_to_file_enforces_max_bytes_and_removes_partial() {
+        // The cap fails the pack CLEANLY (a clear error, no partial archive
+        // left to be served) — the run dies at zero model spend.
+        let tmp = std::env::temp_dir().join(format!("fbx-arch-{}", Uuid::now_v7()));
+        let root = tmp.join("ws");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("big.bin"), vec![7u8; 256 * 1024]).unwrap();
+
+        let dest = tmp.join("archives").join("s.tar.gz");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        let err = pack_workspace_to_file(&root, &dest, 64).unwrap_err();
+        assert!(
+            err.to_string().contains("64"),
+            "error must name the cap: {err}"
+        );
+        assert!(
+            !dest.exists()
+                && !std::path::PathBuf::from(format!("{}.partial", dest.display())).exists(),
+            "a partial over-cap archive must not be left behind"
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 
