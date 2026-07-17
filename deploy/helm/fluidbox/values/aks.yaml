@@ -1,0 +1,11 @@
+# Azure AKS. Choose a NetworkPolicy engine at cluster creation (Azure NPM /
+# Cilium dataplane / Calico) — it cannot be added later. managed-csi is the
+# default StorageClass. Kata pools give hard isolation.
+server:
+  archivePvc:
+    storageClass: managed-csi
+sandbox:
+  egressProfile: zeroEgress
+  runtimeClassName: ""        # set "kata-mshv-vm-isolation" on supported pools
+netpol:
+  requireEnforced: true

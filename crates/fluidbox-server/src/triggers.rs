@@ -949,6 +949,16 @@ pub async fn invoke(
                 "skipped: run {running_session_id} from this subscription is still active (concurrency_policy=skip_if_running)"
             )))
         }
+        Ok(crate::run_service::RunCreation::ReplaceUnpersisted { running_session_id }) => {
+            // Transient, NOT terminal: free the key so the caller's retry
+            // isn't wedged behind a 409 that lies about skip_if_running.
+            fluidbox_db::release_invocation(&state.pool, invocation_id)
+                .await
+                .ok();
+            Err(ApiError::ServiceUnavailable(format!(
+                "could not persist cancellation of running session {running_session_id} for replace; retry"
+            )))
+        }
         Err(e) => {
             // Free the key so the caller's retry isn't wedged behind a failure.
             fluidbox_db::release_invocation(&state.pool, invocation_id)

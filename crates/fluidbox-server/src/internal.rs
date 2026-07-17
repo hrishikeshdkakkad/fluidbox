@@ -157,16 +157,34 @@ async fn decide_tool_call(
                     },
                 )
                 .await;
-                let session_clone = session.clone();
+                let session_id = session.id;
                 let state2 = state.clone();
                 tokio::spawn(async move {
-                    orchestrator::finalize(
-                        &state2,
-                        &session_clone,
-                        "budget_exceeded",
-                        Some("tool-call budget exceeded"),
-                    )
-                    .await;
+                    // Forced stop (runner live → quiesce first). The deny
+                    // verdict below is already out, so this task retries with
+                    // backoff — a budget-less runner that makes no further
+                    // request has no other same-channel driver.
+                    for attempt in 0..5u32 {
+                        match orchestrator::finalize_forced(
+                            &state2,
+                            session_id,
+                            "budget_exceeded",
+                            "tool-call budget exceeded",
+                        )
+                        .await
+                        {
+                            orchestrator::FinalizeStart::DbError => {
+                                tokio::time::sleep(std::time::Duration::from_secs(
+                                    10u64 << attempt.min(3),
+                                ))
+                                .await;
+                            }
+                            _ => return,
+                        }
+                    }
+                    tracing::error!(
+                        "tool-call budget finalize for {session_id} did not persist after retries"
+                    );
                 });
                 return Ok(GateDecision::deny("tool-call budget exceeded"));
             }
@@ -490,9 +508,10 @@ pub async fn permission(
     let session = fluidbox_db::get_session(&state.pool, auth.session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    // A terminal session never gets a fresh decision — the primary guard,
-    // independent of token revocation (which is best-effort defense in depth).
-    if session.status_enum().is_terminal() {
+    // A terminal OR winding-down session never gets a fresh decision — the
+    // primary guard, independent of token revocation (which is best-effort
+    // defense in depth). A run being finalized/cancelled admits no new tools.
+    if !session.status_enum().accepts_work() {
         return Ok(Json(json!({
             "decision": "deny",
             "message": "session is not active",
@@ -542,7 +561,7 @@ pub async fn tool_call(
     let session = fluidbox_db::get_session(&state.pool, auth.session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if session.status_enum().is_terminal() {
+    if !session.status_enum().accepts_work() {
         return Err(ApiError::BadRequest("session is not active".into()));
     }
     let run_spec: RunSpec = serde_json::from_value(session.run_spec.clone())
@@ -753,9 +772,79 @@ pub async fn events(
     Ok(Json(json!({ "seq": seq })))
 }
 
+/// `GET /internal/sessions/{id}/workspace` — the immutable workspace archive
+/// the sandbox's init container pulls (Kubernetes transport). The session is
+/// derived from the BEARER TOKEN, not the path `{id}` (informational, like
+/// every other internal route). The archive is credential-free and
+/// digest-verified by the init container before unpack; serving it grants the
+/// pod nothing it couldn't already reach with the token it holds.
+pub async fn workspace_archive(
+    auth: SessionAuth,
+    State(state): State<AppState>,
+) -> ApiResult<axum::response::Response> {
+    use axum::response::IntoResponse;
+    use tokio::io::AsyncReadExt;
+    // A terminal/winding-down session's archive is moot (the run is over) —
+    // gate on accepts_work(), like every sibling internal endpoint.
+    let session = fluidbox_db::get_session(&state.pool, auth.session_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if !session.status_enum().accepts_work() {
+        return Err(ApiError::BadRequest("session is not active".into()));
+    }
+    let path = crate::orchestrator::archive_path(&state.cfg.data_dir, auth.session_id);
+    // Streamed straight off disk — a large archive must never transit
+    // control-plane RAM (M4). The explicit Content-Length lets the client
+    // detect truncation cheaply; the init container's digest check remains
+    // the integrity authority.
+    let mut file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|_| ApiError::NotFound)?;
+    let len = file.metadata().await.map_err(|_| ApiError::NotFound)?.len();
+    let stream = async_stream::stream! {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match file.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n])),
+                Err(e) => {
+                    yield Err(e);
+                    break;
+                }
+            }
+        }
+    };
+    Ok((
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/gzip".to_string(),
+            ),
+            (axum::http::header::CONTENT_LENGTH, len.to_string()),
+        ],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response())
+}
+
 pub async fn heartbeat(auth: SessionAuth, State(state): State<AppState>) -> ApiResult<Json<Value>> {
     fluidbox_db::heartbeat(&state.pool, auth.session_id).await?;
-    Ok(Json(json!({ "ok": true })))
+    // Deliberately NO eager archive deletion here: Kubernetes documents that
+    // init containers may re-execute (pod-infrastructure restart), and a
+    // re-executed `workspaced init` re-fetches the archive — deleting it on
+    // the first runner heartbeat would 404 that fetch and fail an otherwise
+    // recoverable pod. The archive lives until terminal cleanup; the TTL
+    // sweep is the leak backstop (L3).
+    // Quiesce channel (the ONLY runner-contract change in the K8s design):
+    // once a session enters `cancelling`, its heartbeat response carries
+    // {"action":"quiesce"} — the runner stops the agent and exits WITHOUT
+    // posting /result, so the cancel finalizer collects a settled worktree.
+    // Level-triggered: every heartbeat repeats it until the runner exits.
+    let action = match fluidbox_db::get_session(&state.pool, auth.session_id).await? {
+        Some(s) if s.status_enum() == SessionStatus::Cancelling => Some("quiesce"),
+        _ => None,
+    };
+    Ok(Json(json!({ "ok": true, "action": action })))
 }
 
 #[derive(Deserialize)]
@@ -786,8 +875,24 @@ pub async fn result(
     let session = fluidbox_db::get_session(&state.pool, session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if session.status_enum().is_terminal() {
+    let st = session.status_enum();
+    if st.is_terminal() {
         return Ok(Json(json!({ "ok": true, "note": "already terminal" })));
+    }
+    // Already winding down: a cancel (or a prior /result) owns finalization —
+    // but ONLY if its intent actually persisted. A wind-down state WITHOUT an
+    // intent is the stranded-wedge shape (nothing for recovery to drive);
+    // fall through and (re)persist one instead of falsely ACKing.
+    if st.is_winding_down() {
+        match fluidbox_db::get_finalization(&state.pool, session_id).await {
+            Ok(Some(_)) => return Ok(Json(json!({ "ok": true, "note": "finalizing" }))),
+            Ok(None) => {}
+            Err(_) => {
+                return Err(ApiError::ServiceUnavailable(
+                    "finalization state unavailable; retry".into(),
+                ))
+            }
+        }
     }
     // Non-terminal: the token must still be live to drive a finalize (revoke
     // only happens on terminal, so this is the ordinary first-post path).
@@ -795,13 +900,40 @@ pub async fn result(
         .await?
         .is_none()
     {
-        return Err(ApiError::Unauthorized);
+        // TOCTOU: a racing driver may have terminalized (revoking the token)
+        // after our status read — a lost-response /result retry must get its
+        // idempotent 200. Unknown state must be RETRYABLE (503): the runner
+        // treats 4xx as final, so a transient read error returned as 401
+        // would convert a completed run into a runner-side failure.
+        match fluidbox_db::get_session(&state.pool, session_id).await {
+            Ok(Some(s)) if s.status_enum().is_terminal() => {
+                return Ok(Json(json!({ "ok": true, "note": "already terminal" })));
+            }
+            Ok(_) => return Err(ApiError::Unauthorized),
+            Err(_) => {
+                return Err(ApiError::ServiceUnavailable(
+                    "session state unavailable; retry".into(),
+                ))
+            }
+        }
     }
-    let state2 = state.clone();
-    tokio::spawn(async move {
-        orchestrator::finalize(&state2, &session, &res.outcome, res.summary.as_deref()).await;
-    });
-    Ok(Json(json!({ "ok": true })))
+    // Persist the finalization intent BEFORE ACKing — and NEVER ACK success
+    // when it did not persist: the runner exits on ok:true, and with no
+    // durable intent the watchdog would later record this completed run as
+    // failed. The runner contract retries /result on 5xx.
+    use orchestrator::FinalizeStart;
+    match orchestrator::finalize_reported(&state, session_id, &res.outcome, res.summary.as_deref())
+        .await
+    {
+        FinalizeStart::Persisted { .. } => Ok(Json(json!({ "ok": true }))),
+        FinalizeStart::AlreadyTerminal => {
+            Ok(Json(json!({ "ok": true, "note": "already terminal" })))
+        }
+        FinalizeStart::Missing => Err(ApiError::NotFound),
+        FinalizeStart::DbError => Err(ApiError::ServiceUnavailable(
+            "finalization intent not persisted; retry".into(),
+        )),
+    }
 }
 
 #[derive(Deserialize)]
@@ -829,9 +961,9 @@ pub async fn token_renew(
     let session = fluidbox_db::get_session(&state.pool, auth.session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if session.status_enum().is_terminal() {
+    if !session.status_enum().accepts_work() {
         return Err(ApiError::BadRequest(
-            "session is terminal — token cannot be renewed".into(),
+            "session is not active — token cannot be renewed".into(),
         ));
     }
     let ttl = req.ttl_secs.clamp(1, MAX_RENEW_TTL_SECS);

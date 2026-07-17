@@ -1,0 +1,90 @@
+{{- if .Values.litellm.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "fluidbox.litellmName" . }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    model_list:
+      - model_name: claude-haiku-4-5
+        litellm_params:
+          model: anthropic/claude-haiku-4-5-20251001
+          api_key: os.environ/ANTHROPIC_API_KEY
+      - model_name: "claude-*"
+        litellm_params:
+          model: "anthropic/claude-*"
+          api_key: os.environ/ANTHROPIC_API_KEY
+      - model_name: "gpt-5*"
+        litellm_params:
+          model: "openai/gpt-5*"
+          api_key: os.environ/OPENAI_API_KEY
+    general_settings:
+      master_key: os.environ/LITELLM_MASTER_KEY
+    litellm_settings:
+      drop_params: true
+---
+# Bundled LiteLLM: digest-pinned image, ClusterIP-only, and — critically —
+# unreachable from sandbox pods (the sandbox egress NetworkPolicy allows only
+# the control-plane :8788). External LiteLLM is the production default.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "fluidbox.litellmName" . }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "fluidbox.name" . }}
+      app.kubernetes.io/component: litellm
+  template:
+    metadata:
+      labels:
+        {{- include "fluidbox.labels" . | nindent 8 }}
+        app.kubernetes.io/component: litellm
+    spec:
+      {{- with .Values.images.pullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        # The upstream LiteLLM image declares a non-numeric root USER, so the
+        # kubelet can't verify non-root from runAsNonRoot alone — pin a numeric
+        # uid (the image runs fine as an arbitrary uid).
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: litellm
+          image: {{ .Values.litellm.image | quote }}
+          args: ["--config", "/etc/litellm/config.yaml", "--port", "4000", "--num_workers", "1"]
+          ports:
+            - { name: http, containerPort: 4000 }
+          env:
+            - name: LITELLM_MASTER_KEY
+              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.litellmMasterKey | quote }} } }
+            - name: ANTHROPIC_API_KEY
+              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.litellm.anthropicKeySecretKey | quote }} } }
+          volumeMounts:
+            - { name: config, mountPath: /etc/litellm }
+          resources: {{- toYaml .Values.litellm.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "fluidbox.litellmName" . }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "fluidbox.litellmName" . }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: {{ include "fluidbox.name" . }}
+    app.kubernetes.io/component: litellm
+  ports:
+    - { name: http, port: 4000, targetPort: http }
+{{- end }}

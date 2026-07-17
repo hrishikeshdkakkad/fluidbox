@@ -15,6 +15,12 @@ fn absolute(p: &str) -> PathBuf {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind: String,
+    /// The sandbox-facing internal listener (:8788). Serves ONLY `/internal/*`
+    /// (runner contract, workspace archive, LLM facade) — never `/v1`. Route
+    /// absence is stronger than bearer auth alone: a sandbox that reaches this
+    /// bind is immune to any future `/v1` auth regression (design 2026-07-15,
+    /// §"Dual listener"). The public bind still serves both for Docker.
+    pub internal_bind: String,
     pub database_url: String,
     pub admin_token: String,
     /// URL sandboxes use to reach this control plane (e.g. host.docker.internal).
@@ -52,7 +58,36 @@ pub struct Config {
     /// Feeds the OAuth redirect_uri and the CIMD client_id document — both
     /// are fetched by parties that can't use host.docker.internal.
     pub public_url: String,
+    /// Execution backend: `docker` (default) or `kubernetes`. Selects which
+    /// `ExecutionProvider` `AppState.provider` holds. Dual-provider permanence
+    /// (settled Q17): Docker is never replaced.
+    pub provider: String,
+    /// Sandbox network mode, config-derived instead of hardcoded
+    /// (`host-dev` default; `hardened` = zero external egress). Was pinned to
+    /// HostDev at `orchestrator.rs:150`.
+    pub network_mode: fluidbox_core::traits::NetworkMode,
+    /// Block runs until a probe proves the CNI enforces NetworkPolicy
+    /// (Kubernetes only; fails closed). Default true; `false` is dev-only.
+    pub require_enforced_netpol: bool,
+    /// The probe image used by the boot-time netpol run-gate.
+    pub netpol_probe_image: String,
+    /// The server's own internal Service (name, namespace) — resolved to a
+    /// ClusterIP at boot for the runner's no-DNS control URL under zeroEgress.
+    pub internal_service: Option<String>,
+    pub internal_service_namespace: Option<String>,
+    /// Compressed workspace-archive ceiling: packing streams to disk and a
+    /// run whose archive would exceed this fails cleanly at zero model spend.
+    pub max_archive_bytes: u64,
+    /// TTL for the stored-archive sweep (the leak backstop). The archive is
+    /// single-use init transport — anything older than this is a leak.
+    pub archive_ttl_secs: u64,
 }
+
+/// Serialized runner-env ceiling: env injection is the v1 config channel
+/// (authenticated fetch is the designated v1.1 follow-up), and Kubernetes
+/// caps a Secret/env at ~1 MiB. 512 KiB leaves headroom and fails a bloated
+/// run closed at zero model spend rather than at an opaque kubelet error.
+pub const MAX_RUNNER_ENV_BYTES: usize = 512 * 1024;
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
@@ -66,8 +101,22 @@ impl Config {
         } else {
             get("LITELLM_MASTER_KEY").unwrap_or_default()
         };
+        let provider = get("FLUIDBOX_PROVIDER")
+            .unwrap_or_else(|_| "docker".into())
+            .to_lowercase();
+        let is_k8s_provider = matches!(provider.as_str(), "kubernetes" | "k8s");
         Ok(Config {
             bind: get("FLUIDBOX_BIND").unwrap_or_else(|_| "127.0.0.1:8787".into()),
+            // Only the Kubernetes plane needs a pod-reachable internal bind;
+            // Docker single-host dev must not grow a LAN-exposed listener by
+            // default (the runner reaches :8787 via host.docker.internal).
+            internal_bind: get("FLUIDBOX_INTERNAL_BIND").unwrap_or_else(|_| {
+                if is_k8s_provider {
+                    "0.0.0.0:8788".into()
+                } else {
+                    "127.0.0.1:8788".into()
+                }
+            }),
             database_url: get("DATABASE_URL")
                 .map_err(|_| anyhow::anyhow!("DATABASE_URL is required"))?,
             admin_token: get("FLUIDBOX_ADMIN_TOKEN")
@@ -104,6 +153,58 @@ impl Config {
                 .unwrap_or_else(|_| "http://127.0.0.1:8787".into())
                 .trim_end_matches('/')
                 .to_string(),
+            provider,
+            network_mode: get("FLUIDBOX_NETWORK_MODE")
+                .ok()
+                .and_then(|s| fluidbox_core::traits::NetworkMode::parse(&s.to_lowercase()))
+                .unwrap_or_default(),
+            require_enforced_netpol: get("FLUIDBOX_REQUIRE_ENFORCED_NETPOL")
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(true),
+            netpol_probe_image: get("FLUIDBOX_NETPOL_PROBE_IMAGE")
+                .unwrap_or_else(|_| "busybox:1.36".into()),
+            internal_service: get("FLUIDBOX_INTERNAL_SERVICE")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            internal_service_namespace: get("FLUIDBOX_INTERNAL_SERVICE_NAMESPACE")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            max_archive_bytes: parse_u64_env(
+                "FLUIDBOX_MAX_ARCHIVE_BYTES",
+                get("FLUIDBOX_MAX_ARCHIVE_BYTES").ok(),
+                2 * 1024 * 1024 * 1024, // 2 GiB
+            )?,
+            archive_ttl_secs: parse_u64_env(
+                "FLUIDBOX_ARCHIVE_TTL_SECS",
+                get("FLUIDBOX_ARCHIVE_TTL_SECS").ok(),
+                24 * 3600,
+            )?,
         })
+    }
+}
+
+/// Safety-relevant numeric knobs FAIL BOOT on a malformed value: a typo in an
+/// intended lower archive cap must not silently widen it to the default.
+fn parse_u64_env(name: &str, raw: Option<String>, default: u64) -> anyhow::Result<u64> {
+    match raw.filter(|v| !v.is_empty()) {
+        None => Ok(default),
+        Some(v) => v
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{name}='{v}' is not a valid u64: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safety_caps_fail_boot_on_malformed_values() {
+        assert_eq!(parse_u64_env("X", None, 7).unwrap(), 7);
+        assert_eq!(parse_u64_env("X", Some(String::new()), 7).unwrap(), 7);
+        assert_eq!(parse_u64_env("X", Some("42".into()), 7).unwrap(), 42);
+        // A typo'd cap must be a boot error, never a silent fallback to the
+        // (possibly much wider) default.
+        assert!(parse_u64_env("X", Some("2GiB".into()), 7).is_err());
     }
 }

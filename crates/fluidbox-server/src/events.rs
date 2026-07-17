@@ -158,6 +158,24 @@ pub(crate) async fn process_delivery(
                     "running_session_id": running_session_id,
                 }));
             }
+            Ok(RunCreation::ReplaceUnpersisted { running_session_id }) => {
+                // Transient replace failure: a visible skip, never an error
+                // (which reads as a permanently lost dispatch). Provider
+                // webhook redelivery / the next event retries naturally.
+                fluidbox_db::mark_dispatch_outcome(
+                    &state.pool,
+                    claim.id,
+                    "skipped",
+                    Some("replace_cancel_unpersisted"),
+                )
+                .await
+                .ok();
+                skipped.push(json!({
+                    "subscription_id": sub.id,
+                    "reason": "replace_cancel_unpersisted",
+                    "running_session_id": running_session_id,
+                }));
+            }
             Err(e) => {
                 // Recorded, not retried (scheduler precedent): a config
                 // error must not turn provider retries into a run factory.

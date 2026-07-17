@@ -15,6 +15,18 @@ setup:
 doctor:
     bash scripts/doctor.sh
 
+# Local Kubernetes dev: kind + Calico + image load + helm-install guidance.
+k8s-dev:
+    bash scripts/k8s-dev.sh
+
+# K8s preflight (kube context, StorageClass, enforcing CNI, credential Secret).
+k8s-doctor NS="fluidbox":
+    bash scripts/k8s-doctor.sh {{NS}}
+
+# Build the in-pod workspace collector image.
+collector-build:
+    docker build -t ${FLUIDBOX_COLLECTOR_IMAGE:-fluidbox-workspaced:dev} -f deploy/workspaced.Dockerfile .
+
 # Everything: LiteLLM gateway + server + web (ctrl-c stops all)
 dev:
     just gateway-up
@@ -53,11 +65,20 @@ neon-setup:
 db:
     psql "$DATABASE_URL"
 
-# Remove e2e/test cruft from the DB (sessions, test agents, subscriptions,
-# schedules, bundles). Preserves the tenant, policies, connections, and the
-# seed agents. DRY-RUN by default; pass `apply` to commit. See scripts/db-clean.sh.
+# RESET the DB to seed state — drops ALL sessions, ALL capability bundles
+# (including real ones like `cloudflare`) and every agent outside the keep-list.
+# Preserves the tenant, policies, connections, and registrations. This is a big
+# hammer: for removing only test residue, use `db-clean-tests` instead.
+# DRY-RUN by default; pass `apply` to commit. See scripts/db-clean.sh.
 db-clean *ARGS:
     bash scripts/db-clean.sh {{ARGS}}
+
+# Remove ONLY test-suite residue (fixture agents + their sessions, pmt-bundle-*)
+# by EXACT name — safe to run against a DB with real work in it. Run this after
+# any sanctioned `just check` / `just e2e`, which write fixtures into the real
+# tenant. DRY-RUN by default; pass `apply` to commit. See scripts/db-clean-tests.sh.
+db-clean-tests *ARGS:
+    bash scripts/db-clean-tests.sh {{ARGS}}
 
 # ── Quality ──────────────────────────────────────────────────────────────
 
@@ -71,6 +92,7 @@ test:
     cargo test --workspace
 
 check: fmt lint test
+    cd apps/web && pnpm test
     cd apps/web && pnpm build
 
 # ── E2E acceptance ───────────────────────────────────────────────────────
