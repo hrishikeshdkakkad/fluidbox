@@ -104,7 +104,10 @@ jobs:
         run: docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ github.repository_owner }}/fluidbox-${{ matrix.image }}:latest
 
   # Publish the Helm chart as an OCI artifact to GHCR alongside the images.
+  # Waits for the images: a chart must never land referencing images that
+  # failed to publish.
   chart:
+    needs: publish
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -115,5 +118,18 @@ jobs:
       - name: package + push chart (OCI)
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
-          helm package deploy/helm/fluidbox --destination /tmp/chart
+          # On a version tag, bind the chart to this release: --app-version
+          # rewrites appVersion inside the package, and the image defaults
+          # render from .Chart.AppVersion — so the packaged chart pulls
+          # exactly the images this run published (M9).
+          case "$GITHUB_REF" in
+            refs/tags/v*)
+              VERSION="${GITHUB_REF_NAME#v}"
+              helm package deploy/helm/fluidbox --destination /tmp/chart \
+                --version "$VERSION" --app-version "$VERSION"
+              ;;
+            *)
+              helm package deploy/helm/fluidbox --destination /tmp/chart
+              ;;
+          esac
           helm push /tmp/chart/fluidbox-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
