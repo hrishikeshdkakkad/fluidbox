@@ -735,7 +735,9 @@ Replace the global admin token with a verified principal. Principals are a
 closed set of variants — a trigger token is never modeled as a fake user:
 
     UserPrincipal    { tenant_id, user_id, membership_id, roles,
-                       authentication_strength, session_id }
+                       authentication_strength,
+                       auth_context: browser_session { session_id, … }
+                                   | pat { token_id } }
     TriggerPrincipal { tenant_id, token_id, subscription_id }
     SchedulePrincipal, WebhookPrincipal, SystemWorkerPrincipal — likewise
     distinct, each carrying explicit tenant context.
@@ -1438,9 +1440,10 @@ Implement:
 - memberships and roles;
 - the per-organization, IdP-agnostic identity layer per the companion doc
   (org-scoped users keyed `(tenant, idp_config, subject)`, per-org OIDC
-  configs, invariant-20 login flows, server-side sessions, personal API
-  tokens, break-glass bootstrap; migration `0012` — main's series ends at
-  `0011_finalization_intent`);
+  configs, pre-authentication login flows using invariant 20's one-time
+  browser-binding mechanism with companion-defined bindings, server-side
+  sessions, personal API tokens, break-glass bootstrap; migration `0012`
+  — main's series ends at `0011_finalization_intent`);
 - principal variants (user, trigger, schedule, webhook, system worker) with
   a `Principal` extractor;
 - approval RBAC (`approval.decide_own` / `approval.decide_org`) and
@@ -1462,7 +1465,8 @@ Acceptance:
 - an OIDC round-trip passes against a conformant issuer (Keycloak or Dex in
   CI), with replayed, wrong-browser, and expired login flows all refused;
 - the signing-algorithm allowlist rejects `none`/HS256; multi-audience
-  tokens require `azp`; `nonce` and `at_hash` are enforced;
+  tokens require `azp`; `nonce` is enforced; an access token is required
+  and `at_hash` is verified whenever present;
 - a deactivated membership is refused on its next request and its personal
   API tokens die with it;
 - break-glass bootstrap mints exactly one first owner and is idempotent
@@ -1776,8 +1780,9 @@ the companion identity design. No settled decision changed. Drift fixes:
   double-ledger bug).
 - **Phase B's "OIDC/session authentication" is now fully designed** in the
   companion doc `2026-07-17-idp-agnostic-identity-design.md`: per-organization
-  IdP-agnostic OIDC (any conformant issuer), invariant-20 login-flow rows
-  reusing the GitHub App cookie-hash claim pattern, org-scoped users,
+  IdP-agnostic OIDC (any conformant issuer), one-time login-flow rows
+  reusing the GitHub App cookie-hash claim pattern (the invariant-20
+  mechanism, bindings per the companion), org-scoped users,
   server-side sessions, personal API tokens, and admin-token break-glass.
   Phase B implement/acceptance bullets updated; Gap 5/Phase D re-seal scope
   now names the identity layer's sealed families; migration numbering noted
