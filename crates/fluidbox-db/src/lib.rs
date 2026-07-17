@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 pub mod identity;
 pub mod seed;
+pub mod system_worker;
 
 /// A verified tenant context. Constructible ONLY via [`TenantScope::assume`],
 /// which a caller may invoke only when it genuinely holds a verified tenant
@@ -1664,58 +1665,28 @@ pub async fn create_session(
     Ok(row)
 }
 
-pub async fn get_session(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<SessionRow>> {
-    sqlx::query_as("select * from sessions where id = $1")
+pub async fn get_session(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+) -> sqlx::Result<Option<SessionRow>> {
+    sqlx::query_as("select * from sessions where id = $1 and tenant_id = $2")
         .bind(id)
+        .bind(scope.tenant_id())
         .fetch_optional(pool)
         .await
 }
 
 pub async fn list_sessions(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
     limit: i64,
 ) -> sqlx::Result<Vec<SessionRow>> {
     sqlx::query_as("select * from sessions where tenant_id = $1 order by created_at desc limit $2")
-        .bind(tenant)
+        .bind(scope.tenant_id())
         .bind(limit)
         .fetch_all(pool)
         .await
-}
-
-pub async fn sessions_in_status(pool: &PgPool, statuses: &[&str]) -> sqlx::Result<Vec<SessionRow>> {
-    let list: Vec<String> = statuses.iter().map(|s| s.to_string()).collect();
-    sqlx::query_as("select * from sessions where status = any($1)")
-        .bind(&list)
-        .fetch_all(pool)
-        .await
-}
-
-/// Sessions stuck before launch. The orchestrator moves created →
-/// provisioning → initializing in seconds (initializing: minutes at worst
-/// for a big repo copy), so a stale row means the control plane died
-/// mid-launch and nothing owns the session anymore.
-///
-/// Age is measured from `created_at` — a timestamp NOTHING refreshes. It used
-/// to be `updated_at`, which every runner heartbeat bumps: a crash between
-/// runner start and `set_sandbox_handle` left a heartbeating `initializing`
-/// session this sweep could never age out (M5).
-pub async fn stale_nonstarted_sessions(
-    pool: &PgPool,
-    max_age_mins: i32,
-) -> sqlx::Result<Vec<SessionRow>> {
-    sqlx::query_as(
-        "select * from sessions
-         where status = any($1) and created_at < now() - make_interval(mins => $2)",
-    )
-    .bind(vec![
-        "created".to_string(),
-        "provisioning".to_string(),
-        "initializing".to_string(),
-    ])
-    .bind(max_age_mins)
-    .fetch_all(pool)
-    .await
 }
 
 /// The single status writer. Validates the transition inside a transaction;
@@ -1723,14 +1694,16 @@ pub async fn stale_nonstarted_sessions(
 /// that is an error or a benign race).
 pub async fn transition_session(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
     next: SessionStatus,
     reason: Option<&str>,
 ) -> sqlx::Result<Option<(SessionStatus, SessionRow)>> {
     let mut tx = pool.begin().await?;
     let row: Option<(String,)> =
-        sqlx::query_as("select status from sessions where id = $1 for update")
+        sqlx::query_as("select status from sessions where id = $1 and tenant_id = $2 for update")
             .bind(id)
+            .bind(scope.tenant_id())
             .fetch_optional(&mut *tx)
             .await?;
     let Some((current,)) = row else {
@@ -1774,12 +1747,18 @@ pub async fn transition_session(
 /// re-checks only the target tuple on unblock), so it could attach past a
 /// just-committed intent. Taking the same row lock first and reading the
 /// intent in a SECOND statement gets a fresh snapshot that must see it.
-pub async fn set_sandbox_handle(pool: &PgPool, id: Uuid, handle: &Value) -> sqlx::Result<bool> {
+pub async fn set_sandbox_handle(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    handle: &Value,
+) -> sqlx::Result<bool> {
     use fluidbox_core::state::SessionStatus;
     let mut tx = pool.begin().await?;
     let locked: Option<(String,)> =
-        sqlx::query_as("select status from sessions where id = $1 for update")
+        sqlx::query_as("select status from sessions where id = $1 and tenant_id = $2 for update")
             .bind(id)
+            .bind(scope.tenant_id())
             .fetch_optional(&mut *tx)
             .await?;
     let Some((status,)) = locked else {
@@ -1812,42 +1791,70 @@ pub async fn set_sandbox_handle(pool: &PgPool, id: Uuid, handle: &Value) -> sqlx
 /// `run()`'s own `set_sandbox_handle`, a concurrent cancel, or a terminal
 /// transition can never overwrite a real handle or resurrect a closed
 /// session. Returns whether the adoption landed.
-pub async fn adopt_sandbox_handle(pool: &PgPool, id: Uuid, handle: &Value) -> sqlx::Result<bool> {
+pub async fn adopt_sandbox_handle(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    handle: &Value,
+) -> sqlx::Result<bool> {
     let res = sqlx::query(
         "update sessions set sandbox_handle = $2, updated_at = now()
-         where id = $1 and sandbox_handle is null
+         where id = $1 and tenant_id = $3 and sandbox_handle is null
            and status in ('created','provisioning','initializing','running','awaiting_approval')",
     )
     .bind(id)
     .bind(handle)
+    .bind(scope.tenant_id())
     .execute(pool)
     .await?;
     Ok(res.rows_affected() > 0)
 }
 
-pub async fn set_base_commit(pool: &PgPool, id: Uuid, commit: &str) -> sqlx::Result<()> {
-    sqlx::query("update sessions set base_commit = $2, updated_at = now() where id = $1")
-        .bind(id)
-        .bind(commit)
-        .execute(pool)
-        .await?;
+pub async fn set_base_commit(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    commit: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "update sessions set base_commit = $2, updated_at = now()
+         where id = $1 and tenant_id = $3",
+    )
+    .bind(id)
+    .bind(commit)
+    .bind(scope.tenant_id())
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
-pub async fn set_result_summary(pool: &PgPool, id: Uuid, summary: &str) -> sqlx::Result<()> {
-    sqlx::query("update sessions set result_summary = $2, updated_at = now() where id = $1")
-        .bind(id)
-        .bind(summary)
-        .execute(pool)
-        .await?;
+pub async fn set_result_summary(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    summary: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "update sessions set result_summary = $2, updated_at = now()
+         where id = $1 and tenant_id = $3",
+    )
+    .bind(id)
+    .bind(summary)
+    .bind(scope.tenant_id())
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
-pub async fn heartbeat(pool: &PgPool, id: Uuid) -> sqlx::Result<()> {
-    sqlx::query("update sessions set last_heartbeat_at = now(), updated_at = now() where id = $1")
-        .bind(id)
-        .execute(pool)
-        .await?;
+pub async fn heartbeat(pool: &PgPool, scope: TenantScope, id: Uuid) -> sqlx::Result<()> {
+    sqlx::query(
+        "update sessions set last_heartbeat_at = now(), updated_at = now()
+         where id = $1 and tenant_id = $2",
+    )
+    .bind(id)
+    .bind(scope.tenant_id())
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -1895,8 +1902,10 @@ pub enum BeginFinalization {
 /// between our conflict and our read of the winning row. The first writer
 /// wins the outcome; a racing second caller receives the winner's row with
 /// `created: false` and defers to it.
+#[allow(clippy::too_many_arguments)]
 pub async fn begin_finalization(
     pool: &PgPool,
+    scope: TenantScope,
     session: Uuid,
     outcome: &str,
     summary: Option<&str>,
@@ -1906,11 +1915,13 @@ pub async fn begin_finalization(
 ) -> sqlx::Result<BeginFinalization> {
     use fluidbox_core::state::SessionStatus;
     let mut tx = pool.begin().await?;
-    let locked: Option<(String, Option<Value>)> =
-        sqlx::query_as("select status, sandbox_handle from sessions where id = $1 for update")
-            .bind(session)
-            .fetch_optional(&mut *tx)
-            .await?;
+    let locked: Option<(String, Option<Value>)> = sqlx::query_as(
+        "select status, sandbox_handle from sessions where id = $1 and tenant_id = $2 for update",
+    )
+    .bind(session)
+    .bind(scope.tenant_id())
+    .fetch_optional(&mut *tx)
+    .await?;
     let Some((status, handle)) = locked else {
         return Ok(BeginFinalization::Missing);
     };
@@ -1959,12 +1970,18 @@ pub async fn begin_finalization(
 
 pub async fn get_finalization(
     pool: &PgPool,
+    scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<Option<FinalizationRow>> {
-    sqlx::query_as("select * from session_finalizations where session_id = $1")
-        .bind(session)
-        .fetch_optional(pool)
-        .await
+    sqlx::query_as(
+        "select * from session_finalizations
+         where session_id = $1
+           and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $2)",
+    )
+    .bind(session)
+    .bind(scope.tenant_id())
+    .fetch_optional(pool)
+    .await
 }
 
 /// Claim a finalization for driving: succeeds when the row is unclaimed OR its
@@ -1974,6 +1991,7 @@ pub async fn get_finalization(
 /// gate regardless, so a double-claim can never double-finalize.
 pub async fn claim_finalization(
     pool: &PgPool,
+    scope: TenantScope,
     session: Uuid,
     stale_secs: i64,
 ) -> sqlx::Result<Option<FinalizationRow>> {
@@ -1982,45 +2000,50 @@ pub async fn claim_finalization(
             set claimed_at = now(), attempts = attempts + 1
           where session_id = $1
             and (claimed_at is null or claimed_at < now() - make_interval(secs => $2))
+            and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $3)
           returning *",
     )
     .bind(session)
     .bind(stale_secs as f64)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await
-}
-
-/// Every persisted finalization intent, oldest first — the restart-recovery
-/// worklist. Status-blind BY DESIGN: an intent whose session is still ACTIVE
-/// is the crash-between-persist-and-transition window (the wind-down state
-/// never landed), and an intent whose session is already TERMINAL is cleanup
-/// still owed (reap, workspace/archive removal, delivery reconciliation).
-/// Both must be re-driven; the intent row is deleted only once nothing is
-/// owed, so this list self-drains.
-pub async fn pending_finalizations(pool: &PgPool) -> sqlx::Result<Vec<Uuid>> {
-    let rows: Vec<(Uuid,)> =
-        sqlx::query_as("select session_id from session_finalizations order by created_at asc")
-            .fetch_all(pool)
-            .await?;
-    Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
 /// Release a driver's claim early — for DELIBERATE deferrals (e.g. the
 /// provisioning settle window), so the finalize worker retries at its own
 /// cadence instead of waiting out the stale-claim threshold.
-pub async fn release_finalization_claim(pool: &PgPool, session: Uuid) -> sqlx::Result<()> {
-    sqlx::query("update session_finalizations set claimed_at = null where session_id = $1")
-        .bind(session)
-        .execute(pool)
-        .await?;
+pub async fn release_finalization_claim(
+    pool: &PgPool,
+    scope: TenantScope,
+    session: Uuid,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "update session_finalizations set claimed_at = null
+         where session_id = $1
+           and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $2)",
+    )
+    .bind(session)
+    .bind(scope.tenant_id())
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
-pub async fn delete_finalization(pool: &PgPool, session: Uuid) -> sqlx::Result<()> {
-    sqlx::query("delete from session_finalizations where session_id = $1")
-        .bind(session)
-        .execute(pool)
-        .await?;
+pub async fn delete_finalization(
+    pool: &PgPool,
+    scope: TenantScope,
+    session: Uuid,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "delete from session_finalizations
+         where session_id = $1
+           and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $2)",
+    )
+    .bind(session)
+    .bind(scope.tenant_id())
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -2056,11 +2079,19 @@ pub async fn acquire_oauth_lock(
 /// The stored diff artifact's content, if any — the finalizer's evidence
 /// guard: a re-driven finalization must never overwrite a collected diff
 /// with an `artifact_missing` marker (missing → collected upgrades are fine).
-pub async fn diff_artifact_content(pool: &PgPool, session: Uuid) -> sqlx::Result<Option<String>> {
+pub async fn diff_artifact_content(
+    pool: &PgPool,
+    scope: TenantScope,
+    session: Uuid,
+) -> sqlx::Result<Option<String>> {
     let row: Option<(String,)> = sqlx::query_as(
-        "select content from artifacts where session_id = $1 and kind = 'diff' limit 1",
+        "select content from artifacts
+         where session_id = $1 and kind = 'diff'
+           and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $2)
+         limit 1",
     )
     .bind(session)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(c,)| c))
@@ -2068,6 +2099,7 @@ pub async fn diff_artifact_content(pool: &PgPool, session: Uuid) -> sqlx::Result
 
 pub async fn upsert_artifact(
     pool: &PgPool,
+    scope: TenantScope,
     session: Uuid,
     kind: &str,
     name: &str,
@@ -2075,15 +2107,22 @@ pub async fn upsert_artifact(
     content_type: &str,
 ) -> sqlx::Result<ArtifactRow> {
     let mut tx = pool.begin().await?;
-    sqlx::query("delete from artifacts where session_id = $1 and kind = $2 and name = $3")
-        .bind(session)
-        .bind(kind)
-        .bind(name)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "delete from artifacts
+         where session_id = $1 and kind = $2 and name = $3
+           and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $4)",
+    )
+    .bind(session)
+    .bind(kind)
+    .bind(name)
+    .bind(scope.tenant_id())
+    .execute(&mut *tx)
+    .await?;
     let row: ArtifactRow = sqlx::query_as(
         "insert into artifacts (id, session_id, kind, name, content, content_type)
-         values ($1,$2,$3,$4,$5,$6) returning *",
+         select $1,$2,$3,$4,$5,$6
+         where exists (select 1 from sessions s where s.id = $2 and s.tenant_id = $7)
+         returning *",
     )
     .bind(Uuid::now_v7())
     .bind(session)
@@ -2091,6 +2130,7 @@ pub async fn upsert_artifact(
     .bind(name)
     .bind(content)
     .bind(content_type)
+    .bind(scope.tenant_id())
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -2117,17 +2157,22 @@ pub async fn append_event(pool: &PgPool, event: Redacted<EventEnvelope>) -> sqlx
 
 pub async fn events_after(
     pool: &PgPool,
+    scope: TenantScope,
     session: Uuid,
     after_seq: i64,
     limit: i64,
 ) -> sqlx::Result<Vec<EventRow>> {
     sqlx::query_as(
         "select event_id, session_id, seq, actor, type, payload, occurred_at
-         from events where session_id = $1 and seq > $2 order by seq limit $3",
+         from events
+         where session_id = $1 and seq > $2
+           and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $4)
+         order by seq limit $3",
     )
     .bind(session)
     .bind(after_seq)
     .bind(limit)
+    .bind(scope.tenant_id())
     .fetch_all(pool)
     .await
 }
@@ -2150,6 +2195,9 @@ macro_rules! approval_cols {
          scope, scope_key, status, requested_at, expires_at, decided_at, decided_by"
     };
 }
+// Re-exported by path so the `system_worker` module's approval scans share the
+// same compile-time column literal.
+pub(crate) use approval_cols;
 
 /// Register a tool-call intent, idempotent by (session_id, tool_call_id).
 /// Returns (row, inserted). When `inserted` is false the caller MUST compare
@@ -2157,6 +2205,7 @@ macro_rules! approval_cols {
 /// a protocol violation, never a re-attach.
 pub async fn register_tool_intent(
     pool: &PgPool,
+    scope: TenantScope,
     session: Uuid,
     tool_call_id: &str,
     tool: &str,
@@ -2167,7 +2216,8 @@ pub async fn register_tool_intent(
         "insert into approvals
            (id, session_id, tool_call_id, tool, summary, input_digest, scope, scope_key,
             status, expires_at)
-         values ($1,$2,$3,$4,$5,$6,'once',$4,'intent', now())
+         select $1,$2,$3,$4,$5,$6,'once',$4,'intent', now()
+         where exists (select 1 from sessions s where s.id = $2 and s.tenant_id = $7)
          on conflict (session_id, tool_call_id) do nothing
          returning ",
         approval_cols!()
@@ -2178,6 +2228,7 @@ pub async fn register_tool_intent(
     .bind(tool)
     .bind(summary)
     .bind(input_digest)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await?;
     if let Some(row) = inserted {
@@ -2186,10 +2237,13 @@ pub async fn register_tool_intent(
     let existing: ApprovalRow = sqlx::query_as(concat!(
         "select ",
         approval_cols!(),
-        " from approvals where session_id = $1 and tool_call_id = $2"
+        " from approvals
+         where session_id = $1 and tool_call_id = $2
+           and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $3)"
     ))
     .bind(session)
     .bind(tool_call_id)
+    .bind(scope.tenant_id())
     .fetch_one(pool)
     .await?;
     Ok((existing, false))
@@ -2201,9 +2255,10 @@ pub async fn register_tool_intent(
 /// caller re-reads and acts on the current status.
 pub async fn promote_intent_to_pending(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
     risk: Option<&str>,
-    scope: &str,
+    approval_scope: &str,
     scope_key: &str,
     ttl_secs: i64,
 ) -> sqlx::Result<Option<ApprovalRow>> {
@@ -2212,14 +2267,17 @@ pub async fn promote_intent_to_pending(
             set status = 'pending', risk = $2, scope = $3, scope_key = $4,
                 expires_at = now() + make_interval(secs => $5)
           where id = $1 and status = 'intent'
+            and exists (select 1 from sessions s
+                        where s.id = approvals.session_id and s.tenant_id = $6)
           returning ",
         approval_cols!()
     ))
     .bind(id)
     .bind(risk)
-    .bind(scope)
+    .bind(approval_scope)
     .bind(scope_key)
     .bind(ttl_secs as f64)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await
 }
@@ -2230,13 +2288,21 @@ pub async fn promote_intent_to_pending(
 /// tool_call_id already moved the row, or a human decision landed) gets
 /// false and must adopt the durable outcome instead of its locally-computed
 /// verdict — that is what keeps one intent to one decision under races.
-pub async fn record_intent_verdict(pool: &PgPool, id: Uuid, status: &str) -> sqlx::Result<bool> {
+pub async fn record_intent_verdict(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    status: &str,
+) -> sqlx::Result<bool> {
     let res = sqlx::query(
         "update approvals set status = $2, decided_at = now(), decided_by = 'gate'
-         where id = $1 and status = 'intent'",
+         where id = $1 and status = 'intent'
+           and exists (select 1 from sessions s
+                       where s.id = approvals.session_id and s.tenant_id = $3)",
     )
     .bind(id)
     .bind(status)
+    .bind(scope.tenant_id())
     .execute(pool)
     .await?;
     Ok(res.rows_affected() > 0)
@@ -2244,6 +2310,7 @@ pub async fn record_intent_verdict(pool: &PgPool, id: Uuid, status: &str) -> sql
 
 pub async fn decide_approval(
     pool: &PgPool,
+    scope: TenantScope,
     id: Uuid,
     status: &str,
     decided_by: &str,
@@ -2251,48 +2318,55 @@ pub async fn decide_approval(
     sqlx::query_as(concat!(
         "update approvals set status = $2, decided_at = now(), decided_by = $3
          where id = $1 and status = 'pending'
+           and exists (select 1 from sessions s
+                       where s.id = approvals.session_id and s.tenant_id = $4)
          returning ",
         approval_cols!()
     ))
     .bind(id)
     .bind(status)
     .bind(decided_by)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await
 }
 
-pub async fn get_approval(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<ApprovalRow>> {
+pub async fn get_approval(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+) -> sqlx::Result<Option<ApprovalRow>> {
     sqlx::query_as(concat!(
         "select ",
         approval_cols!(),
-        " from approvals where id = $1"
+        " from approvals
+         where id = $1
+           and exists (select 1 from sessions s
+                       where s.id = approvals.session_id and s.tenant_id = $2)"
     ))
     .bind(id)
+    .bind(scope.tenant_id())
     .fetch_optional(pool)
-    .await
-}
-
-pub async fn pending_approvals(pool: &PgPool) -> sqlx::Result<Vec<ApprovalRow>> {
-    sqlx::query_as(concat!(
-        "select ",
-        approval_cols!(),
-        " from approvals where status = 'pending' order by requested_at"
-    ))
-    .fetch_all(pool)
     .await
 }
 
 /// Human-lifecycle rows only: intent bookkeeping ('intent'/'auto_*') is the
 /// gate's, not the approvals API's.
-pub async fn session_approvals(pool: &PgPool, session: Uuid) -> sqlx::Result<Vec<ApprovalRow>> {
+pub async fn session_approvals(
+    pool: &PgPool,
+    scope: TenantScope,
+    session: Uuid,
+) -> sqlx::Result<Vec<ApprovalRow>> {
     sqlx::query_as(concat!(
         "select ",
         approval_cols!(),
         " from approvals
          where session_id = $1 and status not in ('intent','auto_allowed','auto_denied')
+           and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $2)
          order by requested_at desc"
     ))
     .bind(session)
+    .bind(scope.tenant_id())
     .fetch_all(pool)
     .await
 }
@@ -2300,6 +2374,7 @@ pub async fn session_approvals(pool: &PgPool, session: Uuid) -> sqlx::Result<Vec
 /// Has this session already granted `approved_session` for this scope key?
 pub async fn has_session_grant(
     pool: &PgPool,
+    scope: TenantScope,
     session: Uuid,
     scope_key: &str,
 ) -> sqlx::Result<bool> {
@@ -2307,30 +2382,22 @@ pub async fn has_session_grant(
         "select exists(
            select 1 from approvals
            where session_id = $1 and scope_key = $2 and status = 'approved_session'
+             and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $3)
          ) as granted",
     )
     .bind(session)
     .bind(scope_key)
+    .bind(scope.tenant_id())
     .fetch_one(pool)
     .await?;
     Ok(row.get::<bool, _>("granted"))
-}
-
-pub async fn expire_stale_approvals(pool: &PgPool) -> sqlx::Result<Vec<ApprovalRow>> {
-    sqlx::query_as(concat!(
-        "update approvals set status = 'expired', decided_at = now(), decided_by = 'timeout'
-         where status = 'pending' and expires_at < now()
-         returning ",
-        approval_cols!()
-    ))
-    .fetch_all(pool)
-    .await
 }
 
 // ─── Artifacts ────────────────────────────────────────────────────────────
 
 pub async fn add_artifact(
     pool: &PgPool,
+    scope: TenantScope,
     session: Uuid,
     kind: &str,
     name: &str,
@@ -2339,7 +2406,9 @@ pub async fn add_artifact(
 ) -> sqlx::Result<ArtifactRow> {
     sqlx::query_as(
         "insert into artifacts (id, session_id, kind, name, content, content_type)
-         values ($1,$2,$3,$4,$5,$6) returning *",
+         select $1,$2,$3,$4,$5,$6
+         where exists (select 1 from sessions s where s.id = $2 and s.tenant_id = $7)
+         returning *",
     )
     .bind(Uuid::now_v7())
     .bind(session)
@@ -2347,22 +2416,42 @@ pub async fn add_artifact(
     .bind(name)
     .bind(content)
     .bind(content_type)
+    .bind(scope.tenant_id())
     .fetch_one(pool)
     .await
 }
 
-pub async fn list_artifacts(pool: &PgPool, session: Uuid) -> sqlx::Result<Vec<ArtifactRow>> {
-    sqlx::query_as("select * from artifacts where session_id = $1 order by created_at")
-        .bind(session)
-        .fetch_all(pool)
-        .await
+pub async fn list_artifacts(
+    pool: &PgPool,
+    scope: TenantScope,
+    session: Uuid,
+) -> sqlx::Result<Vec<ArtifactRow>> {
+    sqlx::query_as(
+        "select * from artifacts
+         where session_id = $1
+           and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $2)
+         order by created_at",
+    )
+    .bind(session)
+    .bind(scope.tenant_id())
+    .fetch_all(pool)
+    .await
 }
 
-pub async fn get_artifact(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<ArtifactRow>> {
-    sqlx::query_as("select * from artifacts where id = $1")
-        .bind(id)
-        .fetch_optional(pool)
-        .await
+pub async fn get_artifact(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+) -> sqlx::Result<Option<ArtifactRow>> {
+    sqlx::query_as(
+        "select * from artifacts a
+         where a.id = $1
+           and exists (select 1 from sessions s where s.id = a.session_id and s.tenant_id = $2)",
+    )
+    .bind(id)
+    .bind(scope.tenant_id())
+    .fetch_optional(pool)
+    .await
 }
 
 // ─── Usage ────────────────────────────────────────────────────────────────
@@ -2370,6 +2459,7 @@ pub async fn get_artifact(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<Artifa
 #[allow(clippy::too_many_arguments)]
 pub async fn add_usage(
     pool: &PgPool,
+    scope: TenantScope,
     session: Uuid,
     model: &str,
     input_tokens: i64,
@@ -2384,7 +2474,8 @@ pub async fn add_usage(
         "insert into usage_entries
            (id, session_id, model, input_tokens, output_tokens, cache_read_tokens,
             cache_write_tokens, cost_usd, source, external_id)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+         select $1,$2,$3,$4,$5,$6,$7,$8,$9,$10
+         where exists (select 1 from sessions s where s.id = $2 and s.tenant_id = $11)
          on conflict (external_id) where external_id is not null do nothing",
     )
     .bind(Uuid::now_v7())
@@ -2397,12 +2488,17 @@ pub async fn add_usage(
     .bind(cost_usd)
     .bind(source)
     .bind(external_id)
+    .bind(scope.tenant_id())
     .execute(pool)
     .await?;
     Ok(res.rows_affected() > 0)
 }
 
-pub async fn usage_totals(pool: &PgPool, session: Uuid) -> sqlx::Result<UsageTotals> {
+pub async fn usage_totals(
+    pool: &PgPool,
+    scope: TenantScope,
+    session: Uuid,
+) -> sqlx::Result<UsageTotals> {
     sqlx::query_as(
         "select coalesce(sum(input_tokens),0)::bigint as input_tokens,
                 coalesce(sum(output_tokens),0)::bigint as output_tokens,
@@ -2410,9 +2506,12 @@ pub async fn usage_totals(pool: &PgPool, session: Uuid) -> sqlx::Result<UsageTot
                 coalesce(sum(cache_write_tokens),0)::bigint as cache_write_tokens,
                 coalesce(sum(cost_usd),0)::float8 as cost_usd,
                 count(*)::bigint as requests
-         from usage_entries where session_id = $1",
+         from usage_entries
+         where session_id = $1
+           and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $2)",
     )
     .bind(session)
+    .bind(scope.tenant_id())
     .fetch_one(pool)
     .await
 }
@@ -2420,11 +2519,20 @@ pub async fn usage_totals(pool: &PgPool, session: Uuid) -> sqlx::Result<UsageTot
 /// Unique persistent tool-call INTENTS (one approvals row per tool_call_id)
 /// — the budget's counting unit. Never derived from runner-posted events:
 /// budget parity does not trust runner cooperation.
-pub async fn tool_call_count(pool: &PgPool, session: Uuid) -> sqlx::Result<i64> {
-    let row = sqlx::query("select count(*)::bigint as n from approvals where session_id = $1")
-        .bind(session)
-        .fetch_one(pool)
-        .await?;
+pub async fn tool_call_count(
+    pool: &PgPool,
+    scope: TenantScope,
+    session: Uuid,
+) -> sqlx::Result<i64> {
+    let row = sqlx::query(
+        "select count(*)::bigint as n from approvals
+         where session_id = $1
+           and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $2)",
+    )
+    .bind(session)
+    .bind(scope.tenant_id())
+    .fetch_one(pool)
+    .await?;
     Ok(row.get::<i64, _>("n"))
 }
 
@@ -2432,7 +2540,7 @@ pub async fn tool_call_count(pool: &PgPool, session: Uuid) -> sqlx::Result<i64> 
 
 pub async fn create_session_token(
     pool: &PgPool,
-    tenant: Uuid,
+    scope: TenantScope,
     session: Uuid,
     token_plain: &str,
     ttl_secs: i64,
@@ -2442,7 +2550,7 @@ pub async fn create_session_token(
          values ($1, $2, 'session', $3, $4, now() + make_interval(secs => $5))",
     )
     .bind(Uuid::now_v7())
-    .bind(tenant)
+    .bind(scope.tenant_id())
     .bind(session)
     .bind(sha256_hex(token_plain))
     .bind(ttl_secs as f64)
@@ -2451,29 +2559,51 @@ pub async fn create_session_token(
     Ok(())
 }
 
-/// Resolve a session token to its session id IGNORING revoked_at/expiry —
-/// used ONLY by /result to acknowledge an already-terminal session whose
-/// token was revoked on the terminal transition (so a lost-response retry
-/// acks cleanly). Every other endpoint uses the strict `session_for_token`.
-/// A completely bogus token still returns None; a real token resolves to its
-/// own session, and the caller gates the ack on that session being terminal.
+/// What resolving a session token yields: the session it belongs to AND its
+/// owning tenant. The tenant rides the credential so the caller (auth
+/// extractor / facade / `/result`) can build a `TenantScope` without a second
+/// query — the "bootstrap exception" pattern (token resolution keys purely on
+/// the sha256, then hands back a verified tenant).
+#[derive(Debug, Clone, Copy)]
+pub struct SessionTokenAuth {
+    pub session_id: Uuid,
+    pub tenant_id: Uuid,
+}
+
+/// Resolve a session token to its session IGNORING revoked_at/expiry — used
+/// ONLY by /result to acknowledge an already-terminal session whose token was
+/// revoked on the terminal transition (so a lost-response retry acks cleanly).
+/// Every other endpoint uses the strict `session_for_token`. A completely
+/// bogus token still returns None; a real token resolves to its own session,
+/// and the caller gates the ack on that session being terminal.
 pub async fn session_for_token_incl_revoked(
     pool: &PgPool,
     token_plain: &str,
-) -> sqlx::Result<Option<Uuid>> {
+) -> sqlx::Result<Option<SessionTokenAuth>> {
     let row = sqlx::query(
-        "select session_id from api_tokens where kind = 'session' and token_sha256 = $1",
+        "select session_id, tenant_id from api_tokens
+         where kind = 'session' and token_sha256 = $1",
     )
     .bind(sha256_hex(token_plain))
     .fetch_optional(pool)
     .await?;
-    Ok(row.and_then(|r| r.get::<Option<Uuid>, _>("session_id")))
+    Ok(row.and_then(|r| {
+        r.get::<Option<Uuid>, _>("session_id")
+            .map(|session_id| SessionTokenAuth {
+                session_id,
+                tenant_id: r.get::<Uuid, _>("tenant_id"),
+            })
+    }))
 }
 
-/// Returns the session id a valid (unexpired, unrevoked) token belongs to.
-pub async fn session_for_token(pool: &PgPool, token_plain: &str) -> sqlx::Result<Option<Uuid>> {
+/// Returns the session (and its tenant) a valid (unexpired, unrevoked) token
+/// belongs to.
+pub async fn session_for_token(
+    pool: &PgPool,
+    token_plain: &str,
+) -> sqlx::Result<Option<SessionTokenAuth>> {
     let row = sqlx::query(
-        "select session_id from api_tokens
+        "select session_id, tenant_id from api_tokens
          where kind = 'session' and token_sha256 = $1
            and revoked_at is null
            and (expires_at is null or expires_at > now())",
@@ -2481,7 +2611,13 @@ pub async fn session_for_token(pool: &PgPool, token_plain: &str) -> sqlx::Result
     .bind(sha256_hex(token_plain))
     .fetch_optional(pool)
     .await?;
-    Ok(row.and_then(|r| r.get::<Option<Uuid>, _>("session_id")))
+    Ok(row.and_then(|r| {
+        r.get::<Option<Uuid>, _>("session_id")
+            .map(|session_id| SessionTokenAuth {
+                session_id,
+                tenant_id: r.get::<Uuid, _>("tenant_id"),
+            })
+    }))
 }
 
 pub async fn extend_session_token(
@@ -2504,12 +2640,18 @@ pub async fn extend_session_token(
 /// enters a terminal state so a still-running or wedged runner can no longer
 /// authenticate to the facade or internal gateway (defense in depth beyond
 /// the facade's own terminal-session refusal).
-pub async fn revoke_session_tokens(pool: &PgPool, session: Uuid) -> sqlx::Result<u64> {
+pub async fn revoke_session_tokens(
+    pool: &PgPool,
+    scope: TenantScope,
+    session: Uuid,
+) -> sqlx::Result<u64> {
     let res = sqlx::query(
         "update api_tokens set revoked_at = now()
-         where kind = 'session' and session_id = $1 and revoked_at is null",
+         where kind = 'session' and session_id = $1 and revoked_at is null
+           and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $2)",
     )
     .bind(session)
+    .bind(scope.tenant_id())
     .execute(pool)
     .await?;
     Ok(res.rows_affected())
@@ -2974,14 +3116,24 @@ pub async fn create_trigger_token(
     Ok(())
 }
 
-/// Resolves a scoped trigger token to its subscription. This is the entire
-/// authority of the token — it can never satisfy Admin or SessionAuth.
+/// What resolving a trigger token yields: the subscription it may invoke AND
+/// its owning tenant (the "bootstrap exception" pattern — keys on the sha256,
+/// hands back a verified tenant).
+#[derive(Debug, Clone, Copy)]
+pub struct TriggerTokenAuth {
+    pub subscription_id: Uuid,
+    pub tenant_id: Uuid,
+}
+
+/// Resolves a scoped trigger token to its subscription (and tenant). This is
+/// the entire authority of the token — it can never satisfy Admin or
+/// SessionAuth.
 pub async fn subscription_for_token(
     pool: &PgPool,
     token_plain: &str,
-) -> sqlx::Result<Option<Uuid>> {
+) -> sqlx::Result<Option<TriggerTokenAuth>> {
     let row = sqlx::query(
-        "select subscription_id from api_tokens
+        "select subscription_id, tenant_id from api_tokens
          where kind = 'trigger' and token_sha256 = $1
            and revoked_at is null
            and (expires_at is null or expires_at > now())",
@@ -2989,7 +3141,13 @@ pub async fn subscription_for_token(
     .bind(sha256_hex(token_plain))
     .fetch_optional(pool)
     .await?;
-    Ok(row.and_then(|r| r.get::<Option<Uuid>, _>("subscription_id")))
+    Ok(row.and_then(|r| {
+        r.get::<Option<Uuid>, _>("subscription_id")
+            .map(|subscription_id| TriggerTokenAuth {
+                subscription_id,
+                tenant_id: r.get::<Uuid, _>("tenant_id"),
+            })
+    }))
 }
 
 /// Rotation support: kill every live token for the subscription.
@@ -3277,6 +3435,7 @@ mod tests {
         };
         let pool = connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
             &pool,
             tenant,
@@ -3333,10 +3492,13 @@ mod tests {
             SessionStatus::Initializing,
             SessionStatus::Running,
         ] {
-            transition_session(&pool, racer.id, st, None).await.unwrap();
+            transition_session(&pool, scope, racer.id, st, None)
+                .await
+                .unwrap();
         }
         let attached_active = set_sandbox_handle(
             &pool,
+            scope,
             racer.id,
             &serde_json::json!({"external_id":"t","uid":"u"}),
         )
@@ -3346,8 +3508,26 @@ mod tests {
         // Genuinely concurrent: two connections race the insert under the
         // row lock — a cancel (wants quiesce) against a /result (does not).
         let (a, b) = tokio::join!(
-            begin_finalization(&pool, racer.id, "cancelled", None, Some("race"), true, 30),
-            begin_finalization(&pool, racer.id, "completed", Some("done"), None, false, 30),
+            begin_finalization(
+                &pool,
+                scope,
+                racer.id,
+                "cancelled",
+                None,
+                Some("race"),
+                true,
+                30
+            ),
+            begin_finalization(
+                &pool,
+                scope,
+                racer.id,
+                "completed",
+                Some("done"),
+                None,
+                false,
+                30
+            ),
         );
         let unpack = |r: sqlx::Result<BeginFinalization>| match r.unwrap() {
             BeginFinalization::Persisted {
@@ -3362,64 +3542,93 @@ mod tests {
 
         // Recovery must see the intent while the session is still ACTIVE
         // (the crash-between-persist-and-transition window).
-        let pending_while_active = pending_finalizations(&pool).await.unwrap();
+        let pending_while_active = system_worker::pending_finalizations(&pool).await.unwrap();
 
         // Claim semantics: one holder at a time; an early release (the
         // deliberate settle-defer path) re-opens it immediately, without
         // waiting out the stale threshold.
-        let claim1 = claim_finalization(&pool, racer.id, 420).await.unwrap();
-        let claim_held = claim_finalization(&pool, racer.id, 420).await.unwrap();
-        release_finalization_claim(&pool, racer.id).await.unwrap();
-        let claim_after_release = claim_finalization(&pool, racer.id, 420).await.unwrap();
+        let claim1 = claim_finalization(&pool, scope, racer.id, 420)
+            .await
+            .unwrap();
+        let claim_held = claim_finalization(&pool, scope, racer.id, 420)
+            .await
+            .unwrap();
+        release_finalization_claim(&pool, scope, racer.id)
+            .await
+            .unwrap();
+        let claim_after_release = claim_finalization(&pool, scope, racer.id, 420)
+            .await
+            .unwrap();
 
         // Fence session: persist an intent, terminalize legally, release the
         // intent, then try to re-create it and to attach a handle late.
-        let first_fence =
-            begin_finalization(&pool, fenced.id, "failed", None, Some("t"), false, 30)
-                .await
-                .unwrap();
+        let first_fence = begin_finalization(
+            &pool,
+            scope,
+            fenced.id,
+            "failed",
+            None,
+            Some("t"),
+            false,
+            30,
+        )
+        .await
+        .unwrap();
         // The gap that matters: intent committed, wind-down transition NOT
         // yet applied — the session status still accepts work, but the
         // intent alone must fence a late attach.
         let attached_intent_gap = set_sandbox_handle(
             &pool,
+            scope,
             fenced.id,
             &serde_json::json!({"external_id":"tg","uid":"ug"}),
         )
         .await
         .unwrap();
-        transition_session(&pool, fenced.id, SessionStatus::Finalizing, None)
+        transition_session(&pool, scope, fenced.id, SessionStatus::Finalizing, None)
             .await
             .unwrap();
         // Wind-down owns the session: a provisioning race may no longer
         // attach a handle.
         let attached_winddown = set_sandbox_handle(
             &pool,
+            scope,
             fenced.id,
             &serde_json::json!({"external_id":"tw","uid":"uw"}),
         )
         .await
         .unwrap();
-        transition_session(&pool, fenced.id, SessionStatus::Failed, None)
+        transition_session(&pool, scope, fenced.id, SessionStatus::Failed, None)
             .await
             .unwrap();
         // Terminal + intent = cleanup still owed: recovery must see it.
-        let pending_while_terminal = pending_finalizations(&pool).await.unwrap();
-        delete_finalization(&pool, fenced.id).await.unwrap();
-        let pending_after_release = pending_finalizations(&pool).await.unwrap();
-        let post_terminal = begin_finalization(&pool, fenced.id, "cancelled", None, None, true, 30)
-            .await
-            .unwrap();
+        let pending_while_terminal = system_worker::pending_finalizations(&pool).await.unwrap();
+        delete_finalization(&pool, scope, fenced.id).await.unwrap();
+        let pending_after_release = system_worker::pending_finalizations(&pool).await.unwrap();
+        let post_terminal =
+            begin_finalization(&pool, scope, fenced.id, "cancelled", None, None, true, 30)
+                .await
+                .unwrap();
         let attached_terminal = set_sandbox_handle(
             &pool,
+            scope,
             fenced.id,
             &serde_json::json!({"external_id":"t2","uid":"u2"}),
         )
         .await
         .unwrap();
-        let missing = begin_finalization(&pool, Uuid::now_v7(), "failed", None, None, false, 30)
-            .await
-            .unwrap();
+        let missing = begin_finalization(
+            &pool,
+            scope,
+            Uuid::now_v7(),
+            "failed",
+            None,
+            None,
+            false,
+            30,
+        )
+        .await
+        .unwrap();
 
         // Fixtures out BEFORE the assertions (session delete cascades to the
         // surviving intent).
@@ -3505,6 +3714,7 @@ mod tests {
         };
         let pool = connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let scope = TenantScope::assume(tenant);
 
         let policy = upsert_policy(
             &pool,
@@ -3574,7 +3784,7 @@ mod tests {
             .expect("notify ok");
         assert!(n.payload().starts_with(&session.id.to_string()));
 
-        let events = events_after(&pool, session.id, 0, 10).await.unwrap();
+        let events = events_after(&pool, scope, session.id, 0, 10).await.unwrap();
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].r#type, "agent.message");
     }
@@ -3587,6 +3797,7 @@ mod tests {
         };
         let pool = connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
             &pool,
             tenant,
@@ -3632,23 +3843,42 @@ mod tests {
         .unwrap();
 
         let token = format!("fbx_sess_{}", Uuid::now_v7().simple());
-        create_session_token(&pool, tenant, session.id, &token, 3600)
+        create_session_token(&pool, scope, session.id, &token, 3600)
             .await
             .unwrap();
         assert_eq!(
-            session_for_token(&pool, &token).await.unwrap(),
+            session_for_token(&pool, &token)
+                .await
+                .unwrap()
+                .map(|a| a.session_id),
             Some(session.id)
         );
         // A live token extends.
         assert!(extend_session_token(&pool, &token, 3600).await.unwrap());
 
         // Terminal transition revokes it — the runner can no longer auth.
-        assert_eq!(revoke_session_tokens(&pool, session.id).await.unwrap(), 1);
-        assert_eq!(session_for_token(&pool, &token).await.unwrap(), None);
+        assert_eq!(
+            revoke_session_tokens(&pool, scope, session.id)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            session_for_token(&pool, &token)
+                .await
+                .unwrap()
+                .map(|a| a.session_id),
+            None
+        );
         // And a renew can never resurrect a revoked token.
         assert!(!extend_session_token(&pool, &token, 3600).await.unwrap());
         // Revoking again is a no-op (idempotent).
-        assert_eq!(revoke_session_tokens(&pool, session.id).await.unwrap(), 0);
+        assert_eq!(
+            revoke_session_tokens(&pool, scope, session.id)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -3659,6 +3889,7 @@ mod tests {
         };
         let pool = connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
             &pool,
             tenant,
@@ -3705,14 +3936,14 @@ mod tests {
 
         // Registration is idempotent by (session, tool_call_id).
         let (row, inserted) =
-            register_tool_intent(&pool, session.id, "tc1", "Bash", "cat x", "digest-a")
+            register_tool_intent(&pool, scope, session.id, "tc1", "Bash", "cat x", "digest-a")
                 .await
                 .unwrap();
         assert!(inserted);
         assert_eq!(row.status, "intent");
         assert_eq!(row.input_digest.as_deref(), Some("digest-a"));
         let (again, inserted2) =
-            register_tool_intent(&pool, session.id, "tc1", "Bash", "cat x", "digest-a")
+            register_tool_intent(&pool, scope, session.id, "tc1", "Bash", "cat x", "digest-a")
                 .await
                 .unwrap();
         assert!(!inserted2);
@@ -3720,68 +3951,70 @@ mod tests {
         // The caller compares digests — the registry hands back the stored
         // binding even on a mismatched retry.
         let (mismatch, inserted3) =
-            register_tool_intent(&pool, session.id, "tc1", "Bash", "cat y", "digest-B")
+            register_tool_intent(&pool, scope, session.id, "tc1", "Bash", "cat y", "digest-B")
                 .await
                 .unwrap();
         assert!(!inserted3);
         assert_eq!(mismatch.input_digest.as_deref(), Some("digest-a"));
 
         // Gate verdicts stick, and the CAS reports who won.
-        assert!(record_intent_verdict(&pool, row.id, "auto_allowed")
+        assert!(record_intent_verdict(&pool, scope, row.id, "auto_allowed")
             .await
             .unwrap());
         assert!(
-            !record_intent_verdict(&pool, row.id, "auto_denied")
+            !record_intent_verdict(&pool, scope, row.id, "auto_denied")
                 .await
                 .unwrap(),
             "second verdict loses the CAS — the first stands"
         );
-        let cur = get_approval(&pool, row.id).await.unwrap().unwrap();
+        let cur = get_approval(&pool, scope, row.id).await.unwrap().unwrap();
         assert_eq!(cur.status, "auto_allowed");
         // A decided intent can no longer be promoted into an approval.
         assert!(
-            promote_intent_to_pending(&pool, row.id, None, "once", "Bash", 600)
+            promote_intent_to_pending(&pool, scope, row.id, None, "once", "Bash", 600)
                 .await
                 .unwrap()
                 .is_none()
         );
 
         // The approval lifecycle rides the SAME row when promotion wins.
-        let (row2, _) =
-            register_tool_intent(&pool, session.id, "tc2", "Bash", "git push", "digest-c")
+        let (row2, _) = register_tool_intent(
+            &pool, scope, session.id, "tc2", "Bash", "git push", "digest-c",
+        )
+        .await
+        .unwrap();
+        let promoted =
+            promote_intent_to_pending(&pool, scope, row2.id, Some("high"), "once", "Bash", 600)
                 .await
-                .unwrap();
-        let promoted = promote_intent_to_pending(&pool, row2.id, Some("high"), "once", "Bash", 600)
-            .await
-            .unwrap()
-            .expect("first promotion wins");
+                .unwrap()
+                .expect("first promotion wins");
         assert_eq!(promoted.status, "pending");
         assert!(promoted.expires_at > chrono::Utc::now());
         assert!(
-            promote_intent_to_pending(&pool, row2.id, Some("high"), "once", "Bash", 600)
+            promote_intent_to_pending(&pool, scope, row2.id, Some("high"), "once", "Bash", 600)
                 .await
                 .unwrap()
                 .is_none(),
             "second promotion is a no-op"
         );
-        let decided = decide_approval(&pool, row2.id, "approved_once", "tester")
+        let decided = decide_approval(&pool, scope, row2.id, "approved_once", "tester")
             .await
             .unwrap()
             .expect("pending row decides");
         assert_eq!(decided.status, "approved_once");
         assert!(
-            !record_intent_verdict(&pool, row2.id, "auto_denied")
+            !record_intent_verdict(&pool, scope, row2.id, "auto_denied")
                 .await
                 .unwrap(),
             "a human decision is never overwritten by a gate verdict"
         );
-        let cur2 = get_approval(&pool, row2.id).await.unwrap().unwrap();
+        let cur2 = get_approval(&pool, scope, row2.id).await.unwrap().unwrap();
         assert_eq!(cur2.status, "approved_once");
 
         // The budget counts unique intents; the approvals API hides gate
         // bookkeeping but keeps the human lifecycle.
-        assert_eq!(tool_call_count(&pool, session.id).await.unwrap(), 2);
-        let visible = session_approvals(&pool, session.id).await.unwrap();
+        assert_eq!(tool_call_count(&pool, scope, session.id).await.unwrap(), 2);
+        let visible = session_approvals(&pool, scope, session.id).await.unwrap();
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].tool_call_id, "tc2");
     }
@@ -3794,6 +4027,7 @@ mod tests {
         };
         let pool = connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
             &pool,
             tenant,
@@ -3865,7 +4099,7 @@ mod tests {
             .await
             .unwrap();
 
-        let sweep_created: Vec<Uuid> = stale_nonstarted_sessions(&pool, 15)
+        let sweep_created: Vec<Uuid> = system_worker::stale_nonstarted_sessions(&pool, 15)
             .await
             .unwrap()
             .iter()
@@ -3878,33 +4112,39 @@ mod tests {
         // session may be swept, however old.
         use fluidbox_core::state::SessionStatus;
         let direct_terminal =
-            transition_session(&pool, stale.id, SessionStatus::Failed, Some("test"))
+            transition_session(&pool, scope, stale.id, SessionStatus::Failed, Some("test"))
                 .await
                 .unwrap();
-        let to_finalizing =
-            transition_session(&pool, stale.id, SessionStatus::Finalizing, Some("test"))
-                .await
-                .unwrap();
+        let to_finalizing = transition_session(
+            &pool,
+            scope,
+            stale.id,
+            SessionStatus::Finalizing,
+            Some("test"),
+        )
+        .await
+        .unwrap();
         sqlx::query(backdate)
             .bind(stale.id)
             .execute(&pool)
             .await
             .unwrap();
-        let sweep_finalizing: Vec<Uuid> = stale_nonstarted_sessions(&pool, 15)
+        let sweep_finalizing: Vec<Uuid> = system_worker::stale_nonstarted_sessions(&pool, 15)
             .await
             .unwrap()
             .iter()
             .map(|s| s.id)
             .collect();
-        let to_failed = transition_session(&pool, stale.id, SessionStatus::Failed, Some("test"))
-            .await
-            .unwrap();
+        let to_failed =
+            transition_session(&pool, scope, stale.id, SessionStatus::Failed, Some("test"))
+                .await
+                .unwrap();
         sqlx::query(backdate)
             .bind(stale.id)
             .execute(&pool)
             .await
             .unwrap();
-        let sweep_terminal: Vec<Uuid> = stale_nonstarted_sessions(&pool, 15)
+        let sweep_terminal: Vec<Uuid> = system_worker::stale_nonstarted_sessions(&pool, 15)
             .await
             .unwrap()
             .iter()
@@ -3956,6 +4196,7 @@ mod tests {
         };
         let pool = connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
             &pool,
             tenant,
@@ -4007,12 +4248,12 @@ mod tests {
             serde_json::json!({"runtime":"kubernetes","external_id":"pod-x","attrs":{"uid":"u2"}});
 
         // Active + handle-less → adoption lands.
-        let adopted = adopt_sandbox_handle(&pool, s.id, &discovered)
+        let adopted = adopt_sandbox_handle(&pool, scope, s.id, &discovered)
             .await
             .unwrap();
         // A stored handle is never overwritten (run() won the race).
-        set_sandbox_handle(&pool, s.id, &real).await.unwrap();
-        let overwrote = adopt_sandbox_handle(&pool, s.id, &discovered)
+        set_sandbox_handle(&pool, scope, s.id, &real).await.unwrap();
+        let overwrote = adopt_sandbox_handle(&pool, scope, s.id, &discovered)
             .await
             .unwrap();
         let kept: (Value,) = sqlx::query_as("select sandbox_handle from sessions where id = $1")
@@ -4028,7 +4269,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let resurrected = adopt_sandbox_handle(&pool, s.id, &discovered)
+        let resurrected = adopt_sandbox_handle(&pool, scope, s.id, &discovered)
             .await
             .unwrap();
 
@@ -4182,13 +4423,15 @@ mod tests {
         assert_eq!(
             subscription_for_token(&pool, "fbx_trig_testtoken123")
                 .await
-                .unwrap(),
+                .unwrap()
+                .map(|a| a.subscription_id),
             Some(sub.id)
         );
         assert_eq!(
             subscription_for_token(&pool, "fbx_trig_wrong")
                 .await
-                .unwrap(),
+                .unwrap()
+                .map(|a| a.subscription_id),
             None
         );
         let revoked = revoke_trigger_tokens(&pool, sub.id).await.unwrap();
@@ -4196,7 +4439,8 @@ mod tests {
         assert_eq!(
             subscription_for_token(&pool, "fbx_trig_testtoken123")
                 .await
-                .unwrap(),
+                .unwrap()
+                .map(|a| a.subscription_id),
             None
         );
 
@@ -5218,5 +5462,181 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// Cross-tenant isolation (wave A): a session and its child rows created
+    /// under tenant B are invisible to tenant A's scope. The tenant predicate
+    /// now lives in SQL, so a cross-tenant id misses at the database — never
+    /// via a Rust-side filter. Throwaway orgs; cleanup is children-first
+    /// (tenant FKs are NO ACTION).
+    #[tokio::test]
+    async fn tenant_scope_isolates_sessions_and_children() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+
+        let slug_a = format!("t-{}", Uuid::now_v7().simple());
+        let slug_b = format!("t-{}", Uuid::now_v7().simple());
+        let org_a = identity::create_org(&pool, &slug_a, None).await.unwrap();
+        let org_b = identity::create_org(&pool, &slug_b, None).await.unwrap();
+        let scope_a = TenantScope::assume(org_a.id);
+        let scope_b = TenantScope::assume(org_b.id);
+
+        // A full session fixture under B.
+        let policy = upsert_policy(
+            &pool,
+            org_b.id,
+            "xt-policy",
+            "name: xt",
+            &serde_json::json!({"name":"xt"}),
+        )
+        .await
+        .unwrap();
+        let agent = create_agent(&pool, org_b.id, "xt-agent", None)
+            .await
+            .unwrap();
+        let rev = append_agent_revision(
+            &pool,
+            agent.id,
+            "claude-agent-sdk",
+            "img:test",
+            "claude-haiku-4-5",
+            None,
+            policy.id,
+            &serde_json::json!({}),
+            None,
+            &serde_json::json!([]),
+        )
+        .await
+        .unwrap();
+        let session = create_session(
+            &pool,
+            org_b.id,
+            agent.id,
+            rev.id,
+            "supervised",
+            "trusted",
+            "xt",
+            &serde_json::json!({"kind":"none"}),
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Child rows under B's scope: an event, an artifact, usage, and a
+        // human-visible (pending) approval.
+        let redactor = Redactor::default();
+        append_event(
+            &pool,
+            redactor.scrub(EventEnvelope::new(
+                session.id,
+                Actor::System,
+                EventBody::AgentMessage {
+                    role: "assistant".into(),
+                    text: "hi".into(),
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        add_artifact(
+            &pool,
+            scope_b,
+            session.id,
+            "diff",
+            "changes.patch",
+            "x",
+            "text/plain",
+        )
+        .await
+        .unwrap();
+        add_usage(
+            &pool,
+            scope_b,
+            session.id,
+            "m",
+            1,
+            1,
+            0,
+            0,
+            Some(0.0),
+            "test",
+            None,
+        )
+        .await
+        .unwrap();
+        let (intent, _) = register_tool_intent(&pool, scope_b, session.id, "tc1", "Bash", "s", "d")
+            .await
+            .unwrap();
+        promote_intent_to_pending(&pool, scope_b, intent.id, None, "once", "Bash", 600)
+            .await
+            .unwrap();
+
+        // Negative — tenant A sees NONE of B's rows.
+        let get_a = get_session(&pool, scope_a, session.id).await.unwrap();
+        let events_a = events_after(&pool, scope_a, session.id, 0, 10)
+            .await
+            .unwrap();
+        let approvals_a = session_approvals(&pool, scope_a, session.id).await.unwrap();
+        let artifacts_a = list_artifacts(&pool, scope_a, session.id).await.unwrap();
+        let usage_a = usage_totals(&pool, scope_a, session.id).await.unwrap();
+        // Positive control — tenant B still reads its own.
+        let get_b = get_session(&pool, scope_b, session.id).await.unwrap();
+        let approvals_b = session_approvals(&pool, scope_b, session.id).await.unwrap();
+
+        // Cleanup, children-first, both orgs — BEFORE the assertions so a
+        // failure never leaks throwaway fixtures.
+        for stmt in [
+            "delete from events where session_id in (select id from sessions where tenant_id = $1)",
+            "delete from artifacts where session_id in (select id from sessions where tenant_id = $1)",
+            "delete from approvals where session_id in (select id from sessions where tenant_id = $1)",
+            "delete from usage_entries where session_id in (select id from sessions where tenant_id = $1)",
+            "delete from api_tokens where session_id in (select id from sessions where tenant_id = $1)",
+            "delete from session_finalizations where session_id in (select id from sessions where tenant_id = $1)",
+            "delete from sessions where tenant_id = $1",
+            "delete from agent_revisions where agent_id in (select id from agents where tenant_id = $1)",
+            "delete from agents where tenant_id = $1",
+            "delete from policies where tenant_id = $1",
+        ] {
+            sqlx::query(stmt)
+                .bind(org_b.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        for id in [org_a.id, org_b.id] {
+            sqlx::query("delete from tenants where id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        assert!(get_a.is_none(), "tenant A must not read B's session");
+        assert!(events_a.is_empty(), "tenant A must see none of B's events");
+        assert!(
+            approvals_a.is_empty(),
+            "tenant A must see none of B's approvals"
+        );
+        assert!(
+            artifacts_a.is_empty(),
+            "tenant A must see none of B's artifacts"
+        );
+        assert_eq!(
+            usage_a.requests, 0,
+            "tenant A totals zero usage for B's session"
+        );
+        assert!(get_b.is_some(), "tenant B still reads its own session");
+        assert_eq!(
+            approvals_b.len(),
+            1,
+            "tenant B sees its own pending approval"
+        );
     }
 }

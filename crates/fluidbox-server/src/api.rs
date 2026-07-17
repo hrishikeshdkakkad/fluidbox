@@ -890,7 +890,8 @@ pub async fn list_sessions(
     State(state): State<AppState>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Value>> {
-    let sessions = fluidbox_db::list_sessions(&state.pool, state.tenant_id, q.limit).await?;
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let sessions = fluidbox_db::list_sessions(&state.pool, scope, q.limit).await?;
     Ok(Json(json!({ "sessions": sessions })))
 }
 
@@ -899,10 +900,11 @@ pub async fn get_session(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let session = fluidbox_db::get_session(&state.pool, id)
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let session = fluidbox_db::get_session(&state.pool, scope, id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let totals = fluidbox_db::usage_totals(&state.pool, id).await?;
+    let totals = fluidbox_db::usage_totals(&state.pool, scope, id).await?;
     Ok(Json(json!({ "session": session, "usage": totals })))
 }
 
@@ -942,14 +944,15 @@ pub async fn get_events(
     Path(id): Path<Uuid>,
     Query(q): Query<EventsQuery>,
 ) -> ApiResult<Json<Value>> {
-    let events = fluidbox_db::events_after(&state.pool, id, q.after, q.limit).await?;
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let events = fluidbox_db::events_after(&state.pool, scope, id, q.after, q.limit).await?;
     Ok(Json(json!({ "events": events })))
 }
 
 // ─── Approvals ────────────────────────────────────────────────────────────
 
 pub async fn approvals_inbox(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    let approvals = fluidbox_db::pending_approvals(&state.pool).await?;
+    let approvals = fluidbox_db::system_worker::pending_approvals(&state.pool).await?;
     Ok(Json(json!({ "approvals": approvals })))
 }
 
@@ -958,7 +961,8 @@ pub async fn session_approvals(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let approvals = fluidbox_db::session_approvals(&state.pool, id).await?;
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let approvals = fluidbox_db::session_approvals(&state.pool, scope, id).await?;
     Ok(Json(json!({ "approvals": approvals })))
 }
 
@@ -983,7 +987,8 @@ pub async fn decide_approval(
         other => return Err(ApiError::BadRequest(format!("unknown decision '{other}'"))),
     };
     let decided_by = req.decided_by.unwrap_or_else(|| "operator".into());
-    let row = fluidbox_db::decide_approval(&state.pool, id, status, &decided_by)
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let row = fluidbox_db::decide_approval(&state.pool, scope, id, status, &decided_by)
         .await?
         .ok_or_else(|| ApiError::Conflict("approval is not pending".into()))?;
     // Wake the blocked permission handler.
@@ -1009,7 +1014,8 @@ pub async fn list_artifacts(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let artifacts = fluidbox_db::list_artifacts(&state.pool, id).await?;
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let artifacts = fluidbox_db::list_artifacts(&state.pool, scope, id).await?;
     Ok(Json(json!({ "artifacts": artifacts })))
 }
 
@@ -1018,7 +1024,8 @@ pub async fn get_artifact(
     State(state): State<AppState>,
     Path((_sid, aid)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<Value>> {
-    let artifact = fluidbox_db::get_artifact(&state.pool, aid)
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let artifact = fluidbox_db::get_artifact(&state.pool, scope, aid)
         .await?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(json!({ "artifact": artifact })))
@@ -1029,8 +1036,9 @@ pub async fn get_cost(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let totals = fluidbox_db::usage_totals(&state.pool, id).await?;
-    let tool_calls = fluidbox_db::tool_call_count(&state.pool, id).await?;
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
+    let totals = fluidbox_db::usage_totals(&state.pool, scope, id).await?;
+    let tool_calls = fluidbox_db::tool_call_count(&state.pool, scope, id).await?;
     Ok(Json(json!({ "usage": totals, "tool_calls": tool_calls })))
 }
 

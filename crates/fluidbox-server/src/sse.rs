@@ -28,11 +28,12 @@ pub async fn stream(
 
     let mut rx = state.events_tx.subscribe();
     let pool = state.pool.clone();
+    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
 
     let s = async_stream::stream! {
         // Immediately flush any backlog.
         loop {
-            match fluidbox_db::events_after(&pool, id, last_seq, 500).await {
+            match fluidbox_db::events_after(&pool, scope, id, last_seq, 500).await {
                 Ok(events) if !events.is_empty() => {
                     for ev in events {
                         last_seq = ev.seq;
@@ -59,7 +60,7 @@ pub async fn stream(
                 _ = tokio::time::sleep(Duration::from_secs(2)) => true,
             };
             if !woke { continue; }
-            match fluidbox_db::events_after(&pool, id, last_seq, 500).await {
+            match fluidbox_db::events_after(&pool, scope, id, last_seq, 500).await {
                 Ok(events) => {
                     for ev in events {
                         last_seq = ev.seq;

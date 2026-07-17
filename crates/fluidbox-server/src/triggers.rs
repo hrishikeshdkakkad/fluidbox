@@ -872,9 +872,13 @@ pub async fn invoke(
                     "Idempotency-Key was already used with a different request body".into(),
                 ));
             }
-            let session = fluidbox_db::get_session(&state.pool, session_id)
-                .await?
-                .ok_or(ApiError::NotFound)?;
+            let session = fluidbox_db::get_session(
+                &state.pool,
+                fluidbox_db::TenantScope::assume(state.tenant_id),
+                session_id,
+            )
+            .await?
+            .ok_or(ApiError::NotFound)?;
             return Ok(Json(json!({
                 "session_id": session.id,
                 "status": session.status,
@@ -981,9 +985,13 @@ pub async fn poll_run(
     if !fluidbox_db::subscription_owns_session(&state.pool, id, sid).await? {
         return Err(ApiError::NotFound);
     }
-    let session = fluidbox_db::get_session(&state.pool, sid)
-        .await?
-        .ok_or(ApiError::NotFound)?;
+    let session = fluidbox_db::get_session(
+        &state.pool,
+        fluidbox_db::TenantScope::assume(state.tenant_id),
+        sid,
+    )
+    .await?
+    .ok_or(ApiError::NotFound)?;
     let payload = crate::deliveries::result_payload(&state, &session, None, None).await?;
     Ok(Json(payload))
 }

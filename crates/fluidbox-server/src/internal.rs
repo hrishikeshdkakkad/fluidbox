@@ -21,6 +21,7 @@ use fluidbox_core::event::{digest_json, Actor, EventBody};
 use fluidbox_core::policy::{EvaluationOutcome, Policy, ToolCallRequest, Verdict};
 use fluidbox_core::spec::RunSpec;
 use fluidbox_core::state::SessionStatus;
+use fluidbox_db::TenantScope;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -60,6 +61,9 @@ async fn decide_tool_call(
     input: &Value,
 ) -> ApiResult<GateDecision> {
     let policy: Policy = run_spec.policy_snapshot.clone();
+    // Every gate DB call scopes to the session's own tenant (derived from the
+    // frozen session row, never state.tenant_id).
+    let scope = TenantScope::assume(session.tenant_id);
 
     // ── Intent registration + digest binding (Phase 6 hardening). One
     // persistent row per (session, tool_call_id) is the budget's counting
@@ -69,6 +73,7 @@ async fn decide_tool_call(
     let digest = digest_json(input);
     let (intent, inserted) = fluidbox_db::register_tool_intent(
         &state.pool,
+        scope,
         session.id,
         tool_call_id,
         tool,
@@ -143,9 +148,11 @@ async fn decide_tool_call(
     // loser adopts the durable outcome (never a second finalize or a deny
     // that contradicts an already-recorded verdict).
     if let Some(max) = run_spec.budgets.max_tool_calls {
-        let used = fluidbox_db::tool_call_count(&state.pool, session.id).await?;
+        let used = fluidbox_db::tool_call_count(&state.pool, scope, session.id).await?;
         if used as u64 > max {
-            if fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_denied").await? {
+            if fluidbox_db::record_intent_verdict(&state.pool, scope, intent.id, "auto_denied")
+                .await?
+            {
                 ledger::record(
                     state,
                     session.id,
@@ -188,7 +195,7 @@ async fn decide_tool_call(
                 });
                 return Ok(GateDecision::deny("tool-call budget exceeded"));
             }
-            return adopt_terminal_or_deny(state, intent.id).await;
+            return adopt_terminal_or_deny(state, scope, intent.id).await;
         }
     }
 
@@ -201,7 +208,7 @@ async fn decide_tool_call(
         // CAS the verdict FIRST; only the handler that owns the decision
         // emits the ledger event (concurrent duplicates of a deterministic
         // deny neither double-ledger nor contradict each other).
-        if fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_denied").await? {
+        if fluidbox_db::record_intent_verdict(&state.pool, scope, intent.id, "auto_denied").await? {
             ledger::record(
                 state,
                 session.id,
@@ -221,7 +228,7 @@ async fn decide_tool_call(
         // Lost the CAS to a concurrent handler for the same intent. A
         // capability denial is deterministic on the frozen set, so the
         // durable outcome is the matching terminal deny — adopt it.
-        return adopt_terminal_or_deny(state, intent.id).await;
+        return adopt_terminal_or_deny(state, scope, intent.id).await;
     }
 
     let tool_req = ToolCallRequest {
@@ -236,7 +243,9 @@ async fn decide_tool_call(
     // it. Both the tier denial and the policy's own verdict are ledgered.
     if run_spec.trust_tier == fluidbox_core::spec::TrustTier::ReadOnly {
         if let Some(reason) = fluidbox_core::policy::read_only_denial(&tool_req) {
-            if fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_denied").await? {
+            if fluidbox_db::record_intent_verdict(&state.pool, scope, intent.id, "auto_denied")
+                .await?
+            {
                 ledger::record(
                     state,
                     session.id,
@@ -253,13 +262,15 @@ async fn decide_tool_call(
                 .await;
                 return Ok(GateDecision::deny(reason));
             }
-            return adopt_terminal_or_deny(state, intent.id).await;
+            return adopt_terminal_or_deny(state, scope, intent.id).await;
         }
     }
 
     match &outcome.effective {
         Verdict::Allow => {
-            if fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_allowed").await? {
+            if fluidbox_db::record_intent_verdict(&state.pool, scope, intent.id, "auto_allowed")
+                .await?
+            {
                 emit_decision(
                     state,
                     session.id,
@@ -272,11 +283,13 @@ async fn decide_tool_call(
                 .await;
                 Ok(GateDecision::allow())
             } else {
-                adopt_terminal_or_deny(state, intent.id).await
+                adopt_terminal_or_deny(state, scope, intent.id).await
             }
         }
         Verdict::Deny { reason } => {
-            if fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_denied").await? {
+            if fluidbox_db::record_intent_verdict(&state.pool, scope, intent.id, "auto_denied")
+                .await?
+            {
                 emit_decision(
                     state,
                     session.id,
@@ -289,21 +302,21 @@ async fn decide_tool_call(
                 .await;
                 Ok(GateDecision::deny(reason.clone()))
             } else {
-                adopt_terminal_or_deny(state, intent.id).await
+                adopt_terminal_or_deny(state, scope, intent.id).await
             }
         }
         Verdict::RequireApproval {
             risk,
             ttl_secs,
-            scope,
+            scope: approval_scope,
             scope_key,
         } => {
             // Session-scope grant already given for this key? Adopt the
             // durable outcome if a concurrent handler moved the row first —
             // including a wait-join if that handler promoted it to pending
             // (the narrow grant-lands-mid-flight race).
-            if fluidbox_db::has_session_grant(&state.pool, session.id, scope_key).await? {
-                if fluidbox_db::record_intent_verdict(&state.pool, intent.id, "auto_allowed")
+            if fluidbox_db::has_session_grant(&state.pool, scope, session.id, scope_key).await? {
+                if fluidbox_db::record_intent_verdict(&state.pool, scope, intent.id, "auto_allowed")
                     .await?
                 {
                     emit_decision(
@@ -318,12 +331,13 @@ async fn decide_tool_call(
                     .await;
                     return Ok(GateDecision::allow());
                 }
-                let row = fluidbox_db::get_approval(&state.pool, intent.id)
+                let row = fluidbox_db::get_approval(&state.pool, scope, intent.id)
                     .await?
                     .ok_or(ApiError::NotFound)?;
                 if row.status == "pending" {
                     return await_pending_decision(
                         state,
+                        scope,
                         session.id,
                         row,
                         tool_call_id,
@@ -335,7 +349,7 @@ async fn decide_tool_call(
                 return Ok(decision_from_status(&row.status));
             }
 
-            let scope_str = match scope {
+            let scope_str = match approval_scope {
                 fluidbox_core::policy::ApprovalScope::Once => "once",
                 fluidbox_core::policy::ApprovalScope::Session => "session",
             };
@@ -344,6 +358,7 @@ async fn decide_tool_call(
             // verdict landed) — re-read and act on the current status.
             let promoted = fluidbox_db::promote_intent_to_pending(
                 &state.pool,
+                scope,
                 intent.id,
                 risk.as_deref(),
                 scope_str,
@@ -354,7 +369,7 @@ async fn decide_tool_call(
             let newly_pending = promoted.is_some();
             let approval = match promoted {
                 Some(row) => row,
-                None => fluidbox_db::get_approval(&state.pool, intent.id)
+                None => fluidbox_db::get_approval(&state.pool, scope, intent.id)
                     .await?
                     .ok_or(ApiError::NotFound)?,
             };
@@ -381,6 +396,7 @@ async fn decide_tool_call(
                 .await;
                 fluidbox_db::transition_session(
                     &state.pool,
+                    scope,
                     session.id,
                     SessionStatus::AwaitingApproval,
                     Some("awaiting human approval"),
@@ -389,7 +405,16 @@ async fn decide_tool_call(
                 .ok();
             }
 
-            await_pending_decision(state, session.id, approval, tool_call_id, tool, &outcome).await
+            await_pending_decision(
+                state,
+                scope,
+                session.id,
+                approval,
+                tool_call_id,
+                tool,
+                &outcome,
+            )
+            .await
         }
     }
 }
@@ -401,9 +426,10 @@ async fn decide_tool_call(
 /// fails safe to deny.
 async fn adopt_terminal_or_deny(
     state: &AppState,
+    scope: TenantScope,
     intent_id: uuid::Uuid,
 ) -> ApiResult<GateDecision> {
-    let row = fluidbox_db::get_approval(&state.pool, intent_id)
+    let row = fluidbox_db::get_approval(&state.pool, scope, intent_id)
         .await?
         .ok_or(ApiError::NotFound)?;
     Ok(decision_from_status(&row.status))
@@ -414,6 +440,7 @@ async fn adopt_terminal_or_deny(
 /// it. Shared by the promoter and any handler that adopts a pending row.
 async fn await_pending_decision(
     state: &AppState,
+    scope: TenantScope,
     session_id: uuid::Uuid,
     approval: fluidbox_db::ApprovalRow,
     tool_call_id: &str,
@@ -422,7 +449,7 @@ async fn await_pending_decision(
 ) -> ApiResult<GateDecision> {
     let notifier = state.approvals.notifier(approval.id).await;
     let final_status = loop {
-        let cur = fluidbox_db::get_approval(&state.pool, approval.id)
+        let cur = fluidbox_db::get_approval(&state.pool, scope, approval.id)
             .await?
             .ok_or(ApiError::NotFound)?;
         if cur.status != "pending" {
@@ -433,12 +460,12 @@ async fn await_pending_decision(
             // decision won the row between our read and here, decide_approval
             // affects nothing — adopt the human's verdict rather than
             // fabricating a deny that contradicts the durable row.
-            match fluidbox_db::decide_approval(&state.pool, approval.id, "denied", "timeout")
+            match fluidbox_db::decide_approval(&state.pool, scope, approval.id, "denied", "timeout")
                 .await?
             {
                 Some(_) => break "denied".to_string(),
                 None => {
-                    let row = fluidbox_db::get_approval(&state.pool, approval.id)
+                    let row = fluidbox_db::get_approval(&state.pool, scope, approval.id)
                         .await?
                         .ok_or(ApiError::NotFound)?;
                     break row.status;
@@ -456,7 +483,7 @@ async fn await_pending_decision(
     };
     state.approvals.forget(approval.id).await;
 
-    let decided_by = fluidbox_db::get_approval(&state.pool, approval.id)
+    let decided_by = fluidbox_db::get_approval(&state.pool, scope, approval.id)
         .await?
         .and_then(|a| a.decided_by)
         .unwrap_or_else(|| "system".into());
@@ -485,7 +512,7 @@ async fn await_pending_decision(
     )
     .await;
 
-    maybe_resume(state, session_id).await;
+    maybe_resume(state, scope, session_id).await;
     Ok(decision_from_status(&final_status))
 }
 
@@ -505,7 +532,7 @@ pub async fn permission(
     State(state): State<AppState>,
     Json(req): Json<PermissionReq>,
 ) -> ApiResult<Json<Value>> {
-    let session = fluidbox_db::get_session(&state.pool, auth.session_id)
+    let session = fluidbox_db::get_session(&state.pool, auth.scope, auth.session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
     // A terminal OR winding-down session never gets a fresh decision — the
@@ -558,7 +585,7 @@ pub async fn tool_call(
     State(state): State<AppState>,
     Json(req): Json<BrokeredCallReq>,
 ) -> ApiResult<Json<Value>> {
-    let session = fluidbox_db::get_session(&state.pool, auth.session_id)
+    let session = fluidbox_db::get_session(&state.pool, auth.scope, auth.session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
     if !session.status_enum().accepts_work() {
@@ -653,14 +680,20 @@ pub async fn tool_call(
     }
 }
 
-async fn maybe_resume(state: &AppState, session_id: uuid::Uuid) {
+async fn maybe_resume(state: &AppState, scope: TenantScope, session_id: uuid::Uuid) {
     // If nothing else is pending, return the session to running.
-    if let Ok(approvals) = fluidbox_db::session_approvals(&state.pool, session_id).await {
+    if let Ok(approvals) = fluidbox_db::session_approvals(&state.pool, scope, session_id).await {
         let still_pending = approvals.iter().any(|a| a.status == "pending");
         if !still_pending {
-            fluidbox_db::transition_session(&state.pool, session_id, SessionStatus::Running, None)
-                .await
-                .ok();
+            fluidbox_db::transition_session(
+                &state.pool,
+                scope,
+                session_id,
+                SessionStatus::Running,
+                None,
+            )
+            .await
+            .ok();
         }
     }
 }
@@ -786,7 +819,7 @@ pub async fn workspace_archive(
     use tokio::io::AsyncReadExt;
     // A terminal/winding-down session's archive is moot (the run is over) —
     // gate on accepts_work(), like every sibling internal endpoint.
-    let session = fluidbox_db::get_session(&state.pool, auth.session_id)
+    let session = fluidbox_db::get_session(&state.pool, auth.scope, auth.session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
     if !session.status_enum().accepts_work() {
@@ -828,7 +861,7 @@ pub async fn workspace_archive(
 }
 
 pub async fn heartbeat(auth: SessionAuth, State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    fluidbox_db::heartbeat(&state.pool, auth.session_id).await?;
+    fluidbox_db::heartbeat(&state.pool, auth.scope, auth.session_id).await?;
     // Deliberately NO eager archive deletion here: Kubernetes documents that
     // init containers may re-execute (pod-infrastructure restart), and a
     // re-executed `workspaced init` re-fetches the archive — deleting it on
@@ -840,7 +873,7 @@ pub async fn heartbeat(auth: SessionAuth, State(state): State<AppState>) -> ApiR
     // {"action":"quiesce"} — the runner stops the agent and exits WITHOUT
     // posting /result, so the cancel finalizer collects a settled worktree.
     // Level-triggered: every heartbeat repeats it until the runner exits.
-    let action = match fluidbox_db::get_session(&state.pool, auth.session_id).await? {
+    let action = match fluidbox_db::get_session(&state.pool, auth.scope, auth.session_id).await? {
         Some(s) if s.status_enum() == SessionStatus::Cancelling => Some("quiesce"),
         _ => None,
     };
@@ -869,10 +902,12 @@ pub async fn result(
     Json(res): Json<ResultIn>,
 ) -> ApiResult<Json<Value>> {
     let token = crate::auth::bearer_from_headers(&headers).ok_or(ApiError::Unauthorized)?;
-    let session_id = fluidbox_db::session_for_token_incl_revoked(&state.pool, &token)
+    let sess_auth = fluidbox_db::session_for_token_incl_revoked(&state.pool, &token)
         .await?
         .ok_or(ApiError::Unauthorized)?;
-    let session = fluidbox_db::get_session(&state.pool, session_id)
+    let session_id = sess_auth.session_id;
+    let scope = TenantScope::assume(sess_auth.tenant_id);
+    let session = fluidbox_db::get_session(&state.pool, scope, session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
     let st = session.status_enum();
@@ -884,7 +919,7 @@ pub async fn result(
     // intent is the stranded-wedge shape (nothing for recovery to drive);
     // fall through and (re)persist one instead of falsely ACKing.
     if st.is_winding_down() {
-        match fluidbox_db::get_finalization(&state.pool, session_id).await {
+        match fluidbox_db::get_finalization(&state.pool, scope, session_id).await {
             Ok(Some(_)) => return Ok(Json(json!({ "ok": true, "note": "finalizing" }))),
             Ok(None) => {}
             Err(_) => {
@@ -905,7 +940,7 @@ pub async fn result(
         // idempotent 200. Unknown state must be RETRYABLE (503): the runner
         // treats 4xx as final, so a transient read error returned as 401
         // would convert a completed run into a runner-side failure.
-        match fluidbox_db::get_session(&state.pool, session_id).await {
+        match fluidbox_db::get_session(&state.pool, scope, session_id).await {
             Ok(Some(s)) if s.status_enum().is_terminal() => {
                 return Ok(Json(json!({ "ok": true, "note": "already terminal" })));
             }
@@ -958,7 +993,7 @@ pub async fn token_renew(
     State(state): State<AppState>,
     Json(req): Json<RenewReq>,
 ) -> ApiResult<Json<Value>> {
-    let session = fluidbox_db::get_session(&state.pool, auth.session_id)
+    let session = fluidbox_db::get_session(&state.pool, auth.scope, auth.session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
     if !session.status_enum().accepts_work() {
