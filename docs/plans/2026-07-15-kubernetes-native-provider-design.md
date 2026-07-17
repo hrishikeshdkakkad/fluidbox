@@ -407,6 +407,12 @@ Joint review: Claude (Fable 5) proposed; Codex (GPT-5.6-sol, max reasoning, read
 
 This design is accepted when: demo A (the live agent acceptance run) passes unchanged against `FLUIDBOX_PROVIDER=kubernetes` on a kind+Calico cluster and at least one managed cloud (EKS or GKE), with the hardened `zeroEgress` profile verified by the boot probe, the diff artifact produced by the collector path, `just check` green throughout, **and the Docker provider fully intact**: the same unified finalizer + hardened collection semantics (Phase 0), the full existing e2e suite green on `FLUIDBOX_PROVIDER=docker`, and the docker-compose deployment path still working — Kubernetes support lands beside Docker, never in place of it.
 
+> **Status: ACCEPTED (2026-07-17).** Demo A passed unchanged on `FLUIDBOX_PROVIDER=kubernetes`
+> on kind+Calico (CI) **and** on a live AWS EKS cluster — `zeroEgress` verified by the boot
+> probe, the collector diff produced, governance pause/resume exercised — with the Docker
+> provider intact. The ephemeral EKS environment was torn down and audited to zero orphans.
+> Full evidence: `docs/reviews/2026-07-17-eks-acceptance.md`.
+
 ## References
 
 - `PLAN.md` §2 (invariants), §6.2 (seams), M2/roadmap lines 96, 109, 152, 193, 202, 242-245
