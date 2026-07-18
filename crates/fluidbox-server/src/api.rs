@@ -976,7 +976,9 @@ pub async fn cancel_session(
         .await?
         .ok_or(ApiError::NotFound)?;
     rbac::ensure_run_visible(&principal, &session)?;
-    match orchestrator::cancel(&state, id, "cancelled by user").await {
+    // The session was just loaded under principal.scope() (ownership proven);
+    // thread that scope so the finalizer does not re-resolve the tenant.
+    match orchestrator::cancel(&state, principal.scope(), id, "cancelled by user").await {
         FinalizeStart::Persisted { created } => Ok(Json(json!({ "cancelled": created }))),
         FinalizeStart::AlreadyTerminal | FinalizeStart::Missing => {
             Ok(Json(json!({ "cancelled": false })))
