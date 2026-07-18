@@ -8,13 +8,15 @@ use crate::rbac;
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::Json;
+use fluidbox_core::capability::{validate_requirements, ConnectionRequirement};
 use fluidbox_core::policy::{Policy, RuleAction, ToolOverride};
 use fluidbox_core::spec::{
     Autonomy, Budgets, CheckoutMode, InvocationContext, InvocationKind, WorkspaceSpec,
 };
-use fluidbox_db::TenantScope;
+use fluidbox_db::{ConnectionViewer, TenantScope};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 // ─── Workspace input (shared by run creation and agent defaults) ──────────
@@ -88,6 +90,7 @@ pub(crate) fn valid_repo_name(repo: &str) -> bool {
 pub(crate) async fn resolve_workspace_input(
     state: &AppState,
     scope: TenantScope,
+    viewer: ConnectionViewer,
     input: WorkspaceInput,
 ) -> ApiResult<WorkspaceSpec> {
     Ok(match input {
@@ -120,13 +123,13 @@ pub(crate) async fn resolve_workspace_input(
             }
             let clone_url = match connection_id {
                 Some(cid) => {
-                    // Tenant-scoped (not owner-scoped) by design: this is a
-                    // connection CONSUMED as a workspace, whose authority the
-                    // design routes through run resource bindings (invariant 21,
-                    // Task 5) + the broker owner-membership recheck (Task 6), not
-                    // through Task 4's connection-object viewer. See task-4-report
-                    // "Deferred / flagged".
-                    let conn = fluidbox_db::get_connection(&state.pool, scope, cid)
+                    // Visibility-filtered read (invariant 21): a user naming
+                    // another user's personal connection resolves to None here —
+                    // the SAME "unknown connection" as a truly missing id, so
+                    // existence is not leaked. The credentialed AUTHORITY (owner,
+                    // generation, membership) is frozen by binding resolution in
+                    // create_run and rechecked by every consumer (Task 6).
+                    let conn = fluidbox_db::get_connection_visible(&state.pool, scope, cid, viewer)
                         .await?
                         .ok_or_else(|| ApiError::BadRequest(format!("unknown connection {cid}")))?;
                     if conn.status != "active" {
@@ -198,7 +201,9 @@ pub(crate) async fn resolve_workspace_input(
     })
 }
 
-/// A revision default of Scratch means "no default" — store nothing.
+/// A revision default of Scratch means "no default" — store nothing. Revision
+/// defaults are set by an admin/owner mutation, so the operator lens (`All`)
+/// applies; the per-run authority is re-resolved with the invoker's lens.
 async fn default_workspace_value(
     state: &AppState,
     scope: TenantScope,
@@ -206,10 +211,12 @@ async fn default_workspace_value(
 ) -> ApiResult<Option<Value>> {
     match input {
         None => Ok(None),
-        Some(input) => match resolve_workspace_input(state, scope, input).await? {
-            WorkspaceSpec::Scratch => Ok(None),
-            spec => Ok(Some(serde_json::to_value(&spec)?)),
-        },
+        Some(input) => {
+            match resolve_workspace_input(state, scope, ConnectionViewer::All, input).await? {
+                WorkspaceSpec::Scratch => Ok(None),
+                spec => Ok(Some(serde_json::to_value(&spec)?)),
+            }
+        }
     }
 }
 
@@ -311,6 +318,25 @@ pub struct CreateAgent {
     /// or "name@version" (§17 #7 pin-only).
     #[serde(default)]
     pub capability_bundles: Option<Vec<String>>,
+    /// Brokered connection requirements the agent declares (design §"Agent
+    /// connection requirement"): what it needs, never whose credential. Stored
+    /// (validated) on the initial revision; resolved per-run into bindings.
+    #[serde(default)]
+    pub connection_requirements: Option<Vec<ConnectionRequirement>>,
+}
+
+/// Validate a revision's declared connection requirements into stored jsonb
+/// (or `[]`). A malformed list is a 422 before anything persists.
+fn requirements_json(reqs: Option<&Vec<ConnectionRequirement>>) -> ApiResult<Value> {
+    match reqs {
+        Some(reqs) => {
+            validate_requirements(reqs).map_err(|e| {
+                ApiError::UnprocessableEntity(format!("invalid connection requirements: {e}"))
+            })?;
+            Ok(serde_json::to_value(reqs)?)
+        }
+        None => Ok(json!([])),
+    }
 }
 
 /// Validate a harness id and return its (runner image, model) defaults.
@@ -439,8 +465,7 @@ pub async fn create_agent(
         &serde_json::to_value(&budgets)?,
         default_workspace.as_ref(),
         &capability_pins,
-        // Task 5 wires the request field; empty requirements for now.
-        &json!([]),
+        &requirements_json(req.connection_requirements.as_ref())?,
     )
     .await?;
 
@@ -486,6 +511,10 @@ pub struct AddRevision {
     /// — this is how a bundle upgrade lands: append a revision, §17 #7).
     #[serde(default)]
     pub capability_bundles: Option<Vec<String>>,
+    /// Omitted → inherit the latest revision's requirements. An explicit `[]`
+    /// clears them; a list is validated + stored (append-only, like the pins).
+    #[serde(default)]
+    pub connection_requirements: Option<Vec<ConnectionRequirement>>,
 }
 
 pub async fn add_revision(
@@ -549,6 +578,15 @@ pub async fn add_revision(
             .map(|r| r.capability_bundles.clone())
             .unwrap_or_else(|| json!([])),
     };
+    // Omitted → inherit the previous requirements verbatim; explicit list (incl.
+    // []) is validated + re-stored (append-only on the revision).
+    let requirements = match &req.connection_requirements {
+        Some(_) => requirements_json(req.connection_requirements.as_ref())?,
+        None => latest
+            .as_ref()
+            .map(|r| r.connection_requirements.clone())
+            .unwrap_or_else(|| json!([])),
+    };
 
     let rev = fluidbox_db::append_agent_revision(
         &state.pool,
@@ -574,8 +612,7 @@ pub async fn add_revision(
         &budgets,
         default_workspace.as_ref(),
         &capability_pins,
-        // Task 5 wires the request field; empty requirements for now.
-        &json!([]),
+        &requirements,
     )
     .await?;
     Ok(Json(json!({ "revision": rev })))
@@ -867,6 +904,11 @@ pub struct CreateSession {
     /// intersected with the revision's attachments (remove-only, §3.5).
     #[serde(default)]
     pub capabilities: Option<Vec<String>>,
+    /// The sanctioned explicit binding override (design "Explicit binding"):
+    /// requirement slot → connection id. Binding resolution verifies each
+    /// entry (tenant, caller may use it, connector match, snapshot).
+    #[serde(default)]
+    pub bindings: Option<HashMap<String, Uuid>>,
 }
 
 pub async fn create_session(
@@ -877,6 +919,11 @@ pub async fn create_session(
     // Any authenticated principal may create a run; visibility of the created
     // run is governed by `invoked_by_user_id` (stamped below).
     let scope = principal.scope();
+    // The invoker's visibility lens: a user sees org connections + only its own
+    // personal ones; the operator sees all. A user-supplied workspace connection
+    // resolves through this lens (invariant 21), so naming another user's
+    // personal connection reads as "unknown".
+    let viewer = rbac::connection_viewer(&principal);
     let explicit_input = match (req.workspace, req.repo) {
         (Some(_), Some(_)) => {
             return Err(ApiError::BadRequest(
@@ -886,7 +933,7 @@ pub async fn create_session(
         (w, r) => w.or(r),
     };
     let explicit = match explicit_input {
-        Some(input) => Some(resolve_workspace_input(&state, scope, input).await?),
+        Some(input) => Some(resolve_workspace_input(&state, scope, viewer, input).await?),
         None => None,
     };
     let autonomy = if req.autonomous {
@@ -915,6 +962,7 @@ pub async fn create_session(
                 ..Default::default()
             },
             invoked_by_user_id: principal.user_id(),
+            explicit_bindings: req.bindings.unwrap_or_default(),
             result_destinations: vec![],
             bound_invocation: None,
             bound_dispatch: None,

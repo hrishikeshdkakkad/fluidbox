@@ -1,6 +1,7 @@
 mod admin_orgs;
 mod api;
 mod auth;
+mod bindings;
 mod broker;
 mod callback;
 mod capabilities;
