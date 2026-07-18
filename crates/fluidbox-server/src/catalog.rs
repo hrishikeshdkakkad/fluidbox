@@ -53,7 +53,7 @@ fn is_connectable(transport: &str) -> bool {
 /// deliberately don't count as "this entry's bundle".
 pub async fn list(principal: Principal, State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let scope = principal.scope();
-    let rows = fluidbox_db::list_catalog(&state.pool).await?;
+    let rows = fluidbox_db::list_catalog(&state.pool, scope).await?;
     let conns = fluidbox_db::list_connections(&state.pool, scope).await?;
     let bundles = fluidbox_db::list_capability_bundles(&state.pool, scope).await?;
     let connectors: Vec<Value> = rows
@@ -114,11 +114,12 @@ fn entry_bundle(
 }
 
 pub async fn get(
-    _principal: Principal,
+    principal: Principal,
     State(state): State<AppState>,
     Path(slug): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    let row = fluidbox_db::get_catalog_by_slug(&state.pool, &slug)
+    let scope = principal.scope();
+    let row = fluidbox_db::get_catalog_by_slug(&state.pool, scope, &slug)
         .await?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(json!({ "connector": row })))
@@ -164,7 +165,7 @@ pub async fn create(
             "adding catalog entries requires admin or owner".into(),
         ));
     }
-    let row = create_entry_row(&state, &req).await?;
+    let row = create_entry_row(&state, principal.scope(), &req).await?;
     Ok(Json(json!({ "connector": row })))
 }
 
@@ -173,6 +174,7 @@ pub async fn create(
 /// (`add_custom`) so a pasted URL and a raw catalog POST land identically.
 async fn create_entry_row(
     state: &AppState,
+    scope: TenantScope,
     req: &CreateEntry,
 ) -> ApiResult<fluidbox_db::ConnectorCatalogRow> {
     let slug = req.slug.trim();
@@ -229,7 +231,10 @@ async fn create_entry_row(
             )));
         }
     }
-    if fluidbox_db::get_catalog_by_slug(&state.pool, slug)
+    // Scoped pre-check: a slug already visible to this tenant (its own custom
+    // row OR a shadowing-eligible global) is a 409. The DB `not exists (global)`
+    // guard is the race backstop (returns None → mapped to 409 below).
+    if fluidbox_db::get_catalog_by_slug(&state.pool, scope, slug)
         .await?
         .is_some()
     {
@@ -239,6 +244,7 @@ async fn create_entry_row(
     }
     let row = fluidbox_db::create_catalog_entry(
         &state.pool,
+        scope,
         slug,
         name,
         req.icon.as_deref(),
@@ -253,7 +259,12 @@ async fn create_entry_row(
         req.tool_hints.as_ref().unwrap_or(&json!([])),
         req.sandbox_launch.as_ref(),
     )
-    .await?;
+    .await?
+    .ok_or_else(|| {
+        ApiError::Conflict(format!(
+            "catalog slug '{slug}' collides with a global entry"
+        ))
+    })?;
     Ok(row)
 }
 
@@ -292,10 +303,11 @@ pub async fn connect(
             "connecting a catalog entry requires admin or owner".into(),
         ));
     }
-    let entry = fluidbox_db::get_catalog_by_slug(&state.pool, &slug)
+    let scope = principal.scope();
+    let entry = fluidbox_db::get_catalog_by_slug(&state.pool, scope, &slug)
         .await?
         .ok_or(ApiError::NotFound)?;
-    connect_entry(&state, principal.scope(), entry, req).await
+    connect_entry(&state, scope, entry, req).await
 }
 
 /// The three-branch connect body (none / api_key / oauth), factored out of the
@@ -487,6 +499,9 @@ async fn connect_entry(
                     client_secret_sealed: sealed_secret.as_deref(),
                     registration_id: None,
                 },
+                // Task 4 threads the real principal; org-owned for now.
+                fluidbox_db::ConnectionOwner::Organization,
+                None,
             )
             .await?;
             let authorize_url = crate::oauth::start_dance(state, scope, row.id).await?;
@@ -720,7 +735,7 @@ pub async fn add_custom(
         ));
     }
     let host = parsed.host_str().unwrap_or("mcp");
-    let slug = derive_slug(&state, host, name).await?;
+    let slug = derive_slug(&state, scope, host, name).await?;
 
     // api_key custom header/scheme ride the entry's auth_hints — exactly the
     // shape connect_entry's api_key branch reads (Sentry's custom header etc.).
@@ -759,7 +774,7 @@ pub async fn add_custom(
         tool_hints: None,
         sandbox_launch: None,
     };
-    let entry = create_entry_row(&state, &create).await?;
+    let entry = create_entry_row(&state, scope, &create).await?;
 
     let connect_req = ConnectReq {
         display_name: req.display_name.clone(),
@@ -785,7 +800,7 @@ pub async fn add_custom(
     match connect_entry(&state, scope, entry, connect_req).await {
         Ok(out) => Ok(with_slug(out)),
         Err(e) => {
-            if let Err(del) = fluidbox_db::delete_catalog_entry(&state.pool, &slug).await {
+            if let Err(del) = fluidbox_db::delete_catalog_entry(&state.pool, scope, &slug).await {
                 tracing::warn!(
                     "BYO connect for '{slug}' failed ({e}); entry rollback also failed: {del}"
                 );
@@ -817,7 +832,12 @@ fn slugify(s: &str) -> String {
 
 /// Derive a UNIQUE catalog slug from the server name (host as fallback),
 /// appending `-2`, `-3`, … on collision.
-async fn derive_slug(state: &AppState, host: &str, name: &str) -> ApiResult<String> {
+async fn derive_slug(
+    state: &AppState,
+    scope: TenantScope,
+    host: &str,
+    name: &str,
+) -> ApiResult<String> {
     let mut base = slugify(name);
     if !valid_slug(&base) {
         base = slugify(host);
@@ -832,7 +852,7 @@ async fn derive_slug(state: &AppState, host: &str, name: &str) -> ApiResult<Stri
             format!("{base}-{}", n + 1)
         };
         if valid_slug(&cand)
-            && fluidbox_db::get_catalog_by_slug(&state.pool, &cand)
+            && fluidbox_db::get_catalog_by_slug(&state.pool, scope, &cand)
                 .await?
                 .is_none()
         {

@@ -46,6 +46,46 @@ impl TenantScope {
     }
 }
 
+/// Who owns a connection (design :274-296). `Organization` connections are
+/// visible to every member; `User` connections are one member's personal
+/// custody. github_app connections are ALWAYS `Organization`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionOwner {
+    Organization,
+    User(Uuid),
+}
+
+impl ConnectionOwner {
+    /// (owner_type, owner_user_id) as stamped into the row.
+    fn parts(&self) -> (&'static str, Option<Uuid>) {
+        match self {
+            ConnectionOwner::Organization => ("organization", None),
+            ConnectionOwner::User(id) => ("user", Some(*id)),
+        }
+    }
+}
+
+/// The visibility lens for a connection listing (design :274-296): `All` sees
+/// every connection in the tenant (operator / admin); `User` sees org-owned
+/// connections plus only its OWN personal connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionViewer {
+    All,
+    User(Uuid),
+}
+
+impl ConnectionViewer {
+    /// The user id whose personal rows are visible, or None for `All` — bound
+    /// into the `$n is null or owner_type='organization' or owner_user_id=$n`
+    /// predicate.
+    fn user_id(&self) -> Option<Uuid> {
+        match self {
+            ConnectionViewer::All => None,
+            ConnectionViewer::User(id) => Some(*id),
+        }
+    }
+}
+
 pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
     let pool = PgPoolOptions::new()
         .max_connections(10)
@@ -104,6 +144,11 @@ pub struct AgentRevisionRow {
     pub capability_bundles: Value,
     /// Optional WorkspaceSpec jsonb — the agent's default workspace.
     pub default_workspace: Option<Value>,
+    /// Brokered connection requirements (design :349-389): a validated
+    /// `Vec<ConnectionRequirement>` jsonb (slot / connector / tools / mode).
+    /// Append-only with the revision; validated app-side, never an FK
+    /// (agent_revisions has no tenant column). Defaults to `[]`.
+    pub connection_requirements: Value,
     pub created_at: DateTime<Utc>,
 }
 
@@ -146,6 +191,15 @@ pub struct IntegrationConnectionRow {
     /// webhook secret live on the registration. NULL = legacy per-connection
     /// custody. Resolution fails closed — never falls back across kinds.
     pub registration_id: Option<Uuid>,
+    /// Ownership (design :274-296): `organization` (visible to every member) or
+    /// `user` (one member's personal custody); `owner_user_id` is set iff
+    /// `owner_type='user'`. `created_by_user_id` records who connected it (null
+    /// for system/admin-created rows). `authorization_generation` bumps on every
+    /// re-consent/rotation so stale run bindings fail closed.
+    pub owner_type: String,
+    pub owner_user_id: Option<Uuid>,
+    pub created_by_user_id: Option<Uuid>,
+    pub authorization_generation: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -594,22 +648,24 @@ pub async fn append_agent_revision(
     budgets: &Value,
     default_workspace: Option<&Value>,
     capability_bundles: &Value,
+    connection_requirements: &Value,
 ) -> sqlx::Result<AgentRevisionRow> {
     // Revisions carry no tenant column of their own; the tenant boundary is the
     // parent agent — the insert only lands when the agent AND the referenced
     // policy both belong to the scope (a cross-tenant policy_id is proven
     // impossible in SQL, not just Rust-side). Zero rows → RowNotFound (the
     // existing contract for a not-in-scope agent), which callers already map to
-    // a 404.
+    // a 404. `connection_requirements` is validated app-side (Task 2) before it
+    // reaches here.
     sqlx::query_as(
         "insert into agent_revisions
            (id, agent_id, rev, harness, runner_image, model, system_prompt, policy_id, budgets,
-            default_workspace, capability_bundles)
+            default_workspace, capability_bundles, connection_requirements)
          select $1, $2,
            coalesce((select max(rev) from agent_revisions where agent_id = $2), 0) + 1,
-           $3, $4, $5, $6, $7, $8, $9, $10
-         where exists (select 1 from agents a where a.id = $2 and a.tenant_id = $11)
-           and exists (select 1 from policies p where p.id = $7 and p.tenant_id = $11)
+           $3, $4, $5, $6, $7, $8, $9, $10, $11
+         where exists (select 1 from agents a where a.id = $2 and a.tenant_id = $12)
+           and exists (select 1 from policies p where p.id = $7 and p.tenant_id = $12)
          returning *",
     )
     .bind(Uuid::now_v7())
@@ -622,6 +678,7 @@ pub async fn append_agent_revision(
     .bind(budgets)
     .bind(default_workspace)
     .bind(capability_bundles)
+    .bind(connection_requirements)
     .bind(scope.tenant_id())
     .fetch_one(pool)
     .await
@@ -772,7 +829,8 @@ pub async fn get_capability_bundle_version(
 /// the sealed credential / client secret can't ride along into a row.
 const CONNECTION_COLS: &str = "id, tenant_id, provider, external_account_id, display_name, \
      granted_scopes, resource_selection, status, metadata, auth_kind, oauth, \
-     registration_id, created_at, updated_at";
+     registration_id, owner_type, owner_user_id, created_by_user_id, \
+     authorization_generation, created_at, updated_at";
 
 /// Auth flavor of a new connection. `static` seals the pasted secret now and
 /// starts `active`; `oauth` starts `pending` with NO credential — the
@@ -812,13 +870,19 @@ pub async fn create_connection(
     metadata: &Value,
     webhook_secret_sealed: Option<&[u8]>,
     auth: ConnectionAuth<'_>,
+    owner: ConnectionOwner,
+    created_by_user_id: Option<Uuid>,
 ) -> sqlx::Result<IntegrationConnectionRow> {
+    // owner_type/owner_user_id are stamped from `owner`; authorization_generation
+    // starts at 1 (the column default) and bumps only on re-consent/rotation.
+    let (owner_type, owner_user_id) = owner.parts();
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "insert into integration_connections
            (id, tenant_id, provider, external_account_id, display_name, credential_sealed,
             granted_scopes, resource_selection, metadata, webhook_secret_sealed,
-            auth_kind, status, oauth, client_secret_sealed, registration_id)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+            auth_kind, status, oauth, client_secret_sealed, registration_id,
+            owner_type, owner_user_id, created_by_user_id)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
          returning {CONNECTION_COLS}"
     )))
     .bind(Uuid::now_v7())
@@ -836,6 +900,9 @@ pub async fn create_connection(
     .bind(auth.oauth)
     .bind(auth.client_secret_sealed)
     .bind(auth.registration_id)
+    .bind(owner_type)
+    .bind(owner_user_id)
+    .bind(created_by_user_id)
     .fetch_one(pool)
     .await
 }
@@ -881,6 +948,69 @@ pub async fn revoke_connection(
     .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await
+}
+
+/// List connections through a visibility lens (design :274-296): `All` returns
+/// every connection in the tenant; `User(id)` returns org-owned connections
+/// plus only that user's personal connections. `list_connections` stays the
+/// unfiltered internal/worker reader.
+pub async fn list_connections_visible(
+    pool: &PgPool,
+    scope: TenantScope,
+    viewer: ConnectionViewer,
+) -> sqlx::Result<Vec<IntegrationConnectionRow>> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "select {CONNECTION_COLS} from integration_connections
+         where tenant_id = $1
+           and ($2::uuid is null or owner_type = 'organization' or owner_user_id = $2)
+         order by created_at desc"
+    )))
+    .bind(scope.tenant_id())
+    .bind(viewer.user_id())
+    .fetch_all(pool)
+    .await
+}
+
+/// Read one connection through the same visibility lens as
+/// [`list_connections_visible`] — returns None for another user's personal row.
+pub async fn get_connection_visible(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    viewer: ConnectionViewer,
+) -> sqlx::Result<Option<IntegrationConnectionRow>> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "select {CONNECTION_COLS} from integration_connections
+         where id = $1 and tenant_id = $2
+           and ($3::uuid is null or owner_type = 'organization' or owner_user_id = $3)"
+    )))
+    .bind(id)
+    .bind(scope.tenant_id())
+    .bind(viewer.user_id())
+    .fetch_optional(pool)
+    .await
+}
+
+/// Bump a connection's authorization generation (design :296) — called on every
+/// re-consent/rotation so any run binding that froze the older generation fails
+/// closed at the broker recheck. Returns the new generation, or None if the
+/// connection is not in scope.
+pub async fn bump_connection_generation(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+) -> sqlx::Result<Option<i32>> {
+    let row = sqlx::query(
+        "update integration_connections
+         set authorization_generation = authorization_generation + 1, updated_at = now()
+         where id = $1 and tenant_id = $2
+         returning authorization_generation",
+    )
+    .bind(id)
+    .bind(scope.tenant_id())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.get::<i32, _>("authorization_generation")))
 }
 
 /// Persist non-secret OAuth custody state (discovered endpoints, client
@@ -1018,6 +1148,118 @@ pub async fn connection_client_secret_sealed(
 
 // ─── Connector catalog ────────────────────────────────────────────────────
 
+// ─── Connection tool snapshots ────────────────────────────────────────────
+
+/// One append-only photograph of a brokered connection's `tools/list` (design
+/// :298-318): versioned per (tenant, connection), carrying the tools + digest a
+/// run freezes. Never carries a credential — only tool metadata.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct ConnectionToolSnapshotRow {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub connection_id: Uuid,
+    pub snapshot_version: i32,
+    pub authorization_generation: i32,
+    pub protocol_version: String,
+    pub tools_json: Value,
+    pub tools_digest: String,
+    pub discovered_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Append a new snapshot (version = max+1 within (tenant, connection), exactly
+/// like a bundle version). Executor-generic so it can run inside a caller's
+/// transaction. The `exists` guard proves the connection is in scope — a
+/// cross-tenant connection_id yields RowNotFound (the composite FK is the
+/// backstop).
+pub async fn insert_connection_tool_snapshot<'e, E>(
+    exec: E,
+    scope: TenantScope,
+    connection_id: Uuid,
+    authorization_generation: i32,
+    protocol_version: &str,
+    tools_json: &Value,
+    tools_digest: &str,
+) -> sqlx::Result<ConnectionToolSnapshotRow>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(
+        "insert into connection_tool_snapshots
+           (id, tenant_id, connection_id, snapshot_version, authorization_generation,
+            protocol_version, tools_json, tools_digest)
+         select $1, $2, $3,
+           coalesce((select max(s.snapshot_version) from connection_tool_snapshots s
+                     where s.tenant_id = $2 and s.connection_id = $3), 0) + 1,
+           $4, $5, $6, $7
+         where exists (select 1 from integration_connections c
+                       where c.id = $3 and c.tenant_id = $2)
+         returning *",
+    )
+    .bind(Uuid::now_v7())
+    .bind(scope.tenant_id())
+    .bind(connection_id)
+    .bind(authorization_generation)
+    .bind(protocol_version)
+    .bind(tools_json)
+    .bind(tools_digest)
+    .fetch_one(exec)
+    .await
+}
+
+/// The newest snapshot for a connection, or None if it has never been
+/// photographed.
+pub async fn latest_connection_tool_snapshot(
+    pool: &PgPool,
+    scope: TenantScope,
+    connection_id: Uuid,
+) -> sqlx::Result<Option<ConnectionToolSnapshotRow>> {
+    sqlx::query_as(
+        "select * from connection_tool_snapshots
+         where tenant_id = $1 and connection_id = $2
+         order by snapshot_version desc limit 1",
+    )
+    .bind(scope.tenant_id())
+    .bind(connection_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Every snapshot for a connection, newest first.
+pub async fn list_connection_tool_snapshots(
+    pool: &PgPool,
+    scope: TenantScope,
+    connection_id: Uuid,
+) -> sqlx::Result<Vec<ConnectionToolSnapshotRow>> {
+    sqlx::query_as(
+        "select * from connection_tool_snapshots
+         where tenant_id = $1 and connection_id = $2
+         order by snapshot_version desc",
+    )
+    .bind(scope.tenant_id())
+    .bind(connection_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// One specific snapshot version for a connection (the pin a run froze).
+pub async fn get_connection_tool_snapshot(
+    pool: &PgPool,
+    scope: TenantScope,
+    connection_id: Uuid,
+    version: i32,
+) -> sqlx::Result<Option<ConnectionToolSnapshotRow>> {
+    sqlx::query_as(
+        "select * from connection_tool_snapshots
+         where tenant_id = $1 and connection_id = $2 and snapshot_version = $3",
+    )
+    .bind(scope.tenant_id())
+    .bind(connection_id)
+    .bind(version)
+    .fetch_optional(pool)
+    .await
+}
+
 /// One catalog entry — GLOBAL (tenant-less) reference data, a superset of
 /// the MCP registry's server.json. UNTRUSTED everywhere it is consumed:
 /// tool_hints are policy-default seeds for display, never enforcement.
@@ -1044,34 +1286,68 @@ pub struct ConnectorCatalogRow {
     /// ("mcp-registry" | "open-connector") + pinned snapshot/commit so a future
     /// re-import can diff by (source, upstream_id).
     pub provenance: Value,
+    /// NULL = GLOBAL reference row (curated `fluidbox` seeds + registry
+    /// imports, visible to every tenant); Some = a tenant-owned custom (BYO)
+    /// entry, visible only to that tenant and shadowing a same-slug global row
+    /// (design :262-266).
+    pub tenant_id: Option<Uuid>,
+    /// Soft-disable: an unattributable custom row (migration 0013 could not
+    /// place it under a single tenant) is disabled, never inherited by every
+    /// tenant. Disabled rows are excluded from `list_catalog`/`get_catalog_by_slug`.
+    pub disabled_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-pub async fn list_catalog(pool: &PgPool) -> sqlx::Result<Vec<ConnectorCatalogRow>> {
+/// Active catalog visible to a tenant: global-active ∪ tenant-active, with a
+/// tenant custom row SHADOWING a same-slug global row (design :262-266).
+pub async fn list_catalog(
+    pool: &PgPool,
+    scope: TenantScope,
+) -> sqlx::Result<Vec<ConnectorCatalogRow>> {
     sqlx::query_as(
-        "select * from connector_catalog
+        "select * from connector_catalog c
+         where c.disabled_at is null
+           and (c.tenant_id = $1
+                or (c.tenant_id is null
+                    and not exists (select 1 from connector_catalog t
+                                    where t.tenant_id = $1 and t.slug = c.slug
+                                      and t.disabled_at is null)))
          order by case tier when 'verified' then 0 when 'community' then 1 else 2 end, name",
     )
+    .bind(scope.tenant_id())
     .fetch_all(pool)
     .await
 }
 
+/// Resolve one slug for a tenant: the tenant's custom row first, else the
+/// global row; disabled rows excluded (design :262-266).
 pub async fn get_catalog_by_slug(
     pool: &PgPool,
+    scope: TenantScope,
     slug: &str,
 ) -> sqlx::Result<Option<ConnectorCatalogRow>> {
-    sqlx::query_as("select * from connector_catalog where slug = $1")
-        .bind(slug)
-        .fetch_optional(pool)
-        .await
+    sqlx::query_as(
+        "select * from connector_catalog
+         where slug = $1 and disabled_at is null and (tenant_id = $2 or tenant_id is null)
+         order by (tenant_id is not null) desc
+         limit 1",
+    )
+    .bind(slug)
+    .bind(scope.tenant_id())
+    .fetch_optional(pool)
+    .await
 }
 
 /// API-added entries are always tier `custom` — verified/community are
-/// curation judgements the API cannot self-award.
+/// curation judgements the API cannot self-award — and land tenant-scoped.
+/// Returns None (→ 409 at the server) when the slug collides with a GLOBAL row;
+/// a same-tenant duplicate is refused by the `connector_catalog_slug_tenant`
+/// unique index (surfaced as an Err).
 #[allow(clippy::too_many_arguments)]
 pub async fn create_catalog_entry(
     pool: &PgPool,
+    scope: TenantScope,
     slug: &str,
     name: &str,
     icon: Option<&str>,
@@ -1085,23 +1361,28 @@ pub async fn create_catalog_entry(
     egress: &Value,
     tool_hints: &Value,
     sandbox_launch: Option<&Value>,
-) -> sqlx::Result<ConnectorCatalogRow> {
+) -> sqlx::Result<Option<ConnectorCatalogRow>> {
     // tier AND provenance are forced 'custom': verified/community are curation
     // judgements the API cannot self-award, and a 'custom' provenance keeps a
     // user's BYO entry distinguishable from both the fluidbox seed and an
     // import (the generated import upsert only ever refreshes rows whose
     // provenance.source is an import source — 'mcp-registry' or 'open-connector'
-    // — so it can never clobber this custom row; see the importer).
+    // — so it can never clobber this custom row; see the importer). The
+    // `not exists (global)` guard fails closed on a global-slug collision — a
+    // tenant can never mask a curated slug with a divergent definition.
     sqlx::query_as(
         "insert into connector_catalog
-           (id, slug, name, icon, description, categories, tier, url, transport,
+           (id, tenant_id, slug, name, icon, description, categories, tier, url, transport,
             auth_mode, auth_hints, scopes, egress, tool_hints, sandbox_launch,
             provenance)
-         values ($1,$2,$3,$4,$5,$6,'custom',$7,$8,$9,$10,$11,$12,$13,$14,
-                 '{\"source\":\"custom\"}')
+         select $1,$2,$3,$4,$5,$6,$7,'custom',$8,$9,$10,$11,$12,$13,$14,$15,
+                 '{\"source\":\"custom\"}'
+         where not exists (select 1 from connector_catalog g
+                           where g.slug = $3 and g.tenant_id is null)
          returning *",
     )
     .bind(Uuid::now_v7())
+    .bind(scope.tenant_id())
     .bind(slug)
     .bind(name)
     .bind(icon)
@@ -1115,17 +1396,23 @@ pub async fn create_catalog_entry(
     .bind(egress)
     .bind(tool_hints)
     .bind(sandbox_launch)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
 }
 
-/// Delete a catalog entry by slug. Used to roll back a just-created custom
-/// (BYO) entry when its one-shot connect fails — custom entries are untrusted
-/// reference data with no dependents until a bundle references them, so a
-/// hard delete is safe. Returns the number of rows removed.
-pub async fn delete_catalog_entry(pool: &PgPool, slug: &str) -> sqlx::Result<u64> {
-    let r = sqlx::query("delete from connector_catalog where slug = $1")
+/// Delete a tenant's custom catalog entry by slug (tenant rows only — a global
+/// row is never touched). Used to roll back a just-created custom (BYO) entry
+/// when its one-shot connect fails — custom entries are untrusted reference
+/// data with no dependents until a bundle references them, so a hard delete is
+/// safe. Returns the number of rows removed.
+pub async fn delete_catalog_entry(
+    pool: &PgPool,
+    scope: TenantScope,
+    slug: &str,
+) -> sqlx::Result<u64> {
+    let r = sqlx::query("delete from connector_catalog where slug = $1 and tenant_id = $2")
         .bind(slug)
+        .bind(scope.tenant_id())
         .execute(pool)
         .await?;
     Ok(r.rows_affected())
@@ -1456,12 +1743,15 @@ pub async fn create_github_app_connection_if_absent(
     registration_id: Uuid,
 ) -> sqlx::Result<Option<IntegrationConnectionRow>> {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        // github_app connections are ALWAYS organization-owned (system custody
+        // via the registration) — owner_type is stamped explicitly, never a
+        // per-user personal connection.
         "insert into integration_connections
            (id, tenant_id, provider, external_account_id, display_name, credential_sealed,
             granted_scopes, resource_selection, metadata, webhook_secret_sealed,
-            auth_kind, status, oauth, client_secret_sealed, registration_id)
+            auth_kind, status, oauth, client_secret_sealed, registration_id, owner_type)
          select $1, $2, 'github_app', $3, $4, null, '[]'::jsonb, '{{}}'::jsonb, $5, null,
-                'static', $6, null, null, $7
+                'static', $6, null, null, $7, 'organization'
          where not exists (
              select 1 from integration_connections
              where tenant_id = $2 and provider = 'github_app' and external_account_id = $3
@@ -1574,6 +1864,10 @@ pub struct TriggerSubscriptionRow {
     /// Capability keep-list (bundle names; §3.5 narrowing). NULL = keep all
     /// bundles the resolved revision attaches; intersection is remove-only.
     pub capability_bundles: Option<Value>,
+    /// Generation of the subscription's callback-secret authority (invariant 7,
+    /// design :428-431): bumps on secret rotation so a `subscription_secret`
+    /// binding freezing an older generation fails closed.
+    pub authority_generation: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1582,7 +1876,7 @@ const SUBSCRIPTION_COLS: &str = "id, tenant_id, agent_id, name, trigger_kind, pi
      enabled, task_template, allow_task_override, allow_workspace_override, autonomy, \
      concurrency_policy, budget_override, workspace_override, result_destinations, \
      connection_id, resource_selector, event_filter, event_publish, capability_bundles, \
-     created_at, updated_at";
+     authority_generation, created_at, updated_at";
 
 #[allow(clippy::too_many_arguments)]
 pub async fn create_trigger_subscription(
@@ -1730,6 +2024,154 @@ pub async fn subscription_callback_secret_sealed(
     Ok(row.and_then(|r| r.get::<Option<Vec<u8>>, _>("callback_secret_sealed")))
 }
 
+// ─── Run resource bindings ────────────────────────────────────────────────
+
+/// One per-run resolved authority (design :391-463): what a run bound for a
+/// requirement slot, frozen write-once. The tagged authority union is realized
+/// as typed `connection_id`/`subscription_id` columns discriminated by
+/// `authority_kind`; the CHECK constraints (migration 0013) enforce the shape.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct RunResourceBindingRow {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub session_id: Uuid,
+    pub requirement_slot: String,
+    pub slot_kind: String,
+    pub authority_kind: String,
+    pub connection_id: Option<Uuid>,
+    pub subscription_id: Option<Uuid>,
+    pub authority_generation: Option<i32>,
+    pub connection_owner_type: Option<String>,
+    pub connection_owner_user_id: Option<Uuid>,
+    pub snapshot_version: Option<i32>,
+    pub effective_tools_json: Option<Value>,
+    pub effective_tools_digest: Option<String>,
+    pub resource_scope: Value,
+    pub resolved_by_principal_kind: String,
+    pub resolved_by_principal_id: Option<String>,
+    pub binding_mode: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A binding to insert — [`RunResourceBindingRow`] minus the columns the writer
+/// stamps (tenant_id from the scope, session_id from the run, created_at). The
+/// `id` is pre-minted by the resolver so the frozen RunSpec can reference it.
+#[derive(Debug, Clone)]
+pub struct NewRunResourceBinding {
+    pub id: Uuid,
+    pub requirement_slot: String,
+    pub slot_kind: String,
+    pub authority_kind: String,
+    pub connection_id: Option<Uuid>,
+    pub subscription_id: Option<Uuid>,
+    pub authority_generation: Option<i32>,
+    pub connection_owner_type: Option<String>,
+    pub connection_owner_user_id: Option<Uuid>,
+    pub snapshot_version: Option<i32>,
+    pub effective_tools_json: Option<Value>,
+    pub effective_tools_digest: Option<String>,
+    pub resource_scope: Value,
+    pub resolved_by_principal_kind: String,
+    pub resolved_by_principal_id: Option<String>,
+    pub binding_mode: String,
+}
+
+/// Write a run's resolved bindings (plain multi-insert; write-once — the
+/// `unique (tenant_id, session_id, slot_kind, requirement_slot)` key rejects a
+/// second write for the same slot). Takes a `&mut PgConnection` so it runs
+/// inside `create_session`'s transaction. The composite `(tenant_id, session_id)`
+/// FK refuses a binding for a missing / other-tenant session.
+pub async fn insert_run_resource_bindings(
+    tx: &mut sqlx::PgConnection,
+    scope: TenantScope,
+    session_id: Uuid,
+    rows: &[NewRunResourceBinding],
+) -> sqlx::Result<()> {
+    for b in rows {
+        sqlx::query(
+            "insert into run_resource_bindings
+               (id, tenant_id, session_id, requirement_slot, slot_kind, authority_kind,
+                connection_id, subscription_id, authority_generation, connection_owner_type,
+                connection_owner_user_id, snapshot_version, effective_tools_json,
+                effective_tools_digest, resource_scope, resolved_by_principal_kind,
+                resolved_by_principal_id, binding_mode)
+             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)",
+        )
+        .bind(b.id)
+        .bind(scope.tenant_id())
+        .bind(session_id)
+        .bind(&b.requirement_slot)
+        .bind(&b.slot_kind)
+        .bind(&b.authority_kind)
+        .bind(b.connection_id)
+        .bind(b.subscription_id)
+        .bind(b.authority_generation)
+        .bind(&b.connection_owner_type)
+        .bind(b.connection_owner_user_id)
+        .bind(b.snapshot_version)
+        .bind(&b.effective_tools_json)
+        .bind(&b.effective_tools_digest)
+        .bind(&b.resource_scope)
+        .bind(&b.resolved_by_principal_kind)
+        .bind(&b.resolved_by_principal_id)
+        .bind(&b.binding_mode)
+        .execute(&mut *tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// One binding by id, tenant-scoped.
+pub async fn get_run_resource_binding(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+) -> sqlx::Result<Option<RunResourceBindingRow>> {
+    sqlx::query_as("select * from run_resource_bindings where id = $1 and tenant_id = $2")
+        .bind(id)
+        .bind(scope.tenant_id())
+        .fetch_optional(pool)
+        .await
+}
+
+/// Every binding a run resolved, ordered by slot for stable display.
+pub async fn session_resource_bindings(
+    pool: &PgPool,
+    scope: TenantScope,
+    session_id: Uuid,
+) -> sqlx::Result<Vec<RunResourceBindingRow>> {
+    sqlx::query_as(
+        "select * from run_resource_bindings
+         where session_id = $1 and tenant_id = $2
+         order by slot_kind, requirement_slot",
+    )
+    .bind(session_id)
+    .bind(scope.tenant_id())
+    .fetch_all(pool)
+    .await
+}
+
+/// The one binding for a run's (slot_kind, requirement_slot) — the consumer's
+/// lookup before a credentialed use.
+pub async fn find_session_binding(
+    pool: &PgPool,
+    scope: TenantScope,
+    session_id: Uuid,
+    slot_kind: &str,
+    slot: &str,
+) -> sqlx::Result<Option<RunResourceBindingRow>> {
+    sqlx::query_as(
+        "select * from run_resource_bindings
+         where session_id = $1 and tenant_id = $2 and slot_kind = $3 and requirement_slot = $4",
+    )
+    .bind(session_id)
+    .bind(scope.tenant_id())
+    .bind(slot_kind)
+    .bind(slot)
+    .fetch_optional(pool)
+    .await
+}
+
 // ─── Sessions ─────────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -1749,6 +2191,7 @@ pub async fn create_session(
     invoked_by_user_id: Option<Uuid>,
     bind_invocation: Option<Uuid>,
     bind_dispatch: Option<Uuid>,
+    bindings: &[NewRunResourceBinding],
 ) -> sqlx::Result<SessionRow> {
     let mut tx = pool.begin().await?;
     // Prove the agent AND the pinned revision both belong to this tenant in SQL
@@ -1778,6 +2221,13 @@ pub async fn create_session(
     .bind(invoked_by_user_id)
     .fetch_one(&mut *tx)
     .await?;
+    // Resolved run resource bindings are written INSIDE this transaction — a run
+    // and the frozen record of what it resolved commit together, or not at all
+    // (design :391-463; invariant 21). The composite FK refuses a binding whose
+    // (tenant, session) does not match this session's.
+    if !bindings.is_empty() {
+        insert_run_resource_bindings(&mut tx, scope, row.id, bindings).await?;
+    }
     // Atomic claim bind: the run and its idempotency claim commit together,
     // so a crash can never orphan a created run from its claim (which would
     // let the stale-claim takeover duplicate it).
@@ -3780,6 +4230,7 @@ mod tests {
             &serde_json::json!({}),
             None,
             &serde_json::json!([]),
+            &serde_json::json!([]),
         )
         .await
         .unwrap();
@@ -3802,6 +4253,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &[],
             )
         };
         let racer = mk("finalize-test race").await.unwrap();
@@ -4063,6 +4515,7 @@ mod tests {
             &serde_json::json!({}),
             None,
             &serde_json::json!([]),
+            &serde_json::json!([]),
         )
         .await
         .unwrap();
@@ -4082,6 +4535,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -4152,6 +4606,7 @@ mod tests {
             &serde_json::json!({}),
             None,
             &serde_json::json!([]),
+            &serde_json::json!([]),
         )
         .await
         .unwrap();
@@ -4171,6 +4626,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -4247,6 +4703,7 @@ mod tests {
             &serde_json::json!({}),
             None,
             &serde_json::json!([]),
+            &serde_json::json!([]),
         )
         .await
         .unwrap();
@@ -4266,6 +4723,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -4388,6 +4846,7 @@ mod tests {
             &serde_json::json!({}),
             None,
             &serde_json::json!([]),
+            &serde_json::json!([]),
         )
         .await
         .unwrap();
@@ -4409,6 +4868,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -4428,6 +4888,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -4562,6 +5023,7 @@ mod tests {
             &serde_json::json!({}),
             None,
             &serde_json::json!([]),
+            &serde_json::json!([]),
         )
         .await
         .unwrap();
@@ -4583,6 +5045,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -4653,6 +5116,8 @@ mod tests {
             &serde_json::json!({"test": true}),
             None,
             ConnectionAuth::static_active(),
+            ConnectionOwner::Organization,
+            None,
         )
         .await
         .unwrap();
@@ -4726,6 +5191,7 @@ mod tests {
             policy.id,
             &serde_json::json!({}),
             None,
+            &serde_json::json!([]),
             &serde_json::json!([]),
         )
         .await
@@ -4844,6 +5310,7 @@ mod tests {
             &serde_json::json!({}),
             None,
             &serde_json::json!([]),
+            &serde_json::json!([]),
         )
         .await
         .unwrap();
@@ -4906,6 +5373,7 @@ mod tests {
             None,
             Some(invocation_id),
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -5120,6 +5588,7 @@ mod tests {
             &serde_json::json!({}),
             None,
             &serde_json::json!([]),
+            &serde_json::json!([]),
         )
         .await
         .unwrap();
@@ -5139,6 +5608,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -5250,6 +5720,7 @@ mod tests {
             &serde_json::json!({}),
             Some(&ws),
             &serde_json::json!([]),
+            &serde_json::json!([]),
         )
         .await
         .unwrap();
@@ -5267,6 +5738,7 @@ mod tests {
             policy.id,
             &serde_json::json!({}),
             None,
+            &serde_json::json!([]),
             &serde_json::json!([]),
         )
         .await
@@ -5360,6 +5832,7 @@ mod tests {
             &serde_json::json!({}),
             None,
             &pins,
+            &serde_json::json!([]),
         )
         .await
         .unwrap();
@@ -5422,31 +5895,46 @@ mod tests {
             return;
         };
         let pool = connect(&url).await.expect("connect");
+        // The curated seeds are GLOBAL (tenant_id null); any valid scope sees
+        // them via the tenant-or-global reader.
+        let tenant = ensure_default_tenant(&pool).await.unwrap();
+        let scope = TenantScope::assume(tenant);
 
         // Migration 0007 seeds the curated set (API-only settle: the
         // migration IS the seed; no file, no boot sync).
-        let rows = list_catalog(&pool).await.unwrap();
+        let rows = list_catalog(&pool, scope).await.unwrap();
         assert!(rows.len() >= 7, "expected ≥7 seeded entries");
-        let notion = get_catalog_by_slug(&pool, "notion").await.unwrap().unwrap();
+        let notion = get_catalog_by_slug(&pool, scope, "notion")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(notion.auth_mode, "oauth");
         assert_eq!(notion.tier, "verified");
-        let sentry = get_catalog_by_slug(&pool, "sentry").await.unwrap().unwrap();
+        assert!(notion.tenant_id.is_none(), "curated seeds are global");
+        let sentry = get_catalog_by_slug(&pool, scope, "sentry")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(sentry.auth_hints["header_name"], "Sentry-Bearer");
         assert_eq!(sentry.auth_hints["scheme"], "");
-        let ws = get_catalog_by_slug(&pool, "workspace-info")
+        let ws = get_catalog_by_slug(&pool, scope, "workspace-info")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(ws.transport, "stdio");
         assert!(ws.sandbox_launch.is_some());
         // Slack seed is explicitly deferred to the Phase-7 vertical.
-        assert!(get_catalog_by_slug(&pool, "slack").await.unwrap().is_none());
+        assert!(get_catalog_by_slug(&pool, scope, "slack")
+            .await
+            .unwrap()
+            .is_none());
         // Verified entries sort ahead of custom ones.
         assert_eq!(rows[0].tier, "verified");
 
         let slug = format!("test-cat-{}", Uuid::now_v7().simple());
         let row = create_catalog_entry(
             &pool,
+            scope,
             &slug,
             "Test entry",
             None,
@@ -5462,20 +5950,30 @@ mod tests {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .expect("custom entry lands");
         assert_eq!(row.tier, "custom", "API entries can't self-award tiers");
         assert_eq!(
             row.provenance["source"], "custom",
             "API entries carry a 'custom' provenance, distinct from seed + import"
         );
+        assert_eq!(
+            row.tenant_id,
+            Some(tenant),
+            "custom entries are tenant-scoped"
+        );
         // The curated seed rows keep the fluidbox provenance the 0009 backfill
         // gave them — the import upsert predicate keys off exactly this, so an
         // import can never clobber a hand-curated verified entry.
-        let gh = get_catalog_by_slug(&pool, "github").await.unwrap().unwrap();
+        let gh = get_catalog_by_slug(&pool, scope, "github")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(gh.provenance["source"], "fluidbox");
-        // Slugs are unique — re-insert conflicts.
+        // Same-tenant slug re-insert conflicts (the per-tenant unique index).
         assert!(create_catalog_entry(
             &pool,
+            scope,
             &slug,
             "dup",
             None,
@@ -5529,6 +6027,8 @@ mod tests {
                 client_secret_sealed: Some(b"sealed-client-secret"),
                 registration_id: None,
             },
+            ConnectionOwner::Organization,
+            None,
         )
         .await
         .unwrap();
@@ -5748,6 +6248,7 @@ mod tests {
         let agent = create_agent(&pool, scope, "pau-agent", None).await.unwrap();
         let budgets = serde_json::json!({});
         let pins = serde_json::json!([]);
+        let reqs = serde_json::json!([]);
         let rev = |policy_id| {
             append_agent_revision(
                 &pool,
@@ -5761,6 +6262,7 @@ mod tests {
                 &budgets,
                 None,
                 &pins,
+                &reqs,
             )
         };
 
@@ -5831,6 +6333,7 @@ mod tests {
                 &budgets,
                 None,
                 &pins,
+                &serde_json::json!([]),
             )
             .await
             .unwrap();
@@ -5907,6 +6410,7 @@ mod tests {
             &serde_json::json!({}),
             None,
             &serde_json::json!([]),
+            &serde_json::json!([]),
         )
         .await
         .unwrap();
@@ -5926,6 +6430,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -6173,6 +6678,8 @@ mod tests {
             &serde_json::json!({"base_url":"https://x"}),
             None,
             ConnectionAuth::static_active(),
+            ConnectionOwner::Organization,
+            None,
         )
         .await
         .unwrap();
@@ -6450,5 +6957,631 @@ mod tests {
             "tenant A must not read B's external result"
         );
         assert!(read_b.is_some(), "tenant B reads its own external result");
+    }
+
+    // ─── Phase C (#31): ownership, snapshots, bindings, catalog scoping ──────
+
+    /// Seed a user + active membership under `scope` (each with its own staged
+    /// idp config, so callers need not thread one). Returns the user id — the
+    /// FK target for a connection's `owner_user_id`/`created_by_user_id`.
+    async fn seed_member(pool: &PgPool, scope: TenantScope, subject: &str) -> Uuid {
+        let cfg_id = Uuid::now_v7();
+        sqlx::query(
+            "insert into org_idp_configs
+               (id, tenant_id, generation, issuer, client_id, claim_mappings, status)
+             values ($1, $2,
+                     coalesce((select max(generation) from org_idp_configs where tenant_id = $2), 0) + 1,
+                     $3, 'client-test', '{}'::jsonb, 'staged')",
+        )
+        .bind(cfg_id)
+        .bind(scope.tenant_id())
+        .bind(format!("https://idp.test/{subject}"))
+        .execute(pool)
+        .await
+        .unwrap();
+        let user_id = Uuid::now_v7();
+        sqlx::query(
+            "insert into users
+               (id, tenant_id, idp_config_id, subject, email, email_normalized, email_verified, status)
+             values ($1, $2, $3, $4, $5, $5, true, 'active')",
+        )
+        .bind(user_id)
+        .bind(scope.tenant_id())
+        .bind(cfg_id)
+        .bind(subject)
+        .bind(format!("{subject}@example.com"))
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "insert into org_memberships (id, tenant_id, user_id, roles, status)
+             values ($1, $2, $3, '{member}', 'active')",
+        )
+        .bind(Uuid::now_v7())
+        .bind(scope.tenant_id())
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        user_id
+    }
+
+    async fn cleanup_orgs(pool: &PgPool, stmts: &[&'static str], tenants: &[Uuid]) {
+        for id in tenants {
+            for &stmt in stmts {
+                sqlx::query(stmt).bind(id).execute(pool).await.unwrap();
+            }
+            sqlx::query("delete from tenants where id = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Owner-shape CHECK, ownership visibility lens, and generation bump.
+    #[tokio::test]
+    async fn phase_c_connection_ownership_and_visibility() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let slug = format!("t-{}", Uuid::now_v7().simple());
+        let org = identity::create_org(&pool, &slug, None).await.unwrap();
+        let scope = TenantScope::assume(org.id);
+        let alice = seed_member(&pool, scope, "alice").await;
+        let bob = seed_member(&pool, scope, "bob").await;
+
+        // owner-shape CHECK: owner_type='user' with a NULL owner_user_id is
+        // rejected by the DB (a half-populated owner is fail-closed).
+        let bad_owner = sqlx::query(
+            "insert into integration_connections
+               (id, tenant_id, provider, external_account_id, display_name, owner_type)
+             values ($1, $2, 'mcp_http', 'x', 'bad', 'user')",
+        )
+        .bind(Uuid::now_v7())
+        .bind(org.id)
+        .execute(&pool)
+        .await;
+
+        let org_conn = create_connection(
+            &pool,
+            scope,
+            "mcp_http",
+            "acct-org",
+            "Org conn",
+            None,
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            None,
+            ConnectionAuth::static_active(),
+            ConnectionOwner::Organization,
+            None,
+        )
+        .await
+        .unwrap();
+        let alice_conn = create_connection(
+            &pool,
+            scope,
+            "mcp_http",
+            "acct-alice",
+            "Alice personal",
+            None,
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            None,
+            ConnectionAuth::static_active(),
+            ConnectionOwner::User(alice),
+            Some(alice),
+        )
+        .await
+        .unwrap();
+
+        // bob's lens sees the org connection but NOT alice's personal one.
+        let bob_list = list_connections_visible(&pool, scope, ConnectionViewer::User(bob))
+            .await
+            .unwrap();
+        let all_list = list_connections_visible(&pool, scope, ConnectionViewer::All)
+            .await
+            .unwrap();
+        let bob_sees_alice =
+            get_connection_visible(&pool, scope, alice_conn.id, ConnectionViewer::User(bob))
+                .await
+                .unwrap();
+        let alice_sees_alice =
+            get_connection_visible(&pool, scope, alice_conn.id, ConnectionViewer::User(alice))
+                .await
+                .unwrap();
+        let bumped = bump_connection_generation(&pool, scope, org_conn.id)
+            .await
+            .unwrap();
+
+        cleanup_orgs(
+            &pool,
+            &[
+                "delete from integration_connections where tenant_id = $1",
+                "delete from org_memberships where tenant_id = $1",
+                "delete from users where tenant_id = $1",
+                "delete from org_idp_configs where tenant_id = $1",
+            ],
+            &[org.id],
+        )
+        .await;
+
+        assert!(
+            bad_owner.is_err(),
+            "user owner without owner_user_id rejected"
+        );
+        assert_eq!(org_conn.owner_type, "organization");
+        assert_eq!(org_conn.authorization_generation, 1);
+        assert_eq!(alice_conn.owner_type, "user");
+        assert_eq!(alice_conn.owner_user_id, Some(alice));
+        let bob_ids: Vec<Uuid> = bob_list.iter().map(|c| c.id).collect();
+        assert!(
+            bob_ids.contains(&org_conn.id),
+            "bob sees the org connection"
+        );
+        assert!(
+            !bob_ids.contains(&alice_conn.id),
+            "bob must not see alice's personal connection"
+        );
+        assert_eq!(all_list.len(), 2, "All lens sees both connections");
+        assert!(
+            bob_sees_alice.is_none(),
+            "bob cannot read alice's personal row"
+        );
+        assert!(alice_sees_alice.is_some(), "alice reads her own connection");
+        assert_eq!(bumped, Some(2), "generation bumps 1 → 2");
+    }
+
+    /// Snapshots auto-increment per connection, are append-only, and are
+    /// tenant-scoped.
+    #[tokio::test]
+    async fn phase_c_tool_snapshots_versioned_and_scoped() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let slug_a = format!("t-{}", Uuid::now_v7().simple());
+        let slug_b = format!("t-{}", Uuid::now_v7().simple());
+        let org_a = identity::create_org(&pool, &slug_a, None).await.unwrap();
+        let org_b = identity::create_org(&pool, &slug_b, None).await.unwrap();
+        let scope_a = TenantScope::assume(org_a.id);
+        let scope_b = TenantScope::assume(org_b.id);
+
+        let conn = create_connection(
+            &pool,
+            scope_a,
+            "mcp_http",
+            "acct-snap",
+            "Snap conn",
+            None,
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            None,
+            ConnectionAuth::static_active(),
+            ConnectionOwner::Organization,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let s1 = insert_connection_tool_snapshot(
+            &pool,
+            scope_a,
+            conn.id,
+            1,
+            "2025-06-18",
+            &serde_json::json!([{"name": "t1"}]),
+            "digest-1",
+        )
+        .await
+        .unwrap();
+        let s2 = insert_connection_tool_snapshot(
+            &pool,
+            scope_a,
+            conn.id,
+            1,
+            "2025-06-18",
+            &serde_json::json!([{"name": "t2"}]),
+            "digest-2",
+        )
+        .await
+        .unwrap();
+        let latest = latest_connection_tool_snapshot(&pool, scope_a, conn.id)
+            .await
+            .unwrap();
+        let listed = list_connection_tool_snapshots(&pool, scope_a, conn.id)
+            .await
+            .unwrap();
+        let v1 = get_connection_tool_snapshot(&pool, scope_a, conn.id, 1)
+            .await
+            .unwrap();
+        // Append-only: a duplicate (tenant, connection, version) is rejected.
+        let dup = sqlx::query(
+            "insert into connection_tool_snapshots
+               (id, tenant_id, connection_id, snapshot_version, authorization_generation,
+                protocol_version, tools_json, tools_digest)
+             values ($1, $2, $3, 2, 1, 'p', '[]'::jsonb, 'd')",
+        )
+        .bind(Uuid::now_v7())
+        .bind(org_a.id)
+        .bind(conn.id)
+        .execute(&pool)
+        .await;
+        // Cross-tenant: B cannot read A's snapshots.
+        let latest_b = latest_connection_tool_snapshot(&pool, scope_b, conn.id)
+            .await
+            .unwrap();
+        let get_b = get_connection_tool_snapshot(&pool, scope_b, conn.id, 1)
+            .await
+            .unwrap();
+
+        cleanup_orgs(
+            &pool,
+            &[
+                "delete from connection_tool_snapshots where tenant_id = $1",
+                "delete from integration_connections where tenant_id = $1",
+            ],
+            &[org_a.id, org_b.id],
+        )
+        .await;
+
+        assert_eq!(s1.snapshot_version, 1, "first snapshot is version 1");
+        assert_eq!(
+            s2.snapshot_version, 2,
+            "version auto-increments per connection"
+        );
+        assert_eq!(latest.unwrap().snapshot_version, 2);
+        assert_eq!(listed.len(), 2, "list returns every version, newest first");
+        assert_eq!(listed[0].snapshot_version, 2);
+        assert_eq!(v1.unwrap().tools_digest, "digest-1");
+        assert!(
+            dup.is_err(),
+            "duplicate (tenant, connection, version) rejected"
+        );
+        assert!(latest_b.is_none(), "B cannot read A's snapshot (latest)");
+        assert!(get_b.is_none(), "B cannot read A's snapshot (by version)");
+    }
+
+    /// Bindings commit atomically with the session, are tenant-scoped, and the
+    /// authority/mcp CHECK constraints reject malformed shapes.
+    #[tokio::test]
+    async fn phase_c_run_resource_bindings_atomic_and_checks() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let slug_a = format!("t-{}", Uuid::now_v7().simple());
+        let slug_b = format!("t-{}", Uuid::now_v7().simple());
+        let org_a = identity::create_org(&pool, &slug_a, None).await.unwrap();
+        let org_b = identity::create_org(&pool, &slug_b, None).await.unwrap();
+        let scope_a = TenantScope::assume(org_a.id);
+        let scope_b = TenantScope::assume(org_b.id);
+
+        let mk_session = |scope: TenantScope, bindings: Vec<NewRunResourceBinding>| {
+            let pool = pool.clone();
+            async move {
+                let policy = upsert_policy(
+                    &pool,
+                    scope,
+                    "rb-policy",
+                    "name: rb",
+                    &serde_json::json!({"name":"rb"}),
+                )
+                .await
+                .unwrap();
+                let agent = create_agent(&pool, scope, "rb-agent", None).await.unwrap();
+                let rev = append_agent_revision(
+                    &pool,
+                    scope,
+                    agent.id,
+                    "claude-agent-sdk",
+                    "img:test",
+                    "claude-haiku-4-5",
+                    None,
+                    policy.id,
+                    &serde_json::json!({}),
+                    None,
+                    &serde_json::json!([]),
+                    &serde_json::json!([]),
+                )
+                .await
+                .unwrap();
+                create_session(
+                    &pool,
+                    scope,
+                    agent.id,
+                    rev.id,
+                    "supervised",
+                    "trusted",
+                    "rb",
+                    &serde_json::json!({"kind":"none"}),
+                    &serde_json::json!({}),
+                    &serde_json::json!({}),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &bindings,
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let conn = create_connection(
+            &pool,
+            scope_a,
+            "mcp_http",
+            "acct-rb",
+            "RB conn",
+            None,
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            None,
+            ConnectionAuth::static_active(),
+            ConnectionOwner::Organization,
+            None,
+        )
+        .await
+        .unwrap();
+        let snap = insert_connection_tool_snapshot(
+            &pool,
+            scope_a,
+            conn.id,
+            conn.authorization_generation,
+            "2025-06-18",
+            &serde_json::json!([{"name": "t1"}]),
+            "digest-1",
+        )
+        .await
+        .unwrap();
+
+        let mcp_binding = NewRunResourceBinding {
+            id: Uuid::now_v7(),
+            requirement_slot: "primary".into(),
+            slot_kind: "mcp".into(),
+            authority_kind: "connection".into(),
+            connection_id: Some(conn.id),
+            subscription_id: None,
+            authority_generation: Some(conn.authorization_generation),
+            connection_owner_type: Some(conn.owner_type.clone()),
+            connection_owner_user_id: conn.owner_user_id,
+            snapshot_version: Some(snap.snapshot_version),
+            effective_tools_json: Some(serde_json::json!([{"name": "t1"}])),
+            effective_tools_digest: Some("digest-1".into()),
+            resource_scope: serde_json::json!({}),
+            resolved_by_principal_kind: "operator".into(),
+            resolved_by_principal_id: None,
+            binding_mode: "organization".into(),
+        };
+        let session = mk_session(scope_a, vec![mcp_binding.clone()]).await;
+
+        // Atomic: the binding is present under A immediately after the session.
+        let a_bindings = session_resource_bindings(&pool, scope_a, session.id)
+            .await
+            .unwrap();
+        let by_id = get_run_resource_binding(&pool, scope_a, mcp_binding.id)
+            .await
+            .unwrap();
+        let found = find_session_binding(&pool, scope_a, session.id, "mcp", "primary")
+            .await
+            .unwrap();
+        // Cross-tenant: B cannot read A's binding.
+        let b_bindings = session_resource_bindings(&pool, scope_b, session.id)
+            .await
+            .unwrap();
+        let by_id_b = get_run_resource_binding(&pool, scope_b, mcp_binding.id)
+            .await
+            .unwrap();
+
+        // FK negative: a binding for another tenant's session is refused.
+        let session_b = mk_session(scope_b, vec![]).await;
+        let none_binding = |slot_kind: &str, authority_kind: &str| NewRunResourceBinding {
+            id: Uuid::now_v7(),
+            requirement_slot: "x".into(),
+            slot_kind: slot_kind.into(),
+            authority_kind: authority_kind.into(),
+            connection_id: None,
+            subscription_id: None,
+            authority_generation: None,
+            connection_owner_type: None,
+            connection_owner_user_id: None,
+            snapshot_version: None,
+            effective_tools_json: None,
+            effective_tools_digest: None,
+            resource_scope: serde_json::json!({}),
+            resolved_by_principal_kind: "system".into(),
+            resolved_by_principal_id: None,
+            binding_mode: "organization".into(),
+        };
+        let fk_bad = insert_run_resource_bindings(
+            &mut pool.acquire().await.unwrap(),
+            scope_a,
+            session_b.id,
+            &[none_binding("workspace_fetch", "none")],
+        )
+        .await;
+
+        // Shape CHECK negatives (each on a valid in-scope session):
+        // (a) mcp slot missing the snapshot fields.
+        let mut bad_mcp = mcp_binding.clone();
+        bad_mcp.id = Uuid::now_v7();
+        bad_mcp.snapshot_version = None;
+        bad_mcp.effective_tools_json = None;
+        bad_mcp.effective_tools_digest = None;
+        let shape_a = insert_run_resource_bindings(
+            &mut pool.acquire().await.unwrap(),
+            scope_a,
+            session.id,
+            &[bad_mcp],
+        )
+        .await;
+        // (b) connection authority missing its generation.
+        let mut bad_gen = mcp_binding.clone();
+        bad_gen.id = Uuid::now_v7();
+        bad_gen.requirement_slot = "wf".into();
+        bad_gen.slot_kind = "workspace_fetch".into();
+        bad_gen.snapshot_version = None;
+        bad_gen.effective_tools_json = None;
+        bad_gen.effective_tools_digest = None;
+        bad_gen.authority_generation = None;
+        let shape_b = insert_run_resource_bindings(
+            &mut pool.acquire().await.unwrap(),
+            scope_a,
+            session.id,
+            &[bad_gen],
+        )
+        .await;
+        // (c) none authority carrying a connection_id.
+        let mut bad_none = none_binding("workspace_fetch", "none");
+        bad_none.connection_id = Some(conn.id);
+        let shape_c = insert_run_resource_bindings(
+            &mut pool.acquire().await.unwrap(),
+            scope_a,
+            session.id,
+            &[bad_none],
+        )
+        .await;
+
+        cleanup_orgs(
+            &pool,
+            &[
+                "delete from run_resource_bindings where tenant_id = $1",
+                "delete from sessions where tenant_id = $1",
+                "delete from connection_tool_snapshots where tenant_id = $1",
+                "delete from integration_connections where tenant_id = $1",
+                "delete from agent_revisions where agent_id in (select id from agents where tenant_id = $1)",
+                "delete from agents where tenant_id = $1",
+                "delete from policies where tenant_id = $1",
+            ],
+            &[org_a.id, org_b.id],
+        )
+        .await;
+
+        assert_eq!(
+            a_bindings.len(),
+            1,
+            "the binding committed with the session"
+        );
+        assert_eq!(a_bindings[0].id, mcp_binding.id);
+        assert_eq!(a_bindings[0].authority_kind, "connection");
+        assert!(by_id.is_some(), "binding readable by id in scope");
+        assert!(found.is_some(), "binding found by (slot_kind, slot)");
+        assert!(b_bindings.is_empty(), "B cannot list A's bindings");
+        assert!(by_id_b.is_none(), "B cannot read A's binding by id");
+        assert!(
+            fk_bad.is_err(),
+            "binding for another tenant's session refused"
+        );
+        assert!(
+            shape_a.is_err(),
+            "mcp slot without snapshot fields rejected"
+        );
+        assert!(
+            shape_b.is_err(),
+            "connection authority without generation rejected"
+        );
+        assert!(
+            shape_c.is_err(),
+            "none authority with a connection_id rejected"
+        );
+    }
+
+    /// Custom catalog entries land tenant-scoped, are invisible to another org,
+    /// and cannot mask a global slug.
+    #[tokio::test]
+    async fn phase_c_catalog_custom_entries_tenant_scoped() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let slug_a = format!("t-{}", Uuid::now_v7().simple());
+        let slug_b = format!("t-{}", Uuid::now_v7().simple());
+        let org_a = identity::create_org(&pool, &slug_a, None).await.unwrap();
+        let org_b = identity::create_org(&pool, &slug_b, None).await.unwrap();
+        let scope_a = TenantScope::assume(org_a.id);
+        let scope_b = TenantScope::assume(org_b.id);
+
+        let entry_slug = format!("xt-cat-{}", Uuid::now_v7().simple());
+        let created = create_catalog_entry(
+            &pool,
+            scope_a,
+            &entry_slug,
+            "Tenant custom",
+            None,
+            None,
+            &serde_json::json!([]),
+            Some("https://mcp.example.test/mcp"),
+            "streamable_http",
+            "none",
+            &serde_json::json!({}),
+            &serde_json::json!([]),
+            &serde_json::json!([]),
+            &serde_json::json!([]),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let a_sees = get_catalog_by_slug(&pool, scope_a, &entry_slug)
+            .await
+            .unwrap();
+        let b_sees = get_catalog_by_slug(&pool, scope_b, &entry_slug)
+            .await
+            .unwrap();
+        let a_list = list_catalog(&pool, scope_a).await.unwrap();
+        let b_list = list_catalog(&pool, scope_b).await.unwrap();
+        // A custom slug colliding with a GLOBAL seed ('github') is refused.
+        let collision = create_catalog_entry(
+            &pool,
+            scope_a,
+            "github",
+            "Shadow",
+            None,
+            None,
+            &serde_json::json!([]),
+            Some("https://evil.example.test/mcp"),
+            "streamable_http",
+            "none",
+            &serde_json::json!({}),
+            &serde_json::json!([]),
+            &serde_json::json!([]),
+            &serde_json::json!([]),
+            None,
+        )
+        .await
+        .unwrap();
+
+        cleanup_orgs(
+            &pool,
+            &["delete from connector_catalog where tenant_id = $1"],
+            &[org_a.id, org_b.id],
+        )
+        .await;
+
+        let created = created.expect("custom entry lands");
+        assert_eq!(created.tenant_id, Some(org_a.id));
+        assert!(a_sees.is_some(), "A sees its own custom entry");
+        assert!(b_sees.is_none(), "B cannot see A's custom entry");
+        assert!(
+            a_list.iter().any(|c| c.slug == entry_slug),
+            "A's list includes its custom entry"
+        );
+        assert!(
+            !b_list.iter().any(|c| c.slug == entry_slug),
+            "B's list excludes A's custom entry"
+        );
+        assert!(collision.is_none(), "a global-slug collision is refused");
     }
 }
