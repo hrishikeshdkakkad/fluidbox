@@ -255,7 +255,10 @@ async fn principal_from_bearer(state: &AppState, token: &str) -> Result<Principa
         let auth = fluidbox_db::identity::resolve_pat(&state.pool, token)
             .await?
             .ok_or(ApiError::Unauthorized)?;
-        if auth.membership_status != "active" || auth.tenant_status != "active" {
+        if auth.membership_status != "active"
+            || auth.user_status != "active"
+            || auth.tenant_status != "active"
+        {
             return Err(ApiError::Unauthorized);
         }
         return Ok(Principal::User(UserPrincipal {

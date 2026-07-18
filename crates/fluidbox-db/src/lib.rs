@@ -16,21 +16,27 @@ pub mod seed;
 pub mod system_worker;
 
 /// A verified tenant context. Constructible ONLY via [`TenantScope::assume`],
-/// which a caller may invoke only when it genuinely holds a verified tenant
-/// identity — an authenticated principal's tenant, a `tenant_id` read back
-/// from a DB row, the boot seed, or one of the two documented pre-auth
-/// bootstrap exceptions (the login callback's sealed-`state` tenant and the
-/// session-switch confirmation cookie). Every identity repository takes it
-/// right after the executor and carries its id into a `tenant_id = $n`
-/// predicate, so tenant isolation is a signature requirement, not a
-/// remember-to-filter convention.
+/// which a caller may invoke only when it holds — or has just resolved — a
+/// verified tenant identity: an authenticated principal's own tenant, or a
+/// `tenant_id` read back from a DB row. The non-principal constructions are a
+/// closed, documented set (design doc
+/// `docs/plans/2026-07-17-idp-agnostic-identity-design.md`): (a) verified-
+/// credential resolution — the two credential-like exceptions, keyed purely on
+/// a secret digest (session/PAT token sha256; the pending-switch confirmation-
+/// cookie hash); (b) DB-resolved worker rows (the `system_worker` cross-tenant
+/// scans, each row carrying its own `tenant_id`); (c) design-mandated pre-auth
+/// surfaces that expose no tenant-owned resource — slug → org routing for
+/// login-flow creation only, and the operator org-CRUD endpoints; (d) the boot
+/// seed. Every identity repository takes it right after the executor and
+/// carries its id into a `tenant_id = $n` predicate, so tenant isolation is a
+/// signature requirement, not a remember-to-filter convention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TenantScope(Uuid);
 
 impl TenantScope {
-    /// Assert a verified tenant context. See the type docs for the (short)
-    /// set of callers permitted to do so — do NOT call this with a tenant id
-    /// the browser supplied.
+    /// Assert a verified tenant context. See the type docs for the documented
+    /// set of constructions permitted to do so — do NOT call this with a
+    /// tenant id the browser supplied.
     pub fn assume(tenant_id: Uuid) -> Self {
         Self(tenant_id)
     }

@@ -82,6 +82,10 @@ pub struct UserRow {
     pub last_login_at: Option<DateTime<Utc>>,
 }
 
+const USER_COLS: &str = "id, tenant_id, idp_config_id, subject, email, \
+    email_normalized, email_verified, name, status, created_at, updated_at, \
+    last_login_at";
+
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct OrgMembershipRow {
     pub id: Uuid,
@@ -93,6 +97,9 @@ pub struct OrgMembershipRow {
     pub updated_at: DateTime<Utc>,
     pub deactivated_at: Option<DateTime<Utc>>,
 }
+
+const MEMBERSHIP_COLS: &str = "id, tenant_id, user_id, roles, status, \
+    created_at, updated_at, deactivated_at";
 
 /// Non-secret projection of a `login_flows` row (omits `pkce_verifier_sealed`);
 /// the sealed verifier is surfaced ONLY by [`claim_login_flow`] into a
@@ -140,6 +147,10 @@ pub struct UserSessionRow {
     pub absolute_expires_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
 }
+
+const USER_SESSION_COLS: &str = "id, tenant_id, membership_id, user_id, \
+    session_token_sha256, idp_config_id, acr, amr, auth_time, idp_sid, \
+    created_at, last_seen_at, idle_expires_at, absolute_expires_at, revoked_at";
 
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct PendingLoginSwitchRow {
@@ -209,8 +220,9 @@ pub struct WebSessionAuth {
 }
 
 /// The joined result of resolving a PAT: the token plus its live membership
-/// (status + roles) and tenant status. The caller refuses a non-`active`
-/// membership OR a non-`active` tenant (fail-closed, in one place).
+/// (status + roles), user status, and tenant status. The caller refuses a
+/// non-`active` membership, user, OR tenant (fail-closed, in one place) —
+/// symmetric with [`WebSessionAuth`].
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct PatAuth {
     pub token_id: Uuid,
@@ -220,6 +232,7 @@ pub struct PatAuth {
     pub user_id: Uuid,
     pub roles: Vec<String>,
     pub membership_status: String,
+    pub user_status: String,
 }
 
 /// One `auth_audit_log` row's worth of input. `tenant_id` is `None` for
@@ -557,15 +570,15 @@ pub async fn mint_user_session(
     idle_secs: i64,
     absolute_secs: i64,
 ) -> sqlx::Result<UserSessionRow> {
-    sqlx::query_as(
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "insert into user_sessions
            (id, tenant_id, membership_id, user_id, session_token_sha256, idp_config_id,
             acr, amr, auth_time, idp_sid, idle_expires_at, absolute_expires_at)
          values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                  now() + make_interval(secs => $11::double precision),
                  now() + make_interval(secs => $12::double precision))
-         returning *",
-    )
+         returning {USER_SESSION_COLS}"
+    )))
     .bind(Uuid::now_v7())
     .bind(scope.tenant_id())
     .bind(membership_id)
@@ -624,7 +637,7 @@ pub async fn resolve_web_session(
 }
 
 /// Is this browser session still authorized RIGHT NOW — not revoked, within
-/// both expiries, membership + tenant still active? Read-only and it does NOT
+/// both expiries, membership + user + tenant still active? Read-only and it does NOT
 /// bump idle (design lines 658-664: the bounded stream re-auth must not extend
 /// a session's life). Keyed on the session id under its verified scope.
 pub async fn web_session_live(
@@ -637,12 +650,14 @@ pub async fn web_session_live(
            select 1 from user_sessions s
            join org_memberships m
              on m.tenant_id = s.tenant_id and m.id = s.membership_id and m.user_id = s.user_id
+           join users u on u.tenant_id = s.tenant_id and u.id = s.user_id
            join tenants t on t.id = s.tenant_id
            where s.tenant_id = $1 and s.id = $2
              and s.revoked_at is null
              and s.idle_expires_at > now()
              and s.absolute_expires_at > now()
              and m.status = 'active'
+             and u.status = 'active'
              and t.status = 'active')",
     )
     .bind(scope.tenant_id())
@@ -723,21 +738,24 @@ pub async fn mint_pat(
 }
 
 /// Resolve a PAT (bootstrap exception: keys on the token sha256) and bump
-/// `last_used_at`. Joins the membership for its live status + roles; a
-/// deactivated membership's PATs are already revoked by the cascade, so this
-/// matches only live tokens and the returned status is defense in depth.
+/// `last_used_at`. Joins the membership for its live status + roles, the user
+/// for its status, and the tenant for its status; a deactivated membership's
+/// PATs are already revoked by the cascade, so this matches only live tokens
+/// and the returned statuses are defense in depth (symmetric with
+/// [`resolve_web_session`]).
 pub async fn resolve_pat(pool: &PgPool, token_plain: &str) -> sqlx::Result<Option<PatAuth>> {
     sqlx::query_as(
         "update api_tokens tok set last_used_at = now()
-         from org_memberships m, tenants t
+         from org_memberships m, users u, tenants t
          where tok.kind = 'pat' and tok.token_sha256 = $1
            and tok.revoked_at is null
            and tok.expires_at > now()
            and m.tenant_id = tok.tenant_id and m.id = tok.membership_id and m.user_id = tok.user_id
+           and u.tenant_id = tok.tenant_id and u.id = tok.user_id
            and t.id = tok.tenant_id
          returning tok.id as token_id, tok.tenant_id as tenant_id, t.status as tenant_status,
                    tok.membership_id as membership_id, tok.user_id as user_id,
-                   m.roles as roles, m.status as membership_status",
+                   m.roles as roles, m.status as membership_status, u.status as user_status",
     )
     .bind(sha256_hex(token_plain))
     .fetch_optional(pool)
@@ -830,21 +848,25 @@ pub async fn get_user(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<UserRow>> {
-    sqlx::query_as("select * from users where tenant_id = $1 and id = $2")
-        .bind(scope.tenant_id())
-        .bind(id)
-        .fetch_optional(pool)
-        .await
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "select {USER_COLS} from users where tenant_id = $1 and id = $2"
+    )))
+    .bind(scope.tenant_id())
+    .bind(id)
+    .fetch_optional(pool)
+    .await
 }
 
 pub async fn list_memberships(
     pool: &PgPool,
     scope: TenantScope,
 ) -> sqlx::Result<Vec<OrgMembershipRow>> {
-    sqlx::query_as("select * from org_memberships where tenant_id = $1 order by created_at")
-        .bind(scope.tenant_id())
-        .fetch_all(pool)
-        .await
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "select {MEMBERSHIP_COLS} from org_memberships where tenant_id = $1 order by created_at"
+    )))
+    .bind(scope.tenant_id())
+    .fetch_all(pool)
+    .await
 }
 
 pub async fn get_membership(
@@ -852,11 +874,13 @@ pub async fn get_membership(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<OrgMembershipRow>> {
-    sqlx::query_as("select * from org_memberships where tenant_id = $1 and id = $2")
-        .bind(scope.tenant_id())
-        .bind(id)
-        .fetch_optional(pool)
-        .await
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "select {MEMBERSHIP_COLS} from org_memberships where tenant_id = $1 and id = $2"
+    )))
+    .bind(scope.tenant_id())
+    .bind(id)
+    .fetch_optional(pool)
+    .await
 }
 
 /// Executor-generic core of a status change + its deactivation cascade. When the
@@ -869,14 +893,14 @@ async fn apply_membership_status(
     id: Uuid,
     status: &str,
 ) -> sqlx::Result<Option<OrgMembershipRow>> {
-    let row: Option<OrgMembershipRow> = sqlx::query_as(
+    let row: Option<OrgMembershipRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update org_memberships
          set status = $3,
              deactivated_at = case when $3 = 'deactivated' then now() else deactivated_at end,
              updated_at = now()
          where tenant_id = $1 and id = $2
-         returning *",
-    )
+         returning {MEMBERSHIP_COLS}"
+    )))
     .bind(scope.tenant_id())
     .bind(id)
     .bind(status)
@@ -1651,10 +1675,10 @@ pub async fn set_membership_roles_audited(
         // Empty for a single-admin org with no IdP configs — no bootstrap race.
         lock_org_configs(&mut tx, scope).await?;
     }
-    let row: Option<OrgMembershipRow> = sqlx::query_as(
+    let row: Option<OrgMembershipRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update org_memberships set roles = $3, updated_at = now()
-         where tenant_id = $1 and id = $2 returning *",
-    )
+         where tenant_id = $1 and id = $2 returning {MEMBERSHIP_COLS}"
+    )))
     .bind(scope.tenant_id())
     .bind(id)
     .bind(roles.to_vec())
@@ -2890,13 +2914,27 @@ mod tests {
 
         let token = "fbx_web_mig";
         let mut conn = pool.acquire().await.unwrap();
-        mint_user_session(
+        let sess = mint_user_session(
             &mut conn, scope, membership, user, old.id, token, None, None, None, None, 3_600,
             100_000,
         )
         .await
         .unwrap();
+        // A pending switch on the OLD config (references that session) — the
+        // swap's cascade must cancel it alongside the flow + session.
+        let switch_bh = sha256_hex("mig-switch");
+        let switch_id = create_pending_switch(
+            &mut conn, scope, old.id, membership, user, org.id, sess.id, "/", &switch_bh, None,
+            None, None,
+        )
+        .await
+        .unwrap();
         drop(conn);
+        // An unconsumed login flow on the OLD config.
+        let flow_bh = sha256_hex("mig-flow");
+        let flow_id = create_login_flow(pool, scope, old.id, &[1], "mig-flow", &flow_bh, "/", 600)
+            .await
+            .unwrap();
         let pat_plain = "fbx_pat_migrate0000";
         mint_pat(
             pool,
@@ -2919,6 +2957,36 @@ mod tests {
             _ => panic!("migrate must succeed"),
         };
         assert_eq!(counts.sessions_revoked, 1, "old-config session revoked");
+        // The unconsumed flow + pending switch on the old config are both
+        // counted (rows_affected on `consumed_at is null`) AND actually
+        // cancelled — each is now unclaimable.
+        assert_eq!(counts.flows_cancelled, 1, "old-config login flow cancelled");
+        assert_eq!(
+            counts.switches_cancelled, 1,
+            "old-config pending switch cancelled"
+        );
+        assert!(
+            claim_login_flow(pool, flow_id, org.id, old.id, &flow_bh)
+                .await
+                .unwrap()
+                .is_none(),
+            "cancelled flow is unclaimable"
+        );
+        assert!(
+            claim_pending_switch(
+                pool,
+                switch_id,
+                &switch_bh,
+                token,
+                "fbx_web_mig_new",
+                3_600,
+                100_000
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "cancelled switch is unclaimable"
+        );
 
         // Old retired, new active.
         assert_eq!(
@@ -3021,6 +3089,86 @@ mod tests {
         ));
         let after = get_idp_config(&pool, scope, cfg.id).await.unwrap().unwrap();
         assert_eq!(after.bootstrap_owner_email.as_deref(), Some(email));
+
+        cleanup_tenant(&pool, org.id).await;
+    }
+
+    /// An EXPIRED bootstrap arm is still consumed (single winner) but grants no
+    /// owner role. The promote/reject arithmetic itself lives inline in
+    /// `login::provision` (transaction B) and is not callable from fluidbox-db,
+    /// so this replays the exact DB steps it drives — `lock_idp_config_for_update`
+    /// (captures the pre-UPDATE expiry) → `consume_bootstrap_arm` → the
+    /// `was_unexpired && !owner_exists` promote guard — and asserts BOTH the
+    /// consumption (arm cleared) AND that no owner role was granted.
+    #[tokio::test]
+    async fn bootstrap_arm_expired_consumes_without_promoting() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let slug = format!("t-{}", Uuid::now_v7().simple());
+        let org = create_org(&pool, &slug, None).await.unwrap();
+        let scope = TenantScope::assume(org.id);
+        // staged_config arms bootstrap_owner_email = owner@example.com (expiry NULL).
+        let cfg = staged_config(&pool, scope).await;
+        activate(&pool, cfg.id).await;
+        // Age the arm into the past.
+        sqlx::query(
+            "update org_idp_configs
+             set bootstrap_owner_expires_at = now() - interval '1 hour'
+             where id = $1",
+        )
+        .bind(cfg.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The matching identity: seed_user_membership sets email owner@example.com.
+        let (_user, membership) = seed_user_membership(&pool, scope, cfg.id, "owner").await;
+
+        // Replay transaction B's bootstrap decision through the public fns.
+        let mut tx = pool.begin().await.unwrap();
+        let locked = lock_idp_config_for_update(&mut tx, scope, cfg.id)
+            .await
+            .unwrap()
+            .expect("config locks");
+        // A matching arm is ALWAYS consumed (single winner), expired or not.
+        assert!(
+            consume_bootstrap_arm(&mut tx, scope, cfg.id, "owner@example.com")
+                .await
+                .unwrap()
+                .is_some(),
+            "matching arm is consumed"
+        );
+        // The captured pre-UPDATE expiry proves the arm was expired…
+        let was_unexpired = locked
+            .bootstrap_owner_expires_at
+            .map(|e| e > Utc::now())
+            .unwrap_or(false);
+        assert!(!was_unexpired, "aged arm reads expired");
+        let owner_exists = active_owner_exists(&mut tx, scope).await.unwrap();
+        assert!(!owner_exists, "no active owner before the decision");
+        // …so the decision is reject_and_consume: promote fires only when
+        // `was_unexpired && !owner_exists`, which is false here — no owner grant.
+        let would_promote = was_unexpired && !owner_exists;
+        assert!(!would_promote, "expired arm never promotes");
+        tx.commit().await.unwrap();
+
+        // The arm is cleared (consumed) and no owner role was granted.
+        let after = get_idp_config(&pool, scope, cfg.id).await.unwrap().unwrap();
+        assert!(
+            after.bootstrap_owner_email.is_none(),
+            "arm consumed (cleared)"
+        );
+        assert!(after.bootstrap_owner_expires_at.is_none());
+        let m = get_membership(&pool, scope, membership)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !m.roles.contains(&"owner".to_string()),
+            "expired arm grants no owner role"
+        );
 
         cleanup_tenant(&pool, org.id).await;
     }
