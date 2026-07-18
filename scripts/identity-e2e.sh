@@ -561,12 +561,16 @@ say "(k) Issuer migration — mid-flight login fails closed; old session dies"
 # barriered from outside the process (no HTTP seam pauses B mid-transaction); it
 # is guaranteed instead by the shared `FOR UPDATE` config lock both take
 # (login's `lock_idp_config_for_update` vs the swap's `lock_org_configs`) and is
-# proven directly in fluidbox-db by two interleaving tests (identity.rs):
-# `migration_and_login_b_serialize_on_config_lock` (login-B holds the config lock
-# → a concurrent migrate BLOCKS on a 500ms timeout until B commits, then swaps;
-# and the reverse — a post-swap B status recheck on the now-retired config is
-# refused) and `concurrent_bootstrap_arm_has_a_single_winner` (two logins race
-# the consume-arm UPDATE → exactly one wins). No new test code here.
+# proven directly in fluidbox-db by two interleaving tests (identity.rs): the
+# B-interleaving case by `migration_and_login_b_serialize_on_config_lock`
+# (login-B holds the config lock → a concurrent migrate BLOCKS on a 500ms timeout
+# until B commits, then swaps; and the reverse — a post-swap B status recheck on
+# the now-retired config is refused), and the switch-interleaving case by
+# `migration_and_switch_claim_serialize_on_config_lock` (a swap holds the config
+# lock → a concurrent switch-claim BLOCKS then fails closed against the retired
+# config, keeping the original session; and the reverse — a claim that commits
+# first mints a new session which the subsequent swap revokes). No new test code
+# here.
 # A FRESH alice/config1 session (alice's membership is still active — the switch
 # only revoked one of her sessions, jarA's shared token). This one proves the
 # swap revokes config1 sessions.
@@ -704,6 +708,21 @@ print(rows[0]['membership_id'] if rows else '')" 2>/dev/null)
   if [ "$CLOSED" = 1 ]; then wait "$SSE_PID"; SSE_RC=$?; else kill "$SSE_PID" 2>/dev/null; wait "$SSE_PID" 2>/dev/null; SSE_RC=$?; fi
   echo "    (alice SSE curl exit code: $SSE_RC)"
   [ "$CLOSED" = 1 ] && ok "alice's SSE stream closed within the re-auth interval after deactivation" || no "alice's SSE stream did NOT close within ~6s (curl rc=$SSE_RC)"
+  # Assert the TRANSPORT outcome too — SSE_RC was captured/printed but never
+  # checked, so a nonzero transport failure AFTER establishment (a crash: rc=7
+  # connection refused, rc=28 timeout, rc=52 empty reply) would still pass. On a
+  # clean deactivation the server closes the stream server-side: empirically
+  # `curl -N` exits 0 on a clean stream close, and 18 (CURLE_PARTIAL_FILE —
+  # "transfer closed with outstanding read data remaining") is equally legitimate
+  # when the close lands mid-chunk. Accept exactly {0,18}; anything else is a real
+  # transport failure. Only meaningful on a NATURAL close (CLOSED=1) — the kill
+  # branch's rc reflects our SIGTERM and the line above already failed.
+  if [ "$CLOSED" = 1 ]; then
+    case "$SSE_RC" in
+      0|18) ok "alice's SSE curl exited cleanly on the server-side close (rc=$SSE_RC ∈ {0,18})" ;;
+      *)    no "alice's SSE curl exited $SSE_RC (want 0 or 18 for a server-closed stream — transport failure?)" ;;
+    esac
+  fi
 
   # (c) The control (carol, still active) stream must STILL be open — proving the
   # close was caused by alice's deactivation, not a short-lived / globally-capped

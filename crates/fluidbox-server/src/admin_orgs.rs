@@ -21,8 +21,9 @@ use crate::auth::Admin;
 use crate::error::{ApiError, ApiResult};
 use crate::login;
 use crate::state::AppState;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{ConnectInfo, Path, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use chrono::{DateTime, Duration, Utc};
 use fluidbox_db::identity::{self, IdpConfigParams, IdpPatch, LifecycleOutcome};
@@ -429,6 +430,36 @@ async fn refuse(
     err
 }
 
+/// Unwrap a JSON body whose extractor rejection was DEFERRED into a `Result`
+/// (handler body param `Result<Json<Value>, JsonRejection>`), auditing the
+/// rejection HERE. Malformed JSON syntax or a missing content-type is otherwise
+/// refused by the `Json` extractor BEFORE the handler runs, bypassing rejection
+/// auditing. On a rejection we record `action` + a terse class (never the
+/// unparseable body) and return an error PRESERVING the rejection's status
+/// (400 malformed syntax / 415 missing content-type) in the standard envelope.
+async fn body_or_reject(
+    state: &AppState,
+    tenant_id: Option<Uuid>,
+    source_ip: Option<&str>,
+    action: &str,
+    target: Option<&str>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> ApiResult<Value> {
+    match body {
+        Ok(Json(raw)) => Ok(raw),
+        Err(rej) => {
+            let status = rej.status();
+            let class = if status == StatusCode::UNSUPPORTED_MEDIA_TYPE {
+                "unsupported content-type (want application/json)"
+            } else {
+                "malformed request body"
+            };
+            reject_audit(state, tenant_id, source_ip, action, target, class).await;
+            Err(ApiError::Rejected(status, class.to_string()))
+        }
+    }
+}
+
 // ─── Orgs ─────────────────────────────────────────────────────────────────────
 
 pub async fn create_org(
@@ -436,11 +467,12 @@ pub async fn create_org(
     headers: HeaderMap,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
-    Json(raw): Json<Value>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> ApiResult<Json<Value>> {
     let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
-    // Deserialize INSIDE the handler (body is `Json<Value>`, not `Json<T>`) so a
-    // malformed body is audited + 400'd here, not silently rejected by the axum
+    let raw = body_or_reject(&state, None, sip.as_deref(), "org.create", None, body).await?;
+    // Deserialize INSIDE the handler (the body is a raw `Value`, not `Json<T>`) so
+    // a malformed body is audited + 400'd here, not silently rejected by the axum
     // extractor before the handler runs.
     let body: CreateOrgBody = match serde_json::from_value(raw) {
         Ok(b) => b,
@@ -697,11 +729,20 @@ pub async fn create_idp(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Path(slug): Path<String>,
-    Json(raw): Json<Value>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> ApiResult<Json<Value>> {
     let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
     let org = resolve_org_audited(&state, sip.as_deref(), "idp.create", &slug).await?;
     let scope = TenantScope::assume(org.id);
+    let raw = body_or_reject(
+        &state,
+        Some(org.id),
+        sip.as_deref(),
+        "idp.create",
+        None,
+        body,
+    )
+    .await?;
     let body: CreateIdpBody = match serde_json::from_value(raw) {
         Ok(b) => b,
         Err(e) => {
@@ -815,11 +856,20 @@ pub async fn patch_idp(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Path((slug, id)): Path<(String, Uuid)>,
-    Json(raw): Json<Value>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> ApiResult<Json<Value>> {
     let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
     let org = resolve_org_audited(&state, sip.as_deref(), "idp.patch", &slug).await?;
     let scope = TenantScope::assume(org.id);
+    let raw = body_or_reject(
+        &state,
+        Some(org.id),
+        sip.as_deref(),
+        "idp.patch",
+        Some(&id.to_string()),
+        body,
+    )
+    .await?;
     let config = match identity::get_idp_config(&state.pool, scope, id).await? {
         Some(c) => c,
         None => {
@@ -865,7 +915,10 @@ pub async fn patch_idp(
                 ))
                 .await);
             }
-            let meta = config_discovery_meta(&state, &config).await?;
+            let meta = match config_discovery_meta(&state, &config).await {
+                Ok(m) => m,
+                Err(e) => return Err(bad(e).await),
+            };
             if !auth_method_supported(a, &meta) {
                 return Err(bad(ApiError::BadRequest(format!(
                     "token_endpoint_auth={a} is not advertised by the issuer"
@@ -961,11 +1014,20 @@ pub async fn migrate_idp(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Path((slug, id)): Path<(String, Uuid)>,
-    Json(raw): Json<Value>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> ApiResult<Json<Value>> {
     let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
     let org = resolve_org_audited(&state, sip.as_deref(), "idp.migrate", &slug).await?;
     let scope = TenantScope::assume(org.id);
+    let raw = body_or_reject(
+        &state,
+        Some(org.id),
+        sip.as_deref(),
+        "idp.migrate",
+        Some(&id.to_string()),
+        body,
+    )
+    .await?;
     let body: MigrateBody = match serde_json::from_value(raw) {
         Ok(b) => b,
         Err(e) => {
@@ -1057,11 +1119,20 @@ pub async fn break_glass_owner(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Path(slug): Path<String>,
-    Json(raw): Json<Value>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> ApiResult<Json<Value>> {
     let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
     let org = resolve_org_audited(&state, sip.as_deref(), "break_glass.arm", &slug).await?;
     let scope = TenantScope::assume(org.id);
+    let raw = body_or_reject(
+        &state,
+        Some(org.id),
+        sip.as_deref(),
+        "break_glass.arm",
+        None,
+        body,
+    )
+    .await?;
     let body: BreakGlassBody = match serde_json::from_value(raw) {
         Ok(b) => b,
         Err(e) => {
@@ -1172,11 +1243,20 @@ pub async fn set_member_roles(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Path((slug, membership_id)): Path<(String, Uuid)>,
-    Json(raw): Json<Value>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> ApiResult<Json<Value>> {
     let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
     let org = resolve_org_audited(&state, sip.as_deref(), "member.roles", &slug).await?;
     let scope = TenantScope::assume(org.id);
+    let raw = body_or_reject(
+        &state,
+        Some(org.id),
+        sip.as_deref(),
+        "member.roles",
+        Some(&membership_id.to_string()),
+        body,
+    )
+    .await?;
     let body: RolesBody = match serde_json::from_value(raw) {
         Ok(b) => b,
         Err(e) => {
