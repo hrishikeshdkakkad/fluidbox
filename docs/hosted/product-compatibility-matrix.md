@@ -14,7 +14,7 @@ This matrix defines what the hosted, multi-user fluidbox deployment (~300 seats)
 | **Deferred** | Deliberately out of v1; requires its own security/UX design before any support (parent design, Non-goals) |
 | **Never** | Permanently outside the product boundary; a design change here is a rewrite of the security model |
 
-Phase labels (B–F) refer to the parent design's implementation sequence.
+Phase labels (B–F) refer to the parent design's implementation sequence; a **shipped** qualifier marks a phase already delivered on `main` (Phase B — identity + tenant enforcement — is shipped; C–F remain target-state).
 
 ## MCP protocol surface
 
@@ -122,10 +122,10 @@ Per-organization, IdP-agnostic OIDC (identity design v5). fluidbox is a generic 
 
 | Capability | Status | Notes |
 |---|---|---|
-| Per-org OIDC login (`/v1/auth/*`) | **Supported (Phase B)** | Org-slug URLs; one stable callback; one-time browser-bound `login_flows`; server-side sessions (`__Host-fbx_web` cookie, `fbx_web_` token prefix). |
-| JIT provisioning with claim→role mapping | **Supported (Phase B)** | `sub` is never mappable; `owner` never minted from IdP claims absent explicit operator opt-in. |
-| Personal API tokens (`fbx_pat_`) | **Supported (Phase B)** | Browser-session-minted only; a PAT can never mint/extend/revoke PATs; 90-day default TTL, 1-year max; membership rechecked on every use. |
-| Break-glass / bootstrap | **Supported (Phase B)** | The operator admin token on the explicit `/v1/admin/*` surface; single-winner first-owner claim; fully audited. |
+| Per-org OIDC login (`/v1/auth/*`) | **Supported (shipped, Phase B)** | Org-slug URLs; one stable callback; one-time browser-bound `login_flows`; server-side sessions (`__Host-fbx_web` cookie, `fbx_web_` token prefix). |
+| JIT provisioning with claim→role mapping | **Supported (shipped, Phase B)** | `sub` is never mappable; `owner` never minted from IdP claims absent explicit operator opt-in. |
+| Personal API tokens (`fbx_pat_`) | **Supported (shipped, Phase B)** | Browser-session-minted only; a PAT can never mint/extend/revoke PATs; 90-day default TTL, 1-year max; membership rechecked on every use. |
+| Break-glass / bootstrap | **Supported (shipped, Phase B)** | The operator admin token on the explicit `/v1/admin/*` surface; single-winner first-owner claim; fully audited. |
 | Single-admin mode (no IdP configured) | **Supported (unchanged)** | Multi-user is derived per organization, but the proxy's credential mode is static per deployment: in a local/dev deployment running `FLUIDBOX_WEB_MODE=admin`, today's admin-token behavior continues exactly. In a hosted `sso` deployment the proxy carries no admin token at all — IdP-less organizations there are reachable only through bearer-authenticated `/v1/admin/*` routes, never the browser. |
 | SAML | **Never (directly)** | SAML-only enterprises bridge via Dex/Keycloak on their side. |
 | Password store / MFA enforcement / account recovery | **Never** | The IdP owns authentication; fluidbox owns sessions and authorization. `acr`/`amr` are recorded; assurance is derived only from operator-configured mappings. |
@@ -141,8 +141,8 @@ All entry points converge on the same governed run path (`run_service::create_ru
 
 | Entry point | Principal | Status |
 |---|---|---|
-| Dashboard | User (browser session) | **Supported (Phase B)** — today via the admin-token proxy |
-| Authenticated API / CLI | User (PAT) | **Supported (Phase B)** |
+| Dashboard | User (browser session) | **Supported (shipped, Phase B)** — browser session in `sso` mode; the `admin`-mode proxy injects the admin token for local/single-admin deployments |
+| Authenticated API / CLI | User (PAT) | **Supported (shipped, Phase B)** |
 | API trigger (`POST /v1/triggers/{id}/invoke`) | Trigger token (subscription-scoped) | **Supported** — a trigger token can poll only the runs it created |
 | Webhook (`/v1/ingress/*`) | Webhook (signature-verified) | **Supported** — HMAC is the authentication: against the connection's sealed secret, or the GitHub App registration's sealed secret on the App-level ingress path |
 | Schedule | Schedule principal | **Supported** — exactly-once firing via deterministic idempotency claims |
