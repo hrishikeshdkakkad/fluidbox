@@ -9,12 +9,20 @@
 //
 // route.ts imports these; behavior is byte-for-byte what it had inline.
 
-/** The deployment credential mode. Only the exact string "sso" selects
- *  cookie-passthrough; anything else — including undefined and unrecognized
- *  values — is the admin-token shell. Fails toward admin, which is the
- *  single-tenant default, never toward leaking a hosted session boundary. */
+/** The deployment credential mode, chosen ONLY by FLUIDBOX_WEB_MODE.
+ *
+ *  Unset/absent (undefined or "") stays "admin" — the documented local default.
+ *  "admin" and "sso" select their modes. ANY OTHER value THROWS: a hosted typo
+ *  ("SSO", "prod", "ssoo") must fail loudly at module load rather than silently
+ *  degrade to the admin-token shell (which would leak operator authority into a
+ *  multi-user deployment). route.ts resolves this at module scope, so a bad
+ *  value takes the whole proxy down instead of quietly serving admin. */
 export function webMode(env: string | undefined): "admin" | "sso" {
-  return env === "sso" ? "sso" : "admin";
+  if (env === undefined || env === "") return "admin";
+  if (env === "admin" || env === "sso") return env;
+  throw new Error(
+    `FLUIDBOX_WEB_MODE must be "admin" or "sso" (got ${JSON.stringify(env)})`
+  );
 }
 
 /** Cookies the browser may forward to the control plane in sso mode.

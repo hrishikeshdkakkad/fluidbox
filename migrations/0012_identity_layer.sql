@@ -55,6 +55,8 @@ create table org_idp_configs (
     claim_mappings              jsonb not null,
     bootstrap_owner_email       text,                        -- one-time first-owner; nulled on use
     bootstrap_owner_expires_at  timestamptz,
+    bootstrap_arm_audit_id      uuid,                        -- the arming audit row's id;
+                                -- consumption references it (arm_id) and clears it with the arm
     discovered_metadata         jsonb,                       -- cached RFC 8414/OIDC discovery
     jwks                        jsonb,                       -- cached signing keys
     discovered_at               timestamptz,
