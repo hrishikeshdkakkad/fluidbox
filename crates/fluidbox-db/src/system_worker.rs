@@ -13,6 +13,14 @@
 //! touching any tenant-scoped repository. Nothing here decides authorization
 //! — they are the trusted entry point that resolves which tenant a bare id
 //! belongs to, never a bypass of the scoped surface.
+//!
+//! These DB-resolved worker rows are just ONE of the documented ways a
+//! [`TenantScope`](crate::TenantScope) is constructed without a principal
+//! credential — see its type docs for the full, precise set (the two
+//! credential-like exceptions keyed on a token/cookie digest; design-mandated
+//! pre-auth org routing for login-flow creation plus the operator org-CRUD
+//! surfaces; and the boot seed). None expose a tenant-owned resource without a
+//! verified tenant id.
 
 use crate::approval_cols;
 use crate::{
