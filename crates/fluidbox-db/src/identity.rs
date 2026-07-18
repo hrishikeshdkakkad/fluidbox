@@ -17,7 +17,8 @@
 
 use crate::{sha256_hex, TenantScope};
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde_json::{json, Value};
+use sqlx::error::DatabaseError;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -250,6 +251,11 @@ pub struct IdpConfigParams<'a> {
     pub bootstrap_owner_email: Option<&'a str>,
     pub bootstrap_owner_expires_at: Option<DateTime<Utc>>,
     pub created_by: Option<&'a str>,
+    /// Save-time validated discovery document + signing keys, cached at insert
+    /// so a staged config carries a fresh photograph before it is ever activated.
+    pub discovered_metadata: Option<&'a Value>,
+    pub jwks: Option<&'a Value>,
+    pub discovered_at: Option<DateTime<Utc>>,
 }
 
 // ─── Orgs (tenants) ─────────────────────────────────────────────────────────
@@ -257,8 +263,8 @@ pub struct IdpConfigParams<'a> {
 /// Create a new organization (a `tenants` row). `name` is set to the slug —
 /// the legacy unique `name` column survives, and slug is the identifier
 /// everything routes on now.
-pub async fn create_org(
-    pool: &PgPool,
+async fn insert_org(
+    conn: &mut sqlx::PgConnection,
     slug: &str,
     display_name: Option<&str>,
 ) -> sqlx::Result<OrgRow> {
@@ -270,8 +276,17 @@ pub async fn create_org(
     .bind(Uuid::now_v7())
     .bind(slug)
     .bind(display_name)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await
+}
+
+pub async fn create_org(
+    pool: &PgPool,
+    slug: &str,
+    display_name: Option<&str>,
+) -> sqlx::Result<OrgRow> {
+    let mut conn = pool.acquire().await?;
+    insert_org(&mut conn, slug, display_name).await
 }
 
 /// Pre-auth login-routing helper: resolve a slug to its org BEFORE anyone is
@@ -314,7 +329,7 @@ pub async fn get_org(pool: &PgPool, scope: TenantScope) -> sqlx::Result<Option<O
 /// client secret. Status transitions/swap/arming are a later task (they are
 /// transactional and lock the config row `FOR UPDATE`).
 pub async fn create_idp_config(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     scope: TenantScope,
     params: IdpConfigParams<'_>,
 ) -> sqlx::Result<OrgIdpConfigRow> {
@@ -322,10 +337,11 @@ pub async fn create_idp_config(
         "insert into org_idp_configs
            (id, tenant_id, generation, issuer, client_id, client_secret_sealed,
             token_endpoint_auth, scopes, alg_allowlist, claim_mappings,
-            bootstrap_owner_email, bootstrap_owner_expires_at, status, created_by)
+            bootstrap_owner_email, bootstrap_owner_expires_at, status, created_by,
+            discovered_metadata, jwks, discovered_at)
          select $1, $2,
                 coalesce((select max(generation) from org_idp_configs where tenant_id = $2), 0) + 1,
-                $3, $4, $5, $6, $7, $8, $9, $10, $11, 'staged', $12
+                $3, $4, $5, $6, $7, $8, $9, $10, $11, 'staged', $12, $13, $14, $15
          returning {IDP_CONFIG_COLS}"
     )))
     .bind(Uuid::now_v7())
@@ -340,7 +356,10 @@ pub async fn create_idp_config(
     .bind(params.bootstrap_owner_email)
     .bind(params.bootstrap_owner_expires_at)
     .bind(params.created_by)
-    .fetch_one(pool)
+    .bind(params.discovered_metadata)
+    .bind(params.jwks)
+    .bind(params.discovered_at)
+    .fetch_one(&mut *conn)
     .await
 }
 
@@ -773,7 +792,17 @@ pub async fn insert_audit(
     conn: &mut sqlx::PgConnection,
     entry: AuditEntry<'_>,
 ) -> sqlx::Result<Uuid> {
-    let id = Uuid::now_v7();
+    insert_audit_with_id(conn, Uuid::now_v7(), entry).await
+}
+
+/// Append an audit row with a caller-chosen id. The break-glass arming rows use
+/// this so the audit row's PK can also appear INSIDE its own `detail` (`arm_id`),
+/// giving Task 5's consumption rows a stable value to correlate against.
+pub async fn insert_audit_with_id(
+    conn: &mut sqlx::PgConnection,
+    id: Uuid,
+    entry: AuditEntry<'_>,
+) -> sqlx::Result<Uuid> {
     sqlx::query(
         "insert into auth_audit_log
            (id, tenant_id, actor_kind, actor_id, source_ip, request_id, action, target, success, detail)
@@ -830,16 +859,16 @@ pub async fn get_membership(
         .await
 }
 
-/// Set a membership's status. Deactivation is the kill switch: in the SAME
-/// transaction it revokes the membership's sessions and PATs (design lines
-/// 762-767). Reactivation (`status != 'deactivated'`) fires no cascade.
-pub async fn set_membership_status(
-    pool: &PgPool,
+/// Executor-generic core of a status change + its deactivation cascade. When the
+/// new status is `deactivated` it revokes the membership's sessions and PATs in
+/// the SAME transaction (design lines 762-767). Callers that must also write an
+/// audit row inside the transaction reuse this (the operator kill switch does).
+async fn apply_membership_status(
+    conn: &mut sqlx::PgConnection,
     scope: TenantScope,
     id: Uuid,
     status: &str,
 ) -> sqlx::Result<Option<OrgMembershipRow>> {
-    let mut tx = pool.begin().await?;
     let row: Option<OrgMembershipRow> = sqlx::query_as(
         "update org_memberships
          set status = $3,
@@ -851,12 +880,12 @@ pub async fn set_membership_status(
     .bind(scope.tenant_id())
     .bind(id)
     .bind(status)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *conn)
     .await?;
 
     if let Some(ref m) = row {
         if status == "deactivated" {
-            revoke_sessions_for_membership(&mut tx, scope, m.id).await?;
+            revoke_sessions_for_membership(&mut *conn, scope, m.id).await?;
             sqlx::query(
                 "update api_tokens set revoked_at = now()
                  where kind = 'pat' and tenant_id = $1 and membership_id = $2
@@ -864,11 +893,774 @@ pub async fn set_membership_status(
             )
             .bind(scope.tenant_id())
             .bind(m.id)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
         }
     }
+    Ok(row)
+}
+
+/// Set a membership's status. Deactivation is the kill switch: in the SAME
+/// transaction it revokes the membership's sessions and PATs (design lines
+/// 762-767). Reactivation (`status != 'deactivated'`) fires no cascade.
+pub async fn set_membership_status(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    status: &str,
+) -> sqlx::Result<Option<OrgMembershipRow>> {
+    let mut tx = pool.begin().await?;
+    let row = apply_membership_status(&mut tx, scope, id, status).await?;
     tx.commit().await?;
+    Ok(row)
+}
+
+// ─── Admin org lifecycle (Task 6) ───────────────────────────────────────────
+//
+// Each mutating fn owns its transaction AND the `FOR UPDATE` lock discipline, so
+// serialization (with each other and with a login's transaction B) is
+// structural, not caller-dependent. An ACCEPTED mutation writes its audit row
+// INSIDE that same transaction — a failed audit insert fails the mutation. A
+// REJECTED attempt returns a [`LifecycleOutcome`] variant and is audited by the
+// caller in a separate transaction. actor_kind is always `operator` here (these
+// routes are admin-token gated); the action vocabulary lives with the operation.
+
+/// The result of a lifecycle transition. `Done` has already committed its
+/// accepted audit row; the caller audits `NotFound`/`Refused` as a rejected
+/// attempt (a separate committed transaction) and maps them to 404 / 409.
+pub enum LifecycleOutcome<T> {
+    Done(T),
+    NotFound,
+    Refused(&'static str),
+}
+
+/// Cancel/revoke tallies for the disable + swap cascades.
+pub struct CascadeCounts {
+    pub flows_cancelled: u64,
+    pub switches_cancelled: u64,
+    pub sessions_revoked: u64,
+}
+
+/// The issuer-migration swap's full tally (adds membership deactivations).
+pub struct MigrateCounts {
+    pub flows_cancelled: u64,
+    pub switches_cancelled: u64,
+    pub sessions_revoked: u64,
+    pub memberships_deactivated: u64,
+}
+
+/// Outcome of creating an org: the row, or a slug collision (409).
+pub enum CreateOrgOutcome {
+    Created(OrgRow),
+    SlugConflict,
+}
+
+/// A joined member row for the operator membership list.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct MemberRow {
+    pub membership_id: Uuid,
+    pub user_id: Uuid,
+    pub roles: Vec<String>,
+    pub membership_status: String,
+    pub email: Option<String>,
+    pub name: Option<String>,
+    pub user_status: String,
+    pub idp_config_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub last_login_at: Option<DateTime<Utc>>,
+}
+
+/// The mutable-field patch for an IdP config (identity fields are refused by the
+/// handler, never reach here). Each `Some` field is applied via `coalesce`.
+pub struct IdpPatch<'a> {
+    pub client_secret_sealed: Option<Vec<u8>>,
+    pub token_endpoint_auth: Option<&'a str>,
+    pub scopes: Option<&'a [String]>,
+    pub claim_mappings: Option<&'a Value>,
+    pub alg_allowlist: Option<&'a [String]>,
+    /// `Some((normalized_email, expires_at))` re-arms the bootstrap owner.
+    pub bootstrap: Option<(&'a str, DateTime<Utc>)>,
+}
+
+#[derive(sqlx::FromRow)]
+struct LockedConfig {
+    id: Uuid,
+    generation: i32,
+    status: String,
+}
+
+/// Lock EVERY IdP config row of the org `FOR UPDATE` in a deterministic order
+/// (by id) — the uniform lock every status transition and the swap take, so they
+/// serialize with each other without deadlock, and with a login's transaction B
+/// (which locks the single active row). Returns the locked triples.
+async fn lock_org_configs(
+    conn: &mut sqlx::PgConnection,
+    scope: TenantScope,
+) -> sqlx::Result<Vec<LockedConfig>> {
+    sqlx::query_as(
+        "select id, generation, status from org_idp_configs
+         where tenant_id = $1 order by id for update",
+    )
+    .bind(scope.tenant_id())
+    .fetch_all(&mut *conn)
+    .await
+}
+
+/// Cancel a config's unconsumed login flows + pending switches and revoke its
+/// live sessions — the shared half of both disable and the migration swap
+/// (design lines 197-200).
+async fn cancel_config_flows_switches_sessions(
+    conn: &mut sqlx::PgConnection,
+    scope: TenantScope,
+    config_id: Uuid,
+) -> sqlx::Result<CascadeCounts> {
+    let flows = sqlx::query(
+        "update login_flows set consumed_at = now()
+         where tenant_id = $1 and idp_config_id = $2 and consumed_at is null",
+    )
+    .bind(scope.tenant_id())
+    .bind(config_id)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    let switches = sqlx::query(
+        "update pending_login_switches set consumed_at = now()
+         where tenant_id = $1 and idp_config_id = $2 and consumed_at is null",
+    )
+    .bind(scope.tenant_id())
+    .bind(config_id)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    let sessions = sqlx::query(
+        "update user_sessions set revoked_at = now()
+         where tenant_id = $1 and idp_config_id = $2 and revoked_at is null",
+    )
+    .bind(scope.tenant_id())
+    .bind(config_id)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    Ok(CascadeCounts {
+        flows_cancelled: flows,
+        switches_cancelled: switches,
+        sessions_revoked: sessions,
+    })
+}
+
+/// Deactivate every membership whose user was provisioned by `config_id`, and
+/// revoke those memberships' PATs — the issuer-migration default (design lines
+/// 790-792). Their sessions already carry the old config id and were revoked by
+/// [`cancel_config_flows_switches_sessions`].
+async fn deactivate_config_memberships(
+    conn: &mut sqlx::PgConnection,
+    scope: TenantScope,
+    config_id: Uuid,
+) -> sqlx::Result<u64> {
+    let n = sqlx::query(
+        "update org_memberships m
+         set status = 'deactivated', deactivated_at = now(), updated_at = now()
+         from users u
+         where m.tenant_id = $1 and u.tenant_id = m.tenant_id and u.id = m.user_id
+           and u.idp_config_id = $2 and m.status = 'active'",
+    )
+    .bind(scope.tenant_id())
+    .bind(config_id)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    sqlx::query(
+        "update api_tokens tok set revoked_at = now()
+         from org_memberships m, users u
+         where tok.kind = 'pat' and tok.tenant_id = $1 and tok.revoked_at is null
+           and tok.membership_id = m.id
+           and m.tenant_id = tok.tenant_id and u.tenant_id = m.tenant_id and u.id = m.user_id
+           and u.idp_config_id = $2",
+    )
+    .bind(scope.tenant_id())
+    .bind(config_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(n)
+}
+
+/// Build an operator (`actor_kind='operator'`, no `actor_id`) accepted-audit
+/// entry — the borrowed pieces are locals the caller holds across the insert.
+fn operator_audit<'a>(
+    tenant_id: Uuid,
+    source_ip: Option<&'a str>,
+    action: &'a str,
+    target: &'a str,
+    detail: &'a Value,
+) -> AuditEntry<'a> {
+    AuditEntry {
+        tenant_id: Some(tenant_id),
+        actor_kind: "operator",
+        actor_id: None,
+        source_ip,
+        request_id: None,
+        action,
+        target: Some(target),
+        success: true,
+        detail: Some(detail),
+    }
+}
+
+/// Refuse to arm while an active owner exists (design 709-711); otherwise set
+/// the arm + expiry. Assumes the caller already holds the config row `FOR
+/// UPDATE`, so the owner read and the arm serialize with bootstrap consumption.
+async fn check_and_arm_bootstrap(
+    conn: &mut sqlx::PgConnection,
+    scope: TenantScope,
+    config_id: Uuid,
+    normalized_email: &str,
+    expires_at: DateTime<Utc>,
+) -> sqlx::Result<bool> {
+    if active_owner_exists(&mut *conn, scope).await? {
+        return Ok(false);
+    }
+    sqlx::query(
+        "update org_idp_configs
+         set bootstrap_owner_email = $3, bootstrap_owner_expires_at = $4, updated_at = now()
+         where tenant_id = $1 and id = $2",
+    )
+    .bind(scope.tenant_id())
+    .bind(config_id)
+    .bind(normalized_email)
+    .bind(expires_at)
+    .execute(&mut *conn)
+    .await?;
+    Ok(true)
+}
+
+/// Create an org + its accepted `org.create` audit row in one transaction. A
+/// slug collision (unique violation) becomes `SlugConflict` (409), not an error.
+pub async fn create_org_audited(
+    pool: &PgPool,
+    slug: &str,
+    display_name: Option<&str>,
+    source_ip: Option<&str>,
+) -> sqlx::Result<CreateOrgOutcome> {
+    let mut tx = pool.begin().await?;
+    let row = match insert_org(&mut tx, slug, display_name).await {
+        Ok(r) => r,
+        Err(e) => {
+            tx.rollback().await.ok();
+            if e.as_database_error()
+                .map(DatabaseError::is_unique_violation)
+                .unwrap_or(false)
+            {
+                return Ok(CreateOrgOutcome::SlugConflict);
+            }
+            return Err(e);
+        }
+    };
+    let detail = json!({ "slug": row.slug });
+    let target = row.slug.clone();
+    insert_audit(
+        &mut tx,
+        operator_audit(row.id, source_ip, "org.create", &target, &detail),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(CreateOrgOutcome::Created(row))
+}
+
+/// Insert a staged IdP config (discovery pre-cached in `params`) + its accepted
+/// `idp.create` audit row in one transaction.
+pub async fn create_idp_config_audited(
+    pool: &PgPool,
+    scope: TenantScope,
+    params: IdpConfigParams<'_>,
+    source_ip: Option<&str>,
+) -> sqlx::Result<OrgIdpConfigRow> {
+    let mut tx = pool.begin().await?;
+    let row = create_idp_config(&mut tx, scope, params).await?;
+    let detail = json!({
+        "generation": row.generation,
+        "issuer_sha256": sha256_hex(&row.issuer),
+        "token_endpoint_auth": row.token_endpoint_auth,
+        "bootstrap_armed": row.bootstrap_owner_email.is_some(),
+    });
+    let target = row.id.to_string();
+    insert_audit(
+        &mut tx,
+        operator_audit(scope.tenant_id(), source_ip, "idp.create", &target, &detail),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
+/// `staged → active`, refused (409) while another row is active. The pre-check
+/// gives a clean refusal; the partial unique index is the backstop.
+pub async fn activate_idp_config(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    source_ip: Option<&str>,
+) -> sqlx::Result<LifecycleOutcome<OrgIdpConfigRow>> {
+    let mut tx = pool.begin().await?;
+    let configs = lock_org_configs(&mut tx, scope).await?;
+    let Some(target) = configs.iter().find(|c| c.id == id) else {
+        tx.rollback().await.ok();
+        return Ok(LifecycleOutcome::NotFound);
+    };
+    if target.status != "staged" {
+        tx.rollback().await.ok();
+        return Ok(LifecycleOutcome::Refused(
+            "only a staged configuration can be activated",
+        ));
+    }
+    if configs.iter().any(|c| c.id != id && c.status == "active") {
+        tx.rollback().await.ok();
+        return Ok(LifecycleOutcome::Refused(
+            "another IdP configuration is already active",
+        ));
+    }
+    let row: OrgIdpConfigRow = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "update org_idp_configs set status = 'active', updated_at = now()
+         where tenant_id = $1 and id = $2 returning {IDP_CONFIG_COLS}"
+    )))
+    .bind(scope.tenant_id())
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let detail = json!({ "generation": row.generation, "issuer_sha256": sha256_hex(&row.issuer) });
+    let target_s = id.to_string();
+    insert_audit(
+        &mut tx,
+        operator_audit(
+            scope.tenant_id(),
+            source_ip,
+            "idp.activate",
+            &target_s,
+            &detail,
+        ),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(LifecycleOutcome::Done(row))
+}
+
+/// `active → disabled`, cancelling the config's unconsumed flows + switches and
+/// revoking its sessions in the same transaction (design lines 197-200).
+pub async fn disable_idp_config(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    source_ip: Option<&str>,
+) -> sqlx::Result<LifecycleOutcome<CascadeCounts>> {
+    let mut tx = pool.begin().await?;
+    let configs = lock_org_configs(&mut tx, scope).await?;
+    let Some(target) = configs.iter().find(|c| c.id == id) else {
+        tx.rollback().await.ok();
+        return Ok(LifecycleOutcome::NotFound);
+    };
+    if target.status != "active" {
+        tx.rollback().await.ok();
+        return Ok(LifecycleOutcome::Refused(
+            "only an active configuration can be disabled",
+        ));
+    }
+    let generation = target.generation;
+    sqlx::query(
+        "update org_idp_configs set status = 'disabled', updated_at = now()
+         where tenant_id = $1 and id = $2",
+    )
+    .bind(scope.tenant_id())
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    let counts = cancel_config_flows_switches_sessions(&mut tx, scope, id).await?;
+    let detail = json!({
+        "generation": generation,
+        "flows_cancelled": counts.flows_cancelled,
+        "switches_cancelled": counts.switches_cancelled,
+        "sessions_revoked": counts.sessions_revoked,
+    });
+    let target_s = id.to_string();
+    insert_audit(
+        &mut tx,
+        operator_audit(
+            scope.tenant_id(),
+            source_ip,
+            "idp.disable",
+            &target_s,
+            &detail,
+        ),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(LifecycleOutcome::Done(counts))
+}
+
+/// `disabled → active`, only while no other row is active (design line 203).
+pub async fn reactivate_idp_config(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    source_ip: Option<&str>,
+) -> sqlx::Result<LifecycleOutcome<OrgIdpConfigRow>> {
+    let mut tx = pool.begin().await?;
+    let configs = lock_org_configs(&mut tx, scope).await?;
+    let Some(target) = configs.iter().find(|c| c.id == id) else {
+        tx.rollback().await.ok();
+        return Ok(LifecycleOutcome::NotFound);
+    };
+    if target.status != "disabled" {
+        tx.rollback().await.ok();
+        return Ok(LifecycleOutcome::Refused(
+            "only a disabled configuration can be reactivated",
+        ));
+    }
+    if configs.iter().any(|c| c.id != id && c.status == "active") {
+        tx.rollback().await.ok();
+        return Ok(LifecycleOutcome::Refused(
+            "another IdP configuration is already active",
+        ));
+    }
+    let row: OrgIdpConfigRow = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "update org_idp_configs set status = 'active', updated_at = now()
+         where tenant_id = $1 and id = $2 returning {IDP_CONFIG_COLS}"
+    )))
+    .bind(scope.tenant_id())
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let detail = json!({ "generation": row.generation });
+    let target_s = id.to_string();
+    insert_audit(
+        &mut tx,
+        operator_audit(
+            scope.tenant_id(),
+            source_ip,
+            "idp.reactivate",
+            &target_s,
+            &detail,
+        ),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(LifecycleOutcome::Done(row))
+}
+
+/// The staged issuer-migration swap (design lines 781-802): old (must be active)
+/// → `retired`, new (must be staged) → `active` — retire FIRST so the one-active
+/// partial index permits the order inside the transaction. Cancels the old
+/// config's flows + switches, revokes its sessions, and (unless `carry_forward`)
+/// deactivates its provisioned memberships (killing their PATs). Locks the org's
+/// IdP rows `FOR UPDATE`, the same lock a login's transaction B takes.
+pub async fn migrate_idp_config(
+    pool: &PgPool,
+    scope: TenantScope,
+    old_id: Uuid,
+    new_id: Uuid,
+    carry_forward: bool,
+    source_ip: Option<&str>,
+) -> sqlx::Result<LifecycleOutcome<MigrateCounts>> {
+    let mut tx = pool.begin().await?;
+    let configs = lock_org_configs(&mut tx, scope).await?;
+    let (Some(old), Some(new)) = (
+        configs.iter().find(|c| c.id == old_id),
+        configs.iter().find(|c| c.id == new_id),
+    ) else {
+        tx.rollback().await.ok();
+        return Ok(LifecycleOutcome::NotFound);
+    };
+    if old.status != "active" {
+        tx.rollback().await.ok();
+        return Ok(LifecycleOutcome::Refused(
+            "the configuration being migrated must be active",
+        ));
+    }
+    if new.status != "staged" {
+        tx.rollback().await.ok();
+        return Ok(LifecycleOutcome::Refused(
+            "the replacement configuration must be staged",
+        ));
+    }
+    let (old_gen, new_gen) = (old.generation, new.generation);
+    // Retire old FIRST (frees the one-active slot), then activate new.
+    sqlx::query(
+        "update org_idp_configs set status = 'retired', updated_at = now()
+         where tenant_id = $1 and id = $2",
+    )
+    .bind(scope.tenant_id())
+    .bind(old_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "update org_idp_configs set status = 'active', updated_at = now()
+         where tenant_id = $1 and id = $2",
+    )
+    .bind(scope.tenant_id())
+    .bind(new_id)
+    .execute(&mut *tx)
+    .await?;
+    let cascade = cancel_config_flows_switches_sessions(&mut tx, scope, old_id).await?;
+    let memberships_deactivated = if carry_forward {
+        0
+    } else {
+        deactivate_config_memberships(&mut tx, scope, old_id).await?
+    };
+    let counts = MigrateCounts {
+        flows_cancelled: cascade.flows_cancelled,
+        switches_cancelled: cascade.switches_cancelled,
+        sessions_revoked: cascade.sessions_revoked,
+        memberships_deactivated,
+    };
+    let detail = json!({
+        "old_config": old_id,
+        "new_config": new_id,
+        "old_generation": old_gen,
+        "new_generation": new_gen,
+        "carry_forward": carry_forward,
+        "flows_cancelled": counts.flows_cancelled,
+        "switches_cancelled": counts.switches_cancelled,
+        "sessions_revoked": counts.sessions_revoked,
+        "memberships_deactivated": counts.memberships_deactivated,
+    });
+    let target_s = old_id.to_string();
+    insert_audit(
+        &mut tx,
+        operator_audit(
+            scope.tenant_id(),
+            source_ip,
+            "idp.migrate",
+            &target_s,
+            &detail,
+        ),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(LifecycleOutcome::Done(counts))
+}
+
+/// Re-arm the bootstrap owner on `config_id` (break-glass), refused (409) while
+/// an active owner exists. Locks the config row `FOR UPDATE` (serializes with
+/// bootstrap consumption). The accepted audit row's PK is recorded in its own
+/// `detail` as `arm_id`, so Task 5's consumption rows can be correlated.
+pub async fn arm_bootstrap_owner(
+    pool: &PgPool,
+    scope: TenantScope,
+    config_id: Uuid,
+    normalized_email: &str,
+    expires_at: DateTime<Utc>,
+    source_ip: Option<&str>,
+) -> sqlx::Result<LifecycleOutcome<Uuid>> {
+    let mut tx = pool.begin().await?;
+    let locked: Option<(String,)> = sqlx::query_as(
+        "select status from org_idp_configs where tenant_id = $1 and id = $2 for update",
+    )
+    .bind(scope.tenant_id())
+    .bind(config_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if locked.is_none() {
+        tx.rollback().await.ok();
+        return Ok(LifecycleOutcome::NotFound);
+    }
+    if !check_and_arm_bootstrap(&mut tx, scope, config_id, normalized_email, expires_at).await? {
+        tx.rollback().await.ok();
+        return Ok(LifecycleOutcome::Refused(
+            "an active owner already exists; deactivate it before arming",
+        ));
+    }
+    let arm_id = Uuid::now_v7();
+    let detail = json!({
+        "arm_id": arm_id,
+        "email_sha256": sha256_hex(normalized_email),
+        "expires_at": expires_at,
+    });
+    let target_s = config_id.to_string();
+    insert_audit_with_id(
+        &mut tx,
+        arm_id,
+        operator_audit(
+            scope.tenant_id(),
+            source_ip,
+            "break_glass.arm",
+            &target_s,
+            &detail,
+        ),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(LifecycleOutcome::Done(arm_id))
+}
+
+/// Apply a mutable-field patch (+ optional bootstrap re-arm) to an IdP config in
+/// one transaction, audited as `idp.patch`. Identity-field changes never reach
+/// here (the handler refuses them). A refused re-arm rolls back the whole patch.
+pub async fn patch_idp_config(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    patch: IdpPatch<'_>,
+    source_ip: Option<&str>,
+) -> sqlx::Result<LifecycleOutcome<OrgIdpConfigRow>> {
+    let mut tx = pool.begin().await?;
+    let locked: Option<(String,)> = sqlx::query_as(
+        "select status from org_idp_configs where tenant_id = $1 and id = $2 for update",
+    )
+    .bind(scope.tenant_id())
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if locked.is_none() {
+        tx.rollback().await.ok();
+        return Ok(LifecycleOutcome::NotFound);
+    }
+    let row: OrgIdpConfigRow = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "update org_idp_configs set
+           client_secret_sealed = coalesce($3::bytea, client_secret_sealed),
+           token_endpoint_auth = coalesce($4::text, token_endpoint_auth),
+           scopes = coalesce($5::text[], scopes),
+           claim_mappings = coalesce($6::jsonb, claim_mappings),
+           alg_allowlist = coalesce($7::text[], alg_allowlist),
+           updated_at = now()
+         where tenant_id = $1 and id = $2 returning {IDP_CONFIG_COLS}"
+    )))
+    .bind(scope.tenant_id())
+    .bind(id)
+    .bind(patch.client_secret_sealed.as_deref())
+    .bind(patch.token_endpoint_auth)
+    .bind(patch.scopes.map(<[String]>::to_vec))
+    .bind(patch.claim_mappings)
+    .bind(patch.alg_allowlist.map(<[String]>::to_vec))
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let mut arm_id: Option<Uuid> = None;
+    if let Some((email, expires_at)) = patch.bootstrap {
+        if !check_and_arm_bootstrap(&mut tx, scope, id, email, expires_at).await? {
+            tx.rollback().await.ok();
+            return Ok(LifecycleOutcome::Refused(
+                "an active owner already exists; deactivate it before arming",
+            ));
+        }
+        arm_id = Some(Uuid::now_v7());
+    }
+
+    let detail = json!({
+        "generation": row.generation,
+        "client_secret_rotated": patch.client_secret_sealed.is_some(),
+        "token_endpoint_auth_changed": patch.token_endpoint_auth.is_some(),
+        "scopes_changed": patch.scopes.is_some(),
+        "claim_mappings_changed": patch.claim_mappings.is_some(),
+        "alg_allowlist_changed": patch.alg_allowlist.is_some(),
+        "bootstrap_armed": patch.bootstrap.is_some(),
+        "arm_id": arm_id,
+    });
+    let target_s = id.to_string();
+    let entry = operator_audit(
+        scope.tenant_id(),
+        source_ip,
+        "idp.patch",
+        &target_s,
+        &detail,
+    );
+    match arm_id {
+        Some(aid) => insert_audit_with_id(&mut tx, aid, entry).await?,
+        None => insert_audit(&mut tx, entry).await?,
+    };
+    tx.commit().await?;
+    Ok(LifecycleOutcome::Done(row))
+}
+
+/// The operator membership list (users + memberships + roles + status).
+pub async fn list_members(pool: &PgPool, scope: TenantScope) -> sqlx::Result<Vec<MemberRow>> {
+    sqlx::query_as(
+        "select m.id as membership_id, m.user_id as user_id, m.roles as roles,
+                m.status as membership_status, u.email as email, u.name as name,
+                u.status as user_status, u.idp_config_id as idp_config_id,
+                m.created_at as created_at, u.last_login_at as last_login_at
+         from org_memberships m
+         join users u on u.tenant_id = m.tenant_id and u.id = m.user_id
+         where m.tenant_id = $1 order by m.created_at",
+    )
+    .bind(scope.tenant_id())
+    .fetch_all(pool)
+    .await
+}
+
+/// The operator kill switch: deactivate a membership (cascade revokes its
+/// sessions + PATs) + its accepted `member.deactivate` audit row, one
+/// transaction. `None` when the membership does not exist under this tenant.
+pub async fn deactivate_membership_audited(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    source_ip: Option<&str>,
+) -> sqlx::Result<Option<OrgMembershipRow>> {
+    let mut tx = pool.begin().await?;
+    let row = apply_membership_status(&mut tx, scope, id, "deactivated").await?;
+    match &row {
+        Some(m) => {
+            let detail = json!({ "user": m.user_id });
+            let target_s = m.id.to_string();
+            insert_audit(
+                &mut tx,
+                operator_audit(
+                    scope.tenant_id(),
+                    source_ip,
+                    "member.deactivate",
+                    &target_s,
+                    &detail,
+                ),
+            )
+            .await?;
+            tx.commit().await?;
+        }
+        None => {
+            tx.rollback().await.ok();
+        }
+    }
+    Ok(row)
+}
+
+/// Set a membership's roles (the only owner-granting surface besides bootstrap)
+/// plus its accepted `member.roles` audit row, one transaction. `None` when the
+/// membership does not exist under this tenant.
+pub async fn set_membership_roles_audited(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    roles: &[String],
+    source_ip: Option<&str>,
+) -> sqlx::Result<Option<OrgMembershipRow>> {
+    let mut tx = pool.begin().await?;
+    let row: Option<OrgMembershipRow> = sqlx::query_as(
+        "update org_memberships set roles = $3, updated_at = now()
+         where tenant_id = $1 and id = $2 returning *",
+    )
+    .bind(scope.tenant_id())
+    .bind(id)
+    .bind(roles.to_vec())
+    .fetch_optional(&mut *tx)
+    .await?;
+    match &row {
+        Some(m) => {
+            let detail = json!({ "roles": m.roles });
+            let target_s = m.id.to_string();
+            insert_audit(
+                &mut tx,
+                operator_audit(
+                    scope.tenant_id(),
+                    source_ip,
+                    "member.roles",
+                    &target_s,
+                    &detail,
+                ),
+            )
+            .await?;
+            tx.commit().await?;
+        }
+        None => {
+            tx.rollback().await.ok();
+        }
+    }
     Ok(row)
 }
 
@@ -1283,8 +2075,9 @@ mod tests {
         let mappings = claim_mappings();
         let scopes = vec!["openid".to_string(), "email".to_string()];
         let algs = vec!["RS256".to_string()];
+        let mut conn = pool.acquire().await.unwrap();
         create_idp_config(
-            pool,
+            &mut conn,
             scope,
             IdpConfigParams {
                 issuer: "https://issuer.example",
@@ -1297,6 +2090,9 @@ mod tests {
                 bootstrap_owner_email: Some("owner@example.com"),
                 bootstrap_owner_expires_at: None,
                 created_by: Some("operator"),
+                discovered_metadata: None,
+                jwks: None,
+                discovered_at: None,
             },
         )
         .await
@@ -1888,5 +2684,324 @@ mod tests {
         // OLD org's cascade-FK'd sessions delete cleanly.
         cleanup_tenant(&pool, org_new.id).await;
         cleanup_tenant(&pool, org_old.id).await;
+    }
+
+    async fn audit_count(pool: &PgPool, tenant: Uuid, action: &str) -> i64 {
+        let (n,): (i64,) = sqlx::query_as(
+            "select count(*) from auth_audit_log where tenant_id = $1 and action = $2 and success",
+        )
+        .bind(tenant)
+        .bind(action)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        n
+    }
+
+    #[tokio::test]
+    async fn activate_enforces_one_active_and_writes_audit() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let slug = format!("t-{}", Uuid::now_v7().simple());
+        let org = create_org(&pool, &slug, None).await.unwrap();
+        let scope = TenantScope::assume(org.id);
+        let c1 = staged_config(&pool, scope).await;
+        let c2 = staged_config(&pool, scope).await;
+
+        // Activate the first: staged → active, and its audit row committed.
+        match activate_idp_config(&pool, scope, c1.id, Some("1.2.3.4"))
+            .await
+            .unwrap()
+        {
+            LifecycleOutcome::Done(row) => assert_eq!(row.status, "active"),
+            _ => panic!("first activate must succeed"),
+        }
+        assert_eq!(audit_count(&pool, org.id, "idp.activate").await, 1);
+
+        // The second is refused while the first is active (one-active index).
+        assert!(matches!(
+            activate_idp_config(&pool, scope, c2.id, None)
+                .await
+                .unwrap(),
+            LifecycleOutcome::Refused(_)
+        ));
+        // A missing id is NotFound.
+        assert!(matches!(
+            activate_idp_config(&pool, scope, Uuid::now_v7(), None)
+                .await
+                .unwrap(),
+            LifecycleOutcome::NotFound
+        ));
+
+        cleanup_tenant(&pool, org.id).await;
+    }
+
+    #[tokio::test]
+    async fn disable_cancels_then_reactivate_only_when_none_active() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let slug = format!("t-{}", Uuid::now_v7().simple());
+        let org = create_org(&pool, &slug, None).await.unwrap();
+        let scope = TenantScope::assume(org.id);
+        let cfg = staged_config(&pool, scope).await;
+        activate(&pool, cfg.id).await;
+        let (user, membership) = seed_user_membership(&pool, scope, cfg.id, "sub-dis").await;
+
+        // A session, a pending switch (referencing that session), and a flow —
+        // all under this config.
+        let mut conn = pool.acquire().await.unwrap();
+        let sess = mint_user_session(
+            &mut conn,
+            scope,
+            membership,
+            user,
+            cfg.id,
+            "fbx_web_dis",
+            None,
+            None,
+            None,
+            None,
+            3_600,
+            100_000,
+        )
+        .await
+        .unwrap();
+        create_pending_switch(
+            &mut conn,
+            scope,
+            cfg.id,
+            membership,
+            user,
+            org.id,
+            sess.id,
+            "/",
+            &sha256_hex("n"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        create_login_flow(
+            &pool,
+            scope,
+            cfg.id,
+            &[1],
+            "flow-n",
+            &sha256_hex("y"),
+            "/",
+            600,
+        )
+        .await
+        .unwrap();
+
+        match disable_idp_config(&pool, scope, cfg.id, None)
+            .await
+            .unwrap()
+        {
+            LifecycleOutcome::Done(c) => {
+                assert_eq!(c.flows_cancelled, 1);
+                assert_eq!(c.switches_cancelled, 1);
+                assert_eq!(c.sessions_revoked, 1);
+            }
+            _ => panic!("disable must succeed"),
+        }
+        assert_eq!(
+            get_idp_config(&pool, scope, cfg.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "disabled"
+        );
+        assert!(resolve_web_session(&pool, "fbx_web_dis", 3_600)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Reactivate: disabled → active.
+        match reactivate_idp_config(&pool, scope, cfg.id, None)
+            .await
+            .unwrap()
+        {
+            LifecycleOutcome::Done(row) => assert_eq!(row.status, "active"),
+            _ => panic!("reactivate must succeed"),
+        }
+        // Reactivating an ALREADY-active row is refused (only disabled → active).
+        assert!(matches!(
+            reactivate_idp_config(&pool, scope, cfg.id, None)
+                .await
+                .unwrap(),
+            LifecycleOutcome::Refused(_)
+        ));
+        // With another row active, a disabled row cannot reactivate.
+        let cfg2 = staged_config(&pool, scope).await;
+        // cfg is active; disable it, then activate cfg2, then reactivate cfg → refused.
+        disable_idp_config(&pool, scope, cfg.id, None)
+            .await
+            .unwrap();
+        activate(&pool, cfg2.id).await;
+        assert!(matches!(
+            reactivate_idp_config(&pool, scope, cfg.id, None)
+                .await
+                .unwrap(),
+            LifecycleOutcome::Refused(_)
+        ));
+
+        cleanup_tenant(&pool, org.id).await;
+    }
+
+    /// Seed an active config + a user/session/PAT provisioned by it, then run the
+    /// swap. Returns nothing — asserts inline.
+    async fn migrate_case(pool: &PgPool, carry_forward: bool) {
+        let slug = format!("t-{}", Uuid::now_v7().simple());
+        let org = create_org(pool, &slug, None).await.unwrap();
+        let scope = TenantScope::assume(org.id);
+        let old = staged_config(pool, scope).await;
+        activate(pool, old.id).await;
+        let (user, membership) = seed_user_membership(pool, scope, old.id, "sub-mig").await;
+
+        let token = "fbx_web_mig";
+        let mut conn = pool.acquire().await.unwrap();
+        mint_user_session(
+            &mut conn, scope, membership, user, old.id, token, None, None, None, None, 3_600,
+            100_000,
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        let pat_plain = "fbx_pat_migrate0000";
+        mint_pat(
+            pool,
+            scope,
+            membership,
+            user,
+            "ci",
+            pat_plain,
+            Utc::now() + chrono::Duration::days(30),
+        )
+        .await
+        .unwrap();
+
+        let new = staged_config(pool, scope).await;
+        let counts = match migrate_idp_config(pool, scope, old.id, new.id, carry_forward, None)
+            .await
+            .unwrap()
+        {
+            LifecycleOutcome::Done(c) => c,
+            _ => panic!("migrate must succeed"),
+        };
+        assert_eq!(counts.sessions_revoked, 1, "old-config session revoked");
+
+        // Old retired, new active.
+        assert_eq!(
+            get_idp_config(pool, scope, old.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "retired"
+        );
+        assert_eq!(
+            get_idp_config(pool, scope, new.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "active"
+        );
+        // The old session is revoked either way.
+        assert!(resolve_web_session(pool, token, 3_600)
+            .await
+            .unwrap()
+            .is_none());
+
+        let m = get_membership(pool, scope, membership)
+            .await
+            .unwrap()
+            .unwrap();
+        if carry_forward {
+            assert_eq!(counts.memberships_deactivated, 0);
+            assert_eq!(m.status, "active", "carry_forward keeps memberships");
+            assert!(
+                resolve_pat(pool, pat_plain).await.unwrap().is_some(),
+                "carry_forward keeps PATs"
+            );
+        } else {
+            assert_eq!(counts.memberships_deactivated, 1);
+            assert_eq!(m.status, "deactivated", "default deactivates memberships");
+            assert!(
+                resolve_pat(pool, pat_plain).await.unwrap().is_none(),
+                "default revokes PATs via the cascade"
+            );
+        }
+
+        cleanup_tenant(pool, org.id).await;
+    }
+
+    #[tokio::test]
+    async fn migrate_swap_default_deactivates_and_carry_forward_preserves() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        migrate_case(&pool, false).await;
+        migrate_case(&pool, true).await;
+    }
+
+    #[tokio::test]
+    async fn arm_refused_while_active_owner_exists() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let slug = format!("t-{}", Uuid::now_v7().simple());
+        let org = create_org(&pool, &slug, None).await.unwrap();
+        let scope = TenantScope::assume(org.id);
+        let cfg = staged_config(&pool, scope).await;
+        activate(&pool, cfg.id).await;
+        let (_user, membership) = seed_user_membership(&pool, scope, cfg.id, "owner-sub").await;
+        // Promote to owner.
+        sqlx::query("update org_memberships set roles = '{owner}' where id = $1")
+            .bind(membership)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let email = "new-owner@example.com";
+        let exp = Utc::now() + chrono::Duration::days(7);
+        assert!(
+            matches!(
+                arm_bootstrap_owner(&pool, scope, cfg.id, email, exp, None)
+                    .await
+                    .unwrap(),
+                LifecycleOutcome::Refused(_)
+            ),
+            "arming refused while an active owner exists"
+        );
+
+        // Deactivate the owner, then arming succeeds and lands on the config.
+        set_membership_status(&pool, scope, membership, "deactivated")
+            .await
+            .unwrap();
+        assert!(matches!(
+            arm_bootstrap_owner(&pool, scope, cfg.id, email, exp, None)
+                .await
+                .unwrap(),
+            LifecycleOutcome::Done(_)
+        ));
+        let after = get_idp_config(&pool, scope, cfg.id).await.unwrap().unwrap();
+        assert_eq!(after.bootstrap_owner_email.as_deref(), Some(email));
+
+        cleanup_tenant(&pool, org.id).await;
     }
 }
