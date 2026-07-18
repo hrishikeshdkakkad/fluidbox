@@ -87,6 +87,7 @@ async fn decide_tool_call(
         // ingest; budget parity never trusts runner cooperation.
         ledger::record(
             state,
+            scope,
             session.id,
             Actor::Agent,
             EventBody::ToolRequested {
@@ -106,6 +107,7 @@ async fn decide_tool_call(
         if tool_mismatch || digest_mismatch {
             ledger::record(
                 state,
+                scope,
                 session.id,
                 Actor::System,
                 EventBody::ToolDecision {
@@ -155,6 +157,7 @@ async fn decide_tool_call(
             {
                 ledger::record(
                     state,
+                    scope,
                     session.id,
                     Actor::System,
                     EventBody::BudgetExceeded {
@@ -211,6 +214,7 @@ async fn decide_tool_call(
         if fluidbox_db::record_intent_verdict(&state.pool, scope, intent.id, "auto_denied").await? {
             ledger::record(
                 state,
+                scope,
                 session.id,
                 Actor::System,
                 EventBody::ToolDecision {
@@ -248,6 +252,7 @@ async fn decide_tool_call(
             {
                 ledger::record(
                     state,
+                    scope,
                     session.id,
                     Actor::System,
                     EventBody::ToolDecision {
@@ -273,6 +278,7 @@ async fn decide_tool_call(
             {
                 emit_decision(
                     state,
+                    scope,
                     session.id,
                     tool_call_id,
                     tool,
@@ -292,6 +298,7 @@ async fn decide_tool_call(
             {
                 emit_decision(
                     state,
+                    scope,
                     session.id,
                     tool_call_id,
                     tool,
@@ -321,6 +328,7 @@ async fn decide_tool_call(
                 {
                     emit_decision(
                         state,
+                        scope,
                         session.id,
                         tool_call_id,
                         tool,
@@ -382,6 +390,7 @@ async fn decide_tool_call(
             if newly_pending {
                 ledger::record(
                     state,
+                    scope,
                     session.id,
                     Actor::System,
                     EventBody::ApprovalRequested {
@@ -489,6 +498,7 @@ async fn await_pending_decision(
         .unwrap_or_else(|| "system".into());
     ledger::record(
         state,
+        scope,
         session_id,
         Actor::Human,
         EventBody::ApprovalDecided {
@@ -503,6 +513,7 @@ async fn await_pending_decision(
     let allowed = final_status == "approved_once" || final_status == "approved_session";
     emit_decision(
         state,
+        scope,
         session_id,
         tool_call_id,
         tool,
@@ -643,6 +654,7 @@ pub async fn tool_call(
     let record_exec = |ok: bool, latency_ms: u64, digest: Option<String>, error: Option<String>| {
         ledger::record(
             &state,
+            auth.scope,
             session.id,
             Actor::System,
             EventBody::BrokeredToolCall {
@@ -707,8 +719,10 @@ fn decision_from_status(status: &str) -> GateDecision {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn emit_decision(
     state: &AppState,
+    scope: TenantScope,
     session: uuid::Uuid,
     tool_call_id: &str,
     tool: &str,
@@ -732,6 +746,7 @@ async fn emit_decision(
     };
     ledger::record(
         state,
+        scope,
         session,
         Actor::System,
         EventBody::ToolDecision {
@@ -802,7 +817,7 @@ pub async fn events(
             json!({ "seq": Value::Null, "dropped": "tool.requested" }),
         ));
     }
-    let seq = ledger::record(&state, auth.session_id, actor, body).await;
+    let seq = ledger::record(&state, auth.scope, auth.session_id, actor, body).await;
     Ok(Json(json!({ "seq": seq })))
 }
 

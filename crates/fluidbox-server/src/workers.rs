@@ -223,6 +223,7 @@ async fn reconcile_managed(state: AppState) {
                             );
                             crate::ledger::record(
                                 &state,
+                                scope,
                                 session_id,
                                 fluidbox_core::event::Actor::System,
                                 fluidbox_core::event::EventBody::AgentMessage {
@@ -436,6 +437,7 @@ async fn budget_sweeper(state: AppState) {
                     if (now - started).num_seconds() as u64 > max {
                         crate::ledger::record(
                             &state,
+                            scope,
                             s.id,
                             fluidbox_core::event::Actor::System,
                             fluidbox_core::event::EventBody::BudgetExceeded {

@@ -504,6 +504,7 @@ pub async fn messages(
             // Still record a zero-usage marker so we know a call happened.
             ledger::record(
                 &state2,
+                scope,
                 session_id,
                 Actor::System,
                 EventBody::AgentMessage {
@@ -548,6 +549,7 @@ async fn trigger_budget_stop(
 ) {
     ledger::record(
         state,
+        scope,
         session_id,
         Actor::System,
         EventBody::BudgetExceeded {
@@ -614,6 +616,7 @@ async fn record_usage(
     .ok();
     ledger::record(
         state,
+        scope,
         session_id,
         Actor::System,
         EventBody::ModelResponse {

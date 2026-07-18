@@ -197,6 +197,7 @@ pub async fn create_run(
                         for _ in 0..3u32 {
                             match orchestrator::cancel(
                                 state,
+                                scope,
                                 s.id,
                                 "replaced by a newer invocation of this subscription",
                             )
@@ -358,6 +359,7 @@ pub async fn create_run(
 
     crate::ledger::record(
         state,
+        scope,
         session.id,
         fluidbox_core::event::Actor::System,
         fluidbox_core::event::EventBody::SessionCreated {
@@ -373,6 +375,7 @@ pub async fn create_run(
     if !run_spec.capabilities.is_empty() {
         crate::ledger::record(
             state,
+            scope,
             session.id,
             fluidbox_core::event::Actor::System,
             fluidbox_core::event::EventBody::CapabilitiesFrozen {

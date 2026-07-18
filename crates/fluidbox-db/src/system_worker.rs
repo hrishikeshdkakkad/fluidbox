@@ -2,19 +2,38 @@
 //! scans and lookups the parent design permits (`docs/plans/2026-07-14-
 //! multi-user-mcp-control-plane-design.md`, "Database isolation": *"Generic
 //! UUID-only methods are forbidden OUTSIDE narrowly named system-worker
-//! repositories"*). These serve cross-tenant background workers — the
-//! heartbeat watchdog, budget sweeper, approval-expiry sweep, the
-//! restart-recoverable finalize driver, the managed-sandbox reconciler, and
-//! the delivery worker — which act on ids/status across ALL tenants by
-//! construction.
+//! repositories"*).
 //!
-//! Every row they return carries `tenant_id`; the invariant is that a caller
-//! derives a [`TenantScope`](crate::TenantScope) from that fetched row before
-//! touching any tenant-scoped repository. Nothing here decides authorization
-//! — they are the trusted entry point that resolves which tenant a bare id
-//! belongs to, never a bypass of the scoped surface.
+//! Every row a lookup here returns carries `tenant_id`; the invariant is that a
+//! caller constructs a [`TenantScope`](crate::TenantScope) from a VERIFIED
+//! tenant id before touching any tenant-scoped repository. Nothing here decides
+//! authorization — these are the trusted entry points that resolve which tenant
+//! a bare id belongs to, never a bypass of the scoped surface.
 //!
-//! These DB-resolved worker rows are just ONE of the documented ways a
+//! There are exactly THREE sanctioned categories of caller:
+//!
+//! (a) **Background workers that derive scope from the returned row.** The
+//!     heartbeat watchdog, wall-clock budget sweeper, approval-expiry sweep,
+//!     the restart-recoverable finalize driver, the managed-sandbox reconciler,
+//!     and the delivery worker each act on ids/status across ALL tenants by
+//!     construction (a global scan), then scope every mutation to the
+//!     `tenant_id` of the row they just fetched.
+//!
+//! (b) **Credential-verification bootstrap resolvers for UNAUTHENTICATED
+//!     ingress/callbacks.** Webhook ingress (HMAC via [`get_connection`]),
+//!     app-level GitHub ingress ([`get_github_app_registration`]), and the
+//!     sealed-`state` connector/login OAuth callbacks arrive with no principal.
+//!     The lookup runs BEFORE verification only to fetch the material the
+//!     verification needs (the connection's sealed secret, the registration's
+//!     webhook secret). A [`TenantScope`](crate::TenantScope) is constructed
+//!     ONLY AFTER the signature/sealed-state verifies — the resolved row's
+//!     tenant is not trusted as scope until then.
+//!
+//! (c) **Nothing else.** A request handler that carries a principal MUST use the
+//!     scoped repositories (`get_session`, `get_connection`, … with a
+//!     `TenantScope`), never these bare-id loaders.
+//!
+//! These DB-resolved rows are just ONE of the documented ways a
 //! [`TenantScope`](crate::TenantScope) is constructed without a principal
 //! credential — see its type docs for the full, precise set (the two
 //! credential-like exceptions keyed on a token/cookie digest; design-mandated

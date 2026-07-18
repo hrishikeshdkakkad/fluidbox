@@ -491,11 +491,16 @@ pub async fn create_login_flow(
     redirect_to: &str,
     ttl_secs: i64,
 ) -> sqlx::Result<Uuid> {
+    // GC-on-insert is scoped to the inserting tenant (a per-request write must
+    // never sweep another org's rows). A global sweep of expired flows across
+    // all tenants belongs to a future background worker, not this hot path.
     sqlx::query(
         "delete from login_flows
-         where (consumed_at is null and expires_at < now())
-            or expires_at < now() - interval '7 days'",
+         where tenant_id = $1
+           and ((consumed_at is null and expires_at < now())
+                or expires_at < now() - interval '7 days')",
     )
+    .bind(scope.tenant_id())
     .execute(pool)
     .await?;
     let id = Uuid::now_v7();
@@ -575,7 +580,8 @@ pub async fn mint_user_session(
            (id, tenant_id, membership_id, user_id, session_token_sha256, idp_config_id,
             acr, amr, auth_time, idp_sid, idle_expires_at, absolute_expires_at)
          values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                 now() + make_interval(secs => $11::double precision),
+                 least(now() + make_interval(secs => $11::double precision),
+                       now() + make_interval(secs => $12::double precision)),
                  now() + make_interval(secs => $12::double precision))
          returning {USER_SESSION_COLS}"
     )))
@@ -1918,11 +1924,15 @@ pub async fn create_pending_switch(
     amr: Option<&[String]>,
     auth_time: Option<DateTime<Utc>>,
 ) -> sqlx::Result<Uuid> {
+    // GC-on-insert is scoped to the inserting tenant (the NEW login's org); a
+    // global cross-tenant sweep belongs to a future background worker.
     sqlx::query(
         "delete from pending_login_switches
-         where (consumed_at is null and expires_at < now())
-            or expires_at < now() - interval '7 days'",
+         where tenant_id = $1
+           and ((consumed_at is null and expires_at < now())
+                or expires_at < now() - interval '7 days')",
     )
+    .bind(scope.tenant_id())
     .execute(&mut *conn)
     .await?;
     let id = Uuid::now_v7();
@@ -2026,14 +2036,24 @@ pub async fn claim_pending_switch(
         return Ok(None);
     };
 
-    // (2) Recheck config-active + membership-active + tenant-active on the NEW org.
+    // (2) Recheck config-active + membership-active + tenant-active on the NEW
+    // org, taking `for update of m` on the NEW membership row. That row lock
+    // serializes this claim against the deactivation cascade
+    // (`apply_membership_status` → `revoke_sessions_for_membership`), which
+    // locks the membership row FIRST and its sessions SECOND. This claim takes
+    // the same order — membership here (step 2), then the replaced session
+    // (step 3) — so the two can never deadlock. A concurrent deactivation that
+    // committed before us leaves `m.status <> 'active'` → the recheck matches
+    // zero rows and we roll the WHOLE claim back (fail closed; the browser
+    // retries login).
     let recheck = sqlx::query(
         "select 1 from org_idp_configs c
          join org_memberships m on m.tenant_id = c.tenant_id
          join tenants t on t.id = c.tenant_id
          where c.tenant_id = $1 and c.id = $2 and c.status = 'active'
            and m.id = $3 and m.user_id = $4 and m.status = 'active'
-           and t.status = 'active'",
+           and t.status = 'active'
+         for update of m",
     )
     .bind(row.tenant_id)
     .bind(row.idp_config_id)
@@ -2046,15 +2066,36 @@ pub async fn claim_pending_switch(
         return Ok(None);
     }
 
-    // (3) Revoke the replaced session (in its OWN tenant).
-    sqlx::query(
+    // (3) Revoke the replaced session (in its OWN tenant). Lock the row FOR
+    // UPDATE first (session lock AFTER the membership lock — the order fixed in
+    // step 2), then require the revoke to touch EXACTLY ONE still-live row.
+    // Zero rows means a concurrent logout/revocation already killed the
+    // replaced session between the step-1 claim and here → the switch would be
+    // minting a new session while silently doing nothing about the old one, so
+    // we roll the whole transaction back (claim included) and fail closed.
+    let locked_replaced: Option<(Uuid,)> =
+        sqlx::query_as("select id from user_sessions where tenant_id = $1 and id = $2 for update")
+            .bind(row.replaced_tenant_id)
+            .bind(row.replaced_session_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if locked_replaced.is_none() {
+        tx.rollback().await.ok();
+        return Ok(None);
+    }
+    let revoked = sqlx::query(
         "update user_sessions set revoked_at = now()
          where tenant_id = $1 and id = $2 and revoked_at is null",
     )
     .bind(row.replaced_tenant_id)
     .bind(row.replaced_session_id)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if revoked != 1 {
+        tx.rollback().await.ok();
+        return Ok(None);
+    }
 
     // (4) Mint the new session under the NEW org.
     mint_user_session(
@@ -2676,7 +2717,14 @@ mod tests {
             "wrong current session refused"
         );
 
-        // Happy path: old revoked + new minted atomically.
+        // Happy path: old revoked + new minted atomically. The claim now also
+        // requires the replaced-session revoke to affect EXACTLY ONE live row
+        // (v5 hardening: 0 rows = a concurrent logout/revocation → the whole
+        // claim rolls back). A true concurrency race isn't reproducible on a
+        // single test connection, so we assert the happy path still commits
+        // (the replaced session IS live here, so the revoke hits exactly one
+        // row) and rely on the wrong-cookie / wrong-current-session / replay /
+        // expired negatives above to prove the transaction still fails closed.
         let new_token = "fbx_web_new";
         let claim = claim_pending_switch(
             &pool,
@@ -3171,5 +3219,107 @@ mod tests {
         );
 
         cleanup_tenant(&pool, org.id).await;
+    }
+
+    /// Cross-tenant isolation for the identity family: tenant A's scope reads
+    /// NONE of tenant B's idp config / user / membership / PATs / sealed client
+    /// secret, and cannot revoke B's session — every foreign call misses at the
+    /// DB (None / empty / false), with owning-scope positive controls proving
+    /// the rows really exist. Throwaway orgs; cleanup is children-first.
+    #[tokio::test]
+    async fn tenant_scope_isolates_identity_family() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+
+        let slug_a = format!("t-{}", Uuid::now_v7().simple());
+        let slug_b = format!("t-{}", Uuid::now_v7().simple());
+        let org_a = create_org(&pool, &slug_a, None).await.unwrap();
+        let org_b = create_org(&pool, &slug_b, None).await.unwrap();
+        let scope_a = TenantScope::assume(org_a.id);
+        let scope_b = TenantScope::assume(org_b.id);
+
+        // A full identity family under B: active config (with a sealed client
+        // secret), a user + membership, a live session, and a PAT.
+        let cfg_b = staged_config(&pool, scope_b).await;
+        activate(&pool, cfg_b.id).await;
+        let (user_b, membership_b) =
+            seed_user_membership(&pool, scope_b, cfg_b.id, "iso-sub").await;
+        let token_b = "fbx_web_iso";
+        let mut conn = pool.acquire().await.unwrap();
+        let session_b = mint_user_session(
+            &mut conn,
+            scope_b,
+            membership_b,
+            user_b,
+            cfg_b.id,
+            token_b,
+            None,
+            None,
+            None,
+            None,
+            3_600,
+            100_000,
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        mint_pat(
+            &pool,
+            scope_b,
+            membership_b,
+            user_b,
+            "iso",
+            "fbx_pat_isolate0000",
+            Utc::now() + chrono::Duration::days(30),
+        )
+        .await
+        .unwrap();
+
+        // Foreign scope (A) — every identity read/write against B's ids misses.
+        let idp_a = get_idp_config(&pool, scope_a, cfg_b.id).await.unwrap();
+        let user_a = get_user(&pool, scope_a, user_b).await.unwrap();
+        let membership_a = get_membership(&pool, scope_a, membership_b).await.unwrap();
+        let pats_a = list_pats(&pool, scope_a, membership_b).await.unwrap();
+        let secret_a = idp_client_secret_sealed(&pool, scope_a, cfg_b.id)
+            .await
+            .unwrap();
+        // Session still live here — A's revoke must match zero rows (false).
+        let revoke_a = revoke_user_session(&pool, scope_a, session_b.id)
+            .await
+            .unwrap();
+
+        // Owning scope (B) — the same reads succeed, and B can revoke its own.
+        let idp_b = get_idp_config(&pool, scope_b, cfg_b.id).await.unwrap();
+        let user_bb = get_user(&pool, scope_b, user_b).await.unwrap();
+        let membership_bb = get_membership(&pool, scope_b, membership_b).await.unwrap();
+        let pats_b = list_pats(&pool, scope_b, membership_b).await.unwrap();
+        let secret_b = idp_client_secret_sealed(&pool, scope_b, cfg_b.id)
+            .await
+            .unwrap();
+        let revoke_b = revoke_user_session(&pool, scope_b, session_b.id)
+            .await
+            .unwrap();
+
+        // Cleanup BOTH orgs (children-first) before asserting.
+        cleanup_tenant(&pool, org_b.id).await;
+        cleanup_tenant(&pool, org_a.id).await;
+
+        // Foreign misses.
+        assert!(idp_a.is_none(), "A cannot read B's idp config");
+        assert!(user_a.is_none(), "A cannot read B's user");
+        assert!(membership_a.is_none(), "A cannot read B's membership");
+        assert!(pats_a.is_empty(), "A lists none of B's PATs");
+        assert!(secret_a.is_none(), "A cannot read B's sealed client secret");
+        assert!(!revoke_a, "A cannot revoke B's session");
+        // Owning positives.
+        assert!(idp_b.is_some(), "B reads its own idp config");
+        assert!(user_bb.is_some(), "B reads its own user");
+        assert!(membership_bb.is_some(), "B reads its own membership");
+        assert_eq!(pats_b.len(), 1, "B lists its own PAT");
+        assert!(secret_b.is_some(), "B reads its own sealed client secret");
+        assert!(revoke_b, "B revokes its own live session");
     }
 }

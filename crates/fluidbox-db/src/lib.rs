@@ -596,7 +596,11 @@ pub async fn append_agent_revision(
     capability_bundles: &Value,
 ) -> sqlx::Result<AgentRevisionRow> {
     // Revisions carry no tenant column of their own; the tenant boundary is the
-    // parent agent — the insert only lands when the agent belongs to the scope.
+    // parent agent — the insert only lands when the agent AND the referenced
+    // policy both belong to the scope (a cross-tenant policy_id is proven
+    // impossible in SQL, not just Rust-side). Zero rows → RowNotFound (the
+    // existing contract for a not-in-scope agent), which callers already map to
+    // a 404.
     sqlx::query_as(
         "insert into agent_revisions
            (id, agent_id, rev, harness, runner_image, model, system_prompt, policy_id, budgets,
@@ -605,6 +609,7 @@ pub async fn append_agent_revision(
            coalesce((select max(rev) from agent_revisions where agent_id = $2), 0) + 1,
            $3, $4, $5, $6, $7, $8, $9, $10
          where exists (select 1 from agents a where a.id = $2 and a.tenant_id = $11)
+           and exists (select 1 from policies p where p.id = $7 and p.tenant_id = $11)
          returning *",
     )
     .bind(Uuid::now_v7())
@@ -1302,12 +1307,16 @@ pub async fn revoke_github_app_registration(
         tx.rollback().await?;
         return Ok(None);
     }
+    // Scope the child cascade to the registration's own tenant too — the
+    // composite FK already makes a cross-tenant child impossible, but the
+    // predicate keeps the statement self-scoped (never a bare-id UPDATE).
     let rows = sqlx::query(
         "update integration_connections set status = 'revoked', updated_at = now()
-         where registration_id = $1 and status <> 'revoked'
+         where registration_id = $1 and status <> 'revoked' and tenant_id = $2
          returning id",
     )
     .bind(id)
+    .bind(scope.tenant_id())
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -1598,13 +1607,23 @@ pub async fn create_trigger_subscription(
     event_publish: Option<&Value>,
     capability_bundles: Option<&Value>,
 ) -> sqlx::Result<TriggerSubscriptionRow> {
+    // Prove every referenced parent belongs to this tenant IN SQL (the handler
+    // pre-validates too, but this is the relational backstop): the agent is
+    // in-scope; a Some pinned_revision is a revision of THAT agent; a Some
+    // connection is in-scope. A miss yields zero rows → fetch_one RowNotFound,
+    // the same shape a not-in-scope agent already produced for other writes.
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "insert into trigger_subscriptions
            (id, tenant_id, agent_id, name, trigger_kind, pinned_revision_id, task_template,
             allow_task_override, allow_workspace_override, autonomy, concurrency_policy,
             budget_override, workspace_override, result_destinations, callback_secret_sealed,
             connection_id, resource_selector, event_filter, event_publish, capability_bundles)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+         select $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20
+         where exists (select 1 from agents a where a.id = $3 and a.tenant_id = $2)
+           and ($6::uuid is null or exists (
+                 select 1 from agent_revisions r where r.id = $6 and r.agent_id = $3))
+           and ($16::uuid is null or exists (
+                 select 1 from integration_connections c where c.id = $16 and c.tenant_id = $2))
          returning {SUBSCRIPTION_COLS}"
     )))
     .bind(Uuid::now_v7())
@@ -1732,10 +1751,16 @@ pub async fn create_session(
     bind_dispatch: Option<Uuid>,
 ) -> sqlx::Result<SessionRow> {
     let mut tx = pool.begin().await?;
+    // Prove the agent AND the pinned revision both belong to this tenant in SQL
+    // (the run builder resolves them under scope first; this is the relational
+    // backstop). A miss yields zero rows → fetch_one RowNotFound, surfaced via
+    // `?` like any other create failure.
     let row: SessionRow = sqlx::query_as(
         "insert into sessions
            (id, tenant_id, agent_id, agent_revision_id, autonomy, trust_tier, task, repo_source, run_spec, budgets, trigger, invoked_by_kind, invoked_by_user_id)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         select $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13
+         where exists (select 1 from agents a where a.id = $3 and a.tenant_id = $2)
+           and exists (select 1 from agent_revisions r where r.id = $4 and r.agent_id = $3)
          returning *",
     )
     .bind(Uuid::now_v7())
@@ -1843,11 +1868,12 @@ pub async fn transition_session(
                               then coalesce(started_at, now()) else started_at end,
             finished_at = case when $2 in ('completed','failed','cancelled','budget_exceeded')
                                then now() else finished_at end
-         where id = $1 returning *",
+         where id = $1 and tenant_id = $4 returning *",
     )
     .bind(id)
     .bind(next.as_str())
     .bind(reason)
+    .bind(scope.tenant_id())
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -1896,11 +1922,15 @@ pub async fn set_sandbox_handle(
     if intent_exists {
         return Ok(false);
     }
-    sqlx::query("update sessions set sandbox_handle = $2, updated_at = now() where id = $1")
-        .bind(id)
-        .bind(handle)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "update sessions set sandbox_handle = $2, updated_at = now()
+         where id = $1 and tenant_id = $3",
+    )
+    .bind(id)
+    .bind(handle)
+    .bind(scope.tenant_id())
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(true)
 }
@@ -2259,20 +2289,35 @@ pub async fn upsert_artifact(
 
 // ─── Events (append-only; Redacted enforced at the type level) ────────────
 
-pub async fn append_event(pool: &PgPool, event: Redacted<EventEnvelope>) -> sqlx::Result<i64> {
+pub async fn append_event(
+    pool: &PgPool,
+    scope: TenantScope,
+    event: Redacted<EventEnvelope>,
+) -> sqlx::Result<i64> {
     let env = event.into_inner();
     let payload = serde_json::to_value(&env.body).unwrap_or(Value::Null);
     let type_name = env.body.type_name();
-    let row = sqlx::query("select append_event($1, $2, $3, $4, $5, $6) as seq")
-        .bind(env.session_id)
-        .bind(env.event_id)
-        .bind(env.actor.as_str())
-        .bind(&type_name)
-        .bind(&payload)
-        .bind(env.occurred_at)
-        .fetch_one(pool)
-        .await?;
-    Ok(row.get::<i64, _>("seq"))
+    // Gate the append on the session belonging to the caller's tenant. The
+    // `where exists(...)` guards the target list, so the side-effecting
+    // `append_event(...)` function is NOT invoked on a scope miss (no seq bump,
+    // no NOTIFY) — zero rows → RowNotFound, which the ledger helper logs.
+    let row = sqlx::query(
+        "select append_event($1, $2, $3, $4, $5, $6) as seq
+         where exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $7)",
+    )
+    .bind(env.session_id)
+    .bind(env.event_id)
+    .bind(env.actor.as_str())
+    .bind(&type_name)
+    .bind(&payload)
+    .bind(env.occurred_at)
+    .bind(scope.tenant_id())
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        Some(r) => Ok(r.get::<i64, _>("seq")),
+        None => Err(sqlx::Error::RowNotFound),
+    }
 }
 
 pub async fn events_after(
@@ -3092,10 +3137,16 @@ pub async fn enqueue_result_delivery(
     subscription: Option<Uuid>,
     destination: &Value,
 ) -> sqlx::Result<ResultDeliveryRow> {
+    // The session must be in scope AND — when a subscription is named — it must
+    // belong to the SAME tenant (a cross-tenant subscription is proven
+    // impossible here, not just Rust-side). A miss → fetch_one RowNotFound, the
+    // existing not-in-scope-session shape.
     sqlx::query_as(
         "insert into result_deliveries (id, session_id, subscription_id, destination)
          select $1, $2, $3, $4
          where exists (select 1 from sessions s where s.id = $2 and s.tenant_id = $5)
+           and ($3::uuid is null or exists (
+                 select 1 from trigger_subscriptions sub where sub.id = $3 and sub.tenant_id = $5))
          returning *",
     )
     .bind(Uuid::now_v7())
@@ -3443,11 +3494,18 @@ pub async fn claim_trigger_dispatch(
     delivery: Uuid,
     subscription: Uuid,
 ) -> sqlx::Result<Option<TriggerDispatchRow>> {
+    // Both the subscription AND the delivery's connection must sit in this
+    // tenant (the delivery→connection→tenant join is the same proof
+    // `list_delivery_dispatches` uses). A miss → zero rows → None, the existing
+    // no-claim shape.
     let inserted: Option<TriggerDispatchRow> = sqlx::query_as(
         "insert into trigger_dispatches (id, delivery_id, subscription_id)
          select $1,$2,$3
          where exists (select 1 from trigger_subscriptions sub
                        where sub.id = $3 and sub.tenant_id = $4)
+           and exists (select 1 from trigger_deliveries d
+                       join integration_connections c on c.id = d.connection_id
+                       where d.id = $2 and c.tenant_id = $4)
          on conflict (delivery_id, subscription_id) do nothing
          returning *",
     )
@@ -3468,6 +3526,9 @@ pub async fn claim_trigger_dispatch(
             and created_at < now() - interval '60 seconds'
             and exists (select 1 from trigger_subscriptions sub
                         where sub.id = $2 and sub.tenant_id = $3)
+            and exists (select 1 from trigger_deliveries d
+                        join integration_connections c on c.id = d.connection_id
+                        where d.id = $1 and c.tenant_id = $3)
           returning *",
     )
     .bind(delivery)
@@ -4009,7 +4070,11 @@ mod tests {
                     text: format!("m{i}"),
                 },
             );
-            seqs.push(append_event(&pool, redactor.scrub(env)).await.unwrap());
+            seqs.push(
+                append_event(&pool, scope, redactor.scrub(env))
+                    .await
+                    .unwrap(),
+            );
         }
         assert_eq!(seqs, vec![1, 2, 3]);
 
@@ -5840,6 +5905,7 @@ mod tests {
         let redactor = Redactor::default();
         append_event(
             &pool,
+            scope_b,
             redactor.scrub(EventEnvelope::new(
                 session.id,
                 Actor::System,
@@ -5892,9 +5958,16 @@ mod tests {
         let approvals_a = session_approvals(&pool, scope_a, session.id).await.unwrap();
         let artifacts_a = list_artifacts(&pool, scope_a, session.id).await.unwrap();
         let usage_a = usage_totals(&pool, scope_a, session.id).await.unwrap();
-        // Positive control — tenant B still reads its own.
+        // Positive control — tenant B still reads its own session, approval, AND
+        // every child family (events/artifacts/usage) under its OWNING scope, so
+        // the negatives below prove a tenant boundary, not a globally-broken read.
         let get_b = get_session(&pool, scope_b, session.id).await.unwrap();
         let approvals_b = session_approvals(&pool, scope_b, session.id).await.unwrap();
+        let events_b = events_after(&pool, scope_b, session.id, 0, 10)
+            .await
+            .unwrap();
+        let artifacts_b = list_artifacts(&pool, scope_b, session.id).await.unwrap();
+        let usage_b = usage_totals(&pool, scope_b, session.id).await.unwrap();
 
         // Cleanup, children-first, both orgs — BEFORE the assertions so a
         // failure never leaks throwaway fixtures.
@@ -5944,6 +6017,9 @@ mod tests {
             1,
             "tenant B sees its own pending approval"
         );
+        assert_eq!(events_b.len(), 1, "tenant B reads its own event");
+        assert_eq!(artifacts_b.len(), 1, "tenant B reads its own artifact");
+        assert_eq!(usage_b.requests, 1, "tenant B totals its own usage");
     }
 
     /// Cross-tenant isolation for AGENTS: an agent created under B is invisible

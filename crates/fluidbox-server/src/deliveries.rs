@@ -164,6 +164,7 @@ async fn attempt(state: &AppState, d: &fluidbox_db::ResultDeliveryRow) {
         "delivered" => {
             crate::ledger::record(
                 state,
+                scope,
                 row.session_id,
                 Actor::System,
                 EventBody::CallbackDelivered {
@@ -177,6 +178,7 @@ async fn attempt(state: &AppState, d: &fluidbox_db::ResultDeliveryRow) {
         "failed" => {
             crate::ledger::record(
                 state,
+                scope,
                 row.session_id,
                 Actor::System,
                 EventBody::CallbackFailed {

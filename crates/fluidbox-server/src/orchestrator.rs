@@ -84,6 +84,7 @@ async fn transition(
         Ok(Some((from, _))) => {
             ledger::record(
                 state,
+                scope,
                 id,
                 Actor::System,
                 EventBody::StatusChanged {
@@ -160,6 +161,7 @@ pub async fn finalize_reported(
             reason: None,
             want_quiesce: false, // the runner exits on its own after /result
         },
+        None,
     )
     .await
 }
@@ -184,6 +186,7 @@ pub async fn finalize_forced(
             reason: Some(reason),
             want_quiesce: true,
         },
+        None,
     )
     .await
 }
@@ -192,8 +195,20 @@ pub async fn finalize_forced(
 /// whatever the agent produced, after the runner stopped (quiesce for live
 /// runners; pre-launch/dead sessions skip it via the locked snapshot).
 pub async fn fail(state: &AppState, id: Uuid, reason: &str) -> FinalizeStart {
+    // A worker/system entry with only a bare id: resolve the owning tenant once
+    // (cross-tenant loader) so the RunError event is scoped, then hand the SAME
+    // scope to begin_finalize so it does not re-load.
+    let scope = match fluidbox_db::system_worker::get_session(&state.pool, id).await {
+        Ok(Some(s)) => TenantScope::assume(s.tenant_id),
+        Ok(None) => return FinalizeStart::Missing,
+        Err(e) => {
+            tracing::error!("fail {id} tenant resolve failed: {e}");
+            return FinalizeStart::DbError;
+        }
+    };
     ledger::record(
         state,
+        scope,
         id,
         Actor::System,
         EventBody::RunError {
@@ -210,6 +225,7 @@ pub async fn fail(state: &AppState, id: Uuid, reason: &str) -> FinalizeStart {
             reason: Some(reason),
             want_quiesce: true,
         },
+        Some(scope),
     )
     .await
 }
@@ -220,7 +236,11 @@ pub async fn fail(state: &AppState, id: Uuid, reason: &str) -> FinalizeStart {
 /// worktree, then collect. `Persisted { created: true }` means THIS call
 /// recorded the cancellation; a lost race means some other outcome already
 /// owns the run — callers must not report "cancelled" then.
-pub async fn cancel(state: &AppState, id: Uuid, reason: &str) -> FinalizeStart {
+pub async fn cancel(state: &AppState, scope: TenantScope, id: Uuid, reason: &str) -> FinalizeStart {
+    // Callers reach this only after loading the session UNDER `scope` (the
+    // authenticated handler proved ownership; the concurrency-replace path holds
+    // the run it just resolved), so the tenant is already authorized — pass it
+    // through instead of re-resolving it cross-tenant in begin_finalize.
     begin_finalize(
         state,
         id,
@@ -230,6 +250,7 @@ pub async fn cancel(state: &AppState, id: Uuid, reason: &str) -> FinalizeStart {
             reason: Some(reason),
             want_quiesce: true,
         },
+        Some(scope),
     )
     .await
 }
@@ -238,17 +259,28 @@ pub async fn cancel(state: &AppState, id: Uuid, reason: &str) -> FinalizeStart {
 /// enter the wind-down state THE WINNING INTENT implies, and kick the driver.
 /// Idempotent: a racing second caller receives the winner's row and derives
 /// everything from it — its own outcome/quiesce arguments are discarded.
-async fn begin_finalize(state: &AppState, id: Uuid, params: FinalizeParams<'_>) -> FinalizeStart {
+async fn begin_finalize(
+    state: &AppState,
+    id: Uuid,
+    params: FinalizeParams<'_>,
+    // Some when the caller ALREADY resolved (and authorized) the session's
+    // tenant — the authenticated cancel path passes its scoped row's scope so
+    // this does not re-load cross-tenant. None on the worker/system entries
+    // (finalize_reported/forced, the crash-recovery `fail`), which hold only a
+    // bare id and resolve it here.
+    pre_scope: Option<TenantScope>,
+) -> FinalizeStart {
     use fluidbox_db::BeginFinalization as B;
-    // Entry points carry only a bare session id; resolve its tenant once
-    // (cross-tenant loader) and scope every wind-down write to it.
-    let scope = match fluidbox_db::system_worker::get_session(&state.pool, id).await {
-        Ok(Some(s)) => TenantScope::assume(s.tenant_id),
-        Ok(None) => return FinalizeStart::Missing,
-        Err(e) => {
-            tracing::error!("begin_finalization {id} tenant resolve failed: {e}");
-            return FinalizeStart::DbError;
-        }
+    let scope = match pre_scope {
+        Some(s) => s,
+        None => match fluidbox_db::system_worker::get_session(&state.pool, id).await {
+            Ok(Some(s)) => TenantScope::assume(s.tenant_id),
+            Ok(None) => return FinalizeStart::Missing,
+            Err(e) => {
+                tracing::error!("begin_finalization {id} tenant resolve failed: {e}");
+                return FinalizeStart::DbError;
+            }
+        },
     };
     let begun = fluidbox_db::begin_finalization(
         &state.pool,
@@ -317,6 +349,7 @@ async fn enter_winddown(
     if applied && intent.needs_quiesce {
         ledger::record(
             state,
+            scope,
             id,
             Actor::System,
             EventBody::QuiesceRequested {
@@ -766,6 +799,7 @@ async fn finish_terminal_cleanup(
         Ok(false) => {
             ledger::record(
                 state,
+                scope,
                 id,
                 Actor::Harness,
                 EventBody::RunResult {
@@ -857,6 +891,7 @@ async fn store_collected(
         .await?;
         ledger::record(
             state,
+            scope,
             id,
             Actor::System,
             EventBody::ArtifactCollected {
@@ -890,6 +925,7 @@ async fn record_missing(
     .await?;
     ledger::record(
         state,
+        scope,
         id,
         Actor::System,
         EventBody::ArtifactMissing {
@@ -1023,6 +1059,7 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
 
     ledger::record(
         &state,
+        scope,
         session_id,
         Actor::System,
         EventBody::AgentMessage {
@@ -1318,6 +1355,7 @@ async fn materialize_workspace(
     }
     ledger::record(
         state,
+        scope,
         session_id,
         Actor::System,
         EventBody::WorkspaceInitialized {
