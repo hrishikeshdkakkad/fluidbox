@@ -445,6 +445,31 @@ pub async fn update_idp_discovery_cache(
     Ok(res.rows_affected() == 1)
 }
 
+/// Persist ONLY the cached JWKS document (the forced key-refresh during login),
+/// leaving `discovered_metadata` and `discovered_at` untouched. A key refresh
+/// must never rewrite discovery freshness — doing so would mask stale discovery
+/// metadata and suppress the required discovery refresh (design 815-826).
+/// Returns whether a row matched (`false` ⇒ the config vanished/retired
+/// concurrently, which the caller treats as terminal for the login).
+pub async fn update_idp_jwks_cache(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    jwks: &Value,
+) -> sqlx::Result<bool> {
+    let res = sqlx::query(
+        "update org_idp_configs
+         set jwks = $3, updated_at = now()
+         where tenant_id = $1 and id = $2",
+    )
+    .bind(scope.tenant_id())
+    .bind(id)
+    .bind(jwks)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
 /// The sealed OIDC client secret for the token exchange — a narrow reader that
 /// mirrors `connection_client_secret_sealed`'s shape. `OrgIdpConfigRow`
 /// deliberately omits the sealed column, so the login callback fetches it only

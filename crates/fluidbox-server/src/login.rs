@@ -37,7 +37,7 @@ use axum::Json;
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use fluidbox_db::{identity, sha256_hex, TenantScope};
-use openidconnect::core::{CoreJsonWebKey, CoreJsonWebKeySet, CoreJwsSigningAlgorithm};
+use openidconnect::core::{CoreJsonWebKey, CoreJwsSigningAlgorithm};
 use openidconnect::{AccessToken, AccessTokenHash, JsonWebKey, JsonWebKeyAlgorithm};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -176,16 +176,21 @@ impl OidcRuntime {
         let c = Arc::new(CachedJwks { keys, version });
         self.jwks.lock().await.insert(key, c.clone());
         // Persist last-known-good so a restart re-seeds this refreshed JWKS
-        // (design 815-826). Best effort — the in-memory cache already holds it.
-        let _ = identity::update_idp_discovery_cache(
-            &state.pool,
-            TenantScope::assume(key.0),
-            key.1,
-            &view.meta,
-            &doc,
-            Utc::now(),
-        )
-        .await;
+        // (design 815-826). JWKS-ONLY so a key refresh never rewrites discovery
+        // freshness (`discovered_at`) and masks stale discovery metadata.
+        match identity::update_idp_jwks_cache(&state.pool, TenantScope::assume(key.0), key.1, &doc)
+            .await
+        {
+            Ok(true) => {}
+            // Zero rows: the config vanished or was retired concurrently — the
+            // login is terminal (fail closed as config-inactive).
+            Ok(false) => return Err("SSO configuration changed — sign in again.".into()),
+            // A DB error is best-effort per-refresh: the in-memory cache already
+            // holds the verified keys and this login has already verified, so
+            // durability is not load-bearing here. Warn (config id only, no
+            // secrets) and continue with the in-memory refresh.
+            Err(_) => tracing::warn!(idp_config_id = %key.1, "jwks persist failed"),
+        }
         Ok(c)
     }
 
@@ -207,31 +212,37 @@ impl OidcRuntime {
 }
 
 fn parse_jwks(v: &Value) -> Result<Vec<Jwk>, String> {
+    // Document size bound BEFORE any parse work (design 826-831).
     let raw = serde_json::to_vec(v).map_err(|_| "jwks not serializable".to_string())?;
     if raw.len() > MAX_JWKS_BYTES {
         return Err("jwks document exceeds the size bound".into());
     }
-    let set: CoreJsonWebKeySet =
-        serde_json::from_value(v.clone()).map_err(|e| format!("invalid jwks document: {e}"))?;
-    let keys = set.keys();
-    if keys.len() > MAX_JWKS_KEYS {
+    let raw_keys = match v.get("keys") {
+        Some(Value::Array(a)) => a,
+        _ => return Err("invalid jwks document: 'keys' must be an array".into()),
+    };
+    // Key-count bound over the RAW array: openidconnect silently DROPS entries it
+    // cannot parse, so counting only the parsed keys would understate the doc.
+    if raw_keys.len() > MAX_JWKS_KEYS {
         return Err("jwks document has too many keys".into());
     }
-    // Pair each parsed key with its raw JWK by array index — the crate
-    // deserializes `keys` in order, so the alignment holds.
-    let raw_keys = v
-        .get("keys")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    Ok(keys
-        .iter()
-        .enumerate()
-        .map(|(i, k)| Jwk {
-            key: k.clone(),
-            raw: raw_keys.get(i).cloned().unwrap_or(Value::Null),
-        })
-        .collect())
+    // Deserialize each raw entry INDIVIDUALLY and keep it paired with its own raw
+    // JSON. A set-level `CoreJsonWebKeySet` deserialize skips malformed entries,
+    // which shifts the parsed-vs-raw index pairing when a bad entry PRECEDES a
+    // good one — landing another key's `kid`/`use`/`key_ops` on the wrong key. By
+    // parsing per entry, a key that fails to parse is excluded together with its
+    // raw twin (never index-shifted), so each surviving key's raw metadata is
+    // correct by construction (design 826-831).
+    let mut keys = Vec::with_capacity(raw_keys.len());
+    for entry in raw_keys {
+        if let Ok(key) = serde_json::from_value::<CoreJsonWebKey>(entry.clone()) {
+            keys.push(Jwk {
+                key,
+                raw: entry.clone(),
+            });
+        }
+    }
+    Ok(keys)
 }
 
 // ─── Cookie / header helpers ────────────────────────────────────────────────
@@ -772,9 +783,6 @@ pub(crate) struct DiscoveryView {
     pub(crate) token_endpoint: String,
     pub(crate) jwks_uri: String,
     pub(crate) jwks: Value,
-    /// The raw discovery metadata, retained so a forced JWKS refresh can
-    /// persist last-known-good via `update_idp_discovery_cache` (design 815-826).
-    pub(crate) meta: Value,
 }
 
 pub(crate) fn view_from(meta: &Value, jwks: Value) -> Result<DiscoveryView, String> {
@@ -789,7 +797,6 @@ pub(crate) fn view_from(meta: &Value, jwks: Value) -> Result<DiscoveryView, Stri
         token_endpoint: s("token_endpoint")?,
         jwks_uri: s("jwks_uri")?,
         jwks,
-        meta: meta.clone(),
     })
 }
 
@@ -1031,13 +1038,16 @@ mod verify {
 
     // ─── Strictly-typed claim accessors (design 529-538, fail-closed) ─────────
     // A PRESENT-but-wrong-typed optional claim is a REJECTION, never silently
-    // treated as absent. `null` counts as absent (JSON's explicit absence).
+    // treated as absent. Only a MISSING key reads as absent: an explicitly
+    // present JSON `null` is also a rejection (a conformant issuer omits an
+    // absent claim rather than sending it as null).
 
-    /// An optional string claim: absent/`null` ⇒ `None`; a non-string value ⇒
-    /// error.
+    /// An optional string claim: MISSING ⇒ `None`; explicit `null` or a
+    /// non-string value ⇒ error.
     fn opt_str<'a>(payload: &'a Value, k: &str) -> Result<Option<&'a str>, Error> {
         match payload.get(k) {
-            None | Some(Value::Null) => Ok(None),
+            None => Ok(None),
+            Some(Value::Null) => Err(Error::Terminal(format!("claim '{k}' is present but null"))),
             Some(Value::String(s)) => Ok(Some(s.as_str())),
             Some(_) => Err(Error::Terminal(format!("claim '{k}' must be a string"))),
         }
@@ -1054,10 +1064,12 @@ mod verify {
         }
     }
 
-    /// An optional integer claim: absent/`null` ⇒ `None`; non-integer ⇒ error.
+    /// An optional integer claim: MISSING ⇒ `None`; explicit `null` or a
+    /// non-integer ⇒ error.
     fn opt_i64(payload: &Value, k: &str) -> Result<Option<i64>, Error> {
         match payload.get(k) {
-            None | Some(Value::Null) => Ok(None),
+            None => Ok(None),
+            Some(Value::Null) => Err(Error::Terminal(format!("claim '{k}' is present but null"))),
             Some(Value::Number(n)) => {
                 Ok(Some(n.as_i64().ok_or_else(|| {
                     Error::Terminal(format!("claim '{k}' must be an integer"))
@@ -2664,6 +2676,45 @@ uIATiz1iFxtbjHI9UNGig2aiz3j22PuZSNeJqpxryrgzfWd1s828kecc31+KEIP6
         assert!(verify::key_compatible("RS256", &bare));
     }
 
+    // ─── parse_jwks: malformed entry excluded, never index-shifted ─────────
+    #[test]
+    fn parse_jwks_excludes_malformed_without_shifting_metadata() {
+        // A JWKS whose FIRST entry is malformed (no `kty` ⇒ fails to parse) and
+        // whose SECOND is a valid key. A set-level deserialize skips the bad
+        // entry and would shift the raw metadata by one; per-entry parsing must
+        // exclude the bad entry WITH its raw twin so the valid key keeps its OWN
+        // kid/use/key_ops (design 826-831).
+        let set = json!({"keys":[
+            {"kid":"malformed","use":"sig","alg":"RS256"},
+            {"kty":"RSA","use":"sig","key_ops":["verify"],"alg":"RS256",
+             "kid":"good","n":TEST_JWK_N,"e":"AQAB"},
+        ]});
+        let keys = parse_jwks(&set).unwrap();
+        assert_eq!(keys.len(), 1, "the malformed entry is excluded");
+        // The surviving key carries the SECOND entry's raw metadata, not the
+        // malformed first entry's.
+        assert_eq!(keys[0].raw.get("kid").and_then(Value::as_str), Some("good"));
+        assert!(verify::key_compatible("RS256", &keys[0]));
+        // And it verifies a token whose kid selects it — proving the parsed key
+        // and its raw kid are correctly paired.
+        let now = Utc::now().timestamp();
+        let allow = vec!["RS256".to_string()];
+        let tok = mint(
+            &rsa_test_key("good"),
+            Some("good"),
+            Algorithm::RS256,
+            &base_claims(now),
+        );
+        let v = verify::verify(&inputs(&allow, now), &tok, &keys).unwrap();
+        assert_eq!(v.subject, "subject-1");
+    }
+
+    #[test]
+    fn parse_jwks_rejects_non_array_keys() {
+        assert!(parse_jwks(&json!({"keys":"nope"})).is_err());
+        assert!(parse_jwks(&json!({})).is_err());
+    }
+
     // ─── fix 6: present-but-malformed optional claims fail closed ──────────
     #[test]
     fn malformed_optional_claims_reject() {
@@ -2680,6 +2731,14 @@ uIATiz1iFxtbjHI9UNGig2aiz3j22PuZSNeJqpxryrgzfWd1s828kecc31+KEIP6
         // azp as a number.
         let mut c = base_claims(now);
         c["azp"] = json!(7);
+        bad(c);
+        // azp explicitly PRESENT-but-null → reject (not read as absent).
+        let mut c = base_claims(now);
+        c["azp"] = json!(null);
+        bad(c);
+        // nbf explicitly PRESENT-but-null → reject (not read as absent).
+        let mut c = base_claims(now);
+        c["nbf"] = json!(null);
         bad(c);
         // aud array with a non-string entry.
         let mut c = base_claims(now);
