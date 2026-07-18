@@ -21,7 +21,7 @@ use crate::auth::Admin;
 use crate::error::{ApiError, ApiResult};
 use crate::login;
 use crate::state::AppState;
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use chrono::{DateTime, Duration, Utc};
@@ -29,6 +29,7 @@ use fluidbox_db::identity::{self, IdpConfigParams, IdpPatch, LifecycleOutcome};
 use fluidbox_db::TenantScope;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::net::SocketAddr;
 use uuid::Uuid;
 
 const BOOTSTRAP_ARM_TTL_DAYS: i64 = 7;
@@ -246,8 +247,11 @@ pub(crate) struct RolesBody {
 
 // ─── Shared handler helpers ──────────────────────────────────────────────────
 
-fn source_ip(headers: &HeaderMap) -> Option<String> {
-    let ip = login::client_ip(headers);
+/// The audit `source_ip` for an operator mutation: the socket peer unless a
+/// trusted proxy is declared (`FLUIDBOX_TRUST_FORWARDED_FOR`), never a
+/// client-forgeable `X-Forwarded-For`. `None` collapses the "unknown" sentinel.
+fn source_ip(headers: &HeaderMap, peer: SocketAddr, trust: bool) -> Option<String> {
+    let ip = login::client_ip(headers, Some(peer), trust);
     (ip != "unknown").then_some(ip)
 }
 
@@ -308,10 +312,11 @@ async fn refuse(
 pub async fn create_org(
     _: Admin,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Json(body): Json<CreateOrgBody>,
 ) -> ApiResult<Json<Value>> {
-    let sip = source_ip(&headers);
+    let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
     let slug = body.slug.trim().to_string();
     if !valid_slug(&slug) {
         reject_audit(
@@ -524,11 +529,12 @@ async fn validate_and_stage_config(
 pub async fn create_idp(
     _: Admin,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Path(slug): Path<String>,
     Json(body): Json<CreateIdpBody>,
 ) -> ApiResult<Json<Value>> {
-    let sip = source_ip(&headers);
+    let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
     let org = resolve_org(&state, &slug).await?;
     let scope = TenantScope::assume(org.id);
     let row = validate_and_stage_config(&state, scope, &body, sip.as_deref(), "idp.create").await?;
@@ -538,10 +544,11 @@ pub async fn create_idp(
 pub async fn activate_idp(
     _: Admin,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Path((slug, id)): Path<(String, Uuid)>,
 ) -> ApiResult<Json<Value>> {
-    let sip = source_ip(&headers);
+    let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
     let org = resolve_org(&state, &slug).await?;
     let scope = TenantScope::assume(org.id);
     match identity::activate_idp_config(&state.pool, scope, id, sip.as_deref()).await? {
@@ -556,10 +563,11 @@ pub async fn activate_idp(
 pub async fn disable_idp(
     _: Admin,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Path((slug, id)): Path<(String, Uuid)>,
 ) -> ApiResult<Json<Value>> {
-    let sip = source_ip(&headers);
+    let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
     let org = resolve_org(&state, &slug).await?;
     let scope = TenantScope::assume(org.id);
     match identity::disable_idp_config(&state.pool, scope, id, sip.as_deref()).await? {
@@ -579,10 +587,11 @@ pub async fn disable_idp(
 pub async fn reactivate_idp(
     _: Admin,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Path((slug, id)): Path<(String, Uuid)>,
 ) -> ApiResult<Json<Value>> {
-    let sip = source_ip(&headers);
+    let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
     let org = resolve_org(&state, &slug).await?;
     let scope = TenantScope::assume(org.id);
     match identity::reactivate_idp_config(&state.pool, scope, id, sip.as_deref()).await? {
@@ -600,11 +609,12 @@ pub async fn reactivate_idp(
 pub async fn patch_idp(
     _: Admin,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Path((slug, id)): Path<(String, Uuid)>,
     Json(body): Json<Value>,
 ) -> ApiResult<Json<Value>> {
-    let sip = source_ip(&headers);
+    let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
     let org = resolve_org(&state, &slug).await?;
     let scope = TenantScope::assume(org.id);
     let config = identity::get_idp_config(&state.pool, scope, id)
@@ -737,11 +747,12 @@ pub async fn patch_idp(
 pub async fn migrate_idp(
     _: Admin,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Path((slug, id)): Path<(String, Uuid)>,
     Json(body): Json<MigrateBody>,
 ) -> ApiResult<Json<Value>> {
-    let sip = source_ip(&headers);
+    let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
     let org = resolve_org(&state, &slug).await?;
     let scope = TenantScope::assume(org.id);
 
@@ -800,11 +811,12 @@ pub async fn migrate_idp(
 pub async fn break_glass_owner(
     _: Admin,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Path(slug): Path<String>,
     Json(body): Json<BreakGlassBody>,
 ) -> ApiResult<Json<Value>> {
-    let sip = source_ip(&headers);
+    let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
     let org = resolve_org(&state, &slug).await?;
     let scope = TenantScope::assume(org.id);
     let email = body.email.trim();
@@ -877,10 +889,11 @@ pub async fn list_members(
 pub async fn deactivate_member(
     _: Admin,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Path((slug, membership_id)): Path<(String, Uuid)>,
 ) -> ApiResult<Json<Value>> {
-    let sip = source_ip(&headers);
+    let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
     let org = resolve_org(&state, &slug).await?;
     let scope = TenantScope::assume(org.id);
     match identity::deactivate_membership_audited(&state.pool, scope, membership_id, sip.as_deref())
@@ -894,11 +907,12 @@ pub async fn deactivate_member(
 pub async fn set_member_roles(
     _: Admin,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Path((slug, membership_id)): Path<(String, Uuid)>,
     Json(body): Json<RolesBody>,
 ) -> ApiResult<Json<Value>> {
-    let sip = source_ip(&headers);
+    let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
     let org = resolve_org(&state, &slug).await?;
     let scope = TenantScope::assume(org.id);
     if body.roles.is_empty() {

@@ -30,7 +30,7 @@ use crate::oauth::{b64url, pkce_challenge, random_urlsafe};
 use crate::seal::Sealer;
 use crate::state::AppState;
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::Json;
@@ -214,18 +214,35 @@ fn clear_cookie(name: &str) -> String {
     format!("{name}=deleted; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age=0")
 }
 
-pub(crate) fn client_ip(headers: &HeaderMap) -> String {
-    for h in ["x-forwarded-for", "x-real-ip"] {
-        if let Some(v) = headers.get(h).and_then(|v| v.to_str().ok()) {
-            if let Some(first) = v.split(',').next() {
-                let ip = first.trim();
-                if !ip.is_empty() {
-                    return ip.to_string();
+/// The client IP for rate-limit buckets and audit `source_ip`.
+///
+/// `X-Forwarded-For`/`X-Real-IP` are client-controllable and are honored ONLY
+/// when `trust_forwarded_for` is set (fluidbox behind a trusted reverse proxy
+/// that sets them authoritatively — see `FLUIDBOX_TRUST_FORWARDED_FOR`). Absent
+/// that, the socket peer address (`ConnectInfo`) is the source of truth so a
+/// client can neither spoof a rate-limit bucket nor forge an audit IP. `peer`
+/// is `None` only if `ConnectInfo` was not wired (it always is at serve time).
+pub(crate) fn client_ip(
+    headers: &HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+    trust_forwarded_for: bool,
+) -> String {
+    if trust_forwarded_for {
+        for h in ["x-forwarded-for", "x-real-ip"] {
+            if let Some(v) = headers.get(h).and_then(|v| v.to_str().ok()) {
+                if let Some(first) = v.split(',').next() {
+                    let ip = first.trim();
+                    if !ip.is_empty() {
+                        return ip.to_string();
+                    }
                 }
             }
         }
     }
-    "unknown".to_string()
+    match peer {
+        Some(addr) => addr.ip().to_string(),
+        None => "unknown".to_string(),
+    }
 }
 
 fn html_escape(s: &str) -> String {
@@ -1183,12 +1200,19 @@ pub async fn start(
     State(state): State<AppState>,
     Path(slug): Path<String>,
     Query(p): Query<StartParams>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
     // Per-IP rate limit first (covers unknown/IdP-less slugs — no leak).
     if !state
         .oidc
-        .allow(&format!("ip:{}", client_ip(&headers)), RATE_PER_IP_PER_MIN)
+        .allow(
+            &format!(
+                "ip:{}",
+                client_ip(&headers, Some(peer), state.cfg.trust_forwarded_for)
+            ),
+            RATE_PER_IP_PER_MIN,
+        )
         .await
     {
         return too_many();
@@ -1331,11 +1355,18 @@ fn refuse_page(msg: &str) -> Response {
 pub async fn callback(
     State(state): State<AppState>,
     Query(p): Query<CallbackParams>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
     if !state
         .oidc
-        .allow(&format!("cb:{}", client_ip(&headers)), RATE_PER_IP_PER_MIN)
+        .allow(
+            &format!(
+                "cb:{}",
+                client_ip(&headers, Some(peer), state.cfg.trust_forwarded_for)
+            ),
+            RATE_PER_IP_PER_MIN,
+        )
         .await
     {
         return too_many();
@@ -1486,7 +1517,7 @@ pub async fn callback(
         current,
         &claim.redirect_to,
         &switch_nonce,
-        client_ip(&headers),
+        client_ip(&headers, Some(peer), state.cfg.trust_forwarded_for),
     )
     .await;
 
@@ -2430,6 +2461,25 @@ uIATiz1iFxtbjHI9UNGig2aiz3j22PuZSNeJqpxryrgzfWd1s828kecc31+KEIP6
         assert!(out.contains(&p("127.0.0.1:443")));
         assert!(!out.contains(&p("10.0.0.1:443")));
         assert!(!out.contains(&p("169.254.169.254:443")));
+    }
+
+    // ─── client_ip trust decision table (pure fn) ─────────────────────────
+    #[test]
+    fn client_ip_trust_decision_table() {
+        use std::net::SocketAddr;
+        let peer: SocketAddr = "198.51.100.7:54321".parse().unwrap();
+        let mut with_xff = HeaderMap::new();
+        with_xff.insert("x-forwarded-for", "203.0.113.9, 10.0.0.1".parse().unwrap());
+        let no_xff = HeaderMap::new();
+
+        // Trusted + header present → the FIRST XFF hop.
+        assert_eq!(client_ip(&with_xff, Some(peer), true), "203.0.113.9");
+        // Trusted + no header → fall through to the socket peer.
+        assert_eq!(client_ip(&no_xff, Some(peer), true), "198.51.100.7");
+        // Untrusted + header present → header IGNORED, socket peer wins.
+        assert_eq!(client_ip(&with_xff, Some(peer), false), "198.51.100.7");
+        // No ConnectInfo wired (should not happen at serve time) → "unknown".
+        assert_eq!(client_ip(&with_xff, None, false), "unknown");
     }
 
     // ─── claim mapping ────────────────────────────────────────────────────
