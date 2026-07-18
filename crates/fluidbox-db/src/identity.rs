@@ -1631,6 +1631,26 @@ pub async fn set_membership_roles_audited(
     source_ip: Option<&str>,
 ) -> sqlx::Result<Option<OrgMembershipRow>> {
     let mut tx = pool.begin().await?;
+    // Owner-role mutations serialize on the config row lock, alongside bootstrap
+    // arming + consumption (design 2026-07-17 line 718). Lock the org's IdP
+    // config rows before granting OR revoking owner: a grant is visible in the
+    // new `roles`; a revocation only in the membership's current roles.
+    let mut touches_owner = roles.iter().any(|r| r == "owner");
+    if !touches_owner {
+        let holds: Option<bool> = sqlx::query_scalar(
+            "select 'owner' = any(roles) from org_memberships
+             where tenant_id = $1 and id = $2",
+        )
+        .bind(scope.tenant_id())
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        touches_owner = holds.unwrap_or(false);
+    }
+    if touches_owner {
+        // Empty for a single-admin org with no IdP configs — no bootstrap race.
+        lock_org_configs(&mut tx, scope).await?;
+    }
     let row: Option<OrgMembershipRow> = sqlx::query_as(
         "update org_memberships set roles = $3, updated_at = now()
          where tenant_id = $1 and id = $2 returning *",

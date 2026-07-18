@@ -101,12 +101,11 @@ fn csrf_decision(method: &Method, headers: &HeaderMap, public_url: &str) -> Resu
     Ok(())
 }
 
-/// Admin authentication for the operator surface. Under `FLUIDBOX_REQUIRE_SSO`
-/// this is the ONLY extractor the admin token still satisfies (`Principal`
-/// refuses it there), which confines the operator to `/v1/admin/*`. No route
-/// mounts it yet — the break-glass `/v1/admin/*` surface arrives in Task 5 —
-/// so it reads as dead until then.
-#[allow(dead_code)]
+/// Operator break-glass credential: gates `/v1/admin/*`, and — outside
+/// `require_sso` — resolves to the Operator principal on the data plane. Under
+/// `FLUIDBOX_REQUIRE_SSO` this is the ONLY extractor the admin token still
+/// satisfies (`Principal` refuses it there), which confines the operator to
+/// `/v1/admin/*`.
 pub struct Admin;
 
 impl FromRequestParts<AppState> for Admin {
