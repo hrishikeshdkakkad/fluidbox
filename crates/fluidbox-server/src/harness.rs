@@ -178,6 +178,13 @@ mod tests {
             internal_service_namespace: None,
             max_archive_bytes: 2 * 1024 * 1024 * 1024,
             archive_ttl_secs: 24 * 3600,
+            require_sso: false,
+            trust_forwarded_for: false,
+            session_idle_secs: 8 * 3600,
+            session_absolute_secs: 7 * 24 * 3600,
+            oidc_discovery_max_age_secs: 3600,
+            oidc_clock_skew_secs: 60,
+            session_reauth_secs: 60,
         }
     }
 

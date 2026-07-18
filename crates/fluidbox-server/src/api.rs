@@ -1,9 +1,10 @@
 //! Public `/v1` API (admin token). The dashboard and CLI talk only to this.
 
-use crate::auth::Admin;
+use crate::auth::Principal;
 use crate::error::{ApiError, ApiResult};
 use crate::harness;
 use crate::orchestrator;
+use crate::rbac;
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::Json;
@@ -11,6 +12,7 @@ use fluidbox_core::policy::{Policy, RuleAction, ToolOverride};
 use fluidbox_core::spec::{
     Autonomy, Budgets, CheckoutMode, InvocationContext, InvocationKind, WorkspaceSpec,
 };
+use fluidbox_db::TenantScope;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -85,6 +87,7 @@ pub(crate) fn valid_repo_name(repo: &str) -> bool {
 
 pub(crate) async fn resolve_workspace_input(
     state: &AppState,
+    scope: TenantScope,
     input: WorkspaceInput,
 ) -> ApiResult<WorkspaceSpec> {
     Ok(match input {
@@ -117,9 +120,8 @@ pub(crate) async fn resolve_workspace_input(
             }
             let clone_url = match connection_id {
                 Some(cid) => {
-                    let conn = fluidbox_db::get_connection(&state.pool, cid)
+                    let conn = fluidbox_db::get_connection(&state.pool, scope, cid)
                         .await?
-                        .filter(|c| c.tenant_id == state.tenant_id)
                         .ok_or_else(|| ApiError::BadRequest(format!("unknown connection {cid}")))?;
                     if conn.status != "active" {
                         return Err(ApiError::BadRequest(format!(
@@ -190,11 +192,12 @@ pub(crate) async fn resolve_workspace_input(
 /// A revision default of Scratch means "no default" — store nothing.
 async fn default_workspace_value(
     state: &AppState,
+    scope: TenantScope,
     input: Option<WorkspaceInput>,
 ) -> ApiResult<Option<Value>> {
     match input {
         None => Ok(None),
-        Some(input) => match resolve_workspace_input(state, input).await? {
+        Some(input) => match resolve_workspace_input(state, scope, input).await? {
             WorkspaceSpec::Scratch => Ok(None),
             spec => Ok(Some(serde_json::to_value(&spec)?)),
         },
@@ -208,7 +211,11 @@ async fn default_workspace_value(
 /// upgrading a bundle means appending a new agent revision. Server-alias
 /// collisions across the attached set are refused here so the run-time
 /// intersection can never materialize a shadowed tool.
-pub(crate) async fn resolve_bundle_pins(state: &AppState, specs: &[String]) -> ApiResult<Value> {
+pub(crate) async fn resolve_bundle_pins(
+    state: &AppState,
+    scope: TenantScope,
+    specs: &[String],
+) -> ApiResult<Value> {
     use fluidbox_core::capability::{
         server_collision, BundleRef, CapabilityBundleDef, FrozenBundle,
     };
@@ -232,12 +239,9 @@ pub(crate) async fn resolve_bundle_pins(state: &AppState, specs: &[String]) -> A
         }
         let row = match version {
             Some(v) => {
-                fluidbox_db::get_capability_bundle_version(&state.pool, state.tenant_id, name, v)
-                    .await?
+                fluidbox_db::get_capability_bundle_version(&state.pool, scope, name, v).await?
             }
-            None => {
-                fluidbox_db::latest_capability_bundle(&state.pool, state.tenant_id, name).await?
-            }
+            None => fluidbox_db::latest_capability_bundle(&state.pool, scope, name).await?,
         }
         .ok_or_else(|| ApiError::BadRequest(format!("unknown capability bundle '{spec}'")))?;
         let def: CapabilityBundleDef = serde_json::from_value(row.definition.clone())
@@ -336,7 +340,10 @@ fn validate_model(harness_id: &str, model: &str) -> Result<(), ApiError> {
 /// `GET /v1/harnesses` — the supported harness + model catalog. The SINGLE
 /// source of truth for the dashboard's harness/model pickers (the frontend no
 /// longer hardcodes model lists).
-pub async fn list_harnesses(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Value>> {
+pub async fn list_harnesses(
+    _principal: Principal,
+    State(state): State<AppState>,
+) -> ApiResult<Json<Value>> {
     let harnesses: Vec<Value> = harness::KNOWN
         .iter()
         .map(|&id| {
@@ -378,10 +385,15 @@ fn inherit_unless_switched<'a>(
 }
 
 pub async fn create_agent(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Json(req): Json<CreateAgent>,
 ) -> ApiResult<Json<Value>> {
+    if !rbac::can_mutate_resources(&principal) {
+        return Err(ApiError::Forbidden(
+            "creating agents requires admin or owner".into(),
+        ));
+    }
     // Validate the harness BEFORE the agent row exists — a 422 here must not
     // leave a revision-less agent behind.
     let harness_id = req.harness.as_deref().unwrap_or(harness::CLAUDE_AGENT_SDK);
@@ -390,27 +402,25 @@ pub async fn create_agent(
         validate_model(harness_id, m)?;
     }
 
-    let agent = fluidbox_db::create_agent(
-        &state.pool,
-        state.tenant_id,
-        &req.name,
-        req.description.as_deref(),
-    )
-    .await?;
+    let scope = principal.scope();
+    let agent =
+        fluidbox_db::create_agent(&state.pool, scope, &req.name, req.description.as_deref())
+            .await?;
 
     // Create an initial revision so the agent is immediately runnable.
     let policy_name = req.policy.as_deref().unwrap_or("default");
-    let policy = fluidbox_db::get_policy_by_name(&state.pool, state.tenant_id, policy_name)
+    let policy = fluidbox_db::get_policy_by_name(&state.pool, scope, policy_name)
         .await?
         .ok_or_else(|| ApiError::BadRequest(format!("unknown policy '{policy_name}'")))?;
     let budgets = req.budgets.unwrap_or_default();
-    let default_workspace = default_workspace_value(&state, req.default_workspace).await?;
+    let default_workspace = default_workspace_value(&state, scope, req.default_workspace).await?;
     let capability_pins = match &req.capability_bundles {
-        Some(specs) => resolve_bundle_pins(&state, specs).await?,
+        Some(specs) => resolve_bundle_pins(&state, scope, specs).await?,
         None => json!([]),
     };
     let rev = fluidbox_db::append_agent_revision(
         &state.pool,
+        scope,
         agent.id,
         harness_id,
         req.runner_image.as_deref().unwrap_or(default_image),
@@ -426,20 +436,25 @@ pub async fn create_agent(
     Ok(Json(json!({ "agent": agent, "revision": rev })))
 }
 
-pub async fn list_agents(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    let agents = fluidbox_db::list_agents(&state.pool, state.tenant_id).await?;
+pub async fn list_agents(
+    principal: Principal,
+    State(state): State<AppState>,
+) -> ApiResult<Json<Value>> {
+    let scope = principal.scope();
+    let agents = fluidbox_db::list_agents(&state.pool, scope).await?;
     Ok(Json(json!({ "agents": agents })))
 }
 
 pub async fn get_agent(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let agent = fluidbox_db::get_agent(&state.pool, id)
+    let scope = principal.scope();
+    let agent = fluidbox_db::get_agent(&state.pool, scope, id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let revisions = fluidbox_db::list_revisions(&state.pool, id).await?;
+    let revisions = fluidbox_db::list_revisions(&state.pool, scope, id).await?;
     Ok(Json(json!({ "agent": agent, "revisions": revisions })))
 }
 
@@ -463,15 +478,21 @@ pub struct AddRevision {
 }
 
 pub async fn add_revision(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(req): Json<AddRevision>,
 ) -> ApiResult<Json<Value>> {
-    let agent = fluidbox_db::get_agent(&state.pool, id)
+    if !rbac::can_mutate_resources(&principal) {
+        return Err(ApiError::Forbidden(
+            "editing agents requires admin or owner".into(),
+        ));
+    }
+    let scope = principal.scope();
+    let agent = fluidbox_db::get_agent(&state.pool, scope, id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let latest = fluidbox_db::latest_revision(&state.pool, id).await?;
+    let latest = fluidbox_db::latest_revision(&state.pool, scope, id).await?;
     // Inherit from the latest revision unless overridden.
     let harness_id = req
         .harness
@@ -489,7 +510,7 @@ pub async fn add_revision(
     let policy_name = req.policy.clone();
     let policy_id = match policy_name {
         Some(name) => {
-            fluidbox_db::get_policy_by_name(&state.pool, state.tenant_id, &name)
+            fluidbox_db::get_policy_by_name(&state.pool, scope, &name)
                 .await?
                 .ok_or_else(|| ApiError::BadRequest(format!("unknown policy '{name}'")))?
                 .id
@@ -505,13 +526,13 @@ pub async fn add_revision(
         .unwrap_or_else(|| serde_json::to_value(Budgets::default()).unwrap());
     // Omitted → inherit; explicit scratch → cleared (stored as NULL).
     let default_workspace = match req.default_workspace {
-        Some(input) => default_workspace_value(&state, Some(input)).await?,
+        Some(input) => default_workspace_value(&state, scope, Some(input)).await?,
         None => latest.as_ref().and_then(|r| r.default_workspace.clone()),
     };
     // Omitted → inherit the previous pins verbatim; explicit list (incl.
     // []) re-resolves — the §17 #7 upgrade path.
     let capability_pins = match &req.capability_bundles {
-        Some(specs) => resolve_bundle_pins(&state, specs).await?,
+        Some(specs) => resolve_bundle_pins(&state, scope, specs).await?,
         None => latest
             .as_ref()
             .map(|r| r.capability_bundles.clone())
@@ -520,6 +541,7 @@ pub async fn add_revision(
 
     let rev = fluidbox_db::append_agent_revision(
         &state.pool,
+        scope,
         agent.id,
         harness_id,
         inherit_unless_switched(
@@ -548,14 +570,17 @@ pub async fn add_revision(
 
 // ─── Policies ─────────────────────────────────────────────────────────────
 
-pub async fn list_policies(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    let rows = fluidbox_db::list_policies(&state.pool, state.tenant_id).await?;
+pub async fn list_policies(
+    principal: Principal,
+    State(state): State<AppState>,
+) -> ApiResult<Json<Value>> {
+    let scope = principal.scope();
+    let rows = fluidbox_db::list_policies(&state.pool, scope).await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let policy: Policy = serde_json::from_value(row.parsed.clone())
             .map_err(|e| ApiError::Internal(format!("bad stored policy: {e}")))?;
-        let agents_using =
-            fluidbox_db::policy_agents_using(&state.pool, state.tenant_id, row.id).await?;
+        let agents_using = fluidbox_db::policy_agents_using(&state.pool, scope, row.id).await?;
         out.push(json!({
             "id": row.id,
             "name": row.name,
@@ -571,11 +596,12 @@ pub async fn list_policies(_: Admin, State(state): State<AppState>) -> ApiResult
 /// The Governance page's detail payload. The dashboard renders this verbatim —
 /// it never parses YAML and never resolves policy semantics.
 pub async fn get_policy(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    let row = fluidbox_db::get_policy_by_name(&state.pool, state.tenant_id, &name)
+    let scope = principal.scope();
+    let row = fluidbox_db::get_policy_by_name(&state.pool, scope, &name)
         .await?
         .ok_or(ApiError::NotFound)?;
     let policy: Policy = serde_json::from_value(row.parsed.clone())
@@ -585,7 +611,7 @@ pub async fn get_policy(
         .iter()
         .map(|t| t.name.to_string())
         .collect();
-    names.extend(fluidbox_db::policy_mcp_tools(&state.pool, state.tenant_id, row.id).await?);
+    names.extend(fluidbox_db::policy_mcp_tools(&state.pool, scope, row.id).await?);
 
     let matrix: Vec<Value> = policy
         .tool_matrix(&names)
@@ -617,7 +643,7 @@ pub async fn get_policy(
             "version": row.version,
             "updated_at": row.updated_at,
         },
-        "agents_using": fluidbox_db::policy_agents_using(&state.pool, state.tenant_id, row.id).await?,
+        "agents_using": fluidbox_db::policy_agents_using(&state.pool, scope, row.id).await?,
         "autonomy_summary": policy.autonomy_summary(),
         "defaults": policy.defaults,
         "budgets": policy.budgets,
@@ -634,10 +660,15 @@ pub struct UpsertPolicy {
 }
 
 pub async fn upsert_policy(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Json(req): Json<UpsertPolicy>,
 ) -> ApiResult<Json<Value>> {
+    if !rbac::can_mutate_resources(&principal) {
+        return Err(ApiError::Forbidden(
+            "editing policies requires admin or owner".into(),
+        ));
+    }
     let mut policy = Policy::parse_yaml(&req.yaml).map_err(ApiError::UnprocessableEntity)?;
     if policy.name != req.name {
         return Err(ApiError::BadRequest(
@@ -653,7 +684,8 @@ pub async fn upsert_policy(
     // Assign, never append: `managed_overrides` is `#[serde(default)]`, so yaml
     // could author one, and the column — the only sanctioned writer, `[]` for a
     // policy that does not exist yet — is the truth `parsed` must agree with.
-    let existing = fluidbox_db::get_policy_by_name(&state.pool, state.tenant_id, &req.name).await?;
+    let scope = principal.scope();
+    let existing = fluidbox_db::get_policy_by_name(&state.pool, scope, &req.name).await?;
     policy.managed_overrides = match &existing {
         Some(row) => serde_json::from_value(row.managed_overrides.clone())
             .map_err(|e| ApiError::Internal(format!("bad stored overrides: {e}")))?,
@@ -662,9 +694,7 @@ pub async fn upsert_policy(
     policy.validate().map_err(ApiError::UnprocessableEntity)?;
 
     let parsed = serde_json::to_value(&policy)?;
-    let row =
-        fluidbox_db::upsert_policy(&state.pool, state.tenant_id, &req.name, &req.yaml, &parsed)
-            .await?;
+    let row = fluidbox_db::upsert_policy(&state.pool, scope, &req.name, &req.yaml, &parsed).await?;
     Ok(Json(json!({ "policy": row })))
 }
 
@@ -673,7 +703,10 @@ pub struct ValidatePolicy {
     pub yaml: String,
 }
 
-pub async fn validate_policy(_: Admin, Json(req): Json<ValidatePolicy>) -> ApiResult<Json<Value>> {
+pub async fn validate_policy(
+    _principal: Principal,
+    Json(req): Json<ValidatePolicy>,
+) -> ApiResult<Json<Value>> {
     match Policy::parse_yaml(&req.yaml) {
         Ok(p) => Ok(Json(json!({ "valid": true, "name": p.name }))),
         Err(e) => Err(ApiError::UnprocessableEntity(e)),
@@ -699,12 +732,18 @@ fn policy_gone(e: sqlx::Error) -> ApiError {
 /// action cannot express it and flattening it would delete the rule's
 /// paths.deny / shell constraints.
 pub async fn put_policy_override(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path((name, tool)): Path<(String, String)>,
     Json(req): Json<SetOverride>,
 ) -> ApiResult<Json<Value>> {
-    let row = fluidbox_db::get_policy_by_name(&state.pool, state.tenant_id, &name)
+    if !rbac::can_mutate_resources(&principal) {
+        return Err(ApiError::Forbidden(
+            "editing policies requires admin or owner".into(),
+        ));
+    }
+    let scope = principal.scope();
+    let row = fluidbox_db::get_policy_by_name(&state.pool, scope, &name)
         .await?
         .ok_or(ApiError::NotFound)?;
     let mut policy: Policy = serde_json::from_value(row.parsed.clone())
@@ -726,7 +765,7 @@ pub async fn put_policy_override(
     // tool arrives pre-decided, invisible, never re-decided. So a write must
     // pass the same roster the matrix is drawn from.
     if fluidbox_core::tools::is_mcp(&tool)
-        && !fluidbox_db::policy_mcp_tools(&state.pool, state.tenant_id, row.id)
+        && !fluidbox_db::policy_mcp_tools(&state.pool, scope, row.id)
             .await?
             .iter()
             .any(|t| t == &tool)
@@ -760,26 +799,31 @@ pub async fn put_policy_override(
     });
     policy.validate().map_err(ApiError::BadRequest)?;
 
-    let row =
-        fluidbox_db::set_policy_override(&state.pool, state.tenant_id, &name, &tool, req.action)
-            .await
-            .map_err(policy_gone)?;
+    let row = fluidbox_db::set_policy_override(&state.pool, scope, &name, &tool, req.action)
+        .await
+        .map_err(policy_gone)?;
     Ok(Json(
         json!({ "policy": { "name": row.name, "version": row.version } }),
     ))
 }
 
 pub async fn delete_policy_override(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path((name, tool)): Path<(String, String)>,
 ) -> ApiResult<Json<Value>> {
-    fluidbox_db::get_policy_by_name(&state.pool, state.tenant_id, &name)
+    if !rbac::can_mutate_resources(&principal) {
+        return Err(ApiError::Forbidden(
+            "editing policies requires admin or owner".into(),
+        ));
+    }
+    let scope = principal.scope();
+    fluidbox_db::get_policy_by_name(&state.pool, scope, &name)
         .await?
         .ok_or(ApiError::NotFound)?;
     // Clearing only ever REMOVES an override, so the merged policy it leaves
     // behind is a subset of one that already validated — nothing to re-check.
-    let row = fluidbox_db::clear_policy_override(&state.pool, state.tenant_id, &name, &tool)
+    let row = fluidbox_db::clear_policy_override(&state.pool, scope, &name, &tool)
         .await
         .map_err(policy_gone)?;
     Ok(Json(
@@ -813,10 +857,13 @@ pub struct CreateSession {
 }
 
 pub async fn create_session(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Json(req): Json<CreateSession>,
 ) -> ApiResult<Json<Value>> {
+    // Any authenticated principal may create a run; visibility of the created
+    // run is governed by `invoked_by_user_id` (stamped below).
+    let scope = principal.scope();
     let explicit_input = match (req.workspace, req.repo) {
         (Some(_), Some(_)) => {
             return Err(ApiError::BadRequest(
@@ -826,7 +873,7 @@ pub async fn create_session(
         (w, r) => w.or(r),
     };
     let explicit = match explicit_input {
-        Some(input) => Some(resolve_workspace_input(&state, input).await?),
+        Some(input) => Some(resolve_workspace_input(&state, scope, input).await?),
         None => None,
     };
     let autonomy = if req.autonomous {
@@ -836,6 +883,7 @@ pub async fn create_session(
     };
     let created = crate::run_service::create_run(
         &state,
+        scope,
         crate::run_service::CreateRun {
             agent: req.agent,
             revision: crate::run_service::RevisionSelector::Latest,
@@ -848,11 +896,12 @@ pub async fn create_session(
             invocation: InvocationContext {
                 kind: InvocationKind::Manual,
                 subscription_id: None,
-                actor: Some("operator".into()),
+                actor: Some(principal.decided_by()),
                 attributes: Value::Null,
                 received_at: Some(chrono::Utc::now()),
                 ..Default::default()
             },
+            invoked_by_user_id: principal.user_id(),
             result_destinations: vec![],
             bound_invocation: None,
             bound_dispatch: None,
@@ -886,33 +935,50 @@ fn default_limit() -> i64 {
 }
 
 pub async fn list_sessions(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Value>> {
-    let sessions = fluidbox_db::list_sessions(&state.pool, state.tenant_id, q.limit).await?;
+    let scope = principal.scope();
+    // A plain member sees only runs it invoked; operator / runs.read_all
+    // holders see every run in the tenant. The filter is applied in SQL.
+    let invoked_by = if rbac::can_read_all_runs(&principal) {
+        None
+    } else {
+        Some(principal.user_id().unwrap_or_else(Uuid::nil))
+    };
+    let sessions = fluidbox_db::list_sessions(&state.pool, scope, invoked_by, q.limit).await?;
     Ok(Json(json!({ "sessions": sessions })))
 }
 
 pub async fn get_session(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let session = fluidbox_db::get_session(&state.pool, id)
+    let scope = principal.scope();
+    let session = fluidbox_db::get_session(&state.pool, scope, id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let totals = fluidbox_db::usage_totals(&state.pool, id).await?;
+    rbac::ensure_run_visible(&principal, &session)?;
+    let totals = fluidbox_db::usage_totals(&state.pool, scope, id).await?;
     Ok(Json(json!({ "session": session, "usage": totals })))
 }
 
 pub async fn cancel_session(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     use orchestrator::FinalizeStart;
-    match orchestrator::cancel(&state, id, "cancelled by user").await {
+    // Prove tenant ownership + run visibility before cancelling.
+    let session = fluidbox_db::get_session(&state.pool, principal.scope(), id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    rbac::ensure_run_visible(&principal, &session)?;
+    // The session was just loaded under principal.scope() (ownership proven);
+    // thread that scope so the finalizer does not re-resolve the tenant.
+    match orchestrator::cancel(&state, principal.scope(), id, "cancelled by user").await {
         FinalizeStart::Persisted { created } => Ok(Json(json!({ "cancelled": created }))),
         FinalizeStart::AlreadyTerminal | FinalizeStart::Missing => {
             Ok(Json(json!({ "cancelled": false })))
@@ -937,41 +1003,61 @@ fn default_event_limit() -> i64 {
 }
 
 pub async fn get_events(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(q): Query<EventsQuery>,
 ) -> ApiResult<Json<Value>> {
-    let events = fluidbox_db::events_after(&state.pool, id, q.after, q.limit).await?;
+    let scope = principal.scope();
+    let session = fluidbox_db::get_session(&state.pool, scope, id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    rbac::ensure_run_visible(&principal, &session)?;
+    let events = fluidbox_db::events_after(&state.pool, scope, id, q.after, q.limit).await?;
     Ok(Json(json!({ "events": events })))
 }
 
 // ─── Approvals ────────────────────────────────────────────────────────────
 
-pub async fn approvals_inbox(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    let approvals = fluidbox_db::pending_approvals(&state.pool).await?;
+pub async fn approvals_inbox(
+    principal: Principal,
+    State(state): State<AppState>,
+) -> ApiResult<Json<Value>> {
+    // The org approval queue: only run.read_all holders (operator /
+    // approver / admin / owner) see it; a plain member reads its own runs'
+    // approvals through the per-session list.
+    if !rbac::can_read_all_runs(&principal) {
+        return Err(ApiError::Forbidden(
+            "the approvals inbox requires approver, admin, or owner".into(),
+        ));
+    }
+    let approvals = fluidbox_db::pending_approvals(&state.pool, principal.scope()).await?;
     Ok(Json(json!({ "approvals": approvals })))
 }
 
 pub async fn session_approvals(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let approvals = fluidbox_db::session_approvals(&state.pool, id).await?;
+    let scope = principal.scope();
+    let session = fluidbox_db::get_session(&state.pool, scope, id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    rbac::ensure_run_visible(&principal, &session)?;
+    let approvals = fluidbox_db::session_approvals(&state.pool, scope, id).await?;
     Ok(Json(json!({ "approvals": approvals })))
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Decision {
     /// approved_once | approved_session | denied
     pub decision: String,
-    #[serde(default)]
-    pub decided_by: Option<String>,
 }
 
 pub async fn decide_approval(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(req): Json<Decision>,
@@ -982,8 +1068,31 @@ pub async fn decide_approval(
         "denied" | "deny" => "denied",
         other => return Err(ApiError::BadRequest(format!("unknown decision '{other}'"))),
     };
-    let decided_by = req.decided_by.unwrap_or_else(|| "operator".into());
-    let row = fluidbox_db::decide_approval(&state.pool, id, status, &decided_by)
+    let scope = principal.scope();
+    // Authorization (parent design lines 564-583): decide_org holders may
+    // decide any visible approval; a plain member may decide only approvals on
+    // a run it invoked (`approval.decide_own`). In Phase B every brokered call
+    // carries org authority, so decide_org is the org path.
+    let approval = fluidbox_db::get_approval(&state.pool, scope, id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if !rbac::can_decide_org(&principal) {
+        let session = fluidbox_db::get_session(&state.pool, scope, approval.session_id)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+        // `approval.decide_own` covers only credentialless calls on a run the
+        // member invoked; brokered (`mcp__*`) calls are org authority and need
+        // decide_org (parent design lines 564-579).
+        if !rbac::can_decide_own(&principal, session.invoked_by_user_id, &approval.tool) {
+            return Err(ApiError::Forbidden(
+                "deciding this approval requires approver, admin, or owner".into(),
+            ));
+        }
+    }
+    // `decided_by` is DERIVED from the authenticated principal — never
+    // request-supplied (parent design line 581).
+    let decided_by = principal.decided_by();
+    let row = fluidbox_db::decide_approval(&state.pool, scope, id, status, &decided_by)
         .await?
         .ok_or_else(|| ApiError::Conflict("approval is not pending".into()))?;
     // Wake the blocked permission handler.
@@ -994,43 +1103,68 @@ pub async fn decide_approval(
 // ─── Result deliveries ────────────────────────────────────────────────────
 
 pub async fn session_deliveries(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let deliveries = fluidbox_db::list_session_deliveries(&state.pool, id).await?;
+    let scope = principal.scope();
+    let session = fluidbox_db::get_session(&state.pool, scope, id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    rbac::ensure_run_visible(&principal, &session)?;
+    let deliveries = fluidbox_db::list_session_deliveries(&state.pool, scope, id).await?;
     Ok(Json(json!({ "deliveries": deliveries })))
 }
 
 // ─── Artifacts & cost ─────────────────────────────────────────────────────
 
 pub async fn list_artifacts(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let artifacts = fluidbox_db::list_artifacts(&state.pool, id).await?;
+    let scope = principal.scope();
+    let session = fluidbox_db::get_session(&state.pool, scope, id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    rbac::ensure_run_visible(&principal, &session)?;
+    let artifacts = fluidbox_db::list_artifacts(&state.pool, scope, id).await?;
     Ok(Json(json!({ "artifacts": artifacts })))
 }
 
 pub async fn get_artifact(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
-    Path((_sid, aid)): Path<(Uuid, Uuid)>,
+    Path((sid, aid)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<Value>> {
-    let artifact = fluidbox_db::get_artifact(&state.pool, aid)
+    let scope = principal.scope();
+    let session = fluidbox_db::get_session(&state.pool, scope, sid)
         .await?
         .ok_or(ApiError::NotFound)?;
+    rbac::ensure_run_visible(&principal, &session)?;
+    let artifact = fluidbox_db::get_artifact(&state.pool, scope, aid)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    // Scope the artifact to the visible run: a same-tenant artifact from an
+    // INVISIBLE run must never be readable through a visible run's id.
+    if artifact.session_id != sid {
+        return Err(ApiError::NotFound);
+    }
     Ok(Json(json!({ "artifact": artifact })))
 }
 
 pub async fn get_cost(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let totals = fluidbox_db::usage_totals(&state.pool, id).await?;
-    let tool_calls = fluidbox_db::tool_call_count(&state.pool, id).await?;
+    let scope = principal.scope();
+    let session = fluidbox_db::get_session(&state.pool, scope, id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    rbac::ensure_run_visible(&principal, &session)?;
+    let totals = fluidbox_db::usage_totals(&state.pool, scope, id).await?;
+    let tool_calls = fluidbox_db::tool_call_count(&state.pool, scope, id).await?;
     Ok(Json(json!({ "usage": totals, "tool_calls": tool_calls })))
 }
 
