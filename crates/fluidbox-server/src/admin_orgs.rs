@@ -153,51 +153,82 @@ fn build_claim_mappings(provided: Option<&Value>) -> Result<Value, String> {
     Ok(m)
 }
 
-/// `token_endpoint_auth` must appear in the discovered
-/// `token_endpoint_auth_methods_supported`; an ABSENT list implies the OIDC
-/// default `client_secret_basic` only (design lines 216, 677-682).
-fn auth_method_supported(auth: &str, meta: &Value) -> bool {
-    match meta
-        .get("token_endpoint_auth_methods_supported")
-        .and_then(Value::as_array)
-    {
-        Some(arr) => arr.iter().filter_map(Value::as_str).any(|m| m == auth),
-        None => auth == "client_secret_basic",
+/// The three-way classification of an OIDC-discovery list field: genuinely
+/// ABSENT (accept the documented default), a well-formed array of strings
+/// (evaluate membership), or PRESENT-but-MALFORMED — a non-array value, an
+/// explicit `null`, or an array carrying a non-string element. A malformed
+/// field is REFUSED at save rather than collapsing into the absent/accept
+/// branch: only a genuinely absent field keeps the documented acceptance
+/// (design lines 169-171, 863). `filter_map(as_str)` alone would silently drop
+/// a non-string element and treat `"S256"` (a string, not an array) as an
+/// empty/absent list — the collapse this closes.
+enum MetaList<'a> {
+    Absent,
+    Malformed,
+    Values(Vec<&'a str>),
+}
+
+fn meta_list<'a>(meta: &'a Value, key: &str) -> MetaList<'a> {
+    match meta.get(key) {
+        None => MetaList::Absent,
+        Some(Value::Array(arr)) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for v in arr {
+                match v.as_str() {
+                    Some(s) => out.push(s),
+                    None => return MetaList::Malformed,
+                }
+            }
+            MetaList::Values(out)
+        }
+        // A present non-array (string/number/object/bool) or explicit null is
+        // malformed metadata, not an absent field.
+        Some(_) => MetaList::Malformed,
     }
 }
 
-/// Refuse only when `code_challenge_methods_supported` is PRESENT and lacks
-/// `S256`; absent ⇒ accept (S256 is sendable regardless) — design line 863.
+/// `token_endpoint_auth` must appear in the discovered
+/// `token_endpoint_auth_methods_supported`; an ABSENT list implies the OIDC
+/// default `client_secret_basic` only (design lines 216, 677-682). A PRESENT-
+/// but-malformed list is refused (never silently treated as absent).
+fn auth_method_supported(auth: &str, meta: &Value) -> bool {
+    match meta_list(meta, "token_endpoint_auth_methods_supported") {
+        MetaList::Absent => auth == "client_secret_basic",
+        MetaList::Malformed => false,
+        MetaList::Values(v) => v.contains(&auth),
+    }
+}
+
+/// Refuse when `code_challenge_methods_supported` is PRESENT and lacks `S256`,
+/// AND when it is present but malformed; absent ⇒ accept (S256 is sendable
+/// regardless) — design line 863.
 ///
 /// OIDC discovery makes `code_challenge_methods_supported` an OPTIONAL field:
 /// the conformance floor (design 856-871) requires the IdP to *support* PKCE
 /// S256, not to *advertise* it. An issuer that omits the field entirely still
 /// meets the floor (we always send S256); one that advertises the field but
-/// omits S256 is declaring it cannot do S256, and is refused.
+/// omits S256 — or advertises it as a non-array / non-string — is declaring it
+/// cannot do S256 (or is serving malformed metadata), and is refused.
 fn pkce_ok(meta: &Value) -> bool {
-    match meta
-        .get("code_challenge_methods_supported")
-        .and_then(Value::as_array)
-    {
-        Some(arr) => arr.iter().filter_map(Value::as_str).any(|m| m == "S256"),
-        None => true,
+    match meta_list(meta, "code_challenge_methods_supported") {
+        MetaList::Absent => true,
+        MetaList::Malformed => false,
+        MetaList::Values(v) => v.contains(&"S256"),
     }
 }
 
 /// When the issuer advertises `response_types_supported`, require an entry that
 /// carries the `code` response type (the authorization-code flow the floor
 /// requires). Absent ⇒ accept (OIDC makes the field optional; the floor requires
-/// the *capability*, and every conformant provider serves `code`).
+/// the *capability*, and every conformant provider serves `code`). A present-
+/// but-malformed list is refused.
 fn response_type_code_ok(meta: &Value) -> bool {
-    match meta
-        .get("response_types_supported")
-        .and_then(Value::as_array)
-    {
-        Some(arr) => arr
+    match meta_list(meta, "response_types_supported") {
+        MetaList::Absent => true,
+        MetaList::Malformed => false,
+        MetaList::Values(v) => v
             .iter()
-            .filter_map(Value::as_str)
             .any(|rt| rt.split_whitespace().any(|t| t == "code")),
-        None => true,
     }
 }
 
@@ -308,6 +339,26 @@ async fn resolve_org(state: &AppState, slug: &str) -> ApiResult<fluidbox_db::ide
         .ok_or(ApiError::NotFound)
 }
 
+/// Resolve an org by slug for a MUTATING handler, auditing a miss. A missing
+/// slug on an admin mutation is a rejected attempt like any other refusal, so it
+/// routes through [`reject_audit`] (tenant unknown ⇒ `None`) before the 404 —
+/// the read-only list handlers keep [`resolve_org`]. `action` is the handler's
+/// audit action so per-action filtering stays uniform.
+async fn resolve_org_audited(
+    state: &AppState,
+    sip: Option<&str>,
+    action: &str,
+    slug: &str,
+) -> ApiResult<fluidbox_db::identity::OrgRow> {
+    match identity::get_org_by_slug(&state.pool, slug).await? {
+        Some(org) => Ok(org),
+        None => {
+            reject_audit(state, None, sip, action, Some(slug), "org not found").await;
+            Err(ApiError::NotFound)
+        }
+    }
+}
+
 /// Audit a rejected attempt in a SEPARATE transaction committed after the
 /// refusal (design lines 398-402) — best effort against a fully dead database.
 async fn reject_audit(
@@ -385,9 +436,29 @@ pub async fn create_org(
     headers: HeaderMap,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
-    Json(body): Json<CreateOrgBody>,
+    Json(raw): Json<Value>,
 ) -> ApiResult<Json<Value>> {
     let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
+    // Deserialize INSIDE the handler (body is `Json<Value>`, not `Json<T>`) so a
+    // malformed body is audited + 400'd here, not silently rejected by the axum
+    // extractor before the handler runs.
+    let body: CreateOrgBody = match serde_json::from_value(raw) {
+        Ok(b) => b,
+        Err(e) => {
+            reject_audit(
+                &state,
+                None,
+                sip.as_deref(),
+                "org.create",
+                None,
+                "invalid request body",
+            )
+            .await;
+            return Err(ApiError::BadRequest(format!(
+                "invalid create-org body: {e}"
+            )));
+        }
+    };
     let slug = body.slug.trim().to_string();
     if !valid_slug(&slug) {
         reject_audit(
@@ -626,11 +697,28 @@ pub async fn create_idp(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Path(slug): Path<String>,
-    Json(body): Json<CreateIdpBody>,
+    Json(raw): Json<Value>,
 ) -> ApiResult<Json<Value>> {
     let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
-    let org = resolve_org(&state, &slug).await?;
+    let org = resolve_org_audited(&state, sip.as_deref(), "idp.create", &slug).await?;
     let scope = TenantScope::assume(org.id);
+    let body: CreateIdpBody = match serde_json::from_value(raw) {
+        Ok(b) => b,
+        Err(e) => {
+            reject_audit(
+                &state,
+                Some(org.id),
+                sip.as_deref(),
+                "idp.create",
+                None,
+                "invalid request body",
+            )
+            .await;
+            return Err(ApiError::BadRequest(format!(
+                "invalid create-idp body: {e}"
+            )));
+        }
+    };
     let row = validate_and_stage_config(&state, scope, &body, sip.as_deref(), "idp.create").await?;
     Ok(Json(json!({ "idp": row })))
 }
@@ -643,7 +731,7 @@ pub async fn activate_idp(
     Path((slug, id)): Path<(String, Uuid)>,
 ) -> ApiResult<Json<Value>> {
     let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
-    let org = resolve_org(&state, &slug).await?;
+    let org = resolve_org_audited(&state, sip.as_deref(), "idp.activate", &slug).await?;
     let scope = TenantScope::assume(org.id);
     match identity::activate_idp_config(&state.pool, scope, id, sip.as_deref()).await? {
         LifecycleOutcome::Done(row) => Ok(Json(json!({ "idp": row }))),
@@ -669,7 +757,7 @@ pub async fn disable_idp(
     Path((slug, id)): Path<(String, Uuid)>,
 ) -> ApiResult<Json<Value>> {
     let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
-    let org = resolve_org(&state, &slug).await?;
+    let org = resolve_org_audited(&state, sip.as_deref(), "idp.disable", &slug).await?;
     let scope = TenantScope::assume(org.id);
     match identity::disable_idp_config(&state.pool, scope, id, sip.as_deref()).await? {
         LifecycleOutcome::Done(c) => Ok(Json(json!({
@@ -700,7 +788,7 @@ pub async fn reactivate_idp(
     Path((slug, id)): Path<(String, Uuid)>,
 ) -> ApiResult<Json<Value>> {
     let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
-    let org = resolve_org(&state, &slug).await?;
+    let org = resolve_org_audited(&state, sip.as_deref(), "idp.reactivate", &slug).await?;
     let scope = TenantScope::assume(org.id);
     match identity::reactivate_idp_config(&state.pool, scope, id, sip.as_deref()).await? {
         LifecycleOutcome::Done(row) => Ok(Json(json!({ "idp": row }))),
@@ -730,7 +818,7 @@ pub async fn patch_idp(
     Json(raw): Json<Value>,
 ) -> ApiResult<Json<Value>> {
     let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
-    let org = resolve_org(&state, &slug).await?;
+    let org = resolve_org_audited(&state, sip.as_deref(), "idp.patch", &slug).await?;
     let scope = TenantScope::assume(org.id);
     let config = match identity::get_idp_config(&state.pool, scope, id).await? {
         Some(c) => c,
@@ -826,36 +914,10 @@ pub async fn patch_idp(
         }
     };
 
-    // Coherence AFTER merging with current state: a confidential method
-    // (client_secret_basic/post) requires a secret present post-merge; a public
-    // client (none) must not retain one — refuse rather than silently drift.
-    let has_secret_now = identity::idp_client_secret_sealed(&state.pool, scope, id)
-        .await?
-        .is_some();
-    let secret_present_post = match &secret_patch {
-        identity::SecretPatch::Set(_) => true,
-        identity::SecretPatch::Clear => false,
-        identity::SecretPatch::Keep => has_secret_now,
-    };
-    let eff_auth = new_auth
-        .as_deref()
-        .unwrap_or(config.token_endpoint_auth.as_str());
-    if (eff_auth == "client_secret_basic" || eff_auth == "client_secret_post")
-        && !secret_present_post
-    {
-        return Err(bad(ApiError::BadRequest(format!(
-            "token_endpoint_auth={eff_auth} requires a client_secret to be present after this patch"
-        )))
-        .await);
-    }
-    if eff_auth == "none" && secret_present_post {
-        return Err(bad(ApiError::BadRequest(
-            "token_endpoint_auth=none (public client) must not retain a client_secret; \
-             clear it explicitly with client_secret:null"
-                .into(),
-        ))
-        .await);
-    }
+    // Auth/secret COHERENCE is validated in `patch_idp_config` under the config
+    // row's FOR UPDATE lock (merged against the freshly-read current row), so two
+    // concurrent PATCHes cannot each pass against stale state and commit an
+    // incoherent pair. The handler keeps only request-shape validation above.
 
     // bootstrap_owner_email: re-armed (+7d), refused (in the DB fn, under the
     // config lock) while an active owner exists.
@@ -899,11 +961,26 @@ pub async fn migrate_idp(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Path((slug, id)): Path<(String, Uuid)>,
-    Json(body): Json<MigrateBody>,
+    Json(raw): Json<Value>,
 ) -> ApiResult<Json<Value>> {
     let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
-    let org = resolve_org(&state, &slug).await?;
+    let org = resolve_org_audited(&state, sip.as_deref(), "idp.migrate", &slug).await?;
     let scope = TenantScope::assume(org.id);
+    let body: MigrateBody = match serde_json::from_value(raw) {
+        Ok(b) => b,
+        Err(e) => {
+            reject_audit(
+                &state,
+                Some(org.id),
+                sip.as_deref(),
+                "idp.migrate",
+                Some(&id.to_string()),
+                "invalid request body",
+            )
+            .await;
+            return Err(ApiError::BadRequest(format!("invalid migrate body: {e}")));
+        }
+    };
 
     // Pre-check the OLD config is active BEFORE staging the new one, so a wrong
     // target does not leave an orphan staged config (the swap re-checks under
@@ -980,11 +1057,28 @@ pub async fn break_glass_owner(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Path(slug): Path<String>,
-    Json(body): Json<BreakGlassBody>,
+    Json(raw): Json<Value>,
 ) -> ApiResult<Json<Value>> {
     let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
-    let org = resolve_org(&state, &slug).await?;
+    let org = resolve_org_audited(&state, sip.as_deref(), "break_glass.arm", &slug).await?;
     let scope = TenantScope::assume(org.id);
+    let body: BreakGlassBody = match serde_json::from_value(raw) {
+        Ok(b) => b,
+        Err(e) => {
+            reject_audit(
+                &state,
+                Some(org.id),
+                sip.as_deref(),
+                "break_glass.arm",
+                None,
+                "invalid request body",
+            )
+            .await;
+            return Err(ApiError::BadRequest(format!(
+                "invalid break-glass body: {e}"
+            )));
+        }
+    };
     let email = body.email.trim();
     if email.is_empty() || !email.contains('@') {
         return Err(refuse(
@@ -1055,7 +1149,7 @@ pub async fn deactivate_member(
     Path((slug, membership_id)): Path<(String, Uuid)>,
 ) -> ApiResult<Json<Value>> {
     let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
-    let org = resolve_org(&state, &slug).await?;
+    let org = resolve_org_audited(&state, sip.as_deref(), "member.deactivate", &slug).await?;
     let scope = TenantScope::assume(org.id);
     match identity::deactivate_membership_audited(&state.pool, scope, membership_id, sip.as_deref())
         .await?
@@ -1078,11 +1172,26 @@ pub async fn set_member_roles(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Path((slug, membership_id)): Path<(String, Uuid)>,
-    Json(body): Json<RolesBody>,
+    Json(raw): Json<Value>,
 ) -> ApiResult<Json<Value>> {
     let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
-    let org = resolve_org(&state, &slug).await?;
+    let org = resolve_org_audited(&state, sip.as_deref(), "member.roles", &slug).await?;
     let scope = TenantScope::assume(org.id);
+    let body: RolesBody = match serde_json::from_value(raw) {
+        Ok(b) => b,
+        Err(e) => {
+            reject_audit(
+                &state,
+                Some(org.id),
+                sip.as_deref(),
+                "member.roles",
+                Some(&membership_id.to_string()),
+                "invalid request body",
+            )
+            .await;
+            return Err(ApiError::BadRequest(format!("invalid roles body: {e}")));
+        }
+    };
     if body.roles.is_empty() {
         return Err(refuse(
             &state,
@@ -1268,6 +1377,14 @@ mod tests {
         assert!(auth_method_supported("client_secret_basic", &empty));
         assert!(!auth_method_supported("client_secret_post", &empty));
         assert!(!auth_method_supported("none", &empty));
+        // PRESENT-but-malformed → refuse (NOT collapsed to the absent/basic
+        // branch): a bare string, an explicit null, and a non-string element.
+        let str_meta = json!({ "token_endpoint_auth_methods_supported": "client_secret_basic" });
+        assert!(!auth_method_supported("client_secret_basic", &str_meta));
+        let null_meta = json!({ "token_endpoint_auth_methods_supported": null });
+        assert!(!auth_method_supported("client_secret_basic", &null_meta));
+        let mixed = json!({ "token_endpoint_auth_methods_supported": ["client_secret_basic", 7] });
+        assert!(!auth_method_supported("client_secret_basic", &mixed));
     }
 
     #[test]
@@ -1284,6 +1401,44 @@ mod tests {
         ));
         // Absent → accept.
         assert!(pkce_ok(&json!({})));
+        // PRESENT-but-malformed → refuse: a string instead of an array, an
+        // explicit null, and an array carrying a non-string.
+        assert!(!pkce_ok(
+            &json!({ "code_challenge_methods_supported": "S256" })
+        ));
+        assert!(!pkce_ok(
+            &json!({ "code_challenge_methods_supported": null })
+        ));
+        assert!(!pkce_ok(
+            &json!({ "code_challenge_methods_supported": ["S256", 1] })
+        ));
+    }
+
+    #[test]
+    fn response_type_validation() {
+        // Present with a code-bearing entry → accept.
+        assert!(response_type_code_ok(
+            &json!({ "response_types_supported": ["code", "id_token"] })
+        ));
+        assert!(response_type_code_ok(
+            &json!({ "response_types_supported": ["code id_token"] })
+        ));
+        // Present without code → refuse.
+        assert!(!response_type_code_ok(
+            &json!({ "response_types_supported": ["id_token", "token"] })
+        ));
+        // Absent → accept.
+        assert!(response_type_code_ok(&json!({})));
+        // PRESENT-but-malformed → refuse (non-array, null, non-string element).
+        assert!(!response_type_code_ok(
+            &json!({ "response_types_supported": "code" })
+        ));
+        assert!(!response_type_code_ok(
+            &json!({ "response_types_supported": null })
+        ));
+        assert!(!response_type_code_ok(
+            &json!({ "response_types_supported": ["code", 42] })
+        ));
     }
 
     #[test]
