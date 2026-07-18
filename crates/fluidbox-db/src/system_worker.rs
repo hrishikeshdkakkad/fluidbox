@@ -83,6 +83,27 @@ pub async fn get_connection(
     .await
 }
 
+/// Verification-material reader for the UNAUTHENTICATED per-connection webhook
+/// ingress path: returns ONLY the connection's sealed webhook-secret bytes, by
+/// bare id and with NO tenant predicate. It runs BEFORE verification so the
+/// HMAC can be checked; a [`TenantScope`](crate::TenantScope) is constructed
+/// from the (already resolved, status-checked) connection row's tenant only
+/// AFTER the signature verifies. The scoped
+/// [`connection_webhook_secret_sealed`](crate::connection_webhook_secret_sealed)
+/// stays the reader for authenticated surfaces. `None` = no row / no secret.
+pub async fn connection_webhook_secret_sealed(
+    pool: &PgPool,
+    connection_id: Uuid,
+) -> sqlx::Result<Option<Vec<u8>>> {
+    let row: Option<Option<Vec<u8>>> = sqlx::query_scalar(
+        "select webhook_secret_sealed from integration_connections where id = $1",
+    )
+    .bind(connection_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.flatten())
+}
+
 /// Load a trigger subscription by id with NO tenant predicate — the
 /// cross-tenant loader for the scheduler, which holds only a bare
 /// subscription id sourced from the global `due_schedules` scan. The returned
@@ -121,6 +142,26 @@ pub async fn get_github_app_registration(
     .bind(id)
     .fetch_optional(pool)
     .await
+}
+
+/// Verification-material reader for the UNAUTHENTICATED app-level GitHub
+/// ingress path: returns ONLY the registration's sealed webhook-secret bytes,
+/// by bare id and with NO tenant predicate. Runs BEFORE verification (exactly
+/// parallel to [`connection_webhook_secret_sealed`]); the registration's
+/// tenant becomes the operative scope only AFTER the HMAC verifies. The scoped
+/// [`github_app_registration_webhook_secret_sealed`](crate::github_app_registration_webhook_secret_sealed)
+/// stays the reader for authenticated surfaces. `None` = no row / no secret.
+pub async fn github_app_registration_webhook_secret_sealed(
+    pool: &PgPool,
+    registration_id: Uuid,
+) -> sqlx::Result<Option<Vec<u8>>> {
+    let row: Option<Option<Vec<u8>>> = sqlx::query_scalar(
+        "select webhook_secret_sealed from github_app_registrations where id = $1",
+    )
+    .bind(registration_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.flatten())
 }
 
 pub async fn sessions_in_status(pool: &PgPool, statuses: &[&str]) -> sqlx::Result<Vec<SessionRow>> {

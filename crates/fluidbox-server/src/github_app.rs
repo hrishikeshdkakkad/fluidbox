@@ -1158,8 +1158,9 @@ pub async fn app_ingress(
     // Unauthenticated app-level ingress: the URL carries only a registration id
     // and no principal — the HMAC against the registration's sealed secret IS
     // the auth. Resolve the registration cross-tenant (UUID-only system-worker
-    // loader), then its own tenant becomes the operative scope for the rest of
-    // the delivery spine — exactly parallel to events.rs per-connection ingress.
+    // loader) to fetch the verification material; a TenantScope is NOT
+    // constructed from its tenant until the HMAC verifies (system_worker module
+    // doc) — exactly parallel to events.rs per-connection ingress.
     let reg =
         match fluidbox_db::system_worker::get_github_app_registration(&state.pool, registration_id)
             .await
@@ -1171,10 +1172,10 @@ pub async fn app_ingress(
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
-    let scope = fluidbox_db::TenantScope::assume(reg.tenant_id);
-    let sealed = match fluidbox_db::github_app_registration_webhook_secret_sealed(
+    // Verification material only — a tenant-less reader, because there is no
+    // verified tenant yet (the signature has not been checked).
+    let sealed = match fluidbox_db::system_worker::github_app_registration_webhook_secret_sealed(
         &state.pool,
-        scope,
         reg.id,
     )
     .await
@@ -1200,6 +1201,9 @@ pub async fn app_ingress(
             return StatusCode::UNAUTHORIZED.into_response();
         }
     };
+    // Signature verified: ONLY NOW does the registration's tenant become the
+    // operative scope for the rest of the delivery spine below.
+    let scope = fluidbox_db::TenantScope::assume(reg.tenant_id);
     let payload: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {

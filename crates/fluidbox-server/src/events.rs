@@ -40,12 +40,12 @@ pub async fn ingress(
     }
     // Unauthenticated ingress: the URL carries only a connection id and no
     // principal — the webhook signature is the auth. Resolve the connection
-    // cross-tenant; its own tenant becomes the operative scope for the whole
-    // delivery spine below.
+    // cross-tenant (UUID-only system-worker loader) to fetch the verification
+    // material; a TenantScope is NOT constructed from its tenant until the
+    // signature verifies (system_worker module doc).
     let conn = fluidbox_db::system_worker::get_connection(&state.pool, connection_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let scope = fluidbox_db::TenantScope::assume(conn.tenant_id);
     // The path names the connector; the connection's provider must resolve
     // to the same one (a PAT connection has no ingress, wrong path → 404).
     let connector = connectors::connector_for(&conn.provider)
@@ -57,7 +57,9 @@ pub async fn ingress(
     let sealer = state.sealer.as_ref().ok_or_else(|| {
         ApiError::BadRequest("event ingress is disabled: set FLUIDBOX_CREDENTIAL_KEY".into())
     })?;
-    let sealed = fluidbox_db::connection_webhook_secret_sealed(&state.pool, scope, conn.id)
+    // Verification material only — a tenant-less reader, because there is no
+    // verified tenant yet (the signature has not been checked).
+    let sealed = fluidbox_db::system_worker::connection_webhook_secret_sealed(&state.pool, conn.id)
         .await?
         .ok_or_else(|| {
             ApiError::BadRequest("this connection cannot receive events (no webhook secret)".into())
@@ -75,6 +77,10 @@ pub async fn ingress(
             return Err(ApiError::Unauthorized);
         }
     };
+
+    // Signature verified: ONLY NOW does the resolved row's tenant become the
+    // operative scope for the whole delivery spine below.
+    let scope = fluidbox_db::TenantScope::assume(conn.tenant_id);
 
     let payload: Value = serde_json::from_slice(&body)
         .map_err(|e| ApiError::BadRequest(format!("payload is not json: {e}")))?;
