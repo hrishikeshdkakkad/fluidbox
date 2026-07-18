@@ -33,6 +33,7 @@ use axum::routing::{delete, get, patch, post, put};
 use axum::Router;
 use fluidbox_core::traits::ExecutionProvider;
 use state::{AppStateInner, ApprovalRegistry};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 
@@ -404,9 +405,19 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("default agent: {}", seed.default_agent);
 
     // Serve both planes; if either listener falls over, the process exits.
+    // `ConnectInfo::<SocketAddr>` is wired on BOTH planes so handlers extract the
+    // socket peer uniformly (the internal plane never reads it, but the make
+    // service is uniform and harmless) — the public login/audit path relies on it
+    // as the authoritative client IP unless a trusted proxy is declared.
     tokio::select! {
-        r = axum::serve(public_listener, public_app) => r?,
-        r = axum::serve(internal_listener, internal_app) => r?,
+        r = axum::serve(
+            public_listener,
+            public_app.into_make_service_with_connect_info::<SocketAddr>(),
+        ) => r?,
+        r = axum::serve(
+            internal_listener,
+            internal_app.into_make_service_with_connect_info::<SocketAddr>(),
+        ) => r?,
     }
     Ok(())
 }
