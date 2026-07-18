@@ -408,6 +408,10 @@ async fn apply_verified_installation(
             )
             .await
             .map_err(|e| format!("metadata refresh failed: {e}"))?;
+            // Unfiltered reads by design: github_app lifecycle reconciliation is
+            // driven by a verified webhook / registration JWT (no request
+            // principal), and github_app connections are always org-owned — no
+            // owner-visibility filter applies.
             let updated = if row.status == desired {
                 fluidbox_db::get_connection(&state.pool, scope, row.id)
                     .await

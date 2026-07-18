@@ -30,6 +30,9 @@ pub async fn photograph_connection(
     connection_id: Uuid,
     endpoint_url: &str,
 ) -> ApiResult<fluidbox_db::ConnectionToolSnapshotRow> {
+    // Unfiltered read by design: this internal helper runs only AFTER a create
+    // or a mutation authorization (`connection_for_mutation`) has established
+    // authority — it photographs the row the caller already owns/created.
     let conn = fluidbox_db::get_connection(&state.pool, scope, connection_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -152,38 +155,43 @@ async fn refresh_endpoint_url(
 }
 
 /// `POST /v1/connections/{id}/tools/refresh` — re-photograph a connection's
-/// tools into a new snapshot version. Authz: an organization connection needs
-/// `can_mutate_resources`; a personal connection should additionally require the
-/// owner. Task 4 wires the per-owner check; this task lands the route behind the
-/// coarse admin/owner gate every other connection mutation already uses.
+/// tools into a new snapshot version. Authz (design :274-296): a personal
+/// connection is owner-only (a non-owner 404s, invisibility preserved); an
+/// organization connection needs `can_mutate_resources`. Both are enforced by
+/// `connection_for_mutation`.
 pub async fn refresh_tools(
     principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    if !rbac::can_mutate_resources(&principal) {
-        return Err(ApiError::Forbidden(
-            "refreshing connection tools requires admin or owner".into(),
-        ));
-    }
+    let conn =
+        crate::connections::connection_for_mutation(&state, &principal, id, "refreshing tools for")
+            .await?;
     let scope = principal.scope();
-    let conn = fluidbox_db::get_connection(&state.pool, scope, id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
     let endpoint = refresh_endpoint_url(&state, scope, &conn).await?;
-    let snap = photograph_connection(&state, scope, id, &endpoint).await?;
+    let snap = photograph_connection(&state, scope, conn.id, &endpoint).await?;
     Ok(Json(json!({ "snapshot": snapshot_json(&snap) })))
 }
 
 /// `GET /v1/connections/{id}/tools` — the connection's latest tool snapshot.
-/// Tenant-scoped read; Task 4 finishes per-owner visibility for personal
-/// connections.
+/// Owner-filtered: a personal connection's tools are visible only to its owner
+/// (the visibility fetch returns None for a non-owner ⇒ 404).
 pub async fn get_tools(
     principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     let scope = principal.scope();
+    // Gate the snapshot read on connection visibility so another member's
+    // personal tool surface can never be inspected.
+    fluidbox_db::get_connection_visible(
+        &state.pool,
+        scope,
+        id,
+        rbac::connection_viewer(&principal),
+    )
+    .await?
+    .ok_or(ApiError::NotFound)?;
     let snap = fluidbox_db::latest_connection_tool_snapshot(&state.pool, scope, id)
         .await?
         .ok_or(ApiError::NotFound)?;

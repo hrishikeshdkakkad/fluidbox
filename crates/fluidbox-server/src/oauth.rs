@@ -25,7 +25,6 @@
 
 use crate::auth::Principal;
 use crate::error::{ApiError, ApiResult};
-use crate::rbac;
 use crate::seal::Sealer;
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
@@ -451,6 +450,11 @@ pub async fn start_dance(
     conn_id: Uuid,
 ) -> ApiResult<String> {
     let sealer_ref = sealer(state)?;
+    // Unfiltered read by design: the caller already established authority over
+    // this connection — either the owner-checked `start` route
+    // (`connection_for_mutation`) or a connection this same principal just
+    // created in the catalog/manual oauth branch. The dance mechanics need the
+    // row regardless of the viewer lens.
     let conn = fluidbox_db::get_connection(&state.pool, scope, conn_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -537,12 +541,16 @@ pub async fn start(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    if !rbac::can_mutate_resources(&principal) {
-        return Err(ApiError::Forbidden(
-            "starting an OAuth connection requires admin or owner".into(),
-        ));
-    }
-    let authorize_url = start_dance(&state, principal.scope(), id).await?;
+    // Personal ⇒ owner-only (a non-owner 404s); organization ⇒ admin/owner.
+    // The reconnect path re-authorizes the same way.
+    let conn = crate::connections::connection_for_mutation(
+        &state,
+        &principal,
+        id,
+        "starting or reconnecting the OAuth flow for",
+    )
+    .await?;
+    let authorize_url = start_dance(&state, principal.scope(), conn.id).await?;
     Ok(Json(json!({ "authorize_url": authorize_url })))
 }
 

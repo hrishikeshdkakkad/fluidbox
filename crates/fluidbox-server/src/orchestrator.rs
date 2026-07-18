@@ -1437,6 +1437,9 @@ async fn connection_auth_header(
     scope: TenantScope,
     connection_id: Uuid,
 ) -> anyhow::Result<String> {
+    // Unfiltered read by design: workspace init runs from the frozen RunSpec's
+    // resolved binding (control-plane side, no request principal) — authority is
+    // the binding, not an owner-visibility viewer.
     let conn = fluidbox_db::get_connection(&state.pool, scope, connection_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("connection {connection_id} not found"))?;
