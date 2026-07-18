@@ -501,21 +501,24 @@ pub async fn policy_agents_using(
     .await
 }
 
-/// The union of `mcp__<server>__<tool>` names from the capability bundles pinned
-/// on the LATEST revision of every agent using this policy. This is what makes a
-/// connected server's photographed tools appear in the matrix without anyone
-/// typing them. Sorted and deduplicated: two agents may pin the same bundle.
+/// The union of `mcp__<server>__<tool>` names an agent on this policy can call —
+/// from BOTH attachment paths on the LATEST revision of every agent using it:
+/// the photographed tools in its pinned (sandbox) capability bundles, AND the
+/// `mcp__<slot>__<tool>` names in its brokered `connection_requirements` (Phase
+/// C: converted agents carry brokered tools as requirements, not bundle pins, so
+/// their governance-matrix rows keep appearing). Sorted and deduplicated: two
+/// agents may pin the same bundle or require the same tool.
 ///
 /// Reads the pins' bundle ids rather than resolving `name`/`version` — the pin is
 /// exact by construction (§17 #7), so the id IS the photograph the frozen RunSpec
-/// will carry.
+/// will carry; requirement tool names are the frozen contract directly.
 pub async fn policy_mcp_tools(
     pool: &PgPool,
     scope: TenantScope,
     policy_id: Uuid,
 ) -> sqlx::Result<Vec<String>> {
-    let pins: Vec<Value> = sqlx::query_scalar(
-        "select r.capability_bundles from agents a
+    let revs: Vec<(Value, Value)> = sqlx::query_as(
+        "select r.capability_bundles, r.connection_requirements from agents a
            join lateral (
              select * from agent_revisions r2
               where r2.agent_id = a.id order by r2.rev desc limit 1
@@ -527,9 +530,32 @@ pub async fn policy_mcp_tools(
     .fetch_all(pool)
     .await?;
 
+    let mut out: Vec<String> = Vec::new();
+
+    // Brokered requirement tools: `mcp__<slot>__<tool>` straight off the revision
+    // — the requirement IS the frozen contract, there is no bundle to resolve.
+    for (_, reqs) in &revs {
+        let Some(arr) = reqs.as_array() else { continue };
+        for req in arr {
+            let Some(slot) = req.get("slot").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(tools) = req.get("required_tools").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for t in tools {
+                if let Some(tool) = t.as_str() {
+                    out.push(format!("mcp__{slot}__{tool}"));
+                }
+            }
+        }
+    }
+
+    // Sandbox-bundle tools: resolve each pin's bundle id to its photographed
+    // `definition.servers[].tools[]`.
     let mut ids: Vec<Uuid> = Vec::new();
-    for p in &pins {
-        let Some(arr) = p.as_array() else { continue };
+    for (pins, _) in &revs {
+        let Some(arr) = pins.as_array() else { continue };
         for r in arr {
             if let Some(id) = r
                 .get("id")
@@ -542,38 +568,37 @@ pub async fn policy_mcp_tools(
     }
     ids.sort_unstable();
     ids.dedup();
-    if ids.is_empty() {
-        return Ok(vec![]);
-    }
 
-    // Tenant-scoped: a pin can never reach across a tenant boundary.
-    let defs: Vec<Value> = sqlx::query_scalar(
-        "select definition from capability_bundles where tenant_id = $1 and id = any($2)",
-    )
-    .bind(scope.tenant_id())
-    .bind(&ids)
-    .fetch_all(pool)
-    .await?;
+    if !ids.is_empty() {
+        // Tenant-scoped: a pin can never reach across a tenant boundary.
+        let defs: Vec<Value> = sqlx::query_scalar(
+            "select definition from capability_bundles where tenant_id = $1 and id = any($2)",
+        )
+        .bind(scope.tenant_id())
+        .bind(&ids)
+        .fetch_all(pool)
+        .await?;
 
-    let mut out: Vec<String> = Vec::new();
-    for def in &defs {
-        let Some(servers) = def.get("servers").and_then(|v| v.as_array()) else {
-            continue;
-        };
-        for s in servers {
-            let Some(server) = s.get("name").and_then(|v| v.as_str()) else {
+        for def in &defs {
+            let Some(servers) = def.get("servers").and_then(|v| v.as_array()) else {
                 continue;
             };
-            let Some(tools) = s.get("tools").and_then(|v| v.as_array()) else {
-                continue;
-            };
-            for t in tools {
-                if let Some(tool) = t.get("name").and_then(|v| v.as_str()) {
-                    out.push(format!("mcp__{server}__{tool}"));
+            for s in servers {
+                let Some(server) = s.get("name").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Some(tools) = s.get("tools").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                for t in tools {
+                    if let Some(tool) = t.get("name").and_then(|v| v.as_str()) {
+                        out.push(format!("mcp__{server}__{tool}"));
+                    }
                 }
             }
         }
     }
+
     out.sort_unstable();
     out.dedup();
     Ok(out)
@@ -6363,6 +6388,313 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// Migration 0013 appendix (`fluidbox_convert_legacy_bundles`): a legacy
+    /// agent whose LATEST revision pins a brokered bundle gets an APPENDED
+    /// sandbox-only revision whose brokered servers became
+    /// `connection_requirements`; its pinned subscription is repointed; and a
+    /// second call is idempotent. Also proves the SQL-built requirement jsonb
+    /// round-trips into typed `ConnectionRequirement`s (serde compatibility) and
+    /// that `policy_mcp_tools` unions the converted requirement tools. Throwaway
+    /// org; children-first cleanup BEFORE the asserts.
+    #[tokio::test]
+    async fn convert_legacy_bundles_appends_requirements_and_repoints() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let slug = format!("t-{}", Uuid::now_v7().simple());
+        let org = identity::create_org(&pool, &slug, None).await.unwrap();
+        let scope = TenantScope::assume(org.id);
+
+        // Two brokered endpoints — one matches a tenant catalog row (slug hint),
+        // one has no catalog row (slug null) — so the stored jsonb exercises BOTH
+        // slug shapes and the reverse-match's tenant-first / unique-or-null rule.
+        let gh_url = "https://mcp.github.test/mcp";
+        let ln_url = "https://mcp.linear.test/mcp";
+
+        // An org-owned mcp_http connection: the legacy world embedded its id in
+        // the brokered server (Gap 3). The conversion DROPS that id — we build the
+        // connection only for realism and to prove the conversion ignores it.
+        let conn = create_connection(
+            &pool,
+            scope,
+            "mcp_http",
+            "mcp.github.test",
+            "GitHub MCP",
+            None,
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            &serde_json::json!({ "base_url": gh_url }),
+            None,
+            ConnectionAuth::static_active(),
+            ConnectionOwner::Organization,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // A tenant-owned catalog row whose url == gh_url → reverse-match slug.
+        sqlx::query(
+            "insert into connector_catalog (id, slug, name, url, tenant_id, provenance)
+             values ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(Uuid::now_v7())
+        .bind("github-mcp")
+        .bind("GitHub MCP")
+        .bind(gh_url)
+        .bind(org.id)
+        .bind(serde_json::json!({ "source": "custom" }))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // A brokered bundle: two brokered servers (github matched, linear not);
+        // github ships two tools in a deliberate order, linear one.
+        let brokered_def = serde_json::json!({ "servers": [
+            { "class": "brokered", "name": "github", "url": gh_url,
+              "connection_id": conn.id,
+              "tools": [
+                { "name": "get_pull_request", "description": "d", "input_schema": {"type": "object"} },
+                { "name": "create_review", "description": "d", "input_schema": {"type": "object"} }
+              ] },
+            { "class": "brokered", "name": "linear", "url": ln_url,
+              "connection_id": conn.id,
+              "tools": [
+                { "name": "list_issues", "description": "d", "input_schema": {"type": "object"} }
+              ] }
+        ] });
+        let brokered_bundle = create_capability_bundle(
+            &pool,
+            scope,
+            "connectors",
+            None,
+            &brokered_def,
+            "sha256:brk",
+        )
+        .await
+        .unwrap();
+
+        // A sandbox-only bundle: survives, re-pinned as sandbox-tools@1.
+        let sandbox_def = serde_json::json!({ "servers": [
+            { "class": "sandbox", "name": "ws", "command": "node", "args": ["/x.mjs"],
+              "tools": [ { "name": "count", "description": "d", "input_schema": {"type": "object"} } ] }
+        ] });
+        let sandbox_bundle = create_capability_bundle(
+            &pool,
+            scope,
+            "sandbox-tools",
+            None,
+            &sandbox_def,
+            "sha256:sbx",
+        )
+        .await
+        .unwrap();
+
+        let policy = upsert_policy(
+            &pool,
+            scope,
+            "conv-policy",
+            "name: conv",
+            &serde_json::json!({ "name": "conv" }),
+        )
+        .await
+        .unwrap();
+
+        let agent = create_agent(&pool, scope, "conv-agent", None)
+            .await
+            .unwrap();
+        // rev 1 pins BOTH bundles as BundleRef objects (the live stored shape).
+        let pins = serde_json::json!([
+            { "id": brokered_bundle.id, "name": brokered_bundle.name, "version": brokered_bundle.version },
+            { "id": sandbox_bundle.id, "name": sandbox_bundle.name, "version": sandbox_bundle.version }
+        ]);
+        let rev1 = append_agent_revision(
+            &pool,
+            scope,
+            agent.id,
+            "claude-agent-sdk",
+            "img:test",
+            "claude-haiku-4-5",
+            Some("be helpful"),
+            policy.id,
+            &serde_json::json!({ "wall_clock_secs": 60 }),
+            Some(&serde_json::json!({ "kind": "scratch" })),
+            &pins,
+            &serde_json::json!([]),
+        )
+        .await
+        .unwrap();
+
+        // A subscription pinned to rev 1 — must be repointed to the new revision.
+        let sub = create_trigger_subscription(
+            &pool,
+            scope,
+            agent.id,
+            "conv-sub",
+            "api",
+            Some(rev1.id),
+            Some("do it"),
+            false,
+            false,
+            None,
+            "allow",
+            None,
+            None,
+            &serde_json::json!([]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // ── Convert (the DB test calls the function 0013 defined + already ran) ──
+        sqlx::query("select fluidbox_convert_legacy_bundles()")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let latest = latest_revision(&pool, scope, agent.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let sub_after = get_trigger_subscription(&pool, scope, sub.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let revs_after = list_revisions(&pool, scope, agent.id).await.unwrap();
+
+        // Idempotence: a SECOND call must not append again.
+        sqlx::query("select fluidbox_convert_legacy_bundles()")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let revs_after2 = list_revisions(&pool, scope, agent.id).await.unwrap();
+        let latest2 = latest_revision(&pool, scope, agent.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Governance union AND serde round-trip captured before cleanup.
+        let mcp_tools = policy_mcp_tools(&pool, scope, policy.id).await.unwrap();
+        let req_parse: Result<
+            Vec<fluidbox_core::capability::ConnectionRequirement>,
+            serde_json::Error,
+        > = serde_json::from_value(latest.connection_requirements.clone());
+
+        // ── Cleanup children-first BEFORE the asserts (throwaway org) ──
+        for stmt in [
+            "delete from run_resource_bindings where tenant_id = $1",
+            "delete from connection_tool_snapshots where tenant_id = $1",
+            "delete from trigger_subscriptions where tenant_id = $1",
+            "delete from agent_revisions where agent_id in (select id from agents where tenant_id = $1)",
+            "delete from agents where tenant_id = $1",
+            "delete from capability_bundles where tenant_id = $1",
+            "delete from connector_catalog where tenant_id = $1",
+            "delete from integration_connections where tenant_id = $1",
+            "delete from policies where tenant_id = $1",
+        ] {
+            sqlx::query(stmt).bind(org.id).execute(&pool).await.unwrap();
+        }
+        sqlx::query("delete from tenants where id = $1")
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // ── Asserts ──
+        // A new immutable revision was appended at rev+1, copying the revision's
+        // fields verbatim.
+        assert_eq!(latest.rev, rev1.rev + 1, "conversion appends rev+1");
+        assert_ne!(latest.id, rev1.id);
+        assert_eq!(latest.harness, rev1.harness);
+        assert_eq!(latest.runner_image, rev1.runner_image);
+        assert_eq!(latest.model, rev1.model);
+        assert_eq!(latest.system_prompt, rev1.system_prompt);
+        assert_eq!(latest.policy_id, rev1.policy_id);
+        assert_eq!(latest.budgets, rev1.budgets);
+        assert_eq!(latest.default_workspace, rev1.default_workspace);
+
+        // Only the sandbox-only bundle survives, re-pinned EXPLICITLY as an exact
+        // BundleRef (version 1 IS the `name@1` pin run_service deserializes).
+        assert_eq!(
+            latest.capability_bundles,
+            serde_json::json!([
+                { "id": sandbox_bundle.id, "name": "sandbox-tools", "version": 1 }
+            ]),
+            "only the sandbox-only bundle survives, re-pinned name@1"
+        );
+
+        // Requirements EXACTLY as specified: bundle-pin then server order, tool
+        // order preserved, binding_mode organization, slug matched then null.
+        assert_eq!(
+            latest.connection_requirements,
+            serde_json::json!([
+                { "slot": "github",
+                  "connector": { "url": gh_url, "slug": "github-mcp" },
+                  "required_tools": ["get_pull_request", "create_review"],
+                  "binding_mode": "organization" },
+                { "slot": "linear",
+                  "connector": { "url": ln_url, "slug": null },
+                  "required_tools": ["list_issues"],
+                  "binding_mode": "organization" }
+            ]),
+            "requirements derived deterministically from the brokered servers"
+        );
+
+        // The SQL-built jsonb round-trips into typed requirements AND passes
+        // validate_requirements — pins serde compatibility of both slug shapes.
+        let reqs = req_parse.expect("stored requirements deserialize into ConnectionRequirement");
+        fluidbox_core::capability::validate_requirements(&reqs)
+            .expect("converted requirements are valid");
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].slot, "github");
+        assert_eq!(reqs[0].connector.slug.as_deref(), Some("github-mcp"));
+        assert_eq!(reqs[1].slot, "linear");
+        assert_eq!(reqs[1].connector.slug, None);
+        assert!(matches!(
+            reqs[0].binding_mode,
+            fluidbox_core::capability::BindingMode::Organization
+        ));
+
+        // The pinned subscription was repointed to the new revision.
+        assert_eq!(
+            sub_after.pinned_revision_id,
+            Some(latest.id),
+            "subscription repointed to the converted revision"
+        );
+
+        // Exactly one revision appended, and the second call added none.
+        assert_eq!(revs_after.len(), 2, "exactly one revision appended");
+        assert_eq!(
+            revs_after2.len(),
+            2,
+            "second call is idempotent — no double-append"
+        );
+        assert_eq!(
+            latest2.id, latest.id,
+            "latest unchanged after idempotent re-run"
+        );
+
+        // policy_mcp_tools unions the converted requirement tools with the
+        // surviving sandbox bundle's tools.
+        for t in [
+            "mcp__github__get_pull_request",
+            "mcp__github__create_review",
+            "mcp__linear__list_issues",
+            "mcp__ws__count",
+        ] {
+            assert!(
+                mcp_tools.contains(&t.to_string()),
+                "policy_mcp_tools missing {t}"
+            );
+        }
     }
 
     /// Cross-tenant isolation (wave A): a session and its child rows created
