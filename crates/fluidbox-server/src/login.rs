@@ -13,8 +13,16 @@
 //! verifier cannot express exactly (flow-bound `iat`, one-forced-refresh JWKS
 //! policy, kid-less single-key acceptance, negative-kid cache, azp-when-present,
 //! `at_hash`-without-access-token) is implemented in the [`verify`] wrapper —
-//! the doc wins. All HTTP rides `state.http` under an explicit SSRF policy;
-//! `openidconnect`'s bundled HTTP clients are disabled (`default-features=off`).
+//! the doc wins. Every identity fetch (discovery, JWKS, token endpoint) rides
+//! ONE dedicated client, `state.identity_http` ([`build_identity_http`]), that
+//! enforces the SSRF policy on EVERY hop, not just the request URL: its custom
+//! redirect policy re-validates each hop's scheme + host literal, and its custom
+//! DNS resolver rejects private/loopback/link-local/CGNAT/metadata addresses at
+//! resolution time. That closes the intermediate-hop TOCTOU the earlier
+//! request-URL-only checks left open (a redirect or DNS-rebind can no longer
+//! land a fetch on an internal host). A pre-flight URL validation and a final-URL
+//! check remain as cheap defense in depth. `openidconnect`'s bundled HTTP
+//! clients are disabled (`default-features=off`).
 
 use crate::auth::{AuthContext, Principal};
 use crate::error::{ApiError, ApiResult};
@@ -480,16 +488,99 @@ async fn validate_fetch_target(u: &reqwest::Url, dev: bool) -> Result<(), String
     Ok(())
 }
 
-/// GET a JSON document under the SSRF policy. The request URL is validated at
-/// resolution time; the response's FINAL url (after any redirects `state.http`
-/// followed) is re-validated so a redirect can never land the fetch on a
-/// private host.
+/// The addresses that survive the SSRF filter: every private/loopback/link-local/
+/// CGNAT/metadata/reserved address is dropped (loopback kept only in dev). The
+/// pure core of the identity client's DNS resolver — tested without a network.
+fn filter_public_addrs(
+    addrs: impl Iterator<Item = std::net::SocketAddr>,
+    dev: bool,
+) -> Vec<std::net::SocketAddr> {
+    addrs.filter(|s| !ip_blocked(s.ip(), dev)).collect()
+}
+
+/// One redirect hop's scheme + host-literal gate: https always (loopback http
+/// only in dev), and a host that is a private/loopback/link-local IP literal is
+/// refused — the same host-literal checks `validate_fetch_target` applies to the
+/// request URL. The DNS resolver still filters the *resolved* addresses at
+/// connect time; this is the cheap host-literal defense-in-depth on every hop.
+fn redirect_hop_allowed(u: &reqwest::Url, dev: bool) -> Result<(), String> {
+    match u.scheme() {
+        "https" => {}
+        "http" if dev && host_is_loopback(u) => {}
+        _ => return Err("redirect to a non-https identity endpoint refused".into()),
+    }
+    if let Some(host) = u.host_str() {
+        if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
+            if ip_blocked(ip, dev) {
+                return Err("redirect to a private/loopback address refused".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A `reqwest::dns::Resolve` that resolves via the system resolver and drops
+/// every non-public address at resolution time — DNS-rebinding and per-hop
+/// private targets die here (loopback survives only in dev). Empty after the
+/// filter ⇒ a resolution error, so the connection never opens.
+struct SsrfDnsResolver {
+    dev: bool,
+}
+
+impl reqwest::dns::Resolve for SsrfDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let dev = self.dev;
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            // Port 0: reqwest overrides it with the URL's port; we only care
+            // about the resolved IPs.
+            let resolved = tokio::net::lookup_host((host.as_str(), 0)).await?;
+            let allowed = filter_public_addrs(resolved, dev);
+            if allowed.is_empty() {
+                return Err("refusing to resolve to a private/loopback/link-local address".into());
+            }
+            let addrs: reqwest::dns::Addrs = Box::new(allowed.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
+/// Build the ONE HTTP client used for identity fetches (discovery, JWKS, token
+/// endpoint — nothing else). Per-hop SSRF: a custom redirect policy re-validates
+/// every hop's scheme + host literal (capped at 10 hops), and a custom DNS
+/// resolver filters resolved addresses at connect time, closing the
+/// intermediate-hop TOCTOU. No cookie store (the default with the `cookies`
+/// feature off). The dev (loopback-http) allowance is config-static, so it is
+/// baked into both the redirect closure and the resolver here at build time.
+pub fn build_identity_http(public_url: &str) -> reqwest::Client {
+    let dev = dev_loopback(public_url);
+    let policy = reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.error("too many redirects");
+        }
+        match redirect_hop_allowed(attempt.url(), dev) {
+            Ok(()) => attempt.follow(),
+            Err(e) => attempt.error(e),
+        }
+    });
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(15 * 60))
+        .redirect(policy)
+        .dns_resolver(Arc::new(SsrfDnsResolver { dev }))
+        .build()
+        .expect("identity HTTP client builds")
+}
+
+/// GET a JSON document under the SSRF policy over `state.identity_http`, whose
+/// redirect policy + DNS resolver enforce the policy on every hop. The request
+/// URL is pre-validated and the response's FINAL url re-validated as cheap
+/// defense in depth (the per-hop client is the real guard).
 async fn fetch_json_ssrf(state: &AppState, url: &str) -> Result<Value, String> {
     let dev = dev_loopback(&state.cfg.public_url);
     let u = reqwest::Url::parse(url).map_err(|_| format!("'{url}' is not a valid URL"))?;
     validate_fetch_target(&u, dev).await?;
     let res = state
-        .http
+        .identity_http
         .get(url)
         .timeout(HTTP_TIMEOUT)
         .header("accept", "application/json")
@@ -612,15 +703,19 @@ mod verify {
         pub claims: Value,
     }
 
-    /// `NeedsRefresh` = no compatible key OR a signature failure (the only two
-    /// cases that earn the single forced JWKS refresh). `Terminal` = every
-    /// other failure (claims, ambiguous keys) — no refresh, immediate refuse.
+    /// `NoKey` / `BadSignature` = the only two cases that earn the single forced
+    /// JWKS refresh; they are kept distinct so the caller can negative-cache ONLY
+    /// a genuinely unknown kid (design 823-826): a `BadSignature` after refresh
+    /// is the same-kid-rotation signal and must never poison the kid. `Terminal`
+    /// = every other failure (claims, ambiguous keys) — no refresh, refuse now.
     #[derive(Debug)]
     pub enum Error {
-        /// No compatible key OR a signature failure — the only two cases that
-        /// earn the single forced JWKS refresh. Carries no reason: the caller
-        /// never surfaces it (it retries once, then refuses generically).
-        NeedsRefresh,
+        /// Key selection found no compatible/matching key. Earns the forced
+        /// refresh; if it recurs after refresh the kid is genuinely unknown.
+        NoKey,
+        /// A key matched but the signature did not verify — earns the forced
+        /// refresh (a same-kid rotation looks like this). NEVER negative-cached.
+        BadSignature,
         Terminal(String),
     }
 
@@ -717,8 +812,8 @@ mod verify {
     }
 
     /// Select the signing key per design 815-831: kid → exact match (ambiguous
-    /// ⇒ Terminal, missing ⇒ NeedsRefresh); kid-less ⇒ exactly one compatible
-    /// key (zero ⇒ NeedsRefresh, multiple ⇒ Terminal).
+    /// ⇒ Terminal, missing ⇒ NoKey); kid-less ⇒ exactly one compatible key
+    /// (zero ⇒ NoKey, multiple ⇒ Terminal).
     fn select_key<'a>(
         alg_str: &str,
         kid: Option<&str>,
@@ -733,13 +828,13 @@ mod verify {
                     .filter(|k| key_id_str(k).as_deref() == Some(kid))
                     .collect();
                 match matched.as_slice() {
-                    [] => Err(Error::NeedsRefresh),
+                    [] => Err(Error::NoKey),
                     [one] => Ok(one),
                     _ => Err(Error::Terminal("multiple keys match the token kid".into())),
                 }
             }
             None => match compat.as_slice() {
-                [] => Err(Error::NeedsRefresh),
+                [] => Err(Error::NoKey),
                 [one] => Ok(one),
                 _ => Err(Error::Terminal(
                     "token carries no kid and the JWKS has multiple compatible keys".into(),
@@ -816,7 +911,8 @@ mod verify {
     }
 
     /// Verify an ID token against a specific JWKS. Called once with the cached
-    /// keys; the caller retries once with force-refreshed keys on `NeedsRefresh`.
+    /// keys; the caller retries once with force-refreshed keys on `NoKey` or
+    /// `BadSignature`.
     pub fn verify(
         inp: &Inputs,
         id_token: &str,
@@ -848,7 +944,7 @@ mod verify {
         let signing_input = format!("{h}.{p}");
         let sig = b64(s)?;
         key.verify_signature(&alg, signing_input.as_bytes(), &sig)
-            .map_err(|_| Error::NeedsRefresh)?;
+            .map_err(|_| Error::BadSignature)?;
 
         // at_hash: verified when present; present-with-no-access-token fails.
         if let Some(at_hash) = payload.get("at_hash").and_then(Value::as_str) {
@@ -875,9 +971,15 @@ mod verify {
     }
 }
 
-/// Verify with the one-forced-refresh JWKS policy: cached keys first; on
-/// `NeedsRefresh`, unless the token's kid is negative-cached, force exactly one
-/// JWKS refresh and retry — terminal after that (design 816-826).
+/// Verify with the one-forced-refresh JWKS policy: cached keys first; on `NoKey`
+/// or `BadSignature`, force exactly one JWKS refresh and retry — terminal after
+/// that (design 816-826).
+///
+/// The brief negative-kid cache scopes to UNKNOWN kids only (design 823-826): it
+/// short-circuits the `NoKey` path (junk-kid refresh-storm bound) and, after the
+/// refresh, marks the kid negative ONLY when key selection STILL finds no match.
+/// A `BadSignature` — the same-kid-rotation signal — always earns its refresh
+/// and never poisons the kid, so a real rotation is never blocked.
 async fn verify_with_jwks(
     state: &AppState,
     key: JwksKey,
@@ -887,26 +989,32 @@ async fn verify_with_jwks(
 ) -> Result<verify::Verified, String> {
     let kid = verify::header_meta(id_token).ok().and_then(|(_, k)| k);
     let cached = state.oidc.cached(key, &view.jwks).await?;
-    match verify::verify(inp, id_token, &cached.keys) {
-        Ok(v) => Ok(v),
-        Err(verify::Error::Terminal(r)) => Err(r),
-        Err(verify::Error::NeedsRefresh) => {
-            if let Some(kid) = &kid {
-                if state.oidc.kid_negative(key, kid).await {
-                    return Err("unknown signing key".into());
-                }
-            }
-            let fresh = state.oidc.force_refresh(state, key, &view.jwks_uri).await?;
-            match verify::verify(inp, id_token, &fresh.keys) {
-                Ok(v) => Ok(v),
-                Err(_) => {
-                    if let Some(kid) = &kid {
-                        state.oidc.mark_kid_negative(key, kid).await;
-                    }
-                    Err("the ID token signature could not be verified".into())
-                }
+    let first = match verify::verify(inp, id_token, &cached.keys) {
+        Ok(v) => return Ok(v),
+        Err(verify::Error::Terminal(r)) => return Err(r),
+        Err(e) => e, // NoKey | BadSignature — both earn the one forced refresh.
+    };
+    // The negative-kid cache short-circuits ONLY the unknown-kid path; a
+    // signature failure must always reach the refresh (rotations enter here).
+    if matches!(first, verify::Error::NoKey) {
+        if let Some(kid) = &kid {
+            if state.oidc.kid_negative(key, kid).await {
+                return Err("unknown signing key".into());
             }
         }
+    }
+    let fresh = state.oidc.force_refresh(state, key, &view.jwks_uri).await?;
+    match verify::verify(inp, id_token, &fresh.keys) {
+        Ok(v) => Ok(v),
+        // Only a still-unknown kid (no matching key after the refresh) is
+        // negative-cached; a matched-kid signature failure is NOT.
+        Err(verify::Error::NoKey) => {
+            if let Some(kid) = &kid {
+                state.oidc.mark_kid_negative(key, kid).await;
+            }
+            Err("unknown signing key".into())
+        }
+        Err(_) => Err("the ID token signature could not be verified".into()),
     }
 }
 
@@ -1409,10 +1517,12 @@ async fn token_exchange(
     code: &str,
     verifier: &str,
 ) -> Result<Tokens, String> {
-    // SSRF-validate the token endpoint before posting to it.
+    // SSRF-validate the token endpoint before posting to it (the identity
+    // client re-validates every redirect hop + resolved address underneath).
+    let dev = dev_loopback(&state.cfg.public_url);
     let u =
         reqwest::Url::parse(token_endpoint).map_err(|_| "invalid token endpoint".to_string())?;
-    validate_fetch_target(&u, dev_loopback(&state.cfg.public_url)).await?;
+    validate_fetch_target(&u, dev).await?;
 
     let redirect_uri = format!("{}/v1/auth/callback", state.cfg.public_url);
     let mut form: Vec<(&str, &str)> = vec![
@@ -1447,7 +1557,7 @@ async fn token_exchange(
     }
     let body = url_form(&form);
     let mut req = state
-        .http
+        .identity_http
         .post(token_endpoint)
         .timeout(HTTP_TIMEOUT)
         .header("content-type", "application/x-www-form-urlencoded")
@@ -1462,6 +1572,9 @@ async fn token_exchange(
         .send()
         .await
         .map_err(|e| format!("token exchange failed: {e}"))?;
+    // Final-URL re-validation for symmetry with fetch_json_ssrf (defense in
+    // depth on top of the per-hop identity client).
+    validate_fetch_target(&res.url().clone(), dev).await?;
     let status = res.status();
     let v: Value = res.json().await.unwrap_or(Value::Null);
     if !status.is_success() {
@@ -2029,6 +2142,10 @@ uIATiz1iFxtbjHI9UNGig2aiz3j22PuZSNeJqpxryrgzfWd1s828kecc31+KEIP6
         jsonwebtoken::encode(&header, claims, &key).unwrap()
     }
 
+    fn b64url_json(v: &Value) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap())
+    }
+
     fn base_claims(now: i64) -> Value {
         json!({
             "iss": "https://issuer.example",
@@ -2203,8 +2320,111 @@ uIATiz1iFxtbjHI9UNGig2aiz3j22PuZSNeJqpxryrgzfWd1s828kecc31+KEIP6
         );
         assert!(matches!(
             verify::verify(&inputs(&allow, now), &tok, &keys(&tk)),
-            Err(verify::Error::NeedsRefresh)
+            Err(verify::Error::NoKey)
         ));
+    }
+
+    #[test]
+    fn verify_rejects_alg_none_unsigned() {
+        let now = Utc::now().timestamp();
+        let allow = vec!["RS256".to_string()];
+        let tk = rsa_test_key("k1");
+        // A literal {"alg":"none"} header with an empty signature segment.
+        let header = b64url_json(&json!({ "alg": "none", "kid": "k1" }));
+        let payload = b64url_json(&base_claims(now));
+        let tok = format!("{header}.{payload}.");
+        assert!(matches!(
+            verify::verify(&inputs(&allow, now), &tok, &keys(&tk)),
+            Err(verify::Error::Terminal(_))
+        ));
+        // Even if an operator wrongly allowlists "none", the asymmetric map still
+        // refuses it.
+        let allow_none = vec!["RS256".to_string(), "none".to_string()];
+        assert!(matches!(
+            verify::verify(&inputs(&allow_none, now), &tok, &keys(&tk)),
+            Err(verify::Error::Terminal(_))
+        ));
+    }
+
+    #[test]
+    fn verify_rejects_hs256_even_when_allowlisted() {
+        let now = Utc::now().timestamp();
+        // Operator misconfiguration: HS256 present IN the allowlist. The
+        // asymmetric-map backstop must still reject it (a shared client_secret
+        // must never forge identities — design 832-835).
+        let allow = vec!["RS256".to_string(), "HS256".to_string()];
+        let tk = rsa_test_key("k1");
+        let hs = {
+            let key = EncodingKey::from_secret(b"shared");
+            let mut h = Header::new(Algorithm::HS256);
+            h.kid = Some("k1".into());
+            jsonwebtoken::encode(&h, &base_claims(now), &key).unwrap()
+        };
+        assert!(matches!(
+            verify::verify(&inputs(&allow, now), &hs, &keys(&tk)),
+            Err(verify::Error::Terminal(_))
+        ));
+    }
+
+    #[test]
+    fn verify_nbf_skew() {
+        let now = Utc::now().timestamp();
+        let allow = vec!["RS256".to_string()];
+        let tk = rsa_test_key("k1");
+        // skew is 60 (see `inputs`). nbf 120s in the future is beyond skew →
+        // reject (now < nbf - skew).
+        let mut c = base_claims(now);
+        c["nbf"] = json!(now + 120);
+        let tok = mint(&tk, Some("k1"), Algorithm::RS256, &c);
+        assert!(verify::verify(&inputs(&allow, now), &tok, &keys(&tk)).is_err());
+        // nbf 30s in the future is within skew → accept.
+        let mut c = base_claims(now);
+        c["nbf"] = json!(now + 30);
+        let tok = mint(&tk, Some("k1"), Algorithm::RS256, &c);
+        assert!(verify::verify(&inputs(&allow, now), &tok, &keys(&tk)).is_ok());
+    }
+
+    // ─── per-hop SSRF: redirect closure + DNS filter (pure fns) ────────────
+    #[test]
+    fn redirect_hop_validation() {
+        let u = |s: &str| reqwest::Url::parse(s).unwrap();
+        // https public host → allowed.
+        assert!(redirect_hop_allowed(&u("https://issuer.example/x"), false).is_ok());
+        // http public host, not dev → refused.
+        assert!(redirect_hop_allowed(&u("http://issuer.example/x"), false).is_err());
+        // https to a private / metadata / loopback IP literal → refused.
+        assert!(redirect_hop_allowed(&u("https://169.254.169.254/latest"), false).is_err());
+        assert!(redirect_hop_allowed(&u("https://10.0.0.1/x"), false).is_err());
+        assert!(redirect_hop_allowed(&u("https://[::1]/x"), false).is_err());
+        // http loopback in dev → allowed; the same not-in-dev → refused.
+        assert!(redirect_hop_allowed(&u("http://127.0.0.1:5556/x"), true).is_ok());
+        assert!(redirect_hop_allowed(&u("http://127.0.0.1:5556/x"), false).is_err());
+    }
+
+    #[test]
+    fn dns_filter_range_logic() {
+        use std::net::SocketAddr;
+        let p = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let addrs = || {
+            vec![
+                p("93.184.216.34:443"),   // public
+                p("10.0.0.1:443"),        // private
+                p("127.0.0.1:443"),       // loopback
+                p("169.254.169.254:443"), // link-local metadata
+            ]
+            .into_iter()
+        };
+        // Not dev: only the public address survives.
+        assert_eq!(
+            filter_public_addrs(addrs(), false),
+            vec![p("93.184.216.34:443")]
+        );
+        // Dev: public + loopback survive; private / link-local still dropped.
+        let out = filter_public_addrs(addrs(), true);
+        assert!(out.contains(&p("93.184.216.34:443")));
+        assert!(out.contains(&p("127.0.0.1:443")));
+        assert!(!out.contains(&p("10.0.0.1:443")));
+        assert!(!out.contains(&p("169.254.169.254:443")));
     }
 
     // ─── claim mapping ────────────────────────────────────────────────────
