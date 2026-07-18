@@ -7249,6 +7249,98 @@ mod tests {
         assert!(get_b.is_none(), "B cannot read A's snapshot (by version)");
     }
 
+    /// A snapshot taken after a re-consent records the BUMPED authorization
+    /// generation (design :294-296, :306) — the pin a run binding froze under
+    /// the older generation stays distinguishable, so the broker recheck can
+    /// fail it closed. (The live-MCP photograph itself is CI-e2e territory; this
+    /// exercises the generation stamping the photograph relies on.)
+    #[tokio::test]
+    async fn phase_c_snapshot_records_bumped_generation() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let slug = format!("t-{}", Uuid::now_v7().simple());
+        let org = identity::create_org(&pool, &slug, None).await.unwrap();
+        let scope = TenantScope::assume(org.id);
+
+        let conn = create_connection(
+            &pool,
+            scope,
+            "mcp_http",
+            "acct-gen",
+            "Gen conn",
+            None,
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            None,
+            ConnectionAuth::static_active(),
+            ConnectionOwner::Organization,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // First photograph stamps generation 1.
+        let s1 = insert_connection_tool_snapshot(
+            &pool,
+            scope,
+            conn.id,
+            conn.authorization_generation,
+            "2025-06-18",
+            &serde_json::json!([{ "name": "t1" }]),
+            "digest-1",
+        )
+        .await
+        .unwrap();
+
+        // Re-consent bumps the generation; a fresh photograph stamps the bumped
+        // value (read off the connection's CURRENT generation, as the server does).
+        let bumped = bump_connection_generation(&pool, scope, conn.id)
+            .await
+            .unwrap()
+            .expect("connection in scope");
+        let conn2 = get_connection(&pool, scope, conn.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let s2 = insert_connection_tool_snapshot(
+            &pool,
+            scope,
+            conn.id,
+            conn2.authorization_generation,
+            "2025-06-18",
+            &serde_json::json!([{ "name": "t2" }]),
+            "digest-2",
+        )
+        .await
+        .unwrap();
+
+        cleanup_orgs(
+            &pool,
+            &[
+                "delete from connection_tool_snapshots where tenant_id = $1",
+                "delete from integration_connections where tenant_id = $1",
+            ],
+            &[org.id],
+        )
+        .await;
+
+        assert_eq!(s1.authorization_generation, 1, "first snapshot is gen 1");
+        assert_eq!(bumped, 2, "bump takes the connection to generation 2");
+        assert_eq!(conn2.authorization_generation, 2);
+        assert_eq!(
+            s2.authorization_generation, 2,
+            "snapshot records the BUMPED generation"
+        );
+        assert_eq!(
+            s2.snapshot_version, 2,
+            "snapshot version keeps auto-incrementing across a generation bump"
+        );
+    }
+
     /// Bindings commit atomically with the session, are tenant-scoped, and the
     /// authority/mcp CHECK constraints reject malformed shapes.
     #[tokio::test]

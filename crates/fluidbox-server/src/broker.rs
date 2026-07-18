@@ -11,7 +11,6 @@
 //! `initialize` handshake runs and the call retries once — safe because a
 //! session-required rejection means the tool never executed.
 
-use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use fluidbox_core::capability::{CapabilityServer, ToolSnapshot};
 use serde_json::{json, Value};
@@ -71,14 +70,10 @@ pub fn valid_header_name(name: &str) -> bool {
         && !DENY.contains(&name.to_ascii_lowercase().as_str())
 }
 
-/// Resolve the auth header for a brokered server, enforcing audience
-/// binding: the connection pins a `base_url`, and its credential is only
-/// ever sent to URLs under that base (our RFC-8707-equivalent — a bundle
-/// can never point connection X's token at attacker.example).
-/// `Ok(None)` = the server declared no credential.
-/// Static connections send the sealed secret (per header_name/scheme);
-/// OAuth connections mint/refresh an access token first — the ONLY growth
-/// this phase adds to the broker's credential resolution.
+/// Resolve the auth header for a brokered server (frozen-RunSpec path): fetch
+/// the embedded connection fresh, then defer to [`brokered_auth_for_conn`].
+/// `Ok(None)` = the server declared no connection (credential-free legacy
+/// bundle).
 pub async fn brokered_auth(
     state: &AppState,
     scope: fluidbox_db::TenantScope,
@@ -100,15 +95,34 @@ pub async fn brokered_auth(
         .await
         .map_err(|e| format!("connection lookup failed: {e}"))?
         .ok_or_else(|| format!("capability server '{name}': connection {cid} is missing"))?;
+    brokered_auth_for_conn(state, scope, &conn, url)
+        .await
+        .map_err(|e| format!("capability server '{name}': {e}"))
+}
+
+/// Credential-resolution CORE, callable with an ALREADY-FETCHED connection row
+/// and an explicit endpoint url — the single function serving the frozen-RunSpec
+/// broker path ([`brokered_auth`]), snapshot discovery ([`discover_snapshot`]),
+/// and (Task 6) binding resolution. Enforces the same audience binding (the
+/// connection pins `base_url`, and its credential is only ever sent to URLs
+/// under that base — our RFC-8707 equivalent), the same custom header/scheme
+/// composition, and the same OAuth minting. `Ok(None)` = no credential to send
+/// (`auth_kind = "none"`, a credentialless remote).
+pub async fn brokered_auth_for_conn(
+    state: &AppState,
+    scope: fluidbox_db::TenantScope,
+    conn: &fluidbox_db::IntegrationConnectionRow,
+    url: &str,
+) -> Result<Option<BrokeredAuth>, String> {
     if conn.status != "active" {
         return Err(format!(
-            "capability server '{name}': connection {cid} is {} — reconnect it",
-            conn.status
+            "connection {} is {} — reconnect it",
+            conn.id, conn.status
         ));
     }
     if conn.provider != "mcp_http" {
         return Err(format!(
-            "capability server '{name}': connection provider '{}' does not hold MCP credentials",
+            "connection provider '{}' does not hold MCP credentials",
             conn.provider
         ));
     }
@@ -116,25 +130,30 @@ pub async fn brokered_auth(
         .metadata
         .get("base_url")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| format!("connection {cid} has no base_url — reconnect it"))?;
+        .ok_or_else(|| format!("connection {} has no base_url — reconnect it", conn.id))?;
     if !url_within_base(url, base) {
-        return Err(format!(
-            "capability server '{name}': url is outside the connection's base_url — refusing to send its credential (audience binding)"
-        ));
+        return Err(
+            "url is outside the connection's base_url — refusing to send its credential (audience binding)".into(),
+        );
+    }
+    // Credentialless remote (`auth_kind = "none"`): no header at all. MUST come
+    // BEFORE the static branch, which would fail on the NULL sealed credential.
+    if conn.auth_kind == "none" {
+        return Ok(None);
     }
     if conn.auth_kind == "oauth" {
-        let access = crate::oauth::ensure_access_token(state, &conn).await?;
+        let access = crate::oauth::ensure_access_token(state, conn).await?;
         return Ok(Some(BrokeredAuth {
             header: "authorization".into(),
             value: format!("Bearer {access}"),
-            oauth_connection: Some(*cid),
+            oauth_connection: Some(conn.id),
         }));
     }
     let sealer = state
         .sealer
         .as_ref()
         .ok_or("FLUIDBOX_CREDENTIAL_KEY not configured")?;
-    let sealed = fluidbox_db::connection_credential_sealed(&state.pool, scope, *cid)
+    let sealed = fluidbox_db::connection_credential_sealed(&state.pool, scope, conn.id)
         .await
         .map_err(|e| format!("credential lookup failed: {e}"))?
         .ok_or("connection is not active (revoked or missing)")?;
@@ -413,17 +432,57 @@ async fn handshake(
             .and_then(|v| v.as_str())
             .map(str::to_string),
     };
-    // Fire-and-forget per spec; servers answer 202.
-    let note = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
-    let _ = post_rpc(state, url, auth, Some(&session), &note).await;
+    // `notifications/initialized` only matters once a session was established;
+    // fire-and-forget per spec (servers answer 202).
+    if session.session_id.is_some() {
+        let note = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+        let _ = post_rpc(state, url, auth, Some(&session), &note).await;
+    }
     Ok(session)
 }
 
 // ─── The two operations fluidbox performs ─────────────────────────────────
 
-/// Registration-time discovery — THE photograph (design §8.2). Paginates
-/// tools/list and maps the wire shape (camelCase `inputSchema`) into our
-/// frozen snapshot shape. Validation (charsets, lint, caps) happens in
+/// Map one `tools/list` result page into snapshot shape (camelCase
+/// `inputSchema` → snake `input_schema`; annotations kept verbatim), appending
+/// to `out`, and return the page's `nextCursor` (absent = last page). Shared by
+/// the stateless registration/probe path and the forced-negotiation snapshot
+/// discovery so both map identically.
+fn map_tools_page(result: &Value, out: &mut Vec<ToolSnapshot>) -> Result<Option<String>, CallErr> {
+    for t in result
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .ok_or("mcp tools/list result has no tools array")?
+    {
+        out.push(ToolSnapshot {
+            name: t
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or("mcp tools/list entry has no name")?
+                .to_string(),
+            description: t
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            input_schema: t
+                .get("inputSchema")
+                .cloned()
+                .unwrap_or_else(|| json!({ "type": "object" })),
+            annotations: t.get("annotations").cloned(),
+        });
+    }
+    Ok(result
+        .get("nextCursor")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string))
+}
+
+/// Registration-time discovery — THE (stateless-first) photograph for the
+/// legacy bundle probe path. Paginates tools/list; on hitting the page cap with
+/// a cursor still pending it freezes what it has (acceptable for the probe/BYO
+/// preview — the snapshot path below is stricter). Validation happens in
 /// fluidbox-core after this returns.
 async fn discover_tools(
     state: &AppState,
@@ -438,33 +497,7 @@ async fn discover_tools(
             None => json!({}),
         };
         let result = rpc(state, url, auth, "tools/list", params).await?;
-        for t in result
-            .get("tools")
-            .and_then(|v| v.as_array())
-            .ok_or("mcp tools/list result has no tools array")?
-        {
-            tools.push(ToolSnapshot {
-                name: t
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .ok_or("mcp tools/list entry has no name")?
-                    .to_string(),
-                description: t
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                input_schema: t
-                    .get("inputSchema")
-                    .cloned()
-                    .unwrap_or_else(|| json!({ "type": "object" })),
-                annotations: t.get("annotations").cloned(),
-            });
-        }
-        cursor = result
-            .get("nextCursor")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+        cursor = map_tools_page(&result, &mut tools)?;
         if cursor.is_none() {
             break;
         }
@@ -473,6 +506,95 @@ async fn discover_tools(
         return Err(CallErr::Other("mcp server advertises no tools".into()));
     }
     Ok(tools)
+}
+
+/// One `tools/list` page carrying an ESTABLISHED session (the negotiated
+/// protocol-version + any session-id headers ride along) — the discovery
+/// counterpart to the stateless-first `rpc`. No handshake retry: discovery
+/// already initialized.
+async fn list_tools_page_session(
+    state: &AppState,
+    url: &str,
+    auth: Option<&BrokeredAuth>,
+    session: &McpSession,
+    cursor: Option<&str>,
+) -> Result<Value, CallErr> {
+    let params = match cursor {
+        Some(c) => json!({ "cursor": c }),
+        None => json!({}),
+    };
+    let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": params });
+    let (status, _, value) = post_rpc(state, url, auth, Some(session), &body).await?;
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(CallErr::Unauthorized);
+    }
+    if !status.is_success() {
+        return Err(CallErr::Other(format!(
+            "mcp tools/list returned HTTP {status}"
+        )));
+    }
+    unwrap_result(rpc_error_to_err(status, value, "tools/list")?, "tools/list").map_err(Into::into)
+}
+
+/// The forced-negotiation photograph (design :298-343; Phase C). UNLIKE the
+/// stateless-first paths above, discovery ALWAYS `initialize`s first so it can
+/// record a REAL negotiated protocol version — the whole point of a snapshot
+/// (survey A §2e: the legacy photograph negotiates none and cannot be trusted).
+/// Fails closed when the server negotiates no/empty `protocolVersion`, and —
+/// per design :1282-1283 — when a `nextCursor` still remains after the page cap
+/// (freeze the whole surface or none, never a partial list). The remote list is
+/// untrusted input: it passes core's IDENTICAL `validate_tools` screen (charset,
+/// poison-screen, caps) before it can become a snapshot.
+pub async fn discover_snapshot(
+    state: &AppState,
+    scope: fluidbox_db::TenantScope,
+    conn: &fluidbox_db::IntegrationConnectionRow,
+    endpoint_url: &str,
+) -> anyhow::Result<(String, Vec<ToolSnapshot>)> {
+    let auth = brokered_auth_for_conn(state, scope, conn, endpoint_url)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    // Always initialize first, and require a negotiated protocol version.
+    let session = handshake(state, endpoint_url, auth.as_ref())
+        .await
+        .map_err(|e| anyhow::anyhow!(e.into_msg()))?;
+    let protocol_version = session
+        .protocol_version
+        .clone()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "mcp server negotiated no protocolVersion at initialize — cannot record a trustworthy snapshot"
+            )
+        })?;
+    // Paginate tools/list WITH the session; fail (not freeze) on a leftover cursor.
+    let mut tools = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut complete = false;
+    for _ in 0..MAX_LIST_PAGES {
+        let result = list_tools_page_session(
+            state,
+            endpoint_url,
+            auth.as_ref(),
+            &session,
+            cursor.as_deref(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!(e.into_msg()))?;
+        cursor = map_tools_page(&result, &mut tools).map_err(|e| anyhow::anyhow!(e.into_msg()))?;
+        if cursor.is_none() {
+            complete = true;
+            break;
+        }
+    }
+    if !complete {
+        anyhow::bail!(
+            "mcp server advertises more tools than the discovery page cap — refusing to freeze a partial snapshot"
+        );
+    }
+    fluidbox_core::capability::validate_tools("mcp connection", &tools)
+        .map_err(|e| anyhow::anyhow!("discovered tool snapshot failed validation: {e}"))?;
+    Ok((protocol_version, tools))
 }
 
 /// One brokered tool execution. Returns (content, is_error) from the MCP
@@ -547,26 +669,6 @@ pub async fn call_tool_auth(
     }
 }
 
-/// Discover with the same resolution/retry semantics as execution — used by
-/// the photograph.
-pub async fn discover_tools_auth(
-    state: &AppState,
-    scope: fluidbox_db::TenantScope,
-    server: &CapabilityServer,
-) -> Result<Vec<ToolSnapshot>, String> {
-    let url = server_url(server)?;
-    let auth = brokered_auth(state, scope, server).await?;
-    match discover_tools(state, url, auth.as_ref()).await {
-        Err(CallErr::Unauthorized) => {
-            let auth = reauth_after_401(state, scope, server, auth).await?;
-            discover_tools(state, url, auth.as_ref())
-                .await
-                .map_err(CallErr::into_msg)
-        }
-        r => r.map_err(CallErr::into_msg),
-    }
-}
-
 /// Oversized results are replaced by a truncated text block so a hostile or
 /// chatty server can't balloon the runner/context; the ledger stores only a
 /// digest either way.
@@ -589,27 +691,12 @@ fn cap_content(content: Value) -> Value {
     json!([{ "type": "text", "text": format!("{truncated}\n… (result truncated by fluidbox broker)") }])
 }
 
-/// Registration helper shared by the capabilities API: resolve auth for a
-/// (possibly credentialed) brokered server and photograph its tools.
-pub async fn photograph_brokered(
-    state: &AppState,
-    scope: fluidbox_db::TenantScope,
-    server: &CapabilityServer,
-) -> ApiResult<Vec<ToolSnapshot>> {
-    let CapabilityServer::Brokered { name, .. } = server else {
-        return Err(ApiError::Internal("not a brokered server".into()));
-    };
-    discover_tools_auth(state, scope, server)
-        .await
-        .map_err(|e| ApiError::BadRequest(format!("capability server '{name}': {e}")))
-}
-
 /// The three outcomes of a NON-COMMITTING, credential-free probe of a remote
 /// MCP endpoint. `Unauthorized` (a clean 401) is a *signal* the server wants
 /// auth — the wizard branches on it; `Unreachable` is a genuine error. This
-/// distinction is exactly why the probe rides the private `discover_tools`
-/// (which surfaces `CallErr::Unauthorized`) rather than `discover_tools_auth`
-/// (which collapses a 401 into an opaque credential-rejection message).
+/// distinction is exactly why the probe rides the private `discover_tools`,
+/// which surfaces `CallErr::Unauthorized` rather than collapsing a 401 into an
+/// opaque credential-rejection message.
 pub enum ProbeOutcome {
     /// Authless server — these tools are for DISPLAY only, never persisted;
     /// the authoritative photograph still happens at connect.

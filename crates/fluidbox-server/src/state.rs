@@ -36,6 +36,12 @@ impl ApprovalRegistry {
     }
 }
 
+/// A cached short-lived provider token and its expiry.
+type CachedToken = (String, DateTime<Utc>);
+/// The access/installation-token cache, keyed by
+/// `(connection_id, authorization_generation)` (design :783-789).
+type ConnectorTokenCache = Mutex<HashMap<(Uuid, i32), CachedToken>>;
+
 pub struct AppStateInner {
     pub cfg: Config,
     pub pool: PgPool,
@@ -62,7 +68,12 @@ pub struct AppStateInner {
     /// installation tokens ~1h, OAuth access tokens) — a cache only; the
     /// durable credential (private key / rotating refresh token) stays
     /// sealed in the DB and entries re-mint on expiry or restart.
-    pub connector_tokens: Mutex<HashMap<Uuid, (String, DateTime<Utc>)>>,
+    /// Keyed by `(connection_id, authorization_generation)` (design :783-789):
+    /// a re-consent bump makes the old generation's cached token unreachable, so
+    /// a run bound to the old generation can never be served the new identity's
+    /// token. Eviction (`oauth::invalidate_access`) drops EVERY generation of a
+    /// connection.
+    pub connector_tokens: ConnectorTokenCache,
     /// Per-connection serialization of OAuth token refreshes: rotation means
     /// concurrent brokered calls must mint ONE new refresh token, not race
     /// each other into invalid_grant (Notion keeps ≤2 valid).

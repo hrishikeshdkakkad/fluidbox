@@ -340,16 +340,69 @@ async fn connect_entry(
 
     match entry.auth_mode.as_str() {
         "none" => {
-            let server = authless_server(&entry)?;
-            let row = crate::capabilities::register_bundle(
-                state,
+            // Sandbox (in-image stdio) entries keep the bundle path — bundles
+            // survive for sandbox tools (design :320-323).
+            if entry.sandbox_launch.is_some() {
+                let server = sandbox_launch_server(&entry)?;
+                let row = crate::capabilities::register_bundle(
+                    state,
+                    scope,
+                    &bundle_name,
+                    entry.description.as_deref(),
+                    vec![server],
+                )
+                .await?;
+                return Ok(Json(crate::capabilities::bundle_json(&row)));
+            }
+            // Credentialless remote: a real `auth_kind="none"` connection (NULL
+            // credential) whose tool surface is photographed into a snapshot.
+            let url = entry.url.as_deref().ok_or_else(|| {
+                ApiError::BadRequest("catalog entry has neither url nor sandbox_launch".into())
+            })?;
+            let host = reqwest::Url::parse(url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_else(|| "mcp".into());
+            let metadata =
+                json!({ "base_url": url, "endpoint_url": url, "catalog_slug": entry.slug });
+            let row = fluidbox_db::create_connection(
+                &state.pool,
                 scope,
-                &bundle_name,
-                entry.description.as_deref(),
-                vec![server],
+                "mcp_http",
+                &host,
+                req.display_name.as_deref().unwrap_or(&entry.name),
+                None,
+                &json!([]),
+                &json!({}),
+                &metadata,
+                None,
+                fluidbox_db::ConnectionAuth {
+                    auth_kind: "none",
+                    status: "active",
+                    oauth: None,
+                    client_secret_sealed: None,
+                    registration_id: None,
+                },
+                // Task 4 threads the real principal; org-owned for now.
+                fluidbox_db::ConnectionOwner::Organization,
+                None,
             )
             .await?;
-            Ok(Json(crate::capabilities::bundle_json(&row)))
+            match crate::snapshots::photograph_connection(state, scope, row.id, url).await {
+                Ok(snap) => Ok(Json(json!({
+                    "connection": row,
+                    "snapshot": crate::snapshots::snapshot_json(&snap),
+                }))),
+                Err(e) => {
+                    fluidbox_db::revoke_connection(&state.pool, scope, row.id)
+                        .await
+                        .ok();
+                    Err(crate::snapshots::rolled_back(
+                        "the MCP server could not be photographed",
+                        e,
+                    ))
+                }
+            }
         }
         "api_key" => {
             let url = entry
@@ -385,47 +438,30 @@ async fn connect_entry(
                 client_id: None,
                 client_secret: None,
             };
-            let created =
-                crate::connections::create_mcp_http_connection(state, scope, create).await?;
-            let connection_id = created.id;
-            let server = CapabilityServer::Brokered {
-                name: entry.slug.clone(),
-                url: url.to_string(),
-                connection_id: Some(connection_id),
-                identity: None,
-                tools: Vec::new(),
-            };
-            match crate::capabilities::register_bundle(
+            let created = crate::connections::create_mcp_http_connection(
                 state,
                 scope,
-                &bundle_name,
-                entry.description.as_deref(),
-                vec![server],
+                create,
+                Some(&entry.slug),
             )
-            .await
-            {
-                Ok(row) => {
-                    // Return the photographed servers/tools too so the wizard's
-                    // success screen can show what was discovered.
-                    let bj = crate::capabilities::bundle_json(&row);
-                    Ok(Json(json!({
-                        "connection": created,
-                        "bundle": bj["bundle"],
-                        "servers": bj["servers"],
-                    })))
-                }
+            .await?;
+            let connection_id = created.id;
+            // The photograph is the credential's proof-of-life AND freezes the
+            // tool surface into a snapshot; a refused key must not leave a
+            // dangling connection.
+            match crate::snapshots::photograph_connection(state, scope, connection_id, url).await {
+                Ok(snap) => Ok(Json(json!({
+                    "connection": created,
+                    "snapshot": crate::snapshots::snapshot_json(&snap),
+                }))),
                 Err(e) => {
-                    // The photograph is the credential's proof-of-life; a
-                    // refused key must not leave a dangling connection.
                     fluidbox_db::revoke_connection(&state.pool, scope, connection_id)
                         .await
                         .ok();
-                    Err(match e {
-                        ApiError::BadRequest(m) => ApiError::BadRequest(format!(
-                            "the server rejected this credential (connection rolled back): {m}"
-                        )),
-                        other => other,
-                    })
+                    Err(crate::snapshots::rolled_back(
+                        "the server rejected this credential",
+                        e,
+                    ))
                 }
             }
         }
@@ -456,10 +492,12 @@ async fn connect_entry(
                     scopes.push(s);
                 }
             }
+            // Phase C: the callback photographs a connection snapshot (not a
+            // brokered bundle) at `pending_snapshot.url` after activation.
             let mut oauth = json!({
                 "resource": resource,
                 "scopes": scopes,
-                "pending_bundle": { "name": bundle_name, "url": url },
+                "pending_snapshot": { "url": url },
                 "catalog_slug": entry.slug,
             });
             if let Some(cid) = req
@@ -490,7 +528,7 @@ async fn connect_entry(
                 None,
                 &json!([]),
                 &json!({}),
-                &json!({ "base_url": url }),
+                &json!({ "base_url": url, "endpoint_url": url, "catalog_slug": entry.slug }),
                 None,
                 fluidbox_db::ConnectionAuth {
                     auth_kind: "oauth",
@@ -516,43 +554,36 @@ async fn connect_entry(
     }
 }
 
-/// Build the server for an authless entry: in-image stdio launch (declared
-/// tools) or a credential-free remote (photographed without a connection).
-fn authless_server(entry: &fluidbox_db::ConnectorCatalogRow) -> ApiResult<CapabilityServer> {
-    if let Some(launch) = &entry.sandbox_launch {
-        let command = launch["command"]
-            .as_str()
-            .filter(|c| !c.is_empty())
-            .ok_or_else(|| ApiError::BadRequest("catalog sandbox_launch has no command".into()))?
-            .to_string();
-        let args: Vec<String> = launch["args"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let tools: Vec<ToolSnapshot> = serde_json::from_value(launch["tools"].clone())
-            .map_err(|e| ApiError::BadRequest(format!("catalog sandbox_launch tools: {e}")))?;
-        return Ok(CapabilityServer::Sandbox {
-            name: entry.slug.clone(),
-            command,
-            args,
-            identity: None,
-            tools,
-        });
-    }
-    let url = entry.url.as_deref().ok_or_else(|| {
-        ApiError::BadRequest("catalog entry has neither url nor sandbox_launch".into())
+/// Build the sandbox (in-image stdio) server for an authless entry that carries
+/// a `sandbox_launch`. Brokered/remote authless entries no longer become
+/// bundles — they become credentialless connections + snapshots (see the `none`
+/// connect branch), so this handles only the sandbox case.
+fn sandbox_launch_server(entry: &fluidbox_db::ConnectorCatalogRow) -> ApiResult<CapabilityServer> {
+    let launch = entry.sandbox_launch.as_ref().ok_or_else(|| {
+        ApiError::BadRequest("catalog entry has no sandbox_launch to publish".into())
     })?;
-    Ok(CapabilityServer::Brokered {
+    let command = launch["command"]
+        .as_str()
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("catalog sandbox_launch has no command".into()))?
+        .to_string();
+    let args: Vec<String> = launch["args"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let tools: Vec<ToolSnapshot> = serde_json::from_value(launch["tools"].clone())
+        .map_err(|e| ApiError::BadRequest(format!("catalog sandbox_launch tools: {e}")))?;
+    Ok(CapabilityServer::Sandbox {
         name: entry.slug.clone(),
-        url: url.to_string(),
-        connection_id: None,
+        command,
+        args,
         identity: None,
-        tools: Vec::new(),
+        tools,
     })
 }
 

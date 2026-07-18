@@ -393,9 +393,14 @@ pub async fn installation_token(
         }
         None => None,
     };
+    // Cache key carries the generation (design :783-789). github_app custody
+    // never bumps its generation — the installation id is a positively proven
+    // stable identity — so this is effectively `(conn.id, 1)`, but keyed off the
+    // row's field so it stays uniform with the OAuth path.
+    let cache_key = (conn.id, conn.authorization_generation);
     {
         let cache = state.connector_tokens.lock().await;
-        if let Some((token, expires_at)) = cache.get(&conn.id) {
+        if let Some((token, expires_at)) = cache.get(&cache_key) {
             if *expires_at > Utc::now() + chrono::Duration::seconds(300) {
                 return Ok(token.clone());
             }
@@ -451,7 +456,7 @@ pub async fn installation_token(
         .connector_tokens
         .lock()
         .await
-        .insert(conn.id, (token.clone(), expires_at));
+        .insert(cache_key, (token.clone(), expires_at));
     Ok(token)
 }
 
