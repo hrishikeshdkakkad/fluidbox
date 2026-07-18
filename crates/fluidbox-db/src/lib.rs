@@ -7413,9 +7413,14 @@ mod tests {
         .await;
 
         // Shape CHECK negatives (each on a valid in-scope session):
-        // (a) mcp slot missing the snapshot fields.
+        // (a) mcp slot missing the snapshot fields. A FRESH requirement_slot is
+        // mandatory: reusing "primary" would collide with mcp_binding on the
+        // unique (tenant_id, session_id, slot_kind, requirement_slot) key, so the
+        // insert would fail even if the mcp-shape CHECK regressed. With its own
+        // slot the ONLY reason it can fail is run_resource_bindings_mcp_shape.
         let mut bad_mcp = mcp_binding.clone();
         bad_mcp.id = Uuid::now_v7();
+        bad_mcp.requirement_slot = "shape-a".into();
         bad_mcp.snapshot_version = None;
         bad_mcp.effective_tools_json = None;
         bad_mcp.effective_tools_digest = None;
