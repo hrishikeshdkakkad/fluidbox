@@ -1,3 +1,4 @@
+mod admin_orgs;
 mod api;
 mod auth;
 mod broker;
@@ -28,7 +29,7 @@ mod tokens;
 mod triggers;
 mod workers;
 
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::Router;
 use fluidbox_core::traits::ExecutionProvider;
 use state::{AppStateInner, ApprovalRegistry};
@@ -221,6 +222,49 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/switch/{id}", post(login::switch_confirm))
         .route("/auth/logout", post(login::logout))
         .route("/auth/me", get(login::me))
+        // Operator break-glass + IdP lifecycle (Phase B, Task 6). Every route is
+        // Admin-token gated — this is exactly the surface the operator retains
+        // under FLUIDBOX_REQUIRE_SSO=1 (the `Admin` extractor stays valid there
+        // while `Principal` refuses the admin token). Each accepted mutation
+        // audits inside its transaction; rejected attempts audit separately.
+        .route(
+            "/admin/orgs",
+            get(admin_orgs::list_orgs).post(admin_orgs::create_org),
+        )
+        .route(
+            "/admin/orgs/{slug}/idp",
+            get(admin_orgs::list_idp).post(admin_orgs::create_idp),
+        )
+        .route("/admin/orgs/{slug}/idp/{id}", patch(admin_orgs::patch_idp))
+        .route(
+            "/admin/orgs/{slug}/idp/{id}/activate",
+            post(admin_orgs::activate_idp),
+        )
+        .route(
+            "/admin/orgs/{slug}/idp/{id}/disable",
+            post(admin_orgs::disable_idp),
+        )
+        .route(
+            "/admin/orgs/{slug}/idp/{id}/reactivate",
+            post(admin_orgs::reactivate_idp),
+        )
+        .route(
+            "/admin/orgs/{slug}/idp/{id}/migrate",
+            post(admin_orgs::migrate_idp),
+        )
+        .route(
+            "/admin/orgs/{slug}/break-glass-owner",
+            post(admin_orgs::break_glass_owner),
+        )
+        .route("/admin/orgs/{slug}/members", get(admin_orgs::list_members))
+        .route(
+            "/admin/orgs/{slug}/members/{membership_id}/deactivate",
+            post(admin_orgs::deactivate_member),
+        )
+        .route(
+            "/admin/orgs/{slug}/members/{membership_id}/roles",
+            post(admin_orgs::set_member_roles),
+        )
         .route(
             "/capabilities",
             get(capabilities::list).post(capabilities::create),

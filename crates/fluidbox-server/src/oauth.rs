@@ -434,7 +434,7 @@ async fn resolve_client(
 
 // ─── The dance ────────────────────────────────────────────────────────────
 
-fn sealer(state: &AppState) -> ApiResult<&Sealer> {
+pub(crate) fn sealer(state: &AppState) -> ApiResult<&Sealer> {
     state.sealer.as_ref().ok_or_else(|| {
         ApiError::BadRequest(
             "OAuth connections are disabled: set FLUIDBOX_CREDENTIAL_KEY on the server".into(),
