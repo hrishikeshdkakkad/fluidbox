@@ -330,6 +330,14 @@ impl FromRequestParts<AppState> for TriggerAuth {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let token = bearer(parts).ok_or(ApiError::Unauthorized)?;
+        // Dual-credential rejection (design lines 599-600): a request bearing
+        // BOTH a session cookie and a bearer is refused, never resolved by
+        // precedence — the same rule the Principal/Admin extractors apply.
+        if !web_cookie_values(&parts.headers).is_empty() {
+            return Err(ApiError::BadRequest(
+                "present a session cookie or an Authorization bearer, not both".into(),
+            ));
+        }
         let auth = fluidbox_db::subscription_for_token(&state.pool, &token)
             .await?
             .ok_or(ApiError::Unauthorized)?;
@@ -358,6 +366,13 @@ impl FromRequestParts<AppState> for SessionAuth {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let token = bearer(parts).ok_or(ApiError::Unauthorized)?;
+        // Dual-credential rejection (design lines 599-600): cookie + bearer on
+        // one request is refused rather than resolved by precedence.
+        if !web_cookie_values(&parts.headers).is_empty() {
+            return Err(ApiError::BadRequest(
+                "present a session cookie or an Authorization bearer, not both".into(),
+            ));
+        }
         let auth = fluidbox_db::session_for_token(&state.pool, &token)
             .await?
             .ok_or(ApiError::Unauthorized)?;

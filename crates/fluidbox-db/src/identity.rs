@@ -480,6 +480,13 @@ pub async fn count_outstanding_login_flows(pool: &PgPool, scope: TenantScope) ->
 /// Mint a one-time login flow with GC-on-insert (same discipline as
 /// `create_github_app_flow`). The cleartext cookie nonce lives only in the
 /// browser cookie; only its sha256 (`browser_hash`) is stored.
+///
+/// The outstanding-flow cap (design 852-854) is enforced ATOMICALLY with the
+/// insert: one short transaction locks the tenant row, GCs, counts the still-
+/// claimable flows, and inserts only when under `max_outstanding` — so
+/// concurrent starts cannot race past the cap. `Ok(None)` means over-cap (the
+/// caller surfaces the existing 429/refusal shape). Per-org start
+/// serialization at login volume is the doc's accepted trade.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_login_flow(
     pool: &PgPool,
@@ -490,7 +497,15 @@ pub async fn create_login_flow(
     browser_hash: &str,
     redirect_to: &str,
     ttl_secs: i64,
-) -> sqlx::Result<Uuid> {
+    max_outstanding: i64,
+) -> sqlx::Result<Option<Uuid>> {
+    let mut tx = pool.begin().await?;
+    // Serialize concurrent starts for this org on the tenant row so the cap
+    // check and the insert are one atomic decision.
+    sqlx::query("select id from tenants where id = $1 for update")
+        .bind(scope.tenant_id())
+        .execute(&mut *tx)
+        .await?;
     // GC-on-insert is scoped to the inserting tenant (a per-request write must
     // never sweep another org's rows). A global sweep of expired flows across
     // all tenants belongs to a future background worker, not this hot path.
@@ -501,8 +516,19 @@ pub async fn create_login_flow(
                 or expires_at < now() - interval '7 days')",
     )
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    let (n,): (i64,) = sqlx::query_as(
+        "select count(*) from login_flows
+         where tenant_id = $1 and consumed_at is null and expires_at > now()",
+    )
+    .bind(scope.tenant_id())
+    .fetch_one(&mut *tx)
+    .await?;
+    if n >= max_outstanding {
+        // Over cap: refuse without minting; the transaction rolls back on drop.
+        return Ok(None);
+    }
     let id = Uuid::now_v7();
     sqlx::query(
         "insert into login_flows
@@ -517,9 +543,10 @@ pub async fn create_login_flow(
     .bind(browser_hash)
     .bind(redirect_to)
     .bind(ttl_secs as f64)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
-    Ok(id)
+    tx.commit().await?;
+    Ok(Some(id))
 }
 
 /// The one-time login-flow claim (design lines 503-524). The cookie
@@ -2266,9 +2293,11 @@ mod tests {
             &good_hash,
             "/dashboard",
             600,
+            100,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .expect("flow created");
 
         // wrong browser_hash refused, and the flow is NOT burned
         assert!(claim_login_flow(&pool, flow, org.id, cfg.id, "wrong")
@@ -2289,9 +2318,20 @@ mod tests {
             .is_none());
 
         // an already-expired flow is refused (claim checks expires_at > now())
-        let expired = create_login_flow(&pool, scope, cfg.id, &[1], "nonce-2", &good_hash, "/", -5)
-            .await
-            .unwrap();
+        let expired = create_login_flow(
+            &pool,
+            scope,
+            cfg.id,
+            &[1],
+            "nonce-2",
+            &good_hash,
+            "/",
+            -5,
+            100,
+        )
+        .await
+        .unwrap()
+        .expect("flow created");
         assert!(claim_login_flow(&pool, expired, org.id, cfg.id, &good_hash)
             .await
             .unwrap()
@@ -2890,9 +2930,11 @@ mod tests {
             &sha256_hex("y"),
             "/",
             600,
+            100,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .expect("flow created");
 
         match disable_idp_config(&pool, scope, cfg.id, None)
             .await
@@ -2980,9 +3022,20 @@ mod tests {
         drop(conn);
         // An unconsumed login flow on the OLD config.
         let flow_bh = sha256_hex("mig-flow");
-        let flow_id = create_login_flow(pool, scope, old.id, &[1], "mig-flow", &flow_bh, "/", 600)
-            .await
-            .unwrap();
+        let flow_id = create_login_flow(
+            pool,
+            scope,
+            old.id,
+            &[1],
+            "mig-flow",
+            &flow_bh,
+            "/",
+            600,
+            100,
+        )
+        .await
+        .unwrap()
+        .expect("flow created");
         let pat_plain = "fbx_pat_migrate0000";
         mint_pat(
             pool,
