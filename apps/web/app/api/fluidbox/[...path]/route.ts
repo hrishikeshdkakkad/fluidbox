@@ -15,8 +15,13 @@
 //
 // Both modes stream SSE through untouched.
 
+import { allowedCookieHeader, webMode } from "../../../lib/proxy-auth";
+
 const API = process.env.FLUIDBOX_API_URL || "http://127.0.0.1:8787";
-const MODE = process.env.FLUIDBOX_WEB_MODE === "sso" ? "sso" : "admin";
+// Resolve the mode once at module scope (static deployment config, not
+// per-request). The allowlist + mode logic lives in ./lib/proxy-auth, where it
+// is unit-tested.
+const MODE = webMode(process.env.FLUIDBOX_WEB_MODE);
 
 // Read the operator token ONLY in admin mode. In sso mode this value is never
 // dereferenced, so operator authority is absent from the request path even if
@@ -25,31 +30,6 @@ const ADMIN_TOKEN =
   MODE === "admin" ? process.env.FLUIDBOX_ADMIN_TOKEN || "" : "";
 
 export const dynamic = "force-dynamic";
-
-/** Cookies the browser may forward to the control plane in sso mode. The raw
- *  Cookie header is parsed and filtered — nothing outside this allowlist rides
- *  along (never the raw header). */
-function isAllowedCookie(name: string): boolean {
-  return (
-    name === "__Host-fbx_web" ||
-    name.startsWith("__Host-fbx_login_") ||
-    name.startsWith("__Host-fbx_switch_")
-  );
-}
-
-function allowedCookieHeader(req: Request): string | null {
-  const raw = req.headers.get("cookie");
-  if (!raw) return null;
-  const kept = raw
-    .split(";")
-    .map((pair) => pair.trim())
-    .filter((pair) => {
-      const eq = pair.indexOf("=");
-      const name = eq === -1 ? pair : pair.slice(0, eq);
-      return isAllowedCookie(name);
-    });
-  return kept.length > 0 ? kept.join("; ") : null;
-}
 
 async function forward(req: Request, path: string[]) {
   const url = new URL(req.url);
