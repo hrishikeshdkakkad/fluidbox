@@ -49,6 +49,11 @@ pub struct AppStateInner {
     /// LISTEN/NOTIFY wakeups (session_id, seq) for SSE fanout.
     pub events_tx: broadcast::Sender<(Uuid, i64)>,
     pub http: reqwest::Client,
+    /// The ONE HTTP client for identity fetches (OIDC discovery, JWKS, token
+    /// endpoint) — nothing else uses it. Built with per-hop SSRF enforcement: a
+    /// custom redirect policy re-validates every hop and a custom DNS resolver
+    /// filters resolved addresses at connect time (see `login::build_identity_http`).
+    pub identity_http: reqwest::Client,
     /// Seals/unseals connection credentials. None until
     /// FLUIDBOX_CREDENTIAL_KEY is configured — connection endpoints and
     /// connection-backed workspaces refuse to operate without it.

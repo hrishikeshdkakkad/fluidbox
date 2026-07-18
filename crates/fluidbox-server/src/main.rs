@@ -149,6 +149,11 @@ async fn main() -> anyhow::Result<()> {
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15 * 60))
             .build()?,
+        // Dedicated per-hop-SSRF client for OIDC identity fetches. The dev
+        // (loopback-http) allowance is baked in from the public URL at build
+        // time so a local Dex on 127.0.0.1 with a loopback FLUIDBOX_PUBLIC_URL
+        // still works while every non-dev deployment rejects private targets.
+        identity_http: login::build_identity_http(&cfg.public_url),
         sealer,
         connector_tokens: Default::default(),
         oauth_locks: Default::default(),
