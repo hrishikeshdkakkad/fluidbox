@@ -40,7 +40,11 @@ fi
 command -v docker >/dev/null 2>&1 || { echo "identity-e2e: docker is required (for Dex)." >&2; exit 2; }
 command -v curl   >/dev/null 2>&1 || { echo "identity-e2e: curl is required." >&2; exit 2; }
 command -v python3 >/dev/null 2>&1 || { echo "identity-e2e: python3 is required (JSON + URL joins)." >&2; exit 2; }
-HAVE_PSQL=0; command -v psql >/dev/null 2>&1 && HAVE_PSQL=1
+# psql is REQUIRED, not optional: the acceptance below PROVES the expired-flow,
+# expired-arm, expired-switch, bootstrap-idempotence, and SSE-termination cases
+# by ageing rows / counting audit rows directly. None of them may silently skip,
+# so a missing psql aborts the whole run (CI installs postgresql-client).
+command -v psql >/dev/null 2>&1 || { echo "identity-e2e: psql is required (acceptance must be PROVEN, not skipped)." >&2; exit 2; }
 
 # ── Config ───────────────────────────────────────────────────────────────────
 API=http://127.0.0.1:8787
@@ -53,6 +57,7 @@ DEX_IMAGE=${DEX_IMAGE:-ghcr.io/dexidp/dex:v2.45.0@sha256:b8469881d3cb3a73001506f
 SLUG=acme
 SLUG2=beta          # a real org with NO IdP config (fail-closed browser path)
 SLUG3=gamma-never   # never created (enumeration-parity comparison)
+SLUG4="delta"       # org whose bootstrap arm is EXPIRED (consumed-without-promote)
 PW=password         # matches the embedded bcrypt hash below (non-secret test creds)
 U1=alice@acme.test
 U2=bob@acme.test
@@ -74,7 +79,6 @@ DATA_DIR="$WORK/data"; mkdir -p "$DATA_DIR"
 pass=0; fail=0
 ok()  { printf "  \033[1;32m✓\033[0m %s\n" "$1"; pass=$((pass+1)); }
 no()  { printf "  \033[1;31m✗\033[0m %s\n" "$1"; fail=$((fail+1)); }
-skip(){ printf "  \033[1;33m∼\033[0m %s\n" "$1"; }
 say() { printf "\n\033[1;36m== %s ==\033[0m\n" "$1"; }
 
 j() { python3 -c "import sys,json;d=json.load(sys.stdin);print(d$1)" 2>/dev/null; }
@@ -349,6 +353,56 @@ esac
 AGCODE=$(curl -s -o /dev/null -w '%{http_code}' -b "$jarA" "$API/v1/agents")
 [ "$AGCODE" = 200 ] && ok "GET /v1/agents with the session cookie → 200" || no "agents with cookie → $AGCODE"
 
+# ── (b2) Bootstrap idempotence — a second owner login never re-promotes ───────
+say "(b2) Bootstrap idempotence — re-login grants no second owner promotion"
+TID_ACME=$(db "select id from tenants where slug='$SLUG'")
+PROMO_BEFORE=$(db "select count(*) from auth_audit_log where tenant_id='$TID_ACME' and action='bootstrap_owner.promote'")
+[ "$PROMO_BEFORE" = 1 ] && ok "exactly ONE bootstrap_owner.promote audit row after alice's first login" \
+  || no "unexpected promote-audit count before re-login: $PROMO_BEFORE (want 1)"
+# The arm was consumed on the FIRST login — the active config carries none now.
+ARM_NOW=$(db "select coalesce(bootstrap_owner_email,'') from org_idp_configs where tenant_id='$TID_ACME' and status='active'")
+[ -z "$ARM_NOW" ] && ok "the bootstrap arm is cleared (consumed on first login)" || no "arm still live post-first-login: $ARM_NOW"
+# Re-login in a FRESH flow; alice keeps owner (role preserved, not re-granted).
+jarA2="$WORK/jarA2"
+RES=$(login "$jarA2" "$U1" "$PW" "$SLUG"); C=$(printf '%s' "$RES" | cut -f1)
+[ "$C" = 302 ] && ok "alice re-logs in (fresh flow) → 302" || no "alice re-login → $C"
+ML2=$(me_line "$jarA2")
+case "$ML2" in "$SLUG|$U1|"*owner*"|browser") ok "/me still owner (role preserved across re-login)";; *) no "re-login /me: $ML2";; esac
+PROMO_AFTER=$(db "select count(*) from auth_audit_log where tenant_id='$TID_ACME' and action='bootstrap_owner.promote'")
+[ "$PROMO_AFTER" = 1 ] && ok "still exactly ONE promote audit row (no second promotion; before=$PROMO_BEFORE after=$PROMO_AFTER)" \
+  || no "promote audit count changed on re-login (before=$PROMO_BEFORE after=$PROMO_AFTER)"
+
+# ── (b3) Expired bootstrap arm — matching login consumes it, grants no owner ──
+say "(b3) Expired bootstrap arm — first matching login lands as member, arm consumed"
+admin_post "/v1/admin/orgs" "{\"slug\":\"$SLUG4\",\"display_name\":\"Delta\"}"
+[ "$CODE" = 200 ] && ok "org '$SLUG4' created" || no "create $SLUG4 → $CODE: $BODY"
+CFG_D_BODY=$(cat <<JSON
+{"issuer":"$ISSUER","client_id":"$CLIENT1_ID","client_secret":"$CLIENT1_SECRET",
+ "token_endpoint_auth":"client_secret_basic","bootstrap_owner_email":"$U2"}
+JSON
+)
+admin_post "/v1/admin/orgs/$SLUG4/idp" "$CFG_D_BODY"
+[ "$CODE" = 200 ] && ok "delta IdP config staged (armed for $U2)" || no "delta idp → $CODE: $BODY"
+CFGD=$(echo "$BODY" | j "['idp']['id']")
+admin_post "/v1/admin/orgs/$SLUG4/idp/$CFGD/activate" '{}'
+[ "$CODE" = 200 ] && ok "delta IdP config activated" || no "delta activate → $CODE: $BODY"
+TID_DELTA=$(db "select id from tenants where slug='$SLUG4'")
+# Age the arm into the past BEFORE the first matching login.
+db "update org_idp_configs set bootstrap_owner_expires_at = now() - interval '1 hour'
+    where tenant_id='$TID_DELTA' and id='$CFGD'" >/dev/null
+jarD="$WORK/jarD"
+RES=$(login "$jarD" "$U2" "$PW" "$SLUG4"); C=$(printf '%s' "$RES" | cut -f1)
+[ "$C" = 302 ] && ok "bob logs into delta despite the expired arm (302 — login still succeeds)" || no "delta login → $C"
+MLD=$(me_line "$jarD")
+echo "  /me → $MLD"
+case "$MLD" in
+  "$SLUG4|$U2|"*owner*) no "expired arm WRONGLY promoted to owner: $MLD";;
+  "$SLUG4|$U2|"*) ok "bob lands as a default-role member — no owner from the expired arm";;
+  *) no "delta /me unexpected: $MLD";;
+esac
+ARM_D=$(db "select coalesce(bootstrap_owner_email,'') from org_idp_configs where tenant_id='$TID_DELTA' and status='active'")
+[ -z "$ARM_D" ] && ok "the expired arm was CONSUMED (cleared) by the matching login" || no "delta arm still live: $ARM_D"
+
 # ── (c) Arming refused while an active owner exists ───────────────────────────
 say "(c) Break-glass arming refused while an owner is active"
 admin_post "/v1/admin/orgs/$SLUG/break-glass-owner" "{\"email\":\"$U1\"}"
@@ -375,19 +429,15 @@ cRight=$(complete_cb "$jarWB" "$cbWB")
 [ "$cRight" = 302 ] && ok "…and the flow was NOT burned — the right browser still completes (302)" || no "right-browser after wrong attempt → $cRight (want 302)"
 
 # Expired: age the flow's expires_at via psql, then the callback is refused.
-if [ "$HAVE_PSQL" = 1 ]; then
-  jarEX="$WORK/jarEX"; : > "$jarEX"
-  authz=$(fbx_start "$jarEX" "$SLUG"); cbEX=$(dex_login "$jarEX" "$authz" "$U1" "$PW")
-  TID=$(db "select id from tenants where slug='$SLUG'")
-  db "update login_flows set expires_at = now() - interval '1 minute'
-      where id = (select id from login_flows
-                  where tenant_id='$TID' and consumed_at is null
-                  order by created_at desc limit 1)" >/dev/null
-  cEX=$(complete_cb "$jarEX" "$cbEX")
-  [ "$cEX" = 400 ] && ok "expired flow (expires_at aged via psql) → 400" || no "expired flow → $cEX (want 400)"
-else
-  skip "expired-flow case: psql unavailable (expiry is covered by the login-flow claim predicate; unit + DB-layer)"
-fi
+jarEX="$WORK/jarEX"; : > "$jarEX"
+authz=$(fbx_start "$jarEX" "$SLUG"); cbEX=$(dex_login "$jarEX" "$authz" "$U1" "$PW")
+TID=$(db "select id from tenants where slug='$SLUG'")
+db "update login_flows set expires_at = now() - interval '1 minute'
+    where id = (select id from login_flows
+                where tenant_id='$TID' and consumed_at is null
+                order by created_at desc limit 1)" >/dev/null
+cEX=$(complete_cb "$jarEX" "$cbEX")
+[ "$cEX" = 400 ] && ok "expired flow (expires_at aged via psql) → 400" || no "expired flow → $cEX (want 400)"
 
 # ── (e) Dual credential ───────────────────────────────────────────────────────
 say "(e) Dual credential — cookie + bearer on one request"
@@ -407,7 +457,10 @@ WITHCSRF=$(curl -s -o "$WORK/pat.json" -w '%{http_code}' -X POST -b "$jarA" \
 # ── (g) PAT lifecycle ─────────────────────────────────────────────────────────
 say "(g) Personal access tokens — mint, use, no-self-mint, revoke"
 PAT=$(j "['token']" < "$WORK/pat.json")
-[ -n "$PAT" ] && case "$PAT" in fbx_pat_*) ok "PAT minted via the browser session ($PAT prefix)";; *) no "unexpected PAT: $PAT";; esac
+# NEVER echo the plaintext token (CI logs are retained): print only the display
+# prefix (first 12 chars), matching the display_prefix the API stores for listing.
+PATPFX=${PAT:0:12}
+[ -n "$PAT" ] && case "$PAT" in fbx_pat_*) ok "PAT minted via the browser session (prefix ${PATPFX}…)";; *) no "unexpected PAT prefix: ${PATPFX}…";; esac
 PATID=$(python3 -c "import sys,json;print(json.load(open('$WORK/pat.json'))['pat']['id'])" 2>/dev/null)
 USEPAT=$(curl -s -o /dev/null -w '%{http_code}' -H "authorization: Bearer $PAT" "$API/v1/agents")
 [ "$USEPAT" = 200 ] && ok "GET /v1/agents with the PAT bearer → 200" || no "PAT use → $USEPAT (want 200)"
@@ -443,7 +496,40 @@ MLnew=$(me_line "$jarSW")
 echo "  /me after switch → $MLnew"
 case "$MLnew" in "$SLUG|$U2|"*) ok "the switched session is bob";; *) no "post-switch /me: $MLnew";; esac
 REPLAY=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$jarSW" -c "$jarSW" -H 'x-fluidbox-csrf: 1' "$API/v1/auth/switch/$SWID")
-[ "$REPLAY" != 302 ] && ok "replayed confirm → refused (got $REPLAY, not a 302)" || no "replayed confirm unexpectedly succeeded (302)"
+[ "$REPLAY" = 400 ] && ok "replayed confirm (switch cookie already spent) → 400" || no "replayed confirm → $REPLAY (want 400)"
+# The current (switched) session survives every refused replay/tamper/expiry.
+MLrp=$(me_line "$jarSW")
+case "$MLrp" in "$SLUG|$U2|"*) ok "…and the current session is still valid (bob)";; *) no "post-replay /me: $MLrp";; esac
+
+# Wrong-cookie: stage a FRESH switch (bob→alice), then confirm with a TAMPERED
+# switch nonce (real web cookie + bogus __Host-fbx_switch value) → refused, and
+# the original (bob) session is untouched.
+jarWC="$WORK/jarWC"; web_only_jar "$jarSW" "$jarWC"
+authz=$(fbx_start "$jarWC" "$SLUG"); cbWC=$(dex_login "$jarWC" "$authz" "$U1" "$PW")
+codeWC=$(complete_cb "$jarWC" "$cbWC")
+[ "$codeWC" = 200 ] && ok "staged a fresh switch (bob→alice) → 200 interstitial" || no "stage wrong-cookie switch → $codeWC"
+WCID=$(switch_id_from_headers "$WORK/h.cb")
+WEBWC=$(grep -oE '__Host-fbx_web[[:space:]]+[^[:space:]]+' "$jarWC" | awk '{print $2}')
+WRONG=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'x-fluidbox-csrf: 1' \
+  -H "cookie: __Host-fbx_web=$WEBWC; __Host-fbx_switch_$WCID=00000000000000000000000000000000" \
+  "$API/v1/auth/switch/$WCID")
+[ "$WRONG" = 400 ] && ok "wrong-cookie switch confirm (tampered nonce) → 400" || no "wrong-cookie confirm → $WRONG (want 400)"
+MLwc=$(me_line "$jarWC")
+case "$MLwc" in "$SLUG|$U2|"*) ok "…original session kept (still bob)";; *) no "post-wrong-cookie /me: $MLwc";; esac
+
+# Expired: stage another fresh switch, psql-age its pending_login_switches row,
+# then confirm with the REAL cookies (the only defect is the aged expiry) →
+# refused, original session kept.
+jarEXS="$WORK/jarEXS"; web_only_jar "$jarSW" "$jarEXS"
+authz=$(fbx_start "$jarEXS" "$SLUG"); cbEXS=$(dex_login "$jarEXS" "$authz" "$U1" "$PW")
+codeEXS=$(complete_cb "$jarEXS" "$cbEXS")
+[ "$codeEXS" = 200 ] && ok "staged a fresh switch for the expiry case → 200" || no "stage expired switch → $codeEXS"
+EXSID=$(switch_id_from_headers "$WORK/h.cb")
+db "update pending_login_switches set expires_at = now() - interval '1 minute' where id = '$EXSID'" >/dev/null
+EXPS=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$jarEXS" -c "$jarEXS" -H 'x-fluidbox-csrf: 1' "$API/v1/auth/switch/$EXSID")
+[ "$EXPS" = 400 ] && ok "expired switch confirm (pending row aged via psql) → 400" || no "expired switch confirm → $EXPS (want 400)"
+MLexs=$(me_line "$jarEXS")
+case "$MLexs" in "$SLUG|$U2|"*) ok "…original session kept (still bob)";; *) no "post-expired-switch /me: $MLexs";; esac
 
 # ── (i) Deactivation kills the session AND its PATs ───────────────────────────
 say "(i) Membership deactivation — cookie + PAT die on next use"
@@ -467,6 +553,15 @@ BOBPC=$(curl -s -o /dev/null -w '%{http_code}' -H "authorization: Bearer $BOBPAT
 
 # ── (k) Issuer migration mid-flight ───────────────────────────────────────────
 say "(k) Issuer migration — mid-flight login fails closed; old session dies"
+# SCOPE of what a black-box HTTP client can prove here: transaction A's
+# inactive-flow refusal (a config1 login held across the swap fails at the flow
+# claim once config1 is no longer active), plus the swap's post-hoc session
+# revocation and the old-config login refusal. The genuinely CONCURRENT case —
+# a login's transaction B interleaving WITH the swap's transaction — cannot be
+# barriered from outside the process (no HTTP seam pauses B mid-transaction); it
+# is guaranteed instead by the shared `FOR UPDATE` config lock both take
+# (login's `lock_idp_config_for_update` vs the swap's `lock_org_configs`) and is
+# DB-tested directly in fluidbox-db (`identity.rs`). No new test code here.
 # A FRESH alice/config1 session (alice's membership is still active — the switch
 # only revoked one of her sessions, jarA's shared token). This one proves the
 # swap revokes config1 sessions.
@@ -527,55 +622,55 @@ RES=$(login "$jarL" "$U3" "$PW" "$SLUG"); C=$(printf '%s' "$RES" | cut -f1)
 
 # ── (j) SSE stream terminates within the re-auth interval after deactivation ──
 say "(j) SSE termination — a revoked session's stream closes within the re-auth window"
-SSE_DONE=0
-if [ "$HAVE_PSQL" = 1 ]; then
-  # An SSE stream needs a real session row the principal can SEE. Creating one
-  # via a run would cost model spend and a runner image (forbidden here), so we
-  # seed a minimal session row directly: alice is an OWNER (runs.read_all), so
-  # she can stream ANY session in her org. The row references the boot-seeded
-  # claude-fixer agent/revision (sessions.agent_id is a non-composite FK, so a
-  # default-tenant agent is reachable from an org-tenant session). No sandbox,
-  # no model, no lifecycle — the row exists purely so the timeline endpoint
-  # opens and the cookie re-auth loop can be observed.
-  TID=$(db "select id from tenants where slug='$SLUG'")
-  SID=$(db "insert into sessions
-      (id, tenant_id, agent_id, agent_revision_id, status, autonomy, trust_tier,
-       task, repo_source, run_spec, budgets, invoked_by_kind)
-    select gen_random_uuid(), '$TID', a.id, r.id, 'running', 'supervised', 'trusted',
-       'identity-e2e sse fixture', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 'operator'
-    from agents a join agent_revisions r on r.agent_id = a.id
-    where a.name = 'claude-fixer'
-    order by r.created_at desc limit 1
-    returning id")
-  if [ -n "$SID" ]; then
-    ok "seeded a cookie-reachable session fixture ($SID)"
-    # Open the stream in the background with alice's (owner) cookie.
-    ( curl -s -N --max-time 30 -b "$jarK2" "$API/v1/sessions/$SID/events/stream" > "$WORK/sse.out" 2>/dev/null ) &
-    SSE_PID=$!
-    sleep 2
-    if kill -0 "$SSE_PID" 2>/dev/null; then ok "SSE stream open and following"; else no "SSE stream closed before deactivation"; fi
-    # Deactivate alice mid-stream; the reauth loop (2s) must break the stream.
-    admin_get "/v1/admin/orgs/$SLUG/members"
-    ALMID=$(echo "$BODY" | python3 -c "
+# An SSE stream needs a real session row the principal can SEE. Creating one
+# via a run would cost model spend and a runner image (forbidden here), so we
+# seed a minimal session row directly: alice is an OWNER (runs.read_all), so
+# she can stream ANY session in her org. The row references the boot-seeded
+# claude-fixer agent/revision (sessions.agent_id is a non-composite FK, so a
+# default-tenant agent is reachable from an org-tenant session). No sandbox,
+# no model, no lifecycle — the row exists purely so the timeline endpoint
+# opens and the cookie re-auth loop can be observed.
+TID=$(db "select id from tenants where slug='$SLUG'")
+SID=$(db "insert into sessions
+    (id, tenant_id, agent_id, agent_revision_id, status, autonomy, trust_tier,
+     task, repo_source, run_spec, budgets, invoked_by_kind)
+  select gen_random_uuid(), '$TID', a.id, r.id, 'running', 'supervised', 'trusted',
+     'identity-e2e sse fixture', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 'operator'
+  from agents a join agent_revisions r on r.agent_id = a.id
+  where a.name = 'claude-fixer'
+  order by r.created_at desc limit 1
+  returning id")
+if [ -n "$SID" ]; then
+  ok "seeded a cookie-reachable session fixture ($SID)"
+  # Open the stream in the background with alice's (owner) cookie.
+  ( curl -s -N --max-time 30 -b "$jarK2" "$API/v1/sessions/$SID/events/stream" > "$WORK/sse.out" 2>/dev/null ) &
+  SSE_PID=$!
+  sleep 2
+  if kill -0 "$SSE_PID" 2>/dev/null; then ok "SSE stream open and following"; else no "SSE stream closed before deactivation"; fi
+  # Deactivate alice mid-stream; the reauth loop (2s) must break the stream.
+  admin_get "/v1/admin/orgs/$SLUG/members"
+  ALMID=$(echo "$BODY" | python3 -c "
 import sys,json
 rows=[m for m in json.load(sys.stdin).get('members',[]) if m.get('email')=='$U1' and m.get('membership_status')=='active']
 print(rows[0]['membership_id'] if rows else '')" 2>/dev/null)
-    admin_post "/v1/admin/orgs/$SLUG/members/$ALMID/deactivate" '{}'
-    [ "$CODE" = 200 ] && ok "deactivated alice's (config2) membership mid-stream" || no "deactivate alice → $CODE: $BODY"
-    # Wait up to ~6s (≈ reauth 2s + select sleep 2s + slack) for the stream to close.
-    CLOSED=0
-    for _ in $(seq 1 12); do
-      kill -0 "$SSE_PID" 2>/dev/null || { CLOSED=1; break; }
-      sleep 0.5
-    done
-    kill "$SSE_PID" 2>/dev/null
-    [ "$CLOSED" = 1 ] && ok "SSE stream closed within the re-auth interval after deactivation" || no "SSE stream did NOT close within ~6s"
-    SSE_DONE=1
-  else
-    no "could not seed the SSE fixture (no claude-fixer agent/revision?)"
-  fi
+  admin_post "/v1/admin/orgs/$SLUG/members/$ALMID/deactivate" '{}'
+  [ "$CODE" = 200 ] && ok "deactivated alice's (config2) membership mid-stream" || no "deactivate alice → $CODE: $BODY"
+  # Wait up to ~6s (≈ reauth 2s + select sleep 2s + slack) for the stream to close.
+  CLOSED=0
+  for _ in $(seq 1 12); do
+    kill -0 "$SSE_PID" 2>/dev/null || { CLOSED=1; break; }
+    sleep 0.5
+  done
+  kill "$SSE_PID" 2>/dev/null
+  [ "$CLOSED" = 1 ] && ok "SSE stream closed within the re-auth interval after deactivation" || no "SSE stream did NOT close within ~6s"
+  # False-pass guard: a stream that closed because the SERVER CRASHED would also
+  # satisfy the check above. Prove the control plane is still serving, so the
+  # close is attributable to the re-auth loop, not a panic.
+  HCODE=$(curl -s -o /dev/null -w '%{http_code}' "$API/v1/health")
+  [ "$HCODE" = 200 ] && ok "server still healthy after the mid-stream deactivation (close was re-auth, not a crash)" || no "server /v1/health → $HCODE after SSE close (crash?)"
+else
+  no "could not seed the SSE fixture (no claude-fixer agent/revision?)"
 fi
-[ "$SSE_DONE" = 0 ] && skip "SSE live-stream: psql unavailable — cookie re-auth termination is covered by web_session_live + the sse.rs reauth loop (see report)"
 
 # ── (l) REQUIRE_SSO confines the operator token to /v1/admin/* ────────────────
 say "(l) REQUIRE_SSO — operator confined to /v1/admin/*, cookie still works"
