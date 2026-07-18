@@ -214,7 +214,7 @@ fn clear_cookie(name: &str) -> String {
     format!("{name}=deleted; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age=0")
 }
 
-fn client_ip(headers: &HeaderMap) -> String {
+pub(crate) fn client_ip(headers: &HeaderMap) -> String {
     for h in ["x-forwarded-for", "x-real-ip"] {
         if let Some(v) = headers.get(h).and_then(|v| v.to_str().ok()) {
             if let Some(first) = v.split(',').next() {
@@ -598,14 +598,15 @@ async fn fetch_json_ssrf(state: &AppState, url: &str) -> Result<Value, String> {
 
 // ─── Discovery freshness (design 805-814) ───────────────────────────────────
 
-struct DiscoveryView {
-    authorization_endpoint: String,
-    token_endpoint: String,
-    jwks_uri: String,
-    jwks: Value,
+pub(crate) struct DiscoveryView {
+    pub(crate) authorization_endpoint: String,
+    pub(crate) token_endpoint: String,
+    #[allow(dead_code)]
+    pub(crate) jwks_uri: String,
+    pub(crate) jwks: Value,
 }
 
-fn view_from(meta: &Value, jwks: Value) -> Result<DiscoveryView, String> {
+pub(crate) fn view_from(meta: &Value, jwks: Value) -> Result<DiscoveryView, String> {
     let s = |k: &str| {
         meta.get(k)
             .and_then(Value::as_str)
@@ -620,17 +621,21 @@ fn view_from(meta: &Value, jwks: Value) -> Result<DiscoveryView, String> {
     })
 }
 
-async fn refresh_discovery(
+/// Fetch `{issuer}/.well-known/openid-configuration` + its `jwks_uri` over the
+/// SSRF-hardened client, asserting the discovered `issuer` matches exactly.
+/// Takes the raw issuer (not a config row) so save-time validation — which has
+/// no config row yet — reuses the same fetch/SSRF machinery (Task 6).
+pub(crate) async fn refresh_discovery(
     state: &AppState,
-    config: &identity::OrgIdpConfigRow,
+    issuer: &str,
 ) -> Result<(Value, Value), String> {
     let disc_url = format!(
         "{}/.well-known/openid-configuration",
-        config.issuer.trim_end_matches('/')
+        issuer.trim_end_matches('/')
     );
     let meta = fetch_json_ssrf(state, &disc_url).await?;
     // The discovered issuer must equal the configured issuer exactly.
-    if meta.get("issuer").and_then(Value::as_str) != Some(config.issuer.as_str()) {
+    if meta.get("issuer").and_then(Value::as_str) != Some(issuer) {
         return Err("discovered issuer does not match the configured issuer".into());
     }
     let jwks_uri = meta
@@ -661,7 +666,7 @@ async fn ensure_discovery(
             config.jwks.clone().unwrap(),
         );
     }
-    match refresh_discovery(state, config).await {
+    match refresh_discovery(state, &config.issuer).await {
         Ok((meta, jwks)) => {
             let _ = identity::update_idp_discovery_cache(
                 &state.pool,
@@ -1028,7 +1033,7 @@ struct MappedIdentity {
     roles: Vec<String>,
 }
 
-fn normalize_email(email: &str) -> String {
+pub(crate) fn normalize_email(email: &str) -> String {
     email.trim().to_lowercase()
 }
 
