@@ -354,6 +354,8 @@ pub async fn create_run(
         req.invoked_by_user_id,
         req.bound_invocation,
         req.bound_dispatch,
+        // Task 5 resolves + passes real run resource bindings; none for now.
+        &[],
     )
     .await?;
 

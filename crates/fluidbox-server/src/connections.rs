@@ -185,6 +185,9 @@ async fn create_mcp_http(
                     client_secret_sealed: sealed_secret.as_deref(),
                     registration_id: None,
                 },
+                // Task 4 threads the real principal; org-owned for now.
+                fluidbox_db::ConnectionOwner::Organization,
+                None,
             )
             .await?;
             let next = format!("/v1/connections/{}/oauth/start", row.id);
@@ -264,6 +267,9 @@ pub(crate) async fn create_mcp_http_connection(
         &metadata,
         None,
         fluidbox_db::ConnectionAuth::static_active(),
+        // Task 4 threads the real principal; org-owned for now.
+        fluidbox_db::ConnectionOwner::Organization,
+        None,
     )
     .await?)
 }
@@ -297,6 +303,9 @@ async fn create_github_pat(
         &json!({ "login": login }),
         None,
         fluidbox_db::ConnectionAuth::static_active(),
+        // Task 4 threads the real principal; org-owned for now.
+        fluidbox_db::ConnectionOwner::Organization,
+        None,
     )
     .await?;
     Ok(Json(json!({ "connection": row })))
@@ -353,6 +362,9 @@ async fn create_github_app(
         &metadata,
         Some(&sealed_webhook),
         fluidbox_db::ConnectionAuth::static_active(),
+        // github_app connections are ALWAYS organization-owned (system custody).
+        fluidbox_db::ConnectionOwner::Organization,
+        None,
     )
     .await
     {
