@@ -80,6 +80,19 @@ pass=0; fail=0
 ok()  { printf "  \033[1;32m✓\033[0m %s\n" "$1"; pass=$((pass+1)); }
 no()  { printf "  \033[1;31m✗\033[0m %s\n" "$1"; fail=$((fail+1)); }
 say() { printf "\n\033[1;36m== %s ==\033[0m\n" "$1"; }
+# Fail-fast precondition guard. When a value a section DEPENDS ON (a login result,
+# a membership id, a switch nonce, a fixture id) is empty, record ONE loud failure
+# and return nonzero so the caller SKIPS the dependent steps. This keeps a single
+# broken login legible: without it an empty id flows into a URL (→ "Cannot parse
+# membership_id"/404) or into SQL (→ 'invalid input syntax for uuid ""'), fanning
+# one root failure out into dozens of misleading downstream ones. It never
+# weakens an assertion — in the healthy path the value is non-empty and every
+# guarded assertion runs exactly as before.
+need() { # value message
+  [ -n "$1" ] && return 0
+  no "precondition unmet — $2"
+  return 1
+}
 
 j() { python3 -c "import sys,json;d=json.load(sys.stdin);print(d$1)" 2>/dev/null; }
 urlenc() { python3 -c "import sys,urllib.parse as u;print(u.quote(sys.argv[1],safe=''))" "$1"; }
@@ -248,9 +261,15 @@ fbx_start() { # jar slug [redirect_to]
 dex_login() { # jar authorize_url email pw
   local jar=$1 authz=$2 email=$3 pw=$4
   # GET the authorize URL, following redirects to the rendered login form.
+  # The -w format captures the post-redirect effective URL (to resolve the form
+  # action) appended to the body after a sentinel. CRITICAL: the -w argument must
+  # NOT begin with '@' — curl reads a leading '@' as "@filename" and dies with
+  # "option -w: error encountered when reading a file", so a sentinel like
+  # '@@EFF@@…' makes EVERY dex_login fail closed (empty body → DEX_NO_FORM). Use a
+  # '@'-free sentinel that will not appear in the HTML body or the URL.
   local raw eff page
-  raw=$(curl -s -c "$jar" -b "$jar" -L -w '@@EFF@@%{url_effective}' "$authz")
-  eff=${raw##*@@EFF@@}; page=${raw%@@EFF@@*}
+  raw=$(curl -s -c "$jar" -b "$jar" -L -w '__FBX_EFF__%{url_effective}' "$authz")
+  eff=${raw##*__FBX_EFF__}; page=${raw%__FBX_EFF__*}
   # Extract the form action; decode the HTML-escaped '&' the template emits.
   local action
   action=$(printf '%s' "$page" | grep -oiE 'action="[^"]*"' | head -1 \
@@ -311,7 +330,13 @@ print('%s|%s|%s|%s' % (o.get('slug'), u.get('email'), ','.join(d.get('roles') or
 # psql shortcut (only when psql is present). stderr is left to flow to the log
 # (not swallowed): db() is always used in `$(…)`, so psql errors reach the
 # terminal/log without polluting the captured stdout — and a healthy run is silent.
-db() { psql "$DATABASE_URL" -tAX -c "$1"; }
+# -q is REQUIRED, not cosmetic: without it psql echoes the command tag
+# ("INSERT 0 1") to STDOUT *after* the RETURNING row, so a capture like
+# SID=$(db "insert … returning id") would come back as "<uuid>\nINSERT 0 1" and
+# poison every downstream use (a newline in a URL → curl "malformed URL" exit 3;
+# a newline in SQL → 'invalid input syntax for type uuid'). -q suppresses the tag;
+# -A -t keep tuples-only/unaligned output; -X skips ~/.psqlrc.
+db() { psql "$DATABASE_URL" -X -q -A -t -c "$1"; }
 
 # ═════════════════════════════════════════════════════════════════════════════
 say "BOOT — Dex + control plane"
@@ -483,23 +508,25 @@ cbSW=$(dex_login "$jarSW" "$authz" "$U2" "$PW")
 codeSW=$(complete_cb "$jarSW" "$cbSW")
 [ "$codeSW" = 200 ] && ok "second user in alice's browser → 200 interstitial (not a silent replacement)" || no "switch callback → $codeSW (want 200)"
 SWID=$(switch_id_from_headers "$WORK/h.cb")
-[ -n "$SWID" ] && ok "pending-switch cookie __Host-fbx_switch_$SWID set" || no "no switch cookie set"
-# The OLD session still resolves to alice while the switch is only pending.
-MLold=$(me_line "$jarA")
-case "$MLold" in "$SLUG|$U1|"*owner*) ok "/me with the pre-switch cookie still shows alice (owner)";; *) no "pre-confirm /me: $MLold";; esac
-# Confirm (CSRF header; a form cannot set it). The switch cookie + the current
-# web cookie are both in jarSW.
-CONF=$(curl -s -o /dev/null -w '%{http_code}' -D "$WORK/h.conf" -X POST -b "$jarSW" -c "$jarSW" \
-  -H 'x-fluidbox-csrf: 1' "$API/v1/auth/switch/$SWID")
-[ "$CONF" = 302 ] && ok "confirm POST → 302 (new session minted)" || no "confirm → $CONF (want 302)"
-MLnew=$(me_line "$jarSW")
-echo "  /me after switch → $MLnew"
-case "$MLnew" in "$SLUG|$U2|"*) ok "the switched session is bob";; *) no "post-switch /me: $MLnew";; esac
-REPLAY=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$jarSW" -c "$jarSW" -H 'x-fluidbox-csrf: 1' "$API/v1/auth/switch/$SWID")
-[ "$REPLAY" = 400 ] && ok "replayed confirm (switch cookie already spent) → 400" || no "replayed confirm → $REPLAY (want 400)"
-# The current (switched) session survives every refused replay/tamper/expiry.
-MLrp=$(me_line "$jarSW")
-case "$MLrp" in "$SLUG|$U2|"*) ok "…and the current session is still valid (bob)";; *) no "post-replay /me: $MLrp";; esac
+if need "$SWID" "no pending-switch cookie set (the second-user callback never staged a switch)"; then
+  ok "pending-switch cookie __Host-fbx_switch_$SWID set"
+  # The OLD session still resolves to alice while the switch is only pending.
+  MLold=$(me_line "$jarA")
+  case "$MLold" in "$SLUG|$U1|"*owner*) ok "/me with the pre-switch cookie still shows alice (owner)";; *) no "pre-confirm /me: $MLold";; esac
+  # Confirm (CSRF header; a form cannot set it). The switch cookie + the current
+  # web cookie are both in jarSW.
+  CONF=$(curl -s -o /dev/null -w '%{http_code}' -D "$WORK/h.conf" -X POST -b "$jarSW" -c "$jarSW" \
+    -H 'x-fluidbox-csrf: 1' "$API/v1/auth/switch/$SWID")
+  [ "$CONF" = 302 ] && ok "confirm POST → 302 (new session minted)" || no "confirm → $CONF (want 302)"
+  MLnew=$(me_line "$jarSW")
+  echo "  /me after switch → $MLnew"
+  case "$MLnew" in "$SLUG|$U2|"*) ok "the switched session is bob";; *) no "post-switch /me: $MLnew";; esac
+  REPLAY=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$jarSW" -c "$jarSW" -H 'x-fluidbox-csrf: 1' "$API/v1/auth/switch/$SWID")
+  [ "$REPLAY" = 400 ] && ok "replayed confirm (switch cookie already spent) → 400" || no "replayed confirm → $REPLAY (want 400)"
+  # The current (switched) session survives every refused replay/tamper/expiry.
+  MLrp=$(me_line "$jarSW")
+  case "$MLrp" in "$SLUG|$U2|"*) ok "…and the current session is still valid (bob)";; *) no "post-replay /me: $MLrp";; esac
+fi
 
 # Wrong-cookie: stage a FRESH switch (bob→alice), then confirm with a TAMPERED
 # switch nonce (real web cookie + bogus __Host-fbx_switch value) → refused, and
@@ -510,12 +537,14 @@ codeWC=$(complete_cb "$jarWC" "$cbWC")
 [ "$codeWC" = 200 ] && ok "staged a fresh switch (bob→alice) → 200 interstitial" || no "stage wrong-cookie switch → $codeWC"
 WCID=$(switch_id_from_headers "$WORK/h.cb")
 WEBWC=$(grep -oE '__Host-fbx_web[[:space:]]+[^[:space:]]+' "$jarWC" | awk '{print $2}')
-WRONG=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'x-fluidbox-csrf: 1' \
-  -H "cookie: __Host-fbx_web=$WEBWC; __Host-fbx_switch_$WCID=00000000000000000000000000000000" \
-  "$API/v1/auth/switch/$WCID")
-[ "$WRONG" = 400 ] && ok "wrong-cookie switch confirm (tampered nonce) → 400" || no "wrong-cookie confirm → $WRONG (want 400)"
-MLwc=$(me_line "$jarWC")
-case "$MLwc" in "$SLUG|$U2|"*) ok "…original session kept (still bob)";; *) no "post-wrong-cookie /me: $MLwc";; esac
+if need "$WCID" "wrong-cookie switch was not staged (no switch nonce to tamper)"; then
+  WRONG=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'x-fluidbox-csrf: 1' \
+    -H "cookie: __Host-fbx_web=$WEBWC; __Host-fbx_switch_$WCID=00000000000000000000000000000000" \
+    "$API/v1/auth/switch/$WCID")
+  [ "$WRONG" = 400 ] && ok "wrong-cookie switch confirm (tampered nonce) → 400" || no "wrong-cookie confirm → $WRONG (want 400)"
+  MLwc=$(me_line "$jarWC")
+  case "$MLwc" in "$SLUG|$U2|"*) ok "…original session kept (still bob)";; *) no "post-wrong-cookie /me: $MLwc";; esac
+fi
 
 # Expired: stage another fresh switch, psql-age its pending_login_switches row,
 # then confirm with the REAL cookies (the only defect is the aged expiry) →
@@ -525,11 +554,13 @@ authz=$(fbx_start "$jarEXS" "$SLUG"); cbEXS=$(dex_login "$jarEXS" "$authz" "$U1"
 codeEXS=$(complete_cb "$jarEXS" "$cbEXS")
 [ "$codeEXS" = 200 ] && ok "staged a fresh switch for the expiry case → 200" || no "stage expired switch → $codeEXS"
 EXSID=$(switch_id_from_headers "$WORK/h.cb")
-db "update pending_login_switches set expires_at = now() - interval '1 minute' where id = '$EXSID'" >/dev/null
-EXPS=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$jarEXS" -c "$jarEXS" -H 'x-fluidbox-csrf: 1' "$API/v1/auth/switch/$EXSID")
-[ "$EXPS" = 400 ] && ok "expired switch confirm (pending row aged via psql) → 400" || no "expired switch confirm → $EXPS (want 400)"
-MLexs=$(me_line "$jarEXS")
-case "$MLexs" in "$SLUG|$U2|"*) ok "…original session kept (still bob)";; *) no "post-expired-switch /me: $MLexs";; esac
+if need "$EXSID" "expired-case switch was not staged (no pending_login_switches row to age)"; then
+  db "update pending_login_switches set expires_at = now() - interval '1 minute' where id = '$EXSID'" >/dev/null
+  EXPS=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$jarEXS" -c "$jarEXS" -H 'x-fluidbox-csrf: 1' "$API/v1/auth/switch/$EXSID")
+  [ "$EXPS" = 400 ] && ok "expired switch confirm (pending row aged via psql) → 400" || no "expired switch confirm → $EXPS (want 400)"
+  MLexs=$(me_line "$jarEXS")
+  case "$MLexs" in "$SLUG|$U2|"*) ok "…original session kept (still bob)";; *) no "post-expired-switch /me: $MLexs";; esac
+fi
 
 # ── (i) Deactivation kills the session AND its PATs ───────────────────────────
 say "(i) Membership deactivation — cookie + PAT die on next use"
@@ -543,13 +574,15 @@ import sys,json
 for m in json.load(sys.stdin).get('members',[]):
     if m.get('email')=='$U2': print(m['membership_id'])
 " 2>/dev/null)
-[ -n "$BOBMID" ] && ok "bob's membership id resolved via /members" || no "no bob membership in $BODY"
-admin_post "/v1/admin/orgs/$SLUG/members/$BOBMID/deactivate" '{}'
-[ "$CODE" = 200 ] && ok "operator deactivated bob's membership" || no "deactivate → $CODE: $BODY"
-BOBCK=$(curl -s -o /dev/null -w '%{http_code}' -b "$jarSW" "$API/v1/agents")
-[ "$BOBCK" = 401 ] && ok "bob's session cookie → 401 on the next request" || no "deactivated cookie → $BOBCK (want 401)"
-BOBPC=$(curl -s -o /dev/null -w '%{http_code}' -H "authorization: Bearer $BOBPAT" "$API/v1/agents")
-[ "$BOBPC" = 401 ] && ok "bob's PAT → 401 (died with the membership)" || no "deactivated PAT → $BOBPC (want 401)"
+if need "$BOBMID" "bob's membership id did not resolve (his switch/login never landed a session) in $BODY"; then
+  ok "bob's membership id resolved via /members"
+  admin_post "/v1/admin/orgs/$SLUG/members/$BOBMID/deactivate" '{}'
+  [ "$CODE" = 200 ] && ok "operator deactivated bob's membership" || no "deactivate → $CODE: $BODY"
+  BOBCK=$(curl -s -o /dev/null -w '%{http_code}' -b "$jarSW" "$API/v1/agents")
+  [ "$BOBCK" = 401 ] && ok "bob's session cookie → 401 on the next request" || no "deactivated cookie → $BOBCK (want 401)"
+  BOBPC=$(curl -s -o /dev/null -w '%{http_code}' -H "authorization: Bearer $BOBPAT" "$API/v1/agents")
+  [ "$BOBPC" = 401 ] && ok "bob's PAT → 401 (died with the membership)" || no "deactivated PAT → $BOBPC (want 401)"
+fi
 
 # ── (k) Issuer migration mid-flight ───────────────────────────────────────────
 say "(k) Issuer migration — mid-flight login fails closed; old session dies"
@@ -591,8 +624,15 @@ JSON
 admin_post "/v1/admin/orgs/$SLUG/idp/$CFG1/migrate" "$MIG_BODY"
 [ "$CODE" = 200 ] && ok "migrate config1 → config2 (default deactivation)" || no "migrate → $CODE: $BODY"
 # Completing the held callback now fails at the flow claim (config1 no longer active).
-cHold=$(complete_cb "$jarHold" "$cbHold")
-[ "$cHold" = 400 ] && ok "held callback completed post-swap → 400 (fails closed at the flow claim)" || no "held callback → $cHold (want 400)"
+# Guard on the held URL actually being a callback: a failed hold-login returns a
+# DEX_* sentinel, and feeding that to complete_cb yields a bare 000 that reads as
+# a server fault rather than the real cause (the pre-swap hold never captured).
+case "$cbHold" in
+  "$API"/v1/auth/callback*)
+    cHold=$(complete_cb "$jarHold" "$cbHold")
+    [ "$cHold" = 400 ] && ok "held callback completed post-swap → 400 (fails closed at the flow claim)" || no "held callback → $cHold (want 400)" ;;
+  *) no "precondition unmet — the config1 hold login never captured a callback ($cbHold); cannot test the post-swap flow-claim refusal" ;;
+esac
 # alice's old (config1) session cookie is revoked by the swap.
 OLD=$(curl -s -o /dev/null -w '%{http_code}' -b "$jarKold" "$API/v1/agents")
 [ "$OLD" = 401 ] && ok "alice's pre-swap session cookie → 401" || no "old session post-swap → $OLD (want 401)"
@@ -669,8 +709,10 @@ if [ -n "$SID" ]; then
 import sys,json
 rows=[m for m in json.load(sys.stdin).get('members',[]) if m.get('email')=='$U3' and m.get('membership_status')=='active']
 print(rows[0]['membership_id'] if rows else '')" 2>/dev/null)
-  admin_post "/v1/admin/orgs/$SLUG/members/$CAROLMID/roles" '{"roles":["member","admin"]}'
-  [ "$CODE" = 200 ] && ok "granted carol a read_all (admin) role for the control stream" || no "carol role grant → $CODE: $BODY"
+  if need "$CAROLMID" "carol has no active membership (her login never completed?) in $BODY"; then
+    admin_post "/v1/admin/orgs/$SLUG/members/$CAROLMID/roles" '{"roles":["member","admin"]}'
+    [ "$CODE" = 200 ] && ok "granted carol a read_all (admin) role for the control stream" || no "carol role grant → $CODE: $BODY"
+  fi
   : > "$WORK/sse_ctl.out"
   ( curl -s -N --max-time 30 -b "$jarL" "$API/v1/sessions/$SID/events/stream" > "$WORK/sse_ctl.out" 2>/dev/null ) &
   CTL_PID=$!
@@ -694,8 +736,10 @@ print(rows[0]['membership_id'] if rows else '')" 2>/dev/null)
 import sys,json
 rows=[m for m in json.load(sys.stdin).get('members',[]) if m.get('email')=='$U1' and m.get('membership_status')=='active']
 print(rows[0]['membership_id'] if rows else '')" 2>/dev/null)
-  admin_post "/v1/admin/orgs/$SLUG/members/$ALMID/deactivate" '{}'
-  [ "$CODE" = 200 ] && ok "deactivated alice's (config2) membership mid-stream" || no "deactivate alice → $CODE: $BODY"
+  if need "$ALMID" "alice has no active membership to deactivate (config2 re-login failed?) in $BODY"; then
+    admin_post "/v1/admin/orgs/$SLUG/members/$ALMID/deactivate" '{}'
+    [ "$CODE" = 200 ] && ok "deactivated alice's (config2) membership mid-stream" || no "deactivate alice → $CODE: $BODY"
+  fi
 
   # (b) Wait up to ~6s (≈ reauth 2s + select sleep 2s + slack) for alice's stream
   # to close; then reap curl and LOG its exit code. A 000/reset never reaches
