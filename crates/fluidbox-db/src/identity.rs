@@ -460,7 +460,7 @@ pub async fn update_idp_jwks_cache(
     let res = sqlx::query(
         "update org_idp_configs
          set jwks = $3, updated_at = now()
-         where tenant_id = $1 and id = $2",
+         where tenant_id = $1 and id = $2 and status = 'active'",
     )
     .bind(scope.tenant_id())
     .bind(id)
@@ -2222,7 +2222,49 @@ pub async fn claim_pending_switch(
 ) -> sqlx::Result<Option<SwitchClaim>> {
     let mut tx = pool.begin().await?;
 
-    // (1) Atomic claim binding the currently-presented live session. The
+    // (1) Plain-read the pending switch row to learn WHICH config to lock — NO
+    // lock, no trust. The config lock (step 2) MUST precede the switch-row claim
+    // (step 3) to keep the global lock order config → switch-row → membership →
+    // session, the SAME order the issuer-migration swap takes (`lock_org_configs`
+    // first, then `cancel_config_flows_switches_sessions` updates the switch
+    // rows). Reading the config id unlocked is harmless: the one-time claim
+    // UPDATE in step 3 re-validates EVERY predicate atomically (browser hash,
+    // unconsumed, unexpired, live replaced session), and a switch row's
+    // `idp_config_id` is immutable after creation — so a stale read here can
+    // never widen authority. Row absent → fail closed.
+    let pending: Option<(Uuid, Uuid)> =
+        sqlx::query_as("select tenant_id, idp_config_id from pending_login_switches where id = $1")
+            .bind(switch_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((pending_tenant_id, pending_config_id)) = pending else {
+        tx.rollback().await.ok();
+        return Ok(None);
+    };
+
+    // (2) Lock the NEW org's config row FOR UPDATE and require it active. This
+    // is the SAME lock a login's transaction B (`lock_idp_config_for_update`)
+    // and the issuer-migration swap (`lock_org_configs`) take, so a concurrent
+    // migration fully serializes with this switch: a migrate that retires this
+    // config either commits first (then `status <> 'active'` → we fail closed)
+    // or blocks behind our lock until we commit. Taken FIRST — before the
+    // switch-row claim — this is the head of the lock order config → switch-row
+    // → membership → session, consistent with every other path.
+    let config_live = sqlx::query(
+        "select 1 from org_idp_configs
+         where tenant_id = $1 and id = $2 and status = 'active'
+         for update",
+    )
+    .bind(pending_tenant_id)
+    .bind(pending_config_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if config_live.is_none() {
+        tx.rollback().await.ok();
+        return Ok(None);
+    }
+
+    // (3) Atomic claim binding the currently-presented live session. The
     // replaced session must be FULLY live — not just unrevoked/unexpired, but
     // its membership, user, AND tenant still active (mirrors
     // `session_is_live`). Strictly fail-closed: a deactivation cascade already
@@ -2262,34 +2304,13 @@ pub async fn claim_pending_switch(
         return Ok(None);
     };
 
-    // (2) Lock the NEW org's config row FOR UPDATE and require it active. This
-    // is the SAME lock a login's transaction B (`lock_idp_config_for_update`)
-    // and the issuer-migration swap (`lock_org_configs`) take, so a concurrent
-    // migration fully serializes with this switch: a migrate that retires this
-    // config either commits first (then `status <> 'active'` → we fail closed)
-    // or blocks behind our lock until we commit. Taken FIRST keeps the lock
-    // order config → membership → session, consistent with every other path.
-    let config_live = sqlx::query(
-        "select 1 from org_idp_configs
-         where tenant_id = $1 and id = $2 and status = 'active'
-         for update",
-    )
-    .bind(row.tenant_id)
-    .bind(row.idp_config_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if config_live.is_none() {
-        tx.rollback().await.ok();
-        return Ok(None);
-    }
-
-    // (3) Recheck config-active + membership-active + tenant-active on the NEW
+    // (4) Recheck config-active + membership-active + tenant-active on the NEW
     // org, taking `for update of m` on the NEW membership row. That row lock
     // serializes this claim against the deactivation cascade
     // (`apply_membership_status` → `revoke_sessions_for_membership`), which
     // locks the membership row FIRST and its sessions SECOND. This claim takes
-    // the same order — config (step 2), membership here (step 3), then the
-    // replaced session (step 4) — so the two can never deadlock. A concurrent
+    // the same order — config (step 2), membership here (step 4), then the
+    // replaced session (step 5) — so the two can never deadlock. A concurrent
     // deactivation that committed before us leaves `m.status <> 'active'` → the
     // recheck matches zero rows and we roll the WHOLE claim back (fail closed;
     // the browser retries login).
@@ -2313,10 +2334,10 @@ pub async fn claim_pending_switch(
         return Ok(None);
     }
 
-    // (4) Revoke the replaced session (in its OWN tenant). Lock the row FOR
+    // (5) Revoke the replaced session (in its OWN tenant). Lock the row FOR
     // UPDATE first (session lock AFTER the config + membership locks — the
-    // order fixed in steps 2-3), then require the revoke to touch EXACTLY ONE
-    // still-live row.
+    // order fixed in steps 2 and 4), then require the revoke to touch EXACTLY
+    // ONE still-live row.
     // Zero rows means a concurrent logout/revocation already killed the
     // replaced session between the step-1 claim and here → the switch would be
     // minting a new session while silently doing nothing about the old one, so
@@ -2345,7 +2366,7 @@ pub async fn claim_pending_switch(
         return Ok(None);
     }
 
-    // (5) Mint the new session under the NEW org.
+    // (6) Mint the new session under the NEW org.
     mint_user_session(
         &mut tx,
         TenantScope::assume(row.tenant_id),
@@ -3679,6 +3700,229 @@ mod tests {
         tx.commit().await.unwrap();
 
         cleanup_tenant(&pool, org.id).await;
+    }
+
+    /// A full org-switch scenario: the NEW login's org (ACTIVE config + seeded
+    /// user/membership) plus a SECOND org holding the live replaced session, and
+    /// a pending switch pointing at the NEW config. Returns everything a
+    /// `claim_pending_switch` call needs; tenants are throwaway (cleaned up by
+    /// the caller).
+    struct SwitchScenario {
+        org_new: Uuid,
+        cfg_new: Uuid,
+        org_old: Uuid,
+        cookie: String,
+        current_token: String,
+        switch_id: Uuid,
+    }
+
+    async fn seed_switch_scenario(pool: &PgPool) -> SwitchScenario {
+        let slug_new = format!("t-{}", Uuid::now_v7().simple());
+        let org_new = create_org(pool, &slug_new, None).await.unwrap();
+        let scope_new = TenantScope::assume(org_new.id);
+        let cfg_new = staged_config(pool, scope_new).await;
+        activate(pool, cfg_new.id).await;
+        let (new_user, new_membership) =
+            seed_user_membership(pool, scope_new, cfg_new.id, "new-sub").await;
+
+        let slug_old = format!("t-{}", Uuid::now_v7().simple());
+        let org_old = create_org(pool, &slug_old, None).await.unwrap();
+        let scope_old = TenantScope::assume(org_old.id);
+        let cfg_old = staged_config(pool, scope_old).await;
+        let (old_user, old_membership) =
+            seed_user_membership(pool, scope_old, cfg_old.id, "old-sub").await;
+
+        let current_token = format!("fbx_web_cur_{}", Uuid::now_v7().simple());
+        let cookie = format!("cookie-{}", Uuid::now_v7().simple());
+        let mut conn = pool.acquire().await.unwrap();
+        let current = mint_user_session(
+            &mut conn,
+            scope_old,
+            old_membership,
+            old_user,
+            cfg_old.id,
+            &current_token,
+            None,
+            None,
+            None,
+            None,
+            3_600,
+            100_000,
+        )
+        .await
+        .unwrap();
+        let switch_id = create_pending_switch(
+            &mut conn,
+            scope_new,
+            cfg_new.id,
+            new_membership,
+            new_user,
+            org_old.id,
+            current.id,
+            "/dashboard",
+            &sha256_hex(&cookie),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        drop(conn);
+
+        SwitchScenario {
+            org_new: org_new.id,
+            cfg_new: cfg_new.id,
+            org_old: org_old.id,
+            cookie,
+            current_token,
+            switch_id,
+        }
+    }
+
+    /// The switch-claim vs migration-swap serialization, the companion to
+    /// `migration_and_login_b_serialize_on_config_lock`. Both take the config row
+    /// `FOR UPDATE` FIRST (the swap via `lock_org_configs`, the claim as its
+    /// step 2, BEFORE it touches the switch row), so the two can never deadlock —
+    /// the global lock order is config → switch-row → membership → session. Two
+    /// POOL CONNECTIONS, timeout-bounded so CI can never hang:
+    ///
+    /// (1) FORWARD: a swap holds the config lock; a concurrent claim must BLOCK
+    ///     (500ms `timeout` ELAPSES). Once the swap commits (retiring the config
+    ///     and cancelling the pending switch), the claim unblocks and fails
+    ///     closed (`None`) against the now-retired config — the original session
+    ///     is KEPT.
+    /// (2) REVERSE: the claim commits FIRST (minting the new session); a
+    ///     subsequent swap that retires the new config revokes that fresh session
+    ///     (its `revoked_at` is set).
+    #[tokio::test]
+    async fn migration_and_switch_claim_serialize_on_config_lock() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let pool2 = connect(&url).await.expect("connect 2");
+
+        // ---- FORWARD: swap holds the lock → claim blocks → fails closed. ----
+        let s = seed_switch_scenario(&pool).await;
+        let scope_new = TenantScope::assume(s.org_new);
+
+        // conn1 = a migration swap in progress: hold the SAME config row lock the
+        // claim now takes FIRST (step 2), before it ever touches the switch row.
+        let mut tx1 = pool.begin().await.unwrap();
+        let locked = lock_idp_config_for_update(&mut tx1, scope_new, s.cfg_new)
+            .await
+            .unwrap()
+            .expect("new config locks for the swap");
+        assert_eq!(locked.config_status, "active");
+
+        // conn2 = the switch claim. It plain-reads the switch row then contends
+        // for the config lock, so it must BLOCK while conn1 holds it. `&mut
+        // handle` keeps the task alive across the timeout.
+        let (switch_id, bh, cur, new_tok) = (
+            s.switch_id,
+            sha256_hex(&s.cookie),
+            s.current_token.clone(),
+            "fbx_web_switch_fwd".to_string(),
+        );
+        let mut handle = tokio::spawn(async move {
+            claim_pending_switch(&pool2, switch_id, &bh, &cur, &new_tok, 3_600, 100_000).await
+        });
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut handle).await;
+        assert!(
+            blocked.is_err(),
+            "switch claim BLOCKS while the swap holds the config lock (500ms timeout elapsed)"
+        );
+
+        // The swap retires the config and cancels the pending switch, then commits.
+        sqlx::query(
+            "update org_idp_configs set status = 'retired', updated_at = now()
+             where tenant_id = $1 and id = $2",
+        )
+        .bind(s.org_new)
+        .bind(s.cfg_new)
+        .execute(&mut *tx1)
+        .await
+        .unwrap();
+        cancel_config_flows_switches_sessions(&mut tx1, scope_new, s.cfg_new)
+            .await
+            .unwrap();
+        tx1.commit().await.unwrap();
+
+        // The claim now unblocks and fails closed: the config it locked is
+        // retired, so it returns None WITHOUT revoking the original session.
+        let claim = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("claim completes once the lock releases")
+            .expect("claim task joined")
+            .expect("claim returns Ok");
+        assert!(
+            claim.is_none(),
+            "claim fails closed against a config retired by the swap"
+        );
+        assert!(
+            resolve_web_session(&pool, &s.current_token, 3_600)
+                .await
+                .unwrap()
+                .is_some(),
+            "the replaced session is KEPT when the claim fails closed"
+        );
+
+        // ---- REVERSE: claim commits first → a later swap revokes its session. ----
+        let r = seed_switch_scenario(&pool).await;
+        let scope_r = TenantScope::assume(r.org_new);
+        let new_token_r = "fbx_web_switch_rev";
+        let claimed = claim_pending_switch(
+            &pool,
+            r.switch_id,
+            &sha256_hex(&r.cookie),
+            &r.current_token,
+            new_token_r,
+            3_600,
+            100_000,
+        )
+        .await
+        .unwrap()
+        .expect("claim succeeds when it wins the config lock");
+        assert_eq!(claimed.new_tenant_id, r.org_new);
+
+        // The swap runs AFTER the claim committed: retiring the new config
+        // revokes the freshly minted session (it carries the new config id).
+        let mut tx2 = pool.begin().await.unwrap();
+        lock_org_configs(&mut tx2, scope_r).await.unwrap();
+        sqlx::query(
+            "update org_idp_configs set status = 'retired', updated_at = now()
+             where tenant_id = $1 and id = $2",
+        )
+        .bind(r.org_new)
+        .bind(r.cfg_new)
+        .execute(&mut *tx2)
+        .await
+        .unwrap();
+        cancel_config_flows_switches_sessions(&mut tx2, scope_r, r.cfg_new)
+            .await
+            .unwrap();
+        tx2.commit().await.unwrap();
+
+        let revoked_at: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "select revoked_at from user_sessions
+             where tenant_id = $1 and session_token_sha256 = $2",
+        )
+        .bind(r.org_new)
+        .bind(sha256_hex(new_token_r))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            revoked_at.is_some(),
+            "the swap revokes the newly minted switch session"
+        );
+
+        cleanup_tenant(&pool, s.org_new).await;
+        cleanup_tenant(&pool, s.org_old).await;
+        cleanup_tenant(&pool, r.org_new).await;
+        cleanup_tenant(&pool, r.org_old).await;
     }
 
     /// The concurrent bootstrap-owner claim has EXACTLY ONE winner (design lines
