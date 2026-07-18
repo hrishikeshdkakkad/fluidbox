@@ -132,8 +132,11 @@ pub async fn stream(
         }
 
         // Then follow: wake on NOTIFY, re-poll on a floor so nothing is missed,
-        // and re-authorize on the same bounded interval — including between
-        // per-event sends under back-pressure.
+        // and re-authorize on the same bounded interval — during the outer wait,
+        // the catch-up query, EACH per-event send under back-pressure, AND the
+        // error backoff. Every await that can stall is raced against the tick, so
+        // a stalled pool/query or a slow client can never stretch the recheck
+        // past the bound (design 658-664).
         'follow: loop {
             let should_fetch = tokio::select! {
                 _ = reauth_tick.tick(), if reauth.is_some() => {
@@ -146,7 +149,27 @@ pub async fn stream(
                 _ = tokio::time::sleep(Duration::from_secs(2)) => true,
             };
             if !should_fetch { continue; }
-            match fluidbox_db::events_after(&pool, scope, id, last_seq, 500).await {
+
+            // Race the catch-up query against the re-auth tick: a stalled pool or
+            // slow query must not outlive the bound. The future is PINNED so a
+            // tick that fires mid-query rechecks liveness (terminating on
+            // revoke/expiry/deactivation) and then resumes the SAME query — a
+            // fresh `select!` each loop turn re-polls `&mut fetch`, never
+            // restarting the query (no duplicated work).
+            let fetch = fluidbox_db::events_after(&pool, scope, id, last_seq, 500);
+            tokio::pin!(fetch);
+            let batch = loop {
+                tokio::select! {
+                    biased;
+                    _ = reauth_tick.tick(), if reauth.is_some() => {
+                        if reauth_dead(&pool, scope, reauth).await {
+                            break 'follow; // revoked / expired / membership deactivated
+                        }
+                    }
+                    result = &mut fetch => break result,
+                }
+            };
+            match batch {
                 Ok(events) => {
                     for ev in events {
                         'send: loop {
@@ -173,7 +196,21 @@ pub async fn stream(
                         }
                     }
                 }
-                Err(_) => { tokio::time::sleep(Duration::from_secs(1)).await; }
+                Err(_) => {
+                    // Back off after a query error, but keep the bound: race the
+                    // 1s sleep against the tick. No shared future to preserve, so
+                    // a single `select!` (sleep vs interval) suffices — a tick
+                    // rechecks liveness and, if live, just cuts the backoff short.
+                    tokio::select! {
+                        biased;
+                        _ = reauth_tick.tick(), if reauth.is_some() => {
+                            if reauth_dead(&pool, scope, reauth).await {
+                                break 'follow; // revoked / expired / membership deactivated
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    }
+                }
             }
         }
     };
