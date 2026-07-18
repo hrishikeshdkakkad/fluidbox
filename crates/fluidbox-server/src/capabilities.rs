@@ -4,15 +4,17 @@
 //! declare their tools — and where the poison screen runs (fluidbox-core
 //! lint: control/zero-width/bidi characters are rejected outright).
 
-use crate::auth::Admin;
+use crate::auth::Principal;
 use crate::broker;
 use crate::error::{ApiError, ApiResult};
+use crate::rbac;
 use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::Json;
 use fluidbox_core::capability::{
     definition_digest, tools_digest, CapabilityBundleDef, CapabilityServer,
 };
+use fluidbox_db::TenantScope;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -42,6 +44,7 @@ pub struct CreateBundle {
 /// re-validate the untrusted snapshots → digest → append-only insert.
 pub async fn register_bundle(
     state: &AppState,
+    scope: TenantScope,
     name: &str,
     description: Option<&str>,
     servers: Vec<CapabilityServer>,
@@ -69,7 +72,7 @@ pub async fn register_bundle(
     // credential and freeze what tools/list returns.
     for server in &mut def.servers {
         if server.is_brokered() {
-            let tools = broker::photograph_brokered(state, server).await?;
+            let tools = broker::photograph_brokered(state, scope, server).await?;
             let CapabilityServer::Brokered { tools: slot, .. } = server else {
                 unreachable!()
             };
@@ -86,7 +89,7 @@ pub async fn register_bundle(
     let digest = definition_digest(&def);
     Ok(fluidbox_db::create_capability_bundle(
         &state.pool,
-        state.tenant_id,
+        scope,
         name,
         description,
         &serde_json::to_value(&def)?,
@@ -99,28 +102,41 @@ pub async fn register_bundle(
 /// name again appends version max+1; existing rows (and every RunSpec that
 /// froze them) never change.
 pub async fn create(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Json(req): Json<CreateBundle>,
 ) -> ApiResult<Json<Value>> {
-    let row = register_bundle(&state, &req.name, req.description.as_deref(), req.servers).await?;
+    if !rbac::can_mutate_resources(&principal) {
+        return Err(ApiError::Forbidden(
+            "registering capability bundles requires admin or owner".into(),
+        ));
+    }
+    let row = register_bundle(
+        &state,
+        principal.scope(),
+        &req.name,
+        req.description.as_deref(),
+        req.servers,
+    )
+    .await?;
     Ok(Json(bundle_json(&row)))
 }
 
-pub async fn list(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    let rows = fluidbox_db::list_capability_bundles(&state.pool, state.tenant_id).await?;
+pub async fn list(principal: Principal, State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let scope = principal.scope();
+    let rows = fluidbox_db::list_capability_bundles(&state.pool, scope).await?;
     let bundles: Vec<Value> = rows.iter().map(summary_json).collect();
     Ok(Json(json!({ "bundles": bundles })))
 }
 
 pub async fn get(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let row = fluidbox_db::get_capability_bundle(&state.pool, id)
+    let scope = principal.scope();
+    let row = fluidbox_db::get_capability_bundle(&state.pool, scope, id)
         .await?
-        .filter(|b| b.tenant_id == state.tenant_id)
         .ok_or(ApiError::NotFound)?;
     Ok(Json(bundle_json(&row)))
 }

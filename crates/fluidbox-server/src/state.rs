@@ -49,6 +49,11 @@ pub struct AppStateInner {
     /// LISTEN/NOTIFY wakeups (session_id, seq) for SSE fanout.
     pub events_tx: broadcast::Sender<(Uuid, i64)>,
     pub http: reqwest::Client,
+    /// The ONE HTTP client for identity fetches (OIDC discovery, JWKS, token
+    /// endpoint) — nothing else uses it. Built with per-hop SSRF enforcement: a
+    /// custom redirect policy re-validates every hop and a custom DNS resolver
+    /// filters resolved addresses at connect time (see `login::build_identity_http`).
+    pub identity_http: reqwest::Client,
     /// Seals/unseals connection credentials. None until
     /// FLUIDBOX_CREDENTIAL_KEY is configured — connection endpoints and
     /// connection-backed workspaces refuse to operate without it.
@@ -66,6 +71,10 @@ pub struct AppStateInner {
     /// NetworkPolicy. `create_run` refuses while false + require_enforced_netpol
     /// (fails closed). Always true for Docker (a different isolation model).
     pub netpol_verified: std::sync::atomic::AtomicBool,
+    /// OIDC login runtime: the generation-keyed JWKS cache (singleflight
+    /// refresh + negative-kid cache) and the fixed-window login rate counters.
+    /// In-memory, single-replica (v1); a restart re-seeds from the DB caches.
+    pub oidc: crate::login::OidcRuntime,
 }
 
 pub type AppState = Arc<AppStateInner>;

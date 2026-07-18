@@ -9,7 +9,7 @@
 //! re-walks both and can therefore only HEAL a partial fan-out — never
 //! duplicate a run or a comment.
 
-use crate::auth::Admin;
+use crate::auth::Principal;
 use crate::connectors::{self, NormalizedEvent, VerifiedDelivery};
 use crate::error::{ApiError, ApiResult};
 use crate::run_service::{self, CreateRun, RevisionSelector, RunCreation};
@@ -38,9 +38,13 @@ pub async fn ingress(
     if body.len() > MAX_BODY_BYTES {
         return Err(ApiError::BadRequest("payload too large".into()));
     }
-    let conn = fluidbox_db::get_connection(&state.pool, connection_id)
+    // Unauthenticated ingress: the URL carries only a connection id and no
+    // principal — the webhook signature is the auth. Resolve the connection
+    // cross-tenant (UUID-only system-worker loader) to fetch the verification
+    // material; a TenantScope is NOT constructed from its tenant until the
+    // signature verifies (system_worker module doc).
+    let conn = fluidbox_db::system_worker::get_connection(&state.pool, connection_id)
         .await?
-        .filter(|c| c.tenant_id == state.tenant_id)
         .ok_or(ApiError::NotFound)?;
     // The path names the connector; the connection's provider must resolve
     // to the same one (a PAT connection has no ingress, wrong path → 404).
@@ -53,7 +57,9 @@ pub async fn ingress(
     let sealer = state.sealer.as_ref().ok_or_else(|| {
         ApiError::BadRequest("event ingress is disabled: set FLUIDBOX_CREDENTIAL_KEY".into())
     })?;
-    let sealed = fluidbox_db::connection_webhook_secret_sealed(&state.pool, conn.id)
+    // Verification material only — a tenant-less reader, because there is no
+    // verified tenant yet (the signature has not been checked).
+    let sealed = fluidbox_db::system_worker::connection_webhook_secret_sealed(&state.pool, conn.id)
         .await?
         .ok_or_else(|| {
             ApiError::BadRequest("this connection cannot receive events (no webhook secret)".into())
@@ -72,6 +78,10 @@ pub async fn ingress(
         }
     };
 
+    // Signature verified: ONLY NOW does the resolved row's tenant become the
+    // operative scope for the whole delivery spine below.
+    let scope = fluidbox_db::TenantScope::assume(conn.tenant_id);
+
     let payload: Value = serde_json::from_slice(&body)
         .map_err(|e| ApiError::BadRequest(format!("payload is not json: {e}")))?;
 
@@ -80,7 +90,10 @@ pub async fn ingress(
         "sha256:{}",
         fluidbox_db::sha256_hex(std::str::from_utf8(&body).unwrap_or_default())
     );
-    process_delivery(&state, &conn, connector, &verified, &payload, &digest).await
+    process_delivery(
+        &state, scope, &conn, connector, &verified, &payload, &digest,
+    )
+    .await
 }
 
 /// The provider-ignorant spine after authenticity: normalize → dedup →
@@ -90,6 +103,7 @@ pub async fn ingress(
 /// caller from the exact signed bytes.
 pub(crate) async fn process_delivery(
     state: &AppState,
+    scope: fluidbox_db::TenantScope,
     conn: &fluidbox_db::IntegrationConnectionRow,
     connector: &'static str,
     verified: &VerifiedDelivery,
@@ -108,6 +122,7 @@ pub(crate) async fn process_delivery(
     // Level-1 dedup: the same external delivery is stored exactly once.
     let (delivery, fresh) = fluidbox_db::insert_trigger_delivery(
         &state.pool,
+        scope,
         conn.id,
         &verified.external_event_id,
         &event.event_type,
@@ -119,7 +134,7 @@ pub(crate) async fn process_delivery(
 
     // Match + fan out. Every matched subscription ends as exactly one
     // dispatch row: bound to a run, skipped, or errored.
-    let subs = fluidbox_db::list_event_subscriptions(&state.pool, conn.id).await?;
+    let subs = fluidbox_db::list_event_subscriptions(&state.pool, scope, conn.id).await?;
     let mut dispatched = Vec::new();
     let mut skipped = Vec::new();
     for sub in subs.iter().filter(|s| {
@@ -131,13 +146,13 @@ pub(crate) async fn process_delivery(
         )
     }) {
         let Some(claim) =
-            fluidbox_db::claim_trigger_dispatch(&state.pool, delivery.id, sub.id).await?
+            fluidbox_db::claim_trigger_dispatch(&state.pool, scope, delivery.id, sub.id).await?
         else {
             // This (delivery, subscription) already produced its outcome.
             skipped.push(json!({ "subscription_id": sub.id, "reason": "already_dispatched" }));
             continue;
         };
-        match dispatch_one(state, connector, sub, &event, verified, claim.id).await {
+        match dispatch_one(state, scope, connector, sub, &event, verified, claim.id).await {
             Ok(RunCreation::Created(session)) => {
                 dispatched.push(json!({ "subscription_id": sub.id, "session_id": session.id }));
             }
@@ -146,6 +161,7 @@ pub(crate) async fn process_delivery(
                 // event fan-out too; the skip is recorded visibly.
                 fluidbox_db::mark_dispatch_outcome(
                     &state.pool,
+                    scope,
                     claim.id,
                     "skipped",
                     Some("overlap"),
@@ -164,6 +180,7 @@ pub(crate) async fn process_delivery(
                 // webhook redelivery / the next event retries naturally.
                 fluidbox_db::mark_dispatch_outcome(
                     &state.pool,
+                    scope,
                     claim.id,
                     "skipped",
                     Some("replace_cancel_unpersisted"),
@@ -182,6 +199,7 @@ pub(crate) async fn process_delivery(
                 let msg = e.to_string();
                 fluidbox_db::mark_dispatch_outcome(
                     &state.pool,
+                    scope,
                     claim.id,
                     "error",
                     Some(&format!("error: {msg}")),
@@ -207,8 +225,10 @@ pub(crate) async fn process_delivery(
 /// One matched subscription → one ordinary run through the single
 /// create_run funnel, carrying the event workspace (exact commit), the
 /// pre-downgraded trust tier, and event-derived result destinations.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_one(
     state: &AppState,
+    scope: fluidbox_db::TenantScope,
     provider: &str,
     sub: &fluidbox_db::TriggerSubscriptionRow,
     event: &NormalizedEvent,
@@ -237,6 +257,7 @@ async fn dispatch_one(
     }
     run_service::create_run(
         state,
+        scope,
         CreateRun {
             agent: sub.agent_id.to_string(),
             revision: match sub.pinned_revision_id {
@@ -266,6 +287,8 @@ async fn dispatch_one(
                 resource: Some(event.resource_key.clone()),
                 occurred_at: event.occurred_at,
             },
+            // A connector webhook has no directly-authenticated user.
+            invoked_by_user_id: None,
             result_destinations: destinations,
             bound_invocation: None,
             bound_dispatch: Some(dispatch_id),
@@ -311,18 +334,19 @@ fn subscription_matches(
 /// their per-subscription dispatch outcomes. Payloads stay out of the
 /// listing (the digest identifies them; the row keeps the full body).
 pub async fn connection_deliveries(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let conn = fluidbox_db::get_connection(&state.pool, id)
+    let scope = principal.scope();
+    let conn = fluidbox_db::get_connection(&state.pool, scope, id)
         .await?
-        .filter(|c| c.tenant_id == state.tenant_id)
         .ok_or(ApiError::NotFound)?;
-    let deliveries = fluidbox_db::list_connection_deliveries(&state.pool, conn.id, 30).await?;
+    let deliveries =
+        fluidbox_db::list_connection_deliveries(&state.pool, scope, conn.id, 30).await?;
     let mut out = Vec::with_capacity(deliveries.len());
     for d in deliveries {
-        let dispatches = fluidbox_db::list_delivery_dispatches(&state.pool, d.id).await?;
+        let dispatches = fluidbox_db::list_delivery_dispatches(&state.pool, scope, d.id).await?;
         out.push(json!({
             "id": d.id,
             "external_event_id": d.external_event_id,

@@ -1,3 +1,4 @@
+mod admin_orgs;
 mod api;
 mod auth;
 mod broker;
@@ -15,22 +16,25 @@ mod github_app;
 mod harness;
 mod internal;
 mod ledger;
+mod login;
 mod oauth;
 mod orchestrator;
+mod rbac;
 mod run_service;
 mod scheduler;
 mod seal;
 mod sse;
 mod state;
+mod tokens;
 mod triggers;
 mod workers;
 
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::Router;
 use fluidbox_core::traits::ExecutionProvider;
 use state::{AppStateInner, ApprovalRegistry};
+use std::net::SocketAddr;
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 /// Select the execution backend from `FLUIDBOX_PROVIDER` (default `docker`).
@@ -147,12 +151,18 @@ async fn main() -> anyhow::Result<()> {
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15 * 60))
             .build()?,
+        // Dedicated per-hop-SSRF client for OIDC identity fetches. The dev
+        // (loopback-http) allowance is baked in from the public URL at build
+        // time so a local Dex on 127.0.0.1 with a loopback FLUIDBOX_PUBLIC_URL
+        // still works while every non-dev deployment rejects private targets.
+        identity_http: login::build_identity_http(&cfg.public_url),
         sealer,
         connector_tokens: Default::default(),
         oauth_locks: Default::default(),
         // Docker needs no netpol gate; Kubernetes starts unverified and the
         // worker below flips it once the CNI is proven to enforce policy.
         netpol_verified: std::sync::atomic::AtomicBool::new(!is_k8s),
+        oidc: Default::default(),
         pool,
         cfg,
     });
@@ -197,6 +207,65 @@ async fn main() -> anyhow::Result<()> {
         .route("/sessions/{id}/deliveries", get(api::session_deliveries))
         .route("/approvals", get(api::approvals_inbox))
         .route("/approvals/{id}/decision", post(api::decide_approval))
+        // Personal access tokens (identity Phase B): machine access without a
+        // browser flow. Mint/revoke require a browser session (a PAT can never
+        // mint a PAT); listing accepts either context.
+        .route("/auth/tokens", get(tokens::list).post(tokens::mint))
+        .route("/auth/tokens/{id}", delete(tokens::revoke))
+        // The IdP-agnostic OIDC login surface (Phase B, Task 5). The neutral
+        // entry page, per-org start, and the one stable callback are
+        // unauthenticated by design — the sealed `state` + per-flow cookie ARE
+        // the auth (same pattern as oauth/callback + github/app legs). switch
+        // and logout authenticate by the browser session cookie (CSRF applies).
+        .route("/auth/login", get(login::login_page))
+        .route("/auth/login/{slug}/start", get(login::start))
+        .route("/auth/callback", get(login::callback))
+        .route("/auth/switch/{id}", post(login::switch_confirm))
+        .route("/auth/logout", post(login::logout))
+        .route("/auth/me", get(login::me))
+        // Operator break-glass + IdP lifecycle (Phase B, Task 6). Every route is
+        // Admin-token gated — this is exactly the surface the operator retains
+        // under FLUIDBOX_REQUIRE_SSO=1 (the `Admin` extractor stays valid there
+        // while `Principal` refuses the admin token). Each accepted mutation
+        // audits inside its transaction; rejected attempts audit separately.
+        .route(
+            "/admin/orgs",
+            get(admin_orgs::list_orgs).post(admin_orgs::create_org),
+        )
+        .route(
+            "/admin/orgs/{slug}/idp",
+            get(admin_orgs::list_idp).post(admin_orgs::create_idp),
+        )
+        .route("/admin/orgs/{slug}/idp/{id}", patch(admin_orgs::patch_idp))
+        .route(
+            "/admin/orgs/{slug}/idp/{id}/activate",
+            post(admin_orgs::activate_idp),
+        )
+        .route(
+            "/admin/orgs/{slug}/idp/{id}/disable",
+            post(admin_orgs::disable_idp),
+        )
+        .route(
+            "/admin/orgs/{slug}/idp/{id}/reactivate",
+            post(admin_orgs::reactivate_idp),
+        )
+        .route(
+            "/admin/orgs/{slug}/idp/{id}/migrate",
+            post(admin_orgs::migrate_idp),
+        )
+        .route(
+            "/admin/orgs/{slug}/break-glass-owner",
+            post(admin_orgs::break_glass_owner),
+        )
+        .route("/admin/orgs/{slug}/members", get(admin_orgs::list_members))
+        .route(
+            "/admin/orgs/{slug}/members/{membership_id}/deactivate",
+            post(admin_orgs::deactivate_member),
+        )
+        .route(
+            "/admin/orgs/{slug}/members/{membership_id}/roles",
+            post(admin_orgs::set_member_roles),
+        )
         .route(
             "/capabilities",
             get(capabilities::list).post(capabilities::create),
@@ -310,7 +379,12 @@ async fn main() -> anyhow::Result<()> {
         // client_id; authorization servers fetch it — public by nature.
         .route("/.well-known/fluidbox-client.json", get(oauth::cimd_doc))
         .layer(trace_layer())
-        .layer(CorsLayer::permissive())
+        // NO CORS layer (Phase B): the dashboard is a same-origin proxy
+        // (`/` → web, `/v1` → API, one origin), so cross-origin requests to
+        // `/v1` are never legitimate and no `Access-Control-*` grant should
+        // exist. The permissive layer removed here (design lines 649-653) was a
+        // cookie-auth CSRF footgun; browser writes now carry the
+        // `x-fluidbox-csrf` header + an Origin check instead.
         .with_state(state.clone());
 
     // Internal listener (:8788) — /internal ONLY, no /v1 route exists. This is
@@ -331,9 +405,19 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("default agent: {}", seed.default_agent);
 
     // Serve both planes; if either listener falls over, the process exits.
+    // `ConnectInfo::<SocketAddr>` is wired on BOTH planes so handlers extract the
+    // socket peer uniformly (the internal plane never reads it, but the make
+    // service is uniform and harmless) — the public login/audit path relies on it
+    // as the authoritative client IP unless a trusted proxy is declared.
     tokio::select! {
-        r = axum::serve(public_listener, public_app) => r?,
-        r = axum::serve(internal_listener, internal_app) => r?,
+        r = axum::serve(
+            public_listener,
+            public_app.into_make_service_with_connect_info::<SocketAddr>(),
+        ) => r?,
+        r = axum::serve(
+            internal_listener,
+            internal_app.into_make_service_with_connect_info::<SocketAddr>(),
+        ) => r?,
     }
     Ok(())
 }

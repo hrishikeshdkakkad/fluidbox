@@ -4,7 +4,7 @@
 **Status:** Phase A deliverable of the multi-user MCP control plane epic (#28)
 **Authority:** [`../plans/2026-07-14-multi-user-mcp-control-plane-design.md`](../plans/2026-07-14-multi-user-mcp-control-plane-design.md) (v4, security invariants 1–22 and Gaps 1–14) and [`../plans/2026-07-17-idp-agnostic-identity-design.md`](../plans/2026-07-17-idp-agnostic-identity-design.md) (v5, identity invariants 1–12). Vulnerability reporting: [`SECURITY.md`](../../SECURITY.md).
 
-This threat model covers the hosted multi-user deployment (~300 seats). It is deliberately honest about time: fluidbox today is a single-tenant system with a documented gap register, and every mitigation below carries a **status** — `shipped` or the phase (B–F) that closes it. A row marked with a phase is a *known open risk* until that phase lands; hosted multi-tenant operation is not offered before Phases B–E close their rows.
+This threat model covers the hosted multi-user deployment (~300 seats). It is deliberately honest about time: Phase B has landed per-organization identity and per-tenant repository scoping; every mitigation below still carries a **status** — `shipped` or the phase (C–F) that closes it. A row marked with an unshipped phase is a *known open risk* until that phase lands; hosted multi-tenant operation is not offered before Phases C–E close their remaining rows.
 
 ## Core assumption: the sandbox is compromised
 
@@ -54,7 +54,7 @@ The [network architecture](network-architecture.md) enumerates the edges; the bo
 
 ## Scenarios and controls
 
-Statuses: **shipped** = enforced on `main` today; **Phase B–F** = the phase that closes it (open risk until then).
+Statuses: **shipped** = enforced on `main` today (`shipped (Phase B)` marks a row Phase B closed); **Phase C–F** = the phase that closes it (open risk until then).
 
 ### T1/T2 — the compromised sandbox and the model itself
 
@@ -88,11 +88,11 @@ Statuses: **shipped** = enforced on `main` today; **Phase B–F** = the phase th
 | Attack | Control | Status |
 |---|---|---|
 | Read or bind another user's personal connection | Connection ownership (`owner_type`, `owner_user_id`); binding verification; personal connections invisible to other members | **Phase C** |
-| Approve an action so it runs under someone else's credential | Approval permits the proposed action under the credential already frozen into the run — never the approver's (invariant 8); approvers need `approval.decide_own`/`approval.decide_org`; no role — including admin — authorizes approval under another user's personal connection in v1 | **Phase B/C** |
-| Read another tenant's runs/events/artifacts by UUID | `TenantScope` repository signatures (primary), composite tenant FKs, RLS as depth, cross-tenant negative test matrix; UUID unpredictability is not authorization (invariant 10) | **Phase B** (today: single-tenant, Gaps 1–2 — the hosted blocker) |
-| See tenant existence via login routing | The neutral entry page never enumerates organizations and answers identically for unknown and IdP-less slugs | **Phase B** |
+| Approve an action so it runs under someone else's credential | Approval permits the proposed action under the credential already frozen into the run — never the approver's (invariant 8); approvers need `approval.decide_own`/`approval.decide_org`; no role — including admin — authorizes approval under another user's personal connection in v1 | shipped (approval RBAC, Phase B) / **Phase C** (personal-connection binding) |
+| Read another tenant's runs/events/artifacts by UUID | `TenantScope` repository signatures (primary), composite tenant FKs, cross-tenant negative test matrix; UUID unpredictability is not authorization (invariant 10); RLS remains the not-yet-added defense-in-depth layer | shipped (Phase B; `TenantScope` + composite keys); RLS depth deferred |
+| See tenant existence via login routing | The neutral entry page never enumerates organizations and answers identically for unknown and IdP-less slugs | shipped (Phase B) |
 | A trigger token used beyond its subscription | Subscription-scoped, sha256-hashed tokens: invoke exactly one subscription, poll only runs it created; invoke overrides are opt-in and can only narrow | shipped |
-| A member reads runs they shouldn't | `run.read` visibility rules (own runs; token-created runs; `subscriptions.manage`; `runs.read_all`) on every session/event/artifact/approval/SSE query | **Phase B** |
+| A member reads runs they shouldn't | `run.read` visibility rules (own runs; token-created runs; `subscriptions.manage`; `runs.read_all`) on every session/event/artifact/approval/SSE query | shipped (Phase B) |
 | Custom connector admitted by one tenant becomes bindable in another | Custom definitions tenant-scoped; unattributable legacy rows disabled at backfill | **Phase C** |
 
 ### T6 — the unauthenticated network
@@ -101,21 +101,21 @@ Statuses: **shipped** = enforced on `main` today; **Phase B–F** = the phase th
 |---|---|---|
 | Forged webhook creates runs | HMAC is the authentication — against the connection's sealed secret, or the GitHub App registration's sealed secret on the App-level ingress path; nothing stored before verification | shipped |
 | Replayed webhook duplicates fan-out | Two DB-unique dedup levels bound to the session insert in one transaction — retries heal, never duplicate | shipped |
-| Login CSRF / forced login into an attacker's session | Session replacement is never silent: `pending_login_switches` one-time browser-bound confirmation (cookie hash inside the claim predicate, 120 s expiry, current-session equality in the predicate) | **Phase B** |
-| Replayed / attacker-completed OAuth or login callback | One-time server-side state rows; per-flow `HttpOnly` cookie hash inside the one-time claim predicate — a leaked authorization URL can neither complete nor burn a flow. Invariant 20 itself governs connector OAuth's full binding set; the GitHub App and login flows use the same one-time cookie-hash claim **mechanism** with their own, flow-appropriate binding sets | shipped (GitHub App) / **Phase B** (login) / **Phase D** (connector OAuth, invariant 20) |
+| Login CSRF / forced login into an attacker's session | Session replacement is never silent: `pending_login_switches` one-time browser-bound confirmation (cookie hash inside the claim predicate, 120 s expiry, current-session equality in the predicate) | shipped (Phase B) |
+| Replayed / attacker-completed OAuth or login callback | One-time server-side state rows; per-flow `HttpOnly` cookie hash inside the one-time claim predicate — a leaked authorization URL can neither complete nor burn a flow. Invariant 20 itself governs connector OAuth's full binding set; the GitHub App and login flows use the same one-time cookie-hash claim **mechanism** with their own, flow-appropriate binding sets | shipped (GitHub App, login) / **Phase D** (connector OAuth, invariant 20) |
 | Cross-user grant injection (victim's consent seals into attacker's connection) | The completing browser must prove it started the flow — same cookie-hash predicate; connected account shown for human confirmation before activation | **Phase D** |
-| CSRF against cookie-authenticated APIs | Custom header + `Origin` check on every cookie-authenticated non-GET; `CorsLayer::permissive()` removed in the same change; GET writes limited to the enumerated protocol-forced flows, each with its own one-time claims | **Phase B** |
+| CSRF against cookie-authenticated APIs | Custom header + `Origin` check on every cookie-authenticated non-GET; `CorsLayer::permissive()` removed in the same change; GET writes limited to the enumerated protocol-forced flows, each with its own one-time claims | shipped (Phase B) |
 | SSRF via crafted endpoints, discovery documents, redirects, or DNS rebinding | Admission address-class rules enforced at resolution time on every fetch; redirect re-validation; egress proxy | **Phase E** (Gap 7); policy stated now in the [admission policy](connector-admission-policy.md) |
-| Amplification via unauthenticated login/callback endpoints | Rate limits per IP and per org; caps on outstanding unconsumed flows; flow claims commit before any IdP I/O so slow IdPs cannot hold DB connections | **Phase B** |
+| Amplification via unauthenticated login/callback endpoints | Rate limits per IP and per org; caps on outstanding unconsumed flows; flow claims commit before any IdP I/O so slow IdPs cannot hold DB connections | shipped (Phase B) |
 
 ### T7 — stolen credentials
 
 | Attack | Control | Status |
 |---|---|---|
-| Stolen PAT self-replicates | A PAT can never mint, extend, or revoke PATs (including itself); TTL clamped (90 d default / 1 y max) | **Phase B** |
-| Stolen PAT outlives the person | Membership status and roles re-read on every use; deactivation kills sessions and PATs in one transaction | **Phase B** |
-| Stolen session cookie rides forever | Server-side session rows (revocable), sliding idle expiry capped by an absolute expiry, `__Host-` prefix, HttpOnly, SameSite=Lax; long-lived streams re-authorize on a ≤60 s interval | **Phase B** |
-| Stolen trigger token reaches the admin surface | Token kinds are mutually exclusive (relationally CHECK-enforced); trigger tokens never touch `/v1`-admin routes; the admin token can never invoke a trigger | shipped (kinds) / **Phase B** (CHECK shape) |
+| Stolen PAT self-replicates | A PAT can never mint, extend, or revoke PATs (including itself); TTL clamped (90 d default / 1 y max) | shipped (Phase B) |
+| Stolen PAT outlives the person | Membership status and roles re-read on every use; deactivation kills sessions and PATs in one transaction | shipped (Phase B) |
+| Stolen session cookie rides forever | Server-side session rows (revocable), sliding idle expiry capped by an absolute expiry, `__Host-` prefix, HttpOnly, SameSite=Lax; long-lived streams re-authorize on a ≤60 s interval | shipped (Phase B) |
+| Stolen trigger token reaches the admin surface | Token kinds are mutually exclusive (relationally CHECK-enforced); trigger tokens never touch `/v1`-admin routes; the admin token can never invoke a trigger | shipped |
 | Leaked run session token used from outside | Reaching `:8788` requires being inside the sandbox network path; workload identity/mTLS additionally binds the caller | shipped (network) / **Phase E** (identity, Gap 6 remainder) |
 | Revoked connection's cached access token keeps working | Custody is DB-gated, not cache-gated: fresh status/generation reads before any cached token is served; revoke/membership-change evicts | shipped (GitHub custody pattern) / **Phase D** (generation-aware caches everywhere) |
 
@@ -125,11 +125,11 @@ A compromised org IdP mints valid identities **for that organization only** — 
 
 | Attack | Control | Status |
 |---|---|---|
-| Forge identities in another org | Identity key is `(tenant_id, idp_config_id, subject)`; `iss` verified per token; `sub` never trusted across issuers | **Phase B** |
-| Mint the org's root authority from a claim | `owner` is never grantable from IdP claims absent explicit operator opt-in (`allow_owner_mapping`); bootstrap-owner promotion is a single-winner atomic claim requiring a verified email match, an unexpired arm, and no active owner | **Phase B** |
-| Symmetric-key forgery (`alg=HS256` with the shared client secret) | `none` and all symmetric algorithms rejected unconditionally; the allowlist can only narrow within the asymmetric set | **Phase B** |
-| Token substitution/replay across flows | Full verification: exact `iss`, `aud`+`azp` rules, `exp`/`iat`/`nbf` with bounded skew, `iat` bound to the flow's lifetime, `nonce` single-use, `at_hash` when present | **Phase B** |
-| Locked-out org after IdP death | Break-glass rides the operator admin token, independent of any IdP; issuer migration is a staged atomic swap that cancels old flows and revokes old sessions | **Phase B** |
+| Forge identities in another org | Identity key is `(tenant_id, idp_config_id, subject)`; `iss` verified per token; `sub` never trusted across issuers | shipped (Phase B) |
+| Mint the org's root authority from a claim | `owner` is never grantable from IdP claims absent explicit operator opt-in (`allow_owner_mapping`); bootstrap-owner promotion is a single-winner atomic claim requiring a verified email match, an unexpired arm, and no active owner | shipped (Phase B) |
+| Symmetric-key forgery (`alg=HS256` with the shared client secret) | `none` and all symmetric algorithms rejected unconditionally; the allowlist can only narrow within the asymmetric set | shipped (Phase B) |
+| Token substitution/replay across flows | Full verification: exact `iss`, `aud`+`azp` rules, `exp`/`iat`/`nbf` with bounded skew, `iat` bound to the flow's lifetime, `nonce` single-use, `at_hash` when present | shipped (Phase B) |
+| Locked-out org after IdP death | Break-glass rides the operator admin token, independent of any IdP; issuer migration is a staged atomic swap that cancels old flows and revokes old sessions | shipped (Phase B) |
 
 ### T9/T10 — malicious definitions and operator error
 
@@ -137,7 +137,7 @@ A compromised org IdP mints valid identities **for that organization only** — 
 |---|---|---|
 | Custom endpoint as an internal-network probe | Admission address rules; broker-only egress; private endpoints only via BYOC/relay/explicit approval | **Phase E** enforcement; policy stated now |
 | Catalog entry masquerading as trusted | Catalog is untrusted reference data; curated display bypasses no verification, policy, or approval | shipped |
-| Operator break-glass abuse or mistakes | Explicit `/v1/admin/*` surface; accepted mutations audit in the same transaction (fail together); rejected attempts audited after rollback; arming refused while an active owner exists; arms expire | **Phase B** |
+| Operator break-glass abuse or mistakes | Explicit `/v1/admin/*` surface; accepted mutations audit in the same transaction (fail together); rejected attempts audited after rollback; arming refused while an active owner exists; arms expire | shipped (Phase B) |
 | Sealer-key loss orphans credentials | Documented today (reconnect after rotation); Phase D adds KMS envelope encryption and a resumable, count-parity-verified re-seal migration — the legacy key retires only at 100% | **Phase D** |
 | Gateway supply chain (the LiteLLM malware incident) | Image pinned by digest, never floating tags; private network only; replaceable below the governance plane — Rust owns identity, policy, budget decisions, and the canonical ledger | shipped |
 
@@ -167,8 +167,8 @@ The parent design's production gaps, restated as the risk schedule this threat m
 
 | Gap | Summary | Closed by |
 |---|---|---|
-| 1 | Global admin authentication (no users/memberships/roles) | **B** |
-| 2 | One boot-selected tenant | **B** |
+| 1 | Global admin authentication (no users/memberships/roles) | **B** (shipped) |
+| 2 | One boot-selected tenant | **B** (shipped) |
 | 3 | Capability bundle embeds a concrete connection | **C** |
 | 4 | Process-local OAuth locking | **D** |
 | 5 | One deployment credential key (no KMS envelope) | **D** |
@@ -187,7 +187,7 @@ The parent design's production gaps, restated as the risk schedule this threat m
 Enforcement is proven, not asserted:
 
 - **Network**: the boot-time netpol gate (`+:8788 −:8787`) blocks run admission until enforcement is demonstrated; `helm test` re-certifies per release; CI runs kind + Calico.
-- **Tenancy (Phase B acceptance)**: cross-tenant negative test matrix; workers cannot fall back to a default tenant; OIDC round-trip against a real conformant issuer (Keycloak/Dex) with replayed, wrong-browser, and expired flows all refused; algorithm allowlist rejects `none`/HS256.
+- **Tenancy (Phase B acceptance — shipped; the CI identity job runs `scripts/identity-e2e.sh` against a digest-pinned Dex)**: cross-tenant negative test matrix; workers cannot fall back to a default tenant; OIDC round-trip against a real conformant issuer (Keycloak/Dex) with replayed, wrong-browser, and expired flows all refused; algorithm allowlist rejects `none`/HS256.
 - **Governance**: `scripts/governance-e2e.sh` drives verdicts, approval pause/resume, idempotency, and autonomous auto-deny over real HTTP; the e2e greps keep provider knowledge out of the event spine.
 - **Scale/failure (Phase F)**: load tests at 60/150/300 concurrent sandboxes, OAuth refresh storms, revocation during active runs, upstream 401/404/429/5xx, broker restarts, DB failover, and tenant-isolation fuzzing.
 

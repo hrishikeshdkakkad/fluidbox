@@ -254,7 +254,7 @@ m=[a for a in d if a['session_id']=='$S']
 print(m[0]['id'] if m else '')")
 [ -n "$AID" ] && ok "approval row created + in inbox" || no "no pending approval"
 # approve it
-curl -s -X POST -H "$H" -H 'content-type: application/json' -d '{"decision":"approved_once","decided_by":"gov-test"}' "$API/v1/approvals/$AID/decision" >/dev/null
+curl -s -X POST -H "$H" -H 'content-type: application/json' -d '{"decision":"approved_once"}' "$API/v1/approvals/$AID/decision" >/dev/null
 wait $PERM_PID
 D=$(j "['decision']" < /tmp/fbx_g3.json)
 [ "$D" = "allow" ] && ok "blocked permission returned allow after approval" || no "post-approval expected allow, got $D"

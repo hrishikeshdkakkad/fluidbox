@@ -235,16 +235,16 @@ pub struct Redactor {
 impl Default for Redactor {
     fn default() -> Self {
         let raw = [
-            r"sk-ant-[A-Za-z0-9_\-]{8,}",       // Anthropic keys / oauth tokens
+            r"sk-ant-[A-Za-z0-9_\-]{8,}",   // Anthropic keys / oauth tokens
             r"sk-proj-[A-Za-z0-9_\-]{16,}", // OpenAI project keys (hyphenated — not caught below)
             r"sk-[A-Za-z0-9]{20,}",         // OpenAI-style keys
-            r"fbx_(sess|trig)_[A-Za-z0-9]{8,}", // fluidbox session / trigger tokens
-            r"ghp_[A-Za-z0-9]{20,}",        // GitHub PAT
-            r"github_pat_[A-Za-z0-9_]{20,}", // GitHub fine-grained PAT
-            r"gho_[A-Za-z0-9]{20,}",        // GitHub OAuth
-            r"AKIA[0-9A-Z]{16}",            // AWS access key id
-            r"xox[baprs]-[A-Za-z0-9\-]{10,}", // Slack tokens
-            r"npg_[A-Za-z0-9]{8,}",         // Neon passwords
+            r"fbx_(sess|trig|web|pat)_[A-Za-z0-9]{8,}", // fluidbox session / trigger / web-session / PAT tokens
+            r"ghp_[A-Za-z0-9]{20,}",                    // GitHub PAT
+            r"github_pat_[A-Za-z0-9_]{20,}",            // GitHub fine-grained PAT
+            r"gho_[A-Za-z0-9]{20,}",                    // GitHub OAuth
+            r"AKIA[0-9A-Z]{16}",                        // AWS access key id
+            r"xox[baprs]-[A-Za-z0-9\-]{10,}",           // Slack tokens
+            r"npg_[A-Za-z0-9]{8,}",                     // Neon passwords
             r"(?i)bearer\s+[A-Za-z0-9\._\-]{16,}",
             r"postgres(ql)?://[^\s:]+:[^@\s]+@", // connection-string passwords
         ];
@@ -375,6 +375,22 @@ mod tests {
         let r = Redactor::default();
         let s = r.scrub_text("postgresql://user:supersecret@host/db");
         assert!(!s.contains("supersecret"));
+    }
+
+    #[test]
+    fn redactor_scrubs_fluidbox_token_prefixes() {
+        let r = Redactor::default();
+        // Runner-session, trigger, browser-session, and PAT tokens all scrub.
+        for tok in [
+            "fbx_sess_0123456789abcdef",
+            "fbx_trig_0123456789abcdef",
+            "fbx_web_0123456789abcdef",
+            "fbx_pat_0123456789abcdef",
+        ] {
+            let out = r.scrub_text(&format!("token {tok} end"));
+            assert!(!out.contains(tok), "{tok} must be redacted");
+            assert!(out.contains("‹redacted›"));
+        }
     }
 
     #[test]

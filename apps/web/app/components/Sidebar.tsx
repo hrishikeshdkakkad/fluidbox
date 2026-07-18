@@ -3,17 +3,38 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
-import { apiGet } from "../lib/api";
+import { apiGet, AuthMe, logout } from "../lib/api";
 
 /**
  * The component name remains Sidebar to keep the layout seam stable, but the
  * product navigation is now a compact masthead. The dashboard owns the
  * information architecture; this shell only provides global context.
+ *
+ * `mode` is the static deployment configuration (see the proxy route). In
+ * `admin` it renders exactly as before — no session UI at all. In `sso` it adds
+ * the signed-in organization + email + a Log out control, fed by /auth/me.
  */
-export function Sidebar() {
+export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
   const pathname = usePathname();
   const [pending, setPending] = useState(0);
   const [online, setOnline] = useState(true);
+  const [me, setMe] = useState<AuthMe | null>(null);
+
+  useEffect(() => {
+    if (mode !== "sso") return;
+    let alive = true;
+    apiGet<AuthMe>("/auth/me")
+      .then((m) => {
+        if (alive) setMe(m);
+      })
+      .catch(() => {
+        // 401 already routed the browser to /login (api.ts); other errors just
+        // leave the session block unrendered.
+      });
+    return () => {
+      alive = false;
+    };
+  }, [mode]);
 
   useEffect(() => {
     let alive = true;
@@ -78,6 +99,31 @@ export function Sidebar() {
           <Link className="topbar-action" href="/?action=new-run">
             New Run
           </Link>
+          {mode === "sso" && me?.user && (
+            <div
+              style={{ display: "flex", alignItems: "center", gap: 10 }}
+              data-testid="session-shell"
+            >
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  lineHeight: 1.15,
+                  textAlign: "right",
+                }}
+              >
+                <span style={{ fontSize: 12, color: "var(--ds-gray-1000)", fontWeight: 500 }}>
+                  {me.org?.display_name ?? me.org?.slug ?? ""}
+                </span>
+                <span style={{ fontSize: 11, color: "var(--ds-gray-800)" }}>
+                  {me.user.email}
+                </span>
+              </div>
+              <button className="btn sm ghost" onClick={() => void logout()}>
+                Log out
+              </button>
+            </div>
+          )}
         </div>
       </div>
     </header>
