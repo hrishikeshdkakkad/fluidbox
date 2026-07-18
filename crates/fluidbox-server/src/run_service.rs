@@ -253,6 +253,9 @@ pub async fn create_run(
         ..
     } = &workspace
     {
+        // Unfiltered read by design: create_run resolves connection authority
+        // through the run's resolved binding (invariant 21), not a request
+        // viewer — this is only a liveness precheck before freezing the RunSpec.
         let active = fluidbox_db::get_connection(&state.pool, scope, *cid)
             .await?
             .map(|c| c.status == "active")
@@ -476,6 +479,9 @@ async fn frozen_capabilities(
                 ..
             } = server
             {
+                // Unfiltered read by design: authority is the frozen capability
+                // binding (invariant 21), not a request viewer — a liveness
+                // precheck before model spend.
                 let active = fluidbox_db::get_connection(&state.pool, scope, *cid)
                     .await?
                     .map(|c| c.status == "active")

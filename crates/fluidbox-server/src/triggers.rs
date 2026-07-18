@@ -416,6 +416,12 @@ pub async fn create(
             }
             let cid = Uuid::parse_str(conn_str.trim())
                 .map_err(|_| ApiError::BadRequest("connection must be a connection id".into()))?;
+            // Tenant-scoped (not owner-scoped) by design: a subscription CONSUMES
+            // a connection, and the design routes that authority through run
+            // resource bindings (invariant 21, Task 5) + the broker
+            // owner-membership recheck (Task 6), not Task 4's connection-object
+            // viewer. Subscription create is admin/owner-gated already. See
+            // task-4-report "Deferred / flagged".
             let conn = fluidbox_db::get_connection(&state.pool, scope, cid)
                 .await?
                 .ok_or_else(|| ApiError::BadRequest(format!("unknown connection {cid}")))?;
