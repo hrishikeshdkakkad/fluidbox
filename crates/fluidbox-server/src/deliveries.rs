@@ -219,7 +219,7 @@ async fn try_deliver(
     let dest: ResultDestination = serde_json::from_value(d.destination.clone())
         .map_err(|e| format!("bad destination: {e}"))?;
     match &dest {
-        ResultDestination::SignedWebhook { url } => {
+        ResultDestination::SignedWebhook { url, .. } => {
             let digest = deliver_signed_webhook(state, d, session, url).await?;
             Ok((digest, None))
         }

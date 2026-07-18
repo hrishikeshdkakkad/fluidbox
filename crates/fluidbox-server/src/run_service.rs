@@ -296,6 +296,9 @@ pub async fn create_run(
         invocation: req.invocation.clone(),
         result_destinations: req.result_destinations.clone(),
         capabilities,
+        // Task 5 resolves + freezes brokered surfaces from binding resolution;
+        // none until then (the gate falls back to the legacy `capabilities`).
+        brokered: vec![],
     };
 
     // 512 KiB serialized runner-env ceiling (design 2026-07-15): env injection

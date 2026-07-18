@@ -149,6 +149,8 @@ pub fn normalize(
     // materialize_git's branch-fetch fallback covers plain-git remotes.
     let workspace = WorkspaceSpec::GitRepository {
         connection_id: Some(ctx.connection_id),
+        // Event-derived workspace; create_run resolves its binding (Task 5).
+        binding_id: None,
         repository: Some(repository.clone()),
         clone_url: format!("{}/{repository}", ctx.clone_base.trim_end_matches('/')),
         r#ref: None,
@@ -181,6 +183,8 @@ pub fn normalize(
                 connection_id: ctx.connection_id,
                 repository: repository.clone(),
                 pr_number,
+                // create_run resolves the result_publish binding (Task 5).
+                binding_id: None,
             },
         ),
         (
@@ -189,6 +193,8 @@ pub fn normalize(
                 connection_id: ctx.connection_id,
                 repository: repository.clone(),
                 head_sha: head_sha.clone(),
+                // create_run resolves the result_publish binding (Task 5).
+                binding_id: None,
             },
         ),
     ]
@@ -719,11 +725,13 @@ pub async fn publish(
             connection_id,
             repository,
             pr_number,
+            ..
         } => publish_pr_comment(state, *connection_id, repository, *pr_number, ctx).await,
         ResultDestination::GitHubCheck {
             connection_id,
             repository,
             head_sha,
+            ..
         } => publish_check(state, *connection_id, repository, head_sha, ctx).await,
         ResultDestination::SignedWebhook { .. } => Err("not a github destination".into()),
     }
@@ -1053,6 +1061,7 @@ mod tests {
             r#ref,
             commit_sha,
             checkout_mode,
+            ..
         }) = &ev.workspace
         else {
             panic!("expected a git workspace");

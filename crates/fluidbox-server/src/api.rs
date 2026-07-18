@@ -179,6 +179,9 @@ pub(crate) async fn resolve_workspace_input(
             };
             WorkspaceSpec::GitRepository {
                 connection_id,
+                // Resolved by create_run's binding service (Task 5), never from
+                // user input (invariant 21).
+                binding_id: None,
                 repository,
                 clone_url,
                 r#ref,
