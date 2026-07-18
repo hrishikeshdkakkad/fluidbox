@@ -140,6 +140,38 @@ async fn resolve_bindings(
         }
     }
 
+    // An explicit override may only pin an mcp requirement slot (workspace and
+    // publish slots are server-derived, never explicit-bindable). A key that
+    // matches no requirement slot is a typo that would otherwise fall back
+    // SILENTLY to auto-resolution, so refuse the run — naming the unknown
+    // slot(s) and the valid ones. Runs regardless of tier (a stripped ReadOnly
+    // requirement slot is still a known slot; a typo is still a typo).
+    let slots: std::collections::BTreeSet<&str> =
+        inp.requirements.iter().map(|r| r.slot.as_str()).collect();
+    let mut unknown: Vec<&str> = inp
+        .explicit
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !slots.contains(k))
+        .collect();
+    if !unknown.is_empty() {
+        unknown.sort_unstable();
+        let named = unknown
+            .iter()
+            .map(|s| format!("'{s}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let valid = if slots.is_empty() {
+            "(none)".to_string()
+        } else {
+            slots.into_iter().collect::<Vec<_>>().join(", ")
+        };
+        return Err(ApiError::BadRequest(format!(
+            "unknown binding slot{} {named} — this revision's requirement slots are: {valid}",
+            if unknown.len() == 1 { "" } else { "s" },
+        )));
+    }
+
     // Workspace fetch (at most one — the single `workspace` slot).
     if let Some(ws) = &inp.workspace {
         if let Some(rb) = resolve_workspace_binding(pool, scope, inp, ws).await? {
@@ -422,6 +454,15 @@ async fn resolve_publish_binding(
                 return Err(ApiError::BadRequest(format!(
                     "result destination {index}: connection {connection_id} is {} — reconnect it",
                     conn.status
+                )));
+            }
+            // Defense-in-depth on a server-derived id: comments/checks publish
+            // under the GitHub App identity (§17 #1), so the subscription's
+            // connection must be a github_app connection — never a plain PAT.
+            if conn.provider != "github_app" {
+                return Err(ApiError::BadRequest(format!(
+                    "result destination {index}: subscription's connection '{}' isn't a GitHub App connection",
+                    conn.display_name
                 )));
             }
             authority_from_conn(&conn)
@@ -1084,9 +1125,10 @@ mod tests {
         user_id
     }
 
-    async fn seed_mcp_connection(
+    async fn seed_connection(
         pool: &PgPool,
         scope: TenantScope,
+        provider: &str,
         owner: ConnectionOwner,
         display: &str,
         base_url: &str,
@@ -1094,7 +1136,7 @@ mod tests {
         fluidbox_db::create_connection(
             pool,
             scope,
-            "mcp_http",
+            provider,
             &format!("acct-{}", Uuid::now_v7().simple()),
             display,
             Some(b"sealed-token"),
@@ -1108,6 +1150,16 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    async fn seed_mcp_connection(
+        pool: &PgPool,
+        scope: TenantScope,
+        owner: ConnectionOwner,
+        display: &str,
+        base_url: &str,
+    ) -> IntegrationConnectionRow {
+        seed_connection(pool, scope, "mcp_http", owner, display, base_url).await
     }
 
     async fn seed_snapshot(
@@ -1132,11 +1184,14 @@ mod tests {
 
     async fn cleanup(pool: &PgPool, tenant: Uuid) {
         // Children-first (tenant FKs are NO ACTION): bindings/snapshots ahead of
-        // connections, memberships/users ahead of the idp config, then the org.
+        // connections; subscriptions ahead of the agents + connections they
+        // reference; memberships/users ahead of the idp config, then the org.
         for stmt in [
             "delete from run_resource_bindings where tenant_id = $1",
             "delete from connection_tool_snapshots where tenant_id = $1",
+            "delete from trigger_subscriptions where tenant_id = $1",
             "delete from integration_connections where tenant_id = $1",
+            "delete from agents where tenant_id = $1",
             "delete from org_memberships where tenant_id = $1",
             "delete from users where tenant_id = $1",
             "delete from org_idp_configs where tenant_id = $1",
@@ -1176,6 +1231,33 @@ mod tests {
             result_destinations: &[],
             subscription: None,
         }
+    }
+
+    fn git_ws(connection_id: Uuid) -> WorkspaceSpec {
+        WorkspaceSpec::GitRepository {
+            connection_id: Some(connection_id),
+            binding_id: None,
+            repository: Some("o/r".into()),
+            clone_url: "https://github.com/o/r.git".into(),
+            r#ref: Some("main".into()),
+            commit_sha: None,
+            checkout_mode: Default::default(),
+        }
+    }
+
+    /// Drive the manual (user-supplied) workspace path: the invoking user names
+    /// a connection for the git fetch, resolved under the explicit-mode lens.
+    async fn resolve_manual_ws(
+        pool: &PgPool,
+        scope: TenantScope,
+        spec: &WorkspaceSpec,
+        invoking_user: Option<Uuid>,
+    ) -> Result<Vec<ResolvedBinding>, ApiError> {
+        let reqs: Vec<ConnectionRequirement> = vec![];
+        let explicit = HashMap::new();
+        let mut inp = inputs(&reqs, TrustTier::Trusted, "user", invoking_user, &explicit);
+        inp.workspace = Some(WorkspaceBindingInput { spec, manual: true });
+        resolve_bindings(pool, scope, &inp).await
     }
 
     #[tokio::test]
@@ -1278,7 +1360,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_required_tool_fails_before_any_write() {
+    async fn missing_required_tool_fails_resolution() {
+        // What this proves: satisfaction:all — a snapshot missing a required
+        // tool fails resolution, naming the tool. Atomicity ("no session or
+        // binding row on failure") is NOT asserted here because it is enforced
+        // STRUCTURALLY, not at this seam: `resolve_bindings` only ever reads, and
+        // `create_run` returns on this Err BEFORE it reaches `create_session`
+        // (Task 1's write path), so no row is ever reachable to count. A
+        // `count(*) == 0` against a read-only function would assert nothing.
         let Ok(url) = std::env::var("DATABASE_URL") else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
@@ -1316,15 +1405,6 @@ mod tests {
         let inp = inputs(&reqs, TrustTier::Trusted, "user", Some(uid), &explicit);
 
         let err = resolve_bindings(&pool, scope, &inp).await;
-        // No binding row could have been written: resolution errored, so
-        // create_run returns before create_session (no session, no rows).
-        let bindings_written: i64 =
-            sqlx::query_scalar("select count(*) from run_resource_bindings where tenant_id = $1")
-                .bind(org.id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-
         cleanup(&pool, org.id).await;
 
         let msg = err.expect_err("missing tool must fail").to_string();
@@ -1333,7 +1413,6 @@ mod tests {
             msg.contains("create_review"),
             "names the missing tool: {msg}"
         );
-        assert_eq!(bindings_written, 0, "nothing written on failure");
     }
 
     #[tokio::test]
@@ -1581,5 +1660,340 @@ mod tests {
             resolved[0].resource_scope["url"],
             "https://github.com/o/r.git"
         );
+    }
+
+    #[tokio::test]
+    async fn manual_workspace_connection_authority_branches() {
+        // The manual (user-supplied) workspace connection path: explicit-mode
+        // verification (viewer read + owner check + git-capable provider).
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
+            .await
+            .unwrap();
+        let scope = TenantScope::assume(org.id);
+        let alice = seed_user(&pool, scope, "alice@test.dev").await;
+        let bob = seed_user(&pool, scope, "bob@test.dev").await;
+        let alice_gh = seed_connection(
+            &pool,
+            scope,
+            "github",
+            ConnectionOwner::User(alice),
+            "Alice gh",
+            "https://github.example",
+        )
+        .await;
+        let org_gh = seed_connection(
+            &pool,
+            scope,
+            "github",
+            ConnectionOwner::Organization,
+            "Org gh",
+            "https://github.example",
+        )
+        .await;
+        let alice_mcp = seed_connection(
+            &pool,
+            scope,
+            "mcp_http",
+            ConnectionOwner::User(alice),
+            "Alice mcp",
+            "https://mcp.example.test",
+        )
+        .await;
+
+        let ws_alice = git_ws(alice_gh.id);
+        let ws_org = git_ws(org_gh.id);
+        let ws_mcp = git_ws(alice_mcp.id);
+
+        let personal = resolve_manual_ws(&pool, scope, &ws_alice, Some(alice)).await;
+        let cross = resolve_manual_ws(&pool, scope, &ws_alice, Some(bob)).await;
+        let org_ok = resolve_manual_ws(&pool, scope, &ws_org, Some(alice)).await;
+        let wrong_provider = resolve_manual_ws(&pool, scope, &ws_mcp, Some(alice)).await;
+
+        cleanup(&pool, org.id).await;
+
+        // (1) Personal connection of the invoking user → connection authority,
+        // owner frozen, resource_scope carries the exact fetch coordinates.
+        let b = personal.expect("personal resolves");
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].slot_kind, "workspace_fetch");
+        assert_eq!(b[0].binding_mode, "explicit");
+        assert_eq!(b[0].resource_scope["url"], "https://github.com/o/r.git");
+        assert_eq!(b[0].resource_scope["ref"], "main");
+        match &b[0].authority {
+            ResolvedAuthority::Connection {
+                id,
+                owner_type,
+                owner_user_id,
+                ..
+            } => {
+                assert_eq!(*id, alice_gh.id);
+                assert_eq!(owner_type, "user");
+                assert_eq!(*owner_user_id, Some(alice));
+            }
+            other => panic!("expected connection authority, got {other:?}"),
+        }
+        // (2) Another user's personal connection → the not-found shape, no leak.
+        let msg = cross.expect_err("cross-user must fail").to_string();
+        assert!(msg.contains("not found"), "got: {msg}");
+        assert!(!msg.contains("Alice gh"), "must not leak the name: {msg}");
+        // (3) Org connection → resolves for a plain member, organization owner.
+        let b = org_ok.expect("org resolves");
+        assert_eq!(b.len(), 1);
+        match &b[0].authority {
+            ResolvedAuthority::Connection {
+                id,
+                owner_type,
+                owner_user_id,
+                ..
+            } => {
+                assert_eq!(*id, org_gh.id);
+                assert_eq!(owner_type, "organization");
+                assert_eq!(*owner_user_id, None);
+            }
+            other => panic!("expected connection authority, got {other:?}"),
+        }
+        // (4) A non-git provider (mcp_http) → refused (must be github|github_app).
+        let msg = wrong_provider.expect_err("mcp_http must fail").to_string();
+        assert!(msg.contains("does not supply git workspaces"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn organization_mode_mcp_resolves_org_not_personal() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
+            .await
+            .unwrap();
+        let scope = TenantScope::assume(org.id);
+        let uid = seed_user(&pool, scope, "member@test.dev").await;
+        let base = "https://mcp.example.test";
+        let org_conn = seed_connection(
+            &pool,
+            scope,
+            "mcp_http",
+            ConnectionOwner::Organization,
+            "Org shared",
+            base,
+        )
+        .await;
+        seed_snapshot(
+            &pool,
+            scope,
+            &org_conn,
+            org_conn.authorization_generation,
+            &[tool("get_pull_request")],
+        )
+        .await;
+        // A personal connection matching the SAME connector must NOT be an
+        // organization-mode candidate — else this would go ambiguous, not resolve.
+        let personal = seed_connection(
+            &pool,
+            scope,
+            "mcp_http",
+            ConnectionOwner::User(uid),
+            "My personal",
+            base,
+        )
+        .await;
+        seed_snapshot(
+            &pool,
+            scope,
+            &personal,
+            personal.authorization_generation,
+            &[tool("get_pull_request")],
+        )
+        .await;
+        let reqs = vec![req(
+            "github",
+            "https://mcp.example.test/mcp",
+            &["get_pull_request"],
+            BindingMode::Organization,
+        )];
+        let explicit = HashMap::new();
+        let inp = inputs(&reqs, TrustTier::Trusted, "user", Some(uid), &explicit);
+
+        let resolved = resolve_bindings(&pool, scope, &inp).await;
+        cleanup(&pool, org.id).await;
+
+        let b = resolved.expect("org resolves");
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].binding_mode, "organization");
+        match &b[0].authority {
+            ResolvedAuthority::Connection { id, owner_type, .. } => {
+                assert_eq!(
+                    *id, org_conn.id,
+                    "resolved the org connection, not personal"
+                );
+                assert_eq!(owner_type, "organization");
+            }
+            other => panic!("expected connection authority, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_resolution_authority_branches() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
+            .await
+            .unwrap();
+        let scope = TenantScope::assume(org.id);
+        let agent = fluidbox_db::create_agent(&pool, scope, "pub-agent", None)
+            .await
+            .unwrap();
+        // A subscription that HOLDS a callback secret, and one that does not.
+        let sub_signed = fluidbox_db::create_trigger_subscription(
+            &pool,
+            scope,
+            agent.id,
+            "signed-sub",
+            "api",
+            None,
+            None,
+            false,
+            false,
+            None,
+            "allow",
+            None,
+            None,
+            &json!([]),
+            Some(b"sealed-callback"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let sub_nosecret = fluidbox_db::create_trigger_subscription(
+            &pool,
+            scope,
+            agent.id,
+            "nosecret-sub",
+            "api",
+            None,
+            None,
+            false,
+            false,
+            None,
+            "allow",
+            None,
+            None,
+            &json!([]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let gh_app = seed_connection(
+            &pool,
+            scope,
+            "github_app",
+            ConnectionOwner::Organization,
+            "Org GitHub App",
+            "https://api.github.example",
+        )
+        .await;
+        let gh_plain = seed_connection(
+            &pool,
+            scope,
+            "github",
+            ConnectionOwner::Organization,
+            "Org PAT",
+            "https://api.github.example",
+        )
+        .await;
+
+        let reqs: Vec<ConnectionRequirement> = vec![];
+        let explicit = HashMap::new();
+        let webhook_dest = vec![ResultDestination::SignedWebhook {
+            url: "https://cb.test/hook".into(),
+            binding_id: None,
+        }];
+        let gh_dest = vec![ResultDestination::GitHubCheck {
+            connection_id: gh_app.id,
+            repository: "o/r".into(),
+            head_sha: "a".repeat(40),
+            binding_id: None,
+        }];
+        let gh_plain_dest = vec![ResultDestination::GitHubCheck {
+            connection_id: gh_plain.id,
+            repository: "o/r".into(),
+            head_sha: "a".repeat(40),
+            binding_id: None,
+        }];
+
+        // (1) signed webhook + a subscription holding a callback secret.
+        let mut inp = inputs(&reqs, TrustTier::Trusted, "webhook", None, &explicit);
+        inp.result_destinations = &webhook_dest;
+        inp.subscription = Some(&sub_signed);
+        let signed = resolve_bindings(&pool, scope, &inp).await;
+        // (2) github check → the subscription's github_app connection.
+        let mut inp = inputs(&reqs, TrustTier::Trusted, "webhook", None, &explicit);
+        inp.result_destinations = &gh_dest;
+        inp.subscription = Some(&sub_signed);
+        let github = resolve_bindings(&pool, scope, &inp).await;
+        // (3) signed webhook but the subscription has NO callback secret → refuse.
+        let mut inp = inputs(&reqs, TrustTier::Trusted, "webhook", None, &explicit);
+        inp.result_destinations = &webhook_dest;
+        inp.subscription = Some(&sub_nosecret);
+        let missing = resolve_bindings(&pool, scope, &inp).await;
+        // (4) github check against a non-App github connection → refuse (Fix 4).
+        let mut inp = inputs(&reqs, TrustTier::Trusted, "webhook", None, &explicit);
+        inp.result_destinations = &gh_plain_dest;
+        inp.subscription = Some(&sub_signed);
+        let not_app = resolve_bindings(&pool, scope, &inp).await;
+
+        cleanup(&pool, org.id).await;
+
+        // (1) subscription_secret authority carrying the subscription's generation.
+        let b = signed.expect("signed webhook resolves");
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].slot_kind, "result_publish");
+        assert_eq!(b[0].slot, "publish:0");
+        match &b[0].authority {
+            ResolvedAuthority::SubscriptionSecret { id, generation } => {
+                assert_eq!(*id, sub_signed.id);
+                assert_eq!(*generation, sub_signed.authority_generation);
+            }
+            other => panic!("expected subscription_secret authority, got {other:?}"),
+        }
+        // (2) the subscription's connection, organization authority.
+        let b = github.expect("github check resolves");
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].binding_mode, "organization");
+        match &b[0].authority {
+            ResolvedAuthority::Connection { id, owner_type, .. } => {
+                assert_eq!(*id, gh_app.id);
+                assert_eq!(owner_type, "organization");
+            }
+            other => panic!("expected connection authority, got {other:?}"),
+        }
+        // (3) missing callback secret → refused.
+        let msg = missing
+            .expect_err("missing callback secret must fail")
+            .to_string();
+        assert!(msg.contains("no callback secret"), "got: {msg}");
+        // (4) non-App github connection → refused (freeze-time provider assert).
+        let msg = not_app
+            .expect_err("non-App connection must fail")
+            .to_string();
+        assert!(msg.contains("isn't a GitHub App connection"), "got: {msg}");
     }
 }
