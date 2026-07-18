@@ -397,11 +397,11 @@ DUAL=$(curl -s -o /dev/null -w '%{http_code}' -b "$jarA" -H "$AH" "$API/v1/agent
 # ── (f) CSRF ──────────────────────────────────────────────────────────────────
 say "(f) CSRF — a cookie-authenticated write needs the custom header"
 NOCSRF=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$jarA" -H 'content-type: application/json' \
-  -d '{"name":"csrf-probe","expires_in_secs":3600}' "$API/v1/auth/tokens")
+  -d '{"name":"csrf-probe","expires_in":3600}' "$API/v1/auth/tokens")
 [ "$NOCSRF" = 403 ] && ok "cookie POST WITHOUT x-fluidbox-csrf → 403" || no "no-CSRF write → $NOCSRF (want 403)"
 WITHCSRF=$(curl -s -o "$WORK/pat.json" -w '%{http_code}' -X POST -b "$jarA" \
   -H 'content-type: application/json' -H 'x-fluidbox-csrf: 1' \
-  -d '{"name":"csrf-probe","expires_in_secs":3600}' "$API/v1/auth/tokens")
+  -d '{"name":"csrf-probe","expires_in":3600}' "$API/v1/auth/tokens")
 [ "$WITHCSRF" = 200 ] && ok "cookie POST WITH x-fluidbox-csrf → 200" || no "CSRF write → $WITHCSRF (want 200)"
 
 # ── (g) PAT lifecycle ─────────────────────────────────────────────────────────
@@ -449,7 +449,7 @@ REPLAY=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$jarSW" -c "$jarSW" 
 say "(i) Membership deactivation — cookie + PAT die on next use"
 # Mint a PAT for bob while alive, then deactivate bob's membership.
 BOBPAT=$(curl -s -H 'x-fluidbox-csrf: 1' -b "$jarSW" -H 'content-type: application/json' \
-  -d '{"name":"bob-pat","expires_in_secs":3600}' "$API/v1/auth/tokens" | j "['token']")
+  -d '{"name":"bob-pat","expires_in":3600}' "$API/v1/auth/tokens" | j "['token']")
 [ -n "$BOBPAT" ] && ok "bob minted a PAT while active" || no "bob PAT mint failed"
 admin_get "/v1/admin/orgs/$SLUG/members"
 BOBMID=$(echo "$BODY" | python3 -c "

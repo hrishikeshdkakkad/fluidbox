@@ -1145,6 +1145,11 @@ pub async fn get_artifact(
     let artifact = fluidbox_db::get_artifact(&state.pool, scope, aid)
         .await?
         .ok_or(ApiError::NotFound)?;
+    // Scope the artifact to the visible run: a same-tenant artifact from an
+    // INVISIBLE run must never be readable through a visible run's id.
+    if artifact.session_id != sid {
+        return Err(ApiError::NotFound);
+    }
     Ok(Json(json!({ "artifact": artifact })))
 }
 

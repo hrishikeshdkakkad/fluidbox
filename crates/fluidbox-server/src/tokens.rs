@@ -56,10 +56,12 @@ fn require_browser(u: &UserPrincipal) -> ApiResult<()> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MintPat {
     pub name: String,
+    /// TTL in seconds (settled contract `{name, expires_in}`, design 739-745).
     #[serde(default)]
-    pub expires_in_secs: Option<i64>,
+    pub expires_in: Option<i64>,
 }
 
 /// `POST /v1/auth/tokens` — mint a PAT. Returns the plaintext ONCE.
@@ -79,7 +81,7 @@ pub async fn mint(
             "name too long (> {MAX_NAME_CHARS} chars)"
         )));
     }
-    let ttl = clamp_ttl(req.expires_in_secs);
+    let ttl = clamp_ttl(req.expires_in);
     let expires_at = Utc::now() + chrono::Duration::seconds(ttl);
     let token = mint_token();
     let row = fluidbox_db::identity::mint_pat(

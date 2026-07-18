@@ -63,7 +63,10 @@ fn valid_token_endpoint_auth(auth: &str) -> bool {
 }
 
 /// Reject any `none`/`HS*` (symmetric) entry outright, and require the rest to
-/// be a known asymmetric algorithm (design lines 832-835).
+/// be an algorithm the verifier ACTUALLY implements — so a saved allowlist can
+/// never carry a non-functional alg (EdDSA/ES256K) that would fail only at
+/// login rather than at save (design lines 169-171, 832-835). The
+/// implemented-set is defined once, in `login::IMPLEMENTED_ALGS`.
 fn validate_alg_allowlist(algs: &[String]) -> Result<(), String> {
     if algs.is_empty() {
         return Err("alg_allowlist must not be empty".into());
@@ -75,23 +78,10 @@ fn validate_alg_allowlist(algs: &[String]) -> Result<(), String> {
                 "algorithm '{a}' is rejected: symmetric (HS*) and 'none' are never allowed"
             ));
         }
-        let asymmetric = matches!(
-            u.as_str(),
-            "RS256"
-                | "RS384"
-                | "RS512"
-                | "ES256"
-                | "ES384"
-                | "ES512"
-                | "ES256K"
-                | "PS256"
-                | "PS384"
-                | "PS512"
-                | "EDDSA"
-        );
-        if !asymmetric {
+        if !crate::login::IMPLEMENTED_ALGS.contains(&u.as_str()) {
             return Err(format!(
-                "algorithm '{a}' is not a supported asymmetric algorithm"
+                "algorithm '{a}' is not supported; supported algorithms: {}",
+                crate::login::IMPLEMENTED_ALGS.join(", ")
             ));
         }
     }
@@ -1036,9 +1026,21 @@ mod tests {
     }
 
     #[test]
-    fn alg_allowlist_rejects_symmetric_and_none() {
+    fn alg_allowlist_rejects_symmetric_none_and_unimplemented() {
         assert!(validate_alg_allowlist(&["RS256".into(), "ES256".into()]).is_ok());
-        assert!(validate_alg_allowlist(&["EdDSA".into()]).is_ok());
+        // The full doc default is entirely inside the implemented set.
+        assert!(validate_alg_allowlist(
+            &DEFAULT_ALGS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        )
+        .is_ok());
+        // ES512 IS implemented (the default carries it).
+        assert!(validate_alg_allowlist(&["ES512".into()]).is_ok());
+        // Asymmetric-but-UNIMPLEMENTED algs are refused at SAVE, not at login.
+        assert!(validate_alg_allowlist(&["EdDSA".into()]).is_err());
+        assert!(validate_alg_allowlist(&["ES256K".into()]).is_err());
         assert!(validate_alg_allowlist(&["HS256".into()]).is_err());
         assert!(validate_alg_allowlist(&["hs512".into()]).is_err()); // case-insensitive
         assert!(validate_alg_allowlist(&["none".into()]).is_err());

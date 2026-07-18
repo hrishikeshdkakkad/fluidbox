@@ -52,48 +52,71 @@ pub async fn stream(
     let pool = state.pool.clone();
 
     let s = async_stream::stream! {
-        // Immediately flush any backlog.
-        loop {
-            match fluidbox_db::events_after(&pool, scope, id, last_seq, 500).await {
-                Ok(events) if !events.is_empty() => {
-                    for ev in events {
-                        last_seq = ev.seq;
-                        let data = serde_json::json!({
-                            "seq": ev.seq,
-                            "type": ev.r#type,
-                            "actor": ev.actor,
-                            "payload": ev.payload,
-                            "occurred_at": ev.occurred_at,
-                        });
-                        yield Ok::<Event, Infallible>(
-                            Event::default().id(ev.seq.to_string()).data(data.to_string())
-                        );
+        // The re-auth clock is a `tokio::time::interval` consulted via
+        // `tokio::select!` in BOTH phases (design 658-664), so neither a large
+        // backlog nor a quiet stream can stretch the recheck past the bound.
+        // Consume the immediate first tick so the first recheck lands one
+        // period in (the extractor just authorized).
+        let mut reauth_tick = tokio::time::interval(reauth_every);
+        reauth_tick.tick().await;
+
+        // Immediately flush any backlog — interleaved with the re-auth tick so a
+        // multi-batch backlog cannot postpone the recheck.
+        'backlog: loop {
+            tokio::select! {
+                biased;
+                _ = reauth_tick.tick(), if reauth.is_some() => {
+                    if let Some(sid) = reauth {
+                        if !matches!(
+                            fluidbox_db::identity::web_session_live(&pool, scope, sid).await,
+                            Ok(true)
+                        ) {
+                            return; // revoked / expired / membership deactivated
+                        }
                     }
                 }
-                _ => break,
+                batch = fluidbox_db::events_after(&pool, scope, id, last_seq, 500) => {
+                    match batch {
+                        Ok(events) if !events.is_empty() => {
+                            for ev in events {
+                                last_seq = ev.seq;
+                                let data = serde_json::json!({
+                                    "seq": ev.seq,
+                                    "type": ev.r#type,
+                                    "actor": ev.actor,
+                                    "payload": ev.payload,
+                                    "occurred_at": ev.occurred_at,
+                                });
+                                yield Ok::<Event, Infallible>(
+                                    Event::default().id(ev.seq.to_string()).data(data.to_string())
+                                );
+                            }
+                        }
+                        _ => break 'backlog,
+                    }
+                }
             }
         }
 
-        // Then follow: wake on NOTIFY, but re-poll on a floor so nothing is missed.
-        let mut last_reauth = std::time::Instant::now();
+        // Then follow: wake on NOTIFY, re-poll on a floor so nothing is missed,
+        // and re-authorize on the same bounded interval.
         loop {
-            // Bounded re-authorization for cookie-authenticated streams.
-            if let Some(sid) = reauth {
-                if last_reauth.elapsed() >= reauth_every {
-                    last_reauth = std::time::Instant::now();
-                    if !matches!(
-                        fluidbox_db::identity::web_session_live(&pool, scope, sid).await,
-                        Ok(true)
-                    ) {
-                        break; // revoked / expired / membership deactivated
+            let should_fetch = tokio::select! {
+                _ = reauth_tick.tick(), if reauth.is_some() => {
+                    if let Some(sid) = reauth {
+                        if !matches!(
+                            fluidbox_db::identity::web_session_live(&pool, scope, sid).await,
+                            Ok(true)
+                        ) {
+                            break; // revoked / expired / membership deactivated
+                        }
                     }
+                    false
                 }
-            }
-            let woke = tokio::select! {
                 r = rx.recv() => matches!(r, Ok((sid, _)) if sid == id) || r.is_err(),
                 _ = tokio::time::sleep(Duration::from_secs(2)) => true,
             };
-            if !woke { continue; }
+            if !should_fetch { continue; }
             match fluidbox_db::events_after(&pool, scope, id, last_seq, 500).await {
                 Ok(events) => {
                     for ev in events {

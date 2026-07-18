@@ -61,15 +61,44 @@ const MAX_OUTSTANDING_FLOWS_PER_ORG: i64 = 100;
 const MAX_JWKS_BYTES: usize = 256 * 1024;
 const MAX_JWKS_KEYS: usize = 32;
 const NEGATIVE_KID_TTL_SECS: i64 = 120;
+// Byte ceiling on any identity fetch (discovery, JWKS, token endpoint),
+// enforced BEFORE fully buffering the body (design 806-814).
+const MAX_HTTP_BODY_BYTES: usize = 256 * 1024;
+// Per-org callback rate bucket, applied once open_state names the org (design
+// 494-496, 849-854) — distinct from start's per-org bucket.
+const RATE_PER_ORG_CALLBACK_PER_MIN: u32 = 60;
+
+/// The JWS algorithms the ID-token verifier actually implements — asymmetric
+/// only; HS*/`none` are rejected unconditionally. admin_orgs' save-time
+/// allowlist validation refuses anything outside this set, so a configured
+/// allowlist can never carry a non-functional algorithm (EdDSA/ES256K), which
+/// would otherwise fail only at login (design 169-171, 832-835). The doc's
+/// default allowlist {RS256,ES256,PS256,RS384,ES384,RS512,ES512} is fully
+/// inside this set.
+pub const IMPLEMENTED_ALGS: &[&str] = &[
+    "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512",
+];
 
 // ─── OidcRuntime (an AppState field) ────────────────────────────────────────
 
 /// (tenant_id, idp_config_id, generation) — the JWKS cache key (design 815-816).
 type JwksKey = (Uuid, Uuid, i32);
 
+/// A parsed signing key paired with its RAW JWK JSON. The raw entry is retained
+/// so key selection can consult `use`/`key_ops` even when the openidconnect key
+/// type does not surface them (design 826-831).
+struct Jwk {
+    key: CoreJsonWebKey,
+    raw: Value,
+}
+
 struct CachedJwks {
-    keys: Vec<CoreJsonWebKey>,
-    fetched_at: i64,
+    keys: Vec<Jwk>,
+    /// The refresh generation that produced this entry. `0` marks a DB-SEEDED
+    /// entry, which must NOT count as a network refresh (design 815-826); a
+    /// successful network `force_refresh` stamps a monotonically increasing
+    /// value from `OidcRuntime::refresh_version`.
+    version: u64,
 }
 
 /// In-memory login runtime: the generation-keyed JWKS cache (with per-config
@@ -81,6 +110,12 @@ pub struct OidcRuntime {
     refresh_locks: Mutex<HashMap<JwksKey, Arc<Mutex<()>>>>,
     negative_kids: Mutex<HashMap<(JwksKey, String), i64>>,
     rate: Mutex<HashMap<String, (i64, u32)>>,
+    /// Monotonic counter bumped by every SUCCESSFUL network JWKS refresh. A
+    /// forced refresh skips the network only when this advanced past the value
+    /// it captured before waiting on the singleflight lock — i.e. only when
+    /// someone else genuinely refreshed, never merely because a DB seed is
+    /// fresh (design 815-826).
+    refresh_version: std::sync::atomic::AtomicU64,
 }
 
 impl OidcRuntime {
@@ -97,46 +132,60 @@ impl OidcRuntime {
     }
 
     /// The cached JWKS, seeding from the DB-cached `jwks` document when the
-    /// in-memory cache is cold. Never touches the network.
+    /// in-memory cache is cold. Never touches the network. A DB seed carries
+    /// `version = 0` so a forced refresh never mistakes it for a refresh.
     async fn cached(&self, key: JwksKey, seed: &Value) -> Result<Arc<CachedJwks>, String> {
         if let Some(c) = self.jwks.lock().await.get(&key) {
             return Ok(c.clone());
         }
         let keys = parse_jwks(seed)?;
-        let c = Arc::new(CachedJwks {
-            keys,
-            fetched_at: Utc::now().timestamp(),
-        });
+        let c = Arc::new(CachedJwks { keys, version: 0 });
         self.jwks.lock().await.insert(key, c.clone());
         Ok(c)
     }
 
     /// Exactly-one forced refresh, singleflighted per config (design 816-826).
+    /// A DB-seeded entry (`version = 0`, `fetched_at = now`) does NOT satisfy
+    /// the refresh: we skip the network ONLY when the cache's version advanced
+    /// past the value captured before we waited on the lock — proof that a
+    /// concurrent caller completed a real network refresh. A validated refresh
+    /// is also persisted back to the DB as last-known-good.
     async fn force_refresh(
         &self,
         state: &AppState,
         key: JwksKey,
-        jwks_uri: &str,
+        view: &DiscoveryView,
     ) -> Result<Arc<CachedJwks>, String> {
+        use std::sync::atomic::Ordering;
+        // Captured BEFORE the singleflight lock so a refresh landing while we
+        // wait is observable as an advance.
+        let before = self.refresh_version.load(Ordering::SeqCst);
         let lock = {
             let mut l = self.refresh_locks.lock().await;
             l.entry(key).or_default().clone()
         };
         let _g = lock.lock().await;
-        // A concurrent caller may have just refreshed while we waited.
-        let now = Utc::now().timestamp();
         if let Some(c) = self.jwks.lock().await.get(&key) {
-            if now - c.fetched_at < 2 {
+            if c.version > before {
                 return Ok(c.clone());
             }
         }
-        let doc = fetch_json_ssrf(state, jwks_uri).await?;
+        let doc = fetch_json_ssrf(state, &view.jwks_uri).await?;
         let keys = parse_jwks(&doc)?;
-        let c = Arc::new(CachedJwks {
-            keys,
-            fetched_at: now,
-        });
+        let version = self.refresh_version.fetch_add(1, Ordering::SeqCst) + 1;
+        let c = Arc::new(CachedJwks { keys, version });
         self.jwks.lock().await.insert(key, c.clone());
+        // Persist last-known-good so a restart re-seeds this refreshed JWKS
+        // (design 815-826). Best effort — the in-memory cache already holds it.
+        let _ = identity::update_idp_discovery_cache(
+            &state.pool,
+            TenantScope::assume(key.0),
+            key.1,
+            &view.meta,
+            &doc,
+            Utc::now(),
+        )
+        .await;
         Ok(c)
     }
 
@@ -157,18 +206,32 @@ impl OidcRuntime {
     }
 }
 
-fn parse_jwks(v: &Value) -> Result<Vec<CoreJsonWebKey>, String> {
+fn parse_jwks(v: &Value) -> Result<Vec<Jwk>, String> {
     let raw = serde_json::to_vec(v).map_err(|_| "jwks not serializable".to_string())?;
     if raw.len() > MAX_JWKS_BYTES {
         return Err("jwks document exceeds the size bound".into());
     }
     let set: CoreJsonWebKeySet =
         serde_json::from_value(v.clone()).map_err(|e| format!("invalid jwks document: {e}"))?;
-    let keys = set.keys().to_vec();
+    let keys = set.keys();
     if keys.len() > MAX_JWKS_KEYS {
         return Err("jwks document has too many keys".into());
     }
-    Ok(keys)
+    // Pair each parsed key with its raw JWK by array index — the crate
+    // deserializes `keys` in order, so the alignment holds.
+    let raw_keys = v
+        .get("keys")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| Jwk {
+            key: k.clone(),
+            raw: raw_keys.get(i).cloned().unwrap_or(Value::Null),
+        })
+        .collect())
 }
 
 // ─── Cookie / header helpers ────────────────────────────────────────────────
@@ -324,34 +387,86 @@ fn redirect(status: StatusCode, location: &str, cookies: &[String]) -> Response 
 
 // ─── redirect_to validation (design 843-848) ────────────────────────────────
 
-/// Accept ONLY a single-slash absolute local path. Reject protocol-relative
+/// One hex digit's value, or `None` for a non-hex byte.
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Percent-decode ONE layer. A malformed `%` escape (truncated or non-hex) ⇒
+/// `None` (fail closed), and a decode that does not produce valid UTF-8 ⇒
+/// `None`.
+fn percent_decode_once(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            if i + 2 >= b.len() {
+                return None;
+            }
+            out.push((hex_val(b[i + 1])? << 4) | hex_val(b[i + 2])?);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Every rejection class for a local-redirect path, run over a given form:
+/// must be a single-slash absolute path (`//…` protocol-relative refused),
+/// no backslashes, no control characters, and no `.`/`..` dot-segments in the
+/// path portion. A single leading slash with no backslash cannot form a
+/// userinfo/authority/scheme shape, so those are covered too.
+fn path_is_safe_local(s: &str) -> bool {
+    if !s.starts_with('/') || s.starts_with("//") {
+        return false;
+    }
+    if s.contains('\\') {
+        return false;
+    }
+    if s.chars().any(|c| c.is_control()) {
+        return false;
+    }
+    let path = s.split(['?', '#']).next().unwrap_or("");
+    !path.split('/').any(|seg| seg == "." || seg == "..")
+}
+
+/// Accept ONLY a single-slash absolute local path. Rejects protocol-relative
 /// (`//`), backslashes, control chars, encoded separators (`%2f`/`%5c`),
-/// userinfo/authority/scheme forms, and dot-segments. Empty ⇒ `/`. Pure so the
-/// unit vectors cover every rejection class.
+/// userinfo/authority/scheme forms, and dot-segments — INCLUDING their
+/// percent-encoded forms (`%2e`/`%2E`) and double-encoding tricks
+/// (`%252e`). Empty ⇒ `/`. Pure so the unit vectors cover every class.
 fn validate_redirect_to(raw: &str) -> Option<String> {
     if raw.is_empty() {
         return Some("/".to_string());
     }
-    if !raw.starts_with('/') || raw.starts_with("//") {
-        return None; // relative, or protocol-relative //host
-    }
-    if raw.contains('\\') {
-        return None; // backslash tricks (/\evil, \/\/)
-    }
-    if raw.chars().any(|c| c.is_control()) {
-        return None; // literal control characters
+    // Raw form must pass every class, plus the literal encoded-separator guard.
+    if !path_is_safe_local(raw) {
+        return None;
     }
     let lower = raw.to_ascii_lowercase();
     if lower.contains("%2f") || lower.contains("%5c") {
         return None; // encoded '/' or '\'
     }
-    // A single leading slash with no backslash cannot form //user@host or a
-    // scheme; the remaining risk is dot-segments in the path portion.
-    let path = raw.split(['?', '#']).next().unwrap_or("");
-    for seg in path.split('/') {
-        if seg == "." || seg == ".." {
-            return None;
-        }
+    // Percent-decoding tricks: decode once and twice. A malformed escape is
+    // refused; a difference between single- and double-decode means a
+    // double-encoded separator/dot is hiding (e.g. `/%252e%252e/x`).
+    let once = percent_decode_once(raw)?;
+    let twice = percent_decode_once(&once)?;
+    if once != twice {
+        return None;
+    }
+    // Re-run every rejection class on the DECODED form (catches `%2e`/`%2E`
+    // dot-segments and any decoded separator/control byte).
+    if !path_is_safe_local(&once) {
+        return None;
     }
     Some(raw.to_string())
 }
@@ -596,7 +711,7 @@ async fn fetch_json_ssrf(state: &AppState, url: &str) -> Result<Value, String> {
     let dev = dev_loopback(&state.cfg.public_url);
     let u = reqwest::Url::parse(url).map_err(|_| format!("'{url}' is not a valid URL"))?;
     validate_fetch_target(&u, dev).await?;
-    let res = state
+    let mut res = state
         .identity_http
         .get(url)
         .timeout(HTTP_TIMEOUT)
@@ -608,9 +723,32 @@ async fn fetch_json_ssrf(state: &AppState, url: &str) -> Result<Value, String> {
     if !res.status().is_success() {
         return Err(format!("fetch returned HTTP {}", res.status()));
     }
-    res.json::<Value>()
+    read_json_bounded(&mut res).await
+}
+
+/// Read a JSON body under the byte ceiling ENFORCED BEFORE full buffering: a
+/// declared `Content-Length` over the cap is refused up front, and the body is
+/// then read chunk-by-chunk with the running total re-checked, so a lying or
+/// absent length cannot smuggle an oversized document past the bound (design
+/// 806-814).
+async fn read_json_bounded(res: &mut reqwest::Response) -> Result<Value, String> {
+    if let Some(len) = res.content_length() {
+        if len > MAX_HTTP_BODY_BYTES as u64 {
+            return Err("identity response exceeds the size bound".into());
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = res
+        .chunk()
         .await
-        .map_err(|e| format!("response was not JSON: {e}"))
+        .map_err(|e| format!("response read failed: {e}"))?
+    {
+        if buf.len() + chunk.len() > MAX_HTTP_BODY_BYTES {
+            return Err("identity response exceeds the size bound".into());
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice::<Value>(&buf).map_err(|e| format!("response was not JSON: {e}"))
 }
 
 // ─── Discovery freshness (design 805-814) ───────────────────────────────────
@@ -618,9 +756,11 @@ async fn fetch_json_ssrf(state: &AppState, url: &str) -> Result<Value, String> {
 pub(crate) struct DiscoveryView {
     pub(crate) authorization_endpoint: String,
     pub(crate) token_endpoint: String,
-    #[allow(dead_code)]
     pub(crate) jwks_uri: String,
     pub(crate) jwks: Value,
+    /// The raw discovery metadata, retained so a forced JWKS refresh can
+    /// persist last-known-good via `update_idp_discovery_cache` (design 815-826).
+    pub(crate) meta: Value,
 }
 
 pub(crate) fn view_from(meta: &Value, jwks: Value) -> Result<DiscoveryView, String> {
@@ -635,6 +775,7 @@ pub(crate) fn view_from(meta: &Value, jwks: Value) -> Result<DiscoveryView, Stri
         token_endpoint: s("token_endpoint")?,
         jwks_uri: s("jwks_uri")?,
         jwks,
+        meta: meta.clone(),
     })
 }
 
@@ -660,6 +801,10 @@ pub(crate) async fn refresh_discovery(
         .and_then(Value::as_str)
         .ok_or("discovery document has no jwks_uri")?;
     let jwks = fetch_json_ssrf(state, jwks_uri).await?;
+    // Validate JWKS structure + key count + size BEFORE it can be cached
+    // (design 826-831): a malformed/oversized JWKS must fail save-time and
+    // start-time validation, not first fail at callback verification.
+    parse_jwks(&jwks)?;
     Ok((meta, jwks))
 }
 
@@ -802,23 +947,33 @@ mod verify {
             .and_then(|x| x.as_str().map(str::to_string))
     }
 
-    /// The key's `kid` as a plain string (openidconnect's `JsonWebKeyId` is an
-    /// opaque newtype without `Display`; it serializes to a JSON string).
-    fn key_id_str(k: &CoreJsonWebKey) -> Option<String> {
-        k.key_id()
-            .and_then(|id| serde_json::to_value(id).ok())
-            .and_then(|v| v.as_str().map(String::from))
+    /// The key's `kid`, read from the RAW JWK JSON (a string per RFC 7517).
+    fn key_id_str(jwk: &Jwk) -> Option<String> {
+        jwk.raw.get("kid").and_then(Value::as_str).map(String::from)
     }
 
-    /// `use=sig` (if present), constrained-`alg` (if present), and kty family
-    /// must all be compatible with the header alg.
-    fn key_compatible(alg_str: &str, key: &CoreJsonWebKey) -> bool {
-        if let Some(u) = key.key_use() {
-            if json_str(&serde_json::to_value(u).unwrap_or(Value::Null)).as_deref() == Some("enc") {
+    /// `use`/`key_ops` (from the RAW JWK, since the parsed key type may not
+    /// surface `key_ops`), the constrained parsed `alg` (if present), and the
+    /// kty family must all be compatible with the header alg (design 826-831).
+    pub(super) fn key_compatible(alg_str: &str, jwk: &Jwk) -> bool {
+        // `use`, when present, MUST be exactly "sig" (a signing key is never
+        // `enc`, and any other value is refused rather than waved through).
+        if let Some(u) = jwk.raw.get("use").and_then(Value::as_str) {
+            if u != "sig" {
                 return false;
             }
         }
-        if let JsonWebKeyAlgorithm::Algorithm(a) = key.signing_alg() {
+        // `key_ops`, when present, MUST contain "verify".
+        if let Some(ops) = jwk.raw.get("key_ops") {
+            let has_verify = ops
+                .as_array()
+                .map(|a| a.iter().any(|o| o.as_str() == Some("verify")))
+                .unwrap_or(false);
+            if !has_verify {
+                return false;
+            }
+        }
+        if let JsonWebKeyAlgorithm::Algorithm(a) = jwk.key.signing_alg() {
             if json_str(&serde_json::to_value(a).unwrap_or(Value::Null)).as_deref() != Some(alg_str)
             {
                 return false;
@@ -829,23 +984,18 @@ mod verify {
             "ES" => "EC",
             _ => return false,
         };
-        json_str(&serde_json::to_value(key.key_type()).unwrap_or(Value::Null)).as_deref()
+        json_str(&serde_json::to_value(jwk.key.key_type()).unwrap_or(Value::Null)).as_deref()
             == Some(want)
     }
 
     /// Select the signing key per design 815-831: kid → exact match (ambiguous
     /// ⇒ Terminal, missing ⇒ NoKey); kid-less ⇒ exactly one compatible key
     /// (zero ⇒ NoKey, multiple ⇒ Terminal).
-    fn select_key<'a>(
-        alg_str: &str,
-        kid: Option<&str>,
-        keys: &'a [CoreJsonWebKey],
-    ) -> Result<&'a CoreJsonWebKey, Error> {
-        let compat: Vec<&CoreJsonWebKey> =
-            keys.iter().filter(|k| key_compatible(alg_str, k)).collect();
+    fn select_key<'a>(alg_str: &str, kid: Option<&str>, keys: &'a [Jwk]) -> Result<&'a Jwk, Error> {
+        let compat: Vec<&Jwk> = keys.iter().filter(|k| key_compatible(alg_str, k)).collect();
         match kid {
             Some(kid) => {
-                let matched: Vec<&CoreJsonWebKey> = compat
+                let matched: Vec<&Jwk> = compat
                     .into_iter()
                     .filter(|k| key_id_str(k).as_deref() == Some(kid))
                     .collect();
@@ -865,8 +1015,42 @@ mod verify {
         }
     }
 
-    fn as_i64(v: &Value, k: &str) -> Option<i64> {
-        v.get(k).and_then(Value::as_i64)
+    // ─── Strictly-typed claim accessors (design 529-538, fail-closed) ─────────
+    // A PRESENT-but-wrong-typed optional claim is a REJECTION, never silently
+    // treated as absent. `null` counts as absent (JSON's explicit absence).
+
+    /// An optional string claim: absent/`null` ⇒ `None`; a non-string value ⇒
+    /// error.
+    fn opt_str<'a>(payload: &'a Value, k: &str) -> Result<Option<&'a str>, Error> {
+        match payload.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.as_str())),
+            Some(_) => Err(Error::Terminal(format!("claim '{k}' must be a string"))),
+        }
+    }
+
+    /// A required integer claim: absent ⇒ error; non-integer ⇒ error.
+    fn req_i64(payload: &Value, k: &str) -> Result<i64, Error> {
+        match payload.get(k) {
+            Some(Value::Number(n)) => n
+                .as_i64()
+                .ok_or_else(|| Error::Terminal(format!("claim '{k}' must be an integer"))),
+            Some(_) => Err(Error::Terminal(format!("claim '{k}' must be a number"))),
+            None => Err(Error::Terminal(format!("id token has no {k}"))),
+        }
+    }
+
+    /// An optional integer claim: absent/`null` ⇒ `None`; non-integer ⇒ error.
+    fn opt_i64(payload: &Value, k: &str) -> Result<Option<i64>, Error> {
+        match payload.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Number(n)) => {
+                Ok(Some(n.as_i64().ok_or_else(|| {
+                    Error::Terminal(format!("claim '{k}' must be an integer"))
+                })?))
+            }
+            Some(_) => Err(Error::Terminal(format!("claim '{k}' must be a number"))),
+        }
     }
 
     /// Every claim rule from design step 5 + fail-closed edges 815-841, minus
@@ -877,24 +1061,31 @@ mod verify {
         if payload.get("iss").and_then(Value::as_str) != Some(inp.issuer) {
             return Err(t("issuer mismatch"));
         }
-        // aud contains client_id; multi-aud requires azp == client_id.
+        // aud contains client_id; a non-string entry in the aud ARRAY rejects
+        // (never dropped) — a present-but-malformed aud must fail closed.
         let auds: Vec<String> = match payload.get("aud") {
             Some(Value::String(s)) => vec![s.clone()],
-            Some(Value::Array(a)) => a
-                .iter()
-                .filter_map(Value::as_str)
-                .map(String::from)
-                .collect(),
+            Some(Value::Array(a)) => {
+                let mut v = Vec::with_capacity(a.len());
+                for e in a {
+                    match e.as_str() {
+                        Some(s) => v.push(s.to_string()),
+                        None => return Err(t("aud array contains a non-string entry")),
+                    }
+                }
+                v
+            }
             _ => return Err(t("id token has no audience")),
         };
         if !auds.iter().any(|a| a == inp.client_id) {
             return Err(t("audience does not include this client"));
         }
-        let azp = payload.get("azp").and_then(Value::as_str);
+        // azp: present ⇒ must be a string AND equal client_id (multi-aud makes
+        // it required). A non-string azp rejects rather than reading as absent.
+        let azp = opt_str(payload, "azp")?;
         if auds.len() > 1 && azp != Some(inp.client_id) {
             return Err(t("multi-audience token requires azp == client_id"));
         }
-        // azp, if present at all, must equal client_id.
         if let Some(azp) = azp {
             if azp != inp.client_id {
                 return Err(t("azp does not equal this client"));
@@ -902,30 +1093,30 @@ mod verify {
         }
         let now = inp.now.timestamp();
         let skew = inp.skew_secs;
-        // exp with skew.
-        let exp = as_i64(payload, "exp").ok_or_else(|| t("id token has no exp"))?;
+        // exp with skew (present-but-non-numeric rejects).
+        let exp = req_i64(payload, "exp")?;
         if now >= exp + skew {
             return Err(t("id token is expired"));
         }
-        // nbf with skew, if present.
-        if let Some(nbf) = as_i64(payload, "nbf") {
+        // nbf with skew, if present (present-but-non-numeric rejects).
+        if let Some(nbf) = opt_i64(payload, "nbf")? {
             if now < nbf - skew {
                 return Err(t("id token is not yet valid (nbf)"));
             }
         }
-        // iat bound to the flow lifetime.
-        let iat = as_i64(payload, "iat").ok_or_else(|| t("id token has no iat"))?;
+        // iat bound to the flow lifetime (present-but-non-numeric rejects).
+        let iat = req_i64(payload, "iat")?;
         let lo = inp.flow_created_at.timestamp() - skew;
         let hi = now + skew;
         if iat < lo || iat > hi {
             return Err(t("id token iat is outside the flow window"));
         }
-        // nonce equals the stored nonce.
-        if payload.get("nonce").and_then(Value::as_str) != Some(inp.nonce) {
+        // nonce equals the stored nonce (present-but-non-string rejects).
+        if opt_str(payload, "nonce")? != Some(inp.nonce) {
             return Err(t("nonce mismatch"));
         }
-        // sub present, nonempty, ≤255 bytes.
-        let sub = payload.get("sub").and_then(Value::as_str).unwrap_or("");
+        // sub present, nonempty, ≤255 bytes (present-but-non-string rejects).
+        let sub = opt_str(payload, "sub")?.unwrap_or("");
         if sub.is_empty() || sub.len() > 255 {
             return Err(t("subject is missing or too long"));
         }
@@ -935,11 +1126,7 @@ mod verify {
     /// Verify an ID token against a specific JWKS. Called once with the cached
     /// keys; the caller retries once with force-refreshed keys on `NoKey` or
     /// `BadSignature`.
-    pub fn verify(
-        inp: &Inputs,
-        id_token: &str,
-        keys: &[CoreJsonWebKey],
-    ) -> Result<Verified, Error> {
+    pub fn verify(inp: &Inputs, id_token: &str, keys: &[Jwk]) -> Result<Verified, Error> {
         let mut parts = id_token.split('.');
         let (h, p, s) = match (parts.next(), parts.next(), parts.next(), parts.next()) {
             (Some(h), Some(p), Some(s), None) => (h, p, s),
@@ -962,14 +1149,17 @@ mod verify {
             .map_err(|_| Error::Terminal("bad JWT payload".into()))?;
         let subject = check_claims(&payload, inp)?;
 
-        let key = select_key(&alg_str, kid.as_deref(), keys)?;
+        let jwk = select_key(&alg_str, kid.as_deref(), keys)?;
         let signing_input = format!("{h}.{p}");
         let sig = b64(s)?;
-        key.verify_signature(&alg, signing_input.as_bytes(), &sig)
+        jwk.key
+            .verify_signature(&alg, signing_input.as_bytes(), &sig)
             .map_err(|_| Error::BadSignature)?;
 
-        // at_hash: verified when present; present-with-no-access-token fails.
-        if let Some(at_hash) = payload.get("at_hash").and_then(Value::as_str) {
+        // at_hash: verified when present; a present-but-non-string at_hash
+        // rejects (never treated as absent), and present-with-no-access-token
+        // fails.
+        if let Some(at_hash) = opt_str(&payload, "at_hash")? {
             if inp.access_token.is_empty() {
                 return Err(Error::Terminal(
                     "at_hash present but no access token".into(),
@@ -978,7 +1168,7 @@ mod verify {
             let computed = AccessTokenHash::from_token(
                 &AccessToken::new(inp.access_token.to_string()),
                 &alg,
-                key,
+                &jwk.key,
             )
             .map_err(|_| Error::Terminal("could not compute at_hash".into()))?;
             if computed != AccessTokenHash::new(at_hash.to_string()) {
@@ -1025,7 +1215,7 @@ async fn verify_with_jwks(
             }
         }
     }
-    let fresh = state.oidc.force_refresh(state, key, &view.jwks_uri).await?;
+    let fresh = state.oidc.force_refresh(state, key, view).await?;
     match verify::verify(inp, id_token, &fresh.keys) {
         Ok(v) => Ok(v),
         // Only a still-unknown kid (no matching key after the refresh) is
@@ -1283,10 +1473,13 @@ pub async fn start(
         &browser_hash,
         &redirect_to,
         LOGIN_FLOW_TTL_SECS,
+        MAX_OUTSTANDING_FLOWS_PER_ORG,
     )
     .await
     {
-        Ok(id) => id,
+        Ok(Some(id)) => id,
+        // Over the outstanding-flow cap (checked atomically with the insert).
+        Ok(None) => return too_many(),
         Err(_) => return neutral_unavailable(),
     };
 
@@ -1348,6 +1541,20 @@ fn refuse_page(msg: &str) -> Response {
     )
 }
 
+/// A terminal refusal that ALSO clears the per-flow login cookie. Every
+/// callback failure AFTER transaction A consumed the flow uses this — the flow
+/// is spent, so its cookie must not linger (design 581-582). Pre-claim
+/// refusals keep the cookie (the flow is still claimable).
+fn refuse_page_clearing(msg: &str, login_cookie: &str) -> Response {
+    page(
+        StatusCode::BAD_REQUEST,
+        "Sign in failed",
+        &format!("<p>{}</p>", html_escape(msg)),
+        "default-src 'none'; style-src 'unsafe-inline'",
+        &[clear_cookie(login_cookie)],
+    )
+}
+
 /// `GET /v1/auth/callback` — design steps 1-11, two-phase (transaction A = the
 /// one-time flow claim, committed before any external I/O; token exchange +
 /// verification hold NO DB transaction; transaction B = provisioning + session
@@ -1384,6 +1591,20 @@ pub async fn callback(
     };
     let scope = TenantScope::assume(ls.tenant_id);
 
+    // Per-org callback rate limit (design 494-496, 849-854): now that
+    // open_state has named the org, bound provisioning amplification per org —
+    // the per-IP bucket above already covers the org-agnostic surface.
+    if !state
+        .oidc
+        .allow(
+            &format!("cb-org:{}", ls.tenant_id),
+            RATE_PER_ORG_CALLBACK_PER_MIN,
+        )
+        .await
+    {
+        return too_many();
+    }
+
     // (2) read the per-flow cookie; duplicates refuse.
     let login_cookie = login_cookie_name(ls.flow_id);
     let nonce_cookie = match cookie_values(&headers, &login_cookie).as_slice() {
@@ -1418,19 +1639,26 @@ pub async fn callback(
     };
 
     // Load the config + ensure discovery (token endpoint + jwks). NO DB txn held.
+    // Everything from here is POST-CLAIM: the flow is spent, so every terminal
+    // refusal below also clears the login cookie (design 581-582).
     let config = match identity::get_idp_config(&state.pool, scope, ls.idp_config_id).await {
         Ok(Some(c)) => c,
-        _ => return refuse_page("Sign-in failed."),
+        _ => return refuse_page_clearing("Sign-in failed.", &login_cookie),
     };
     let view = match ensure_discovery(&state, scope, &config).await {
         Ok(v) => v,
-        Err(_) => return refuse_page("The identity provider is temporarily unavailable."),
+        Err(_) => {
+            return refuse_page_clearing(
+                "The identity provider is temporarily unavailable.",
+                &login_cookie,
+            )
+        }
     };
 
     // (4) token exchange — unseal PKCE verifier; auth per validated method.
     let verifier = match sealer.open(&claim.pkce_verifier_sealed) {
         Ok(v) => v,
-        Err(_) => return refuse_page("Sign-in failed."),
+        Err(_) => return refuse_page_clearing("Sign-in failed.", &login_cookie),
     };
     let tokens = match token_exchange(
         &state,
@@ -1443,7 +1671,7 @@ pub async fn callback(
     .await
     {
         Ok(t) => t,
-        Err(e) => return refuse_page(&e),
+        Err(e) => return refuse_page_clearing(&e, &login_cookie),
     };
 
     // (5) verify the ID token.
@@ -1461,33 +1689,56 @@ pub async fn callback(
     let verified = match verify_with_jwks(&state, jwks_key, &view, &inputs, &tokens.id_token).await
     {
         Ok(v) => v,
-        Err(e) => return refuse_page(&e),
+        Err(e) => return refuse_page_clearing(&e, &login_cookie),
     };
 
     // (6) map claims; apply require_email_verified.
     let identity_claims = map_claims(&verified.claims, &config.claim_mappings);
     if require_email_verified(&config.claim_mappings) && !identity_claims.email_verified {
-        return refuse_page("Your email address is not verified with the identity provider.");
+        return refuse_page_clearing(
+            "Your email address is not verified with the identity provider.",
+            &login_cookie,
+        );
     }
 
     // Authentication context is carried verbatim from the ID token (its mere
     // presence proves nothing — the operator maps acr/amr to assurance later).
-    let acr = verified
-        .claims
-        .get("acr")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let amr: Vec<String> = verified
-        .claims
-        .get("amr")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default();
+    // A PRESENT-but-malformed acr/amr rejects, never reads as absent (design
+    // 529-538, fail-closed).
+    let acr = match verified.claims.get("acr") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => {
+            return refuse_page_clearing(
+                "The identity provider returned a malformed acr claim.",
+                &login_cookie,
+            )
+        }
+    };
+    let amr: Vec<String> = match verified.claims.get("amr") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(a)) => {
+            let mut v = Vec::with_capacity(a.len());
+            for e in a {
+                match e.as_str() {
+                    Some(s) => v.push(s.to_string()),
+                    None => {
+                        return refuse_page_clearing(
+                            "The identity provider returned a malformed amr claim.",
+                            &login_cookie,
+                        )
+                    }
+                }
+            }
+            v
+        }
+        Some(_) => {
+            return refuse_page_clearing(
+                "The identity provider returned a malformed amr claim.",
+                &login_cookie,
+            )
+        }
+    };
     let auth_time = verified
         .claims
         .get("auth_time")
@@ -1533,8 +1784,9 @@ pub async fn callback(
         Ok(Provision::PendingSwitch { switch_id }) => {
             confirmation_page(switch_id, &switch_nonce, &login_cookie)
         }
-        Ok(Provision::Refused(msg)) => refuse_page(&msg),
-        Err(_) => refuse_page("Sign-in failed."),
+        // Post-claim provisioning refusals clear the spent login cookie too.
+        Ok(Provision::Refused(msg)) => refuse_page_clearing(&msg, &login_cookie),
+        Err(_) => refuse_page_clearing("Sign-in failed.", &login_cookie),
     }
 }
 
@@ -2042,6 +2294,13 @@ mod tests {
             "/foo%5cbar",          // encoded backslash
             "relative/path",       // not absolute
             "/foo\u{0007}bar",     // control char
+            "/%2e%2e/x",           // encoded dot-segment (%2e = '.')
+            "/%2E%2E/x",           // encoded dot-segment upper
+            "/a/%2e%2e/b",         // encoded dot-segment mid-path
+            "/%2e/x",              // encoded single-dot segment
+            "/%252e%252e/x",       // DOUBLE-encoded dot-segment
+            "/foo%",               // malformed percent escape
+            "/foo%zz",             // non-hex percent escape
         ] {
             assert!(validate_redirect_to(bad).is_none(), "must reject {bad:?}");
         }
@@ -2208,8 +2467,14 @@ uIATiz1iFxtbjHI9UNGig2aiz3j22PuZSNeJqpxryrgzfWd1s828kecc31+KEIP6
         }
     }
 
-    fn keys(tk: &Tk) -> Vec<CoreJsonWebKey> {
+    fn keys(tk: &Tk) -> Vec<Jwk> {
         parse_jwks(&tk.jwks).unwrap()
+    }
+
+    /// Build a `Jwk` from a raw JWK JSON object (for `use`/`key_ops` vectors).
+    fn jwk_from_raw(raw: Value) -> Jwk {
+        let set = json!({ "keys": [raw] });
+        parse_jwks(&set).unwrap().pop().unwrap()
     }
 
     #[test]
@@ -2341,6 +2606,89 @@ uIATiz1iFxtbjHI9UNGig2aiz3j22PuZSNeJqpxryrgzfWd1s828kecc31+KEIP6
             verify::verify(&inp, &tok, &keys(&tk)),
             Err(verify::Error::Terminal(_))
         ));
+        // at_hash present but NON-STRING (a number) → Terminal, never absent.
+        let mut c = base_claims(now);
+        c["at_hash"] = json!(12345);
+        let tok = mint(&tk, Some("k1"), Algorithm::RS256, &c);
+        assert!(matches!(
+            verify::verify(&inputs(&allow, now), &tok, &keys(&tk)),
+            Err(verify::Error::Terminal(_))
+        ));
+    }
+
+    // ─── fix 5: JWK use / key_ops selection (design 826-831) ───────────────
+    #[test]
+    fn key_use_and_key_ops_selection() {
+        // use=sig, key_ops=[verify] → compatible.
+        let ok = jwk_from_raw(json!({
+            "kty":"RSA","use":"sig","key_ops":["verify"],"alg":"RS256",
+            "kid":"k1","n":TEST_JWK_N,"e":"AQAB"
+        }));
+        assert!(verify::key_compatible("RS256", &ok));
+        // use=enc → refused.
+        let enc = jwk_from_raw(json!({
+            "kty":"RSA","use":"enc","alg":"RS256","kid":"k1","n":TEST_JWK_N,"e":"AQAB"
+        }));
+        assert!(!verify::key_compatible("RS256", &enc));
+        // use is some other value (not "sig") → refused, never waved through.
+        let other = jwk_from_raw(json!({
+            "kty":"RSA","use":"tls","alg":"RS256","kid":"k1","n":TEST_JWK_N,"e":"AQAB"
+        }));
+        assert!(!verify::key_compatible("RS256", &other));
+        // key_ops present WITHOUT "verify" → refused.
+        let noverify = jwk_from_raw(json!({
+            "kty":"RSA","key_ops":["encrypt"],"alg":"RS256","kid":"k1",
+            "n":TEST_JWK_N,"e":"AQAB"
+        }));
+        assert!(!verify::key_compatible("RS256", &noverify));
+        // no use / no key_ops (only kty+alg) → still compatible.
+        let bare = jwk_from_raw(json!({
+            "kty":"RSA","alg":"RS256","kid":"k1","n":TEST_JWK_N,"e":"AQAB"
+        }));
+        assert!(verify::key_compatible("RS256", &bare));
+    }
+
+    // ─── fix 6: present-but-malformed optional claims fail closed ──────────
+    #[test]
+    fn malformed_optional_claims_reject() {
+        let now = Utc::now().timestamp();
+        let allow = vec!["RS256".to_string()];
+        let tk = rsa_test_key("k1");
+        let bad = |c: Value| {
+            let tok = mint(&tk, Some("k1"), Algorithm::RS256, &c);
+            assert!(
+                verify::verify(&inputs(&allow, now), &tok, &keys(&tk)).is_err(),
+                "must reject {c}"
+            );
+        };
+        // azp as a number.
+        let mut c = base_claims(now);
+        c["azp"] = json!(7);
+        bad(c);
+        // aud array with a non-string entry.
+        let mut c = base_claims(now);
+        c["aud"] = json!(["client-abc", 9]);
+        bad(c);
+        // nbf as a string.
+        let mut c = base_claims(now);
+        c["nbf"] = json!("soon");
+        bad(c);
+        // exp as a string.
+        let mut c = base_claims(now);
+        c["exp"] = json!("later");
+        bad(c);
+        // iat as a boolean.
+        let mut c = base_claims(now);
+        c["iat"] = json!(true);
+        bad(c);
+        // nonce as a number.
+        let mut c = base_claims(now);
+        c["nonce"] = json!(1);
+        bad(c);
+        // sub as a number.
+        let mut c = base_claims(now);
+        c["sub"] = json!(42);
+        bad(c);
     }
 
     #[test]
