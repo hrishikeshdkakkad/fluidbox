@@ -52,13 +52,14 @@ describe("webMode", () => {
     expect(webMode("sso")).toBe("sso");
   });
 
-  it("stays admin for unset/absent (the documented local default)", () => {
+  it("stays admin ONLY for an absent variable (the documented local default)", () => {
     expect(webMode(undefined)).toBe("admin");
-    expect(webMode("")).toBe("admin");
     expect(webMode("admin")).toBe("admin");
   });
 
-  it("THROWS on any other value — a hosted typo must never become admin", () => {
+  it("THROWS on any other value — incl. a SET-but-empty string — never admin", () => {
+    // A SET-but-empty value is a misconfiguration, not the local default.
+    expect(() => webMode("")).toThrow();
     expect(() => webMode("SSO")).toThrow();
     expect(() => webMode("typo")).toThrow();
     expect(() => webMode("anything-else")).toThrow();

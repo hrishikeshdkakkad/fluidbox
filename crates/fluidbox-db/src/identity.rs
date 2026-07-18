@@ -1667,6 +1667,15 @@ pub async fn arm_bootstrap_owner(
 /// Apply a mutable-field patch (+ optional bootstrap re-arm) to an IdP config in
 /// one transaction, audited as `idp.patch`. Identity-field changes never reach
 /// here (the handler refuses them). A refused re-arm rolls back the whole patch.
+///
+/// The auth/secret COHERENCE check runs HERE, under the config row's `FOR UPDATE`
+/// lock, against the freshly-read current row: a confidential method
+/// (`client_secret_basic`/`post`) requires a secret present post-merge; a public
+/// client (`none`) must not retain one. Reading current state before the lock (as
+/// the handler once did) let two concurrent PATCHes each validate against stale
+/// state and commit an incoherent auth/secret pair; merging under the lock closes
+/// that. An incoherent merge is a `Refused` outcome (rolled back). The handler
+/// keeps only request-shape validation (valid method, method advertised, etc.).
 pub async fn patch_idp_config(
     pool: &PgPool,
     scope: TenantScope,
@@ -1675,17 +1684,51 @@ pub async fn patch_idp_config(
     source_ip: Option<&str>,
 ) -> sqlx::Result<LifecycleOutcome<OrgIdpConfigRow>> {
     let mut tx = pool.begin().await?;
-    let locked: Option<(String,)> = sqlx::query_as(
-        "select status from org_idp_configs where tenant_id = $1 and id = $2 for update",
+    // Lock the row and capture the CURRENT auth method + whether a sealed secret
+    // is present, so the coherence merge below reads consistent, locked state.
+    let locked: Option<(String, bool)> = sqlx::query_as(
+        "select token_endpoint_auth, client_secret_sealed is not null
+         from org_idp_configs where tenant_id = $1 and id = $2 for update",
     )
     .bind(scope.tenant_id())
     .bind(id)
     .fetch_optional(&mut *tx)
     .await?;
-    if locked.is_none() {
+    let Some((cur_auth, has_secret_now)) = locked else {
         tx.rollback().await.ok();
         return Ok(LifecycleOutcome::NotFound);
+    };
+
+    // Coherence AFTER merging the tri-state secret + optional new method against
+    // the LOCKED current row. Borrow `patch.client_secret` here (the move-match
+    // for the UPDATE comes after).
+    let secret_present_post = match &patch.client_secret {
+        SecretPatch::Set(_) => true,
+        SecretPatch::Clear => false,
+        SecretPatch::Keep => has_secret_now,
+    };
+    let eff_auth = patch.token_endpoint_auth.unwrap_or(cur_auth.as_str());
+    if (eff_auth == "client_secret_basic" || eff_auth == "client_secret_post")
+        && !secret_present_post
+    {
+        tx.rollback().await.ok();
+        return Ok(LifecycleOutcome::Refused(match eff_auth {
+            "client_secret_post" => {
+                "token_endpoint_auth=client_secret_post requires a client_secret to be present after this patch"
+            }
+            _ => {
+                "token_endpoint_auth=client_secret_basic requires a client_secret to be present after this patch"
+            }
+        }));
     }
+    if eff_auth == "none" && secret_present_post {
+        tx.rollback().await.ok();
+        return Ok(LifecycleOutcome::Refused(
+            "token_endpoint_auth=none (public client) must not retain a client_secret; \
+             clear it explicitly with client_secret:null",
+        ));
+    }
+
     // Client-secret tri-state: Clear ⇒ null; Set ⇒ new sealed bytes; Keep ⇒
     // coalesce($3 = null) leaves the current value. `coalesce` alone cannot
     // express Clear, so a `$4::bool` flag forces null ahead of the coalesce.
@@ -1783,22 +1826,14 @@ pub async fn deactivate_membership_audited(
     let mut tx = pool.begin().await?;
     // Deactivating an OWNER frees the org for a bootstrap re-arm, so it must
     // serialize with arming/consumption/role-changes on the SAME config lock as
-    // the roles-change path. Lock order is config → membership → sessions,
-    // consistent with login transaction B, the issuer-migration swap, and the
-    // org-switch: take the config lock BEFORE the membership status change + its
-    // session/PAT cascade. A non-owner deactivation touches no owner invariant,
-    // so it skips the lock. The owner read below precedes the status change (the
-    // roles are still the current set).
-    let holds_owner: Option<bool> = sqlx::query_scalar(
-        "select 'owner' = any(roles) from org_memberships where tenant_id = $1 and id = $2",
-    )
-    .bind(scope.tenant_id())
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if holds_owner.unwrap_or(false) {
-        lock_org_configs(&mut tx, scope).await?;
-    }
+    // the roles-change path. Take `lock_org_configs` FIRST, UNCONDITIONALLY
+    // (config → membership → sessions order, consistent with login transaction B,
+    // the issuer-migration swap, and the org-switch). Gating the lock on a prior
+    // owner-status read raced a concurrent owner GRANT landing between the read
+    // and this deactivation — the grant would slip past serialization and the
+    // deactivation would not lock. The lock is cheap (the org's handful of config
+    // rows), so we always take it and then read/mutate the membership under it.
+    lock_org_configs(&mut tx, scope).await?;
     let row = apply_membership_status(&mut tx, scope, id, "deactivated").await?;
     match &row {
         Some(m) => {
@@ -3562,5 +3597,145 @@ mod tests {
         assert_eq!(pats_b.len(), 1, "B lists its own PAT");
         assert!(secret_b.is_some(), "B reads its own sealed client secret");
         assert!(revoke_b, "B revokes its own live session");
+    }
+
+    /// Interleaving evidence for the migration-vs-login-B serialization the
+    /// identity-e2e migration section cites but cannot barrier from a black-box
+    /// HTTP client. Two POOL CONNECTIONS, bounded by timeouts so CI can never
+    /// hang:
+    ///
+    /// (1) login-B holds the config lock (`lock_idp_config_for_update`, the same
+    ///     `FOR UPDATE` a real transaction B opens with); a concurrent
+    ///     `migrate_idp_config` (which takes `lock_org_configs` over the same
+    ///     rows) must BLOCK until B commits — proven by a 500ms `timeout`
+    ///     ELAPSING while B holds, then the swap completing once B releases.
+    /// (2) the REVERSE ordering: after the swap the old config is `retired`, so a
+    ///     login-B status recheck that locks it reads `retired` and would refuse
+    ///     (a real transaction B admits only an `active` config).
+    #[tokio::test]
+    async fn migration_and_login_b_serialize_on_config_lock() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let pool2 = connect(&url).await.expect("connect 2");
+
+        let slug = format!("t-{}", Uuid::now_v7().simple());
+        let org = create_org(&pool, &slug, None).await.unwrap();
+        let scope = TenantScope::assume(org.id);
+        let cfg1 = staged_config(&pool, scope).await; // generation 1
+        let cfg2 = staged_config(&pool, scope).await; // generation 2 (the replacement)
+                                                      // Copy the ids out so the spawned task captures only `Copy` Uuids, leaving
+                                                      // `cfg1` usable in the reverse-ordering recheck below.
+        let (cfg1_id, cfg2_id) = (cfg1.id, cfg2.id);
+        activate(&pool, cfg1_id).await;
+
+        // conn1 = login-B's opening lock on the active config1.
+        let mut tx1 = pool.begin().await.unwrap();
+        let locked = lock_idp_config_for_update(&mut tx1, scope, cfg1_id)
+            .await
+            .unwrap()
+            .expect("config1 locks for B");
+        assert_eq!(locked.config_status, "active");
+
+        // conn2 = a concurrent migrate. Spawn it; it must NOT finish while tx1
+        // holds the config lock. `&mut handle` keeps the task alive across the
+        // timeout so it can be awaited after tx1 commits.
+        let mut handle = tokio::spawn(async move {
+            migrate_idp_config(&pool2, scope, cfg1_id, cfg2_id, false, None).await
+        });
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut handle).await;
+        assert!(
+            blocked.is_err(),
+            "migrate BLOCKS while login-B holds the config lock (500ms timeout elapsed)"
+        );
+
+        // Release B's lock; the swap now proceeds and succeeds.
+        tx1.commit().await.unwrap();
+        let swapped = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("migrate completes once the lock releases")
+            .expect("migrate task joined")
+            .expect("migrate returns Ok");
+        assert!(
+            matches!(swapped, LifecycleOutcome::Done(_)),
+            "swap succeeds after B commits"
+        );
+
+        // Reverse ordering: the swap ran first, so config1 is now retired. A
+        // login-B status recheck locks it and reads a non-active status — a real
+        // transaction B refuses any config that is not active.
+        let mut tx = pool.begin().await.unwrap();
+        let post = lock_idp_config_for_update(&mut tx, scope, cfg1_id)
+            .await
+            .unwrap()
+            .expect("config1 row still present post-swap");
+        assert_eq!(
+            post.config_status, "retired",
+            "post-swap config1 is retired → a login-B recheck refuses it"
+        );
+        tx.commit().await.unwrap();
+
+        cleanup_tenant(&pool, org.id).await;
+    }
+
+    /// The concurrent bootstrap-owner claim has EXACTLY ONE winner (design lines
+    /// 683-690). Two logins race the consume-arm UPDATE for the same armed email
+    /// on two connections; the row lock serializes them, so exactly one clears
+    /// the arm (`Some`) and the other sees the now-null email and matches nothing
+    /// (`None`). Bounded by a timeout so a lock-ordering regression fails fast
+    /// instead of hanging CI.
+    #[tokio::test]
+    async fn concurrent_bootstrap_arm_has_a_single_winner() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let pool_a = connect(&url).await.expect("connect a");
+        let pool_b = connect(&url).await.expect("connect b");
+
+        let slug = format!("t-{}", Uuid::now_v7().simple());
+        let org = create_org(&pool, &slug, None).await.unwrap();
+        let scope = TenantScope::assume(org.id);
+        // staged_config arms bootstrap_owner_email = owner@example.com.
+        let cfg = staged_config(&pool, scope).await;
+        activate(&pool, cfg.id).await;
+
+        // Each racer runs the consume-arm UPDATE in its OWN transaction so the
+        // row lock is held until commit — the DB serializes the two.
+        async fn race_consume(pool: PgPool, scope: TenantScope, cfg_id: Uuid) -> Option<Uuid> {
+            let mut tx = pool.begin().await.unwrap();
+            let r = consume_bootstrap_arm(&mut tx, scope, cfg_id, "owner@example.com")
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            r
+        }
+        let (ra, rb) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            tokio::join!(
+                race_consume(pool_a, scope, cfg.id),
+                race_consume(pool_b, scope, cfg.id),
+            )
+        })
+        .await
+        .expect("bootstrap race completes within the bound");
+
+        assert_eq!(
+            ra.is_some() as u8 + rb.is_some() as u8,
+            1,
+            "exactly one login consumes the arm (single winner)"
+        );
+
+        // The arm is cleared exactly once.
+        let after = get_idp_config(&pool, scope, cfg.id).await.unwrap().unwrap();
+        assert!(
+            after.bootstrap_owner_email.is_none(),
+            "the arm is consumed (cleared)"
+        );
+
+        cleanup_tenant(&pool, org.id).await;
     }
 }

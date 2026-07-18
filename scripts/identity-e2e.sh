@@ -561,7 +561,12 @@ say "(k) Issuer migration — mid-flight login fails closed; old session dies"
 # barriered from outside the process (no HTTP seam pauses B mid-transaction); it
 # is guaranteed instead by the shared `FOR UPDATE` config lock both take
 # (login's `lock_idp_config_for_update` vs the swap's `lock_org_configs`) and is
-# DB-tested directly in fluidbox-db (`identity.rs`). No new test code here.
+# proven directly in fluidbox-db by two interleaving tests (identity.rs):
+# `migration_and_login_b_serialize_on_config_lock` (login-B holds the config lock
+# → a concurrent migrate BLOCKS on a 500ms timeout until B commits, then swaps;
+# and the reverse — a post-swap B status recheck on the now-retired config is
+# refused) and `concurrent_bootstrap_arm_has_a_single_winner` (two logins race
+# the consume-arm UPDATE → exactly one wins). No new test code here.
 # A FRESH alice/config1 session (alice's membership is still active — the switch
 # only revoked one of her sessions, jarA's shared token). This one proves the
 # swap revokes config1 sessions.
@@ -642,12 +647,44 @@ SID=$(db "insert into sessions
   returning id")
 if [ -n "$SID" ]; then
   ok "seeded a cookie-reachable session fixture ($SID)"
-  # Open the stream in the background with alice's (owner) cookie.
+  # Seed ONE timeline event so a freshly-opened stream FLUSHES an SSE data line
+  # immediately. This fixture has no lifecycle; without an event the first bytes
+  # over the wire would be a 15s keep-alive comment, and "did the stream
+  # establish?" could not be told apart from a reset-at-open. append_event
+  # assigns the per-session seq and notifies, exactly like a real event.
+  db "select append_event('$SID', gen_random_uuid(), 'operator', 'session.note', '{}'::jsonb, now())" >/dev/null
+
+  # A CONTROL stream by a STILL-ACTIVE reader in the same org: carol is a member,
+  # so grant her a read_all role (admin). Her LIVE session picks it up (a session's
+  # roles are joined live from the membership on every request), so no re-login is
+  # needed. This stream must STAY OPEN when alice's closes — the witness that the
+  # close is deactivation-specific, not an unconditionally short-lived / globally
+  # capped stream.
+  admin_get "/v1/admin/orgs/$SLUG/members"
+  CAROLMID=$(echo "$BODY" | python3 -c "
+import sys,json
+rows=[m for m in json.load(sys.stdin).get('members',[]) if m.get('email')=='$U3' and m.get('membership_status')=='active']
+print(rows[0]['membership_id'] if rows else '')" 2>/dev/null)
+  admin_post "/v1/admin/orgs/$SLUG/members/$CAROLMID/roles" '{"roles":["member","admin"]}'
+  [ "$CODE" = 200 ] && ok "granted carol a read_all (admin) role for the control stream" || no "carol role grant → $CODE: $BODY"
+  : > "$WORK/sse_ctl.out"
+  ( curl -s -N --max-time 30 -b "$jarL" "$API/v1/sessions/$SID/events/stream" > "$WORK/sse_ctl.out" 2>/dev/null ) &
+  CTL_PID=$!
+
+  # The stream UNDER TEST: alice (owner) — this one must CLOSE on her deactivation.
+  : > "$WORK/sse.out"
   ( curl -s -N --max-time 30 -b "$jarK2" "$API/v1/sessions/$SID/events/stream" > "$WORK/sse.out" 2>/dev/null ) &
   SSE_PID=$!
   sleep 2
-  if kill -0 "$SSE_PID" 2>/dev/null; then ok "SSE stream open and following"; else no "SSE stream closed before deactivation"; fi
-  # Deactivate alice mid-stream; the reauth loop (2s) must break the stream.
+
+  # (a) ESTABLISHMENT: the stream must have actually opened AND flushed the seeded
+  # event before we deactivate. A reset-at-open (000 / immediate close) leaves the
+  # capture empty and fails HERE, not as a spurious "closed within bound" pass.
+  if kill -0 "$SSE_PID" 2>/dev/null; then ok "alice's SSE stream open and following"; else no "alice's SSE stream closed before deactivation"; fi
+  grep -q '^data:' "$WORK/sse.out" && ok "alice's stream ESTABLISHED (flushed an SSE data line pre-deactivation)" || no "alice's stream produced no SSE data line (reset-at-open?): $(head -c120 "$WORK/sse.out")"
+  grep -q '^data:' "$WORK/sse_ctl.out" && ok "control (carol) stream ESTABLISHED" || no "control stream produced no SSE data line: $(head -c120 "$WORK/sse_ctl.out")"
+
+  # Deactivate alice mid-stream; the reauth loop (2s) must break HER stream.
   admin_get "/v1/admin/orgs/$SLUG/members"
   ALMID=$(echo "$BODY" | python3 -c "
 import sys,json
@@ -655,17 +692,28 @@ rows=[m for m in json.load(sys.stdin).get('members',[]) if m.get('email')=='$U1'
 print(rows[0]['membership_id'] if rows else '')" 2>/dev/null)
   admin_post "/v1/admin/orgs/$SLUG/members/$ALMID/deactivate" '{}'
   [ "$CODE" = 200 ] && ok "deactivated alice's (config2) membership mid-stream" || no "deactivate alice → $CODE: $BODY"
-  # Wait up to ~6s (≈ reauth 2s + select sleep 2s + slack) for the stream to close.
+
+  # (b) Wait up to ~6s (≈ reauth 2s + select sleep 2s + slack) for alice's stream
+  # to close; then reap curl and LOG its exit code. A 000/reset never reaches
+  # here — (a) already failed on the empty capture.
   CLOSED=0
   for _ in $(seq 1 12); do
     kill -0 "$SSE_PID" 2>/dev/null || { CLOSED=1; break; }
     sleep 0.5
   done
-  kill "$SSE_PID" 2>/dev/null
-  [ "$CLOSED" = 1 ] && ok "SSE stream closed within the re-auth interval after deactivation" || no "SSE stream did NOT close within ~6s"
-  # False-pass guard: a stream that closed because the SERVER CRASHED would also
-  # satisfy the check above. Prove the control plane is still serving, so the
-  # close is attributable to the re-auth loop, not a panic.
+  if [ "$CLOSED" = 1 ]; then wait "$SSE_PID"; SSE_RC=$?; else kill "$SSE_PID" 2>/dev/null; wait "$SSE_PID" 2>/dev/null; SSE_RC=$?; fi
+  echo "    (alice SSE curl exit code: $SSE_RC)"
+  [ "$CLOSED" = 1 ] && ok "alice's SSE stream closed within the re-auth interval after deactivation" || no "alice's SSE stream did NOT close within ~6s (curl rc=$SSE_RC)"
+
+  # (c) The control (carol, still active) stream must STILL be open — proving the
+  # close was caused by alice's deactivation, not a short-lived / globally-capped
+  # stream. Kill it explicitly afterwards.
+  if kill -0 "$CTL_PID" 2>/dev/null; then ok "control (carol) stream STILL OPEN when alice's closed (close is deactivation-specific)"; else no "control stream also closed — the close is not attributable to alice's deactivation"; fi
+  kill "$CTL_PID" 2>/dev/null; wait "$CTL_PID" 2>/dev/null
+
+  # (d) False-pass guard: a stream that closed because the SERVER CRASHED would
+  # also satisfy (b). Prove the control plane is still serving, so the close is
+  # attributable to the re-auth loop, not a panic.
   HCODE=$(curl -s -o /dev/null -w '%{http_code}' "$API/v1/health")
   [ "$HCODE" = 200 ] && ok "server still healthy after the mid-stream deactivation (close was re-auth, not a crash)" || no "server /v1/health → $HCODE after SSE close (crash?)"
 else
