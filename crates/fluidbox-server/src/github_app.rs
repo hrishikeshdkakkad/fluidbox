@@ -433,6 +433,11 @@ async fn apply_verified_installation(
                 }
             };
             if desired == "suspended" {
+                // Suspend/unsuspend reconciliation evicts the cached installation
+                // token but does NOT bump the authorization generation: the
+                // installation id is a positively proven stable identity, so the
+                // logical account is unchanged and in-flight bindings stay valid
+                // (unlike an OAuth reconnect, which may change the account).
                 crate::oauth::invalidate_access(state, row.id).await;
             }
             return updated.ok_or_else(|| "connection changed state underneath".into());

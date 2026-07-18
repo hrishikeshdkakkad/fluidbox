@@ -129,8 +129,28 @@ async fn create_mcp_http(
     }
     match req.auth_kind.as_deref().unwrap_or("static") {
         "static" => {
-            let row = create_mcp_http_connection(state, scope, req).await?;
-            Ok(Json(json!({ "connection": row })))
+            // Own the endpoint before `req` moves; a static mcp_http endpoint IS
+            // the base_url.
+            let endpoint = base_url.to_string();
+            let row = create_mcp_http_connection(state, scope, req, None).await?;
+            // Photograph proves the credential works AND freezes the tool
+            // surface; a refused credential must not leave a dangling connection
+            // (mirrors the catalog api_key rollback).
+            match crate::snapshots::photograph_connection(state, scope, row.id, &endpoint).await {
+                Ok(snap) => Ok(Json(json!({
+                    "connection": row,
+                    "snapshot": crate::snapshots::snapshot_json(&snap),
+                }))),
+                Err(e) => {
+                    fluidbox_db::revoke_connection(&state.pool, scope, row.id)
+                        .await
+                        .ok();
+                    Err(crate::snapshots::rolled_back(
+                        "the server rejected this credential",
+                        e,
+                    ))
+                }
+            }
         }
         "oauth" => {
             let sealer = sealer(state)?;
@@ -201,10 +221,14 @@ async fn create_mcp_http(
 
 /// The static mcp_http creator, reusable by the catalog Connect flow:
 /// validates base_url + header/scheme, seals the secret, returns the row.
+/// `catalog_slug` (Some for a catalog/BYO connect) is recorded in metadata for
+/// provenance; `endpoint_url` (= base_url for a static mcp_http server) is always
+/// recorded so a later `/tools/refresh` knows exactly what to re-photograph.
 pub(crate) async fn create_mcp_http_connection(
     state: &AppState,
     scope: TenantScope,
     req: CreateConnection,
+    catalog_slug: Option<&str>,
 ) -> ApiResult<fluidbox_db::IntegrationConnectionRow> {
     let base_url = req
         .base_url
@@ -225,7 +249,12 @@ pub(crate) async fn create_mcp_http_connection(
             "token is required for mcp_http (credential-free servers need no connection)".into(),
         ));
     }
-    let mut metadata = json!({ "base_url": base_url });
+    // For a static mcp_http server the MCP endpoint IS the base_url; store it as
+    // `endpoint_url` so a later re-photograph resolves the same target.
+    let mut metadata = json!({ "base_url": base_url, "endpoint_url": base_url });
+    if let Some(slug) = catalog_slug.map(str::trim).filter(|s| !s.is_empty()) {
+        metadata["catalog_slug"] = json!(slug);
+    }
     if let Some(h) = req
         .header_name
         .as_deref()
@@ -502,6 +531,11 @@ pub async fn approve(
         &crate::github_app::installation_metadata(&reg, &conn.external_account_id, login),
     )
     .await?;
+    // Reactivating a github_app connection does NOT bump the authorization
+    // generation (unlike an OAuth reconnect): the installation id is a
+    // positively proven stable identity, so the logical account is unchanged and
+    // in-flight bindings stay valid. Only the cached installation token is
+    // evicted so a re-mint picks up the reconciled state.
     crate::oauth::invalidate_access(&state, conn.id).await;
     // Compensating check: a registration revoke racing this approve must
     // win. Re-read AFTER our transition — if the registration flipped, the

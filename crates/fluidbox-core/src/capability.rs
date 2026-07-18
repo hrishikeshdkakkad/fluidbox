@@ -227,7 +227,13 @@ pub fn lint_text(field: &str, s: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_tools(server: &str, tools: &[ToolSnapshot]) -> Result<(), String> {
+/// Validate a discovered/declared tool set: the per-server tool cap, the MCP
+/// name charset, duplicate-name rejection, the poison screen on every
+/// description ([`lint_text`]), and the object-shaped input schema. Public so
+/// the connection-snapshot photograph (Phase C) runs the IDENTICAL screen on an
+/// untrusted remote `tools/list` that bundle registration runs on declared
+/// tools — one validation path, no duplication.
+pub fn validate_tools(server: &str, tools: &[ToolSnapshot]) -> Result<(), String> {
     if tools.len() > MAX_TOOLS_PER_SERVER {
         return Err(format!(
             "server '{server}' declares {} tools (max {MAX_TOOLS_PER_SERVER})",

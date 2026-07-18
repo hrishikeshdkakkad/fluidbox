@@ -622,9 +622,12 @@ pub async fn callback(
     }
 }
 
-/// Exchange the code, seal the rotating refresh token, activate the
-/// connection, and auto-register the pending bundle (settle #4) — the
-/// photograph runs with the freshly minted access token.
+/// Exchange the code, seal the rotating refresh token, activate the connection,
+/// bump the authorization generation on a RECONNECT (fail-closed — a re-consent
+/// may change the account/issuer/audience, so any in-flight run bound to the old
+/// generation must fail closed; design :294-296), and photograph the pending
+/// snapshot with the freshly minted access token (Phase C: snapshots replace the
+/// old brokered-bundle auto-register).
 async fn complete_dance(
     state: &AppState,
     conn_id: Uuid,
@@ -714,13 +717,18 @@ async fn complete_dance(
             .unwrap_or_default(),
     };
 
+    // Whether this is a FIRST connect (pending→active) or a RECONNECT (an
+    // ever-activated connection re-consenting) decides the generation bump — so
+    // capture the prior status BEFORE activation flips it.
+    let prior_status = conn.status.clone();
+
     // Seal + activate (clears a previous error note), then cache the access
     // token so the photograph below doesn't immediately re-mint.
     let mut clean = oauth.clone();
     if let Some(o) = clean.as_object_mut() {
         o.remove("error");
     }
-    fluidbox_db::activate_connection_oauth(
+    let activated = fluidbox_db::activate_connection_oauth(
         &state.pool,
         scope,
         conn.id,
@@ -732,51 +740,72 @@ async fn complete_dance(
     .map_err(|e| format!("activation failed: {e}"))?
     .ok_or("connection changed state during the exchange")?;
     state.connector_tokens.lock().await.insert(
-        conn.id,
+        (conn.id, activated.authorization_generation),
         (access, Utc::now() + Duration::seconds(expires_in)),
     );
 
-    // Auto-register the pending bundle (photograph with the fresh token).
-    let Some(pending) = oauth.get("pending_bundle") else {
+    // Reconnect of an ever-activated connection ⇒ bump the generation (the
+    // logical account/issuer/audience may have changed and MCP servers are not
+    // obliged to prove identity, so fail closed) and evict every cached token so
+    // the next use re-mints under the new generation. First activation stays
+    // generation 1 (design :294-296).
+    if prior_status != "pending" {
+        fluidbox_db::bump_connection_generation(&state.pool, scope, conn.id)
+            .await
+            .map_err(|e| format!("authorization generation bump failed: {e}"))?;
+        invalidate_access(state, conn.id).await;
+    }
+
+    // Photograph the pending snapshot with the fresh token (Phase C: snapshots,
+    // not brokered bundles). A failed post-activation photograph marks the
+    // connection `error` so Connect is visibly incomplete, never half-connected.
+    let Some(url) = oauth
+        .get("pending_snapshot")
+        .and_then(|p| p.get("url"))
+        .and_then(Value::as_str)
+    else {
         return Ok(String::new());
     };
-    let (Some(name), Some(url)) = (
-        pending.get("name").and_then(Value::as_str),
-        pending.get("url").and_then(Value::as_str),
-    ) else {
-        return Ok(String::new());
-    };
-    let server = fluidbox_core::capability::CapabilityServer::Brokered {
-        name: name.to_string(),
-        url: url.to_string(),
-        connection_id: Some(conn.id),
-        identity: None,
-        tools: Vec::new(),
-    };
-    match crate::capabilities::register_bundle(
-        state,
-        scope,
-        name,
-        Some("Registered from the connector catalog"),
-        vec![server],
-    )
-    .await
-    {
-        Ok(row) => Ok(format!(
-            " Capability bundle <b>{}@{}</b> was registered.",
-            row.name, row.version
-        )),
-        Err(e) => Ok(format!(
-            " The connection works, but bundle registration failed ({e:?}) — register it from the Capabilities page."
-        )),
+    let url = url.to_string();
+    match crate::snapshots::photograph_connection(state, scope, conn.id, &url).await {
+        Ok(snap) => {
+            let count = snap.tools_json.as_array().map(|a| a.len()).unwrap_or(0);
+            Ok(format!(
+                " Discovered and snapshotted {count} tool(s) (v{}).",
+                snap.snapshot_version
+            ))
+        }
+        Err(e) => {
+            // Status flip → error: pair it with token eviction (custody
+            // discipline), so nothing serves the just-cached token.
+            fluidbox_db::mark_connection_error(
+                &state.pool,
+                scope,
+                conn.id,
+                &format!("tool discovery failed after authorization: {e}"),
+            )
+            .await
+            .ok();
+            invalidate_access(state, conn.id).await;
+            Err(format!(
+                "authorized, but tool discovery failed ({e}) — the connection is marked error; reconnect it"
+            ))
+        }
     }
 }
 
 // ─── Access-token custody (used by the broker) ────────────────────────────
 
-/// Drop a cached access token (reactive-401 path).
+/// Drop cached access tokens for a connection — EVERY authorization generation
+/// (the cache key is `(connection_id, generation)`; a generation bump or status
+/// flip must strand no stale token). Called on reactive-401, revoke, error,
+/// suspend, and re-consent.
 pub async fn invalidate_access(state: &AppState, connection_id: Uuid) {
-    state.connector_tokens.lock().await.remove(&connection_id);
+    state
+        .connector_tokens
+        .lock()
+        .await
+        .retain(|(cid, _generation), _| *cid != connection_id);
 }
 
 /// Return a live access token for an OAuth connection: cache hit inside the
@@ -787,7 +816,11 @@ pub async fn ensure_access_token(
     conn: &fluidbox_db::IntegrationConnectionRow,
 ) -> Result<String, String> {
     let margin = Duration::seconds(EXPIRY_MARGIN_SECS);
-    if let Some((tok, exp)) = state.connector_tokens.lock().await.get(&conn.id) {
+    // The cache key carries the connection's CURRENT generation (read off the
+    // fresh row the caller holds): a bump makes the prior generation's token
+    // unreachable, so we never serve a superseded identity's token.
+    let key = (conn.id, conn.authorization_generation);
+    if let Some((tok, exp)) = state.connector_tokens.lock().await.get(&key) {
         if *exp - margin > Utc::now() {
             return Ok(tok.clone());
         }
@@ -813,7 +846,7 @@ pub async fn ensure_access_token(
         .map_err(|e| format!("oauth advisory lock failed: {e}"))?;
     // Double-check under both locks: another caller (here or on another
     // replica) may have refreshed while we waited.
-    if let Some((tok, exp)) = state.connector_tokens.lock().await.get(&conn.id) {
+    if let Some((tok, exp)) = state.connector_tokens.lock().await.get(&key) {
         if *exp - margin > Utc::now() {
             return Ok(tok.clone());
         }
@@ -924,7 +957,7 @@ async fn refresh_access_token(
         }
     }
     state.connector_tokens.lock().await.insert(
-        conn.id,
+        (conn.id, conn.authorization_generation),
         (access.clone(), Utc::now() + Duration::seconds(expires_in)),
     );
     Ok(access)
