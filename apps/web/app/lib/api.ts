@@ -67,6 +67,22 @@ export async function apiPut<T = unknown>(path: string, body: unknown): Promise<
   return text ? JSON.parse(text) : ({} as T);
 }
 
+// No call sites yet — this exists so a future partial-update goes through the
+// sanctioned surface (CSRF header + 401→/login) instead of a raw fetch.
+export async function apiPatch<T = unknown>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json", ...CSRF_HEADERS },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    redirectOnUnauthorized(res);
+    throw new Error(text || `${res.status}`);
+  }
+  return text ? JSON.parse(text) : ({} as T);
+}
+
 export async function apiDelete<T = unknown>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`, { method: "DELETE", headers: { ...CSRF_HEADERS } });
   const text = await res.text();
