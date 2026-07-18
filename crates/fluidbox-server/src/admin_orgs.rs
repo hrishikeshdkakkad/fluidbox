@@ -62,25 +62,23 @@ fn valid_token_endpoint_auth(auth: &str) -> bool {
     TOKEN_ENDPOINT_AUTH_METHODS.contains(&auth)
 }
 
-/// Reject any `none`/`HS*` (symmetric) entry outright, and require the rest to
-/// be an algorithm the verifier ACTUALLY implements — so a saved allowlist can
-/// never carry a non-functional alg (EdDSA/ES256K) that would fail only at
-/// login rather than at save (design lines 169-171, 832-835). The
-/// implemented-set is defined once, in `login::IMPLEMENTED_ALGS`.
+/// Require every entry to EXACTLY match an algorithm the verifier implements —
+/// so a saved allowlist can never carry a non-functional alg (EdDSA/ES256K), a
+/// symmetric/`none` alg, or a mis-cased spelling that would fail only at login
+/// rather than at save (design lines 169-171, 832-835). JOSE `alg` values are
+/// case-SENSITIVE (RFC 7515) and the verifier compares the JWT header alg
+/// against these entries verbatim, so a case-folding shim would let e.g.
+/// `rs256` validate here yet never match `RS256` at login. `none`/HS* need no
+/// special-case — they are simply absent from the asymmetric implemented set.
+/// The implemented-set is defined once, in `login::IMPLEMENTED_ALGS`.
 fn validate_alg_allowlist(algs: &[String]) -> Result<(), String> {
     if algs.is_empty() {
         return Err("alg_allowlist must not be empty".into());
     }
     for a in algs {
-        let u = a.to_ascii_uppercase();
-        if u == "NONE" || u.starts_with("HS") {
+        if !crate::login::IMPLEMENTED_ALGS.contains(&a.as_str()) {
             return Err(format!(
-                "algorithm '{a}' is rejected: symmetric (HS*) and 'none' are never allowed"
-            ));
-        }
-        if !crate::login::IMPLEMENTED_ALGS.contains(&u.as_str()) {
-            return Err(format!(
-                "algorithm '{a}' is not supported; supported algorithms: {}",
+                "algorithm '{a}' is not supported; supported algorithms (exact case): {}",
                 crate::login::IMPLEMENTED_ALGS.join(", ")
             ));
         }
@@ -1222,9 +1220,13 @@ mod tests {
         assert!(validate_alg_allowlist(&["EdDSA".into()]).is_err());
         assert!(validate_alg_allowlist(&["ES256K".into()]).is_err());
         assert!(validate_alg_allowlist(&["HS256".into()]).is_err());
-        assert!(validate_alg_allowlist(&["hs512".into()]).is_err()); // case-insensitive
+        assert!(validate_alg_allowlist(&["hs512".into()]).is_err()); // HS* absent from the set
         assert!(validate_alg_allowlist(&["none".into()]).is_err());
         assert!(validate_alg_allowlist(&["NONE".into()]).is_err());
+        // JOSE alg is case-SENSITIVE: a mis-cased asymmetric alg is refused at
+        // SAVE (it would otherwise never match the JWT header alg at login).
+        assert!(validate_alg_allowlist(&["rs256".into()]).is_err());
+        assert!(validate_alg_allowlist(&["Es256".into()]).is_err());
         assert!(validate_alg_allowlist(&["RS256".into(), "HS256".into()]).is_err()); // one bad entry taints
         assert!(validate_alg_allowlist(&["banana".into()]).is_err());
         assert!(validate_alg_allowlist(&[]).is_err());

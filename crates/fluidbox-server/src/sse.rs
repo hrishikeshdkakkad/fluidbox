@@ -14,6 +14,25 @@ use std::convert::Infallible;
 use std::time::Duration;
 use uuid::Uuid;
 
+/// Re-authorize a cookie-authenticated stream mid-flight: `true` = the session
+/// is gone (revoked / expired / membership deactivated) and the stream must
+/// terminate. `None` (bearer/operator) is always live. Kept tiny so every
+/// re-auth branch — the DB-fetch race AND each per-event send — shares ONE
+/// liveness rule (design 658-664).
+async fn reauth_dead(
+    pool: &sqlx::PgPool,
+    scope: fluidbox_db::TenantScope,
+    reauth: Option<Uuid>,
+) -> bool {
+    match reauth {
+        Some(sid) => !matches!(
+            fluidbox_db::identity::web_session_live(pool, scope, sid).await,
+            Ok(true)
+        ),
+        None => false,
+    }
+}
+
 pub async fn stream(
     principal: Principal,
     State(state): State<AppState>,
@@ -53,63 +72,73 @@ pub async fn stream(
 
     let s = async_stream::stream! {
         // The re-auth clock is a `tokio::time::interval` consulted via
-        // `tokio::select!` in BOTH phases (design 658-664), so neither a large
-        // backlog nor a quiet stream can stretch the recheck past the bound.
-        // Consume the immediate first tick so the first recheck lands one
-        // period in (the extractor just authorized).
+        // `tokio::select!` around EVERY await that can stall — the DB fetch AND
+        // each per-event send — so neither a large backlog, a quiet stream, nor a
+        // back-pressured client can stretch the recheck past the bound (design
+        // 658-664). Consume the immediate first tick so the first recheck lands
+        // one period in (the extractor just authorized). Memory stays bounded:
+        // events are fetched in fixed 500-row batches, never accumulated.
         let mut reauth_tick = tokio::time::interval(reauth_every);
         reauth_tick.tick().await;
 
-        // Immediately flush any backlog — interleaved with the re-auth tick so a
-        // multi-batch backlog cannot postpone the recheck.
+        // Immediately flush any backlog — the fetch is raced against the re-auth
+        // tick, and each event is SENT from inside a select (the `ready` branch)
+        // so a client that stalls past the re-auth interval between yields is
+        // re-checked (the `tick` branch) BEFORE any further event is sent.
         'backlog: loop {
             tokio::select! {
                 biased;
                 _ = reauth_tick.tick(), if reauth.is_some() => {
-                    if let Some(sid) = reauth {
-                        if !matches!(
-                            fluidbox_db::identity::web_session_live(&pool, scope, sid).await,
-                            Ok(true)
-                        ) {
-                            return; // revoked / expired / membership deactivated
-                        }
+                    if reauth_dead(&pool, scope, reauth).await {
+                        return; // revoked / expired / membership deactivated
                     }
                 }
                 batch = fluidbox_db::events_after(&pool, scope, id, last_seq, 500) => {
-                    match batch {
-                        Ok(events) if !events.is_empty() => {
-                            for ev in events {
-                                last_seq = ev.seq;
-                                let data = serde_json::json!({
-                                    "seq": ev.seq,
-                                    "type": ev.r#type,
-                                    "actor": ev.actor,
-                                    "payload": ev.payload,
-                                    "occurred_at": ev.occurred_at,
-                                });
-                                yield Ok::<Event, Infallible>(
-                                    Event::default().id(ev.seq.to_string()).data(data.to_string())
-                                );
+                    let events = match batch {
+                        Ok(events) if !events.is_empty() => events,
+                        _ => break 'backlog,
+                    };
+                    for ev in events {
+                        // `biased`: the tick is polled first, so an elapsed
+                        // re-auth interval always rechecks (and may terminate)
+                        // before the `ready` branch sends THIS event.
+                        'send: loop {
+                            tokio::select! {
+                                biased;
+                                _ = reauth_tick.tick(), if reauth.is_some() => {
+                                    if reauth_dead(&pool, scope, reauth).await {
+                                        return;
+                                    }
+                                }
+                                _ = std::future::ready(()) => {
+                                    last_seq = ev.seq;
+                                    let data = serde_json::json!({
+                                        "seq": ev.seq,
+                                        "type": ev.r#type,
+                                        "actor": ev.actor,
+                                        "payload": ev.payload,
+                                        "occurred_at": ev.occurred_at,
+                                    });
+                                    yield Ok::<Event, Infallible>(
+                                        Event::default().id(ev.seq.to_string()).data(data.to_string())
+                                    );
+                                    break 'send;
+                                }
                             }
                         }
-                        _ => break 'backlog,
                     }
                 }
             }
         }
 
         // Then follow: wake on NOTIFY, re-poll on a floor so nothing is missed,
-        // and re-authorize on the same bounded interval.
-        loop {
+        // and re-authorize on the same bounded interval — including between
+        // per-event sends under back-pressure.
+        'follow: loop {
             let should_fetch = tokio::select! {
                 _ = reauth_tick.tick(), if reauth.is_some() => {
-                    if let Some(sid) = reauth {
-                        if !matches!(
-                            fluidbox_db::identity::web_session_live(&pool, scope, sid).await,
-                            Ok(true)
-                        ) {
-                            break; // revoked / expired / membership deactivated
-                        }
+                    if reauth_dead(&pool, scope, reauth).await {
+                        break 'follow; // revoked / expired / membership deactivated
                     }
                     false
                 }
@@ -120,15 +149,28 @@ pub async fn stream(
             match fluidbox_db::events_after(&pool, scope, id, last_seq, 500).await {
                 Ok(events) => {
                     for ev in events {
-                        last_seq = ev.seq;
-                        let data = serde_json::json!({
-                            "seq": ev.seq,
-                            "type": ev.r#type,
-                            "actor": ev.actor,
-                            "payload": ev.payload,
-                            "occurred_at": ev.occurred_at,
-                        });
-                        yield Ok(Event::default().id(ev.seq.to_string()).data(data.to_string()));
+                        'send: loop {
+                            tokio::select! {
+                                biased;
+                                _ = reauth_tick.tick(), if reauth.is_some() => {
+                                    if reauth_dead(&pool, scope, reauth).await {
+                                        break 'follow;
+                                    }
+                                }
+                                _ = std::future::ready(()) => {
+                                    last_seq = ev.seq;
+                                    let data = serde_json::json!({
+                                        "seq": ev.seq,
+                                        "type": ev.r#type,
+                                        "actor": ev.actor,
+                                        "payload": ev.payload,
+                                        "occurred_at": ev.occurred_at,
+                                    });
+                                    yield Ok(Event::default().id(ev.seq.to_string()).data(data.to_string()));
+                                    break 'send;
+                                }
+                            }
+                        }
                     }
                 }
                 Err(_) => { tokio::time::sleep(Duration::from_secs(1)).await; }
