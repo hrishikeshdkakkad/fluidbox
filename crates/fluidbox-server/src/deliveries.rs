@@ -219,11 +219,18 @@ async fn try_deliver(
     let dest: ResultDestination = serde_json::from_value(d.destination.clone())
         .map_err(|e| format!("bad destination: {e}"))?;
     match &dest {
-        ResultDestination::SignedWebhook { url, .. } => {
-            let digest = deliver_signed_webhook(state, d, session, url).await?;
+        ResultDestination::SignedWebhook { url, binding_id } => {
+            let digest = deliver_signed_webhook(state, d, session, url, *binding_id).await?;
             Ok((digest, None))
         }
         _ => {
+            // Phase C: a GitHub publish destination carries a `result_publish`
+            // binding — recheck it (status + generation + owner membership) BEFORE
+            // the connector mints an installation token. A revoked/reauthorized
+            // authority fails the attempt visibly and retries per the existing
+            // backoff until attempts exhaust (design "fails visibly"). Legacy
+            // destinations (no binding_id) skip the recheck, unchanged.
+            recheck_publish_binding(state, &dest, session).await?;
             let ctx = publish_context(state, d, session).await?;
             let outcome = crate::connectors::publish(state, &dest, &ctx).await?;
             Ok((
@@ -232,6 +239,47 @@ async fn try_deliver(
             ))
         }
     }
+}
+
+/// Recheck a GitHub result-publish destination's frozen binding before its
+/// installation token mints (design `:705-723`). The binding is the delivery
+/// worker's consumption of the `result_publish` slot (invariant 21): it must
+/// authorize the exact connection the destination names (belt-and-braces), then
+/// pass the connection-authority recheck. Legacy destinations (no binding_id)
+/// and signed webhooks are no-ops here.
+async fn recheck_publish_binding(
+    state: &AppState,
+    dest: &ResultDestination,
+    session: &SessionRow,
+) -> Result<(), String> {
+    let (binding_id, connection_id) = match dest {
+        ResultDestination::GitHubPrComment {
+            binding_id,
+            connection_id,
+            ..
+        }
+        | ResultDestination::GitHubCheck {
+            binding_id,
+            connection_id,
+            ..
+        } => (*binding_id, *connection_id),
+        ResultDestination::SignedWebhook { .. } => return Ok(()),
+    };
+    let Some(binding_id) = binding_id else {
+        return Ok(()); // legacy destination — unchanged
+    };
+    let scope = TenantScope::assume(session.tenant_id);
+    let binding = fluidbox_db::get_run_resource_binding(&state.pool, scope, binding_id)
+        .await
+        .map_err(|e| format!("binding lookup failed: {e}"))?
+        .ok_or("result publish binding is missing")?;
+    if binding.connection_id != Some(connection_id) {
+        return Err("result publish binding does not authorize the destination connection".into());
+    }
+    crate::broker::recheck_binding(state, scope, &binding)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("result publish binding recheck failed: {e}"))
 }
 
 /// Provider-neutral publish inputs from the session + frozen RunSpec.
@@ -274,11 +322,37 @@ async fn deliver_signed_webhook(
     d: &fluidbox_db::ResultDeliveryRow,
     session: &SessionRow,
     url: &str,
+    binding_id: Option<Uuid>,
 ) -> Result<String, String> {
     let sub_id = d
         .subscription_id
         .ok_or("delivery has no subscription (cannot resolve signing secret)")?;
     let scope = TenantScope::assume(session.tenant_id);
+    // Phase C: a signed-webhook destination freezes a `subscription_secret`
+    // binding. Fresh-read the subscription and refuse when its authority
+    // generation moved since the run bound it (a re-armed callback secret is a
+    // new generation) BEFORE unsealing the callback secret (design :705-723).
+    // The delivery worker owns this comparison — recheck_binding covers only
+    // connection authority. Legacy destinations (no binding_id) are unchanged.
+    if let Some(bid) = binding_id {
+        let binding = fluidbox_db::get_run_resource_binding(&state.pool, scope, bid)
+            .await
+            .map_err(|e| format!("binding lookup failed: {e}"))?
+            .ok_or("signed webhook binding is missing")?;
+        if binding.subscription_id != Some(sub_id) {
+            return Err("signed webhook binding does not match the delivery subscription".into());
+        }
+        let sub = fluidbox_db::get_trigger_subscription(&state.pool, scope, sub_id)
+            .await
+            .map_err(|e| format!("subscription lookup failed: {e}"))?
+            .ok_or("subscription is missing")?;
+        if binding.authority_generation != Some(sub.authority_generation) {
+            return Err(
+                "subscription was re-armed after this run started — its callback binding is stale"
+                    .into(),
+            );
+        }
+    }
     let sealed = fluidbox_db::subscription_callback_secret_sealed(&state.pool, scope, sub_id)
         .await
         .map_err(|e| format!("secret lookup failed: {e}"))?
