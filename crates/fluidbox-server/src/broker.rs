@@ -91,9 +91,12 @@ pub async fn brokered_auth(
     let Some(cid) = connection_id else {
         return Ok(None);
     };
-    // Unfiltered read by design: the broker's authority comes from the frozen
-    // RunSpec (Task 6 adds the binding generation + owner-membership recheck
-    // here), never from a request viewer — no owner-visibility filter applies.
+    // Unfiltered read by design: the LEGACY broker path's authority comes from
+    // the frozen RunSpec's embedded `connection_id`, never a request viewer — so
+    // no owner-visibility filter applies. This path (a pre-Phase-C bundle) froze
+    // no binding, so there is no generation/owner to recheck; the status read
+    // below is the only live check. Phase C runs route through the binding path
+    // ([`recheck_binding`] + [`call_tool_for_conn`]), never here.
     let conn = fluidbox_db::get_connection(&state.pool, scope, *cid)
         .await
         .map_err(|e| format!("connection lookup failed: {e}"))?
@@ -177,6 +180,86 @@ pub async fn brokered_auth_for_conn(
         value: compose_header_value(scheme, &token),
         oauth_connection: None,
     }))
+}
+
+/// Revocation recheck for a CONNECTION-authority run resource binding (design
+/// `:705-723`, invariant 21): fresh-read the connection and fail closed on
+/// anything that would let a stale or revoked authority still execute. Called
+/// by every credentialed consumer — the brokered MCP call, the workspace fetch,
+/// and the GitHub result publish — IMMEDIATELY before secret access, so a
+/// revoke takes effect on in-flight runs within one call.
+///
+/// Refuses when: the connection is non-active; its `authorization_generation`
+/// no longer equals the generation the run froze (it was reauthorized to a new
+/// account/audience since — a rotation within the same generation is fine);
+/// the binding is user-owned and the owner's tenant membership is not active
+/// (UNCONDITIONAL for user-owned — design `:713-716`); or the binding does not
+/// belong to `scope`'s tenant (belt-and-braces). Returns the freshly-read row so
+/// the caller sends the credential without a second lookup.
+///
+/// NOT this function's job: `subscription_secret` authorities (the delivery
+/// worker compares the subscription row's generation itself) and the mechanical
+/// `resource_scope` match for workspace/publish slots (the consumer enforces it
+/// — the mcp scope is enforced by the upstream grant, design `:718-720`).
+pub async fn recheck_binding(
+    state: &AppState,
+    scope: fluidbox_db::TenantScope,
+    binding: &fluidbox_db::RunResourceBindingRow,
+) -> Result<fluidbox_db::IntegrationConnectionRow, String> {
+    recheck_binding_pool(&state.pool, scope, binding).await
+}
+
+/// Pool-based core of [`recheck_binding`] — the public fn (fixed to take
+/// `&AppState` by the Phase C plan) only unwraps `state.pool`. Split out so the
+/// matrix DB tests drive it without an `AppState` (matching `bindings.rs`).
+async fn recheck_binding_pool(
+    pool: &sqlx::PgPool,
+    scope: fluidbox_db::TenantScope,
+    binding: &fluidbox_db::RunResourceBindingRow,
+) -> Result<fluidbox_db::IntegrationConnectionRow, String> {
+    // Tenant equality (belt-and-braces): the scoped reads below already pin the
+    // tenant, but a binding row handed in from elsewhere must match it.
+    if binding.tenant_id != scope.tenant_id() {
+        return Err("run resource binding belongs to a different tenant".into());
+    }
+    let cid = binding
+        .connection_id
+        .ok_or("run resource binding has no connection authority to recheck")?;
+    let expected_generation = binding
+        .authority_generation
+        .ok_or("connection binding froze no authorization generation")?;
+    let conn = fluidbox_db::get_connection(pool, scope, cid)
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?
+        .ok_or_else(|| format!("connection {cid} is missing"))?;
+    if conn.status != "active" {
+        return Err(format!(
+            "connection {} is {} — reconnect it",
+            conn.id, conn.status
+        ));
+    }
+    if conn.authorization_generation != expected_generation {
+        return Err(format!(
+            "connection {} was reauthorized after this run started — its binding is stale",
+            conn.id
+        ));
+    }
+    // User-owned connections: the owner must still hold an active membership —
+    // unconditionally, never "where applicable" (design `:713-716`). A missing
+    // membership row fails closed exactly like a deactivated one.
+    if binding.connection_owner_type.as_deref() == Some("user") {
+        let owner = binding
+            .connection_owner_user_id
+            .ok_or("user-owned binding is missing its owner id")?;
+        let active = fluidbox_db::identity::get_membership_by_user(pool, scope, owner)
+            .await
+            .map_err(|e| format!("owner membership lookup failed: {e}"))?
+            .is_some_and(|m| m.status == "active");
+        if !active {
+            return Err("the connection owner's tenant membership is not active".into());
+        }
+    }
+    Ok(conn)
 }
 
 /// scheme + host + port must match; the base path must prefix the url path
@@ -672,6 +755,52 @@ pub async fn call_tool_auth(
     }
 }
 
+/// Execute one brokered tool against a run resource binding's connection (the
+/// Phase C path). The caller has ALREADY run [`recheck_binding`] on this exact
+/// connection immediately before — so the credential resolved here rides an
+/// authority just verified live (status + generation + owner membership). The
+/// counterpart to [`call_tool_auth`], but the credential comes from a connection
+/// row + an explicit endpoint (the binding's frozen surface url) rather than a
+/// `CapabilityServer::Brokered`. Same single reactive-401 retry: OAuth re-mints
+/// once (a 401 proves the tool never executed); a static credential is terminal.
+pub async fn call_tool_for_conn(
+    state: &AppState,
+    scope: fluidbox_db::TenantScope,
+    conn: &fluidbox_db::IntegrationConnectionRow,
+    url: &str,
+    tool: &str,
+    arguments: &Value,
+) -> Result<(Value, bool), String> {
+    let auth = brokered_auth_for_conn(state, scope, conn, url).await?;
+    match call_tool(state, url, auth.as_ref(), tool, arguments).await {
+        Err(CallErr::Unauthorized) => {
+            let auth = reauth_after_401_conn(state, scope, conn, url, auth).await?;
+            call_tool(state, url, auth.as_ref(), tool, arguments)
+                .await
+                .map_err(CallErr::into_msg)
+        }
+        r => r.map_err(CallErr::into_msg),
+    }
+}
+
+/// Reactive-401 recovery for the binding path — OAuth connections only, re-minting
+/// against the SAME connection + endpoint just rechecked. Mirrors
+/// [`reauth_after_401`] but resolves via [`brokered_auth_for_conn`] (no
+/// `CapabilityServer` in hand). A static credential that 401s is terminal.
+async fn reauth_after_401_conn(
+    state: &AppState,
+    scope: fluidbox_db::TenantScope,
+    conn: &fluidbox_db::IntegrationConnectionRow,
+    url: &str,
+    auth: Option<BrokeredAuth>,
+) -> Result<Option<BrokeredAuth>, String> {
+    let Some(cid) = auth.as_ref().and_then(|a| a.oauth_connection) else {
+        return Err("mcp server rejected the credential (HTTP 401)".into());
+    };
+    crate::oauth::invalidate_access(state, cid).await;
+    brokered_auth_for_conn(state, scope, conn, url).await
+}
+
 /// Oversized results are replaced by a truncated text block so a hostile or
 /// chatty server can't balloon the runner/context; the ledger stores only a
 /// digest either way.
@@ -811,5 +940,233 @@ mod tests {
         let s = capped.to_string();
         assert!(s.len() < MAX_RESULT_BYTES);
         assert!(s.contains("truncated by fluidbox broker"));
+    }
+
+    // ── recheck_binding matrix (real Neon; self-skips when DATABASE_URL unset) ──
+    //
+    // Drives the pool-based core with directly-constructed binding rows pointed
+    // at real seeded connections + memberships: the happy paths pass, and each
+    // single revocation-recheck violation refuses. Children-first cleanup runs
+    // BEFORE the asserts so a failing assert never leaks fixtures.
+
+    use chrono::Utc;
+    use fluidbox_db::{
+        connect, identity, ConnectionAuth, ConnectionOwner, IntegrationConnectionRow,
+        RunResourceBindingRow, TenantScope,
+    };
+    use uuid::Uuid;
+
+    async fn seed_user(
+        pool: &sqlx::PgPool,
+        scope: TenantScope,
+        subject: &str,
+        member: bool,
+    ) -> Uuid {
+        let cfg_id = Uuid::now_v7();
+        sqlx::query(
+            "insert into org_idp_configs
+               (id, tenant_id, generation, issuer, client_id, claim_mappings, status)
+             values ($1, $2,
+                     coalesce((select max(generation) from org_idp_configs where tenant_id = $2), 0) + 1,
+                     $3, 'client-test', '{}'::jsonb, 'staged')",
+        )
+        .bind(cfg_id)
+        .bind(scope.tenant_id())
+        .bind(format!("https://idp.test/{subject}"))
+        .execute(pool)
+        .await
+        .unwrap();
+        let user_id = Uuid::now_v7();
+        sqlx::query(
+            "insert into users
+               (id, tenant_id, idp_config_id, subject, email, email_normalized, email_verified, status)
+             values ($1, $2, $3, $4, $5, $5, true, 'active')",
+        )
+        .bind(user_id)
+        .bind(scope.tenant_id())
+        .bind(cfg_id)
+        .bind(subject)
+        .bind(format!("{subject}@example.com"))
+        .execute(pool)
+        .await
+        .unwrap();
+        if member {
+            sqlx::query(
+                "insert into org_memberships (id, tenant_id, user_id, roles, status)
+                 values ($1, $2, $3, '{member}', 'active')",
+            )
+            .bind(Uuid::now_v7())
+            .bind(scope.tenant_id())
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        user_id
+    }
+
+    async fn seed_conn(
+        pool: &sqlx::PgPool,
+        scope: TenantScope,
+        owner: ConnectionOwner,
+        display: &str,
+    ) -> IntegrationConnectionRow {
+        fluidbox_db::create_connection(
+            pool,
+            scope,
+            "mcp_http",
+            &format!("acct-{}", Uuid::now_v7().simple()),
+            display,
+            Some(b"sealed-token"),
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            &serde_json::json!({ "base_url": "https://mcp.example.test" }),
+            None,
+            ConnectionAuth::static_active(),
+            owner,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn binding_row(
+        tenant: Uuid,
+        conn: &IntegrationConnectionRow,
+        generation: i32,
+        owner_type: &str,
+        owner_user_id: Option<Uuid>,
+    ) -> RunResourceBindingRow {
+        RunResourceBindingRow {
+            id: Uuid::now_v7(),
+            tenant_id: tenant,
+            session_id: Uuid::now_v7(),
+            requirement_slot: "github".into(),
+            slot_kind: "mcp".into(),
+            authority_kind: "connection".into(),
+            connection_id: Some(conn.id),
+            subscription_id: None,
+            authority_generation: Some(generation),
+            connection_owner_type: Some(owner_type.into()),
+            connection_owner_user_id: owner_user_id,
+            snapshot_version: Some(1),
+            effective_tools_json: None,
+            effective_tools_digest: None,
+            resource_scope: serde_json::json!({}),
+            resolved_by_principal_kind: "user".into(),
+            resolved_by_principal_id: None,
+            binding_mode: "invoking_user".into(),
+            created_at: Utc::now(),
+        }
+    }
+
+    async fn cleanup(pool: &sqlx::PgPool, tenant: Uuid) {
+        for stmt in [
+            "delete from integration_connections where tenant_id = $1",
+            "delete from org_memberships where tenant_id = $1",
+            "delete from users where tenant_id = $1",
+            "delete from org_idp_configs where tenant_id = $1",
+            "delete from tenants where id = $1",
+        ] {
+            let _ = sqlx::query(stmt).bind(tenant).execute(pool).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn recheck_binding_matrix_passes_happy_and_refuses_each_violation() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
+            .await
+            .unwrap();
+        let scope = TenantScope::assume(org.id);
+        let alice = seed_user(&pool, scope, "alice@test.dev", true).await;
+        let ghost = seed_user(&pool, scope, "ghost@test.dev", false).await; // no membership
+
+        let org_conn = seed_conn(&pool, scope, ConnectionOwner::Organization, "Org").await;
+        let alice_conn = seed_conn(&pool, scope, ConnectionOwner::User(alice), "Alice").await;
+        let ghost_conn = seed_conn(&pool, scope, ConnectionOwner::User(ghost), "Ghost").await;
+        // Connections start at authorization_generation = 1.
+        let gen = org_conn.authorization_generation;
+
+        // Collect (label, result) so ALL asserts run after cleanup.
+        let happy_org = recheck_binding_pool(
+            &pool,
+            scope,
+            &binding_row(org.id, &org_conn, gen, "organization", None),
+        )
+        .await;
+        let happy_user = recheck_binding_pool(
+            &pool,
+            scope,
+            &binding_row(org.id, &alice_conn, gen, "user", Some(alice)),
+        )
+        .await;
+        let gen_mismatch = recheck_binding_pool(
+            &pool,
+            scope,
+            &binding_row(org.id, &org_conn, gen + 1, "organization", None),
+        )
+        .await;
+        let tenant_mismatch = recheck_binding_pool(
+            &pool,
+            scope,
+            &binding_row(Uuid::now_v7(), &org_conn, gen, "organization", None),
+        )
+        .await;
+        let missing_membership = recheck_binding_pool(
+            &pool,
+            scope,
+            &binding_row(org.id, &ghost_conn, gen, "user", Some(ghost)),
+        )
+        .await;
+
+        // Deactivate Alice's membership → her user binding now fails closed.
+        sqlx::query("update org_memberships set status = 'deactivated' where tenant_id = $1 and user_id = $2")
+            .bind(org.id)
+            .bind(alice)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let deactivated_owner = recheck_binding_pool(
+            &pool,
+            scope,
+            &binding_row(org.id, &alice_conn, gen, "user", Some(alice)),
+        )
+        .await;
+
+        // Revoke the org connection → its binding now fails closed.
+        fluidbox_db::set_connection_status(&pool, scope, org_conn.id, "revoked", &["active"])
+            .await
+            .unwrap();
+        let non_active = recheck_binding_pool(
+            &pool,
+            scope,
+            &binding_row(org.id, &org_conn, gen, "organization", None),
+        )
+        .await;
+
+        cleanup(&pool, org.id).await;
+
+        // Happy paths pass; each single violation refuses with a distinct reason.
+        assert_eq!(happy_org.expect("org happy").id, org_conn.id);
+        assert_eq!(happy_user.expect("user happy").id, alice_conn.id);
+        assert!(gen_mismatch
+            .expect_err("gen mismatch")
+            .contains("reauthorized"));
+        assert!(tenant_mismatch
+            .expect_err("tenant mismatch")
+            .contains("different tenant"));
+        assert!(missing_membership
+            .expect_err("missing membership")
+            .contains("membership is not active"));
+        assert!(deactivated_owner
+            .expect_err("deactivated owner")
+            .contains("membership is not active"));
+        assert!(non_active.expect_err("non active").contains("revoked"));
     }
 }
