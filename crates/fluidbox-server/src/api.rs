@@ -1130,26 +1130,39 @@ pub async fn decide_approval(
         other => return Err(ApiError::BadRequest(format!("unknown decision '{other}'"))),
     };
     let scope = principal.scope();
-    // Authorization (parent design lines 564-583): decide_org holders may
-    // decide any visible approval; a plain member may decide only approvals on
-    // a run it invoked (`approval.decide_own`). In Phase B every brokered call
-    // carries org authority, so decide_org is the org path.
     let approval = fluidbox_db::get_approval(&state.pool, scope, id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if !rbac::can_decide_org(&principal) {
-        let session = fluidbox_db::get_session(&state.pool, scope, approval.session_id)
-            .await?
-            .ok_or(ApiError::NotFound)?;
-        // `approval.decide_own` covers only credentialless calls on a run the
-        // member invoked; brokered (`mcp__*`) calls are org authority and need
-        // decide_org (parent design lines 564-579).
-        if !rbac::can_decide_own(&principal, session.invoked_by_user_id, &approval.tool) {
-            return Err(ApiError::Forbidden(
-                "deciding this approval requires approver, admin, or owner".into(),
-            ));
+    let session = fluidbox_db::get_session(&state.pool, scope, approval.session_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    // Authorization (parent design lines 562-583). Phase C ends Phase B's "every
+    // brokered call is org authority" premise: an mcp tool resolves to its slot's
+    // run resource binding, and a personal (user-owned) connection is decidable
+    // ONLY by its owner (on a run they invoked) — no role, admin/owner/operator
+    // included. A non-mcp built-in tool is credentialless; an mcp tool with no
+    // binding is a legacy brokered call that keeps Phase B's org authority.
+    let binding = match fluidbox_core::capability::parse_mcp_tool(&approval.tool) {
+        Some((slot, _)) => {
+            fluidbox_db::find_session_binding(&state.pool, scope, session.id, "mcp", slot).await?
         }
+        None => None,
+    };
+    let facts = binding
+        .as_ref()
+        .map(rbac::ApprovalBindingFacts::from_binding);
+    let authority = rbac::classify_approval_authority(&approval.tool, facts.as_ref());
+    // Enforced identically on approve AND deny (symmetric, v1).
+    if let Err(refusal) = rbac::authorize_approval_decision(
+        &authority,
+        session.invoked_by_user_id,
+        principal.user_id(),
+        rbac::can_decide_org(&principal),
+    ) {
+        return Err(approval_refusal_error(&state, scope, refusal, binding.as_ref()).await);
     }
+
     // `decided_by` is DERIVED from the authenticated principal — never
     // request-supplied (parent design line 581).
     let decided_by = principal.decided_by();
@@ -1159,6 +1172,47 @@ pub async fn decide_approval(
     // Wake the blocked permission handler.
     state.approvals.wake(id).await;
     Ok(Json(json!({ "approval": row })))
+}
+
+/// Turn an approval-authorization refusal into an `ApiError::Forbidden`. The
+/// personal-connection case names WHOSE connection would execute (design
+/// :576-579) using the connection's display name — never a secret; the org /
+/// credentialless cases keep Phase B's message verbatim.
+async fn approval_refusal_error(
+    state: &AppState,
+    scope: TenantScope,
+    refusal: rbac::ApprovalRefusal,
+    binding: Option<&fluidbox_db::RunResourceBindingRow>,
+) -> ApiError {
+    match refusal {
+        rbac::ApprovalRefusal::PersonalConnection { owner_user_id } => {
+            let label = personal_connection_label(state, scope, binding, owner_user_id).await;
+            ApiError::Forbidden(format!(
+                "this approval executes under {label}, a personal connection — only its owner, who invoked the run, may decide it"
+            ))
+        }
+        // Both non-personal refusals keep Phase B's exact message.
+        rbac::ApprovalRefusal::NeedsOrg | rbac::ApprovalRefusal::NeedsOwnOrOrg => {
+            ApiError::Forbidden("deciding this approval requires approver, admin, or owner".into())
+        }
+    }
+}
+
+/// A safe, human label for the personal connection an approval would execute
+/// under: the connection's display name when readable (not a secret), else a
+/// generic phrase naming the owner id. Never leaks a credential.
+async fn personal_connection_label(
+    state: &AppState,
+    scope: TenantScope,
+    binding: Option<&fluidbox_db::RunResourceBindingRow>,
+    owner_user_id: Uuid,
+) -> String {
+    if let Some(cid) = binding.and_then(|b| b.connection_id) {
+        if let Ok(Some(conn)) = fluidbox_db::get_connection(&state.pool, scope, cid).await {
+            return format!("connection '{}'", conn.display_name);
+        }
+    }
+    format!("another user's personal connection (owner {owner_user_id})")
 }
 
 // ─── Result deliveries ────────────────────────────────────────────────────

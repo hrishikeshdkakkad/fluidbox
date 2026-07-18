@@ -139,6 +139,12 @@ pub enum EventBody {
         tool_call_id: String,
         tool: String,
         server: String,
+        /// The `run_resource_bindings` row (mcp slot) whose connection served
+        /// this call (Phase C). `#[serde(default)]` keeps legacy tool.brokered
+        /// events — frozen before bindings existed — parseable; None on the
+        /// legacy embedded-connection broker path (no binding to reference).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding_id: Option<Uuid>,
         ok: bool,
         latency_ms: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -326,10 +332,12 @@ mod tests {
         assert_eq!(v["type"], "capability.frozen");
         assert_eq!(frozen.type_name(), "capability.frozen");
 
+        let binding_id = Uuid::now_v7();
         let brokered = EventBody::BrokeredToolCall {
             tool_call_id: "t1".into(),
             tool: "mcp__kb__kb_search".into(),
             server: "kb".into(),
+            binding_id: Some(binding_id),
             ok: true,
             latency_ms: 42,
             result_digest: Some("sha256:abcd".into()),
@@ -338,9 +346,36 @@ mod tests {
         let v = serde_json::to_value(&brokered).unwrap();
         assert_eq!(v["type"], "tool.brokered");
         assert_eq!(v["data"]["latency_ms"], 42);
+        assert_eq!(v["data"]["binding_id"], binding_id.to_string());
         assert!(v["data"].get("error").is_none());
-        let back: EventBody = serde_json::from_value(v).unwrap();
+        let back: EventBody = serde_json::from_value(v.clone()).unwrap();
         assert_eq!(back.type_name(), "tool.brokered");
+        // Phase C round-trip: binding_id survives.
+        assert!(matches!(
+            back,
+            EventBody::BrokeredToolCall { binding_id: Some(b), .. } if b == binding_id
+        ));
+
+        // Legacy tool.brokered events (frozen before Phase C) carry no
+        // binding_id and MUST still parse — to None, not an error.
+        let legacy = serde_json::json!({
+            "type": "tool.brokered",
+            "data": {
+                "tool_call_id": "t0",
+                "tool": "mcp__kb__kb_search",
+                "server": "kb",
+                "ok": true,
+                "latency_ms": 7,
+            }
+        });
+        let back: EventBody = serde_json::from_value(legacy).unwrap();
+        assert!(matches!(
+            back,
+            EventBody::BrokeredToolCall {
+                binding_id: None,
+                ..
+            }
+        ));
     }
 
     #[test]
