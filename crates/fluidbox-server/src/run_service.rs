@@ -5,11 +5,12 @@
 //! the invocation context, and the result destinations. An invocation may
 //! narrow the agent's authority; nothing here can widen it.
 
+use crate::bindings::{self, BindingInputs, WorkspaceBindingInput};
 use crate::error::{ApiError, ApiResult};
 use crate::orchestrator;
 use crate::state::AppState;
 use fluidbox_core::capability::{
-    narrow_bundles, server_collision, BundleRef, CapabilityBundleDef, CapabilityServer,
+    narrow_bundles, server_collision, BundleRef, CapabilityBundleDef, ConnectionRequirement,
     FrozenBundle,
 };
 use fluidbox_core::policy::Policy;
@@ -19,6 +20,7 @@ use fluidbox_core::spec::{
     WorkspaceSpec,
 };
 use fluidbox_db::TenantScope;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 pub enum RevisionSelector {
@@ -54,6 +56,12 @@ pub struct CreateRun {
     /// path once identity lands). None for operator-token, trigger, schedule,
     /// and webhook invocations. Stamped onto `sessions.invoked_by_user_id`.
     pub invoked_by_user_id: Option<Uuid>,
+    /// The sanctioned explicit binding override: requirement slot → connection
+    /// id (design "Explicit binding", `:513-523`). Only the manual/UI path
+    /// supplies one; binding resolution verifies each entry (tenant, caller may
+    /// use it, connector match, snapshot). Empty for triggers/schedules/events
+    /// (invoke overrides only narrow — never introduce a new connection).
+    pub explicit_bindings: HashMap<String, Uuid>,
     pub result_destinations: Vec<ResultDestination>,
     /// Idempotency claim bound atomically with session creation (same DB
     /// transaction) — a crash can never leave a created run unclaimed, so a
@@ -244,28 +252,11 @@ pub async fn create_run(
         .map(|v| serde_json::from_value(v.clone()))
         .transpose()
         .map_err(|e| ApiError::Internal(format!("bad stored default workspace: {e}")))?;
-    let workspace = WorkspaceSpec::resolve(req.explicit_workspace, revision_default);
-
-    // A connection-backed workspace must still be usable at run time (the
-    // connection may have been revoked since the default was stored).
-    if let WorkspaceSpec::GitRepository {
-        connection_id: Some(cid),
-        ..
-    } = &workspace
-    {
-        // Unfiltered read by design: create_run resolves connection authority
-        // through the run's resolved binding (invariant 21), not a request
-        // viewer — this is only a liveness precheck before freezing the RunSpec.
-        let active = fluidbox_db::get_connection(&state.pool, scope, *cid)
-            .await?
-            .map(|c| c.status == "active")
-            .unwrap_or(false);
-        if !active {
-            return Err(ApiError::BadRequest(format!(
-                "workspace connection {cid} is not active — reconnect it or override the workspace"
-            )));
-        }
-    }
+    // Mutable: binding resolution stamps the `workspace_fetch` binding id in.
+    let mut workspace = WorkspaceSpec::resolve(req.explicit_workspace, revision_default);
+    // The workspace connection's status/generation/owner and (manual path)
+    // caller-may-use are verified inside binding resolution below (invariant 21),
+    // replacing the old status-only precheck.
 
     // Effective capabilities (design §4): revision pins ∩ subscription
     // keep-list ∩ per-run keep-list ∩ trust tier — frozen with full schema
@@ -279,6 +270,85 @@ pub async fn create_run(
         req.trust_tier,
     )
     .await?;
+
+    // Parse + re-validate the revision's connection requirements. They were
+    // validated at append time; re-validate cheaply and fail closed on corrupt
+    // stored json before any spend (design §"satisfaction: all", `:367-376`).
+    let requirements: Vec<ConnectionRequirement> =
+        serde_json::from_value(rev.connection_requirements.clone())
+            .map_err(|e| ApiError::Internal(format!("bad stored connection requirements: {e}")))?;
+    fluidbox_core::capability::validate_requirements(&requirements).map_err(|e| {
+        ApiError::UnprocessableEntity(format!("invalid stored connection requirements: {e}"))
+    })?;
+
+    // Who resolved this run (design `resolved_by_principal`), derived from the
+    // invocation kind: a directly-authenticated principal is a "user" when its
+    // id is known, else an "operator"; a trigger invoke is a "trigger", a
+    // schedule tick a "schedule", a connector webhook a "webhook".
+    let invoked_by_kind = match req.invocation.kind {
+        InvocationKind::Manual => {
+            if req.invoked_by_user_id.is_some() {
+                "user"
+            } else {
+                "operator"
+            }
+        }
+        InvocationKind::Api => "trigger",
+        InvocationKind::Schedule => "schedule",
+        InvocationKind::Event => "webhook",
+    };
+    let principal_id: Option<String> = match invoked_by_kind {
+        "user" => req.invoked_by_user_id.map(|u| u.to_string()),
+        "operator" => None,
+        // trigger/schedule/webhook: the subscription is the acting principal.
+        _ => req.invocation.subscription_id.map(|s| s.to_string()),
+    };
+    // Manual (`user`/`operator`) workspaces carry a user-supplied connection id →
+    // full explicit-mode verification; server-derived workspaces (trigger/
+    // schedule/event) resolve as organization authority.
+    let workspace_is_manual = matches!(invoked_by_kind, "user" | "operator");
+
+    let mut result_destinations = req.result_destinations.clone();
+
+    // Resolve every requirement (mcp / workspace_fetch / result_publish) to a
+    // frozen, authorized binding BEFORE any sandbox or model work — the design's
+    // "resolve each requirement before model spend" (invariants 6, 7, 21). A
+    // failure here returns before `create_session`: never a half-created run.
+    let inp = BindingInputs {
+        requirements: &requirements,
+        trust_tier: req.trust_tier,
+        principal_kind: invoked_by_kind,
+        principal_id: principal_id.clone(),
+        invoking_user: req.invoked_by_user_id,
+        explicit: &req.explicit_bindings,
+        workspace: Some(WorkspaceBindingInput {
+            spec: &workspace,
+            manual: workspace_is_manual,
+        }),
+        result_destinations: &result_destinations,
+        subscription: subscription.as_ref(),
+    };
+    let resolved = bindings::resolve_run_bindings(state, scope, &inp).await?;
+    // Map to the write-once DB rows (this is `inp`'s last use, so its immutable
+    // borrows of the workspace/destinations end here — before they are stamped).
+    let binding_rows =
+        bindings::to_new_binding_rows(&resolved, inp.principal_kind, inp.principal_id.as_deref())?;
+
+    // Collision-freedom is create_run's job (Task-2 review): a requirement slot
+    // must not collide with a frozen sandbox server alias, because
+    // `RunSpec::mcp_tool_available` unions brokered surfaces and sandbox servers
+    // — a shared alias would let one shadow the other.
+    let brokered = bindings::brokered_surfaces(&resolved);
+    if let Some(slot) = bindings::slot_collision(&brokered, &capabilities) {
+        return Err(ApiError::BadRequest(format!(
+            "requirement slot '{slot}' collides with a sandbox capability server of the same alias — rename the slot"
+        )));
+    }
+
+    // Stamp the resolved binding ids into the workspace + result destinations so
+    // every credentialed consumer resolves the binding, never the raw connection
+    // id (invariant 21). The RunSpec then references each binding row 1:1.
+    bindings::apply_binding_ids(&resolved, &mut workspace, &mut result_destinations);
 
     let run_spec = RunSpec {
         agent_id: agent.id,
@@ -297,11 +367,11 @@ pub async fn create_run(
         policy_version: policy_row.version,
         policy_snapshot: policy,
         invocation: req.invocation.clone(),
-        result_destinations: req.result_destinations.clone(),
+        result_destinations: result_destinations.clone(),
         capabilities,
-        // Task 5 resolves + freezes brokered surfaces from binding resolution;
-        // none until then (the gate falls back to the legacy `capabilities`).
-        brokered: vec![],
+        // Frozen brokered surfaces from binding resolution (the connection-free
+        // successor to embedding a connection_id in a `capabilities` server).
+        brokered,
     };
 
     // 512 KiB serialized runner-env ceiling (design 2026-07-15): env injection
@@ -325,25 +395,6 @@ pub async fn create_run(
         )));
     }
 
-    // Who invoked this run (design "tenant/user audit fields"), derived from the
-    // invocation kind create_run already computes: a directly-authenticated
-    // principal on the admin/UI path is a "user" when their id is known, else an
-    // "operator" (today's shared admin token / no-identity path); a trigger-token
-    // invoke is a "trigger"; a schedule tick is a "schedule"; a connector webhook
-    // is a "webhook". `invoked_by_user_id` is None until identity plumbs it in.
-    let invoked_by_kind = match req.invocation.kind {
-        InvocationKind::Manual => {
-            if req.invoked_by_user_id.is_some() {
-                "user"
-            } else {
-                "operator"
-            }
-        }
-        InvocationKind::Api => "trigger",
-        InvocationKind::Schedule => "schedule",
-        InvocationKind::Event => "webhook",
-    };
-
     let session = fluidbox_db::create_session(
         &state.pool,
         scope,
@@ -360,8 +411,10 @@ pub async fn create_run(
         req.invoked_by_user_id,
         req.bound_invocation,
         req.bound_dispatch,
-        // Task 5 resolves + passes real run resource bindings; none for now.
-        &[],
+        // The resolved bindings commit in the SAME transaction as the session
+        // (design `:391-463`; invariant 21): a run and the frozen record of what
+        // it resolved land together, or not at all.
+        &binding_rows,
     )
     .await?;
 
@@ -468,32 +521,18 @@ async fn frozen_capabilities(
             "capability server name '{name}' appears in more than one attached bundle — narrow the set or re-bundle"
         )));
     }
-    // A brokered server's connection must still be usable at run time (it
-    // may have been revoked since the bundle was registered) — fail closed
-    // during creation, before any model spend.
-    for bundle in &bundles {
-        for server in &bundle.servers {
-            if let CapabilityServer::Brokered {
-                name,
-                connection_id: Some(cid),
-                ..
-            } = server
-            {
-                // Unfiltered read by design: authority is the frozen capability
-                // binding (invariant 21), not a request viewer — a liveness
-                // precheck before model spend.
-                let active = fluidbox_db::get_connection(&state.pool, scope, *cid)
-                    .await?
-                    .map(|c| c.status == "active")
-                    .unwrap_or(false);
-                if !active {
-                    return Err(ApiError::BadRequest(format!(
-                        "capability server '{name}' (bundle {}@{}) uses connection {cid} which is not active — reconnect it or narrow the capabilities",
-                        bundle.name, bundle.version
-                    )));
-                }
-            }
-        }
+    // Phase C cutoff (design `:346-347`): brokered servers no longer ride
+    // capability bundles — they are agent connection requirements resolved into
+    // run_resource_bindings. A revision still pinning a bundle with a brokered
+    // server predates Phase C; refuse rather than run it with an unresolvable
+    // (org-wide, shared) embedded connection. Task 7's conversion makes this
+    // rare — only an explicitly pinned pre-conversion revision reaches here.
+    if let Some((server, bundle, version)) = bindings::first_brokered_server(&bundles) {
+        return Err(ApiError::BadRequest(format!(
+            "capability server '{server}' (bundle {bundle}@{version}) is brokered — this revision \
+             predates connection requirements (Phase C); append a new revision — see \
+             docs/guides/capabilities.md"
+        )));
     }
     Ok(bundles)
 }
