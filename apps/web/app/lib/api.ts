@@ -1,45 +1,102 @@
-// Browser-side client. All calls go to the same-origin proxy, which injects
-// the admin token server-side. The browser never holds a credential.
+// Browser-side client. All calls go to the same-origin proxy. In admin mode the
+// proxy injects the admin token server-side; in sso mode it forwards the
+// browser's session cookie. Either way the browser never holds a credential.
 
 const BASE = "/api/fluidbox";
 
+// The deployment mode is server-authoritative: the root layout stamps it onto
+// <html data-web-mode>. Only two things vary by mode client-side, and both are
+// presentation, not authorization: writes carry the CSRF header (required in
+// sso, inert under the admin bearer path), and a 401 in sso mode means the
+// browser session is missing/expired, so we send the user to /login.
+function ssoMode(): boolean {
+  return (
+    typeof document !== "undefined" &&
+    document.documentElement.dataset.webMode === "sso"
+  );
+}
+
+/** Cookie-authenticated writes require this header (the control plane rejects
+ *  cookie non-GETs without it); the admin bearer path ignores it. */
+const CSRF_HEADERS = { "x-fluidbox-csrf": "1" } as const;
+
+/** In sso mode a 401 means "no live session" — route the browser to the login
+ *  page. Guarded against a redirect loop when already on /login. Admin mode
+ *  never triggers this (the injected bearer is always present). */
+function redirectOnUnauthorized(res: Response): void {
+  if (res.status !== 401 || !ssoMode() || typeof window === "undefined") return;
+  if (window.location.pathname !== "/login") {
+    window.location.href = "/login";
+  }
+}
+
 export async function apiGet<T = unknown>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`, { cache: "no-store" });
-  if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+  if (!res.ok) {
+    redirectOnUnauthorized(res);
+    throw new Error(`${res.status}: ${await res.text()}`);
+  }
   return res.json();
 }
 
 export async function apiPost<T = unknown>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...CSRF_HEADERS },
     body: JSON.stringify(body),
   });
   const text = await res.text();
-  if (!res.ok) throw new Error(text || `${res.status}`);
+  if (!res.ok) {
+    redirectOnUnauthorized(res);
+    throw new Error(text || `${res.status}`);
+  }
   return text ? JSON.parse(text) : ({} as T);
 }
 
 export async function apiPut<T = unknown>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     method: "PUT",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...CSRF_HEADERS },
     body: JSON.stringify(body),
   });
   const text = await res.text();
-  if (!res.ok) throw new Error(text || `${res.status}`);
+  if (!res.ok) {
+    redirectOnUnauthorized(res);
+    throw new Error(text || `${res.status}`);
+  }
   return text ? JSON.parse(text) : ({} as T);
 }
 
 export async function apiDelete<T = unknown>(path: string): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, { method: "DELETE" });
+  const res = await fetch(`${BASE}${path}`, { method: "DELETE", headers: { ...CSRF_HEADERS } });
   const text = await res.text();
-  if (!res.ok) throw new Error(text || `${res.status}`);
+  if (!res.ok) {
+    redirectOnUnauthorized(res);
+    throw new Error(text || `${res.status}`);
+  }
   return text ? JSON.parse(text) : ({} as T);
 }
 
 export function streamUrl(sessionId: string): string {
   return `${BASE}/sessions/${sessionId}/events/stream`;
+}
+
+/** GET /auth/me — who the current browser session belongs to (sso mode). The
+ *  admin token yields `{ operator: true }` instead; users get org + identity.
+ *  The dashboard renders this; it never derives authority from it. */
+export interface AuthMe {
+  operator?: boolean;
+  org?: { slug: string; display_name: string } | null;
+  user?: { email: string | null; name: string | null } | null;
+  roles?: string[];
+  auth_kind?: string;
+}
+
+/** sso mode: end the browser session, then return to the login page. The write
+ *  carries the CSRF header; the response body is irrelevant. */
+export async function logout(): Promise<void> {
+  await fetch(`${BASE}/auth/logout`, { method: "POST", headers: { ...CSRF_HEADERS } });
+  if (typeof window !== "undefined") window.location.href = "/login";
 }
 
 // ─── Types ────────────────────────────────────────────────────────────────
