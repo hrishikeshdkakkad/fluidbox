@@ -14,6 +14,12 @@ pub enum ApiError {
     Forbidden(String),
     #[error("{0}")]
     BadRequest(String),
+    /// An axum extractor rejection surfaced from INSIDE a handler (body param
+    /// `Result<Json<_>, JsonRejection>`) so it can be audited before becoming a
+    /// response — carries the rejection's own status (400 malformed JSON / 415
+    /// missing content-type) rendered in our standard error envelope.
+    #[error("{1}")]
+    Rejected(StatusCode, String),
     #[error("{0}")]
     Conflict(String),
     #[error("{0}")]
@@ -39,6 +45,7 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
             ApiError::Forbidden(_) => (StatusCode::FORBIDDEN, self.to_string()),
             ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            ApiError::Rejected(status, msg) => (*status, msg.clone()),
             ApiError::Conflict(_) => (StatusCode::CONFLICT, self.to_string()),
             ApiError::UnprocessableEntity(_) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, self.to_string())
