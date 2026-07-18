@@ -703,6 +703,20 @@ pub fn build_identity_http(public_url: &str) -> reqwest::Client {
         .expect("identity HTTP client builds")
 }
 
+/// Save-time endpoint validation: parse `url` and apply the SAME https + SSRF
+/// policy the login fetches use (loopback under the same `dev_loopback` gating).
+/// admin_orgs calls this on the discovered `authorization_endpoint` /
+/// `token_endpoint` / `jwks_uri` so a config advertising a private/loopback/
+/// non-https endpoint is refused at SAVE time — the discovery save only *fetches*
+/// jwks_uri, so authorize/token would otherwise first fail (or exfiltrate) at
+/// redirect/callback time. Reuses `validate_fetch_target` — the SSRF policy is
+/// never duplicated.
+pub(crate) async fn validate_endpoint_target(state: &AppState, url: &str) -> Result<(), String> {
+    let dev = dev_loopback(&state.cfg.public_url);
+    let u = reqwest::Url::parse(url).map_err(|_| format!("'{url}' is not a valid URL"))?;
+    validate_fetch_target(&u, dev).await
+}
+
 /// GET a JSON document under the SSRF policy over `state.identity_http`, whose
 /// redirect policy + DNS resolver enforce the policy on every hop. The request
 /// URL is pre-validated and the response's FINAL url re-validated as cheap
@@ -2017,6 +2031,8 @@ async fn provision(
                 "subject": subject,
                 "was_unexpired": was_unexpired,
                 "active_owner_existed": owner_exists,
+                // Correlate this consumption to the arming audit row (design 401-402).
+                "arm_id": locked.bootstrap_arm_audit_id,
             });
             identity::insert_audit(
                 &mut tx,

@@ -87,6 +87,11 @@ jobs:
           shared-key: debug
       - name: build server
         run: cargo build -p fluidbox-server
+      # psql is REQUIRED by the acceptance script (it ages rows + counts audit
+      # rows to PROVE the expired-flow/expired-arm/expired-switch/idempotence/SSE
+      # cases). The script aborts if psql is missing, so install the client here.
+      - name: install postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
       - name: identity acceptance (Dex round-trip + negative matrix)
         env:
           # Reuse the just-built binary so the script `exec`s it directly (clean
@@ -112,6 +117,10 @@ jobs:
           cache-dependency-path: apps/web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
+      # Proxy-auth + sso-route unit tests (vitest) — the credential-boundary logic
+      # (webMode strictness, cookie allowlist, no-bearer forward, Set-Cookie
+      # propagation) is unit-tested; run it in CI alongside the build.
+      - run: pnpm test
 
   # Supply-chain gate: advisories, licenses, bans, sources (deny.toml).
   deny:

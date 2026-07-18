@@ -52,11 +52,15 @@ describe("webMode", () => {
     expect(webMode("sso")).toBe("sso");
   });
 
-  it("falls back to admin for undefined and anything unrecognized", () => {
+  it("stays admin for unset/absent (the documented local default)", () => {
     expect(webMode(undefined)).toBe("admin");
-    expect(webMode("admin")).toBe("admin");
-    expect(webMode("anything-else")).toBe("admin");
     expect(webMode("")).toBe("admin");
-    expect(webMode("SSO")).toBe("admin");
+    expect(webMode("admin")).toBe("admin");
+  });
+
+  it("THROWS on any other value — a hosted typo must never become admin", () => {
+    expect(() => webMode("SSO")).toThrow();
+    expect(() => webMode("typo")).toThrow();
+    expect(() => webMode("anything-else")).toThrow();
   });
 });

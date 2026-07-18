@@ -169,13 +169,36 @@ fn auth_method_supported(auth: &str, meta: &Value) -> bool {
 }
 
 /// Refuse only when `code_challenge_methods_supported` is PRESENT and lacks
-/// `S256`; absent ⇒ accept (S256 is sendable regardless) — design lines 863.
+/// `S256`; absent ⇒ accept (S256 is sendable regardless) — design line 863.
+///
+/// OIDC discovery makes `code_challenge_methods_supported` an OPTIONAL field:
+/// the conformance floor (design 856-871) requires the IdP to *support* PKCE
+/// S256, not to *advertise* it. An issuer that omits the field entirely still
+/// meets the floor (we always send S256); one that advertises the field but
+/// omits S256 is declaring it cannot do S256, and is refused.
 fn pkce_ok(meta: &Value) -> bool {
     match meta
         .get("code_challenge_methods_supported")
         .and_then(Value::as_array)
     {
         Some(arr) => arr.iter().filter_map(Value::as_str).any(|m| m == "S256"),
+        None => true,
+    }
+}
+
+/// When the issuer advertises `response_types_supported`, require an entry that
+/// carries the `code` response type (the authorization-code flow the floor
+/// requires). Absent ⇒ accept (OIDC makes the field optional; the floor requires
+/// the *capability*, and every conformant provider serves `code`).
+fn response_type_code_ok(meta: &Value) -> bool {
+    match meta
+        .get("response_types_supported")
+        .and_then(Value::as_array)
+    {
+        Some(arr) => arr
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|rt| rt.split_whitespace().any(|t| t == "code")),
         None => true,
     }
 }
@@ -235,6 +258,42 @@ pub(crate) struct RolesBody {
     roles: Vec<String>,
 }
 
+/// serde helper distinguishing an ABSENT field from a present `null`. With
+/// `#[serde(default, deserialize_with = "double_option")]` a field yields `None`
+/// when the key is absent, `Some(None)` when present as `null`, and `Some(Some(v))`
+/// for a value — the three states the client_secret PATCH leg needs.
+fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Some(Option::deserialize(de)?))
+}
+
+/// The strict IdP PATCH body. `deny_unknown_fields` rejects typos/garbage keys
+/// and every value field is typed, so a malformed field type is a hard 400
+/// (audited), never silently ignored. Identity fields (issuer/client_id/
+/// generation) are NOT listed here — the handler checks the raw body for them
+/// FIRST and returns the specific "immutable → migrate" message before this
+/// strict parse runs, so `deny_unknown_fields` never masks that steer.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PatchIdpBody {
+    #[serde(default)]
+    token_endpoint_auth: Option<String>,
+    #[serde(default)]
+    scopes: Option<Vec<String>>,
+    #[serde(default)]
+    claim_mappings: Option<Value>,
+    #[serde(default)]
+    alg_allowlist: Option<Vec<String>>,
+    #[serde(default)]
+    bootstrap_owner_email: Option<String>,
+    /// tri-state: absent = keep, null = clear, string = re-seal.
+    #[serde(default, deserialize_with = "double_option")]
+    client_secret: Option<Option<String>>,
+}
+
 // ─── Shared handler helpers ──────────────────────────────────────────────────
 
 /// The audit `source_ip` for an operator mutation: the socket peer unless a
@@ -280,6 +339,30 @@ async fn reject_audit(
         },
     )
     .await;
+}
+
+/// Audit an authorized-but-unfulfillable request that resolves to a missing
+/// target (a `LifecycleOutcome::NotFound`, or a config/membership that does not
+/// exist under this tenant) and return the 404. A terse reason, no body echo —
+/// every `/v1/admin/orgs*` NotFound routes through here so refusals are audited
+/// uniformly (design 395-400).
+async fn refuse_not_found(
+    state: &AppState,
+    tenant_id: Uuid,
+    source_ip: Option<&str>,
+    action: &str,
+    target: Option<&str>,
+) -> ApiError {
+    reject_audit(
+        state,
+        Some(tenant_id),
+        source_ip,
+        action,
+        target,
+        "not found",
+    )
+    .await;
+    ApiError::NotFound
 }
 
 /// Record a rejected attempt and return the error to raise — the one-liner every
@@ -384,6 +467,9 @@ async fn validate_and_stage_config(
     if body.issuer.trim().is_empty() {
         return Err(bad(ApiError::BadRequest("issuer is required".into())).await);
     }
+    if body.client_id.trim().is_empty() {
+        return Err(bad(ApiError::BadRequest("client_id is required".into())).await);
+    }
     if !valid_token_endpoint_auth(&body.token_endpoint_auth) {
         return Err(bad(ApiError::BadRequest(
             "token_endpoint_auth must be client_secret_basic, client_secret_post, or none".into(),
@@ -422,31 +508,17 @@ async fn validate_and_stage_config(
         Err(e) => return Err(bad(ApiError::BadRequest(e)).await),
     };
 
-    // bootstrap_owner_email: normalized + armed, refused while an active owner
-    // exists (design lines 709-711).
+    // bootstrap_owner_email: normalized + armed. The owner-absence precondition
+    // is enforced UNDER the config lock inside `create_idp_config_audited`
+    // (design 709-719), not here — an unlocked pre-check would race a concurrent
+    // owner-granting login.
     let bootstrap_email = match &body.bootstrap_owner_email {
         Some(e) if !e.trim().is_empty() => Some(login::normalize_email(e)),
         _ => None,
     };
-    let bootstrap_expires = if bootstrap_email.is_some() {
-        if owner_exists(state, scope).await? {
-            return Err(refuse(
-                state,
-                tenant,
-                sip,
-                action,
-                None,
-                ApiError::Conflict(
-                    "an active owner already exists; deactivate it before arming a bootstrap owner"
-                        .into(),
-                ),
-            )
-            .await);
-        }
-        Some(Utc::now() + Duration::days(BOOTSTRAP_ARM_TTL_DAYS))
-    } else {
-        None
-    };
+    let bootstrap_expires = bootstrap_email
+        .is_some()
+        .then(|| Utc::now() + Duration::days(BOOTSTRAP_ARM_TTL_DAYS));
 
     // Discovery: fetch + validate over the SSRF-hardened client (reused).
     let (meta, jwks) = match login::refresh_discovery(state, &body.issuer).await {
@@ -458,10 +530,36 @@ async fn validate_and_stage_config(
             .await)
         }
     };
-    if let Err(e) = login::view_from(&meta, jwks.clone()) {
-        return Err(bad(ApiError::BadRequest(format!(
-            "discovery is non-conformant: {e}"
-        )))
+    let view = match login::view_from(&meta, jwks.clone()) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(bad(ApiError::BadRequest(format!(
+                "discovery is non-conformant: {e}"
+            )))
+            .await)
+        }
+    };
+    // The three discovery endpoints must each meet the SAME https + SSRF policy
+    // the login fetches enforce (loopback only under dev). The discovery save
+    // only FETCHES jwks_uri, so authorize/token would otherwise first be caught
+    // at redirect/callback time — validate all three now, at save.
+    for (label, url) in [
+        ("authorization_endpoint", &view.authorization_endpoint),
+        ("token_endpoint", &view.token_endpoint),
+        ("jwks_uri", &view.jwks_uri),
+    ] {
+        if let Err(e) = login::validate_endpoint_target(state, url).await {
+            return Err(bad(ApiError::BadRequest(format!(
+                "discovered {label} is not an acceptable URL: {e}"
+            )))
+            .await);
+        }
+    }
+    if !response_type_code_ok(&meta) {
+        return Err(bad(ApiError::BadRequest(
+            "the issuer advertises response_types_supported without the authorization-code flow (code)"
+                .into(),
+        ))
         .await);
     }
     if !auth_method_supported(&body.token_endpoint_auth, &meta) {
@@ -512,8 +610,16 @@ async fn validate_and_stage_config(
         jwks: Some(&jwks),
         discovered_at: Some(now),
     };
-    let row = identity::create_idp_config_audited(&state.pool, scope, params, sip).await?;
-    Ok(row)
+    match identity::create_idp_config_audited(&state.pool, scope, params, sip).await? {
+        LifecycleOutcome::Done(row) => Ok(row),
+        // Owner-exists refusal (checked under the config lock): 409, audited.
+        LifecycleOutcome::Refused(reason) => Err(bad(ApiError::Conflict(reason.into())).await),
+        // create never resolves to a missing target; keep the arm audited.
+        LifecycleOutcome::NotFound => Err(bad(ApiError::BadRequest(
+            "could not stage the configuration".into(),
+        ))
+        .await),
+    }
 }
 
 pub async fn create_idp(
@@ -543,7 +649,14 @@ pub async fn activate_idp(
     let scope = TenantScope::assume(org.id);
     match identity::activate_idp_config(&state.pool, scope, id, sip.as_deref()).await? {
         LifecycleOutcome::Done(row) => Ok(Json(json!({ "idp": row }))),
-        LifecycleOutcome::NotFound => Err(ApiError::NotFound),
+        LifecycleOutcome::NotFound => Err(refuse_not_found(
+            &state,
+            org.id,
+            sip.as_deref(),
+            "idp.activate",
+            Some(&id.to_string()),
+        )
+        .await),
         LifecycleOutcome::Refused(reason) => {
             Err(refuse_lifecycle(&state, org.id, sip.as_deref(), "idp.activate", id, reason).await)
         }
@@ -567,7 +680,14 @@ pub async fn disable_idp(
             "switches_cancelled": c.switches_cancelled,
             "sessions_revoked": c.sessions_revoked,
         }))),
-        LifecycleOutcome::NotFound => Err(ApiError::NotFound),
+        LifecycleOutcome::NotFound => Err(refuse_not_found(
+            &state,
+            org.id,
+            sip.as_deref(),
+            "idp.disable",
+            Some(&id.to_string()),
+        )
+        .await),
         LifecycleOutcome::Refused(reason) => {
             Err(refuse_lifecycle(&state, org.id, sip.as_deref(), "idp.disable", id, reason).await)
         }
@@ -586,7 +706,14 @@ pub async fn reactivate_idp(
     let scope = TenantScope::assume(org.id);
     match identity::reactivate_idp_config(&state.pool, scope, id, sip.as_deref()).await? {
         LifecycleOutcome::Done(row) => Ok(Json(json!({ "idp": row }))),
-        LifecycleOutcome::NotFound => Err(ApiError::NotFound),
+        LifecycleOutcome::NotFound => Err(refuse_not_found(
+            &state,
+            org.id,
+            sip.as_deref(),
+            "idp.reactivate",
+            Some(&id.to_string()),
+        )
+        .await),
         LifecycleOutcome::Refused(reason) => {
             Err(
                 refuse_lifecycle(&state, org.id, sip.as_deref(), "idp.reactivate", id, reason)
@@ -602,46 +729,50 @@ pub async fn patch_idp(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Path((slug, id)): Path<(String, Uuid)>,
-    Json(body): Json<Value>,
+    Json(raw): Json<Value>,
 ) -> ApiResult<Json<Value>> {
     let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
     let org = resolve_org(&state, &slug).await?;
     let scope = TenantScope::assume(org.id);
-    let config = identity::get_idp_config(&state.pool, scope, id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-
-    // Identity fields are immutable — steer the operator to a migration.
-    if let Some(f) = patch_immutable_field(&body) {
-        return Err(refuse(
-            &state,
-            org.id,
-            sip.as_deref(),
-            "idp.patch",
-            Some(&id.to_string()),
-            ApiError::BadRequest(format!(
-                "{f} is immutable; fix identity fields with POST …/idp/{{id}}/migrate"
-            )),
-        )
-        .await);
-    }
-    let obj = body
-        .as_object()
-        .ok_or_else(|| ApiError::BadRequest("body must be a JSON object".into()))?;
+    let config = match identity::get_idp_config(&state.pool, scope, id).await? {
+        Some(c) => c,
+        None => {
+            return Err(refuse_not_found(
+                &state,
+                org.id,
+                sip.as_deref(),
+                "idp.patch",
+                Some(&id.to_string()),
+            )
+            .await)
+        }
+    };
     let tgt = id.to_string();
     let bad = |e: ApiError| async {
         refuse(&state, org.id, sip.as_deref(), "idp.patch", Some(&tgt), e).await
     };
 
+    // Identity fields are immutable — steer the operator to a migration. Checked
+    // on the RAW body FIRST, so the specific message wins over the strict parse's
+    // unknown-field rejection below.
+    if let Some(f) = patch_immutable_field(&raw) {
+        return Err(bad(ApiError::BadRequest(format!(
+            "{f} is immutable; fix identity fields with POST …/idp/{{id}}/migrate"
+        )))
+        .await);
+    }
+    // Strict typed parse: deny_unknown_fields + typed value fields mean a typo or
+    // malformed field type is a hard 400 (audited), never silently ignored.
+    let body: PatchIdpBody = match serde_json::from_value(raw) {
+        Ok(b) => b,
+        Err(e) => return Err(bad(ApiError::BadRequest(format!("invalid patch body: {e}"))).await),
+    };
+
     // token_endpoint_auth: validated against the config's cached (or refreshed)
     // discovery methods.
-    let new_auth: Option<String> = match obj.get("token_endpoint_auth") {
-        Some(v) => {
-            let a = v
-                .as_str()
-                .ok_or_else(|| ApiError::BadRequest("token_endpoint_auth must be a string".into()))?
-                .to_string();
-            if !valid_token_endpoint_auth(&a) {
+    let new_auth: Option<String> = match &body.token_endpoint_auth {
+        Some(a) => {
+            if !valid_token_endpoint_auth(a) {
                 return Err(bad(ApiError::BadRequest(
                     "token_endpoint_auth must be client_secret_basic, client_secret_post, or none"
                         .into(),
@@ -649,28 +780,22 @@ pub async fn patch_idp(
                 .await);
             }
             let meta = config_discovery_meta(&state, &config).await?;
-            if !auth_method_supported(&a, &meta) {
+            if !auth_method_supported(a, &meta) {
                 return Err(bad(ApiError::BadRequest(format!(
                     "token_endpoint_auth={a} is not advertised by the issuer"
                 )))
                 .await);
             }
-            Some(a)
+            Some(a.clone())
         }
         None => None,
     };
 
-    // scopes
-    let new_scopes: Option<Vec<String>> = match obj.get("scopes") {
-        Some(v) => Some(
-            serde_json::from_value(v.clone())
-                .map_err(|_| ApiError::BadRequest("scopes must be an array of strings".into()))?,
-        ),
-        None => None,
-    };
+    // scopes (already typed by the strict parse).
+    let new_scopes: Option<Vec<String>> = body.scopes.clone();
 
     // claim_mappings: role rules re-validated + defaults filled.
-    let new_mappings: Option<Value> = match obj.get("claim_mappings") {
+    let new_mappings: Option<Value> = match &body.claim_mappings {
         Some(v) => match build_claim_mappings(Some(v)) {
             Ok(m) => Some(m),
             Err(e) => return Err(bad(ApiError::BadRequest(e)).await),
@@ -679,44 +804,73 @@ pub async fn patch_idp(
     };
 
     // alg_allowlist: HS*/none re-rejected.
-    let new_algs: Option<Vec<String>> = match obj.get("alg_allowlist") {
-        Some(v) => {
-            let a: Vec<String> = serde_json::from_value(v.clone()).map_err(|_| {
-                ApiError::BadRequest("alg_allowlist must be an array of strings".into())
-            })?;
-            if let Err(e) = validate_alg_allowlist(&a) {
+    let new_algs: Option<Vec<String>> = match &body.alg_allowlist {
+        Some(a) => {
+            if let Err(e) = validate_alg_allowlist(a) {
                 return Err(bad(ApiError::BadRequest(e)).await);
             }
-            Some(a)
+            Some(a.clone())
         }
         None => None,
     };
 
-    // client_secret: re-sealed (requires the Sealer), no generation bump.
-    let new_secret: Option<Vec<u8>> = match obj.get("client_secret").and_then(Value::as_str) {
-        Some(secret) => {
+    // client_secret tri-state: absent = keep, null = clear, string = re-seal
+    // (re-seal requires the Sealer). No generation bump.
+    let secret_patch = match &body.client_secret {
+        None => identity::SecretPatch::Keep,
+        Some(None) => identity::SecretPatch::Clear,
+        Some(Some(secret)) => {
             let sealer = match crate::oauth::sealer(&state) {
                 Ok(s) => s,
                 Err(e) => return Err(bad(e).await),
             };
-            Some(sealer.seal(secret))
+            identity::SecretPatch::Set(sealer.seal(secret))
         }
-        None => None,
     };
 
-    // bootstrap_owner_email: re-armed (+7d), refused (in the DB fn) while an
-    // active owner exists.
-    let new_bootstrap: Option<(String, DateTime<Utc>)> =
-        match obj.get("bootstrap_owner_email").and_then(Value::as_str) {
-            Some(e) if !e.trim().is_empty() => Some((
-                login::normalize_email(e),
-                Utc::now() + Duration::days(BOOTSTRAP_ARM_TTL_DAYS),
-            )),
-            _ => None,
-        };
+    // Coherence AFTER merging with current state: a confidential method
+    // (client_secret_basic/post) requires a secret present post-merge; a public
+    // client (none) must not retain one — refuse rather than silently drift.
+    let has_secret_now = identity::idp_client_secret_sealed(&state.pool, scope, id)
+        .await?
+        .is_some();
+    let secret_present_post = match &secret_patch {
+        identity::SecretPatch::Set(_) => true,
+        identity::SecretPatch::Clear => false,
+        identity::SecretPatch::Keep => has_secret_now,
+    };
+    let eff_auth = new_auth
+        .as_deref()
+        .unwrap_or(config.token_endpoint_auth.as_str());
+    if (eff_auth == "client_secret_basic" || eff_auth == "client_secret_post")
+        && !secret_present_post
+    {
+        return Err(bad(ApiError::BadRequest(format!(
+            "token_endpoint_auth={eff_auth} requires a client_secret to be present after this patch"
+        )))
+        .await);
+    }
+    if eff_auth == "none" && secret_present_post {
+        return Err(bad(ApiError::BadRequest(
+            "token_endpoint_auth=none (public client) must not retain a client_secret; \
+             clear it explicitly with client_secret:null"
+                .into(),
+        ))
+        .await);
+    }
+
+    // bootstrap_owner_email: re-armed (+7d), refused (in the DB fn, under the
+    // config lock) while an active owner exists.
+    let new_bootstrap: Option<(String, DateTime<Utc>)> = match &body.bootstrap_owner_email {
+        Some(e) if !e.trim().is_empty() => Some((
+            login::normalize_email(e),
+            Utc::now() + Duration::days(BOOTSTRAP_ARM_TTL_DAYS),
+        )),
+        _ => None,
+    };
 
     let patch = IdpPatch {
-        client_secret_sealed: new_secret,
+        client_secret: secret_patch,
         token_endpoint_auth: new_auth.as_deref(),
         scopes: new_scopes.as_deref(),
         claim_mappings: new_mappings.as_ref(),
@@ -727,7 +881,14 @@ pub async fn patch_idp(
     };
     match identity::patch_idp_config(&state.pool, scope, id, patch, sip.as_deref()).await? {
         LifecycleOutcome::Done(row) => Ok(Json(json!({ "idp": row }))),
-        LifecycleOutcome::NotFound => Err(ApiError::NotFound),
+        LifecycleOutcome::NotFound => Err(refuse_not_found(
+            &state,
+            org.id,
+            sip.as_deref(),
+            "idp.patch",
+            Some(&id.to_string()),
+        )
+        .await),
         LifecycleOutcome::Refused(reason) => {
             Err(refuse_lifecycle(&state, org.id, sip.as_deref(), "idp.patch", id, reason).await)
         }
@@ -749,9 +910,19 @@ pub async fn migrate_idp(
     // Pre-check the OLD config is active BEFORE staging the new one, so a wrong
     // target does not leave an orphan staged config (the swap re-checks under
     // the lock as the authority).
-    let old = identity::get_idp_config(&state.pool, scope, id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
+    let old = match identity::get_idp_config(&state.pool, scope, id).await? {
+        Some(c) => c,
+        None => {
+            return Err(refuse_not_found(
+                &state,
+                org.id,
+                sip.as_deref(),
+                "idp.migrate",
+                Some(&id.to_string()),
+            )
+            .await)
+        }
+    };
     if old.status != "active" {
         return Err(refuse(
             &state,
@@ -789,7 +960,14 @@ pub async fn migrate_idp(
             "sessions_revoked": c.sessions_revoked,
             "memberships_deactivated": c.memberships_deactivated,
         }))),
-        LifecycleOutcome::NotFound => Err(ApiError::NotFound),
+        LifecycleOutcome::NotFound => Err(refuse_not_found(
+            &state,
+            org.id,
+            sip.as_deref(),
+            "idp.migrate",
+            Some(&id.to_string()),
+        )
+        .await),
         LifecycleOutcome::Refused(reason) => {
             Err(refuse_lifecycle(&state, org.id, sip.as_deref(), "idp.migrate", id, reason).await)
         }
@@ -822,8 +1000,21 @@ pub async fn break_glass_owner(
         .await);
     }
     let normalized = login::normalize_email(email);
-    let Some(active) = identity::active_idp_config(&state.pool, org.id).await? else {
-        return Err(refuse(
+    let expires_at = Utc::now() + Duration::days(BOOTSTRAP_ARM_TTL_DAYS);
+    // arm_bootstrap_owner resolves + locks the org's active config in ONE
+    // transaction (rechecking status='active' and owner-absence under the lock);
+    // nothing is trusted from an unlocked prior read.
+    match identity::arm_bootstrap_owner(&state.pool, scope, &normalized, expires_at, sip.as_deref())
+        .await?
+    {
+        LifecycleOutcome::Done((config_id, arm_id)) => Ok(Json(json!({
+            "armed": true,
+            "arm_id": arm_id,
+            "config": config_id,
+            "expires_at": expires_at,
+        }))),
+        // No active config to arm — audited 409 (preserves the prior status).
+        LifecycleOutcome::NotFound => Err(refuse(
             &state,
             org.id,
             sip.as_deref(),
@@ -831,33 +1022,15 @@ pub async fn break_glass_owner(
             None,
             ApiError::Conflict("no active IdP configuration to arm".into()),
         )
-        .await);
-    };
-    let expires_at = Utc::now() + Duration::days(BOOTSTRAP_ARM_TTL_DAYS);
-    match identity::arm_bootstrap_owner(
-        &state.pool,
-        scope,
-        active.id,
-        &normalized,
-        expires_at,
-        sip.as_deref(),
-    )
-    .await?
-    {
-        LifecycleOutcome::Done(arm_id) => Ok(Json(json!({
-            "armed": true,
-            "arm_id": arm_id,
-            "config": active.id,
-            "expires_at": expires_at,
-        }))),
-        LifecycleOutcome::NotFound => Err(ApiError::NotFound),
-        LifecycleOutcome::Refused(reason) => Err(refuse_lifecycle(
+        .await),
+        // Active owner exists / config no longer active — audited 409.
+        LifecycleOutcome::Refused(reason) => Err(refuse(
             &state,
             org.id,
             sip.as_deref(),
             "break_glass.arm",
-            active.id,
-            reason,
+            None,
+            ApiError::Conflict(reason.into()),
         )
         .await),
     }
@@ -890,7 +1063,14 @@ pub async fn deactivate_member(
         .await?
     {
         Some(m) => Ok(Json(json!({ "membership": m }))),
-        None => Err(ApiError::NotFound),
+        None => Err(refuse_not_found(
+            &state,
+            org.id,
+            sip.as_deref(),
+            "member.deactivate",
+            Some(&membership_id.to_string()),
+        )
+        .await),
     }
 }
 
@@ -948,7 +1128,14 @@ pub async fn set_member_roles(
     .await?
     {
         Some(m) => Ok(Json(json!({ "membership": m }))),
-        None => Err(ApiError::NotFound),
+        None => Err(refuse_not_found(
+            &state,
+            org.id,
+            sip.as_deref(),
+            "member.roles",
+            Some(&membership_id.to_string()),
+        )
+        .await),
     }
 }
 
@@ -988,13 +1175,6 @@ async fn config_discovery_meta(
         .await
         .map_err(|e| ApiError::BadRequest(format!("issuer discovery failed: {e}")))?;
     Ok(meta)
-}
-
-/// Reader for the org-wide active-owner precondition (create-time bootstrap
-/// arming). Acquires a connection to reuse the executor-generic DB helper.
-async fn owner_exists(state: &AppState, scope: TenantScope) -> ApiResult<bool> {
-    let mut conn = state.pool.acquire().await?;
-    Ok(identity::active_owner_exists(&mut conn, scope).await?)
 }
 
 #[cfg(test)]

@@ -69,18 +69,32 @@ async function forward(req: Request, path: string[]) {
   }
 
   const upstream = await fetch(target, init);
-
-  // Stream SSE through untouched (both modes).
   const upstreamCt = upstream.headers.get("content-type") || "";
+
+  // Propagate the redirect Location and EVERY Set-Cookie header (getSetCookie
+  // preserves them individually; append keeps them distinct on the outgoing
+  // Response) in sso mode. Defined BEFORE the streaming-vs-buffered branch so an
+  // SSE response carries session cookies identically to a buffered one — a login
+  // leg that streams must still let the browser store its cookie. A no-op in
+  // admin mode (there are no session cookies to forward).
+  const propagateCookies = (headers: Headers) => {
+    if (MODE !== "sso") return;
+    const location = upstream.headers.get("location");
+    if (location) headers.set("location", location);
+    for (const cookie of upstream.headers.getSetCookie()) {
+      headers.append("set-cookie", cookie);
+    }
+  };
+
+  // Stream SSE through untouched (both modes), now carrying cookies in sso.
   if (upstreamCt.includes("event-stream")) {
-    return new Response(upstream.body, {
-      status: upstream.status,
-      headers: {
-        "content-type": "text/event-stream",
-        "cache-control": "no-cache, no-transform",
-        connection: "keep-alive",
-      },
+    const headers = new Headers({
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
     });
+    propagateCookies(headers);
+    return new Response(upstream.body, { status: upstream.status, headers });
   }
 
   const body = await upstream.text();
@@ -93,16 +107,10 @@ async function forward(req: Request, path: string[]) {
     });
   }
 
-  // sso: propagate status, content-type, any redirect Location, and EVERY
-  // Set-Cookie header separately (getSetCookie preserves them individually,
-  // and append keeps them distinct on the outgoing Response).
+  // sso: propagate status, content-type, any redirect Location, and Set-Cookie.
   const out = new Headers();
   out.set("content-type", upstreamCt || "application/json");
-  const location = upstream.headers.get("location");
-  if (location) out.set("location", location);
-  for (const cookie of upstream.headers.getSetCookie()) {
-    out.append("set-cookie", cookie);
-  }
+  propagateCookies(out);
   return new Response(body, { status: upstream.status, headers: out });
 }
 

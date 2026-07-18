@@ -52,6 +52,9 @@ pub struct OrgIdpConfigRow {
     pub claim_mappings: Value,
     pub bootstrap_owner_email: Option<String>,
     pub bootstrap_owner_expires_at: Option<DateTime<Utc>>,
+    /// The arming audit row's id, stored when a bootstrap owner is armed; login
+    /// consumption references it (`arm_id`) and clears it with the arm.
+    pub bootstrap_arm_audit_id: Option<Uuid>,
     pub discovered_metadata: Option<Value>,
     pub jwks: Option<Value>,
     pub discovered_at: Option<DateTime<Utc>>,
@@ -63,8 +66,8 @@ pub struct OrgIdpConfigRow {
 
 const IDP_CONFIG_COLS: &str = "id, tenant_id, generation, issuer, client_id, \
     token_endpoint_auth, scopes, alg_allowlist, claim_mappings, \
-    bootstrap_owner_email, bootstrap_owner_expires_at, discovered_metadata, \
-    jwks, discovered_at, status, created_by, created_at, updated_at";
+    bootstrap_owner_email, bootstrap_owner_expires_at, bootstrap_arm_audit_id, \
+    discovered_metadata, jwks, discovered_at, status, created_by, created_at, updated_at";
 
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct UserRow {
@@ -1027,10 +1030,20 @@ pub struct MemberRow {
     pub last_login_at: Option<DateTime<Utc>>,
 }
 
+/// The client-secret leg of a PATCH — a tri-state mirroring the JSON body:
+/// absent = keep the current sealed secret, null = clear it, a string = re-seal.
+/// `coalesce` alone cannot express "clear", so the tri-state is carried through
+/// to the UPDATE explicitly.
+pub enum SecretPatch {
+    Keep,
+    Clear,
+    Set(Vec<u8>),
+}
+
 /// The mutable-field patch for an IdP config (identity fields are refused by the
 /// handler, never reach here). Each `Some` field is applied via `coalesce`.
 pub struct IdpPatch<'a> {
-    pub client_secret_sealed: Option<Vec<u8>>,
+    pub client_secret: SecretPatch,
     pub token_endpoint_auth: Option<&'a str>,
     pub scopes: Option<&'a [String]>,
     pub claim_mappings: Option<&'a Value>,
@@ -1050,6 +1063,10 @@ struct LockedConfig {
 /// (by id) — the uniform lock every status transition and the swap take, so they
 /// serialize with each other without deadlock, and with a login's transaction B
 /// (which locks the single active row). Returns the locked triples.
+///
+/// Taken by every path that arms/consumes/revokes owner under the same
+/// discipline — the create-IdP and owner-deactivation paths join the existing
+/// status-transition/swap/role-change callers (all in this module).
 async fn lock_org_configs(
     conn: &mut sqlx::PgConnection,
     scope: TenantScope,
@@ -1170,21 +1187,26 @@ async fn check_and_arm_bootstrap(
     conn: &mut sqlx::PgConnection,
     scope: TenantScope,
     config_id: Uuid,
+    arm_audit_id: Uuid,
     normalized_email: &str,
     expires_at: DateTime<Utc>,
 ) -> sqlx::Result<bool> {
     if active_owner_exists(&mut *conn, scope).await? {
         return Ok(false);
     }
+    // Store the arming audit row's id alongside the arm so consumption can
+    // reference it (`arm_id`) and clear it with the arm (design 401-402).
     sqlx::query(
         "update org_idp_configs
-         set bootstrap_owner_email = $3, bootstrap_owner_expires_at = $4, updated_at = now()
+         set bootstrap_owner_email = $3, bootstrap_owner_expires_at = $4,
+             bootstrap_arm_audit_id = $5, updated_at = now()
          where tenant_id = $1 and id = $2",
     )
     .bind(scope.tenant_id())
     .bind(config_id)
     .bind(normalized_email)
     .bind(expires_at)
+    .bind(arm_audit_id)
     .execute(&mut *conn)
     .await?;
     Ok(true)
@@ -1225,28 +1247,67 @@ pub async fn create_org_audited(
 
 /// Insert a staged IdP config (discovery pre-cached in `params`) + its accepted
 /// `idp.create` audit row in one transaction.
+///
+/// When `params` carries a bootstrap arm, the WHOLE thing runs under the org's
+/// config lock ([`lock_org_configs`]): the arm's owner-absence precondition and
+/// the staged insert then serialize with bootstrap consumption / role changes /
+/// the issuer-migration swap (design 709-719). The lock is taken FIRST, before
+/// the insert, so a login promoting a new owner cannot slip between the
+/// owner-exists check and the arm landing. Returns `Refused` when an active
+/// owner already exists (the caller audits + 409s); a staged insert WITHOUT an
+/// arm needs no lock (nothing to serialize).
 pub async fn create_idp_config_audited(
     pool: &PgPool,
     scope: TenantScope,
     params: IdpConfigParams<'_>,
     source_ip: Option<&str>,
-) -> sqlx::Result<OrgIdpConfigRow> {
+) -> sqlx::Result<LifecycleOutcome<OrgIdpConfigRow>> {
+    let arming = params.bootstrap_owner_email.is_some();
     let mut tx = pool.begin().await?;
-    let row = create_idp_config(&mut tx, scope, params).await?;
+    if arming {
+        // Lock the org's existing config rows FIRST, then re-check owner-absence
+        // under that lock — the create-path half of the arming invariant.
+        lock_org_configs(&mut tx, scope).await?;
+        if active_owner_exists(&mut tx, scope).await? {
+            tx.rollback().await.ok();
+            return Ok(LifecycleOutcome::Refused(
+                "an active owner already exists; deactivate it before arming a bootstrap owner",
+            ));
+        }
+    }
+    let mut row = create_idp_config(&mut tx, scope, params).await?;
+    // The arm's audit id links arming to consumption (design 401-402); generate
+    // it up front so the SAME id is both the audit row's PK and the value stored
+    // in `bootstrap_arm_audit_id`.
+    let audit_id = Uuid::now_v7();
     let detail = json!({
         "generation": row.generation,
         "issuer_sha256": sha256_hex(&row.issuer),
         "token_endpoint_auth": row.token_endpoint_auth,
-        "bootstrap_armed": row.bootstrap_owner_email.is_some(),
+        "bootstrap_armed": arming,
+        "arm_id": if arming { Some(audit_id) } else { None },
     });
     let target = row.id.to_string();
-    insert_audit(
+    insert_audit_with_id(
         &mut tx,
+        audit_id,
         operator_audit(scope.tenant_id(), source_ip, "idp.create", &target, &detail),
     )
     .await?;
+    if arming {
+        sqlx::query(
+            "update org_idp_configs set bootstrap_arm_audit_id = $3
+             where tenant_id = $1 and id = $2",
+        )
+        .bind(scope.tenant_id())
+        .bind(row.id)
+        .bind(audit_id)
+        .execute(&mut *tx)
+        .await?;
+        row.bootstrap_arm_audit_id = Some(audit_id);
+    }
     tx.commit().await?;
-    Ok(row)
+    Ok(LifecycleOutcome::Done(row))
 }
 
 /// `staged → active`, refused (409) while another row is active. The pre-check
@@ -1494,37 +1555,59 @@ pub async fn migrate_idp_config(
     Ok(LifecycleOutcome::Done(counts))
 }
 
-/// Re-arm the bootstrap owner on `config_id` (break-glass), refused (409) while
-/// an active owner exists. Locks the config row `FOR UPDATE` (serializes with
-/// bootstrap consumption). The accepted audit row's PK is recorded in its own
-/// `detail` as `arm_id`, so Task 5's consumption rows can be correlated.
+/// Break-glass: re-arm the bootstrap owner on the org's ACTIVE config, refused
+/// (409) while an active owner exists. Resolve + arm happen in ONE transaction
+/// that locks the target config row `FOR UPDATE` and rechecks `status = 'active'`
+/// and owner-absence UNDER the lock (design 709-719) — a config disabled/retired
+/// by a concurrent transaction after an unlocked read can never be armed. The
+/// active config is resolved via the `status = 'active'` partial-unique index
+/// (≤1 row) INSIDE the transaction, so nothing is trusted from a prior read.
+/// Returns `Done((config_id, arm_id))`; the accepted audit row's PK is recorded
+/// as `arm_id` and stored on the config so consumption can correlate.
 pub async fn arm_bootstrap_owner(
     pool: &PgPool,
     scope: TenantScope,
-    config_id: Uuid,
     normalized_email: &str,
     expires_at: DateTime<Utc>,
     source_ip: Option<&str>,
-) -> sqlx::Result<LifecycleOutcome<Uuid>> {
+) -> sqlx::Result<LifecycleOutcome<(Uuid, Uuid)>> {
     let mut tx = pool.begin().await?;
-    let locked: Option<(String,)> = sqlx::query_as(
-        "select status from org_idp_configs where tenant_id = $1 and id = $2 for update",
+    // Resolve + lock the active config in one shot (partial unique index ⇒ ≤1).
+    let active: Option<(Uuid, String)> = sqlx::query_as(
+        "select id, status from org_idp_configs
+         where tenant_id = $1 and status = 'active' for update",
     )
     .bind(scope.tenant_id())
-    .bind(config_id)
     .fetch_optional(&mut *tx)
     .await?;
-    if locked.is_none() {
+    let Some((config_id, status)) = active else {
         tx.rollback().await.ok();
         return Ok(LifecycleOutcome::NotFound);
+    };
+    // Recheck under the lock (the WHERE already constrained it; this makes the
+    // status guard explicit and survives a future non-index-backed resolve).
+    if status != "active" {
+        tx.rollback().await.ok();
+        return Ok(LifecycleOutcome::Refused(
+            "no active IdP configuration to arm",
+        ));
     }
-    if !check_and_arm_bootstrap(&mut tx, scope, config_id, normalized_email, expires_at).await? {
+    let arm_id = Uuid::now_v7();
+    if !check_and_arm_bootstrap(
+        &mut tx,
+        scope,
+        config_id,
+        arm_id,
+        normalized_email,
+        expires_at,
+    )
+    .await?
+    {
         tx.rollback().await.ok();
         return Ok(LifecycleOutcome::Refused(
             "an active owner already exists; deactivate it before arming",
         ));
     }
-    let arm_id = Uuid::now_v7();
     let detail = json!({
         "arm_id": arm_id,
         "email_sha256": sha256_hex(normalized_email),
@@ -1544,7 +1627,7 @@ pub async fn arm_bootstrap_owner(
     )
     .await?;
     tx.commit().await?;
-    Ok(LifecycleOutcome::Done(arm_id))
+    Ok(LifecycleOutcome::Done((config_id, arm_id)))
 }
 
 /// Apply a mutable-field patch (+ optional bootstrap re-arm) to an IdP config in
@@ -1569,19 +1652,29 @@ pub async fn patch_idp_config(
         tx.rollback().await.ok();
         return Ok(LifecycleOutcome::NotFound);
     }
+    // Client-secret tri-state: Clear ⇒ null; Set ⇒ new sealed bytes; Keep ⇒
+    // coalesce($3 = null) leaves the current value. `coalesce` alone cannot
+    // express Clear, so a `$4::bool` flag forces null ahead of the coalesce.
+    let (clear_secret, set_secret): (bool, Option<Vec<u8>>) = match patch.client_secret {
+        SecretPatch::Keep => (false, None),
+        SecretPatch::Clear => (true, None),
+        SecretPatch::Set(bytes) => (false, Some(bytes)),
+    };
     let row: OrgIdpConfigRow = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update org_idp_configs set
-           client_secret_sealed = coalesce($3::bytea, client_secret_sealed),
-           token_endpoint_auth = coalesce($4::text, token_endpoint_auth),
-           scopes = coalesce($5::text[], scopes),
-           claim_mappings = coalesce($6::jsonb, claim_mappings),
-           alg_allowlist = coalesce($7::text[], alg_allowlist),
+           client_secret_sealed = case when $4::bool then null
+                                       else coalesce($3::bytea, client_secret_sealed) end,
+           token_endpoint_auth = coalesce($5::text, token_endpoint_auth),
+           scopes = coalesce($6::text[], scopes),
+           claim_mappings = coalesce($7::jsonb, claim_mappings),
+           alg_allowlist = coalesce($8::text[], alg_allowlist),
            updated_at = now()
          where tenant_id = $1 and id = $2 returning {IDP_CONFIG_COLS}"
     )))
     .bind(scope.tenant_id())
     .bind(id)
-    .bind(patch.client_secret_sealed.as_deref())
+    .bind(set_secret.as_deref())
+    .bind(clear_secret)
     .bind(patch.token_endpoint_auth)
     .bind(patch.scopes.map(<[String]>::to_vec))
     .bind(patch.claim_mappings)
@@ -1591,18 +1684,20 @@ pub async fn patch_idp_config(
 
     let mut arm_id: Option<Uuid> = None;
     if let Some((email, expires_at)) = patch.bootstrap {
-        if !check_and_arm_bootstrap(&mut tx, scope, id, email, expires_at).await? {
+        let aid = Uuid::now_v7();
+        if !check_and_arm_bootstrap(&mut tx, scope, id, aid, email, expires_at).await? {
             tx.rollback().await.ok();
             return Ok(LifecycleOutcome::Refused(
                 "an active owner already exists; deactivate it before arming",
             ));
         }
-        arm_id = Some(Uuid::now_v7());
+        arm_id = Some(aid);
     }
 
     let detail = json!({
         "generation": row.generation,
-        "client_secret_rotated": patch.client_secret_sealed.is_some(),
+        "client_secret_rotated": set_secret.is_some(),
+        "client_secret_cleared": clear_secret,
         "token_endpoint_auth_changed": patch.token_endpoint_auth.is_some(),
         "scopes_changed": patch.scopes.is_some(),
         "claim_mappings_changed": patch.claim_mappings.is_some(),
@@ -1652,6 +1747,24 @@ pub async fn deactivate_membership_audited(
     source_ip: Option<&str>,
 ) -> sqlx::Result<Option<OrgMembershipRow>> {
     let mut tx = pool.begin().await?;
+    // Deactivating an OWNER frees the org for a bootstrap re-arm, so it must
+    // serialize with arming/consumption/role-changes on the SAME config lock as
+    // the roles-change path. Lock order is config → membership → sessions,
+    // consistent with login transaction B, the issuer-migration swap, and the
+    // org-switch: take the config lock BEFORE the membership status change + its
+    // session/PAT cascade. A non-owner deactivation touches no owner invariant,
+    // so it skips the lock. The owner read below precedes the status change (the
+    // roles are still the current set).
+    let holds_owner: Option<bool> = sqlx::query_scalar(
+        "select 'owner' = any(roles) from org_memberships where tenant_id = $1 and id = $2",
+    )
+    .bind(scope.tenant_id())
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if holds_owner.unwrap_or(false) {
+        lock_org_configs(&mut tx, scope).await?;
+    }
     let row = apply_membership_status(&mut tx, scope, id, "deactivated").await?;
     match &row {
         Some(m) => {
@@ -1757,6 +1870,9 @@ pub struct LockedIdpConfig {
     pub tenant_status: String,
     pub bootstrap_owner_email: Option<String>,
     pub bootstrap_owner_expires_at: Option<DateTime<Utc>>,
+    /// The arming audit row's id (if armed), captured so consumption's audit can
+    /// reference it as `arm_id` (design 401-402).
+    pub bootstrap_arm_audit_id: Option<Uuid>,
 }
 
 /// Transaction B's opening lock: `for update of c` takes an exclusive row lock
@@ -1770,7 +1886,8 @@ pub async fn lock_idp_config_for_update(
     sqlx::query_as(
         "select c.status as config_status, t.status as tenant_status,
                 c.bootstrap_owner_email as bootstrap_owner_email,
-                c.bootstrap_owner_expires_at as bootstrap_owner_expires_at
+                c.bootstrap_owner_expires_at as bootstrap_owner_expires_at,
+                c.bootstrap_arm_audit_id as bootstrap_arm_audit_id
          from org_idp_configs c
          join tenants t on t.id = c.tenant_id
          where c.tenant_id = $1 and c.id = $2
@@ -1882,7 +1999,8 @@ pub async fn consume_bootstrap_arm(
 ) -> sqlx::Result<Option<Uuid>> {
     let row: Option<(Uuid,)> = sqlx::query_as(
         "update org_idp_configs
-         set bootstrap_owner_email = null, bootstrap_owner_expires_at = null, updated_at = now()
+         set bootstrap_owner_email = null, bootstrap_owner_expires_at = null,
+             bootstrap_arm_audit_id = null, updated_at = now()
          where tenant_id = $1 and id = $2 and bootstrap_owner_email = $3
          returning id",
     )
@@ -3168,9 +3286,11 @@ mod tests {
 
         let email = "new-owner@example.com";
         let exp = Utc::now() + chrono::Duration::days(7);
+        // arm_bootstrap_owner resolves the org's ACTIVE config itself (cfg was
+        // activated above), so the call takes no config id.
         assert!(
             matches!(
-                arm_bootstrap_owner(&pool, scope, cfg.id, email, exp, None)
+                arm_bootstrap_owner(&pool, scope, email, exp, None)
                     .await
                     .unwrap(),
                 LifecycleOutcome::Refused(_)
@@ -3183,7 +3303,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            arm_bootstrap_owner(&pool, scope, cfg.id, email, exp, None)
+            arm_bootstrap_owner(&pool, scope, email, exp, None)
                 .await
                 .unwrap(),
             LifecycleOutcome::Done(_)
