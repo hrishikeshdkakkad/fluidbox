@@ -196,6 +196,7 @@ declare
     v_pin            jsonb;
     v_pin_name       text;
     v_pin_version    int;
+    v_pin_suffix     text;
     v_bundle_id      uuid;
     v_bundle_name    text;
     v_bundle_version int;
@@ -210,6 +211,7 @@ declare
     v_suffix         int;
     v_url            text;
     v_slug           text;
+    v_dropped_sandbox text;
     v_cnt            int;
     v_new_rev        int;
     v_new_rev_id     uuid;
@@ -255,13 +257,21 @@ begin
             elsif jsonb_typeof(v_pin) = 'string' then
                 v_pin_name := split_part(v_pin #>> '{}', '@', 1);
                 if position('@' in (v_pin #>> '{}')) > 0 then
-                    v_pin_version := nullif(split_part(v_pin #>> '{}', '@', 2), '')::int;
-                    select b.id, b.name, b.version, b.definition
-                      into v_bundle_id, v_bundle_name, v_bundle_version, v_def
-                      from capability_bundles b
-                     where b.tenant_id = v_agent.tenant_id
-                       and b.name = v_pin_name
-                       and b.version = v_pin_version;
+                    -- Defensive `name@N` string: only a purely-numeric suffix is a
+                    -- version. A non-numeric one (e.g. `name@abc`) must NOT abort the
+                    -- whole migration on an int cast — leave v_bundle_id null so the
+                    -- unresolvable drop+notice path below handles it, exactly like a
+                    -- BundleRef pointing at a missing bundle.
+                    v_pin_suffix := split_part(v_pin #>> '{}', '@', 2);
+                    if v_pin_suffix ~ '^[0-9]+$' then
+                        v_pin_version := v_pin_suffix::int;
+                        select b.id, b.name, b.version, b.definition
+                          into v_bundle_id, v_bundle_name, v_bundle_version, v_def
+                          from capability_bundles b
+                         where b.tenant_id = v_agent.tenant_id
+                           and b.name = v_pin_name
+                           and b.version = v_pin_version;
+                    end if;
                 else
                     select b.id, b.name, b.version, b.definition
                       into v_bundle_id, v_bundle_name, v_bundle_version, v_def
@@ -298,6 +308,23 @@ begin
             -- pins (a mixed bundle's sandbox servers go with it — the design's
             -- per-bundle rule), and each brokered server becomes a requirement.
             v_has_brokered := true;
+
+            -- Settled (the controller's call): a mixed bundle is dropped WHOLE and
+            -- its sandbox servers are surfaced by notice — we do NOT synthesize a
+            -- new sandbox-only bundle version. No real mixed bundles exist, so
+            -- synthesis would add migration write surface for a nonexistent case,
+            -- and the brokered cutoff makes keeping the original pin impossible.
+            -- Name the dropped sandbox server(s) so an operator can re-add them by
+            -- hand (names only; every value is a % arg, never concatenated in).
+            select string_agg(elem->>'name', ', ' order by ord)
+              into v_dropped_sandbox
+              from jsonb_array_elements(coalesce(v_def->'servers', '[]'::jsonb))
+                       with ordinality as srv(elem, ord)
+             where elem->>'class' <> 'brokered';
+            if v_dropped_sandbox is not null then
+                raise notice 'convert_legacy_bundles: agent % dropped mixed bundle %@% — sandbox server(s) % must be re-added manually',
+                    v_agent.id, v_bundle_name, v_bundle_version, v_dropped_sandbox;
+            end if;
 
             for v_server in
                 select elem
