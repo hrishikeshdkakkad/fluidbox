@@ -210,7 +210,7 @@ fluidbox is pre-1.0 security software. Its guarantees come from explicit boundar
 - **Audit is redacted by construction.** The append path accepts only `Redacted<EventEnvelope>` values. The ledger keeps digests, decisions, usage, cost, lifecycle, and artifact metadata—not raw model prompts, secrets, or brokered tool payloads.
 - **Finalization is durable.** Terminal intent is persisted before acknowledgement; artifact collection precedes the terminal transition; interrupted finalizations are recovered after restart.
 
-The current deployment model is self-hosted and effectively single-tenant, with one admin bearer token. Tenant-aware tables are not presented as multi-user authentication or RBAC. Read [SECURITY.md](./SECURITY.md) before operating fluidbox outside a local environment.
+The default deployment model is self-hosted and effectively single-tenant, with one admin bearer token. Multi-user mode — per-organization OIDC login, server-side sessions, personal API tokens (`fbx_pat_`), and RBAC — is available behind `FLUIDBOX_REQUIRE_SSO` (Phase B); single-admin mode is unchanged when it is off. Read [SECURITY.md](./SECURITY.md) before operating fluidbox outside a local environment.
 
 ## Kubernetes
 
