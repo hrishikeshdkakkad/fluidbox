@@ -54,7 +54,14 @@ fn is_connectable(transport: &str) -> bool {
 pub async fn list(principal: Principal, State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let scope = principal.scope();
     let rows = fluidbox_db::list_catalog(&state.pool, scope).await?;
-    let conns = fluidbox_db::list_connections(&state.pool, scope).await?;
+    // Owner-filtered so a teammate's PERSONAL connection never renders an entry
+    // as "connected" for someone who can't see it (design :274-296).
+    let conns = fluidbox_db::list_connections_visible(
+        &state.pool,
+        scope,
+        rbac::connection_viewer(&principal),
+    )
+    .await?;
     let bundles = fluidbox_db::list_capability_bundles(&state.pool, scope).await?;
     let connectors: Vec<Value> = rows
         .iter()
@@ -288,6 +295,11 @@ pub struct ConnectReq {
     pub client_secret: Option<String>,
     #[serde(default)]
     pub scopes: Option<Vec<String>>,
+    /// `organization` (default; requires admin/owner) or `personal` (any
+    /// member's private custody). Mirrors `POST /v1/connections` (design
+    /// :274-296).
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 /// `POST /v1/catalog/{slug}/connect` — settle #4: one click from catalog
@@ -298,16 +310,15 @@ pub async fn connect(
     Path(slug): Path<String>,
     Json(req): Json<ConnectReq>,
 ) -> ApiResult<Json<Value>> {
-    if !rbac::can_mutate_resources(&principal) {
-        return Err(ApiError::Forbidden(
-            "connecting a catalog entry requires admin or owner".into(),
-        ));
-    }
+    // Ownership + authorization: catalog Connect only ever produces an mcp_http
+    // connection (or an org sandbox bundle), so resolve against that provider —
+    // `organization` needs admin/owner, `personal` any member (design :274-296).
+    let owner = crate::connections::resolve_owner(&principal, "mcp_http", req.owner.as_deref())?;
     let scope = principal.scope();
     let entry = fluidbox_db::get_catalog_by_slug(&state.pool, scope, &slug)
         .await?
         .ok_or(ApiError::NotFound)?;
-    connect_entry(&state, scope, entry, req).await
+    connect_entry(&state, scope, owner, entry, req).await
 }
 
 /// The three-branch connect body (none / api_key / oauth), factored out of the
@@ -317,6 +328,7 @@ pub async fn connect(
 async fn connect_entry(
     state: &AppState,
     scope: TenantScope,
+    owner: crate::connections::OwnerContext,
     entry: fluidbox_db::ConnectorCatalogRow,
     req: ConnectReq,
 ) -> ApiResult<Json<Value>> {
@@ -343,6 +355,18 @@ async fn connect_entry(
             // Sandbox (in-image stdio) entries keep the bundle path — bundles
             // survive for sandbox tools (design :320-323).
             if entry.sandbox_launch.is_some() {
+                // A capability bundle is a credential-free, org-SHARED resource
+                // with no personal custody — `personal` doesn't apply. Since
+                // `resolve_owner` already required admin/owner for `organization`,
+                // rejecting a personal request here also blocks a plain member
+                // from registering an org bundle (no privilege escalation).
+                if !matches!(owner.owner, fluidbox_db::ConnectionOwner::Organization) {
+                    return Err(ApiError::BadRequest(
+                        "in-image (stdio) connectors are organization capability bundles and \
+                         cannot be personal — connect them as an organization connection"
+                            .into(),
+                    ));
+                }
                 let server = sandbox_launch_server(&entry)?;
                 let row = crate::capabilities::register_bundle(
                     state,
@@ -383,9 +407,8 @@ async fn connect_entry(
                     client_secret_sealed: None,
                     registration_id: None,
                 },
-                // Task 4 threads the real principal; org-owned for now.
-                fluidbox_db::ConnectionOwner::Organization,
-                None,
+                owner.owner,
+                owner.created_by_user_id,
             )
             .await?;
             match crate::snapshots::photograph_connection(state, scope, row.id, url).await {
@@ -437,10 +460,14 @@ async fn connect_entry(
                 scopes: None,
                 client_id: None,
                 client_secret: None,
+                // Ownership is passed to `create_mcp_http_connection` via the
+                // `owner` arg, not this request body.
+                owner: None,
             };
             let created = crate::connections::create_mcp_http_connection(
                 state,
                 scope,
+                owner,
                 create,
                 Some(&entry.slug),
             )
@@ -537,9 +564,8 @@ async fn connect_entry(
                     client_secret_sealed: sealed_secret.as_deref(),
                     registration_id: None,
                 },
-                // Task 4 threads the real principal; org-owned for now.
-                fluidbox_db::ConnectionOwner::Organization,
-                None,
+                owner.owner,
+                owner.created_by_user_id,
             )
             .await?;
             let authorize_url = crate::oauth::start_dance(state, scope, row.id).await?;
@@ -730,6 +756,12 @@ pub struct AddCustomReq {
     pub client_id: Option<String>,
     #[serde(default)]
     pub client_secret: Option<String>,
+    /// `organization` (default; requires admin/owner) or `personal` (any
+    /// member's private custody). The auto-created tier=custom catalog entry
+    /// stays organization reference data regardless — only the CONNECTION it
+    /// produces carries the personal owner.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 /// `POST /v1/mcp/servers` — the one-shot "bring your own MCP server" flow: a
@@ -743,11 +775,10 @@ pub async fn add_custom(
     State(state): State<AppState>,
     Json(req): Json<AddCustomReq>,
 ) -> ApiResult<Json<Value>> {
-    if !rbac::can_mutate_resources(&principal) {
-        return Err(ApiError::Forbidden(
-            "adding a custom MCP server requires admin or owner".into(),
-        ));
-    }
+    // Ownership + authorization (design :274-296): `organization` needs
+    // admin/owner, `personal` any member. The tier=custom catalog entry created
+    // below is org reference data regardless; only the connection is owned.
+    let owner = crate::connections::resolve_owner(&principal, "mcp_http", req.owner.as_deref())?;
     let scope = principal.scope();
     let url = req.url.trim();
     let parsed = reqwest::Url::parse(url)
@@ -814,6 +845,9 @@ pub async fn add_custom(
         client_id: req.client_id.clone(),
         client_secret: req.client_secret.clone(),
         scopes: req.scopes.clone(),
+        // Ownership is carried by the `owner` arg to `connect_entry`, resolved
+        // once above — this inner request never re-resolves it.
+        owner: None,
     };
 
     let with_slug = |mut out: Json<Value>| {
@@ -828,7 +862,7 @@ pub async fn add_custom(
     // rolls it back on FAILURE — including a failed OAuth dance (a discover /
     // insert / start_dance error means no callback is ever coming, so the
     // entry would otherwise orphan exactly like a refused api_key).
-    match connect_entry(&state, scope, entry, connect_req).await {
+    match connect_entry(&state, scope, owner, entry, connect_req).await {
         Ok(out) => Ok(with_slug(out)),
         Err(e) => {
             if let Err(del) = fluidbox_db::delete_catalog_entry(&state.pool, scope, &slug).await {

@@ -12,6 +12,7 @@
 use crate::auth::Principal;
 use crate::connectors::{self, NormalizedEvent, VerifiedDelivery};
 use crate::error::{ApiError, ApiResult};
+use crate::rbac;
 use crate::run_service::{self, CreateRun, RevisionSelector, RunCreation};
 use crate::state::AppState;
 use crate::triggers::{render_task_template, sub_run_params, SubRunParams};
@@ -339,9 +340,16 @@ pub async fn connection_deliveries(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     let scope = principal.scope();
-    let conn = fluidbox_db::get_connection(&state.pool, scope, id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
+    // Owner-filtered read: another member's personal connection is invisible
+    // here (None ⇒ 404), so its delivery history can never be inspected.
+    let conn = fluidbox_db::get_connection_visible(
+        &state.pool,
+        scope,
+        id,
+        rbac::connection_viewer(&principal),
+    )
+    .await?
+    .ok_or(ApiError::NotFound)?;
     let deliveries =
         fluidbox_db::list_connection_deliveries(&state.pool, scope, conn.id, 30).await?;
     let mut out = Vec::with_capacity(deliveries.len());

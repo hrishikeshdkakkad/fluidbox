@@ -8,7 +8,7 @@
 
 use crate::auth::Principal;
 use crate::error::ApiError;
-use fluidbox_db::SessionRow;
+use fluidbox_db::{ConnectionViewer, SessionRow};
 use uuid::Uuid;
 
 pub fn has_role(principal: &Principal, role: &str) -> bool {
@@ -59,6 +59,33 @@ pub fn can_manage_org(principal: &Principal) -> bool {
 /// connections, custom catalog entries, github app registrations) — admin/owner.
 pub fn can_mutate_resources(principal: &Principal) -> bool {
     principal.is_operator() || any_role(principal, &["admin", "owner"])
+}
+
+/// May this principal create a PERSONAL (user-owned) connection? Any User
+/// principal qualifies: the extractor liveness-gates every request, so the
+/// principal's existence already proves an active membership — no elevated role
+/// is required to hold one's own credential. The operator is excluded:
+/// single-admin mode has no user identity to own a personal row, so the
+/// operator creates organization connections only.
+pub fn can_create_personal_connection(principal: &Principal) -> bool {
+    principal.user_id().is_some()
+}
+
+/// The visibility lens for connection listings / per-connection reads (design
+/// :274-296). EVERY user principal — plain member through owner — sees
+/// organization connections plus only its OWN personal connections
+/// (`User(user_id)`). Admin/owner roles get NO extra reach into other members'
+/// personal rows: the Phase C acceptance bar is owner-only inspection ("neither
+/// can select or inspect the other's personal connection"), and offboarding is
+/// covered by membership deactivation (the broker owner-membership recheck),
+/// not by admin visibility. Only the operator gets `All` — single-admin mode
+/// has no user identity, and under REQUIRE_SSO the operator is confined to
+/// /v1/admin anyway, so `All` never widens a real user's view.
+pub fn connection_viewer(principal: &Principal) -> ConnectionViewer {
+    match principal.user_id() {
+        Some(uid) => ConnectionViewer::User(uid),
+        None => ConnectionViewer::All,
+    }
 }
 
 /// Enforce `run.read` after a tenant-scoped fetch has already proven the run
@@ -171,5 +198,48 @@ mod tests {
         assert!(can_manage_subscriptions(&p));
         assert!(can_manage_org(&p));
         assert!(can_mutate_resources(&p));
+    }
+
+    #[test]
+    fn only_the_operator_gets_all_connection_visibility() {
+        // The operator (single-admin break-glass) sees every connection.
+        assert!(matches!(
+            connection_viewer(&operator()),
+            ConnectionViewer::All
+        ));
+        // Every user principal — member through owner — is scoped to its own
+        // personal rows (plus org rows the DB predicate always admits).
+        for roles in [
+            &["member"][..],
+            &["approver"][..],
+            &["admin"][..],
+            &["owner"][..],
+        ] {
+            let p = user(roles);
+            match connection_viewer(&p) {
+                ConnectionViewer::User(uid) => assert_eq!(Some(uid), p.user_id()),
+                ConnectionViewer::All => {
+                    panic!("a user principal ({roles:?}) must never get All visibility")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn any_member_may_create_a_personal_connection_but_not_the_operator() {
+        // The operator has no personal identity to own a personal row.
+        assert!(!can_create_personal_connection(&operator()));
+        // Every member — no elevated role required — may hold their own.
+        for roles in [
+            &["member"][..],
+            &["approver"][..],
+            &["admin"][..],
+            &["owner"][..],
+        ] {
+            assert!(
+                can_create_personal_connection(&user(roles)),
+                "member {roles:?} should be able to create a personal connection"
+            );
+        }
     }
 }

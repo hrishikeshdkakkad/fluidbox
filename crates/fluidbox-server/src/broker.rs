@@ -91,6 +91,9 @@ pub async fn brokered_auth(
     let Some(cid) = connection_id else {
         return Ok(None);
     };
+    // Unfiltered read by design: the broker's authority comes from the frozen
+    // RunSpec (Task 6 adds the binding generation + owner-membership recheck
+    // here), never from a request viewer — no owner-visibility filter applies.
     let conn = fluidbox_db::get_connection(&state.pool, scope, *cid)
         .await
         .map_err(|e| format!("connection lookup failed: {e}"))?

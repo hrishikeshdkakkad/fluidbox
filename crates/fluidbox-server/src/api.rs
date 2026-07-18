@@ -120,6 +120,12 @@ pub(crate) async fn resolve_workspace_input(
             }
             let clone_url = match connection_id {
                 Some(cid) => {
+                    // Tenant-scoped (not owner-scoped) by design: this is a
+                    // connection CONSUMED as a workspace, whose authority the
+                    // design routes through run resource bindings (invariant 21,
+                    // Task 5) + the broker owner-membership recheck (Task 6), not
+                    // through Task 4's connection-object viewer. See task-4-report
+                    // "Deferred / flagged".
                     let conn = fluidbox_db::get_connection(&state.pool, scope, cid)
                         .await?
                         .ok_or_else(|| ApiError::BadRequest(format!("unknown connection {cid}")))?;
