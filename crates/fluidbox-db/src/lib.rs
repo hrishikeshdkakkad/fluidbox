@@ -6697,6 +6697,274 @@ mod tests {
         }
     }
 
+    /// Migration 0013 appendix — branch coverage the happy path above never
+    /// reaches: (a) a brokered server with EMPTY tools is skipped while its
+    /// bundle-mates still convert; (b) two pinned bundles whose brokered servers
+    /// share an alias dedup to `slot` / `slot-2` in encounter order; (c) a SECOND
+    /// agent in the same call also converts (both get new revisions); (d) an
+    /// agent with NO subscription converts cleanly (nothing to repoint); (e) an
+    /// unresolvable BundleRef object AND a non-numeric `name@abc` string pin
+    /// (Finding 3) are both dropped without aborting, the other pins converting.
+    /// One conversion call; throwaway org; children-first cleanup BEFORE asserts.
+    #[tokio::test]
+    async fn convert_legacy_bundles_covers_skip_dedup_multiagent_and_unresolvable() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let slug = format!("t-{}", Uuid::now_v7().simple());
+        let org = identity::create_org(&pool, &slug, None).await.unwrap();
+        let scope = TenantScope::assume(org.id);
+
+        // Small builders so the fixtures read as data, not boilerplate.
+        let brokered = |name: &str, url: &str, tools: &[&str]| -> serde_json::Value {
+            let tools_json: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!(
+                        { "name": t, "description": "d", "input_schema": {"type": "object"} }
+                    )
+                })
+                .collect();
+            serde_json::json!({ "class": "brokered", "name": name, "url": url, "tools": tools_json })
+        };
+        let sandbox = |name: &str| -> serde_json::Value {
+            serde_json::json!({ "class": "sandbox", "name": name, "command": "node", "args": ["/x.mjs"],
+                "tools": [ { "name": "count", "description": "d", "input_schema": {"type": "object"} } ] })
+        };
+
+        let policy = upsert_policy(
+            &pool,
+            scope,
+            "cov-policy",
+            "name: cov",
+            &serde_json::json!({ "name": "cov" }),
+        )
+        .await
+        .unwrap();
+
+        // ── Agent A: a MIXED bundle (brokered-with-tools + brokered-EMPTY +
+        // sandbox) then a second bundle re-using the `dup` alias, then two
+        // unresolvable pins (a missing BundleRef object and a `ghost@abc`
+        // string). No subscription. ──
+        let dup_a_url = "https://a.dup.test/mcp";
+        let dup_b_url = "https://b.dup.test/mcp";
+        let bundle_dup_a = create_capability_bundle(
+            &pool,
+            scope,
+            "dup-a",
+            None,
+            &serde_json::json!({ "servers": [
+                brokered("dup", dup_a_url, &["a_one", "a_two"]),
+                brokered("empty", "https://empty.test/mcp", &[]),
+                sandbox("sbx"),
+            ] }),
+            "sha256:dupa",
+        )
+        .await
+        .unwrap();
+        let bundle_dup_b = create_capability_bundle(
+            &pool,
+            scope,
+            "dup-b",
+            None,
+            &serde_json::json!({ "servers": [ brokered("dup", dup_b_url, &["b_one"]) ] }),
+            "sha256:dupb",
+        )
+        .await
+        .unwrap();
+
+        let agent_a = create_agent(&pool, scope, "cov-agent-a", None)
+            .await
+            .unwrap();
+        let pins_a = serde_json::json!([
+            { "id": bundle_dup_a.id, "name": bundle_dup_a.name, "version": bundle_dup_a.version },
+            { "id": bundle_dup_b.id, "name": bundle_dup_b.name, "version": bundle_dup_b.version },
+            // (e) unresolvable BundleRef object — random id, no such bundle.
+            { "id": Uuid::now_v7(), "name": "ghost", "version": 1 },
+            // (Finding 3) non-numeric `name@N` string — must drop, not abort.
+            "ghost@abc"
+        ]);
+        let rev_a1 = append_agent_revision(
+            &pool,
+            scope,
+            agent_a.id,
+            "claude-agent-sdk",
+            "img:test",
+            "claude-haiku-4-5",
+            Some("be helpful"),
+            policy.id,
+            &serde_json::json!({ "wall_clock_secs": 60 }),
+            None,
+            &pins_a,
+            &serde_json::json!([]),
+        )
+        .await
+        .unwrap();
+
+        // ── Agent B: a second agent with its own brokered pin and a pinned
+        // subscription that must be repointed. ──
+        let jira_url = "https://jira.test/mcp";
+        let bundle_solo_b = create_capability_bundle(
+            &pool,
+            scope,
+            "solo-b",
+            None,
+            &serde_json::json!({ "servers": [ brokered("jira", jira_url, &["search"]) ] }),
+            "sha256:solob",
+        )
+        .await
+        .unwrap();
+        let agent_b = create_agent(&pool, scope, "cov-agent-b", None)
+            .await
+            .unwrap();
+        let pins_b = serde_json::json!([
+            { "id": bundle_solo_b.id, "name": bundle_solo_b.name, "version": bundle_solo_b.version }
+        ]);
+        let rev_b1 = append_agent_revision(
+            &pool,
+            scope,
+            agent_b.id,
+            "claude-agent-sdk",
+            "img:test",
+            "claude-haiku-4-5",
+            Some("be helpful"),
+            policy.id,
+            &serde_json::json!({ "wall_clock_secs": 60 }),
+            None,
+            &pins_b,
+            &serde_json::json!([]),
+        )
+        .await
+        .unwrap();
+        let sub_b = create_trigger_subscription(
+            &pool,
+            scope,
+            agent_b.id,
+            "cov-sub-b",
+            "api",
+            Some(rev_b1.id),
+            Some("do it"),
+            false,
+            false,
+            None,
+            "allow",
+            None,
+            None,
+            &serde_json::json!([]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // ── One conversion call processes BOTH agents (c). ──
+        sqlx::query("select fluidbox_convert_legacy_bundles()")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let latest_a = latest_revision(&pool, scope, agent_a.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let latest_b = latest_revision(&pool, scope, agent_b.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let revs_a = list_revisions(&pool, scope, agent_a.id).await.unwrap();
+        let revs_b = list_revisions(&pool, scope, agent_b.id).await.unwrap();
+        let sub_b_after = get_trigger_subscription(&pool, scope, sub_b.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // ── Cleanup children-first BEFORE the asserts (throwaway org) ──
+        for stmt in [
+            "delete from trigger_subscriptions where tenant_id = $1",
+            "delete from agent_revisions where agent_id in (select id from agents where tenant_id = $1)",
+            "delete from agents where tenant_id = $1",
+            "delete from capability_bundles where tenant_id = $1",
+            "delete from policies where tenant_id = $1",
+        ] {
+            sqlx::query(stmt).bind(org.id).execute(&pool).await.unwrap();
+        }
+        sqlx::query("delete from tenants where id = $1")
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // ── Asserts ──
+        // (c) BOTH agents converted in the single call — each has exactly two
+        // revisions, the new one appended at rev+1.
+        assert_eq!(revs_a.len(), 2, "agent A converted (rev appended)");
+        assert_eq!(revs_b.len(), 2, "agent B converted in the SAME call (c)");
+        assert_eq!(latest_a.rev, rev_a1.rev + 1);
+        assert_eq!(latest_b.rev, rev_b1.rev + 1);
+
+        // (a)+(b)+(e)+Finding 3: agent A's requirements are EXACTLY the two
+        // brokered servers that carried tools — `empty` skipped (a), sandbox
+        // dropped, both unresolvable pins gone (e / Finding 3) — with the shared
+        // alias dedup'd in encounter order: `dup` (from dup-a) then `dup-2`
+        // (from dup-b), each connector.url proving which bundle it came from.
+        assert_eq!(
+            latest_a.connection_requirements,
+            serde_json::json!([
+                { "slot": "dup",
+                  "connector": { "url": dup_a_url, "slug": null },
+                  "required_tools": ["a_one", "a_two"],
+                  "binding_mode": "organization" },
+                { "slot": "dup-2",
+                  "connector": { "url": dup_b_url, "slug": null },
+                  "required_tools": ["b_one"],
+                  "binding_mode": "organization" }
+            ]),
+            "empty-tools skipped, sandbox dropped, unresolvable pins dropped, alias dedup'd"
+        );
+        // The dedup'd shape still validates — proves the suffixed slot `dup-2`
+        // is a legal server alias, and pins the exact slot names + suffix.
+        let reqs_a: Vec<fluidbox_core::capability::ConnectionRequirement> =
+            serde_json::from_value(latest_a.connection_requirements.clone())
+                .expect("agent A requirements deserialize");
+        fluidbox_core::capability::validate_requirements(&reqs_a)
+            .expect("dedup'd requirements (incl. slot 'dup-2') are valid");
+        let slots_a: Vec<&str> = reqs_a.iter().map(|r| r.slot.as_str()).collect();
+        assert_eq!(slots_a, ["dup", "dup-2"], "alias dedup order: dup, dup-2");
+
+        // (d)+(e): agent A pinned no surviving sandbox-only bundle and both
+        // unresolvable pins were dropped, so the copied pin list is empty.
+        assert_eq!(
+            latest_a.capability_bundles,
+            serde_json::json!([]),
+            "no surviving pins (mixed bundle + unresolvable pins all dropped)"
+        );
+
+        // (c)+repoint: agent B has its single requirement, and its subscription
+        // was repointed to the converted revision (repoint count where
+        // applicable; agent A had no subscription to repoint — d).
+        assert_eq!(
+            latest_b.connection_requirements,
+            serde_json::json!([
+                { "slot": "jira",
+                  "connector": { "url": jira_url, "slug": null },
+                  "required_tools": ["search"],
+                  "binding_mode": "organization" }
+            ]),
+            "agent B's lone brokered server became one requirement"
+        );
+        assert_eq!(
+            sub_b_after.pinned_revision_id,
+            Some(latest_b.id),
+            "agent B's subscription repointed to its converted revision"
+        );
+    }
+
     /// Cross-tenant isolation (wave A): a session and its child rows created
     /// under tenant B are invisible to tenant A's scope. The tenant predicate
     /// now lives in SQL, so a cross-tenant id misses at the database — never
