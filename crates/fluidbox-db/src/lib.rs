@@ -1782,20 +1782,41 @@ pub async fn create_session(
     // so a crash can never orphan a created run from its claim (which would
     // let the stale-claim takeover duplicate it).
     if let Some(invocation) = bind_invocation {
-        sqlx::query("update trigger_invocations set session_id = $2 where id = $1")
-            .bind(invocation)
-            .bind(row.id)
-            .execute(&mut *tx)
-            .await?;
+        // EXISTS-scoped through the owning subscription so the claim can only
+        // bind an invocation in this session's tenant (matches the predicate
+        // style in `mark_invocation_skipped`).
+        sqlx::query(
+            "update trigger_invocations set session_id = $2
+             where id = $1
+               and exists (select 1 from trigger_subscriptions sub
+                           where sub.id = trigger_invocations.subscription_id
+                             and sub.tenant_id = $3)",
+        )
+        .bind(invocation)
+        .bind(row.id)
+        .bind(scope.tenant_id())
+        .execute(&mut *tx)
+        .await?;
     }
     // Same discipline for the event fan-out claim (level-2 dedup): the
     // dispatch row and the session commit together.
     if let Some(dispatch) = bind_dispatch {
-        sqlx::query("update trigger_dispatches set session_id = $2 where id = $1")
-            .bind(dispatch)
-            .bind(row.id)
-            .execute(&mut *tx)
-            .await?;
+        // EXISTS-scoped through the owning delivery → connection so the claim
+        // can only bind a dispatch in this session's tenant (matches the
+        // predicate style in `list_delivery_dispatches`).
+        sqlx::query(
+            "update trigger_dispatches set session_id = $2
+             where id = $1
+               and exists (select 1 from trigger_deliveries d
+                           join integration_connections c on c.id = d.connection_id
+                           where d.id = trigger_dispatches.delivery_id
+                             and c.tenant_id = $3)",
+        )
+        .bind(dispatch)
+        .bind(row.id)
+        .bind(scope.tenant_id())
+        .execute(&mut *tx)
+        .await?;
     }
     tx.commit().await?;
     Ok(row)
@@ -1914,11 +1935,20 @@ pub async fn set_sandbox_handle(
     if !active {
         return Ok(false);
     }
-    let (intent_exists,): (bool,) =
-        sqlx::query_as("select exists(select 1 from session_finalizations where session_id = $1)")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
+    // EXISTS-scoped through the owning session so the intent probe stays inside
+    // this tenant (belt-and-braces: the row above is already locked and
+    // tenant-checked; `session_finalizations` has no tenant column of its own).
+    let (intent_exists,): (bool,) = sqlx::query_as(
+        "select exists(
+             select 1 from session_finalizations f
+             where f.session_id = $1
+               and exists (select 1 from sessions s
+                           where s.id = f.session_id and s.tenant_id = $2))",
+    )
+    .bind(id)
+    .bind(scope.tenant_id())
+    .fetch_one(&mut *tx)
+    .await?;
     if intent_exists {
         return Ok(false);
     }

@@ -1097,6 +1097,9 @@ async fn cancel_config_flows_switches_sessions(
     .execute(&mut *conn)
     .await?
     .rows_affected();
+    // Switches cancelled BEFORE sessions are revoked (deterministic order; kept
+    // stable even though the switch-claim's config lock has since made the
+    // ordering non-load-bearing — see `migrate_idp_config`).
     let switches = sqlx::query(
         "update pending_login_switches set consumed_at = now()
          where tenant_id = $1 and idp_config_id = $2 and consumed_at is null",
@@ -1516,6 +1519,12 @@ pub async fn migrate_idp_config(
     .bind(new_id)
     .execute(&mut *tx)
     .await?;
+    // Cascade order is deterministic: cancel unconsumed pending switches BEFORE
+    // revoking the old config's sessions (the helper runs flows → switches →
+    // sessions). Now that the switch-claim takes the config row FOR UPDATE (see
+    // `claim_pending_switch` step 2), this ordering is no longer load-bearing —
+    // a racing claim serializes behind the swap's `lock_org_configs` regardless
+    // — but we keep it fixed and explicit.
     let cascade = cancel_config_flows_switches_sessions(&mut tx, scope, old_id).await?;
     let memberships_deactivated = if carry_forward {
         0
@@ -2153,10 +2162,19 @@ pub async fn claim_pending_switch(
 ) -> sqlx::Result<Option<SwitchClaim>> {
     let mut tx = pool.begin().await?;
 
-    // (1) Atomic claim binding the currently-presented live session.
+    // (1) Atomic claim binding the currently-presented live session. The
+    // replaced session must be FULLY live — not just unrevoked/unexpired, but
+    // its membership, user, AND tenant still active (mirrors
+    // `session_is_live`). Strictly fail-closed: a deactivation cascade already
+    // revokes the session, so `cur.revoked_at is null` would normally suffice;
+    // these joins are belt-and-braces against any revoke that races the cascade.
     let claimed: Option<SwitchClaimRow> = sqlx::query_as(
         "update pending_login_switches ps set consumed_at = now()
          from user_sessions cur
+         join org_memberships m
+           on m.tenant_id = cur.tenant_id and m.id = cur.membership_id and m.user_id = cur.user_id
+         join users u on u.tenant_id = cur.tenant_id and u.id = cur.user_id
+         join tenants t on t.id = cur.tenant_id
          where ps.id = $1
            and ps.browser_hash = $2
            and ps.consumed_at is null
@@ -2167,6 +2185,9 @@ pub async fn claim_pending_switch(
            and cur.revoked_at is null
            and cur.idle_expires_at > now()
            and cur.absolute_expires_at > now()
+           and m.status = 'active'
+           and u.status = 'active'
+           and t.status = 'active'
          returning ps.tenant_id, ps.replaced_tenant_id, ps.replaced_session_id,
                    ps.new_membership_id, ps.new_user_id, ps.idp_config_id,
                    ps.redirect_to, ps.acr, ps.amr, ps.auth_time",
@@ -2181,16 +2202,37 @@ pub async fn claim_pending_switch(
         return Ok(None);
     };
 
-    // (2) Recheck config-active + membership-active + tenant-active on the NEW
+    // (2) Lock the NEW org's config row FOR UPDATE and require it active. This
+    // is the SAME lock a login's transaction B (`lock_idp_config_for_update`)
+    // and the issuer-migration swap (`lock_org_configs`) take, so a concurrent
+    // migration fully serializes with this switch: a migrate that retires this
+    // config either commits first (then `status <> 'active'` → we fail closed)
+    // or blocks behind our lock until we commit. Taken FIRST keeps the lock
+    // order config → membership → session, consistent with every other path.
+    let config_live = sqlx::query(
+        "select 1 from org_idp_configs
+         where tenant_id = $1 and id = $2 and status = 'active'
+         for update",
+    )
+    .bind(row.tenant_id)
+    .bind(row.idp_config_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if config_live.is_none() {
+        tx.rollback().await.ok();
+        return Ok(None);
+    }
+
+    // (3) Recheck config-active + membership-active + tenant-active on the NEW
     // org, taking `for update of m` on the NEW membership row. That row lock
     // serializes this claim against the deactivation cascade
     // (`apply_membership_status` → `revoke_sessions_for_membership`), which
     // locks the membership row FIRST and its sessions SECOND. This claim takes
-    // the same order — membership here (step 2), then the replaced session
-    // (step 3) — so the two can never deadlock. A concurrent deactivation that
-    // committed before us leaves `m.status <> 'active'` → the recheck matches
-    // zero rows and we roll the WHOLE claim back (fail closed; the browser
-    // retries login).
+    // the same order — config (step 2), membership here (step 3), then the
+    // replaced session (step 4) — so the two can never deadlock. A concurrent
+    // deactivation that committed before us leaves `m.status <> 'active'` → the
+    // recheck matches zero rows and we roll the WHOLE claim back (fail closed;
+    // the browser retries login).
     let recheck = sqlx::query(
         "select 1 from org_idp_configs c
          join org_memberships m on m.tenant_id = c.tenant_id
@@ -2211,9 +2253,10 @@ pub async fn claim_pending_switch(
         return Ok(None);
     }
 
-    // (3) Revoke the replaced session (in its OWN tenant). Lock the row FOR
-    // UPDATE first (session lock AFTER the membership lock — the order fixed in
-    // step 2), then require the revoke to touch EXACTLY ONE still-live row.
+    // (4) Revoke the replaced session (in its OWN tenant). Lock the row FOR
+    // UPDATE first (session lock AFTER the config + membership locks — the
+    // order fixed in steps 2-3), then require the revoke to touch EXACTLY ONE
+    // still-live row.
     // Zero rows means a concurrent logout/revocation already killed the
     // replaced session between the step-1 claim and here → the switch would be
     // minting a new session while silently doing nothing about the old one, so
@@ -2242,7 +2285,7 @@ pub async fn claim_pending_switch(
         return Ok(None);
     }
 
-    // (4) Mint the new session under the NEW org.
+    // (5) Mint the new session under the NEW org.
     mint_user_session(
         &mut tx,
         TenantScope::assume(row.tenant_id),
