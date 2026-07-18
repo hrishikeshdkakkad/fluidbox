@@ -372,16 +372,19 @@ pub async fn list_idp(
 }
 
 /// Full save-time validation + staging, shared by `create_idp` and the migrate
-/// swap's phase 1. On any refusal it audits `idp.create` (rejected) and returns
-/// the error. On success it returns the freshly staged, discovery-cached row.
+/// swap's phase 1. On any refusal it audits `action` (rejected) — `idp.create`
+/// for the create route, `idp.migrate` for the migrate path, so per-action
+/// filtering stays clean — and returns the error. On success it returns the
+/// freshly staged, discovery-cached row.
 async fn validate_and_stage_config(
     state: &AppState,
     scope: TenantScope,
     body: &CreateIdpBody,
     sip: Option<&str>,
+    action: &str,
 ) -> ApiResult<identity::OrgIdpConfigRow> {
     let tenant = scope.tenant_id();
-    let bad = |e: ApiError| async move { refuse(state, tenant, sip, "idp.create", None, e).await };
+    let bad = |e: ApiError| async move { refuse(state, tenant, sip, action, None, e).await };
 
     if body.issuer.trim().is_empty() {
         return Err(bad(ApiError::BadRequest("issuer is required".into())).await);
@@ -436,7 +439,7 @@ async fn validate_and_stage_config(
                 state,
                 tenant,
                 sip,
-                "idp.create",
+                action,
                 None,
                 ApiError::Conflict(
                     "an active owner already exists; deactivate it before arming a bootstrap owner"
@@ -485,7 +488,7 @@ async fn validate_and_stage_config(
         Some(secret) => {
             let sealer = match crate::oauth::sealer(state) {
                 Ok(s) => s,
-                Err(e) => return Err(refuse(state, tenant, sip, "idp.create", None, e).await),
+                Err(e) => return Err(refuse(state, tenant, sip, action, None, e).await),
             };
             Some(sealer.seal(secret))
         }
@@ -528,7 +531,7 @@ pub async fn create_idp(
     let sip = source_ip(&headers);
     let org = resolve_org(&state, &slug).await?;
     let scope = TenantScope::assume(org.id);
-    let row = validate_and_stage_config(&state, scope, &body, sip.as_deref()).await?;
+    let row = validate_and_stage_config(&state, scope, &body, sip.as_deref(), "idp.create").await?;
     Ok(Json(json!({ "idp": row })))
 }
 
@@ -760,8 +763,10 @@ pub async fn migrate_idp(
         .await);
     }
 
-    // Phase 1: stage + fully validate the new (generation+1) config.
-    let new = validate_and_stage_config(&state, scope, &body.config, sip.as_deref()).await?;
+    // Phase 1: stage + fully validate the new (generation+1) config. Refusals
+    // audit "idp.migrate" (not "idp.create") so the migrate path stays filterable.
+    let new = validate_and_stage_config(&state, scope, &body.config, sip.as_deref(), "idp.migrate")
+        .await?;
 
     // Phase 2: the atomic swap.
     match identity::migrate_idp_config(
