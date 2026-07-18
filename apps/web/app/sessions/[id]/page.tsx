@@ -80,7 +80,7 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
   }, [loadMeta]);
 
   const decide = async (approvalId: string, decision: string) => {
-    await apiPost(`/approvals/${approvalId}/decision`, { decision, decided_by: "dashboard" });
+    await apiPost(`/approvals/${approvalId}/decision`, { decision });
     loadMeta();
   };
 

@@ -24,6 +24,7 @@ use axum::response::Response;
 use fluidbox_core::event::{Actor, EventBody};
 use fluidbox_core::spec::RunSpec;
 use fluidbox_core::usage::{estimate_cost_usd, UsageDelta};
+use fluidbox_db::TenantScope;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -236,11 +237,13 @@ pub async fn messages(
     body: axum::body::Bytes,
 ) -> ApiResult<Response> {
     let token = session_token(&headers).ok_or(ApiError::Unauthorized)?;
-    let session_id = fluidbox_db::session_for_token(&state.pool, &token)
+    let sess_auth = fluidbox_db::session_for_token(&state.pool, &token)
         .await?
         .ok_or(ApiError::Unauthorized)?;
+    let session_id = sess_auth.session_id;
+    let scope = TenantScope::assume(sess_auth.tenant_id);
 
-    let session = fluidbox_db::get_session(&state.pool, session_id)
+    let session = fluidbox_db::get_session(&state.pool, scope, session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
     // No model spend for a terminal OR winding-down run — the budget stop and
@@ -278,11 +281,12 @@ pub async fn messages(
     // Budget stop (pre-proxy, dialect-shaped): cost, then tokens summed
     // across ALL categories — uncached input, output, cache reads, cache
     // writes. A cached-heavy run can no longer fly under the token budget.
-    let totals = fluidbox_db::usage_totals(&state.pool, session_id).await?;
+    let totals = fluidbox_db::usage_totals(&state.pool, scope, session_id).await?;
     if let Some(max_cost) = run_spec.budgets.max_cost_usd {
         if totals.cost_usd >= max_cost {
             trigger_budget_stop(
                 &state,
+                scope,
                 session_id,
                 "max_cost_usd",
                 max_cost,
@@ -304,6 +308,7 @@ pub async fn messages(
         if used >= max_tokens {
             trigger_budget_stop(
                 &state,
+                scope,
                 session_id,
                 "max_tokens",
                 max_tokens as f64,
@@ -445,7 +450,7 @@ pub async fn messages(
         };
         if status.is_success() {
             if let Some(usage) = parse_usage_json(dialect, &bytes) {
-                record_usage(&state, session_id, &model_hint, usage, None).await;
+                record_usage(&state, scope, session_id, &model_hint, usage, None).await;
             }
         }
         let mut builder = Response::builder().status(status);
@@ -486,11 +491,20 @@ pub async fn messages(
         decoder.finish(|line| meter.on_line(line));
         // Meter on stream end.
         if meter.any() {
-            record_usage(&state2, session_id, &model2, meter.into_delta(), None).await;
+            record_usage(
+                &state2,
+                scope,
+                session_id,
+                &model2,
+                meter.into_delta(),
+                None,
+            )
+            .await;
         } else {
             // Still record a zero-usage marker so we know a call happened.
             ledger::record(
                 &state2,
+                scope,
                 session_id,
                 Actor::System,
                 EventBody::AgentMessage {
@@ -527,6 +541,7 @@ fn session_token(headers: &HeaderMap) -> Option<String> {
 
 async fn trigger_budget_stop(
     state: &AppState,
+    scope: TenantScope,
     session_id: Uuid,
     budget: &str,
     limit: f64,
@@ -534,6 +549,7 @@ async fn trigger_budget_stop(
 ) {
     ledger::record(
         state,
+        scope,
         session_id,
         Actor::System,
         EventBody::BudgetExceeded {
@@ -543,7 +559,7 @@ async fn trigger_budget_stop(
         },
     )
     .await;
-    if let Ok(Some(session)) = fluidbox_db::get_session(&state.pool, session_id).await {
+    if let Ok(Some(session)) = fluidbox_db::get_session(&state.pool, scope, session_id).await {
         let state2 = state.clone();
         let reason = format!("{budget} budget exceeded");
         tokio::spawn(async move {
@@ -576,6 +592,7 @@ async fn trigger_budget_stop(
 
 async fn record_usage(
     state: &AppState,
+    scope: TenantScope,
     session_id: Uuid,
     model: &str,
     usage: UsageDelta,
@@ -584,6 +601,7 @@ async fn record_usage(
     let cost = estimate_cost_usd(model, &usage);
     fluidbox_db::add_usage(
         &state.pool,
+        scope,
         session_id,
         model,
         usage.input_tokens as i64,
@@ -598,6 +616,7 @@ async fn record_usage(
     .ok();
     ledger::record(
         state,
+        scope,
         session_id,
         Actor::System,
         EventBody::ModelResponse {

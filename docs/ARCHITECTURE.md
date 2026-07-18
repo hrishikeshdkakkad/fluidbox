@@ -41,6 +41,8 @@ Background workers cover the failure modes: a heartbeat watchdog, a wall-clock b
 
 Trigger tokens are a fourth, narrower authority: subscription-scoped, sha256-hashed, able to invoke exactly one subscription and poll the runs it created — never the admin API. The admin token, conversely, can never invoke a trigger. Webhook ingress is deliberately unauthenticated as an endpoint; the signature against the connection's sealed secret *is* the authentication, and nothing is stored before it verifies.
 
+Under multi-user mode (`FLUIDBOX_REQUIRE_SSO`, Phase B) the `/v1` public API additionally authenticates browser sessions (`__Host-fbx_web` cookie) and personal API tokens (`fbx_pat_`) with per-organization RBAC, and the admin bearer token is confined to the `/v1/admin/*` break-glass surface; single-admin mode is otherwise unchanged.
+
 ## The security model
 
 A few load-bearing invariants explain most of the design:
