@@ -430,6 +430,8 @@ pub async fn create_agent(
         &serde_json::to_value(&budgets)?,
         default_workspace.as_ref(),
         &capability_pins,
+        // Task 5 wires the request field; empty requirements for now.
+        &json!([]),
     )
     .await?;
 
@@ -563,6 +565,8 @@ pub async fn add_revision(
         &budgets,
         default_workspace.as_ref(),
         &capability_pins,
+        // Task 5 wires the request field; empty requirements for now.
+        &json!([]),
     )
     .await?;
     Ok(Json(json!({ "revision": rev })))
