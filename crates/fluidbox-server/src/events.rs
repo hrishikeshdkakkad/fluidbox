@@ -290,6 +290,8 @@ async fn dispatch_one(
             },
             // A connector webhook has no directly-authenticated user.
             invoked_by_user_id: None,
+            // The event derives its authority server-side; no explicit binding.
+            explicit_bindings: std::collections::HashMap::new(),
             result_destinations: destinations,
             bound_invocation: None,
             bound_dispatch: Some(dispatch_id),

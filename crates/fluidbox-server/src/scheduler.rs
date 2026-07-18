@@ -233,6 +233,8 @@ async fn build_and_create(
             },
             // A schedule tick has no directly-authenticated user.
             invoked_by_user_id: None,
+            // Server-derived authority only; a schedule names no explicit binding.
+            explicit_bindings: std::collections::HashMap::new(),
             result_destinations,
             bound_invocation: Some(invocation_id),
             bound_dispatch: None,

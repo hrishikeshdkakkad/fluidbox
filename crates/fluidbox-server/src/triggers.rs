@@ -536,7 +536,16 @@ pub async fn create(
     };
     let workspace_value = match req.workspace {
         None => None,
-        Some(input) => match crate::api::resolve_workspace_input(&state, scope, input).await? {
+        // Subscription config is an admin/owner mutation → operator lens; the
+        // per-run authority is re-resolved server-side at fire time.
+        Some(input) => match crate::api::resolve_workspace_input(
+            &state,
+            scope,
+            fluidbox_db::ConnectionViewer::All,
+            input,
+        )
+        .await?
+        {
             WorkspaceSpec::Scratch => None,
             spec => Some(serde_json::to_value(&spec)?),
         },
@@ -981,6 +990,9 @@ pub async fn invoke(
             invocation,
             // A trigger-token invoke is not a directly-authenticated user.
             invoked_by_user_id: None,
+            // Invoke overrides only narrow — a trigger never introduces a new
+            // connection (design/trap); the subscription derives its authority.
+            explicit_bindings: std::collections::HashMap::new(),
             result_destinations: destinations,
             bound_invocation: Some(invocation_id),
             bound_dispatch: None,
