@@ -2,7 +2,8 @@ import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import "./geist.css";
-import { Sidebar } from "./components/Sidebar";
+import { Shell } from "./components/Shell";
+import { webMode } from "./lib/proxy-auth";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -31,7 +32,7 @@ export const viewport: Viewport = {
 // hosted session shell + login redirects; anything else is today's admin shell.
 // Stamped onto <html data-web-mode> so client code (api.ts) is mode-aware
 // without a second env var, and passed to the shell so it renders session UI.
-const WEB_MODE = process.env.FLUIDBOX_WEB_MODE === "sso" ? "sso" : "admin";
+const WEB_MODE = webMode(process.env.FLUIDBOX_WEB_MODE);
 
 export default function RootLayout({
   children,
@@ -43,10 +44,7 @@ export default function RootLayout({
       data-web-mode={WEB_MODE}
     >
       <body>
-        <div className="shell">
-          <Sidebar mode={WEB_MODE} />
-          <main className="main">{children}</main>
-        </div>
+        <Shell mode={WEB_MODE}>{children}</Shell>
       </body>
     </html>
   );
