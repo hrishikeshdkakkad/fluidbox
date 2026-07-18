@@ -26,7 +26,11 @@ alter table tenants
 -- row gets a derived, unique slug before the NOT NULL + shape check + unique
 -- index land. On a fresh DB both updates touch nothing.
 update tenants set slug = 'default' where name = 'default' and slug is null;
-update tenants set slug = 'org-' || left(id::text, 8) where slug is null;
+-- Use the FULL id (not a left(…,8) prefix): UUIDv7 leading chars are
+-- timestamp-derived, so an 8-char prefix is not collision-safe. 'org-' + a
+-- 36-char uuid is 40 chars — within the 63-char shape check and unique by
+-- construction (the id is the PK).
+update tenants set slug = 'org-' || id::text where slug is null;
 
 alter table tenants alter column slug set not null;
 alter table tenants add constraint tenants_slug_shape
@@ -192,13 +196,18 @@ create table pending_login_switches (
 create index pending_login_switches_expiry on pending_login_switches (expires_at);
 
 -- ─── auth_audit_log ─────────────────────────────────────────────────────────
--- Append-only "enforced, not asserted" (design §"auth_audit_log"): the runtime
--- role is granted INSERT/SELECT only. Single-role deployments (Neon owner)
--- cannot express that — the owner keeps UPDATE/DELETE by ownership regardless
--- of the REVOKE — so a BEFORE UPDATE OR DELETE trigger ALSO refuses at the
--- statement level. This is the one table without unique (tenant_id, id):
--- tenant_id is nullable (deployment-level operator actions carry none) and
--- nothing references this log.
+-- Append-only "enforced, not asserted" (design §"auth_audit_log"). What THIS
+-- migration enforces at the statement level, independent of role: UPDATE and
+-- DELETE are revoked from public AND refused by a BEFORE UPDATE OR DELETE
+-- trigger; TRUNCATE is likewise revoked from public AND refused by a BEFORE
+-- TRUNCATE trigger (TRUNCATE cannot be a row-level trigger, so it is a separate
+-- FOR EACH STATEMENT trigger). The triggers are the real guard: an owner keeps
+-- these privileges by ownership regardless of the REVOKE, and only a trigger
+-- can stop the owner. Granting a dedicated NON-OWNER runtime role INSERT/SELECT
+-- only — so the process the API runs as cannot mutate the log at all — remains
+-- deployment-level hardening (Phase D); no such grant is made here. This is the
+-- one table without unique (tenant_id, id): tenant_id is nullable
+-- (deployment-level operator actions carry none) and nothing references it.
 create table auth_audit_log (
     id          uuid primary key,
     tenant_id   uuid,                    -- nullable: deployment-level operator actions
@@ -214,7 +223,7 @@ create table auth_audit_log (
 );
 create index auth_audit_log_tenant on auth_audit_log (tenant_id, created_at desc);
 
-revoke update, delete on auth_audit_log from public;
+revoke update, delete, truncate on auth_audit_log from public;
 
 create or replace function auth_audit_log_reject_mutation() returns trigger
     language plpgsql as $$
@@ -226,6 +235,13 @@ $$;
 create trigger auth_audit_log_append_only
     before update or delete on auth_audit_log
     for each row execute function auth_audit_log_reject_mutation();
+
+-- TRUNCATE bypasses row triggers entirely, so it needs its own statement-level
+-- guard (same rejecting function) — otherwise the append-only log could be
+-- wiped wholesale.
+create trigger auth_audit_log_no_truncate
+    before truncate on auth_audit_log
+    for each statement execute function auth_audit_log_reject_mutation();
 
 -- ─── sessions / trigger_subscriptions composite-unique targets ──────────────
 -- Neither table had a (tenant_id, id) key; api_tokens' new composite FKs need
