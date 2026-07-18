@@ -85,6 +85,13 @@ pub struct Config {
     /// With it set, `Principal` refuses the admin token on data-plane routes —
     /// a hosted deployment authorizes only verified user principals there.
     pub require_sso: bool,
+    /// Trust client-supplied `X-Forwarded-For` / `X-Real-IP` for the login
+    /// rate-limit buckets and audit `source_ip` (`FLUIDBOX_TRUST_FORWARDED_FOR`).
+    /// Set this ONLY when fluidbox runs behind a trusted reverse proxy that
+    /// strips any client-supplied XFF and sets its own — otherwise any client
+    /// spoofs its rate-limit bucket and forges audit source IPs. Default false:
+    /// the socket peer address is authoritative.
+    pub trust_forwarded_for: bool,
     /// Browser-session sliding idle window (seconds). The idle bump is always
     /// `least(now() + idle, absolute_expires_at)`.
     pub session_idle_secs: i64,
@@ -196,6 +203,9 @@ impl Config {
                 24 * 3600,
             )?,
             require_sso: get("FLUIDBOX_REQUIRE_SSO")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            trust_forwarded_for: get("FLUIDBOX_TRUST_FORWARDED_FOR")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             session_idle_secs: parse_i64_env(

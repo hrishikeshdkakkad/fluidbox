@@ -45,9 +45,11 @@ HAVE_PSQL=0; command -v psql >/dev/null 2>&1 && HAVE_PSQL=1
 # ── Config ───────────────────────────────────────────────────────────────────
 API=http://127.0.0.1:8787
 ISSUER=http://127.0.0.1:5556/dex
-# Pinned by exact version tag (digest-pinning is a hardening follow-up). Dex's
-# staticPasswords set email_verified=true by default, which the login gate needs.
-DEX_IMAGE=${DEX_IMAGE:-ghcr.io/dexidp/dex:v2.45.0}
+# Pinned by the multi-arch INDEX digest (tag kept for readability; the @sha256
+# is what Docker resolves). Re-pin with:
+#   docker buildx imagetools inspect ghcr.io/dexidp/dex:<tag>   # → Digest:
+# Dex's staticPasswords set email_verified=true by default, which the gate needs.
+DEX_IMAGE=${DEX_IMAGE:-ghcr.io/dexidp/dex:v2.45.0@sha256:b8469881d3cb3a73001506f0d3aaefecb9c45d2311c1e0f405d8ac538316c59d}
 SLUG=acme
 SLUG2=beta          # a real org with NO IdP config (fail-closed browser path)
 SLUG3=gamma-never   # never created (enumeration-parity comparison)
@@ -166,6 +168,10 @@ start_server() {
     export FLUIDBOX_PROVIDER=docker
     export FLUIDBOX_DATA_DIR="$DATA_DIR"
     export FLUIDBOX_SESSION_REAUTH_SECS=2
+    # This run declares a trusted proxy so the per-call spoofed X-Forwarded-For
+    # (see xff()) is honored for the rate-limit buckets; without it the socket
+    # peer is authoritative and every curl would share one bucket and trip.
+    export FLUIDBOX_TRUST_FORWARDED_FOR=1
     export FLUIDBOX_REQUIRE_SSO="$require_sso"
     export RUST_LOG="${RUST_LOG:-warn,fluidbox_server=info}"
     if [ -n "${FLUIDBOX_SERVER_BIN:-}" ] && [ -x "${FLUIDBOX_SERVER_BIN}" ]; then
@@ -179,7 +185,7 @@ start_server() {
       echo "identity-e2e: server process exited during boot" >&2
       tail -40 "$SERVER_LOG" >&2; exit 1
     fi
-    if curl -sf "$API/health" >/dev/null 2>&1; then return 0; fi
+    if curl -sf "$API/v1/health" >/dev/null 2>&1; then return 0; fi
     sleep 1
   done
   echo "identity-e2e: server did not become ready" >&2
@@ -298,8 +304,10 @@ print('%s|%s|%s|%s' % (o.get('slug'), u.get('email'), ','.join(d.get('roles') or
 "
 }
 
-# psql shortcut (only when psql is present).
-db() { psql "$DATABASE_URL" -tAX -c "$1" 2>/dev/null; }
+# psql shortcut (only when psql is present). stderr is left to flow to the log
+# (not swallowed): db() is always used in `$(…)`, so psql errors reach the
+# terminal/log without polluting the captured stdout — and a healthy run is silent.
+db() { psql "$DATABASE_URL" -tAX -c "$1"; }
 
 # ═════════════════════════════════════════════════════════════════════════════
 say "BOOT — Dex + control plane"
