@@ -90,14 +90,28 @@ MCP_PROTO="2025-06-18-fakekb-1"
 SINK_PORT=8899
 SINK_URL="http://127.0.0.1:$SINK_PORT/hook"
 
+# Fake GitHub API (validate_pat's GET /user) + a dumb-HTTP git server that LOGS
+# the Authorization header (the workspace_fetch consumer proof, G2). Two distinct
+# github PATs so alice's PERSONAL and the ORG connection differ, and the git log
+# proves the FROZEN binding's credential (alice's) reaches the consumer.
+GH_API_PORT=8895
+GH_API_URL="http://127.0.0.1:$GH_API_PORT"
+GIT_PORT=8896
+GIT_URL="http://127.0.0.1:$GIT_PORT"
+PAT_ALICE="ghp_aliceDISTINCT$$"
+PAT_ORG="ghp_orgDISTINCT$$"
+
 WORK=$(mktemp -d)
 DEX_NAME="fbx-dex-bindings-$$"
 MCP_LOG="$WORK/mcp-requests.jsonl"; : > "$MCP_LOG"
 SINK_LOG="$WORK/sink-requests.jsonl"; : > "$SINK_LOG"
+GIT_LOG="$WORK/git-requests.jsonl"; : > "$GIT_LOG"
 SERVER_LOG="$WORK/server.log"
 SERVER_PID=""
 MCP_PID=""
 SINK_PID=""
+GH_API_PID=""
+GIT_PID=""
 DATA_DIR="$WORK/data"; mkdir -p "$DATA_DIR"
 UB="$WORK/ub"           # scratch body file for the cookie/admin curl helpers
 
@@ -132,6 +146,8 @@ cleanup() {
   [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
   [ -n "$MCP_PID" ] && kill "$MCP_PID" 2>/dev/null
   [ -n "$SINK_PID" ] && kill "$SINK_PID" 2>/dev/null
+  [ -n "$GH_API_PID" ] && kill "$GH_API_PID" 2>/dev/null
+  [ -n "$GIT_PID" ] && kill "$GIT_PID" 2>/dev/null
   docker rm -f "$DEX_NAME" >/dev/null 2>&1
   rm -rf "$WORK"
 }
@@ -252,32 +268,39 @@ print(last)
 PYEOF
 }
 
-# Prove the discovery handshake order: the FIRST tools/list in the log is preceded
-# by at least one initialize (every connect initializes before listing). Prints
-# "yes"/"no".
-mcp_init_before_first_list() {
+# Prove the discovery handshake order PER PHOTOGRAPH (R3.9/G3): grouping the
+# request log BY BEARER, every tools/list must be preceded by an initialize since
+# that bearer's PREVIOUS tools/list — each connect/re-photograph negotiates a real
+# protocol version before it lists, not just the globally-first one. Prints
+# "yes"/"no" ("no" also when no tools/list was ever logged).
+mcp_init_before_every_list() {
   python3 - "$MCP_LOG" <<'PYEOF'
 import json, sys
 log = sys.argv[1]
-seen_init = False
+seen_init = {}   # bearer -> initialize seen since its last tools/list
+saw_list = False
+ok = True
 for line in open(log):
     r = json.loads(line)
-    m = r.get("method")
+    m = r.get("method"); a = r.get("auth", "")
     if m == "initialize":
-        seen_init = True
-    if m == "tools/list":
-        print("yes" if seen_init else "no")
-        break
-else:
-    print("no")
+        seen_init[a] = True
+    elif m == "tools/list":
+        saw_list = True
+        if not seen_init.get(a, False):
+            ok = False
+            break
+        seen_init[a] = False   # the next list for this bearer needs its own init
+print("yes" if (ok and saw_list) else "no")
 PYEOF
 }
 
 # ── Signed-webhook sink (the result_publish consumer) ─────────────────────────
 # A one-file HTTP sink for the signed-webhook publish path (R3.8). Every POST is
-# logged as one jsonl line {delivery, signature, body_len} — the two fluidbox
-# delivery headers prove the delivery worker signed + shipped the callback. Always
-# answers 200 (a delivered attempt is what freezes the publish binding row).
+# logged as one jsonl line {delivery, signature, timestamp, body, body_len} — the
+# two fluidbox delivery headers prove the delivery worker signed + shipped the
+# callback, and timestamp+body let the test RECOMPUTE and VERIFY the HMAC (G1).
+# Always answers 200 (a delivered attempt is what freezes the publish binding row).
 start_sink() {
   python3 - "$SINK_PORT" "$SINK_LOG" <<'PYEOF' &
 import http.server, json, sys
@@ -291,6 +314,8 @@ class Sink(http.server.BaseHTTPRequestHandler):
             f.write(json.dumps({
                 "delivery": self.headers.get("x-fluidbox-delivery", ""),
                 "signature": self.headers.get("x-fluidbox-signature", ""),
+                "timestamp": self.headers.get("x-fluidbox-timestamp", ""),
+                "body": body.decode("utf-8", "replace"),
                 "body_len": len(body)}) + "\n")
         self.send_response(200); self.send_header("content-length", "0")
         self.end_headers()
@@ -320,6 +345,137 @@ for line in open(log):
     if not signed or (r.get("delivery") and r.get("signature")):
         n += 1
 print(n)
+PYEOF
+}
+
+# For the LAST signed sink request: write the EXACT HMAC signing input
+# "{timestamp}.{body}" to $1 (so openssl can hash the precise bytes, no shell
+# quoting), and print the received x-fluidbox-signature. Empty when none (G1).
+sink_last_signing() { # outfile
+  python3 - "$SINK_LOG" "$1" <<'PYEOF'
+import json, sys
+log, out = sys.argv[1], sys.argv[2]
+last = None
+for line in open(log):
+    r = json.loads(line)
+    if r.get("delivery") and r.get("signature"):
+        last = r
+if not last:
+    print("")
+    sys.exit(0)
+with open(out, "w") as f:
+    f.write(f"{last['timestamp']}.{last['body']}")
+print(last["signature"])
+PYEOF
+}
+
+# ── Fake GitHub API (validate_pat's GET /user, G2) ────────────────────────────
+# create_github_pat proves a token via GET /user before storing it. This answers
+# with a login+id keyed off the Bearer PAT so alice's + the org's connections are
+# distinct; any other token → 401. Nothing is logged here (the git server below is
+# where we prove WHICH credential the fetch used).
+start_gh_api() {
+  python3 - "$GH_API_PORT" "$PAT_ALICE" "$PAT_ORG" <<'PYEOF' &
+import http.server, json, sys
+port, pat_alice, pat_org = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+class Gh(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def _send(self, code, obj, extra=None):
+        data = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(data)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+    def do_GET(self):
+        auth = self.headers.get("authorization", "")
+        tok = auth.split(" ", 1)[1] if " " in auth else ""
+        if self.path == "/user":
+            if tok == pat_alice:
+                return self._send(200, {"login": "alice-gh", "id": 4001},
+                                  {"x-oauth-scopes": "repo"})
+            if tok == pat_org:
+                return self._send(200, {"login": "org-gh", "id": 5002},
+                                  {"x-oauth-scopes": "repo"})
+            return self._send(401, {"message": "Bad credentials"})
+        return self._send(404, {"message": "not found"})
+    def log_message(self, *a): pass
+http.server.HTTPServer(("127.0.0.1", port), Gh).serve_forever()
+PYEOF
+  GH_API_PID=$!
+  for _ in $(seq 1 40); do
+    if curl -s -o /dev/null "$GH_API_URL/user" 2>/dev/null; then
+      ok "fake GitHub API up on :$GH_API_PORT (/user validates PATs)"; return 0
+    fi
+    sleep 0.25
+  done
+  echo "bindings-e2e: fake GitHub API did not become ready" >&2; exit 1
+}
+
+# ── Fake dumb-HTTP git server (the workspace_fetch consumer, G2) ───────────────
+# Logs the Authorization header of every request as one jsonl line {path, auth}.
+# The orchestrator's credentialed workspace fetch (materialize_git) injects it via
+# http.extraHeader = "Authorization: basic base64(x-access-token:<PAT>)" — so this
+# log proves the FROZEN binding's credential (alice's, NOT the org's) reaches the
+# consumer. Returns 404 (the fetch then fails and the run rots, which is fine); the
+# header rides the FIRST request regardless, and materialize_git sets
+# GIT_TERMINAL_PROMPT=0 so git never prompts — nothing hangs.
+start_git() {
+  python3 - "$GIT_PORT" "$GIT_LOG" <<'PYEOF' &
+import http.server, json, sys
+port, log = int(sys.argv[1]), sys.argv[2]
+class Git(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def _log_and_404(self):
+        with open(log, "a") as f:
+            f.write(json.dumps({"path": self.path,
+                                "auth": self.headers.get("authorization", "")}) + "\n")
+        self.send_response(404)
+        self.send_header("content-length", "0")
+        self.end_headers()
+    def do_GET(self):
+        self._log_and_404()
+    def do_POST(self):
+        # Drain any body first so the connection closes cleanly.
+        n = int(self.headers.get("content-length") or 0)
+        if n:
+            self.rfile.read(n)
+        self._log_and_404()
+    def log_message(self, *a): pass
+http.server.HTTPServer(("127.0.0.1", port), Git).serve_forever()
+PYEOF
+  GIT_PID=$!
+  for _ in $(seq 1 40); do
+    if curl -s -o /dev/null "$GIT_URL/" 2>/dev/null; then
+      : > "$GIT_LOG"
+      ok "fake git server up on :$GIT_PORT (Authorization log at git-requests.jsonl)"; return 0
+    fi
+    sleep 0.25
+  done
+  echo "bindings-e2e: fake git server did not become ready" >&2; exit 1
+}
+
+# The DECODED Authorization of the LAST git request carrying a basic credential —
+# how we prove WHICH github token the orchestrator injected at the consumer (the
+# fetch shape is `basic base64(x-access-token:<PAT>)`).
+git_last_basic() {
+  python3 - "$GIT_LOG" <<'PYEOF'
+import base64, json, sys
+log = sys.argv[1]
+last = ""
+for line in open(log):
+    r = json.loads(line)
+    a = r.get("auth", "")
+    if a.lower().startswith("basic "):
+        last = a
+if not last:
+    print(""); sys.exit(0)
+try:
+    print(base64.b64decode(last.split(" ", 1)[1]).decode("utf-8", "replace"))
+except Exception:
+    print("")
 PYEOF
 }
 
@@ -396,6 +552,11 @@ start_server() {
     export FLUIDBOX_CODEX_SANDBOX_IMAGE=localhost:1/fluidbox-absent:ci
     export FLUIDBOX_DATA_DIR="$DATA_DIR"
     export FLUIDBOX_REQUIRE_SSO=1
+    # G2: point the github PAT-validation seam + git clone base at the local
+    # fakes so `create_github_pat` (GET /user) and the orchestrator's workspace
+    # fetch both stay hermetic — no public GitHub.
+    export FLUIDBOX_GITHUB_API_URL="$GH_API_URL"
+    export FLUIDBOX_GITHUB_CLONE_BASE="$GIT_URL"
     unset FLUIDBOX_TRUST_FORWARDED_FOR
     export RUST_LOG="${RUST_LOG:-warn,fluidbox_server=info}"
     if [ -n "${FLUIDBOX_SERVER_BIN:-}" ] && [ -x "${FLUIDBOX_SERVER_BIN}" ]; then
@@ -549,10 +710,12 @@ print(rows[0]['id'] if rows else '')" 2>/dev/null)
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
-say "BOOT — Dex + fake MCP + signed-webhook sink + control plane (REQUIRE_SSO=1)"
+say "BOOT — Dex + fake MCP + signed-webhook sink + fake GitHub/git + control plane (REQUIRE_SSO=1)"
 start_dex
 start_mcp
 start_sink
+start_gh_api
+start_git
 start_server
 ok "control plane up (REQUIRE_SSO=1, sealer set, provider=docker)"
 
@@ -666,11 +829,12 @@ for pair in "alice:$ALICE_CONN" "bob:$BOB_CONN" "org:$ORG_CONN"; do
   { [ "$SV" = 1 ] && [ "$PV" = "$MCP_PROTO" ]; } && ok "$who snapshot row: version=$SV protocol_version='$PV' (== negotiated $MCP_PROTO)" \
     || no "$who snapshot row wrong (version='$SV' protocol_version='$PV', want $MCP_PROTO)"
 done
-# Every connect initialized BEFORE it listed tools (R3.9): the first tools/list
-# in the request log is preceded by an initialize.
-[ "$(mcp_init_before_first_list)" = yes ] \
-  && ok "the discovery handshake initialized before the first tools/list" \
-  || no "a tools/list preceded initialize in the request log"
+# Every connect initialized BEFORE it listed tools (R3.9/G3): PER BEARER, every
+# tools/list is preceded by an initialize since that bearer's previous list — not
+# merely the globally-first one.
+[ "$(mcp_init_before_every_list)" = yes ] \
+  && ok "every photograph initialized before its tools/list (per bearer)" \
+  || no "a tools/list without a preceding initialize for its bearer (per-photograph negotiation)"
 # GET /tools reads the latest snapshot (owner-filtered).
 u_get "$jarA" "/v1/connections/$ALICE_CONN/tools"
 { [ "$CODE" = 200 ] && [ "$(echo "$BODY" | j "['snapshot']['version']")" = 1 ]; } && ok "GET alice /tools → snapshot v1" || no "alice /tools → $CODE: $BODY"
@@ -882,8 +1046,13 @@ if need "$BOB_MID" "bob's membership id missing (see section k)"; then
   [ "$CODE" = 200 ] && ok "operator deactivated bob's membership" || no "deactivate bob → $CODE: $BODY"
   CALLS_I=$(mcp_count tools/call)
   R=$(sess_call "$BOB_RUN" "sess-bob-$$" '{"tool_call_id":"i1","tool":"mcp__kb__kb_search","input":{"query":"x"}}')
-  { echo "$R" | j "['denied']" | grep -qi true && echo "$R" | grep -qi "membership"; } \
-    && ok "bob's running session's next call is REFUSED (owner membership not active)" \
+  # Bob is BOTH the invoker AND the connection owner, so the fail-closed
+  # invoking-USER recheck fires first ("no longer an active member"); a run bound
+  # to another member's still-active connection would instead trip the owner-
+  # membership check ("membership … not active"). Accept EITHER phrasing.
+  { echo "$R" | j "['denied']" | grep -qi true \
+      && echo "$R" | grep -qiE "membership|no longer an active member"; } \
+    && ok "bob's running session's next call is REFUSED (invoker/owner membership not active)" \
     || no "membership kill-switch refusal: $R"
   [ "$(mcp_count tools/call)" = "$CALLS_I" ] && ok "the refused call reached the upstream ZERO times" || no "a refused call still hit the MCP server"
 fi
@@ -925,6 +1094,8 @@ u_post "$jarA" "/v1/triggers" \
 [ "$CODE" = 200 ] && ok "subscription 'pub-sub' created (api trigger, signed-webhook to the sink)" || no "pub-sub → $CODE: $BODY"
 PUB_SUB=$(echo "$BODY" | j "['subscription']['id']")
 PUB_TOK=$(echo "$BODY" | j "['token']")
+# The callback signing secret is returned ONCE, at creation (triggers.rs).
+PUB_SECRET=$(echo "$BODY" | j "['callback_secret']")
 if need "$PUB_SUB" "publish subscription id missing" && need "$PUB_TOK" "publish trigger token missing"; then
   SINK_BEFORE=$(sink_count)
   PUB_RUN=$(curl -s -X POST -H "authorization: Bearer $PUB_TOK" -H 'content-type: application/json' \
@@ -940,6 +1111,17 @@ if need "$PUB_SUB" "publish subscription id missing" && need "$PUB_TOK" "publish
     [ "$got" = 1 ] \
       && ok "the sink received a SIGNED delivery (x-fluidbox-delivery + x-fluidbox-signature)" \
       || no "no signed delivery reached the sink within budget"
+    # The signature must be CORRECT, not merely present (G1): recompute
+    # v1=HMAC-SHA256(callback_secret, "{ts}.{body}") with openssl over the EXACT
+    # bytes the sink received and assert equality against x-fluidbox-signature.
+    if need "$PUB_SECRET" "callback_secret was not returned at subscription creation"; then
+      SIG_IN="$WORK/pub-sig-input"
+      RECV_SIG=$(sink_last_signing "$SIG_IN")
+      CALC="v1=$(openssl dgst -sha256 -hmac "$PUB_SECRET" < "$SIG_IN" | sed 's/^.*= //')"
+      { [ -n "$RECV_SIG" ] && [ "$RECV_SIG" = "$CALC" ]; } \
+        && ok "the delivery signature VERIFIES: v1=HMAC-SHA256(secret, ts.body) matches" \
+        || no "publish signature mismatch (received='$RECV_SIG' computed='$CALC')"
+    fi
     # The publish:0 binding froze the subscription_secret authority at generation 1.
     BK=$(db "select authority_kind from run_resource_bindings where session_id='$PUB_RUN' and requirement_slot='publish:0'")
     BG=$(db "select authority_generation from run_resource_bindings where session_id='$PUB_RUN' and requirement_slot='publish:0'")
@@ -973,13 +1155,67 @@ fi
 
 # Workspace consumer refusal: alice naming BOB's PERSONAL connection as her run's
 # workspace connection resolves as not-found (viewer-filtered read), refusing at
-# creation. The fake-git POSITIVE fetch path stays covered by the Rust tests
-# (crates/fluidbox-server/src/orchestrator.rs workspace_binding_auth_header).
+# creation. The POSITIVE fetch path is proven at the consumer in (m) below.
 u_post "$jarA" "/v1/sessions" \
   "{\"agent\":\"publish-agent\",\"task\":\"t\",\"repo\":{\"kind\":\"git_repository\",\"connection_id\":\"$BOB_CONN\",\"repository\":\"acme/app\"}}"
 { [ "$CODE" != 200 ] && { echo "$BODY" | grep -qi "unknown connection" || echo "$BODY" | grep -qi "not found"; }; } \
   && ok "alice naming bob's personal connection as her workspace → $CODE (not-found shape)" \
   || no "workspace cross-user refusal → $CODE: $BODY (want 4xx / not found)"
+
+# ── (m) Workspace consumer PROOF — the FROZEN binding's credential fetches ─────
+# Prove the orchestrator's credentialed workspace fetch (materialize_workspace,
+# which runs during `initializing` BEFORE the dead-image provision) injects the
+# run's FROZEN workspace_fetch binding credential — ALICE's github PAT — at the
+# git consumer, never the org one. Two github PAT connections (validated against
+# the fake GitHub API); a manual run bound to alice's; then read the git server's
+# logged Authorization (`basic base64(x-access-token:<PAT>)`).
+say "(m) Workspace credentialed fetch — ALICE's github PAT reaches the git server, not the org's"
+u_post "$jarA" "/v1/connections" \
+  "{\"provider\":\"github\",\"token\":\"$PAT_ALICE\",\"owner\":\"personal\",\"display_name\":\"alice-gh\"}"
+ALICE_GH=$(echo "$BODY" | j "['connection']['id']")
+{ [ "$CODE" = 200 ] && [ -n "$ALICE_GH" ]; } \
+  && ok "alice's personal github PAT connection created ($ALICE_GH)" \
+  || no "alice github connect → $CODE: $BODY"
+u_post "$jarA" "/v1/connections" \
+  "{\"provider\":\"github\",\"token\":\"$PAT_ORG\",\"owner\":\"organization\",\"display_name\":\"org-gh\"}"
+ORG_GH=$(echo "$BODY" | j "['connection']['id']")
+{ [ "$CODE" = 200 ] && [ -n "$ORG_GH" ]; } \
+  && ok "org github PAT connection created ($ORG_GH)" \
+  || no "org github connect → $CODE: $BODY"
+
+if need "$ALICE_GH" "alice github connection missing (skipping consumer proof)"; then
+  GIT_BEFORE=$(wc -l < "$GIT_LOG" 2>/dev/null | tr -d ' ')
+  u_post "$jarA" "/v1/sessions" \
+    "{\"agent\":\"publish-agent\",\"task\":\"t\",\"repo\":{\"kind\":\"git_repository\",\"connection_id\":\"$ALICE_GH\",\"repository\":\"acme/app\"}}"
+  WS_RUN=$(echo "$BODY" | j "['session']['id']")
+  { [ "$CODE" = 200 ] && [ -n "$WS_RUN" ]; } \
+    && ok "alice created a git-workspace run bound to HER github connection ($WS_RUN)" \
+    || no "workspace run create → $CODE: $BODY"
+  if need "$WS_RUN" "workspace run not created"; then
+    # Wait for the initializing fetch to reach the git server (a new log line).
+    got=0
+    for _ in $(seq 1 240); do
+      NOW=$(wc -l < "$GIT_LOG" 2>/dev/null | tr -d ' ')
+      [ "${NOW:-0}" -gt "${GIT_BEFORE:-0}" ] && { got=1; break; }
+      sleep 0.5
+    done
+    if [ "$got" = 1 ]; then
+      ok "the orchestrator's workspace fetch reached the git server"
+      DECODED=$(git_last_basic)
+      echo "$DECODED" | grep -q "x-access-token:$PAT_ALICE" \
+        && ok "the fetch used ALICE's frozen github credential (x-access-token:<alice PAT>)" \
+        || no "workspace fetch credential wrong (decoded='$DECODED', want alice's PAT)"
+      echo "$DECODED" | grep -q "$PAT_ORG" \
+        && no "the fetch LEAKED the org token" \
+        || ok "the fetch did NOT use the org token"
+    else
+      no "the workspace fetch never reached the git server within budget"
+    fi
+    # The run then rots on the dumb-HTTP fetch failure / dead-image provision;
+    # cancel best-effort so it settles (it may already be terminal).
+    u_post "$jarA" "/v1/sessions/$WS_RUN/cancel" '{}' >/dev/null 2>&1 || true
+  fi
+fi
 
 # ── Result ───────────────────────────────────────────────────────────────────
 say "RESULT"
