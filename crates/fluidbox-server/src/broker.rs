@@ -590,8 +590,10 @@ async fn rpc(
 /// JSON-RPC error message; that string must never leave the broker verbatim (it
 /// would flow into logs, the connection's persisted `oauth.error`, and the
 /// dashboard). We surface method + HTTP status + JSON-RPC code + this digest so
-/// an operator can still correlate repeated failures without the bytes.
-fn msg_digest(msg: &str) -> String {
+/// an operator can still correlate repeated failures without the bytes. Shared
+/// with `oauth.rs`, whose AS-error log boundary needs the identical treatment
+/// (an authorization server can echo the sealed state/code/verifier/secret).
+pub(crate) fn msg_digest(msg: &str) -> String {
     format!(
         "sha256:{}",
         hex::encode(&Sha256::digest(msg.as_bytes())[..8])

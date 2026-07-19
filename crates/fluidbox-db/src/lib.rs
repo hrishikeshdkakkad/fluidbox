@@ -945,17 +945,25 @@ pub async fn list_connections(
     .await
 }
 
-pub async fn get_connection(
-    pool: &PgPool,
+// Executor-generic so a caller holding the per-connection OAuth advisory lock
+// can re-read THROUGH its own transaction (`&mut *tx`) instead of borrowing a
+// SECOND pooled connection — the latter deadlocks the fixed-size pool under
+// concurrent refreshes/callbacks. Existing `&PgPool` call sites are unchanged
+// (`&PgPool: PgExecutor`).
+pub async fn get_connection<'e, E>(
+    exec: E,
     scope: TenantScope,
     id: Uuid,
-) -> sqlx::Result<Option<IntegrationConnectionRow>> {
+) -> sqlx::Result<Option<IntegrationConnectionRow>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {CONNECTION_COLS} from integration_connections where id = $1 and tenant_id = $2"
     )))
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(exec)
     .await
 }
 
@@ -1073,14 +1081,20 @@ pub async fn update_connection_oauth(
 /// ⇒ no bump; reconnect (from `active`/`error`) ⇒ bump — all in ONE write, so no
 /// crash window where a reconnected grant serves the OLD generation. The returned
 /// row carries the FINAL generation the caller caches under.
-pub async fn activate_connection_oauth(
-    pool: &PgPool,
+// Executor-generic (see `get_connection`): the callback activation runs THROUGH
+// the connection that holds the OAuth advisory lock, so the critical section
+// uses exactly one pooled connection.
+pub async fn activate_connection_oauth<'e, E>(
+    exec: E,
     scope: TenantScope,
     id: Uuid,
     sealed_refresh: &[u8],
     oauth: &Value,
     granted_scopes: &Value,
-) -> sqlx::Result<Option<IntegrationConnectionRow>> {
+) -> sqlx::Result<Option<IntegrationConnectionRow>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update integration_connections
          set credential_sealed = $2, oauth = $3, granted_scopes = $4,
@@ -1096,7 +1110,7 @@ pub async fn activate_connection_oauth(
     .bind(oauth)
     .bind(granted_scopes)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(exec)
     .await
 }
 
@@ -1108,13 +1122,16 @@ pub async fn activate_connection_oauth(
 /// (that would restore a superseded grant). Returns false when the row was
 /// revoked/errored OR reauthorized (generation moved) underneath the caller;
 /// the refresh path treats a false as a stale mint and fails closed.
-pub async fn rotate_connection_refresh(
-    pool: &PgPool,
+pub async fn rotate_connection_refresh<'e, E>(
+    exec: E,
     scope: TenantScope,
     id: Uuid,
     sealed_new: &[u8],
     expected_generation: i32,
-) -> sqlx::Result<bool> {
+) -> sqlx::Result<bool>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let r = sqlx::query(
         "update integration_connections set credential_sealed = $2, updated_at = now()
          where id = $1 and status = 'active' and auth_kind = 'oauth' and tenant_id = $3
@@ -1124,7 +1141,7 @@ pub async fn rotate_connection_refresh(
     .bind(sealed_new)
     .bind(scope.tenant_id())
     .bind(expected_generation)
-    .execute(pool)
+    .execute(exec)
     .await?;
     Ok(r.rows_affected() == 1)
 }
@@ -1133,12 +1150,15 @@ pub async fn rotate_connection_refresh(
 /// needs human re-consent. Everything downstream fails closed off the
 /// status: `connection_credential_sealed` stops returning, run creation
 /// refuses, the broker surfaces "reconnect".
-pub async fn mark_connection_error(
-    pool: &PgPool,
+pub async fn mark_connection_error<'e, E>(
+    exec: E,
     scope: TenantScope,
     id: Uuid,
     note: &str,
-) -> sqlx::Result<()> {
+) -> sqlx::Result<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     sqlx::query(
         "update integration_connections
          set status = 'error', updated_at = now(),
@@ -1148,7 +1168,7 @@ pub async fn mark_connection_error(
     .bind(id)
     .bind(note)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(exec)
     .await
     .map(|_| ())
 }
@@ -1177,18 +1197,21 @@ pub async fn set_connection_client_secret(
 /// Client identity outlives token state — the dance needs it while the row
 /// is still pending (first exchange) or errored (reconnect) — so any
 /// non-revoked status qualifies.
-pub async fn connection_client_secret_sealed(
-    pool: &PgPool,
+pub async fn connection_client_secret_sealed<'e, E>(
+    exec: E,
     scope: TenantScope,
     id: Uuid,
-) -> sqlx::Result<Option<Vec<u8>>> {
+) -> sqlx::Result<Option<Vec<u8>>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let row = sqlx::query(
         "select client_secret_sealed from integration_connections
          where id = $1 and status <> 'revoked' and tenant_id = $2",
     )
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(exec)
     .await?;
     Ok(row.and_then(|r| r.get::<Option<Vec<u8>>, _>("client_secret_sealed")))
 }
@@ -1471,18 +1494,21 @@ pub async fn delete_catalog_entry(
 /// The only reader of the sealed credential. Returns None unless the
 /// connection exists AND is active — a revoked connection can never again
 /// produce a credential.
-pub async fn connection_credential_sealed(
-    pool: &PgPool,
+pub async fn connection_credential_sealed<'e, E>(
+    exec: E,
     scope: TenantScope,
     id: Uuid,
-) -> sqlx::Result<Option<Vec<u8>>> {
+) -> sqlx::Result<Option<Vec<u8>>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let row = sqlx::query(
         "select credential_sealed from integration_connections
          where id = $1 and status = 'active' and tenant_id = $2",
     )
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(exec)
     .await?;
     Ok(row.map(|r| r.get::<Vec<u8>, _>("credential_sealed")))
 }
