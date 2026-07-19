@@ -990,6 +990,9 @@ pub async fn invoke(
             invocation,
             // A trigger-token invoke is not a directly-authenticated user.
             invoked_by_user_id: None,
+            // Freeze the exact invoking token as the run's `trigger` principal
+            // (E1) so the binding recheck fails closed on token revocation.
+            invoking_token_id: Some(auth.token_id),
             // Invoke overrides only narrow — a trigger never introduces a new
             // connection (design/trap); the subscription derives its authority.
             explicit_bindings: std::collections::HashMap::new(),

@@ -56,6 +56,11 @@ pub struct CreateRun {
     /// path once identity lands). None for operator-token, trigger, schedule,
     /// and webhook invocations. Stamped onto `sessions.invoked_by_user_id`.
     pub invoked_by_user_id: Option<Uuid>,
+    /// The exact trigger TOKEN that invoked an API-trigger run (design :741/:748).
+    /// Frozen as the run's `trigger` invoking principal so the binding recheck can
+    /// fail closed on a revoked/expired token, not merely a disabled subscription
+    /// (E1). Only the trigger-invoke path sets this; None everywhere else.
+    pub invoking_token_id: Option<Uuid>,
     /// The sanctioned explicit binding override: requirement slot → connection
     /// id (design "Explicit binding", `:513-523`). Only the manual/UI path
     /// supplies one; binding resolution verifies each entry (tenant, caller may
@@ -300,7 +305,12 @@ pub async fn create_run(
     let principal_id: Option<String> = match invoked_by_kind {
         "user" => req.invoked_by_user_id.map(|u| u.to_string()),
         "operator" => None,
-        // trigger/schedule/webhook: the subscription is the acting principal.
+        // A trigger invoke freezes the exact TOKEN as the principal (design
+        // "The exact trigger token ID is stored on each invocation") so the
+        // recheck fails closed on a revoked/expired token, not just a disabled
+        // subscription (E1).
+        "trigger" => req.invoking_token_id.map(|t| t.to_string()),
+        // schedule / webhook: the subscription is their standing authority.
         _ => req.invocation.subscription_id.map(|s| s.to_string()),
     };
     // Manual (`user`/`operator`) workspaces carry a user-supplied connection id →
