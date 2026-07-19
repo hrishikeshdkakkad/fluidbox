@@ -158,28 +158,46 @@ export function AddServerWizard({
       try {
         const list = await apiGet<{ connections: Connection[] }>("/connections");
         const c = list.connections.find((x) => x.id === connId);
-        if (c?.status === "active") {
-          stopPolling();
-          // The callback photographed the snapshot; fetch it so an embedded
-          // caller can preselect its tools into a requirement.
-          setDoneConnection(c);
-          const snap = await fetchConnectionTools(c.id).catch(() => null);
-          if (snap) {
-            setDoneSnapshot(snap);
-            setDoneTools(snap.tools.map((t) => ({ name: t.name, description: t.description })));
-          }
-          setDoneMsg(
-            snap
-              ? `Connected — photographed ${snap.tools.length} tool(s) with the fresh credential.`
-              : "Connected — the connection was registered with the fresh credential."
-          );
-          setStep("done");
-        } else if (c?.status === "error") {
+        if (c?.status === "error") {
           stopPolling();
           setErr("Authorization didn't complete — the sign-in was refused. You can try again.");
-        } else if (waited >= MAX_WAIT) {
+          return;
+        }
+        if (c?.status === "active") {
+          // `active` can briefly PRECEDE the post-activation photograph, so a
+          // /tools fetch here can 404 → null. Only COMPLETE once the snapshot has
+          // landed AND was taken under THIS connection's current authorization
+          // generation; otherwise keep polling within the budget rather than
+          // finishing with no tools (F2).
+          const snap = await fetchConnectionTools(c.id).catch(() => null);
+          if (snap && snap.authorization_generation === c.authorization_generation) {
+            stopPolling();
+            setDoneConnection(c);
+            setDoneSnapshot(snap);
+            setDoneTools(snap.tools.map((t) => ({ name: t.name, description: t.description })));
+            setDoneMsg(
+              `Connected — photographed ${snap.tools.length} tool(s) with the fresh credential.`
+            );
+            setStep("done");
+            return;
+          }
+          // Active but the photograph hasn't settled yet — fall through and keep
+          // polling until it lands or the budget is exhausted (handled below).
+        }
+        if (waited >= MAX_WAIT) {
           stopPolling();
-          setErr("Timed out waiting for authorization. Finish the sign-in in the opened tab, then retry.");
+          if (c?.status === "active") {
+            // Connected, but the photograph never settled within the budget.
+            // Surface it explicitly (the connection IS live) rather than
+            // completing with nothing.
+            setDoneConnection(c);
+            setDoneMsg(
+              "Connected — tools are still photographing. Refresh in Integrations in a moment to see them."
+            );
+            setStep("done");
+          } else {
+            setErr("Timed out waiting for authorization. Finish the sign-in in the opened tab, then retry.");
+          }
         }
       } catch {
         /* transient list failure — keep polling until MAX_WAIT */
