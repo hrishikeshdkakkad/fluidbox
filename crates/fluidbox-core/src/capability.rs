@@ -31,7 +31,9 @@ const MAX_DESCRIPTION_CHARS: usize = 32_768;
 /// Whole-definition ceiling (serialized): with 16 servers × 64 tools ×
 /// 32 KiB descriptions the naive worst case is ~32 MiB — every byte of
 /// which would be frozen into each RunSpec jsonb. Cap it well below that.
-const MAX_DEFINITION_BYTES: usize = 2 * 1024 * 1024;
+/// Public so the connection-tool-snapshot path (server) enforces the same
+/// serialized ceiling against a discovered `tools/list` before it is stored.
+pub const MAX_DEFINITION_BYTES: usize = 2 * 1024 * 1024;
 
 /// The pin an agent revision stores per attached bundle (§17 #7, settled
 /// 2026-07-10: pin-only — attaching resolves to the newest version AT
