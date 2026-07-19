@@ -619,26 +619,38 @@ export function RunComposer({
                 // just-connected server. Presentation-only — create_run
                 // revalidates the requirement and resolves the binding.
                 if (result.connection && result.snapshot) {
+                  const conn = result.connection;
                   const endpoint =
-                    result.connection.metadata?.endpoint_url ??
-                    result.connection.metadata?.base_url ??
+                    conn.metadata?.endpoint_url ??
+                    conn.metadata?.base_url ??
                     "";
                   const base =
                     (result.slug ?? "server").replace(/[^a-z0-9-]/gi, "-").toLowerCase() || "server";
-                  setRequirements((current) => {
-                    let slot = base;
-                    let n = 2;
-                    while (current.some((r) => r.slot === slot)) slot = `${base}-${n++}`;
-                    return [
-                      ...current,
-                      {
-                        slot,
-                        connector: { url: endpoint, slug: result.slug ?? null },
-                        required_tools: result.snapshot!.tools.map((t) => t.name),
-                        binding_mode: "organization" as const,
-                      },
-                    ];
-                  });
+                  // Owner-aware binding mode: a member's new PERSONAL connection
+                  // satisfies an "invoking_user" requirement; an org connection an
+                  // "organization" one. Hardcoding "organization" would leave a
+                  // personal connection never satisfying the generated slot (F1).
+                  const bindingMode =
+                    conn.owner_type === "user" ? "invoking_user" : "organization";
+                  // Compute the non-colliding slot ONCE (from the current
+                  // requirements) so the explicit bindings map can point at the
+                  // same slot.
+                  let slot = base;
+                  let n = 2;
+                  while (requirements.some((r) => r.slot === slot)) slot = `${base}-${n++}`;
+                  setRequirements((current) => [
+                    ...current,
+                    {
+                      slot,
+                      connector: { url: endpoint, slug: result.slug ?? null },
+                      required_tools: result.snapshot!.tools.map((t) => t.name),
+                      binding_mode: bindingMode,
+                    },
+                  ]);
+                  // Bind the generated slot to the just-connected connection for
+                  // THIS run so the immediate run uses exactly what was connected
+                  // rather than silently resolving a different org credential (F1).
+                  setBindings((current) => ({ ...current, [slot]: conn.id }));
                   touchRevision();
                 }
               }}
