@@ -100,6 +100,55 @@ jobs:
           FLUIDBOX_SERVER_BIN: ${{ github.workspace }}/target/debug/fluidbox-server
         run: bash scripts/identity-e2e.sh
 
+  # Phase C acceptance: connection ownership + run resource bindings, driven
+  # end-to-end over HTTP against a REAL issuer (Dex) and a bearer-checked fake
+  # brokered MCP server, with FLUIDBOX_REQUIRE_SSO=1. It proves the design's
+  # Phase C acceptance list: same agent → different per-user connections; neither
+  # user can inspect the other's personal connection; identical model aliases but
+  # the broker resolves the correct binding; a third-user approval never changes
+  # credential identity; missing/ambiguous bindings fail before provisioning; and
+  # the generation / membership / legacy-cutoff fail-closed matrix. Hermetic and
+  # spends no model credits (runs never launch a sandbox), so it runs on every PR
+  # like the other cheap gates. A distinct Postgres DB name keeps it isolated.
+  bindings:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: fluidbox_bindings
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/fluidbox_bindings
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Share the debug build cache with the `rust` job — same profile.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: debug
+      - name: build server
+        run: cargo build -p fluidbox-server
+      # psql is REQUIRED by the acceptance script (it PROVES the binding rows,
+      # snapshot versions, the generation bump, and the legacy-bundle fixture).
+      - name: install postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: bindings acceptance (Dex + fake MCP + per-user binding matrix)
+        env:
+          # Reuse the just-built binary so the script `exec`s it directly (clean
+          # single-process lifecycle). Docker on ubuntu-latest runs the Dex
+          # container; the missing runner image makes each run fail provisioning,
+          # which is exactly what the forged-run fixture expects.
+          FLUIDBOX_SERVER_BIN: ${{ github.workspace }}/target/debug/fluidbox-server
+        run: bash scripts/bindings-e2e.sh
+
   web:
     runs-on: ubuntu-latest
     defaults:

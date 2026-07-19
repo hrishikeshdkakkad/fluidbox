@@ -66,7 +66,7 @@ export function BundlePicker({
   if (names.length === 0) {
     return (
       <div className="field">
-        <span className="lab">Capability bundles</span>
+        <span className="lab">Sandbox tool bundles</span>
         <span className="helper">
           None registered yet. Connect an MCP server to photograph its tools into a versioned bundle.
         </span>
@@ -81,7 +81,7 @@ export function BundlePicker({
   return (
     <div className="field">
       <div className="bundle-picker-head">
-        <span className="lab">Capability bundles — exact version pins</span>
+        <span className="lab">Sandbox tool bundles — exact version pins</span>
         {onAddServer && (
           <button className="btn ghost sm" type="button" onClick={onAddServer}>Connect new MCP</button>
         )}

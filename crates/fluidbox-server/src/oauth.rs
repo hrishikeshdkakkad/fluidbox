@@ -25,7 +25,6 @@
 
 use crate::auth::Principal;
 use crate::error::{ApiError, ApiResult};
-use crate::rbac;
 use crate::seal::Sealer;
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
@@ -451,6 +450,11 @@ pub async fn start_dance(
     conn_id: Uuid,
 ) -> ApiResult<String> {
     let sealer_ref = sealer(state)?;
+    // Unfiltered read by design: the caller already established authority over
+    // this connection — either the owner-checked `start` route
+    // (`connection_for_mutation`) or a connection this same principal just
+    // created in the catalog/manual oauth branch. The dance mechanics need the
+    // row regardless of the viewer lens.
     let conn = fluidbox_db::get_connection(&state.pool, scope, conn_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -537,12 +541,16 @@ pub async fn start(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    if !rbac::can_mutate_resources(&principal) {
-        return Err(ApiError::Forbidden(
-            "starting an OAuth connection requires admin or owner".into(),
-        ));
-    }
-    let authorize_url = start_dance(&state, principal.scope(), id).await?;
+    // Personal ⇒ owner-only (a non-owner 404s); organization ⇒ admin/owner.
+    // The reconnect path re-authorizes the same way.
+    let conn = crate::connections::connection_for_mutation(
+        &state,
+        &principal,
+        id,
+        "starting or reconnecting the OAuth flow for",
+    )
+    .await?;
+    let authorize_url = start_dance(&state, principal.scope(), conn.id).await?;
     Ok(Json(json!({ "authorize_url": authorize_url })))
 }
 
@@ -558,73 +566,141 @@ pub struct CallbackParams {
     pub error_description: Option<String>,
 }
 
-fn page(title: &str, body: &str) -> Html<String> {
-    Html(format!(
-        "<!doctype html><meta charset=\"utf-8\"><title>fluidbox — {title}</title>\
+/// Escape the five HTML metacharacters so an interpolated value can never break
+/// out of text content (or the one inline attribute) into markup (R3.4). Tiny +
+/// local — no new dependency; the callback page below is the sole HTML sink.
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Render the browser-facing callback page. EVERY interpolated dynamic value is
+/// HTML-escaped, and the response carries a strict CSP — `default-src 'none'`
+/// with `style-src 'unsafe-inline'` for the single inline `style` attribute the
+/// page uses — so even a hypothetical escape gap cannot execute script. Only
+/// server-authored, non-secret, non-upstream text ever reaches `body`.
+fn page(status: axum::http::StatusCode, title: &str, body: &str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let html = Html(format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>fluidbox — {t}</title>\
          <body style=\"font-family:system-ui;max-width:38rem;margin:4rem auto;line-height:1.5\">\
-         <h2>{title}</h2><p>{body}</p></body>"
-    ))
+         <h2>{t}</h2><p>{b}</p></body>",
+        t = escape_html(title),
+        b = escape_html(body),
+    ));
+    (
+        status,
+        [(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            "default-src 'none'; style-src 'unsafe-inline'",
+        )],
+        html,
+    )
+        .into_response()
+}
+
+/// Collapse an authorization-server-supplied `error` code to a known OAuth 2.0
+/// slug (RFC 6749 §4.1.2.1 / §5.2), or `"other"` for anything else. The AS
+/// controls this field, so only a fixed allowlist may reach the logs verbatim —
+/// an arbitrary value (which could carry echoed credential material) never does.
+fn known_oauth_error(code: &str) -> &'static str {
+    match code {
+        "invalid_grant" => "invalid_grant",
+        "invalid_client" => "invalid_client",
+        "invalid_request" => "invalid_request",
+        "access_denied" => "access_denied",
+        "server_error" => "server_error",
+        "temporarily_unavailable" => "temporarily_unavailable",
+        _ => "other",
+    }
 }
 
 /// `GET /v1/oauth/callback` — THE one stable redirect URI. Unauthenticated
 /// by design (a browser redirect can't carry the admin token); the sealed
 /// `state` parameter is the authentication, and nothing is trusted before
-/// it verifies. Browser-facing: answers HTML, never JSON errors.
+/// it verifies. Browser-facing: answers HTML, never JSON errors. Upstream-
+/// derived text (the AS `error`/`error_description`, MCP discovery errors) is
+/// NEVER reflected — it goes to the server log and the browser sees a generic
+/// line (R3.4).
 pub async fn callback(
     State(state): State<AppState>,
     Query(p): Query<CallbackParams>,
-) -> (axum::http::StatusCode, Html<String>) {
+) -> axum::response::Response {
     use axum::http::StatusCode;
     let Some(sealer_ref) = state.sealer.as_ref() else {
-        return (
+        return page(
             StatusCode::BAD_REQUEST,
-            page(
-                "Connection failed",
-                "FLUIDBOX_CREDENTIAL_KEY is not configured.",
-            ),
+            "Connection failed",
+            "FLUIDBOX_CREDENTIAL_KEY is not configured.",
         );
     };
     let Some(state_param) = p.state.as_deref() else {
-        return (
+        return page(
             StatusCode::BAD_REQUEST,
-            page("Connection failed", "Missing state parameter."),
+            "Connection failed",
+            "Missing state parameter.",
         );
     };
     let (conn_id, verifier) = match open_state(sealer_ref, state_param) {
         Ok(v) => v,
-        Err(e) => return (StatusCode::BAD_REQUEST, page("Connection failed", &e)),
+        Err(e) => return page(StatusCode::BAD_REQUEST, "Connection failed", &e),
     };
     if let Some(err) = &p.error {
-        let desc = p.error_description.as_deref().unwrap_or("");
-        return (
+        // The AS `error`/`error_description` are attacker-influenceable (they ride
+        // the redirect query) and can echo the sealed state, the authorization
+        // code, the PKCE verifier, or the client secret. Log ONLY an allowlisted
+        // error code + a bounded digest of the raw text — never the verbatim
+        // strings (R3.4, parity with the broker boundary in d87fb88). The browser
+        // sees a generic line.
+        let detail = p
+            .error_description
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(err.as_str());
+        tracing::warn!(
+            oauth_error = known_oauth_error(err),
+            detail = %crate::broker::msg_digest(detail),
+            "oauth callback: authorization server refused"
+        );
+        return page(
             StatusCode::BAD_REQUEST,
-            page(
-                "Authorization refused",
-                &format!("The authorization server answered: {err} {desc}"),
-            ),
+            "Authorization refused",
+            "The authorization server refused the request. You can close this tab and try again.",
         );
     }
     let Some(code) = p.code.as_deref() else {
-        return (
+        return page(
             StatusCode::BAD_REQUEST,
-            page("Connection failed", "Missing authorization code."),
+            "Connection failed",
+            "Missing authorization code.",
         );
     };
     match complete_dance(&state, conn_id, &verifier, code).await {
-        Ok(bundle_note) => (
+        Ok(bundle_note) => page(
             StatusCode::OK,
-            page(
-                "Connected",
-                &format!("The connection is active.{bundle_note} You can close this tab."),
-            ),
+            "Connected",
+            &format!("The connection is active.{bundle_note} You can close this tab."),
         ),
-        Err(e) => (StatusCode::BAD_REQUEST, page("Connection failed", &e)),
+        Err(e) => page(StatusCode::BAD_REQUEST, "Connection failed", &e),
     }
 }
 
-/// Exchange the code, seal the rotating refresh token, activate the
-/// connection, and auto-register the pending bundle (settle #4) — the
-/// photograph runs with the freshly minted access token.
+/// Exchange the code, seal the rotating refresh token, activate the connection,
+/// bump the authorization generation on a RECONNECT (fail-closed — a re-consent
+/// may change the account/issuer/audience, so any in-flight run bound to the old
+/// generation must fail closed; design :294-296), and photograph the pending
+/// snapshot with the freshly minted access token (Phase C: snapshots replace the
+/// old brokered-bundle auto-register).
 async fn complete_dance(
     state: &AppState,
     conn_id: Uuid,
@@ -688,8 +764,20 @@ async fn complete_dance(
     let status = res.status();
     let v: Value = res.json().await.unwrap_or(Value::Null);
     if !status.is_success() {
-        let err = v["error"].as_str().unwrap_or("unknown_error");
-        return Err(format!("token exchange returned HTTP {status} ({err})"));
+        // The token endpoint's JSON is attacker-controlled: a malicious AS can put
+        // the code, PKCE verifier, or client secret into the `error` value. Log
+        // ONLY an allowlisted code + status + a bounded digest of the raw error
+        // text — never the verbatim value (R3.4). The browser gets a generic line.
+        let raw = v.get("error").map(ToString::to_string).unwrap_or_default();
+        tracing::warn!(
+            %status,
+            oauth_error = known_oauth_error(v["error"].as_str().unwrap_or("")),
+            detail = %crate::broker::msg_digest(&raw),
+            "oauth callback: token exchange rejected"
+        );
+        return Err(
+            "the authorization server rejected the token exchange — reconnect and try again".into(),
+        );
     }
     let access = v["access_token"]
         .as_str()
@@ -714,69 +802,139 @@ async fn complete_dance(
             .unwrap_or_default(),
     };
 
-    // Seal + activate (clears a previous error note), then cache the access
-    // token so the photograph below doesn't immediately re-mint.
+    // Whether this is a FIRST connect (pending→active) or a RECONNECT (an
+    // ever-activated connection re-consenting) decides the generation bump. That
+    // decision is made INSIDE activate_connection_oauth from the row's pre-update
+    // status under the row lock (B1) — never a boolean derived from the pre-lock
+    // read above, which two racing first-connects would both compute as `false`.
+    // A reconnect (from a non-`pending` status) may be a new account/issuer/
+    // audience, so it bumps the generation and any in-flight run bound to the old
+    // one fails closed (design :294-296).
+
+    // Seal + activate (clears a previous error note).
     let mut clean = oauth.clone();
     if let Some(o) = clean.as_object_mut() {
         o.remove("error");
     }
-    fluidbox_db::activate_connection_oauth(
-        &state.pool,
-        scope,
-        conn.id,
-        &sealer_ref.seal(refresh),
-        &clean,
-        &json!(granted),
-    )
-    .await
-    .map_err(|e| format!("activation failed: {e}"))?
-    .ok_or("connection changed state during the exchange")?;
-    state.connector_tokens.lock().await.insert(
-        conn.id,
-        (access, Utc::now() + Duration::seconds(expires_in)),
-    );
 
-    // Auto-register the pending bundle (photograph with the fresh token).
-    let Some(pending) = oauth.get("pending_bundle") else {
-        return Ok(String::new());
-    };
-    let (Some(name), Some(url)) = (
-        pending.get("name").and_then(Value::as_str),
-        pending.get("url").and_then(Value::as_str),
-    ) else {
-        return Ok(String::new());
-    };
-    let server = fluidbox_core::capability::CapabilityServer::Brokered {
-        name: name.to_string(),
-        url: url.to_string(),
-        connection_id: Some(conn.id),
-        identity: None,
-        tools: Vec::new(),
-    };
-    match crate::capabilities::register_bundle(
-        state,
-        scope,
-        name,
-        Some("Registered from the connector catalog"),
-        vec![server],
-    )
-    .await
+    // Serialize the activation against the refresh path (R3.2): acquire the SAME
+    // per-connection in-process mutex + Postgres advisory lock `ensure_access_token`
+    // uses, so a concurrent in-flight refresh rotating the OLD grant's token can
+    // never clobber the NEW grant landing here (which would restore a superseded
+    // grant). Held only across the activation write + cache update; released
+    // BEFORE the photograph, which re-mints under its own lock (a nested acquire
+    // of the same in-process mutex would deadlock).
     {
-        Ok(row) => Ok(format!(
-            " Capability bundle <b>{}@{}</b> was registered.",
-            row.name, row.version
-        )),
-        Err(e) => Ok(format!(
-            " The connection works, but bundle registration failed ({e:?}) — register it from the Capabilities page."
-        )),
+        let lock = {
+            let mut locks = state.oauth_locks.lock().await;
+            locks.entry(conn.id).or_default().clone()
+        };
+        let _guard = lock.lock().await;
+        let mut tx = state
+            .pool
+            .begin()
+            .await
+            .map_err(|e| format!("oauth lock txn failed: {e}"))?;
+        fluidbox_db::acquire_oauth_lock(&mut tx, conn.id)
+            .await
+            .map_err(|e| format!("oauth advisory lock failed: {e}"))?;
+        // The activate + generation bump is ONE atomic UPDATE (R1.3+R3.1): no
+        // crash window where a reconnected grant is active yet still serving the
+        // prior generation. The returned row carries the FINAL generation. It runs
+        // THROUGH `tx` (the connection that holds the advisory lock) so the whole
+        // critical section borrows exactly ONE pooled connection — routing this
+        // back through `&state.pool` would need a SECOND connection while the first
+        // is held, and ten concurrent callbacks each doing that deadlock the
+        // fixed-size pool until the acquire timeout.
+        let activated = fluidbox_db::activate_connection_oauth(
+            &mut *tx,
+            scope,
+            conn.id,
+            &sealer_ref.seal(refresh),
+            &clean,
+            &json!(granted),
+        )
+        .await
+        .map_err(|e| format!("activation failed: {e}"))?
+        .ok_or("connection changed state during the exchange")?;
+        // Commit (releasing the advisory lock) BEFORE touching the token cache:
+        // a cache entry must never outlive a rolled-back activation. A failed or
+        // AMBIGUOUS commit fails closed: the AS may already have invalidated the
+        // rotated-away refresh token, so serving this access token while the DB
+        // kept the dead grant would corrupt custody. Drop every cached generation
+        // and refuse — the caller reconnects/retries.
+        if let Err(e) = tx.commit().await {
+            invalidate_access(state, conn.id).await;
+            return Err(format!("could not persist OAuth custody — retry: {e}"));
+        }
+        // Evict any token cached under a PRIOR generation BEFORE caching the new
+        // one: `invalidate_access` drops every generation for this connection, so
+        // caching must come AFTER the eviction (otherwise it would strand the
+        // fresh entry). Cache under the RETURNED (possibly bumped) generation.
+        invalidate_access(state, conn.id).await;
+        state.connector_tokens.lock().await.insert(
+            (conn.id, activated.authorization_generation),
+            (access, Utc::now() + Duration::seconds(expires_in)),
+        );
+    }
+
+    // Photograph the pending snapshot with the fresh token (Phase C: snapshots,
+    // not brokered bundles). A failed post-activation photograph marks the
+    // connection `error` so Connect is visibly incomplete, never half-connected.
+    let Some(url) = oauth
+        .get("pending_snapshot")
+        .and_then(|p| p.get("url"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(String::new());
+    };
+    let url = url.to_string();
+    match crate::snapshots::photograph_connection(state, scope, conn.id, &url).await {
+        Ok(snap) => {
+            let count = snap.tools_json.as_array().map(|a| a.len()).unwrap_or(0);
+            Ok(format!(
+                " Discovered and snapshotted {count} tool(s) (v{}).",
+                snap.snapshot_version
+            ))
+        }
+        Err(e) => {
+            // The broker already sanitizes upstream text (C: method + status +
+            // code + digest, never the verbatim message). The persisted note is
+            // kept GENERIC regardless — an untrusted upstream string must never
+            // become durable connection state (it is serialized in listings +
+            // rendered in the dashboard); the sanitized detail rides the log only.
+            // Status flip → error is paired with token eviction (custody
+            // discipline) so nothing serves the just-cached token.
+            tracing::warn!(connection = %conn.id, error = %e, "oauth callback: tool discovery failed after authorization");
+            fluidbox_db::mark_connection_error(
+                &state.pool,
+                scope,
+                conn.id,
+                "MCP tool discovery failed after authorization — reconnect this connection",
+            )
+            .await
+            .ok();
+            invalidate_access(state, conn.id).await;
+            Err(
+                "authorized, but tool discovery failed — the connection is marked error; reconnect it"
+                    .into(),
+            )
+        }
     }
 }
 
 // ─── Access-token custody (used by the broker) ────────────────────────────
 
-/// Drop a cached access token (reactive-401 path).
+/// Drop cached access tokens for a connection — EVERY authorization generation
+/// (the cache key is `(connection_id, generation)`; a generation bump or status
+/// flip must strand no stale token). Called on reactive-401, revoke, error,
+/// suspend, and re-consent.
 pub async fn invalidate_access(state: &AppState, connection_id: Uuid) {
-    state.connector_tokens.lock().await.remove(&connection_id);
+    state
+        .connector_tokens
+        .lock()
+        .await
+        .retain(|(cid, _generation), _| *cid != connection_id);
 }
 
 /// Return a live access token for an OAuth connection: cache hit inside the
@@ -787,7 +945,11 @@ pub async fn ensure_access_token(
     conn: &fluidbox_db::IntegrationConnectionRow,
 ) -> Result<String, String> {
     let margin = Duration::seconds(EXPIRY_MARGIN_SECS);
-    if let Some((tok, exp)) = state.connector_tokens.lock().await.get(&conn.id) {
+    // The cache key carries the connection's CURRENT generation (read off the
+    // fresh row the caller holds): a bump makes the prior generation's token
+    // unreachable, so we never serve a superseded identity's token.
+    let key = (conn.id, conn.authorization_generation);
+    if let Some((tok, exp)) = state.connector_tokens.lock().await.get(&key) {
         if *exp - margin > Utc::now() {
             return Ok(tok.clone());
         }
@@ -813,24 +975,86 @@ pub async fn ensure_access_token(
         .map_err(|e| format!("oauth advisory lock failed: {e}"))?;
     // Double-check under both locks: another caller (here or on another
     // replica) may have refreshed while we waited.
-    if let Some((tok, exp)) = state.connector_tokens.lock().await.get(&conn.id) {
+    if let Some((tok, exp)) = state.connector_tokens.lock().await.get(&key) {
         if *exp - margin > Utc::now() {
             return Ok(tok.clone());
         }
     }
-    let result = refresh_access_token(state, conn).await;
-    // Commit releases the advisory lock (a dropped/rolled-back tx would too).
-    tx.commit().await.ok();
-    result
+    // Re-read the connection under BOTH locks before touching custody (B2/R3.2):
+    // the caller's `conn` row was fetched before we serialized here, so a
+    // reconnect that bumped the generation (or a revoke/error) may have landed
+    // while we waited. Operate on the FRESH row and refuse on any drift, so we
+    // never unseal a superseded grant's refresh token or mint against a stale
+    // binding. Early returns drop the tx (rollback releases the advisory lock).
+    let scope = fluidbox_db::TenantScope::assume(conn.tenant_id);
+    // Re-read THROUGH `tx` (the lock-holding connection), never `&state.pool`: the
+    // whole critical section must borrow exactly ONE pooled connection, or N
+    // concurrent refreshes — each holding one connection and reaching for a second
+    // — deadlock the fixed-size pool until the acquire timeout.
+    let fresh = match fluidbox_db::get_connection(&mut *tx, scope, conn.id).await {
+        Ok(Some(f))
+            if f.status == "active"
+                && f.authorization_generation == conn.authorization_generation =>
+        {
+            f
+        }
+        Ok(_) => return Err("connection was reauthorized during refresh — retry".into()),
+        Err(e) => return Err(format!("connection re-read failed during refresh: {e}")),
+    };
+    // The refresh runs its DB reads/writes through the SAME connection and the
+    // advisory lock spans the HTTP token exchange ON PURPOSE — that serializes
+    // refresh vs. reconnect so neither clobbers the other's grant (R3.2). The
+    // exchange's position is unchanged; the only fix here is that the critical
+    // section no longer reaches for a second pooled connection.
+    let result = refresh_access_token(state, &mut tx, &fresh).await;
+    // Commit (releasing the advisory lock) BEFORE writing the token cache: a
+    // dropped/rolled-back tx releases the lock too, and a cached token must never
+    // outlive an uncommitted rotation.
+    let committed = tx.commit().await;
+    // The commit check DOMINATES the inner result — evaluate it FIRST, before we
+    // honor `result`. BOTH branches stage durable writes: a success rotated the
+    // refresh token, and an `invalid_grant`/`invalid_client` failure staged
+    // `status='error'` (~:1115). A failed or AMBIGUOUS commit therefore fails
+    // closed regardless of `result`: otherwise the Err branch would surface
+    // "re-authorize" while the row stayed `active` on a known-dead grant (new runs
+    // could bind it), and the Ok branch could serve a token the AS may already
+    // have invalidated. Drop every cached generation and refuse — the caller
+    // retries.
+    if let Err(e) = committed {
+        invalidate_access(state, conn.id).await;
+        return Err(format!("could not persist OAuth custody — retry: {e}"));
+    }
+    match result {
+        Ok((access, expires_in)) => {
+            // Cache under the generation THIS refresh ran against (== `fresh`'s,
+            // verified equal to the caller's above). A concurrent reconnect bump
+            // makes this (connection, old-generation) key unreachable to current
+            // readers, so a stale entry can never be served.
+            state.connector_tokens.lock().await.insert(
+                (fresh.id, fresh.authorization_generation),
+                (access.clone(), Utc::now() + Duration::seconds(expires_in)),
+            );
+            Ok(access)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// One refresh-grant round trip. Rotation: a new refresh token atomically
 /// overwrites the sealed one the moment it arrives. `invalid_grant` ⇒ the
 /// connection flips to `error` and every downstream path fails closed.
+///
+/// Runs ALL of its DB statements through `db` — the connection the caller's
+/// transaction (and the per-connection advisory lock) is bound to — so the
+/// whole refresh critical section borrows exactly ONE pooled connection.
+/// Returns `(access_token, expires_in)`; the caller commits the transaction and
+/// only THEN writes the token cache, so a cached token can never outlive an
+/// uncommitted rotation.
 async fn refresh_access_token(
     state: &AppState,
+    db: &mut sqlx::PgConnection,
     conn: &fluidbox_db::IntegrationConnectionRow,
-) -> Result<String, String> {
+) -> Result<(String, i64), String> {
     let sealer_ref = state
         .sealer
         .as_ref()
@@ -838,7 +1062,7 @@ async fn refresh_access_token(
     // The connection row is already resolved and trusted (the broker fetched it
     // under the run's scope); derive the scope from its own tenant.
     let scope = fluidbox_db::TenantScope::assume(conn.tenant_id);
-    let sealed = fluidbox_db::connection_credential_sealed(&state.pool, scope, conn.id)
+    let sealed = fluidbox_db::connection_credential_sealed(&mut *db, scope, conn.id)
         .await
         .map_err(|e| format!("credential lookup failed: {e}"))?
         .ok_or("connection is not active — reconnect it in Connections")?;
@@ -871,7 +1095,7 @@ async fn refresh_access_token(
         .header("content-type", "application/x-www-form-urlencoded")
         .body(form_body(&form));
     if let Some(sealed_secret) =
-        fluidbox_db::connection_client_secret_sealed(&state.pool, scope, conn.id)
+        fluidbox_db::connection_client_secret_sealed(&mut *db, scope, conn.id)
             .await
             .map_err(|e| format!("client secret lookup failed: {e}"))?
     {
@@ -889,8 +1113,11 @@ async fn refresh_access_token(
     if !status.is_success() {
         let err = v["error"].as_str().unwrap_or("");
         if err == "invalid_grant" || err == "invalid_client" {
+            // `err` is one of the two matched literals here — never raw AS text —
+            // so the persisted note carries no attacker-controlled bytes. Written
+            // through `db`; the caller's commit makes it durable.
             fluidbox_db::mark_connection_error(
-                &state.pool,
+                &mut *db,
                 scope,
                 conn.id,
                 &format!("{err} during token refresh — re-authorize this connection"),
@@ -912,22 +1139,45 @@ async fn refresh_access_token(
     if let Some(new_refresh) = v["refresh_token"].as_str() {
         if new_refresh != refresh
             && !fluidbox_db::rotate_connection_refresh(
-                &state.pool,
+                &mut *db,
                 scope,
                 conn.id,
                 &sealer_ref.seal(new_refresh),
+                conn.authorization_generation,
             )
             .await
             .map_err(|e| format!("rotation persist failed: {e}"))?
         {
-            return Err("connection changed state during refresh — reconnect it".into());
+            // 0 rows: the connection was revoked/errored OR reauthorized (its
+            // generation moved) beneath this in-flight refresh (R3.2). The token
+            // just minted rides a grant that is no longer current — evict and
+            // fail closed rather than persist a rotated OLD refresh token that
+            // would restore a superseded grant. The caller retries and re-mints
+            // under the new generation.
+            invalidate_access(state, conn.id).await;
+            return Err("connection was reauthorized during refresh — retry".into());
         }
     }
-    state.connector_tokens.lock().await.insert(
-        conn.id,
-        (access.clone(), Utc::now() + Duration::seconds(expires_in)),
-    );
-    Ok(access)
+    // Re-verify the binding is STILL the one we entered with, INDEPENDENT of
+    // whether the provider rotated the refresh token (B2/R3.2): a provider that
+    // omits or reuses the refresh token skips the generation-guarded rotate above,
+    // so without this a token just minted for a reconnected account could be
+    // cached and served for the OLD binding. Re-read under scope and refuse on any
+    // status/generation drift. (The oauth locks make a mid-refresh bump
+    // impossible; this fails closed regardless.)
+    match fluidbox_db::get_connection(&mut *db, scope, conn.id).await {
+        Ok(Some(fresh))
+            if fresh.status == "active"
+                && fresh.authorization_generation == conn.authorization_generation => {}
+        _ => {
+            invalidate_access(state, conn.id).await;
+            return Err("connection was reauthorized during refresh — retry".into());
+        }
+    }
+    // Hand the token back UNcached: the caller commits the transaction (releasing
+    // the advisory lock) and only then inserts it into `connector_tokens`, so a
+    // cached token can never outlive an uncommitted rotation.
+    Ok((access, expires_in))
 }
 
 // ─── Client ID metadata document (CIMD, spec 2025-11-25 SHOULD) ───────────
@@ -955,6 +1205,25 @@ mod tests {
 
     fn test_sealer() -> Sealer {
         Sealer::from_key_string(&"ab".repeat(32)).unwrap()
+    }
+
+    // A malicious authorization server can echo the sealed state / a bearer into
+    // its `error` / `error_description` — the sanitized log form (allowlisted code
+    // + digest) must never carry those bytes (parity with the broker boundary).
+    #[test]
+    fn as_error_text_never_leaks_credential_material() {
+        let smuggled = "fbx_pat_supersecrettoken_ABCDEF0123456789";
+        let digest = crate::broker::msg_digest(smuggled);
+        assert!(
+            !digest.contains(smuggled) && !digest.contains("supersecrettoken"),
+            "digest leaked the token: {digest}"
+        );
+        assert!(digest.starts_with("sha256:"));
+        // An arbitrary (crafted) error code collapses to "other"; only the fixed
+        // allowlist passes through verbatim.
+        assert_eq!(known_oauth_error(smuggled), "other");
+        assert_eq!(known_oauth_error("invalid_grant"), "invalid_grant");
+        assert_eq!(known_oauth_error("access_denied"), "access_denied");
     }
 
     #[test]

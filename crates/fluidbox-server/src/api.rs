@@ -8,13 +8,15 @@ use crate::rbac;
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::Json;
+use fluidbox_core::capability::{validate_requirements, ConnectionRequirement};
 use fluidbox_core::policy::{Policy, RuleAction, ToolOverride};
 use fluidbox_core::spec::{
     Autonomy, Budgets, CheckoutMode, InvocationContext, InvocationKind, WorkspaceSpec,
 };
-use fluidbox_db::TenantScope;
+use fluidbox_db::{ConnectionViewer, TenantScope};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 // ─── Workspace input (shared by run creation and agent defaults) ──────────
@@ -88,6 +90,7 @@ pub(crate) fn valid_repo_name(repo: &str) -> bool {
 pub(crate) async fn resolve_workspace_input(
     state: &AppState,
     scope: TenantScope,
+    viewer: ConnectionViewer,
     input: WorkspaceInput,
 ) -> ApiResult<WorkspaceSpec> {
     Ok(match input {
@@ -120,7 +123,13 @@ pub(crate) async fn resolve_workspace_input(
             }
             let clone_url = match connection_id {
                 Some(cid) => {
-                    let conn = fluidbox_db::get_connection(&state.pool, scope, cid)
+                    // Visibility-filtered read (invariant 21): a user naming
+                    // another user's personal connection resolves to None here —
+                    // the SAME "unknown connection" as a truly missing id, so
+                    // existence is not leaked. The credentialed AUTHORITY (owner,
+                    // generation, membership) is frozen by binding resolution in
+                    // create_run and rechecked by every consumer (Task 6).
+                    let conn = fluidbox_db::get_connection_visible(&state.pool, scope, cid, viewer)
                         .await?
                         .ok_or_else(|| ApiError::BadRequest(format!("unknown connection {cid}")))?;
                     if conn.status != "active" {
@@ -179,6 +188,9 @@ pub(crate) async fn resolve_workspace_input(
             };
             WorkspaceSpec::GitRepository {
                 connection_id,
+                // Resolved by create_run's binding service (Task 5), never from
+                // user input (invariant 21).
+                binding_id: None,
                 repository,
                 clone_url,
                 r#ref,
@@ -189,7 +201,9 @@ pub(crate) async fn resolve_workspace_input(
     })
 }
 
-/// A revision default of Scratch means "no default" — store nothing.
+/// A revision default of Scratch means "no default" — store nothing. Revision
+/// defaults are set by an admin/owner mutation, so the operator lens (`All`)
+/// applies; the per-run authority is re-resolved with the invoker's lens.
 async fn default_workspace_value(
     state: &AppState,
     scope: TenantScope,
@@ -197,10 +211,12 @@ async fn default_workspace_value(
 ) -> ApiResult<Option<Value>> {
     match input {
         None => Ok(None),
-        Some(input) => match resolve_workspace_input(state, scope, input).await? {
-            WorkspaceSpec::Scratch => Ok(None),
-            spec => Ok(Some(serde_json::to_value(&spec)?)),
-        },
+        Some(input) => {
+            match resolve_workspace_input(state, scope, ConnectionViewer::All, input).await? {
+                WorkspaceSpec::Scratch => Ok(None),
+                spec => Ok(Some(serde_json::to_value(&spec)?)),
+            }
+        }
     }
 }
 
@@ -302,6 +318,25 @@ pub struct CreateAgent {
     /// or "name@version" (§17 #7 pin-only).
     #[serde(default)]
     pub capability_bundles: Option<Vec<String>>,
+    /// Brokered connection requirements the agent declares (design §"Agent
+    /// connection requirement"): what it needs, never whose credential. Stored
+    /// (validated) on the initial revision; resolved per-run into bindings.
+    #[serde(default)]
+    pub connection_requirements: Option<Vec<ConnectionRequirement>>,
+}
+
+/// Validate a revision's declared connection requirements into stored jsonb
+/// (or `[]`). A malformed list is a 422 before anything persists.
+fn requirements_json(reqs: Option<&Vec<ConnectionRequirement>>) -> ApiResult<Value> {
+    match reqs {
+        Some(reqs) => {
+            validate_requirements(reqs).map_err(|e| {
+                ApiError::UnprocessableEntity(format!("invalid connection requirements: {e}"))
+            })?;
+            Ok(serde_json::to_value(reqs)?)
+        }
+        None => Ok(json!([])),
+    }
 }
 
 /// Validate a harness id and return its (runner image, model) defaults.
@@ -430,6 +465,7 @@ pub async fn create_agent(
         &serde_json::to_value(&budgets)?,
         default_workspace.as_ref(),
         &capability_pins,
+        &requirements_json(req.connection_requirements.as_ref())?,
     )
     .await?;
 
@@ -475,6 +511,10 @@ pub struct AddRevision {
     /// — this is how a bundle upgrade lands: append a revision, §17 #7).
     #[serde(default)]
     pub capability_bundles: Option<Vec<String>>,
+    /// Omitted → inherit the latest revision's requirements. An explicit `[]`
+    /// clears them; a list is validated + stored (append-only, like the pins).
+    #[serde(default)]
+    pub connection_requirements: Option<Vec<ConnectionRequirement>>,
 }
 
 pub async fn add_revision(
@@ -538,6 +578,15 @@ pub async fn add_revision(
             .map(|r| r.capability_bundles.clone())
             .unwrap_or_else(|| json!([])),
     };
+    // Omitted → inherit the previous requirements verbatim; explicit list (incl.
+    // []) is validated + re-stored (append-only on the revision).
+    let requirements = match &req.connection_requirements {
+        Some(_) => requirements_json(req.connection_requirements.as_ref())?,
+        None => latest
+            .as_ref()
+            .map(|r| r.connection_requirements.clone())
+            .unwrap_or_else(|| json!([])),
+    };
 
     let rev = fluidbox_db::append_agent_revision(
         &state.pool,
@@ -563,6 +612,7 @@ pub async fn add_revision(
         &budgets,
         default_workspace.as_ref(),
         &capability_pins,
+        &requirements,
     )
     .await?;
     Ok(Json(json!({ "revision": rev })))
@@ -854,6 +904,11 @@ pub struct CreateSession {
     /// intersected with the revision's attachments (remove-only, §3.5).
     #[serde(default)]
     pub capabilities: Option<Vec<String>>,
+    /// The sanctioned explicit binding override (design "Explicit binding"):
+    /// requirement slot → connection id. Binding resolution verifies each
+    /// entry (tenant, caller may use it, connector match, snapshot).
+    #[serde(default)]
+    pub bindings: Option<HashMap<String, Uuid>>,
 }
 
 pub async fn create_session(
@@ -864,6 +919,11 @@ pub async fn create_session(
     // Any authenticated principal may create a run; visibility of the created
     // run is governed by `invoked_by_user_id` (stamped below).
     let scope = principal.scope();
+    // The invoker's visibility lens: a user sees org connections + only its own
+    // personal ones; the operator sees all. A user-supplied workspace connection
+    // resolves through this lens (invariant 21), so naming another user's
+    // personal connection reads as "unknown".
+    let viewer = rbac::connection_viewer(&principal);
     let explicit_input = match (req.workspace, req.repo) {
         (Some(_), Some(_)) => {
             return Err(ApiError::BadRequest(
@@ -873,7 +933,7 @@ pub async fn create_session(
         (w, r) => w.or(r),
     };
     let explicit = match explicit_input {
-        Some(input) => Some(resolve_workspace_input(&state, scope, input).await?),
+        Some(input) => Some(resolve_workspace_input(&state, scope, viewer, input).await?),
         None => None,
     };
     let autonomy = if req.autonomous {
@@ -902,6 +962,10 @@ pub async fn create_session(
                 ..Default::default()
             },
             invoked_by_user_id: principal.user_id(),
+            // A manual/UI run's principal is the user (or operator), never a
+            // trigger token.
+            invoking_token_id: None,
+            explicit_bindings: req.bindings.unwrap_or_default(),
             result_destinations: vec![],
             bound_invocation: None,
             bound_dispatch: None,
@@ -1069,26 +1133,82 @@ pub async fn decide_approval(
         other => return Err(ApiError::BadRequest(format!("unknown decision '{other}'"))),
     };
     let scope = principal.scope();
-    // Authorization (parent design lines 564-583): decide_org holders may
-    // decide any visible approval; a plain member may decide only approvals on
-    // a run it invoked (`approval.decide_own`). In Phase B every brokered call
-    // carries org authority, so decide_org is the org path.
     let approval = fluidbox_db::get_approval(&state.pool, scope, id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if !rbac::can_decide_org(&principal) {
-        let session = fluidbox_db::get_session(&state.pool, scope, approval.session_id)
-            .await?
-            .ok_or(ApiError::NotFound)?;
-        // `approval.decide_own` covers only credentialless calls on a run the
-        // member invoked; brokered (`mcp__*`) calls are org authority and need
-        // decide_org (parent design lines 564-579).
-        if !rbac::can_decide_own(&principal, session.invoked_by_user_id, &approval.tool) {
-            return Err(ApiError::Forbidden(
-                "deciding this approval requires approver, admin, or owner".into(),
+    let session = fluidbox_db::get_session(&state.pool, scope, approval.session_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    // Authorization (parent design lines 562-583). Phase C ends Phase B's "every
+    // brokered call is org authority" premise: an mcp tool resolves to its slot's
+    // run resource binding, and a personal (user-owned) connection is decidable
+    // ONLY by its owner (on a run they invoked) — no role, admin/owner/operator
+    // included. A non-mcp built-in tool is credentialless; an mcp tool with no
+    // binding is a LEGACY brokered call that keeps Phase B's org authority.
+    let slot =
+        fluidbox_core::capability::parse_mcp_tool(&approval.tool).map(|(s, _)| s.to_string());
+    let run_spec: Option<fluidbox_core::spec::RunSpec> =
+        serde_json::from_value(session.run_spec.clone()).ok();
+    // A Phase C run declares a BrokeredSurface per bound mcp slot in its RunSpec.
+    let surface = match (&slot, &run_spec) {
+        (Some(s), Some(rs)) => rs.find_brokered_surface(s).cloned(),
+        _ => None,
+    };
+    let binding = match &slot {
+        Some(s) => {
+            fluidbox_db::find_session_binding(&state.pool, scope, session.id, "mcp", s).await?
+        }
+        None => None,
+    };
+    // R1.4(b): when the RunSpec has a BrokeredSurface for this slot, its binding
+    // MUST exist and match — a missing/mismatched row is an integrity error, NOT
+    // a fall-through to org authority. The legacy Organization fallback below
+    // applies ONLY when there is no surface (a pre-Phase-C embedded FrozenBundle
+    // brokered server).
+    if let Some(surface) = &surface {
+        let ok = binding.as_ref().is_some_and(|b| b.id == surface.binding_id);
+        if !ok {
+            return Err(ApiError::Conflict(
+                "this approval's brokered surface has no matching run resource binding — refusing to classify its authority".into(),
             ));
         }
     }
+    let authority = match &binding {
+        Some(b) => {
+            let facts = rbac::ApprovalBindingFacts::from_binding(b);
+            // R1.4(c): an mcp binding is always a connection authority — cross-check
+            // the LIVE connection owner (one scoped read) and prefer the stricter of
+            // frozen-vs-live, so a stale/mislabeled org binding can never let a
+            // non-owner decide under what is really a personal connection.
+            match b.connection_id {
+                Some(cid) => match fluidbox_db::get_connection(&state.pool, scope, cid).await? {
+                    Some(conn) => rbac::reconcile_connection_authority(
+                        &facts,
+                        &conn.owner_type,
+                        conn.owner_user_id,
+                    ),
+                    None => {
+                        return Err(ApiError::Conflict(
+                            "this approval's connection no longer exists — cannot classify its authority".into(),
+                        ))
+                    }
+                },
+                None => rbac::classify_approval_authority(&approval.tool, Some(&facts)),
+            }
+        }
+        None => rbac::classify_approval_authority(&approval.tool, None),
+    };
+    // Enforced identically on approve AND deny (symmetric, v1).
+    if let Err(refusal) = rbac::authorize_approval_decision(
+        &authority,
+        session.invoked_by_user_id,
+        principal.user_id(),
+        rbac::can_decide_org(&principal),
+    ) {
+        return Err(approval_refusal_error(&state, scope, refusal, binding.as_ref()).await);
+    }
+
     // `decided_by` is DERIVED from the authenticated principal — never
     // request-supplied (parent design line 581).
     let decided_by = principal.decided_by();
@@ -1098,6 +1218,47 @@ pub async fn decide_approval(
     // Wake the blocked permission handler.
     state.approvals.wake(id).await;
     Ok(Json(json!({ "approval": row })))
+}
+
+/// Turn an approval-authorization refusal into an `ApiError::Forbidden`. The
+/// personal-connection case names WHOSE connection would execute (design
+/// :576-579) using the connection's display name — never a secret; the org /
+/// credentialless cases keep Phase B's message verbatim.
+async fn approval_refusal_error(
+    state: &AppState,
+    scope: TenantScope,
+    refusal: rbac::ApprovalRefusal,
+    binding: Option<&fluidbox_db::RunResourceBindingRow>,
+) -> ApiError {
+    match refusal {
+        rbac::ApprovalRefusal::PersonalConnection { owner_user_id } => {
+            let label = personal_connection_label(state, scope, binding, owner_user_id).await;
+            ApiError::Forbidden(format!(
+                "this approval executes under {label}, a personal connection — only its owner, who invoked the run, may decide it"
+            ))
+        }
+        // Both non-personal refusals keep Phase B's exact message.
+        rbac::ApprovalRefusal::NeedsOrg | rbac::ApprovalRefusal::NeedsOwnOrOrg => {
+            ApiError::Forbidden("deciding this approval requires approver, admin, or owner".into())
+        }
+    }
+}
+
+/// A safe, human label for the personal connection an approval would execute
+/// under: the connection's display name when readable (not a secret), else a
+/// generic phrase naming the owner id. Never leaks a credential.
+async fn personal_connection_label(
+    state: &AppState,
+    scope: TenantScope,
+    binding: Option<&fluidbox_db::RunResourceBindingRow>,
+    owner_user_id: Uuid,
+) -> String {
+    if let Some(cid) = binding.and_then(|b| b.connection_id) {
+        if let Ok(Some(conn)) = fluidbox_db::get_connection(&state.pool, scope, cid).await {
+            return format!("connection '{}'", conn.display_name);
+        }
+    }
+    format!("another user's personal connection (owner {owner_user_id})")
 }
 
 // ─── Result deliveries ────────────────────────────────────────────────────

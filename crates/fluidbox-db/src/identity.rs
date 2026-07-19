@@ -944,6 +944,24 @@ pub async fn get_membership(
     .await
 }
 
+/// A membership by USER id (unique(tenant_id, user_id) → a single row). The
+/// broker's owner-membership recheck maps a connection's `owner_user_id` to its
+/// live membership `status` (design :693-728): a `user`-owned connection whose
+/// owner is no longer an active member fails closed.
+pub async fn get_membership_by_user(
+    pool: &PgPool,
+    scope: TenantScope,
+    user_id: Uuid,
+) -> sqlx::Result<Option<OrgMembershipRow>> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "select {MEMBERSHIP_COLS} from org_memberships where tenant_id = $1 and user_id = $2"
+    )))
+    .bind(scope.tenant_id())
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+}
+
 /// Executor-generic core of a status change + its deactivation cascade. When the
 /// new status is `deactivated` it revokes the membership's sessions and PATs in
 /// the SAME transaction (design lines 762-767). Callers that must also write an
