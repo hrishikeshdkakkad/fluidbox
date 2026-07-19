@@ -80,13 +80,24 @@ TOK_ALICE="kbtok-alice-$$"
 TOK_BOB="kbtok-bob-$$"
 TOK_ORG="kbtok-org-$$"
 SLUG_CAT="kb-fake"       # the custom catalog entry's slug (valid [a-z0-9-])
+# The distinctive negotiated protocol version the fake MCP returns at initialize —
+# the snapshot MUST record THIS exact string (proves the photograph negotiated a
+# real version, not a client-offered default).
+MCP_PROTO="2025-06-18-fakekb-1"
+
+# A one-file HTTP sink for the signed-webhook publish consumer (R3.8): logs each
+# request's method + the two fluidbox delivery headers + a body digest as jsonl.
+SINK_PORT=8899
+SINK_URL="http://127.0.0.1:$SINK_PORT/hook"
 
 WORK=$(mktemp -d)
 DEX_NAME="fbx-dex-bindings-$$"
 MCP_LOG="$WORK/mcp-requests.jsonl"; : > "$MCP_LOG"
+SINK_LOG="$WORK/sink-requests.jsonl"; : > "$SINK_LOG"
 SERVER_LOG="$WORK/server.log"
 SERVER_PID=""
 MCP_PID=""
+SINK_PID=""
 DATA_DIR="$WORK/data"; mkdir -p "$DATA_DIR"
 UB="$WORK/ub"           # scratch body file for the cookie/admin curl helpers
 
@@ -120,6 +131,7 @@ db() { psql "$DATABASE_URL" -X -q -A -t -c "$1"; }
 cleanup() {
   [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
   [ -n "$MCP_PID" ] && kill "$MCP_PID" 2>/dev/null
+  [ -n "$SINK_PID" ] && kill "$SINK_PID" 2>/dev/null
   docker rm -f "$DEX_NAME" >/dev/null 2>&1
   rm -rf "$WORK"
 }
@@ -128,16 +140,18 @@ trap cleanup EXIT INT TERM
 # ── Fake brokered MCP server (the "class 2" upstream) ─────────────────────────
 # Streamable-HTTP-shaped: JSON-RPC POSTs to /mcp, plain JSON responses. Accepts
 # EXACTLY the three test bearers (TOK_ALICE/TOK_BOB/TOK_ORG); anything else is a
-# 401 (a real credentialed server). Serves initialize (with a negotiated
-# protocolVersion — the snapshot path REQUIRES one), notifications/initialized,
+# 401 (a real credentialed server). Serves initialize (with a DISTINCTIVE
+# negotiated protocolVersion — the snapshot path REQUIRES one, and the test
+# asserts the stored snapshot records THIS exact string), notifications/initialized,
 # tools/list (kb_search + kb_write, stable schemas), and tools/call (echo).
 # EVERY request is logged as one jsonl line {path, auth, method (jsonrpc), tool}
-# — that log is how we prove WHICH credential the control plane turned.
+# — that log is how we prove WHICH credential the control plane turned, AND that
+# an `initialize` precedes the first `tools/list` on every connect.
 start_mcp() {
-  python3 - "$MCP_PORT" "$MCP_LOG" "$TOK_ALICE" "$TOK_BOB" "$TOK_ORG" <<'PYEOF' &
+  python3 - "$MCP_PORT" "$MCP_LOG" "$MCP_PROTO" "$TOK_ALICE" "$TOK_BOB" "$TOK_ORG" <<'PYEOF' &
 import http.server, json, sys
-port, log = int(sys.argv[1]), sys.argv[2]
-accepted = {"Bearer " + t for t in sys.argv[3:]}
+port, log, proto = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+accepted = {"Bearer " + t for t in sys.argv[4:]}
 class Mcp(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def _send(self, code, obj):
@@ -167,7 +181,7 @@ class Mcp(http.server.BaseHTTPRequestHandler):
             return self._send(404, {"message": "not found"})
         if method == "initialize":
             return self._send(200, {"jsonrpc": "2.0", "id": rid, "result": {
-                "protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+                "protocolVersion": proto, "capabilities": {"tools": {}},
                 "serverInfo": {"name": "fake-kb", "version": "1.0.0"}}})
         if method == "notifications/initialized":
             self.send_response(202); self.send_header("content-length", "0")
@@ -235,6 +249,77 @@ for line in open(log):
     if not method or r.get("method") == method:
         last = r.get("auth", "")
 print(last)
+PYEOF
+}
+
+# Prove the discovery handshake order: the FIRST tools/list in the log is preceded
+# by at least one initialize (every connect initializes before listing). Prints
+# "yes"/"no".
+mcp_init_before_first_list() {
+  python3 - "$MCP_LOG" <<'PYEOF'
+import json, sys
+log = sys.argv[1]
+seen_init = False
+for line in open(log):
+    r = json.loads(line)
+    m = r.get("method")
+    if m == "initialize":
+        seen_init = True
+    if m == "tools/list":
+        print("yes" if seen_init else "no")
+        break
+else:
+    print("no")
+PYEOF
+}
+
+# ── Signed-webhook sink (the result_publish consumer) ─────────────────────────
+# A one-file HTTP sink for the signed-webhook publish path (R3.8). Every POST is
+# logged as one jsonl line {delivery, signature, body_len} — the two fluidbox
+# delivery headers prove the delivery worker signed + shipped the callback. Always
+# answers 200 (a delivered attempt is what freezes the publish binding row).
+start_sink() {
+  python3 - "$SINK_PORT" "$SINK_LOG" <<'PYEOF' &
+import http.server, json, sys
+port, log = int(sys.argv[1]), sys.argv[2]
+class Sink(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def do_POST(self):
+        n = int(self.headers.get("content-length") or 0)
+        body = self.rfile.read(n) if n else b""
+        with open(log, "a") as f:
+            f.write(json.dumps({
+                "delivery": self.headers.get("x-fluidbox-delivery", ""),
+                "signature": self.headers.get("x-fluidbox-signature", ""),
+                "body_len": len(body)}) + "\n")
+        self.send_response(200); self.send_header("content-length", "0")
+        self.end_headers()
+    def log_message(self, *a): pass
+http.server.HTTPServer(("127.0.0.1", port), Sink).serve_forever()
+PYEOF
+  SINK_PID=$!
+  for _ in $(seq 1 40); do
+    if curl -s -o /dev/null -X POST "$SINK_URL" 2>/dev/null; then
+      # Drop the readiness probe's own line so counts start clean.
+      : > "$SINK_LOG"
+      ok "signed-webhook sink up on :$SINK_PORT (request log at sink-requests.jsonl)"; return 0
+    fi
+    sleep 0.25
+  done
+  echo "bindings-e2e: signed-webhook sink did not become ready" >&2; exit 1
+}
+
+# Count sink requests (optionally only those carrying BOTH delivery headers).
+sink_count() { # [signed]
+  python3 - "$SINK_LOG" "${1:-}" <<'PYEOF'
+import json, sys
+log, signed = sys.argv[1], sys.argv[2]
+n = 0
+for line in open(log):
+    r = json.loads(line)
+    if not signed or (r.get("delivery") and r.get("signature")):
+        n += 1
+print(n)
 PYEOF
 }
 
@@ -464,9 +549,10 @@ print(rows[0]['id'] if rows else '')" 2>/dev/null)
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
-say "BOOT — Dex + fake MCP + control plane (REQUIRE_SSO=1)"
+say "BOOT — Dex + fake MCP + signed-webhook sink + control plane (REQUIRE_SSO=1)"
 start_dex
 start_mcp
+start_sink
 start_server
 ok "control plane up (REQUIRE_SSO=1, sealer set, provider=docker)"
 
@@ -570,14 +656,21 @@ ORG_CONN=$(echo "$BODY" | j "['connection']['id']")
 [ "$(echo "$BODY" | j "['snapshot']['version']")" = 1 ] && ok "org snapshot v1" || no "org snapshot: $BODY"
 
 need "$ALICE_CONN" "alice connection id missing" && need "$BOB_CONN" "bob connection id missing" && need "$ORG_CONN" "org connection id missing"
-# Snapshot rows exist at v1 with a NON-EMPTY negotiated protocol_version.
+# Snapshot rows exist at v1 with the EXACT negotiated protocol_version the fake
+# server returned (R3.9 — proves the photograph recorded a real negotiated
+# version, not a client-offered default).
 for pair in "alice:$ALICE_CONN" "bob:$BOB_CONN" "org:$ORG_CONN"; do
   who=${pair%%:*}; cid=${pair#*:}
   SV=$(db "select snapshot_version from connection_tool_snapshots where connection_id='$cid'")
   PV=$(db "select protocol_version from connection_tool_snapshots where connection_id='$cid'")
-  { [ "$SV" = 1 ] && [ -n "$PV" ]; } && ok "$who snapshot row: version=$SV protocol_version='$PV' (non-empty)" \
-    || no "$who snapshot row wrong (version='$SV' protocol_version='$PV')"
+  { [ "$SV" = 1 ] && [ "$PV" = "$MCP_PROTO" ]; } && ok "$who snapshot row: version=$SV protocol_version='$PV' (== negotiated $MCP_PROTO)" \
+    || no "$who snapshot row wrong (version='$SV' protocol_version='$PV', want $MCP_PROTO)"
 done
+# Every connect initialized BEFORE it listed tools (R3.9): the first tools/list
+# in the request log is preceded by an initialize.
+[ "$(mcp_init_before_first_list)" = yes ] \
+  && ok "the discovery handshake initialized before the first tools/list" \
+  || no "a tools/list preceded initialize in the request log"
 # GET /tools reads the latest snapshot (owner-filtered).
 u_get "$jarA" "/v1/connections/$ALICE_CONN/tools"
 { [ "$CODE" = 200 ] && [ "$(echo "$BODY" | j "['snapshot']['version']")" = 1 ]; } && ok "GET alice /tools → snapshot v1" || no "alice /tools → $CODE: $BODY"
@@ -673,6 +766,46 @@ u_post "$jarA" "/v1/sessions" "{\"agent\":\"needs-missing\",\"task\":\"t\",\"rep
 SESS_AFTER=$(db "select count(*) from sessions where tenant_id='$TID'")
 [ "$SESS_BEFORE" = "$SESS_AFTER" ] && ok "zero new session rows (no half-created run: $SESS_BEFORE→$SESS_AFTER)" || no "a session row leaked ($SESS_BEFORE→$SESS_AFTER)"
 
+# Zero-candidate: a requirement whose connector url matches NO connection refuses
+# at creation, naming the slot, with zero new sessions (R3.7).
+u_post "$jarA" "/v1/agents" \
+  "{\"name\":\"zero-cand\",\"policy\":\"kb-allow\",\"connection_requirements\":[{\"slot\":\"kb\",\"connector\":{\"url\":\"http://127.0.0.1:9/mcp\"},\"required_tools\":[\"kb_search\"],\"binding_mode\":\"organization\"}]}"
+[ "$CODE" = 200 ] && ok "agent 'zero-cand' created (requires a connector no connection serves)" || no "zero-cand → $CODE: $BODY"
+SESS_BEFORE=$(db "select count(*) from sessions where tenant_id='$TID'")
+u_post "$jarA" "/v1/sessions" "{\"agent\":\"zero-cand\",\"task\":\"t\",\"repo\":{\"kind\":\"none\"}}"
+{ [ "$CODE" != 200 ] && echo "$BODY" | grep -q "requirement 'kb'"; } \
+  && ok "zero-candidate run → $CODE naming the slot (no connection matches the connector)" \
+  || no "zero-candidate run → $CODE: $BODY (want 4xx naming requirement 'kb')"
+SESS_AFTER=$(db "select count(*) from sessions where tenant_id='$TID'")
+[ "$SESS_BEFORE" = "$SESS_AFTER" ] && ok "zero-candidate: no session row leaked ($SESS_BEFORE→$SESS_AFTER)" || no "zero-candidate leaked a session ($SESS_BEFORE→$SESS_AFTER)"
+
+# Ambiguous: a SECOND org connection to the SAME fake-MCP url makes org resolution
+# ambiguous, refusing at creation and naming the candidates, with zero new
+# sessions (R3.7). Create the second org connection here, then revoke it so later
+# sections still see exactly one active org connection.
+u_post "$jarA" "/v1/agents" \
+  "{\"name\":\"org-binds\",\"policy\":\"kb-allow\",\"connection_requirements\":[{\"slot\":\"kb\",\"connector\":{\"url\":\"$MCP_URL\",\"slug\":\"$SLUG_CAT\"},\"required_tools\":[\"kb_search\"],\"binding_mode\":\"organization\"}]}"
+[ "$CODE" = 200 ] && ok "agent 'org-binds' created (organization binding to the fake connector)" || no "org-binds → $CODE: $BODY"
+u_post "$jarA" "/v1/catalog/$SLUG_CAT/connect" "{\"owner\":\"organization\",\"token\":\"$TOK_ORG\",\"display_name\":\"org-kb-2\"}"
+[ "$CODE" = 200 ] && ok "a SECOND org connection created (org-kb-2)" || no "second org connect → $CODE: $BODY"
+ORG_CONN2=$(echo "$BODY" | j "['connection']['id']")
+if need "$ORG_CONN2" "second org connection id missing"; then
+  SESS_BEFORE=$(db "select count(*) from sessions where tenant_id='$TID'")
+  u_post "$jarA" "/v1/sessions" "{\"agent\":\"org-binds\",\"task\":\"t\",\"repo\":{\"kind\":\"none\"}}"
+  { [ "$CODE" != 200 ] && echo "$BODY" | grep -qi "multiple"; } \
+    && ok "ambiguous run → $CODE naming the candidate connections (disambiguate)" \
+    || no "ambiguous run → $CODE: $BODY (want 4xx / multiple)"
+  SESS_AFTER=$(db "select count(*) from sessions where tenant_id='$TID'")
+  [ "$SESS_BEFORE" = "$SESS_AFTER" ] && ok "ambiguous: no session row leaked ($SESS_BEFORE→$SESS_AFTER)" || no "ambiguous leaked a session ($SESS_BEFORE→$SESS_AFTER)"
+  # Revoke the second org connection (precondition: it is active) so downstream
+  # org resolution is unambiguous again.
+  PRE=$(db "select status from integration_connections where id='$ORG_CONN2'")
+  [ "$PRE" = active ] && ok "second org connection active pre-revoke" || no "second org connection not active (was '$PRE')"
+  db "update integration_connections set status='revoked', updated_at=now() where id='$ORG_CONN2'" >/dev/null
+  POST=$(db "select status from integration_connections where id='$ORG_CONN2'")
+  [ "$POST" = revoked ] && ok "second org connection revoked (org resolution unambiguous again)" || no "second org connection revoke failed (status='$POST')"
+fi
+
 # ── (h) Generation fail-closed ────────────────────────────────────────────────
 say "(h) Generation fail-closed — a reauthorized connection stalls in-flight + new runs"
 GEN0=$(db "select authorization_generation from integration_connections where id='$ALICE_CONN'")
@@ -695,6 +828,9 @@ u_post "$jarA" "/v1/sessions" "{\"agent\":\"shared-kb\",\"task\":\"t\",\"repo\":
 u_post "$jarA" "/v1/connections/$ALICE_CONN/tools/refresh" '{}'
 { [ "$CODE" = 200 ] && [ "$(echo "$BODY" | j "['snapshot']['version']")" = 2 ]; } \
   && ok "POST /tools/refresh re-photographs (snapshot v2 at the new generation)" || no "refresh → $CODE: $BODY"
+# The re-photograph negotiated the SAME distinctive protocol version (R3.9).
+PV2=$(db "select protocol_version from connection_tool_snapshots where connection_id='$ALICE_CONN' and snapshot_version=2")
+[ "$PV2" = "$MCP_PROTO" ] && ok "snapshot v2 records protocol_version '$PV2' (== negotiated $MCP_PROTO)" || no "v2 protocol_version='$PV2' (want $MCP_PROTO)"
 create_run "$jarA" "shared-kb"; H_RUN="$RUN"
 need "$H_RUN" "post-refresh run not created" && ok "a new run now SUCCEEDS against the refreshed snapshot ($H_RUN)"
 
@@ -775,6 +911,75 @@ u_post "$jarA" "/v1/sessions" "{\"agent\":\"legacy-brokered\",\"task\":\"t\",\"r
 { [ "$CODE" != 200 ] && echo "$BODY" | grep -q "Phase C"; } \
   && ok "a run from the unconverted revision → $CODE naming Phase C (cutoff enforced)" \
   || no "legacy cutoff → $CODE: $BODY (want 4xx / Phase C)"
+
+# ── (l) Publish binding at the consumer + workspace-connection refusal ────────
+say "(l) Result-publish binding — signed-webhook delivery, generation fail-closed; workspace refusal"
+# An org agent whose subscription publishes a signed webhook to the local sink. An
+# invoked run fails provisioning fast, settles terminal, and the delivery worker
+# fires the SignedWebhook destination — freezing a publish:0 binding
+# (subscription_secret, generation 1).
+u_post "$jarA" "/v1/agents" "{\"name\":\"publish-agent\",\"policy\":\"kb-allow\"}"
+[ "$CODE" = 200 ] && ok "agent 'publish-agent' created" || no "publish-agent → $CODE: $BODY"
+u_post "$jarA" "/v1/triggers" \
+  "{\"name\":\"pub-sub\",\"agent\":\"publish-agent\",\"task_template\":\"publish e2e\",\"callback_url\":\"$SINK_URL\"}"
+[ "$CODE" = 200 ] && ok "subscription 'pub-sub' created (api trigger, signed-webhook to the sink)" || no "pub-sub → $CODE: $BODY"
+PUB_SUB=$(echo "$BODY" | j "['subscription']['id']")
+PUB_TOK=$(echo "$BODY" | j "['token']")
+if need "$PUB_SUB" "publish subscription id missing" && need "$PUB_TOK" "publish trigger token missing"; then
+  SINK_BEFORE=$(sink_count)
+  PUB_RUN=$(curl -s -X POST -H "authorization: Bearer $PUB_TOK" -H 'content-type: application/json' \
+    -d '{}' "$API/v1/triggers/$PUB_SUB/invoke" | j "['session_id']")
+  if need "$PUB_RUN" "publish run not created via invoke"; then
+    ok "invoked pub-sub → run $PUB_RUN"
+    # Wait for the terminal run's signed delivery to reach the sink.
+    got=0
+    for _ in $(seq 1 600); do
+      [ "$(sink_count signed)" -gt "$SINK_BEFORE" ] && { got=1; break; }
+      sleep 0.5
+    done
+    [ "$got" = 1 ] \
+      && ok "the sink received a SIGNED delivery (x-fluidbox-delivery + x-fluidbox-signature)" \
+      || no "no signed delivery reached the sink within budget"
+    # The publish:0 binding froze the subscription_secret authority at generation 1.
+    BK=$(db "select authority_kind from run_resource_bindings where session_id='$PUB_RUN' and requirement_slot='publish:0'")
+    BG=$(db "select authority_generation from run_resource_bindings where session_id='$PUB_RUN' and requirement_slot='publish:0'")
+    { [ "$BK" = subscription_secret ] && [ "$BG" = 1 ]; } \
+      && ok "publish:0 binding: authority_kind=$BK generation=$BG" \
+      || no "publish:0 binding wrong (kind='$BK' generation='$BG')"
+
+    # Bump the subscription's authority generation (a re-armed callback secret is a
+    # new generation). Precondition: it is currently 1.
+    SGEN=$(db "select authority_generation from trigger_subscriptions where id='$PUB_SUB'")
+    [ "$SGEN" = 1 ] && ok "subscription authority_generation is 1 (pre-bump)" || no "subscription generation not 1 (was '$SGEN')"
+    db "update trigger_subscriptions set authority_generation = authority_generation + 1, updated_at=now() where id='$PUB_SUB'" >/dev/null
+    # Re-enqueue the (delivered) publish so the worker retries it AFTER the bump:
+    # the binding froze generation 1, the subscription is now 2 → fail closed.
+    SINK_MID=$(sink_count)
+    db "update result_deliveries set status='pending', next_attempt_at = now() - interval '1 minute' where session_id='$PUB_RUN'" >/dev/null
+    failed=0
+    for _ in $(seq 1 120); do
+      LE=$(db "select coalesce(last_error,'') from result_deliveries where session_id='$PUB_RUN'")
+      case "$LE" in *re-armed*) failed=1; break;; esac
+      sleep 0.5
+    done
+    [ "$failed" = 1 ] \
+      && ok "the re-enqueued delivery FAILS with the generation reason (last_error: re-armed)" \
+      || no "stale-generation delivery did not fail (last_error: $(db "select coalesce(last_error,'') from result_deliveries where session_id='$PUB_RUN'"))"
+    [ "$(sink_count)" = "$SINK_MID" ] \
+      && ok "the stale-generation retry reached the sink ZERO times (fail-closed before egress)" \
+      || no "a stale-generation retry still hit the sink"
+  fi
+fi
+
+# Workspace consumer refusal: alice naming BOB's PERSONAL connection as her run's
+# workspace connection resolves as not-found (viewer-filtered read), refusing at
+# creation. The fake-git POSITIVE fetch path stays covered by the Rust tests
+# (crates/fluidbox-server/src/orchestrator.rs workspace_binding_auth_header).
+u_post "$jarA" "/v1/sessions" \
+  "{\"agent\":\"publish-agent\",\"task\":\"t\",\"repo\":{\"kind\":\"git_repository\",\"connection_id\":\"$BOB_CONN\",\"repository\":\"acme/app\"}}"
+{ [ "$CODE" != 200 ] && { echo "$BODY" | grep -qi "unknown connection" || echo "$BODY" | grep -qi "not found"; }; } \
+  && ok "alice naming bob's personal connection as her workspace → $CODE (not-found shape)" \
+  || no "workspace cross-user refusal → $CODE: $BODY (want 4xx / not found)"
 
 # ── Result ───────────────────────────────────────────────────────────────────
 say "RESULT"

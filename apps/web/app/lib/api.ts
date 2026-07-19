@@ -524,13 +524,29 @@ export interface ProbeResult {
   notes: string[];
 }
 
-/** POST /mcp/servers response (fields vary by auth_mode, + derived slug). */
+/** POST /mcp/servers response (fields vary by auth_mode, + derived slug).
+ *  Phase C: a remote (none/api_key) connect returns `{connection, snapshot}`
+ *  (brokered tools are a per-connection snapshot now, not a bundle); a sandbox
+ *  (stdio) connect still returns a `bundle`; oauth returns `{connection,
+ *  authorize_url}` and the snapshot is photographed by the callback. */
 export interface AddServerResult {
   slug?: string;
   bundle?: { name: string; version: number };
   servers?: BundleServer[];
   connection?: Connection;
+  snapshot?: ConnectionToolSnapshot;
   authorize_url?: string;
+}
+
+/** What the Add-server wizard hands back on success: the sandbox bundle (legacy
+ *  path) OR the freshly-connected brokered connection + its photographed
+ *  snapshot + derived slug (Phase C), so an embedded caller can append a
+ *  matching ConnectionRequirement. */
+export interface AddServerCompletion {
+  bundle: { name: string; version: number } | null;
+  connection?: Connection;
+  snapshot?: ConnectionToolSnapshot;
+  slug?: string;
 }
 
 /** One model offered for a harness (GET /harnesses). */

@@ -705,6 +705,17 @@ NTSTATUS=$(get "/connections" | python3 -c "
 import sys, json
 print([c['status'] for c in json.load(sys.stdin)['connections'] if c['id'] == '$NTCONN'][0])")
 [ "$NTSTATUS" = "active" ] && ok "connection revived (error → active)" || no "status after reconnect: $NTSTATUS"
+# R3.1-tail: the reconnect (from error, NOT a first connect) bumped the
+# authorization generation atomically in the activation, and a post-reconnect
+# tools refresh photographs a snapshot stamped at the NEW generation — so any run
+# binding frozen under the old generation fails closed.
+NTGEN=$(pq "select authorization_generation from integration_connections where id='$NTCONN'")
+[ "$NTGEN" = "2" ] && ok "reconnect bumped authorization_generation → 2 (re-consent may be a new grant)" || no "generation after reconnect: $NTGEN (want 2)"
+CODE=$(post "/connections/$NTCONN/tools/refresh" "{}")
+RSGEN=$(jb "['snapshot']['authorization_generation']")
+{ [ "$CODE" = "200" ] && [ "$RSGEN" = "2" ]; } \
+  && ok "post-reconnect tools refresh photographs at the new generation (snapshot gen $RSGEN)" \
+  || no "post-reconnect refresh → $CODE snapshot gen '$RSGEN' (want 200 / gen 2)"
 CODE=$(post "/sessions" "{\"agent\":\"conn-nt-$$\",\"task\":\"works again\",\"autonomous\":true,\"budgets\":$PROBE_BUDGET}")
 [ "$CODE" = "200" ] && ok "new run creates again after reconnect" || no "run after reconnect → $CODE"
 SID_RE=$(jb "['session']['id']")
