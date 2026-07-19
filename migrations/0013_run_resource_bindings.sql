@@ -402,22 +402,24 @@ begin
 end;
 $$;
 
--- Append ONE converted revision (rev = max+1 at call time), copying the SOURCE
--- revision's fields and stamping the derived surviving pins + requirements.
+-- Append ONE converted revision at the caller-provided p_rev, copying the SOURCE
+-- revision's fields and stamping the derived surviving pins + requirements. The
+-- caller (fluidbox_convert_legacy_bundles) OWNS rev assignment via a per-agent
+-- counter; computing max(rev)+1 HERE is unsafe because this function is invoked
+-- through a `v := fluidbox_convert_append(...)` assignment, whose simple-expression
+-- evaluation reuses the outer statement's snapshot and would read a STALE max
+-- (missing sibling appends made earlier in the same call), colliding on the rev.
 -- Returns the new revision id.
 create or replace function fluidbox_convert_append(
-    p_agent uuid, p_source_rev_id uuid, p_surviving jsonb, p_requirements jsonb
+    p_agent uuid, p_source_rev_id uuid, p_rev int, p_surviving jsonb, p_requirements jsonb
 ) returns uuid language plpgsql as $$
 declare
-    v_new_rev int;
-    v_id      uuid;
+    v_id uuid;
 begin
-    select coalesce(max(rev), 0) + 1 into v_new_rev
-      from agent_revisions where agent_id = p_agent;
     insert into agent_revisions
         (id, agent_id, rev, harness, runner_image, model, system_prompt, policy_id,
          budgets, default_workspace, capability_bundles, connection_requirements)
-    select gen_random_uuid(), p_agent, v_new_rev, s.harness, s.runner_image, s.model,
+    select gen_random_uuid(), p_agent, p_rev, s.harness, s.runner_image, s.model,
            s.system_prompt, s.policy_id, s.budgets, s.default_workspace,
            p_surviving, p_requirements
       from agent_revisions s
@@ -443,6 +445,7 @@ declare
     v_has_brokered   boolean;
     v_reqs_key       text;
     v_new_rev_id     uuid;
+    v_next_rev       int;
     v_existing       uuid;
     v_live_copy      uuid;
     v_deferred       uuid[];
@@ -464,6 +467,13 @@ begin
         if not found then
             continue;
         end if;
+        -- Per-agent rev counter, seeded from the current max (== v_latest.rev). Every
+        -- real append advances it IN MEMORY and passes the value explicitly to
+        -- fluidbox_convert_append. Re-reading max(rev) inside that helper is unsafe:
+        -- it is called via a `v := f(...)` assignment whose simple-expression
+        -- evaluator reuses the outer statement's snapshot and misses this txn's prior
+        -- appends, so two sibling appends would collide on the same rev.
+        v_next_rev := v_latest.rev;
 
         -- Live (unpinned/manual) derivation of the LATEST with the FULL keep-list
         -- (NULL = all). Used to decide the live append AND to dedup subscriptions
@@ -518,8 +528,9 @@ begin
                 end if;
             end loop;
             if v_existing is null then
+                v_next_rev := v_next_rev + 1;
                 v_new_rev_id := fluidbox_convert_append(
-                    v_agent.id, v_source.id, v_surviving, v_requirements);
+                    v_agent.id, v_source.id, v_next_rev, v_surviving, v_requirements);
                 v_map_source := array_append(v_map_source, v_source.id);
                 v_map_reqs := array_append(v_map_reqs, v_reqs_key);
                 v_map_newrev := array_append(v_map_newrev, v_new_rev_id);
@@ -569,8 +580,9 @@ begin
                     end if;
                 end loop;
                 if v_existing is null then
+                    v_next_rev := v_next_rev + 1;
                     v_new_rev_id := fluidbox_convert_append(
-                        v_agent.id, v_latest.id, v_surviving, v_requirements);
+                        v_agent.id, v_latest.id, v_next_rev, v_surviving, v_requirements);
                     v_map_source := array_append(v_map_source, v_latest.id);
                     v_map_reqs := array_append(v_map_reqs, v_reqs_key);
                     v_map_newrev := array_append(v_map_newrev, v_new_rev_id);
@@ -584,14 +596,15 @@ begin
 
             -- Live path LAST so its copy has the highest rev and is the new
             -- `latest`; then repoint every deferred subscription to it.
+            v_next_rev := v_next_rev + 1;
             v_live_copy := fluidbox_convert_append(
-                v_agent.id, v_latest.id, v_surviving_l, v_requirements_l);
+                v_agent.id, v_latest.id, v_next_rev, v_surviving_l, v_requirements_l);
             if array_length(v_deferred, 1) is not null then
                 update trigger_subscriptions
                    set pinned_revision_id = v_live_copy, updated_at = now()
                  where id = any(v_deferred);
             end if;
-        elsif (select max(rev) from agent_revisions where agent_id = v_agent.id) > v_latest.rev then
+        elsif v_next_rev > v_latest.rev then
             -- The latest is brokered-free (NOT converted). If subscription copies
             -- from OLDER brokered revisions were appended with higher revs, the
             -- untouched latest is no longer the max rev, so unpinned/manual runs
@@ -604,8 +617,9 @@ begin
             -- resolve the clone, semantically the sandbox-only latest. Idempotent:
             -- on a re-run the latest IS already the max rev (the clone), so this
             -- does not fire.
+            v_next_rev := v_next_rev + 1;
             v_new_rev_id := fluidbox_convert_append(
-                v_agent.id, v_latest.id, v_latest.capability_bundles,
+                v_agent.id, v_latest.id, v_next_rev, v_latest.capability_bundles,
                 v_latest.connection_requirements);
         end if;
     end loop;
