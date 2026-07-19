@@ -1,6 +1,7 @@
 mod admin_orgs;
 mod api;
 mod auth;
+mod bindings;
 mod broker;
 mod callback;
 mod capabilities;
@@ -23,6 +24,7 @@ mod rbac;
 mod run_service;
 mod scheduler;
 mod seal;
+mod snapshots;
 mod sse;
 mod state;
 mod tokens;
@@ -278,6 +280,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/connections/{id}/revoke", post(connections::revoke))
         .route("/connections/{id}/approve", post(connections::approve))
         .route("/connections/{id}/repos", get(connections::repos))
+        // Connection tool snapshots (Phase C): re-photograph on demand, and read
+        // the latest photographed tool surface.
+        .route("/connections/{id}/tools", get(snapshots::get_tools))
+        .route(
+            "/connections/{id}/tools/refresh",
+            post(snapshots::refresh_tools),
+        )
         .route("/connections/{id}/oauth/start", post(oauth::start))
         // Seamless GitHub connect (Phase 5.6): admin start endpoints mint
         // one-time flows; the go/callback/setup legs are browser-facing

@@ -9,11 +9,13 @@ import {
   apiPost,
   Agent,
   BundleRef,
+  ConnectionRequirement,
   Revision,
   workspaceLabel,
   bundleRefsLabel,
 } from "../lib/api";
 import { BundlePicker } from "../components/BundlePicker";
+import { RequirementsEditor } from "../components/RequirementsEditor";
 import { HarnessPicker } from "../components/HarnessPicker";
 import { useHarnesses, modelsFor, defaultModelFor } from "../lib/harnesses";
 import { LoadingRows, ModalShell, PageHead, short } from "../components/bits";
@@ -371,6 +373,9 @@ function AddRevision({
   const [systemPrompt, setSystemPrompt] = useState(current?.system_prompt || "");
   const [workspace, setWorkspace] = useState<WorkspaceDraft>(specToDraft(current?.default_workspace));
   const [pins, setPins] = useState<BundleRef[]>(current?.capability_bundles ?? []);
+  const [requirements, setRequirements] = useState<ConnectionRequirement[]>(
+    current?.connection_requirements ?? []
+  );
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
@@ -383,12 +388,14 @@ function AddRevision({
       // Capability pins are WYSIWYG too: exactly the name@version refs
       // shown in the picker are attached (§17 #7 — nothing floats, and an
       // existing pin never upgrades unless its version was changed here).
+      // Requirements are WYSIWYG as well (sent explicitly, incl. [] to clear).
       await apiPost(`/agents/${agentId}/revisions`, {
         harness,
         model,
         system_prompt: systemPrompt.trim() || null,
         default_workspace: draftToInput(workspace),
         capability_bundles: pins.map((p) => `${p.name}@${p.version}`),
+        connection_requirements: requirements,
       });
       onAdded();
     } catch (e) {
@@ -444,6 +451,7 @@ function AddRevision({
       </label>
       <WorkspacePicker draft={workspace} onChange={setWorkspace} />
       <BundlePicker pins={pins} onChange={setPins} />
+      <RequirementsEditor value={requirements} onChange={setRequirements} />
       {err && <div className="err">{err}</div>}
       <div className="spread" style={{ marginTop: 14 }}>
         <span className="helper">Inherits harness · policy · image · budgets.</span>

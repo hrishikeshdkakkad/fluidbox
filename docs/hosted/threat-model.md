@@ -4,7 +4,7 @@
 **Status:** Phase A deliverable of the multi-user MCP control plane epic (#28)
 **Authority:** [`../plans/2026-07-14-multi-user-mcp-control-plane-design.md`](../plans/2026-07-14-multi-user-mcp-control-plane-design.md) (v4, security invariants 1–22 and Gaps 1–14) and [`../plans/2026-07-17-idp-agnostic-identity-design.md`](../plans/2026-07-17-idp-agnostic-identity-design.md) (v5, identity invariants 1–12). Vulnerability reporting: [`SECURITY.md`](../../SECURITY.md).
 
-This threat model covers the hosted multi-user deployment (~300 seats). It is deliberately honest about time: Phase B has landed per-organization identity and per-tenant repository scoping; every mitigation below still carries a **status** — `shipped` or the phase (C–F) that closes it. A row marked with an unshipped phase is a *known open risk* until that phase lands; hosted multi-tenant operation is not offered before Phases C–E close their remaining rows.
+This threat model covers the hosted multi-user deployment (~300 seats). It is deliberately honest about time: Phase B landed per-organization identity and per-tenant repository scoping, and Phase C landed connection ownership + per-run resource bindings; every mitigation below still carries a **status** — `shipped` or the phase (D–F) that closes it. A row marked with an unshipped phase is a *known open risk* until that phase lands; hosted multi-tenant operation is not offered before Phases D–E close their remaining rows.
 
 ## Core assumption: the sandbox is compromised
 
@@ -54,7 +54,7 @@ The [network architecture](network-architecture.md) enumerates the edges; the bo
 
 ## Scenarios and controls
 
-Statuses: **shipped** = enforced on `main` today (`shipped (Phase B)` marks a row Phase B closed); **Phase C–F** = the phase that closes it (open risk until then).
+Statuses: **shipped** = enforced on `main` today (`shipped (Phase B)`/`shipped (Phase C)` mark a row that phase closed); **Phase D–F** = the phase that closes it (open risk until then).
 
 ### T1/T2 — the compromised sandbox and the model itself
 
@@ -63,7 +63,7 @@ Statuses: **shipped** = enforced on `main` today (`shipped (Phase B)` marks a ro
 | Exfiltrate an upstream credential from the sandbox | Credentials never enter the sandbox (invariants 1, 2): LLM key swapped at the facade, git credentials control-plane-side via ephemeral `GIT_CONFIG_*`, MCP credentials used only by the broker | shipped |
 | Reach the internet / LiteLLM / metadata endpoints directly | `zeroEgress` NetworkPolicy (only `:8788`; no DNS), boot-gate-proven enforcement, no service-account token in the pod (invariant 3) | shipped (Kubernetes provider; subject to the accepted EKS pod-start enforcement window below) |
 | Call a tool outside the frozen set, or a rug-pulled/drifted tool | Frozen-set availability check at the gate — drifted or vanished tools are denied (`source=capability`); a live upstream tools-list change never mutates an in-flight run (invariant 14) | shipped |
-| Choose *whose* credential executes a tool | The model chooses only among frozen tools; bindings are frozen at run creation; the broker resolves the credential solely from the authenticated session's binding (invariants 4, 5) | shipped for today's attached connections; full binding model Phase C |
+| Choose *whose* credential executes a tool | The model chooses only among frozen tools; bindings are frozen at run creation; the broker resolves the credential solely from the run's `run_resource_bindings` row (invariants 4, 5) | shipped (Phase C; pre-Phase-C in-flight runs keep the embedded-connection path with a status-only recheck — see residuals) |
 | Bypass the permission callback (autonomy modes) | The callback stays wired in both modes — never the SDK's `bypassPermissions`; autonomous mode rewrites `RequireApproval` to the policy fallback inside `evaluate()`, ledgering both verdicts | shipped |
 | Impersonate runner-control actions (report results, heartbeats) after reading the process env | Today one bearer holds every audience — agent code **can** read it (Gap 10) | **Phase E**: audience-scoped credentials; runner-control unreachable from agent subprocesses |
 | Overspend the per-run LLM budget with parallel calls | Facade checks-then-records today — concurrent calls can pass the same remaining budget (Gap 14) | **Phase E**: durable request-ID-keyed reservations; **Phase D**: per-tenant LiteLLM virtual keys as the fairness backstop |
@@ -87,13 +87,13 @@ Statuses: **shipped** = enforced on `main` today (`shipped (Phase B)` marks a ro
 
 | Attack | Control | Status |
 |---|---|---|
-| Read or bind another user's personal connection | Connection ownership (`owner_type`, `owner_user_id`); binding verification; personal connections invisible to other members | **Phase C** |
-| Approve an action so it runs under someone else's credential | Approval permits the proposed action under the credential already frozen into the run — never the approver's (invariant 8); approvers need `approval.decide_own`/`approval.decide_org`; no role — including admin — authorizes approval under another user's personal connection in v1 | shipped (approval RBAC, Phase B) / **Phase C** (personal-connection binding) |
+| Read or bind another user's personal connection | Connection ownership (`owner_type`, `owner_user_id`); binding verification; personal connections invisible to other members — 404-not-403, admins included (they act through their own viewer lens) | shipped (Phase C) |
+| Approve an action so it runs under someone else's credential | Approval permits the proposed action under the credential already frozen into the run — never the approver's (invariant 8); approvers need `approval.decide_own`/`approval.decide_org`; no role — including admin or the operator — authorizes approval under another user's personal connection, and only its owner-who-invoked may decide it (`authorize_approval_decision`) | shipped (approval RBAC Phase B; personal-connection authority Phase C) |
 | Read another tenant's runs/events/artifacts by UUID | `TenantScope` repository signatures (primary), composite tenant FKs, cross-tenant negative test matrix; UUID unpredictability is not authorization (invariant 10); RLS remains the not-yet-added defense-in-depth layer | shipped (Phase B; `TenantScope` + composite keys); RLS depth deferred |
 | See tenant existence via login routing | The neutral entry page never enumerates organizations and answers identically for unknown and IdP-less slugs | shipped (Phase B) |
 | A trigger token used beyond its subscription | Subscription-scoped, sha256-hashed tokens: invoke exactly one subscription, poll only runs it created; invoke overrides are opt-in and can only narrow | shipped |
 | A member reads runs they shouldn't | `run.read` visibility rules (own runs; token-created runs; `subscriptions.manage`; `runs.read_all`) on every session/event/artifact/approval/SSE query | shipped (Phase B) |
-| Custom connector admitted by one tenant becomes bindable in another | Custom definitions tenant-scoped; unattributable legacy rows disabled at backfill | **Phase C** |
+| Custom connector admitted by one tenant becomes bindable in another | Custom definitions tenant-scoped (partial unique indexes: global slug + per-tenant custom slug); unattributable legacy rows disabled at the 0013 backfill | shipped (Phase C) |
 
 ### T6 — the unauthenticated network
 
@@ -117,7 +117,7 @@ Statuses: **shipped** = enforced on `main` today (`shipped (Phase B)` marks a ro
 | Stolen session cookie rides forever | Server-side session rows (revocable), sliding idle expiry capped by an absolute expiry, `__Host-` prefix, HttpOnly, SameSite=Lax; long-lived streams re-authorize on a ≤60 s interval | shipped (Phase B) |
 | Stolen trigger token reaches the admin surface | Token kinds are mutually exclusive (relationally CHECK-enforced); trigger tokens never touch `/v1`-admin routes; the admin token can never invoke a trigger | shipped |
 | Leaked run session token used from outside | Reaching `:8788` requires being inside the sandbox network path; workload identity/mTLS additionally binds the caller | shipped (network) / **Phase E** (identity, Gap 6 remainder) |
-| Revoked connection's cached access token keeps working | Custody is DB-gated, not cache-gated: fresh status/generation reads before any cached token is served; revoke/membership-change evicts | shipped (GitHub custody pattern) / **Phase D** (generation-aware caches everywhere) |
+| Revoked connection's cached access token keeps working | Custody is DB-gated, not cache-gated: every credentialed consumer (broker MCP call, workspace fetch, result publish) rechecks live status + authorization generation + owner membership before any cached token is minted or served; the in-memory token cache is keyed by `(connection, generation)` and a generation bump evicts it | shipped (GitHub custody pattern; Phase C broker/workspace/publish rechecks + generation-keyed cache) / **Phase D** (distributed refresh coordination across replicas, Gap 4) |
 
 ### T8 — the compromised IdP
 
@@ -158,6 +158,7 @@ A compromised org IdP mints valid identities **for that organization only** — 
 | **At-most-once dispatch, not exactly-once**: an ambiguous upstream outcome stays ambiguous | True exactly-once side effects are not achievable over MCP; ambiguity is surfaced to policy/user/model, never hidden or blindly retried |
 | **VPC CNI standard-mode pod-start window** (EKS): a just-created pod is briefly fail-open until the node agent programs its eBPF rules | Observed live on EKS; strict mode is worse (it starves system pods). No duration or ordering guarantee relative to runner startup is claimed — the boot gate and long-lived probes are the authoritative enforcement signals, and the shipped isolation row above is qualified by this window |
 | **Result delivery is at-least-once** | Receivers dedup on `x-fluidbox-delivery`; provider idempotency / deterministic markers cover the crash window between remote creation and recording |
+| **Pre-Phase-C in-flight runs use the legacy broker path**: a run created before the Phase C cutover froze no `run_resource_bindings` row, so its brokered calls resolve the `connection_id` embedded in the RunSpec and recheck only live status — not authorization generation or owner membership | Bounded and self-draining: only runs already in flight at the cutover; historical RunSpecs are never rewritten; every new run freezes bindings and gets the full status+generation+membership recheck, and a revision still pinning a brokered bundle is refused at creation, so no new legacy-path run can start |
 
 Not a residual: the **approval `approval.decided` double-emission** inside one process is a *current known defect* with an assigned fix — the transactional outbox in the Phase E statelessness work (Gap 13) — not an accepted post-mitigation risk.
 
@@ -169,7 +170,7 @@ The parent design's production gaps, restated as the risk schedule this threat m
 |---|---|---|
 | 1 | Global admin authentication (no users/memberships/roles) | **B** (shipped) |
 | 2 | One boot-selected tenant | **B** (shipped) |
-| 3 | Capability bundle embeds a concrete connection | **C** |
+| 3 | Capability bundle embeds a concrete connection | **C** (shipped) |
 | 4 | Process-local OAuth locking | **D** |
 | 5 | One deployment credential key (no KMS envelope) | **D** |
 | 6 | Workload identity/mTLS on the internal gateway (network hardening itself largely shipped) | **E** |
@@ -188,6 +189,7 @@ Enforcement is proven, not asserted:
 
 - **Network**: the boot-time netpol gate (`+:8788 −:8787`) blocks run admission until enforcement is demonstrated; `helm test` re-certifies per release; CI runs kind + Calico.
 - **Tenancy (Phase B acceptance — shipped; the CI identity job runs `scripts/identity-e2e.sh` against a digest-pinned Dex)**: cross-tenant negative test matrix; workers cannot fall back to a default tenant; OIDC round-trip against a real conformant issuer (Keycloak/Dex) with replayed, wrong-browser, and expired flows all refused; algorithm allowlist rejects `none`/HS256.
+- **Connection binding (Phase C acceptance — shipped; the CI bindings job runs `scripts/bindings-e2e.sh` on its own database)**: ownership isolation (a member cannot read or bind another's personal connection); per-user bindings resolved from an identical shared requirement; approval identity (only the owner-who-invoked decides a personal-connection call); and the fail-closed matrix — unsatisfiable requirement, stale generation, deactivated owner, and missing snapshot each refuse before provisioning.
 - **Governance**: `scripts/governance-e2e.sh` drives verdicts, approval pause/resume, idempotency, and autonomous auto-deny over real HTTP; the e2e greps keep provider knowledge out of the event spine.
 - **Scale/failure (Phase F)**: load tests at 60/150/300 concurrent sandboxes, OAuth refresh storms, revocation during active runs, upstream 401/404/429/5xx, broker restarts, DB failover, and tenant-isolation fuzzing.
 

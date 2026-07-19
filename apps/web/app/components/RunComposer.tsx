@@ -7,11 +7,16 @@ import {
   apiPost,
   BundleRef,
   Connection,
+  ConnectionRequirement,
+  connectionMatchesConnector,
+  isToolConnection,
+  ownerBadge,
   Revision,
   TriggerSubscription,
 } from "../lib/api";
 import { AddServerWizard } from "../capabilities/AddServerWizard";
 import { defaultModelFor, modelsFor, useHarnesses } from "../lib/harnesses";
+import { useAuthMe } from "../lib/useAuthMe";
 import { BundlePicker } from "./BundlePicker";
 import { HarnessPicker } from "./HarnessPicker";
 import {
@@ -69,6 +74,7 @@ export function RunComposer({
   onAutomationCreated: (minted: MintedAutomation) => void;
   onAgentCreated?: () => void;
 }) {
+  const me = useAuthMe();
   const { harnesses, loading: harnessesLoading, error: harnessesError, reload: reloadHarnesses } = useHarnesses();
   const steps = useMemo<ComposerStep[]>(
     () => (agentOnly ? ["agent", "resources", "review"] : ["run", "agent", "resources", "controls", "review"]),
@@ -96,6 +102,12 @@ export function RunComposer({
   const [systemPrompt, setSystemPrompt] = useState("");
   const [workspace, setWorkspace] = useState<WorkspaceDraft>(emptyDraft("scratch"));
   const [pins, setPins] = useState<BundleRef[]>([]);
+  // Phase C: the selected revision's declared brokered connection requirements,
+  // and the invoking user's explicit per-slot binding overrides (slot →
+  // connection id; "" = resolve automatically). Bindings ride POST /sessions.
+  const [requirements, setRequirements] = useState<ConnectionRequirement[]>([]);
+  const [bindings, setBindings] = useState<Record<string, string>>({});
+  const [bindableConnections, setBindableConnections] = useState<Connection[]>([]);
   const [capabilityRefresh, setCapabilityRefresh] = useState(0);
   const [addingMcp, setAddingMcp] = useState(false);
 
@@ -157,6 +169,8 @@ export function RunComposer({
             setSystemPrompt(latest.system_prompt || "");
             setWorkspace(specToDraft(latest.default_workspace));
             setPins(latest.capability_bundles ?? []);
+            setRequirements(latest.connection_requirements ?? []);
+            setBindings({}); // re-resolve automatically for the new agent
           }
           setRevisionTouched(false);
         })
@@ -182,6 +196,16 @@ export function RunComposer({
       .catch(() => {});
   }, [connections.length, kind, mode]);
 
+  // The invoking-user-visible connections used to offer per-slot binding options
+  // for a "once" run whose agent declares brokered requirements. The list is
+  // already viewer-filtered server-side; the server re-verifies every binding.
+  useEffect(() => {
+    if (mode !== "once" || requirements.length === 0 || bindableConnections.length > 0) return;
+    apiGet<{ connections: Connection[] }>("/connections")
+      .then((response) => setBindableConnections(response.connections))
+      .catch(() => {});
+  }, [mode, requirements.length, bindableConnections.length]);
+
   useEffect(() => {
     const timer = window.setTimeout(() => {
       stageRef.current?.focus({ preventScroll: true });
@@ -202,6 +226,8 @@ export function RunComposer({
     setSystemPrompt("");
     setWorkspace(emptyDraft("scratch"));
     setPins([]);
+    setRequirements([]); // a new agent declares its requirements in the editor
+    setBindings({});
     setRevisionTouched(false);
   };
 
@@ -262,6 +288,10 @@ export function RunComposer({
           policy: "default",
           default_workspace: draftToInput(workspace),
           capability_bundles: pins.map((pin) => `${pin.name}@${pin.version}`),
+          // Send the draft brokered requirements (incl. any appended by the
+          // embedded add-server flow); the server revalidates each. Omitted when
+          // empty so plain agents are unaffected.
+          ...(requirements.length > 0 ? { connection_requirements: requirements } : {}),
         });
         createdAgent = response.agent;
         runAgentName = response.agent.name;
@@ -274,6 +304,7 @@ export function RunComposer({
           system_prompt: systemPrompt.trim() || null,
           default_workspace: draftToInput(workspace),
           capability_bundles: pins.map((pin) => `${pin.name}@${pin.version}`),
+          ...(requirements.length > 0 ? { connection_requirements: requirements } : {}),
         });
         setRevisionTouched(false);
       }
@@ -284,7 +315,20 @@ export function RunComposer({
       }
 
       if (mode === "once") {
-        await apiPost("/sessions", { agent: runAgentName, task: task.trim(), autonomous });
+        // Explicit per-slot bindings (design "Explicit binding"): send only the
+        // slots a connection was picked for; omitted slots auto-resolve. The
+        // server re-verifies each (tenant, usable, connector match, snapshot)
+        // and returns actionable 4xx messages we surface verbatim.
+        const explicit = Object.fromEntries(
+          Object.entries(bindings).filter(([, connId]) => connId)
+        );
+        const body: Record<string, unknown> = {
+          agent: runAgentName,
+          task: task.trim(),
+          autonomous,
+        };
+        if (Object.keys(explicit).length > 0) body.bindings = explicit;
+        await apiPost("/sessions", body);
         onRunCreated();
         return;
       }
@@ -559,11 +603,54 @@ export function RunComposer({
           addingMcp ? (
             <AddServerWizard
               embedded
+              me={me}
               onClose={() => setAddingMcp(false)}
-              onCompleted={(bundle) => {
+              onCompleted={(result) => {
                 setCapabilityRefresh((current) => current + 1);
+                if (!result) return;
+                // Sandbox (stdio) bundle: attach it as a pin (legacy path).
+                const bundle = result.bundle;
                 if (bundle && !pins.some((pin) => pin.name === bundle.name)) {
                   setPins((current) => [...current, { id: "", name: bundle.name, version: bundle.version }]);
+                  touchRevision();
+                }
+                // Phase C brokered connection: append a matching
+                // ConnectionRequirement to the draft so this run/agent binds the
+                // just-connected server. Presentation-only — create_run
+                // revalidates the requirement and resolves the binding.
+                if (result.connection && result.snapshot) {
+                  const conn = result.connection;
+                  const endpoint =
+                    conn.metadata?.endpoint_url ??
+                    conn.metadata?.base_url ??
+                    "";
+                  const base =
+                    (result.slug ?? "server").replace(/[^a-z0-9-]/gi, "-").toLowerCase() || "server";
+                  // Owner-aware binding mode: a member's new PERSONAL connection
+                  // satisfies an "invoking_user" requirement; an org connection an
+                  // "organization" one. Hardcoding "organization" would leave a
+                  // personal connection never satisfying the generated slot (F1).
+                  const bindingMode =
+                    conn.owner_type === "user" ? "invoking_user" : "organization";
+                  // Compute the non-colliding slot ONCE (from the current
+                  // requirements) so the explicit bindings map can point at the
+                  // same slot.
+                  let slot = base;
+                  let n = 2;
+                  while (requirements.some((r) => r.slot === slot)) slot = `${base}-${n++}`;
+                  setRequirements((current) => [
+                    ...current,
+                    {
+                      slot,
+                      connector: { url: endpoint, slug: result.slug ?? null },
+                      required_tools: result.snapshot!.tools.map((t) => t.name),
+                      binding_mode: bindingMode,
+                    },
+                  ]);
+                  // Bind the generated slot to the just-connected connection for
+                  // THIS run so the immediate run uses exactly what was connected
+                  // rather than silently resolving a different org credential (F1).
+                  setBindings((current) => ({ ...current, [slot]: conn.id }));
                   touchRevision();
                 }
               }}
@@ -594,6 +681,81 @@ export function RunComposer({
                   touchRevision();
                 }}
               />
+              {mode === "once" && requirements.length > 0 && (
+                <div className="field">
+                  <span className="lab">Connection bindings</span>
+                  <span className="field-hint">
+                    This agent needs brokered connections. Leave a slot on “Resolve automatically”
+                    to let the server pick per its binding mode, or bind a specific connection you
+                    can use.
+                  </span>
+                  <div className="opt-list">
+                    {requirements.map((req) => {
+                      const matches = bindableConnections.filter(
+                        (c) =>
+                          c.status === "active" &&
+                          isToolConnection(c) &&
+                          connectionMatchesConnector(c, req.connector.url)
+                      );
+                      return (
+                        <div
+                          key={req.slot}
+                          style={{
+                            display: "grid",
+                            gap: 4,
+                            padding: "8px 0",
+                            borderBottom: "1px solid var(--border)",
+                          }}
+                        >
+                          <div className="chips" style={{ alignItems: "center" }}>
+                            <span className="chip mono">{req.slot}</span>
+                            <span className="faint" style={{ fontSize: 11.5 }}>
+                              {req.connector.slug ? `${req.connector.slug} · ` : ""}
+                              {req.connector.url}
+                            </span>
+                            <span className="badge">
+                              {req.binding_mode === "organization" ? "organization" : "invoking user"}
+                            </span>
+                          </div>
+                          <div className="faint" style={{ fontSize: 11 }}>
+                            requires: {req.required_tools.join(", ")}
+                          </div>
+                          <select
+                            className="inp"
+                            value={bindings[req.slot] ?? ""}
+                            onChange={(event) =>
+                              setBindings((current) => ({
+                                ...current,
+                                [req.slot]: event.target.value,
+                              }))
+                            }
+                          >
+                            <option value="">Resolve automatically</option>
+                            {matches.map((c) => {
+                              const badge = ownerBadge(c, me?.user_id);
+                              const suffix = badge
+                                ? ` (${badge.label}${badge.yours ? " · yours" : ""})`
+                                : "";
+                              return (
+                                <option key={c.id} value={c.id}>
+                                  {c.display_name}
+                                  {suffix}
+                                </option>
+                              );
+                            })}
+                          </select>
+                          {matches.length === 0 && (
+                            <span className="faint" style={{ fontSize: 11 }}>
+                              No matching connection you can use — the server resolves it or reports
+                              an actionable error.
+                            </span>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
             </>
           )
         )}

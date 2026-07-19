@@ -102,6 +102,11 @@ export function streamUrl(sessionId: string): string {
  *  The dashboard renders this; it never derives authority from it. */
 export interface AuthMe {
   operator?: boolean;
+  /** Stable id of the signed-in user (Phase C): lets the dashboard tell "my
+   *  personal connection" from a teammate's. Absent for the operator and in
+   *  admin mode — ownership rendering degrades to org/personal without "yours".
+   *  The server still owner-filters; this is presentation only. */
+  user_id?: string;
   org?: { slug: string; display_name: string } | null;
   user?: { email: string | null; name: string | null } | null;
   roles?: string[];
@@ -171,7 +176,32 @@ export interface Revision {
   default_workspace: WorkspaceSpec | null;
   /** §17 #7 pins: exact bundle versions resolved at attach time. */
   capability_bundles: BundleRef[];
+  /** Phase C (design :349-389): brokered connection requirements this revision
+   *  declares — *what* it needs per slot, never *whose* credential. Resolved
+   *  per-run into bindings. Defaults to [] on pre-Phase-C revisions. */
+  connection_requirements?: ConnectionRequirement[];
   created_at: string;
+}
+
+/** Which identity's credential should satisfy a requirement's binding at run
+ *  creation (mirrors fluidbox-core BindingMode, snake_case on the wire). */
+export type BindingMode = "invoking_user" | "organization";
+
+/** How a requirement names the connector it needs. `url` is the load-bearing
+ *  selector (the brokered MCP endpoint); `slug` is an optional catalog hint. */
+export interface ConnectorSelector {
+  url: string;
+  slug?: string | null;
+}
+
+/** What an agent revision declares it needs per slot (mirrors fluidbox-core
+ *  ConnectionRequirement). `required_tools` is a fail-closed contract: every
+ *  entry must exist in the bound connection's snapshot at run creation. */
+export interface ConnectionRequirement {
+  slot: string;
+  connector: ConnectorSelector;
+  required_tools: string[];
+  binding_mode: BindingMode;
 }
 
 /** Mirrors fluidbox-core BundleRef (agent_revisions.capability_bundles). */
@@ -239,11 +269,25 @@ export interface Connection {
     installation_id?: string;
     registration_id?: string;
     base_url?: string;
+    /** The exact MCP endpoint a static mcp_http connection was photographed at
+     *  (= base_url for a static server). Used to match a connection to an agent
+     *  requirement's connector url — display convenience; the server re-verifies. */
+    endpoint_url?: string;
     header_name?: string;
     scheme?: string;
   };
   /** static (pasted secret) | oauth (custodied rotating refresh token). */
   auth_kind: string;
+  /** Ownership (Phase C, design :274-296). `owner_type` is the WIRE value —
+   *  "organization" (visible to every member) or "user" (one member's personal
+   *  custody, rendered as "Personal"). `owner_user_id` is set iff owner_type is
+   *  "user". These arrive on every row post-Phase-C; the list is already
+   *  viewer-filtered server-side, so other users' personal rows never appear. */
+  owner_type?: "organization" | "user";
+  owner_user_id?: string | null;
+  created_by_user_id?: string | null;
+  /** Bumps on every re-consent/rotation so stale run bindings fail closed. */
+  authorization_generation?: number;
   /** Non-secret OAuth custody state; null on static connections. */
   oauth: {
     resource?: string;
@@ -291,6 +335,116 @@ export const isGitConnection = (c: Connection): boolean =>
 /** Is this a brokered tool-server credential? The mirror of isGitConnection. */
 export const isToolConnection = (c: Connection): boolean =>
   PROVIDER_CLASS[c.provider as ConnectionProvider] === "tool";
+
+// ─── Connection ownership (Phase C, presentation only) ──────────────────────
+// The server is the sole authority on who may see/use a connection (the list is
+// already viewer-filtered). Everything below only SHAPES the UI: badges, which
+// owner radios to offer. Every write re-checks server-side.
+
+/** The badge for a connection row: "Organization" or "Personal", with `yours`
+ *  set only when a personal connection's owner matches the viewer. Needs
+ *  `meUserId` (from GET /auth/me); absent in admin mode, where `yours` stays
+ *  false. Returns null when the row carries no ownership (pre-Phase-C shape). */
+export interface OwnerBadge {
+  label: "Organization" | "Personal";
+  yours: boolean;
+}
+export function ownerBadge(c: Connection, meUserId?: string | null): OwnerBadge | null {
+  if (!c.owner_type) return null;
+  if (c.owner_type === "user") {
+    return { label: "Personal", yours: !!meUserId && c.owner_user_id === meUserId };
+  }
+  return { label: "Organization", yours: false };
+}
+
+export type OwnerChoice = "organization" | "personal";
+
+/** Which owner options a principal may pick when creating a connection, and the
+ *  default. Mirrors the server's `resolve_owner` gate (design :274-296):
+ *  `organization` needs admin/owner (or the operator); `personal` needs a
+ *  signed-in member and is refused for the operator and for github_app custody
+ *  (`allowPersonal=false`). Pure so the radio gating is unit-tested; the server
+ *  RE-ENFORCES — this only shapes the form. */
+export interface OwnerOptions {
+  canOrganization: boolean;
+  canPersonal: boolean;
+  default: OwnerChoice;
+}
+export function ownerOptions(me: AuthMe | null, allowPersonal = true): OwnerOptions {
+  const operator = !!me?.operator;
+  const isUser = !!me && !operator; // a signed-in member (browser/pat)
+  const roles = me?.roles ?? [];
+  const elevated = operator || roles.includes("admin") || roles.includes("owner");
+  // me absent (auth/me failed) → fall back to organization-only, the
+  // pre-Phase-C behavior; the server still enforces authority.
+  const canOrganization = elevated || !me;
+  const canPersonal = allowPersonal && isUser;
+  const dflt: OwnerChoice =
+    canOrganization && (elevated || !me) ? "organization" : canPersonal ? "personal" : "organization";
+  return { canOrganization, canPersonal, default: dflt };
+}
+
+/** Normalize a URL to origin+path without a trailing slash, lowercased — so
+ *  `https://H/mcp/` and `https://h/mcp` compare equal. Falls back to a trimmed
+ *  string for non-URLs. */
+function normUrl(u: string): string {
+  const trimmed = u.trim();
+  try {
+    const p = new URL(trimmed);
+    return (p.origin + p.pathname).replace(/\/+$/, "").toLowerCase();
+  } catch {
+    return trimmed.replace(/\/+$/, "").toLowerCase();
+  }
+}
+
+/** Does this connection back the connector at `connectorUrl`? Matched against
+ *  the stored `endpoint_url`/`base_url` (equal, or one contains the other at a
+ *  path boundary — audience binding). Display-only convenience for the run
+ *  composer's per-slot picker; the server re-verifies every binding. */
+export function connectionMatchesConnector(c: Connection, connectorUrl: string): boolean {
+  const target = normUrl(connectorUrl);
+  if (!target) return false;
+  const candidates = [c.metadata?.endpoint_url, c.metadata?.base_url]
+    .filter((x): x is string => !!x && x.trim().length > 0)
+    .map(normUrl);
+  return candidates.some(
+    (u) => u === target || target.startsWith(`${u}/`) || u.startsWith(`${target}/`)
+  );
+}
+
+/** A connection's append-only tool photograph (GET /connections/{id}/tools).
+ *  Mirrors the server's `snapshot_json` (schemas stay server-side). */
+export interface ConnectionToolSnapshot {
+  version: number;
+  protocol_version: string;
+  tools_digest: string;
+  discovered_at: string;
+  authorization_generation: number;
+  tools: { name: string; description: string }[];
+}
+
+/** GET /connections/{id}/tools — the latest snapshot, or null when none has
+ *  been photographed yet (404) or the row is not visible. Other errors throw. */
+export async function fetchConnectionTools(id: string): Promise<ConnectionToolSnapshot | null> {
+  try {
+    const r = await apiGet<{ snapshot: ConnectionToolSnapshot }>(`/connections/${id}/tools`);
+    return r.snapshot;
+  } catch (e) {
+    if (e instanceof Error && e.message.startsWith("404")) return null;
+    throw e;
+  }
+}
+
+/** POST /connections/{id}/tools/refresh — re-photograph into a new version.
+ *  4xx bodies (e.g. reauthorization guidance) are actionable — surface them
+ *  verbatim to the caller (this throws them as-is). */
+export async function refreshConnectionTools(id: string): Promise<ConnectionToolSnapshot> {
+  const r = await apiPost<{ snapshot: ConnectionToolSnapshot }>(
+    `/connections/${id}/tools/refresh`,
+    {}
+  );
+  return r.snapshot;
+}
 
 /** One connector-catalog entry (untrusted reference data; tool_hints are
  *  policy-default seeds — the permission gate stays the judge). */
@@ -370,13 +524,29 @@ export interface ProbeResult {
   notes: string[];
 }
 
-/** POST /mcp/servers response (fields vary by auth_mode, + derived slug). */
+/** POST /mcp/servers response (fields vary by auth_mode, + derived slug).
+ *  Phase C: a remote (none/api_key) connect returns `{connection, snapshot}`
+ *  (brokered tools are a per-connection snapshot now, not a bundle); a sandbox
+ *  (stdio) connect still returns a `bundle`; oauth returns `{connection,
+ *  authorize_url}` and the snapshot is photographed by the callback. */
 export interface AddServerResult {
   slug?: string;
   bundle?: { name: string; version: number };
   servers?: BundleServer[];
   connection?: Connection;
+  snapshot?: ConnectionToolSnapshot;
   authorize_url?: string;
+}
+
+/** What the Add-server wizard hands back on success: the sandbox bundle (legacy
+ *  path) OR the freshly-connected brokered connection + its photographed
+ *  snapshot + derived slug (Phase C), so an embedded caller can append a
+ *  matching ConnectionRequirement. */
+export interface AddServerCompletion {
+  bundle: { name: string; version: number } | null;
+  connection?: Connection;
+  snapshot?: ConnectionToolSnapshot;
+  slug?: string;
 }
 
 /** One model offered for a harness (GET /harnesses). */
