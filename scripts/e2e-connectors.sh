@@ -402,11 +402,15 @@ CODE=$(post "/catalog/workspace-info/connect" "{}")
   || { no "authless connect → $CODE: $(cat "$B")"; exit 1; }
 
 # ── INC 1: api_key connect with a CUSTOM header (the Sentry shape) ────────
-say "CONNECT (api_key) — sealed key, custom header honored, photograph proves it"
+# Phase C: a REMOTE (streamable_http) connect no longer auto-registers a
+# capability bundle — it creates a CONNECTION and photographs its tool surface
+# into a connection SNAPSHOT ({connection, snapshot}). Bundles now survive only
+# for in-image sandbox (stdio) entries (workspace-info above).
+say "CONNECT (api_key) — sealed key, custom header honored, snapshot proves it"
 CODE=$(post "/catalog/fx-sentry/connect" "{\"token\":\"$SN_KEY\"}")
-[ "$CODE" = "200" ] && ok "fx-sentry connected (connection + bundle in one step)" || { no "connect → $CODE: $(cat "$B")"; exit 1; }
+[ "$CODE" = "200" ] && ok "fx-sentry connected (connection + snapshot in one step)" || { no "connect → $CODE: $(cat "$B")"; exit 1; }
 SNCONN=$(jb "['connection']['id']")
-[ "$(jb "['bundle']['name']")" = "fx-sentry" ] && ok "bundle fx-sentry auto-registered (settle #4)" || no "bundle: $(cat "$B")"
+[ "$(jb "['snapshot']['version']")" = "1" ] && ok "connection snapshot v1 photographed (Phase C: snapshots, not bundles)" || no "snapshot: $(cat "$B")"
 grep -q "$SN_KEY" "$B" && no "api key echoed in connect response!" || ok "api key not in the connect response"
 get "/connections" | grep -q "$SN_KEY" && no "api key in connection listing!" || ok "api key not in the listing"
 LAST_LIST=$(grep '"method": "tools/list"' "$SN_LOG" | tail -1)
@@ -418,9 +422,9 @@ DECOR=$(get "/catalog" | python3 -c "
 import sys, json
 d = {c['slug']: c for c in json.load(sys.stdin)['connectors']}
 e = d.get('fx-sentry', {})
-conn, bundle = e.get('connection') or {}, e.get('bundle') or {}
-print('ok' if conn.get('status') == 'active' and bundle.get('version', 0) >= 1 else str((conn, bundle)))")
-[ "$DECOR" = "ok" ] && ok "catalog entries decorate with live connection + bundle state (UI renders connected/disconnect)" || no "decoration: $DECOR"
+conn = e.get('connection') or {}
+print('ok' if conn.get('status') == 'active' else str(conn))")
+[ "$DECOR" = "ok" ] && ok "catalog entries decorate with live connection state (UI renders connected/disconnect)" || no "decoration: $DECOR"
 
 CODE=$(post "/catalog/fx-sentry/connect" "{\"token\":\"wrong-key\",\"bundle_name\":\"fx-sentry-bad\",\"display_name\":\"sentry-bad\"}")
 [ "$CODE" = "400" ] && grep -q "rejected this credential" "$B" \
@@ -432,7 +436,10 @@ print(sum(1 for c in cs if c['display_name'] == 'sentry-bad' and c['status'] == 
 [ "$ACTIVE_BAD" = "0" ] && ok "refused credential's connection rolled back (no active row)" || no "dangling connection!"
 
 say "BROKER (api_key) — end-to-end through the custom header"
-post "/agents" "{\"name\":\"conn-sn-$$\",\"policy\":\"conn-e2e\",\"capability_bundles\":[\"fx-sentry\"]}" >/dev/null
+# Phase C: the agent DECLARES a connection requirement (slot fx-sentry, organization
+# binding — the operator has no personal identity); create_run resolves it to the
+# fx-sentry connection's snapshot and freezes a brokered surface in the RunSpec.
+post "/agents" "{\"name\":\"conn-sn-$$\",\"policy\":\"conn-e2e\",\"connection_requirements\":[{\"slot\":\"fx-sentry\",\"connector\":{\"url\":\"http://127.0.0.1:$SN_PORT/mcp\",\"slug\":\"fx-sentry\"},\"required_tools\":[\"sn_find_issues\"],\"binding_mode\":\"organization\"}]}" >/dev/null
 SID_SN=$(probe_session "conn-sn-$$")
 TOK_SN=$(token_for "$SID_SN")
 [ -n "$TOK_SN" ] && ok "probe session launched; runner killed (we drive the contract)" || { no "no session token"; exit 1; }
@@ -471,23 +478,20 @@ CODE=$(post "/mcp/probe" "{\"url\":\"http://127.0.0.1:1/mcp\"}")
 BYO="byo-sentry-$$"
 CODE=$(post "/mcp/servers" "{\"url\":\"http://127.0.0.1:$SN_PORT/mcp\",\"name\":\"$BYO\",
   \"auth_mode\":\"api_key\",\"token\":\"$SN_KEY\",\"header_name\":\"Sentry-Bearer\",\"scheme\":\"\"}")
-[ "$CODE" = "200" ] && ok "one-shot BYO connect → 200 (entry + connection + bundle in one call)" || { no "byo connect → $CODE: $(cat "$B")"; exit 1; }
+[ "$CODE" = "200" ] && ok "one-shot BYO connect → 200 (entry + connection + snapshot in one call)" || { no "byo connect → $CODE: $(cat "$B")"; exit 1; }
+BYOCONN=$(jb "['connection']['id']")
 [ "$(jb "['slug']")" = "$BYO" ] && ok "slug derived server-side ($BYO)" || no "slug: $(jb "['slug']")"
 [ "$(pq "select tier from connector_catalog where slug='$BYO'")" = "custom" ] && ok "BYO server became a tier=custom catalog entry (reuse-the-catalog)" || no "no custom catalog row"
-grep -q "sn_find_issues" "$B" && ok "connect response previews the PHOTOGRAPHED tools (sn_find_issues)" || no "no tool preview in connect response: $(cat "$B")"
+grep -q "sn_find_issues" "$B" && ok "connect response previews the PHOTOGRAPHED snapshot tools (sn_find_issues)" || no "no tool preview in connect response: $(cat "$B")"
 grep -q "$SN_KEY" "$B" && no "api key echoed in BYO connect response!" || ok "api key not in the BYO connect response"
 
-# Tool preview API: GET /capabilities/{id} now returns per-server tool lists.
-BID=$(get "/capabilities" | python3 -c "
+# Tool surface API (Phase C): GET /connections/{id}/tools returns the latest
+# connection snapshot's per-tool list (name + description) for the UI preview.
+PREV=$(get "/connections/$BYOCONN/tools" | python3 -c "
 import sys, json
-bs = [b for b in json.load(sys.stdin)['bundles'] if b['name'] == '$BYO']
-print(bs[0]['id'] if bs else '')")
-PREV=$(get "/capabilities/$BID" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-ts = [t for s in d.get('servers', []) for t in s.get('tools', [])]
+ts = json.load(sys.stdin).get('snapshot', {}).get('tools', [])
 print('ok' if any(t.get('name') and 'description' in t for t in ts) else 'no')")
-[ "$PREV" = "ok" ] && ok "GET /capabilities/{id} exposes per-server tools (name + description) for the UI preview" || no "no tool preview in bundle detail"
+[ "$PREV" = "ok" ] && ok "GET /connections/{id}/tools exposes the snapshot's tools (name + description) for the UI preview" || no "no tool preview in the connection snapshot"
 
 # Orphan cleanup: a refused key rolls BOTH the connection AND the custom entry.
 BYO_BAD="byo-bad-$$"
@@ -536,9 +540,10 @@ echo "$CB_URL" | grep -q "^http://127.0.0.1:8787/v1/oauth/callback?" \
   && ok "AS redirected to THE one stable callback" || { no "redirect: $CB_URL"; exit 1; }
 CB_BODY=$(curl -s "$CB_URL")
 echo "$CB_BODY" | grep -q "Connected" && ok "callback (unauthenticated route) completed the exchange" || { no "callback: $CB_BODY"; exit 1; }
-# Version-agnostic: the bundle registry is append-only, so reruns publish
-# the next fx-notion version.
-echo "$CB_BODY" | grep -qE "fx-notion@[0-9]+" && ok "pending bundle auto-registered with the fresh token" || no "bundle note missing: $CB_BODY"
+# Phase C: the callback photographs the pending_snapshot (not a brokered bundle)
+# with the freshly minted access token — the "Connected" page reports the count.
+echo "$CB_BODY" | grep -qiE "snapshotted [0-9]+ tool" && echo "$CB_BODY" | grep -qE "\(v[0-9]+\)" \
+  && ok "pending_snapshot photographed with the fresh token (connection snapshot, not a bundle)" || no "snapshot note missing: $CB_BODY"
 NTSTATUS=$(get "/connections" | python3 -c "
 import sys, json
 print([c['status'] for c in json.load(sys.stdin)['connections'] if c['id'] == '$NTCONN'][0])")
@@ -572,7 +577,10 @@ print(json.dumps(gs[-1]) if gs else '')"
 # container's session ~60s after its last heartbeat, so each cluster gets
 # its own just-in-time session.
 say "REFRESH — reactive 401 + atomic rotation (old token dead) + proactive pre-expiry"
-post "/agents" "{\"name\":\"conn-nt-$$\",\"policy\":\"conn-e2e\",\"capability_bundles\":[\"fx-notion\"]}" >/dev/null
+# Phase C: the OAuth custody rides the connection; the agent declares a
+# requirement (slot fx-notion) that create_run resolves to the fx-notion
+# connection's snapshot — the broker mint/refresh/rotation below is unchanged.
+post "/agents" "{\"name\":\"conn-nt-$$\",\"policy\":\"conn-e2e\",\"connection_requirements\":[{\"slot\":\"fx-notion\",\"connector\":{\"url\":\"http://127.0.0.1:$AS_PORT/mcp\",\"slug\":\"fx-notion\"},\"required_tools\":[\"nt_search\"],\"binding_mode\":\"organization\"}]}" >/dev/null
 SID_NT=$(probe_session "conn-nt-$$")
 TOK_NT=$(token_for "$SID_NT")
 R=$(broke "$SID_NT" "$TOK_NT" n1 "mcp__fx-notion__nt_search" '{"query":"roadmap"}')
