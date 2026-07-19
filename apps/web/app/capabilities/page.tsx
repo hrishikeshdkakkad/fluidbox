@@ -1115,12 +1115,6 @@ const BUNDLE_EXAMPLE = `[
       { "name": "workspace_file_count", "description": "Count files in the workspace",
         "input_schema": { "type": "object", "properties": {} } }
     ]
-  },
-  {
-    "class": "brokered",
-    "name": "kb",
-    "url": "https://mcp.example.com/mcp",
-    "connection_id": "<mcp_http connection id, omit if the server needs no credential>"
   }
 ]`;
 
@@ -1165,9 +1159,13 @@ function NewBundle({ onClose, onCreated }: { onClose: () => void; onCreated: () 
       onClose={onClose}
     >
       <p className="helper" style={{ marginTop: 0 }}>
-        Brokered servers are contacted now to photograph their tools — declare tools only for
-        sandbox servers. Credentials come from mcp_http connections; they are never stored here
-        and never enter a sandbox.
+        Bundles now carry <strong>sandbox</strong> (in-image stdio) servers only — declare their
+        tools inline, as above.
+      </p>
+      <p className="helper" style={{ marginTop: 0 }}>
+        For a brokered (remote) MCP server, connect it under{" "}
+        <Link href="/capabilities">Integrations</Link> instead — its tools are photographed into a
+        per-connection snapshot, and an agent names it through a connection requirement.
       </p>
       <label className="field">
         <span className="lab">Name</span>
@@ -1189,9 +1187,9 @@ function NewBundle({ onClose, onCreated }: { onClose: () => void; onCreated: () 
       </label>
       {err && <div className="err">{err}</div>}
       <div className="spread" style={{ marginTop: 16 }}>
-        <span className="helper">Brokered servers are discovered &amp; validated before storage.</span>
+        <span className="helper">Sandbox servers are validated before storage.</span>
         <button className="btn primary" onClick={submit} disabled={busy}>
-          {busy ? "Photographing…" : "Register"}
+          {busy ? "Registering…" : "Register"}
         </button>
       </div>
     </ModalShell>
