@@ -1061,12 +1061,17 @@ pub async fn update_connection_oauth(
 /// The callback exchange completing: seal the rotating refresh token into
 /// `credential_sealed` (the SAME custody column static bearers use), flip the
 /// connection live, and — atomically in the SAME UPDATE — bump the authorization
-/// generation when `bump_generation` is set (a reconnect: the account/issuer/
-/// audience may have changed, so any in-flight run bound to the old generation
-/// must fail closed; design :294-296). Doing the activate + bump as ONE write
-/// closes the crash window a sequential activate-then-bump left open, where a
-/// reconnected grant could serve the OLD generation. Works from pending (first
-/// connect, `bump_generation = false`) and error (reconnect) alike. The returned
+/// generation on a RECONNECT (a re-consent from any non-`pending` status: the
+/// account/issuer/audience may have changed, so any in-flight run bound to the
+/// old generation must fail closed; design :294-296). The bump is decided from
+/// the row's PRE-UPDATE `status` INSIDE the SET (`status <> 'pending'`) — under
+/// the row lock the SET reads the OLD status, which IS the prior status at commit
+/// time. This is deliberately NOT a caller-supplied boolean (B1): two first-
+/// connect callbacks both reading `pending` before serializing on the oauth lock
+/// would each pass `bump=false`; the second must still bump because by the time
+/// it holds the lock the row is already `active`. First connect (from `pending`)
+/// ⇒ no bump; reconnect (from `active`/`error`) ⇒ bump — all in ONE write, so no
+/// crash window where a reconnected grant serves the OLD generation. The returned
 /// row carries the FINAL generation the caller caches under.
 pub async fn activate_connection_oauth(
     pool: &PgPool,
@@ -1075,14 +1080,13 @@ pub async fn activate_connection_oauth(
     sealed_refresh: &[u8],
     oauth: &Value,
     granted_scopes: &Value,
-    bump_generation: bool,
 ) -> sqlx::Result<Option<IntegrationConnectionRow>> {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update integration_connections
          set credential_sealed = $2, oauth = $3, granted_scopes = $4,
              status = 'active',
              authorization_generation =
-                 authorization_generation + case when $6 then 1 else 0 end,
+                 authorization_generation + case when status <> 'pending' then 1 else 0 end,
              updated_at = now()
          where id = $1 and status <> 'revoked' and auth_kind = 'oauth' and tenant_id = $5
          returning {CONNECTION_COLS}"
@@ -1092,7 +1096,6 @@ pub async fn activate_connection_oauth(
     .bind(oauth)
     .bind(granted_scopes)
     .bind(scope.tenant_id())
-    .bind(bump_generation)
     .fetch_optional(pool)
     .await
 }
@@ -3880,16 +3883,19 @@ pub async fn create_trigger_token(
     Ok(())
 }
 
-/// What resolving a trigger token yields: the subscription it may invoke AND
-/// its owning tenant (the "bootstrap exception" pattern — keys on the sha256,
-/// hands back a verified tenant).
+/// What resolving a trigger token yields: the token row's id (the exact
+/// invoking principal a trigger run freezes — design "The exact trigger token ID
+/// is stored on each invocation"), the subscription it may invoke, AND its owning
+/// tenant (the "bootstrap exception" pattern — keys on the sha256, hands back a
+/// verified tenant).
 #[derive(Debug, Clone, Copy)]
 pub struct TriggerTokenAuth {
+    pub token_id: Uuid,
     pub subscription_id: Uuid,
     pub tenant_id: Uuid,
 }
 
-/// Resolves a scoped trigger token to its subscription (and tenant). This is
+/// Resolves a scoped trigger token to its id + subscription (and tenant). This is
 /// the entire authority of the token — it can never satisfy Admin or
 /// SessionAuth.
 pub async fn subscription_for_token(
@@ -3897,7 +3903,7 @@ pub async fn subscription_for_token(
     token_plain: &str,
 ) -> sqlx::Result<Option<TriggerTokenAuth>> {
     let row = sqlx::query(
-        "select subscription_id, tenant_id from api_tokens
+        "select id, subscription_id, tenant_id from api_tokens
          where kind = 'trigger' and token_sha256 = $1
            and revoked_at is null
            and (expires_at is null or expires_at > now())",
@@ -3908,10 +3914,42 @@ pub async fn subscription_for_token(
     Ok(row.and_then(|r| {
         r.get::<Option<Uuid>, _>("subscription_id")
             .map(|subscription_id| TriggerTokenAuth {
+                token_id: r.get::<Uuid, _>("id"),
                 subscription_id,
                 tenant_id: r.get::<Uuid, _>("tenant_id"),
             })
     }))
+}
+
+/// Revocation recheck for a trigger-invoked run's frozen principal (design
+/// :741/:748, invariant R2.2): the exact api_tokens row the run froze must still
+/// exist, be a live trigger token (not revoked, not expired), and JOIN to a
+/// subscription that still exists and is ENABLED. The token is subscription-
+/// scoped by an immutable FK, so its subscription IS the run's subscription —
+/// "still belongs to the run's subscription" is verified by that JOIN. Scoped to
+/// the tenant on both rows. Returns false on any drift (fail closed).
+pub async fn trigger_token_active(
+    pool: &PgPool,
+    scope: TenantScope,
+    token_id: Uuid,
+) -> sqlx::Result<bool> {
+    let row = sqlx::query(
+        "select exists (
+             select 1
+               from api_tokens t
+               join trigger_subscriptions s
+                 on s.id = t.subscription_id and s.tenant_id = t.tenant_id
+              where t.id = $1 and t.tenant_id = $2 and t.kind = 'trigger'
+                and t.revoked_at is null
+                and (t.expires_at is null or t.expires_at > now())
+                and s.enabled
+         ) as ok",
+    )
+    .bind(token_id)
+    .bind(scope.tenant_id())
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get::<bool, _>("ok"))
 }
 
 /// Rotation support: kill every live token for the subscription.
@@ -6099,7 +6137,9 @@ mod tests {
             .await
             .unwrap());
 
-        // Callback exchange: seal refresh + activate. First connect ⇒ no bump.
+        // Callback exchange: seal refresh + activate. First connect (from
+        // `pending`) ⇒ no bump — the bump is derived from the row's pre-update
+        // status inside the UPDATE (B1), not a caller boolean.
         let row = activate_connection_oauth(
             &pool,
             scope,
@@ -6107,7 +6147,6 @@ mod tests {
             b"sealed-rt-1",
             &serde_json::json!({"resource": "https://mcp.example.test", "client_id": "c1"}),
             &serde_json::json!(["read"]),
-            false,
         )
         .await
         .unwrap()
@@ -6169,6 +6208,7 @@ mod tests {
 
         // Reconnect path: activation works FROM error too, and bumps the
         // generation atomically (R1.3+R3.1) — the reconnect may be a new grant.
+        // The bump is derived from the pre-update status (`error` <> `pending`).
         let row = activate_connection_oauth(
             &pool,
             scope,
@@ -6176,7 +6216,6 @@ mod tests {
             b"sealed-rt-3",
             &serde_json::json!({"resource": "https://mcp.example.test"}),
             &serde_json::json!([]),
-            true,
         )
         .await
         .unwrap()
@@ -6185,6 +6224,25 @@ mod tests {
         assert_eq!(
             row.authorization_generation, 2,
             "reconnect bumps the generation in the same atomic activation"
+        );
+
+        // B1 regression: re-activating an ALREADY-active row bumps again — proving
+        // the bump is derived from the row's live status under the lock, not from
+        // a pre-lock read (two racing first-connects that both saw `pending`).
+        let row = activate_connection_oauth(
+            &pool,
+            scope,
+            conn.id,
+            b"sealed-rt-4",
+            &serde_json::json!({"resource": "https://mcp.example.test"}),
+            &serde_json::json!([]),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            row.authorization_generation, 3,
+            "activating the now-active row bumps again (status <> 'pending')"
         );
 
         sqlx::query("delete from integration_connections where id = $1")
@@ -7011,9 +7069,12 @@ mod tests {
     /// preserving repoints (R1.1/R1.2). Covers: (i) a subscription pinned to an
     /// OLDER brokered revision gets a copy carrying THAT revision's model/prompt
     /// while the latest converts separately; (ii) a sandbox-only latest above a
-    /// pinned brokered old revision converts the pinned source yet the sandbox
-    /// latest stays `latest`; (iii) a restrictive keep-list narrows the derived
-    /// requirements; (iv) an empty keep-list ⇒ zero requirements; (v) idempotence.
+    /// pinned brokered old revision converts the pinned source and — append-only
+    /// being sacred (A2) — the sandbox latest is CLONED (never rewritten) as the
+    /// new `latest`; (iii) a restrictive keep-list narrows the derived
+    /// requirements; (iv) an empty keep-list ⇒ zero requirements; (v) idempotence;
+    /// (A1) FLOATING subscriptions — a restrictive/empty keep-list floater is
+    /// pinned to a tailored copy, a NULL keep-list floater keeps floating.
     #[tokio::test]
     async fn convert_legacy_bundles_per_source_revision_and_keep_lists() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
@@ -7193,6 +7254,59 @@ mod tests {
         .await;
         let sub_q = mk_sub(agent_q.id, "sub-q", q_rev1.id, None).await;
 
+        // ── Agent R: brokered latest (gh + stripe) with FLOATING subscriptions
+        // (pinned_revision_id NULL). A1: a floating sub whose NON-NULL keep-list
+        // narrows the latest's brokered authority must be PINNED to a tailored
+        // copy (the narrowing frozen); a NULL keep-list floater keeps floating. ──
+        let agent_r = create_agent(&pool, scope, "psr-agent-r", None)
+            .await
+            .unwrap();
+        let r_rev1 = mk_rev(
+            agent_r.id,
+            "r-latest",
+            "r-prompt",
+            serde_json::json!([pin(&gh_b), pin(&stripe_b)]),
+        )
+        .await;
+        let mk_float = |agent_id: Uuid, name: &'static str, keep: Option<Value>| {
+            let pool = pool.clone();
+            async move {
+                create_trigger_subscription(
+                    &pool,
+                    scope,
+                    agent_id,
+                    name,
+                    "api",
+                    None,
+                    Some("t"),
+                    false,
+                    false,
+                    None,
+                    "allow",
+                    None,
+                    None,
+                    &serde_json::json!([]),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    keep.as_ref(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let sub_float_gh = mk_float(
+            agent_r.id,
+            "float-gh",
+            Some(serde_json::json!(["gh-bundle"])),
+        )
+        .await;
+        let sub_float_empty =
+            mk_float(agent_r.id, "float-empty", Some(serde_json::json!([]))).await;
+        let sub_float_null = mk_float(agent_r.id, "float-null", None).await;
+
         // ── Convert, then re-convert for idempotence (v). ──
         sqlx::query("select fluidbox_convert_legacy_bundles()")
             .execute(&pool)
@@ -7229,6 +7343,23 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let r_revs = list_revisions(&pool, scope, agent_r.id).await.unwrap();
+        let r_latest = latest_revision(&pool, scope, agent_r.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let sub_float_gh_a = get_trigger_subscription(&pool, scope, sub_float_gh.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let sub_float_empty_a = get_trigger_subscription(&pool, scope, sub_float_empty.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let sub_float_null_a = get_trigger_subscription(&pool, scope, sub_float_null.id)
+            .await
+            .unwrap()
+            .unwrap();
 
         // Idempotence: a second run appends nothing and moves no pin.
         sqlx::query("select fluidbox_convert_legacy_bundles()")
@@ -7237,6 +7368,7 @@ mod tests {
             .unwrap();
         let p_revs2 = list_revisions(&pool, scope, agent_p.id).await.unwrap();
         let q_revs2 = list_revisions(&pool, scope, agent_q.id).await.unwrap();
+        let r_revs2 = list_revisions(&pool, scope, agent_r.id).await.unwrap();
         let p_latest2 = latest_revision(&pool, scope, agent_p.id)
             .await
             .unwrap()
@@ -7254,6 +7386,8 @@ mod tests {
         let gh_copy = rev_of(&p_revs, sub_gh_a.pinned_revision_id).unwrap();
         let empty_copy = rev_of(&p_revs, sub_empty_a.pinned_revision_id).unwrap();
         let q_copy = rev_of(&q_revs, sub_q_a.pinned_revision_id).unwrap();
+        let float_gh_copy = rev_of(&r_revs, sub_float_gh_a.pinned_revision_id).unwrap();
+        let float_empty_copy = rev_of(&r_revs, sub_float_empty_a.pinned_revision_id).unwrap();
 
         for stmt in [
             "delete from trigger_subscriptions where tenant_id = $1",
@@ -7331,17 +7465,38 @@ mod tests {
             "empty keep-list ⇒ zero requirements (removed authority not regained)"
         );
 
-        // (ii) sandbox-only latest stays latest (its content untouched); the
-        // pinned OLD brokered source still converts for the subscription.
+        // (ii) sandbox-only latest — APPEND-ONLY is sacred (A2). The ORIGINAL
+        // rev2 is NEVER rewritten (keeps its rev + content); an exact CLONE is
+        // APPENDED as the new `latest` so unpinned runs still resolve the
+        // sandbox-only semantics. The pinned OLD brokered source still converts.
+        let q_rev2_after = rev_of(&q_revs, Some(q_rev2.id)).unwrap();
         assert_eq!(
+            q_rev2_after.rev, q_rev2.rev,
+            "the ORIGINAL sandbox-only latest keeps its rev (never rewritten)"
+        );
+        assert_eq!(
+            q_rev2_after.capability_bundles,
+            serde_json::json!([pin(&q_sand)]),
+            "the ORIGINAL sandbox-only latest keeps its content"
+        );
+        assert_ne!(
             q_latest.id, q_rev2.id,
-            "sandbox-only latest stays the latest"
+            "the new latest is an APPENDED CLONE, not the rewritten original"
+        );
+        assert!(
+            q_latest.rev > q_rev2_after.rev,
+            "the clone is appended above the original"
         );
         assert_eq!(q_latest.model, "q-new");
         assert_eq!(
             q_latest.capability_bundles,
             serde_json::json!([pin(&q_sand)]),
-            "the sandbox-only latest is untouched (still its own sandbox pin)"
+            "the clone is content-identical to the sandbox-only latest"
+        );
+        assert_eq!(
+            q_latest.connection_requirements,
+            serde_json::json!([]),
+            "the sandbox-only clone carries no brokered requirements"
         );
         assert_ne!(
             sub_q_a.pinned_revision_id,
@@ -7377,6 +7532,48 @@ mod tests {
         assert_eq!(
             sub_full_b.pinned_revision_id, sub_full_a.pinned_revision_id,
             "pin stable on re-run"
+        );
+
+        // (A1) FLOATING subscriptions.
+        // The live latest is the FULL converted copy (both brokered → requirements).
+        assert_ne!(
+            r_latest.id, r_rev1.id,
+            "agent R latest is the converted live copy, not the original brokered rev"
+        );
+        assert_eq!(
+            r_latest.connection_requirements,
+            serde_json::json!([gh_req, stripe_req]),
+            "the live latest keeps BOTH brokered servers as requirements"
+        );
+        // A NULL keep-list floater keeps floating (no pin, still resolves latest).
+        assert_eq!(
+            sub_float_null_a.pinned_revision_id, None,
+            "a NULL keep-list floater keeps floating (never pinned)"
+        );
+        // A restrictive keep-list floater is PINNED to a tailored copy — gh only.
+        assert!(
+            sub_float_gh_a.pinned_revision_id.is_some(),
+            "a restrictive-keep-list floater is PINNED (its narrowing frozen)"
+        );
+        assert_eq!(
+            float_gh_copy.connection_requirements,
+            serde_json::json!([gh_req]),
+            "float-gh keep-list ['gh-bundle'] ⇒ ONLY github survives as a requirement"
+        );
+        // An empty keep-list floater is PINNED to a zero-requirement copy.
+        assert!(
+            sub_float_empty_a.pinned_revision_id.is_some(),
+            "an empty-keep-list floater is PINNED"
+        );
+        assert_eq!(
+            float_empty_copy.connection_requirements,
+            serde_json::json!([]),
+            "float-empty keep-list [] ⇒ zero requirements (removed authority not regained)"
+        );
+        assert_eq!(
+            r_revs2.len(),
+            r_revs.len(),
+            "agent R: second run appends nothing (idempotent)"
         );
     }
 

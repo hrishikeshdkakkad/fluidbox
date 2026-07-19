@@ -962,6 +962,9 @@ pub async fn create_session(
                 ..Default::default()
             },
             invoked_by_user_id: principal.user_id(),
+            // A manual/UI run's principal is the user (or operator), never a
+            // trigger token.
+            invoking_token_id: None,
             explicit_bindings: req.bindings.unwrap_or_default(),
             result_destinations: vec![],
             bound_invocation: None,
