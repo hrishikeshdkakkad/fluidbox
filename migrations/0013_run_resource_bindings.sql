@@ -106,7 +106,9 @@ create table run_resource_bindings (
     effective_tools_json jsonb,
     effective_tools_digest text,
     resource_scope jsonb not null default '{}'::jsonb,
-    resolved_by_principal_kind text not null,
+    resolved_by_principal_kind text not null
+        check (resolved_by_principal_kind in
+               ('user','operator','trigger','schedule','webhook','system')),
     resolved_by_principal_id text,
     binding_mode text not null
         check (binding_mode in ('invoking_user','organization','explicit')),
@@ -197,7 +199,15 @@ create unique index connector_catalog_slug_tenant on connector_catalog (tenant_i
 --     fields from the SOURCE revision;
 --   * converted copies dedupe on (source_revision, derived requirement set):
 --     subscriptions sharing both share one copy; a subscription pinning the
---     latest at FULL authority shares the live copy.
+--     latest at FULL authority shares the live copy;
+--   * a FLOATING subscription (pinned_revision_id IS NULL) whose NON-NULL
+--     keep-list narrows the latest's brokered authority is PINNED to a tailored
+--     copy of the latest (R1.1/R1.2) — the only way to freeze the narrowing; a
+--     NULL keep-list floater keeps floating (the full converted latest is right);
+--   * NOTHING here ever rewrites a historical revision (append-only is sacred,
+--     design :338-339): when the latest is sandbox-only but older revisions
+--     converted above it, an exact CLONE of the latest is APPENDED (not its rev
+--     bumped) so unpinned runs still resolve the sandbox-only semantics.
 -- Sandbox pins survive as exact BundleRef objects `{id,name,version}` (the shape
 -- `frozen_capabilities` deserializes; the version IS the `name@<version>` pin);
 -- the subscription's keep-list still narrows them at run time.
@@ -521,9 +531,59 @@ begin
              where id = v_sub.sub_id;
         end loop;
 
-        -- Live path LAST so its copy has the highest rev and is the new `latest`;
-        -- then repoint every deferred subscription to it.
+        -- Floating subscriptions (pinned_revision_id IS NULL) resolve the LATEST
+        -- at run time. Post-conversion the latest becomes the FULL live copy, so a
+        -- floating sub whose NON-NULL keep-list REMOVED brokered authority would
+        -- REGAIN it by following the live copy (A1). A NULL keep-list floater is
+        -- correct to keep floating (full authority); a restrictive/empty keep-list
+        -- floater must be PINNED to a copy derived under ITS keep-list — pinning is
+        -- the ONLY way to freeze the narrowing, and it DELIBERATELY stops the sub
+        -- floating (design R1.1/R1.2). Only meaningful when the latest actually
+        -- holds brokered authority; appended BEFORE the live copy so the live copy
+        -- stays the highest rev / new `latest`.
         if v_brokered_l then
+            for v_sub in
+                select ts.id as sub_id, ts.capability_bundles as keep
+                  from trigger_subscriptions ts
+                 where ts.agent_id = v_agent.id and ts.pinned_revision_id is null
+                   and ts.capability_bundles is not null
+                 order by ts.created_at, ts.id
+            loop
+                select * into v_surviving, v_requirements, v_has_brokered
+                  from fluidbox_convert_derive(v_agent.id, v_agent.tenant_id,
+                         coalesce(v_latest.capability_bundles, '[]'::jsonb), v_sub.keep);
+                -- A keep-list that removes NO brokered authority derives the full
+                -- live requirements — leave the sub floating (== a NULL keep-list).
+                if v_requirements::text = v_requirements_l::text then
+                    continue;
+                end if;
+                -- Narrowing keep-list: dedup on (latest source, requirement set)
+                -- among the copies built so far, append a fresh copy on a miss,
+                -- then PIN (this deliberately stops the sub floating).
+                v_reqs_key := v_requirements::text;
+                v_existing := null;
+                for i in 1 .. coalesce(array_length(v_map_source, 1), 0) loop
+                    if v_map_source[i] = v_latest.id and v_map_reqs[i] = v_reqs_key then
+                        v_existing := v_map_newrev[i];
+                        exit;
+                    end if;
+                end loop;
+                if v_existing is null then
+                    v_new_rev_id := fluidbox_convert_append(
+                        v_agent.id, v_latest.id, v_surviving, v_requirements);
+                    v_map_source := array_append(v_map_source, v_latest.id);
+                    v_map_reqs := array_append(v_map_reqs, v_reqs_key);
+                    v_map_newrev := array_append(v_map_newrev, v_new_rev_id);
+                else
+                    v_new_rev_id := v_existing;
+                end if;
+                update trigger_subscriptions
+                   set pinned_revision_id = v_new_rev_id, updated_at = now()
+                 where id = v_sub.sub_id;
+            end loop;
+
+            -- Live path LAST so its copy has the highest rev and is the new
+            -- `latest`; then repoint every deferred subscription to it.
             v_live_copy := fluidbox_convert_append(
                 v_agent.id, v_latest.id, v_surviving_l, v_requirements_l);
             if array_length(v_deferred, 1) is not null then
@@ -533,14 +593,20 @@ begin
             end if;
         elsif (select max(rev) from agent_revisions where agent_id = v_agent.id) > v_latest.rev then
             -- The latest is brokered-free (NOT converted). If subscription copies
-            -- from OLDER brokered revisions were appended with higher revs, lift
-            -- the untouched latest back to the top by its rev ordinal (content
-            -- unchanged; revisions are pinned by id) so unpinned/manual runs keep
-            -- resolving it — never a converted older revision. Idempotent: on a
-            -- re-run the latest is already the max rev, so this does not fire.
-            update agent_revisions
-               set rev = (select max(rev) from agent_revisions where agent_id = v_agent.id) + 1
-             where id = v_latest.id;
+            -- from OLDER brokered revisions were appended with higher revs, the
+            -- untouched latest is no longer the max rev, so unpinned/manual runs
+            -- would resolve a converted OLDER revision. Append-only is SACRED
+            -- (design :338-339 — never rewrite a historical agent revision): rather
+            -- than bumping v_latest's rev, APPEND an exact CLONE of it as the new
+            -- highest rev (A2). Content identical — same bundles/requirements plus
+            -- model/prompt/policy/budgets copied from the source by
+            -- fluidbox_convert_append — with a fresh id + rev; unpinned runs then
+            -- resolve the clone, semantically the sandbox-only latest. Idempotent:
+            -- on a re-run the latest IS already the max rev (the clone), so this
+            -- does not fire.
+            v_new_rev_id := fluidbox_convert_append(
+                v_agent.id, v_latest.id, v_latest.capability_bundles,
+                v_latest.connection_requirements);
         end if;
     end loop;
 end;
