@@ -1142,17 +1142,60 @@ pub async fn decide_approval(
     // run resource binding, and a personal (user-owned) connection is decidable
     // ONLY by its owner (on a run they invoked) — no role, admin/owner/operator
     // included. A non-mcp built-in tool is credentialless; an mcp tool with no
-    // binding is a legacy brokered call that keeps Phase B's org authority.
-    let binding = match fluidbox_core::capability::parse_mcp_tool(&approval.tool) {
-        Some((slot, _)) => {
-            fluidbox_db::find_session_binding(&state.pool, scope, session.id, "mcp", slot).await?
+    // binding is a LEGACY brokered call that keeps Phase B's org authority.
+    let slot =
+        fluidbox_core::capability::parse_mcp_tool(&approval.tool).map(|(s, _)| s.to_string());
+    let run_spec: Option<fluidbox_core::spec::RunSpec> =
+        serde_json::from_value(session.run_spec.clone()).ok();
+    // A Phase C run declares a BrokeredSurface per bound mcp slot in its RunSpec.
+    let surface = match (&slot, &run_spec) {
+        (Some(s), Some(rs)) => rs.find_brokered_surface(s).cloned(),
+        _ => None,
+    };
+    let binding = match &slot {
+        Some(s) => {
+            fluidbox_db::find_session_binding(&state.pool, scope, session.id, "mcp", s).await?
         }
         None => None,
     };
-    let facts = binding
-        .as_ref()
-        .map(rbac::ApprovalBindingFacts::from_binding);
-    let authority = rbac::classify_approval_authority(&approval.tool, facts.as_ref());
+    // R1.4(b): when the RunSpec has a BrokeredSurface for this slot, its binding
+    // MUST exist and match — a missing/mismatched row is an integrity error, NOT
+    // a fall-through to org authority. The legacy Organization fallback below
+    // applies ONLY when there is no surface (a pre-Phase-C embedded FrozenBundle
+    // brokered server).
+    if let Some(surface) = &surface {
+        let ok = binding.as_ref().is_some_and(|b| b.id == surface.binding_id);
+        if !ok {
+            return Err(ApiError::Conflict(
+                "this approval's brokered surface has no matching run resource binding — refusing to classify its authority".into(),
+            ));
+        }
+    }
+    let authority = match &binding {
+        Some(b) => {
+            let facts = rbac::ApprovalBindingFacts::from_binding(b);
+            // R1.4(c): an mcp binding is always a connection authority — cross-check
+            // the LIVE connection owner (one scoped read) and prefer the stricter of
+            // frozen-vs-live, so a stale/mislabeled org binding can never let a
+            // non-owner decide under what is really a personal connection.
+            match b.connection_id {
+                Some(cid) => match fluidbox_db::get_connection(&state.pool, scope, cid).await? {
+                    Some(conn) => rbac::reconcile_connection_authority(
+                        &facts,
+                        &conn.owner_type,
+                        conn.owner_user_id,
+                    ),
+                    None => {
+                        return Err(ApiError::Conflict(
+                            "this approval's connection no longer exists — cannot classify its authority".into(),
+                        ))
+                    }
+                },
+                None => rbac::classify_approval_authority(&approval.tool, Some(&facts)),
+            }
+        }
+        None => rbac::classify_approval_authority(&approval.tool, None),
+    };
     // Enforced identically on approve AND deny (symmetric, v1).
     if let Err(refusal) = rbac::authorize_approval_decision(
         &authority,

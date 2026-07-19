@@ -403,6 +403,15 @@ async fn resolve_workspace_binding(
                     .ok_or_else(|| {
                         ApiError::BadRequest(format!("workspace connection {cid} is missing"))
                     })?;
+                // R2.1: personal-connection delegation is omitted in v1 — an
+                // unattended (trigger/schedule/event) run must never fetch under
+                // a member's personal grant. Require an organization connection.
+                if conn.owner_type != "organization" {
+                    return Err(ApiError::BadRequest(format!(
+                        "workspace connection '{}' is personal — unattended runs need an organization connection",
+                        conn.display_name
+                    )));
+                }
                 if conn.status != "active" {
                     return Err(ApiError::BadRequest(format!(
                         "workspace connection {cid} is {} — reconnect it",

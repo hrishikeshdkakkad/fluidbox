@@ -103,6 +103,36 @@ pub fn classify_approval_authority(
     }
 }
 
+/// Reconcile the frozen binding owner with the LIVE connection owner for an
+/// approval decision (R1.4c). Owner fields are immutable in v1, so a divergence
+/// is corruption; resolve it toward the STRICTER (personal) authority so a
+/// mislabeled/stale org binding can never let a non-owner decide under what is
+/// really a personal connection. If EITHER side is user-owned the authority is
+/// `UserConnection`; when both are user-owned but name different owners, the
+/// frozen owner wins here (personal, so only that user could decide) and the
+/// live-owner divergence is separately caught at execution by `recheck_binding`.
+pub fn reconcile_connection_authority(
+    frozen: &ApprovalBindingFacts,
+    live_owner_type: &str,
+    live_owner_user_id: Option<Uuid>,
+) -> ApprovalAuthority {
+    let frozen_user = (frozen.owner_type.as_deref() == Some("user"))
+        .then_some(frozen.owner_user_id)
+        .flatten();
+    let live_user = (live_owner_type == "user")
+        .then_some(live_owner_user_id)
+        .flatten();
+    match (frozen_user, live_user) {
+        // Neither side personal → organization authority.
+        (None, None) => ApprovalAuthority::Organization,
+        // Exactly one side personal, or both agree → personal, owned by that user.
+        (Some(u), None) | (None, Some(u)) => ApprovalAuthority::UserConnection { owner_user_id: u },
+        (Some(f), Some(l)) if f == l => ApprovalAuthority::UserConnection { owner_user_id: f },
+        // Both personal but different owners → prefer the frozen (bound) owner.
+        (Some(f), Some(_)) => ApprovalAuthority::UserConnection { owner_user_id: f },
+    }
+}
+
 /// Whether the principal may decide this approval — approve OR deny, symmetric
 /// in v1 (design :564-583). Pure over the classified authority + the run's
 /// invoker + the principal's identity and `decide_org` capability.
@@ -341,6 +371,46 @@ mod tests {
         assert_eq!(
             classify_approval_authority("mcp__x__y", Some(&conn_facts("user", None))),
             ApprovalAuthority::Organization
+        );
+    }
+
+    #[test]
+    fn reconcile_prefers_the_stricter_owner() {
+        let alice = Uuid::now_v7();
+        let bob = Uuid::now_v7();
+        // Both org → org.
+        assert_eq!(
+            reconcile_connection_authority(&conn_facts("organization", None), "organization", None),
+            ApprovalAuthority::Organization
+        );
+        // Frozen org but LIVE personal → personal (the stricter): a mislabeled or
+        // since-changed binding can't let a non-owner decide.
+        assert_eq!(
+            reconcile_connection_authority(&conn_facts("organization", None), "user", Some(alice)),
+            ApprovalAuthority::UserConnection {
+                owner_user_id: alice
+            }
+        );
+        // Frozen personal but LIVE org → still personal (the stricter).
+        assert_eq!(
+            reconcile_connection_authority(&conn_facts("user", Some(alice)), "organization", None),
+            ApprovalAuthority::UserConnection {
+                owner_user_id: alice
+            }
+        );
+        // Both personal, agree → that owner.
+        assert_eq!(
+            reconcile_connection_authority(&conn_facts("user", Some(alice)), "user", Some(alice)),
+            ApprovalAuthority::UserConnection {
+                owner_user_id: alice
+            }
+        );
+        // Both personal, DIFFERENT owners → the frozen (bound) owner wins.
+        assert_eq!(
+            reconcile_connection_authority(&conn_facts("user", Some(alice)), "user", Some(bob)),
+            ApprovalAuthority::UserConnection {
+                owner_user_id: alice
+            }
         );
     }
 

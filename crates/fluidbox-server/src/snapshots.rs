@@ -49,7 +49,22 @@ pub async fn photograph_connection(
             .await
             .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let tools_json = serde_json::to_value(&tools)?;
+    // R3.3: reject a surface whose SERIALIZED size exceeds the same 2 MiB ceiling
+    // fluidbox-core enforces on bundle definitions — a snapshot is frozen into
+    // every bound run's RunSpec jsonb. (The discovery rpc path also caps the
+    // upstream Content-Length before buffering; full streaming caps are Phase E.)
+    let serialized_len = tools_json.to_string().len();
+    if serialized_len > fluidbox_core::capability::MAX_DEFINITION_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "discovered tool snapshot is {serialized_len} bytes serialized (max {}) — the server advertises too large a surface",
+            fluidbox_core::capability::MAX_DEFINITION_BYTES
+        )));
+    }
     let digest = tools_digest(&tools);
+    // The generation guard lives in the INSERT (it fires only when the connection
+    // is still at `conn.authorization_generation`); a concurrent reconnect that
+    // moved the generation, or a concurrent refresh that already took the next
+    // version, both map to one actionable retry error (R1.7).
     let row = fluidbox_db::insert_connection_tool_snapshot(
         &state.pool,
         scope,
@@ -59,8 +74,27 @@ pub async fn photograph_connection(
         &tools_json,
         &digest,
     )
-    .await?;
+    .await
+    .map_err(map_snapshot_insert_err)?;
     Ok(row)
+}
+
+/// A snapshot INSERT can fail two ways that both mean "a concurrent
+/// reauthorization/refresh moved things underneath discovery — retry" (R1.7):
+/// `RowNotFound` (the generation guard saw the connection had already left the
+/// captured generation) and a unique-violation on
+/// (tenant, connection, snapshot_version) (a racing refresh already claimed the
+/// next version). Everything else propagates unchanged.
+fn map_snapshot_insert_err(e: sqlx::Error) -> ApiError {
+    let stale = matches!(&e, sqlx::Error::RowNotFound)
+        || e.as_database_error()
+            .map(|d| d.is_unique_violation())
+            .unwrap_or(false);
+    if stale {
+        ApiError::Conflict("connection was reauthorized during discovery — retry refresh".into())
+    } else {
+        ApiError::from(e)
+    }
 }
 
 /// Wrap a photograph failure as a "connection rolled back" message. The

@@ -1059,9 +1059,15 @@ pub async fn update_connection_oauth(
 }
 
 /// The callback exchange completing: seal the rotating refresh token into
-/// `credential_sealed` (the SAME custody column static bearers use) and
-/// flip the connection live. Works from pending (first connect) and error
-/// (reconnect after invalid_grant) alike.
+/// `credential_sealed` (the SAME custody column static bearers use), flip the
+/// connection live, and — atomically in the SAME UPDATE — bump the authorization
+/// generation when `bump_generation` is set (a reconnect: the account/issuer/
+/// audience may have changed, so any in-flight run bound to the old generation
+/// must fail closed; design :294-296). Doing the activate + bump as ONE write
+/// closes the crash window a sequential activate-then-bump left open, where a
+/// reconnected grant could serve the OLD generation. Works from pending (first
+/// connect, `bump_generation = false`) and error (reconnect) alike. The returned
+/// row carries the FINAL generation the caller caches under.
 pub async fn activate_connection_oauth(
     pool: &PgPool,
     scope: TenantScope,
@@ -1069,11 +1075,15 @@ pub async fn activate_connection_oauth(
     sealed_refresh: &[u8],
     oauth: &Value,
     granted_scopes: &Value,
+    bump_generation: bool,
 ) -> sqlx::Result<Option<IntegrationConnectionRow>> {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update integration_connections
          set credential_sealed = $2, oauth = $3, granted_scopes = $4,
-             status = 'active', updated_at = now()
+             status = 'active',
+             authorization_generation =
+                 authorization_generation + case when $6 then 1 else 0 end,
+             updated_at = now()
          where id = $1 and status <> 'revoked' and auth_kind = 'oauth' and tenant_id = $5
          returning {CONNECTION_COLS}"
     )))
@@ -1082,26 +1092,35 @@ pub async fn activate_connection_oauth(
     .bind(oauth)
     .bind(granted_scopes)
     .bind(scope.tenant_id())
+    .bind(bump_generation)
     .fetch_optional(pool)
     .await
 }
 
 /// Refresh-token rotation: one atomic overwrite (OAuth 2.1 MUST — old token
-/// is gone the moment the new one lands). Active connections only; returns
-/// false when the row was revoked/errored underneath the caller.
+/// is gone the moment the new one lands). Active connections only, and ONLY
+/// while the connection is still at `expected_generation` — a concurrent
+/// reconnect that bumped the generation (and landed a NEW refresh token) must
+/// NOT be clobbered by an in-flight refresh rotating the OLD grant's token
+/// (that would restore a superseded grant). Returns false when the row was
+/// revoked/errored OR reauthorized (generation moved) underneath the caller;
+/// the refresh path treats a false as a stale mint and fails closed.
 pub async fn rotate_connection_refresh(
     pool: &PgPool,
     scope: TenantScope,
     id: Uuid,
     sealed_new: &[u8],
+    expected_generation: i32,
 ) -> sqlx::Result<bool> {
     let r = sqlx::query(
         "update integration_connections set credential_sealed = $2, updated_at = now()
-         where id = $1 and status = 'active' and auth_kind = 'oauth' and tenant_id = $3",
+         where id = $1 and status = 'active' and auth_kind = 'oauth' and tenant_id = $3
+           and authorization_generation = $4",
     )
     .bind(id)
     .bind(sealed_new)
     .bind(scope.tenant_id())
+    .bind(expected_generation)
     .execute(pool)
     .await?;
     Ok(r.rows_affected() == 1)
@@ -1194,9 +1213,11 @@ pub struct ConnectionToolSnapshotRow {
 
 /// Append a new snapshot (version = max+1 within (tenant, connection), exactly
 /// like a bundle version). Executor-generic so it can run inside a caller's
-/// transaction. The `exists` guard proves the connection is in scope — a
-/// cross-tenant connection_id yields RowNotFound (the composite FK is the
-/// backstop).
+/// transaction. The `exists` guard proves the connection is in scope AND still
+/// at `authorization_generation` — a cross-tenant connection_id OR one whose
+/// generation moved since discovery began (a concurrent reconnect) yields
+/// RowNotFound, so a snapshot never lands stamped at a generation the connection
+/// has already left (design :294-296, :306). The composite FK is the backstop.
 pub async fn insert_connection_tool_snapshot<'e, E>(
     exec: E,
     scope: TenantScope,
@@ -1218,7 +1239,8 @@ where
                      where s.tenant_id = $2 and s.connection_id = $3), 0) + 1,
            $4, $5, $6, $7
          where exists (select 1 from integration_connections c
-                       where c.id = $3 and c.tenant_id = $2)
+                       where c.id = $3 and c.tenant_id = $2
+                         and c.authorization_generation = $4)
          returning *",
     )
     .bind(Uuid::now_v7())
@@ -6073,11 +6095,11 @@ mod tests {
             Some(b"sealed-client-secret".as_slice())
         );
         // Rotation refuses non-active rows.
-        assert!(!rotate_connection_refresh(&pool, scope, conn.id, b"rt1")
+        assert!(!rotate_connection_refresh(&pool, scope, conn.id, b"rt1", 1)
             .await
             .unwrap());
 
-        // Callback exchange: seal refresh + activate.
+        // Callback exchange: seal refresh + activate. First connect ⇒ no bump.
         let row = activate_connection_oauth(
             &pool,
             scope,
@@ -6085,11 +6107,16 @@ mod tests {
             b"sealed-rt-1",
             &serde_json::json!({"resource": "https://mcp.example.test", "client_id": "c1"}),
             &serde_json::json!(["read"]),
+            false,
         )
         .await
         .unwrap()
         .unwrap();
         assert_eq!(row.status, "active");
+        assert_eq!(
+            row.authorization_generation, 1,
+            "first activation stays generation 1 (no bump)"
+        );
         assert_eq!(
             connection_credential_sealed(&pool, scope, conn.id)
                 .await
@@ -6098,9 +6125,10 @@ mod tests {
             Some(b"sealed-rt-1".as_slice())
         );
 
-        // Rotation is one atomic overwrite; the old bytes are gone.
+        // Rotation is one atomic overwrite AT the current generation; the old
+        // bytes are gone.
         assert!(
-            rotate_connection_refresh(&pool, scope, conn.id, b"sealed-rt-2")
+            rotate_connection_refresh(&pool, scope, conn.id, b"sealed-rt-2", 1)
                 .await
                 .unwrap()
         );
@@ -6110,6 +6138,14 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some(b"sealed-rt-2".as_slice())
+        );
+        // A rotation naming a stale (moved) generation is refused (R3.2): the
+        // grant was reauthorized underneath the in-flight refresh.
+        assert!(
+            !rotate_connection_refresh(&pool, scope, conn.id, b"sealed-rt-stale", 999)
+                .await
+                .unwrap(),
+            "rotation at a superseded generation must fail closed"
         );
 
         // invalid_grant ⇒ error: the credential reader fails closed; the
@@ -6131,7 +6167,8 @@ mod tests {
             .unwrap()
             .is_none());
 
-        // Reconnect path: activation works FROM error too.
+        // Reconnect path: activation works FROM error too, and bumps the
+        // generation atomically (R1.3+R3.1) — the reconnect may be a new grant.
         let row = activate_connection_oauth(
             &pool,
             scope,
@@ -6139,11 +6176,16 @@ mod tests {
             b"sealed-rt-3",
             &serde_json::json!({"resource": "https://mcp.example.test"}),
             &serde_json::json!([]),
+            true,
         )
         .await
         .unwrap()
         .unwrap();
         assert_eq!(row.status, "active");
+        assert_eq!(
+            row.authorization_generation, 2,
+            "reconnect bumps the generation in the same atomic activation"
+        );
 
         sqlx::query("delete from integration_connections where id = $1")
             .bind(conn.id)
@@ -6962,6 +7004,379 @@ mod tests {
             sub_b_after.pinned_revision_id,
             Some(latest_b.id),
             "agent B's subscription repointed to its converted revision"
+        );
+    }
+
+    /// Migration 0013 appendix — per-source-revision conversion + keep-list
+    /// preserving repoints (R1.1/R1.2). Covers: (i) a subscription pinned to an
+    /// OLDER brokered revision gets a copy carrying THAT revision's model/prompt
+    /// while the latest converts separately; (ii) a sandbox-only latest above a
+    /// pinned brokered old revision converts the pinned source yet the sandbox
+    /// latest stays `latest`; (iii) a restrictive keep-list narrows the derived
+    /// requirements; (iv) an empty keep-list ⇒ zero requirements; (v) idempotence.
+    #[tokio::test]
+    async fn convert_legacy_bundles_per_source_revision_and_keep_lists() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let slug = format!("t-{}", Uuid::now_v7().simple());
+        let org = identity::create_org(&pool, &slug, None).await.unwrap();
+        let scope = TenantScope::assume(org.id);
+
+        let gh_url = "https://mcp.github.test/mcp";
+        let stripe_url = "https://mcp.stripe.test/mcp";
+        let q_url = "https://mcp.q.test/mcp";
+
+        let brok_def = |srv: &str, url: &str, tool: &str| {
+            serde_json::json!({ "servers": [
+                { "class": "brokered", "name": srv, "url": url, "tools": [
+                    { "name": tool, "description": "d", "input_schema": {"type": "object"} } ] } ] })
+        };
+        let sand_def = |srv: &str| {
+            serde_json::json!({ "servers": [
+                { "class": "sandbox", "name": srv, "command": "node", "args": ["/x.mjs"], "tools": [
+                    { "name": "t", "description": "d", "input_schema": {"type": "object"} } ] } ] })
+        };
+        let pin = |b: &CapabilityBundleRow| serde_json::json!({ "id": b.id, "name": b.name, "version": b.version });
+        let policy = upsert_policy(
+            &pool,
+            scope,
+            "psr-policy",
+            "name: psr",
+            &serde_json::json!({ "name": "psr" }),
+        )
+        .await
+        .unwrap();
+        let mk_rev = |agent_id: Uuid, model: &'static str, prompt: &'static str, pins: Value| {
+            let pool = pool.clone();
+            let pid = policy.id;
+            async move {
+                append_agent_revision(
+                    &pool,
+                    scope,
+                    agent_id,
+                    "claude-agent-sdk",
+                    "img:test",
+                    model,
+                    Some(prompt),
+                    pid,
+                    &serde_json::json!({ "wall_clock_secs": 60 }),
+                    None,
+                    &pins,
+                    &serde_json::json!([]),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let mk_sub = |agent_id: Uuid, name: &'static str, rev: Uuid, keep: Option<Value>| {
+            let pool = pool.clone();
+            async move {
+                create_trigger_subscription(
+                    &pool,
+                    scope,
+                    agent_id,
+                    name,
+                    "api",
+                    Some(rev),
+                    Some("t"),
+                    false,
+                    false,
+                    None,
+                    "allow",
+                    None,
+                    None,
+                    &serde_json::json!([]),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    keep.as_ref(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // ── Agent P: OLDER brokered rev1 (model p-old) + brokered-narrower latest
+        // rev2 (model p-new); four subscriptions pinned to rev1 exercising NULL /
+        // dedup / restrictive / empty keep-lists. ──
+        let gh_b = create_capability_bundle(
+            &pool,
+            scope,
+            "gh-bundle",
+            None,
+            &brok_def("github", gh_url, "get_pr"),
+            "sha256:gh",
+        )
+        .await
+        .unwrap();
+        let stripe_b = create_capability_bundle(
+            &pool,
+            scope,
+            "stripe-bundle",
+            None,
+            &brok_def("stripe", stripe_url, "charge"),
+            "sha256:st",
+        )
+        .await
+        .unwrap();
+        let agent_p = create_agent(&pool, scope, "psr-agent-p", None)
+            .await
+            .unwrap();
+        let p_rev1 = mk_rev(
+            agent_p.id,
+            "p-old",
+            "old-prompt",
+            serde_json::json!([pin(&gh_b), pin(&stripe_b)]),
+        )
+        .await;
+        let p_rev2 = mk_rev(
+            agent_p.id,
+            "p-new",
+            "new-prompt",
+            serde_json::json!([pin(&gh_b)]),
+        )
+        .await;
+        let sub_full = mk_sub(agent_p.id, "sub-full", p_rev1.id, None).await;
+        let sub_full2 = mk_sub(agent_p.id, "sub-full2", p_rev1.id, None).await;
+        let sub_gh = mk_sub(
+            agent_p.id,
+            "sub-gh",
+            p_rev1.id,
+            Some(serde_json::json!(["gh-bundle"])),
+        )
+        .await;
+        let sub_empty = mk_sub(
+            agent_p.id,
+            "sub-empty",
+            p_rev1.id,
+            Some(serde_json::json!([])),
+        )
+        .await;
+
+        // ── Agent Q: OLDER brokered rev1 (model q-old) + SANDBOX-ONLY latest rev2
+        // (model q-new); one subscription pinned to rev1. ──
+        let q_brok = create_capability_bundle(
+            &pool,
+            scope,
+            "q-brok",
+            None,
+            &brok_def("qsrv", q_url, "q"),
+            "sha256:qb",
+        )
+        .await
+        .unwrap();
+        let q_sand =
+            create_capability_bundle(&pool, scope, "q-sand", None, &sand_def("qs"), "sha256:qs")
+                .await
+                .unwrap();
+        let agent_q = create_agent(&pool, scope, "psr-agent-q", None)
+            .await
+            .unwrap();
+        let q_rev1 = mk_rev(
+            agent_q.id,
+            "q-old",
+            "q-old-prompt",
+            serde_json::json!([pin(&q_brok)]),
+        )
+        .await;
+        let q_rev2 = mk_rev(
+            agent_q.id,
+            "q-new",
+            "q-new-prompt",
+            serde_json::json!([pin(&q_sand)]),
+        )
+        .await;
+        let sub_q = mk_sub(agent_q.id, "sub-q", q_rev1.id, None).await;
+
+        // ── Convert, then re-convert for idempotence (v). ──
+        sqlx::query("select fluidbox_convert_legacy_bundles()")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let p_revs = list_revisions(&pool, scope, agent_p.id).await.unwrap();
+        let p_latest = latest_revision(&pool, scope, agent_p.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let q_revs = list_revisions(&pool, scope, agent_q.id).await.unwrap();
+        let q_latest = latest_revision(&pool, scope, agent_q.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let sub_full_a = get_trigger_subscription(&pool, scope, sub_full.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let sub_full2_a = get_trigger_subscription(&pool, scope, sub_full2.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let sub_gh_a = get_trigger_subscription(&pool, scope, sub_gh.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let sub_empty_a = get_trigger_subscription(&pool, scope, sub_empty.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let sub_q_a = get_trigger_subscription(&pool, scope, sub_q.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Idempotence: a second run appends nothing and moves no pin.
+        sqlx::query("select fluidbox_convert_legacy_bundles()")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let p_revs2 = list_revisions(&pool, scope, agent_p.id).await.unwrap();
+        let q_revs2 = list_revisions(&pool, scope, agent_q.id).await.unwrap();
+        let p_latest2 = latest_revision(&pool, scope, agent_p.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let sub_full_b = get_trigger_subscription(&pool, scope, sub_full.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Snapshot the row a subscription now points at (by id) BEFORE cleanup.
+        let rev_of = |revs: &[AgentRevisionRow], id: Option<Uuid>| {
+            revs.iter().find(|r| Some(r.id) == id).cloned()
+        };
+        let full_copy = rev_of(&p_revs, sub_full_a.pinned_revision_id).unwrap();
+        let gh_copy = rev_of(&p_revs, sub_gh_a.pinned_revision_id).unwrap();
+        let empty_copy = rev_of(&p_revs, sub_empty_a.pinned_revision_id).unwrap();
+        let q_copy = rev_of(&q_revs, sub_q_a.pinned_revision_id).unwrap();
+
+        for stmt in [
+            "delete from trigger_subscriptions where tenant_id = $1",
+            "delete from agent_revisions where agent_id in (select id from agents where tenant_id = $1)",
+            "delete from agents where tenant_id = $1",
+            "delete from capability_bundles where tenant_id = $1",
+            "delete from policies where tenant_id = $1",
+        ] {
+            sqlx::query(stmt).bind(org.id).execute(&pool).await.unwrap();
+        }
+        sqlx::query("delete from tenants where id = $1")
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let gh_req = serde_json::json!({ "slot": "github",
+            "connector": { "url": gh_url, "slug": null },
+            "required_tools": ["get_pr"], "binding_mode": "organization" });
+        let stripe_req = serde_json::json!({ "slot": "stripe",
+            "connector": { "url": stripe_url, "slug": null },
+            "required_tools": ["charge"], "binding_mode": "organization" });
+        let qsrv_req = serde_json::json!({ "slot": "qsrv",
+            "connector": { "url": q_url, "slug": null },
+            "required_tools": ["q"], "binding_mode": "organization" });
+
+        // (i) the latest converts SEPARATELY with the NEW model + full (single) req;
+        // the subscription copy carries the OLDER revision's model/prompt.
+        assert_eq!(
+            p_latest.model, "p-new",
+            "latest is the converted NEW revision"
+        );
+        assert_ne!(
+            p_latest.id, p_rev2.id,
+            "the latest is the CONVERTED copy of rev2, not the original brokered rev2"
+        );
+        assert_eq!(p_latest.system_prompt.as_deref(), Some("new-prompt"));
+        assert_eq!(
+            p_latest.connection_requirements,
+            serde_json::json!([gh_req]),
+            "latest's full derivation keeps only github (rev2 pinned gh only)"
+        );
+        assert_eq!(
+            full_copy.model, "p-old",
+            "sub copy carries the OLD revision's model"
+        );
+        assert_eq!(full_copy.system_prompt.as_deref(), Some("old-prompt"));
+        assert_eq!(
+            full_copy.connection_requirements,
+            serde_json::json!([gh_req, stripe_req]),
+            "NULL keep-list ⇒ both brokered servers become requirements"
+        );
+
+        // dedup: two NULL-keep subs pinning the same old source share ONE copy.
+        assert_eq!(
+            sub_full_a.pinned_revision_id, sub_full2_a.pinned_revision_id,
+            "subscriptions sharing (source, requirements) share one converted copy"
+        );
+
+        // (iii) restrictive keep-list ⇒ ONLY github; (iv) empty keep-list ⇒ none.
+        assert_eq!(gh_copy.model, "p-old");
+        assert_eq!(
+            gh_copy.connection_requirements,
+            serde_json::json!([gh_req]),
+            "keep-list ['gh-bundle'] ⇒ ONLY github survives as a requirement"
+        );
+        assert_ne!(
+            sub_gh_a.pinned_revision_id, sub_full_a.pinned_revision_id,
+            "the narrowed sub gets its OWN copy, distinct from the full one"
+        );
+        assert_eq!(empty_copy.model, "p-old");
+        assert_eq!(
+            empty_copy.connection_requirements,
+            serde_json::json!([]),
+            "empty keep-list ⇒ zero requirements (removed authority not regained)"
+        );
+
+        // (ii) sandbox-only latest stays latest (its content untouched); the
+        // pinned OLD brokered source still converts for the subscription.
+        assert_eq!(
+            q_latest.id, q_rev2.id,
+            "sandbox-only latest stays the latest"
+        );
+        assert_eq!(q_latest.model, "q-new");
+        assert_eq!(
+            q_latest.capability_bundles,
+            serde_json::json!([pin(&q_sand)]),
+            "the sandbox-only latest is untouched (still its own sandbox pin)"
+        );
+        assert_ne!(
+            sub_q_a.pinned_revision_id,
+            Some(q_rev1.id),
+            "sub_q repointed off the legacy rev"
+        );
+        assert_ne!(sub_q_a.pinned_revision_id, Some(q_rev2.id));
+        assert_eq!(
+            q_copy.model, "q-old",
+            "sub_q's copy carries the OLD revision model"
+        );
+        assert_eq!(
+            q_copy.connection_requirements,
+            serde_json::json!([qsrv_req]),
+            "the pinned brokered source converted for the subscription"
+        );
+
+        // (v) idempotence: no second-run appends, no pin moved.
+        assert_eq!(
+            p_revs2.len(),
+            p_revs.len(),
+            "agent P: second run appends nothing"
+        );
+        assert_eq!(
+            q_revs2.len(),
+            q_revs.len(),
+            "agent Q: second run appends nothing"
+        );
+        assert_eq!(
+            p_latest2.id, p_latest.id,
+            "agent P latest unchanged on re-run"
+        );
+        assert_eq!(
+            sub_full_b.pinned_revision_id, sub_full_a.pinned_revision_id,
+            "pin stable on re-run"
         );
     }
 
@@ -8149,6 +8564,19 @@ mod tests {
             &[bad_none],
         )
         .await;
+        // R1.5 FK negative: an mcp binding naming a NONEXISTENT snapshot version is
+        // refused by the composite (tenant, connection, snapshot_version) FK.
+        let mut bad_snap = mcp_binding.clone();
+        bad_snap.id = Uuid::now_v7();
+        bad_snap.requirement_slot = "fk-snap".into();
+        bad_snap.snapshot_version = Some(999);
+        let fk_snapshot = insert_run_resource_bindings(
+            &mut pool.acquire().await.unwrap(),
+            scope_a,
+            session.id,
+            &[bad_snap],
+        )
+        .await;
 
         cleanup_orgs(
             &pool,
@@ -8192,6 +8620,169 @@ mod tests {
             shape_c.is_err(),
             "none authority with a connection_id rejected"
         );
+        assert!(
+            fk_snapshot.is_err(),
+            "mcp binding naming a nonexistent snapshot version rejected (R1.5 FK)"
+        );
+    }
+
+    /// R1.8: `create_session` writes the session, its resource bindings, AND its
+    /// idempotency-claim bind in ONE transaction — a CHECK-violating binding must
+    /// roll ALL of it back: no session, no binding, and the claim stays unbound.
+    #[tokio::test]
+    async fn create_session_rolls_back_on_check_violating_binding() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let slug = format!("t-{}", Uuid::now_v7().simple());
+        let org = identity::create_org(&pool, &slug, None).await.unwrap();
+        let scope = TenantScope::assume(org.id);
+
+        let policy = upsert_policy(
+            &pool,
+            scope,
+            "rb2",
+            "name: rb2",
+            &serde_json::json!({"name":"rb2"}),
+        )
+        .await
+        .unwrap();
+        let agent = create_agent(&pool, scope, "rb2-agent", None).await.unwrap();
+        let rev = append_agent_revision(
+            &pool,
+            scope,
+            agent.id,
+            "claude-agent-sdk",
+            "img:test",
+            "claude-haiku-4-5",
+            None,
+            policy.id,
+            &serde_json::json!({}),
+            None,
+            &serde_json::json!([]),
+            &serde_json::json!([]),
+        )
+        .await
+        .unwrap();
+        let sub = create_trigger_subscription(
+            &pool,
+            scope,
+            agent.id,
+            "rb2-sub",
+            "api",
+            Some(rev.id),
+            Some("t"),
+            false,
+            false,
+            None,
+            "allow",
+            None,
+            None,
+            &serde_json::json!([]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let InvocationClaim::Claimed { invocation_id } =
+            claim_invocation(&pool, scope, sub.id, "idem-rollback", "digest")
+                .await
+                .unwrap()
+        else {
+            panic!("expected a fresh claim");
+        };
+
+        // authority_kind 'none' but carrying an authority_generation → violates
+        // run_resource_bindings_authority_shape (no FK involved: all ids null).
+        let bad = NewRunResourceBinding {
+            id: Uuid::now_v7(),
+            requirement_slot: "x".into(),
+            slot_kind: "workspace_fetch".into(),
+            authority_kind: "none".into(),
+            connection_id: None,
+            subscription_id: None,
+            authority_generation: Some(1),
+            connection_owner_type: None,
+            connection_owner_user_id: None,
+            snapshot_version: None,
+            effective_tools_json: None,
+            effective_tools_digest: None,
+            resource_scope: serde_json::json!({}),
+            resolved_by_principal_kind: "system".into(),
+            resolved_by_principal_id: None,
+            binding_mode: "organization".into(),
+        };
+        let result = create_session(
+            &pool,
+            scope,
+            agent.id,
+            rev.id,
+            "supervised",
+            "trusted",
+            "rollback",
+            &serde_json::json!({"kind":"none"}),
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            None,
+            None,
+            None,
+            Some(invocation_id),
+            None,
+            &[bad],
+        )
+        .await;
+
+        let sessions: i64 = sqlx::query_scalar(
+            "select count(*) from sessions where tenant_id = $1 and agent_id = $2",
+        )
+        .bind(org.id)
+        .bind(agent.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let bindings: i64 =
+            sqlx::query_scalar("select count(*) from run_resource_bindings where tenant_id = $1")
+                .bind(org.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let claim_session: Option<Uuid> =
+            sqlx::query_scalar("select session_id from trigger_invocations where id = $1")
+                .bind(invocation_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        for stmt in [
+            "delete from trigger_invocations where subscription_id in (select id from trigger_subscriptions where tenant_id = $1)",
+            "delete from trigger_subscriptions where tenant_id = $1",
+            "delete from run_resource_bindings where tenant_id = $1",
+            "delete from sessions where tenant_id = $1",
+            "delete from agent_revisions where agent_id in (select id from agents where tenant_id = $1)",
+            "delete from agents where tenant_id = $1",
+            "delete from policies where tenant_id = $1",
+        ] {
+            sqlx::query(stmt).bind(org.id).execute(&pool).await.unwrap();
+        }
+        sqlx::query("delete from tenants where id = $1")
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_err(),
+            "create_session must fail on a CHECK-violating binding"
+        );
+        assert_eq!(sessions, 0, "no session row committed");
+        assert_eq!(bindings, 0, "no binding row committed");
+        assert_eq!(claim_session, None, "the idempotency claim stays unbound");
     }
 
     /// Custom catalog entries land tenant-scoped, are invisible to another org,

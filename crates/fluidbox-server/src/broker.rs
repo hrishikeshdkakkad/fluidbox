@@ -26,6 +26,13 @@ const MAX_LIST_PAGES: usize = 4;
 /// Result payloads larger than this are replaced by a truncated text block
 /// — the ledger stores only digests either way.
 const MAX_RESULT_BYTES: usize = 256 * 1024;
+/// Hard ceiling on an MCP response we will buffer: a server advertising a
+/// Content-Length over this is refused BEFORE the body is read into memory
+/// (R3.3). A chunked response without Content-Length slips this pre-check —
+/// full streaming caps are Phase E; `cap_content` still truncates tool results
+/// after the fact, and discovery re-validates the whole surface against
+/// fluidbox-core's 2 MiB serialized ceiling.
+const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// A resolved outbound credential: which header to set, its full value, and
 /// — for OAuth connections — the connection whose access token can be
@@ -209,6 +216,64 @@ pub async fn recheck_binding(
     recheck_binding_pool(&state.pool, scope, binding).await
 }
 
+/// Revalidate the RUN's invoking authority (design `:716-717`), which is
+/// ORTHOGONAL to the binding's own connection/secret authority: a run bound to a
+/// still-valid org connection may nonetheless have been started by a user since
+/// deactivated, or by a subscription since disabled/deleted. Applied at the same
+/// seam as [`recheck_binding`] (and by the signed-webhook publish path, which
+/// carries no connection authority to recheck) so EVERY credentialed use fails
+/// closed on a revoked invoker.
+///
+/// The invoking principal is read straight off the binding row: `create_run`
+/// stamps `resolved_by_principal_id` with the invoking USER's id for `user` runs
+/// and the acting SUBSCRIPTION's id for `trigger`/`schedule`/`webhook` runs
+/// (run_service.rs `:300-305`), so no session/trigger-context lookup is needed —
+/// the minimal correct source. `operator` (break-glass admin) and `system`
+/// (worker) hold no revocable membership/subscription and pass.
+pub(crate) async fn recheck_invoking_authority(
+    pool: &sqlx::PgPool,
+    scope: fluidbox_db::TenantScope,
+    principal_kind: &str,
+    principal_id: Option<&str>,
+) -> Result<(), String> {
+    match principal_kind {
+        "user" => {
+            let uid = principal_id
+                .and_then(|s| s.parse::<uuid::Uuid>().ok())
+                .ok_or("run's invoking user id is missing or malformed")?;
+            let active = fluidbox_db::identity::get_membership_by_user(pool, scope, uid)
+                .await
+                .map_err(|e| format!("invoking-user membership lookup failed: {e}"))?
+                .is_some_and(|m| m.status == "active");
+            if !active {
+                return Err(
+                    "the run's invoking user is no longer an active member — its authority is revoked".into(),
+                );
+            }
+            Ok(())
+        }
+        "trigger" | "schedule" | "webhook" => {
+            let sid = principal_id
+                .and_then(|s| s.parse::<uuid::Uuid>().ok())
+                .ok_or("run's invoking subscription id is missing or malformed")?;
+            let sub = fluidbox_db::get_trigger_subscription(pool, scope, sid)
+                .await
+                .map_err(|e| format!("invoking-subscription lookup failed: {e}"))?
+                .ok_or(
+                    "the run's invoking subscription no longer exists — its authority is revoked",
+                )?;
+            if !sub.enabled {
+                return Err(
+                    "the run's invoking subscription is disabled — its authority is revoked".into(),
+                );
+            }
+            Ok(())
+        }
+        // operator / system: no revocable membership or subscription to check.
+        _ => Ok(()),
+    }
+}
+
 /// Pool-based core of [`recheck_binding`] — the public fn (fixed to take
 /// `&AppState` by the Phase C plan) only unwraps `state.pool`. Split out so the
 /// matrix DB tests drive it without an `AppState` (matching `bindings.rs`).
@@ -222,6 +287,15 @@ async fn recheck_binding_pool(
     if binding.tenant_id != scope.tenant_id() {
         return Err("run resource binding belongs to a different tenant".into());
     }
+    // R2.2: the run's INVOKING authority must still be valid — orthogonal to the
+    // connection authority below and checked before any secret access.
+    recheck_invoking_authority(
+        pool,
+        scope,
+        &binding.resolved_by_principal_kind,
+        binding.resolved_by_principal_id.as_deref(),
+    )
+    .await?;
     let cid = binding
         .connection_id
         .ok_or("run resource binding has no connection authority to recheck")?;
@@ -241,6 +315,18 @@ async fn recheck_binding_pool(
     if conn.authorization_generation != expected_generation {
         return Err(format!(
             "connection {} was reauthorized after this run started — its binding is stale",
+            conn.id
+        ));
+    }
+    // R1.4(a): the connection's owner fields are immutable in v1, so the fresh
+    // row MUST still match the owner the binding froze. A divergence is
+    // corruption (or a would-be ownership swap) — fail closed rather than serve
+    // a credential under a different owner than the run authorized.
+    if conn.owner_type != binding.connection_owner_type.as_deref().unwrap_or_default()
+        || conn.owner_user_id != binding.connection_owner_user_id
+    {
+        return Err(format!(
+            "connection {} ownership changed since this run bound it — its binding is stale",
             conn.id
         ));
     }
@@ -364,6 +450,14 @@ async fn post_rpc(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.contains("event-stream"))
         .unwrap_or(false);
+    // R3.3: refuse an over-large advertised body BEFORE buffering it in memory.
+    if let Some(len) = res.content_length() {
+        if len > MAX_RESPONSE_BYTES {
+            return Err(format!(
+                "mcp response advertises {len} bytes, over the {MAX_RESPONSE_BYTES}-byte cap"
+            ));
+        }
+    }
     let text = res
         .text()
         .await
@@ -758,11 +852,16 @@ pub async fn call_tool_auth(
 /// Execute one brokered tool against a run resource binding's connection (the
 /// Phase C path). The caller has ALREADY run [`recheck_binding`] on this exact
 /// connection immediately before — so the credential resolved here rides an
-/// authority just verified live (status + generation + owner membership). The
+/// authority just verified live (status + generation + owner + invoker). The
 /// counterpart to [`call_tool_auth`], but the credential comes from a connection
 /// row + an explicit endpoint (the binding's frozen surface url) rather than a
 /// `CapabilityServer::Brokered`. Same single reactive-401 retry: OAuth re-mints
 /// once (a 401 proves the tool never executed); a static credential is terminal.
+///
+/// R2.5 / invariant 9: the retry is a SECOND upstream call, so it RE-runs
+/// [`recheck_binding`] before re-minting — a revoke/reauthorize/deactivate that
+/// lands between the first call and the 401 fails the retry closed. It re-mints
+/// against the FRESH connection row the recheck returns.
 pub async fn call_tool_for_conn(
     state: &AppState,
     scope: fluidbox_db::TenantScope,
@@ -770,11 +869,13 @@ pub async fn call_tool_for_conn(
     url: &str,
     tool: &str,
     arguments: &Value,
+    binding: &fluidbox_db::RunResourceBindingRow,
 ) -> Result<(Value, bool), String> {
     let auth = brokered_auth_for_conn(state, scope, conn, url).await?;
     match call_tool(state, url, auth.as_ref(), tool, arguments).await {
         Err(CallErr::Unauthorized) => {
-            let auth = reauth_after_401_conn(state, scope, conn, url, auth).await?;
+            let fresh = recheck_binding(state, scope, binding).await?;
+            let auth = reauth_after_401_conn(state, scope, &fresh, url, auth).await?;
             call_tool(state, url, auth.as_ref(), tool, arguments)
                 .await
                 .map_err(CallErr::into_msg)
@@ -1054,7 +1155,11 @@ mod tests {
             effective_tools_json: None,
             effective_tools_digest: None,
             resource_scope: serde_json::json!({}),
-            resolved_by_principal_kind: "user".into(),
+            // `operator` invoker: the invoking-authority recheck (R2.2) is a
+            // no-op for operator/system, so this matrix stays focused on the
+            // CONNECTION-authority checks. A dedicated test below drives the
+            // user/subscription invoker paths.
+            resolved_by_principal_kind: "operator".into(),
             resolved_by_principal_id: None,
             binding_mode: "invoking_user".into(),
             created_at: Utc::now(),
@@ -1168,5 +1273,153 @@ mod tests {
             .expect_err("deactivated owner")
             .contains("membership is not active"));
         assert!(non_active.expect_err("non active").contains("revoked"));
+    }
+
+    // ── invoking-authority recheck (R2.2): a run bound to a VALID org connection
+    // still fails closed when its invoking user was deactivated or its invoking
+    // subscription was disabled/deleted. The connection authority is held
+    // constant (a live org connection) so the only variable is the invoker.
+    #[tokio::test]
+    async fn recheck_binding_refuses_revoked_invoker() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
+            .await
+            .unwrap();
+        let scope = TenantScope::assume(org.id);
+
+        let conn = seed_conn(&pool, scope, ConnectionOwner::Organization, "Org").await;
+        let gen = conn.authorization_generation;
+        let member = seed_user(&pool, scope, "member@test.dev", true).await;
+        let gone = seed_user(&pool, scope, "gone@test.dev", true).await;
+
+        // A subscription to invoke under (needs agent + policy + revision).
+        let policy = fluidbox_db::upsert_policy(
+            &pool,
+            scope,
+            "inv-pol",
+            "name: inv",
+            &serde_json::json!({"name":"inv"}),
+        )
+        .await
+        .unwrap();
+        let agent = fluidbox_db::create_agent(&pool, scope, "inv-agent", None)
+            .await
+            .unwrap();
+        let rev = fluidbox_db::append_agent_revision(
+            &pool,
+            scope,
+            agent.id,
+            "claude-agent-sdk",
+            "img:test",
+            "claude-haiku-4-5",
+            Some("p"),
+            policy.id,
+            &serde_json::json!({}),
+            None,
+            &serde_json::json!([]),
+            &serde_json::json!([]),
+        )
+        .await
+        .unwrap();
+        let sub = fluidbox_db::create_trigger_subscription(
+            &pool,
+            scope,
+            agent.id,
+            "inv-sub",
+            "api",
+            Some(rev.id),
+            Some("t"),
+            false,
+            false,
+            None,
+            "allow",
+            None,
+            None,
+            &serde_json::json!([]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // A connection binding with an overridable invoking principal.
+        let invoker_binding = |kind: &str, id: Option<String>| {
+            let mut b = binding_row(org.id, &conn, gen, "organization", None);
+            b.resolved_by_principal_kind = kind.into();
+            b.resolved_by_principal_id = id;
+            b
+        };
+
+        let user_ok = recheck_binding_pool(
+            &pool,
+            scope,
+            &invoker_binding("user", Some(member.to_string())),
+        )
+        .await;
+        let sub_ok = recheck_binding_pool(
+            &pool,
+            scope,
+            &invoker_binding("trigger", Some(sub.id.to_string())),
+        )
+        .await;
+        let missing_sub = recheck_binding_pool(
+            &pool,
+            scope,
+            &invoker_binding("schedule", Some(Uuid::now_v7().to_string())),
+        )
+        .await;
+
+        sqlx::query("update org_memberships set status = 'deactivated' where tenant_id = $1 and user_id = $2")
+            .bind(org.id)
+            .bind(gone)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let user_revoked = recheck_binding_pool(
+            &pool,
+            scope,
+            &invoker_binding("user", Some(gone.to_string())),
+        )
+        .await;
+
+        fluidbox_db::set_trigger_subscription_enabled(&pool, scope, sub.id, false)
+            .await
+            .unwrap();
+        let sub_disabled = recheck_binding_pool(
+            &pool,
+            scope,
+            &invoker_binding("webhook", Some(sub.id.to_string())),
+        )
+        .await;
+
+        for stmt in [
+            "delete from trigger_subscriptions where tenant_id = $1",
+            "delete from agent_revisions where agent_id in (select id from agents where tenant_id = $1)",
+            "delete from agents where tenant_id = $1",
+            "delete from policies where tenant_id = $1",
+        ] {
+            let _ = sqlx::query(stmt).bind(org.id).execute(&pool).await;
+        }
+        cleanup(&pool, org.id).await;
+
+        assert_eq!(user_ok.expect("active member invoker").id, conn.id);
+        assert_eq!(sub_ok.expect("enabled subscription invoker").id, conn.id);
+        assert!(missing_sub
+            .expect_err("missing subscription")
+            .contains("no longer exists"));
+        assert!(user_revoked
+            .expect_err("deactivated invoker")
+            .contains("no longer an active member"));
+        assert!(sub_disabled
+            .expect_err("disabled subscription")
+            .contains("disabled"));
     }
 }

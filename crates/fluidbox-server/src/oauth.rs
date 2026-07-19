@@ -566,67 +566,104 @@ pub struct CallbackParams {
     pub error_description: Option<String>,
 }
 
-fn page(title: &str, body: &str) -> Html<String> {
-    Html(format!(
-        "<!doctype html><meta charset=\"utf-8\"><title>fluidbox — {title}</title>\
+/// Escape the five HTML metacharacters so an interpolated value can never break
+/// out of text content (or the one inline attribute) into markup (R3.4). Tiny +
+/// local — no new dependency; the callback page below is the sole HTML sink.
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Render the browser-facing callback page. EVERY interpolated dynamic value is
+/// HTML-escaped, and the response carries a strict CSP — `default-src 'none'`
+/// with `style-src 'unsafe-inline'` for the single inline `style` attribute the
+/// page uses — so even a hypothetical escape gap cannot execute script. Only
+/// server-authored, non-secret, non-upstream text ever reaches `body`.
+fn page(status: axum::http::StatusCode, title: &str, body: &str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let html = Html(format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>fluidbox — {t}</title>\
          <body style=\"font-family:system-ui;max-width:38rem;margin:4rem auto;line-height:1.5\">\
-         <h2>{title}</h2><p>{body}</p></body>"
-    ))
+         <h2>{t}</h2><p>{b}</p></body>",
+        t = escape_html(title),
+        b = escape_html(body),
+    ));
+    (
+        status,
+        [(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            "default-src 'none'; style-src 'unsafe-inline'",
+        )],
+        html,
+    )
+        .into_response()
 }
 
 /// `GET /v1/oauth/callback` — THE one stable redirect URI. Unauthenticated
 /// by design (a browser redirect can't carry the admin token); the sealed
 /// `state` parameter is the authentication, and nothing is trusted before
-/// it verifies. Browser-facing: answers HTML, never JSON errors.
+/// it verifies. Browser-facing: answers HTML, never JSON errors. Upstream-
+/// derived text (the AS `error`/`error_description`, MCP discovery errors) is
+/// NEVER reflected — it goes to the server log and the browser sees a generic
+/// line (R3.4).
 pub async fn callback(
     State(state): State<AppState>,
     Query(p): Query<CallbackParams>,
-) -> (axum::http::StatusCode, Html<String>) {
+) -> axum::response::Response {
     use axum::http::StatusCode;
     let Some(sealer_ref) = state.sealer.as_ref() else {
-        return (
+        return page(
             StatusCode::BAD_REQUEST,
-            page(
-                "Connection failed",
-                "FLUIDBOX_CREDENTIAL_KEY is not configured.",
-            ),
+            "Connection failed",
+            "FLUIDBOX_CREDENTIAL_KEY is not configured.",
         );
     };
     let Some(state_param) = p.state.as_deref() else {
-        return (
+        return page(
             StatusCode::BAD_REQUEST,
-            page("Connection failed", "Missing state parameter."),
+            "Connection failed",
+            "Missing state parameter.",
         );
     };
     let (conn_id, verifier) = match open_state(sealer_ref, state_param) {
         Ok(v) => v,
-        Err(e) => return (StatusCode::BAD_REQUEST, page("Connection failed", &e)),
+        Err(e) => return page(StatusCode::BAD_REQUEST, "Connection failed", &e),
     };
     if let Some(err) = &p.error {
+        // The AS `error`/`error_description` are attacker-influenceable (they
+        // ride the redirect query) — log them, show the browser a generic line.
         let desc = p.error_description.as_deref().unwrap_or("");
-        return (
+        tracing::warn!(error = %err, error_description = %desc, "oauth callback: authorization server refused");
+        return page(
             StatusCode::BAD_REQUEST,
-            page(
-                "Authorization refused",
-                &format!("The authorization server answered: {err} {desc}"),
-            ),
+            "Authorization refused",
+            "The authorization server refused the request. You can close this tab and try again.",
         );
     }
     let Some(code) = p.code.as_deref() else {
-        return (
+        return page(
             StatusCode::BAD_REQUEST,
-            page("Connection failed", "Missing authorization code."),
+            "Connection failed",
+            "Missing authorization code.",
         );
     };
     match complete_dance(&state, conn_id, &verifier, code).await {
-        Ok(bundle_note) => (
+        Ok(bundle_note) => page(
             StatusCode::OK,
-            page(
-                "Connected",
-                &format!("The connection is active.{bundle_note} You can close this tab."),
-            ),
+            "Connected",
+            &format!("The connection is active.{bundle_note} You can close this tab."),
         ),
-        Err(e) => (StatusCode::BAD_REQUEST, page("Connection failed", &e)),
+        Err(e) => page(StatusCode::BAD_REQUEST, "Connection failed", &e),
     }
 }
 
@@ -700,7 +737,11 @@ async fn complete_dance(
     let v: Value = res.json().await.unwrap_or(Value::Null);
     if !status.is_success() {
         let err = v["error"].as_str().unwrap_or("unknown_error");
-        return Err(format!("token exchange returned HTTP {status} ({err})"));
+        // AS-derived detail → server log; the browser gets a generic line (R3.4).
+        tracing::warn!(%status, as_error = %err, "oauth callback: token exchange rejected");
+        return Err(
+            "the authorization server rejected the token exchange — reconnect and try again".into(),
+        );
     }
     let access = v["access_token"]
         .as_str()
@@ -727,41 +768,65 @@ async fn complete_dance(
 
     // Whether this is a FIRST connect (pending→active) or a RECONNECT (an
     // ever-activated connection re-consenting) decides the generation bump — so
-    // capture the prior status BEFORE activation flips it.
+    // capture the prior status BEFORE activation flips it. A reconnect may be a
+    // new account/issuer/audience (MCP servers are not obliged to prove
+    // identity), so it bumps the generation and any in-flight run bound to the
+    // old one fails closed (design :294-296).
     let prior_status = conn.status.clone();
+    let bump = prior_status != "pending";
 
-    // Seal + activate (clears a previous error note), then cache the access
-    // token so the photograph below doesn't immediately re-mint.
+    // Seal + activate (clears a previous error note).
     let mut clean = oauth.clone();
     if let Some(o) = clean.as_object_mut() {
         o.remove("error");
     }
-    let activated = fluidbox_db::activate_connection_oauth(
-        &state.pool,
-        scope,
-        conn.id,
-        &sealer_ref.seal(refresh),
-        &clean,
-        &json!(granted),
-    )
-    .await
-    .map_err(|e| format!("activation failed: {e}"))?
-    .ok_or("connection changed state during the exchange")?;
-    state.connector_tokens.lock().await.insert(
-        (conn.id, activated.authorization_generation),
-        (access, Utc::now() + Duration::seconds(expires_in)),
-    );
 
-    // Reconnect of an ever-activated connection ⇒ bump the generation (the
-    // logical account/issuer/audience may have changed and MCP servers are not
-    // obliged to prove identity, so fail closed) and evict every cached token so
-    // the next use re-mints under the new generation. First activation stays
-    // generation 1 (design :294-296).
-    if prior_status != "pending" {
-        fluidbox_db::bump_connection_generation(&state.pool, scope, conn.id)
+    // Serialize the activation against the refresh path (R3.2): acquire the SAME
+    // per-connection in-process mutex + Postgres advisory lock `ensure_access_token`
+    // uses, so a concurrent in-flight refresh rotating the OLD grant's token can
+    // never clobber the NEW grant landing here (which would restore a superseded
+    // grant). Held only across the activation write + cache update; released
+    // BEFORE the photograph, which re-mints under its own lock (a nested acquire
+    // of the same in-process mutex would deadlock).
+    {
+        let lock = {
+            let mut locks = state.oauth_locks.lock().await;
+            locks.entry(conn.id).or_default().clone()
+        };
+        let _guard = lock.lock().await;
+        let mut tx = state
+            .pool
+            .begin()
             .await
-            .map_err(|e| format!("authorization generation bump failed: {e}"))?;
+            .map_err(|e| format!("oauth lock txn failed: {e}"))?;
+        fluidbox_db::acquire_oauth_lock(&mut tx, conn.id)
+            .await
+            .map_err(|e| format!("oauth advisory lock failed: {e}"))?;
+        // The activate + generation bump is ONE atomic UPDATE (R1.3+R3.1): no
+        // crash window where a reconnected grant is active yet still serving the
+        // prior generation. The returned row carries the FINAL generation.
+        let activated = fluidbox_db::activate_connection_oauth(
+            &state.pool,
+            scope,
+            conn.id,
+            &sealer_ref.seal(refresh),
+            &clean,
+            &json!(granted),
+            bump,
+        )
+        .await
+        .map_err(|e| format!("activation failed: {e}"))?
+        .ok_or("connection changed state during the exchange")?;
+        tx.commit().await.ok();
+        // Evict any token cached under a PRIOR generation BEFORE caching the new
+        // one: `invalidate_access` drops every generation for this connection, so
+        // caching must come AFTER the eviction (otherwise it would strand the
+        // fresh entry). Cache under the RETURNED (possibly bumped) generation.
         invalidate_access(state, conn.id).await;
+        state.connector_tokens.lock().await.insert(
+            (conn.id, activated.authorization_generation),
+            (access, Utc::now() + Duration::seconds(expires_in)),
+        );
     }
 
     // Photograph the pending snapshot with the fresh token (Phase C: snapshots,
@@ -784,8 +849,12 @@ async fn complete_dance(
             ))
         }
         Err(e) => {
-            // Status flip → error: pair it with token eviction (custody
-            // discipline), so nothing serves the just-cached token.
+            // Upstream MCP discovery text → server log + the connection's error
+            // note (dashboard is an authorized channel); the unauthenticated
+            // browser callback gets a generic line (R3.4). Status flip → error is
+            // paired with token eviction (custody discipline) so nothing serves
+            // the just-cached token.
+            tracing::warn!(connection = %conn.id, error = %e, "oauth callback: tool discovery failed after authorization");
             fluidbox_db::mark_connection_error(
                 &state.pool,
                 scope,
@@ -795,9 +864,10 @@ async fn complete_dance(
             .await
             .ok();
             invalidate_access(state, conn.id).await;
-            Err(format!(
-                "authorized, but tool discovery failed ({e}) — the connection is marked error; reconnect it"
-            ))
+            Err(
+                "authorized, but tool discovery failed — the connection is marked error; reconnect it"
+                    .into(),
+            )
         }
     }
 }
@@ -957,13 +1027,25 @@ async fn refresh_access_token(
                 scope,
                 conn.id,
                 &sealer_ref.seal(new_refresh),
+                conn.authorization_generation,
             )
             .await
             .map_err(|e| format!("rotation persist failed: {e}"))?
         {
-            return Err("connection changed state during refresh — reconnect it".into());
+            // 0 rows: the connection was revoked/errored OR reauthorized (its
+            // generation moved) beneath this in-flight refresh (R3.2). The token
+            // just minted rides a grant that is no longer current — evict and
+            // fail closed rather than persist a rotated OLD refresh token that
+            // would restore a superseded grant. The caller retries and re-mints
+            // under the new generation.
+            invalidate_access(state, conn.id).await;
+            return Err("connection was reauthorized during refresh — retry".into());
         }
     }
+    // Cache under the generation THIS refresh ran against. If a concurrent
+    // reconnect bumped the generation, this (connection, old-generation) key is
+    // already unreachable to current-generation readers (their cache key carries
+    // the new generation), so a stale entry can never be served.
     state.connector_tokens.lock().await.insert(
         (conn.id, conn.authorization_generation),
         (access.clone(), Utc::now() + Duration::seconds(expires_in)),

@@ -220,7 +220,7 @@ async fn try_deliver(
         .map_err(|e| format!("bad destination: {e}"))?;
     match &dest {
         ResultDestination::SignedWebhook { url, binding_id } => {
-            let digest = deliver_signed_webhook(state, d, session, url, *binding_id).await?;
+            let digest = deliver_signed_webhook(state, d, session, &dest, url, *binding_id).await?;
             Ok((digest, None))
         }
         _ => {
@@ -273,6 +273,10 @@ async fn recheck_publish_binding(
         .await
         .map_err(|e| format!("binding lookup failed: {e}"))?
         .ok_or("result publish binding is missing")?;
+    // R2.3: mechanically verify the loaded binding authorizes THIS delivery
+    // (session + slot kind + connection authority + frozen destination) before
+    // any custody access.
+    verify_publish_binding_scope(&binding, session, dest, "connection")?;
     if binding.connection_id != Some(connection_id) {
         return Err("result publish binding does not authorize the destination connection".into());
     }
@@ -280,6 +284,49 @@ async fn recheck_publish_binding(
         .await
         .map(|_| ())
         .map_err(|e| format!("result publish binding recheck failed: {e}"))
+}
+
+/// R2.3 (design :447-451): mechanically verify a loaded `result_publish` binding
+/// authorizes THIS delivery, BEFORE any custody access — it belongs to the
+/// delivery's session, is the `result_publish` slot kind, carries the authority
+/// kind the destination type requires (github ⇒ `connection`; signed webhook ⇒
+/// `subscription_secret`), and froze EXACTLY this destination (serde-normalized
+/// equality). A mismatch fails the attempt with a reason; the caller's existing
+/// backoff retries.
+fn verify_publish_binding_scope(
+    binding: &fluidbox_db::RunResourceBindingRow,
+    session: &SessionRow,
+    dest: &ResultDestination,
+    expected_authority_kind: &str,
+) -> Result<(), String> {
+    if binding.session_id != session.id {
+        return Err("result publish binding does not belong to this run".into());
+    }
+    if binding.slot_kind != "result_publish" {
+        return Err("result publish binding is not a result_publish slot".into());
+    }
+    if binding.authority_kind != expected_authority_kind {
+        return Err("result publish binding authority does not match the destination type".into());
+    }
+    // The frozen `resource_scope` is the destination serialized BEFORE the
+    // binding_id was stamped into it, so drop that key on both sides for a
+    // serde-normalized (object-order-independent) equality.
+    let dest_scope = strip_binding_id(
+        serde_json::to_value(dest).map_err(|e| format!("destination serialize failed: {e}"))?,
+    );
+    if dest_scope != strip_binding_id(binding.resource_scope.clone()) {
+        return Err("result publish binding scope does not match the destination".into());
+    }
+    Ok(())
+}
+
+/// Drop the top-level `binding_id` key (stamped AFTER the binding froze its
+/// `resource_scope`, so it is absent there) for scope equality.
+fn strip_binding_id(mut v: Value) -> Value {
+    if let Some(o) = v.as_object_mut() {
+        o.remove("binding_id");
+    }
+    v
 }
 
 /// Provider-neutral publish inputs from the session + frozen RunSpec.
@@ -321,6 +368,7 @@ async fn deliver_signed_webhook(
     state: &AppState,
     d: &fluidbox_db::ResultDeliveryRow,
     session: &SessionRow,
+    dest: &ResultDestination,
     url: &str,
     binding_id: Option<Uuid>,
 ) -> Result<String, String> {
@@ -339,9 +387,22 @@ async fn deliver_signed_webhook(
             .await
             .map_err(|e| format!("binding lookup failed: {e}"))?
             .ok_or("signed webhook binding is missing")?;
+        // R2.3: mechanically verify the loaded binding authorizes THIS delivery
+        // (session + slot kind + subscription_secret authority + frozen
+        // destination) before any custody access.
+        verify_publish_binding_scope(&binding, session, dest, "subscription_secret")?;
         if binding.subscription_id != Some(sub_id) {
             return Err("signed webhook binding does not match the delivery subscription".into());
         }
+        // R2.2: the run's invoking authority (the acting subscription, here) must
+        // still be valid before the callback secret is unsealed.
+        crate::broker::recheck_invoking_authority(
+            &state.pool,
+            scope,
+            &binding.resolved_by_principal_kind,
+            binding.resolved_by_principal_id.as_deref(),
+        )
+        .await?;
         let sub = fluidbox_db::get_trigger_subscription(&state.pool, scope, sub_id)
             .await
             .map_err(|e| format!("subscription lookup failed: {e}"))?
