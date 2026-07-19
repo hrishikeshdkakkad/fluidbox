@@ -301,6 +301,14 @@ start_server() {
     export FLUIDBOX_ADMIN_TOKEN="$ADMIN_TOKEN"
     export FLUIDBOX_CREDENTIAL_KEY="$CRED_KEY"
     export FLUIDBOX_PROVIDER=docker
+    # Force provisioning to fail INSTANTLY. CI has no sandbox runner image, and the
+    # forge_running fixture needs each run to FAIL provisioning to settle terminal.
+    # A missing image on a REAL registry takes ~2 min to give up (that blew the
+    # settle budget → runs stuck at 'finalizing'); a dead-registry ref (localhost:1,
+    # nothing listening → connection-refused in ms) makes the failure immediate.
+    # These exports run after the CI job env, so they win over any image set there.
+    export FLUIDBOX_SANDBOX_IMAGE=localhost:1/fluidbox-absent:ci
+    export FLUIDBOX_CODEX_SANDBOX_IMAGE=localhost:1/fluidbox-absent:ci
     export FLUIDBOX_DATA_DIR="$DATA_DIR"
     export FLUIDBOX_REQUIRE_SSO=1
     unset FLUIDBOX_TRUST_FORWARDED_FOR
@@ -407,7 +415,11 @@ forge_running() { # sid token-plaintext label
   need "$sid" "no session id for the $label run" || return 1
   cnt=$(db "select count(*) from sessions where id='$sid'")
   [ "$cnt" = 1 ] || { no "$label: session row missing (count=$cnt)"; return 1; }
-  for _ in $(seq 1 180); do
+  # Wait for the run to settle to a quiescent terminal state. In CI the deliberate
+  # provisioning failure has been observed to take up to ~105-140s per run, so the
+  # budget is 300s (600 iterations × 0.5s poll) as safety margin — the dead-registry
+  # runner-image ref (set in the server env above) normally makes it fail far sooner.
+  for _ in $(seq 1 600); do
     st=$(db "select status from sessions where id='$sid'")
     fin=$(db "select count(*) from session_finalizations where session_id='$sid'")
     case "$st" in
