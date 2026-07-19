@@ -997,6 +997,14 @@ PV2=$(db "select protocol_version from connection_tool_snapshots where connectio
 [ "$PV2" = "$MCP_PROTO" ] && ok "snapshot v2 records protocol_version '$PV2' (== negotiated $MCP_PROTO)" || no "v2 protocol_version='$PV2' (want $MCP_PROTO)"
 create_run "$jarA" "shared-kb"; H_RUN="$RUN"
 need "$H_RUN" "post-refresh run not created" && ok "a new run now SUCCEEDS against the refreshed snapshot ($H_RUN)"
+# Re-check the per-bearer initialize-before-list invariant NOW that the refresh
+# above gave alice's bearer a SECOND photographed tools/list (connect + refresh).
+# The section-(b) run of this assertion saw only one list per bearer, so the "a
+# list needs its OWN initialize since that bearer's previous list" branch was
+# never exercised there; with ≥2 lists for alice it is.
+[ "$(mcp_init_before_every_list)" = yes ] \
+  && ok "per-bearer initialize precedes EVERY tools/list across the refresh re-photograph (alice has ≥2)" \
+  || no "a tools/list without a preceding initialize for its bearer after the refresh re-photograph"
 
 # ── (k) Personal-connection approval boundary (runs BEFORE i deactivates bob) ─
 # k must precede i: it needs bob ACTIVE (approver) to prove the 403; i then
