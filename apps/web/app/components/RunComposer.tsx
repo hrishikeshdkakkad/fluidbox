@@ -288,6 +288,10 @@ export function RunComposer({
           policy: "default",
           default_workspace: draftToInput(workspace),
           capability_bundles: pins.map((pin) => `${pin.name}@${pin.version}`),
+          // Send the draft brokered requirements (incl. any appended by the
+          // embedded add-server flow); the server revalidates each. Omitted when
+          // empty so plain agents are unaffected.
+          ...(requirements.length > 0 ? { connection_requirements: requirements } : {}),
         });
         createdAgent = response.agent;
         runAgentName = response.agent.name;
@@ -300,6 +304,7 @@ export function RunComposer({
           system_prompt: systemPrompt.trim() || null,
           default_workspace: draftToInput(workspace),
           capability_bundles: pins.map((pin) => `${pin.name}@${pin.version}`),
+          ...(requirements.length > 0 ? { connection_requirements: requirements } : {}),
         });
         setRevisionTouched(false);
       }
@@ -600,10 +605,40 @@ export function RunComposer({
               embedded
               me={me}
               onClose={() => setAddingMcp(false)}
-              onCompleted={(bundle) => {
+              onCompleted={(result) => {
                 setCapabilityRefresh((current) => current + 1);
+                if (!result) return;
+                // Sandbox (stdio) bundle: attach it as a pin (legacy path).
+                const bundle = result.bundle;
                 if (bundle && !pins.some((pin) => pin.name === bundle.name)) {
                   setPins((current) => [...current, { id: "", name: bundle.name, version: bundle.version }]);
+                  touchRevision();
+                }
+                // Phase C brokered connection: append a matching
+                // ConnectionRequirement to the draft so this run/agent binds the
+                // just-connected server. Presentation-only — create_run
+                // revalidates the requirement and resolves the binding.
+                if (result.connection && result.snapshot) {
+                  const endpoint =
+                    result.connection.metadata?.endpoint_url ??
+                    result.connection.metadata?.base_url ??
+                    "";
+                  const base =
+                    (result.slug ?? "server").replace(/[^a-z0-9-]/gi, "-").toLowerCase() || "server";
+                  setRequirements((current) => {
+                    let slot = base;
+                    let n = 2;
+                    while (current.some((r) => r.slot === slot)) slot = `${base}-${n++}`;
+                    return [
+                      ...current,
+                      {
+                        slot,
+                        connector: { url: endpoint, slug: result.slug ?? null },
+                        required_tools: result.snapshot!.tools.map((t) => t.name),
+                        binding_mode: "organization" as const,
+                      },
+                    ];
+                  });
                   touchRevision();
                 }
               }}

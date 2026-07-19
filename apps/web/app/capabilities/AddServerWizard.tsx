@@ -12,10 +12,13 @@ import Link from "next/link";
 import {
   apiGet,
   apiPost,
+  AddServerCompletion,
   AddServerResult,
   AuthMe,
   BundleServer,
   Connection,
+  ConnectionToolSnapshot,
+  fetchConnectionTools,
   OwnerChoice,
   ownerOptions,
   ProbeResult,
@@ -70,7 +73,7 @@ export function AddServerWizard({
 }: {
   onClose: () => void;
   embedded?: boolean;
-  onCompleted?: (bundle: { name: string; version: number } | null) => void;
+  onCompleted?: (result: AddServerCompletion | null) => void;
   me?: AuthMe | null;
 }) {
   const [step, setStep] = useState<Step>("url");
@@ -95,6 +98,11 @@ export function AddServerWizard({
   const [doneMsg, setDoneMsg] = useState("");
   const [doneTools, setDoneTools] = useState<ToolPreview[]>([]);
   const [doneBundle, setDoneBundle] = useState<{ name: string; version: number } | null>(null);
+  // Phase C: the freshly-connected brokered connection + its snapshot + slug, so
+  // an embedded caller (RunComposer) can append a matching ConnectionRequirement.
+  const [doneConnection, setDoneConnection] = useState<Connection | null>(null);
+  const [doneSnapshot, setDoneSnapshot] = useState<ConnectionToolSnapshot | null>(null);
+  const [doneSlug, setDoneSlug] = useState<string | null>(null);
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -152,7 +160,19 @@ export function AddServerWizard({
         const c = list.connections.find((x) => x.id === connId);
         if (c?.status === "active") {
           stopPolling();
-          setDoneMsg("Connected — the bundle was registered with the fresh credential.");
+          // The callback photographed the snapshot; fetch it so an embedded
+          // caller can preselect its tools into a requirement.
+          setDoneConnection(c);
+          const snap = await fetchConnectionTools(c.id).catch(() => null);
+          if (snap) {
+            setDoneSnapshot(snap);
+            setDoneTools(snap.tools.map((t) => ({ name: t.name, description: t.description })));
+          }
+          setDoneMsg(
+            snap
+              ? `Connected — photographed ${snap.tools.length} tool(s) with the fresh credential.`
+              : "Connected — the connection was registered with the fresh credential."
+          );
           setStep("done");
         } else if (c?.status === "error") {
           stopPolling();
@@ -191,20 +211,32 @@ export function AddServerWizard({
         owner,
       });
       if (authMode !== "oauth") {
-        setDoneTools(flattenTools(r.servers));
+        // Phase C: a remote (none/api_key) connect returns {connection, snapshot}
+        // (its tools photographed); a sandbox (stdio) connect returns a bundle.
         setDoneBundle(r.bundle ?? null);
+        setDoneConnection(r.connection ?? null);
+        setDoneSnapshot(r.snapshot ?? null);
+        setDoneSlug(r.slug ?? null);
+        setDoneTools(
+          r.snapshot
+            ? r.snapshot.tools.map((t) => ({ name: t.name, description: t.description }))
+            : flattenTools(r.servers)
+        );
         setDoneMsg(
           r.bundle
             ? `Registered ${r.bundle.name}@${r.bundle.version} — attach it on an agent.`
-            : "Connected."
+            : r.snapshot
+              ? `Connected — photographed ${r.snapshot.tools.length} tool(s).`
+              : "Connected."
         );
         setBusy(false);
         setStep("done");
         return;
       }
       // OAuth: hand the browser to the AS, then watch the connection go active
-      // (the callback photographs the bundle).
+      // (the callback photographs the snapshot).
       if (r.authorize_url) window.open(r.authorize_url, "_blank", "noopener");
+      setDoneSlug(r.slug ?? null);
       setBusy(false);
       watchUntilActive(r.connection?.id);
     } catch (e) {
@@ -221,7 +253,12 @@ export function AddServerWizard({
         : "This server needs an API key — it's sealed at rest and proven by registration.";
 
   const finish = () => {
-    onCompleted?.(doneBundle);
+    onCompleted?.({
+      bundle: doneBundle,
+      connection: doneConnection ?? undefined,
+      snapshot: doneSnapshot ?? undefined,
+      slug: doneSlug ?? undefined,
+    });
     onClose();
   };
 
