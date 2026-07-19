@@ -14,7 +14,7 @@ This matrix defines what the hosted, multi-user fluidbox deployment (~300 seats)
 | **Deferred** | Deliberately out of v1; requires its own security/UX design before any support (parent design, Non-goals) |
 | **Never** | Permanently outside the product boundary; a design change here is a rewrite of the security model |
 
-Phase labels (B–F) refer to the parent design's implementation sequence; a **shipped** qualifier marks a phase already delivered on `main` (Phase B — identity + tenant enforcement — is shipped; C–F remain target-state).
+Phase labels (B–F) refer to the parent design's implementation sequence; a **shipped** qualifier marks a phase already delivered on `main` (Phase B — identity + tenant enforcement — and Phase C — connection ownership + run resource bindings — are shipped; D–F remain target-state).
 
 ## MCP protocol surface
 
@@ -73,17 +73,17 @@ The four objects are independent (parent design, "The multi-user connection mode
 
 | Ownership | Status | Use |
 |---|---|---|
-| Personal connection (`owner_type = user`) | **Supported (Phase C)** | Interactive runs: dashboard, authenticated API. (Today's connections are tenant-owned — Gap 3.) |
-| Organization service connection (`owner_type = organization`) | **Supported (Phase C)** | Schedules, webhooks, org-wide agents, GitHub App installations, unattended automation. |
+| Personal connection (`owner_type = user`) | **Supported (shipped, Phase C)** | Interactive runs: dashboard, authenticated API. Owner-only visible and mutable; other members (and admins through their own lens) get a 404, never a 403. Membership deactivation is the kill switch. |
+| Organization service connection (`owner_type = organization`) | **Supported (shipped, Phase C)** | Schedules, webhooks, org-wide agents, GitHub App installations, unattended automation. The default owner; mutable by admin/owner. |
 | Unattended **personal** delegation | **Deferred (not in v1)** | A schedule or webhook can never ride a personal connection in v1. Omitted until a concrete customer requirement demands it, with expiry/revocation/membership-loss semantics designed first. |
 
 ### Binding modes at run creation
 
 | Mode | Status | Rule |
 |---|---|---|
-| `invoking_user` | **Supported (Phase C)** | The authenticated invoking user's active personal connection. No unambiguous match ⇒ run creation fails before provisioning — never "latest connection" silently. |
-| Organization service | **Supported (Phase C)** | Administrator-managed org connection; the only mode available to schedules/webhooks (no interactive user exists). |
-| Explicit | **Supported (Phase C)** | Caller supplies a connection ID; fluidbox verifies tenant, caller authorization, requirement satisfaction, scopes, active status, and snapshot coverage. |
+| `invoking_user` | **Supported (shipped, Phase C)** | The authenticated invoking user's active personal connection. No unambiguous match ⇒ run creation fails before provisioning — never "latest connection" silently. |
+| Organization service | **Supported (shipped, Phase C)** | Administrator-managed org connection; the only mode available to schedules/webhooks (no interactive user exists). |
+| Explicit | **Supported (shipped, Phase C)** | Caller supplies a per-slot connection ID on `POST /v1/sessions`; fluidbox verifies tenant, caller authorization/visibility, requirement satisfaction, active status, and snapshot coverage. Only `mcp` slots are explicit-bindable; a key naming an unknown slot is rejected. |
 | Delegated personal | **Deferred** | See above. |
 
 ### Requirement satisfaction (settled)
@@ -170,7 +170,7 @@ Fork PRs freeze `TrustTier::ReadOnly` (all MCP tools stripped from the frozen se
 | Decision | Statement |
 |---|---|
 | Two tool classes | *Sandbox* (in-image stdio, credential-free, contained) and *brokered* (executed by the control plane with sealed credentials). The split **is** the security model. |
-| Fate of capability bundles | Bundles survive **only** for sandbox-class tools. Brokered tools move entirely to agent connection requirements + per-connection tool snapshots + per-run resource bindings (Phase C), with an additive migration: legacy deserialization retained, historical RunSpecs never rewritten, legacy connections rediscovered into real snapshots, pinned subscriptions explicitly repointed, unconverted legacy revisions refused after a cutoff. |
+| Fate of capability bundles | Bundles survive **only** for sandbox-class tools (shipped, Phase C). Brokered tools moved entirely to agent connection requirements + per-connection tool snapshots + per-run resource bindings, additively: legacy deserialization retained, historical RunSpecs never rewritten, the 0013 migration appends converted agent revisions and repoints pinned subscriptions, and an unconverted revision still pinning a brokered bundle is refused at run creation after the cutoff (mixed brokered+sandbox bundles drop whole with an operator notice). Connections photograph their tool snapshots at connect and on demand (`/tools/refresh`). |
 | Attach ≠ allow | Availability (frozen set) and permission (policy/approval) remain independent layers; the single gate judges every call. |
 | Tenant isolation | Tenant-scoped repository methods are the primary mechanism (`TenantScope` signatures); RLS is defense in depth; composite `(tenant_id, id)` keys/FKs are mandatory for tenant-owned relationships. |
 
