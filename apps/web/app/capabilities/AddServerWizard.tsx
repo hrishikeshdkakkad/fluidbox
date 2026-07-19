@@ -13,12 +13,16 @@ import {
   apiGet,
   apiPost,
   AddServerResult,
+  AuthMe,
   BundleServer,
   Connection,
+  OwnerChoice,
+  ownerOptions,
   ProbeResult,
   ToolPreview,
 } from "../lib/api";
 import { ModalShell } from "../components/bits";
+import { OwnerPicker } from "../components/OwnerPicker";
 
 type Step = "url" | "detected" | "done";
 type AuthChoice = "none" | "api_key" | "oauth";
@@ -62,10 +66,12 @@ export function AddServerWizard({
   onClose,
   embedded = false,
   onCompleted,
+  me = null,
 }: {
   onClose: () => void;
   embedded?: boolean;
   onCompleted?: (bundle: { name: string; version: number } | null) => void;
+  me?: AuthMe | null;
 }) {
   const [step, setStep] = useState<Step>("url");
   const [url, setUrl] = useState("");
@@ -79,6 +85,9 @@ export function AddServerWizard({
   const [scheme, setScheme] = useState("Bearer");
   const [clientId, setClientId] = useState("");
   const [clientSecret, setClientSecret] = useState("");
+  const [ownerChoice, setOwnerChoice] = useState<OwnerChoice | null>(null);
+  // A BYO mcp_http server allows personal ownership for any member.
+  const owner = ownerChoice ?? ownerOptions(me, true).default;
 
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
@@ -179,6 +188,7 @@ export function AddServerWizard({
         scheme: authMode === "api_key" ? scheme : null,
         client_id: clientId.trim() || null,
         client_secret: clientSecret.trim() || null,
+        owner,
       });
       if (authMode !== "oauth") {
         setDoneTools(flattenTools(r.servers));
@@ -281,6 +291,8 @@ export function AddServerWizard({
             <span className="lab">Name</span>
             <input className="inp mono" value={name} onChange={(e) => setName(e.target.value)} />
           </label>
+
+          <OwnerPicker me={me} value={owner} onChange={setOwnerChoice} />
 
           {authMode === "none" && probe.tools_preview.length > 0 && (
             <div className="field">
