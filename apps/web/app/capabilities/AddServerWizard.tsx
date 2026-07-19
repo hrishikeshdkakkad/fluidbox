@@ -12,13 +12,20 @@ import Link from "next/link";
 import {
   apiGet,
   apiPost,
+  AddServerCompletion,
   AddServerResult,
+  AuthMe,
   BundleServer,
   Connection,
+  ConnectionToolSnapshot,
+  fetchConnectionTools,
+  OwnerChoice,
+  ownerOptions,
   ProbeResult,
   ToolPreview,
 } from "../lib/api";
 import { ModalShell } from "../components/bits";
+import { OwnerPicker } from "../components/OwnerPicker";
 
 type Step = "url" | "detected" | "done";
 type AuthChoice = "none" | "api_key" | "oauth";
@@ -62,10 +69,12 @@ export function AddServerWizard({
   onClose,
   embedded = false,
   onCompleted,
+  me = null,
 }: {
   onClose: () => void;
   embedded?: boolean;
-  onCompleted?: (bundle: { name: string; version: number } | null) => void;
+  onCompleted?: (result: AddServerCompletion | null) => void;
+  me?: AuthMe | null;
 }) {
   const [step, setStep] = useState<Step>("url");
   const [url, setUrl] = useState("");
@@ -79,6 +88,9 @@ export function AddServerWizard({
   const [scheme, setScheme] = useState("Bearer");
   const [clientId, setClientId] = useState("");
   const [clientSecret, setClientSecret] = useState("");
+  const [ownerChoice, setOwnerChoice] = useState<OwnerChoice | null>(null);
+  // A BYO mcp_http server allows personal ownership for any member.
+  const owner = ownerChoice ?? ownerOptions(me, true).default;
 
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
@@ -86,6 +98,11 @@ export function AddServerWizard({
   const [doneMsg, setDoneMsg] = useState("");
   const [doneTools, setDoneTools] = useState<ToolPreview[]>([]);
   const [doneBundle, setDoneBundle] = useState<{ name: string; version: number } | null>(null);
+  // Phase C: the freshly-connected brokered connection + its snapshot + slug, so
+  // an embedded caller (RunComposer) can append a matching ConnectionRequirement.
+  const [doneConnection, setDoneConnection] = useState<Connection | null>(null);
+  const [doneSnapshot, setDoneSnapshot] = useState<ConnectionToolSnapshot | null>(null);
+  const [doneSlug, setDoneSlug] = useState<string | null>(null);
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -141,16 +158,46 @@ export function AddServerWizard({
       try {
         const list = await apiGet<{ connections: Connection[] }>("/connections");
         const c = list.connections.find((x) => x.id === connId);
-        if (c?.status === "active") {
-          stopPolling();
-          setDoneMsg("Connected — the bundle was registered with the fresh credential.");
-          setStep("done");
-        } else if (c?.status === "error") {
+        if (c?.status === "error") {
           stopPolling();
           setErr("Authorization didn't complete — the sign-in was refused. You can try again.");
-        } else if (waited >= MAX_WAIT) {
+          return;
+        }
+        if (c?.status === "active") {
+          // `active` can briefly PRECEDE the post-activation photograph, so a
+          // /tools fetch here can 404 → null. Only COMPLETE once the snapshot has
+          // landed AND was taken under THIS connection's current authorization
+          // generation; otherwise keep polling within the budget rather than
+          // finishing with no tools (F2).
+          const snap = await fetchConnectionTools(c.id).catch(() => null);
+          if (snap && snap.authorization_generation === c.authorization_generation) {
+            stopPolling();
+            setDoneConnection(c);
+            setDoneSnapshot(snap);
+            setDoneTools(snap.tools.map((t) => ({ name: t.name, description: t.description })));
+            setDoneMsg(
+              `Connected — photographed ${snap.tools.length} tool(s) with the fresh credential.`
+            );
+            setStep("done");
+            return;
+          }
+          // Active but the photograph hasn't settled yet — fall through and keep
+          // polling until it lands or the budget is exhausted (handled below).
+        }
+        if (waited >= MAX_WAIT) {
           stopPolling();
-          setErr("Timed out waiting for authorization. Finish the sign-in in the opened tab, then retry.");
+          if (c?.status === "active") {
+            // Connected, but the photograph never settled within the budget.
+            // Surface it explicitly (the connection IS live) rather than
+            // completing with nothing.
+            setDoneConnection(c);
+            setDoneMsg(
+              "Connected — tools are still photographing. Refresh in Integrations in a moment to see them."
+            );
+            setStep("done");
+          } else {
+            setErr("Timed out waiting for authorization. Finish the sign-in in the opened tab, then retry.");
+          }
         }
       } catch {
         /* transient list failure — keep polling until MAX_WAIT */
@@ -179,22 +226,35 @@ export function AddServerWizard({
         scheme: authMode === "api_key" ? scheme : null,
         client_id: clientId.trim() || null,
         client_secret: clientSecret.trim() || null,
+        owner,
       });
       if (authMode !== "oauth") {
-        setDoneTools(flattenTools(r.servers));
+        // Phase C: a remote (none/api_key) connect returns {connection, snapshot}
+        // (its tools photographed); a sandbox (stdio) connect returns a bundle.
         setDoneBundle(r.bundle ?? null);
+        setDoneConnection(r.connection ?? null);
+        setDoneSnapshot(r.snapshot ?? null);
+        setDoneSlug(r.slug ?? null);
+        setDoneTools(
+          r.snapshot
+            ? r.snapshot.tools.map((t) => ({ name: t.name, description: t.description }))
+            : flattenTools(r.servers)
+        );
         setDoneMsg(
           r.bundle
             ? `Registered ${r.bundle.name}@${r.bundle.version} — attach it on an agent.`
-            : "Connected."
+            : r.snapshot
+              ? `Connected — photographed ${r.snapshot.tools.length} tool(s).`
+              : "Connected."
         );
         setBusy(false);
         setStep("done");
         return;
       }
       // OAuth: hand the browser to the AS, then watch the connection go active
-      // (the callback photographs the bundle).
+      // (the callback photographs the snapshot).
       if (r.authorize_url) window.open(r.authorize_url, "_blank", "noopener");
+      setDoneSlug(r.slug ?? null);
       setBusy(false);
       watchUntilActive(r.connection?.id);
     } catch (e) {
@@ -211,7 +271,12 @@ export function AddServerWizard({
         : "This server needs an API key — it's sealed at rest and proven by registration.";
 
   const finish = () => {
-    onCompleted?.(doneBundle);
+    onCompleted?.({
+      bundle: doneBundle,
+      connection: doneConnection ?? undefined,
+      snapshot: doneSnapshot ?? undefined,
+      slug: doneSlug ?? undefined,
+    });
     onClose();
   };
 
@@ -281,6 +346,8 @@ export function AddServerWizard({
             <span className="lab">Name</span>
             <input className="inp mono" value={name} onChange={(e) => setName(e.target.value)} />
           </label>
+
+          <OwnerPicker me={me} value={owner} onChange={setOwnerChoice} />
 
           {authMode === "none" && probe.tools_preview.length > 0 && (
             <div className="field">

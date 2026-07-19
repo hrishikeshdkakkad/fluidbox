@@ -1307,6 +1307,7 @@ async fn materialize_workspace(
         }
         WorkspaceSpec::GitRepository {
             connection_id,
+            binding_id,
             clone_url,
             r#ref,
             commit_sha,
@@ -1315,9 +1316,31 @@ async fn materialize_workspace(
             // The credential is unsealed here, used for the fetch, and
             // dropped — it never reaches the RunSpec, sandbox env, ledger,
             // or artifacts.
-            let auth_header = match connection_id {
-                Some(cid) => Some(connection_auth_header(state, scope, *cid).await?),
-                None => None,
+            let auth_header = match binding_id {
+                // Phase C: the fetch credential rides the run's frozen
+                // `workspace_fetch` binding — recheck it (status + generation +
+                // owner membership) and mechanically enforce the frozen resource
+                // scope IMMEDIATELY before credential injection (design
+                // :705-723). Authority `none` = public fetch, no credential.
+                Some(bid) => {
+                    workspace_binding_auth_header(
+                        state,
+                        scope,
+                        session_id,
+                        *bid,
+                        clone_url,
+                        r#ref.as_deref(),
+                        commit_sha.as_deref(),
+                    )
+                    .await?
+                }
+                // Legacy runs froze no binding — the embedded connection_id
+                // path, unchanged (status-only fresh check inside
+                // connection_auth_header).
+                None => match connection_id {
+                    Some(cid) => Some(connection_auth_header(state, scope, *cid).await?),
+                    None => None,
+                },
             };
             let (url, rf, sha) = (clone_url.clone(), r#ref.clone(), commit_sha.clone());
             let ws = tokio::task::spawn_blocking(move || {
@@ -1428,6 +1451,75 @@ async fn abandon_launch(state: &AppState, scope: TenantScope, id: Uuid) {
     let _ = delete_archive(&state.cfg.data_dir, id);
 }
 
+/// Phase C workspace fetch: resolve the git auth header from the run's frozen
+/// `workspace_fetch` binding. Mechanically enforces the frozen resource scope
+/// (the URL — and ref/commit when pinned — actually about to be fetched must
+/// equal what the binding froze, design `:718`) BEFORE any credential access,
+/// then reruns the connection-authority recheck (status + generation + owner
+/// membership) IMMEDIATELY before minting the credential. Authority `none`
+/// binding ⇒ public fetch, no credential (`Ok(None)`). Fails closed: a stale
+/// binding, drifted scope, or revoked authority stops the run during
+/// `initializing`, before any model spend.
+async fn workspace_binding_auth_header(
+    state: &AppState,
+    scope: TenantScope,
+    session_id: Uuid,
+    binding_id: Uuid,
+    clone_url: &str,
+    r#ref: Option<&str>,
+    commit_sha: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let binding = fluidbox_db::get_run_resource_binding(&state.pool, scope, binding_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("workspace binding {binding_id} not found"))?;
+    // Belt-and-braces: the binding must belong to THIS session (both frozen in
+    // one transaction — a mismatch is corruption).
+    if binding.session_id != session_id {
+        anyhow::bail!("workspace binding {binding_id} does not belong to this session");
+    }
+    // Mechanical resource-scope enforcement BEFORE credential resolution.
+    enforce_workspace_scope(&binding.resource_scope, clone_url, r#ref, commit_sha)?;
+    // Public / credentialless fetch: no authority to recheck, no header to mint.
+    if binding.authority_kind == "none" {
+        return Ok(None);
+    }
+    // Connection authority: recheck immediately before the credential mints.
+    let conn = crate::broker::recheck_binding(state, scope, &binding)
+        .await
+        .map_err(|e| anyhow::anyhow!("workspace binding recheck failed: {e}"))?;
+    Ok(Some(
+        crate::connectors::fetch_auth_header(state, &conn).await?,
+    ))
+}
+
+/// The mechanical `workspace_fetch` scope check (design `:718-720`): the URL
+/// about to be fetched must equal the frozen `resource_scope.url`, and the
+/// ref/commit must match when the scope pins them (a null pin is unconstrained).
+/// A clone of an admitted repo is not authority over some other url the RunSpec
+/// might carry — so a mismatch refuses before any credential is read.
+fn enforce_workspace_scope(
+    resource_scope: &serde_json::Value,
+    clone_url: &str,
+    r#ref: Option<&str>,
+    commit_sha: Option<&str>,
+) -> anyhow::Result<()> {
+    let scope_url = resource_scope.get("url").and_then(|v| v.as_str());
+    if scope_url != Some(clone_url) {
+        anyhow::bail!("workspace fetch url does not match the frozen binding scope");
+    }
+    if let Some(pinned) = resource_scope.get("ref").and_then(|v| v.as_str()) {
+        if r#ref != Some(pinned) {
+            anyhow::bail!("workspace fetch ref does not match the frozen binding scope");
+        }
+    }
+    if let Some(pinned) = resource_scope.get("commit").and_then(|v| v.as_str()) {
+        if commit_sha != Some(pinned) {
+            anyhow::bail!("workspace fetch commit does not match the frozen binding scope");
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a connection into an `Authorization` header value for git fetch
 /// via the provider's connector (PAT, or a minted App installation token).
 /// Fails closed: missing/revoked connection or missing key stops the run
@@ -1437,6 +1529,9 @@ async fn connection_auth_header(
     scope: TenantScope,
     connection_id: Uuid,
 ) -> anyhow::Result<String> {
+    // Unfiltered read by design: workspace init runs from the frozen RunSpec's
+    // resolved binding (control-plane side, no request principal) — authority is
+    // the binding, not an owner-visibility viewer.
     let conn = fluidbox_db::get_connection(&state.pool, scope, connection_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("connection {connection_id} not found"))?;

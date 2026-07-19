@@ -318,6 +318,9 @@ async fn principal_from_cookie(
 /// tenant), so trigger handlers scope every DB call to the real tenant rather
 /// than `state.tenant_id`.
 pub struct TriggerAuth {
+    /// The exact api_tokens row id — frozen as a trigger run's invoking principal
+    /// so the binding recheck can fail closed on a revoked/expired token (E1).
+    pub token_id: Uuid,
     pub subscription_id: Uuid,
     pub scope: TenantScope,
 }
@@ -342,6 +345,7 @@ impl FromRequestParts<AppState> for TriggerAuth {
             .await?
             .ok_or(ApiError::Unauthorized)?;
         Ok(TriggerAuth {
+            token_id: auth.token_id,
             subscription_id: auth.subscription_id,
             scope: TenantScope::assume(auth.tenant_id),
         })

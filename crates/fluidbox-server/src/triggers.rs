@@ -122,6 +122,7 @@ pub fn narrow_workspace(
         r#ref,
         commit_sha,
         checkout_mode,
+        ..
     } = base
     else {
         return Err(
@@ -170,6 +171,9 @@ pub fn narrow_workspace(
     };
     Ok(WorkspaceSpec::GitRepository {
         connection_id: *connection_id,
+        // A narrowed workspace starts unbound; create_run resolves its
+        // workspace_fetch binding (Task 5), never narrow-time.
+        binding_id: None,
         repository,
         clone_url,
         r#ref: req.r#ref.clone().or_else(|| r#ref.clone()),
@@ -412,6 +416,12 @@ pub async fn create(
             }
             let cid = Uuid::parse_str(conn_str.trim())
                 .map_err(|_| ApiError::BadRequest("connection must be a connection id".into()))?;
+            // Tenant-scoped (not owner-scoped) by design: a subscription CONSUMES
+            // a connection, and the design routes that authority through run
+            // resource bindings (invariant 21, Task 5) + the broker
+            // owner-membership recheck (Task 6), not Task 4's connection-object
+            // viewer. Subscription create is admin/owner-gated already. See
+            // task-4-report "Deferred / flagged".
             let conn = fluidbox_db::get_connection(&state.pool, scope, cid)
                 .await?
                 .ok_or_else(|| ApiError::BadRequest(format!("unknown connection {cid}")))?;
@@ -526,7 +536,16 @@ pub async fn create(
     };
     let workspace_value = match req.workspace {
         None => None,
-        Some(input) => match crate::api::resolve_workspace_input(&state, scope, input).await? {
+        // Subscription config is an admin/owner mutation → operator lens; the
+        // per-run authority is re-resolved server-side at fire time.
+        Some(input) => match crate::api::resolve_workspace_input(
+            &state,
+            scope,
+            fluidbox_db::ConnectionViewer::All,
+            input,
+        )
+        .await?
+        {
             WorkspaceSpec::Scratch => None,
             spec => Some(serde_json::to_value(&spec)?),
         },
@@ -548,8 +567,10 @@ pub async fn create(
             })?;
             let secret = random_hex_token(SECRET_PREFIX);
             let sealed = sealer.seal(&secret);
-            let dests =
-                serde_json::to_value(vec![ResultDestination::SignedWebhook { url: url.clone() }])?;
+            let dests = serde_json::to_value(vec![ResultDestination::SignedWebhook {
+                url: url.clone(),
+                binding_id: None,
+            }])?;
             (dests, Some(secret), Some(sealed))
         }
     };
@@ -969,6 +990,12 @@ pub async fn invoke(
             invocation,
             // A trigger-token invoke is not a directly-authenticated user.
             invoked_by_user_id: None,
+            // Freeze the exact invoking token as the run's `trigger` principal
+            // (E1) so the binding recheck fails closed on token revocation.
+            invoking_token_id: Some(auth.token_id),
+            // Invoke overrides only narrow — a trigger never introduces a new
+            // connection (design/trap); the subscription derives its authority.
+            explicit_bindings: std::collections::HashMap::new(),
             result_destinations: destinations,
             bound_invocation: Some(invocation_id),
             bound_dispatch: None,
@@ -1069,6 +1096,7 @@ mod tests {
     fn git_base(connection: bool) -> WorkspaceSpec {
         WorkspaceSpec::GitRepository {
             connection_id: connection.then(Uuid::now_v7),
+            binding_id: None,
             repository: Some("acme/base".into()),
             clone_url: "https://github.com/acme/base.git".into(),
             r#ref: Some("main".into()),
@@ -1134,6 +1162,7 @@ mod tests {
         // repository swap on a non-github base (file:// fixture) → refused.
         let file_base = WorkspaceSpec::GitRepository {
             connection_id: None,
+            binding_id: None,
             repository: None,
             clone_url: "file:///tmp/fixture".into(),
             r#ref: None,
@@ -1153,6 +1182,7 @@ mod tests {
         // is refused too — local paths are not a provider namespace.
         let file_repo_base = WorkspaceSpec::GitRepository {
             connection_id: Some(Uuid::now_v7()),
+            binding_id: None,
             repository: Some("acme/base".into()),
             clone_url: "file:///tmp/fixture/acme/base".into(),
             r#ref: None,

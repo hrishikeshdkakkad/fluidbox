@@ -2277,6 +2277,10 @@ pub async fn me(principal: Principal, State(state): State<AppState>) -> ApiResul
             });
             let user_json = user.map(|us| json!({ "email": us.email, "name": us.name }));
             Ok(Json(json!({
+                // A stable user id so the dashboard can tell "my personal
+                // connection" from a teammate's (the server still owner-filters;
+                // this is presentation only).
+                "user_id": u.user_id,
                 "org": org_json,
                 "user": user_json,
                 "roles": u.roles,

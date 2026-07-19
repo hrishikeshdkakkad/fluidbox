@@ -715,8 +715,14 @@ fn provenance_expr(r: &CatalogRow) -> String {
     format!("jsonb_build_object({parts})")
 }
 
+// Migration 0013 replaced connector_catalog's full `slug` unique with two
+// PARTIAL uniques (`connector_catalog_slug_global` on (slug) where tenant_id is
+// null; `connector_catalog_slug_tenant` on (tenant_id, slug) where tenant_id is
+// not null). Import rows are all GLOBAL (tenant_id null), so the ON CONFLICT
+// arbiter must name the matching partial index via its predicate — a bare
+// `on conflict (slug)` cannot infer a partial index and fails at apply time.
 const ON_CONFLICT: &str = "\
-on conflict (slug) do update set
+on conflict (slug) where tenant_id is null do update set
   name = excluded.name, icon = excluded.icon, description = excluded.description,
   categories = excluded.categories, tier = excluded.tier, url = excluded.url,
   transport = excluded.transport, auth_mode = excluded.auth_mode,

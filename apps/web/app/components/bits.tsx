@@ -2,6 +2,7 @@
 
 import React, { useEffect, useId, useRef } from "react";
 import Link from "next/link";
+import { Connection, ownerBadge } from "../lib/api";
 
 export function Pill({ status }: { status: string }) {
   const label = status.replace(/_/g, " ");
@@ -17,6 +18,27 @@ export function Pill({ status }: { status: string }) {
 export function AutoPill({ autonomy }: { autonomy: string }) {
   return (
     <span className={`badge ${autonomy === "autonomous" ? "warn" : ""}`}>{autonomy}</span>
+  );
+}
+
+/** Ownership chip for a connection row (Phase C): "Organization" / "Personal",
+ *  with a "yours" marker when a personal connection's owner matches the viewer
+ *  (needs `meUserId`; absent in admin mode → no marker). Renders nothing for a
+ *  row without ownership data (pre-Phase-C shape). Presentation only. */
+export function OwnerTag({
+  connection,
+  meUserId,
+}: {
+  connection: Connection;
+  meUserId?: string | null;
+}) {
+  const badge = ownerBadge(connection, meUserId);
+  if (!badge) return null;
+  return (
+    <span className="chip" title={badge.label === "Personal" ? "Personal connection" : "Organization connection"}>
+      {badge.label}
+      {badge.yours && <span className="faint" style={{ marginLeft: 4 }}>· yours</span>}
+    </span>
   );
 }
 

@@ -78,6 +78,109 @@ pub struct CreateConnection {
     pub client_id: Option<String>,
     #[serde(default)]
     pub client_secret: Option<String>,
+    /// Who owns the connection (design :274-296): `organization` (default,
+    /// visible to every member, requires admin/owner) or `personal` (one
+    /// member's private custody, allowed for any signed-in member).
+    #[serde(default)]
+    pub owner: Option<String>,
+}
+
+/// Resolved ownership for a connection create: which owner the row is stamped
+/// with, and who created it. Threaded from the request `owner` field + the
+/// authenticated principal into every `create_connection`.
+#[derive(Clone, Copy)]
+pub(crate) struct OwnerContext {
+    pub owner: fluidbox_db::ConnectionOwner,
+    pub created_by_user_id: Option<Uuid>,
+}
+
+/// Resolve the request `owner` field against the principal (design :274-296).
+/// `organization` (the default, back-compat) requires `can_mutate_resources`;
+/// `personal` requires a signed-in User (the operator has no identity to own a
+/// personal row — 400) and is open to ANY member. `created_by_user_id` is
+/// always stamped from the principal (None for the operator). `github_app`
+/// connections are organization custody by construction and REFUSE personal.
+pub(crate) fn resolve_owner(
+    principal: &Principal,
+    provider: &str,
+    owner: Option<&str>,
+) -> ApiResult<OwnerContext> {
+    let created_by = principal.user_id();
+    match owner.map(str::trim).unwrap_or("organization") {
+        "organization" | "" => {
+            if !rbac::can_mutate_resources(principal) {
+                return Err(ApiError::Forbidden(
+                    "creating an organization connection requires admin or owner".into(),
+                ));
+            }
+            Ok(OwnerContext {
+                owner: fluidbox_db::ConnectionOwner::Organization,
+                created_by_user_id: created_by,
+            })
+        }
+        "personal" => {
+            if provider == "github_app" {
+                return Err(ApiError::BadRequest(
+                    "github_app connections are organization custody and cannot be personal".into(),
+                ));
+            }
+            if !rbac::can_create_personal_connection(principal) {
+                // The operator has no personal identity to own the row.
+                return Err(ApiError::BadRequest(
+                    "personal connections require a signed-in user (the admin token has no personal identity)"
+                        .into(),
+                ));
+            }
+            let uid = principal
+                .user_id()
+                .expect("can_create_personal_connection implies a user id");
+            Ok(OwnerContext {
+                owner: fluidbox_db::ConnectionOwner::User(uid),
+                created_by_user_id: Some(uid),
+            })
+        }
+        other => Err(ApiError::BadRequest(format!(
+            "owner must be 'organization' or 'personal' (got '{other}')"
+        ))),
+    }
+}
+
+/// Fetch a connection for a MUTATION (revoke / oauth start / tools refresh),
+/// enforcing ownership authority and returning the row. A PERSONAL connection
+/// (`owner_type='user'`) is owner-only: it is fetched through the caller's
+/// visibility lens, so another member's personal row is already invisible
+/// (None ⇒ 404) — the deliberate 404-not-403 shape (a personal connection is
+/// invisible, not forbidden, so its existence is never revealed). An
+/// ORGANIZATION connection keeps the standard `can_mutate_resources` gate.
+/// `action` names the verb for the forbidden message ("revoking", …).
+pub(crate) async fn connection_for_mutation(
+    state: &AppState,
+    principal: &Principal,
+    id: Uuid,
+    action: &str,
+) -> ApiResult<fluidbox_db::IntegrationConnectionRow> {
+    let scope = principal.scope();
+    let conn = fluidbox_db::get_connection_visible(
+        &state.pool,
+        scope,
+        id,
+        rbac::connection_viewer(principal),
+    )
+    .await?
+    .ok_or(ApiError::NotFound)?;
+    if conn.owner_type == "user" {
+        // Personal: owner only. The User-viewer fetch already excluded other
+        // members; assert the owner id so the operator (All viewer) — which is
+        // never the owner — also 404s rather than mutating a personal row.
+        if principal.user_id() != conn.owner_user_id {
+            return Err(ApiError::NotFound);
+        }
+    } else if !rbac::can_mutate_resources(principal) {
+        return Err(ApiError::Forbidden(format!(
+            "{action} an organization connection requires admin or owner"
+        )));
+    }
+    Ok(conn)
 }
 
 pub async fn create(
@@ -85,16 +188,14 @@ pub async fn create(
     State(state): State<AppState>,
     Json(req): Json<CreateConnection>,
 ) -> ApiResult<Json<Value>> {
-    if !rbac::can_mutate_resources(&principal) {
-        return Err(ApiError::Forbidden(
-            "creating connections requires admin or owner".into(),
-        ));
-    }
+    // Ownership + authorization: `organization` requires admin/owner,
+    // `personal` requires any signed-in member (design :274-296).
+    let owner = resolve_owner(&principal, &req.provider, req.owner.as_deref())?;
     let scope = principal.scope();
     match req.provider.as_str() {
-        "github" => create_github_pat(&state, scope, req).await,
-        "github_app" => create_github_app(&state, scope, req).await,
-        "mcp_http" => create_mcp_http(&state, scope, req).await,
+        "github" => create_github_pat(&state, scope, owner, req).await,
+        "github_app" => create_github_app(&state, scope, owner, req).await,
+        "mcp_http" => create_mcp_http(&state, scope, owner, req).await,
         other => Err(ApiError::BadRequest(format!(
             "unsupported provider '{other}' (supported: github, github_app, mcp_http)"
         ))),
@@ -114,6 +215,7 @@ pub async fn create(
 async fn create_mcp_http(
     state: &AppState,
     scope: TenantScope,
+    owner: OwnerContext,
     req: CreateConnection,
 ) -> ApiResult<Json<Value>> {
     let base_url = req
@@ -129,8 +231,28 @@ async fn create_mcp_http(
     }
     match req.auth_kind.as_deref().unwrap_or("static") {
         "static" => {
-            let row = create_mcp_http_connection(state, scope, req).await?;
-            Ok(Json(json!({ "connection": row })))
+            // Own the endpoint before `req` moves; a static mcp_http endpoint IS
+            // the base_url.
+            let endpoint = base_url.to_string();
+            let row = create_mcp_http_connection(state, scope, owner, req, None).await?;
+            // Photograph proves the credential works AND freezes the tool
+            // surface; a refused credential must not leave a dangling connection
+            // (mirrors the catalog api_key rollback).
+            match crate::snapshots::photograph_connection(state, scope, row.id, &endpoint).await {
+                Ok(snap) => Ok(Json(json!({
+                    "connection": row,
+                    "snapshot": crate::snapshots::snapshot_json(&snap),
+                }))),
+                Err(e) => {
+                    fluidbox_db::revoke_connection(&state.pool, scope, row.id)
+                        .await
+                        .ok();
+                    Err(crate::snapshots::rolled_back(
+                        "the server rejected this credential",
+                        e,
+                    ))
+                }
+            }
         }
         "oauth" => {
             let sealer = sealer(state)?;
@@ -185,6 +307,8 @@ async fn create_mcp_http(
                     client_secret_sealed: sealed_secret.as_deref(),
                     registration_id: None,
                 },
+                owner.owner,
+                owner.created_by_user_id,
             )
             .await?;
             let next = format!("/v1/connections/{}/oauth/start", row.id);
@@ -198,10 +322,15 @@ async fn create_mcp_http(
 
 /// The static mcp_http creator, reusable by the catalog Connect flow:
 /// validates base_url + header/scheme, seals the secret, returns the row.
+/// `catalog_slug` (Some for a catalog/BYO connect) is recorded in metadata for
+/// provenance; `endpoint_url` (= base_url for a static mcp_http server) is always
+/// recorded so a later `/tools/refresh` knows exactly what to re-photograph.
 pub(crate) async fn create_mcp_http_connection(
     state: &AppState,
     scope: TenantScope,
+    owner: OwnerContext,
     req: CreateConnection,
+    catalog_slug: Option<&str>,
 ) -> ApiResult<fluidbox_db::IntegrationConnectionRow> {
     let base_url = req
         .base_url
@@ -222,7 +351,12 @@ pub(crate) async fn create_mcp_http_connection(
             "token is required for mcp_http (credential-free servers need no connection)".into(),
         ));
     }
-    let mut metadata = json!({ "base_url": base_url });
+    // For a static mcp_http server the MCP endpoint IS the base_url; store it as
+    // `endpoint_url` so a later re-photograph resolves the same target.
+    let mut metadata = json!({ "base_url": base_url, "endpoint_url": base_url });
+    if let Some(slug) = catalog_slug.map(str::trim).filter(|s| !s.is_empty()) {
+        metadata["catalog_slug"] = json!(slug);
+    }
     if let Some(h) = req
         .header_name
         .as_deref()
@@ -264,6 +398,8 @@ pub(crate) async fn create_mcp_http_connection(
         &metadata,
         None,
         fluidbox_db::ConnectionAuth::static_active(),
+        owner.owner,
+        owner.created_by_user_id,
     )
     .await?)
 }
@@ -271,6 +407,7 @@ pub(crate) async fn create_mcp_http_connection(
 async fn create_github_pat(
     state: &AppState,
     scope: TenantScope,
+    owner: OwnerContext,
     req: CreateConnection,
 ) -> ApiResult<Json<Value>> {
     let token = req.token.as_deref().map(str::trim).unwrap_or_default();
@@ -297,6 +434,8 @@ async fn create_github_pat(
         &json!({ "login": login }),
         None,
         fluidbox_db::ConnectionAuth::static_active(),
+        owner.owner,
+        owner.created_by_user_id,
     )
     .await?;
     Ok(Json(json!({ "connection": row })))
@@ -305,6 +444,7 @@ async fn create_github_pat(
 async fn create_github_app(
     state: &AppState,
     scope: TenantScope,
+    owner: OwnerContext,
     req: CreateConnection,
 ) -> ApiResult<Json<Value>> {
     let field = |v: &Option<String>, name: &str| -> ApiResult<String> {
@@ -353,6 +493,11 @@ async fn create_github_app(
         &metadata,
         Some(&sealed_webhook),
         fluidbox_db::ConnectionAuth::static_active(),
+        // github_app connections are ALWAYS organization-owned (system custody);
+        // `resolve_owner` has already refused a `personal` request for this
+        // provider, so `owner.owner` is guaranteed `Organization` here.
+        owner.owner,
+        owner.created_by_user_id,
     )
     .await
     {
@@ -375,7 +520,14 @@ async fn create_github_app(
 
 pub async fn list(principal: Principal, State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let scope = principal.scope();
-    let connections = fluidbox_db::list_connections(&state.pool, scope).await?;
+    // Owner-filtered: a member sees org connections + only their own personal
+    // rows; the operator sees all (design :274-296).
+    let connections = fluidbox_db::list_connections_visible(
+        &state.pool,
+        scope,
+        rbac::connection_viewer(&principal),
+    )
+    .await?;
     Ok(Json(json!({ "connections": connections })))
 }
 
@@ -384,15 +536,12 @@ pub async fn revoke(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    if !rbac::can_mutate_resources(&principal) {
-        return Err(ApiError::Forbidden(
-            "revoking connections requires admin or owner".into(),
-        ));
-    }
+    // Personal ⇒ owner-only (else 404); organization ⇒ admin/owner.
+    let conn = connection_for_mutation(&state, &principal, id, "revoking").await?;
     let scope = principal.scope();
-    let row = fluidbox_db::revoke_connection(&state.pool, scope, id)
+    let row = fluidbox_db::revoke_connection(&state.pool, scope, conn.id)
         .await?
-        .ok_or_else(|| ApiError::Conflict("connection not found or already revoked".into()))?;
+        .ok_or_else(|| ApiError::Conflict("connection is already revoked".into()))?;
     // A cached installation/access token must not outlive the revocation.
     crate::oauth::invalidate_access(&state, row.id).await;
     Ok(Json(json!({ "connection": row })))
@@ -414,6 +563,10 @@ pub async fn approve(
         ));
     }
     let scope = principal.scope();
+    // approve applies ONLY to seamless github_app connections, which are ALWAYS
+    // organization-owned (create refuses `personal` for github_app) — so the
+    // unfiltered `get_connection` is equivalent to the visible variant here, and
+    // `can_mutate_resources` above is the correct (org) gate.
     let conn = fluidbox_db::get_connection(&state.pool, scope, id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -490,6 +643,11 @@ pub async fn approve(
         &crate::github_app::installation_metadata(&reg, &conn.external_account_id, login),
     )
     .await?;
+    // Reactivating a github_app connection does NOT bump the authorization
+    // generation (unlike an OAuth reconnect): the installation id is a
+    // positively proven stable identity, so the logical account is unchanged and
+    // in-flight bindings stay valid. Only the cached installation token is
+    // evicted so a re-mint picks up the reconciled state.
     crate::oauth::invalidate_access(&state, conn.id).await;
     // Compensating check: a registration revoke racing this approve must
     // win. Re-read AFTER our transition — if the registration flipped, the
@@ -541,9 +699,16 @@ pub async fn repos(
     Query(q): Query<ReposQuery>,
 ) -> ApiResult<Json<Value>> {
     let scope = principal.scope();
-    let conn = fluidbox_db::get_connection(&state.pool, scope, id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
+    // Owner-filtered read: another member's personal connection is invisible
+    // here (None ⇒ 404), so its repositories can never be browsed.
+    let conn = fluidbox_db::get_connection_visible(
+        &state.pool,
+        scope,
+        id,
+        rbac::connection_viewer(&principal),
+    )
+    .await?
+    .ok_or(ApiError::NotFound)?;
     if conn.status != "active" {
         return Err(ApiError::Conflict(format!(
             "connection is {} — reconnect to browse repositories",
@@ -555,4 +720,107 @@ pub async fn repos(
         .await
         .map_err(ApiError::BadRequest)?;
     Ok(Json(json!({ "repos": repos })))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pure-function coverage for `resolve_owner` (DB-free). The owner-filtered
+    //! reads and `connection_for_mutation` need a live connection row, so their
+    //! matrix (Alice/Bob personal isolation, admin-can't-see-personal, operator
+    //! mutate-personal → 404) is deferred to the Task 9 CI e2e.
+    use super::*;
+    use crate::auth::{AuthContext, UserPrincipal};
+    use fluidbox_db::{ConnectionOwner, TenantScope};
+
+    fn operator() -> Principal {
+        Principal::Operator {
+            scope: TenantScope::assume(Uuid::now_v7()),
+        }
+    }
+
+    fn user(roles: &[&str]) -> Principal {
+        Principal::User(UserPrincipal {
+            tenant_id: Uuid::now_v7(),
+            user_id: Uuid::now_v7(),
+            membership_id: Uuid::now_v7(),
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+            auth: AuthContext::Pat {
+                token_id: Uuid::now_v7(),
+            },
+        })
+    }
+
+    #[test]
+    fn organization_default_requires_mutate_and_stamps_creator() {
+        // Operator: org connection, no created_by (no personal identity).
+        let op = operator();
+        let ctx = resolve_owner(&op, "mcp_http", None).expect("operator may create org");
+        assert!(matches!(ctx.owner, ConnectionOwner::Organization));
+        assert_eq!(ctx.created_by_user_id, None);
+
+        // Admin: org connection, created_by stamped from the principal.
+        let admin = user(&["admin"]);
+        let ctx =
+            resolve_owner(&admin, "mcp_http", Some("organization")).expect("admin may create org");
+        assert!(matches!(ctx.owner, ConnectionOwner::Organization));
+        assert_eq!(ctx.created_by_user_id, admin.user_id());
+
+        // Plain member: org connection refused (needs admin/owner).
+        let member = user(&["member"]);
+        assert!(matches!(
+            resolve_owner(&member, "mcp_http", Some("organization")),
+            Err(ApiError::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn personal_is_open_to_any_member_but_not_the_operator() {
+        // Any member — no elevated role — may own a personal connection.
+        for roles in [&["member"][..], &["admin"][..], &["owner"][..]] {
+            let p = user(roles);
+            let ctx = resolve_owner(&p, "mcp_http", Some("personal"))
+                .unwrap_or_else(|_| panic!("member {roles:?} may create personal"));
+            match ctx.owner {
+                ConnectionOwner::User(uid) => {
+                    assert_eq!(Some(uid), p.user_id());
+                    assert_eq!(ctx.created_by_user_id, p.user_id());
+                }
+                ConnectionOwner::Organization => panic!("expected a personal owner"),
+            }
+        }
+        // The operator has no identity to own a personal row → 400.
+        assert!(matches!(
+            resolve_owner(&operator(), "mcp_http", Some("personal")),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn github_app_refuses_personal_for_any_principal() {
+        for p in [operator(), user(&["admin"]), user(&["owner"])] {
+            assert!(
+                matches!(
+                    resolve_owner(&p, "github_app", Some("personal")),
+                    Err(ApiError::BadRequest(_))
+                ),
+                "github_app must refuse personal"
+            );
+        }
+        // github_app organization still works for an admin.
+        let ctx = resolve_owner(&user(&["admin"]), "github_app", Some("organization"))
+            .expect("github_app org is allowed");
+        assert!(matches!(ctx.owner, ConnectionOwner::Organization));
+    }
+
+    #[test]
+    fn unknown_owner_value_is_rejected() {
+        assert!(matches!(
+            resolve_owner(&user(&["admin"]), "mcp_http", Some("everyone")),
+            Err(ApiError::BadRequest(_))
+        ));
+        // An empty/whitespace owner falls back to the organization default.
+        let ctx = resolve_owner(&user(&["admin"]), "mcp_http", Some("  "))
+            .expect("blank owner defaults to organization");
+        assert!(matches!(ctx.owner, ConnectionOwner::Organization));
+    }
 }

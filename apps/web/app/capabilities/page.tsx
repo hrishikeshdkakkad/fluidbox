@@ -16,15 +16,23 @@ import {
 import {
   apiGet,
   apiPost,
+  AuthMe,
   BundleDetail,
   BundleServer,
   CapabilityBundle,
   CatalogConnectResult,
   CatalogEntry,
   Connection,
+  ConnectionToolSnapshot,
+  fetchConnectionTools,
   isToolConnection,
+  OwnerChoice,
+  ownerOptions,
+  refreshConnectionTools,
 } from "../lib/api";
-import { GitHubMark, LoadingRows, ModalShell, PageHead } from "../components/bits";
+import { useAuthMe } from "../lib/useAuthMe";
+import { GitHubMark, LoadingRows, ModalShell, OwnerTag, PageHead, timeAgo } from "../components/bits";
+import { OwnerPicker } from "../components/OwnerPicker";
 import { AddServerWizard } from "./AddServerWizard";
 
 type Tab = "store" | "bundles" | "connections";
@@ -38,6 +46,7 @@ export default function CapabilitiesPage() {
 }
 
 function Capabilities() {
+  const me = useAuthMe();
   const router = useRouter();
   const params = useSearchParams();
   const tab = ((params.get("tab") as Tab) || "store") as Tab;
@@ -50,6 +59,7 @@ function Capabilities() {
   const [connecting, setConnecting] = useState<CatalogEntry | null>(null);
   const [showBundle, setShowBundle] = useState(false);
   const [showWizard, setShowWizard] = useState(false);
+  const [toolsFor, setToolsFor] = useState<Connection | null>(null);
   const [err, setErr] = useState("");
   const [loading, setLoading] = useState(true);
 
@@ -138,14 +148,17 @@ function Capabilities() {
       ) : (
         <ToolConnections
           connections={toolConnections}
+          meUserId={me?.user_id}
           onRevoke={revoke}
           onReconnect={reconnectOauth}
+          onShowTools={setToolsFor}
         />
       )}
 
       {connecting && (
         <ConnectCatalog
           entry={connecting}
+          me={me}
           onClose={() => {
             setConnecting(null);
             load();
@@ -163,11 +176,15 @@ function Capabilities() {
       )}
       {showWizard && (
         <AddServerWizard
+          me={me}
           onClose={() => {
             setShowWizard(false);
             load();
           }}
         />
+      )}
+      {toolsFor && (
+        <ConnectionToolsPanel connection={toolsFor} onClose={() => setToolsFor(null)} />
       )}
     </>
   );
@@ -507,12 +524,16 @@ function BundlesTab({
 
 function ToolConnections({
   connections,
+  meUserId,
   onRevoke,
   onReconnect,
+  onShowTools,
 }: {
   connections: Connection[];
+  meUserId?: string | null;
   onRevoke: (id: string) => void;
   onReconnect: (id: string) => void;
+  onShowTools: (c: Connection) => void;
 }) {
   return (
     <>
@@ -532,10 +553,13 @@ function ToolConnections({
                 <span className="task">
                   {c.display_name}
                   <span className="chips" style={{ display: "inline-flex", marginLeft: 8, verticalAlign: "middle" }}>
+                    <OwnerTag connection={c} meUserId={meUserId} />
                     {c.auth_kind === "oauth" ? (
                       <span className="chip">
                         oauth{c.oauth?.client_id_source ? ` · ${c.oauth.client_id_source}` : ""}
                       </span>
+                    ) : c.auth_kind === "none" ? (
+                      <span className="chip">no auth</span>
                     ) : (
                       <span className="chip">api key</span>
                     )}
@@ -565,6 +589,9 @@ function ToolConnections({
                   <span className="badge err">{c.status}</span>
                 )}
                 <span style={{ display: "flex", gap: 6 }}>
+                  <button className="btn ghost sm" onClick={() => onShowTools(c)}>
+                    Tools
+                  </button>
                   {c.status === "active" ? (
                     <button className="btn ghost sm danger" onClick={() => onRevoke(c.id)}>
                       Revoke
@@ -589,13 +616,140 @@ function ToolConnections({
   );
 }
 
+/* ─── Connection tool snapshot panel ─────────────────────────────────── */
+
+// The append-only photograph of a brokered connection's tools/list
+// (GET /connections/{id}/tools). Refresh re-photographs into a new version; a
+// 4xx body is actionable (e.g. reauthorization guidance) and is shown verbatim.
+function ConnectionToolsPanel({
+  connection,
+  onClose,
+}: {
+  connection: Connection;
+  onClose: () => void;
+}) {
+  const [snapshot, setSnapshot] = useState<ConnectionToolSnapshot | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [err, setErr] = useState("");
+
+  const load = useCallback(async () => {
+    setErr("");
+    try {
+      setSnapshot(await fetchConnectionTools(connection.id));
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [connection.id]);
+
+  useEffect(() => {
+    // Defer the first fetch out of the effect body (repo convention, survey D
+    // §9) so the synchronous setState inside load() doesn't cascade-render.
+    const t = window.setTimeout(() => void load(), 0);
+    return () => clearTimeout(t);
+  }, [load]);
+
+  const refresh = async () => {
+    setErr("");
+    setRefreshing(true);
+    try {
+      setSnapshot(await refreshConnectionTools(connection.id));
+    } catch (e) {
+      // 4xx bodies (generation refresh / reauthorization guidance) are designed
+      // to be actionable — surface them verbatim.
+      setErr(String(e));
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  return (
+    <ModalShell
+      title={`${connection.display_name} · tools`}
+      sub="The connection's latest photographed tool surface. The permission gate still judges every call."
+      onClose={onClose}
+    >
+      {loading ? (
+        <div className="tool-list">
+          <div className="tool-loading">Loading tools…</div>
+        </div>
+      ) : snapshot ? (
+        <>
+          <div className="chips" style={{ marginBottom: 10 }}>
+            <span className="chip">
+              version <b>{snapshot.version}</b>
+            </span>
+            <span className="chip">
+              protocol <b>{snapshot.protocol_version}</b>
+            </span>
+            <span className="chip">
+              generation <b>{snapshot.authorization_generation}</b>
+            </span>
+            <span className="chip">
+              photographed <b>{timeAgo(snapshot.discovered_at)}</b>
+            </span>
+          </div>
+          <div className="field">
+            <span className="lab">Tools ({snapshot.tools.length})</span>
+            {snapshot.tools.length === 0 ? (
+              <div className="tool-empty">No tools in this snapshot.</div>
+            ) : (
+              <div className="rows" style={{ marginTop: 6 }}>
+                {snapshot.tools.map((t) => (
+                  <div
+                    key={t.name}
+                    className="row"
+                    style={{ gridTemplateColumns: "minmax(120px, 40%) 1fr", padding: "6px 10px" }}
+                  >
+                    <span className="mono" style={{ fontSize: 12, color: "var(--accent)" }}>
+                      {t.name}
+                    </span>
+                    <span className="faint" style={{ fontSize: 12 }}>
+                      {t.description || "—"}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+          <p className="faint mono" style={{ fontSize: 11, marginTop: 6 }}>
+            digest {snapshot.tools_digest.slice(0, 24)}…
+          </p>
+        </>
+      ) : (
+        <div className="empty" style={{ padding: "18px 0" }}>
+          <div>No tool snapshot yet — refresh to photograph.</div>
+        </div>
+      )}
+      {err && <div className="err">{err}</div>}
+      <div className="spread" style={{ marginTop: 16 }}>
+        <span className="helper">Re-photographing appends a new snapshot version.</span>
+        <button className="btn primary" onClick={refresh} disabled={refreshing}>
+          {refreshing ? "Refreshing…" : "Refresh tools"}
+        </button>
+      </div>
+    </ModalShell>
+  );
+}
+
 /* ─── Connect-from-catalog modal ─────────────────────────────────────── */
 
-function ConnectCatalog({ entry, onClose }: { entry: CatalogEntry; onClose: () => void }) {
+function ConnectCatalog({
+  entry,
+  me,
+  onClose,
+}: {
+  entry: CatalogEntry;
+  me: AuthMe | null;
+  onClose: () => void;
+}) {
   const [token, setToken] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [clientId, setClientId] = useState("");
   const [clientSecret, setClientSecret] = useState("");
+  const [ownerChoice, setOwnerChoice] = useState<OwnerChoice | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [done, setDone] = useState("");
@@ -603,6 +757,8 @@ function ConnectCatalog({ entry, onClose }: { entry: CatalogEntry; onClose: () =
   const [toolDetail, setToolDetail] = useState<BundleDetail | null>(null);
   const [toolsErr, setToolsErr] = useState(false);
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Catalog connections are mcp_http — personal is allowed for any member.
+  const owner = ownerChoice ?? ownerOptions(me, true).default;
 
   const conn = entry.connection;
   const isConnected = conn?.status === "active" || (entry.auth_mode === "none" && !!entry.bundle);
@@ -700,6 +856,7 @@ function ConnectCatalog({ entry, onClose }: { entry: CatalogEntry; onClose: () =
         display_name: displayName.trim() || null,
         client_id: clientId.trim() || null,
         client_secret: clientSecret.trim() || null,
+        owner,
       });
       if (entry.auth_mode !== "oauth") {
         setDone(
@@ -922,6 +1079,7 @@ function ConnectCatalog({ entry, onClose }: { entry: CatalogEntry; onClose: () =
               </label>
             </>
           )}
+          <OwnerPicker me={me} value={owner} onChange={setOwnerChoice} />
           <label className="field">
             <span className="lab">Display name (optional)</span>
             <input className="inp" value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
@@ -957,12 +1115,6 @@ const BUNDLE_EXAMPLE = `[
       { "name": "workspace_file_count", "description": "Count files in the workspace",
         "input_schema": { "type": "object", "properties": {} } }
     ]
-  },
-  {
-    "class": "brokered",
-    "name": "kb",
-    "url": "https://mcp.example.com/mcp",
-    "connection_id": "<mcp_http connection id, omit if the server needs no credential>"
   }
 ]`;
 
@@ -1007,9 +1159,13 @@ function NewBundle({ onClose, onCreated }: { onClose: () => void; onCreated: () 
       onClose={onClose}
     >
       <p className="helper" style={{ marginTop: 0 }}>
-        Brokered servers are contacted now to photograph their tools — declare tools only for
-        sandbox servers. Credentials come from mcp_http connections; they are never stored here
-        and never enter a sandbox.
+        Bundles now carry <strong>sandbox</strong> (in-image stdio) servers only — declare their
+        tools inline, as above.
+      </p>
+      <p className="helper" style={{ marginTop: 0 }}>
+        For a brokered (remote) MCP server, connect it under{" "}
+        <Link href="/capabilities">Integrations</Link> instead — its tools are photographed into a
+        per-connection snapshot, and an agent names it through a connection requirement.
       </p>
       <label className="field">
         <span className="lab">Name</span>
@@ -1031,9 +1187,9 @@ function NewBundle({ onClose, onCreated }: { onClose: () => void; onCreated: () 
       </label>
       {err && <div className="err">{err}</div>}
       <div className="spread" style={{ marginTop: 16 }}>
-        <span className="helper">Brokered servers are discovered &amp; validated before storage.</span>
+        <span className="helper">Sandbox servers are validated before storage.</span>
         <button className="btn primary" onClick={submit} disabled={busy}>
-          {busy ? "Photographing…" : "Register"}
+          {busy ? "Registering…" : "Register"}
         </button>
       </div>
     </ModalShell>

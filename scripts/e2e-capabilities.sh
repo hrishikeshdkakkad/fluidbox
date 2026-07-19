@@ -11,8 +11,9 @@
 # §17 #7 PINS + snapshots into the RunSpec; the ONE permission gate denies
 # any mcp__* call outside the frozen set (drift/rug-pull = visible deny).
 # Attach ≠ allow: policy still judges every available tool.
-#   • §12 acceptance: two agents on the SAME event carry different bundles;
-#     each uses only its frozen capabilities; every call in the ledger
+#   • §12 acceptance: two agents on the SAME event carry different capability
+#     surfaces (sandbox bundles + brokered connection requirements); each uses
+#     only its frozen set; every call in the ledger
 #   • live: an agent actually uses a brokered tool + a sandbox tool through
 #     the real SDK (self-skips without a key)
 # No public URL needed: a fake MCP server (bearer-checked, request log,
@@ -233,31 +234,40 @@ CODE=$(post "/policies" "{\"name\":\"cap-e2e\",\"yaml\":$PY}")
 [ "$CODE" = "200" ] && ok "cap-e2e policy created (kb_write deny > mcp__* allow)" || { no "policy create → $CODE: $(cat "$B")"; exit 1; }
 
 # ── mcp_http connection: sealed credential, audience-bound ────────────────
-say "CONNECTION — mcp_http: bearer sealed at rest, never echoed"
-CODE=$(post "/connections" "{\"provider\":\"mcp_http\",\"base_url\":\"http://127.0.0.1:$MCP_PORT\",\"token\":\"$KB_TOKEN\",\"display_name\":\"kb-upstream\"}")
-[ "$CODE" = "200" ] && ok "mcp_http connection created" || { no "connection → $CODE: $(cat "$B")"; exit 1; }
+# Phase C: a static mcp_http connect photographs the /mcp endpoint's tools into a
+# connection SNAPSHOT immediately. Brokered tools are agent connection
+# REQUIREMENTS resolved into run bindings now — no brokered capability bundle.
+say "CONNECTION — mcp_http: bearer sealed at rest; the photograph is a snapshot"
+CODE=$(post "/connections" "{\"provider\":\"mcp_http\",\"base_url\":\"http://127.0.0.1:$MCP_PORT/mcp\",\"token\":\"$KB_TOKEN\",\"display_name\":\"kb-upstream\"}")
+[ "$CODE" = "200" ] && ok "mcp_http connection created + photographed" || { no "connection → $CODE: $(cat "$B")"; exit 1; }
 KBCONN=$(jb "['connection']['id']")
+[ "$(jb "['snapshot']['version']")" = "1" ] && ok "connection snapshot v1 in the create response (Phase C: snapshots, not bundles)" || no "no snapshot: $(cat "$B")"
 grep -q "$KB_TOKEN" "$B" && no "bearer token echoed in create response!" || ok "bearer token not in response"
 get "/connections" | grep -q "$KB_TOKEN" && no "bearer token in connection listing!" || ok "bearer token not in listing"
+grep -q "Bearer $KB_TOKEN" "$MCP_LOG" && ok "discovery authenticated with the sealed bearer (server-side turn)" || no "no bearer in mcp log"
 CODE=$(post "/connections" "{\"provider\":\"mcp_http\",\"base_url\":\"ftp://x\",\"token\":\"t\"}")
 [ "$CODE" = "400" ] && ok "non-http base_url → 400" || no "wanted 400, got $CODE"
 
-# ── Registry: registration IS the photograph ──────────────────────────────
-say "REGISTRY — brokered discovery, sandbox declaration, append-only versions"
-KB="kb-tools-$$"; WS="ws-tools-$$"; WS2="ws2-tools-$$"
-LIST_BEFORE=$(mcp_count "tools/list")
-CODE=$(post "/capabilities" "{\"name\":\"$KB\",\"description\":\"brokered kb\",\"servers\":[
-  {\"class\":\"brokered\",\"name\":\"kb\",\"url\":\"http://127.0.0.1:$MCP_PORT/mcp\",\"connection_id\":\"$KBCONN\"}]}")
-[ "$CODE" = "200" ] && ok "brokered bundle registered (v$(jb "['bundle']['version']"))" || { no "kb bundle → $CODE: $(cat "$B")"; exit 1; }
-[ "$(jb "['bundle']['version']")" = "1" ] || no "expected version 1"
-[ "$(mcp_count "tools/list")" -gt "$LIST_BEFORE" ] && ok "control plane DISCOVERED tools (tools/list hit the fake)" || no "no tools/list seen"
-grep -q "Bearer $KB_TOKEN" "$MCP_LOG" && ok "discovery authenticated with the sealed bearer (server-side turn)" || no "no bearer in mcp log"
-TOOLS=$(jb "['bundle']['definition']['servers'][0]['tools']")
-echo "$TOOLS" | grep -q "kb_search" && echo "$TOOLS" | grep -q "kb_write" \
-  && ok "photograph holds kb_search + kb_write with schemas" || no "snapshot wrong: $TOOLS"
-DIGEST1=$(jb "['bundle']['definition_digest']")
-[ -n "$DIGEST1" ] && ok "definition digest recorded ($(echo "$DIGEST1" | cut -c1-18)…)" || no "no digest"
+# The requirement the brokered agents DECLARE (slot kb; organization binding —
+# these runs are event-driven and carry no invoking user). required_tools keeps
+# kb_write so the gate reaches POLICY for it (attach != allow), not a capability deny.
+KB_REQ="[{\"slot\":\"kb\",\"connector\":{\"url\":\"http://127.0.0.1:$MCP_PORT/mcp\",\"slug\":\"kb\"},\"required_tools\":[\"kb_search\",\"kb_write\"],\"binding_mode\":\"organization\"}]"
 
+# ── Registry: registration IS the photograph ──────────────────────────────
+say "SNAPSHOT — the connection's tool surface is photographed + digested"
+WS="ws-tools-$$"; WS2="ws2-tools-$$"
+# The connection's snapshot IS the photograph (Phase C): read it and assert the
+# tool contract + digest + a negotiated protocol version.
+SNAP=$(get "/connections/$KBCONN/tools")
+TOOLS=$(echo "$SNAP" | j "['snapshot']['tools']")
+echo "$TOOLS" | grep -q "kb_search" && echo "$TOOLS" | grep -q "kb_write" \
+  && ok "snapshot holds kb_search + kb_write" || no "snapshot wrong: $TOOLS"
+DIGEST1=$(echo "$SNAP" | j "['snapshot']['tools_digest']")
+[ -n "$DIGEST1" ] && ok "snapshot tools_digest recorded" || no "no digest"
+PROTO=$(echo "$SNAP" | j "['snapshot']['protocol_version']")
+[ -n "$PROTO" ] && ok "snapshot recorded a negotiated protocol_version ($PROTO)" || no "no protocol version"
+
+say "REGISTRY — sandbox declaration survives (Phase C keeps bundles for stdio)"
 CODE=$(post "/capabilities" "{\"name\":\"$WS\",\"description\":\"sandbox workspace tools\",\"servers\":[
   {\"class\":\"sandbox\",\"name\":\"ws\",\"command\":\"node\",\"args\":[\"/opt/fluidbox-runner/servers/workspace-info.mjs\"],
    \"tools\":[
@@ -267,10 +277,9 @@ CODE=$(post "/capabilities" "{\"name\":\"$WS\",\"description\":\"sandbox workspa
       \"input_schema\":{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"}},\"required\":[\"pattern\"]}}]}]}")
 [ "$CODE" = "200" ] && ok "sandbox bundle registered (declared photograph)" || { no "ws bundle → $CODE: $(cat "$B")"; exit 1; }
 
-say "REGISTRY GUARDS — poison screen + class rules refused at the door"
-CODE=$(post "/capabilities" "{\"name\":\"bad1-$$\",\"servers\":[{\"class\":\"brokered\",\"name\":\"kb\",\"url\":\"http://127.0.0.1:$MCP_PORT/mcp\",
-  \"tools\":[{\"name\":\"sneaky\",\"input_schema\":{}}]}]}")
-[ "$CODE" = "400" ] && ok "brokered server with DECLARED tools → 400 (discovery is the photograph)" || no "wanted 400, got $CODE"
+say "REGISTRY GUARDS — brokered cutover + poison screen + class rules at the door"
+CODE=$(post "/capabilities" "{\"name\":\"bad1-$$\",\"servers\":[{\"class\":\"brokered\",\"name\":\"kb\",\"url\":\"http://127.0.0.1:$MCP_PORT/mcp\",\"connection_id\":\"$KBCONN\"}]}")
+[ "$CODE" = "400" ] && ok "a brokered server in a bundle → 400 (Phase C: brokered tools are connection requirements)" || no "wanted 400, got $CODE"
 CODE=$(post "/capabilities" "{\"name\":\"bad2-$$\",\"servers\":[{\"class\":\"sandbox\",\"name\":\"ws\",\"command\":\"node\",\"tools\":[]}]}")
 [ "$CODE" = "400" ] && ok "sandbox server without declared tools → 400" || no "wanted 400, got $CODE"
 CODE=$(post "/capabilities" "{\"name\":\"bad3-$$\",\"servers\":[{\"class\":\"sandbox\",\"name\":\"W_S\",\"command\":\"node\",
@@ -284,28 +293,29 @@ CODE=$(post "/capabilities" "{\"name\":\"bad@5\",\"servers\":[]}")
 [ "$CODE" = "400" ] && ok "bundle name with '@' → 400 (it is the version separator)" || no "wanted 400, got $CODE"
 
 # ── Attach (§17 #7 pin-only) ──────────────────────────────────────────────
-say "ATTACH — bare names pin the newest version AT ATTACH TIME"
-mk_agent() { # name bundles-json → 000 on failure
-  post "/agents" "{\"name\":\"$1\",\"policy\":\"cap-e2e\",\"capability_bundles\":$2}"
+say "ATTACH — sandbox bundles PIN (§17 #7); brokered agents DECLARE a requirement"
+mk_agent() { # name bundles-json [requirements-json] → 000 on failure
+  post "/agents" "{\"name\":\"$1\",\"policy\":\"cap-e2e\",\"capability_bundles\":$2,\"connection_requirements\":${3:-[]}}"
 }
-CODE=$(mk_agent "cap-a-$$" "[\"$KB\",\"$WS\"]")
-[ "$CODE" = "200" ] && ok "agent A attaches [$KB, $WS]" || { no "agent A → $CODE: $(cat "$B")"; exit 1; }
+CODE=$(mk_agent "cap-a-$$" "[\"$WS\"]" "$KB_REQ")
+[ "$CODE" = "200" ] && ok "agent A attaches [$WS] + declares the kb requirement" || { no "agent A → $CODE: $(cat "$B")"; exit 1; }
 PINS=$(jb "['revision']['capability_bundles']")
-echo "$PINS" | grep -q "'version': 1" && ok "revision stores exact pins (version 1)" || no "pins: $PINS"
+echo "$PINS" | grep -q "'version': 1" && ok "revision stores exact sandbox pins (version 1)" || no "pins: $PINS"
+jb "['revision']['connection_requirements']" | grep -q "kb" && ok "revision stores the kb connection requirement" || no "requirement not stored"
 CODE=$(mk_agent "cap-b-$$" "[\"$WS\"]")
-[ "$CODE" = "200" ] && ok "agent B attaches [$WS] only" || no "agent B → $CODE"
+[ "$CODE" = "200" ] && ok "agent B attaches [$WS] only (no kb requirement)" || no "agent B → $CODE"
 CODE=$(mk_agent "cap-c-$$" "null")
 [ "$CODE" = "200" ] && ok "agent C attaches nothing" || no "agent C → $CODE"
-CODE=$(mk_agent "cap-f-$$" "[\"$KB\"]")
-[ "$CODE" = "200" ] && ok "fork-probe agent F attaches [$KB]" || no "agent F → $CODE"
+CODE=$(mk_agent "cap-f-$$" "[]" "$KB_REQ")
+[ "$CODE" = "200" ] && ok "fork-probe agent F declares the kb requirement" || no "agent F → $CODE"
 CODE=$(mk_agent "cap-x-$$" "[\"nonexistent-bundle\"]")
 [ "$CODE" = "400" ] && ok "unknown bundle ref → 400" || no "wanted 400, got $CODE"
 
-# Publishing v2 AFTER the attach must not move any pin (§17 #7).
-CODE=$(post "/capabilities" "{\"name\":\"$KB\",\"servers\":[
-  {\"class\":\"brokered\",\"name\":\"kb\",\"url\":\"http://127.0.0.1:$MCP_PORT/mcp\",\"connection_id\":\"$KBCONN\"}]}")
+# Publishing a sandbox bundle v2 AFTER the attach must not move any pin (§17 #7).
+CODE=$(post "/capabilities" "{\"name\":\"$WS\",\"servers\":[{\"class\":\"sandbox\",\"name\":\"ws\",\"command\":\"node\",
+  \"tools\":[{\"name\":\"workspace_file_count\",\"input_schema\":{\"type\":\"object\"}}]}]}")
 [ "$CODE" = "200" ] && [ "$(jb "['bundle']['version']")" = "2" ] \
-  && ok "re-publishing $KB appends version 2 (append-only registry)" || no "v2 publish: $CODE"
+  && ok "re-publishing $WS appends version 2 (append-only registry)" || no "v2 publish: $CODE"
 
 # Shadowing defense: a second bundle claiming server alias "ws".
 post "/capabilities" "{\"name\":\"$WS2\",\"servers\":[{\"class\":\"sandbox\",\"name\":\"ws\",\"command\":\"node\",
@@ -314,7 +324,7 @@ CODE=$(mk_agent "cap-y-$$" "[\"$WS\",\"$WS2\"]")
 [ "$CODE" = "400" ] && ok "server-alias collision across bundles → 400 at attach (shadowing defense)" || no "wanted 400, got $CODE"
 
 # ── App connection + subscriptions on one repository ──────────────────────
-say "SUBSCRIPTIONS — same event, different bundles (+ §3.5 keep-list)"
+say "SUBSCRIPTIONS — same event, different capability surfaces (+ §3.5 keep-list)"
 PEM_FILE="$CAP_DIR/app-key.pem"
 openssl genrsa -out "$PEM_FILE" 2048 2>/dev/null
 WHSEC="whsec-cap-$$"
@@ -340,11 +350,14 @@ mk_sub() { # name agent extra-json → sub id (empty on failure)
 SUBA=$(mk_sub "cap-sub-a-$$" "cap-a-$$" "")
 SUBB=$(mk_sub "cap-sub-b-$$" "cap-b-$$" "")
 SUBC=$(mk_sub "cap-sub-c-$$" "cap-c-$$" "")
-SUBN=$(mk_sub "cap-sub-n-$$" "cap-a-$$" ",\"capabilities\":[\"$WS\"]")
+# N narrows cap-a's keep-list to [] — this removes the WS BUNDLE but NOT the kb
+# CONNECTION REQUIREMENT (keep-lists narrow bundles; requirements resolve
+# independently). So N freezes zero sandbox capabilities but still binds kb.
+SUBN=$(mk_sub "cap-sub-n-$$" "cap-a-$$" ",\"capabilities\":[]")
 [ -n "$SUBA" ] && [ -n "$SUBB" ] && [ -n "$SUBC" ] && [ -n "$SUBN" ] \
-  && ok "four subscriptions on acme/site (A full, B ws-only, C none, N narrowed)" \
+  && ok "four subscriptions on acme/site (A full, B ws-only, C none, N bundle-narrowed)" \
   || { no "subscription create failed: $(cat "$B")"; exit 1; }
-CODE=$(post "/triggers" "{\"agent\":\"cap-c-$$\",\"name\":\"cap-dead-$$\",\"task_template\":\"t\",\"capabilities\":[\"$KB\"]}")
+CODE=$(post "/triggers" "{\"agent\":\"cap-c-$$\",\"name\":\"cap-dead-$$\",\"task_template\":\"t\",\"capabilities\":[\"$WS2\"]}")
 [ "$CODE" = "400" ] && ok "keep-list naming an unattached bundle → 400 (dead config refused)" || no "wanted 400, got $CODE"
 
 # ── One PR-opened event → four isolated runs, four distinct frozen sets ───
@@ -406,24 +419,26 @@ N=$(python3 -c "import json;print(len(json.load(open('$B'))['dispatched']))" 2>/
 sid_of() { python3 -c "import json;d=json.load(open('$B'));print([x['session_id'] for x in d['dispatched'] if x['subscription_id']=='$1'][0])"; }
 SA=$(sid_of "$SUBA"); SB=$(sid_of "$SUBB"); SC=$(sid_of "$SUBC"); SN=$(sid_of "$SUBN")
 
-CAPS_A=$(sfield "$SA" "['run_spec']['capabilities']")
+BROK_A=$(sfield "$SA" "['run_spec']['brokered']")
 PINOK=$(curl -s -H "$H" "$API/v1/sessions/$SA" | python3 -c "
 import sys, json
 caps = json.load(sys.stdin)['session']['run_spec'].get('capabilities', [])
 pairs = sorted((b['name'], b['version']) for b in caps)
-print('ok' if pairs == sorted([('$KB', 1), ('$WS', 1)]) else pairs)
+print('ok' if pairs == [('$WS', 1)] else pairs)
 ")
 [ "$PINOK" = "ok" ] \
-  && ok "A froze $KB@1 + $WS@1 — v2 exists but the PIN held (§17 #7)" || no "A pins: $PINOK"
-echo "$CAPS_A" | grep -q "kb_search" && echo "$CAPS_A" | grep -q "input_schema" \
-  && ok "A's RunSpec embeds the full tool-schema snapshots" || no "A snapshot missing"
+  && ok "A froze the $WS bundle @1 (sandbox v2 exists but the PIN held, section 17 #7)" || no "A pins: $PINOK"
+echo "$BROK_A" | grep -q "'slot': 'kb'" && echo "$BROK_A" | grep -q "kb_search" && echo "$BROK_A" | grep -q "input_schema" \
+  && ok "A's RunSpec froze a kb BROKERED SURFACE with the full tool-schema snapshot" || no "A brokered surface missing: $(echo "$BROK_A" | head -c 200)"
+BROK_B=$(sfield "$SB" "['run_spec']['brokered']")
 CAPS_B=$(sfield "$SB" "['run_spec']['capabilities']")
-echo "$CAPS_B" | grep -q "$WS" && ! echo "$CAPS_B" | grep -q "$KB" \
-  && ok "B froze only $WS (same event, different bundles — §12)" || no "B capabilities: $(echo "$CAPS_B" | head -c 200)"
-[ -z "$(sfield "$SC" "['run_spec']['capabilities']")" ] && ok "C froze no capabilities" || no "C should have none"
+{ echo "$CAPS_B" | grep -q "$WS" && ! echo "$BROK_B" | grep -q "kb"; } \
+  && ok "B froze the $WS bundle and NO kb surface (same event, different agents, section 12)" || no "B: caps=$(echo "$CAPS_B" | head -c 120) brokered=$(echo "$BROK_B" | head -c 120)"
+{ [ -z "$(sfield "$SC" "['run_spec']['capabilities']")" ] && [ -z "$(sfield "$SC" "['run_spec']['brokered']")" ]; } && ok "C froze nothing (no bundle, no surface)" || no "C should have none"
 CAPS_N=$(sfield "$SN" "['run_spec']['capabilities']")
-echo "$CAPS_N" | grep -q "$WS" && ! echo "$CAPS_N" | grep -q "$KB" \
-  && ok "N's keep-list removed $KB (narrowing removes, never adds)" || no "N capabilities: $(echo "$CAPS_N" | head -c 200)"
+BROK_N=$(sfield "$SN" "['run_spec']['brokered']")
+{ [ -z "$CAPS_N" ] && echo "$BROK_N" | grep -q "'slot': 'kb'"; } \
+  && ok "N's keep-list removed the $WS BUNDLE but KEPT the kb requirement (keep-lists narrow bundles, not requirements)" || no "N: caps=$(echo "$CAPS_N" | head -c 120) brokered=$(echo "$BROK_N" | head -c 120)"
 FROZEN_EV=$(pq "select count(*) from events where session_id='$SA' and type='capability.frozen'")
 [ "${FROZEN_EV:-0}" = "1" ] && ok "capability.frozen ledgered for A" || no "capability.frozen events: $FROZEN_EV"
 
@@ -485,9 +500,13 @@ R=$(perm "$SA" "$TA" g3 "mcp__ghost__anything" '{}')
   && ok "A: unattached server → deny (availability)" || no "ghost: $R"
 R=$(perm "$SB" "$TB" g4 "mcp__kb__kb_search" '{"query":"x"}')
 [ "$(echo "$R" | j "['decision']")" = "deny" ] && echo "$R" | grep -q "frozen capability set" \
-  && ok "B: mcp__kb__kb_search → deny — SAME EVENT, different bundles (§12)" || no "B kb: $R"
+  && ok "B: mcp__kb__kb_search -> deny (B has no kb requirement; same event, different agents)" || no "B kb: $R"
+# N kept the kb REQUIREMENT (keep-lists don't narrow requirements) but lost the
+# WS bundle: kb is available, ws is not.
 D=$(perm "$SN" "$TN" g5 "mcp__kb__kb_search" '{"query":"x"}' | j "['decision']")
-[ "$D" = "deny" ] && ok "N: narrowed-out bundle's tool → deny" || no "N kb: $D"
+[ "$D" = "allow" ] && ok "N: mcp__kb__kb_search -> allow (the kb requirement survived the bundle keep-list)" || no "N kb: $D"
+D=$(perm "$SN" "$TN" g5b "mcp__ws__workspace_file_count" '{}' | j "['decision']")
+[ "$D" = "deny" ] && ok "N: mcp__ws__workspace_file_count -> deny (the WS bundle was narrowed away)" || no "N ws: $D"
 D=$(perm "$SA" "$TA" g6 "mcp__ws__workspace_file_count" '{}' | j "['decision']")
 [ "$D" = "allow" ] && ok "A: sandbox-class tool → allow (policy mcp__* rule)" || no "ws tool: $D"
 CAPDENY=$(pq "select count(*) from events where session_id in ('$SA','$SB','$SN') and type='tool.decision' and payload::text like '%\"source\": \"capability\"%'")
@@ -514,7 +533,7 @@ R=$(broke "$SA" "$TA" b2 "mcp__kb__kb_write" '{"note":"x"}')
 echo "$R" | j "['denied']" | grep -q True && [ "$(mcp_count "tools/call" "kb_write")" = "$WRITES_BEFORE" ] \
   && ok "denied kb_write never reached the upstream (gate before egress)" || no "kb_write broker: $R"
 R=$(broke "$SB" "$TB" b3 "mcp__kb__kb_search" '{"query":"x"}')
-echo "$R" | j "['denied']" | grep -q True && ok "B's broker call → capability deny (not B's bundle)" || no "B broker: $R"
+echo "$R" | j "['denied']" | grep -q True && ok "B's broker call -> capability deny (B has no kb surface)" || no "B broker: $R"
 CODE=$(curl -s -o "$B" -w "%{http_code}" -X POST -H "authorization: Bearer $TA" -H "$CT" \
   -d '{"tool_call_id":"b4","tool":"mcp__ws__workspace_file_count","input":{}}' "$API/internal/sessions/$SA/tools/call")
 [ "$CODE" = "400" ] && ok "sandbox-class tool via the broker → 400 (wrong class)" || no "class check: $CODE"
@@ -522,8 +541,22 @@ CODE=$(curl -s -o "$B" -w "%{http_code}" -X POST -H "authorization: Bearer $TA" 
 touch "$DRIFT_FLAG"
 R=$(broke "$SA" "$TA" b5 "mcp__kb__kb_admin" '{}')
 echo "$R" | j "['denied']" | grep -q True && echo "$R" | grep -q "frozen capability set" \
-  && ok "DRIFT: tool the live server now advertises → deny (photograph rule beats the rug-pull)" || no "drift: $R"
-[ "$(mcp_count "tools/call" "kb_admin")" = "0" ] && ok "drifted tool never invoked upstream" || no "kb_admin reached the fake!"
+  && ok "DRIFT: a tool the live server now advertises -> deny (A's frozen surface beats the rug-pull)" || no "drift: $R"
+[ "$(mcp_count "tools/call" "kb_admin")" = "0" ] && ok "the drifted tool never reached the upstream" || no "kb_admin reached the fake!"
+# Phase C freeze/drift: a REFRESH photographs a NEW snapshot (v2, with the
+# drifted tool); the in-flight run's frozen surface is UNCHANGED; a NEW run
+# re-resolves against the fresh snapshot (its required subset still excludes the
+# drifted tool, so the rug-pull is never callable).
+post "/connections/$KBCONN/tools/refresh" "{}" >/dev/null
+SV2=$(get "/connections/$KBCONN/tools" | j "['snapshot']['version']")
+[ "$SV2" = "2" ] && ok "POST /tools/refresh photographed a NEW snapshot v2 (the drifted surface)" || no "refresh snapshot: $SV2"
+AV=$(sfield "$SA" "['run_spec']['brokered'][0]['snapshot_version']")
+[ "$AV" = "1" ] && ok "A's in-flight run's frozen surface is UNCHANGED (still snapshot v1)" || no "A surface version drifted: $AV"
+post "/sessions" "{\"agent\":\"cap-a-$$\",\"task\":\"drift-reresolve\"}" >/dev/null
+DRIFT_SID=$(jb "['session']['id']")
+NV=$(sfield "$DRIFT_SID" "['run_spec']['brokered'][0]['snapshot_version']")
+[ "$NV" = "2" ] && ok "a NEW run RE-RESOLVES against snapshot v2 (freshly bound)" || no "new run surface version: $NV"
+[ -n "$DRIFT_SID" ] && curl -s -X POST -H "$H" "$API/v1/sessions/$DRIFT_SID/cancel" >/dev/null
 
 BROKERED_EV=$(pq "select count(*) from events where session_id='$SA' and type='tool.brokered' and payload::text like '%\"ok\": true%'")
 [ "${BROKERED_EV:-0}" -ge 1 ] && ok "tool.brokered ledgered (identity, latency, digest)" || no "tool.brokered events: $BROKERED_EV"
@@ -533,15 +566,16 @@ curl -s -H "$H" "$API/v1/sessions/$SA/events?limit=500" | grep -q "deploy checkl
   && no "raw tool RESULT leaked into the ledger!" || ok "ledger holds digests, never tool results"
 
 # ── Fail-closed: a revoked credential stops runs before any spend ─────────
-say "FAIL-CLOSED — revoked connection refuses new runs at creation"
-post "/connections" "{\"provider\":\"mcp_http\",\"base_url\":\"http://127.0.0.1:$MCP_PORT\",\"token\":\"$KB_TOKEN\",\"display_name\":\"kb-2\"}" >/dev/null
+say "FAIL-CLOSED — a revoked connection refuses new runs at creation"
+post "/connections" "{\"provider\":\"mcp_http\",\"base_url\":\"http://127.0.0.1:$MCP_PORT/mcp\",\"token\":\"$KB_TOKEN\",\"display_name\":\"kb-2\"}" >/dev/null
 KBCONN2=$(jb "['connection']['id']")
-post "/capabilities" "{\"name\":\"kbr-$$\",\"servers\":[
-  {\"class\":\"brokered\",\"name\":\"kbr\",\"url\":\"http://127.0.0.1:$MCP_PORT/mcp\",\"connection_id\":\"$KBCONN2\"}]}" >/dev/null
-mk_agent "cap-r-$$" "[\"kbr-$$\"]" >/dev/null
+mk_agent "cap-r-$$" "[]" "$KB_REQ" >/dev/null
 post "/connections/$KBCONN2/revoke" "{}" >/dev/null
-CODE=$(post "/sessions" "{\"agent\":\"cap-r-$$\",\"task\":\"t\"}")
-[ "$CODE" = "400" ] && ok "run creation with a revoked capability connection → 400 (zero spend)" || no "wanted 400, got $CODE: $(cat "$B")"
+# Bind the revoked connection explicitly: resolution refuses BEFORE any spend.
+# (An organization auto-resolve would be ambiguous with the still-active kb
+# connection, so name the revoked one directly — the fail-closed path under test.)
+CODE=$(post "/sessions" "{\"agent\":\"cap-r-$$\",\"task\":\"t\",\"bindings\":{\"kb\":\"$KBCONN2\"}}")
+[ "$CODE" = "400" ] && ok "run bound to a revoked connection -> 400 (zero spend)" || no "wanted 400, got $CODE: $(cat "$B")"
 
 # ── Fork PRs: zero MCP surface, read-only gate ────────────────────────────
 say "FORK — untrusted event source strips capabilities at freeze"
@@ -555,8 +589,8 @@ SF=$(python3 -c "import json;print(json.load(open('$B'))['dispatched'][0]['sessi
 [ "$CODE" = "200" ] && [ -n "$SF" ] && ok "fork PR dispatched" || { no "fork: $CODE $(cat "$B")"; SF=""; }
 if [ -n "$SF" ]; then
   [ "$(sfield "$SF" "['run_spec']['trust_tier']")" = "read_only" ] && ok "fork run frozen read_only" || no "fork tier wrong"
-  [ -z "$(sfield "$SF" "['run_spec']['capabilities']")" ] \
-    && ok "agent F attaches $KB, but the fork run froze ZERO capabilities (trust-tier strip)" || no "fork kept capabilities!"
+  { [ -z "$(sfield "$SF" "['run_spec']['capabilities']")" ] && [ -z "$(sfield "$SF" "['run_spec']['brokered']")" ]; } \
+    && ok "agent F declares the kb requirement, but the fork run froze ZERO capabilities AND ZERO brokered surfaces (trust-tier strip)" || no "fork kept capabilities/surfaces!"
   TF=$(token_for "$SF")
   if [ -n "$TF" ]; then
     D=$(perm "$SF" "$TF" f1 "mcp__kb__kb_search" '{"query":"x"}' | j "['decision']")
@@ -580,7 +614,7 @@ else
     curl -s -X POST -H "$H" "$API/v1/triggers/$SUB/disable" >/dev/null
   done
   LB='{"max_wall_clock_secs": 240, "max_cost_usd": 0.30}'
-  post "/agents" "{\"name\":\"live-kb-$$\",\"policy\":\"cap-e2e\",\"capability_bundles\":[\"$KB\",\"$WS\"]}" >/dev/null
+  post "/agents" "{\"name\":\"live-kb-$$\",\"policy\":\"cap-e2e\",\"capability_bundles\":[\"$WS\"],\"connection_requirements\":$KB_REQ}" >/dev/null
   post "/agents" "{\"name\":\"live-plain-$$\",\"policy\":\"cap-e2e\",\"capability_bundles\":[\"$WS\"]}" >/dev/null
   L1=$(post "/triggers" "{\"agent\":\"live-kb-$$\",\"name\":\"live-kb-sub-$$\",\"autonomous\":true,\"budgets\":$LB,
     \"connection\":\"$GHCONN\",\"repositories\":[\"acme/site\"],\"publish\":[],

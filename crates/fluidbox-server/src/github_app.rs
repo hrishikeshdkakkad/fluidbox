@@ -408,6 +408,10 @@ async fn apply_verified_installation(
             )
             .await
             .map_err(|e| format!("metadata refresh failed: {e}"))?;
+            // Unfiltered reads by design: github_app lifecycle reconciliation is
+            // driven by a verified webhook / registration JWT (no request
+            // principal), and github_app connections are always org-owned — no
+            // owner-visibility filter applies.
             let updated = if row.status == desired {
                 fluidbox_db::get_connection(&state.pool, scope, row.id)
                     .await
@@ -433,6 +437,11 @@ async fn apply_verified_installation(
                 }
             };
             if desired == "suspended" {
+                // Suspend/unsuspend reconciliation evicts the cached installation
+                // token but does NOT bump the authorization generation: the
+                // installation id is a positively proven stable identity, so the
+                // logical account is unchanged and in-flight bindings stay valid
+                // (unlike an OAuth reconnect, which may change the account).
                 crate::oauth::invalidate_access(state, row.id).await;
             }
             return updated.ok_or_else(|| "connection changed state underneath".into());

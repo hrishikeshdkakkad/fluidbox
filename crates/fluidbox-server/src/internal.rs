@@ -203,11 +203,17 @@ async fn decide_tool_call(
     }
 
     // Capability availability (design §8): an mcp__* call must name a tool
-    // in the run's FROZEN capability set. Attach ≠ allow — but not-attached
-    // = unavailable, whatever the policy says. This is also the rug-pull
-    // defense: a tool the live server started advertising after the
-    // photograph simply does not exist for this run.
-    if let Some(reason) = capability::capability_denial(&run_spec.capabilities, tool) {
+    // in the run's FROZEN set. Attach ≠ allow — but not-attached = unavailable,
+    // whatever the policy says. This is also the rug-pull defense: a tool the
+    // live server started advertising after the photograph simply does not
+    // exist for this run. Phase C unions BOTH attachment paths — the legacy
+    // frozen `capabilities` bundles and the binding-backed `brokered` surfaces
+    // — so a connection-free run's tools are available; the message contract is
+    // byte-identical to the legacy check, so the ledger stays uniform. This
+    // union swap is the ONLY change to the gate's decision order.
+    if let Some(reason) =
+        capability::brokered_surface_denial(&run_spec.brokered, &run_spec.capabilities, tool)
+    {
         // CAS the verdict FIRST; only the handler that owns the decision
         // emits the ledger event (concurrent duplicates of a deterministic
         // deny neither double-ledger nor contradict each other).
@@ -604,19 +610,34 @@ pub async fn tool_call(
     }
     let run_spec: RunSpec = serde_json::from_value(session.run_spec.clone())
         .map_err(|e| ApiError::Internal(format!("bad run_spec: {e}")))?;
+    let scope = auth.scope;
 
-    // Class check: only brokered tools cross this endpoint. A tool the
-    // frozen set doesn't know falls through to the gate for a uniform,
-    // ledgered capability denial.
-    let server = capability::parse_mcp_tool(&req.tool)
+    // Phase C: a binding-backed brokered surface (the connection-free RunSpec
+    // successor to an embedded `connection_id`). Resolved from the tool's server
+    // alias; takes precedence over any legacy bundle so a Phase C run always
+    // routes through the binding path (recheck + call_tool_for_conn).
+    let surface = capability::parse_mcp_tool(&req.tool)
+        .and_then(|(srv, _)| run_spec.find_brokered_surface(srv))
+        .cloned();
+
+    // Legacy: a brokered server still embedded in a frozen capability bundle
+    // (pre-Phase-C / in-flight runs). A tool the frozen set doesn't know falls
+    // through to the gate for a uniform, ledgered capability denial.
+    let legacy_server = capability::parse_mcp_tool(&req.tool)
         .and_then(|(srv, tool)| capability::find_tool(&run_spec.capabilities, srv, tool))
         .map(|(srv, _)| srv);
-    if let Some(srv) = server {
-        if !srv.is_brokered() {
-            return Err(ApiError::BadRequest(format!(
-                "tool '{}' is sandbox-class — it executes inside the sandbox, not through the broker",
-                req.tool
-            )));
+
+    // Class check: a sandbox-class tool executes inside the sandbox, not here.
+    // A binding surface is broker-only by construction, so this only guards the
+    // legacy bundle path.
+    if surface.is_none() {
+        if let Some(srv) = legacy_server {
+            if !srv.is_brokered() {
+                return Err(ApiError::BadRequest(format!(
+                    "tool '{}' is sandbox-class — it executes inside the sandbox, not through the broker",
+                    req.tool
+                )));
+            }
         }
     }
 
@@ -642,7 +663,17 @@ pub async fn tool_call(
         })));
     }
 
-    let srv = server.expect("gate allowed the call, so the tool is in the frozen set");
+    // ── Phase C binding path (takes precedence over legacy bundles) ──
+    if let Some(surface) = surface {
+        return broker_call_via_binding(&state, scope, &session, &req, &surface).await;
+    }
+
+    // ── Legacy path (byte-for-byte today's behavior): the credential comes
+    // from the connection_id embedded in the frozen bundle server, and the only
+    // live check is broker.rs's status read (a legacy run froze no generation
+    // or owner to compare — the residual invariant-21 gap the binding path
+    // closes for new runs). ──
+    let srv = legacy_server.expect("gate allowed the call, so the tool is in the frozen set");
     let CapabilityServer::Brokered {
         name: server_name, ..
     } = srv
@@ -651,35 +682,29 @@ pub async fn tool_call(
     };
     let (_, tool_name) = capability::parse_mcp_tool(&req.tool).expect("found in the frozen set");
 
-    let record_exec = |ok: bool, latency_ms: u64, digest: Option<String>, error: Option<String>| {
-        ledger::record(
-            &state,
-            auth.scope,
-            session.id,
-            Actor::System,
-            EventBody::BrokeredToolCall {
-                tool_call_id: req.tool_call_id.clone(),
-                tool: req.tool.clone(),
-                server: server_name.clone(),
-                ok,
-                latency_ms,
-                result_digest: digest,
-                error,
-            },
-        )
-    };
-
     // Credential turn happens inside the broker: resolved (static compose
     // or OAuth mint/refresh), sent to the (audience-bound) server, dropped.
     // Resolution failure is an execution failure, not a policy denial —
     // visibly ledgered either way.
     let started = std::time::Instant::now();
-    let outcome =
-        crate::broker::call_tool_auth(&state, auth.scope, srv, tool_name, &req.input).await;
+    let outcome = crate::broker::call_tool_auth(&state, scope, srv, tool_name, &req.input).await;
     let latency_ms = started.elapsed().as_millis() as u64;
     match outcome {
         Ok((content, is_error)) => {
-            record_exec(!is_error, latency_ms, Some(digest_json(&content)), None).await;
+            record_brokered_exec(
+                &state,
+                scope,
+                session.id,
+                &req.tool_call_id,
+                &req.tool,
+                server_name,
+                None,
+                !is_error,
+                latency_ms,
+                Some(digest_json(&content)),
+                None,
+            )
+            .await;
             Ok(Json(json!({
                 "ok": true,
                 "result": { "content": content, "is_error": is_error },
@@ -687,10 +712,208 @@ pub async fn tool_call(
         }
         Err(e) => {
             let msg: String = e.chars().take(300).collect();
-            record_exec(false, latency_ms, None, Some(msg.clone())).await;
+            record_brokered_exec(
+                &state,
+                scope,
+                session.id,
+                &req.tool_call_id,
+                &req.tool,
+                server_name,
+                None,
+                false,
+                latency_ms,
+                None,
+                Some(msg.clone()),
+            )
+            .await;
             Ok(Json(json!({ "ok": false, "error": msg })))
         }
     }
+}
+
+/// The Phase C brokered-execution path: the requested tool resolved to a
+/// binding-backed surface. Recheck the run resource binding (status +
+/// generation + owner membership) IMMEDIATELY before the credential turns
+/// server-side, then execute against the frozen surface url. A binding refusal
+/// ledgers `tool.decision` (source="binding") — the same audit shape as a
+/// capability denial — before the denial returns; a corrupt surface⇄binding
+/// link is a 500-class integrity error (both written in one transaction).
+async fn broker_call_via_binding(
+    state: &AppState,
+    scope: TenantScope,
+    session: &fluidbox_db::SessionRow,
+    req: &BrokeredCallReq,
+    surface: &fluidbox_core::spec::BrokeredSurface,
+) -> ApiResult<Json<Value>> {
+    let binding =
+        fluidbox_db::find_session_binding(&state.pool, scope, session.id, "mcp", &surface.slot)
+            .await?;
+    let binding = match binding {
+        Some(b) if b.id == surface.binding_id => b,
+        _ => {
+            let reason = format!(
+                "brokered surface '{}' has no matching run resource binding",
+                surface.slot
+            );
+            record_binding_denial(
+                state,
+                scope,
+                session.id,
+                &req.tool_call_id,
+                &req.tool,
+                &reason,
+            )
+            .await;
+            return Err(ApiError::Internal(reason));
+        }
+    };
+
+    // Revocation recheck immediately before secret access (design :705-723): a
+    // revoked/reauthorized connection or a deactivated owner fails closed here.
+    let conn = match crate::broker::recheck_binding(state, scope, &binding).await {
+        Ok(conn) => conn,
+        Err(e) => {
+            let reason: String = e.chars().take(300).collect();
+            record_binding_denial(
+                state,
+                scope,
+                session.id,
+                &req.tool_call_id,
+                &req.tool,
+                &reason,
+            )
+            .await;
+            return Ok(Json(json!({
+                "ok": false,
+                "denied": true,
+                "message": reason,
+            })));
+        }
+    };
+
+    let (_, tool_name) = capability::parse_mcp_tool(&req.tool)
+        .expect("gate allowed an mcp surface tool, so it parses");
+
+    // Credential turns server-side inside the broker against the just-rechecked
+    // connection + the frozen surface url; sent to the (audience-bound) server,
+    // dropped. Resolution/transport failure is an execution failure, ledgered.
+    let started = std::time::Instant::now();
+    let outcome = crate::broker::call_tool_for_conn(
+        state,
+        scope,
+        &conn,
+        &surface.url,
+        tool_name,
+        &req.input,
+        &binding,
+    )
+    .await;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    match outcome {
+        Ok((content, is_error)) => {
+            record_brokered_exec(
+                state,
+                scope,
+                session.id,
+                &req.tool_call_id,
+                &req.tool,
+                &surface.slot,
+                Some(surface.binding_id),
+                !is_error,
+                latency_ms,
+                Some(digest_json(&content)),
+                None,
+            )
+            .await;
+            Ok(Json(json!({
+                "ok": true,
+                "result": { "content": content, "is_error": is_error },
+            })))
+        }
+        Err(e) => {
+            let msg: String = e.chars().take(300).collect();
+            record_brokered_exec(
+                state,
+                scope,
+                session.id,
+                &req.tool_call_id,
+                &req.tool,
+                &surface.slot,
+                Some(surface.binding_id),
+                false,
+                latency_ms,
+                None,
+                Some(msg.clone()),
+            )
+            .await;
+            Ok(Json(json!({ "ok": false, "error": msg })))
+        }
+    }
+}
+
+/// Ledger one `tool.brokered` event (identity + digests + latency; never
+/// inputs, outputs, or secrets). `binding_id` is Some on the Phase C binding
+/// path, None on the legacy embedded-connection path.
+#[allow(clippy::too_many_arguments)]
+async fn record_brokered_exec(
+    state: &AppState,
+    scope: TenantScope,
+    session_id: uuid::Uuid,
+    tool_call_id: &str,
+    tool: &str,
+    server: &str,
+    binding_id: Option<uuid::Uuid>,
+    ok: bool,
+    latency_ms: u64,
+    result_digest: Option<String>,
+    error: Option<String>,
+) {
+    ledger::record(
+        state,
+        scope,
+        session_id,
+        Actor::System,
+        EventBody::BrokeredToolCall {
+            tool_call_id: tool_call_id.to_string(),
+            tool: tool.to_string(),
+            server: server.to_string(),
+            binding_id,
+            ok,
+            latency_ms,
+            result_digest,
+            error,
+        },
+    )
+    .await;
+}
+
+/// Ledger a brokered-binding refusal as `tool.decision` (source="binding") —
+/// the same audit shape as a capability denial — before the endpoint returns
+/// it. The gate already allowed the call on the frozen set; the binding recheck
+/// is the live revocation layer above it (design :705-723).
+async fn record_binding_denial(
+    state: &AppState,
+    scope: TenantScope,
+    session_id: uuid::Uuid,
+    tool_call_id: &str,
+    tool: &str,
+    reason: &str,
+) {
+    ledger::record(
+        state,
+        scope,
+        session_id,
+        Actor::System,
+        EventBody::ToolDecision {
+            tool_call_id: tool_call_id.to_string(),
+            tool: tool.to_string(),
+            verdict: "deny".into(),
+            source: "binding".into(),
+            original_verdict: None,
+            reason: Some(reason.to_string()),
+        },
+    )
+    .await;
 }
 
 async fn maybe_resume(state: &AppState, scope: TenantScope, session_id: uuid::Uuid) {

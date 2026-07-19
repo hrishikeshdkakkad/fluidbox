@@ -5,7 +5,6 @@
 //! lint: control/zero-width/bidi characters are rejected outright).
 
 use crate::auth::Principal;
-use crate::broker;
 use crate::error::{ApiError, ApiResult};
 use crate::rbac;
 use crate::state::AppState;
@@ -38,10 +37,28 @@ pub struct CreateBundle {
     pub servers: Vec<CapabilityServer>,
 }
 
-/// The registration path — shared by the HTTP handler, the catalog Connect
-/// flow, and the OAuth callback's auto-register (settle #4). Validation →
-/// PHOTOGRAPH (brokered discovery with the sealed/minted credential) →
-/// re-validate the untrusted snapshots → digest → append-only insert.
+/// Cutover guard (design :340; Phase C): brokered tools are no longer bundle
+/// members — they move to agent connection requirements + per-connection tool
+/// snapshots + per-run bindings. A bundle may now carry only sandbox (in-image
+/// stdio) servers. Split from `register_bundle`'s I/O so the refusal is unit
+/// testable without a DB.
+fn reject_brokered_servers(servers: &[CapabilityServer]) -> ApiResult<()> {
+    if let Some(server) = servers.iter().find(|s| s.is_brokered()) {
+        return Err(ApiError::BadRequest(format!(
+            "brokered server '{}' can no longer be published in a capability bundle — \
+             brokered tools are now connection requirements + snapshots; \
+             see docs/guides/capabilities.md",
+            server.name()
+        )));
+    }
+    Ok(())
+}
+
+/// The registration path — shared by the HTTP handler and the catalog Connect
+/// sandbox-launch branch. Brokered tools are cut over to connection snapshots
+/// (design :320-347), so this is now SANDBOX-ONLY: validate name → refuse
+/// brokered → structural validation (sandbox servers declare their tools) →
+/// digest → append-only insert.
 pub async fn register_bundle(
     state: &AppState,
     scope: TenantScope,
@@ -55,36 +72,12 @@ pub async fn register_bundle(
             "bundle name must be 1-64 chars of [a-z0-9_-]".into(),
         ));
     }
-    let mut def = CapabilityBundleDef { servers };
-    // Brokered tools are DISCOVERED, never declared — a registrant-supplied
-    // list would be a photograph of nothing.
-    for server in &def.servers {
-        if server.is_brokered() && !server.tools().is_empty() {
-            return Err(ApiError::BadRequest(format!(
-                "brokered server '{}' must not declare tools — they are discovered (photographed) at registration",
-                server.name()
-            )));
-        }
-    }
-    // Structural validation first (aliases, sandbox declarations, lint)…
+    reject_brokered_servers(&servers)?;
+    let def = CapabilityBundleDef { servers };
+    // Sandbox servers declare their tools; structural validation applies the
+    // alias/charset/poison screen. There is no photograph — brokered discovery
+    // now lands in connection_tool_snapshots via `snapshots::photograph_connection`.
     def.validate().map_err(ApiError::BadRequest)?;
-    // …then the photograph: connect to each brokered server with its sealed
-    // credential and freeze what tools/list returns.
-    for server in &mut def.servers {
-        if server.is_brokered() {
-            let tools = broker::photograph_brokered(state, scope, server).await?;
-            let CapabilityServer::Brokered { tools: slot, .. } = server else {
-                unreachable!()
-            };
-            *slot = tools;
-        }
-    }
-    // Re-validate with the discovered snapshots in place: the remote server
-    // is untrusted input — its tool names/descriptions pass the same
-    // charset + poison screen as declared ones.
-    def.validate().map_err(|e| {
-        ApiError::BadRequest(format!("discovered tool snapshot failed validation: {e}"))
-    })?;
 
     let digest = definition_digest(&def);
     Ok(fluidbox_db::create_capability_bundle(
@@ -209,5 +202,35 @@ mod tests {
         assert!(!valid_bundle_name(""));
         assert!(!valid_bundle_name("-x"));
         assert!(!valid_bundle_name(&"x".repeat(65)));
+    }
+
+    #[test]
+    fn brokered_servers_are_refused_after_cutover() {
+        use fluidbox_core::capability::CapabilityServer;
+        // A sandbox-only server list passes the cutover guard.
+        let sandbox = vec![CapabilityServer::Sandbox {
+            name: "fs".into(),
+            command: "mcp-fs".into(),
+            args: vec![],
+            identity: None,
+            tools: vec![],
+        }];
+        assert!(reject_brokered_servers(&sandbox).is_ok());
+        // Any brokered server is refused with the docs pointer (design :340).
+        let brokered = vec![CapabilityServer::Brokered {
+            name: "sentry".into(),
+            url: "https://mcp.sentry.test/mcp".into(),
+            connection_id: None,
+            identity: None,
+            tools: vec![],
+        }];
+        let err = reject_brokered_servers(&brokered).unwrap_err();
+        match err {
+            ApiError::BadRequest(m) => {
+                assert!(m.contains("docs/guides/capabilities.md"), "{m}");
+                assert!(m.contains("connection requirements"), "{m}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
     }
 }
