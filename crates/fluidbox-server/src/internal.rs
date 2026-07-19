@@ -798,9 +798,16 @@ async fn broker_call_via_binding(
     // connection + the frozen surface url; sent to the (audience-bound) server,
     // dropped. Resolution/transport failure is an execution failure, ledgered.
     let started = std::time::Instant::now();
-    let outcome =
-        crate::broker::call_tool_for_conn(state, scope, &conn, &surface.url, tool_name, &req.input)
-            .await;
+    let outcome = crate::broker::call_tool_for_conn(
+        state,
+        scope,
+        &conn,
+        &surface.url,
+        tool_name,
+        &req.input,
+        &binding,
+    )
+    .await;
     let latency_ms = started.elapsed().as_millis() as u64;
     match outcome {
         Ok((content, is_error)) => {
