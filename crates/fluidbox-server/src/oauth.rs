@@ -767,13 +767,13 @@ async fn complete_dance(
     };
 
     // Whether this is a FIRST connect (pending→active) or a RECONNECT (an
-    // ever-activated connection re-consenting) decides the generation bump — so
-    // capture the prior status BEFORE activation flips it. A reconnect may be a
-    // new account/issuer/audience (MCP servers are not obliged to prove
-    // identity), so it bumps the generation and any in-flight run bound to the
-    // old one fails closed (design :294-296).
-    let prior_status = conn.status.clone();
-    let bump = prior_status != "pending";
+    // ever-activated connection re-consenting) decides the generation bump. That
+    // decision is made INSIDE activate_connection_oauth from the row's pre-update
+    // status under the row lock (B1) — never a boolean derived from the pre-lock
+    // read above, which two racing first-connects would both compute as `false`.
+    // A reconnect (from a non-`pending` status) may be a new account/issuer/
+    // audience, so it bumps the generation and any in-flight run bound to the old
+    // one fails closed (design :294-296).
 
     // Seal + activate (clears a previous error note).
     let mut clean = oauth.clone();
@@ -812,7 +812,6 @@ async fn complete_dance(
             &sealer_ref.seal(refresh),
             &clean,
             &json!(granted),
-            bump,
         )
         .await
         .map_err(|e| format!("activation failed: {e}"))?
@@ -849,17 +848,19 @@ async fn complete_dance(
             ))
         }
         Err(e) => {
-            // Upstream MCP discovery text → server log + the connection's error
-            // note (dashboard is an authorized channel); the unauthenticated
-            // browser callback gets a generic line (R3.4). Status flip → error is
-            // paired with token eviction (custody discipline) so nothing serves
-            // the just-cached token.
+            // The broker already sanitizes upstream text (C: method + status +
+            // code + digest, never the verbatim message). The persisted note is
+            // kept GENERIC regardless — an untrusted upstream string must never
+            // become durable connection state (it is serialized in listings +
+            // rendered in the dashboard); the sanitized detail rides the log only.
+            // Status flip → error is paired with token eviction (custody
+            // discipline) so nothing serves the just-cached token.
             tracing::warn!(connection = %conn.id, error = %e, "oauth callback: tool discovery failed after authorization");
             fluidbox_db::mark_connection_error(
                 &state.pool,
                 scope,
                 conn.id,
-                &format!("tool discovery failed after authorization: {e}"),
+                "MCP tool discovery failed after authorization — reconnect this connection",
             )
             .await
             .ok();
@@ -929,7 +930,24 @@ pub async fn ensure_access_token(
             return Ok(tok.clone());
         }
     }
-    let result = refresh_access_token(state, conn).await;
+    // Re-read the connection under BOTH locks before touching custody (B2/R3.2):
+    // the caller's `conn` row was fetched before we serialized here, so a
+    // reconnect that bumped the generation (or a revoke/error) may have landed
+    // while we waited. Operate on the FRESH row and refuse on any drift, so we
+    // never unseal a superseded grant's refresh token or mint against a stale
+    // binding. Early returns drop the tx (rollback releases the advisory lock).
+    let scope = fluidbox_db::TenantScope::assume(conn.tenant_id);
+    let fresh = match fluidbox_db::get_connection(&state.pool, scope, conn.id).await {
+        Ok(Some(f))
+            if f.status == "active"
+                && f.authorization_generation == conn.authorization_generation =>
+        {
+            f
+        }
+        Ok(_) => return Err("connection was reauthorized during refresh — retry".into()),
+        Err(e) => return Err(format!("connection re-read failed during refresh: {e}")),
+    };
+    let result = refresh_access_token(state, &fresh).await;
     // Commit releases the advisory lock (a dropped/rolled-back tx would too).
     tx.commit().await.ok();
     result
@@ -1038,6 +1056,22 @@ async fn refresh_access_token(
             // fail closed rather than persist a rotated OLD refresh token that
             // would restore a superseded grant. The caller retries and re-mints
             // under the new generation.
+            invalidate_access(state, conn.id).await;
+            return Err("connection was reauthorized during refresh — retry".into());
+        }
+    }
+    // Re-verify the binding is STILL the one we entered with, INDEPENDENT of
+    // whether the provider rotated the refresh token (B2/R3.2): a provider that
+    // omits or reuses the refresh token skips the generation-guarded rotate above,
+    // so without this a token just minted for a reconnected account could be
+    // cached and served for the OLD binding. Re-read under scope and refuse on any
+    // status/generation drift. (The oauth locks make a mid-refresh bump
+    // impossible; this fails closed regardless.)
+    match fluidbox_db::get_connection(&state.pool, scope, conn.id).await {
+        Ok(Some(fresh))
+            if fresh.status == "active"
+                && fresh.authorization_generation == conn.authorization_generation => {}
+        _ => {
             invalidate_access(state, conn.id).await;
             return Err("connection was reauthorized during refresh — retry".into());
         }

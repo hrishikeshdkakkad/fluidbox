@@ -13,7 +13,9 @@
 
 use crate::state::AppState;
 use fluidbox_core::capability::{CapabilityServer, ToolSnapshot};
+use futures::StreamExt;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 const MCP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -28,10 +30,11 @@ const MAX_LIST_PAGES: usize = 4;
 const MAX_RESULT_BYTES: usize = 256 * 1024;
 /// Hard ceiling on an MCP response we will buffer: a server advertising a
 /// Content-Length over this is refused BEFORE the body is read into memory
-/// (R3.3). A chunked response without Content-Length slips this pre-check —
-/// full streaming caps are Phase E; `cap_content` still truncates tool results
-/// after the fact, and discovery re-validates the whole surface against
-/// fluidbox-core's 2 MiB serialized ceiling.
+/// (R3.3), AND the decoded body is streamed into a buffer capped at the same
+/// ceiling (D) so a chunked/compressed response without Content-Length cannot
+/// buffer unboundedly. `cap_content` still truncates tool results after the fact,
+/// and discovery re-validates the whole surface against fluidbox-core's 2 MiB
+/// serialized ceiling.
 const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// A resolved outbound credential: which header to set, its full value, and
@@ -225,11 +228,12 @@ pub async fn recheck_binding(
 /// closed on a revoked invoker.
 ///
 /// The invoking principal is read straight off the binding row: `create_run`
-/// stamps `resolved_by_principal_id` with the invoking USER's id for `user` runs
-/// and the acting SUBSCRIPTION's id for `trigger`/`schedule`/`webhook` runs
-/// (run_service.rs `:300-305`), so no session/trigger-context lookup is needed —
-/// the minimal correct source. `operator` (break-glass admin) and `system`
-/// (worker) hold no revocable membership/subscription and pass.
+/// stamps `resolved_by_principal_id` with the invoking USER's id for `user` runs,
+/// the invoking TRIGGER TOKEN's id for `trigger` runs (E1/design :741/:748), and
+/// the acting SUBSCRIPTION's id for `schedule`/`webhook` runs (run_service.rs), so
+/// no session/trigger-context lookup is needed — the minimal correct source.
+/// `operator` (break-glass admin) and `system` (worker) hold no revocable
+/// membership/subscription and pass; any OTHER kind fails closed (E2).
 pub(crate) async fn recheck_invoking_authority(
     pool: &sqlx::PgPool,
     scope: fluidbox_db::TenantScope,
@@ -252,7 +256,27 @@ pub(crate) async fn recheck_invoking_authority(
             }
             Ok(())
         }
-        "trigger" | "schedule" | "webhook" => {
+        // A trigger run froze the exact TOKEN as its principal: the token row must
+        // still be a live trigger token AND its (immutable-FK) subscription must
+        // still exist + be enabled — so a revoked/expired token fails closed, not
+        // just a disabled subscription (E1).
+        "trigger" => {
+            let tid = principal_id
+                .and_then(|s| s.parse::<uuid::Uuid>().ok())
+                .ok_or("run's invoking trigger token id is missing or malformed")?;
+            let active = fluidbox_db::trigger_token_active(pool, scope, tid)
+                .await
+                .map_err(|e| format!("invoking-token lookup failed: {e}"))?;
+            if !active {
+                return Err(
+                    "the run's invoking trigger token was revoked or expired, or its subscription \
+                     was disabled — its authority is revoked"
+                        .into(),
+                );
+            }
+            Ok(())
+        }
+        "schedule" | "webhook" => {
             let sid = principal_id
                 .and_then(|s| s.parse::<uuid::Uuid>().ok())
                 .ok_or("run's invoking subscription id is missing or malformed")?;
@@ -270,7 +294,12 @@ pub(crate) async fn recheck_invoking_authority(
             Ok(())
         }
         // operator / system: no revocable membership or subscription to check.
-        _ => Ok(()),
+        "operator" | "system" => Ok(()),
+        // Fail closed on any unrecognized principal kind (E2) — never pass an
+        // authority we cannot revalidate.
+        other => Err(format!(
+            "run has an unrecognized invoking principal kind '{other}' — refusing"
+        )),
     }
 }
 
@@ -458,10 +487,23 @@ async fn post_rpc(
             ));
         }
     }
-    let text = res
-        .text()
-        .await
-        .map_err(|e| format!("mcp response unreadable: {e}"))?;
+    // The Content-Length pre-check only bounds a body that ADVERTISES its length;
+    // a chunked or compressed response slips it and `text()` would then buffer
+    // unboundedly (D). Read the DECODED body through the byte stream and abort the
+    // moment the accumulated size would exceed the same hard cap. The per-call
+    // tools/call result path still truncates via `cap_content` after this.
+    let mut stream = res.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("mcp response unreadable: {e}"))?;
+        if buf.len() + chunk.len() > MAX_RESPONSE_BYTES as usize {
+            return Err(format!(
+                "mcp response exceeds the {MAX_RESPONSE_BYTES}-byte cap while streaming"
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8_lossy(&buf).into_owned();
     let value = if text.trim().is_empty() {
         Value::Null
     } else if is_sse {
@@ -543,21 +585,35 @@ async fn rpc(
     unwrap_result(rpc_error_to_err(status, value, method)?, method).map_err(Into::into)
 }
 
+/// A short, non-reversible fingerprint of an UNTRUSTED upstream error message
+/// (C). A malicious MCP server can echo the bearer we just sent inside its
+/// JSON-RPC error message; that string must never leave the broker verbatim (it
+/// would flow into logs, the connection's persisted `oauth.error`, and the
+/// dashboard). We surface method + HTTP status + JSON-RPC code + this digest so
+/// an operator can still correlate repeated failures without the bytes.
+fn msg_digest(msg: &str) -> String {
+    format!(
+        "sha256:{}",
+        hex::encode(&Sha256::digest(msg.as_bytes())[..8])
+    )
+}
+
 fn rpc_error_to_err(
     status: reqwest::StatusCode,
     value: Value,
     method: &str,
 ) -> Result<Value, String> {
     if let Some(err) = value.get("error") {
-        let msg: String = err
+        let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+        // The upstream message is untrusted — surface only its digest (C).
+        let digest = err
             .get("message")
             .and_then(|m| m.as_str())
-            .unwrap_or("unknown error")
-            .chars()
-            .take(300)
-            .collect();
-        let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
-        return Err(format!("mcp {method} failed ({code}): {msg}"));
+            .map(msg_digest)
+            .unwrap_or_else(|| "none".into());
+        return Err(format!(
+            "mcp {method} failed (HTTP {status}, code {code}, msg {digest})"
+        ));
     }
     if !status.is_success() {
         return Err(format!("mcp {method} returned HTTP {status}"));
@@ -567,14 +623,14 @@ fn rpc_error_to_err(
 
 fn unwrap_result(value: Value, method: &str) -> Result<Value, String> {
     if let Some(err) = value.get("error") {
-        let msg: String = err
+        let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+        // The upstream message is untrusted — surface only its digest (C).
+        let digest = err
             .get("message")
             .and_then(|m| m.as_str())
-            .unwrap_or("unknown error")
-            .chars()
-            .take(300)
-            .collect();
-        return Err(format!("mcp {method} failed: {msg}"));
+            .map(msg_digest)
+            .unwrap_or_else(|| "none".into());
+        return Err(format!("mcp {method} failed (code {code}, msg {digest})"));
     }
     value
         .get("result")
@@ -956,6 +1012,41 @@ pub async fn probe_tools(state: &AppState, url: &str) -> ProbeOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_error_message_never_leaks_verbatim() {
+        // A malicious server echoes the bearer it just received into its error
+        // message. rpc_error_to_err / unwrap_result must surface method + code +
+        // a digest — NEVER the token-shaped substring (C).
+        let secret = "sk-live-abc123SECRETtoken";
+        let value = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "error": { "code": -32000, "message": format!("bad bearer {secret} rejected") }
+        });
+        let e = rpc_error_to_err(
+            reqwest::StatusCode::BAD_REQUEST,
+            value.clone(),
+            "tools/list",
+        )
+        .unwrap_err();
+        assert!(
+            !e.contains(secret),
+            "sanitized rpc error leaked the token: {e}"
+        );
+        assert!(
+            e.contains("code -32000") && e.contains("tools/list") && e.contains("sha256:"),
+            "sanitized rpc error dropped method/code/digest: {e}"
+        );
+        let e2 = unwrap_result(value, "tools/call").unwrap_err();
+        assert!(
+            !e2.contains(secret),
+            "sanitized unwrap error leaked the token: {e2}"
+        );
+        assert!(
+            e2.contains("code -32000") && e2.contains("sha256:"),
+            "sanitized unwrap error dropped code/digest: {e2}"
+        );
+    }
 
     #[test]
     fn sse_framed_responses_parse_by_id() {
@@ -1364,10 +1455,35 @@ mod tests {
             &invoker_binding("user", Some(member.to_string())),
         )
         .await;
+        // A trigger run freezes the exact TOKEN as its principal (E1): mint a live
+        // trigger token for the subscription and recheck against ITS id.
+        let tok_plain = format!("fbx_trig_{}", Uuid::now_v7().simple());
+        fluidbox_db::create_trigger_token(&pool, scope, sub.id, &tok_plain)
+            .await
+            .unwrap();
+        let tok_id = fluidbox_db::subscription_for_token(&pool, &tok_plain)
+            .await
+            .unwrap()
+            .unwrap()
+            .token_id;
         let sub_ok = recheck_binding_pool(
             &pool,
             scope,
-            &invoker_binding("trigger", Some(sub.id.to_string())),
+            &invoker_binding("trigger", Some(tok_id.to_string())),
+        )
+        .await;
+        // A forged/unknown trigger token id fails closed (E1).
+        let trigger_bad = recheck_binding_pool(
+            &pool,
+            scope,
+            &invoker_binding("trigger", Some(Uuid::now_v7().to_string())),
+        )
+        .await;
+        // An unrecognized principal kind fails closed (E2).
+        let unknown_kind = recheck_binding_pool(
+            &pool,
+            scope,
+            &invoker_binding("martian", Some(Uuid::now_v7().to_string())),
         )
         .await;
         let missing_sub = recheck_binding_pool(
@@ -1411,7 +1527,13 @@ mod tests {
         cleanup(&pool, org.id).await;
 
         assert_eq!(user_ok.expect("active member invoker").id, conn.id);
-        assert_eq!(sub_ok.expect("enabled subscription invoker").id, conn.id);
+        assert_eq!(sub_ok.expect("live trigger token invoker").id, conn.id);
+        assert!(trigger_bad
+            .expect_err("forged trigger token")
+            .contains("revoked or expired"));
+        assert!(unknown_kind
+            .expect_err("unrecognized principal kind")
+            .contains("unrecognized invoking principal kind"));
         assert!(missing_sub
             .expect_err("missing subscription")
             .contains("no longer exists"));
