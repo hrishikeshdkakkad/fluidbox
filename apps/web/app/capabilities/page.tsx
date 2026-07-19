@@ -558,6 +558,8 @@ function ToolConnections({
                       <span className="chip">
                         oauth{c.oauth?.client_id_source ? ` · ${c.oauth.client_id_source}` : ""}
                       </span>
+                    ) : c.auth_kind === "none" ? (
+                      <span className="chip">no auth</span>
                     ) : (
                       <span className="chip">api key</span>
                     )}
