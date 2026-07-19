@@ -1218,7 +1218,7 @@ dependencies = [
  "fluidbox-provider-k8s",
  "fluidbox-workspace",
  "futures",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "hex",
  "hmac 0.13.0",
  "jsonwebtoken",
