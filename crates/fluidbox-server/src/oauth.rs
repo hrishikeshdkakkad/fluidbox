@@ -858,8 +858,15 @@ async fn complete_dance(
         .map_err(|e| format!("activation failed: {e}"))?
         .ok_or("connection changed state during the exchange")?;
         // Commit (releasing the advisory lock) BEFORE touching the token cache:
-        // a cache entry must never outlive a rolled-back activation.
-        tx.commit().await.ok();
+        // a cache entry must never outlive a rolled-back activation. A failed or
+        // AMBIGUOUS commit fails closed: the AS may already have invalidated the
+        // rotated-away refresh token, so serving this access token while the DB
+        // kept the dead grant would corrupt custody. Drop every cached generation
+        // and refuse — the caller reconnects/retries.
+        if let Err(e) = tx.commit().await {
+            invalidate_access(state, conn.id).await;
+            return Err(format!("could not persist OAuth custody — retry: {e}"));
+        }
         // Evict any token cached under a PRIOR generation BEFORE caching the new
         // one: `invalidate_access` drops every generation for this connection, so
         // caching must come AFTER the eviction (otherwise it would strand the
@@ -1003,9 +1010,18 @@ pub async fn ensure_access_token(
     // Commit (releasing the advisory lock) BEFORE writing the token cache: a
     // dropped/rolled-back tx releases the lock too, and a cached token must never
     // outlive an uncommitted rotation.
-    tx.commit().await.ok();
+    let committed = tx.commit().await;
     match result {
         Ok((access, expires_in)) => {
+            // The rotation only counts if it durably landed. A failed or AMBIGUOUS
+            // commit fails closed: the AS may already have invalidated the
+            // rotated-away refresh token, so serving this access token while the DB
+            // kept the dead grant would corrupt custody. Drop every cached
+            // generation and refuse — the caller retries.
+            if let Err(e) = committed {
+                invalidate_access(state, conn.id).await;
+                return Err(format!("could not persist OAuth custody — retry: {e}"));
+            }
             // Cache under the generation THIS refresh ran against (== `fresh`'s,
             // verified equal to the caller's above). A concurrent reconnect bump
             // makes this (connection, old-generation) key unreachable to current
