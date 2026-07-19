@@ -116,6 +116,13 @@ create table run_resource_bindings (
     foreign key (tenant_id, session_id) references sessions (tenant_id, id) on delete cascade,
     foreign key (tenant_id, connection_id) references integration_connections (tenant_id, id),
     foreign key (tenant_id, subscription_id) references trigger_subscriptions (tenant_id, id),
+    -- An mcp binding names an EXACT frozen snapshot version — bind it relationally
+    -- so a binding can never reference a snapshot that does not exist (R1.5). The
+    -- three columns are nullable (non-mcp rows leave them NULL); MATCH SIMPLE (the
+    -- default) skips the FK entirely when ANY column is null, so only fully-
+    -- populated mcp rows are checked.
+    foreign key (tenant_id, connection_id, snapshot_version)
+        references connection_tool_snapshots (tenant_id, connection_id, snapshot_version),
     -- The tagged union: exactly the columns the chosen authority_kind needs are
     -- set, and the rest are null (fail-closed — no ambiguous half-populated row).
     constraint run_resource_bindings_authority_shape check (
@@ -172,52 +179,273 @@ create unique index connector_catalog_slug_tenant on connector_catalog (tenant_i
 -- ─── (g) capability-bundle conversion: legacy brokered bundles → requirements ─
 -- Design :320-347 (settled fate + additive migration rules): `capability_bundles`
 -- survives ONLY for sandbox-class stdio tools; brokered tools move to immutable
--- agent connection requirements (+ per-connection snapshots + per-run bindings,
--- both other tasks). This block APPENDS a migrated revision per affected agent and
+-- agent connection requirements. This block APPENDS migrated revisions and
 -- explicitly repoints pinned subscriptions. It touches nothing else: bundle rows
 -- stay (historical pins/RunSpecs keep deserializing), sessions/RunSpecs are
 -- untouched, and unconverted (sandbox-only or bundle-less) agents get no revision.
 --
--- Deterministic + idempotent. It is defined as a plain SQL function CALLED ONCE by
--- the DO block below (at migration time) and LEFT IN PLACE so the DB test can call
--- it again after inserting legacy fixtures (0013 already ran at connect() time).
--- Idempotence: an agent is processed ONLY when its LATEST revision pins at least
--- one bundle whose definition contains a `"class":"brokered"` server — which a
--- converted agent's new latest revision (sandbox-only pins, no brokered) never
--- does, so re-running never double-appends. Nothing floats: surviving sandbox
--- pins are re-emitted as exact BundleRef objects `{id,name,version}` (the shape
--- run_service's `frozen_capabilities` deserializes — the pin's version IS the
--- explicit `name@<version>` the design mandates).
+-- Convert PER SOURCE REVISION, not just the latest (R1.1/R1.2). A subscription
+-- may pin an OLDER revision (different model/prompt/pins) and carry its OWN
+-- `capability_bundles` keep-list (a remove-only §3.5 narrowing). Repointing every
+-- subscription to the latest's FULL conversion would (a) silently replace its
+-- model/prompt and (b) re-grant brokered authority a keep-list had removed. So:
+--   * the agent's LATEST revision converts with the FULL (no keep-list)
+--     derivation — the live/unpinned path, appended LAST so it stays `latest`;
+--   * every revision a subscription pins converts using THAT subscription's
+--     keep-list (NULL = all bundles; [] = none ⇒ zero requirements — the sub had
+--     removed all brokered authority and must not regain it), copying all other
+--     fields from the SOURCE revision;
+--   * converted copies dedupe on (source_revision, derived requirement set):
+--     subscriptions sharing both share one copy; a subscription pinning the
+--     latest at FULL authority shares the live copy.
+-- Sandbox pins survive as exact BundleRef objects `{id,name,version}` (the shape
+-- `frozen_capabilities` deserializes; the version IS the `name@<version>` pin);
+-- the subscription's keep-list still narrows them at run time.
+--
+-- Deterministic + idempotent. Three plain functions: a per-(revision,keep-list)
+-- derivation, an append helper, and the orchestrator called once by the DO block
+-- (at migration time) and LEFT IN PLACE so the DB test can re-call it after
+-- inserting fixtures. Idempotence: a revision is a conversion SOURCE only when its
+-- pins resolve to ≥1 brokered server; after one run the latest is brokered-free
+-- and every subscription pin points at a brokered-free copy, so a second run is a
+-- no-op.
+
+-- Derive, for ONE revision's pins under ONE keep-list, the surviving sandbox pins
+-- (keep-list-independent — narrowed at run time), the brokered requirements (only
+-- from bundles the keep-list keeps), and whether the pins hold ANY brokered
+-- bundle (source qualification, keep-list-independent).
+create or replace function fluidbox_convert_derive(
+    p_agent uuid, p_tenant uuid, p_pins jsonb, p_keep jsonb,
+    out o_surviving jsonb, out o_requirements jsonb, out o_has_brokered boolean
+) language plpgsql as $$
+declare
+    v_pin          jsonb;
+    v_pin_name     text;
+    v_pin_version  int;
+    v_pin_suffix   text;
+    v_bundle_id    uuid;
+    v_bundle_name  text;
+    v_bundle_version int;
+    v_def          jsonb;
+    v_server       jsonb;
+    v_bundle_brokered boolean;
+    v_base_slot    text;
+    v_slot         text;
+    v_suffix       int;
+    v_url          text;
+    v_slug         text;
+    v_dropped_sandbox text;
+    v_cnt          int;
+begin
+    o_surviving := '[]'::jsonb;
+    o_requirements := '[]'::jsonb;
+    o_has_brokered := false;
+
+    for v_pin in
+        select elem
+          from jsonb_array_elements(coalesce(p_pins, '[]'::jsonb))
+                   with ordinality as p(elem, ord)
+         order by p.ord
+    loop
+        -- Resolve the pin to a bundle row WITHIN the tenant, mirroring
+        -- run_service's semantics. The live stored shape is a BundleRef object
+        -- `{id,name,version}` (resolve by id); a bare/`name@N` string is also
+        -- accepted defensively. Reset first so a malformed element can't inherit
+        -- a prior iteration's resolution.
+        v_bundle_id := null;
+        v_bundle_name := null;
+        v_bundle_version := null;
+        v_def := null;
+        if jsonb_typeof(v_pin) = 'object' and (v_pin ? 'id') then
+            select b.id, b.name, b.version, b.definition
+              into v_bundle_id, v_bundle_name, v_bundle_version, v_def
+              from capability_bundles b
+             where b.tenant_id = p_tenant and b.id = (v_pin->>'id')::uuid;
+        elsif jsonb_typeof(v_pin) = 'string' then
+            v_pin_name := split_part(v_pin #>> '{}', '@', 1);
+            if position('@' in (v_pin #>> '{}')) > 0 then
+                -- Only a purely-numeric suffix is a version; a non-numeric one
+                -- (`name@abc`) must NOT abort the migration on an int cast — leave
+                -- v_bundle_id null so the drop+notice path handles it.
+                v_pin_suffix := split_part(v_pin #>> '{}', '@', 2);
+                if v_pin_suffix ~ '^[0-9]+$' then
+                    v_pin_version := v_pin_suffix::int;
+                    select b.id, b.name, b.version, b.definition
+                      into v_bundle_id, v_bundle_name, v_bundle_version, v_def
+                      from capability_bundles b
+                     where b.tenant_id = p_tenant
+                       and b.name = v_pin_name
+                       and b.version = v_pin_version;
+                end if;
+            else
+                select b.id, b.name, b.version, b.definition
+                  into v_bundle_id, v_bundle_name, v_bundle_version, v_def
+                  from capability_bundles b
+                 where b.tenant_id = p_tenant and b.name = v_pin_name
+                 order by b.version desc
+                 limit 1;
+            end if;
+        end if;
+
+        if v_bundle_id is null then
+            raise notice 'convert_legacy_bundles: agent % has an unresolvable capability pin — dropped', p_agent;
+            continue;
+        end if;
+
+        v_bundle_brokered := exists (
+            select 1
+              from jsonb_array_elements(coalesce(v_def->'servers', '[]'::jsonb)) s
+             where s->>'class' = 'brokered');
+
+        if not v_bundle_brokered then
+            -- Sandbox-only bundle survives, re-pinned EXPLICITLY (exact
+            -- id+name+version). Keep-list-independent: the subscription's keep-list
+            -- still narrows it at run time against the converted revision.
+            o_surviving := o_surviving || jsonb_build_array(jsonb_build_object(
+                'id', v_bundle_id, 'name', v_bundle_name, 'version', v_bundle_version));
+            continue;
+        end if;
+
+        -- A brokered bundle qualifies the revision as a conversion SOURCE,
+        -- REGARDLESS of the keep-list (so an empty keep-list still yields a copy
+        -- with zero requirements rather than skipping the revision entirely).
+        o_has_brokered := true;
+
+        -- Keep-list gate for REQUIREMENT derivation (R1.2): NULL keep = all;
+        -- otherwise only bundles whose NAME is kept contribute requirements. A
+        -- removed brokered bundle adds nothing (and never survives — it is
+        -- brokered), so its authority is not regained.
+        if p_keep is not null and not (p_keep @> to_jsonb(v_bundle_name)) then
+            continue;
+        end if;
+
+        -- Name the dropped sandbox server(s) of this (dropped WHOLE) mixed bundle
+        -- so an operator can re-add them by hand (names only; every value is a %
+        -- arg, never concatenated in).
+        select string_agg(elem->>'name', ', ' order by ord)
+          into v_dropped_sandbox
+          from jsonb_array_elements(coalesce(v_def->'servers', '[]'::jsonb))
+                   with ordinality as srv(elem, ord)
+         where elem->>'class' <> 'brokered';
+        if v_dropped_sandbox is not null then
+            raise notice 'convert_legacy_bundles: agent % dropped mixed bundle %@% — sandbox server(s) % must be re-added manually',
+                p_agent, v_bundle_name, v_bundle_version, v_dropped_sandbox;
+        end if;
+
+        for v_server in
+            select elem
+              from jsonb_array_elements(coalesce(v_def->'servers', '[]'::jsonb))
+                       with ordinality as s(elem, ord)
+             order by s.ord
+        loop
+            if v_server->>'class' <> 'brokered' then
+                continue;
+            end if;
+            if jsonb_array_length(coalesce(v_server->'tools', '[]'::jsonb)) = 0 then
+                raise notice 'convert_legacy_bundles: agent % brokered server ''%'' has zero tools — skipped', p_agent, v_server->>'name';
+                continue;
+            end if;
+
+            v_url := v_server->>'url';
+
+            -- Slug reverse-match: the UNIQUE catalog row whose url equals the
+            -- server url, tenant row shadowing global; ambiguous/absent ⇒ null.
+            select count(*), min(c.slug) into v_cnt, v_slug
+              from connector_catalog c
+             where c.url = v_url and c.disabled_at is null
+               and c.tenant_id = p_tenant;
+            if v_cnt > 1 then
+                v_slug := null;
+            elsif v_cnt = 0 then
+                select count(*), min(c.slug) into v_cnt, v_slug
+                  from connector_catalog c
+                 where c.url = v_url and c.disabled_at is null
+                   and c.tenant_id is null;
+                if v_cnt <> 1 then
+                    v_slug := null;
+                end if;
+            end if;
+
+            -- Slot = server name, duplicates suffixed -2, -3 … in encounter order.
+            v_base_slot := v_server->>'name';
+            v_slot := v_base_slot;
+            v_suffix := 2;
+            while exists (
+                select 1 from jsonb_array_elements(o_requirements) rq
+                 where rq->>'slot' = v_slot)
+            loop
+                v_slot := v_base_slot || '-' || v_suffix;
+                v_suffix := v_suffix + 1;
+            end loop;
+
+            o_requirements := o_requirements || jsonb_build_array(jsonb_build_object(
+                'slot', v_slot,
+                'connector', jsonb_build_object('url', v_url, 'slug', to_jsonb(v_slug)),
+                'required_tools', (
+                    select coalesce(jsonb_agg(t.elem->>'name' order by t.ord), '[]'::jsonb)
+                      from jsonb_array_elements(v_server->'tools')
+                               with ordinality as t(elem, ord)
+                     where t.elem ? 'name'),
+                'binding_mode', 'organization'));
+        end loop;
+    end loop;
+end;
+$$;
+
+-- Append ONE converted revision (rev = max+1 at call time), copying the SOURCE
+-- revision's fields and stamping the derived surviving pins + requirements.
+-- Returns the new revision id.
+create or replace function fluidbox_convert_append(
+    p_agent uuid, p_source_rev_id uuid, p_surviving jsonb, p_requirements jsonb
+) returns uuid language plpgsql as $$
+declare
+    v_new_rev int;
+    v_id      uuid;
+begin
+    select coalesce(max(rev), 0) + 1 into v_new_rev
+      from agent_revisions where agent_id = p_agent;
+    insert into agent_revisions
+        (id, agent_id, rev, harness, runner_image, model, system_prompt, policy_id,
+         budgets, default_workspace, capability_bundles, connection_requirements)
+    select gen_random_uuid(), p_agent, v_new_rev, s.harness, s.runner_image, s.model,
+           s.system_prompt, s.policy_id, s.budgets, s.default_workspace,
+           p_surviving, p_requirements
+      from agent_revisions s
+     where s.id = p_source_rev_id
+    returning id into v_id;
+    return v_id;
+end;
+$$;
+-- The orchestrator: convert per source revision, dedupe copies, repoint each
+-- subscription to its own copy, and keep the live (latest) conversion as `latest`.
 create or replace function fluidbox_convert_legacy_bundles() returns void
 language plpgsql as $$
 declare
     v_agent          record;
-    v_latest         record;
-    v_pin            jsonb;
-    v_pin_name       text;
-    v_pin_version    int;
-    v_pin_suffix     text;
-    v_bundle_id      uuid;
-    v_bundle_name    text;
-    v_bundle_version int;
-    v_def            jsonb;
-    v_server         jsonb;
+    v_latest         agent_revisions%rowtype;
+    v_surviving_l    jsonb;
+    v_requirements_l jsonb;
+    v_brokered_l     boolean;
+    v_sub            record;
+    v_source         agent_revisions%rowtype;
     v_surviving      jsonb;
     v_requirements   jsonb;
     v_has_brokered   boolean;
-    v_bundle_brokered boolean;
-    v_base_slot      text;
-    v_slot           text;
-    v_suffix         int;
-    v_url            text;
-    v_slug           text;
-    v_dropped_sandbox text;
-    v_cnt            int;
-    v_new_rev        int;
+    v_reqs_key       text;
     v_new_rev_id     uuid;
+    v_existing       uuid;
+    v_live_copy      uuid;
+    v_deferred       uuid[];
+    -- Per-agent dedup map for NON-deferred subscription copies, keyed
+    -- (source_revision, derived requirement set). Parallel arrays (not a temp
+    -- table — a plpgsql function that creates/drops a temp table across calls
+    -- trips the cached-plan/OID gotcha).
+    v_map_source     uuid[];
+    v_map_reqs       text[];
+    v_map_newrev     uuid[];
+    i                int;
 begin
     for v_agent in select id, tenant_id from agents loop
-        -- The agent's LATEST revision governs future runs; only it is converted.
         select * into v_latest
           from agent_revisions r
          where r.agent_id = v_agent.id
@@ -227,202 +455,97 @@ begin
             continue;
         end if;
 
-        v_has_brokered := false;
-        v_surviving    := '[]'::jsonb;
-        v_requirements := '[]'::jsonb;
+        -- Live (unpinned/manual) derivation of the LATEST with the FULL keep-list
+        -- (NULL = all). Used to decide the live append AND to dedup subscriptions
+        -- pinning the latest at full authority onto the live copy.
+        select * into v_surviving_l, v_requirements_l, v_brokered_l
+          from fluidbox_convert_derive(v_agent.id, v_agent.tenant_id,
+                 coalesce(v_latest.capability_bundles, '[]'::jsonb), null);
 
-        -- Pins in ARRAY ORDER (deterministic via WITH ORDINALITY).
-        for v_pin in
-            select elem
-              from jsonb_array_elements(coalesce(v_latest.capability_bundles, '[]'::jsonb))
-                       with ordinality as p(elem, ord)
-             order by p.ord
+        v_deferred := '{}';
+        v_map_source := '{}';
+        v_map_reqs := '{}';
+        v_map_newrev := '{}';
+
+        -- Every subscription pinned to a brokered SOURCE revision, per keep-list.
+        for v_sub in
+            select ts.id as sub_id, ts.pinned_revision_id, ts.capability_bundles as keep
+              from trigger_subscriptions ts
+             where ts.agent_id = v_agent.id and ts.pinned_revision_id is not null
+             order by ts.created_at, ts.id
         loop
-            -- Resolve the pin to a bundle row WITHIN the agent's tenant, mirroring
-            -- run_service's semantics. The live stored shape is a BundleRef object
-            -- `{id,name,version}` (resolve by id); a bare/`name@N` string is also
-            -- accepted defensively ("name" = the max version at conversion time,
-            -- "name@N" = exact). Reset first so a malformed element can't inherit a
-            -- prior iteration's resolution.
-            v_bundle_id := null;
-            v_bundle_name := null;
-            v_bundle_version := null;
-            v_def := null;
-            if jsonb_typeof(v_pin) = 'object' and (v_pin ? 'id') then
-                select b.id, b.name, b.version, b.definition
-                  into v_bundle_id, v_bundle_name, v_bundle_version, v_def
-                  from capability_bundles b
-                 where b.tenant_id = v_agent.tenant_id
-                   and b.id = (v_pin->>'id')::uuid;
-            elsif jsonb_typeof(v_pin) = 'string' then
-                v_pin_name := split_part(v_pin #>> '{}', '@', 1);
-                if position('@' in (v_pin #>> '{}')) > 0 then
-                    -- Defensive `name@N` string: only a purely-numeric suffix is a
-                    -- version. A non-numeric one (e.g. `name@abc`) must NOT abort the
-                    -- whole migration on an int cast — leave v_bundle_id null so the
-                    -- unresolvable drop+notice path below handles it, exactly like a
-                    -- BundleRef pointing at a missing bundle.
-                    v_pin_suffix := split_part(v_pin #>> '{}', '@', 2);
-                    if v_pin_suffix ~ '^[0-9]+$' then
-                        v_pin_version := v_pin_suffix::int;
-                        select b.id, b.name, b.version, b.definition
-                          into v_bundle_id, v_bundle_name, v_bundle_version, v_def
-                          from capability_bundles b
-                         where b.tenant_id = v_agent.tenant_id
-                           and b.name = v_pin_name
-                           and b.version = v_pin_version;
-                    end if;
-                else
-                    select b.id, b.name, b.version, b.definition
-                      into v_bundle_id, v_bundle_name, v_bundle_version, v_def
-                      from capability_bundles b
-                     where b.tenant_id = v_agent.tenant_id
-                       and b.name = v_pin_name
-                     order by b.version desc
-                     limit 1;
-                end if;
+            select * into v_source
+              from agent_revisions r
+             where r.id = v_sub.pinned_revision_id and r.agent_id = v_agent.id;
+            if not found then
+                continue;  -- dangling pin: leave the subscription untouched
             end if;
 
-            if v_bundle_id is null then
-                -- A dangling pin already fails runs today; do not invent new
-                -- behavior — drop it from the copied list and skip requirement
-                -- derivation (name/id only, never secrets).
-                raise notice 'convert_legacy_bundles: agent % has an unresolvable capability pin — dropped', v_agent.id;
+            select * into v_surviving, v_requirements, v_has_brokered
+              from fluidbox_convert_derive(v_agent.id, v_agent.tenant_id,
+                     coalesce(v_source.capability_bundles, '[]'::jsonb), v_sub.keep);
+            if not v_has_brokered then
+                continue;  -- pinned to a brokered-free revision: untouched
+            end if;
+
+            -- A subscription pinning the LATEST at FULL authority shares the live
+            -- copy — deferred until after it is appended (LAST) so the live
+            -- conversion stays the agent's `latest`.
+            if v_brokered_l and v_source.id = v_latest.id
+               and v_requirements::text = v_requirements_l::text then
+                v_deferred := array_append(v_deferred, v_sub.sub_id);
                 continue;
             end if;
 
-            v_bundle_brokered := exists (
-                select 1
-                  from jsonb_array_elements(coalesce(v_def->'servers', '[]'::jsonb)) s
-                 where s->>'class' = 'brokered');
-
-            if not v_bundle_brokered then
-                -- Sandbox-only bundle survives, re-pinned EXPLICITLY (exact
-                -- id+name+version; the version IS the `name@<version>` pin).
-                v_surviving := v_surviving || jsonb_build_array(jsonb_build_object(
-                    'id', v_bundle_id, 'name', v_bundle_name, 'version', v_bundle_version));
-                continue;
-            end if;
-
-            -- This bundle carries brokered servers: it is DROPPED from the copied
-            -- pins (a mixed bundle's sandbox servers go with it — the design's
-            -- per-bundle rule), and each brokered server becomes a requirement.
-            v_has_brokered := true;
-
-            -- Settled (the controller's call): a mixed bundle is dropped WHOLE and
-            -- its sandbox servers are surfaced by notice — we do NOT synthesize a
-            -- new sandbox-only bundle version. No real mixed bundles exist, so
-            -- synthesis would add migration write surface for a nonexistent case,
-            -- and the brokered cutoff makes keeping the original pin impossible.
-            -- Name the dropped sandbox server(s) so an operator can re-add them by
-            -- hand (names only; every value is a % arg, never concatenated in).
-            select string_agg(elem->>'name', ', ' order by ord)
-              into v_dropped_sandbox
-              from jsonb_array_elements(coalesce(v_def->'servers', '[]'::jsonb))
-                       with ordinality as srv(elem, ord)
-             where elem->>'class' <> 'brokered';
-            if v_dropped_sandbox is not null then
-                raise notice 'convert_legacy_bundles: agent % dropped mixed bundle %@% — sandbox server(s) % must be re-added manually',
-                    v_agent.id, v_bundle_name, v_bundle_version, v_dropped_sandbox;
-            end if;
-
-            for v_server in
-                select elem
-                  from jsonb_array_elements(coalesce(v_def->'servers', '[]'::jsonb))
-                           with ordinality as s(elem, ord)
-                 order by s.ord
-            loop
-                if v_server->>'class' <> 'brokered' then
-                    continue;
+            -- Otherwise: dedup on (source_revision, requirement set) among the
+            -- subscription copies built so far; append a fresh copy on a miss.
+            v_reqs_key := v_requirements::text;
+            v_existing := null;
+            for i in 1 .. coalesce(array_length(v_map_source, 1), 0) loop
+                if v_map_source[i] = v_source.id and v_map_reqs[i] = v_reqs_key then
+                    v_existing := v_map_newrev[i];
+                    exit;
                 end if;
-                -- A brokered server with zero photographed tools can satisfy no
-                -- requirement — skip it (tool/slot names only in the notice).
-                if jsonb_array_length(coalesce(v_server->'tools', '[]'::jsonb)) = 0 then
-                    raise notice 'convert_legacy_bundles: agent % brokered server ''%'' has zero tools — skipped', v_agent.id, v_server->>'name';
-                    continue;
-                end if;
-
-                v_url := v_server->>'url';
-
-                -- Slug reverse-match: the UNIQUE connector_catalog row whose url
-                -- equals the server url exactly, tenant row shadowing global;
-                -- ambiguous (>1) or absent ⇒ null (display hint only).
-                select count(*), min(c.slug) into v_cnt, v_slug
-                  from connector_catalog c
-                 where c.url = v_url and c.disabled_at is null
-                   and c.tenant_id = v_agent.tenant_id;
-                if v_cnt > 1 then
-                    v_slug := null;
-                elsif v_cnt = 0 then
-                    select count(*), min(c.slug) into v_cnt, v_slug
-                      from connector_catalog c
-                     where c.url = v_url and c.disabled_at is null
-                       and c.tenant_id is null;
-                    if v_cnt <> 1 then
-                        v_slug := null;
-                    end if;
-                end if;
-
-                -- Slot = server name, with duplicates suffixed -2, -3 … across the
-                -- requirements built so far (encounter order → deterministic).
-                v_base_slot := v_server->>'name';
-                v_slot := v_base_slot;
-                v_suffix := 2;
-                while exists (
-                    select 1 from jsonb_array_elements(v_requirements) rq
-                     where rq->>'slot' = v_slot)
-                loop
-                    v_slot := v_base_slot || '-' || v_suffix;
-                    v_suffix := v_suffix + 1;
-                end loop;
-
-                -- Build EXACTLY ConnectionRequirement's serde shape (snake_case,
-                -- deny_unknown_fields): {slot, connector{url,slug}, required_tools,
-                -- binding_mode}. required_tools keeps the photographed tool order.
-                v_requirements := v_requirements || jsonb_build_array(jsonb_build_object(
-                    'slot', v_slot,
-                    'connector', jsonb_build_object('url', v_url, 'slug', to_jsonb(v_slug)),
-                    'required_tools', (
-                        select coalesce(jsonb_agg(t.elem->>'name' order by t.ord), '[]'::jsonb)
-                          from jsonb_array_elements(v_server->'tools')
-                                   with ordinality as t(elem, ord)
-                         where t.elem ? 'name'),
-                    'binding_mode', 'organization'));
             end loop;
+            if v_existing is null then
+                v_new_rev_id := fluidbox_convert_append(
+                    v_agent.id, v_source.id, v_surviving, v_requirements);
+                v_map_source := array_append(v_map_source, v_source.id);
+                v_map_reqs := array_append(v_map_reqs, v_reqs_key);
+                v_map_newrev := array_append(v_map_newrev, v_new_rev_id);
+            else
+                v_new_rev_id := v_existing;
+            end if;
+            update trigger_subscriptions
+               set pinned_revision_id = v_new_rev_id, updated_at = now()
+             where id = v_sub.sub_id;
         end loop;
 
-        -- No brokered pins on the latest revision ⇒ nothing to convert. This is
-        -- also the idempotence guard: a previously-converted agent's latest
-        -- revision is sandbox-only, so it lands here and is skipped.
-        if not v_has_brokered then
-            continue;
+        -- Live path LAST so its copy has the highest rev and is the new `latest`;
+        -- then repoint every deferred subscription to it.
+        if v_brokered_l then
+            v_live_copy := fluidbox_convert_append(
+                v_agent.id, v_latest.id, v_surviving_l, v_requirements_l);
+            if array_length(v_deferred, 1) is not null then
+                update trigger_subscriptions
+                   set pinned_revision_id = v_live_copy, updated_at = now()
+                 where id = any(v_deferred);
+            end if;
+        elsif (select max(rev) from agent_revisions where agent_id = v_agent.id) > v_latest.rev then
+            -- The latest is brokered-free (NOT converted). If subscription copies
+            -- from OLDER brokered revisions were appended with higher revs, lift
+            -- the untouched latest back to the top by its rev ordinal (content
+            -- unchanged; revisions are pinned by id) so unpinned/manual runs keep
+            -- resolving it — never a converted older revision. Idempotent: on a
+            -- re-run the latest is already the max rev, so this does not fire.
+            update agent_revisions
+               set rev = (select max(rev) from agent_revisions where agent_id = v_agent.id) + 1
+             where id = v_latest.id;
         end if;
-
-        select coalesce(max(rev), 0) + 1 into v_new_rev
-          from agent_revisions where agent_id = v_agent.id;
-
-        insert into agent_revisions
-            (id, agent_id, rev, harness, runner_image, model, system_prompt, policy_id,
-             budgets, default_workspace, capability_bundles, connection_requirements)
-        values
-            (gen_random_uuid(), v_agent.id, v_new_rev, v_latest.harness, v_latest.runner_image,
-             v_latest.model, v_latest.system_prompt, v_latest.policy_id, v_latest.budgets,
-             v_latest.default_workspace, v_surviving, v_requirements)
-        returning id into v_new_rev_id;
-
-        -- Explicitly repoint EVERY subscription pinned to ANY revision of this
-        -- agent onto the new revision (design :346).
-        update trigger_subscriptions ts
-           set pinned_revision_id = v_new_rev_id,
-               updated_at = now()
-         where ts.agent_id = v_agent.id
-           and ts.pinned_revision_id is not null
-           and ts.pinned_revision_id in (
-                 select r.id from agent_revisions r where r.agent_id = v_agent.id);
     end loop;
 end;
 $$;
 
 -- Run the conversion once, now, at migration time (a no-op on a fresh DB — the
--- boot seed's agents don't exist yet). The function stays defined for the DB test.
+-- boot seed's agents don't exist yet). The functions stay defined for the DB test.
 do $$ begin perform fluidbox_convert_legacy_bundles(); end $$;
