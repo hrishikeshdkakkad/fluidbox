@@ -1011,17 +1011,21 @@ pub async fn ensure_access_token(
     // dropped/rolled-back tx releases the lock too, and a cached token must never
     // outlive an uncommitted rotation.
     let committed = tx.commit().await;
+    // The commit check DOMINATES the inner result — evaluate it FIRST, before we
+    // honor `result`. BOTH branches stage durable writes: a success rotated the
+    // refresh token, and an `invalid_grant`/`invalid_client` failure staged
+    // `status='error'` (~:1115). A failed or AMBIGUOUS commit therefore fails
+    // closed regardless of `result`: otherwise the Err branch would surface
+    // "re-authorize" while the row stayed `active` on a known-dead grant (new runs
+    // could bind it), and the Ok branch could serve a token the AS may already
+    // have invalidated. Drop every cached generation and refuse — the caller
+    // retries.
+    if let Err(e) = committed {
+        invalidate_access(state, conn.id).await;
+        return Err(format!("could not persist OAuth custody — retry: {e}"));
+    }
     match result {
         Ok((access, expires_in)) => {
-            // The rotation only counts if it durably landed. A failed or AMBIGUOUS
-            // commit fails closed: the AS may already have invalidated the
-            // rotated-away refresh token, so serving this access token while the DB
-            // kept the dead grant would corrupt custody. Drop every cached
-            // generation and refuse — the caller retries.
-            if let Err(e) = committed {
-                invalidate_access(state, conn.id).await;
-                return Err(format!("could not persist OAuth custody — retry: {e}"));
-            }
             // Cache under the generation THIS refresh ran against (== `fresh`'s,
             // verified equal to the caller's above). A concurrent reconnect bump
             // makes this (connection, old-generation) key unreachable to current
