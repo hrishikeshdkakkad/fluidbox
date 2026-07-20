@@ -3947,3 +3947,358 @@ select.inp {
     display: none;
   }
 }
+/* ─── Run composer: one form, one live spec ────────────────────────────
+   Replaces the five-step wizard. The left column is a single scrolling
+   form whose content reacts to earlier choices; the right column is a
+   sticky panel showing exactly what the RunSpec will freeze. Seeing the
+   spec assemble teaches the immutability model while you configure.
+   Namespaced `rc-` — `.composer`/`.spec-row` belong to the agent composer. */
+
+.rc-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 28px;
+  align-items: start;
+}
+.rc-form {
+  display: grid;
+  gap: 26px;
+  min-width: 0;
+}
+
+.rc-section {
+  display: grid;
+  gap: 14px;
+}
+.rc-section + .rc-section {
+  padding-top: 24px;
+  border-top: 1px solid var(--border);
+}
+.rc-section-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+.rc-section-index {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  color: var(--ink-2);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  display: grid;
+  place-items: center;
+  margin-top: 2px;
+}
+.rc-section-head h3 {
+  font-family: var(--font-display);
+  font-size: 17px;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+.rc-section-head p {
+  font-size: 12px;
+  color: var(--ink-2);
+  margin: 3px 0 0;
+  max-width: 62ch;
+}
+.rc-section-body {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+/* The selected trigger's settings, revealed in place under the choice
+   that asked for them. */
+.rc-trigger-detail {
+  border-left: 2px solid var(--accent);
+  background: var(--surface-hover);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  padding: 14px 16px;
+  display: grid;
+  gap: 14px;
+  animation: rc-reveal 180ms ease-out;
+}
+.rc-trigger-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-2);
+  max-width: 60ch;
+}
+@keyframes rc-reveal {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rc-trigger-detail { animation: none; }
+}
+
+.rc-binding-row {
+  display: grid;
+  gap: 4px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+/* ── Live spec panel ── */
+
+.rc-spec {
+  position: sticky;
+  top: 8px;
+  min-width: 0;
+}
+.rc-spec-inner {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--raised);
+}
+.rc-spec-head p {
+  font-size: 11.5px;
+  color: var(--ink-3);
+  margin: 4px 0 0;
+  line-height: 1.45;
+}
+
+.rc-row {
+  display: grid;
+  gap: 2px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.rc-row-label {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--ink-3);
+}
+.rc-row-value {
+  font-size: 13px;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.rc-row-value.rc-clamp {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.rc-row-sub {
+  font-size: 11.5px;
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+}
+.rc-row.pending .rc-row-value {
+  color: var(--ink-3);
+  font-style: italic;
+}
+.rc-row-binding {
+  font-size: 12px;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.rc-note {
+  font-size: 11.5px;
+  color: var(--amber);
+  margin: 0;
+  line-height: 1.45;
+}
+
+.rc-submit {
+  width: 100%;
+  justify-content: center;
+  margin-top: 2px;
+}
+.rc-blocker {
+  font-size: 11.5px;
+  color: var(--ink-3);
+  margin: 0;
+  text-align: center;
+  line-height: 1.45;
+}
+.rc-error {
+  font-size: 12px;
+}
+
+@media (max-width: 900px) {
+  .rc-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 22px;
+  }
+  .rc-spec {
+    position: static;
+    order: -1;
+  }
+}
+
+/* ─── Schedule picker ──────────────────────────────────────────────────
+   Days and times, not cron fields. The generated expression stays visible
+   beside the plain-English summary so nothing is hidden — the sentence is
+   what a person checks, the cron is what the scheduler stores. */
+
+.sched {
+  display: grid;
+  gap: 14px;
+}
+.sched-freq {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.sched-freq-option {
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--ink-2);
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
+}
+.sched-freq-option:hover {
+  color: var(--ink);
+  border-color: var(--border-strong);
+}
+.sched-freq-option.on {
+  background: var(--accent-tint);
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
+.sched-detail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: flex-start;
+}
+.sched-detail > .field {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+.sched-detail > .sched-narrow {
+  flex: 0 0 150px;
+}
+.sched-detail > .sched-zone {
+  flex: 1 1 220px;
+}
+
+.sched-days {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.sched-day {
+  width: 42px;
+  padding: 6px 0;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--ink-3);
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
+}
+.sched-day:hover {
+  color: var(--ink);
+  border-color: var(--border-strong);
+}
+.sched-day.on {
+  background: var(--accent-tint);
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
+.sched-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+  margin: 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+  color: var(--ink);
+}
+.sched-cron {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-3);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 2px 7px;
+}
+
+/* ─── Automation integration contract ──────────────────────────────────
+   The panel shown once, at creation: secrets, real endpoint, declared
+   variables, and the responses to expect. Everything is copyable because
+   this is the only time the secrets exist. */
+
+.contract {
+  display: grid;
+  gap: 22px;
+}
+.contract-section {
+  display: grid;
+  gap: 10px;
+}
+.contract-section + .contract-section {
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+}
+.contract-section h4 {
+  font-family: var(--font-display);
+  font-size: 14px;
+  font-weight: 400;
+  letter-spacing: -0.005em;
+  margin: 0;
+  color: var(--ink);
+}
+.contract-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.contract-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-2);
+  line-height: 1.5;
+}
+.contract-note code,
+.contract-var code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.contract-var {
+  grid-template-columns: minmax(120px, 30%) 1fr;
+  gap: 10px;
+  padding: 7px 10px;
+  align-items: baseline;
+}
+.contract-var .mono {
+  font-size: 12px;
+  color: var(--accent);
+}
+.contract-var .faint {
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+/* A pinned bundle that Phase C refuses at run creation. Kept visible so a
+   legacy revision can be fixed, marked so it is not mistaken for usable. */
+.cap-row.blocked {
+  border-color: var(--red);
+  background: rgba(255, 115, 115, 0.06);
+}

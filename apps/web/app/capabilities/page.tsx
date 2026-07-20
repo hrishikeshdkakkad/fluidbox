@@ -159,6 +159,10 @@ function Capabilities() {
         <ConnectCatalog
           entry={connecting}
           me={me}
+          // The catalog projection carries only {id,status,auth_kind}; the full
+          // row (ownership, name, created_at) comes from the connections list
+          // the page already holds.
+          fullConnection={connections.find((c) => c.id === connecting.connection?.id) ?? null}
           onClose={() => {
             setConnecting(null);
             load();
@@ -739,10 +743,12 @@ function ConnectionToolsPanel({
 function ConnectCatalog({
   entry,
   me,
+  fullConnection,
   onClose,
 }: {
   entry: CatalogEntry;
   me: AuthMe | null;
+  fullConnection: Connection | null;
   onClose: () => void;
 }) {
   const [token, setToken] = useState("");
@@ -756,11 +762,14 @@ function ConnectCatalog({
   const [waiting, setWaiting] = useState(false);
   const [toolDetail, setToolDetail] = useState<BundleDetail | null>(null);
   const [toolsErr, setToolsErr] = useState(false);
+  const [snapshot, setSnapshot] = useState<ConnectionToolSnapshot | null>(null);
+  const [snapshotErr, setSnapshotErr] = useState(false);
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   // Catalog connections are mcp_http — personal is allowed for any member.
   const owner = ownerChoice ?? ownerOptions(me, true).default;
 
   const conn = entry.connection;
+  const connId = conn?.id;
   const isConnected = conn?.status === "active" || (entry.auth_mode === "none" && !!entry.bundle);
   const needsReattention = !!conn && conn.status !== "active" && !isConnected;
   const bundleId = entry.bundle?.id;
@@ -789,6 +798,24 @@ function ConnectCatalog({
       cancelled = true;
     };
   }, [isConnected, bundleId]);
+
+  // A brokered (remote) connection never registers a bundle — Phase C moved its
+  // tool surface to a per-connection snapshot. Read that instead, so the tools
+  // are visible here and not only behind the Connections tab's Tools panel.
+  useEffect(() => {
+    if (!isConnected || !connId || bundleId) return;
+    let cancelled = false;
+    fetchConnectionTools(connId)
+      .then((s) => {
+        if (!cancelled) setSnapshot(s);
+      })
+      .catch(() => {
+        if (!cancelled) setSnapshotErr(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isConnected, connId, bundleId]);
   // Imported `rest_action` cards are reference-only until the REST action
   // executor lands — Connect is refused server-side, so don't offer it here.
   const referenceOnly = entry.connectable === false;
@@ -936,16 +963,62 @@ function ConnectCatalog({
           <div className="connector-status">
             <span className="status-dot" />
             <span>Connected</span>
+            {fullConnection && <OwnerTag connection={fullConnection} meUserId={me?.user_id} />}
             {entry.bundle ? (
               <span className="bundle-chip">
                 {entry.bundle.name}@{entry.bundle.version}
               </span>
+            ) : snapshot ? (
+              <span className="bundle-chip">
+                v{snapshot.version} · {snapshot.protocol_version}
+              </span>
+            ) : snapshotErr ? (
+              <span className="faint" style={{ fontSize: 12, fontWeight: 400 }}>
+                tool snapshot unavailable
+              </span>
             ) : (
               <span className="faint" style={{ fontSize: 12, fontWeight: 400 }}>
-                no bundle registered yet
+                reading tool snapshot…
               </span>
             )}
           </div>
+          {(fullConnection || snapshot) && (
+            <p className="faint" style={{ fontSize: 12, marginTop: 6 }}>
+              {fullConnection && `${fullConnection.display_name} · connected ${timeAgo(fullConnection.created_at)}`}
+              {snapshot &&
+                `${fullConnection ? " · " : ""}photographed ${timeAgo(snapshot.discovered_at)} · generation ${snapshot.authorization_generation}`}
+            </p>
+          )}
+          {!entry.bundle && snapshot && (
+            <div className="tool-section">
+              <div className="tool-section-head">
+                <h4>Tools</h4>
+                <span className="tool-count">{snapshot.tools.length} agents can call</span>
+              </div>
+              {snapshot.tools.length === 0 ? (
+                <div className="tool-list">
+                  <div className="tool-empty">No tools in this snapshot.</div>
+                </div>
+              ) : (
+                <div className="rows" style={{ marginTop: 6 }}>
+                  {snapshot.tools.map((t) => (
+                    <div
+                      key={t.name}
+                      className="row"
+                      style={{ gridTemplateColumns: "minmax(120px, 40%) 1fr", padding: "6px 10px" }}
+                    >
+                      <span className="mono" style={{ fontSize: 12, color: "var(--accent)" }}>
+                        {t.name}
+                      </span>
+                      <span className="faint" style={{ fontSize: 12 }}>
+                        {t.description || "—"}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           {entry.bundle && (
             <div className="tool-section">
               <div className="tool-section-head">

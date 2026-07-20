@@ -85,12 +85,15 @@ export function ModalShell({
   onClose,
   children,
   wide,
+  maxWidth,
 }: {
   title: string;
   sub?: string;
   onClose: () => void;
   children: React.ReactNode;
   wide?: boolean;
+  /** Explicit shell width — beats `wide`. For layouts that need two panes. */
+  maxWidth?: string;
 }) {
   const modalRef = useRef<HTMLDivElement>(null);
   const onCloseRef = useRef(onClose);
@@ -140,7 +143,7 @@ export function ModalShell({
       <div
         ref={modalRef}
         className="modal"
-        style={wide ? { width: "min(680px, 92vw)" } : undefined}
+        style={maxWidth ? { width: maxWidth } : wide ? { width: "min(680px, 92vw)" } : undefined}
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"

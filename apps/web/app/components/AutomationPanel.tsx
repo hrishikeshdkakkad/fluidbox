@@ -72,15 +72,20 @@ export function AutomationPanel({
   const rotate = async (subscription: TriggerSubscription) => {
     setErr("");
     try {
-      const response = await apiPost<{ token: string }>(
-        `/triggers/${subscription.id}/rotate_token`,
-        {}
-      );
+      const response = await apiPost<{
+        token: string;
+        base_url: string | null;
+        invoke_url: string | null;
+        poll_url_template: string | null;
+      }>(`/triggers/${subscription.id}/rotate_token`, {});
       setMinted({
         subscription,
         token: response.token,
         callback_secret: null,
         rotated: true,
+        base_url: response.base_url,
+        invoke_url: response.invoke_url,
+        poll_url_template: response.poll_url_template,
       });
     } catch (error) {
       setErr(String(error));
