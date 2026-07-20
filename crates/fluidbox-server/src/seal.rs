@@ -51,6 +51,9 @@ const TRANSIT_AAD: &str = "fbx:v2:transit";
 /// UUID = the deployment context — documented at those call sites).
 // The last four variants have no Task-1 seal site — they belong to migrations
 // 0015-0017 (Tasks 3-5). Declared here to fix the interface across tasks.
+// oauth_client_registrations (Task 3) rows are deployment-global (tenant_id
+// NULL); their secrets seal under the DEPLOYMENT tenant's DEK
+// (`Sealer::deployment_ctx`), NOT the nil UUID — tenant_deks has a real FK.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SealFamily {
@@ -97,8 +100,10 @@ impl std::fmt::Display for SealFamily {
 }
 
 /// Everything a v2 seal binds: the tenant whose DEK seals it and the family whose
-/// name goes into the AAD. `tenant_id` is the nil UUID for deployment-global rows
-/// (Task 3's global client registrations).
+/// name goes into the AAD. For deployment-global rows (Task 3's global client
+/// registrations, `tenant_id` NULL) this carries the DEPLOYMENT tenant's id —
+/// a real `tenants` row — via [`Sealer::deployment_ctx`], never the nil UUID
+/// (`tenant_deks` has a real FK on it).
 #[derive(Debug, Clone, Copy)]
 pub struct SealCtx {
     pub tenant_id: Uuid,
@@ -318,6 +323,26 @@ impl Sealer {
             }
             other => anyhow::bail!("unknown sealed key version {other}"),
         }
+    }
+
+    /// The [`SealCtx`] for a deployment-global row's sealed column (`tenant_id`
+    /// NULL): it seals/opens under the DEPLOYMENT tenant's DEK. A global row has
+    /// no tenant of its own, and `tenant_deks` has a real FK, so the nil UUID
+    /// cannot key it — the always-present boot/seed tenant does (the same tenant
+    /// [`seal_token`](Self::seal_token) keys transit tokens under). Task 3's
+    /// `oauth_client_registrations` are the first global family. In KMS-off mode
+    /// the tenant is moot (the legacy seal ignores it).
+    pub fn deployment_ctx(&self, family: SealFamily) -> SealCtx {
+        SealCtx::new(self.inner.deployment_tenant, family)
+    }
+
+    /// The [`SealCtx`] for a re-sealed row given its stored `tenant_id`: a real
+    /// tenant for tenant-owned families, or `None` for a deployment-global family
+    /// (`oauth_client_registrations`) → the deployment tenant's DEK, exactly as
+    /// [`deployment_ctx`](Self::deployment_ctx). The re-seal job resolves each
+    /// row's ctx through this so a NULL-tenant global row seals under a real DEK.
+    pub fn row_ctx(&self, tenant_id: Option<Uuid>, family: SealFamily) -> SealCtx {
+        SealCtx::new(tenant_id.unwrap_or(self.inner.deployment_tenant), family)
     }
 
     /// Self-describing ephemeral TRANSIT-token sealing — github_app flow tokens

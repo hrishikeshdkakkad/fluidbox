@@ -292,9 +292,12 @@ pub struct FamilyKeyVersionCounts {
 
 /// Count legacy (v1) vs envelope (v2) rows for every sealed column across ALL
 /// tenants — the D4 retirement gates' input (a cross-tenant scan, no principal).
-/// One `UNION ALL` over the nine sealed columns; each family filters on its own
-/// `<col> is not null` so NULL secrets never count. Returns counts only, never a
-/// sealed byte.
+/// One `UNION ALL` over the eleven sealed columns (the nine tenant-owned ones
+/// plus Task 3's two deployment-global `oauth_client_registrations` columns);
+/// each family filters on its own `<col> is not null` so NULL secrets never
+/// count. Returns counts only, never a sealed byte. MUST stay in lockstep with
+/// `reseal::FAMILIES`, or a v1 row of an uncounted family would escape both the
+/// re-seal job AND the retirement gate and orphan when the legacy key retires.
 pub async fn sealed_key_version_counts(pool: &PgPool) -> sqlx::Result<Vec<FamilyKeyVersionCounts>> {
     sqlx::query_as(
         "select 'integration_connections.credential_sealed' as family,
@@ -340,7 +343,17 @@ pub async fn sealed_key_version_counts(pool: &PgPool) -> sqlx::Result<Vec<Family
          select 'login_flows.pkce_verifier_sealed',
                 count(*) filter (where pkce_verifier_sealed is not null and pkce_verifier_key_version = 1),
                 count(*) filter (where pkce_verifier_sealed is not null and pkce_verifier_key_version = 2)
-           from login_flows",
+           from login_flows
+         union all
+         select 'oauth_client_registrations.client_secret_sealed',
+                count(*) filter (where client_secret_sealed is not null and client_secret_key_version = 1),
+                count(*) filter (where client_secret_sealed is not null and client_secret_key_version = 2)
+           from oauth_client_registrations
+         union all
+         select 'oauth_client_registrations.registration_access_token_sealed',
+                count(*) filter (where registration_access_token_sealed is not null and registration_access_token_key_version = 1),
+                count(*) filter (where registration_access_token_sealed is not null and registration_access_token_key_version = 2)
+           from oauth_client_registrations",
     )
     .fetch_all(pool)
     .await
@@ -393,7 +406,11 @@ pub async fn reseal_candidate_ids(
 /// so the caller can re-check it is STILL 1 under the lock — the page read
 /// [`reseal_candidate_ids`] was unlocked, so a concurrent writer may have
 /// re-sealed the row since. `None` (outer) = the row vanished (deleted) between
-/// paging and locking; `None` (inner, the bytes) = the column is now NULL.
+/// paging and locking; `None` (inner, the bytes) = the column is now NULL. The
+/// `tenant_id` is `Option<Uuid>` because a deployment-global family
+/// (`oauth_client_registrations`, tenant_id NULL) re-seals under the DEPLOYMENT
+/// tenant's DEK — the server resolves NULL → deployment tenant via
+/// `Sealer::row_ctx` (plaintext never transits this crate).
 ///
 /// The row lock plus the caller's CAS write ([`reseal_write_row`]) make a separate
 /// oauth advisory lock unnecessary for the concurrent-rotation hot spot: a live
@@ -407,7 +424,7 @@ pub async fn reseal_lock_row(
     column: &str,
     version_column: &str,
     id: Uuid,
-) -> sqlx::Result<Option<(Option<Vec<u8>>, i16, Uuid)>> {
+) -> sqlx::Result<Option<(Option<Vec<u8>>, i16, Option<Uuid>)>> {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {column}, {version_column}, tenant_id from {table}
          where id = $1 for update"
