@@ -591,6 +591,32 @@ mod tests {
         }
     }
 
+    // Cross-crate lockstep belt: the family SET the fluidbox-db retirement counter
+    // reports MUST equal the family set reseal::FAMILIES walks. A column added to
+    // one and not the other (a v1 row of an uncounted family) would escape the
+    // re-seal job AND the retirement gate and orphan when the legacy key retires.
+    #[tokio::test]
+    async fn counts_and_families_cover_the_same_set() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = fluidbox_db::connect(&url).await.expect("connect");
+        let from_counts: std::collections::BTreeSet<String> =
+            fluidbox_db::system_worker::sealed_key_version_counts(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|c| c.family)
+                .collect();
+        let from_families: std::collections::BTreeSet<String> =
+            FAMILIES.iter().map(|f| f.seal_family.to_string()).collect();
+        assert_eq!(
+            from_counts, from_families,
+            "sealed_key_version_counts and reseal::FAMILIES must cover the identical family set"
+        );
+    }
+
     #[test]
     fn status_serializes_expected_shape() {
         let s = ResealStatus {
