@@ -58,7 +58,14 @@ create table connector_oauth_flows (
     challenge_method          text        not null default 'S256',
     -- The shared client identity this dance resolved (Task 3); NULL for a
     -- per-connection pre-registered identity (its secret stays on the connection).
-    client_registration_id    uuid        references oauth_client_registrations(id),
+    -- ON DELETE SET NULL: a registration the authorization server rejects with
+    -- `invalid_client` is RETIRED (oauth.rs `retire_rejected_registration`) so the
+    -- next dance re-resolves a fresh identity — and consumed flow rows are kept 7
+    -- days for audit, so a plain reference would make that delete a guaranteed
+    -- 23503. The flow's own frozen `client_id` (not this FK) is what the exchange
+    -- used, so nulling the pointer loses nothing: the flow is already single-use.
+    client_registration_id    uuid        references oauth_client_registrations(id)
+                                              on delete set null,
     client_id                 text        not null,
     -- The PKCE verifier, sealed at rest (never plaintext) — the challenge alone
     -- cannot perform the token exchange (design :638-639). Envelope-native

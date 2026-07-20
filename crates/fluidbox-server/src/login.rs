@@ -27,7 +27,7 @@
 use crate::auth::{AuthContext, Principal};
 use crate::error::{ApiError, ApiResult};
 use crate::oauth::{b64url, pkce_challenge, random_urlsafe};
-use crate::seal::{SealCtx, SealFamily, Sealer};
+use crate::seal::{SealCtx, SealFamily, Sealer, TRANSIT_LOGIN};
 use crate::state::AppState;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, State};
@@ -503,9 +503,10 @@ struct LoginState {
 }
 
 /// `{purpose:"login", v:1, flow_id, tenant_id, idp_config_id, exp}` — sealed via
-/// the shared `Sealer::seal_token` transit primitive, but carrying a `purpose`/`v`
-/// discriminator so login states and any other sealed transit token (e.g. the
-/// connector OAuth boot token) are mutually unredeemable (unit-tested).
+/// the shared `Sealer::seal_token` transit primitive under the `TRANSIT_LOGIN`
+/// AAD purpose, so a login state is CRYPTOGRAPHICALLY unopenable as any other
+/// transit token; the in-payload `purpose`/`v` discriminator then keeps them
+/// mutually unredeemable in legacy (AAD-less) sealing too (unit-tested).
 async fn seal_login_state(
     sealer: &Sealer,
     flow_id: Uuid,
@@ -523,7 +524,7 @@ async fn seal_login_state(
     // Transit-token sealing (self-describing) — survives a KMS mode flip within
     // the state's short TTL; see `Sealer::seal_token`.
     let sealed = sealer
-        .seal_token(&payload.to_string())
+        .seal_token(TRANSIT_LOGIN, &payload.to_string())
         .await
         .map_err(|e| e.to_string())?;
     Ok(b64url(&sealed))
@@ -534,7 +535,7 @@ async fn open_login_state(sealer: &Sealer, param: &str) -> Result<LoginState, St
         .decode(param)
         .map_err(|_| "malformed state parameter")?;
     let plain = sealer
-        .open_token(&raw)
+        .open_token(TRANSIT_LOGIN, &raw)
         .await
         .map_err(|_| "state parameter failed verification")?;
     let v: Value = serde_json::from_str(&plain).map_err(|_| "state parameter is corrupt")?;
@@ -2388,10 +2389,13 @@ mod tests {
         assert_eq!(ls.tenant_id, tenant);
         assert_eq!(ls.idp_config_id, cfg);
 
-        // A foreign sealed token (a connector-shaped {c,v,x} transit blob) must NOT
-        // open as a login state (no `p` purpose tag).
+        // A foreign sealed token (a connector-shaped {c,v,x} transit blob, sealed
+        // under the OAuth-boot AAD purpose) must NOT open as a login state — in KMS
+        // mode the AAD purpose refuses it outright, and in legacy (AAD-less)
+        // sealing the missing `purpose` tag does.
         let connector = crate::oauth::b64url(
             &s.seal_token(
+                crate::seal::TRANSIT_OAUTH_BOOT,
                 &serde_json::json!({ "c": Uuid::now_v7(), "v": "verifier", "x": 9_999_999_999i64 })
                     .to_string(),
             )
@@ -2415,7 +2419,11 @@ mod tests {
                 "tenant_id": Uuid::now_v7(), "idp_config_id": Uuid::now_v7(),
                 "exp": Utc::now().timestamp() - 1,
             });
-            b64url(&s.seal_token(&payload.to_string()).await.unwrap())
+            b64url(
+                &s.seal_token(TRANSIT_LOGIN, &payload.to_string())
+                    .await
+                    .unwrap(),
+            )
         };
         assert!(open_login_state(&s, &stale).await.is_err());
         let wrong_v = {
@@ -2424,7 +2432,11 @@ mod tests {
                 "tenant_id": Uuid::now_v7(), "idp_config_id": Uuid::now_v7(),
                 "exp": Utc::now().timestamp() + 600,
             });
-            b64url(&s.seal_token(&payload.to_string()).await.unwrap())
+            b64url(
+                &s.seal_token(TRANSIT_LOGIN, &payload.to_string())
+                    .await
+                    .unwrap(),
+            )
         };
         assert!(open_login_state(&s, &wrong_v).await.is_err());
     }

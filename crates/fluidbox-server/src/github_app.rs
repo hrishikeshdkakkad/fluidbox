@@ -22,7 +22,7 @@ use crate::auth::Principal;
 use crate::connectors::github;
 use crate::error::{ApiError, ApiResult};
 use crate::rbac;
-use crate::seal::{SealCtx, SealFamily, Sealer};
+use crate::seal::{SealCtx, SealFamily, Sealer, TRANSIT_GITHUB_APP_FLOW};
 use crate::state::AppState;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -96,9 +96,12 @@ pub(crate) async fn seal_flow_token(
         "x": Utc::now().timestamp() + FLOW_TTL_SECS,
     });
     // Transit-token sealing (self-describing, versionless companion): survives a
-    // KMS mode flip within the flow's short TTL — see `Sealer::seal_token`.
+    // KMS mode flip within the flow's short TTL — see `Sealer::seal_token`. The
+    // AAD purpose separates these from login states / connector boot tokens
+    // cryptographically; the in-payload `t` tag separates the THREE github_app
+    // steps from each other (one purpose, three tags).
     let sealed = sealer
-        .seal_token(&payload.to_string())
+        .seal_token(TRANSIT_GITHUB_APP_FLOW, &payload.to_string())
         .await
         .map_err(|e| e.to_string())?;
     Ok(crate::oauth::b64url(&sealed))
@@ -114,7 +117,7 @@ pub(crate) async fn open_flow_token(
         .decode(token)
         .map_err(|_| "malformed token")?;
     let plain = sealer
-        .open_token(&raw)
+        .open_token(TRANSIT_GITHUB_APP_FLOW, &raw)
         .await
         .map_err(|_| "token failed verification")?;
     let v: Value = serde_json::from_str(&plain).map_err(|_| "token is corrupt")?;
@@ -1611,9 +1614,11 @@ mod tests {
         assert!(open_flow_token(&s, TAG_BOOT, &manifest).await.is_err());
         assert!(open_flow_token(&s, TAG_INSTALL, &manifest).await.is_err());
         // Cross-module: a foreign sealed token (an oauth.rs-shaped {c,v,x} transit
-        // blob) is refused as a gh-manifest token (no `t` tag).
+        // blob sealed under the OAuth-boot AAD purpose) is refused as a gh-manifest
+        // token — by the AAD purpose in KMS mode, by the missing `t` tag in legacy.
         let oauth_state = crate::oauth::b64url(
             &s.seal_token(
+                crate::seal::TRANSIT_OAUTH_BOOT,
                 &serde_json::json!({ "c": Uuid::now_v7(), "v": "v", "x": 9_999_999_999i64 })
                     .to_string(),
             )
