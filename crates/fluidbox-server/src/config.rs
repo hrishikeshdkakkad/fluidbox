@@ -70,8 +70,15 @@ pub struct Config {
     /// D8). `None` (default, `FLUIDBOX_RUNTIME_ROLE` unset) = single-role mode: the
     /// owner runs everything, RLS still binds it via FORCE + the tenant GUC. `Some`
     /// opts into the role split — migration 0018 creates `fluidbox_runtime`, and boot
-    /// verifies the role exists then `SET ROLE`s via `after_connect`.
+    /// verifies the role exists (and its posture) then `SET ROLE`s via `after_connect`.
     pub runtime_role: Option<String>,
+    /// Escape hatch for the multi-user RLS boot gate (`FLUIDBOX_ALLOW_RLS_BYPASS`,
+    /// review M2). With `FLUIDBOX_REQUIRE_SSO=1`, boot REFUSES a pool whose effective
+    /// role is SUPERUSER/BYPASSRLS, because PostgreSQL then skips every migration-0018
+    /// policy and tenant isolation is back to being a `where tenant_id = $n`
+    /// convention. Set this to `1` only for local single-user operation on a
+    /// superuser database; a hosted deployment must fix the role instead.
+    pub allow_rls_bypass: bool,
     pub admin_token: String,
     /// URL sandboxes use to reach this control plane (e.g. host.docker.internal).
     pub public_control_url: String,
@@ -249,6 +256,9 @@ impl Config {
                     }
                 }
             },
+            allow_rls_bypass: get("FLUIDBOX_ALLOW_RLS_BYPASS")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
             admin_token: get("FLUIDBOX_ADMIN_TOKEN")
                 .map_err(|_| anyhow::anyhow!("FLUIDBOX_ADMIN_TOKEN is required"))?,
             public_control_url: get("FLUIDBOX_PUBLIC_CONTROL_URL")

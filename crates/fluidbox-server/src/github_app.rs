@@ -554,6 +554,7 @@ pub async fn manifest_start(
             .await?;
     let flow = fluidbox_db::create_github_app_flow(
         &state.pool,
+        scope,
         registration.id,
         PURPOSE_MANIFEST,
         FLOW_TTL_SECS,
@@ -592,9 +593,14 @@ pub async fn install_start(
             reg.status
         )));
     }
-    let flow =
-        fluidbox_db::create_github_app_flow(&state.pool, reg.id, PURPOSE_INSTALL, FLOW_TTL_SECS)
-            .await?;
+    let flow = fluidbox_db::create_github_app_flow(
+        &state.pool,
+        scope,
+        reg.id,
+        PURPOSE_INSTALL,
+        FLOW_TTL_SECS,
+    )
+    .await?;
     let boot = seal_flow_token(sealer_ref, TAG_BOOT, flow, reg.id)
         .await
         .map_err(ApiError::Internal)?;
@@ -1000,6 +1006,7 @@ pub async fn manifest_callback(
     // the browser gets bound to the new flow (never a direct GitHub link).
     let install_note = match fluidbox_db::create_github_app_flow(
         &state.pool,
+        scope,
         reg.id,
         PURPOSE_INSTALL,
         FLOW_TTL_SECS,

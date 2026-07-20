@@ -155,6 +155,7 @@ mod tests {
             internal_bind: String::new(),
             database_url: String::new(),
             runtime_role: None,
+            allow_rls_bypass: false,
             admin_token: String::new(),
             public_control_url: String::new(),
             data_dir: std::path::PathBuf::new(),

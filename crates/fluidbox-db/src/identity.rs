@@ -949,12 +949,19 @@ pub async fn revoke_pat(
 /// fresh connection committed after the rollback. The append-only trigger
 /// blocks any later UPDATE/DELETE.
 ///
-/// RLS (Phase D): `auth_audit_log`'s INSERT policy is `with check (true)` —
-/// operator actions carry a NULL `tenant_id`, and a rejected-attempt audit runs
-/// pool-direct with no principal — so this INSERT needs NO tenant GUC and rides
-/// whatever executor the caller supplies (an accepted mutation's scoped/worker tx,
-/// or a bare pool connection for a rejected attempt). SELECTs of the log ARE
-/// tenant-or-null-or-bypass gated; there is no such reader in production code.
+/// RLS (Phase D, tightened by review M3): `auth_audit_log`'s INSERT policy now
+/// carries the SAME tenant floor as every other tenant-owned write —
+/// `tenant_id = current_setting('fluidbox.tenant_id')` OR the system-worker
+/// bypass. It was `with check (true)`, which let a transaction scoped to tenant A
+/// append a row stamped `tenant_id = B` into B's permanent, append-only security
+/// history with no way to retract it.
+///
+/// So the executor a caller supplies MUST carry the matching GUC: an accepted
+/// mutation passes its own `scoped_tx`/`worker_tx` (they all already did), and a
+/// standalone audit — a rejected attempt, or a deployment-level row with a NULL
+/// tenant — must go through [`insert_audit_standalone`] rather than a bare pooled
+/// connection. SELECTs of the log are tenant-or-null-or-bypass gated; there is no
+/// such reader in production code.
 pub async fn insert_audit(
     conn: &mut sqlx::PgConnection,
     entry: AuditEntry<'_>,
@@ -987,6 +994,35 @@ pub async fn insert_audit_with_id(
     .bind(entry.detail)
     .execute(&mut *conn)
     .await?;
+    Ok(id)
+}
+
+/// Append an audit row in its OWN short transaction, carrying the GUC the
+/// tightened INSERT policy requires (review M3).
+///
+/// This is the shape used by every audit that is NOT part of a mutation's
+/// transaction: a REJECTED attempt (audited in a transaction committed after the
+/// refusal rolled back — design 398-402), and a deployment-level operator row.
+/// Those used to run on a bare `pool.acquire()` connection with no GUC at all,
+/// which only worked because the policy was `with check (true)`.
+///
+/// The GUC follows the row, not the caller's convenience:
+/// * `tenant_id = Some(t)` → [`crate::scoped_tx`] on `t`. The row can only be
+///   stamped with the tenant it is actually about. Callers pass a tenant they
+///   VERIFIED (a resolved org, a principal's own scope) — the same rule as
+///   [`TenantScope`] everywhere else.
+/// * `tenant_id = None` → [`crate::worker_tx`]. A deployment-level row belongs to
+///   no tenant, so it takes the one audited, grep-able escape hatch like every
+///   other principal-less write.
+///
+/// The transaction is one INSERT long, so it never holds a connection across I/O.
+pub async fn insert_audit_standalone(pool: &PgPool, entry: AuditEntry<'_>) -> sqlx::Result<Uuid> {
+    let mut tx = match entry.tenant_id {
+        Some(t) => crate::scoped_tx(pool, TenantScope::assume(t)).await?,
+        None => crate::worker_tx(pool).await?,
+    };
+    let id = insert_audit(&mut tx, entry).await?;
+    tx.commit().await?;
     Ok(id)
 }
 

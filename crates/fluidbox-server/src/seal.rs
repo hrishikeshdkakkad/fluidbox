@@ -545,15 +545,27 @@ fn build_wrapper(cfg: &Config) -> anyhow::Result<Option<Arc<dyn KeyWrapper>>> {
 ///     tenants failed every unwrap while new tenants happily minted DEKs under it,
 ///     splitting custody across two KEKs with no recovery (review H1). This gate
 ///     proves the configured backend can actually READ a stored DEK before we
-///     serve. It builds its own wrapper from the same config as `build_sealer`
-///     (an `aws` backend therefore constructs one extra lazily-initialized client
-///     at boot — one probe Decrypt, once).
+///     serve. Pass the already-built `sealer` and the probe runs on ITS backend and
+///     ITS cache, so the one unwrap the gate performs anyway warms the live DEK
+///     cache (and an `aws` deployment does not construct a second client just to
+///     probe). `None` falls back to a wrapper built from the same config.
 ///  2. **Version retirement** — the counts are fetched ONLY when a key is missing:
 ///     with both keys present (the migration window) every stored version is
 ///     openable, so there is nothing a scan could refuse.
-pub async fn check_retirement_gates(cfg: &Config, pool: &PgPool) -> anyhow::Result<()> {
-    if let Some(wrapper) = build_wrapper(cfg)? {
-        kms::check_kek_compatibility(pool, wrapper.as_ref()).await?;
+pub async fn check_retirement_gates(
+    cfg: &Config,
+    pool: &PgPool,
+    sealer: Option<&Sealer>,
+) -> anyhow::Result<()> {
+    match sealer.and_then(|s| s.inner.kms.as_ref()) {
+        Some(kms) => {
+            kms::check_kek_compatibility(pool, kms.wrapper.as_ref(), Some(&kms.cache)).await?
+        }
+        None => {
+            if let Some(wrapper) = build_wrapper(cfg)? {
+                kms::check_kek_compatibility(pool, wrapper.as_ref(), None).await?;
+            }
+        }
     }
     let kms_on = cfg.kms_mode != KmsMode::Off;
     let legacy_present = cfg.credential_key.is_some();

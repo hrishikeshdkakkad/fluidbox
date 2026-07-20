@@ -54,19 +54,33 @@ server:
   # zeroEgress injects the internal Service ClusterIP here at render time; set
   # explicitly to override.
   publicControlUrl: ""
-  # RLS pool split (FLUIDBOX_RUNTIME_ROLE, migration 0018). "" = single-role mode:
-  # RLS still binds the table OWNER via FORCE, so a single-role deployment is
-  # enforced — UNLESS the DATABASE_URL role is a SUPERUSER or carries BYPASSRLS
-  # (Neon's default neon_superuser does), for which Postgres skips policies
-  # entirely. Role attributes are NOT inherited through membership, so check the
-  # role you actually connect as:
+  # RLS pool split (FLUIDBOX_RUNTIME_ROLE, migration 0018). DEFAULTS ON for the
+  # chart (review M2): a Helm install is a hosted, multi-user deployment, and the
+  # documented Neon posture (neondb_owner / neon_superuser carries BYPASSRLS) makes
+  # PostgreSQL skip EVERY 0018 policy — RLS applied, FORCEd, and completely inert.
+  # With FLUIDBOX_REQUIRE_SSO=1 (set via server.extraEnv) the server REFUSES TO BOOT
+  # in that state rather than serve with tenant isolation resting on predicates alone.
+  #
+  # "fluidbox_runtime" is the NOLOGIN least-privilege role 0018 creates and GRANTs
+  # to the migration owner; every pooled connection then SET ROLEs to it. Boot FAILS
+  # if the named role does not exist, or if it exists with an unsafe posture
+  # (LOGIN/SUPERUSER/BYPASSRLS/CREATEROLE, inherited memberships, or members other
+  # than the migration owner) — on a managed host that restricts CREATE ROLE, 0018
+  # only WARNS, so create it out-of-band first (see docs/hosted/kms-operations.md §9).
+  #
+  # PostgreSQL roles are CLUSTER-global while the grants are DATABASE-local: if this
+  # cluster hosts more than one fluidbox database (or anything else that might own
+  # this name), give each deployment its OWN name here — the migration reads it and
+  # will refuse to reuse a role somebody else can already SET ROLE into.
+  #
+  # Set to "" ONLY for a single-role deployment whose DATABASE_URL role is neither
+  # SUPERUSER nor BYPASSRLS (FORCE then binds the owner and RLS is enforced anyway):
   #   select rolsuper, rolbypassrls from pg_roles where rolname = current_user;
-  # If either is true, set this to "fluidbox_runtime" (the NOLOGIN least-privilege
-  # role 0018 creates and GRANTs to the migration owner) — every pooled connection
-  # then SET ROLEs to it. Boot FAILS if the named role does not exist; on a managed
-  # host that restricts CREATE ROLE, 0018 only WARNS, so create it out-of-band
-  # first (see docs/hosted/kms-operations.md §9).
-  runtimeRole: ""
+  runtimeRole: "fluidbox_runtime"
+  # Accept a pool role that BYPASSES RLS even under FLUIDBOX_REQUIRE_SSO=1 (M2).
+  # Leave false: it turns migration 0018's policies into decoration. Only for a
+  # local/single-user cluster whose database credential is unavoidably a superuser.
+  allowRlsBypass: false
   resources:
     requests: { cpu: "250m", memory: "512Mi" }
     limits: { cpu: "1", memory: "1Gi" }

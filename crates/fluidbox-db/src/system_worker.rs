@@ -39,7 +39,10 @@
 //!     [`reseal_lock_row`]/[`reseal_write_row`] are cross-tenant by the same
 //!     construction — they carry the row's `tenant_id` back out so the SERVER
 //!     unseals/re-seals under the right per-tenant DEK; plaintext NEVER transits
-//!     this crate (sealed bytes out, sealed bytes back in).
+//!     this crate (sealed bytes out, sealed bytes back in). [`dek_kek_census`] is
+//!     the same category for KEK custody: which KEK(s) wrapped the stored DEKs is
+//!     a deployment-wide question, and a GUC-less read of it would return zero
+//!     rows and make the boot gate FAIL OPEN.
 //!
 //! (d) **Nothing else.** A request handler that carries a principal MUST use the
 //!     scoped repositories (`get_session`, `get_connection`, … with a
@@ -54,7 +57,7 @@
 //! functions legitimately span tenants.
 //!
 //! Be precise about the guarantee: `worker_tx` is `pub(crate)`, so the server crate
-//! cannot ASSEMBLE a bypass ad-hoc — it must go through a function named here. That
+//! cannot ASSEMBLE a bypass ad-hoc — it must go through a function named below. That
 //! is NOT the same as "the server can never hold a bypass-armed transaction": a few
 //! entry points in this module ([`reseal_begin`], [`global_registration_tx`]) are
 //! `pub` and deliberately HAND ONE OUT, because their callers drive a multi-statement
@@ -64,6 +67,36 @@
 //! "unreachable". The bypass is deliberate and grep-able, not ambient: prove it by
 //! running one of these queries WITHOUT `worker_tx` and it returns nothing (there is
 //! a test for exactly that).
+//!
+//! ## The FULL bypass-bearing inventory (review L6)
+//!
+//! "The server reaches a bypass only through `system_worker`" was never literally
+//! true: `crate` and `crate::identity` expose their own public functions that call
+//! [`crate::worker_tx`] internally, for the pre-auth categories above. They stay
+//! where they are (they belong to their repository's family, not to the worker
+//! scans), so the honest guarantee is this ENUMERATION. `rg 'worker_tx\('` over
+//! `crates/fluidbox-db/src` must yield exactly this set plus this module:
+//!
+//! * **`crate` (lib.rs)** — `ensure_default_tenant` (boot seed: the tenant's own id
+//!   is not yet any GUC's tenant); `session_for_token`,
+//!   `session_for_token_incl_revoked`, `extend_session_token`,
+//!   `subscription_for_token` (token-DIGEST resolution — the tenant is unknown until
+//!   the secret resolves); `claim_connector_oauth_flow`, `peek_connector_oauth_flow`,
+//!   `claim_github_app_bootstrap`, `claim_github_app_flow` (one-time PRE-AUTH claims
+//!   where a sealed `state` param or a browser-cookie hash inside the predicate IS
+//!   the auth).
+//! * **`crate::identity`** — `create_org`, `create_org_audited` (a brand-new tenant
+//!   row plus its audit row; nothing can be scoped to a tenant that does not exist
+//!   yet); `get_org_by_slug`, `list_orgs`, `active_idp_config` (pre-auth login
+//!   routing — slug → org → active IdP, before any principal); `claim_login_flow`,
+//!   `claim_pending_switch` (browser-bound one-time claims); `resolve_web_session`,
+//!   `resolve_pat` (cookie/PAT digest resolution).
+//! * **everything in this module**, including the two `pub` tx hand-outs.
+//!
+//! Anything NOT on that list is scoped, and adding to it is a review event. The
+//! authenticated GitHub-App flow MINT used to be here out of convenience — it holds
+//! a verified tenant at all three call sites — and is now `scoped_tx`
+//! ([`crate::create_github_app_flow`]); only the two CLAIMs remain pre-auth.
 //!
 //! These DB-resolved rows are just ONE of the documented ways a
 //! [`TenantScope`](crate::TenantScope) is constructed without a principal
@@ -325,6 +358,44 @@ pub async fn due_result_deliveries(
          order by next_attempt_at limit $1",
     )
     .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(out)
+}
+
+// ─── KEK custody census (Phase D, #32; category (c) above) ──────────────────
+
+/// One distinct KEK found in `tenant_deks`, with a sample row to probe against.
+/// `wrapped_dek` is already-WRAPPED key material (exactly what is stored) — this
+/// crate never sees, and never returns, a plaintext key.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DekKekSample {
+    pub kek_id: String,
+    pub tenant_id: Uuid,
+    pub version: i32,
+    pub wrapped_dek: Vec<u8>,
+}
+
+/// The DISTINCT KEKs that wrapped the stored per-tenant DEKs, one sample row each
+/// — the input to the server's boot-time KEK-compatibility gate.
+///
+/// BOOT-PATH CARVE-OUT, same shape as [`sealed_key_version_counts`]: "which KEK(s)
+/// wrapped this deployment's DEKs" is a deployment-wide key-management question
+/// asked with no principal, so it is cross-tenant by construction and rides the
+/// audited system-worker bypass. Without the GUC, FORCE RLS returns ZERO rows and
+/// the gate reads that as "no DEKs stored yet" — it would FAIL OPEN and boot a
+/// deployment whose configured KEK cannot open any stored DEK, which is precisely
+/// the split-key database the gate exists to prevent. It lives HERE, named, rather
+/// than as ad-hoc SQL riding [`reseal_begin`]'s hand-out, so the bypass inventory
+/// above stays complete.
+pub async fn dek_kek_census(pool: &PgPool) -> sqlx::Result<Vec<DekKekSample>> {
+    let mut tx = crate::worker_tx(pool).await?;
+    let out = sqlx::query_as(
+        "select distinct on (kek_id) kek_id, tenant_id, version, wrapped_dek
+           from tenant_deks
+          order by kek_id, tenant_id, version",
+    )
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;

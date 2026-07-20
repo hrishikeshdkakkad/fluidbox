@@ -2152,7 +2152,9 @@ async fn provision(
 }
 
 /// A rejected security attempt is audited in a transaction committed AFTER the
-/// rollback (design 398-402) — best effort against a fully dead database.
+/// rollback (design 398-402) — best effort against a fully dead database. Rides
+/// `insert_audit_standalone` so the row carries the tenant GUC the tightened RLS
+/// INSERT policy requires (review M3), instead of a GUC-less pooled connection.
 async fn rejected_audit(
     state: &AppState,
     tenant_id: Option<Uuid>,
@@ -2161,11 +2163,8 @@ async fn rejected_audit(
     action: &str,
     target: Option<&str>,
 ) {
-    let Ok(mut conn) = state.pool.acquire().await else {
-        return;
-    };
-    let _ = identity::insert_audit(
-        &mut conn,
+    let _ = identity::insert_audit_standalone(
+        &state.pool,
         identity::AuditEntry {
             tenant_id,
             actor_kind: "user",
