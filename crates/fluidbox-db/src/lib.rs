@@ -2330,6 +2330,22 @@ pub async fn insert_tenant_llm_key(
     })
 }
 
+/// Drop a tenant's sealed virtual key so the next `ensure_tenant_key` MINTS a
+/// fresh one. The facade's reactive-401 recovery (Phase D final review): a key
+/// LiteLLM no longer knows is worse than no key at all — the cached value can be
+/// evicted, but a cold cache would just re-read the same dead row and 401 forever
+/// (LiteLLM redeployed with a fresh DB, or an operator pruned keys). Deleting the
+/// row is what makes the recovery survive a restart. Tenant-scoped by the PK.
+pub async fn delete_tenant_llm_key(pool: &PgPool, scope: TenantScope) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    sqlx::query("delete from tenant_llm_keys where tenant_id = $1")
+        .bind(scope.tenant_id())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Swap a tenant's sealed virtual key for a freshly minted one (rotation),
 /// bumping `rotated_at`. Returns the OLD sealed bytes + version so the caller can
 /// retire the old key at LiteLLM; `None` = the tenant had no prior key (this

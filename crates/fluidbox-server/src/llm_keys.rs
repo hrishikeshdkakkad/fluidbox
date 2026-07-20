@@ -36,6 +36,15 @@ use uuid::Uuid;
 /// fake in Task 8's acceptance).
 const LITELLM_KEY_FIELD: &str = "key";
 
+/// Per-call timeout for the LiteLLM ADMIN plane (`/key/generate`, `/key/delete`).
+/// `state.http` is the FACADE client — built with a 15-minute timeout because a
+/// model request legitimately streams for that long — and these control-plane
+/// calls must not inherit it: a hung LiteLLM admin plane would otherwise block the
+/// first model request of every tenant for 15 minutes (nothing caches the failure,
+/// so each retry re-hangs) and stall `create_org`'s eager mint. Mirrors `oauth.rs`'s
+/// explicit `HTTP_TIMEOUT` on every outbound OAuth call.
+const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Which credential the facade presents upstream for THIS request. A PURE decision
 /// (no I/O), so the facade's branch is unit-testable without HTTP: tenant mode
 /// always resolves a per-tenant virtual key; shared mode presents the deployment
@@ -59,6 +68,25 @@ pub fn key_source(mode: LlmKeyMode, require_sso: bool) -> KeySource {
         (LlmKeyMode::Shared, true) => KeySource::RefuseSsoShared,
         (LlmKeyMode::Shared, false) => KeySource::Shared,
     }
+}
+
+/// Does this upstream status mean the TENANT key we just presented is dead at
+/// LiteLLM — and is a re-mint still allowed for this request? A PURE decision (no
+/// I/O) so the facade's recovery branch is unit-testable.
+///
+/// Why it exists: nothing else recovers a dead tenant key. LiteLLM redeployed with
+/// a fresh database (or an operator pruning keys) leaves a sealed row LiteLLM has
+/// never heard of; the facade forwards the 401 verbatim, `ensure_tenant_key` reads
+/// cache → sealed row → mint, so even a restart re-reads the SAME dead key. Every
+/// model request then 401s forever, and only the operator-only rotate endpoint
+/// could fix it (an org owner under `FLUIDBOX_REQUIRE_SSO` cannot).
+///
+/// `already_reminted` is what BOUNDS it: the retry passes `true`, so the second
+/// answer for one request is ALWAYS false. A dead-key mint loop is impossible by
+/// construction — exactly the discipline `oauth.rs` uses for its single reactive
+/// 401 retry (the 401 proves the request never executed, so one retry is safe).
+pub fn should_remint_tenant_key(source: KeySource, status: u16, already_reminted: bool) -> bool {
+    !already_reminted && source == KeySource::Tenant && (status == 401 || status == 403)
 }
 
 /// The tenant-key alias LiteLLM stores for attribution/debugging.
@@ -136,6 +164,7 @@ async fn mint_at_litellm(
     let resp = state
         .http
         .post(&url)
+        .timeout(HTTP_TIMEOUT)
         .header(
             "authorization",
             format!("Bearer {}", state.cfg.llm_upstream_key),
@@ -183,6 +212,7 @@ async fn delete_at_litellm(state: &AppState, key: &str) {
     match state
         .http
         .post(&url)
+        .timeout(HTTP_TIMEOUT)
         .header(
             "authorization",
             format!("Bearer {}", state.cfg.llm_upstream_key),
@@ -322,11 +352,31 @@ pub async fn rotate_tenant_key(state: &AppState, tenant_id: Uuid) -> ApiResult<(
 /// Drop a tenant's cached virtual key. The rotate path re-seeds instead; this is
 /// the standalone evict hook (e.g. a future tenant-suspend or manual invalidation)
 /// so a cached key can be forced to re-read from the sealed row on next use.
-// For-future-use per plan D7 resolution 7 (an explicit eviction site beyond
-// rotate's re-seed); no current caller, mirrors Task 1's forward-declared surface.
-#[allow(dead_code)]
 pub async fn evict_tenant_llm_key(state: &AppState, tenant_id: Uuid) {
     state.tenant_llm_keys.lock().await.remove(&tenant_id);
+}
+
+/// Discard a tenant's virtual key ENTIRELY — cache AND sealed row — so the next
+/// [`ensure_tenant_key`] mints a fresh one. The facade's reactive-401 recovery
+/// (see [`should_remint_tenant_key`]): evicting the cache alone is not enough,
+/// because the cold-cache path re-reads the same dead key from the sealed row and
+/// would 401 forever, across restarts.
+///
+/// Best-effort by design: a failed delete leaves the dead row in place (the next
+/// request tries again) — it must never turn a recoverable 401 into a hard error.
+/// Nothing is deleted at LiteLLM: the key we are discarding is precisely the one
+/// LiteLLM no longer knows.
+pub async fn discard_tenant_llm_key(state: &AppState, tenant_id: Uuid) {
+    evict_tenant_llm_key(state, tenant_id).await;
+    if let Err(e) =
+        fluidbox_db::delete_tenant_llm_key(&state.pool, TenantScope::assume(tenant_id)).await
+    {
+        tracing::warn!(
+            tenant = %tenant_id,
+            error = %e,
+            "could not drop the tenant's sealed LLM key — the next request will retry"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -345,6 +395,32 @@ mod tests {
             key_source(LlmKeyMode::Shared, true),
             KeySource::RefuseSsoShared
         );
+    }
+
+    #[test]
+    fn tenant_key_remint_is_bounded_to_once_per_request() {
+        // An auth rejection in TENANT mode is the dead-key signal: discard + re-mint.
+        assert!(should_remint_tenant_key(KeySource::Tenant, 401, false));
+        assert!(should_remint_tenant_key(KeySource::Tenant, 403, false));
+        // THE BOUND: the replay passes already_reminted = true, so the second answer
+        // for one request is always false — a dead key can never drive a mint loop.
+        assert!(!should_remint_tenant_key(KeySource::Tenant, 401, true));
+        assert!(!should_remint_tenant_key(KeySource::Tenant, 403, true));
+        // Any other status is the model's own answer — forwarded verbatim.
+        for status in [200, 400, 404, 429, 500, 502, 529] {
+            assert!(
+                !should_remint_tenant_key(KeySource::Tenant, status, false),
+                "status {status} must not re-mint"
+            );
+        }
+        // Shared mode has no tenant key to re-mint (and the deployment key's 401 is
+        // an operator problem, not something the facade may rotate); the SSO refusal
+        // never reaches an upstream call at all.
+        for source in [KeySource::Shared, KeySource::RefuseSsoShared] {
+            for status in [401, 403] {
+                assert!(!should_remint_tenant_key(source, status, false));
+            }
+        }
     }
 
     #[test]
