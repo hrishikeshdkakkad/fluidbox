@@ -362,6 +362,9 @@ async fn resolve_org_audited(
 
 /// Audit a rejected attempt in a SEPARATE transaction committed after the
 /// refusal (design lines 398-402) — best effort against a fully dead database.
+/// Routed through `insert_audit_standalone` so the row carries the tenant GUC the
+/// tightened RLS INSERT policy requires (review M3): a known tenant gets a scoped
+/// tx, an unresolved one (`tenant_id = None`) the audited worker bypass.
 async fn reject_audit(
     state: &AppState,
     tenant_id: Option<Uuid>,
@@ -370,12 +373,9 @@ async fn reject_audit(
     target: Option<&str>,
     reason: &str,
 ) {
-    let Ok(mut conn) = state.pool.acquire().await else {
-        return;
-    };
     let detail = json!({ "reason": reason });
-    let _ = identity::insert_audit(
-        &mut conn,
+    let _ = identity::insert_audit_standalone(
+        &state.pool,
         identity::AuditEntry {
             tenant_id,
             actor_kind: "operator",
@@ -386,6 +386,35 @@ async fn reject_audit(
             target,
             success: false,
             detail: Some(&detail),
+        },
+    )
+    .await;
+}
+
+/// Audit an ACCEPTED operator mutation that has no in-transaction audit of its
+/// own. Most `/v1/admin/orgs*` mutations audit inside their identity transaction;
+/// the LLM-key rotate touches LiteLLM + the sealed `tenant_llm_keys` row (no
+/// identity tx), so it records its success here. Best effort, mirrors
+/// [`reject_audit`]'s shape.
+async fn accept_audit(
+    state: &AppState,
+    tenant_id: Uuid,
+    source_ip: Option<&str>,
+    action: &str,
+    target: &str,
+) {
+    let _ = identity::insert_audit_standalone(
+        &state.pool,
+        identity::AuditEntry {
+            tenant_id: Some(tenant_id),
+            actor_kind: "operator",
+            actor_id: None,
+            source_ip,
+            request_id: None,
+            action,
+            target: Some(target),
+            success: true,
+            detail: None,
         },
     )
     .await;
@@ -514,7 +543,22 @@ pub async fn create_org(
     )
     .await?
     {
-        identity::CreateOrgOutcome::Created(org) => Ok(Json(json!({ "org": org }))),
+        identity::CreateOrgOutcome::Created(org) => {
+            // Eager, best-effort LiteLLM virtual-key mint (tenant mode only): warm
+            // the new tenant's key so its first model call doesn't pay the mint
+            // latency. A failure is non-fatal — the lazy facade path
+            // (`llm_keys::ensure_tenant_key`) provisions on first use — so it only
+            // warns and never fails org creation (design D7 resolution 5).
+            if state.cfg.llm_key_mode == crate::config::LlmKeyMode::Tenant {
+                if let Err(e) = crate::llm_keys::ensure_tenant_key(&state, org.id).await {
+                    tracing::warn!(
+                        "eager LLM virtual-key mint for new org {} failed (lazy path will retry): {e}",
+                        org.id
+                    );
+                }
+            }
+            Ok(Json(json!({ "org": org })))
+        }
         identity::CreateOrgOutcome::SlugConflict => {
             reject_audit(
                 &state,
@@ -535,6 +579,28 @@ pub async fn create_org(
 pub async fn list_orgs(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let orgs = identity::list_orgs(&state.pool).await?;
     Ok(Json(json!({ "orgs": orgs })))
+}
+
+/// `POST /v1/admin/orgs/{slug}/llm-key/rotate` — rotate a tenant's LiteLLM virtual
+/// key (operator only; Phase D, #32). Mints a fresh key, swaps the sealed row,
+/// evicts+re-seeds the cache, and best-effort retires the old key at LiteLLM. 404
+/// on an unknown org; a provisioning failure surfaces as 502/503. Never returns
+/// the key — the response is `{"rotated": true}`.
+pub async fn rotate_llm_key(
+    _: Admin,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(slug): Path<String>,
+    State(state): State<AppState>,
+) -> ApiResult<Json<Value>> {
+    let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
+    let action = "org.llm_key.rotate";
+    let org = resolve_org_audited(&state, sip.as_deref(), action, &slug).await?;
+    if let Err(e) = crate::llm_keys::rotate_tenant_key(&state, org.id).await {
+        return Err(refuse(&state, org.id, sip.as_deref(), action, Some(&slug), e).await);
+    }
+    accept_audit(&state, org.id, sip.as_deref(), action, &slug).await;
+    Ok(Json(json!({ "rotated": true })))
 }
 
 // ─── IdP configs ──────────────────────────────────────────────────────────────
@@ -677,16 +743,28 @@ async fn validate_and_stage_config(
         .await);
     }
 
-    // Seal the client secret (requires the Sealer).
-    let sealed = match &body.client_secret {
+    // Seal the client secret (requires the Sealer). Carries the v2 key-version
+    // companion into the IdP config row.
+    let (client_secret_sealed, client_secret_key_version) = match &body.client_secret {
         Some(secret) => {
             let sealer = match crate::oauth::sealer(state) {
                 Ok(s) => s,
                 Err(e) => return Err(refuse(state, tenant, sip, action, None, e).await),
             };
-            Some(sealer.seal(secret))
+            match sealer
+                .seal(
+                    secret,
+                    crate::seal::SealCtx::new(tenant, crate::seal::SealFamily::IdpClientSecret),
+                )
+                .await
+            {
+                Ok(s) => (Some(s.bytes), s.key_version),
+                Err(e) => {
+                    return Err(refuse(state, tenant, sip, action, None, ApiError::from(e)).await)
+                }
+            }
         }
-        None => None,
+        None => (None, 1),
     };
 
     let scopes: Vec<String> = body.scopes.clone().unwrap_or_else(|| {
@@ -699,7 +777,8 @@ async fn validate_and_stage_config(
     let params = IdpConfigParams {
         issuer: body.issuer.trim(),
         client_id: &body.client_id,
-        client_secret_sealed: sealed,
+        client_secret_sealed,
+        client_secret_key_version,
         token_endpoint_auth: &body.token_endpoint_auth,
         scopes: &scopes,
         alg_allowlist: &algs,
@@ -963,7 +1042,17 @@ pub async fn patch_idp(
                 Ok(s) => s,
                 Err(e) => return Err(bad(e).await),
             };
-            identity::SecretPatch::Set(sealer.seal(secret))
+            let sealed = match sealer
+                .seal(
+                    secret,
+                    crate::seal::SealCtx::new(org.id, crate::seal::SealFamily::IdpClientSecret),
+                )
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => return Err(bad(ApiError::from(e)).await),
+            };
+            identity::SecretPatch::Set(sealed.bytes, sealed.key_version)
         }
     };
 

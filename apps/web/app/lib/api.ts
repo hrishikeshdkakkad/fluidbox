@@ -484,7 +484,9 @@ export interface CatalogEntry {
 export interface CatalogConnectResult {
   bundle?: { name: string; version: number };
   connection?: Connection;
-  authorize_url?: string;
+  /** OAuth: the control-plane /v1/oauth/go URL — it binds the per-flow browser
+   *  cookie, then 302s to the authorization server (invariant 20). */
+  go_url?: string;
   /** Photographed servers/tools (none/api_key connects). */
   servers?: BundleServer[];
 }
@@ -528,14 +530,16 @@ export interface ProbeResult {
  *  Phase C: a remote (none/api_key) connect returns `{connection, snapshot}`
  *  (brokered tools are a per-connection snapshot now, not a bundle); a sandbox
  *  (stdio) connect still returns a `bundle`; oauth returns `{connection,
- *  authorize_url}` and the snapshot is photographed by the callback. */
+ *  go_url}` and the snapshot is photographed by the callback. */
 export interface AddServerResult {
   slug?: string;
   bundle?: { name: string; version: number };
   servers?: BundleServer[];
   connection?: Connection;
   snapshot?: ConnectionToolSnapshot;
-  authorize_url?: string;
+  /** OAuth: the control-plane /v1/oauth/go URL (binds the browser cookie, then
+   *  302s to the authorization server — invariant 20). */
+  go_url?: string;
 }
 
 /** What the Add-server wizard hands back on success: the sandbox bundle (legacy

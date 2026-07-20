@@ -184,12 +184,23 @@ start_server() {
     export FLUIDBOX_CREDENTIAL_KEY="$CRED_KEY"
     export FLUIDBOX_PROVIDER=docker
     export FLUIDBOX_DATA_DIR="$DATA_DIR"
+    # Phase D (#32): run the app pool as the NON-superuser role migration 0018
+    # creates, so every HTTP request in this suite executes with RLS actually
+    # ENFORCED. Without it the whole identity surface runs RLS-free (CI's DB user
+    # is the superuser `postgres`, for whom policies are skipped entirely) and a
+    # repository fn that forgot `scoped_tx` would return rows here and empty in
+    # production. 0018 grants the role to current_user, so `SET ROLE` works as-is.
+    export FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime
     export FLUIDBOX_SESSION_REAUTH_SECS=2
     # This run declares a trusted proxy so the per-call spoofed X-Forwarded-For
     # (see xff()) is honored for the rate-limit buckets; without it the socket
     # peer is authoritative and every curl would share one bucket and trip.
     export FLUIDBOX_TRUST_FORWARDED_FOR=1
     export FLUIDBOX_REQUIRE_SSO="$require_sso"
+    # Phase D (#32): the default (shared) LLM key mode refuses to boot on an EMPTY
+    # upstream key. This suite boots keyless and makes NO model calls, so a
+    # non-empty placeholder is all the empty-key boot gate needs.
+    export LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-sk-fbx-ci-placeholder}"
     export RUST_LOG="${RUST_LOG:-warn,fluidbox_server=info}"
     if [ -n "${FLUIDBOX_SERVER_BIN:-}" ] && [ -x "${FLUIDBOX_SERVER_BIN}" ]; then
       exec "$FLUIDBOX_SERVER_BIN"
@@ -336,7 +347,11 @@ print('%s|%s|%s|%s' % (o.get('slug'), u.get('email'), ','.join(d.get('roles') or
 # poison every downstream use (a newline in a URL → curl "malformed URL" exit 3;
 # a newline in SQL → 'invalid input syntax for type uuid'). -q suppresses the tag;
 # -A -t keep tuples-only/unaligned output; -X skips ~/.psqlrc.
-db() { psql "$DATABASE_URL" -X -q -A -t -c "$1"; }
+# `set fluidbox.bypass`: migration 0018 FORCEs RLS on every tenant table, which
+# binds the table OWNER too — without the GUC a fixture read returns zero rows
+# and a fixture INSERT is refused. A session-level SET on a custom (dotted)
+# option needs no privilege, so it rides INSIDE the helper: every call carries it.
+db() { psql "$DATABASE_URL" -X -q -A -t -c "set fluidbox.bypass = 'system_worker'; $1"; }
 
 # ═════════════════════════════════════════════════════════════════════════════
 say "BOOT — Dex + control plane"

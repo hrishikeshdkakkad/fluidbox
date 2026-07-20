@@ -101,9 +101,9 @@ function Capabilities() {
     const tabRef = window.open("", "_blank");
     act(async () => {
       try {
-        const r = await apiPost<{ authorize_url: string }>(`/connections/${id}/oauth/start`, {});
-        if (tabRef) tabRef.location.href = r.authorize_url;
-        else window.location.href = r.authorize_url;
+        const r = await apiPost<{ go_url: string }>(`/connections/${id}/oauth/start`, {});
+        if (tabRef) tabRef.location.href = r.go_url;
+        else window.location.href = r.go_url;
       } catch (e) {
         tabRef?.close();
         throw e;
@@ -856,8 +856,8 @@ function ConnectCatalog({
     setErr("");
     setBusy(true);
     try {
-      const r = await apiPost<{ authorize_url: string }>(`/connections/${conn.id}/oauth/start`, {});
-      window.open(r.authorize_url, "_blank", "noopener");
+      const r = await apiPost<{ go_url: string }>(`/connections/${conn.id}/oauth/start`, {});
+      window.open(r.go_url, "_blank", "noopener");
       setBusy(false);
       watchUntilActive(conn.id);
     } catch (e) {
@@ -894,9 +894,10 @@ function ConnectCatalog({
         setBusy(false);
         return;
       }
-      // OAuth: hand the browser to the authorization server, then watch the
-      // connection flip active (the callback photographs the bundle).
-      if (r.authorize_url) window.open(r.authorize_url, "_blank", "noopener");
+      // OAuth: hand the browser to the go endpoint (it binds the per-flow cookie,
+      // then redirects to the authorization server), then watch the connection
+      // flip active (the callback photographs the bundle).
+      if (r.go_url) window.open(r.go_url, "_blank", "noopener");
       setBusy(false);
       watchUntilActive(r.connection?.id);
     } catch (e) {

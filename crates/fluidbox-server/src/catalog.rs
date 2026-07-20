@@ -396,15 +396,18 @@ async fn connect_entry(
                 &host,
                 req.display_name.as_deref().unwrap_or(&entry.name),
                 None,
+                1,
                 &json!([]),
                 &json!({}),
                 &metadata,
                 None,
+                1,
                 fluidbox_db::ConnectionAuth {
                     auth_kind: "none",
                     status: "active",
                     oauth: None,
                     client_secret_sealed: None,
+                    client_secret_key_version: 1,
                     registration_id: None,
                 },
                 owner.owner,
@@ -536,12 +539,26 @@ async fn connect_entry(
                 oauth["client_id"] = json!(cid);
                 oauth["client_id_source"] = json!("preregistered");
             }
-            let sealed_secret = req
+            let sealed_secret = match req
                 .client_secret
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(|s| sealer.seal(s));
+            {
+                Some(s) => Some(
+                    sealer
+                        .seal(
+                            s,
+                            crate::seal::SealCtx::new(
+                                scope.tenant_id(),
+                                crate::seal::SealFamily::ConnectionClientSecret,
+                            ),
+                        )
+                        .await?,
+                ),
+                None => None,
+            };
+            let (cs_bytes, cs_kv) = crate::seal::Sealed::split(&sealed_secret);
             let host = reqwest::Url::parse(url)
                 .ok()
                 .and_then(|u| u.host_str().map(str::to_string))
@@ -553,25 +570,31 @@ async fn connect_entry(
                 &host,
                 req.display_name.as_deref().unwrap_or(&entry.name),
                 None,
+                1,
                 &json!([]),
                 &json!({}),
                 &json!({ "base_url": url, "endpoint_url": url, "catalog_slug": entry.slug }),
                 None,
+                1,
                 fluidbox_db::ConnectionAuth {
                     auth_kind: "oauth",
                     status: "pending",
                     oauth: Some(&oauth),
-                    client_secret_sealed: sealed_secret.as_deref(),
+                    client_secret_sealed: cs_bytes,
+                    client_secret_key_version: cs_kv,
                     registration_id: None,
                 },
                 owner.owner,
                 owner.created_by_user_id,
             )
             .await?;
-            let authorize_url = crate::oauth::start_dance(state, scope, row.id).await?;
+            // The initiating user (from the resolved owner; None for the operator)
+            // is bound onto the one-time flow row (invariant 20).
+            let go_url =
+                crate::oauth::start_dance(state, scope, owner.created_by_user_id, row.id).await?;
             Ok(Json(json!({
                 "connection": row,
-                "authorize_url": authorize_url,
+                "go_url": go_url,
             })))
         }
         other => Err(ApiError::BadRequest(format!(

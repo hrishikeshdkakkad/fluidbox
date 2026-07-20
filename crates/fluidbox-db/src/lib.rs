@@ -86,13 +86,328 @@ impl ConnectionViewer {
     }
 }
 
-pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
+/// Connect the application pool, running migrations first.
+///
+/// Phase D (#32) splits the two identities the process used to conflate: DDL runs
+/// on a one-shot OWNER connection (migrations need ownership, and the owner is not
+/// subject to a not-yet-created runtime role), then the app pool is built. When
+/// `runtime_role` is `Some` (`FLUIDBOX_RUNTIME_ROLE`), every pooled connection
+/// `SET ROLE`s to that least-privilege NON-owner role via `after_connect`, so RLS
+/// binds it by ordinary means (not just FORCE). Default (`None`) = single-role mode:
+/// the owner runs everything and RLS still binds it via FORCE + the tenant GUC.
+///
+/// **What the SET ROLE split is and is NOT** (review M4). It narrows the authority
+/// of the ordinary, fixed application queries this process issues: those run as a
+/// non-owner with enumerated DML and no BYPASSRLS, so a missing `tenant_id`
+/// predicate is contained by the policy rather than by convention. It is NOT a
+/// credential boundary. `RESET ROLE` returns the SAME connection to the migration
+/// owner, and the process still holds the owner `DATABASE_URL` and can open a
+/// fresh owner connection whenever it likes — so against process compromise, or a
+/// SQL-injection sink that can emit a second statement, the split buys nothing.
+/// Genuine separation needs two DISTINCT connection strings: a migration-owner one
+/// used only for DDL, and a runtime LOGIN role that owns no schema objects and
+/// carries no bypass attributes. That is a deployment topology change, not this
+/// function; it is deliberately not claimed here.
+///
+/// The role name is interpolated into `SET ROLE` (a SQL identifier, never a bind
+/// parameter), so it is validated to a strict identifier shape. Boot then REFUSES
+/// a configured-but-absent role with the exact `CREATE ROLE` fix, and re-runs the
+/// migration's POSTURE validation ([`check_runtime_role_posture`]) — a role can be
+/// altered, or re-granted to another principal, long after 0018 ran.
+pub async fn connect(database_url: &str, runtime_role: Option<&str>) -> anyhow::Result<PgPool> {
+    use sqlx::Connection;
+    // (1) Migrations + role verification on a one-shot OWNER connection, closed
+    // before the app pool exists. DDL is never attempted under the runtime role.
+    let mut owner = sqlx::PgConnection::connect(database_url).await?;
+    if let Some(role) = runtime_role {
+        validate_runtime_role_name(role).map_err(|e| anyhow::anyhow!(e))?;
+        // Publish the deployment's chosen role name to migration 0018, which creates
+        // + posture-validates + grants it. Session-level (`false`) so it survives
+        // sqlx's per-migration transactions on this connection. Without it 0018
+        // falls back to the single hardcoded `fluidbox_runtime`, which on a SHARED
+        // cluster is a name collision with someone else's principal.
+        sqlx::query("select set_config('fluidbox.runtime_role', $1, false)")
+            .bind(role)
+            .execute(&mut owner)
+            .await?;
+    }
+    sqlx::migrate!("../../migrations").run(&mut owner).await?;
+    if let Some(role) = runtime_role {
+        let exists: bool =
+            sqlx::query_scalar("select exists(select 1 from pg_roles where rolname = $1)")
+                .bind(role)
+                .fetch_one(&mut owner)
+                .await?;
+        if !exists {
+            owner.close().await.ok();
+            anyhow::bail!(
+                "FLUIDBOX_RUNTIME_ROLE='{role}' is set but the role does not exist — migration 0018 \
+                 could not create it (managed hosts often restrict CREATE ROLE). Create it and grant \
+                 the privileges, then restart:\n  \
+                 CREATE ROLE {role} NOLOGIN;\n  \
+                 GRANT {role} TO CURRENT_USER;\n  \
+                 -- plus the table/function grants from migrations/0018_rls_enforcement.sql"
+            );
+        }
+        if let Err(msg) = check_runtime_role_posture(&mut owner, role).await? {
+            owner.close().await.ok();
+            anyhow::bail!(msg);
+        }
+    }
+    owner.close().await?;
+
+    // (2) The application pool. In runtime-role mode every connection SET ROLEs on
+    // acquisition; the tenant/bypass GUC (scoped_tx/worker_tx) then rides each tx.
+    let opts = PgPoolOptions::new()
+        .max_connections(10)
+        .acquire_timeout(std::time::Duration::from_secs(15));
+    let pool = match runtime_role {
+        Some(role) => {
+            // Validated above to ^[a-z_][a-z0-9_]*$, so plain double-quoting is safe.
+            // Leaked to `&'static str` (once per process): sqlx's after_connect future
+            // must be 'static, so the SET ROLE text cannot borrow a stack local.
+            let set_role: &'static str = Box::leak(format!("set role \"{role}\"").into_boxed_str());
+            opts.after_connect(move |conn, _meta| {
+                Box::pin(async move {
+                    use sqlx::Executor;
+                    conn.execute(set_role).await?;
+                    Ok(())
+                })
+            })
+            .connect(database_url)
+            .await?
+        }
+        None => opts.connect(database_url).await?,
+    };
+    Ok(pool)
+}
+
+/// A configured runtime-role name is interpolated into `SET ROLE` DDL, so it is
+/// validated to a strict lowercase SQL-identifier shape (`^[a-z_][a-z0-9_]*$`, ≤63
+/// chars) and REFUSED otherwise — fail closed rather than build injectable DDL.
+pub fn validate_runtime_role_name(role: &str) -> Result<(), String> {
+    let ok = !role.is_empty()
+        && role.len() <= 63
+        && role
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| b == b'_' || b.is_ascii_lowercase() || (i > 0 && b.is_ascii_digit()));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "FLUIDBOX_RUNTIME_ROLE='{role}' is not a valid role name (expected ^[a-z_][a-z0-9_]*$, ≤63 chars)"
+        ))
+    }
+}
+
+/// Re-run migration 0018's POSTURE validation of the configured runtime role at
+/// every boot (review H1). Existence is not trust: PostgreSQL roles are
+/// CLUSTER-global while the grants 0018 issues are DATABASE-local, so on a shared
+/// cluster the name may belong to somebody else's principal — and even a role we
+/// created can be `ALTER ROLE`d or re-`GRANT`ed after the migration ran.
+///
+/// Refuses on (a) unsafe attributes — LOGIN (the role is meant to be reachable
+/// only via `SET ROLE` from our own connection), SUPERUSER/BYPASSRLS (policies
+/// would be skipped, making the split theatre), CREATEROLE/CREATEDB/REPLICATION;
+/// (b) any role it is a MEMBER of (inherited privileges we never granted);
+/// (c) any member OTHER than the connecting user — that principal can `SET ROLE`
+/// into it and then set `fluidbox.bypass`, i.e. read every tenant of this database.
+///
+/// Both membership questions read DIRECT `pg_auth_members` rows, not the transitive
+/// closure. That is deliberate: a transitive path necessarily runs through a role
+/// that is already an admin over the connecting user, so flagging it would refuse
+/// every managed host whose owner sits beneath a platform admin group (Neon's
+/// `neon_superuser`) while describing no capability that principal lacks.
+///
+/// `Ok(Ok(()))` = clean. `Ok(Err(message))` = a posture refusal with the fix named
+/// (the caller decides whether that is a boot abort). `Err(_)` = the catalog query
+/// itself failed.
+pub async fn check_runtime_role_posture(
+    conn: &mut sqlx::PgConnection,
+    role: &str,
+) -> sqlx::Result<Result<(), String>> {
+    let attrs: Option<(bool, bool, bool, bool, bool, bool)> = sqlx::query_as(
+        "select rolcanlogin, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb, rolreplication
+           from pg_roles where rolname = $1",
+    )
+    .bind(role)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((login, super_, bypass, createrole, createdb, replication)) = attrs else {
+        return Ok(Err(format!("role '{role}' does not exist")));
+    };
+    let bad: Vec<&str> = [
+        (login, "LOGIN"),
+        (super_, "SUPERUSER"),
+        (bypass, "BYPASSRLS"),
+        (createrole, "CREATEROLE"),
+        (createdb, "CREATEDB"),
+        (replication, "REPLICATION"),
+    ]
+    .iter()
+    .filter(|(on, _)| *on)
+    .map(|(_, n)| *n)
+    .collect();
+    if !bad.is_empty() {
+        return Ok(Err(format!(
+            "FLUIDBOX_RUNTIME_ROLE='{role}' carries unsafe attribute(s): {}. fluidbox refuses to \
+             run its pool under it — LOGIN makes it an authenticable principal, and \
+             SUPERUSER/BYPASSRLS make PostgreSQL skip every migration-0018 policy, so the role \
+             split would enforce nothing. Fix:\n  \
+             ALTER ROLE {role} NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION;\n\
+             or set FLUIDBOX_RUNTIME_ROLE to a name this deployment owns.",
+            bad.join(", ")
+        )));
+    }
+    let inherits: Vec<String> = sqlx::query_scalar(
+        "select distinct g.rolname from pg_auth_members m
+           join pg_roles g on g.oid = m.roleid
+           join pg_roles r on r.oid = m.member
+          where r.rolname = $1 order by g.rolname",
+    )
+    .bind(role)
+    .fetch_all(&mut *conn)
+    .await?;
+    if !inherits.is_empty() {
+        return Ok(Err(format!(
+            "FLUIDBOX_RUNTIME_ROLE='{role}' is a member of {}, so it silently inherits privileges \
+             fluidbox never granted. A least-privilege runtime role must be a member of nothing. \
+             Fix: REVOKE those memberships FROM {role}, or point FLUIDBOX_RUNTIME_ROLE at a \
+             deployment-specific role.",
+            inherits.join(", ")
+        )));
+    }
+    let members: Vec<String> = sqlx::query_scalar(
+        "select distinct mm.rolname from pg_auth_members m
+           join pg_roles mm on mm.oid = m.member
+           join pg_roles r on r.oid = m.roleid
+          where r.rolname = $1 and mm.rolname <> current_user order by mm.rolname",
+    )
+    .bind(role)
+    .fetch_all(&mut *conn)
+    .await?;
+    if !members.is_empty() {
+        return Ok(Err(format!(
+            "FLUIDBOX_RUNTIME_ROLE='{role}' is granted to {} — those principals can `SET ROLE \
+             {role}`, then set `fluidbox.bypass` and read EVERY tenant in this database. \
+             PostgreSQL roles are cluster-global while fluidbox's grants are database-local, so a \
+             shared cluster turns one hardcoded role name into a shared credential. Fix: REVOKE \
+             {role} FROM those roles, or set FLUIDBOX_RUNTIME_ROLE to a deployment-specific name.",
+            members.join(", ")
+        )));
+    }
+    Ok(Ok(()))
+}
+
+/// Prove the pool's EFFECTIVE role is actually bound by RLS, i.e. that migration
+/// 0018's policies run at all (review M2).
+///
+/// PostgreSQL skips every policy for a SUPERUSER or a BYPASSRLS role. Neon's
+/// default `neondb_owner`/`neon_superuser` credential is exactly that, and it is
+/// the documented posture in this repo's own setup script — so a deployment that
+/// leaves `FLUIDBOX_RUNTIME_ROLE` unset gets RLS ENABLED, FORCED, and silently
+/// INERT. A later missing `tenant_id` predicate then returns every tenant's rows
+/// instead of being contained, which is the entire failure RLS exists to stop.
+///
+/// This runs on a POOLED connection so it observes whatever `after_connect SET
+/// ROLE` produced — `current_user`, not the role in `DATABASE_URL`. Attributes are
+/// NOT inherited through membership, so reading them off `current_user` is the
+/// only correct question to ask. The caller (server boot) makes it fatal in
+/// multi-user mode and advisory otherwise.
+pub async fn pool_role_bypasses_rls(pool: &PgPool) -> sqlx::Result<Option<String>> {
+    let (user, bypasses): (String, bool) = sqlx::query_as(
+        "select current_user::text,
+                coalesce((select rolsuper or rolbypassrls from pg_roles
+                           where rolname = current_user), false)",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(bypasses.then_some(user))
+}
+
+/// Open a transaction with the tenant RLS GUC set (`fluidbox.tenant_id`),
+/// transaction-local (`set_config(..., true)`) so it auto-resets on commit/rollback
+/// and never leaks to the next borrower of a pooled connection. EVERY tenant-scoped
+/// read/write rides one of these: the `where tenant_id = $n` predicate stays as
+/// defense-in-depth, and the RLS policy (migration 0018) is the enforcing floor —
+/// a buggy or absent predicate is still filtered by the policy (issue #75).
+///
+/// Single-statement reads acquire one too: `SET LOCAL`/`set_config(..., true)` only
+/// takes effect inside a transaction, so the +1 round-trip is the cost of DB-enforced
+/// isolation (accepted, plan D8). The returned tx is `'static` — it owns a pooled
+/// connection — so callers keep the usual `&mut *tx` + `tx.commit()` shape.
+pub async fn scoped_tx(
+    pool: &PgPool,
+    scope: TenantScope,
+) -> sqlx::Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("select set_config('fluidbox.tenant_id', $1, true)")
+        .bind(scope.tenant_id().to_string())
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
+
+/// Open a transaction with the audited system-worker bypass GUC set
+/// (`fluidbox.bypass = 'system_worker'`), so the RLS policies' bypass arm lets a
+/// genuine cross-tenant scan or a principal-less credential-digest resolution see
+/// every tenant's rows. The category rides IN the GUC value — one grep-able choke
+/// point rather than a distinct BYPASSRLS role (plan D8). Used by the `system_worker`
+/// scans (Task 7) and the handful of lib.rs / identity.rs bootstrap resolvers that
+/// have no scope by construction (token-digest resolution, pre-auth flow claims, the
+/// boot seed's tenant upsert). That set is ENUMERATED in the `system_worker` module
+/// docs — every named function outside this module that reaches a bypass is listed
+/// there, so the inventory is grep-checkable rather than "somewhere in the crate".
+pub(crate) async fn worker_tx(
+    pool: &PgPool,
+) -> sqlx::Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("select set_config('fluidbox.bypass', 'system_worker', true)")
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
+
+/// The TEST-FIXTURE lane (Phase D, #32): `connect()` plus the audited system-worker
+/// bypass GUC (`fluidbox.bypass = 'system_worker'`) set at SESSION level on every
+/// pooled connection. Compiled only for this crate's own `#[cfg(test)]` module.
+///
+/// Why it exists: migration 0018 ENABLEs + FORCEs RLS on 37 tables, and FORCE binds
+/// the table OWNER too. A fixture writes and reads ACROSS tenants and predates any
+/// [`TenantScope`], so on a plain pool every fixture INSERT is refused outright
+/// ("new row violates row-level security policy") and every fixture SELECT/DELETE
+/// silently matches ZERO rows — the second is the nastier failure, because a cleanup
+/// helper then reports success while deleting nothing. Neither shape surfaces today:
+/// CI connects as the superuser `postgres` (RLS skipped entirely) and Neon's default
+/// role carries BYPASSRLS. This lane is what makes the suite work on an RLS-BOUND
+/// owner, which is the posture 0018 exists for.
+///
+/// It does not weaken what the suite proves. RLS enforcement is asserted by the four
+/// tests that open their OWN `SET ROLE fluidbox_runtime` connection or runtime-role
+/// pool (`rls_enforces_tenant_isolation_under_runtime_role`,
+/// `rls_system_worker_bypass_is_explicit`, `rls_reseal_helpers_work_under_worker_tx`,
+/// and identity's `rls_identity_family_cross_tenant_isolation`) — none of which route
+/// their ASSERTIONS through this pool — and end-to-end by the acceptance suites that
+/// boot the server with `FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime`.
+#[cfg(test)]
+pub(crate) async fn test_connect(database_url: &str) -> anyhow::Result<PgPool> {
+    use sqlx::Executor;
+    // Migrations + role validation exactly as production does; the pool it builds is
+    // closed immediately — only the migration side effect is wanted here.
+    connect(database_url, None).await?.close().await;
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .acquire_timeout(std::time::Duration::from_secs(15))
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                conn.execute("set fluidbox.bypass = 'system_worker'")
+                    .await?;
+                Ok(())
+            })
+        })
         .connect(database_url)
         .await?;
-    sqlx::migrate!("../../migrations").run(&pool).await?;
     Ok(pool)
 }
 
@@ -296,6 +611,11 @@ pub struct UsageTotals {
 
 pub async fn ensure_default_tenant(pool: &PgPool) -> sqlx::Result<Uuid> {
     let id = Uuid::now_v7();
+    // Boot bootstrap under the audited bypass: this writes/updates the `tenants`
+    // registry ITSELF — possibly a pre-existing 'default' of unknown id via ON
+    // CONFLICT (name) — so there is no tenant scope to key on, and the tenants RLS
+    // policy's WITH CHECK would otherwise refuse the insert. The row IS the tenant.
+    let mut tx = worker_tx(pool).await?;
     // Migration 0012 made `slug` NOT NULL; the boot tenant owns slug 'default'.
     // On a live DB the migration backfilled it already — this keeps a fresh DB
     // and any hand-edited row converged.
@@ -305,9 +625,11 @@ pub async fn ensure_default_tenant(pool: &PgPool) -> sqlx::Result<Uuid> {
          returning id",
     )
     .bind(id)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
-    Ok(row.get("id"))
+    let out = row.get("id");
+    tx.commit().await?;
+    Ok(out)
 }
 
 // ─── Policies ─────────────────────────────────────────────────────────────
@@ -328,7 +650,9 @@ pub async fn upsert_policy(
     yaml_source: &str,
     parsed: &Value,
 ) -> sqlx::Result<PolicyRow> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "insert into policies (id, tenant_id, name, yaml_source, parsed)
          values ($1, $2, $3, $4, $5)
          on conflict (tenant_id, name) do update
@@ -345,8 +669,10 @@ pub async fn upsert_policy(
     .bind(name)
     .bind(yaml_source)
     .bind(parsed)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Upsert ONE exact-name override, replacing any existing decision for that
@@ -388,7 +714,8 @@ async fn write_policy_overrides(
     tool: &str,
     append: &Value,
 ) -> sqlx::Result<PolicyRow> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+    let __rls_out = sqlx::query_as(
         "with target as (
            select id,
                   coalesce(
@@ -413,8 +740,10 @@ async fn write_policy_overrides(
     .bind(name)
     .bind(tool)
     .bind(append)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Bootstrap a policy from a seed file only if it does not already exist.
@@ -430,6 +759,7 @@ pub async fn seed_policy_if_absent(
     if let Some(existing) = get_policy_by_name(pool, scope, name).await? {
         return Ok((existing, false));
     }
+    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query_as(
         "insert into policies (id, tenant_id, name, yaml_source, parsed)
          values ($1, $2, $3, $4, $5)
@@ -441,16 +771,21 @@ pub async fn seed_policy_if_absent(
     .bind(name)
     .bind(yaml_source)
     .bind(parsed)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok((row, true))
 }
 
 pub async fn list_policies(pool: &PgPool, scope: TenantScope) -> sqlx::Result<Vec<PolicyRow>> {
-    sqlx::query_as("select * from policies where tenant_id = $1 order by name")
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as("select * from policies where tenant_id = $1 order by name")
         .bind(scope.tenant_id())
-        .fetch_all(pool)
-        .await
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_policy(
@@ -458,11 +793,15 @@ pub async fn get_policy(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<PolicyRow>> {
-    sqlx::query_as("select * from policies where id = $1 and tenant_id = $2")
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as("select * from policies where id = $1 and tenant_id = $2")
         .bind(id)
         .bind(scope.tenant_id())
-        .fetch_optional(pool)
-        .await
+        .fetch_optional(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_policy_by_name(
@@ -470,11 +809,15 @@ pub async fn get_policy_by_name(
     scope: TenantScope,
     name: &str,
 ) -> sqlx::Result<Option<PolicyRow>> {
-    sqlx::query_as("select * from policies where tenant_id = $1 and name = $2")
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as("select * from policies where tenant_id = $1 and name = $2")
         .bind(scope.tenant_id())
         .bind(name)
-        .fetch_optional(pool)
-        .await
+        .fetch_optional(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Agents whose LATEST revision uses this policy — the blast radius an override
@@ -485,7 +828,9 @@ pub async fn policy_agents_using(
     scope: TenantScope,
     policy_id: Uuid,
 ) -> sqlx::Result<i64> {
-    sqlx::query_scalar(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_scalar(
         "select count(*) from agents a
           where a.tenant_id = $1
             and (
@@ -497,8 +842,10 @@ pub async fn policy_agents_using(
     )
     .bind(scope.tenant_id())
     .bind(policy_id)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// The union of `mcp__<server>__<tool>` names an agent on this policy can call —
@@ -517,6 +864,7 @@ pub async fn policy_mcp_tools(
     scope: TenantScope,
     policy_id: Uuid,
 ) -> sqlx::Result<Vec<String>> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let revs: Vec<(Value, Value)> = sqlx::query_as(
         "select r.capability_bundles, r.connection_requirements from agents a
            join lateral (
@@ -527,7 +875,7 @@ pub async fn policy_mcp_tools(
     )
     .bind(scope.tenant_id())
     .bind(policy_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
 
     let mut out: Vec<String> = Vec::new();
@@ -576,7 +924,7 @@ pub async fn policy_mcp_tools(
         )
         .bind(scope.tenant_id())
         .bind(&ids)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await?;
 
         for def in &defs {
@@ -599,6 +947,7 @@ pub async fn policy_mcp_tools(
         }
     }
 
+    tx.commit().await?;
     out.sort_unstable();
     out.dedup();
     Ok(out)
@@ -612,7 +961,9 @@ pub async fn create_agent(
     name: &str,
     description: Option<&str>,
 ) -> sqlx::Result<AgentRow> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "insert into agents (id, tenant_id, name, description) values ($1,$2,$3,$4)
          on conflict (tenant_id, name) do update set description = excluded.description
          returning *",
@@ -621,15 +972,21 @@ pub async fn create_agent(
     .bind(scope.tenant_id())
     .bind(name)
     .bind(description)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn list_agents(pool: &PgPool, scope: TenantScope) -> sqlx::Result<Vec<AgentRow>> {
-    sqlx::query_as("select * from agents where tenant_id = $1 order by name")
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as("select * from agents where tenant_id = $1 order by name")
         .bind(scope.tenant_id())
-        .fetch_all(pool)
-        .await
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_agent(
@@ -637,11 +994,15 @@ pub async fn get_agent(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<AgentRow>> {
-    sqlx::query_as("select * from agents where id = $1 and tenant_id = $2")
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as("select * from agents where id = $1 and tenant_id = $2")
         .bind(id)
         .bind(scope.tenant_id())
-        .fetch_optional(pool)
-        .await
+        .fetch_optional(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_agent_by_name(
@@ -649,11 +1010,15 @@ pub async fn get_agent_by_name(
     scope: TenantScope,
     name: &str,
 ) -> sqlx::Result<Option<AgentRow>> {
-    sqlx::query_as("select * from agents where tenant_id = $1 and name = $2")
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as("select * from agents where tenant_id = $1 and name = $2")
         .bind(scope.tenant_id())
         .bind(name)
-        .fetch_optional(pool)
-        .await
+        .fetch_optional(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Appends a new immutable revision (rev = max+1). Editing an agent is
@@ -675,6 +1040,8 @@ pub async fn append_agent_revision(
     capability_bundles: &Value,
     connection_requirements: &Value,
 ) -> sqlx::Result<AgentRevisionRow> {
+    let mut tx = scoped_tx(pool, scope).await?;
+
     // Revisions carry no tenant column of their own; the tenant boundary is the
     // parent agent — the insert only lands when the agent AND the referenced
     // policy both belong to the scope (a cross-tenant policy_id is proven
@@ -682,7 +1049,7 @@ pub async fn append_agent_revision(
     // existing contract for a not-in-scope agent), which callers already map to
     // a 404. `connection_requirements` is validated app-side (Task 2) before it
     // reaches here.
-    sqlx::query_as(
+    let __rls_out = sqlx::query_as(
         "insert into agent_revisions
            (id, agent_id, rev, harness, runner_image, model, system_prompt, policy_id, budgets,
             default_workspace, capability_bundles, connection_requirements)
@@ -705,8 +1072,10 @@ pub async fn append_agent_revision(
     .bind(capability_bundles)
     .bind(connection_requirements)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn latest_revision(
@@ -714,7 +1083,9 @@ pub async fn latest_revision(
     scope: TenantScope,
     agent_id: Uuid,
 ) -> sqlx::Result<Option<AgentRevisionRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select r.* from agent_revisions r
          join agents a on a.id = r.agent_id
          where r.agent_id = $1 and a.tenant_id = $2
@@ -722,8 +1093,10 @@ pub async fn latest_revision(
     )
     .bind(agent_id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn list_revisions(
@@ -731,7 +1104,9 @@ pub async fn list_revisions(
     scope: TenantScope,
     agent_id: Uuid,
 ) -> sqlx::Result<Vec<AgentRevisionRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select r.* from agent_revisions r
          join agents a on a.id = r.agent_id
          where r.agent_id = $1 and a.tenant_id = $2
@@ -739,8 +1114,10 @@ pub async fn list_revisions(
     )
     .bind(agent_id)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_revision(
@@ -748,15 +1125,19 @@ pub async fn get_revision(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<AgentRevisionRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select r.* from agent_revisions r
          join agents a on a.id = r.agent_id
          where r.id = $1 and a.tenant_id = $2",
     )
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 // ─── Capability bundles (Phase 5: the registry) ───────────────────────────
@@ -772,7 +1153,9 @@ pub async fn create_capability_bundle(
     definition: &Value,
     definition_digest: &str,
 ) -> sqlx::Result<CapabilityBundleRow> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "insert into capability_bundles
            (id, tenant_id, name, version, description, definition, definition_digest)
          values ($1, $2, $3,
@@ -787,21 +1170,27 @@ pub async fn create_capability_bundle(
     .bind(description)
     .bind(definition)
     .bind(definition_digest)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn list_capability_bundles(
     pool: &PgPool,
     scope: TenantScope,
 ) -> sqlx::Result<Vec<CapabilityBundleRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from capability_bundles where tenant_id = $1
          order by name, version desc",
     )
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_capability_bundle(
@@ -809,11 +1198,16 @@ pub async fn get_capability_bundle(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<CapabilityBundleRow>> {
-    sqlx::query_as("select * from capability_bundles where id = $1 and tenant_id = $2")
-        .bind(id)
-        .bind(scope.tenant_id())
-        .fetch_optional(pool)
-        .await
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out =
+        sqlx::query_as("select * from capability_bundles where id = $1 and tenant_id = $2")
+            .bind(id)
+            .bind(scope.tenant_id())
+            .fetch_optional(&mut *tx)
+            .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn latest_capability_bundle(
@@ -821,14 +1215,18 @@ pub async fn latest_capability_bundle(
     scope: TenantScope,
     name: &str,
 ) -> sqlx::Result<Option<CapabilityBundleRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from capability_bundles where tenant_id = $1 and name = $2
          order by version desc limit 1",
     )
     .bind(scope.tenant_id())
     .bind(name)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_capability_bundle_version(
@@ -837,15 +1235,19 @@ pub async fn get_capability_bundle_version(
     name: &str,
     version: i32,
 ) -> sqlx::Result<Option<CapabilityBundleRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from capability_bundles
          where tenant_id = $1 and name = $2 and version = $3",
     )
     .bind(scope.tenant_id())
     .bind(name)
     .bind(version)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 // ─── Integration connections ──────────────────────────────────────────────
@@ -865,6 +1267,9 @@ pub struct ConnectionAuth<'a> {
     pub status: &'a str,    // active | pending | suspended
     pub oauth: Option<&'a Value>,
     pub client_secret_sealed: Option<&'a [u8]>,
+    /// Envelope key-version companion for `client_secret_sealed` (1 legacy, 2
+    /// v2). Ignored when `client_secret_sealed` is None.
+    pub client_secret_key_version: i16,
     /// Set only by the seamless github_app flows (custody on the
     /// registration); legacy/manual connections leave it NULL.
     pub registration_id: Option<Uuid>,
@@ -877,6 +1282,7 @@ impl ConnectionAuth<'static> {
             status: "active",
             oauth: None,
             client_secret_sealed: None,
+            client_secret_key_version: 1,
             registration_id: None,
         }
     }
@@ -890,24 +1296,31 @@ pub async fn create_connection(
     external_account_id: &str,
     display_name: &str,
     credential_sealed: Option<&[u8]>,
+    credential_key_version: i16,
     granted_scopes: &Value,
     resource_selection: &Value,
     metadata: &Value,
     webhook_secret_sealed: Option<&[u8]>,
+    webhook_secret_key_version: i16,
     auth: ConnectionAuth<'_>,
     owner: ConnectionOwner,
     created_by_user_id: Option<Uuid>,
 ) -> sqlx::Result<IntegrationConnectionRow> {
+    let mut tx = scoped_tx(pool, scope).await?;
+
     // owner_type/owner_user_id are stamped from `owner`; authorization_generation
     // starts at 1 (the column default) and bumps only on re-consent/rotation.
+    // The `_key_version` companions ride beside each sealed column (1 legacy, 2
+    // v2 envelope) so the reader can dispatch on open.
     let (owner_type, owner_user_id) = owner.parts();
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "insert into integration_connections
            (id, tenant_id, provider, external_account_id, display_name, credential_sealed,
             granted_scopes, resource_selection, metadata, webhook_secret_sealed,
             auth_kind, status, oauth, client_secret_sealed, registration_id,
-            owner_type, owner_user_id, created_by_user_id)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+            owner_type, owner_user_id, created_by_user_id,
+            credential_key_version, webhook_secret_key_version, client_secret_key_version)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
          returning {CONNECTION_COLS}"
     )))
     .bind(Uuid::now_v7())
@@ -928,21 +1341,30 @@ pub async fn create_connection(
     .bind(owner_type)
     .bind(owner_user_id)
     .bind(created_by_user_id)
-    .fetch_one(pool)
-    .await
+    .bind(credential_key_version)
+    .bind(webhook_secret_key_version)
+    .bind(auth.client_secret_key_version)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn list_connections(
     pool: &PgPool,
     scope: TenantScope,
 ) -> sqlx::Result<Vec<IntegrationConnectionRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {CONNECTION_COLS} from integration_connections
          where tenant_id = $1 order by created_at desc"
     )))
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 // Executor-generic so a caller holding the per-connection OAuth advisory lock
@@ -972,15 +1394,19 @@ pub async fn revoke_connection(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<IntegrationConnectionRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update integration_connections set status = 'revoked', updated_at = now()
          where id = $1 and status <> 'revoked' and tenant_id = $2
          returning {CONNECTION_COLS}"
     )))
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// List connections through a visibility lens (design :274-296): `All` returns
@@ -992,7 +1418,9 @@ pub async fn list_connections_visible(
     scope: TenantScope,
     viewer: ConnectionViewer,
 ) -> sqlx::Result<Vec<IntegrationConnectionRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {CONNECTION_COLS} from integration_connections
          where tenant_id = $1
            and ($2::uuid is null or owner_type = 'organization' or owner_user_id = $2)
@@ -1000,8 +1428,10 @@ pub async fn list_connections_visible(
     )))
     .bind(scope.tenant_id())
     .bind(viewer.user_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Read one connection through the same visibility lens as
@@ -1012,7 +1442,9 @@ pub async fn get_connection_visible(
     id: Uuid,
     viewer: ConnectionViewer,
 ) -> sqlx::Result<Option<IntegrationConnectionRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {CONNECTION_COLS} from integration_connections
          where id = $1 and tenant_id = $2
            and ($3::uuid is null or owner_type = 'organization' or owner_user_id = $3)"
@@ -1020,8 +1452,10 @@ pub async fn get_connection_visible(
     .bind(id)
     .bind(scope.tenant_id())
     .bind(viewer.user_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Bump a connection's authorization generation (design :296) — called on every
@@ -1033,6 +1467,7 @@ pub async fn bump_connection_generation(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<i32>> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query(
         "update integration_connections
          set authorization_generation = authorization_generation + 1, updated_at = now()
@@ -1041,29 +1476,61 @@ pub async fn bump_connection_generation(
     )
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.map(|r| r.get::<i32, _>("authorization_generation")))
 }
 
 /// Persist non-secret OAuth custody state (discovered endpoints, client
 /// identity, pending bundle) before the connection is activated.
-pub async fn update_connection_oauth(
-    pool: &PgPool,
+///
+/// **Executor-generic on purpose, and the production caller MUST pass a
+/// transaction that already holds this connection's OAuth advisory lock**
+/// (`oauth::commit_start_epoch` — see `acquire_oauth_lock`). This write is the
+/// tail of a read-modify-write that spans seconds of outbound discovery HTTP:
+/// the bag it lands was assembled from a read taken BEFORE that HTTP, so it may
+/// only be committed once the caller has proven — under the same lock the
+/// activation path takes — that nothing re-authorized the connection meanwhile.
+/// Riding the caller's lock-holding transaction makes the proof and the write
+/// ONE atomic step. A standalone round trip on `&PgPool` (what this used to be)
+/// leaves a window in which a SUPERSEDED start clobbers the winner's token
+/// endpoint / client identity, so its refresh would authenticate to the wrong
+/// endpoint under the wrong client (review #32).
+///
+/// The caller's bag REPLACES the stored one — except for
+/// [`ACTIVATED_AT_KEY`], which is carried over unconditionally. That stamp is
+/// owned by [`activate_connection_oauth`] and is half of its compare-and-swap
+/// (review H2): an activation landing in the read-modify-write window would
+/// otherwise have its stamp erased by a stale bag — handing a superseded sibling
+/// flow a passing expectation. Belt-and-braces now that the write rides the
+/// lock, and the only protection left for any caller that does not.
+pub async fn update_connection_oauth<'e, E>(
+    exec: E,
     scope: TenantScope,
     id: Uuid,
     oauth: &Value,
-) -> sqlx::Result<()> {
-    sqlx::query(
-        "update integration_connections set oauth = $2, updated_at = now()
-         where id = $1 and status <> 'revoked' and tenant_id = $3",
-    )
+) -> sqlx::Result<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "update integration_connections
+         set oauth = case
+                 when jsonb_typeof($2::jsonb) = 'object'
+                      and (oauth -> '{ACTIVATED_AT_KEY}') is not null
+                 then jsonb_set($2::jsonb, '{{{ACTIVATED_AT_KEY}}}',
+                                oauth -> '{ACTIVATED_AT_KEY}')
+                 else $2::jsonb end,
+             updated_at = now()
+         where id = $1 and status <> 'revoked' and tenant_id = $3"
+    )))
     .bind(id)
     .bind(oauth)
     .bind(scope.tenant_id())
-    .execute(pool)
-    .await
-    .map(|_| ())
+    .execute(exec)
+    .await?;
+    Ok(())
 }
 
 /// The callback exchange completing: seal the rotating refresh token into
@@ -1081,28 +1548,65 @@ pub async fn update_connection_oauth(
 /// ⇒ no bump; reconnect (from `active`/`error`) ⇒ bump — all in ONE write, so no
 /// crash window where a reconnected grant serves the OLD generation. The returned
 /// row carries the FINAL generation the caller caches under.
+///
+/// **THE ACTIVATION IS A COMPARE-AND-SWAP** (Phase D review H2). The callback's
+/// pre-exchange generation recheck is an optimization that avoids burning a code;
+/// it is NOT the boundary, because the code exchange is a full HTTP round trip
+/// during which a sibling flow can activate. TWO predicates make the write itself
+/// the boundary, both frozen at the flow's START:
+///   - `authorization_generation = expected_generation` — the flow row's frozen
+///     generation. A sibling RECONNECT that landed first moved it, so the loser
+///     matches zero rows instead of overwriting the newer refresh token.
+///   - `activated_at < flow_started_at` — the connection's own last-activation
+///     instant (stamped by this UPDATE, DB clock, never caller-supplied) against
+///     the flow row's `created_at`. This is what covers FIRST connect, where the
+///     `pending → active` activation deliberately does NOT bump the generation:
+///     two callbacks racing on the same pending row both froze the same
+///     generation, so the generation predicate alone cannot separate them. Every
+///     successful activation stamps an instant strictly later than every
+///     in-flight flow's `created_at`, so ONE activation invalidates every sibling
+///     flow's expectation — including its own siblings' retries.
+///
+/// `None` therefore means "superseded / no longer activatable" (revoked, wrong
+/// auth_kind, reauthorized, or already activated since this flow started); the
+/// caller must tell the user to restart the connect flow, never retry blindly.
+///
+/// `activated_at` lives inside the `oauth` jsonb bag rather than its own column
+/// because this wave may not add migrations; the bag is rewritten here from the
+/// caller's value, so the stamp is applied SQL-side (`jsonb_set` +
+/// `clock_timestamp()`) and cannot be forged or dropped by the caller.
 // Executor-generic (see `get_connection`): the callback activation runs THROUGH
 // the connection that holds the OAuth advisory lock, so the critical section
 // uses exactly one pooled connection.
+#[allow(clippy::too_many_arguments)]
 pub async fn activate_connection_oauth<'e, E>(
     exec: E,
     scope: TenantScope,
     id: Uuid,
     sealed_refresh: &[u8],
+    key_version: i16,
     oauth: &Value,
     granted_scopes: &Value,
+    expected_generation: i32,
+    flow_started_at: DateTime<Utc>,
 ) -> sqlx::Result<Option<IntegrationConnectionRow>>
 where
     E: sqlx::PgExecutor<'e>,
 {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update integration_connections
-         set credential_sealed = $2, oauth = $3, granted_scopes = $4,
+         set credential_sealed = $2, credential_key_version = $6, granted_scopes = $4,
+             oauth = jsonb_set(
+                 case when jsonb_typeof($3::jsonb) = 'object' then $3::jsonb else '{{}}'::jsonb end,
+                 '{{{ACTIVATED_AT_KEY}}}', to_jsonb(clock_timestamp())),
              status = 'active',
              authorization_generation =
                  authorization_generation + case when status <> 'pending' then 1 else 0 end,
              updated_at = now()
          where id = $1 and status <> 'revoked' and auth_kind = 'oauth' and tenant_id = $5
+           and authorization_generation = $7
+           and coalesce((oauth ->> '{ACTIVATED_AT_KEY}')::timestamptz, '-infinity'::timestamptz)
+               < $8
          returning {CONNECTION_COLS}"
     )))
     .bind(id)
@@ -1110,9 +1614,17 @@ where
     .bind(oauth)
     .bind(granted_scopes)
     .bind(scope.tenant_id())
+    .bind(key_version)
+    .bind(expected_generation)
+    .bind(flow_started_at)
     .fetch_optional(exec)
     .await
 }
+
+/// The `oauth` jsonb key carrying the connection's last successful OAuth
+/// activation instant (DB clock). Written ONLY by [`activate_connection_oauth`],
+/// read by its CAS predicate and by the callback's pre-exchange fast refusal.
+pub const ACTIVATED_AT_KEY: &str = "activated_at";
 
 /// Refresh-token rotation: one atomic overwrite (OAuth 2.1 MUST — old token
 /// is gone the moment the new one lands). Active connections only, and ONLY
@@ -1127,13 +1639,15 @@ pub async fn rotate_connection_refresh<'e, E>(
     scope: TenantScope,
     id: Uuid,
     sealed_new: &[u8],
+    key_version: i16,
     expected_generation: i32,
 ) -> sqlx::Result<bool>
 where
     E: sqlx::PgExecutor<'e>,
 {
     let r = sqlx::query(
-        "update integration_connections set credential_sealed = $2, updated_at = now()
+        "update integration_connections
+         set credential_sealed = $2, credential_key_version = $5, updated_at = now()
          where id = $1 and status = 'active' and auth_kind = 'oauth' and tenant_id = $3
            and authorization_generation = $4",
     )
@@ -1141,6 +1655,7 @@ where
     .bind(sealed_new)
     .bind(scope.tenant_id())
     .bind(expected_generation)
+    .bind(key_version)
     .execute(exec)
     .await?;
     Ok(r.rows_affected() == 1)
@@ -1173,25 +1688,10 @@ where
     .map(|_| ())
 }
 
-/// Store a (DCR-minted) client secret after connection creation. Sealed by
-/// the caller; readable only via `connection_client_secret_sealed`.
-pub async fn set_connection_client_secret(
-    pool: &PgPool,
-    scope: TenantScope,
-    id: Uuid,
-    sealed: &[u8],
-) -> sqlx::Result<()> {
-    sqlx::query(
-        "update integration_connections set client_secret_sealed = $2, updated_at = now()
-         where id = $1 and status <> 'revoked' and tenant_id = $3",
-    )
-    .bind(id)
-    .bind(sealed)
-    .bind(scope.tenant_id())
-    .execute(pool)
-    .await
-    .map(|_| ())
-}
+// (`set_connection_client_secret` retired in Phase D Task 3 (#32): DCR client
+// secrets now live on the shared `oauth_client_registrations` row, not the
+// connection. Pre-registered confidential secrets are still written per-connection
+// at CREATE time via `ConnectionAuth.client_secret_sealed`, and read below.)
 
 /// The only reader of the sealed client secret (confidential OAuth clients).
 /// Client identity outlives token state — the dance needs it while the row
@@ -1201,19 +1701,471 @@ pub async fn connection_client_secret_sealed<'e, E>(
     exec: E,
     scope: TenantScope,
     id: Uuid,
-) -> sqlx::Result<Option<Vec<u8>>>
+) -> sqlx::Result<Option<(Vec<u8>, i16)>>
 where
     E: sqlx::PgExecutor<'e>,
 {
     let row = sqlx::query(
-        "select client_secret_sealed from integration_connections
+        "select client_secret_sealed, client_secret_key_version from integration_connections
          where id = $1 and status <> 'revoked' and tenant_id = $2",
     )
     .bind(id)
     .bind(scope.tenant_id())
     .fetch_optional(exec)
     .await?;
-    Ok(row.and_then(|r| r.get::<Option<Vec<u8>>, _>("client_secret_sealed")))
+    Ok(row.and_then(|r| {
+        r.get::<Option<Vec<u8>>, _>("client_secret_sealed")
+            .map(|b| (b, r.get::<i16, _>("client_secret_key_version")))
+    }))
+}
+
+// ─── Reusable OAuth client registrations (Phase D Task 3, #32; design D6) ────
+//
+// A shared client identity keyed on (issuer, redirect_uri): the first OAuth
+// connection to an authorization server registers (or resolves CIMD) once and
+// every later connection to the same issuer reuses the row instead of minting
+// its own per-connection DCR client. Pre-registered (operator-pasted) identities
+// stay per-connection custody and get NO row.
+//
+// PLACEMENT (reviewer note): these are principal-less GLOBAL reads, but they are
+// deliberately NOT in `system_worker` — that module is for cross-tenant scans of
+// TENANT-owned data. Client registrations are deployment INFRASTRUCTURE (like
+// `connector_catalog`'s global rows). v1 only ever WRITES `tenant_id NULL`; both
+// lookups (`find_client_registration`, `find_client_registration_by_id`) FILTER
+// `tenant_id is null`; `touch`/`delete` act on an already-resolved id. There is no
+// tenant to scope by, so they live here beside the connection custody they serve,
+// unscoped by construction. The nullable `tenant_id` + per-tenant partial unique
+// are forward-compat only (migration 0015).
+
+/// A shared OAuth client registration. Carries its sealed secret because every
+/// read IS a credential resolution (unseal for token-endpoint auth) — the row is
+/// internal deployment infrastructure and NEVER crosses an API boundary, so
+/// unlike `IntegrationConnectionRow` it does not hide the sealed bytea behind a
+/// dedicated reader (and is deliberately NOT `Serialize`).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct OauthClientRegistrationRow {
+    pub id: Uuid,
+    /// NULL = deployment-global (v1 always). Present only for a future per-tenant
+    /// client identity.
+    pub tenant_id: Option<Uuid>,
+    pub issuer: String,
+    pub redirect_uri: String,
+    pub source: String, // dcr | cimd | preregistered
+    pub client_id: String,
+    pub client_secret_sealed: Option<Vec<u8>>,
+    pub client_secret_key_version: i16,
+    pub registration_endpoint: Option<String>,
+    pub registration_access_token_sealed: Option<Vec<u8>>,
+    pub registration_access_token_key_version: i16,
+    pub token_endpoint_auth_method: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+}
+
+/// Values for a new registration row. Sealed bytes are pre-sealed by the caller
+/// (server owns the crypto); the companion key-versions ride beside them.
+pub struct NewOauthClientRegistration<'a> {
+    /// v1 always passes `None` (global). Present only for a future per-tenant row.
+    pub tenant_id: Option<Uuid>,
+    pub issuer: &'a str,
+    pub redirect_uri: &'a str,
+    pub source: &'a str, // dcr | cimd | preregistered
+    pub client_id: &'a str,
+    pub client_secret_sealed: Option<&'a [u8]>,
+    pub client_secret_key_version: i16,
+    pub registration_endpoint: Option<&'a str>,
+    pub registration_access_token_sealed: Option<&'a [u8]>,
+    pub registration_access_token_key_version: i16,
+    pub token_endpoint_auth_method: Option<&'a str>,
+}
+
+/// Find the shared registration for an (issuer, redirect_uri). Global rows only
+/// in v1 (`tenant_id is null`). Executor-generic so the DCR resolution can run it
+/// THROUGH the advisory-lock-holding transaction (`&mut *tx`).
+pub async fn find_client_registration<'e, E>(
+    exec: E,
+    issuer: &str,
+    redirect_uri: &str,
+) -> sqlx::Result<Option<OauthClientRegistrationRow>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(
+        "select * from oauth_client_registrations
+         where tenant_id is null and issuer = $1 and redirect_uri = $2",
+    )
+    .bind(issuer)
+    .bind(redirect_uri)
+    .fetch_optional(exec)
+    .await
+}
+
+/// Load one GLOBAL registration by id — the exchange/refresh path resolves the
+/// identity the connection's `oauth.registration_id` points at. `and tenant_id is
+/// null` is a v1 belt: a connection only ever stores a GLOBAL registration id, so
+/// a non-global id fails closed to None rather than crossing into a future
+/// per-tenant row.
+pub async fn find_client_registration_by_id<'e, E>(
+    exec: E,
+    id: Uuid,
+) -> sqlx::Result<Option<OauthClientRegistrationRow>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as("select * from oauth_client_registrations where id = $1 and tenant_id is null")
+        .bind(id)
+        .fetch_optional(exec)
+        .await
+}
+
+/// Insert a shared registration. `ON CONFLICT DO NOTHING` returns `None` when a
+/// concurrent connect already registered this (issuer, redirect_uri) — the caller
+/// re-selects the winner (and abandons its own AS-side minted client). Global rows
+/// only in v1 (`tenant_id NULL`); the partial unique enforces one per key.
+pub async fn insert_client_registration<'e, E>(
+    exec: E,
+    new: NewOauthClientRegistration<'_>,
+) -> sqlx::Result<Option<OauthClientRegistrationRow>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(
+        "insert into oauth_client_registrations
+           (id, tenant_id, issuer, redirect_uri, source, client_id,
+            client_secret_sealed, client_secret_key_version,
+            registration_endpoint,
+            registration_access_token_sealed, registration_access_token_key_version,
+            token_endpoint_auth_method, last_used_at)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, now())
+         on conflict do nothing
+         returning *",
+    )
+    .bind(Uuid::now_v7())
+    .bind(new.tenant_id)
+    .bind(new.issuer)
+    .bind(new.redirect_uri)
+    .bind(new.source)
+    .bind(new.client_id)
+    .bind(new.client_secret_sealed)
+    .bind(new.client_secret_key_version)
+    .bind(new.registration_endpoint)
+    .bind(new.registration_access_token_sealed)
+    .bind(new.registration_access_token_key_version)
+    .bind(new.token_endpoint_auth_method)
+    .fetch_optional(exec)
+    .await
+}
+
+/// Mark a registration reused this dance (`last_used_at`).
+pub async fn touch_client_registration<'e, E>(exec: E, id: Uuid) -> sqlx::Result<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query("update oauth_client_registrations set last_used_at = now() where id = $1")
+        .bind(id)
+        .execute(exec)
+        .await
+        .map(|_| ())
+}
+
+/// Delete a registration whose client the AS rejected (`invalid_client` self-heal
+/// at code exchange) so the next resolution mints a fresh one.
+pub async fn delete_client_registration<'e, E>(exec: E, id: Uuid) -> sqlx::Result<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query("delete from oauth_client_registrations where id = $1")
+        .bind(id)
+        .execute(exec)
+        .await
+        .map(|_| ())
+}
+
+/// Stable 64-bit advisory-lock key for a registration's (issuer, redirect_uri) —
+/// mirrors [`oauth_lock_key`]'s fold-leading-8-bytes construction, over a sha256
+/// of `issuer‖NUL‖redirect_uri` (the NUL separator keeps `a‖bc` ≠ `ab‖c`).
+pub fn registration_lock_key(issuer: &str, redirect_uri: &str) -> i64 {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(issuer.as_bytes());
+    h.update([0u8]);
+    h.update(redirect_uri.as_bytes());
+    let d = h.finalize();
+    i64::from_be_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]])
+}
+
+/// Take a transaction-scoped advisory lock on (issuer, redirect_uri) — serializes
+/// DCR across connects (and replicas) so the first connect registers and later
+/// ones reuse, yielding ONE `/register` per issuer. Releases when `tx` commits or
+/// drops; the caller holds it across the find → DCR HTTP → insert window.
+pub async fn acquire_registration_lock(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    issuer: &str,
+    redirect_uri: &str,
+) -> sqlx::Result<()> {
+    sqlx::query("select pg_advisory_xact_lock($1)")
+        .bind(registration_lock_key(issuer, redirect_uri))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+// ─── Connector OAuth flows (Phase D Task 4, #32 — invariant 20) ─────────────
+//
+// One-time server-side OAuth state rows, browser-bound like login_flows /
+// github_app_flows. Replaces the stateless AEAD `state` param. The claim/peek
+// fns are PRE-AUTH — keyed by `state_hash` (the opaque random the AS echoes back
+// as `state`), which is the row's OWN authenticator (the row IS the auth, like a
+// webhook signature). They take no `TenantScope`: the callback has no principal
+// (a browser redirect can't carry the API token), and the verified tenant rides
+// out ON the returned row. This mirrors how `claim_login_flow` (identity.rs)
+// takes a raw id rather than a scope, for the same bootstrap reason.
+
+/// A one-time connector-OAuth-flow row. NOT `Serialize` — it carries sealed key
+/// material (`pkce_verifier_sealed`) and one-time secrets' hashes; nothing here
+/// ever reaches an API response.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ConnectorOauthFlowRow {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub connection_id: Uuid,
+    pub initiated_by_user_id: Option<Uuid>,
+    pub state_hash: String,
+    pub browser_hash: String,
+    pub issuer: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub metadata_digest: String,
+    pub resource: String,
+    pub redirect_uri: String,
+    pub scopes: Value,
+    pub challenge: String,
+    pub challenge_method: String,
+    pub client_registration_id: Option<Uuid>,
+    pub client_id: String,
+    pub pkce_verifier_sealed: Vec<u8>,
+    pub pkce_verifier_key_version: i16,
+    pub expected_generation: i32,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
+/// Values for a new flow row. The PKCE verifier is pre-sealed by the caller
+/// (server owns the crypto); `ttl_secs` sets `expires_at = now() + ttl` DB-side so
+/// the returned row's exact expiry seeds the boot token.
+pub struct NewConnectorOauthFlow<'a> {
+    pub connection_id: Uuid,
+    pub initiated_by_user_id: Option<Uuid>,
+    pub state_hash: &'a str,
+    pub browser_hash: &'a str,
+    pub issuer: &'a str,
+    pub authorization_endpoint: &'a str,
+    pub token_endpoint: &'a str,
+    pub metadata_digest: &'a str,
+    pub resource: &'a str,
+    pub redirect_uri: &'a str,
+    pub scopes: &'a Value,
+    pub challenge: &'a str,
+    pub challenge_method: &'a str,
+    pub client_registration_id: Option<Uuid>,
+    pub client_id: &'a str,
+    pub pkce_verifier_sealed: &'a [u8],
+    pub pkce_verifier_key_version: i16,
+    pub expected_generation: i32,
+    pub ttl_secs: i64,
+}
+
+/// Insert a one-time flow, returning the persisted row (its `id` + `expires_at`
+/// seed the boot token). GC-on-insert (login_flows precedent) sweeps this tenant's
+/// abandoned flows first — scoped to the inserting tenant so a per-request write
+/// never touches another org's rows. Takes a `TenantScope` (the start principal's
+/// verified tenant) which is stamped into `tenant_id` for the composite FK and a
+/// future RLS `WITH CHECK`.
+pub async fn insert_connector_oauth_flow(
+    pool: &PgPool,
+    scope: TenantScope,
+    new: NewConnectorOauthFlow<'_>,
+) -> sqlx::Result<ConnectorOauthFlowRow> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    sqlx::query(
+        "delete from connector_oauth_flows
+         where tenant_id = $1
+           and ((consumed_at is null and expires_at < now())
+                or expires_at < now() - interval '7 days')",
+    )
+    .bind(scope.tenant_id())
+    .execute(&mut *tx)
+    .await?;
+    let __rls_out = sqlx::query_as(
+        "insert into connector_oauth_flows
+           (id, tenant_id, connection_id, initiated_by_user_id, state_hash, browser_hash,
+            issuer, authorization_endpoint, token_endpoint, metadata_digest, resource,
+            redirect_uri, scopes, challenge, challenge_method, client_registration_id,
+            client_id, pkce_verifier_sealed, pkce_verifier_key_version, expected_generation,
+            expires_at)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+                 now() + make_interval(secs => $21::double precision))
+         returning *",
+    )
+    .bind(Uuid::now_v7())
+    .bind(scope.tenant_id())
+    .bind(new.connection_id)
+    .bind(new.initiated_by_user_id)
+    .bind(new.state_hash)
+    .bind(new.browser_hash)
+    .bind(new.issuer)
+    .bind(new.authorization_endpoint)
+    .bind(new.token_endpoint)
+    .bind(new.metadata_digest)
+    .bind(new.resource)
+    .bind(new.redirect_uri)
+    .bind(new.scopes)
+    .bind(new.challenge)
+    .bind(new.challenge_method)
+    .bind(new.client_registration_id)
+    .bind(new.client_id)
+    .bind(new.pkce_verifier_sealed)
+    .bind(new.pkce_verifier_key_version)
+    .bind(new.expected_generation)
+    .bind(new.ttl_secs as f64)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
+}
+
+/// The one-time connector-OAuth-flow claim (invariant 20). Keyed by `state_hash`
+/// (pre-auth — see the module note above). The cookie `browser_hash` sits INSIDE
+/// the single-use predicate alongside `consumed_at is null` and `expires_at >
+/// now()`: a leaked authorization URL WITHOUT the initiating browser's cookie
+/// matches ZERO rows, so it can neither complete NOR burn the flow (design
+/// :646-656). Returns the burned row on success.
+pub async fn claim_connector_oauth_flow(
+    pool: &PgPool,
+    state_hash: &str,
+    browser_hash: &str,
+) -> sqlx::Result<Option<ConnectorOauthFlowRow>> {
+    // Pre-auth credential-digest resolution (audited bypass): the go/callback legs
+    // are UNAUTHENTICATED — the sealed `state` IS the auth — and this UPDATE is
+    // keyed on the state/browser digests with NO principal until it resolves the
+    // flow's tenant. It rides `worker_tx` for the same reason the lib.rs
+    // token-digest resolvers do (the credential IS the key). No caller supplies a
+    // scope; changing the executor-generic parameter to `pool` is compatible
+    // (every call site passed a bare `&PgPool`).
+    let mut tx = worker_tx(pool).await?;
+    let __rls_out = sqlx::query_as(
+        "update connector_oauth_flows set consumed_at = now()
+         where state_hash = $1 and browser_hash = $2
+           and consumed_at is null and expires_at > now()
+         returning *",
+    )
+    .bind(state_hash)
+    .bind(browser_hash)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
+}
+
+/// Read a flow by `state_hash` WITHOUT mutating it (never consumes). Two callers:
+/// (1) the go page checks liveness before it sets the cookie + redirects, and
+/// (2) the callback, ONLY after a failed claim, splits "wrong browser" (row still
+/// live but the cookie hash mismatched → 403, row UNBURNED) from
+/// "unknown/expired/consumed" (→ 400 generic). Pre-auth, keyed by `state_hash`.
+pub async fn peek_connector_oauth_flow(
+    pool: &PgPool,
+    state_hash: &str,
+) -> sqlx::Result<Option<ConnectorOauthFlowRow>> {
+    // Pre-auth credential-digest resolution (audited bypass), keyed by `state_hash`
+    // with no principal — see `claim_connector_oauth_flow`. Never mutates.
+    let mut tx = worker_tx(pool).await?;
+    let __rls_out = sqlx::query_as("select * from connector_oauth_flows where state_hash = $1")
+        .bind(state_hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
+}
+
+// ─── Per-tenant DEKs (Phase D envelope sealing, #32) ────────────────────────
+
+/// One wrapped Data Encryption Key per `(tenant, version)`. `wrapped_dek` is the
+/// DEK sealed by a KEK backend — NEVER the raw key. Not `Serialize`: it carries
+/// wrapped key material. Keyed by a raw `tenant_id` (not a `TenantScope`): the
+/// DEK orchestration in `kms::dek_for_seal`/`dek_for_open` already holds a
+/// verified tenant from a `SealCtx`, and these are single-row keyed reads, not
+/// cross-tenant scans.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TenantDekRow {
+    pub tenant_id: Uuid,
+    pub version: i32,
+    pub kek_id: String,
+    pub wrapped_dek: Vec<u8>,
+    pub created_at: DateTime<Utc>,
+    pub retired_at: Option<DateTime<Utc>>,
+}
+
+/// Read one tenant's DEK at a specific version (`None` if never minted).
+pub async fn get_tenant_dek<'e, E>(
+    exec: E,
+    tenant_id: Uuid,
+    version: i32,
+) -> sqlx::Result<Option<TenantDekRow>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(
+        "select tenant_id, version, kek_id, wrapped_dek, created_at, retired_at
+         from tenant_deks where tenant_id = $1 and version = $2",
+    )
+    .bind(tenant_id)
+    .bind(version)
+    .fetch_optional(exec)
+    .await
+}
+
+/// The highest-version DEK for a tenant (a future rotation reads the current one).
+pub async fn latest_tenant_dek<'e, E>(
+    exec: E,
+    tenant_id: Uuid,
+) -> sqlx::Result<Option<TenantDekRow>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(
+        "select tenant_id, version, kek_id, wrapped_dek, created_at, retired_at
+         from tenant_deks where tenant_id = $1 order by version desc limit 1",
+    )
+    .bind(tenant_id)
+    .fetch_optional(exec)
+    .await
+}
+
+/// Claim a `(tenant, version)` DEK row. `on conflict do nothing` makes the lazy
+/// mint race-safe: two concurrent first-seals both attempt the insert, one wins,
+/// and both callers re-read the winner (see `kms::dek_for_seal`).
+pub async fn insert_tenant_dek<'e, E>(
+    exec: E,
+    tenant_id: Uuid,
+    version: i32,
+    kek_id: &str,
+    wrapped_dek: &[u8],
+) -> sqlx::Result<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query(
+        "insert into tenant_deks (tenant_id, version, kek_id, wrapped_dek)
+         values ($1, $2, $3, $4) on conflict (tenant_id, version) do nothing",
+    )
+    .bind(tenant_id)
+    .bind(version)
+    .bind(kek_id)
+    .bind(wrapped_dek)
+    .execute(exec)
+    .await
+    .map(|_| ())
 }
 
 // ─── Connector catalog ────────────────────────────────────────────────────
@@ -1287,15 +2239,19 @@ pub async fn latest_connection_tool_snapshot(
     scope: TenantScope,
     connection_id: Uuid,
 ) -> sqlx::Result<Option<ConnectionToolSnapshotRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from connection_tool_snapshots
          where tenant_id = $1 and connection_id = $2
          order by snapshot_version desc limit 1",
     )
     .bind(scope.tenant_id())
     .bind(connection_id)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Every snapshot for a connection, newest first.
@@ -1304,15 +2260,19 @@ pub async fn list_connection_tool_snapshots(
     scope: TenantScope,
     connection_id: Uuid,
 ) -> sqlx::Result<Vec<ConnectionToolSnapshotRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from connection_tool_snapshots
          where tenant_id = $1 and connection_id = $2
          order by snapshot_version desc",
     )
     .bind(scope.tenant_id())
     .bind(connection_id)
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// One specific snapshot version for a connection (the pin a run froze).
@@ -1322,15 +2282,19 @@ pub async fn get_connection_tool_snapshot(
     connection_id: Uuid,
     version: i32,
 ) -> sqlx::Result<Option<ConnectionToolSnapshotRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from connection_tool_snapshots
          where tenant_id = $1 and connection_id = $2 and snapshot_version = $3",
     )
     .bind(scope.tenant_id())
     .bind(connection_id)
     .bind(version)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// One catalog entry — GLOBAL (tenant-less) reference data, a superset of
@@ -1378,7 +2342,9 @@ pub async fn list_catalog(
     pool: &PgPool,
     scope: TenantScope,
 ) -> sqlx::Result<Vec<ConnectorCatalogRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from connector_catalog c
          where c.disabled_at is null
            and (c.tenant_id = $1
@@ -1389,8 +2355,10 @@ pub async fn list_catalog(
          order by case tier when 'verified' then 0 when 'community' then 1 else 2 end, name",
     )
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Resolve one slug for a tenant: the tenant's custom row first, else the
@@ -1400,7 +2368,9 @@ pub async fn get_catalog_by_slug(
     scope: TenantScope,
     slug: &str,
 ) -> sqlx::Result<Option<ConnectorCatalogRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from connector_catalog
          where slug = $1 and disabled_at is null and (tenant_id = $2 or tenant_id is null)
          order by (tenant_id is not null) desc
@@ -1408,8 +2378,10 @@ pub async fn get_catalog_by_slug(
     )
     .bind(slug)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// API-added entries are always tier `custom` — verified/community are
@@ -1435,6 +2407,8 @@ pub async fn create_catalog_entry(
     tool_hints: &Value,
     sandbox_launch: Option<&Value>,
 ) -> sqlx::Result<Option<ConnectorCatalogRow>> {
+    let mut tx = scoped_tx(pool, scope).await?;
+
     // tier AND provenance are forced 'custom': verified/community are curation
     // judgements the API cannot self-award, and a 'custom' provenance keeps a
     // user's BYO entry distinguishable from both the fluidbox seed and an
@@ -1443,7 +2417,7 @@ pub async fn create_catalog_entry(
     // — so it can never clobber this custom row; see the importer). The
     // `not exists (global)` guard fails closed on a global-slug collision — a
     // tenant can never mask a curated slug with a divergent definition.
-    sqlx::query_as(
+    let __rls_out = sqlx::query_as(
         "insert into connector_catalog
            (id, tenant_id, slug, name, icon, description, categories, tier, url, transport,
             auth_mode, auth_hints, scopes, egress, tool_hints, sandbox_launch,
@@ -1469,8 +2443,10 @@ pub async fn create_catalog_entry(
     .bind(egress)
     .bind(tool_hints)
     .bind(sandbox_launch)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Delete a tenant's custom catalog entry by slug (tenant rows only — a global
@@ -1483,11 +2459,13 @@ pub async fn delete_catalog_entry(
     scope: TenantScope,
     slug: &str,
 ) -> sqlx::Result<u64> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let r = sqlx::query("delete from connector_catalog where slug = $1 and tenant_id = $2")
         .bind(slug)
         .bind(scope.tenant_id())
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(r.rows_affected())
 }
 
@@ -1498,19 +2476,22 @@ pub async fn connection_credential_sealed<'e, E>(
     exec: E,
     scope: TenantScope,
     id: Uuid,
-) -> sqlx::Result<Option<Vec<u8>>>
+) -> sqlx::Result<Option<(Vec<u8>, i16)>>
 where
     E: sqlx::PgExecutor<'e>,
 {
     let row = sqlx::query(
-        "select credential_sealed from integration_connections
+        "select credential_sealed, credential_key_version from integration_connections
          where id = $1 and status = 'active' and tenant_id = $2",
     )
     .bind(id)
     .bind(scope.tenant_id())
     .fetch_optional(exec)
     .await?;
-    Ok(row.map(|r| r.get::<Vec<u8>, _>("credential_sealed")))
+    Ok(row.and_then(|r| {
+        r.get::<Option<Vec<u8>>, _>("credential_sealed")
+            .map(|b| (b, r.get::<i16, _>("credential_key_version")))
+    }))
 }
 
 /// The only reader of the sealed webhook secret (verified on every ingress
@@ -1519,16 +2500,239 @@ pub async fn connection_webhook_secret_sealed(
     pool: &PgPool,
     scope: TenantScope,
     id: Uuid,
-) -> sqlx::Result<Option<Vec<u8>>> {
+) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query(
-        "select webhook_secret_sealed from integration_connections
+        "select webhook_secret_sealed, webhook_secret_key_version from integration_connections
          where id = $1 and status = 'active' and tenant_id = $2",
     )
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    Ok(row.and_then(|r| r.get::<Option<Vec<u8>>, _>("webhook_secret_sealed")))
+    tx.commit().await?;
+    Ok(row.and_then(|r| {
+        r.get::<Option<Vec<u8>>, _>("webhook_secret_sealed")
+            .map(|b| (b, r.get::<i16, _>("webhook_secret_key_version")))
+    }))
+}
+
+// ─── Per-tenant LiteLLM virtual keys (Phase D, #32) ───────────────────────
+
+/// The outcome of an insert-or-adopt of a tenant's virtual key: the winning row's
+/// sealed bytes + companion version, and whether OUR insert is the one that
+/// persisted. A mint race (two concurrent first-uses) resolves here — one insert
+/// wins, the loser reads `we_won = false` + the winner's sealed key to adopt.
+pub struct TenantLlmKeyInsert {
+    pub sealed: Vec<u8>,
+    pub key_version: i16,
+    pub we_won: bool,
+}
+
+/// A tenant's virtual-key row as the RECOVERY path needs it: the sealed bytes
+/// EXACTLY as stored (the compare-and-swap expectation — sealing is
+/// nondeterministic, so only the bytes we read can be compared), the companion
+/// version, and `minted_at` = when this key was created or last rotated.
+///
+/// `minted_at` is the DURABLE recovery cooldown (Phase D review H3): it survives
+/// restarts and is shared by every replica, so a LiteLLM outage that keeps
+/// rejecting keys cannot drive re-provisioning in a loop.
+pub struct TenantLlmKeyRow {
+    pub sealed: Vec<u8>,
+    pub key_version: i16,
+    pub minted_at: DateTime<Utc>,
+}
+
+/// Read a tenant's virtual-key row (sealed bytes + version + `minted_at`).
+/// `None` = not yet minted. Tenant-scoped by the PK.
+pub async fn tenant_llm_key_row(
+    pool: &PgPool,
+    scope: TenantScope,
+) -> sqlx::Result<Option<TenantLlmKeyRow>> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let row: Option<(Vec<u8>, i16, DateTime<Utc>)> = sqlx::query_as(
+        "select litellm_key_sealed, litellm_key_key_version, coalesce(rotated_at, created_at)
+           from tenant_llm_keys where tenant_id = $1",
+    )
+    .bind(scope.tenant_id())
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row.map(|(sealed, key_version, minted_at)| TenantLlmKeyRow {
+        sealed,
+        key_version,
+        minted_at,
+    }))
+}
+
+/// Compare-and-swap a tenant's virtual key: replace it ONLY while the stored
+/// sealed bytes are still `expected_sealed` (Phase D review M4). The reactive
+/// recovery path reads the row, proves the key LiteLLM rejected is the CURRENT
+/// one, mints a replacement, and lands it here — between the read and the write
+/// an operator rotation (or another replica's recovery) may have installed a new
+/// key, and blindly overwriting it would leak a live key and discard a
+/// successful rotation. `false` = someone else swapped first; the caller must
+/// drop its fresh mint and adopt the current key instead. Tenant-scoped by the PK.
+pub async fn rotate_tenant_llm_key_cas(
+    pool: &PgPool,
+    scope: TenantScope,
+    expected_sealed: &[u8],
+    sealed: &[u8],
+    key_version: i16,
+    key_alias: &str,
+    litellm_token_id: Option<&str>,
+) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let r = sqlx::query(
+        "update tenant_llm_keys
+            set litellm_key_sealed = $2, litellm_key_key_version = $3, key_alias = $4,
+                litellm_token_id = $5, rotated_at = now()
+          where tenant_id = $1 and litellm_key_sealed = $6",
+    )
+    .bind(scope.tenant_id())
+    .bind(sealed)
+    .bind(key_version)
+    .bind(key_alias)
+    .bind(litellm_token_id)
+    .bind(expected_sealed)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(r.rows_affected() == 1)
+}
+
+/// Read a tenant's sealed virtual key + companion version. `None` = not yet
+/// minted. Tenant-scoped: keyed on the scope's tenant (the table's PK).
+pub async fn tenant_llm_key_sealed(
+    pool: &PgPool,
+    scope: TenantScope,
+) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let row: Option<(Vec<u8>, i16)> = sqlx::query_as(
+        "select litellm_key_sealed, litellm_key_key_version from tenant_llm_keys
+         where tenant_id = $1",
+    )
+    .bind(scope.tenant_id())
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
+/// Insert a tenant's freshly minted+sealed virtual key, or adopt the winner of a
+/// mint race. `ON CONFLICT (tenant_id) DO NOTHING RETURNING` tells us whether our
+/// row persisted; on a conflict we re-read the winner's sealed key so the caller
+/// can adopt it (and drop its own orphaned LiteLLM key). Tenant-scoped by the PK.
+pub async fn insert_tenant_llm_key(
+    pool: &PgPool,
+    scope: TenantScope,
+    sealed: &[u8],
+    key_version: i16,
+    key_alias: &str,
+    litellm_token_id: Option<&str>,
+) -> sqlx::Result<TenantLlmKeyInsert> {
+    let tenant_id = scope.tenant_id();
+    let mut tx = scoped_tx(pool, scope).await?;
+    let inserted: Option<(Vec<u8>, i16)> = sqlx::query_as(
+        "insert into tenant_llm_keys
+           (tenant_id, litellm_key_sealed, litellm_key_key_version, key_alias, litellm_token_id)
+         values ($1, $2, $3, $4, $5)
+         on conflict (tenant_id) do nothing
+         returning litellm_key_sealed, litellm_key_key_version",
+    )
+    .bind(tenant_id)
+    .bind(sealed)
+    .bind(key_version)
+    .bind(key_alias)
+    .bind(litellm_token_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((s, v)) = inserted {
+        tx.commit().await?;
+        return Ok(TenantLlmKeyInsert {
+            sealed: s,
+            key_version: v,
+            we_won: true,
+        });
+    }
+    // Conflict: another minter won. Re-read the winner's sealed key to adopt.
+    let (s, v): (Vec<u8>, i16) = sqlx::query_as(
+        "select litellm_key_sealed, litellm_key_key_version from tenant_llm_keys
+         where tenant_id = $1",
+    )
+    .bind(tenant_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(TenantLlmKeyInsert {
+        sealed: s,
+        key_version: v,
+        we_won: false,
+    })
+}
+
+/// Drop a tenant's sealed virtual key so the next `ensure_tenant_key` MINTS a
+/// fresh one. Teardown / manual-invalidation only.
+///
+/// NOT the reactive-401 recovery path any more (review M4): "evict + delete the
+/// tenant's row" is unconditional, so a stale rejection (a request that presented
+/// a key an operator had already rotated away) deleted the CURRENT row — losing a
+/// live key and superseding a successful rotation. Recovery now compare-and-swaps
+/// on the exact sealed bytes it read (`rotate_tenant_llm_key_cas`), which also
+/// keeps `coalesce(rotated_at, created_at)` as its durable cooldown stamp — a
+/// delete would reset that and re-open the loop. Tenant-scoped by the PK.
+pub async fn delete_tenant_llm_key(pool: &PgPool, scope: TenantScope) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    sqlx::query("delete from tenant_llm_keys where tenant_id = $1")
+        .bind(scope.tenant_id())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Swap a tenant's sealed virtual key for a freshly minted one (rotation),
+/// bumping `rotated_at`. Returns the OLD sealed bytes + version so the caller can
+/// retire the old key at LiteLLM; `None` = the tenant had no prior key (this
+/// created it). Reads-old-then-upserts under a row lock so a concurrent rotate
+/// can't lose the old value it must delete. Tenant-scoped by the PK.
+pub async fn rotate_tenant_llm_key(
+    pool: &PgPool,
+    scope: TenantScope,
+    sealed: &[u8],
+    key_version: i16,
+    key_alias: &str,
+    litellm_token_id: Option<&str>,
+) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
+    let tenant_id = scope.tenant_id();
+    let mut tx = scoped_tx(pool, scope).await?;
+    let old: Option<(Vec<u8>, i16)> = sqlx::query_as(
+        "select litellm_key_sealed, litellm_key_key_version from tenant_llm_keys
+         where tenant_id = $1 for update",
+    )
+    .bind(tenant_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    sqlx::query(
+        "insert into tenant_llm_keys
+           (tenant_id, litellm_key_sealed, litellm_key_key_version, key_alias, litellm_token_id)
+         values ($1, $2, $3, $4, $5)
+         on conflict (tenant_id) do update set
+           litellm_key_sealed = excluded.litellm_key_sealed,
+           litellm_key_key_version = excluded.litellm_key_key_version,
+           key_alias = excluded.key_alias,
+           litellm_token_id = excluded.litellm_token_id,
+           rotated_at = now()",
+    )
+    .bind(tenant_id)
+    .bind(sealed)
+    .bind(key_version)
+    .bind(key_alias)
+    .bind(litellm_token_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(old)
 }
 
 // ─── GitHub App registrations & flows (Phase 5.6) ─────────────────────────
@@ -1567,7 +2771,9 @@ pub async fn create_github_app_registration(
     target_kind: &str,
     target_org: Option<&str>,
 ) -> sqlx::Result<GithubAppRegistrationRow> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "insert into github_app_registrations (id, tenant_id, target_kind, target_org)
          values ($1, $2, $3, $4)
          returning {GH_REG_COLS}"
@@ -1576,21 +2782,27 @@ pub async fn create_github_app_registration(
     .bind(scope.tenant_id())
     .bind(target_kind)
     .bind(target_org)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn list_github_app_registrations(
     pool: &PgPool,
     scope: TenantScope,
 ) -> sqlx::Result<Vec<GithubAppRegistrationRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {GH_REG_COLS} from github_app_registrations
          where tenant_id = $1 order by created_at desc"
     )))
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_github_app_registration(
@@ -1598,13 +2810,17 @@ pub async fn get_github_app_registration(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<GithubAppRegistrationRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {GH_REG_COLS} from github_app_registrations where id = $1 and tenant_id = $2"
     )))
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// The manifest conversion landing: exactly ONE conversion may complete a
@@ -1622,14 +2838,21 @@ pub async fn activate_github_app_registration(
     html_url: &str,
     owner_login: Option<&str>,
     pem_sealed: &[u8],
+    pem_key_version: i16,
     webhook_secret_sealed: Option<&[u8]>,
+    webhook_secret_key_version: i16,
     client_secret_sealed: Option<&[u8]>,
+    client_secret_key_version: i16,
 ) -> sqlx::Result<Option<GithubAppRegistrationRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update github_app_registrations
          set app_id = $2, slug = $3, name = $4, client_id = $5, html_url = $6,
              owner_login = $7, pem_sealed = $8, webhook_secret_sealed = $9,
-             client_secret_sealed = $10, status = 'active', updated_at = now()
+             client_secret_sealed = $10, pem_key_version = $12,
+             webhook_secret_key_version = $13, client_secret_key_version = $14,
+             status = 'active', updated_at = now()
          where id = $1 and status = 'pending' and tenant_id = $11
          returning {GH_REG_COLS}"
     )))
@@ -1644,8 +2867,13 @@ pub async fn activate_github_app_registration(
     .bind(webhook_secret_sealed)
     .bind(client_secret_sealed)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .bind(pem_key_version)
+    .bind(webhook_secret_key_version)
+    .bind(client_secret_key_version)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Revoke a registration AND its child connections in one transaction;
@@ -1657,7 +2885,7 @@ pub async fn revoke_github_app_registration(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<Vec<Uuid>>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = scoped_tx(pool, scope).await?;
     let reg = sqlx::query(
         "update github_app_registrations set status = 'revoked', updated_at = now()
          where id = $1 and status <> 'revoked' and tenant_id = $2",
@@ -1693,16 +2921,21 @@ pub async fn github_app_registration_pem_sealed(
     pool: &PgPool,
     scope: TenantScope,
     id: Uuid,
-) -> sqlx::Result<Option<Vec<u8>>> {
+) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query(
-        "select pem_sealed from github_app_registrations
+        "select pem_sealed, pem_key_version from github_app_registrations
          where id = $1 and status = 'active' and tenant_id = $2",
     )
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    Ok(row.and_then(|r| r.get::<Option<Vec<u8>>, _>("pem_sealed")))
+    tx.commit().await?;
+    Ok(row.and_then(|r| {
+        r.get::<Option<Vec<u8>>, _>("pem_sealed")
+            .map(|b| (b, r.get::<i16, _>("pem_key_version")))
+    }))
 }
 
 /// Active-only reader for the app-level webhook secret (verified on every
@@ -1711,45 +2944,79 @@ pub async fn github_app_registration_webhook_secret_sealed(
     pool: &PgPool,
     scope: TenantScope,
     id: Uuid,
-) -> sqlx::Result<Option<Vec<u8>>> {
+) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query(
-        "select webhook_secret_sealed from github_app_registrations
+        "select webhook_secret_sealed, webhook_secret_key_version from github_app_registrations
          where id = $1 and status = 'active' and tenant_id = $2",
     )
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    Ok(row.and_then(|r| r.get::<Option<Vec<u8>>, _>("webhook_secret_sealed")))
+    tx.commit().await?;
+    Ok(row.and_then(|r| {
+        r.get::<Option<Vec<u8>>, _>("webhook_secret_sealed")
+            .map(|b| (b, r.get::<i16, _>("webhook_secret_key_version")))
+    }))
 }
 
-/// Mint a one-time flow (admin intent). Opportunistically sweeps expired
+/// Mint a one-time flow. Opportunistically sweeps this tenant's expired
 /// unconsumed flows immediately, and consumed ones after a 7-day audit
 /// window, so abandoned dances never accumulate.
+///
+/// TENANT-SCOPED (review L6). Minting is the AUTHENTICATED half of the GitHub-App
+/// dance — all three call sites already hold a verified tenant (two admin-token'd
+/// start endpoints via `principal.scope()`, and the manifest callback via the
+/// scope it derives from the registration row it just resolved) — so it has no
+/// business on the cross-tenant bypass. Only the two CLAIMs
+/// ([`claim_github_app_bootstrap`], [`claim_github_app_flow`]) are genuinely
+/// pre-auth: those arrive from GitHub/the browser with no principal, and the
+/// one-time flow id + browser-cookie hash ARE the auth.
+///
+/// The insert derives its `registration_id` from a row selected under the scope,
+/// so a caller cannot mint a flow against another tenant's registration even if
+/// RLS is inert (a superuser/BYPASSRLS pool role); returns [`sqlx::Error::RowNotFound`]
+/// when the registration is absent from this tenant.
 pub async fn create_github_app_flow(
     pool: &PgPool,
+    scope: TenantScope,
     registration_id: Uuid,
     purpose: &str,
     ttl_secs: i64,
 ) -> sqlx::Result<Uuid> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    // Self-scoped sweep: only flows under THIS tenant's registrations (the RLS
+    // child policy composes the same predicate; the EXISTS keeps it true without it).
     sqlx::query(
-        "delete from github_app_flows
-         where (consumed_at is null and expires_at < now())
-            or expires_at < now() - interval '7 days'",
+        "delete from github_app_flows f
+         where ((f.consumed_at is null and f.expires_at < now())
+                or f.expires_at < now() - interval '7 days')
+           and exists (select 1 from github_app_registrations r
+                        where r.id = f.registration_id and r.tenant_id = $1)",
     )
-    .execute(pool)
+    .bind(scope.tenant_id())
+    .execute(&mut *tx)
     .await?;
     let id = Uuid::now_v7();
-    sqlx::query(
+    let inserted = sqlx::query(
         "insert into github_app_flows (id, registration_id, purpose, expires_at)
-         values ($1, $2, $3, now() + make_interval(secs => $4::double precision))",
+         select $1, r.id, $3, now() + make_interval(secs => $4::double precision)
+           from github_app_registrations r
+          where r.id = $2 and r.tenant_id = $5",
     )
     .bind(id)
     .bind(registration_id)
     .bind(purpose)
     .bind(ttl_secs as f64)
-    .execute(pool)
+    .bind(scope.tenant_id())
+    .execute(&mut *tx)
     .await?;
+    if inserted.rows_affected() != 1 {
+        tx.rollback().await.ok();
+        return Err(sqlx::Error::RowNotFound);
+    }
+    tx.commit().await?;
     Ok(id)
 }
 
@@ -1761,6 +3028,8 @@ pub async fn claim_github_app_bootstrap(
     purpose: &str,
     browser_hash: &str,
 ) -> sqlx::Result<Option<Uuid>> {
+    // Pre-auth bootstrap claim (browser cookie is the auth) — audited bypass.
+    let mut tx = worker_tx(pool).await?;
     let row = sqlx::query(
         "update github_app_flows
          set bootstrap_consumed_at = now(), browser_hash = $3
@@ -1771,8 +3040,9 @@ pub async fn claim_github_app_bootstrap(
     .bind(flow_id)
     .bind(purpose)
     .bind(browser_hash)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.map(|r| r.get::<Uuid, _>("registration_id")))
 }
 
@@ -1786,6 +3056,8 @@ pub async fn claim_github_app_flow(
     registration_id: Uuid,
     browser_hash: &str,
 ) -> sqlx::Result<bool> {
+    // Pre-auth one-time claim (browser cookie inside the predicate) — audited bypass.
+    let mut tx = worker_tx(pool).await?;
     let r = sqlx::query(
         "update github_app_flows
          set consumed_at = now()
@@ -1797,8 +3069,9 @@ pub async fn claim_github_app_flow(
     .bind(purpose)
     .bind(registration_id)
     .bind(browser_hash)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(r.rows_affected() == 1)
 }
 
@@ -1818,7 +3091,9 @@ pub async fn create_github_app_connection_if_absent(
     status: &str,
     registration_id: Uuid,
 ) -> sqlx::Result<Option<IntegrationConnectionRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         // github_app connections are ALWAYS organization-owned (system custody
         // via the registration) — owner_type is stamped explicitly, never a
         // per-user personal connection.
@@ -1841,8 +3116,10 @@ pub async fn create_github_app_connection_if_absent(
     .bind(metadata)
     .bind(status)
     .bind(registration_id)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// The single live connection row for a GitHub installation, preferring a
@@ -1853,7 +3130,9 @@ pub async fn get_github_app_connection_by_installation(
     scope: TenantScope,
     installation_id: &str,
 ) -> sqlx::Result<Option<IntegrationConnectionRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {CONNECTION_COLS} from integration_connections
          where tenant_id = $1 and provider = 'github_app' and external_account_id = $2
          order by (status <> 'revoked') desc, created_at desc
@@ -1861,8 +3140,10 @@ pub async fn get_github_app_connection_by_installation(
     )))
     .bind(scope.tenant_id())
     .bind(installation_id)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Guarded status transition: only fires when the current status is one of
@@ -1874,8 +3155,10 @@ pub async fn set_connection_status(
     status: &str,
     allowed_from: &[&str],
 ) -> sqlx::Result<Option<IntegrationConnectionRow>> {
+    let mut tx = scoped_tx(pool, scope).await?;
+
     let from: Vec<String> = allowed_from.iter().map(|s| s.to_string()).collect();
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update integration_connections set status = $2, updated_at = now()
          where id = $1 and status = any($3) and tenant_id = $4
          returning {CONNECTION_COLS}"
@@ -1884,8 +3167,10 @@ pub async fn set_connection_status(
     .bind(status)
     .bind(&from)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Refresh the display metadata a setup/sync re-verification produced.
@@ -1896,6 +3181,8 @@ pub async fn refresh_connection_metadata(
     display_name: &str,
     metadata: &Value,
 ) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
+
     sqlx::query(
         "update integration_connections
          set display_name = $2, metadata = $3, updated_at = now()
@@ -1905,9 +3192,10 @@ pub async fn refresh_connection_metadata(
     .bind(display_name)
     .bind(metadata)
     .bind(scope.tenant_id())
-    .execute(pool)
-    .await
-    .map(|_| ())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 // ─── Trigger subscriptions ────────────────────────────────────────────────
@@ -1971,24 +3259,28 @@ pub async fn create_trigger_subscription(
     workspace_override: Option<&Value>,
     result_destinations: &Value,
     callback_secret_sealed: Option<&[u8]>,
+    callback_secret_key_version: i16,
     connection_id: Option<Uuid>,
     resource_selector: Option<&Value>,
     event_filter: Option<&Value>,
     event_publish: Option<&Value>,
     capability_bundles: Option<&Value>,
 ) -> sqlx::Result<TriggerSubscriptionRow> {
+    let mut tx = scoped_tx(pool, scope).await?;
+
     // Prove every referenced parent belongs to this tenant IN SQL (the handler
     // pre-validates too, but this is the relational backstop): the agent is
     // in-scope; a Some pinned_revision is a revision of THAT agent; a Some
     // connection is in-scope. A miss yields zero rows → fetch_one RowNotFound,
     // the same shape a not-in-scope agent already produced for other writes.
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "insert into trigger_subscriptions
            (id, tenant_id, agent_id, name, trigger_kind, pinned_revision_id, task_template,
             allow_task_override, allow_workspace_override, autonomy, concurrency_policy,
             budget_override, workspace_override, result_destinations, callback_secret_sealed,
-            connection_id, resource_selector, event_filter, event_publish, capability_bundles)
-         select $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20
+            connection_id, resource_selector, event_filter, event_publish, capability_bundles,
+            callback_secret_key_version)
+         select $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21
          where exists (select 1 from agents a where a.id = $3 and a.tenant_id = $2)
            and ($6::uuid is null or exists (
                  select 1 from agent_revisions r where r.id = $6 and r.agent_id = $3))
@@ -2016,8 +3308,11 @@ pub async fn create_trigger_subscription(
     .bind(event_filter)
     .bind(event_publish)
     .bind(capability_bundles)
-    .fetch_one(pool)
-    .await
+    .bind(callback_secret_key_version)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Enabled event subscriptions listening on a connection — the matcher's
@@ -2027,28 +3322,36 @@ pub async fn list_event_subscriptions(
     scope: TenantScope,
     connection: Uuid,
 ) -> sqlx::Result<Vec<TriggerSubscriptionRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {SUBSCRIPTION_COLS} from trigger_subscriptions
          where connection_id = $1 and trigger_kind = 'event' and enabled and tenant_id = $2
          order by created_at"
     )))
     .bind(connection)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn list_trigger_subscriptions(
     pool: &PgPool,
     scope: TenantScope,
 ) -> sqlx::Result<Vec<TriggerSubscriptionRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {SUBSCRIPTION_COLS} from trigger_subscriptions
          where tenant_id = $1 order by created_at desc"
     )))
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_trigger_subscription(
@@ -2056,13 +3359,17 @@ pub async fn get_trigger_subscription(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<TriggerSubscriptionRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {SUBSCRIPTION_COLS} from trigger_subscriptions where id = $1 and tenant_id = $2"
     )))
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn set_trigger_subscription_enabled(
@@ -2071,15 +3378,19 @@ pub async fn set_trigger_subscription_enabled(
     id: Uuid,
     enabled: bool,
 ) -> sqlx::Result<Option<TriggerSubscriptionRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update trigger_subscriptions set enabled = $2, updated_at = now()
          where id = $1 and tenant_id = $3 returning {SUBSCRIPTION_COLS}"
     )))
     .bind(id)
     .bind(enabled)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// The only reader of the sealed callback secret. Deliveries for in-flight
@@ -2088,16 +3399,21 @@ pub async fn subscription_callback_secret_sealed(
     pool: &PgPool,
     scope: TenantScope,
     id: Uuid,
-) -> sqlx::Result<Option<Vec<u8>>> {
+) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query(
-        "select callback_secret_sealed from trigger_subscriptions
+        "select callback_secret_sealed, callback_secret_key_version from trigger_subscriptions
          where id = $1 and tenant_id = $2",
     )
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    Ok(row.and_then(|r| r.get::<Option<Vec<u8>>, _>("callback_secret_sealed")))
+    tx.commit().await?;
+    Ok(row.and_then(|r| {
+        r.get::<Option<Vec<u8>>, _>("callback_secret_sealed")
+            .map(|b| (b, r.get::<i16, _>("callback_secret_key_version")))
+    }))
 }
 
 // ─── Run resource bindings ────────────────────────────────────────────────
@@ -2203,11 +3519,16 @@ pub async fn get_run_resource_binding(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<RunResourceBindingRow>> {
-    sqlx::query_as("select * from run_resource_bindings where id = $1 and tenant_id = $2")
-        .bind(id)
-        .bind(scope.tenant_id())
-        .fetch_optional(pool)
-        .await
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out =
+        sqlx::query_as("select * from run_resource_bindings where id = $1 and tenant_id = $2")
+            .bind(id)
+            .bind(scope.tenant_id())
+            .fetch_optional(&mut *tx)
+            .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Every binding a run resolved, ordered by slot for stable display.
@@ -2216,15 +3537,19 @@ pub async fn session_resource_bindings(
     scope: TenantScope,
     session_id: Uuid,
 ) -> sqlx::Result<Vec<RunResourceBindingRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from run_resource_bindings
          where session_id = $1 and tenant_id = $2
          order by slot_kind, requirement_slot",
     )
     .bind(session_id)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// The one binding for a run's (slot_kind, requirement_slot) — the consumer's
@@ -2236,7 +3561,9 @@ pub async fn find_session_binding(
     slot_kind: &str,
     slot: &str,
 ) -> sqlx::Result<Option<RunResourceBindingRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from run_resource_bindings
          where session_id = $1 and tenant_id = $2 and slot_kind = $3 and requirement_slot = $4",
     )
@@ -2244,8 +3571,10 @@ pub async fn find_session_binding(
     .bind(scope.tenant_id())
     .bind(slot_kind)
     .bind(slot)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 // ─── Sessions ─────────────────────────────────────────────────────────────
@@ -2269,7 +3598,7 @@ pub async fn create_session(
     bind_dispatch: Option<Uuid>,
     bindings: &[NewRunResourceBinding],
 ) -> sqlx::Result<SessionRow> {
-    let mut tx = pool.begin().await?;
+    let mut tx = scoped_tx(pool, scope).await?;
     // Prove the agent AND the pinned revision both belong to this tenant in SQL
     // (the run builder resolves them under scope first; this is the relational
     // backstop). A miss yields zero rows → fetch_one RowNotFound, surfaced via
@@ -2353,11 +3682,15 @@ pub async fn get_session(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<SessionRow>> {
-    sqlx::query_as("select * from sessions where id = $1 and tenant_id = $2")
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as("select * from sessions where id = $1 and tenant_id = $2")
         .bind(id)
         .bind(scope.tenant_id())
-        .fetch_optional(pool)
-        .await
+        .fetch_optional(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// List a tenant's sessions, newest first. `invoked_by` narrows to a single
@@ -2369,7 +3702,9 @@ pub async fn list_sessions(
     invoked_by: Option<Uuid>,
     limit: i64,
 ) -> sqlx::Result<Vec<SessionRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from sessions
          where tenant_id = $1 and ($2::uuid is null or invoked_by_user_id = $2)
          order by created_at desc limit $3",
@@ -2377,8 +3712,10 @@ pub async fn list_sessions(
     .bind(scope.tenant_id())
     .bind(invoked_by)
     .bind(limit)
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// The single status writer. Validates the transition inside a transaction;
@@ -2391,7 +3728,7 @@ pub async fn transition_session(
     next: SessionStatus,
     reason: Option<&str>,
 ) -> sqlx::Result<Option<(SessionStatus, SessionRow)>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = scoped_tx(pool, scope).await?;
     let row: Option<(String,)> =
         sqlx::query_as("select status from sessions where id = $1 and tenant_id = $2 for update")
             .bind(id)
@@ -2447,7 +3784,7 @@ pub async fn set_sandbox_handle(
     handle: &Value,
 ) -> sqlx::Result<bool> {
     use fluidbox_core::state::SessionStatus;
-    let mut tx = pool.begin().await?;
+    let mut tx = scoped_tx(pool, scope).await?;
     let locked: Option<(String,)> =
         sqlx::query_as("select status from sessions where id = $1 and tenant_id = $2 for update")
             .bind(id)
@@ -2503,6 +3840,7 @@ pub async fn adopt_sandbox_handle(
     id: Uuid,
     handle: &Value,
 ) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let res = sqlx::query(
         "update sessions set sandbox_handle = $2, updated_at = now()
          where id = $1 and tenant_id = $3 and sandbox_handle is null
@@ -2511,8 +3849,9 @@ pub async fn adopt_sandbox_handle(
     .bind(id)
     .bind(handle)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -2522,6 +3861,7 @@ pub async fn set_base_commit(
     id: Uuid,
     commit: &str,
 ) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
         "update sessions set base_commit = $2, updated_at = now()
          where id = $1 and tenant_id = $3",
@@ -2529,8 +3869,9 @@ pub async fn set_base_commit(
     .bind(id)
     .bind(commit)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -2540,6 +3881,7 @@ pub async fn set_result_summary(
     id: Uuid,
     summary: &str,
 ) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
         "update sessions set result_summary = $2, updated_at = now()
          where id = $1 and tenant_id = $3",
@@ -2547,20 +3889,23 @@ pub async fn set_result_summary(
     .bind(id)
     .bind(summary)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
 pub async fn heartbeat(pool: &PgPool, scope: TenantScope, id: Uuid) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
         "update sessions set last_heartbeat_at = now(), updated_at = now()
          where id = $1 and tenant_id = $2",
     )
     .bind(id)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -2620,7 +3965,7 @@ pub async fn begin_finalization(
     quiesce_deadline_secs: i64,
 ) -> sqlx::Result<BeginFinalization> {
     use fluidbox_core::state::SessionStatus;
-    let mut tx = pool.begin().await?;
+    let mut tx = scoped_tx(pool, scope).await?;
     let locked: Option<(String, Option<Value>)> = sqlx::query_as(
         "select status, sandbox_handle from sessions where id = $1 and tenant_id = $2 for update",
     )
@@ -2679,15 +4024,19 @@ pub async fn get_finalization(
     scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<Option<FinalizationRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from session_finalizations
          where session_id = $1
            and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $2)",
     )
     .bind(session)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Claim a finalization for driving: succeeds when the row is unclaimed OR its
@@ -2701,7 +4050,9 @@ pub async fn claim_finalization(
     session: Uuid,
     stale_secs: i64,
 ) -> sqlx::Result<Option<FinalizationRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "update session_finalizations
             set claimed_at = now(), attempts = attempts + 1
           where session_id = $1
@@ -2712,8 +4063,10 @@ pub async fn claim_finalization(
     .bind(session)
     .bind(stale_secs as f64)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Release a driver's claim early — for DELIBERATE deferrals (e.g. the
@@ -2724,6 +4077,7 @@ pub async fn release_finalization_claim(
     scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
         "update session_finalizations set claimed_at = null
          where session_id = $1
@@ -2731,8 +4085,9 @@ pub async fn release_finalization_claim(
     )
     .bind(session)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -2741,6 +4096,7 @@ pub async fn delete_finalization(
     scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
         "delete from session_finalizations
          where session_id = $1
@@ -2748,8 +4104,9 @@ pub async fn delete_finalization(
     )
     .bind(session)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -2790,6 +4147,7 @@ pub async fn diff_artifact_content(
     scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<Option<String>> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let row: Option<(String,)> = sqlx::query_as(
         "select content from artifacts
          where session_id = $1 and kind = 'diff'
@@ -2798,8 +4156,9 @@ pub async fn diff_artifact_content(
     )
     .bind(session)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.map(|(c,)| c))
 }
 
@@ -2812,7 +4171,7 @@ pub async fn upsert_artifact(
     content: &str,
     content_type: &str,
 ) -> sqlx::Result<ArtifactRow> {
-    let mut tx = pool.begin().await?;
+    let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
         "delete from artifacts
          where session_id = $1 and kind = $2 and name = $3
@@ -2856,7 +4215,10 @@ pub async fn append_event(
     // Gate the append on the session belonging to the caller's tenant. The
     // `where exists(...)` guards the target list, so the side-effecting
     // `append_event(...)` function is NOT invoked on a scope miss (no seq bump,
-    // no NOTIFY) — zero rows → RowNotFound, which the ledger helper logs.
+    // no NOTIFY) — zero rows → RowNotFound, which the ledger helper logs. The scoped
+    // tx also sets the tenant GUC so the plpgsql function's `update sessions` +
+    // `insert events` (SECURITY INVOKER, subject to RLS) pass under the policies.
+    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query(
         "select append_event($1, $2, $3, $4, $5, $6) as seq
          where exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $7)",
@@ -2868,8 +4230,9 @@ pub async fn append_event(
     .bind(&payload)
     .bind(env.occurred_at)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     match row {
         Some(r) => Ok(r.get::<i64, _>("seq")),
         None => Err(sqlx::Error::RowNotFound),
@@ -2883,7 +4246,9 @@ pub async fn events_after(
     after_seq: i64,
     limit: i64,
 ) -> sqlx::Result<Vec<EventRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select event_id, session_id, seq, actor, type, payload, occurred_at
          from events
          where session_id = $1 and seq > $2
@@ -2894,8 +4259,10 @@ pub async fn events_after(
     .bind(after_seq)
     .bind(limit)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 // ─── Approvals & tool-call intents ────────────────────────────────────────
@@ -2933,6 +4300,7 @@ pub async fn register_tool_intent(
     summary: &str,
     input_digest: &str,
 ) -> sqlx::Result<(ApprovalRow, bool)> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let inserted: Option<ApprovalRow> = sqlx::query_as(concat!(
         "insert into approvals
            (id, session_id, tool_call_id, tool, summary, input_digest, scope, scope_key,
@@ -2950,9 +4318,10 @@ pub async fn register_tool_intent(
     .bind(summary)
     .bind(input_digest)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     if let Some(row) = inserted {
+        tx.commit().await?;
         return Ok((row, true));
     }
     let existing: ApprovalRow = sqlx::query_as(concat!(
@@ -2965,8 +4334,9 @@ pub async fn register_tool_intent(
     .bind(session)
     .bind(tool_call_id)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok((existing, false))
 }
 
@@ -2983,7 +4353,9 @@ pub async fn promote_intent_to_pending(
     scope_key: &str,
     ttl_secs: i64,
 ) -> sqlx::Result<Option<ApprovalRow>> {
-    sqlx::query_as(concat!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(concat!(
         "update approvals
             set status = 'pending', risk = $2, scope = $3, scope_key = $4,
                 expires_at = now() + make_interval(secs => $5)
@@ -2999,8 +4371,10 @@ pub async fn promote_intent_to_pending(
     .bind(scope_key)
     .bind(ttl_secs as f64)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Record the gate's own verdict on an intent ('auto_allowed'/'auto_denied').
@@ -3015,6 +4389,7 @@ pub async fn record_intent_verdict(
     id: Uuid,
     status: &str,
 ) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let res = sqlx::query(
         "update approvals set status = $2, decided_at = now(), decided_by = 'gate'
          where id = $1 and status = 'intent'
@@ -3024,8 +4399,9 @@ pub async fn record_intent_verdict(
     .bind(id)
     .bind(status)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -3036,7 +4412,9 @@ pub async fn decide_approval(
     status: &str,
     decided_by: &str,
 ) -> sqlx::Result<Option<ApprovalRow>> {
-    sqlx::query_as(concat!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(concat!(
         "update approvals set status = $2, decided_at = now(), decided_by = $3
          where id = $1 and status = 'pending'
            and exists (select 1 from sessions s
@@ -3048,8 +4426,10 @@ pub async fn decide_approval(
     .bind(status)
     .bind(decided_by)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_approval(
@@ -3057,7 +4437,9 @@ pub async fn get_approval(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<ApprovalRow>> {
-    sqlx::query_as(concat!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(concat!(
         "select ",
         approval_cols!(),
         " from approvals
@@ -3067,8 +4449,10 @@ pub async fn get_approval(
     ))
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Human-lifecycle rows only: intent bookkeeping ('intent'/'auto_*') is the
@@ -3078,7 +4462,9 @@ pub async fn session_approvals(
     scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<Vec<ApprovalRow>> {
-    sqlx::query_as(concat!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(concat!(
         "select ",
         approval_cols!(),
         " from approvals
@@ -3088,8 +4474,10 @@ pub async fn session_approvals(
     ))
     .bind(session)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// The tenant-scoped approvals inbox (the org approval queue). The
@@ -3100,7 +4488,9 @@ pub async fn pending_approvals(
     pool: &PgPool,
     scope: TenantScope,
 ) -> sqlx::Result<Vec<ApprovalRow>> {
-    sqlx::query_as(concat!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(concat!(
         "select ",
         approval_cols!(),
         " from approvals
@@ -3110,8 +4500,10 @@ pub async fn pending_approvals(
          order by requested_at"
     ))
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Has this session already granted `approved_session` for this scope key?
@@ -3121,6 +4513,7 @@ pub async fn has_session_grant(
     session: Uuid,
     scope_key: &str,
 ) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query(
         "select exists(
            select 1 from approvals
@@ -3131,8 +4524,9 @@ pub async fn has_session_grant(
     .bind(session)
     .bind(scope_key)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.get::<bool, _>("granted"))
 }
 
@@ -3147,7 +4541,9 @@ pub async fn add_artifact(
     content: &str,
     content_type: &str,
 ) -> sqlx::Result<ArtifactRow> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "insert into artifacts (id, session_id, kind, name, content, content_type)
          select $1,$2,$3,$4,$5,$6
          where exists (select 1 from sessions s where s.id = $2 and s.tenant_id = $7)
@@ -3160,8 +4556,10 @@ pub async fn add_artifact(
     .bind(content)
     .bind(content_type)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn list_artifacts(
@@ -3169,7 +4567,9 @@ pub async fn list_artifacts(
     scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<Vec<ArtifactRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from artifacts
          where session_id = $1
            and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $2)
@@ -3177,8 +4577,10 @@ pub async fn list_artifacts(
     )
     .bind(session)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_artifact(
@@ -3186,15 +4588,19 @@ pub async fn get_artifact(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<ArtifactRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from artifacts a
          where a.id = $1
            and exists (select 1 from sessions s where s.id = a.session_id and s.tenant_id = $2)",
     )
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 // ─── Usage ────────────────────────────────────────────────────────────────
@@ -3213,6 +4619,7 @@ pub async fn add_usage(
     source: &str,
     external_id: Option<&str>,
 ) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let res = sqlx::query(
         "insert into usage_entries
            (id, session_id, model, input_tokens, output_tokens, cache_read_tokens,
@@ -3232,8 +4639,9 @@ pub async fn add_usage(
     .bind(source)
     .bind(external_id)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -3242,7 +4650,9 @@ pub async fn usage_totals(
     scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<UsageTotals> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select coalesce(sum(input_tokens),0)::bigint as input_tokens,
                 coalesce(sum(output_tokens),0)::bigint as output_tokens,
                 coalesce(sum(cache_read_tokens),0)::bigint as cache_read_tokens,
@@ -3255,8 +4665,10 @@ pub async fn usage_totals(
     )
     .bind(session)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Unique persistent tool-call INTENTS (one approvals row per tool_call_id)
@@ -3267,6 +4679,7 @@ pub async fn tool_call_count(
     scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<i64> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query(
         "select count(*)::bigint as n from approvals
          where session_id = $1
@@ -3274,8 +4687,9 @@ pub async fn tool_call_count(
     )
     .bind(session)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.get::<i64, _>("n"))
 }
 
@@ -3288,6 +4702,7 @@ pub async fn create_session_token(
     token_plain: &str,
     ttl_secs: i64,
 ) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
         "insert into api_tokens (id, tenant_id, kind, session_id, token_sha256, expires_at)
          values ($1, $2, 'session', $3, $4, now() + make_interval(secs => $5))",
@@ -3297,8 +4712,9 @@ pub async fn create_session_token(
     .bind(session)
     .bind(sha256_hex(token_plain))
     .bind(ttl_secs as f64)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -3323,13 +4739,19 @@ pub async fn session_for_token_incl_revoked(
     pool: &PgPool,
     token_plain: &str,
 ) -> sqlx::Result<Option<SessionTokenAuth>> {
+    // Credential-digest bootstrap resolution: keyed purely on the token sha256, with
+    // NO tenant scope (the caller has no principal until this resolves the tenant).
+    // Rides the audited bypass so api_tokens is visible across tenants — the digest
+    // IS the credential (documented TenantScope bootstrap exception).
+    let mut tx = worker_tx(pool).await?;
     let row = sqlx::query(
         "select session_id, tenant_id from api_tokens
          where kind = 'session' and token_sha256 = $1",
     )
     .bind(sha256_hex(token_plain))
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.and_then(|r| {
         r.get::<Option<Uuid>, _>("session_id")
             .map(|session_id| SessionTokenAuth {
@@ -3345,6 +4767,9 @@ pub async fn session_for_token(
     pool: &PgPool,
     token_plain: &str,
 ) -> sqlx::Result<Option<SessionTokenAuth>> {
+    // Credential-digest bootstrap resolution (audited bypass) — see
+    // `session_for_token_incl_revoked`.
+    let mut tx = worker_tx(pool).await?;
     let row = sqlx::query(
         "select session_id, tenant_id from api_tokens
          where kind = 'session' and token_sha256 = $1
@@ -3352,8 +4777,9 @@ pub async fn session_for_token(
            and (expires_at is null or expires_at > now())",
     )
     .bind(sha256_hex(token_plain))
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.and_then(|r| {
         r.get::<Option<Uuid>, _>("session_id")
             .map(|session_id| SessionTokenAuth {
@@ -3368,14 +4794,18 @@ pub async fn extend_session_token(
     token_plain: &str,
     ttl_secs: i64,
 ) -> sqlx::Result<bool> {
+    // Keyed on the token digest with no principal scope — audited bypass, like the
+    // session-token resolvers above.
+    let mut tx = worker_tx(pool).await?;
     let res = sqlx::query(
         "update api_tokens set expires_at = now() + make_interval(secs => $2)
          where kind = 'session' and token_sha256 = $1 and revoked_at is null",
     )
     .bind(sha256_hex(token_plain))
     .bind(ttl_secs as f64)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -3388,6 +4818,7 @@ pub async fn revoke_session_tokens(
     scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<u64> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let res = sqlx::query(
         "update api_tokens set revoked_at = now()
          where kind = 'session' and session_id = $1 and revoked_at is null
@@ -3395,8 +4826,9 @@ pub async fn revoke_session_tokens(
     )
     .bind(session)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(res.rows_affected())
 }
 
@@ -3429,6 +4861,7 @@ pub async fn claim_invocation(
     idempotency_key: &str,
     request_digest: &str,
 ) -> sqlx::Result<InvocationClaim> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let inserted = sqlx::query(
         "insert into trigger_invocations (id, subscription_id, idempotency_key, request_digest)
          select $1, $2, $3, $4
@@ -3441,12 +4874,12 @@ pub async fn claim_invocation(
     .bind(idempotency_key)
     .bind(request_digest)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     if let Some(row) = inserted {
-        return Ok(InvocationClaim::Claimed {
-            invocation_id: row.get("id"),
-        });
+        let invocation_id: Uuid = row.get("id");
+        tx.commit().await?;
+        return Ok(InvocationClaim::Claimed { invocation_id });
     }
     let existing = sqlx::query(
         "select id, session_id, request_digest, skip_reason, created_at from trigger_invocations
@@ -3456,15 +4889,18 @@ pub async fn claim_invocation(
     .bind(subscription)
     .bind(idempotency_key)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     if let Some(session_id) = existing.get::<Option<Uuid>, _>("session_id") {
+        let request_digest: String = existing.get("request_digest");
+        tx.commit().await?;
         return Ok(InvocationClaim::Replay {
             session_id,
-            request_digest: existing.get("request_digest"),
+            request_digest,
         });
     }
     if let Some(reason) = existing.get::<Option<String>, _>("skip_reason") {
+        tx.commit().await?;
         return Ok(InvocationClaim::Skipped { reason });
     }
     // Unbound claim: take it over only once it is stale (crashed creator).
@@ -3482,14 +4918,16 @@ pub async fn claim_invocation(
     .bind(idempotency_key)
     .bind(request_digest)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    Ok(match takeover {
+    let out = match takeover {
         Some(row) => InvocationClaim::Claimed {
             invocation_id: row.get("id"),
         },
         None => InvocationClaim::InFlight,
-    })
+    };
+    tx.commit().await?;
+    Ok(out)
 }
 
 /// A skipped firing is the terminal state of its claim row: visibly
@@ -3501,6 +4939,7 @@ pub async fn mark_invocation_skipped(
     invocation: Uuid,
     reason: &str,
 ) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
         "update trigger_invocations set skip_reason = $2
          where id = $1 and session_id is null
@@ -3511,8 +4950,9 @@ pub async fn mark_invocation_skipped(
     .bind(invocation)
     .bind(reason)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -3532,7 +4972,9 @@ pub async fn list_subscription_invocations(
     subscription: Uuid,
     limit: i64,
 ) -> sqlx::Result<Vec<TriggerInvocationRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select id, subscription_id, idempotency_key, session_id, skip_reason, created_at
          from trigger_invocations where subscription_id = $1
            and exists (select 1 from trigger_subscriptions where id = $1 and tenant_id = $3)
@@ -3541,8 +4983,10 @@ pub async fn list_subscription_invocations(
     .bind(subscription)
     .bind(limit)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Non-terminal runs of a subscription — the concurrency-policy input.
@@ -3551,7 +4995,9 @@ pub async fn active_subscription_sessions(
     scope: TenantScope,
     subscription: Uuid,
 ) -> sqlx::Result<Vec<SessionRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select s.* from sessions s
          join trigger_invocations i on i.session_id = s.id
          where i.subscription_id = $1 and s.tenant_id = $2
@@ -3560,8 +5006,10 @@ pub async fn active_subscription_sessions(
     )
     .bind(subscription)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Free a claim whose run creation failed, so an immediate retry can re-try.
@@ -3570,6 +5018,7 @@ pub async fn release_invocation(
     scope: TenantScope,
     invocation: Uuid,
 ) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
         "delete from trigger_invocations where id = $1 and session_id is null
            and exists (select 1 from trigger_subscriptions sub
@@ -3578,8 +5027,9 @@ pub async fn release_invocation(
     )
     .bind(invocation)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -3589,7 +5039,9 @@ pub async fn list_subscription_sessions(
     subscription: Uuid,
     limit: i64,
 ) -> sqlx::Result<Vec<SessionRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select s.* from sessions s
          join trigger_invocations i on i.session_id = s.id
          where i.subscription_id = $1 and s.tenant_id = $3
@@ -3598,8 +5050,10 @@ pub async fn list_subscription_sessions(
     .bind(subscription)
     .bind(limit)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Scopes the trigger-token polling endpoint to runs this subscription made.
@@ -3609,6 +5063,7 @@ pub async fn subscription_owns_session(
     subscription: Uuid,
     session: Uuid,
 ) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query(
         "select exists(
            select 1 from trigger_invocations ti
@@ -3619,8 +5074,9 @@ pub async fn subscription_owns_session(
     .bind(subscription)
     .bind(session)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.get::<bool, _>("owned"))
 }
 
@@ -3654,6 +5110,7 @@ pub async fn result_delivery_exists_for(
     session: Uuid,
     destination: &Value,
 ) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let (exists,): (bool,) = sqlx::query_as(
         "select exists(select 1 from result_deliveries
            where session_id = $1 and destination = $2
@@ -3662,8 +5119,9 @@ pub async fn result_delivery_exists_for(
     .bind(session)
     .bind(destination)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(exists)
 }
 
@@ -3675,14 +5133,16 @@ pub async fn has_run_result_event(
     scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let (exists,): (bool,) = sqlx::query_as(
         "select exists(select 1 from events where session_id = $1 and type = 'run.result'
            and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $2))",
     )
     .bind(session)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(exists)
 }
 
@@ -3693,11 +5153,13 @@ pub async fn enqueue_result_delivery(
     subscription: Option<Uuid>,
     destination: &Value,
 ) -> sqlx::Result<ResultDeliveryRow> {
+    let mut tx = scoped_tx(pool, scope).await?;
+
     // The session must be in scope AND — when a subscription is named — it must
     // belong to the SAME tenant (a cross-tenant subscription is proven
     // impossible here, not just Rust-side). A miss → fetch_one RowNotFound, the
     // existing not-in-scope-session shape.
-    sqlx::query_as(
+    let __rls_out = sqlx::query_as(
         "insert into result_deliveries (id, session_id, subscription_id, destination)
          select $1, $2, $3, $4
          where exists (select 1 from sessions s where s.id = $2 and s.tenant_id = $5)
@@ -3710,8 +5172,10 @@ pub async fn enqueue_result_delivery(
     .bind(subscription)
     .bind(destination)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Record one attempt. ok → delivered; failure → attempts+1 and either
@@ -3727,7 +5191,9 @@ pub async fn mark_delivery_attempt(
     retry_in_secs: i64,
     max_attempts: i32,
 ) -> sqlx::Result<Option<ResultDeliveryRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "update result_deliveries set
             attempts = attempts + 1,
             status = case when $2 then 'delivered'
@@ -3750,8 +5216,10 @@ pub async fn mark_delivery_attempt(
     .bind(retry_in_secs as f64)
     .bind(max_attempts)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn list_session_deliveries(
@@ -3759,15 +5227,19 @@ pub async fn list_session_deliveries(
     scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<Vec<ResultDeliveryRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from result_deliveries where session_id = $1
            and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $2)
          order by created_at",
     )
     .bind(session)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn list_subscription_deliveries(
@@ -3776,7 +5248,9 @@ pub async fn list_subscription_deliveries(
     subscription: Uuid,
     limit: i64,
 ) -> sqlx::Result<Vec<ResultDeliveryRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from result_deliveries where subscription_id = $1
            and exists (select 1 from trigger_subscriptions sub
                        where sub.id = $1 and sub.tenant_id = $3)
@@ -3785,8 +5259,10 @@ pub async fn list_subscription_deliveries(
     .bind(subscription)
     .bind(limit)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 // ─── Schedules (Phase 3: the clock on a subscription) ────────────────────
@@ -3813,7 +5289,9 @@ pub async fn create_schedule(
     next_fire_at: DateTime<Utc>,
     missed_run_policy: &str,
 ) -> sqlx::Result<ScheduleRow> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "insert into schedules (id, subscription_id, cron, timezone, next_fire_at, missed_run_policy)
          select $1, $2, $3, $4, $5, $6
          where exists (select 1 from trigger_subscriptions where id = $2 and tenant_id = $7)
@@ -3826,8 +5304,10 @@ pub async fn create_schedule(
     .bind(next_fire_at)
     .bind(missed_run_policy)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn schedule_for_subscription(
@@ -3835,29 +5315,37 @@ pub async fn schedule_for_subscription(
     scope: TenantScope,
     subscription: Uuid,
 ) -> sqlx::Result<Option<ScheduleRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from schedules where subscription_id = $1
            and exists (select 1 from trigger_subscriptions sub
                        where sub.id = $1 and sub.tenant_id = $2)",
     )
     .bind(subscription)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn schedules_for_tenant(
     pool: &PgPool,
     scope: TenantScope,
 ) -> sqlx::Result<Vec<ScheduleRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select sc.* from schedules sc
          join trigger_subscriptions sub on sub.id = sc.subscription_id
          where sub.tenant_id = $1",
     )
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// CAS advance: only moves the clock if next_fire_at is still the fire time
@@ -3871,6 +5359,7 @@ pub async fn advance_schedule(
     to: Option<DateTime<Utc>>,
     fired_at: Option<DateTime<Utc>>,
 ) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let res = sqlx::query(
         "update schedules set
             next_fire_at = $2,
@@ -3885,8 +5374,9 @@ pub async fn advance_schedule(
     .bind(fired_at)
     .bind(from)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -3896,6 +5386,7 @@ pub async fn create_trigger_token(
     subscription: Uuid,
     token_plain: &str,
 ) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
         "insert into api_tokens (id, tenant_id, kind, subscription_id, token_sha256)
          values ($1, $2, 'trigger', $3, $4)",
@@ -3904,8 +5395,9 @@ pub async fn create_trigger_token(
     .bind(scope.tenant_id())
     .bind(subscription)
     .bind(sha256_hex(token_plain))
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -3928,6 +5420,9 @@ pub async fn subscription_for_token(
     pool: &PgPool,
     token_plain: &str,
 ) -> sqlx::Result<Option<TriggerTokenAuth>> {
+    // Credential-digest bootstrap resolution (audited bypass): the trigger token's
+    // sha256 is the only key; the verified tenant rides out on the returned row.
+    let mut tx = worker_tx(pool).await?;
     let row = sqlx::query(
         "select id, subscription_id, tenant_id from api_tokens
          where kind = 'trigger' and token_sha256 = $1
@@ -3935,8 +5430,9 @@ pub async fn subscription_for_token(
            and (expires_at is null or expires_at > now())",
     )
     .bind(sha256_hex(token_plain))
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.and_then(|r| {
         r.get::<Option<Uuid>, _>("subscription_id")
             .map(|subscription_id| TriggerTokenAuth {
@@ -3959,6 +5455,7 @@ pub async fn trigger_token_active(
     scope: TenantScope,
     token_id: Uuid,
 ) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query(
         "select exists (
              select 1
@@ -3973,8 +5470,9 @@ pub async fn trigger_token_active(
     )
     .bind(token_id)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.get::<bool, _>("ok"))
 }
 
@@ -3984,6 +5482,7 @@ pub async fn revoke_trigger_tokens(
     scope: TenantScope,
     subscription: Uuid,
 ) -> sqlx::Result<u64> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let res = sqlx::query(
         "update api_tokens set revoked_at = now()
          where kind = 'trigger' and subscription_id = $1 and revoked_at is null
@@ -3992,8 +5491,9 @@ pub async fn revoke_trigger_tokens(
     )
     .bind(subscription)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(res.rows_affected())
 }
 
@@ -4041,6 +5541,7 @@ pub async fn insert_trigger_delivery(
     payload_digest: &str,
     occurred_at: Option<DateTime<Utc>>,
 ) -> sqlx::Result<(TriggerDeliveryRow, bool)> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let inserted: Option<TriggerDeliveryRow> = sqlx::query_as(
         "insert into trigger_deliveries
            (id, connection_id, external_event_id, event_type, payload, payload_digest, occurred_at)
@@ -4057,9 +5558,10 @@ pub async fn insert_trigger_delivery(
     .bind(payload_digest)
     .bind(occurred_at)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     if let Some(row) = inserted {
+        tx.commit().await?;
         return Ok((row, true));
     }
     let existing = sqlx::query_as(
@@ -4069,8 +5571,9 @@ pub async fn insert_trigger_delivery(
     .bind(connection)
     .bind(external_event_id)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok((existing, false))
 }
 
@@ -4089,6 +5592,7 @@ pub async fn claim_trigger_dispatch(
     // tenant (the delivery→connection→tenant join is the same proof
     // `list_delivery_dispatches` uses). A miss → zero rows → None, the existing
     // no-claim shape.
+    let mut tx = scoped_tx(pool, scope).await?;
     let inserted: Option<TriggerDispatchRow> = sqlx::query_as(
         "insert into trigger_dispatches (id, delivery_id, subscription_id)
          select $1,$2,$3
@@ -4104,12 +5608,13 @@ pub async fn claim_trigger_dispatch(
     .bind(delivery)
     .bind(subscription)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     if inserted.is_some() {
+        tx.commit().await?;
         return Ok(inserted);
     }
-    sqlx::query_as(
+    let __rls_out = sqlx::query_as(
         "update trigger_dispatches
             set created_at = now()
           where delivery_id = $1 and subscription_id = $2
@@ -4125,8 +5630,10 @@ pub async fn claim_trigger_dispatch(
     .bind(delivery)
     .bind(subscription)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Terminal bookkeeping for a claimed-but-not-run dispatch (skipped |
@@ -4138,6 +5645,7 @@ pub async fn mark_dispatch_outcome(
     status: &str,
     skip_reason: Option<&str>,
 ) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
         "update trigger_dispatches set status = $2, skip_reason = $3
          where id = $1 and session_id is null
@@ -4148,8 +5656,9 @@ pub async fn mark_dispatch_outcome(
     .bind(status)
     .bind(skip_reason)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -4158,7 +5667,9 @@ pub async fn list_delivery_dispatches(
     scope: TenantScope,
     delivery: Uuid,
 ) -> sqlx::Result<Vec<TriggerDispatchRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from trigger_dispatches where delivery_id = $1
            and exists (select 1 from trigger_deliveries d
                        join integration_connections c on c.id = d.connection_id
@@ -4167,8 +5678,10 @@ pub async fn list_delivery_dispatches(
     )
     .bind(delivery)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn list_connection_deliveries(
@@ -4177,7 +5690,9 @@ pub async fn list_connection_deliveries(
     connection: Uuid,
     limit: i64,
 ) -> sqlx::Result<Vec<TriggerDeliveryRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from trigger_deliveries where connection_id = $1
            and exists (select 1 from integration_connections c where c.id = $1 and c.tenant_id = $3)
          order by received_at desc limit $2",
@@ -4185,8 +5700,10 @@ pub async fn list_connection_deliveries(
     .bind(connection)
     .bind(limit)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 // ─── External results (§17 #3: stable update-in-place identity) ───────────
@@ -4210,7 +5727,9 @@ pub async fn get_external_result(
     kind: &str,
     resource_key: &str,
 ) -> sqlx::Result<Option<ExternalResultRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from external_results
          where subscription_id = $1 and kind = $2 and resource_key = $3
            and exists (select 1 from trigger_subscriptions sub
@@ -4220,8 +5739,10 @@ pub async fn get_external_result(
     .bind(kind)
     .bind(resource_key)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn upsert_external_result(
@@ -4233,7 +5754,9 @@ pub async fn upsert_external_result(
     external_id: &str,
     external_url: Option<&str>,
 ) -> sqlx::Result<ExternalResultRow> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "insert into external_results
            (id, subscription_id, kind, resource_key, external_id, external_url)
          select $1,$2,$3,$4,$5,$6
@@ -4252,10 +5775,19 @@ pub async fn upsert_external_result(
     .bind(external_id)
     .bind(external_url)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
+/// The LISTEN/NOTIFY relay runs on its OWN connection (outside the app pool) and
+/// needs NO tenant GUC: `LISTEN fluidbox_events` and the `pg_notify` payloads it
+/// receives (`session_id:seq`) are not table reads, so RLS never applies here. The
+/// notify is only a wakeup — the `seq` catch-up query that actually delivers events
+/// rides the RLS-scoped `events_after` on the app pool (via the SSE handlers), so
+/// this connection deliberately stays role-plain (it does not even need the runtime
+/// role; it only LISTENs).
 pub fn spawn_listener(database_url: String) -> tokio::sync::broadcast::Sender<(Uuid, i64)> {
     let (tx, _) = tokio::sync::broadcast::channel::<(Uuid, i64)>(1024);
     let tx2 = tx.clone();
@@ -4314,7 +5846,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -4598,7 +6130,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
 
@@ -4690,7 +6222,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -4787,7 +6319,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -4930,7 +6462,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -5107,7 +6639,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -5210,7 +6742,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
 
@@ -5222,10 +6754,12 @@ mod tests {
             "test-account-42",
             "test-connection",
             Some(&sealed),
+            1,
             &serde_json::json!(["repo"]),
             &serde_json::json!({}),
             &serde_json::json!({"test": true}),
             None,
+            1,
             ConnectionAuth::static_active(),
             ConnectionOwner::Organization,
             None,
@@ -5245,7 +6779,7 @@ mod tests {
             .await
             .unwrap()
             .expect("active connection has credential");
-        assert_eq!(got, sealed);
+        assert_eq!(got, (sealed, 1), "legacy sealer stamps key_version 1");
 
         // Revocation is terminal for credential access.
         let revoked = revoke_connection(&pool, scope, conn.id)
@@ -5276,7 +6810,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -5325,6 +6859,7 @@ mod tests {
             None,
             &serde_json::json!([{"kind": "signed_webhook", "url": "http://127.0.0.1:1/cb"}]),
             Some(&sealed),
+            1,
             None,
             None,
             None,
@@ -5344,7 +6879,7 @@ mod tests {
         let got = subscription_callback_secret_sealed(&pool, scope, sub.id)
             .await
             .unwrap();
-        assert_eq!(got, Some(sealed));
+        assert_eq!(got, Some((sealed, 1)));
 
         // Trigger tokens: hashed at rest, resolvable, revocable.
         create_trigger_token(&pool, scope, sub.id, "fbx_trig_testtoken123")
@@ -5394,7 +6929,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -5441,6 +6976,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             None,
+            1,
             None,
             None,
             None,
@@ -5547,7 +7083,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let agent = create_agent(&pool, scope, "test-sched-agent", None)
@@ -5569,6 +7105,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             None,
+            1,
             None,
             None,
             None,
@@ -5672,7 +7209,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -5798,7 +7335,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -5874,7 +7411,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let name = format!("test-bundle-{}", Uuid::now_v7());
@@ -5966,6 +7503,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             None,
+            1,
             None,
             None,
             None,
@@ -6005,7 +7543,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         // The curated seeds are GLOBAL (tenant_id null); any valid scope sees
         // them via the tenant-or-global reader.
         let tenant = ensure_default_tenant(&pool).await.unwrap();
@@ -6115,7 +7653,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
 
@@ -6127,15 +7665,18 @@ mod tests {
             "mcp.example.test",
             "oauth-lifecycle-test",
             None,
+            1,
             &serde_json::json!([]),
             &serde_json::json!({}),
             &serde_json::json!({"base_url": "https://mcp.example.test"}),
             None,
+            1,
             ConnectionAuth {
                 auth_kind: "oauth",
                 status: "pending",
                 oauth: Some(&serde_json::json!({"resource": "https://mcp.example.test"})),
                 client_secret_sealed: Some(b"sealed-client-secret"),
+                client_secret_key_version: 1,
                 registration_id: None,
             },
             ConnectionOwner::Organization,
@@ -6155,24 +7696,41 @@ mod tests {
             connection_client_secret_sealed(&pool, scope, conn.id)
                 .await
                 .unwrap()
+                .map(|t| t.0)
                 .as_deref(),
             Some(b"sealed-client-secret".as_slice())
         );
         // Rotation refuses non-active rows.
-        assert!(!rotate_connection_refresh(&pool, scope, conn.id, b"rt1", 1)
-            .await
-            .unwrap());
+        assert!(
+            !rotate_connection_refresh(&pool, scope, conn.id, b"rt1", 1, 1)
+                .await
+                .unwrap()
+        );
 
         // Callback exchange: seal refresh + activate. First connect (from
         // `pending`) ⇒ no bump — the bump is derived from the row's pre-update
         // status inside the UPDATE (B1), not a caller boolean.
+        // `flow_a_started` stands in for the flow row's `created_at` (frozen at
+        // START, before any activation). It is read from the DB clock, exactly
+        // like the real `connector_oauth_flows.created_at default now()` — the
+        // comparison is DB-clock vs DB-clock, never the test host's clock.
+        let db_now = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, DateTime<Utc>>("select clock_timestamp()")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        let flow_a_started = db_now(pool.clone()).await;
         let row = activate_connection_oauth(
             &pool,
             scope,
             conn.id,
             b"sealed-rt-1",
+            1,
             &serde_json::json!({"resource": "https://mcp.example.test", "client_id": "c1"}),
             &serde_json::json!(["read"]),
+            1,
+            flow_a_started,
         )
         .await
         .unwrap()
@@ -6182,10 +7740,83 @@ mod tests {
             row.authorization_generation, 1,
             "first activation stays generation 1 (no bump)"
         );
+        // H2: a SIBLING first-connect flow — same frozen generation, started
+        // before the winner activated — is now refused by the write itself. Its
+        // generation expectation is still satisfiable (pending → active does not
+        // bump), so the activation instant is the only thing that separates them.
+        assert!(
+            activate_connection_oauth(
+                &pool,
+                scope,
+                conn.id,
+                b"sealed-rt-sibling",
+                1,
+                &serde_json::json!({"resource": "https://mcp.example.test"}),
+                &serde_json::json!([]),
+                1,
+                flow_a_started,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "a first-connect sibling flow must not overwrite the grant that activated first"
+        );
         assert_eq!(
             connection_credential_sealed(&pool, scope, conn.id)
                 .await
                 .unwrap()
+                .map(|t| t.0)
+                .as_deref(),
+            Some(b"sealed-rt-1".as_slice()),
+            "the superseded sibling left the winner's refresh token untouched"
+        );
+        // H2: a flow START rewrites the oauth bag from a value it read BEFORE the
+        // activation. The activation stamp must survive that read-modify-write —
+        // erasing it would hand the superseded sibling a passing expectation.
+        // In production this write now rides the start's lock-holding transaction
+        // (#32), so the carry-over is belt-and-braces there; it stays the ONLY
+        // protection for a caller that passes a bare pool, as here.
+        update_connection_oauth(
+            &pool,
+            scope,
+            conn.id,
+            &serde_json::json!({"resource": "https://mcp.example.test", "issuer": "https://as"}),
+        )
+        .await
+        .unwrap();
+        let after_start = get_connection(&pool, scope, conn.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .oauth
+            .unwrap();
+        assert!(
+            after_start.get(ACTIVATED_AT_KEY).is_some(),
+            "the activation stamp survives a flow-start bag rewrite"
+        );
+        assert_eq!(after_start["issuer"], "https://as", "the rest is replaced");
+        assert!(
+            activate_connection_oauth(
+                &pool,
+                scope,
+                conn.id,
+                b"sealed-rt-sibling-2",
+                1,
+                &serde_json::json!({"resource": "https://mcp.example.test"}),
+                &serde_json::json!([]),
+                1,
+                flow_a_started,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "the sibling is still refused after a concurrent flow start"
+        );
+        assert_eq!(
+            connection_credential_sealed(&pool, scope, conn.id)
+                .await
+                .unwrap()
+                .map(|t| t.0)
                 .as_deref(),
             Some(b"sealed-rt-1".as_slice())
         );
@@ -6193,7 +7824,7 @@ mod tests {
         // Rotation is one atomic overwrite AT the current generation; the old
         // bytes are gone.
         assert!(
-            rotate_connection_refresh(&pool, scope, conn.id, b"sealed-rt-2", 1)
+            rotate_connection_refresh(&pool, scope, conn.id, b"sealed-rt-2", 1, 1)
                 .await
                 .unwrap()
         );
@@ -6201,13 +7832,14 @@ mod tests {
             connection_credential_sealed(&pool, scope, conn.id)
                 .await
                 .unwrap()
+                .map(|t| t.0)
                 .as_deref(),
             Some(b"sealed-rt-2".as_slice())
         );
         // A rotation naming a stale (moved) generation is refused (R3.2): the
         // grant was reauthorized underneath the in-flight refresh.
         assert!(
-            !rotate_connection_refresh(&pool, scope, conn.id, b"sealed-rt-stale", 999)
+            !rotate_connection_refresh(&pool, scope, conn.id, b"sealed-rt-stale", 1, 999)
                 .await
                 .unwrap(),
             "rotation at a superseded generation must fail closed"
@@ -6235,13 +7867,36 @@ mod tests {
         // Reconnect path: activation works FROM error too, and bumps the
         // generation atomically (R1.3+R3.1) — the reconnect may be a new grant.
         // The bump is derived from the pre-update status (`error` <> `pending`).
+        let flow_b_started = db_now(pool.clone()).await;
+        // H2: a reconnect flow frozen at a STALE generation is refused by the
+        // write, even though its start-time instant is fresh.
+        assert!(
+            activate_connection_oauth(
+                &pool,
+                scope,
+                conn.id,
+                b"sealed-rt-stale-gen",
+                1,
+                &serde_json::json!({"resource": "https://mcp.example.test"}),
+                &serde_json::json!([]),
+                999,
+                flow_b_started,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "activation at a superseded generation must fail closed"
+        );
         let row = activate_connection_oauth(
             &pool,
             scope,
             conn.id,
             b"sealed-rt-3",
+            1,
             &serde_json::json!({"resource": "https://mcp.example.test"}),
             &serde_json::json!([]),
+            1,
+            flow_b_started,
         )
         .await
         .unwrap()
@@ -6255,13 +7910,20 @@ mod tests {
         // B1 regression: re-activating an ALREADY-active row bumps again — proving
         // the bump is derived from the row's live status under the lock, not from
         // a pre-lock read (two racing first-connects that both saw `pending`).
+        // H2: it takes a flow that started AFTER the last activation and names the
+        // now-current generation — i.e. a genuinely newer authorization, which is
+        // exactly what the CAS admits (and the superseded ones above it refuses).
+        let flow_c_started = db_now(pool.clone()).await;
         let row = activate_connection_oauth(
             &pool,
             scope,
             conn.id,
             b"sealed-rt-4",
+            1,
             &serde_json::json!({"resource": "https://mcp.example.test"}),
             &serde_json::json!([]),
+            2,
+            flow_c_started,
         )
         .await
         .unwrap()
@@ -6269,6 +7931,34 @@ mod tests {
         assert_eq!(
             row.authorization_generation, 3,
             "activating the now-active row bumps again (status <> 'pending')"
+        );
+        // H2: replaying that same flow (its instant is now older than the
+        // activation it just performed) matches nothing — one activation per flow,
+        // enforced by the write, not only by the one-time claim.
+        assert!(
+            activate_connection_oauth(
+                &pool,
+                scope,
+                conn.id,
+                b"sealed-rt-replay",
+                1,
+                &serde_json::json!({"resource": "https://mcp.example.test"}),
+                &serde_json::json!([]),
+                3,
+                flow_c_started,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "a flow cannot activate twice: its start instant is older than its own activation"
+        );
+        assert_eq!(
+            connection_credential_sealed(&pool, scope, conn.id)
+                .await
+                .unwrap()
+                .map(|t| t.0)
+                .as_deref(),
+            Some(b"sealed-rt-4".as_slice())
         );
 
         sqlx::query("delete from integration_connections where id = $1")
@@ -6287,7 +7977,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let yaml = "name: ov-test\ntools: []\n";
@@ -6371,7 +8061,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
 
@@ -6436,7 +8126,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
 
@@ -6516,6 +8206,80 @@ mod tests {
             .is_empty());
     }
 
+    /// Run migration 0013's legacy-bundle conversion RLS-BOUND — the ONLY
+    /// sanctioned way for a test to invoke it (see the source guard
+    /// `conversion_is_only_ever_invoked_rls_bound`).
+    ///
+    /// WHY (CI round 4, #32). The conversion is a deliberately tenant-LESS
+    /// maintenance scan — `for v_agent in select id, tenant_id from agents` — and it
+    /// allocates each appended revision's `rev` from a per-agent counter seeded by
+    /// the current `max(rev)`. Called bare on the shared test database it therefore
+    /// converts EVERY other test's agents as well as its own, and two calls in
+    /// flight at the same moment both read `max(rev) = 1` and both insert rev 2: the
+    /// loser waits on `agent_revisions_agent_id_rev_key` and dies with 23505. That
+    /// is exactly how CI failed — the three conversion tests all ran within 300 ms
+    /// of each other and one of them had its own agent converted out from under it.
+    ///
+    /// The confinement has to be RLS, because the function takes no tenant
+    /// argument. A DEDICATED connection `SET ROLE`s to migration 0018's runtime role
+    /// — CI's base user is the SUPERUSER `postgres`, for whom Postgres skips every
+    /// policy, so the `SET ROLE` is what makes the policy run at all — and then sets
+    /// `fluidbox.tenant_id`. The function is SECURITY INVOKER, so every read and
+    /// write inside it is policy-filtered to `tenant`: a test can now only ever
+    /// convert its own throwaway org, whatever else is running beside it.
+    ///
+    /// The connection is dedicated, never borrowed from the fixture pool, because
+    /// `SET ROLE` is SESSION state and would ride a pooled connection back to the
+    /// next borrower.
+    ///
+    /// `tenant: None` sets NO GUC at all. That is used once, on purpose, to prove
+    /// the degraded mode of a GUC-less caller: zero visible `agents` rows means the
+    /// loop body never runs, so the conversion is a silent NO-OP rather than a
+    /// miscomputed append.
+    async fn convert_legacy_bundles_rls_bound(url: &str, tenant: Option<Uuid>) {
+        use sqlx::{Connection, Executor};
+        let mut conn = sqlx::PgConnection::connect(url)
+            .await
+            .expect("conversion connection");
+        conn.execute("set role fluidbox_runtime")
+            .await
+            .expect("set role fluidbox_runtime (migration 0018 creates + grants it)");
+        let mut tx = conn.begin().await.expect("begin conversion tx");
+        if let Some(t) = tenant {
+            sqlx::query("select set_config('fluidbox.tenant_id', $1, true)")
+                .bind(t.to_string())
+                .execute(&mut *tx)
+                .await
+                .expect("tenant guc");
+        }
+        sqlx::query("select fluidbox_convert_legacy_bundles()")
+            .execute(&mut *tx)
+            .await
+            .expect("conversion");
+        tx.commit().await.expect("commit conversion tx");
+        conn.close().await.ok();
+    }
+
+    /// Source guard for the CI-round-4 class (#32). The conversion is tenant-less
+    /// and races on `max(rev)`, so ANY caller outside
+    /// `convert_legacy_bundles_rls_bound` reintroduces the cross-test collision.
+    /// This is a source assertion, not a DB test: it runs even without
+    /// `DATABASE_URL`, so a re-added bare caller fails CI immediately instead of
+    /// flaking. The needle is assembled from two halves so this guard is not itself
+    /// an occurrence of it.
+    #[test]
+    fn conversion_is_only_ever_invoked_rls_bound() {
+        let needle = concat!("select fluidbox_convert_legacy", "_bundles()");
+        let n = include_str!("lib.rs").matches(needle).count();
+        assert_eq!(
+            n, 1,
+            "`{needle}` must appear exactly ONCE in fluidbox-db (inside \
+             convert_legacy_bundles_rls_bound) — found {n}. Route the new call through that \
+             helper: a bare pool call converts every other test's agents and races them for \
+             the next rev (23505 on agent_revisions_agent_id_rev_key)."
+        );
+    }
+
     /// Migration 0013 appendix (`fluidbox_convert_legacy_bundles`): a legacy
     /// agent whose LATEST revision pins a brokered bundle gets an APPENDED
     /// sandbox-only revision whose brokered servers became
@@ -6530,7 +8294,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = identity::create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -6551,10 +8315,12 @@ mod tests {
             "mcp.github.test",
             "GitHub MCP",
             None,
+            1,
             &serde_json::json!([]),
             &serde_json::json!({}),
             &serde_json::json!({ "base_url": gh_url }),
             None,
+            1,
             ConnectionAuth::static_active(),
             ConnectionOwner::Organization,
             None,
@@ -6671,6 +8437,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             None,
+            1,
             None,
             None,
             None,
@@ -6680,11 +8447,10 @@ mod tests {
         .await
         .unwrap();
 
-        // ── Convert (the DB test calls the function 0013 defined + already ran) ──
-        sqlx::query("select fluidbox_convert_legacy_bundles()")
-            .execute(&pool)
-            .await
-            .unwrap();
+        // ── Convert (the DB test calls the function 0013 defined + already ran),
+        // RLS-BOUND and confined to this org so it cannot reach — or race — the
+        // other conversion tests' agents. ──
+        convert_legacy_bundles_rls_bound(&url, Some(org.id)).await;
 
         let latest = latest_revision(&pool, scope, agent.id)
             .await
@@ -6697,10 +8463,7 @@ mod tests {
         let revs_after = list_revisions(&pool, scope, agent.id).await.unwrap();
 
         // Idempotence: a SECOND call must not append again.
-        sqlx::query("select fluidbox_convert_legacy_bundles()")
-            .execute(&pool)
-            .await
-            .unwrap();
+        convert_legacy_bundles_rls_bound(&url, Some(org.id)).await;
         let revs_after2 = list_revisions(&pool, scope, agent.id).await.unwrap();
         let latest2 = latest_revision(&pool, scope, agent.id)
             .await
@@ -6830,15 +8593,19 @@ mod tests {
     /// agent in the same call also converts (both get new revisions); (d) an
     /// agent with NO subscription converts cleanly (nothing to repoint); (e) an
     /// unresolvable BundleRef object AND a non-numeric `name@abc` string pin
-    /// (Finding 3) are both dropped without aborting, the other pins converting.
-    /// One conversion call; throwaway org; children-first cleanup BEFORE asserts.
+    /// (Finding 3) are both dropped without aborting, the other pins converting;
+    /// (f) the RLS degraded mode — the same function on an RLS-bound connection with
+    /// NO GUC converts NOTHING (a silent no-op, never a partial append).
+    /// One conversion call (RLS-bound, confined to this org — see
+    /// `convert_legacy_bundles_rls_bound`); throwaway org; children-first cleanup
+    /// BEFORE asserts.
     #[tokio::test]
     async fn convert_legacy_bundles_covers_skip_dedup_multiagent_and_unresolvable() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = identity::create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -6980,6 +8747,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             None,
+            1,
             None,
             None,
             None,
@@ -6989,11 +8757,26 @@ mod tests {
         .await
         .unwrap();
 
-        // ── One conversion call processes BOTH agents (c). ──
-        sqlx::query("select fluidbox_convert_legacy_bundles()")
-            .execute(&pool)
+        // ── (f) GUC guard, asserted below: the SAME function on an RLS-BOUND
+        // connection with NEITHER GUC set sees zero `agents` rows, so its loop body
+        // never runs and it converts NOTHING. Pinning that here keeps the degraded
+        // mode honest — a GUC-less caller is a silent NO-OP, never a partial or
+        // miscomputed append — and proves the confinement below is real RLS rather
+        // than coincidence. ──
+        convert_legacy_bundles_rls_bound(&url, None).await;
+        let revs_a_gucless = list_revisions(&pool, scope, agent_a.id)
             .await
-            .unwrap();
+            .unwrap()
+            .len();
+        let revs_b_gucless = list_revisions(&pool, scope, agent_b.id)
+            .await
+            .unwrap()
+            .len();
+
+        // ── One conversion call processes BOTH agents (c) — RLS-BOUND and confined
+        // to this org, so it can neither reach nor race the other conversion
+        // tests' agents (they are in their own throwaway orgs). ──
+        convert_legacy_bundles_rls_bound(&url, Some(org.id)).await;
 
         let latest_a = latest_revision(&pool, scope, agent_a.id)
             .await
@@ -7027,6 +8810,15 @@ mod tests {
             .unwrap();
 
         // ── Asserts ──
+        // (f) The GUC-less call converted NOTHING: both agents still stood at their
+        // single seed revision when the confined call ran. This is the fail-closed
+        // direction of the RLS contract — invisible rows mean no work, not wrong work.
+        assert_eq!(
+            (revs_a_gucless, revs_b_gucless),
+            (1, 1),
+            "a GUC-less conversion must be a silent NO-OP (RLS hides every agent row)"
+        );
+
         // (c) BOTH agents converted in the single call — each has exactly two
         // revisions, the new one appended at rev+1.
         assert_eq!(revs_a.len(), 2, "agent A converted (rev appended)");
@@ -7107,7 +8899,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = identity::create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -7177,6 +8969,7 @@ mod tests {
                     None,
                     &serde_json::json!([]),
                     None,
+                    1,
                     None,
                     None,
                     None,
@@ -7313,6 +9106,7 @@ mod tests {
                     None,
                     &serde_json::json!([]),
                     None,
+                    1,
                     None,
                     None,
                     None,
@@ -7333,11 +9127,11 @@ mod tests {
             mk_float(agent_r.id, "float-empty", Some(serde_json::json!([]))).await;
         let sub_float_null = mk_float(agent_r.id, "float-null", None).await;
 
-        // ── Convert, then re-convert for idempotence (v). ──
-        sqlx::query("select fluidbox_convert_legacy_bundles()")
-            .execute(&pool)
-            .await
-            .unwrap();
+        // ── Convert, then re-convert for idempotence (v). RLS-BOUND and confined to
+        // this org: the fixtures below are built across several statements, and an
+        // unconfined conversion from a sibling test could otherwise repoint them
+        // mid-build (or race this call for the next rev). ──
+        convert_legacy_bundles_rls_bound(&url, Some(org.id)).await;
 
         let p_revs = list_revisions(&pool, scope, agent_p.id).await.unwrap();
         let p_latest = latest_revision(&pool, scope, agent_p.id)
@@ -7388,10 +9182,7 @@ mod tests {
             .unwrap();
 
         // Idempotence: a second run appends nothing and moves no pin.
-        sqlx::query("select fluidbox_convert_legacy_bundles()")
-            .execute(&pool)
-            .await
-            .unwrap();
+        convert_legacy_bundles_rls_bound(&url, Some(org.id)).await;
         let p_revs2 = list_revisions(&pool, scope, agent_p.id).await.unwrap();
         let q_revs2 = list_revisions(&pool, scope, agent_q.id).await.unwrap();
         let r_revs2 = list_revisions(&pool, scope, agent_r.id).await.unwrap();
@@ -7614,7 +9405,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
 
         let slug_a = format!("t-{}", Uuid::now_v7().simple());
         let slug_b = format!("t-{}", Uuid::now_v7().simple());
@@ -7804,7 +9595,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -7846,7 +9637,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -7894,7 +9685,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -7911,10 +9702,12 @@ mod tests {
             "acct",
             "disp",
             Some(&[1, 2, 3]),
+            1,
             &serde_json::json!([]),
             &serde_json::json!({}),
             &serde_json::json!({"base_url":"https://x"}),
             None,
+            1,
             ConnectionAuth::static_active(),
             ConnectionOwner::Organization,
             None,
@@ -7960,7 +9753,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -7989,6 +9782,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             None,
+            1,
             None,
             None,
             None,
@@ -8035,7 +9829,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -8064,6 +9858,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             None,
+            1,
             None,
             None,
             None,
@@ -8118,7 +9913,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -8147,6 +9942,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             None,
+            1,
             None,
             None,
             None,
@@ -8264,7 +10060,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = identity::create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -8290,10 +10086,12 @@ mod tests {
             "acct-org",
             "Org conn",
             None,
+            1,
             &serde_json::json!([]),
             &serde_json::json!({}),
             &serde_json::json!({}),
             None,
+            1,
             ConnectionAuth::static_active(),
             ConnectionOwner::Organization,
             None,
@@ -8307,10 +10105,12 @@ mod tests {
             "acct-alice",
             "Alice personal",
             None,
+            1,
             &serde_json::json!([]),
             &serde_json::json!({}),
             &serde_json::json!({}),
             None,
+            1,
             ConnectionAuth::static_active(),
             ConnectionOwner::User(alice),
             Some(alice),
@@ -8383,7 +10183,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug_a = format!("t-{}", Uuid::now_v7().simple());
         let slug_b = format!("t-{}", Uuid::now_v7().simple());
         let org_a = identity::create_org(&pool, &slug_a, None).await.unwrap();
@@ -8398,10 +10198,12 @@ mod tests {
             "acct-snap",
             "Snap conn",
             None,
+            1,
             &serde_json::json!([]),
             &serde_json::json!({}),
             &serde_json::json!({}),
             None,
+            1,
             ConnectionAuth::static_active(),
             ConnectionOwner::Organization,
             None,
@@ -8498,7 +10300,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = identity::create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -8510,10 +10312,12 @@ mod tests {
             "acct-gen",
             "Gen conn",
             None,
+            1,
             &serde_json::json!([]),
             &serde_json::json!({}),
             &serde_json::json!({}),
             None,
+            1,
             ConnectionAuth::static_active(),
             ConnectionOwner::Organization,
             None,
@@ -8587,7 +10391,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug_a = format!("t-{}", Uuid::now_v7().simple());
         let slug_b = format!("t-{}", Uuid::now_v7().simple());
         let org_a = identity::create_org(&pool, &slug_a, None).await.unwrap();
@@ -8654,10 +10458,12 @@ mod tests {
             "acct-rb",
             "RB conn",
             None,
+            1,
             &serde_json::json!([]),
             &serde_json::json!({}),
             &serde_json::json!({}),
             None,
+            1,
             ConnectionAuth::static_active(),
             ConnectionOwner::Organization,
             None,
@@ -8858,7 +10664,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = identity::create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -8905,6 +10711,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             None,
+            1,
             None,
             None,
             None,
@@ -9016,7 +10823,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug_a = format!("t-{}", Uuid::now_v7().simple());
         let slug_b = format!("t-{}", Uuid::now_v7().simple());
         let org_a = identity::create_org(&pool, &slug_a, None).await.unwrap();
@@ -9094,5 +10901,1661 @@ mod tests {
             "B's list excludes A's custom entry"
         );
         assert!(collision.is_none(), "a global-slug collision is refused");
+    }
+
+    // ─── Phase D envelope sealing (#32) ─────────────────────────────────────
+
+    async fn new_dek_org(pool: &PgPool) -> TenantScope {
+        let slug = format!("t-{}", Uuid::now_v7().simple());
+        let org = crate::identity::create_org(pool, &slug, None)
+            .await
+            .unwrap();
+        TenantScope::assume(org.id)
+    }
+
+    // Children-first cleanup (tenant FKs are NO ACTION): tenant_llm_keys +
+    // tenant_deks + integration_connections before the tenant row.
+    async fn cleanup_dek_tenant(pool: &PgPool, tenant: Uuid) {
+        for stmt in [
+            "delete from tenant_llm_keys where tenant_id = $1",
+            "delete from tenant_deks where tenant_id = $1",
+            "delete from integration_connections where tenant_id = $1",
+            "delete from tenants where id = $1",
+        ] {
+            sqlx::query(stmt).bind(tenant).execute(pool).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn tenant_dek_get_insert_latest() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let scope = new_dek_org(&pool).await;
+        let tenant = scope.tenant_id();
+
+        assert!(get_tenant_dek(&pool, tenant, 1).await.unwrap().is_none());
+        assert!(latest_tenant_dek(&pool, tenant).await.unwrap().is_none());
+
+        insert_tenant_dek(&pool, tenant, 1, "static:abc", b"wrapped-dek-1")
+            .await
+            .unwrap();
+        let row = get_tenant_dek(&pool, tenant, 1)
+            .await
+            .unwrap()
+            .expect("row");
+        assert_eq!(row.version, 1);
+        assert_eq!(row.kek_id, "static:abc");
+        assert_eq!(row.wrapped_dek, b"wrapped-dek-1");
+        assert!(row.retired_at.is_none());
+        assert_eq!(
+            latest_tenant_dek(&pool, tenant)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            1
+        );
+        // A version that was never minted is None (open must fail closed on it).
+        assert!(get_tenant_dek(&pool, tenant, 2).await.unwrap().is_none());
+
+        cleanup_dek_tenant(&pool, tenant).await;
+    }
+
+    #[tokio::test]
+    async fn tenant_dek_insert_race_one_row_wins() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let scope = new_dek_org(&pool).await;
+        let tenant = scope.tenant_id();
+
+        // Concurrent first-mints for (tenant, 1) with DIFFERENT wrapped bytes:
+        // `on conflict do nothing` means exactly ONE row lands, and every racer
+        // that re-reads sees the SAME winner (kms::dek_for_seal relies on this to
+        // converge concurrent first-seals on one DEK).
+        let mut handles = vec![];
+        for i in 0..6u8 {
+            let p = pool.clone();
+            handles.push(tokio::spawn(async move {
+                insert_tenant_dek(&p, tenant, 1, "static:race", &[i; 16])
+                    .await
+                    .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let (n,): (i64,) =
+            sqlx::query_as("select count(*) from tenant_deks where tenant_id = $1 and version = 1")
+                .bind(tenant)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(n, 1, "exactly one DEK row survives the race");
+        let winner = get_tenant_dek(&pool, tenant, 1)
+            .await
+            .unwrap()
+            .unwrap()
+            .wrapped_dek;
+        assert_eq!(
+            get_tenant_dek(&pool, tenant, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .wrapped_dek,
+            winner,
+            "re-reads are stable — all racers unwrap the same DEK"
+        );
+
+        cleanup_dek_tenant(&pool, tenant).await;
+    }
+
+    #[tokio::test]
+    async fn sealed_column_key_version_roundtrips_and_counts() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let scope = new_dek_org(&pool).await;
+        let tenant = scope.tenant_id();
+
+        // A v2-marked credential + webhook secret round-trip their key_version.
+        let v2 = create_connection(
+            &pool,
+            scope,
+            "github",
+            "kv-acct-v2",
+            "kv-conn-v2",
+            Some(b"env-cred"),
+            2,
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            Some(b"env-webhook"),
+            2,
+            ConnectionAuth::static_active(),
+            ConnectionOwner::Organization,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            connection_credential_sealed(&pool, scope, v2.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            (b"env-cred".to_vec(), 2)
+        );
+        assert_eq!(
+            connection_webhook_secret_sealed(&pool, scope, v2.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            (b"env-webhook".to_vec(), 2)
+        );
+
+        // A legacy (v1) credential defaults its companion to 1.
+        let v1 = create_connection(
+            &pool,
+            scope,
+            "github",
+            "kv-acct-v1",
+            "kv-conn-v1",
+            Some(b"legacy-cred"),
+            1,
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            None,
+            1,
+            ConnectionAuth::static_active(),
+            ConnectionOwner::Organization,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            connection_credential_sealed(&pool, scope, v1.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            (b"legacy-cred".to_vec(), 1)
+        );
+
+        // The retirement-gate counter sees both key-versions (global scan; other
+        // tenants may add to the totals, so assert presence, not exact counts).
+        let counts = crate::system_worker::sealed_key_version_counts(&pool)
+            .await
+            .unwrap();
+        // THIRTEEN sealed columns today (Tasks 3/4/5 added the two
+        // oauth_client_registrations twins, the connector_oauth_flows PKCE
+        // verifier, and tenant_llm_keys). `reseal::FAMILIES` is the authority and
+        // `reseal::tests::counts_and_families_cover_the_same_set` enforces
+        // set-equality with this fn; here we only pin the shape.
+        assert_eq!(counts.len(), 13, "one row per sealed column");
+        let distinct: std::collections::BTreeSet<&str> =
+            counts.iter().map(|c| c.family.as_str()).collect();
+        assert_eq!(
+            distinct.len(),
+            counts.len(),
+            "every counted family is distinct — no double-counted column"
+        );
+        let cred = counts
+            .iter()
+            .find(|c| c.family == "integration_connections.credential_sealed")
+            .unwrap();
+        assert!(cred.legacy >= 1 && cred.envelope >= 1);
+
+        cleanup_dek_tenant(&pool, tenant).await;
+    }
+
+    // The re-seal job's DB mechanics (Task 2): keyset paging, the FOR UPDATE
+    // lock/read, and the CAS write — exercised with arbitrary bytes (the DB
+    // layer never sees plaintext; the crypto roundtrip is tested server-side).
+    // Assertions are written to be robust against OTHER tenants sharing the
+    // table (the test DB is shared): filter/relate to our own seeded ids only.
+    #[tokio::test]
+    async fn reseal_paging_lock_and_cas() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let scope = new_dek_org(&pool).await;
+        let tenant = scope.tenant_id();
+
+        // Three v1 credential rows under a throwaway tenant.
+        let mut ids = vec![];
+        for i in 0..3 {
+            let c = create_connection(
+                &pool,
+                scope,
+                "custom",
+                &format!("rs-acct-{i}"),
+                &format!("rs-conn-{i}"),
+                Some(format!("legacy-cred-{i}").as_bytes()),
+                1,
+                &serde_json::json!([]),
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+                None,
+                1,
+                ConnectionAuth::static_active(),
+                ConnectionOwner::Organization,
+                None,
+            )
+            .await
+            .unwrap();
+            ids.push(c.id);
+        }
+        ids.sort(); // reseal_candidate_ids orders by id
+
+        let tbl = "integration_connections";
+        let col = "credential_sealed";
+        let ver = "credential_key_version";
+        let key = "id"; // integration_connections is keyed by id
+
+        // Keyset cursor: `id > after` is exclusive. After ids[0], a large page
+        // includes ids[1]/ids[2] but never ids[0].
+        let after0 =
+            crate::system_worker::reseal_candidate_ids(&pool, tbl, col, ver, key, ids[0], 1000)
+                .await
+                .unwrap();
+        assert!(!after0.contains(&ids[0]), "cursor is exclusive");
+        assert!(after0.contains(&ids[1]) && after0.contains(&ids[2]));
+        // After the last id, none of ours can appear (all <= ids[2]).
+        let after_last =
+            crate::system_worker::reseal_candidate_ids(&pool, tbl, col, ver, key, ids[2], 1000)
+                .await
+                .unwrap();
+        assert!(ids.iter().all(|i| !after_last.contains(i)));
+        // `limit` caps the page (≥1 v1 row exists past ids[0] — ids[1]).
+        let capped =
+            crate::system_worker::reseal_candidate_ids(&pool, tbl, col, ver, key, ids[0], 1)
+                .await
+                .unwrap();
+        assert_eq!(capped.len(), 1, "limit bounds the page");
+
+        // Lock + read one row inside a tx, then CAS the v2 bytes in.
+        let mut tx = pool.begin().await.unwrap();
+        let locked = crate::system_worker::reseal_lock_row(&mut tx, tbl, col, ver, key, ids[0])
+            .await
+            .unwrap()
+            .expect("row exists");
+        assert_eq!(locked.0.as_deref(), Some(b"legacy-cred-0".as_ref()));
+        assert_eq!(locked.1, 1, "still v1 under the lock");
+        assert_eq!(
+            locked.2,
+            Some(tenant),
+            "carries the row's tenant for the seal ctx (Some for a tenant-owned family)"
+        );
+        let affected = crate::system_worker::reseal_write_row(
+            &mut tx,
+            tbl,
+            col,
+            ver,
+            key,
+            ids[0],
+            b"v2-bytes",
+        )
+        .await
+        .unwrap();
+        assert_eq!(affected, 1, "CAS flips 1 → 2");
+        tx.commit().await.unwrap();
+
+        // The reader sees the new bytes at v2.
+        assert_eq!(
+            connection_credential_sealed(&pool, scope, ids[0])
+                .await
+                .unwrap()
+                .unwrap(),
+            (b"v2-bytes".to_vec(), 2)
+        );
+
+        // A second CAS on the now-v2 row is a no-op (a concurrent writer already
+        // moved it off v1) — 0 rows, the caller counts it as skipped.
+        let mut tx2 = pool.begin().await.unwrap();
+        let noop = crate::system_worker::reseal_write_row(
+            &mut tx2,
+            tbl,
+            col,
+            ver,
+            key,
+            ids[0],
+            b"v2-again",
+        )
+        .await
+        .unwrap();
+        assert_eq!(noop, 0, "CAS no-op when the row already left v1");
+        tx2.commit().await.unwrap();
+
+        // The re-sealed row drops out of the candidate predicate; the other two
+        // remain (idempotent restart-safety: re-scans skip finished rows).
+        let remaining = crate::system_worker::reseal_candidate_ids(
+            &pool,
+            tbl,
+            col,
+            ver,
+            key,
+            Uuid::nil(),
+            1000,
+        )
+        .await
+        .unwrap();
+        assert!(!remaining.contains(&ids[0]));
+        assert!(remaining.contains(&ids[1]) && remaining.contains(&ids[2]));
+
+        cleanup_dek_tenant(&pool, tenant).await;
+    }
+
+    // Per-tenant LiteLLM virtual keys (Task 5): insert-or-adopt + rotate row
+    // semantics, with ARBITRARY bytes (the crypto roundtrip is server-side).
+    #[tokio::test]
+    async fn tenant_llm_key_insert_adopt_and_rotate() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let scope = new_dek_org(&pool).await;
+        let tenant = scope.tenant_id();
+
+        // Not minted yet.
+        assert!(tenant_llm_key_sealed(&pool, scope).await.unwrap().is_none());
+        assert!(tenant_llm_key_row(&pool, scope).await.unwrap().is_none());
+
+        // First insert wins and returns our sealed bytes.
+        let first = insert_tenant_llm_key(
+            &pool,
+            scope,
+            b"sealed-v1-a",
+            1,
+            "fbx-tenant-x",
+            Some("tok-a"),
+        )
+        .await
+        .unwrap();
+        assert!(first.we_won, "first insert wins");
+        assert_eq!(first.sealed, b"sealed-v1-a");
+        assert_eq!(first.key_version, 1);
+        assert_eq!(
+            tenant_llm_key_sealed(&pool, scope).await.unwrap().unwrap(),
+            (b"sealed-v1-a".to_vec(), 1)
+        );
+
+        // A racing second insert loses (ON CONFLICT DO NOTHING) and ADOPTS the
+        // winner's sealed bytes — its own minted key would be orphaned.
+        let second = insert_tenant_llm_key(
+            &pool,
+            scope,
+            b"sealed-v1-b",
+            1,
+            "fbx-tenant-x",
+            Some("tok-b"),
+        )
+        .await
+        .unwrap();
+        assert!(!second.we_won, "second insert loses the race");
+        assert_eq!(second.sealed, b"sealed-v1-a", "adopts the winner's key");
+        // The stored row is unchanged (still the winner's).
+        assert_eq!(
+            tenant_llm_key_sealed(&pool, scope).await.unwrap().unwrap(),
+            (b"sealed-v1-a".to_vec(), 1)
+        );
+
+        // Rotate: returns the OLD sealed for LiteLLM cleanup, swaps in the new,
+        // bumps rotated_at, records the new companion version.
+        let old = rotate_tenant_llm_key(
+            &pool,
+            scope,
+            b"sealed-v2-c",
+            2,
+            "fbx-tenant-x",
+            Some("tok-c"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(old, Some((b"sealed-v1-a".to_vec(), 1)), "old key returned");
+        assert_eq!(
+            tenant_llm_key_sealed(&pool, scope).await.unwrap().unwrap(),
+            (b"sealed-v2-c".to_vec(), 2)
+        );
+        let rotated_at: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("select rotated_at from tenant_llm_keys where tenant_id = $1")
+                .bind(tenant)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(rotated_at.is_some(), "rotate bumps rotated_at");
+
+        // The row reader carries the CAS expectation + the durable cooldown
+        // stamp (Phase D review H3/M4).
+        let row = tenant_llm_key_row(&pool, scope).await.unwrap().unwrap();
+        assert_eq!(row.sealed, b"sealed-v2-c");
+        assert_eq!(row.key_version, 2);
+        assert_eq!(
+            row.minted_at,
+            rotated_at.unwrap(),
+            "minted_at is the rotation instant once rotated"
+        );
+
+        // M4: the recovery CAS only swaps while the stored bytes are still the
+        // ones the caller read. A stale expectation (the key an in-flight request
+        // presented, already rotated away) matches ZERO rows — the freshly
+        // rotated key survives instead of being silently superseded.
+        assert!(
+            !rotate_tenant_llm_key_cas(
+                &pool,
+                scope,
+                b"sealed-v1-a", // the pre-rotation key
+                b"sealed-v3-stale",
+                2,
+                "fbx-tenant-x",
+                None,
+            )
+            .await
+            .unwrap(),
+            "CAS against a superseded key must not swap"
+        );
+        assert_eq!(
+            tenant_llm_key_sealed(&pool, scope).await.unwrap().unwrap(),
+            (b"sealed-v2-c".to_vec(), 2),
+            "the winning rotation is intact"
+        );
+
+        // …and it DOES swap when the expectation is the live key.
+        assert!(rotate_tenant_llm_key_cas(
+            &pool,
+            scope,
+            b"sealed-v2-c",
+            b"sealed-v3-d",
+            2,
+            "fbx-tenant-x",
+            Some("tok-d"),
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            tenant_llm_key_sealed(&pool, scope).await.unwrap().unwrap(),
+            (b"sealed-v3-d".to_vec(), 2)
+        );
+
+        cleanup_dek_tenant(&pool, tenant).await;
+    }
+
+    #[tokio::test]
+    async fn tenant_llm_key_rotate_creates_when_absent() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let scope = new_dek_org(&pool).await;
+        let tenant = scope.tenant_id();
+
+        // Rotate on a tenant with no key: nothing to delete (None), creates it.
+        let old = rotate_tenant_llm_key(&pool, scope, b"sealed-new", 2, "fbx-tenant-y", None)
+            .await
+            .unwrap();
+        assert_eq!(old, None, "no prior key to retire");
+        assert_eq!(
+            tenant_llm_key_sealed(&pool, scope).await.unwrap().unwrap(),
+            (b"sealed-new".to_vec(), 2)
+        );
+
+        cleanup_dek_tenant(&pool, tenant).await;
+    }
+
+    // ─── OAuth client registrations (Phase D Task 3, #32) ───────────────────
+
+    fn new_reg<'a>(
+        tenant_id: Option<Uuid>,
+        issuer: &'a str,
+        redirect: &'a str,
+        client_id: &'a str,
+    ) -> NewOauthClientRegistration<'a> {
+        NewOauthClientRegistration {
+            tenant_id,
+            issuer,
+            redirect_uri: redirect,
+            source: "dcr",
+            client_id,
+            client_secret_sealed: None,
+            client_secret_key_version: 1,
+            registration_endpoint: Some("https://as.test/register"),
+            registration_access_token_sealed: None,
+            registration_access_token_key_version: 1,
+            token_endpoint_auth_method: Some("none"),
+        }
+    }
+
+    // Two transactions inserting the SAME (issuer, redirect): exactly one row
+    // lands and the loser's ON CONFLICT DO NOTHING yields None, so the caller
+    // re-selects the winner (never a duplicate DCR client). Each `&pool` insert
+    // is its own transaction.
+    #[tokio::test]
+    async fn client_registration_insert_race_keeps_one_row() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let issuer = format!("https://as-{}.test", Uuid::now_v7().simple());
+        let redirect = "https://fbx.test/v1/oauth/callback";
+
+        let first = insert_client_registration(&pool, new_reg(None, &issuer, redirect, "client-a"))
+            .await
+            .unwrap();
+        assert!(first.is_some(), "first insert wins");
+        assert!(
+            first.as_ref().unwrap().last_used_at.is_some(),
+            "last_used_at set"
+        );
+
+        // The loser conflicts on the global partial unique → None.
+        let second =
+            insert_client_registration(&pool, new_reg(None, &issuer, redirect, "client-b"))
+                .await
+                .unwrap();
+        assert!(
+            second.is_none(),
+            "second insert conflicts (ON CONFLICT DO NOTHING)"
+        );
+
+        // Re-select returns the ONE winner, and there is exactly one row.
+        let winner = find_client_registration(&pool, &issuer, redirect)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(winner.client_id, "client-a");
+        let (n,): (i64,) = sqlx::query_as(
+            "select count(*) from oauth_client_registrations
+             where issuer = $1 and redirect_uri = $2",
+        )
+        .bind(&issuer)
+        .bind(redirect)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1);
+
+        // by-id load + touch + delete round-trip.
+        let by_id = find_client_registration_by_id(&pool, winner.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_id.client_id, "client-a");
+        assert!(by_id.tenant_id.is_none(), "v1 rows are global");
+        touch_client_registration(&pool, winner.id).await.unwrap();
+        delete_client_registration(&pool, winner.id).await.unwrap();
+        assert!(find_client_registration(&pool, &issuer, redirect)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    // The two partial uniques are INDEPENDENT: a global row (tenant_id NULL) and a
+    // per-tenant row can share the same (issuer, redirect_uri); a second row within
+    // the same scope conflicts; and the v1 reader sees ONLY the global row.
+    #[tokio::test]
+    async fn client_registration_partial_uniques_are_independent() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
+            .await
+            .unwrap();
+        let tenant = org.id;
+        let issuer = format!("https://as-{}.test", Uuid::now_v7().simple());
+        let redirect = "https://fbx.test/v1/oauth/callback";
+
+        let global =
+            insert_client_registration(&pool, new_reg(None, &issuer, redirect, "g-client"))
+                .await
+                .unwrap();
+        assert!(global.is_some(), "global row inserts");
+        // A per-tenant row with the SAME key coexists (different partial index).
+        let tenant_row =
+            insert_client_registration(&pool, new_reg(Some(tenant), &issuer, redirect, "t-client"))
+                .await
+                .unwrap();
+        assert!(
+            tenant_row.is_some(),
+            "a per-tenant row is independent of the same-key global row"
+        );
+        // A second GLOBAL row for the key conflicts.
+        assert!(
+            insert_client_registration(&pool, new_reg(None, &issuer, redirect, "g-dupe"))
+                .await
+                .unwrap()
+                .is_none(),
+            "a second global row for the key is refused"
+        );
+        // The v1 reader returns ONLY the global row (tenant_id is null).
+        let found = find_client_registration(&pool, &issuer, redirect)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.client_id, "g-client");
+        assert!(found.tenant_id.is_none());
+
+        // Cleanup (registration rows before the tenant — FKs are NO ACTION).
+        sqlx::query("delete from oauth_client_registrations where issuer = $1")
+            .bind(&issuer)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("delete from tenants where id = $1")
+            .bind(tenant)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    // The advisory lock serializes DCR per (issuer, redirect_uri): while one
+    // transaction holds it, a second connection cannot take the SAME key but CAN
+    // take a different one; it frees on transaction end. This is what collapses
+    // concurrent connects to ONE `/register`.
+    #[tokio::test]
+    async fn registration_lock_serializes_same_key() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let issuer = format!("https://as-{}.test", Uuid::now_v7().simple());
+        let redirect = "https://fbx.test/v1/oauth/callback";
+        let key = registration_lock_key(&issuer, redirect);
+        assert_ne!(
+            key,
+            registration_lock_key(&issuer, "https://other.test/cb"),
+            "distinct (issuer, redirect) fold to distinct keys"
+        );
+
+        let mut tx1 = pool.begin().await.unwrap();
+        acquire_registration_lock(&mut tx1, &issuer, redirect)
+            .await
+            .unwrap();
+        // A second connection cannot take the held key, but a different key is free.
+        let mut c2 = pool.acquire().await.unwrap();
+        let (same,): (bool,) = sqlx::query_as("select pg_try_advisory_xact_lock($1)")
+            .bind(key)
+            .fetch_one(&mut *c2)
+            .await
+            .unwrap();
+        assert!(!same, "same-key lock is held by tx1");
+        let (other,): (bool,) = sqlx::query_as("select pg_try_advisory_xact_lock($1)")
+            .bind(registration_lock_key(&issuer, "https://other.test/cb"))
+            .fetch_one(&mut *c2)
+            .await
+            .unwrap();
+        assert!(other, "a different (issuer, redirect) key is independent");
+        drop(c2);
+
+        // Releasing tx1 frees the key.
+        tx1.rollback().await.unwrap();
+        let mut tx3 = pool.begin().await.unwrap();
+        let (freed,): (bool,) = sqlx::query_as("select pg_try_advisory_xact_lock($1)")
+            .bind(key)
+            .fetch_one(&mut *tx3)
+            .await
+            .unwrap();
+        assert!(freed, "the lock is free after tx1 released");
+        tx3.rollback().await.unwrap();
+    }
+
+    // ─── Connector OAuth flows (Phase D Task 4, #32 — invariant 20) ──────────
+
+    // A flow-row template borrowing the caller's per-case hashes/scopes (one
+    // shared lifetime); string/byte literals are 'static and coerce in.
+    fn new_flow<'a>(
+        connection_id: Uuid,
+        expected_generation: i32,
+        state_hash: &'a str,
+        browser_hash: &'a str,
+        scopes: &'a Value,
+        ttl_secs: i64,
+    ) -> NewConnectorOauthFlow<'a> {
+        NewConnectorOauthFlow {
+            connection_id,
+            initiated_by_user_id: None,
+            state_hash,
+            browser_hash,
+            issuer: "https://as.test",
+            authorization_endpoint: "https://as.test/authorize",
+            token_endpoint: "https://as.test/token",
+            metadata_digest: "sha256:abc",
+            resource: "https://mcp.test",
+            redirect_uri: "https://fbx.test/v1/oauth/callback",
+            scopes,
+            challenge: "chal",
+            challenge_method: "S256",
+            client_registration_id: None,
+            client_id: "client-1",
+            pkce_verifier_sealed: &[1, 2, 3],
+            pkce_verifier_key_version: 1,
+            expected_generation,
+            ttl_secs,
+        }
+    }
+
+    // The full claim matrix: happy path consumes once; replay refused; a WRONG
+    // browser_hash matches nothing AND leaves consumed_at null (then the right
+    // browser still completes — the no-burn proof); expired refused; peek never
+    // consumes; and the row FREEZES the connection's generation so a mid-flow
+    // reconnect (bump) is detectable by the callback's coherence check.
+    #[tokio::test]
+    async fn connector_oauth_flow_claim_matrix() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
+            .await
+            .unwrap();
+        let scope = TenantScope::assume(org.id);
+        // A connection to satisfy the composite (tenant_id, connection_id) FK.
+        let conn = create_connection(
+            &pool,
+            scope,
+            "mcp_http",
+            "acct",
+            "disp",
+            None,
+            1,
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            &serde_json::json!({ "base_url": "https://x" }),
+            None,
+            1,
+            ConnectionAuth {
+                auth_kind: "oauth",
+                status: "pending",
+                oauth: None,
+                client_secret_sealed: None,
+                client_secret_key_version: 1,
+                registration_id: None,
+            },
+            ConnectionOwner::Organization,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let scopes = serde_json::json!(["read", "offline_access"]);
+        let gen = conn.authorization_generation;
+        let s_hash = sha256_hex("state-secret");
+        let b_hash = sha256_hex("cookie-secret");
+
+        // Insert returns the persisted row (its expires_at seeds the boot token).
+        let row = insert_connector_oauth_flow(
+            &pool,
+            scope,
+            new_flow(conn.id, gen, &s_hash, &b_hash, &scopes, 600),
+        )
+        .await
+        .unwrap();
+        assert_eq!(row.tenant_id, org.id);
+        assert_eq!(row.connection_id, conn.id);
+        assert!(row.consumed_at.is_none());
+        assert!(row.expires_at > Utc::now());
+
+        // peek returns the row and does NOT consume it.
+        let peeked = peek_connector_oauth_flow(&pool, &s_hash)
+            .await
+            .unwrap()
+            .expect("peek finds the live flow");
+        assert_eq!(peeked.id, row.id);
+        assert!(peeked.consumed_at.is_none(), "peek never consumes");
+        assert_eq!(peeked.pkce_verifier_sealed, vec![1, 2, 3]);
+
+        // WRONG browser_hash: matches nothing AND burns nothing.
+        assert!(
+            claim_connector_oauth_flow(&pool, &s_hash, &sha256_hex("attacker"))
+                .await
+                .unwrap()
+                .is_none(),
+            "wrong browser is refused"
+        );
+        let unburned = peek_connector_oauth_flow(&pool, &s_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            unburned.consumed_at.is_none(),
+            "a wrong-browser claim burns NOTHING (the no-burn proof)"
+        );
+
+        // RIGHT browser then still completes — consumes exactly once.
+        let claimed = claim_connector_oauth_flow(&pool, &s_hash, &b_hash)
+            .await
+            .unwrap()
+            .expect("the right browser claims after a wrong-browser attempt");
+        assert_eq!(claimed.client_id, "client-1");
+        assert_eq!(claimed.scopes, scopes);
+        assert_eq!(claimed.expected_generation, conn.authorization_generation);
+        assert!(claimed.consumed_at.is_some(), "claim consumes the row");
+
+        // REPLAY (correct browser, second time) is refused.
+        assert!(
+            claim_connector_oauth_flow(&pool, &s_hash, &b_hash)
+                .await
+                .unwrap()
+                .is_none(),
+            "replay of a consumed flow is refused"
+        );
+
+        // Unknown state_hash: no claim, no peek row.
+        assert!(
+            claim_connector_oauth_flow(&pool, &sha256_hex("nope"), &b_hash)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(peek_connector_oauth_flow(&pool, &sha256_hex("nope"))
+            .await
+            .unwrap()
+            .is_none());
+
+        // Expired flow: claim refused; peek still SEES it (peek is a plain read,
+        // it never filters — the caller classifies).
+        let s_exp = sha256_hex("state-expired");
+        insert_connector_oauth_flow(
+            &pool,
+            scope,
+            new_flow(conn.id, gen, &s_exp, &b_hash, &scopes, -5),
+        )
+        .await
+        .unwrap();
+        assert!(
+            claim_connector_oauth_flow(&pool, &s_exp, &b_hash)
+                .await
+                .unwrap()
+                .is_none(),
+            "an already-expired flow is refused"
+        );
+        assert!(
+            peek_connector_oauth_flow(&pool, &s_exp)
+                .await
+                .unwrap()
+                .is_some(),
+            "peek never filters — it returns the expired row so the caller can 400"
+        );
+
+        // Generation drift: the row froze the connection's generation; a reconnect
+        // bumps it, so the callback's `authorization_generation == expected_generation`
+        // coherence check detects the drift and refuses.
+        let s_gen = sha256_hex("state-gen");
+        let gen_flow = insert_connector_oauth_flow(
+            &pool,
+            scope,
+            new_flow(conn.id, gen, &s_gen, &b_hash, &scopes, 600),
+        )
+        .await
+        .unwrap();
+        let new_gen = bump_connection_generation(&pool, scope, conn.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let fresh = get_connection(&pool, scope, conn.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.authorization_generation, new_gen);
+        assert_ne!(
+            fresh.authorization_generation, gen_flow.expected_generation,
+            "a reconnect (generation bump) drifts past the flow's frozen expected_generation"
+        );
+
+        // Cleanup: children-first (FKs are NO ACTION) — flows, then the connection,
+        // then the tenant.
+        for stmt in [
+            "delete from connector_oauth_flows where tenant_id = $1",
+            "delete from integration_connections where tenant_id = $1",
+            "delete from tenants where id = $1",
+        ] {
+            sqlx::query(stmt).bind(org.id).execute(&pool).await.unwrap();
+        }
+    }
+
+    /// Phase D (#32, #75) — the RLS acceptance core. Proves DB-enforced tenant
+    /// isolation, NOT the Rust `where tenant_id = $n` predicate: every assertion query
+    /// OMITS the predicate on purpose (the buggy-predicate proof).
+    ///
+    /// TEST-ROLE GOTCHA (resolution 9): a Postgres SUPERUSER bypasses RLS entirely,
+    /// even under FORCE — and CI's DB user is the superuser `postgres`. So the
+    /// assertions run through a dedicated connection that `SET ROLE fluidbox_runtime`
+    /// (the 0018 NON-owner role, `GRANT`ed to the owner so SET ROLE works on any
+    /// Postgres). Only then does the policy actually run, so this proves the policy
+    /// logic under the REAL runtime role regardless of the base user's privilege.
+    /// Seeding runs under the audited bypass (`worker_tx`, on the `test_connect`
+    /// fixture pool) so it works whether the base role is a superuser (RLS skipped)
+    /// or the table owner under FORCE RLS — and the assertions below never touch
+    /// that pool, so the bypass cannot leak into what they prove.
+    /// `connect()` here applies migrations 0014-0018 from scratch — a failed 0018
+    /// would fail this test at `.expect("connect")` (the migration smoke check).
+    #[tokio::test]
+    async fn rls_enforces_tenant_isolation_under_runtime_role() {
+        use sqlx::{Connection, Executor};
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+
+        // Two throwaway tenants + one session + one event each.
+        let a = Uuid::now_v7();
+        let b = Uuid::now_v7();
+        {
+            let mut tx = worker_tx(&pool).await.unwrap();
+            for id in [a, b] {
+                let slug = format!("rls-{}", id.simple());
+                sqlx::query("insert into tenants (id, name, slug) values ($1, $2, $3)")
+                    .bind(id)
+                    .bind(&slug)
+                    .bind(&slug)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+        for id in [a, b] {
+            let scope = TenantScope::assume(id);
+            let policy = upsert_policy(
+                &pool,
+                scope,
+                "rls",
+                "name: rls",
+                &serde_json::json!({"name":"rls"}),
+            )
+            .await
+            .unwrap();
+            let agent = create_agent(&pool, scope, "rls-agent", None).await.unwrap();
+            let rev = append_agent_revision(
+                &pool,
+                scope,
+                agent.id,
+                "claude-agent-sdk",
+                "img:test",
+                "claude-haiku-4-5",
+                None,
+                policy.id,
+                &serde_json::json!({}),
+                None,
+                &serde_json::json!([]),
+                &serde_json::json!([]),
+            )
+            .await
+            .unwrap();
+            let repo = serde_json::json!({"kind":"none"});
+            let empty = serde_json::json!({});
+            let session = create_session(
+                &pool,
+                scope,
+                agent.id,
+                rev.id,
+                "supervised",
+                "trusted",
+                "rls task",
+                &repo,
+                &empty,
+                &empty,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
+            .await
+            .unwrap();
+            // One event per session (a child-table row for the parent-composed policy).
+            let mut tx = worker_tx(&pool).await.unwrap();
+            sqlx::query(
+                "insert into events (event_id, session_id, seq, actor, type, payload, occurred_at)
+                 values ($1, $2, 1, 'system', 'rls.test', '{}'::jsonb, now())",
+            )
+            .bind(Uuid::now_v7())
+            .bind(session.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+
+        // Assert through the NON-superuser runtime role — otherwise RLS is bypassed.
+        let mut rt = sqlx::PgConnection::connect(&url).await.expect("rt connect");
+        rt.execute("set role fluidbox_runtime")
+            .await
+            .expect("set role");
+
+        async fn count_as(
+            rt: &mut sqlx::PgConnection,
+            guc: Option<(&str, String)>,
+            sql: &'static str,
+        ) -> i64 {
+            let mut tx = rt.begin().await.unwrap();
+            if let Some((name, val)) = guc {
+                sqlx::query("select set_config($1, $2, true)")
+                    .bind(name)
+                    .bind(val)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+            let (n,): (i64,) = sqlx::query_as(sql).fetch_one(&mut *tx).await.unwrap();
+            tx.rollback().await.ok();
+            n
+        }
+        let a_str = a.to_string();
+        let tid = "fluidbox.tenant_id";
+
+        // (a) A-scope sees ONLY tenant A's session — with NO where clause (#75 proof).
+        assert_eq!(
+            count_as(
+                &mut rt,
+                Some((tid, a_str.clone())),
+                "select count(*) from sessions"
+            )
+            .await,
+            1,
+            "A-scope must see only tenant A's session even without a predicate"
+        );
+        // (c) child table (events) follows the parent (sessions) policy.
+        assert_eq!(
+            count_as(
+                &mut rt,
+                Some((tid, a_str.clone())),
+                "select count(*) from events"
+            )
+            .await,
+            1,
+            "A-scope sees only A's events (parent-composed EXISTS policy)"
+        );
+        // (f) tenants keys on its own id — A-scope sees exactly its own row.
+        assert_eq!(
+            count_as(
+                &mut rt,
+                Some((tid, a_str.clone())),
+                "select count(*) from tenants"
+            )
+            .await,
+            1,
+            "A-scope sees exactly the tenants row whose id matches"
+        );
+        // (d) the audited bypass sees BOTH tenants' rows.
+        assert!(
+            count_as(
+                &mut rt,
+                Some(("fluidbox.bypass", "system_worker".into())),
+                "select count(*) from sessions"
+            )
+            .await
+                >= 2,
+            "the system_worker bypass sees every tenant"
+        );
+        // (e) no GUC → zero rows on a policy'd table.
+        assert_eq!(
+            count_as(&mut rt, None, "select count(*) from sessions").await,
+            0,
+            "a transaction with no GUC sees nothing"
+        );
+
+        // (b) INSERT of a cross-tenant row is refused by WITH CHECK.
+        let mut tx = rt.begin().await.unwrap();
+        sqlx::query("select set_config('fluidbox.tenant_id', $1, true)")
+            .bind(&a_str)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let res = sqlx::query(
+            "insert into settings (tenant_id, key, value) values ($1, 'rls-check', '{}'::jsonb)",
+        )
+        .bind(b) // tenant B under the tenant-A GUC
+        .execute(&mut *tx)
+        .await;
+        tx.rollback().await.ok();
+        let err = res.expect_err("a cross-tenant insert must be refused by RLS WITH CHECK");
+        assert!(
+            err.to_string()
+                .to_lowercase()
+                .contains("row-level security"),
+            "expected an RLS policy violation, got: {err}"
+        );
+
+        rt.close().await.ok();
+
+        // Cleanup, children-first, under the bypass (FKs are NO ACTION; sessions
+        // cascade events, agents cascade revisions).
+        let mut tx = worker_tx(&pool).await.unwrap();
+        for id in [a, b] {
+            for stmt in [
+                "delete from sessions where tenant_id = $1",
+                "delete from agents where tenant_id = $1",
+                "delete from policies where tenant_id = $1",
+                "delete from tenants where id = $1",
+            ] {
+                sqlx::query(stmt).bind(id).execute(&mut *tx).await.ok();
+            }
+        }
+        tx.commit().await.unwrap();
+    }
+
+    /// Seed a throwaway tenant + one `created` session, returning both ids. The
+    /// tenant insert rides `worker_tx` (a new tenant id is no GUC's tenant); the
+    /// policy/agent/revision/session ride the scoped repositories. Runs on the base
+    /// pool (superuser bypasses RLS), so it is agnostic to the enforcement asserted.
+    async fn seed_tenant_session(pool: &PgPool) -> (Uuid, Uuid) {
+        let tenant = Uuid::now_v7();
+        {
+            let slug = format!("rls-sw-{}", tenant.simple());
+            let mut tx = worker_tx(pool).await.unwrap();
+            sqlx::query("insert into tenants (id, name, slug) values ($1, $2, $3)")
+                .bind(tenant)
+                .bind(&slug)
+                .bind(&slug)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let scope = TenantScope::assume(tenant);
+        let policy = upsert_policy(
+            pool,
+            scope,
+            "rls",
+            "name: rls",
+            &serde_json::json!({"name":"rls"}),
+        )
+        .await
+        .unwrap();
+        let agent = create_agent(pool, scope, "rls-agent", None).await.unwrap();
+        let rev = append_agent_revision(
+            pool,
+            scope,
+            agent.id,
+            "claude-agent-sdk",
+            "img:test",
+            "claude-haiku-4-5",
+            None,
+            policy.id,
+            &serde_json::json!({}),
+            None,
+            &serde_json::json!([]),
+            &serde_json::json!([]),
+        )
+        .await
+        .unwrap();
+        let repo = serde_json::json!({"kind":"none"});
+        let empty = serde_json::json!({});
+        let session = create_session(
+            pool,
+            scope,
+            agent.id,
+            rev.id,
+            "supervised",
+            "trusted",
+            "rls task",
+            &repo,
+            &empty,
+            &empty,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+        (tenant, session.id)
+    }
+
+    async fn cleanup_sw_tenant(pool: &PgPool, tenant: Uuid) {
+        let mut tx = worker_tx(pool).await.unwrap();
+        for stmt in [
+            "delete from integration_connections where tenant_id = $1",
+            "delete from sessions where tenant_id = $1",
+            "delete from agents where tenant_id = $1",
+            "delete from policies where tenant_id = $1",
+            "delete from tenants where id = $1",
+        ] {
+            sqlx::query(stmt).bind(tenant).execute(&mut *tx).await.ok();
+        }
+        tx.commit().await.unwrap();
+    }
+
+    /// Phase D (#32, #75) — RLS wave B, system_worker bypass. Proves (b) the
+    /// `system_worker` scans see cross-tenant rows THROUGH `worker_tx`, and (c) THE
+    /// EXPLICITNESS PROOF: the identically-shaped query WITHOUT `worker_tx` (a plain
+    /// runtime-role transaction, no GUC) sees ZERO rows — the bypass is a deliberate,
+    /// grep-able choice, never ambient. The `system_worker` fns are exercised through
+    /// a pool that `SET ROLE`s to the NON-owner `fluidbox_runtime` (a superuser would
+    /// bypass RLS and make the test vacuous).
+    #[tokio::test]
+    async fn rls_system_worker_bypass_is_explicit() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (ta, sa) = seed_tenant_session(&pool).await;
+        let (tb, sb) = seed_tenant_session(&pool).await;
+
+        // Runtime-role pool: the system_worker fns' internal `worker_tx` runs as
+        // fluidbox_runtime under FORCE RLS, so the bypass is actually exercised.
+        let rt_pool = connect(&url, Some("fluidbox_runtime"))
+            .await
+            .expect("runtime pool");
+
+        // (b) two representative cross-tenant scans see BOTH tenants' rows.
+        let in_status = system_worker::sessions_in_status(&rt_pool, &["created"])
+            .await
+            .unwrap();
+        assert_eq!(
+            in_status
+                .iter()
+                .filter(|s| s.id == sa || s.id == sb)
+                .count(),
+            2,
+            "sessions_in_status (worker_tx) must see BOTH tenants' sessions"
+        );
+        assert!(
+            system_worker::get_session(&rt_pool, sa)
+                .await
+                .unwrap()
+                .is_some(),
+            "get_session (worker_tx) resolves tenant A's session cross-tenant"
+        );
+        assert!(
+            system_worker::get_session(&rt_pool, sb)
+                .await
+                .unwrap()
+                .is_some(),
+            "get_session (worker_tx) resolves tenant B's session cross-tenant"
+        );
+
+        // (c) the SAME shape WITHOUT worker_tx (plain runtime-role tx, no GUC) → 0.
+        let mut plain = rt_pool.begin().await.unwrap();
+        let (n,): (i64,) = sqlx::query_as("select count(*) from sessions")
+            .fetch_one(&mut *plain)
+            .await
+            .unwrap();
+        plain.rollback().await.ok();
+        assert_eq!(
+            n, 0,
+            "a plain runtime-role tx with no bypass GUC must see zero sessions — the bypass is explicit"
+        );
+
+        cleanup_sw_tenant(&pool, ta).await;
+        cleanup_sw_tenant(&pool, tb).await;
+    }
+
+    /// Phase D (#32, #75) — RLS wave B, re-seal helpers under `worker_tx`. Seeds a
+    /// v1 sealed connection, then drives the restructured lock/CAS path
+    /// (`reseal_begin` → `reseal_lock_row` → `reseal_write_row`) as the NON-owner
+    /// runtime role: the lock RESOLVES the row and its tenant, the CAS flips exactly
+    /// one v1 row to v2, and — the explicitness half — the same lock WITHOUT
+    /// `worker_tx` (a plain runtime tx) resolves nothing.
+    #[tokio::test]
+    async fn rls_reseal_helpers_work_under_worker_tx() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let tenant = Uuid::now_v7();
+        {
+            let slug = format!("rls-rs-{}", tenant.simple());
+            let mut tx = worker_tx(&pool).await.unwrap();
+            sqlx::query("insert into tenants (id, name, slug) values ($1, $2, $3)")
+                .bind(tenant)
+                .bind(&slug)
+                .bind(&slug)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let scope = TenantScope::assume(tenant);
+        let conn = create_connection(
+            &pool,
+            scope,
+            "mcp_http",
+            "acct",
+            "disp",
+            Some(&[9u8, 9, 9]),
+            1,
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            &serde_json::json!({ "base_url": "https://x" }),
+            None,
+            1,
+            ConnectionAuth {
+                // `integration_connections_auth_kind_shape` (0013) allows only
+                // static | oauth | none; a pasted-secret connection is 'static'.
+                auth_kind: "static",
+                status: "active",
+                oauth: None,
+                client_secret_sealed: None,
+                client_secret_key_version: 1,
+                registration_id: None,
+            },
+            ConnectionOwner::Organization,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rt_pool = connect(&url, Some("fluidbox_runtime"))
+            .await
+            .expect("runtime pool");
+        let (table, col, ver, key) = (
+            "integration_connections",
+            "credential_sealed",
+            "credential_key_version",
+            "id",
+        );
+
+        // lock + CAS-write through the restructured helpers (tx IS a worker_tx).
+        let mut tx = system_worker::reseal_begin(&rt_pool).await.unwrap();
+        let locked = system_worker::reseal_lock_row(&mut tx, table, col, ver, key, conn.id)
+            .await
+            .unwrap();
+        let Some((Some(bytes), kv, tid)) = locked else {
+            panic!("reseal_lock_row saw no row under worker_tx");
+        };
+        assert_eq!(kv, 1, "the seeded credential is v1");
+        assert_eq!(tid, Some(tenant), "the lock returns the row's own tenant");
+        let mut newbytes = bytes.clone();
+        newbytes.push(2);
+        let affected =
+            system_worker::reseal_write_row(&mut tx, table, col, ver, key, conn.id, &newbytes)
+                .await
+                .unwrap();
+        assert_eq!(
+            affected, 1,
+            "the CAS flips exactly one v1 row to v2 under worker_tx"
+        );
+        tx.commit().await.unwrap();
+
+        // The companion version is now 2 (read back via the superuser base pool).
+        let (after, kv2) = connection_credential_sealed(&pool, scope, conn.id)
+            .await
+            .unwrap()
+            .expect("credential still present");
+        assert_eq!(kv2, 2, "credential_key_version is 2 after the CAS");
+        assert_eq!(after, newbytes, "the re-sealed bytes landed");
+
+        // Explicitness: the SAME lock WITHOUT worker_tx (plain runtime tx) sees nothing.
+        let mut plain = rt_pool.begin().await.unwrap();
+        let none = system_worker::reseal_lock_row(&mut plain, table, col, ver, key, conn.id)
+            .await
+            .unwrap();
+        plain.rollback().await.ok();
+        assert!(
+            none.is_none(),
+            "without the bypass GUC the FOR UPDATE lock resolves no row — the reseal bypass is explicit"
+        );
+
+        let mut tx = worker_tx(&pool).await.unwrap();
+        for stmt in [
+            "delete from integration_connections where tenant_id = $1",
+            "delete from tenants where id = $1",
+        ] {
+            sqlx::query(stmt).bind(tenant).execute(&mut *tx).await.ok();
+        }
+        tx.commit().await.unwrap();
+    }
+
+    /// Review M3: `auth_audit_log` INSERT now carries the SAME tenant floor as every
+    /// other tenant-owned write. The old `with check (true)` let a transaction scoped
+    /// to tenant A append a row stamped `tenant_id = B` — a forged entry in another
+    /// tenant's permanent security history that, because the log is append-only, the
+    /// runtime role could never retract.
+    ///
+    /// Asserted through the NON-superuser `fluidbox_runtime` role (a superuser skips
+    /// policies and would make this vacuous). NOTHING is committed: an audit row
+    /// cannot be deleted afterwards, so every case runs in its own rolled-back tx.
+    #[tokio::test]
+    async fn rls_audit_insert_carries_the_tenant_floor() {
+        use sqlx::{Connection, Executor};
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        // Apply migrations (incl. the runtime role) then drop that pool immediately.
+        connect(&url, None).await.expect("migrate").close().await;
+        let mut rt = sqlx::PgConnection::connect(&url).await.expect("rt connect");
+        rt.execute("set role fluidbox_runtime")
+            .await
+            .expect("set role");
+
+        async fn try_insert(
+            rt: &mut sqlx::PgConnection,
+            guc: Option<(&str, String)>,
+            tenant: Option<Uuid>,
+        ) -> sqlx::Result<()> {
+            let mut tx = rt.begin().await.unwrap();
+            if let Some((name, val)) = guc {
+                sqlx::query("select set_config($1, $2, true)")
+                    .bind(name)
+                    .bind(val)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+            let res = sqlx::query(
+                "insert into auth_audit_log (id, tenant_id, actor_kind, action, success)
+                 values ($1, $2, 'operator', 'rls.m3.probe', true)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(tenant)
+            .execute(&mut *tx)
+            .await
+            .map(|_| ());
+            tx.rollback().await.ok();
+            res
+        }
+        fn assert_rls_refusal(res: sqlx::Result<()>, what: &str) {
+            let err = res
+                .err()
+                .unwrap_or_else(|| panic!("{what} must be refused"));
+            assert!(
+                err.to_string()
+                    .to_lowercase()
+                    .contains("row-level security"),
+                "{what}: expected an RLS policy violation, got: {err}"
+            );
+        }
+
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        let tid = "fluidbox.tenant_id";
+        let bypass = ("fluidbox.bypass", "system_worker".to_string());
+
+        // In-tenant: the ordinary audited mutation, unchanged.
+        try_insert(&mut rt, Some((tid, a.to_string())), Some(a))
+            .await
+            .expect("an in-tenant audit row must still insert");
+        // THE FINDING: tenant A cannot write tenant B's history.
+        assert_rls_refusal(
+            try_insert(&mut rt, Some((tid, a.to_string())), Some(b)).await,
+            "a cross-tenant audit insert",
+        );
+        // A scoped tx cannot forge a deployment-level (NULL-tenant) row either.
+        assert_rls_refusal(
+            try_insert(&mut rt, Some((tid, a.to_string())), None).await,
+            "a NULL-tenant audit insert from a tenant-scoped tx",
+        );
+        // The old pool-direct path (no GUC at all) is now refused — which is why
+        // standalone audits route through `identity::insert_audit_standalone`.
+        assert_rls_refusal(
+            try_insert(&mut rt, None, Some(a)).await,
+            "an audit insert with no GUC",
+        );
+        // The audited bypass remains the one way to write deployment-level rows.
+        try_insert(&mut rt, Some(bypass.clone()), None)
+            .await
+            .expect("the system_worker bypass must still write NULL-tenant rows");
+        try_insert(&mut rt, Some(bypass), Some(b))
+            .await
+            .expect("the system_worker bypass writes any tenant's row");
+
+        rt.close().await.ok();
+    }
+
+    /// Review H1: a runtime role is only trustworthy if its POSTURE is checked, not
+    /// just its name. PostgreSQL roles are cluster-global while 0018's grants are
+    /// database-local, so on a shared cluster the name may already belong to another
+    /// principal — as LOGIN/BYPASSRLS, or granted to somebody else's owner, who could
+    /// then `SET ROLE` in and set `fluidbox.bypass`. Each shape must REFUSE.
+    ///
+    /// Probe roles are uniquely named (tests run in parallel and roles are
+    /// cluster-global) and dropped at the end.
+    #[tokio::test]
+    async fn runtime_role_posture_refuses_unsafe_roles() {
+        use sqlx::Connection;
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        // Role DDL cannot take bind parameters; the names are locally generated
+        // (`fbx_(probe|other)_<uuid-hex>`), never caller input.
+        async fn ddl(c: &mut sqlx::PgConnection, sql: String) -> sqlx::Result<()> {
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&mut *c)
+                .await
+                .map(|_| ())
+        }
+        let mut c = sqlx::PgConnection::connect(&url).await.expect("connect");
+        let probe = format!("fbx_probe_{}", Uuid::now_v7().simple());
+        let other = format!("fbx_other_{}", Uuid::now_v7().simple());
+        if ddl(&mut c, format!("create role {probe} nologin"))
+            .await
+            .is_err()
+        {
+            eprintln!("skipping: this database role cannot CREATE ROLE");
+            return;
+        }
+        ddl(&mut c, format!("create role {other} nologin"))
+            .await
+            .expect("create the second probe role");
+
+        // A freshly created NOLOGIN role with no memberships is the clean posture.
+        assert!(
+            check_runtime_role_posture(&mut c, &probe)
+                .await
+                .unwrap()
+                .is_ok(),
+            "a NOLOGIN role that is a member of nothing must pass"
+        );
+
+        // (a) attributes. LOGIN is settable by any CREATEROLE holder; BYPASSRLS needs
+        // superuser, so it is asserted only where the ALTER actually lands.
+        ddl(&mut c, format!("alter role {probe} login"))
+            .await
+            .unwrap();
+        let err = check_runtime_role_posture(&mut c, &probe)
+            .await
+            .unwrap()
+            .expect_err("a LOGIN runtime role must be refused");
+        assert!(
+            err.contains("LOGIN"),
+            "refusal must name the attribute: {err}"
+        );
+        ddl(&mut c, format!("alter role {probe} nologin"))
+            .await
+            .unwrap();
+        if ddl(&mut c, format!("alter role {probe} bypassrls"))
+            .await
+            .is_ok()
+        {
+            let err = check_runtime_role_posture(&mut c, &probe)
+                .await
+                .unwrap()
+                .expect_err("a BYPASSRLS runtime role must be refused");
+            assert!(
+                err.contains("BYPASSRLS"),
+                "refusal must name the attribute: {err}"
+            );
+            ddl(&mut c, format!("alter role {probe} nobypassrls"))
+                .await
+                .unwrap();
+        }
+
+        // (b) THE SHARED-CLUSTER SHAPE: someone else can SET ROLE into it.
+        ddl(&mut c, format!("grant {probe} to {other}"))
+            .await
+            .unwrap();
+        let err = check_runtime_role_posture(&mut c, &probe)
+            .await
+            .unwrap()
+            .expect_err("a runtime role granted to another principal must be refused");
+        assert!(
+            err.contains(&other),
+            "refusal must name the foreign member: {err}"
+        );
+        ddl(&mut c, format!("revoke {probe} from {other}"))
+            .await
+            .unwrap();
+
+        // (c) inherited privileges we never granted.
+        ddl(&mut c, format!("grant {other} to {probe}"))
+            .await
+            .unwrap();
+        let err = check_runtime_role_posture(&mut c, &probe)
+            .await
+            .unwrap()
+            .expect_err("a runtime role inheriting another role must be refused");
+        assert!(
+            err.contains(&other),
+            "refusal must name the inherited role: {err}"
+        );
+        ddl(&mut c, format!("revoke {other} from {probe}"))
+            .await
+            .unwrap();
+
+        // A name that does not exist at all is a refusal, never a silent pass.
+        assert!(check_runtime_role_posture(&mut c, "fbx_no_such_role_xyz")
+            .await
+            .unwrap()
+            .is_err());
+
+        for r in [&probe, &other] {
+            ddl(&mut c, format!("drop role {r}")).await.ok();
+        }
+        c.close().await.ok();
+    }
+
+    /// Review M2: the boot gate reads the EFFECTIVE role of a pooled connection, so
+    /// it observes `after_connect SET ROLE` rather than whatever `DATABASE_URL` says.
+    /// Under the role split the answer must be "not bypassing" — that is the whole
+    /// point of the split, and in multi-user mode boot refuses on anything else.
+    #[tokio::test]
+    async fn pool_role_bypasses_rls_reads_the_effective_role() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let rt_pool = connect(&url, Some("fluidbox_runtime"))
+            .await
+            .expect("runtime pool");
+        assert_eq!(
+            pool_role_bypasses_rls(&rt_pool).await.unwrap(),
+            None,
+            "a pool that SET ROLEs to fluidbox_runtime must be RLS-BOUND"
+        );
+        rt_pool.close().await;
     }
 }

@@ -60,13 +60,26 @@ pub async fn ingress(
     })?;
     // Verification material only — a tenant-less reader, because there is no
     // verified tenant yet (the signature has not been checked).
-    let sealed = fluidbox_db::system_worker::connection_webhook_secret_sealed(&state.pool, conn.id)
-        .await?
-        .ok_or_else(|| {
-            ApiError::BadRequest("this connection cannot receive events (no webhook secret)".into())
-        })?;
+    let (sealed, kv) =
+        fluidbox_db::system_worker::connection_webhook_secret_sealed(&state.pool, conn.id)
+            .await?
+            .ok_or_else(|| {
+                ApiError::BadRequest(
+                    "this connection cannot receive events (no webhook secret)".into(),
+                )
+            })?;
+    // The connection's tenant seals its custody; the row resolved it (scope is
+    // trusted only after this HMAC verifies, but the DEK/AAD need the tenant now).
     let secret = sealer
-        .open(&sealed)
+        .open(
+            &sealed,
+            kv,
+            crate::seal::SealCtx::new(
+                conn.tenant_id,
+                crate::seal::SealFamily::ConnectionWebhookSecret,
+            ),
+        )
+        .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     // Duty #1 (connector): authenticity. Reasons are logged, not echoed —

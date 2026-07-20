@@ -138,7 +138,11 @@ urljoin() { python3 -c "import sys,urllib.parse as u;print(u.urljoin(sys.argv[1]
 # psql shortcut. -q suppresses the command tag (else "INSERT 0 1" would poison a
 # RETURNING capture); -A -t keep tuples-only/unaligned; -X skips ~/.psqlrc.
 # stderr flows to the log (not swallowed) so a broken query is visible.
-db() { psql "$DATABASE_URL" -X -q -A -t -c "$1"; }
+# `set fluidbox.bypass`: migration 0018 FORCEs RLS on every tenant table, which
+# binds the table OWNER too — without the GUC a fixture read returns zero rows
+# and a fixture INSERT is refused. A session-level SET on a custom (dotted)
+# option needs no privilege, so it rides INSIDE the helper: every call carries it.
+db() { psql "$DATABASE_URL" -X -q -A -t -c "set fluidbox.bypass = 'system_worker'; $1"; }
 
 # ── Cleanup ──────────────────────────────────────────────────────────────────
 # shellcheck disable=SC2329  # invoked via the EXIT/INT/TERM trap
@@ -551,6 +555,13 @@ start_server() {
     export FLUIDBOX_SANDBOX_IMAGE=localhost:1/fluidbox-absent:ci
     export FLUIDBOX_CODEX_SANDBOX_IMAGE=localhost:1/fluidbox-absent:ci
     export FLUIDBOX_DATA_DIR="$DATA_DIR"
+    # Phase D (#32): run the app pool as the NON-superuser role migration 0018
+    # creates, so every HTTP request in this suite executes with RLS actually
+    # ENFORCED. Without it the whole bindings/broker surface runs RLS-free (CI's
+    # DB user is the superuser `postgres`, for whom policies are skipped entirely)
+    # and a repository fn that forgot `scoped_tx` would return rows here and empty
+    # in production. 0018 grants the role to current_user, so `SET ROLE` works.
+    export FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime
     export FLUIDBOX_REQUIRE_SSO=1
     # G2: point the github PAT-validation seam + git clone base at the local
     # fakes so `create_github_pat` (GET /user) and the orchestrator's workspace
@@ -558,6 +569,10 @@ start_server() {
     export FLUIDBOX_GITHUB_API_URL="$GH_API_URL"
     export FLUIDBOX_GITHUB_CLONE_BASE="$GIT_URL"
     unset FLUIDBOX_TRUST_FORWARDED_FOR
+    # Phase D (#32): the default (shared) LLM key mode refuses to boot on an EMPTY
+    # upstream key. This suite boots keyless and makes NO model calls, so a
+    # non-empty placeholder is all the empty-key boot gate needs.
+    export LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-sk-fbx-ci-placeholder}"
     export RUST_LOG="${RUST_LOG:-warn,fluidbox_server=info}"
     if [ -n "${FLUIDBOX_SERVER_BIN:-}" ] && [ -x "${FLUIDBOX_SERVER_BIN}" ]; then
       exec "$FLUIDBOX_SERVER_BIN"

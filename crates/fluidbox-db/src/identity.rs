@@ -127,6 +127,8 @@ pub struct LoginFlowRow {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct LoginFlowClaim {
     pub pkce_verifier_sealed: Vec<u8>,
+    /// Envelope key-version companion for `pkce_verifier_sealed`.
+    pub pkce_verifier_key_version: i16,
     pub nonce: String,
     pub redirect_to: String,
     pub created_at: DateTime<Utc>,
@@ -260,6 +262,8 @@ pub struct IdpConfigParams<'a> {
     pub issuer: &'a str,
     pub client_id: &'a str,
     pub client_secret_sealed: Option<Vec<u8>>,
+    /// Envelope key-version companion for `client_secret_sealed` (1 legacy, 2 v2).
+    pub client_secret_key_version: i16,
     pub token_endpoint_auth: &'a str,
     pub scopes: &'a [String],
     pub alg_allowlist: &'a [String],
@@ -301,40 +305,59 @@ pub async fn create_org(
     slug: &str,
     display_name: Option<&str>,
 ) -> sqlx::Result<OrgRow> {
-    let mut conn = pool.acquire().await?;
-    insert_org(&mut conn, slug, display_name).await
+    // Operator org-CRUD (a sanctioned bypass category): the new `tenants` row's id
+    // is not yet any GUC's tenant, so its WITH CHECK is satisfied only by the
+    // audited system-worker bypass. `worker_tx` is the one grep-able choke point.
+    let mut tx = crate::worker_tx(pool).await?;
+    let __rls_out = insert_org(&mut tx, slug, display_name).await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Pre-auth login-routing helper: resolve a slug to its org BEFORE anyone is
-/// authenticated. Answers identically (None) for unknown slugs.
+/// authenticated. Answers identically (None) for unknown slugs. Rides the audited
+/// system-worker bypass (`worker_tx`): no tenant is known yet — the slug IS the
+/// key — so RLS cannot filter on `fluidbox.tenant_id`; the sanctioned pre-auth
+/// org-routing category (mirrors the token-digest resolvers in lib.rs).
 pub async fn get_org_by_slug(pool: &PgPool, slug: &str) -> sqlx::Result<Option<OrgRow>> {
-    sqlx::query_as(
+    let mut tx = crate::worker_tx(pool).await?;
+    let __rls_out = sqlx::query_as(
         "select id, name, slug, display_name, status, created_at
          from tenants where slug = $1",
     )
     .bind(slug)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
-/// Operator surface: every org.
+/// Operator surface: every org. Rides the audited system-worker bypass
+/// (`worker_tx`) — a cross-tenant scan of `tenants` by construction (the operator
+/// org-CRUD category); a tenant-scoped read would see only its own row.
 pub async fn list_orgs(pool: &PgPool) -> sqlx::Result<Vec<OrgRow>> {
-    sqlx::query_as(
+    let mut tx = crate::worker_tx(pool).await?;
+    let __rls_out = sqlx::query_as(
         "select id, name, slug, display_name, status, created_at
          from tenants order by created_at",
     )
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_org(pool: &PgPool, scope: TenantScope) -> sqlx::Result<Option<OrgRow>> {
-    sqlx::query_as(
+    let mut tx = crate::scoped_tx(pool, scope).await?;
+    let __rls_out = sqlx::query_as(
         "select id, name, slug, display_name, status, created_at
          from tenants where id = $1",
     )
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 // ─── org_idp_configs ────────────────────────────────────────────────────────
@@ -354,10 +377,10 @@ pub async fn create_idp_config(
            (id, tenant_id, generation, issuer, client_id, client_secret_sealed,
             token_endpoint_auth, scopes, alg_allowlist, claim_mappings,
             bootstrap_owner_email, bootstrap_owner_expires_at, status, created_by,
-            discovered_metadata, jwks, discovered_at)
+            discovered_metadata, jwks, discovered_at, client_secret_key_version)
          select $1, $2,
                 coalesce((select max(generation) from org_idp_configs where tenant_id = $2), 0) + 1,
-                $3, $4, $5, $6, $7, $8, $9, $10, $11, 'staged', $12, $13, $14, $15
+                $3, $4, $5, $6, $7, $8, $9, $10, $11, 'staged', $12, $13, $14, $15, $16
          returning {IDP_CONFIG_COLS}"
     )))
     .bind(Uuid::now_v7())
@@ -375,6 +398,7 @@ pub async fn create_idp_config(
     .bind(params.discovered_metadata)
     .bind(params.jwks)
     .bind(params.discovered_at)
+    .bind(params.client_secret_key_version)
     .fetch_one(&mut *conn)
     .await
 }
@@ -384,41 +408,52 @@ pub async fn get_idp_config(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<OrgIdpConfigRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = crate::scoped_tx(pool, scope).await?;
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {IDP_CONFIG_COLS} from org_idp_configs where tenant_id = $1 and id = $2"
     )))
     .bind(scope.tenant_id())
     .bind(id)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn list_idp_configs(
     pool: &PgPool,
     scope: TenantScope,
 ) -> sqlx::Result<Vec<OrgIdpConfigRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = crate::scoped_tx(pool, scope).await?;
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {IDP_CONFIG_COLS} from org_idp_configs where tenant_id = $1 order by generation"
     )))
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Pre-auth: the one active config for an org (login routing loads this before
 /// any principal exists). At most one row by the `one_active_idp_per_org`
-/// partial index.
+/// partial index. Rides the audited system-worker bypass (`worker_tx`): the
+/// `tenant_id` came from an UNAUTHENTICATED slug lookup and no principal is
+/// verified yet — the sanctioned pre-auth login-routing category.
 pub async fn active_idp_config(
     pool: &PgPool,
     tenant_id: Uuid,
 ) -> sqlx::Result<Option<OrgIdpConfigRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = crate::worker_tx(pool).await?;
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {IDP_CONFIG_COLS} from org_idp_configs
          where tenant_id = $1 and status = 'active'"
     )))
     .bind(tenant_id)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Refresh the cached discovery document + JWKS. Returns whether a row matched.
@@ -430,6 +465,7 @@ pub async fn update_idp_discovery_cache(
     jwks: &Value,
     discovered_at: DateTime<Utc>,
 ) -> sqlx::Result<bool> {
+    let mut tx = crate::scoped_tx(pool, scope).await?;
     let res = sqlx::query(
         "update org_idp_configs
          set discovered_metadata = $3, jwks = $4, discovered_at = $5, updated_at = now()
@@ -440,8 +476,9 @@ pub async fn update_idp_discovery_cache(
     .bind(metadata)
     .bind(jwks)
     .bind(discovered_at)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(res.rows_affected() == 1)
 }
 
@@ -457,6 +494,7 @@ pub async fn update_idp_jwks_cache(
     id: Uuid,
     jwks: &Value,
 ) -> sqlx::Result<bool> {
+    let mut tx = crate::scoped_tx(pool, scope).await?;
     let res = sqlx::query(
         "update org_idp_configs
          set jwks = $3, updated_at = now()
@@ -465,8 +503,9 @@ pub async fn update_idp_jwks_cache(
     .bind(scope.tenant_id())
     .bind(id)
     .bind(jwks)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(res.rows_affected() == 1)
 }
 
@@ -478,28 +517,33 @@ pub async fn idp_client_secret_sealed(
     pool: &PgPool,
     scope: TenantScope,
     id: Uuid,
-) -> sqlx::Result<Option<Vec<u8>>> {
-    let row: Option<(Option<Vec<u8>>,)> = sqlx::query_as(
-        "select client_secret_sealed from org_idp_configs where tenant_id = $1 and id = $2",
+) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
+    let mut tx = crate::scoped_tx(pool, scope).await?;
+    let row: Option<(Option<Vec<u8>>, i16)> = sqlx::query_as(
+        "select client_secret_sealed, client_secret_key_version
+         from org_idp_configs where tenant_id = $1 and id = $2",
     )
     .bind(scope.tenant_id())
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    Ok(row.and_then(|(s,)| s))
+    tx.commit().await?;
+    Ok(row.and_then(|(s, v)| s.map(|s| (s, v))))
 }
 
 /// Count a tenant's still-claimable login flows — the per-org outstanding-flow
 /// cap the start endpoint enforces to bound DB/IdP amplification from the
 /// unauthenticated login surface (design lines 852-854).
 pub async fn count_outstanding_login_flows(pool: &PgPool, scope: TenantScope) -> sqlx::Result<i64> {
+    let mut tx = crate::scoped_tx(pool, scope).await?;
     let (n,): (i64,) = sqlx::query_as(
         "select count(*) from login_flows
          where tenant_id = $1 and consumed_at is null and expires_at > now()",
     )
     .bind(scope.tenant_id())
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(n)
 }
 
@@ -521,13 +565,14 @@ pub async fn create_login_flow(
     scope: TenantScope,
     idp_config_id: Uuid,
     pkce_verifier_sealed: &[u8],
+    pkce_verifier_key_version: i16,
     nonce: &str,
     browser_hash: &str,
     redirect_to: &str,
     ttl_secs: i64,
     max_outstanding: i64,
 ) -> sqlx::Result<Option<Uuid>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::scoped_tx(pool, scope).await?;
     // Serialize concurrent starts for this org on the tenant row so the cap
     // check and the insert are one atomic decision.
     sqlx::query("select id from tenants where id = $1 for update")
@@ -560,8 +605,9 @@ pub async fn create_login_flow(
     let id = Uuid::now_v7();
     sqlx::query(
         "insert into login_flows
-           (id, tenant_id, idp_config_id, pkce_verifier_sealed, nonce, browser_hash, redirect_to, expires_at)
-         values ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(secs => $8::double precision))",
+           (id, tenant_id, idp_config_id, pkce_verifier_sealed, nonce, browser_hash, redirect_to,
+            expires_at, pkce_verifier_key_version)
+         values ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(secs => $8::double precision), $9)",
     )
     .bind(id)
     .bind(scope.tenant_id())
@@ -571,6 +617,7 @@ pub async fn create_login_flow(
     .bind(browser_hash)
     .bind(redirect_to)
     .bind(ttl_secs as f64)
+    .bind(pkce_verifier_key_version)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -590,7 +637,13 @@ pub async fn claim_login_flow(
     idp_config_id: Uuid,
     browser_hash: &str,
 ) -> sqlx::Result<Option<LoginFlowClaim>> {
-    sqlx::query_as(
+    // Rides the audited system-worker bypass (`worker_tx`): the login callback has
+    // no principal — the `tenant_id` was extracted from the verified sealed state,
+    // the browser-cookie hash sits INSIDE the predicate, and the config must still
+    // be active. The sanctioned pre-auth login-bootstrap category (mirrors the
+    // token-digest resolvers).
+    let mut tx = crate::worker_tx(pool).await?;
+    let __rls_out = sqlx::query_as(
         "update login_flows f set consumed_at = now()
          from org_idp_configs c
          where f.id = $1 and f.tenant_id = $2
@@ -600,14 +653,16 @@ pub async fn claim_login_flow(
            and f.consumed_at is null
            and f.browser_hash = $4
            and f.expires_at > now()
-         returning f.pkce_verifier_sealed, f.nonce, f.redirect_to, f.created_at",
+         returning f.pkce_verifier_sealed, f.pkce_verifier_key_version, f.nonce, f.redirect_to, f.created_at",
     )
     .bind(flow_id)
     .bind(tenant_id)
     .bind(idp_config_id)
     .bind(browser_hash)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 // ─── user_sessions ──────────────────────────────────────────────────────────
@@ -668,7 +723,12 @@ pub async fn resolve_web_session(
     token_plain: &str,
     idle_secs: i64,
 ) -> sqlx::Result<Option<WebSessionAuth>> {
-    sqlx::query_as(
+    // Rides the audited system-worker bypass (`worker_tx`): keyed purely on the
+    // session-token sha256 with NO tenant scope — the caller has no principal until
+    // this resolves the tenant. The credential-digest bootstrap category (mirrors
+    // the lib.rs token-digest resolvers).
+    let mut tx = crate::worker_tx(pool).await?;
+    let __rls_out = sqlx::query_as(
         "update user_sessions s
          set last_seen_at = now(),
              idle_expires_at = least(
@@ -693,8 +753,10 @@ pub async fn resolve_web_session(
     )
     .bind(sha256_hex(token_plain))
     .bind(idle_secs as f64)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Is this browser session still authorized RIGHT NOW — not revoked, within
@@ -706,6 +768,7 @@ pub async fn web_session_live(
     scope: TenantScope,
     session_id: Uuid,
 ) -> sqlx::Result<bool> {
+    let mut tx = crate::scoped_tx(pool, scope).await?;
     let (live,): (bool,) = sqlx::query_as(
         "select exists(
            select 1 from user_sessions s
@@ -723,8 +786,9 @@ pub async fn web_session_live(
     )
     .bind(scope.tenant_id())
     .bind(session_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(live)
 }
 
@@ -735,14 +799,16 @@ pub async fn revoke_user_session(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<bool> {
+    let mut tx = crate::scoped_tx(pool, scope).await?;
     let res = sqlx::query(
         "update user_sessions set revoked_at = now()
          where tenant_id = $1 and id = $2 and revoked_at is null",
     )
     .bind(scope.tenant_id())
     .bind(id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(res.rows_affected() == 1)
 }
 
@@ -780,7 +846,8 @@ pub async fn mint_pat(
     expires_at: DateTime<Utc>,
 ) -> sqlx::Result<PatRow> {
     let display_prefix: String = token_plain.chars().take(12).collect();
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = crate::scoped_tx(pool, scope).await?;
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "insert into api_tokens
            (id, tenant_id, kind, membership_id, user_id, name, display_prefix, token_sha256, expires_at)
          values ($1, $2, 'pat', $3, $4, $5, $6, $7, $8)
@@ -794,8 +861,10 @@ pub async fn mint_pat(
     .bind(display_prefix)
     .bind(sha256_hex(token_plain))
     .bind(expires_at)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Resolve a PAT (bootstrap exception: keys on the token sha256) and bump
@@ -805,7 +874,12 @@ pub async fn mint_pat(
 /// and the returned statuses are defense in depth (symmetric with
 /// [`resolve_web_session`]).
 pub async fn resolve_pat(pool: &PgPool, token_plain: &str) -> sqlx::Result<Option<PatAuth>> {
-    sqlx::query_as(
+    // Rides the audited system-worker bypass (`worker_tx`): keyed purely on the
+    // PAT sha256 with NO tenant scope — the caller has no principal until this
+    // resolves the tenant. The credential-digest bootstrap category (mirrors the
+    // lib.rs token-digest resolvers).
+    let mut tx = crate::worker_tx(pool).await?;
+    let __rls_out = sqlx::query_as(
         "update api_tokens tok set last_used_at = now()
          from org_memberships m, users u, tenants t
          where tok.kind = 'pat' and tok.token_sha256 = $1
@@ -819,8 +893,10 @@ pub async fn resolve_pat(pool: &PgPool, token_plain: &str) -> sqlx::Result<Optio
                    m.roles as roles, m.status as membership_status, u.status as user_status",
     )
     .bind(sha256_hex(token_plain))
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn list_pats(
@@ -828,15 +904,18 @@ pub async fn list_pats(
     scope: TenantScope,
     membership_id: Uuid,
 ) -> sqlx::Result<Vec<PatRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = crate::scoped_tx(pool, scope).await?;
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {PAT_COLS} from api_tokens
          where kind = 'pat' and tenant_id = $1 and membership_id = $2
          order by created_at desc"
     )))
     .bind(scope.tenant_id())
     .bind(membership_id)
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Revoke one PAT, scoped to its membership so a caller can only revoke its
@@ -847,6 +926,7 @@ pub async fn revoke_pat(
     membership_id: Uuid,
     token_id: Uuid,
 ) -> sqlx::Result<bool> {
+    let mut tx = crate::scoped_tx(pool, scope).await?;
     let res = sqlx::query(
         "update api_tokens set revoked_at = now()
          where kind = 'pat' and tenant_id = $1 and membership_id = $2 and id = $3
@@ -855,8 +935,9 @@ pub async fn revoke_pat(
     .bind(scope.tenant_id())
     .bind(membership_id)
     .bind(token_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(res.rows_affected() == 1)
 }
 
@@ -867,6 +948,20 @@ pub async fn revoke_pat(
 /// audit insert fails, the mutation fails); a REJECTED attempt calls it on a
 /// fresh connection committed after the rollback. The append-only trigger
 /// blocks any later UPDATE/DELETE.
+///
+/// RLS (Phase D, tightened by review M3): `auth_audit_log`'s INSERT policy now
+/// carries the SAME tenant floor as every other tenant-owned write —
+/// `tenant_id = current_setting('fluidbox.tenant_id')` OR the system-worker
+/// bypass. It was `with check (true)`, which let a transaction scoped to tenant A
+/// append a row stamped `tenant_id = B` into B's permanent, append-only security
+/// history with no way to retract it.
+///
+/// So the executor a caller supplies MUST carry the matching GUC: an accepted
+/// mutation passes its own `scoped_tx`/`worker_tx` (they all already did), and a
+/// standalone audit — a rejected attempt, or a deployment-level row with a NULL
+/// tenant — must go through [`insert_audit_standalone`] rather than a bare pooled
+/// connection. SELECTs of the log are tenant-or-null-or-bypass gated; there is no
+/// such reader in production code.
 pub async fn insert_audit(
     conn: &mut sqlx::PgConnection,
     entry: AuditEntry<'_>,
@@ -902,6 +997,35 @@ pub async fn insert_audit_with_id(
     Ok(id)
 }
 
+/// Append an audit row in its OWN short transaction, carrying the GUC the
+/// tightened INSERT policy requires (review M3).
+///
+/// This is the shape used by every audit that is NOT part of a mutation's
+/// transaction: a REJECTED attempt (audited in a transaction committed after the
+/// refusal rolled back — design 398-402), and a deployment-level operator row.
+/// Those used to run on a bare `pool.acquire()` connection with no GUC at all,
+/// which only worked because the policy was `with check (true)`.
+///
+/// The GUC follows the row, not the caller's convenience:
+/// * `tenant_id = Some(t)` → [`crate::scoped_tx`] on `t`. The row can only be
+///   stamped with the tenant it is actually about. Callers pass a tenant they
+///   VERIFIED (a resolved org, a principal's own scope) — the same rule as
+///   [`TenantScope`] everywhere else.
+/// * `tenant_id = None` → [`crate::worker_tx`]. A deployment-level row belongs to
+///   no tenant, so it takes the one audited, grep-able escape hatch like every
+///   other principal-less write.
+///
+/// The transaction is one INSERT long, so it never holds a connection across I/O.
+pub async fn insert_audit_standalone(pool: &PgPool, entry: AuditEntry<'_>) -> sqlx::Result<Uuid> {
+    let mut tx = match entry.tenant_id {
+        Some(t) => crate::scoped_tx(pool, TenantScope::assume(t)).await?,
+        None => crate::worker_tx(pool).await?,
+    };
+    let id = insert_audit(&mut tx, entry).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
 // ─── users / memberships (reads + the deactivation cascade) ─────────────────
 
 pub async fn get_user(
@@ -909,25 +1033,31 @@ pub async fn get_user(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<UserRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = crate::scoped_tx(pool, scope).await?;
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {USER_COLS} from users where tenant_id = $1 and id = $2"
     )))
     .bind(scope.tenant_id())
     .bind(id)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn list_memberships(
     pool: &PgPool,
     scope: TenantScope,
 ) -> sqlx::Result<Vec<OrgMembershipRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = crate::scoped_tx(pool, scope).await?;
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {MEMBERSHIP_COLS} from org_memberships where tenant_id = $1 order by created_at"
     )))
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_membership(
@@ -935,13 +1065,16 @@ pub async fn get_membership(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<OrgMembershipRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = crate::scoped_tx(pool, scope).await?;
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {MEMBERSHIP_COLS} from org_memberships where tenant_id = $1 and id = $2"
     )))
     .bind(scope.tenant_id())
     .bind(id)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// A membership by USER id (unique(tenant_id, user_id) → a single row). The
@@ -953,13 +1086,16 @@ pub async fn get_membership_by_user(
     scope: TenantScope,
     user_id: Uuid,
 ) -> sqlx::Result<Option<OrgMembershipRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = crate::scoped_tx(pool, scope).await?;
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {MEMBERSHIP_COLS} from org_memberships where tenant_id = $1 and user_id = $2"
     )))
     .bind(scope.tenant_id())
     .bind(user_id)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Executor-generic core of a status change + its deactivation cascade. When the
@@ -1012,7 +1148,7 @@ pub async fn set_membership_status(
     id: Uuid,
     status: &str,
 ) -> sqlx::Result<Option<OrgMembershipRow>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::scoped_tx(pool, scope).await?;
     let row = apply_membership_status(&mut tx, scope, id, status).await?;
     tx.commit().await?;
     Ok(row)
@@ -1080,7 +1216,8 @@ pub struct MemberRow {
 pub enum SecretPatch {
     Keep,
     Clear,
-    Set(Vec<u8>),
+    /// New sealed bytes + their envelope key-version companion.
+    Set(Vec<u8>, i16),
 }
 
 /// The mutable-field patch for an IdP config (identity fields are refused by the
@@ -1266,7 +1403,10 @@ pub async fn create_org_audited(
     display_name: Option<&str>,
     source_ip: Option<&str>,
 ) -> sqlx::Result<CreateOrgOutcome> {
-    let mut tx = pool.begin().await?;
+    // Operator org-CRUD (a sanctioned bypass category): the new `tenants` row's id
+    // is not yet any GUC's tenant, so its WITH CHECK — and the audit row it commits
+    // alongside — are satisfied only under the audited system-worker bypass.
+    let mut tx = crate::worker_tx(pool).await?;
     let row = match insert_org(&mut tx, slug, display_name).await {
         Ok(r) => r,
         Err(e) => {
@@ -1309,7 +1449,7 @@ pub async fn create_idp_config_audited(
     source_ip: Option<&str>,
 ) -> sqlx::Result<LifecycleOutcome<OrgIdpConfigRow>> {
     let arming = params.bootstrap_owner_email.is_some();
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::scoped_tx(pool, scope).await?;
     if arming {
         // Lock the org's existing config rows FIRST, then re-check owner-absence
         // under that lock — the create-path half of the arming invariant.
@@ -1364,7 +1504,7 @@ pub async fn activate_idp_config(
     id: Uuid,
     source_ip: Option<&str>,
 ) -> sqlx::Result<LifecycleOutcome<OrgIdpConfigRow>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::scoped_tx(pool, scope).await?;
     let configs = lock_org_configs(&mut tx, scope).await?;
     let Some(target) = configs.iter().find(|c| c.id == id) else {
         tx.rollback().await.ok();
@@ -1415,7 +1555,7 @@ pub async fn disable_idp_config(
     id: Uuid,
     source_ip: Option<&str>,
 ) -> sqlx::Result<LifecycleOutcome<CascadeCounts>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::scoped_tx(pool, scope).await?;
     let configs = lock_org_configs(&mut tx, scope).await?;
     let Some(target) = configs.iter().find(|c| c.id == id) else {
         tx.rollback().await.ok();
@@ -1466,7 +1606,7 @@ pub async fn reactivate_idp_config(
     id: Uuid,
     source_ip: Option<&str>,
 ) -> sqlx::Result<LifecycleOutcome<OrgIdpConfigRow>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::scoped_tx(pool, scope).await?;
     let configs = lock_org_configs(&mut tx, scope).await?;
     let Some(target) = configs.iter().find(|c| c.id == id) else {
         tx.rollback().await.ok();
@@ -1523,7 +1663,7 @@ pub async fn migrate_idp_config(
     carry_forward: bool,
     source_ip: Option<&str>,
 ) -> sqlx::Result<LifecycleOutcome<MigrateCounts>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::scoped_tx(pool, scope).await?;
     let configs = lock_org_configs(&mut tx, scope).await?;
     let (Some(old), Some(new)) = (
         configs.iter().find(|c| c.id == old_id),
@@ -1623,7 +1763,7 @@ pub async fn arm_bootstrap_owner(
     expires_at: DateTime<Utc>,
     source_ip: Option<&str>,
 ) -> sqlx::Result<LifecycleOutcome<(Uuid, Uuid)>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::scoped_tx(pool, scope).await?;
     // Resolve + lock the active config in one shot (partial unique index ⇒ ≤1).
     let active: Option<(Uuid, String)> = sqlx::query_as(
         "select id, status from org_idp_configs
@@ -1701,7 +1841,7 @@ pub async fn patch_idp_config(
     patch: IdpPatch<'_>,
     source_ip: Option<&str>,
 ) -> sqlx::Result<LifecycleOutcome<OrgIdpConfigRow>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::scoped_tx(pool, scope).await?;
     // Lock the row and capture the CURRENT auth method + whether a sealed secret
     // is present, so the coherence merge below reads consistent, locked state.
     let locked: Option<(String, bool)> = sqlx::query_as(
@@ -1721,7 +1861,7 @@ pub async fn patch_idp_config(
     // the LOCKED current row. Borrow `patch.client_secret` here (the move-match
     // for the UPDATE comes after).
     let secret_present_post = match &patch.client_secret {
-        SecretPatch::Set(_) => true,
+        SecretPatch::Set(..) => true,
         SecretPatch::Clear => false,
         SecretPatch::Keep => has_secret_now,
     };
@@ -1750,15 +1890,18 @@ pub async fn patch_idp_config(
     // Client-secret tri-state: Clear ⇒ null; Set ⇒ new sealed bytes; Keep ⇒
     // coalesce($3 = null) leaves the current value. `coalesce` alone cannot
     // express Clear, so a `$4::bool` flag forces null ahead of the coalesce.
-    let (clear_secret, set_secret): (bool, Option<Vec<u8>>) = match patch.client_secret {
-        SecretPatch::Keep => (false, None),
-        SecretPatch::Clear => (true, None),
-        SecretPatch::Set(bytes) => (false, Some(bytes)),
-    };
+    let (clear_secret, set_secret, set_version): (bool, Option<Vec<u8>>, Option<i16>) =
+        match patch.client_secret {
+            SecretPatch::Keep => (false, None, None),
+            SecretPatch::Clear => (true, None, None),
+            SecretPatch::Set(bytes, version) => (false, Some(bytes), Some(version)),
+        };
     let row: OrgIdpConfigRow = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update org_idp_configs set
            client_secret_sealed = case when $4::bool then null
                                        else coalesce($3::bytea, client_secret_sealed) end,
+           client_secret_key_version = case when $4::bool then 1
+                                       else coalesce($9::smallint, client_secret_key_version) end,
            token_endpoint_auth = coalesce($5::text, token_endpoint_auth),
            scopes = coalesce($6::text[], scopes),
            claim_mappings = coalesce($7::jsonb, claim_mappings),
@@ -1774,6 +1917,7 @@ pub async fn patch_idp_config(
     .bind(patch.scopes.map(<[String]>::to_vec))
     .bind(patch.claim_mappings)
     .bind(patch.alg_allowlist.map(<[String]>::to_vec))
+    .bind(set_version)
     .fetch_one(&mut *tx)
     .await?;
 
@@ -1818,7 +1962,8 @@ pub async fn patch_idp_config(
 
 /// The operator membership list (users + memberships + roles + status).
 pub async fn list_members(pool: &PgPool, scope: TenantScope) -> sqlx::Result<Vec<MemberRow>> {
-    sqlx::query_as(
+    let mut tx = crate::scoped_tx(pool, scope).await?;
+    let __rls_out = sqlx::query_as(
         "select m.id as membership_id, m.user_id as user_id, m.roles as roles,
                 m.status as membership_status, u.email as email, u.name as name,
                 u.status as user_status, u.idp_config_id as idp_config_id,
@@ -1828,8 +1973,10 @@ pub async fn list_members(pool: &PgPool, scope: TenantScope) -> sqlx::Result<Vec
          where m.tenant_id = $1 order by m.created_at",
     )
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// The operator kill switch: deactivate a membership (cascade revokes its
@@ -1841,7 +1988,7 @@ pub async fn deactivate_membership_audited(
     id: Uuid,
     source_ip: Option<&str>,
 ) -> sqlx::Result<Option<OrgMembershipRow>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::scoped_tx(pool, scope).await?;
     // Deactivating an OWNER frees the org for a bootstrap re-arm, so it must
     // serialize with arming/consumption/role-changes on the SAME config lock as
     // the roles-change path. Take `lock_org_configs` FIRST, UNCONDITIONALLY
@@ -1887,7 +2034,7 @@ pub async fn set_membership_roles_audited(
     roles: &[String],
     source_ip: Option<&str>,
 ) -> sqlx::Result<Option<OrgMembershipRow>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::scoped_tx(pool, scope).await?;
     // Owner-role mutations serialize on the config row lock, alongside bootstrap
     // arming + consumption (design 2026-07-17 line 718). Lock the org's IdP
     // config rows before granting OR revoking owner: a grant is visible in the
@@ -2238,7 +2385,12 @@ pub async fn claim_pending_switch(
     idle_secs: i64,
     absolute_secs: i64,
 ) -> sqlx::Result<Option<SwitchClaim>> {
-    let mut tx = pool.begin().await?;
+    // The dual-tenant one-time switch claim is the second credential-like bootstrap
+    // exception (design lines 355-377): it reads/writes across BOTH the new org and
+    // the replaced org, keyed on the confirmation-cookie hash — no single tenant
+    // scope covers it — so it rides the audited system-worker bypass. Every branch
+    // still re-validates the browser hash + live replaced session atomically.
+    let mut tx = crate::worker_tx(pool).await?;
 
     // (1) Plain-read the pending switch row to learn WHICH config to lock — NO
     // lock, no trust. The config lock (step 2) MUST precede the switch-row claim
@@ -2415,12 +2567,19 @@ pub async fn claim_pending_switch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connect;
+    // `test_connect` (NOT `connect`): the fixtures below write and read across
+    // tenants with no TenantScope, which migration 0018's FORCEd RLS refuses on a
+    // plain pool. See its doc comment on the crate root.
+    use crate::test_connect;
 
     /// Delete everything a test created under a throwaway tenant, children
     /// first (tenant FKs are NO ACTION — no cascade). `auth_audit_log` is
-    /// append-only (its trigger blocks DELETE), so tests never COMMIT audit
-    /// rows tied to a tenant — they exercise audit inside a rolled-back tx.
+    /// append-only (DELETE is denied — by the 0018 RLS policy set on an
+    /// RLS-bound role, by the 0012 trigger on one that bypasses RLS), so tests
+    /// never COMMIT audit rows tied to a tenant — they exercise audit inside a
+    /// rolled-back tx. Runs on the fixture pool: the deletes below are
+    /// cross-tenant by construction and would silently match zero rows without
+    /// the audited bypass GUC.
     async fn cleanup_tenant(pool: &PgPool, tenant: Uuid) {
         for stmt in [
             "delete from api_tokens where tenant_id = $1",
@@ -2455,6 +2614,7 @@ mod tests {
                 issuer: "https://issuer.example",
                 client_id: "client-abc",
                 client_secret_sealed: Some(vec![1, 2, 3]),
+                client_secret_key_version: 1,
                 token_endpoint_auth: "client_secret_basic",
                 scopes: &scopes,
                 alg_allowlist: &algs,
@@ -2513,13 +2673,146 @@ mod tests {
         (user_id, membership_id)
     }
 
+    /// Count rows on a policy'd table through a runtime-role connection, optionally
+    /// under a GUC. Mirrors the lib.rs RLS test helper: a Postgres SUPERUSER
+    /// bypasses RLS even under FORCE, and CI's DB user is the superuser, so the
+    /// assertion MUST run through a `SET ROLE fluidbox_runtime` connection for the
+    /// policy to actually execute. Every query OMITS a `where tenant_id` clause on
+    /// purpose (the buggy-predicate proof, #75).
+    async fn count_rows(
+        rt: &mut sqlx::PgConnection,
+        guc: Option<(&str, String)>,
+        sql: &'static str,
+    ) -> i64 {
+        use sqlx::Connection;
+        let mut tx = rt.begin().await.unwrap();
+        if let Some((name, val)) = guc {
+            sqlx::query("select set_config($1, $2, true)")
+                .bind(name)
+                .bind(val)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        let (n,): (i64,) = sqlx::query_as(sql).fetch_one(&mut *tx).await.unwrap();
+        tx.rollback().await.ok();
+        n
+    }
+
+    /// Phase D (#32, #75) — RLS wave B, identity family. Proves DB-enforced tenant
+    /// isolation on the FOUR identity tables `scoped_tx` now guards
+    /// (`users`/`org_memberships`/`user_sessions`/`api_tokens`): a tenant-A GUC sees
+    /// ONLY tenant A's rows even with NO predicate, the audited bypass sees both,
+    /// and a no-GUC transaction sees nothing. Seeding runs on the FIXTURE pool
+    /// (`test_connect`, session-level system-worker bypass) so it is agnostic to the
+    /// base role's privilege and to the enforcement asserted below — which is
+    /// asserted through a SEPARATE `SET ROLE fluidbox_runtime` connection that never
+    /// carries that GUC.
+    #[tokio::test]
+    async fn rls_identity_family_cross_tenant_isolation() {
+        use sqlx::{Connection, Executor};
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+
+        // Two throwaway orgs; each gets an active IdP config, a user + membership, a
+        // browser session, and a PAT — one row per identity table per tenant.
+        let slug_a = format!("rlsa-{}", Uuid::now_v7().simple());
+        let slug_b = format!("rlsb-{}", Uuid::now_v7().simple());
+        let a = create_org(&pool, &slug_a, None).await.unwrap();
+        let b = create_org(&pool, &slug_b, None).await.unwrap();
+        for org in [&a, &b] {
+            let scope = TenantScope::assume(org.id);
+            let cfg = staged_config(&pool, scope).await;
+            activate(&pool, cfg.id).await;
+            let (user_id, membership_id) =
+                seed_user_membership(&pool, scope, cfg.id, "rls-subj").await;
+            sqlx::query(
+                "insert into user_sessions
+                   (id, tenant_id, membership_id, user_id, session_token_sha256, idp_config_id,
+                    idle_expires_at, absolute_expires_at)
+                 values ($1, $2, $3, $4, $5, $6,
+                         now() + interval '1 hour', now() + interval '1 day')",
+            )
+            .bind(Uuid::now_v7())
+            .bind(org.id)
+            .bind(membership_id)
+            .bind(user_id)
+            .bind(sha256_hex(&format!("sess-{}", org.id)))
+            .bind(cfg.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            // `api_tokens_kind_shape` (0012) demands the FULL pat shape — name +
+            // display_prefix + a finite expiry — so the fixture mirrors `mint_pat`.
+            sqlx::query(
+                "insert into api_tokens
+                   (id, tenant_id, kind, membership_id, user_id, name, display_prefix,
+                    token_sha256, expires_at)
+                 values ($1, $2, 'pat', $3, $4, 'rls-pat', 'fbx_pat_rls0', $5,
+                         now() + interval '1 day')",
+            )
+            .bind(Uuid::now_v7())
+            .bind(org.id)
+            .bind(membership_id)
+            .bind(user_id)
+            .bind(sha256_hex(&format!("pat-{}", org.id)))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Assert through the NON-superuser runtime role — otherwise RLS is bypassed.
+        let mut rt = sqlx::PgConnection::connect(&url).await.expect("rt connect");
+        rt.execute("set role fluidbox_runtime")
+            .await
+            .expect("set role");
+        let a_str = a.id.to_string();
+        let tid = "fluidbox.tenant_id";
+        // Literal per-table SQL (sqlx needs a `'static` query); every one OMITS a
+        // `where tenant_id` clause on purpose (the buggy-predicate proof).
+        for (table, sql) in [
+            ("users", "select count(*) from users"),
+            ("org_memberships", "select count(*) from org_memberships"),
+            ("user_sessions", "select count(*) from user_sessions"),
+            ("api_tokens", "select count(*) from api_tokens"),
+        ] {
+            assert_eq!(
+                count_rows(&mut rt, Some((tid, a_str.clone())), sql).await,
+                1,
+                "A-scope must see ONLY tenant A's {table} row even without a predicate",
+            );
+            assert_eq!(
+                count_rows(&mut rt, None, sql).await,
+                0,
+                "a no-GUC transaction must see zero {table} rows",
+            );
+            assert!(
+                count_rows(
+                    &mut rt,
+                    Some(("fluidbox.bypass", "system_worker".into())),
+                    sql,
+                )
+                .await
+                    >= 2,
+                "the system_worker bypass must see both tenants' {table} rows",
+            );
+        }
+        rt.close().await.ok();
+
+        cleanup_tenant(&pool, a.id).await;
+        cleanup_tenant(&pool, b.id).await;
+    }
+
     #[tokio::test]
     async fn org_config_and_login_flow_claim() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
 
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = create_org(&pool, &slug, Some("Test Org")).await.unwrap();
@@ -2549,6 +2842,7 @@ mod tests {
             scope,
             cfg.id,
             &[9, 8, 7],
+            1,
             "nonce-1",
             &good_hash,
             "/dashboard",
@@ -2583,6 +2877,7 @@ mod tests {
             scope,
             cfg.id,
             &[1],
+            1,
             "nonce-2",
             &good_hash,
             "/",
@@ -2606,7 +2901,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
 
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = create_org(&pool, &slug, None).await.unwrap();
@@ -2748,16 +3043,45 @@ mod tests {
         cleanup_tenant(&pool, org.id).await;
     }
 
+    /// Append-only-ness, asserted at the depth that ACTUALLY applies to the
+    /// connecting role. Migration 0018 changed which layer fires first, so the old
+    /// "UPDATE/DELETE always raise" assertion is no longer the whole truth:
+    ///
+    /// * **RLS-BOUND role** (what FORCE RLS produces for the plain owner and for
+    ///   `fluidbox_runtime`): 0018 gives `auth_audit_log` an INSERT policy and a
+    ///   SELECT policy and NOTHING else, so UPDATE/DELETE match no policy and are
+    ///   FILTERED to zero rows. The statement returns `Ok`, the row is untouched,
+    ///   and the 0012 trigger is never reached.
+    /// * **RLS-BYPASSING role** (superuser or BYPASSRLS — CI's `postgres`, Neon's
+    ///   `neon_superuser`): policies are skipped entirely and the 0012 trigger is
+    ///   what refuses, raising `auth_audit_log is append-only`. Post-0018 that
+    ///   trigger is the BACKSTOP for exactly these roles, not the primary
+    ///   owner-path guard it was written as.
+    /// * **`fluidbox_runtime`**: refused one layer earlier still — 0018 REVOKEs
+    ///   UPDATE/DELETE from it (0012's deferred grant), so it is a privilege error.
+    ///
+    /// All three are deny. The invariant both base-role branches pin is the same:
+    /// the row survives the mutation attempt unchanged.
     #[tokio::test]
     async fn audit_log_is_append_only() {
+        use sqlx::{Connection, Executor};
         let Ok(url) = std::env::var("DATABASE_URL") else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
+
+        // Which depth applies here? Role attributes are NOT inherited through
+        // membership, so this must be read off the connecting role itself.
+        let (bypasses_rls,): (bool,) = sqlx::query_as(
+            "select rolsuper or rolbypassrls from pg_roles where rolname = current_user",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
         // Everything inside one tx we roll back — an audit row can never be
-        // deleted (the trigger blocks it), so we never commit one in a test.
+        // deleted (whichever layer refuses), so we never commit one in a test.
         let mut tx = pool.begin().await.unwrap();
         let detail = serde_json::json!({"before": "a", "after": "b"});
         let id = insert_audit(
@@ -2777,19 +3101,39 @@ mod tests {
         .await
         .unwrap();
 
-        // UPDATE is refused by the append-only trigger.
         let upd = sqlx::query("update auth_audit_log set success = false where id = $1")
             .bind(id)
             .execute(&mut *tx)
             .await;
-        assert!(
-            upd.is_err(),
-            "UPDATE must raise auth_audit_log is append-only"
-        );
-        // The failed statement poisons the tx; roll it back so nothing persists.
-        tx.rollback().await.ok();
+        if bypasses_rls {
+            assert!(
+                upd.is_err(),
+                "on an RLS-bypassing role the 0012 trigger must raise \
+                 'auth_audit_log is append-only'"
+            );
+            // The failed statement poisons the tx; roll it back so nothing persists.
+            tx.rollback().await.ok();
+        } else {
+            assert_eq!(
+                upd.expect("RLS filters the UPDATE — it must not error")
+                    .rows_affected(),
+                0,
+                "under FORCE RLS with no UPDATE policy the mutation must affect zero rows"
+            );
+            let (still_true,): (bool,) =
+                sqlx::query_as("select success from auth_audit_log where id = $1")
+                    .bind(id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
+            assert!(
+                still_true,
+                "the audit row must survive the UPDATE unchanged"
+            );
+            tx.rollback().await.ok();
+        }
 
-        // DELETE is likewise refused (fresh tx, also rolled back).
+        // DELETE is likewise denied (fresh tx, also rolled back).
         let mut tx = pool.begin().await.unwrap();
         let id2 = insert_audit(
             &mut tx,
@@ -2811,11 +3155,60 @@ mod tests {
             .bind(id2)
             .execute(&mut *tx)
             .await;
-        assert!(
-            del.is_err(),
-            "DELETE must raise auth_audit_log is append-only"
-        );
-        tx.rollback().await.ok();
+        if bypasses_rls {
+            assert!(
+                del.is_err(),
+                "on an RLS-bypassing role the 0012 trigger must raise \
+                 'auth_audit_log is append-only'"
+            );
+            tx.rollback().await.ok();
+        } else {
+            assert_eq!(
+                del.expect("RLS filters the DELETE — it must not error")
+                    .rows_affected(),
+                0,
+                "under FORCE RLS with no DELETE policy the mutation must affect zero rows"
+            );
+            let (survives,): (i64,) =
+                sqlx::query_as("select count(*) from auth_audit_log where id = $1")
+                    .bind(id2)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
+            assert_eq!(survives, 1, "the audit row must survive the DELETE");
+            tx.rollback().await.ok();
+        }
+
+        // The third depth, and the one that is deterministic on EVERY host that ran
+        // 0018: the least-privilege runtime role has UPDATE/DELETE revoked, so it is
+        // refused by the grant before either RLS or the trigger is consulted.
+        let has_role: bool =
+            sqlx::query_scalar("select exists(select 1 from pg_roles where rolname = $1)")
+                .bind("fluidbox_runtime")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        if has_role {
+            let mut rt = sqlx::PgConnection::connect(&url).await.expect("rt connect");
+            rt.execute("set role fluidbox_runtime")
+                .await
+                .expect("set role");
+            let mut rtx = rt.begin().await.unwrap();
+            let denied = sqlx::query("update auth_audit_log set success = false where id = $1")
+                .bind(Uuid::now_v7())
+                .execute(&mut *rtx)
+                .await;
+            let msg = denied
+                .map(|_| String::new())
+                .unwrap_or_else(|e| e.to_string());
+            assert!(
+                msg.to_lowercase().contains("permission denied"),
+                "fluidbox_runtime must be denied UPDATE on auth_audit_log by the 0018 \
+                 grant (got: {msg})"
+            );
+            rtx.rollback().await.ok();
+            rt.close().await.ok();
+        }
     }
 
     #[tokio::test]
@@ -2824,7 +3217,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -2888,7 +3281,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
 
         // The NEW login's org (config must be ACTIVE — the claim rechecks it).
         let slug_new = format!("t-{}", Uuid::now_v7().simple());
@@ -3096,7 +3489,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -3137,7 +3530,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -3186,6 +3579,7 @@ mod tests {
             scope,
             cfg.id,
             &[1],
+            1,
             "flow-n",
             &sha256_hex("y"),
             "/",
@@ -3287,6 +3681,7 @@ mod tests {
             scope,
             old.id,
             &[1],
+            1,
             "mig-flow",
             &flow_bh,
             "/",
@@ -3401,7 +3796,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         migrate_case(&pool, false).await;
         migrate_case(&pool, true).await;
     }
@@ -3412,7 +3807,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -3469,7 +3864,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -3547,7 +3942,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
 
         let slug_a = format!("t-{}", Uuid::now_v7().simple());
         let slug_b = format!("t-{}", Uuid::now_v7().simple());
@@ -3657,8 +4052,8 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
-        let pool2 = connect(&url).await.expect("connect 2");
+        let pool = test_connect(&url).await.expect("connect");
+        let pool2 = test_connect(&url).await.expect("connect 2");
 
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = create_org(&pool, &slug, None).await.unwrap();
@@ -3818,8 +4213,8 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
-        let pool2 = connect(&url).await.expect("connect 2");
+        let pool = test_connect(&url).await.expect("connect");
+        let pool2 = test_connect(&url).await.expect("connect 2");
 
         // ---- FORWARD: swap holds the lock → claim blocks → fails closed. ----
         let s = seed_switch_scenario(&pool).await;
@@ -3955,9 +4350,9 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
-        let pool_a = connect(&url).await.expect("connect a");
-        let pool_b = connect(&url).await.expect("connect b");
+        let pool = test_connect(&url).await.expect("connect");
+        let pool_a = test_connect(&url).await.expect("connect a");
+        let pool_b = test_connect(&url).await.expect("connect b");
 
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = create_org(&pool, &slug, None).await.unwrap();

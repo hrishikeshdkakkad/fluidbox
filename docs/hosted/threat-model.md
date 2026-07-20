@@ -4,7 +4,7 @@
 **Status:** Phase A deliverable of the multi-user MCP control plane epic (#28)
 **Authority:** [`../plans/2026-07-14-multi-user-mcp-control-plane-design.md`](../plans/2026-07-14-multi-user-mcp-control-plane-design.md) (v4, security invariants 1–22 and Gaps 1–14) and [`../plans/2026-07-17-idp-agnostic-identity-design.md`](../plans/2026-07-17-idp-agnostic-identity-design.md) (v5, identity invariants 1–12). Vulnerability reporting: [`SECURITY.md`](../../SECURITY.md).
 
-This threat model covers the hosted multi-user deployment (~300 seats). It is deliberately honest about time: Phase B landed per-organization identity and per-tenant repository scoping, and Phase C landed connection ownership + per-run resource bindings; every mitigation below still carries a **status** — `shipped` or the phase (D–F) that closes it. A row marked with an unshipped phase is a *known open risk* until that phase lands; hosted multi-tenant operation is not offered before Phases D–E close their remaining rows.
+This threat model covers the hosted multi-user deployment (~300 seats). It is deliberately honest about time: Phase B landed per-organization identity and per-tenant repository scoping, Phase C landed connection ownership + per-run resource bindings, and Phase D landed KMS envelope sealing + one-time browser-bound / reusable connector OAuth + per-tenant LiteLLM virtual keys + database-enforced RLS; every mitigation below still carries a **status** — `shipped` or the phase (E–F) that closes it. A row marked with an unshipped phase is a *known open risk* until that phase lands; hosted multi-tenant operation is not offered before Phase E closes its remaining rows.
 
 ## Core assumption: the sandbox is compromised
 
@@ -14,7 +14,7 @@ fluidbox does not try to prevent sandbox compromise — it **assumes** it. Promp
 
 | # | Asset | Where it lives |
 |---|---|---|
-| A1 | Upstream connector credentials (OAuth refresh tokens, static API keys, GitHub App private keys, webhook/delivery secrets) | AEAD-sealed at rest (`seal.rs`, `FLUIDBOX_CREDENTIAL_KEY`); access tokens minted at call time, cached in memory only |
+| A1 | Upstream connector credentials (OAuth refresh tokens, static API keys, GitHub App private keys, webhook/delivery secrets) | AEAD-sealed at rest (`seal.rs`): v1 under the deployment-wide `FLUIDBOX_CREDENTIAL_KEY`, or — when KMS envelope sealing is enabled (`FLUIDBOX_KMS_MODE`, off by default) — v2 under a per-tenant DEK wrapped by a KEK, with a per-column `_key_version` companion; access tokens minted at call time, cached in memory only |
 | A2 | Identity secrets (IdP client secrets, PKCE verifiers, browser-session tokens, PATs) | Sealed columns; session/PAT secrets stored only as sha256 |
 | A3 | Tenant data (runs, event ledger, artifacts, workspace source code, connection metadata) | Postgres + workspace archive volume |
 | A4 | Model spend and compute (LLM budgets, sandbox capacity) | Facade budget stops; per-run budgets; LiteLLM keys |
@@ -54,7 +54,7 @@ The [network architecture](network-architecture.md) enumerates the edges; the bo
 
 ## Scenarios and controls
 
-Statuses: **shipped** = enforced on `main` today (`shipped (Phase B)`/`shipped (Phase C)` mark a row that phase closed); **Phase D–F** = the phase that closes it (open risk until then).
+Statuses: **shipped** = enforced on `main` today (`shipped (Phase B)`/`shipped (Phase C)`/`shipped (Phase D)` mark a row that phase closed); **Phase E–F** = the phase that closes it (open risk until then).
 
 ### T1/T2 — the compromised sandbox and the model itself
 
@@ -66,7 +66,7 @@ Statuses: **shipped** = enforced on `main` today (`shipped (Phase B)`/`shipped (
 | Choose *whose* credential executes a tool | The model chooses only among frozen tools; bindings are frozen at run creation; the broker resolves the credential solely from the run's `run_resource_bindings` row (invariants 4, 5) | shipped (Phase C; pre-Phase-C in-flight runs keep the embedded-connection path with a status-only recheck — see residuals) |
 | Bypass the permission callback (autonomy modes) | The callback stays wired in both modes — never the SDK's `bypassPermissions`; autonomous mode rewrites `RequireApproval` to the policy fallback inside `evaluate()`, ledgering both verdicts | shipped |
 | Impersonate runner-control actions (report results, heartbeats) after reading the process env | Today one bearer holds every audience — agent code **can** read it (Gap 10) | **Phase E**: audience-scoped credentials; runner-control unreachable from agent subprocesses |
-| Overspend the per-run LLM budget with parallel calls | Facade checks-then-records today — concurrent calls can pass the same remaining budget (Gap 14) | **Phase E**: durable request-ID-keyed reservations; **Phase D**: per-tenant LiteLLM virtual keys as the fairness backstop |
+| Overspend the per-run LLM budget with parallel calls | Facade checks-then-records today — concurrent calls can pass the same remaining budget (Gap 14) | **Phase E**: durable request-ID-keyed reservations; **shipped (Phase D)**: per-tenant LiteLLM virtual keys (`FLUIDBOX_LLM_KEY_MODE=tenant`) as the fairness backstop — each carries its own server-side spend/token/rate ceiling |
 | Replay a decided tool call to execute the write twice | Decision idempotency exists; execution idempotency does not yet (Gap 11) | **Phase E**: durable execution claims keyed `(tenant, run, tool_call_id, input_digest)`, at most one dispatch attempt (invariant 16) |
 | Execute a late-approved call after cancellation/budget termination | Terminality checked before the wait today, not before send | **Phase E**: claim conditional on nonterminal session (invariant 18) |
 | Poison the ledger with prompts/secrets | The sink accepts only `Redacted<EventEnvelope>` (constructible solely via the redactor) — digests, usage, cost only | shipped |
@@ -89,11 +89,27 @@ Statuses: **shipped** = enforced on `main` today (`shipped (Phase B)`/`shipped (
 |---|---|---|
 | Read or bind another user's personal connection | Connection ownership (`owner_type`, `owner_user_id`); binding verification; personal connections invisible to other members — 404-not-403, admins included (they act through their own viewer lens) | shipped (Phase C) |
 | Approve an action so it runs under someone else's credential | Approval permits the proposed action under the credential already frozen into the run — never the approver's (invariant 8); approvers need `approval.decide_own`/`approval.decide_org`; no role — including admin or the operator — authorizes approval under another user's personal connection, and only its owner-who-invoked may decide it (`authorize_approval_decision`) | shipped (approval RBAC Phase B; personal-connection authority Phase C) |
-| Read another tenant's runs/events/artifacts by UUID | `TenantScope` repository signatures (primary), composite tenant FKs, cross-tenant negative test matrix; UUID unpredictability is not authorization (invariant 10); RLS remains the not-yet-added defense-in-depth layer | shipped (Phase B; `TenantScope` + composite keys); RLS depth deferred |
+| Read another tenant's runs/events/artifacts by UUID | `TenantScope` repository signatures (primary), composite tenant FKs, cross-tenant negative test matrix; UUID unpredictability is not authorization (invariant 10); RLS now enforces the same tenant floor in the database (migration 0018: 37 tenant-owned tables `ENABLE`+`FORCE`, GUC-driven policies via `scoped_tx`/`worker_tx`; the negative tests run as the non-owner `fluidbox_runtime` role). **Two caveats, both operational:** the two tables holding cross-tenant SHARED rows (`connector_catalog`, `oauth_client_registrations`) are readable by every scope by design — writes to those global rows are bypass-only, so the floor covers mutation but not visibility of shared reference data; and RLS is **inert for a SUPERUSER or BYPASSRLS role** (Neon's default `neon_superuser`), which is not inherited through role membership — set `FLUIDBOX_RUNTIME_ROLE` and verify with `just doctor`. Multi-user boot now **REFUSES** that state (`FLUIDBOX_REQUIRE_SSO=1` + a bypassing effective pool role ⇒ `REFUSING TO BOOT`, unless `FLUIDBOX_ALLOW_RLS_BYPASS=1` accepts it for local single-user work), and the runtime role itself is posture-validated (no LOGIN/SUPERUSER/BYPASSRLS/CREATEROLE/CREATEDB/REPLICATION, no memberships, no other members) in both the migration and every boot, since PostgreSQL roles are cluster-global while the grants are database-local. **`SET ROLE` is not a credential boundary** — see below | shipped (Phase B `TenantScope` + composite keys; Phase D RLS depth) |
 | See tenant existence via login routing | The neutral entry page never enumerates organizations and answers identically for unknown and IdP-less slugs | shipped (Phase B) |
 | A trigger token used beyond its subscription | Subscription-scoped, sha256-hashed tokens: invoke exactly one subscription, poll only runs it created; invoke overrides are opt-in and can only narrow | shipped |
 | A member reads runs they shouldn't | `run.read` visibility rules (own runs; token-created runs; `subscriptions.manage`; `runs.read_all`) on every session/event/artifact/approval/SSE query | shipped (Phase B) |
 | Custom connector admitted by one tenant becomes bindable in another | Custom definitions tenant-scoped (partial unique indexes: global slug + per-tenant custom slug); unattributable legacy rows disabled at the 0013 backfill | shipped (Phase C) |
+
+> **Do not size this model around the runtime role.** `SET ROLE` narrows the
+> authority of the ordinary application queries this process issues; it is NOT a
+> credential boundary. `RESET ROLE` returns the same connection to the migration
+> owner, and the process still holds the owner `DATABASE_URL` and can open a fresh
+> owner connection — so it does not defend against process compromise or SQL
+> injection. Genuine separation needs distinct migration-owner and runtime-LOGIN
+> connection strings, with the runtime login owning no schema objects and carrying
+> no bypass attributes; fluidbox runs one `DATABASE_URL` today. What the split does
+> buy is containment of fluidbox's OWN bugs: a query that lost its tenant scope
+> returns zero rows instead of every tenant's. Operational residuals, stated plainly:
+> the role's membership checks are DIRECT-only (a transitive path runs through a
+> role that is already an admin over the connecting user, so flagging it would
+> refuse every managed host); `audit_select` remains tenant-or-null-or-bypass (the
+> INSERT floor is the one that was tightened); and the RLS-bypass boot gate is fatal
+> only under `FLUIDBOX_REQUIRE_SSO=1` — single-user deployments warn.
 
 ### T6 — the unauthenticated network
 
@@ -102,8 +118,8 @@ Statuses: **shipped** = enforced on `main` today (`shipped (Phase B)`/`shipped (
 | Forged webhook creates runs | HMAC is the authentication — against the connection's sealed secret, or the GitHub App registration's sealed secret on the App-level ingress path; nothing stored before verification | shipped |
 | Replayed webhook duplicates fan-out | Two DB-unique dedup levels bound to the session insert in one transaction — retries heal, never duplicate | shipped |
 | Login CSRF / forced login into an attacker's session | Session replacement is never silent: `pending_login_switches` one-time browser-bound confirmation (cookie hash inside the claim predicate, 120 s expiry, current-session equality in the predicate) | shipped (Phase B) |
-| Replayed / attacker-completed OAuth or login callback | One-time server-side state rows; per-flow `HttpOnly` cookie hash inside the one-time claim predicate — a leaked authorization URL can neither complete nor burn a flow. Invariant 20 itself governs connector OAuth's full binding set; the GitHub App and login flows use the same one-time cookie-hash claim **mechanism** with their own, flow-appropriate binding sets | shipped (GitHub App, login) / **Phase D** (connector OAuth, invariant 20) |
-| Cross-user grant injection (victim's consent seals into attacker's connection) | The completing browser must prove it started the flow — same cookie-hash predicate; connected account shown for human confirmation before activation | **Phase D** |
+| Replayed / attacker-completed OAuth or login callback | One-time server-side state rows; a per-flow `HttpOnly` `__Host-fbx_oauth_flow` cookie whose sha256 sits inside the atomic single-use claim predicate — a leaked authorization URL can neither complete nor burn a flow. Connector OAuth (invariant 20) freezes its full binding set into the `connector_oauth_flows` row at start — authorization/token endpoints, resolved client, `resource`, sealed PKCE verifier, and the connection's `authorization_generation` — and the callback exchanges against the frozen row (closing AS mix-up) and refuses a moved generation; the GitHub App and login flows use the same one-time cookie-hash claim mechanism with their own, flow-appropriate binding sets | shipped (GitHub App, login; connector OAuth Phase D, invariant 20) |
+| Cross-user grant injection (victim's consent seals into attacker's connection) | The completing browser must prove it started the flow — the `__Host-fbx_oauth_flow` cookie-hash predicate sits inside the one-time claim, so a *leaked* authorization URL can neither complete nor burn a flow (shipped). It does NOT stop a **transferable `go_url`**: the `/go` boot token carries the cookie plaintext, so whichever browser opens the link *becomes* the initiating browser. The callback then activates directly, with no connected-account confirmation — and a confirmation only helps under the conditions spelled out in the [residual below](#residual-detail--the-transferable-connector-oauth-go_url) | partially shipped (Phase D — leaked-URL binding); **transferable-`go_url` lure OPEN** |
 | CSRF against cookie-authenticated APIs | Custom header + `Origin` check on every cookie-authenticated non-GET; `CorsLayer::permissive()` removed in the same change; GET writes limited to the enumerated protocol-forced flows, each with its own one-time claims | shipped (Phase B) |
 | SSRF via crafted endpoints, discovery documents, redirects, or DNS rebinding | Admission address-class rules enforced at resolution time on every fetch; redirect re-validation; egress proxy | **Phase E** (Gap 7); policy stated now in the [admission policy](connector-admission-policy.md) |
 | Amplification via unauthenticated login/callback endpoints | Rate limits per IP and per org; caps on outstanding unconsumed flows; flow claims commit before any IdP I/O so slow IdPs cannot hold DB connections | shipped (Phase B) |
@@ -117,7 +133,7 @@ Statuses: **shipped** = enforced on `main` today (`shipped (Phase B)`/`shipped (
 | Stolen session cookie rides forever | Server-side session rows (revocable), sliding idle expiry capped by an absolute expiry, `__Host-` prefix, HttpOnly, SameSite=Lax; long-lived streams re-authorize on a ≤60 s interval | shipped (Phase B) |
 | Stolen trigger token reaches the admin surface | Token kinds are mutually exclusive (relationally CHECK-enforced); trigger tokens never touch `/v1`-admin routes; the admin token can never invoke a trigger | shipped |
 | Leaked run session token used from outside | Reaching `:8788` requires being inside the sandbox network path; workload identity/mTLS additionally binds the caller | shipped (network) / **Phase E** (identity, Gap 6 remainder) |
-| Revoked connection's cached access token keeps working | Custody is DB-gated, not cache-gated: every credentialed consumer (broker MCP call, workspace fetch, result publish) rechecks live status + authorization generation + owner membership before any cached token is minted or served; the in-memory token cache is keyed by `(connection, generation)` and a generation bump evicts it | shipped (GitHub custody pattern; Phase C broker/workspace/publish rechecks + generation-keyed cache) / **Phase D** (distributed refresh coordination across replicas, Gap 4) |
+| Revoked connection's cached access token keeps working | Custody is DB-gated, not cache-gated: every credentialed consumer (broker MCP call, workspace fetch, result publish) rechecks live status + authorization generation + owner membership before any cached token is minted or served; the in-memory token cache is keyed by `(connection, generation)` and a generation bump evicts it | shipped (GitHub custody pattern; Phase C broker/workspace/publish rechecks + generation-keyed cache; a per-connection Postgres advisory lock — `pg_advisory_xact_lock` keyed on the connection id — serializes OAuth refresh across replicas, closing Gap 4) |
 
 ### T8 — the compromised IdP
 
@@ -138,13 +154,13 @@ A compromised org IdP mints valid identities **for that organization only** — 
 | Custom endpoint as an internal-network probe | Admission address rules; broker-only egress; private endpoints only via BYOC/relay/explicit approval | **Phase E** enforcement; policy stated now |
 | Catalog entry masquerading as trusted | Catalog is untrusted reference data; curated display bypasses no verification, policy, or approval | shipped |
 | Operator break-glass abuse or mistakes | Explicit `/v1/admin/*` surface; accepted mutations audit in the same transaction (fail together); rejected attempts audited after rollback; arming refused while an active owner exists; arms expire | shipped (Phase B) |
-| Sealer-key loss orphans credentials | Documented today (reconnect after rotation); Phase D adds KMS envelope encryption and a resumable, count-parity-verified re-seal migration — the legacy key retires only at 100% | **Phase D** |
+| Sealer-key loss orphans credentials | KMS envelope sealing moves the trust root off the single deployment key onto per-tenant DEKs wrapped by a KEK you control (`FLUIDBOX_KMS_MODE` `static`/`aws`); a resumable, count-parity-verified re-seal job (`POST /v1/admin/reseal`) migrates legacy v1 blobs to v2, and the legacy key retires only when boot proves zero v1 rows. Retiring `FLUIDBOX_CREDENTIAL_KEY` is now a supported migration (losing it before the re-seal orphans the remaining v1 rows). Custody then roots on the KEK: *losing the KEK is unrecoverable* from the moment any v2 row exists, and after retirement it loses ALL custody — by design, so back it up (see [kms-operations.md](kms-operations.md)) | shipped (Phase D) |
 | Gateway supply chain (the LiteLLM malware incident) | Image pinned by digest, never floating tags; private network only; replaceable below the governance plane — Rust owns identity, policy, budget decisions, and the canonical ledger | shipped |
 
 ## Explicitly out of scope (assumed trusted)
 
 - **The substrate**: Kubernetes control plane, the enforcing CNI (though enforcement is *probed*, never assumed — runs stay blocked without proof), node kernels (optional gVisor/Kata runtime classes raise this tier), and the cloud provider.
-- **Neon Postgres** as a data custodian (TLS, direct connections; DB compromise is game over for A3/A5 by definition — mitigated by sealed credentials for A1/A2 and, from Phase D, KMS envelope keys).
+- **Neon Postgres** as a data custodian (TLS, direct connections; DB compromise is game over for A3/A5 by definition — mitigated by sealed credentials for A1/A2 and, as of Phase D (shipped), KMS envelope keys whose KEK lives outside Postgres, so a stolen database dump cannot open v2 custody).
 - **Model providers** (Anthropic/OpenAI) receiving prompts via the gateway.
 - **The org's own IdP within its org** — see T8: trusted *for its organization*, structurally unable to cross tenants.
 - Malicious code changes in fluidbox itself (supply chain of this repo; CI, review, and release signing are process controls outside this document).
@@ -159,8 +175,59 @@ A compromised org IdP mints valid identities **for that organization only** — 
 | **VPC CNI standard-mode pod-start window** (EKS): a just-created pod is briefly fail-open until the node agent programs its eBPF rules | Observed live on EKS; strict mode is worse (it starves system pods). No duration or ordering guarantee relative to runner startup is claimed — the boot gate and long-lived probes are the authoritative enforcement signals, and the shipped isolation row above is qualified by this window |
 | **Result delivery is at-least-once** | Receivers dedup on `x-fluidbox-delivery`; provider idempotency / deterministic markers cover the crash window between remote creation and recording |
 | **Pre-Phase-C in-flight runs use the legacy broker path**: a run created before the Phase C cutover froze no `run_resource_bindings` row, so its brokered calls resolve the `connection_id` embedded in the RunSpec and recheck only live status — not authorization generation or owner membership | Bounded and self-draining: only runs already in flight at the cutover; historical RunSpecs are never rewritten; every new run freezes bindings and gets the full status+generation+membership recheck, and a revision still pinning a brokered bundle is refused at creation, so no new legacy-path run can start |
+| **Transferable connector-OAuth `go_url`**: an attacker starts Connect on their OWN pending connection and sends the returned `go_url` to a victim; the victim's browser is bound as "the initiating browser", the victim consents at the authorization server, and the victim's refresh grant seals into the ATTACKER's connection | Requires a social step against a signed-in target and yields an attacker-held connection to the victim's account, not the reverse. The shipped binding removes the passive variants (a leaked or replayed authorization URL, a replayed callback, an attacker-completed callback). Detail, and the closure path, below |
 
 Not a residual: the **approval `approval.decided` double-emission** inside one process is a *current known defect* with an assigned fix — the transactional outbox in the Phase E statelessness work (Gap 13) — not an accepted post-mitigation risk.
+
+### Residual detail — the transferable connector-OAuth `go_url`
+
+**Correction (2026-07-20, #32).** Earlier revisions of this document and of
+`CLAUDE.md` recorded this residual as closed by the deferred "connected-account
+confirmation before activation" UI. That was wrong as stated, and the correction
+matters because it changes what has to be built:
+
+> A connected-account confirmation closes the transferable-`go_url` lure ONLY if it
+> gives the EXTERNAL ACCOUNT HOLDER informed consent — i.e. it is shown to the
+> browser COMPLETING the flow, or it binds an expected external subject captured at
+> start. A confirmation shown to the flow's INITIATOR closes nothing: in the lure
+> the initiator IS the attacker, who would simply confirm the victim's account.
+
+**Why the binding does not already stop it.** The `/go` boot token is AEAD-sealed
+but *transferable*: it carries the flow-cookie plaintext (`c`), and the `/go` page
+is what sets `__Host-fbx_oauth_flow`. Anyone who opens the link therefore becomes
+the initiating browser. The cookie predicate defeats a *leaked authorization URL*
+(the AS leg), not a *deliberately shared start URL*.
+
+**Why the obvious fixes do not work.** `__Host-` cookies are host-locked, and in
+`FLUIDBOX_WEB_MODE=sso` the dashboard proxy hands each `Set-Cookie` back to the
+browser — so the session cookie lives on the DASHBOARD origin while
+`/v1/oauth/go` and `/v1/oauth/callback` live on the CONTROL-PLANE origin. Both
+one-line fixes die on that split: the control plane cannot see the session cookie
+at `/go` (which is why the flow cookie is minted there rather than at the
+authenticated start), and a flow cookie set on the authenticated start would be
+stored against the dashboard origin and never sent to a control-plane callback.
+Whichever end you move the cookie to, the callback has to move with it.
+
+**Known closure path (proposed, NOT built).** Move the browser-facing leg onto the
+origin that already holds the session:
+
+1. make the browser-facing OAuth callback URI **configurable** (today it is
+   derived from `FLUIDBOX_PUBLIC_URL` as `/v1/oauth/callback`);
+2. in hosted mode place it on the **dashboard origin**, behind the existing
+   same-origin proxy;
+3. set the HttpOnly flow cookie on the **authenticated start response** — where the
+   browser stores it against the dashboard origin, bound to the session that
+   started the flow;
+4. have the authorization server redirect to that dashboard-origin proxy callback,
+   which forwards the cookie to the control plane;
+5. **drop `c` from the `/go` token**, so the start URL stops being a bearer of the
+   browser binding;
+6. keep today's control-plane callback for direct/local deployments.
+
+Cost: a dashboard-proxy cookie-allowlist change and a **registered** dashboard
+callback URI at every authorization server (a redirect-URI change is an
+operational event for pre-registered clients). Not scheduled here — recorded so the
+follow-up starts from the real mechanism rather than from the confirmation UI.
 
 ## Gap register
 
@@ -171,8 +238,8 @@ The parent design's production gaps, restated as the risk schedule this threat m
 | 1 | Global admin authentication (no users/memberships/roles) | **B** (shipped) |
 | 2 | One boot-selected tenant | **B** (shipped) |
 | 3 | Capability bundle embeds a concrete connection | **C** (shipped) |
-| 4 | Process-local OAuth locking | **D** |
-| 5 | One deployment credential key (no KMS envelope) | **D** |
+| 4 | Process-local OAuth locking → per-connection Postgres advisory-lock refresh serialization (+ the Phase D reusable-registration DCR singleflight) | **shipped (C/D)** |
+| 5 | One deployment credential key (no KMS envelope) | **D (shipped)** |
 | 6 | Workload identity/mTLS on the internal gateway (network hardening itself largely shipped) | **E** |
 | 7 | SSRF boundary for custom endpoints/discovery | **E** |
 | 8 | Minimal/stateless-first MCP client (2025-11-25 conformance) | **E** |
@@ -190,6 +257,7 @@ Enforcement is proven, not asserted:
 - **Network**: the boot-time netpol gate (`+:8788 −:8787`) blocks run admission until enforcement is demonstrated; `helm test` re-certifies per release; CI runs kind + Calico.
 - **Tenancy (Phase B acceptance — shipped; the CI identity job runs `scripts/identity-e2e.sh` against a digest-pinned Dex)**: cross-tenant negative test matrix; workers cannot fall back to a default tenant; OIDC round-trip against a real conformant issuer (Keycloak/Dex) with replayed, wrong-browser, and expired flows all refused; algorithm allowlist rejects `none`/HS256.
 - **Connection binding (Phase C acceptance — shipped; the CI bindings job runs `scripts/bindings-e2e.sh` on its own database)**: ownership isolation (a member cannot read or bind another's personal connection); per-user bindings resolved from an identical shared requirement; approval identity (only the owner-who-invoked decides a personal-connection call); and the fail-closed matrix — unsatisfiable requirement, stale generation, deactivated owner, and missing snapshot each refuse before provisioning.
+- **Sealing / keys / RLS (Phase D acceptance — shipped; the CI secrets job runs `scripts/secrets-e2e.sh`, matrix sections (a)–(k))**: the KMS boot matrix (config refusals + the legacy-key retirement gate proved both ways — retires at zero parity, refuses on a straggler), re-seal count-parity + the dump/wipe/restore drill, the one-time browser-bound connector OAuth flow (replayed and wrong-browser completions refused, flow consumed exactly once), reusable client-registration singleflight (two connects to one issuer ⇒ one `/register`), per-tenant virtual-key selection with the master key confined to provisioning, and RLS negative tests run as the non-owner `fluidbox_runtime` role — section (k) greps every per-boot server log to prove no secret leaks.
 - **Governance**: `scripts/governance-e2e.sh` drives verdicts, approval pause/resume, idempotency, and autonomous auto-deny over real HTTP; the e2e greps keep provider knowledge out of the event spine.
 - **Scale/failure (Phase F)**: load tests at 60/150/300 concurrent sandboxes, OAuth refresh storms, revocation during active runs, upstream 401/404/429/5xx, broker restarts, DB failover, and tenant-isolation fuzzing.
 

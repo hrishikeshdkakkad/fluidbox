@@ -422,9 +422,11 @@ pub async fn create(
             // owner-membership recheck (Task 6), not Task 4's connection-object
             // viewer. Subscription create is admin/owner-gated already. See
             // task-4-report "Deferred / flagged".
-            let conn = fluidbox_db::get_connection(&state.pool, scope, cid)
+            let mut conn_tx = fluidbox_db::scoped_tx(&state.pool, scope).await?;
+            let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, cid)
                 .await?
                 .ok_or_else(|| ApiError::BadRequest(format!("unknown connection {cid}")))?;
+            conn_tx.commit().await?;
             if conn.status != "active" {
                 return Err(ApiError::BadRequest(format!(
                     "connection is {} — reconnect it first",
@@ -566,7 +568,15 @@ pub async fn create(
                 )
             })?;
             let secret = random_hex_token(SECRET_PREFIX);
-            let sealed = sealer.seal(&secret);
+            let sealed = sealer
+                .seal(
+                    &secret,
+                    crate::seal::SealCtx::new(
+                        scope.tenant_id(),
+                        crate::seal::SealFamily::SubscriptionCallbackSecret,
+                    ),
+                )
+                .await?;
             let dests = serde_json::to_value(vec![ResultDestination::SignedWebhook {
                 url: url.clone(),
                 binding_id: None,
@@ -593,6 +603,7 @@ pub async fn create(
             ),
         };
 
+    let (cb_bytes, cb_kv) = crate::seal::Sealed::split(&secret_sealed);
     let sub = fluidbox_db::create_trigger_subscription(
         &state.pool,
         scope,
@@ -612,7 +623,8 @@ pub async fn create(
             .as_ref(),
         workspace_value.as_ref(),
         &destinations,
-        secret_sealed.as_deref(),
+        cb_bytes,
+        cb_kv,
         connection_id,
         resource_selector.as_ref(),
         event_filter.as_ref(),

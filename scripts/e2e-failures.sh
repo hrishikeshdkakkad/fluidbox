@@ -148,7 +148,12 @@ for _ in $(seq 1 15); do [ "$(containers_for "$S3")" = "0" ] && break; sleep 1; 
 # ── F4: stalled-launch sweep ────────────────────────────────────────────
 say "F4 — session stalled in 'created' → stale-launch sweep fails it"
 # -q + head -1: psql prints the INSERT command tag even under -tA.
+# `set fluidbox.bypass`: migration 0018 FORCEs RLS on `sessions`, which binds the
+# table OWNER too — without the GUC this INSERT is refused ("new row violates
+# row-level security policy"). A session-level SET on a custom (dotted) option
+# needs no privilege.
 S4=$(psql "$DATABASE_URL" -qtA -c "
+  set fluidbox.bypass = 'system_worker';
   insert into sessions (id, tenant_id, agent_id, agent_revision_id, status, autonomy,
                         trust_tier, task, repo_source, run_spec, budgets, created_at, updated_at)
   select gen_random_uuid(), tenant_id, agent_id, agent_revision_id, 'created', 'supervised',

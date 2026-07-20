@@ -25,17 +25,24 @@
 
 use crate::auth::Principal;
 use crate::error::{ApiError, ApiResult};
-use crate::seal::Sealer;
+use crate::seal::{SealCtx, SealFamily, Sealer, TRANSIT_OAUTH_BOOT};
 use crate::state::AppState;
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::response::Html;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::Response;
 use axum::Json;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 const STATE_TTL_SECS: i64 = 600;
+/// The initiating-browser cookie (invariant 20). Fixed name (`__Host-` requires
+/// Path=/ + Secure): the connector dance is one-at-a-time per browser, so a
+/// per-flow name is unnecessary and the callback reads it without knowing the
+/// flow id up front.
+const OAUTH_FLOW_COOKIE: &str = "__Host-fbx_oauth_flow";
 /// Refresh proactively when the cached access token has less than this left.
 const EXPIRY_MARGIN_SECS: i64 = 300;
 const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -79,19 +86,29 @@ pub fn cimd_eligible(public_url: &str) -> bool {
 
 /// Should a STORED client identity be reused for this dance? A stale one
 /// must be re-resolved instead of replayed forever at the AS:
+/// - a stored `registration_id` whose shared row NO LONGER EXISTS is dead for
+///   EVERY source (`registration_missing`): the row was retired because the AS
+///   rejected its client (`invalid_client`), so replaying the identity it named
+///   would replay exactly what the deployment just threw away — and would leave
+///   the connection pointing at a dangling id forever;
 /// - a CIMD identity is dead the moment CIMD stops being presentable, or
 ///   when the document URL no longer matches this deployment;
 /// - a DCR identity is dead when the redirect_uri it was registered with
 ///   changed (the AS would refuse the exchange on redirect mismatch);
-/// - pre-registered identities are user-owned and never auto-invalidated.
+/// - pre-registered identities are user-owned and never auto-invalidated (they
+///   carry no `registration_id`, so `registration_missing` is false for them).
 fn stored_identity_stale(
     source: &str,
     client_id: &str,
     registered_redirect: Option<&str>,
+    registration_missing: bool,
     cimd_ok: bool,
     current_cimd_id: &str,
     current_redirect: &str,
 ) -> bool {
+    if registration_missing {
+        return true;
+    }
     match source {
         "cimd" => !cimd_ok || client_id != current_cimd_id,
         "dcr" => registered_redirect.is_some_and(|r| r != current_redirect),
@@ -147,38 +164,145 @@ pub fn canonical_resource(url: &str) -> Result<String, String> {
     Ok(format!("{}://{host}{port}{path}", u.scheme()))
 }
 
-/// The opaque signed `state` parameter: AEAD-sealed (tamper-proof AND
-/// unreadable to the AS/browser it transits), carrying the connection and
-/// the PKCE verifier — stateless, so a control-plane restart mid-dance
-/// changes nothing.
-pub fn seal_state(sealer: &Sealer, connection_id: Uuid, verifier: &str) -> String {
-    let payload = json!({
-        "c": connection_id,
-        "v": verifier,
-        "x": Utc::now().timestamp() + STATE_TTL_SECS,
-    });
-    b64url(&sealer.seal(&payload.to_string()))
+/// The sealed one-time boot token the go endpoint unseals: `{f: flow_id, s, c,
+/// x: exp}`. `s` and `c` are two INDEPENDENT 32-byte randoms — the state secret
+/// (its sha256 is the flow row's `state_hash` lookup key) and the per-flow cookie
+/// value (its sha256 is `browser_hash`). The row stores ONLY the hashes; the
+/// plaintexts live solely inside this AEAD-sealed transit token (and, for `c`,
+/// the browser cookie the go page sets). Sealed via `seal_token` (self-describing,
+/// deployment DEK) so it survives a KMS mode flip within the flow's TTL, under the
+/// `TRANSIT_OAUTH_BOOT` AAD purpose — this payload carries no purpose tag of its
+/// own (`open_boot_token` discriminates by required-field SHAPE), so the AAD is
+/// what makes it unopenable as a login state or a github_app flow token. `exp` is
+/// the row's exact `expires_at` — the go page double-checks it, but the row's own
+/// `expires_at` is the authority for liveness.
+pub(crate) struct BootToken {
+    pub flow_id: Uuid,
+    pub s: String,
+    pub c: String,
 }
 
-pub fn open_state(sealer: &Sealer, state_param: &str) -> Result<(Uuid, String), String> {
+async fn seal_boot_token(
+    sealer: &Sealer,
+    flow_id: Uuid,
+    s: &str,
+    c: &str,
+    exp: i64,
+) -> Result<String, String> {
+    let payload = json!({ "f": flow_id, "s": s, "c": c, "x": exp });
+    let sealed = sealer
+        .seal_token(TRANSIT_OAUTH_BOOT, &payload.to_string())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(b64url(&sealed))
+}
+
+async fn open_boot_token(sealer: &Sealer, token: &str) -> Result<BootToken, String> {
     use base64::Engine;
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(state_param)
-        .map_err(|_| "malformed state parameter")?;
+        .decode(token)
+        .map_err(|_| "malformed token")?;
     let plain = sealer
-        .open(&raw)
-        .map_err(|_| "state parameter failed verification")?;
-    let v: Value = serde_json::from_str(&plain).map_err(|_| "state parameter is corrupt")?;
-    let exp = v["x"].as_i64().ok_or("state parameter is corrupt")?;
+        .open_token(TRANSIT_OAUTH_BOOT, &raw)
+        .await
+        .map_err(|_| "token failed verification")?;
+    let v: Value = serde_json::from_str(&plain).map_err(|_| "token is corrupt")?;
+    let exp = v["x"].as_i64().ok_or("token is corrupt")?;
     if Utc::now().timestamp() > exp {
-        return Err("authorization took too long — start the connect flow again".into());
+        return Err("this link expired — start the connect flow again".into());
     }
-    let cid = v["c"]
+    let flow_id = v["f"]
         .as_str()
         .and_then(|s| Uuid::parse_str(s).ok())
-        .ok_or("state parameter is corrupt")?;
-    let verifier = v["v"].as_str().ok_or("state parameter is corrupt")?;
-    Ok((cid, verifier.to_string()))
+        .ok_or("token is corrupt")?;
+    let s = v["s"].as_str().ok_or("token is corrupt")?.to_string();
+    let c = v["c"].as_str().ok_or("token is corrupt")?.to_string();
+    Ok(BootToken { flow_id, s, c })
+}
+
+/// Read the initiating-browser cookie value from the request headers.
+fn oauth_flow_cookie(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    raw.split(';')
+        .filter_map(|p| p.trim().split_once('='))
+        .find(|(k, _)| *k == OAUTH_FLOW_COOKIE)
+        .map(|(_, v)| v.to_string())
+}
+
+/// The `Set-Cookie` header for the initiating-browser cookie.
+///
+/// `Secure` is UNCONDITIONAL — it is not a deployment choice. The `__Host-`
+/// prefix is DEFINED as `Secure` + `Path=/` + no `Domain` (RFC 6265bis §4.1.3.2);
+/// a `__Host-` cookie without `Secure` is malformed and every conforming client
+/// DISCARDS it outright — browsers, and curl since 7.87. The earlier
+/// "omit Secure on local http, curl jars are lenient" special-case (copied from
+/// github_app.rs, whose cookie is plain `fbx_gh_<flow>` and so genuinely may drop
+/// it) therefore did not relax the cookie, it deleted it: on an http public URL
+/// the browser never stored the flow cookie, so `callback` saw no cookie and the
+/// dance ended at "This browser did not start the connect flow" — 400, flow
+/// unburned, connection stuck `pending`. `login.rs`'s `__Host-fbx_web` is the
+/// in-repo precedent and always sends `Secure`; browsers treat `http://localhost`
+/// / `http://127.0.0.1` as trustworthy origins, so local dev keeps working.
+fn set_oauth_flow_cookie(value: &str) -> String {
+    format!(
+        "{OAUTH_FLOW_COOKIE}={value}; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age={STATE_TTL_SECS}"
+    )
+}
+
+/// Expire the initiating-browser cookie (same name/path/Secure so it matches).
+fn clear_oauth_flow_cookie() -> String {
+    format!("{OAUTH_FLOW_COOKIE}=gone; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age=0")
+}
+
+/// A deterministic sha256 fingerprint of the discovered AS metadata, frozen on
+/// the flow row at start (design :636-641 — the state must bind a metadata
+/// digest). Canonicalizes the binding-relevant fields (scopes sorted) so the same
+/// discovery always yields the same digest.
+fn metadata_digest(meta: &AsMeta) -> String {
+    let mut scopes = meta.scopes_supported.clone();
+    scopes.sort();
+    let canonical = json!({
+        "issuer": meta.issuer,
+        "authorization_endpoint": meta.authorization_endpoint,
+        "token_endpoint": meta.token_endpoint,
+        "registration_endpoint": meta.registration_endpoint,
+        "cimd_supported": meta.cimd_supported,
+        "scopes_supported": scopes,
+    });
+    format!("sha256:{}", fluidbox_db::sha256_hex(&canonical.to_string()))
+}
+
+/// Rebuild the authorization-endpoint URL from the frozen flow fields (design D5:
+/// the go page rebuilds FROM THE ROW so start and callback share one issuer +
+/// client + redirect + resource, closing AS mix-up and discovery-change races).
+/// Pure + unit-tested. `scopes` is space-joined when non-empty (mirrors the pre-D
+/// dance, incl. `offline_access`).
+#[allow(clippy::too_many_arguments)]
+fn build_authorize_url(
+    authorization_endpoint: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    state_param: &str,
+    challenge: &str,
+    challenge_method: &str,
+    resource: &str,
+    scopes: &[String],
+) -> Result<String, String> {
+    let mut url = reqwest::Url::parse(authorization_endpoint)
+        .map_err(|_| "AS authorization_endpoint is not a valid URL".to_string())?;
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", client_id)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("state", state_param)
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", challenge_method)
+        .append_pair("resource", resource);
+    if !scopes.is_empty() {
+        url.query_pairs_mut()
+            .append_pair("scope", &scopes.join(" "));
+    }
+    Ok(url.to_string())
 }
 
 /// Pull `resource_metadata="…"` out of a `WWW-Authenticate` challenge
@@ -347,47 +471,234 @@ pub async fn discover(state: &AppState, mcp_url: &str) -> Result<AsMeta, String>
     ))
 }
 
-/// Resolve the client identity for this connection against this AS.
-/// Priority: whatever the connection already carries (pre-registered or a
-/// previously minted DCR id — never re-register while it's still valid) →
-/// CIMD when advertised AND presentable from this deployment → DCR.
-/// Returns (client_id, source).
-async fn resolve_client(
-    state: &AppState,
-    scope: fluidbox_db::TenantScope,
-    conn_id: Uuid,
-    oauth: &Value,
-    meta: &AsMeta,
-) -> Result<(String, String), String> {
-    let cimd_ok = meta.cimd_supported && cimd_eligible(&state.cfg.public_url);
-    if let Some(existing) = oauth.get("client_id").and_then(Value::as_str) {
-        let source = oauth
-            .get("client_id_source")
-            .and_then(Value::as_str)
-            .unwrap_or("preregistered");
-        if !stored_identity_stale(
-            source,
-            existing,
-            oauth.get("redirect_uri").and_then(Value::as_str),
-            cimd_ok,
-            &cimd_client_id(state),
-            &redirect_uri(state),
-        ) {
-            return Ok((existing.to_string(), source.to_string()));
-        }
-        // Stale — fall through and mint a fresh identity (reconnect after
-        // an ineligible-CIMD dance or a public-URL move lands here).
+/// The resolved OAuth client identity for a dance. `registration_id` points at
+/// the shared `oauth_client_registrations` row that dedups this identity (Some
+/// for cimd/dcr — the reusable identities); pre-registered identities are
+/// per-connection custody and carry None (design D6).
+struct ResolvedClient {
+    client_id: String,
+    source: String,
+    registration_id: Option<Uuid>,
+}
+
+/// Which arm resolves the client identity for a dance — the PURE priority
+/// decision (unit-tested). `Reuse` short-circuits with the stored identity;
+/// `Cimd`/`Dcr` do the network/DB work. Priority is UNCHANGED from before
+/// Task 3: a non-stale stored identity (pre-registered or a previously resolved
+/// cimd/dcr id) wins, then CIMD when presentable, then DCR.
+#[derive(Debug, PartialEq, Eq)]
+enum ClientResolution {
+    Reuse,
+    Cimd,
+    Dcr,
+}
+
+fn classify_client_resolution(
+    stored: Option<&str>,
+    stale: bool,
+    cimd_ok: bool,
+) -> ClientResolution {
+    if stored.is_some() && !stale {
+        return ClientResolution::Reuse;
     }
     if cimd_ok {
-        return Ok((cimd_client_id(state), "cimd".to_string()));
+        ClientResolution::Cimd
+    } else {
+        ClientResolution::Dcr
     }
-    let Some(reg) = &meta.registration_endpoint else {
-        return Err(
-            "authorization server supports neither CIMD nor dynamic client registration — \
-             supply a pre-registered client_id on the connection"
-                .into(),
-        );
+}
+
+/// Resolve the client identity for this connection against this AS. Priority
+/// UNCHANGED (reuse a valid stored identity → CIMD → DCR); only the CIMD and DCR
+/// arms changed — they now dedup into the shared `oauth_client_registrations`
+/// table (design D6) instead of minting per-connection, and return the shared
+/// row id so the connection can reference it. Pre-registered identities stay
+/// per-connection custody (no row).
+async fn resolve_client(
+    state: &AppState,
+    oauth: &Value,
+    meta: &AsMeta,
+) -> Result<ResolvedClient, String> {
+    let cimd_ok = meta.cimd_supported && cimd_eligible(&state.cfg.public_url);
+    let stored = oauth.get("client_id").and_then(Value::as_str);
+    let source = oauth
+        .get("client_id_source")
+        .and_then(Value::as_str)
+        .unwrap_or("preregistered");
+    let stored_registration_id = oauth
+        .get("registration_id")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok());
+    // A stored pointer at a shared registration row that no longer resolves is
+    // STALE — the row was retired (an `invalid_client` retirement) and its identity
+    // must not be replayed. Checked HERE, not just carried through: without it the
+    // Reuse arm copies a dangling id into the next flow row (which then FK-nulls)
+    // and keeps presenting a client the AS already rejected.
+    let registration_missing = match stored_registration_id {
+        Some(rid) => fluidbox_db::find_client_registration_by_id(&state.pool, rid)
+            .await
+            .map_err(|e| {
+                tracing::warn!(registration = %rid, error = %e, "oauth: registration lookup failed");
+                "client registration lookup failed".to_string()
+            })?
+            .is_none(),
+        None => false,
     };
+    // No stored identity ⇒ treat as "stale" so classify falls through to CIMD/DCR.
+    let stale = stored
+        .map(|cid| {
+            stored_identity_stale(
+                source,
+                cid,
+                oauth.get("redirect_uri").and_then(Value::as_str),
+                registration_missing,
+                cimd_ok,
+                &cimd_client_id(state),
+                &redirect_uri(state),
+            )
+        })
+        .unwrap_or(true);
+    let redirect = redirect_uri(state);
+    match classify_client_resolution(stored, stale, cimd_ok) {
+        ClientResolution::Reuse => {
+            // Reuse the stored identity AND carry forward the shared registration
+            // row it points at (if any — pre-registered identities have none). The
+            // pointer was VERIFIED to resolve above; a missing row made the identity
+            // stale and we would not be in this arm.
+            Ok(ResolvedClient {
+                client_id: stored
+                    .expect("Reuse implies a stored client_id")
+                    .to_string(),
+                source: source.to_string(),
+                registration_id: stored_registration_id,
+            })
+        }
+        ClientResolution::Cimd => {
+            // ADOPT: if a row already exists for this (issuer, redirect_uri) — of
+            // ANY source — carry ITS identity on BOTH legs (never send cimd_url on
+            // authorize while the exchange resolves a stored DCR client_id).
+            let cimd_id = cimd_client_id(state);
+            let registered =
+                ensure_cimd_registration(state, &meta.issuer, &redirect, &cimd_id).await?;
+            Ok(ResolvedClient {
+                client_id: registered.client_id,
+                source: registered.source,
+                registration_id: Some(registered.registration_id),
+            })
+        }
+        ClientResolution::Dcr => {
+            let Some(reg_endpoint) = &meta.registration_endpoint else {
+                return Err(
+                    "authorization server supports neither CIMD nor dynamic client registration — \
+                     supply a pre-registered client_id on the connection"
+                        .into(),
+                );
+            };
+            let registered =
+                register_dcr_client(state, &meta.issuer, &redirect, reg_endpoint).await?;
+            Ok(ResolvedClient {
+                client_id: registered.client_id,
+                source: registered.source,
+                registration_id: Some(registered.registration_id),
+            })
+        }
+    }
+}
+
+/// The identity a resolution arm ADOPTS from an existing shared registration row:
+/// ALWAYS the row's own `(client_id, source)`, regardless of which arm (CIMD or
+/// DCR) found it, so the authorize and exchange legs carry the SAME identity. A
+/// CIMD arm must NEVER present `cimd_url` on the authorize leg while a stored DCR
+/// `client_id` resolves on the exchange leg — that is RFC 6749 `invalid_grant`
+/// ("code issued to another client"), which the `invalid_client` retirement never
+/// catches, so every later connect to that issuer would fail forever.
+///
+/// Convergence if the adopted identity is dead at the AS: a DCR-sourced identity
+/// (it records its `registration_endpoint`) CONVERGES ACROSS TWO DANCES — the
+/// exchange returns `invalid_client`, [`retire_rejected_registration`] deletes the
+/// row and the user is told to start over; that next dance finds no row, registers
+/// a fresh client via DCR, and completes. (It cannot converge WITHIN one dance:
+/// the authorization code is already bound to the rejected client.) A CIMD-sourced
+/// identity has no `registration_endpoint`, so a dead one is a terminal clean
+/// `invalid_client` (NOT a mismatch) — but a CIMD `client_id` is the doc URL,
+/// which only "dies" when the AS cannot fetch it (a public-URL config problem that
+/// also moves the redirect_uri = the registration key), so a stale CIMD row is not
+/// even found for the current key.
+fn adopt_registration(row: &fluidbox_db::OauthClientRegistrationRow) -> (String, String) {
+    (row.client_id.clone(), row.source.clone())
+}
+
+/// Adopt-or-mint the shared client identity for a CIMD-eligible dance. Mirrors
+/// [`register_dcr_client`]'s ADOPT semantics: if a row already exists for
+/// (issuer, redirect_uri) — of ANY source — reuse ITS identity verbatim
+/// (see [`adopt_registration`]); only when NONE exists mint a fresh CIMD identity
+/// (client_id = the doc URL, source='cimd', no secret). The row also lets the
+/// one-time state flows (Task 4) FK the client. No advisory lock — CIMD has no
+/// `/register` HTTP to serialize; find-or-insert with `ON CONFLICT DO NOTHING`
+/// re-select is race-safe on its own.
+///
+/// The two WRITES take the audited system-worker entry points: migration 0018
+/// grants global rows (`tenant_id is null`) SELECT from any scope but
+/// INSERT/UPDATE/DELETE only under the bypass GUC, and this resolution is
+/// principal-less by construction (it runs mid-dance, before any connection is
+/// active). The reads stay pool-direct — the SELECT policy already admits them.
+async fn ensure_cimd_registration(
+    state: &AppState,
+    issuer: &str,
+    redirect: &str,
+    cimd_id: &str,
+) -> Result<RegisteredClient, String> {
+    if let Some(r) = fluidbox_db::find_client_registration(&state.pool, issuer, redirect)
+        .await
+        .map_err(|e| format!("registration lookup failed: {e}"))?
+    {
+        fluidbox_db::system_worker::touch_global_registration(&state.pool, r.id)
+            .await
+            .map_err(|e| format!("registration touch failed: {e}"))?;
+        let (client_id, source) = adopt_registration(&r);
+        return Ok(RegisteredClient {
+            client_id,
+            registration_id: r.id,
+            source,
+        });
+    }
+    let new = fluidbox_db::NewOauthClientRegistration {
+        tenant_id: None,
+        issuer,
+        redirect_uri: redirect,
+        source: "cimd",
+        client_id: cimd_id,
+        client_secret_sealed: None,
+        client_secret_key_version: 1,
+        registration_endpoint: None,
+        registration_access_token_sealed: None,
+        registration_access_token_key_version: 1,
+        token_endpoint_auth_method: Some("none"),
+    };
+    let row = match fluidbox_db::system_worker::insert_global_registration(&state.pool, new)
+        .await
+        .map_err(|e| format!("registration insert failed: {e}"))?
+    {
+        Some(r) => r,
+        None => fluidbox_db::find_client_registration(&state.pool, issuer, redirect)
+            .await
+            .map_err(|e| format!("registration re-select failed: {e}"))?
+            .ok_or("registration race lost with no winner")?,
+    };
+    let (client_id, source) = adopt_registration(&row);
+    Ok(RegisteredClient {
+        client_id,
+        registration_id: row.id,
+        source,
+    })
+}
+
+/// One RFC 7591 dynamic client registration POST. Returns `(client_id, secret?)`;
+/// the secret is rare with `token_endpoint_auth_method: "none"` (public client).
+async fn dcr_register(
+    state: &AppState,
+    registration_endpoint: &str,
+) -> Result<(String, Option<String>), String> {
     let body = json!({
         "client_name": "fluidbox",
         "redirect_uris": [redirect_uri(state)],
@@ -397,7 +708,7 @@ async fn resolve_client(
     });
     let res = state
         .http
-        .post(reg)
+        .post(registration_endpoint)
         .timeout(HTTP_TIMEOUT)
         .json(&body)
         .send()
@@ -414,39 +725,148 @@ async fn resolve_client(
         .as_str()
         .ok_or("registration response has no client_id")?
         .to_string();
-    // A DCR-minted secret (rare with auth method "none") is custodied like
-    // any other: sealed, never echoed.
-    if let Some(secret) = v["client_secret"].as_str() {
-        if let Some(sealer) = &state.sealer {
-            fluidbox_db::set_connection_client_secret(
-                &state.pool,
-                scope,
-                conn_id,
-                &sealer.seal(secret),
-            )
+    Ok((client_id, v["client_secret"].as_str().map(String::from)))
+}
+
+/// A found-or-registered shared DCR client.
+struct RegisteredClient {
+    client_id: String,
+    registration_id: Uuid,
+    source: String,
+}
+
+/// Find-or-register the shared client for (issuer, redirect_uri): take the
+/// advisory lock, reuse an existing row (bumping `last_used_at`), else DCR at
+/// `registration_endpoint` and insert. The advisory lock + `ON CONFLICT DO
+/// NOTHING` re-select collapse concurrent connects to the same issuer down to ONE
+/// `/register`. The DCR HTTP runs UNDER the lock (like the refresh path) so a
+/// second connect blocks and then reuses THIS row rather than double-registering.
+///
+/// The transaction is opened through `system_worker::global_registration_tx`, so
+/// the audited bypass GUC spans the whole critical section — 0018 admits an INSERT
+/// of a global row (`tenant_id is null`) only under it, and the UPDATE behind
+/// `touch` would otherwise be filtered to zero rows in silence. Everything this tx
+/// touches is the deployment-global registration (the lock, the find, the touch,
+/// the insert, the re-select); no tenant-owned row is read or written under it.
+async fn register_dcr_client(
+    state: &AppState,
+    issuer: &str,
+    redirect: &str,
+    registration_endpoint: &str,
+) -> Result<RegisteredClient, String> {
+    let mut tx = fluidbox_db::system_worker::global_registration_tx(&state.pool)
+        .await
+        .map_err(|e| format!("registration txn failed: {e}"))?;
+    fluidbox_db::acquire_registration_lock(&mut tx, issuer, redirect)
+        .await
+        .map_err(|e| format!("registration lock failed: {e}"))?;
+    if let Some(r) = fluidbox_db::find_client_registration(&mut *tx, issuer, redirect)
+        .await
+        .map_err(|e| format!("registration lookup failed: {e}"))?
+    {
+        fluidbox_db::touch_client_registration(&mut *tx, r.id)
             .await
-            .map_err(|e| format!("failed to store client secret: {e}"))?;
-        }
+            .map_err(|e| format!("registration touch failed: {e}"))?;
+        tx.commit()
+            .await
+            .map_err(|e| format!("registration commit failed: {e}"))?;
+        let (client_id, source) = adopt_registration(&r);
+        return Ok(RegisteredClient {
+            client_id,
+            registration_id: r.id,
+            source,
+        });
     }
-    Ok((client_id, "dcr".to_string()))
+    let (client_id, secret) = dcr_register(state, registration_endpoint).await?;
+    // Seal the (rare) confidential secret under the DEPLOYMENT DEK — registrations
+    // are global rows (tenant_id NULL). The deployment DEK is warm from transit-
+    // token sealing (every dance seals a state param), so this near-never reaches
+    // for a second pooled connection while the lock's is held; and it only runs
+    // for the uncommon auth-method secret at all.
+    let sealer_ref = state.sealer.as_ref().ok_or("credential key missing")?;
+    let sealed = match &secret {
+        Some(s) => Some(
+            sealer_ref
+                .seal(
+                    s,
+                    sealer_ref.deployment_ctx(SealFamily::RegistrationClientSecret),
+                )
+                .await
+                .map_err(|e| format!("failed to seal client secret: {e}"))?,
+        ),
+        None => None,
+    };
+    let (sealed_bytes, kv) = match &sealed {
+        Some(s) => (Some(s.bytes.as_slice()), s.key_version),
+        None => (None, 1),
+    };
+    let new = fluidbox_db::NewOauthClientRegistration {
+        tenant_id: None,
+        issuer,
+        redirect_uri: redirect,
+        source: "dcr",
+        client_id: &client_id,
+        client_secret_sealed: sealed_bytes,
+        client_secret_key_version: kv,
+        registration_endpoint: Some(registration_endpoint),
+        registration_access_token_sealed: None,
+        registration_access_token_key_version: 1,
+        token_endpoint_auth_method: Some("none"),
+    };
+    let row = match fluidbox_db::insert_client_registration(&mut *tx, new)
+        .await
+        .map_err(|e| format!("registration insert failed: {e}"))?
+    {
+        Some(r) => r,
+        None => {
+            // A racer won the (issuer, redirect_uri) key: adopt its row and abandon
+            // the client we just minted at the AS (a harmless orphan — log at debug).
+            tracing::debug!(%issuer, "oauth registration race: adopting the winner's client");
+            fluidbox_db::find_client_registration(&mut *tx, issuer, redirect)
+                .await
+                .map_err(|e| format!("registration re-select failed: {e}"))?
+                .ok_or("registration race lost with no winner")?
+        }
+    };
+    let (client_id, source) = adopt_registration(&row);
+    tx.commit()
+        .await
+        .map_err(|e| format!("registration commit failed: {e}"))?;
+    Ok(RegisteredClient {
+        client_id,
+        registration_id: row.id,
+        source,
+    })
 }
 
 // ─── The dance ────────────────────────────────────────────────────────────
 
+/// The sealer, or the operator-facing refusal. Sealing is enabled by EITHER key
+/// path (Phase D): the legacy `FLUIDBOX_CREDENTIAL_KEY` or `FLUIDBOX_KMS_MODE`
+/// (`static|aws`) with its KEK — naming only the former sent KMS operators
+/// hunting for a variable their deployment does not use.
 pub(crate) fn sealer(state: &AppState) -> ApiResult<&Sealer> {
     state.sealer.as_ref().ok_or_else(|| {
         ApiError::BadRequest(
-            "OAuth connections are disabled: set FLUIDBOX_CREDENTIAL_KEY on the server".into(),
+            "OAuth connections are disabled: configure credential sealing on the server — \
+             either FLUIDBOX_KMS_MODE=static|aws (with its KEK) or FLUIDBOX_CREDENTIAL_KEY"
+                .into(),
         )
     })
 }
 
-/// Shared by the start endpoint and the catalog Connect flow: run discovery
-/// and client-identity resolution (idempotent — results persist on the
-/// connection), then mint the PKCE pair and return the authorize URL.
+/// Shared by the start endpoint and the catalog Connect flow: run discovery and
+/// client-identity resolution (idempotent — results persist on the connection),
+/// then mint a one-time server-side flow row (invariant 20) and return the
+/// `go_url`. `initiated_by_user_id` is the initiating fluidbox user (None for the
+/// operator/admin token — the cookie still binds the browser). The authorize URL
+/// is NOT built here: the go endpoint rebuilds it FROM THE ROW after binding the
+/// browser cookie, so a leaked authorization URL can neither complete nor burn
+/// the flow (design D5 / :646-656).
 pub async fn start_dance(
     state: &AppState,
     scope: fluidbox_db::TenantScope,
+    initiated_by_user_id: Option<Uuid>,
     conn_id: Uuid,
 ) -> ApiResult<String> {
     let sealer_ref = sealer(state)?;
@@ -455,9 +875,20 @@ pub async fn start_dance(
     // (`connection_for_mutation`) or a connection this same principal just
     // created in the catalog/manual oauth branch. The dance mechanics need the
     // row regardless of the viewer lens.
-    let conn = fluidbox_db::get_connection(&state.pool, scope, conn_id)
+    // Tenant known (the initiating principal's scope) → scoped_tx so the RLS GUC
+    // rides the executor-generic read.
+    let mut conn_tx = fluidbox_db::scoped_tx(&state.pool, scope).await?;
+    let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, conn_id)
         .await?
         .ok_or(ApiError::NotFound)?;
+    conn_tx.commit().await?;
+    // THE ATTEMPT'S REAL START EPOCH (review: start-epoch race), frozen HERE —
+    // before discovery, client resolution, or any other outbound HTTP. The flow
+    // row's `created_at` is NOT this instant: it is stamped seconds later, after
+    // those round trips, so an attempt that began BEFORE a sibling's successful
+    // activation would otherwise mint a flow row that POST-DATES that activation
+    // and sail through the activation CAS. See `commit_start_epoch`.
+    let started_with = StartExpectation::of(&conn);
     if conn.auth_kind != "oauth" {
         return Err(ApiError::BadRequest(
             "this connection does not use OAuth — it has a static credential".into(),
@@ -478,12 +909,16 @@ pub async fn start_dance(
     let meta = discover(state, &resource)
         .await
         .map_err(ApiError::BadRequest)?;
-    let (client_id, client_source) = resolve_client(state, scope, conn.id, &oauth, &meta)
+    let ResolvedClient {
+        client_id,
+        source: client_source,
+        registration_id,
+    } = resolve_client(state, &oauth, &meta)
         .await
         .map_err(ApiError::BadRequest)?;
 
-    // Persist the discovered custody state (idempotent re-runs overwrite
-    // with fresh endpoints; the client identity sticks).
+    // Assemble the discovered custody state. It is PERSISTED only after this
+    // attempt clears the commit point below — see the write near the end.
     let scopes: Vec<String> = oauth
         .get("scopes")
         .and_then(Value::as_array)
@@ -512,30 +947,87 @@ pub async fn start_dance(
     // The redirect this identity was resolved for — staleness detection
     // re-registers a DCR client if the public URL later moves.
     o.insert("redirect_uri".into(), json!(redirect_uri(state)));
-    o.insert("scopes".into(), json!(scopes));
-    fluidbox_db::update_connection_oauth(&state.pool, scope, conn.id, &oauth).await?;
-
-    let verifier = random_urlsafe();
-    let state_param = seal_state(sealer_ref, conn.id, &verifier);
-    let mut url = reqwest::Url::parse(&meta.authorization_endpoint)
-        .map_err(|_| ApiError::BadRequest("AS authorization_endpoint is not a valid URL".into()))?;
-    url.query_pairs_mut()
-        .append_pair("response_type", "code")
-        .append_pair("client_id", &client_id)
-        .append_pair("redirect_uri", &redirect_uri(state))
-        .append_pair("state", &state_param)
-        .append_pair("code_challenge", &pkce_challenge(&verifier))
-        .append_pair("code_challenge_method", "S256")
-        .append_pair("resource", &resource);
-    if !scopes.is_empty() {
-        url.query_pairs_mut()
-            .append_pair("scope", &scopes.join(" "));
+    // The shared registration row this identity dedups into (cimd/dcr); cleared
+    // for a per-connection pre-registered identity so a stale pointer never rides.
+    match registration_id {
+        Some(rid) => {
+            o.insert("registration_id".into(), json!(rid));
+        }
+        None => {
+            o.remove("registration_id");
+        }
     }
-    Ok(url.to_string())
+    o.insert("scopes".into(), json!(scopes));
+
+    // Mint the PKCE pair. The challenge is PUBLIC (rides the authorize URL); the
+    // verifier is custody (performs the exchange) and is sealed at rest so a leaked
+    // flow row cannot exchange (design :638-639).
+    let verifier = random_urlsafe();
+    let challenge = pkce_challenge(&verifier);
+    let sealed_verifier = sealer_ref
+        .seal(
+            &verifier,
+            SealCtx::new(scope.tenant_id(), SealFamily::OauthFlowPkceVerifier),
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to seal PKCE verifier: {e}")))?;
+    // Two independent 32-byte randoms: the state `s` (its hash is the row's lookup
+    // key) and the cookie `c` (its hash binds the initiating browser). The row
+    // stores ONLY the hashes; the plaintext rides the sealed boot token.
+    let s = random_urlsafe();
+    let c = random_urlsafe();
+    let digest = metadata_digest(&meta);
+    let flow = fluidbox_db::insert_connector_oauth_flow(
+        &state.pool,
+        scope,
+        fluidbox_db::NewConnectorOauthFlow {
+            connection_id: conn.id,
+            initiated_by_user_id,
+            state_hash: &fluidbox_db::sha256_hex(&s),
+            browser_hash: &fluidbox_db::sha256_hex(&c),
+            issuer: &meta.issuer,
+            authorization_endpoint: &meta.authorization_endpoint,
+            token_endpoint: &meta.token_endpoint,
+            metadata_digest: &digest,
+            resource: &resource,
+            redirect_uri: &redirect_uri(state),
+            scopes: &json!(scopes),
+            challenge: &challenge,
+            challenge_method: "S256",
+            client_registration_id: registration_id,
+            client_id: &client_id,
+            pkce_verifier_sealed: &sealed_verifier.bytes,
+            pkce_verifier_key_version: sealed_verifier.key_version,
+            expected_generation: conn.authorization_generation,
+            ttl_secs: STATE_TTL_SECS,
+        },
+    )
+    .await?;
+
+    // THE COMMIT POINT for this attempt (review: start-epoch race). Nothing the
+    // attempt produced is honored until the connection is proven un-reauthorized
+    // since `started_with` — and the custody bag write RIDES THAT PROOF'S
+    // TRANSACTION, under the same advisory lock, so the two are ONE atomic step.
+    // A refusal burns the flow row we just inserted and writes nothing, so a
+    // superseded attempt leaves neither a usable flow nor a repointed connection.
+    if let Err(refusal) =
+        commit_start_epoch(&state.pool, scope, conn.id, started_with, &oauth).await
+    {
+        burn_flow(state, &s, &c).await?;
+        return Err(refusal);
+    }
+
+    // The boot token's expiry is the row's exact `expires_at` — one TTL.
+    let boot = seal_boot_token(sealer_ref, flow.id, &s, &c, flow.expires_at.timestamp())
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(format!("{}/v1/oauth/go?f={}", state.cfg.public_url, boot))
 }
 
-/// `POST /v1/connections/{id}/oauth/start` (admin) → `{authorize_url}`.
-/// Also the RECONNECT path: an errored connection redoes the dance in place.
+/// `POST /v1/connections/{id}/oauth/start` (admin) → `{go_url}`.
+/// Also the RECONNECT path: an errored connection redoes the dance in place. The
+/// browser navigates to `go_url` (the control-plane origin), which binds a
+/// per-flow cookie before redirecting to the authorization server.
 pub async fn start(
     principal: Principal,
     State(state): State<AppState>,
@@ -550,8 +1042,149 @@ pub async fn start(
         "starting or reconnecting the OAuth flow for",
     )
     .await?;
-    let authorize_url = start_dance(&state, principal.scope(), conn.id).await?;
-    Ok(Json(json!({ "authorize_url": authorize_url })))
+    // The initiating user (None for the operator) is bound onto the flow row.
+    let go_url = start_dance(&state, principal.scope(), principal.user_id(), conn.id).await?;
+    Ok(Json(json!({ "go_url": go_url })))
+}
+
+#[derive(Deserialize)]
+pub struct GoParams {
+    #[serde(default)]
+    pub f: Option<String>,
+}
+
+/// `GET /v1/oauth/go` — the interstitial that binds the initiating browser and
+/// launches the dance. Unauthenticated by design: the AEAD-sealed boot token in
+/// `f` IS the auth (a browser redirect can't carry the API token), same pattern
+/// as the callback + github_app go legs. It verifies the flow row is LIVE (never
+/// consuming it — the callback is the sole consumer) AND that its connection is
+/// still connectable, sets the per-flow HttpOnly cookie on the CONTROL-PLANE
+/// origin (why the dashboard can't set it), and 302s to the authorization
+/// endpoint rebuilt FROM THE ROW with `state=s` (design D5).
+pub async fn go(State(state): State<AppState>, Query(q): Query<GoParams>) -> Response {
+    let Some(sealer_ref) = state.sealer.as_ref() else {
+        return page(
+            StatusCode::BAD_REQUEST,
+            "Connection failed",
+            "Credential sealing is not configured on this server.",
+            None,
+        );
+    };
+    let Some(boot) = q.f.as_deref() else {
+        return page(
+            StatusCode::BAD_REQUEST,
+            "Connection failed",
+            "Missing token.",
+            None,
+        );
+    };
+    let bt = match open_boot_token(sealer_ref, boot).await {
+        Ok(v) => v,
+        Err(e) => return page(StatusCode::BAD_REQUEST, "Connection failed", &e, None),
+    };
+    let state_hash = fluidbox_db::sha256_hex(&bt.s);
+    // Peek (NEVER consume) and verify the row is live AND the one the token names.
+    let row = match fluidbox_db::peek_connector_oauth_flow(&state.pool, &state_hash).await {
+        Ok(Some(r))
+            if r.id == bt.flow_id && r.consumed_at.is_none() && r.expires_at > Utc::now() =>
+        {
+            r
+        }
+        Ok(_) => {
+            return page(
+                StatusCode::BAD_REQUEST,
+                "Connection failed",
+                "This link expired or was already used — start the connect flow again.",
+                None,
+            )
+        }
+        Err(e) => {
+            tracing::error!("oauth go: flow lookup failed: {e}");
+            return page(
+                StatusCode::BAD_REQUEST,
+                "Connection failed",
+                "Something went wrong — try again from the dashboard.",
+                None,
+            );
+        }
+    };
+    // The connection can be revoked BETWEEN start and go. Refuse here rather than
+    // sending the browser to the authorization server to consent for a connection
+    // the callback (`complete_flow`) is going to refuse anyway. Only `revoked` —
+    // `error` is the RECONNECT path (`start_dance` allows it and activation clears
+    // the note), so refusing it would make an errored connection unrecoverable.
+    let conn_scope = fluidbox_db::TenantScope::assume(row.tenant_id);
+    let revoked = match fluidbox_db::scoped_tx(&state.pool, conn_scope).await {
+        Ok(mut tx) => {
+            let status = fluidbox_db::get_connection(&mut *tx, conn_scope, row.connection_id)
+                .await
+                .map(|c| c.map(|c| c.status));
+            let _ = tx.commit().await;
+            match status {
+                // A vanished connection is refused for the same reason.
+                Ok(Some(s)) => s == "revoked",
+                Ok(None) => true,
+                Err(e) => {
+                    tracing::error!("oauth go: connection lookup failed: {e}");
+                    return page(
+                        StatusCode::BAD_REQUEST,
+                        "Connection failed",
+                        "Something went wrong — try again from the dashboard.",
+                        None,
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!("oauth go: connection lookup failed: {e}");
+            return page(
+                StatusCode::BAD_REQUEST,
+                "Connection failed",
+                "Something went wrong — try again from the dashboard.",
+                None,
+            );
+        }
+    };
+    if revoked {
+        return page(
+            StatusCode::BAD_REQUEST,
+            "Connection failed",
+            "This connection is no longer available — create a new one from the dashboard.",
+            None,
+        );
+    }
+    let scopes: Vec<String> = row
+        .scopes
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let authorize = match build_authorize_url(
+        &row.authorization_endpoint,
+        &row.client_id,
+        &row.redirect_uri,
+        &bt.s,
+        &row.challenge,
+        &row.challenge_method,
+        &row.resource,
+        &scopes,
+    ) {
+        Ok(u) => u,
+        Err(e) => return page(StatusCode::BAD_REQUEST, "Connection failed", &e, None),
+    };
+    // 302 to the AS, binding this browser via the per-flow cookie.
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header(axum::http::header::LOCATION, authorize)
+        .header(axum::http::header::CACHE_CONTROL, "no-store")
+        .header("referrer-policy", "no-referrer")
+        .header(axum::http::header::SET_COOKIE, set_oauth_flow_cookie(&bt.c))
+        .body(Body::empty())
+        .expect("static response builds")
 }
 
 #[derive(Deserialize)]
@@ -588,25 +1221,37 @@ fn escape_html(s: &str) -> String {
 /// HTML-escaped, and the response carries a strict CSP — `default-src 'none'`
 /// with `style-src 'unsafe-inline'` for the single inline `style` attribute the
 /// page uses — so even a hypothetical escape gap cannot execute script. Only
-/// server-authored, non-secret, non-upstream text ever reaches `body`.
-fn page(status: axum::http::StatusCode, title: &str, body: &str) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    let html = Html(format!(
+/// server-authored, non-secret, non-upstream text ever reaches `body`. `cookie`
+/// carries an optional `Set-Cookie` (the flow-cookie clear, on flow-ending
+/// outcomes).
+fn page(status: StatusCode, title: &str, body: &str, cookie: Option<String>) -> Response {
+    let html = format!(
         "<!doctype html><meta charset=\"utf-8\"><title>fluidbox — {t}</title>\
          <body style=\"font-family:system-ui;max-width:38rem;margin:4rem auto;line-height:1.5\">\
          <h2>{t}</h2><p>{b}</p></body>",
         t = escape_html(title),
         b = escape_html(body),
-    ));
-    (
-        status,
-        [(
-            axum::http::header::CONTENT_SECURITY_POLICY,
-            "default-src 'none'; style-src 'unsafe-inline'",
-        )],
-        html,
-    )
-        .into_response()
+    );
+    let mut builder = Response::builder().status(status).header(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        "default-src 'none'; style-src 'unsafe-inline'",
+    );
+    if let Some(c) = cookie {
+        builder = builder.header(axum::http::header::SET_COOKIE, c);
+    }
+    builder
+        .body(Body::from(html))
+        .expect("static response builds")
+}
+
+/// Log an internal (database / infrastructure) failure and hand the BROWSER one
+/// generic line. The callback page is unauthenticated, so sqlx text — constraint
+/// names, table names, connection strings — must never reach it; the same
+/// sanitization discipline the broker applies to upstream AS error text. `stage`
+/// is a fixed server-authored label, never request data.
+fn internal_page_error(stage: &'static str, e: impl std::fmt::Display) -> String {
+    tracing::warn!(stage, error = %e, "oauth callback: internal failure");
+    "Something went wrong completing the connection — try again from the dashboard.".to_string()
 }
 
 /// Collapse an authorization-server-supplied `error` code to a known OAuth 2.0
@@ -625,23 +1270,42 @@ fn known_oauth_error(code: &str) -> &'static str {
     }
 }
 
-/// `GET /v1/oauth/callback` — THE one stable redirect URI. Unauthenticated
-/// by design (a browser redirect can't carry the admin token); the sealed
-/// `state` parameter is the authentication, and nothing is trusted before
-/// it verifies. Browser-facing: answers HTML, never JSON errors. Upstream-
-/// derived text (the AS `error`/`error_description`, MCP discovery errors) is
-/// NEVER reflected — it goes to the server log and the browser sees a generic
-/// line (R3.4).
+/// `GET /v1/oauth/callback` — THE one stable redirect URI. Unauthenticated by
+/// design (a browser redirect can't carry the admin token). The authentication is
+/// the ONE-TIME flow claim with the initiating-browser cookie hash INSIDE the
+/// predicate (invariant 20): nothing is trusted before it claims. Browser-facing:
+/// answers HTML, never JSON errors. Upstream-derived text is NEVER reflected — it
+/// goes to the server log and the browser sees a generic line (R3.4).
+///
+/// Ordering is load-bearing (design D5): read cookie → claim (one-time + browser)
+/// → on miss, `peek` splits wrong-browser (403, row UNBURNED, cookie kept) from
+/// unknown/expired/consumed (400 generic) → on a claimed row, surface an AS error
+/// FIRST (a refusal is what actually happened — reporting a coherence failure
+/// instead would misdescribe it), then verify connection coherence + generation,
+/// else exchange FROM THE ROW. Every flow-ending outcome clears the cookie; the
+/// wrong-browser 403 does NOT (the right browser may still complete).
 pub async fn callback(
     State(state): State<AppState>,
     Query(p): Query<CallbackParams>,
-) -> axum::response::Response {
-    use axum::http::StatusCode;
-    let Some(sealer_ref) = state.sealer.as_ref() else {
+    headers: HeaderMap,
+) -> Response {
+    if state.sealer.is_none() {
         return page(
             StatusCode::BAD_REQUEST,
             "Connection failed",
-            "FLUIDBOX_CREDENTIAL_KEY is not configured.",
+            "Credential sealing is not configured on this server.",
+            None,
+        );
+    }
+    // The initiating-browser cookie is the second factor. Missing → 400 generic;
+    // we do NOT touch the row (the claim's browser predicate needs it, and we must
+    // not peek-and-reveal without it) — design :646-656.
+    let Some(cookie) = oauth_flow_cookie(&headers) else {
+        return page(
+            StatusCode::BAD_REQUEST,
+            "Connection failed",
+            "This browser did not start the connect flow — start again from the dashboard.",
+            None,
         );
     };
     let Some(state_param) = p.state.as_deref() else {
@@ -649,96 +1313,180 @@ pub async fn callback(
             StatusCode::BAD_REQUEST,
             "Connection failed",
             "Missing state parameter.",
+            None,
         );
     };
-    let (conn_id, verifier) = match open_state(sealer_ref, state_param) {
-        Ok(v) => v,
-        Err(e) => return page(StatusCode::BAD_REQUEST, "Connection failed", &e),
+    let state_hash = fluidbox_db::sha256_hex(state_param);
+    let browser_hash = fluidbox_db::sha256_hex(&cookie);
+    // The one-time claim: `browser_hash` sits INSIDE the single-use predicate, so a
+    // wrong browser matches nothing and BURNS NOTHING (invariant 20).
+    let flow = match fluidbox_db::claim_connector_oauth_flow(
+        &state.pool,
+        &state_hash,
+        &browser_hash,
+    )
+    .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            // Split wrong-browser (row still live → 403, UNBURNED, cookie KEPT so
+            // the right browser can still complete) from unknown/expired/consumed
+            // (→ 400 generic).
+            return match fluidbox_db::peek_connector_oauth_flow(&state.pool, &state_hash).await {
+                Ok(Some(r)) if r.consumed_at.is_none() && r.expires_at > Utc::now() => page(
+                    StatusCode::FORBIDDEN,
+                    "Connection failed",
+                    "This authorization was not started by this browser.",
+                    None,
+                ),
+                _ => page(
+                    StatusCode::BAD_REQUEST,
+                    "Connection failed",
+                    "This authorization link is invalid, expired, or already used.",
+                    None,
+                ),
+            };
+        }
+        Err(e) => {
+            tracing::error!("oauth callback: flow claim failed: {e}");
+            return page(
+                StatusCode::BAD_REQUEST,
+                "Connection failed",
+                "Something went wrong — try again from the dashboard.",
+                None,
+            );
+        }
     };
-    if let Some(err) = &p.error {
-        // The AS `error`/`error_description` are attacker-influenceable (they ride
-        // the redirect query) and can echo the sealed state, the authorization
-        // code, the PKCE verifier, or the client secret. Log ONLY an allowlisted
-        // error code + a bounded digest of the raw text — never the verbatim
-        // strings (R3.4, parity with the broker boundary in d87fb88). The browser
-        // sees a generic line.
-        let detail = p
-            .error_description
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(err.as_str());
-        tracing::warn!(
-            oauth_error = known_oauth_error(err),
-            detail = %crate::broker::msg_digest(detail),
-            "oauth callback: authorization server refused"
-        );
-        return page(
-            StatusCode::BAD_REQUEST,
-            "Authorization refused",
-            "The authorization server refused the request. You can close this tab and try again.",
-        );
-    }
-    let Some(code) = p.code.as_deref() else {
-        return page(
-            StatusCode::BAD_REQUEST,
-            "Connection failed",
-            "Missing authorization code.",
-        );
-    };
-    match complete_dance(&state, conn_id, &verifier, code).await {
-        Ok(bundle_note) => page(
+    // The flow is now BURNED — every outcome from here clears the cookie.
+    let clear = Some(clear_oauth_flow_cookie());
+    match complete_flow(
+        &state,
+        &flow,
+        p.code.as_deref(),
+        p.error.as_deref(),
+        p.error_description.as_deref(),
+    )
+    .await
+    {
+        Ok(note) => page(
             StatusCode::OK,
             "Connected",
-            &format!("The connection is active.{bundle_note} You can close this tab."),
+            &format!("The connection is active.{note} You can close this tab."),
+            clear,
         ),
-        Err(e) => page(StatusCode::BAD_REQUEST, "Connection failed", &e),
+        Err(e) => page(StatusCode::BAD_REQUEST, "Connection failed", &e, clear),
     }
 }
 
-/// Exchange the code, seal the rotating refresh token, activate the connection,
-/// bump the authorization generation on a RECONNECT (fail-closed — a re-consent
-/// may change the account/issuer/audience, so any in-flight run bound to the old
-/// generation must fail closed; design :294-296), and photograph the pending
-/// snapshot with the freshly minted access token (Phase C: snapshots replace the
-/// old brokered-bundle auto-register).
-async fn complete_dance(
-    state: &AppState,
-    conn_id: Uuid,
-    verifier: &str,
-    code: &str,
-) -> Result<String, String> {
-    let sealer_ref = state.sealer.as_ref().ok_or("credential key missing")?;
-    // The AEAD-sealed `state` param carrying conn_id IS the auth (like a webhook
-    // signature) — this browser leg has no principal. Resolve the connection
-    // cross-tenant (UUID-only system-worker loader), then its OWN tenant is the
-    // operative scope for the exchange, exactly parallel to events.rs ingress.
-    let conn = fluidbox_db::system_worker::get_connection(&state.pool, conn_id)
-        .await
-        .map_err(|e| format!("connection lookup failed: {e}"))?
-        .ok_or("connection not found")?;
-    let scope = fluidbox_db::TenantScope::assume(conn.tenant_id);
-    if conn.status == "revoked" {
-        return Err("connection was revoked — create a new one".into());
-    }
-    let oauth = conn.oauth.clone().unwrap_or_else(|| json!({}));
-    let token_endpoint = oauth
-        .get("token_endpoint")
-        .and_then(Value::as_str)
-        .ok_or("connection has no token endpoint — start the connect flow again")?;
-    let client_id = oauth
-        .get("client_id")
-        .and_then(Value::as_str)
-        .ok_or("connection has no client identity — start the connect flow again")?;
-    let resource = oauth.get("resource").and_then(Value::as_str);
+/// The client identity resolved for a token exchange / refresh: the `client_id`
+/// and the (transient, unsealed) confidential `secret` if any. `registration` is
+/// the shared row when the identity is registration-sourced — the exchange's
+/// `invalid_client` disposition needs it to decide whether to retire it.
+struct ExchangeClient {
+    client_id: String,
+    secret: Option<String>,
+    registration: Option<fluidbox_db::OauthClientRegistrationRow>,
+}
 
+/// Resolve the client identity for a code exchange / refresh. Prefers the shared
+/// registration row (`registration_id`) — unsealing ITS secret under the
+/// deployment DEK — and falls back to `client_id` + the per-connection legacy
+/// secret for connections created before Task 3 (or a `registration_id` whose row
+/// a different connection's retirement deleted; a public client keeps working on
+/// the stored `client_id` alone — and the NEXT dance re-resolves the identity,
+/// because a missing row makes it stale). The callback passes these OFF THE FROZEN FLOW
+/// ROW (the row is the authority — invariant 20); the refresh path passes them off
+/// the connection's `oauth` bag. Reads run THROUGH `db` so a refresh stays on its
+/// single lock-holding connection (design D6).
+async fn resolve_exchange_client(
+    state: &AppState,
+    db: &mut sqlx::PgConnection,
+    scope: fluidbox_db::TenantScope,
+    conn_id: Uuid,
+    registration_id: Option<Uuid>,
+    client_id: &str,
+) -> Result<ExchangeClient, String> {
+    let sealer_ref = state.sealer.as_ref().ok_or("credential key missing")?;
+    if let Some(reg_id) = registration_id {
+        if let Some(reg) = fluidbox_db::find_client_registration_by_id(&mut *db, reg_id)
+            .await
+            .map_err(|e| format!("client registration lookup failed: {e}"))?
+        {
+            let secret = match &reg.client_secret_sealed {
+                Some(bytes) => Some(
+                    sealer_ref
+                        .open(
+                            bytes,
+                            reg.client_secret_key_version,
+                            sealer_ref.deployment_ctx(SealFamily::RegistrationClientSecret),
+                        )
+                        .await
+                        .map_err(|_| "registration client secret unseal failed")?,
+                ),
+                None => None,
+            };
+            return Ok(ExchangeClient {
+                client_id: reg.client_id.clone(),
+                secret,
+                registration: Some(reg),
+            });
+        }
+        // The row is gone (a retirement deleted it): fall through to the passed
+        // `client_id` + per-connection legacy secret.
+    }
+    let secret = match fluidbox_db::connection_client_secret_sealed(&mut *db, scope, conn_id)
+        .await
+        .map_err(|e| format!("client secret lookup failed: {e}"))?
+    {
+        Some((bytes, kv)) => Some(
+            sealer_ref
+                .open(
+                    &bytes,
+                    kv,
+                    SealCtx::new(scope.tenant_id(), SealFamily::ConnectionClientSecret),
+                )
+                .await
+                .map_err(|_| "client secret unseal failed")?,
+        ),
+        None => None,
+    };
+    Ok(ExchangeClient {
+        client_id: client_id.to_string(),
+        secret,
+        registration: None,
+    })
+}
+
+/// Outcome of a code exchange. `InvalidClient` is surfaced typed so the caller can
+/// retire the rejected shared registration (a repair for the NEXT dance — never a
+/// retry of this code); `Other` carries a browser-safe message.
+enum ExchangeOutcome {
+    Ok(Value),
+    InvalidClient,
+    Other(String),
+}
+
+/// One authorization-code exchange round trip. Upstream error text is sanitized
+/// exactly as before (allowlisted code + status + digest to the log; generic to
+/// the browser). A token-endpoint `invalid_client` is returned typed.
+#[allow(clippy::too_many_arguments)]
+async fn do_code_exchange(
+    state: &AppState,
+    token_endpoint: &str,
+    client_id: &str,
+    secret: Option<&str>,
+    code: &str,
+    verifier: &str,
+    redirect: &str,
+    resource: Option<&str>,
+) -> ExchangeOutcome {
     let mut form: Vec<(&str, &str)> = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
         ("client_id", client_id),
         ("code_verifier", verifier),
+        ("redirect_uri", redirect),
     ];
-    let ru = redirect_uri(state);
-    form.push(("redirect_uri", &ru));
     if let Some(r) = resource {
         form.push(("resource", r));
     }
@@ -748,37 +1496,489 @@ async fn complete_dance(
         .timeout(HTTP_TIMEOUT)
         .header("content-type", "application/x-www-form-urlencoded")
         .body(form_body(&form));
-    if let Some(sealed) = fluidbox_db::connection_client_secret_sealed(&state.pool, scope, conn.id)
-        .await
-        .map_err(|e| format!("client secret lookup failed: {e}"))?
-    {
-        let secret = sealer_ref
-            .open(&sealed)
-            .map_err(|_| "client secret unseal failed")?;
-        req = req.basic_auth(client_id, Some(secret));
+    if let Some(s) = secret {
+        req = req.basic_auth(client_id, Some(s));
     }
-    let res = req
-        .send()
-        .await
-        .map_err(|e| format!("token exchange failed: {e}"))?;
+    let res = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return ExchangeOutcome::Other(format!("token exchange failed: {e}")),
+    };
     let status = res.status();
     let v: Value = res.json().await.unwrap_or(Value::Null);
-    if !status.is_success() {
-        // The token endpoint's JSON is attacker-controlled: a malicious AS can put
-        // the code, PKCE verifier, or client secret into the `error` value. Log
-        // ONLY an allowlisted code + status + a bounded digest of the raw error
-        // text — never the verbatim value (R3.4). The browser gets a generic line.
-        let raw = v.get("error").map(ToString::to_string).unwrap_or_default();
+    if status.is_success() {
+        return ExchangeOutcome::Ok(v);
+    }
+    // The token endpoint's JSON is attacker-controlled: a malicious AS can put the
+    // code, PKCE verifier, or client secret into `error`. Log ONLY an allowlisted
+    // code + status + a bounded digest — never the verbatim value (R3.4).
+    let err = v["error"].as_str().unwrap_or("");
+    let raw = v.get("error").map(ToString::to_string).unwrap_or_default();
+    tracing::warn!(
+        %status,
+        oauth_error = known_oauth_error(err),
+        detail = %crate::broker::msg_digest(&raw),
+        "oauth callback: token exchange rejected"
+    );
+    if err == "invalid_client" {
+        return ExchangeOutcome::InvalidClient;
+    }
+    ExchangeOutcome::Other(
+        "the authorization server rejected the token exchange — reconnect and try again".into(),
+    )
+}
+
+/// The TERMINAL disposition of an exchange-time `invalid_client` (pure): whether
+/// the shared registration row should be RETIRED, plus the browser-facing message.
+///
+/// There is deliberately no "retry" disposition. RFC 6749 §4.1.3 binds an
+/// authorization code to the client it was issued to, so re-exchanging the SAME
+/// code under a freshly registered `client_id` is `invalid_grant` ("code was
+/// issued to another client") — a retry could only ever have failed. Retiring the
+/// rejected registration is therefore a repair for the NEXT dance, and the user is
+/// told to start the flow again (which is also the only way to re-consent — no
+/// user is present on this browser leg to approve a second authorization).
+///
+/// Only a registration-sourced identity that records its `registration_endpoint`
+/// is worth retiring: that is the one a fresh resolution can replace with a
+/// DIFFERENT `client_id` (DCR). A CIMD row's client_id is this deployment's
+/// document URL, so re-minting it reproduces exactly what the AS just rejected; a
+/// per-connection pre-registered/legacy secret has no shared row at all (the AS
+/// rejected operator-supplied credentials — a human must fix them).
+fn invalid_client_disposition(client: &ExchangeClient) -> (bool, &'static str) {
+    let retire = client
+        .registration
+        .as_ref()
+        .is_some_and(|r| r.registration_endpoint.is_some());
+    if retire {
+        (
+            true,
+            "the authorization server rejected this deployment's registered OAuth client — \
+             start the connect flow again from the dashboard to register a fresh one",
+        )
+    } else {
+        (
+            false,
+            "the authorization server rejected the client — reconnect and try again",
+        )
+    }
+}
+
+/// Retire the shared client registration the token endpoint rejected with
+/// `invalid_client`, so the NEXT dance re-resolves a fresh identity instead of
+/// replaying the dead one. Repair-for-next-time ONLY — see
+/// [`invalid_client_disposition`] for why this exchange cannot be rescued.
+///
+/// The delete is safe by construction: `connector_oauth_flows.client_registration_id`
+/// is `on delete set null` (migration 0016), so the very flow row being completed —
+/// which always references this registration and is retained 7 days — cannot
+/// FK-violate it. Sibling connections whose `oauth.registration_id` pointed here
+/// find the row missing on their next dance and re-resolve
+/// ([`stored_identity_stale`]'s `registration_missing`), so nothing dangles.
+///
+/// The DELETE rides the audited system-worker entry point: 0018 admits mutation of
+/// a global row (`tenant_id is null`) only under the bypass GUC, and a filtered
+/// DELETE would "succeed" against zero rows — leaving the dead identity adopted
+/// forever, which is exactly the bug this function exists to prevent.
+///
+/// Best effort: a failed delete is logged and reported as "not retired" — the user
+/// still restarts the flow, and the next attempt simply meets the same live row.
+/// A REFRESH-path `invalid_client` deliberately does NOT come here — it flips the
+/// connection to `error` and waits for human re-consent (design D6).
+async fn retire_rejected_registration(state: &AppState, client: &ExchangeClient) -> bool {
+    let (retire, _) = invalid_client_disposition(client);
+    if !retire {
+        return false;
+    }
+    let reg = client
+        .registration
+        .as_ref()
+        .expect("the retire disposition proved the registration is present");
+    tracing::info!(
+        registration = %reg.id,
+        "oauth callback: invalid_client — retiring the rejected shared client registration"
+    );
+    match fluidbox_db::system_worker::delete_global_registration(&state.pool, reg.id).await {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                registration = %reg.id,
+                error = %e,
+                "oauth callback: could not retire the rejected client registration"
+            );
+            false
+        }
+    }
+}
+
+/// What the user is told when this flow's activation expectation no longer
+/// holds: a newer authorization for the same connection already landed. Used by
+/// BOTH the pre-exchange fast refusal and the CAS refusal, so the two cannot
+/// drift apart.
+const SUPERSEDED_MSG: &str =
+    "this authorization was superseded by a newer one — restart the connect flow";
+
+/// The connection's last successful OAuth activation instant, as stamped by
+/// `activate_connection_oauth` (DB clock, SQL-side, never caller-supplied).
+///
+/// `None` = never activated. A present-but-unparseable stamp yields
+/// `DateTime::<Utc>::MAX_UTC`, i.e. EVERY flow reads as superseded: we cannot
+/// prove freshness, and the DB CAS's `::timestamptz` cast would hard-error on
+/// the same value — refusing with "restart the connect flow" is the honest
+/// answer, not a 500.
+fn last_activated_at(oauth: Option<&Value>) -> Option<DateTime<Utc>> {
+    let raw = oauth?.get(fluidbox_db::ACTIVATED_AT_KEY)?;
+    if raw.is_null() {
+        return None;
+    }
+    Some(
+        raw.as_str()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC),
+    )
+}
+
+/// Has a newer authorization for this connection already landed, making THIS
+/// flow's expectation stale? PURE — the same two predicates the activation CAS
+/// re-asserts inside its UPDATE (review H2):
+///   - the frozen generation moved (a RECONNECT activated), or
+///   - the connection was activated at-or-after this flow started (which is what
+///     catches FIRST connect, where `pending → active` does not bump the
+///     generation and two racing callbacks froze the same one).
+///
+/// `>=` not `>`: equal instants are unorderable, so they fail closed.
+fn flow_superseded(
+    conn_generation: i32,
+    last_activated: Option<DateTime<Utc>>,
+    expected_generation: i32,
+    flow_created_at: DateTime<Utc>,
+) -> bool {
+    conn_generation != expected_generation || last_activated.is_some_and(|t| t >= flow_created_at)
+}
+
+/// [`flow_superseded`] against a freshly read connection row + its flow.
+fn superseded_flow(
+    conn: &fluidbox_db::IntegrationConnectionRow,
+    flow: &fluidbox_db::ConnectorOauthFlowRow,
+) -> bool {
+    flow_superseded(
+        conn.authorization_generation,
+        last_activated_at(conn.oauth.as_ref()),
+        flow.expected_generation,
+        flow.created_at,
+    )
+}
+
+/// The connection's authorization state as an authorization ATTEMPT found it —
+/// frozen in `start_dance`'s initial read, BEFORE any outbound HTTP.
+///
+/// Why the flow row's `created_at` cannot play this role: it is stamped only
+/// after discovery + client resolution (seconds of outbound HTTP). Two starts
+/// that both read the same pending connection can therefore have their flow rows
+/// materialize on OPPOSITE sides of a successful activation — the slower one's
+/// row post-dating an activation its own expectation pre-dates, which passes
+/// both activation-CAS predicates (the generation did not move on a first
+/// connect, and `activated_at < created_at` holds). This type is that missing
+/// epoch, expressed as the connection state itself rather than a clock reading,
+/// so it needs no new column and no cross-clock comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StartExpectation {
+    generation: i32,
+    activated_at: Option<DateTime<Utc>>,
+}
+
+impl StartExpectation {
+    fn of(conn: &fluidbox_db::IntegrationConnectionRow) -> Self {
+        Self {
+            generation: conn.authorization_generation,
+            activated_at: last_activated_at(conn.oauth.as_ref()),
+        }
+    }
+}
+
+/// Has the connection been re-authorized since this attempt began? PURE.
+///
+/// Equality on BOTH halves, not the CAS's ordering test: the question here is
+/// "did ANYTHING activate since I read this row", and any movement of either
+/// value answers yes. `None` for `current` (the connection vanished) is movement
+/// too. An unparseable activation stamp reads as `MAX_UTC` (see
+/// [`last_activated_at`]) and so differs from every real one — fail closed.
+fn start_expectation_moved(
+    started_with: StartExpectation,
+    current: Option<StartExpectation>,
+) -> bool {
+    current != Some(started_with)
+}
+
+/// What the commit point does with an attempt, as a VALUE — the whole decision,
+/// pure, so "a superseded attempt writes nothing" is testable without a database.
+/// [`commit_start_epoch`] only executes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartCommit {
+    /// Nothing activated since the attempt began ⇒ persist its custody bag, in
+    /// the very transaction that proved it.
+    PersistBag,
+    /// A newer authorization landed ⇒ write NOTHING (no bag, no repointed token
+    /// endpoint or client identity) and refuse with [`SUPERSEDED_MSG`].
+    Superseded,
+}
+
+/// The commit point's decision. ONE predicate gates BOTH consequences — whether
+/// this attempt's flow row survives and whether its custody bag is persisted —
+/// so the two can never drift apart.
+fn start_commit_decision(
+    started_with: StartExpectation,
+    current: Option<StartExpectation>,
+) -> StartCommit {
+    if start_expectation_moved(started_with, current) {
+        StartCommit::Superseded
+    } else {
+        StartCommit::PersistBag
+    }
+}
+
+/// An authorization attempt's COMMIT POINT: prove the connection has not been
+/// re-authorized since [`StartExpectation`] was frozen (the flow row is already
+/// inserted), and — in the SAME transaction, under the SAME lock — persist the
+/// custody bag this attempt discovered: endpoints, client identity, registration
+/// pointer.
+///
+/// **The bag write rides this transaction rather than taking its own round trip
+/// (review #32).** It is a whole-bag REPLACE closing a read-modify-write that
+/// spanned discovery, so landing it on a connection a sibling flow has just
+/// activated would pair THAT grant's refresh token with THIS attempt's token
+/// endpoint + client identity — the winner's refresh would then authenticate to
+/// the wrong client at the wrong endpoint. Guarding it with its own predicate
+/// would work, but a second guarded round trip is strictly weaker than being
+/// inside the transaction that already holds the lock: here there is no interval
+/// between the proof and the write for an activation to occupy at all.
+///
+/// It is ordered against EVERY activation by the connection's OAuth advisory
+/// lock, which `complete_flow` holds across its activation UPDATE *and* that
+/// transaction's commit. So for a given attempt every activation `A` is in
+/// exactly one of two classes:
+///
+///   - `A` committed before we take the lock ⇒ our re-read OBSERVES it (`A` could
+///     not have been mid-UPDATE without us blocking on the lock), the frozen
+///     expectation differs, and we refuse — writing no bag — while the caller
+///     burns the flow row, whose callback can then never claim it.
+///   - `A` takes the lock only after we RELEASE it (at this transaction's commit,
+///     which is also when the bag lands) ⇒ its `clock_timestamp()` activation
+///     stamp is strictly later than this read, hence later than our flow row's
+///     `created_at` (inserted before this call), so the activation CAS
+///     `activated_at < flow.created_at` refuses OUR flow. `A` then writes its own
+///     bag over ours, which is the correct outcome: the newest authorization owns
+///     the connection's custody state.
+///
+/// There is no third class — no activation can interleave between the proof and
+/// the bag write, because they are the same transaction — so "one activation
+/// invalidates every sibling flow" finally holds for attempts that merely BEGAN
+/// before it, not only for flow rows that already existed when it landed.
+///
+/// THIS RESTS ON: `activate_connection_oauth` is only ever called while holding
+/// `acquire_oauth_lock` for the same connection (today exactly one call site —
+/// `complete_flow`). A second, unlocked activation writer would silently reopen
+/// the race.
+///
+/// One pooled connection at a time (lock + read + update + commit, nothing
+/// nested — no HTTP, no seal, no second acquire): the fixed-size-pool hazard
+/// `complete_flow`'s activation documents applies here too, so the burn runs
+/// AFTER this transaction ends. Lock-then-row is also the ordering every other
+/// oauth writer uses, so the extra row lock introduces no deadlock cycle.
+async fn commit_start_epoch(
+    pool: &sqlx::PgPool,
+    scope: fluidbox_db::TenantScope,
+    conn_id: Uuid,
+    started_with: StartExpectation,
+    oauth: &Value,
+) -> ApiResult<()> {
+    let mut tx = fluidbox_db::scoped_tx(pool, scope).await?;
+    fluidbox_db::acquire_oauth_lock(&mut tx, conn_id).await?;
+    let current = fluidbox_db::get_connection(&mut *tx, scope, conn_id).await?;
+    match start_commit_decision(started_with, current.as_ref().map(StartExpectation::of)) {
+        StartCommit::Superseded => {
+            // Release the connection explicitly before returning: the caller
+            // burns the flow row next and that needs a pooled connection this
+            // one must not still be holding. Nothing was written, so a failed
+            // rollback changes no outcome — it is logged, never allowed to
+            // replace the refusal the caller must surface.
+            if let Err(e) = tx.rollback().await {
+                tracing::warn!(error = %e, "oauth start: rollback after a superseded refusal failed");
+            }
+            tracing::info!(
+                connection = %conn_id,
+                "oauth start: the connection was reauthorized while this attempt was in discovery — refusing it"
+            );
+            Err(ApiError::Conflict(SUPERSEDED_MSG.into()))
+        }
+        StartCommit::PersistBag => {
+            // Idempotent re-runs overwrite with fresh endpoints; the client
+            // identity sticks. `update_connection_oauth` is executor-generic
+            // precisely so this rides `tx` — see its doc comment.
+            fluidbox_db::update_connection_oauth(&mut *tx, scope, conn_id, oauth).await?;
+            tx.commit().await?;
+            Ok(())
+        }
+    }
+}
+
+/// Retire a flow row this attempt inserted but must not honor, through the SAME
+/// one-time claim the callback uses — after this the row can never be exchanged.
+///
+/// LOAD-BEARING, not best effort: the row we are burning is precisely the one the
+/// activation CAS cannot catch (its `created_at` post-dates the activation that
+/// superseded it), so leaving it live would leave the race open for the flow's
+/// full TTL. One retry, then a hard error rather than a silent success.
+async fn burn_flow(state: &AppState, s: &str, c: &str) -> ApiResult<()> {
+    let (state_hash, browser_hash) = (fluidbox_db::sha256_hex(s), fluidbox_db::sha256_hex(c));
+    let mut last = None;
+    for _ in 0..2 {
+        match fluidbox_db::claim_connector_oauth_flow(&state.pool, &state_hash, &browser_hash).await
+        {
+            Ok(_) => return Ok(()),
+            Err(e) => last = Some(e),
+        }
+    }
+    tracing::error!(
+        error = ?last,
+        "oauth start: could not retire a superseded flow row — it stays exchangeable until it expires"
+    );
+    Err(ApiError::Internal(
+        "could not retire the superseded authorization — reconnect this connection".into(),
+    ))
+}
+
+/// Complete a claimed flow (invariant 20): verify connection coherence + frozen
+/// generation, unseal the PKCE verifier, exchange the code AGAINST THE FROZEN ROW
+/// (its token_endpoint / client identity / resource — never re-discovered, closing
+/// AS mix-up + discovery-change races), then seal the rotating refresh token,
+/// activate (a RECONNECT bumps the generation — a re-consent may change the
+/// account/issuer/audience, so any in-flight run bound to the old generation fails
+/// closed; design :294-296), and photograph the pending snapshot. The caller has
+/// already burned the flow; this never touches the flow row again.
+async fn complete_flow(
+    state: &AppState,
+    flow: &fluidbox_db::ConnectorOauthFlowRow,
+    code: Option<&str>,
+    error: Option<&str>,
+    error_description: Option<&str>,
+) -> Result<String, String> {
+    let sealer_ref = state.sealer.as_ref().ok_or("credential key missing")?;
+    // The AS returned an error (denied consent, etc.) — surfaced FIRST, before any
+    // connection coherence check: the AS's refusal is what actually happened, and
+    // reporting "connection was reauthorized" for a user who clicked Deny during a
+    // concurrent reconnect would be a lie. The flow is already claimed (burned) —
+    // a denied consent is terminal for it either way. Log ONLY an allowlisted code
+    // + a bounded digest (the AS text is attacker-influenceable and can echo the
+    // state/code/verifier/secret); the browser sees a generic line (R3.4).
+    if let Some(err) = error {
+        let detail = error_description.filter(|s| !s.is_empty()).unwrap_or(err);
         tracing::warn!(
-            %status,
-            oauth_error = known_oauth_error(v["error"].as_str().unwrap_or("")),
-            detail = %crate::broker::msg_digest(&raw),
-            "oauth callback: token exchange rejected"
+            oauth_error = known_oauth_error(err),
+            detail = %crate::broker::msg_digest(detail),
+            "oauth callback: authorization server refused"
         );
         return Err(
-            "the authorization server rejected the token exchange — reconnect and try again".into(),
+            "The authorization server refused the request. You can close this tab and try again."
+                .into(),
         );
     }
+    // The ROW is the authority now (its tenant was verified when the start
+    // principal inserted it): load the connection under the row's own tenant scope,
+    // NOT the cross-tenant system-worker loader the stateless state once required.
+    let scope = fluidbox_db::TenantScope::assume(flow.tenant_id);
+    // Tenant known (the flow's own, verified when the start principal inserted it)
+    // → scoped_tx so the RLS GUC rides the executor-generic read.
+    let mut conn_tx = fluidbox_db::scoped_tx(&state.pool, scope)
+        .await
+        .map_err(|e| internal_page_error("connection lookup", e))?;
+    let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, flow.connection_id)
+        .await
+        .map_err(|e| internal_page_error("connection lookup", e))?
+        .ok_or("connection not found — it may have been removed")?;
+    conn_tx
+        .commit()
+        .await
+        .map_err(|e| internal_page_error("connection lookup", e))?;
+    if conn.status == "revoked" {
+        return Err("connection was revoked — create a new one".into());
+    }
+    // Generation coherence: a reconnect that landed mid-authorization bumped the
+    // generation past what the flow froze — refuse rather than seal a fresh grant
+    // onto a superseded binding (design :1535, generation acceptance).
+    //
+    // THIS CHECK IS AN OPTIMIZATION, NOT THE BOUNDARY (review H2): it runs BEFORE
+    // the code exchange — a full HTTP round trip — so a sibling flow can activate
+    // in the window between it and the write. It exists to avoid burning an
+    // authorization code we already know we cannot use; the security boundary is
+    // the compare-and-swap in `activate_connection_oauth` below, which re-asserts
+    // BOTH of these predicates in the UPDATE itself.
+    if superseded_flow(&conn, flow) {
+        return Err(SUPERSEDED_MSG.into());
+    }
+    let code = code.ok_or("Missing authorization code.")?;
+    // Unseal the PKCE verifier (the challenge alone cannot exchange — design
+    // :638-639). ROW tenant ctx.
+    let verifier = sealer_ref
+        .open(
+            &flow.pkce_verifier_sealed,
+            flow.pkce_verifier_key_version,
+            SealCtx::new(flow.tenant_id, SealFamily::OauthFlowPkceVerifier),
+        )
+        .await
+        .map_err(|_| "PKCE verifier unseal failed — start the connect flow again")?;
+
+    // The connection's oauth bag (for the granted-scope fallback); token_endpoint /
+    // client identity / resource / redirect come from the FROZEN ROW.
+    let oauth = conn.oauth.clone().unwrap_or_else(|| json!({}));
+    let resource = Some(flow.resource.as_str());
+
+    // Resolve the client identity (shared registration preferred; per-connection
+    // legacy fallback) from the ROW. Uses a short-lived scoped transaction (the
+    // per-connection secret read is tenant-scoped under RLS) — the activation
+    // critical section below takes its own, so nothing nests.
+    let mut resolve_tx = fluidbox_db::scoped_tx(&state.pool, scope)
+        .await
+        .map_err(|e| internal_page_error("db acquire", e))?;
+    let client = resolve_exchange_client(
+        state,
+        &mut resolve_tx,
+        scope,
+        conn.id,
+        flow.client_registration_id,
+        &flow.client_id,
+    )
+    .await
+    .map_err(|e| internal_page_error("client resolution", e))?;
+    resolve_tx
+        .commit()
+        .await
+        .map_err(|e| internal_page_error("db commit", e))?;
+
+    // Exchange the code. Exactly ONE exchange: an `invalid_client` retires the
+    // rejected shared registration (a repair for the NEXT dance) and reports —
+    // re-exchanging this code under a fresh client_id would be `invalid_grant` by
+    // construction (RFC 6749 §4.1.3; see `invalid_client_disposition`).
+    let v = match do_code_exchange(
+        state,
+        &flow.token_endpoint,
+        &client.client_id,
+        client.secret.as_deref(),
+        code,
+        &verifier,
+        &flow.redirect_uri,
+        resource,
+    )
+    .await
+    {
+        ExchangeOutcome::Ok(v) => v,
+        ExchangeOutcome::Other(msg) => return Err(msg),
+        ExchangeOutcome::InvalidClient => {
+            let (_, msg) = invalid_client_disposition(&client);
+            retire_rejected_registration(state, &client).await;
+            return Err(msg.to_string());
+        }
+    };
     let access = v["access_token"]
         .as_str()
         .ok_or("token response has no access_token")?
@@ -816,12 +2016,28 @@ async fn complete_dance(
     if let Some(o) = clean.as_object_mut() {
         o.remove("error");
     }
+    // Seal the rotating refresh token BEFORE entering the advisory-lock critical
+    // section: in KMS mode the seal may mint/unwrap this tenant's DEK on a
+    // SEPARATE pooled connection, which must not run while the lock's connection
+    // is held (the same fixed-pool hazard the activation UPDATE routes around).
+    let sealed_refresh = sealer_ref
+        .seal(
+            refresh,
+            SealCtx::new(scope.tenant_id(), SealFamily::ConnectionCredential),
+        )
+        .await
+        .map_err(|e| internal_page_error("refresh-token seal", e))?;
 
     // Serialize the activation against the refresh path (R3.2): acquire the SAME
     // per-connection in-process mutex + Postgres advisory lock `ensure_access_token`
     // uses, so a concurrent in-flight refresh rotating the OLD grant's token can
     // never clobber the NEW grant landing here (which would restore a superseded
-    // grant). Held only across the activation write + cache update; released
+    // grant). THE ADVISORY LOCK IS ALSO WHAT ORDERS THIS ACTIVATION AGAINST THE
+    // START SIDE — `commit_start_epoch` takes it to prove no activation slipped
+    // under an in-flight attempt AND to land that attempt's custody bag in the
+    // same transaction — so `activate_connection_oauth` must never be called
+    // outside this lock. Held only across the activation write + cache
+    // update; released
     // BEFORE the photograph, which re-mints under its own lock (a nested acquire
     // of the same in-process mutex would deadlock).
     {
@@ -830,14 +2046,15 @@ async fn complete_dance(
             locks.entry(conn.id).or_default().clone()
         };
         let _guard = lock.lock().await;
-        let mut tx = state
-            .pool
-            .begin()
+        // scoped_tx (not a bare begin): the activate UPDATE below is tenant-scoped
+        // under RLS, and the whole critical section still borrows exactly ONE pooled
+        // connection (the advisory lock + activation ride this tx).
+        let mut tx = fluidbox_db::scoped_tx(&state.pool, scope)
             .await
-            .map_err(|e| format!("oauth lock txn failed: {e}"))?;
+            .map_err(|e| internal_page_error("oauth lock txn", e))?;
         fluidbox_db::acquire_oauth_lock(&mut tx, conn.id)
             .await
-            .map_err(|e| format!("oauth advisory lock failed: {e}"))?;
+            .map_err(|e| internal_page_error("oauth advisory lock", e))?;
         // The activate + generation bump is ONE atomic UPDATE (R1.3+R3.1): no
         // crash window where a reconnected grant is active yet still serving the
         // prior generation. The returned row carries the FINAL generation. It runs
@@ -850,13 +2067,25 @@ async fn complete_dance(
             &mut *tx,
             scope,
             conn.id,
-            &sealer_ref.seal(refresh),
+            &sealed_refresh.bytes,
+            sealed_refresh.key_version,
             &clean,
             &json!(granted),
+            // THE SECURITY BOUNDARY (review H2): the activation is a
+            // compare-and-swap on the flow's OWN start-time expectation —
+            // the frozen generation AND "nothing has activated this
+            // connection since this flow started". A flow superseded by a
+            // newer authorization (a competing admin's reconnect, or a
+            // sibling first-connect on the same pending row) matches ZERO
+            // rows here, so it can never overwrite the newer grant's refresh
+            // token. Both values are frozen at START — never re-read now,
+            // which is precisely the TOCTOU the pre-exchange check has.
+            flow.expected_generation,
+            flow.created_at,
         )
         .await
-        .map_err(|e| format!("activation failed: {e}"))?
-        .ok_or("connection changed state during the exchange")?;
+        .map_err(|e| internal_page_error("activation", e))?
+        .ok_or(SUPERSEDED_MSG)?;
         // Commit (releasing the advisory lock) BEFORE touching the token cache:
         // a cache entry must never outlive a rolled-back activation. A failed or
         // AMBIGUOUS commit fails closed: the AS may already have invalidated the
@@ -865,7 +2094,13 @@ async fn complete_dance(
         // and refuse — the caller reconnects/retries.
         if let Err(e) = tx.commit().await {
             invalidate_access(state, conn.id).await;
-            return Err(format!("could not persist OAuth custody — retry: {e}"));
+            // The sqlx text goes to the log only — this page is unauthenticated.
+            tracing::warn!(stage = "activation commit", error = %e, "oauth callback: internal failure");
+            return Err(
+                "could not persist the connection — start the connect flow again from the \
+                 dashboard"
+                    .into(),
+            );
         }
         // Evict any token cached under a PRIOR generation BEFORE caching the new
         // one: `invalidate_access` drops every generation for this connection, so
@@ -906,14 +2141,19 @@ async fn complete_dance(
             // Status flip → error is paired with token eviction (custody
             // discipline) so nothing serves the just-cached token.
             tracing::warn!(connection = %conn.id, error = %e, "oauth callback: tool discovery failed after authorization");
-            fluidbox_db::mark_connection_error(
-                &state.pool,
-                scope,
-                conn.id,
-                "MCP tool discovery failed after authorization — reconnect this connection",
-            )
-            .await
-            .ok();
+            // Best-effort status flip → error (RLS: the write is tenant-scoped, so
+            // it rides a scoped_tx; a tx failure is swallowed like the write itself).
+            if let Ok(mut err_tx) = fluidbox_db::scoped_tx(&state.pool, scope).await {
+                fluidbox_db::mark_connection_error(
+                    &mut *err_tx,
+                    scope,
+                    conn.id,
+                    "MCP tool discovery failed after authorization — reconnect this connection",
+                )
+                .await
+                .ok();
+                err_tx.commit().await.ok();
+            }
             invalidate_access(state, conn.id).await;
             Err(
                 "authorized, but tool discovery failed — the connection is marked error; reconnect it"
@@ -935,6 +2175,46 @@ pub async fn invalidate_access(state: &AppState, connection_id: Uuid) {
         .lock()
         .await
         .retain(|(cid, _generation), _| *cid != connection_id);
+}
+
+/// KEEP predicate for [`invalidate_rejected_access`], factored out so the
+/// singleflight-preserving semantic is unit-testable without an `AppState`:
+/// an entry survives unless it belongs to `connection_id` AND still holds the
+/// exact token the upstream rejected.
+fn survives_rejection(
+    entry_conn: Uuid,
+    entry_token: &str,
+    connection_id: Uuid,
+    rejected: &str,
+) -> bool {
+    entry_conn != connection_id || entry_token != rejected
+}
+
+/// Reactive-401 eviction: drop the cached access token for `connection_id` ONLY
+/// when the cache still holds the EXACT token the upstream just rejected.
+///
+/// The unconditional [`invalidate_access`] is wrong here and defeats the
+/// singleflight it sits next to. N concurrent brokered calls all resolve the
+/// same cached token, all 401 together, and then serialize through this path:
+/// caller A evicts, refreshes, and caches a FRESH token — and caller B, arriving
+/// a moment later, would blow that fresh token away and rotate the refresh token
+/// a second time. `ensure_access_token`'s double-check never gets to fire,
+/// because the entry it would have hit was just deleted. The result is one
+/// refresh grant per concurrent 401 (a refresh storm, and needless rotation
+/// churn against authorization servers that keep only a bounded number of valid
+/// refresh tokens). Comparing the token makes B's eviction a no-op, so B's
+/// `ensure_access_token` hits A's freshly-cached token and the retry rides it.
+///
+/// Every OTHER eviction (revoke, error, suspend, generation bump, re-consent)
+/// stays unconditional — those invalidate the AUTHORITY, not one minted token.
+pub async fn invalidate_rejected_access(state: &AppState, connection_id: Uuid, rejected: &str) {
+    state
+        .connector_tokens
+        .lock()
+        .await
+        .retain(|(cid, _generation), (tok, _exp)| {
+            survives_rejection(*cid, tok, connection_id, rejected)
+        });
 }
 
 /// Return a live access token for an OAuth connection: cache hit inside the
@@ -965,9 +2245,12 @@ pub async fn ensure_access_token(
         locks.entry(conn.id).or_default().clone()
     };
     let _guard = lock.lock().await;
-    let mut tx = state
-        .pool
-        .begin()
+    // scoped_tx (not a bare begin): every DB touch in this critical section — the
+    // fresh re-read and the rotation write — is tenant-scoped under RLS and rides
+    // this ONE pooled connection (the advisory lock spans it). The scope is the
+    // connection's own tenant.
+    let scope = fluidbox_db::TenantScope::assume(conn.tenant_id);
+    let mut tx = fluidbox_db::scoped_tx(&state.pool, scope)
         .await
         .map_err(|e| format!("oauth lock txn failed: {e}"))?;
     fluidbox_db::acquire_oauth_lock(&mut tx, conn.id)
@@ -986,7 +2269,7 @@ pub async fn ensure_access_token(
     // while we waited. Operate on the FRESH row and refuse on any drift, so we
     // never unseal a superseded grant's refresh token or mint against a stale
     // binding. Early returns drop the tx (rollback releases the advisory lock).
-    let scope = fluidbox_db::TenantScope::assume(conn.tenant_id);
+    // `scope` was derived above (the connection's tenant) so it could open the tx.
     // Re-read THROUGH `tx` (the lock-holding connection), never `&state.pool`: the
     // whole critical section must borrow exactly ONE pooled connection, or N
     // concurrent refreshes — each holding one connection and reaching for a second
@@ -1062,28 +2345,46 @@ async fn refresh_access_token(
     // The connection row is already resolved and trusted (the broker fetched it
     // under the run's scope); derive the scope from its own tenant.
     let scope = fluidbox_db::TenantScope::assume(conn.tenant_id);
-    let sealed = fluidbox_db::connection_credential_sealed(&mut *db, scope, conn.id)
+    let (sealed, kv) = fluidbox_db::connection_credential_sealed(&mut *db, scope, conn.id)
         .await
         .map_err(|e| format!("credential lookup failed: {e}"))?
         .ok_or("connection is not active — reconnect it in Connections")?;
     let refresh = sealer_ref
-        .open(&sealed)
+        .open(
+            &sealed,
+            kv,
+            SealCtx::new(conn.tenant_id, SealFamily::ConnectionCredential),
+        )
+        .await
         .map_err(|_| "refresh token unseal failed (credential key rotated?) — reconnect")?;
     let oauth = conn.oauth.clone().unwrap_or_else(|| json!({}));
     let token_endpoint = oauth
         .get("token_endpoint")
         .and_then(Value::as_str)
         .ok_or("connection has no token endpoint — reconnect it")?;
+    let resource = oauth.get("resource").and_then(Value::as_str);
+    // Resolve the client identity (shared registration preferred, per-connection
+    // legacy fallback) THROUGH `db` — the refresh stays on its single lock-holding
+    // connection. A refresh-path `invalid_client` is handled below (mark error;
+    // NEVER re-register mid-refresh — no user is present to re-consent; design D6).
+    // The refresh reads its client identity off the connection's `oauth` bag (the
+    // frozen flow row belongs to the initial dance only).
+    let registration_id = oauth
+        .get("registration_id")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok());
     let client_id = oauth
         .get("client_id")
         .and_then(Value::as_str)
         .ok_or("connection has no client identity — reconnect it")?;
-    let resource = oauth.get("resource").and_then(Value::as_str);
+    let client =
+        resolve_exchange_client(state, &mut *db, scope, conn.id, registration_id, client_id)
+            .await?;
 
     let mut form: Vec<(&str, &str)> = vec![
         ("grant_type", "refresh_token"),
         ("refresh_token", &refresh),
-        ("client_id", client_id),
+        ("client_id", &client.client_id),
     ];
     if let Some(r) = resource {
         form.push(("resource", r));
@@ -1094,15 +2395,8 @@ async fn refresh_access_token(
         .timeout(HTTP_TIMEOUT)
         .header("content-type", "application/x-www-form-urlencoded")
         .body(form_body(&form));
-    if let Some(sealed_secret) =
-        fluidbox_db::connection_client_secret_sealed(&mut *db, scope, conn.id)
-            .await
-            .map_err(|e| format!("client secret lookup failed: {e}"))?
-    {
-        let secret = sealer_ref
-            .open(&sealed_secret)
-            .map_err(|_| "client secret unseal failed")?;
-        req = req.basic_auth(client_id, Some(secret));
+    if let Some(secret) = &client.secret {
+        req = req.basic_auth(&client.client_id, Some(secret));
     }
     let res = req
         .send()
@@ -1137,25 +2431,34 @@ async fn refresh_access_token(
         .to_string();
     let expires_in = v["expires_in"].as_i64().unwrap_or(3600);
     if let Some(new_refresh) = v["refresh_token"].as_str() {
-        if new_refresh != refresh
-            && !fluidbox_db::rotate_connection_refresh(
+        if new_refresh != refresh {
+            let sealed_new = sealer_ref
+                .seal(
+                    new_refresh,
+                    SealCtx::new(conn.tenant_id, SealFamily::ConnectionCredential),
+                )
+                .await
+                .map_err(|e| format!("failed to seal rotated refresh token: {e}"))?;
+            if !fluidbox_db::rotate_connection_refresh(
                 &mut *db,
                 scope,
                 conn.id,
-                &sealer_ref.seal(new_refresh),
+                &sealed_new.bytes,
+                sealed_new.key_version,
                 conn.authorization_generation,
             )
             .await
             .map_err(|e| format!("rotation persist failed: {e}"))?
-        {
-            // 0 rows: the connection was revoked/errored OR reauthorized (its
-            // generation moved) beneath this in-flight refresh (R3.2). The token
-            // just minted rides a grant that is no longer current — evict and
-            // fail closed rather than persist a rotated OLD refresh token that
-            // would restore a superseded grant. The caller retries and re-mints
-            // under the new generation.
-            invalidate_access(state, conn.id).await;
-            return Err("connection was reauthorized during refresh — retry".into());
+            {
+                // 0 rows: the connection was revoked/errored OR reauthorized (its
+                // generation moved) beneath this in-flight refresh (R3.2). The token
+                // just minted rides a grant that is no longer current — evict and
+                // fail closed rather than persist a rotated OLD refresh token that
+                // would restore a superseded grant. The caller retries and re-mints
+                // under the new generation.
+                invalidate_access(state, conn.id).await;
+                return Err("connection was reauthorized during refresh — retry".into());
+            }
         }
     }
     // Re-verify the binding is STILL the one we entered with, INDEPENDENT of
@@ -1226,35 +2529,578 @@ mod tests {
         assert_eq!(known_oauth_error("access_denied"), "access_denied");
     }
 
+    // Reactive-401 eviction must not defeat the refresh singleflight. Two
+    // concurrent brokered calls resolve the SAME cached access token and 401
+    // together; the first evicts + refreshes + caches a fresh token, and the
+    // second's eviction must then be a NO-OP so `ensure_access_token`'s
+    // double-check serves the fresh token instead of rotating a second time.
     #[test]
-    fn state_roundtrip_tamper_and_expiry() {
+    fn rejected_eviction_spares_a_concurrently_refreshed_token() {
+        let conn = Uuid::now_v7();
+        let other = Uuid::now_v7();
+        // The token that actually 401'd → evicted (the normal, uncontended case).
+        assert!(!survives_rejection(conn, "acc-1", conn, "acc-1"));
+        // A FRESHER token, already refreshed in by a concurrent caller → kept.
+        assert!(survives_rejection(conn, "acc-2", conn, "acc-1"));
+        // Another connection's token is never collateral, same token bytes or not.
+        assert!(survives_rejection(other, "acc-1", conn, "acc-1"));
+        // A non-OAuth (or missing) credential yields an empty "rejected" probe —
+        // it must match nothing rather than everything.
+        assert!(survives_rejection(conn, "acc-1", conn, ""));
+    }
+
+    #[tokio::test]
+    async fn boot_token_roundtrips_and_fails_closed() {
         let s = test_sealer();
-        let cid = Uuid::now_v7();
-        let tok = seal_state(&s, cid, "verifier-123");
-        let (got_cid, got_v) = open_state(&s, &tok).unwrap();
-        assert_eq!(got_cid, cid);
-        assert_eq!(got_v, "verifier-123");
-        // Opaque: the verifier is not readable from the parameter.
-        assert!(!tok.contains("verifier-123"));
+        let flow = Uuid::now_v7();
+        let exp = Utc::now().timestamp() + STATE_TTL_SECS;
+        let tok = seal_boot_token(&s, flow, "state-secret", "cookie-secret", exp)
+            .await
+            .unwrap();
+        let bt = open_boot_token(&s, &tok).await.unwrap();
+        assert_eq!(bt.flow_id, flow);
+        assert_eq!(bt.s, "state-secret");
+        assert_eq!(bt.c, "cookie-secret");
+        // Opaque: neither secret is readable from the sealed token.
+        assert!(!tok.contains("state-secret") && !tok.contains("cookie-secret"));
         // Tampering breaks verification.
         let mut chars: Vec<char> = tok.chars().collect();
         let mid = chars.len() / 2;
         chars[mid] = if chars[mid] == 'A' { 'B' } else { 'A' };
-        assert!(open_state(&s, &chars.into_iter().collect::<String>()).is_err());
-        // Garbage and wrong-key states fail closed.
-        assert!(open_state(&s, "not-base64!!").is_err());
+        assert!(open_boot_token(&s, &chars.into_iter().collect::<String>())
+            .await
+            .is_err());
+        // Garbage and wrong-key tokens fail closed.
+        assert!(open_boot_token(&s, "not-base64!!").await.is_err());
         let other = Sealer::from_key_string(&"cd".repeat(32)).unwrap();
-        assert!(open_state(&other, &tok).is_err());
-        // Expired states are refused.
-        let stale = {
-            use base64::Engine;
-            let payload = serde_json::json!({
-                "c": cid, "v": "x", "x": Utc::now().timestamp() - 1,
-            });
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s.seal(&payload.to_string()))
+        assert!(open_boot_token(&other, &tok).await.is_err());
+        // Expired boot tokens are refused (BootToken deliberately isn't Debug — it
+        // carries plaintext secrets — so match rather than unwrap_err).
+        let stale = seal_boot_token(&s, flow, "x", "y", Utc::now().timestamp() - 1)
+            .await
+            .unwrap();
+        match open_boot_token(&s, &stale).await {
+            Err(m) => assert!(m.contains("expired")),
+            Ok(_) => panic!("expired boot token must be refused"),
+        }
+    }
+
+    #[test]
+    fn authorize_url_rebuilds_every_param_from_the_row() {
+        let url = build_authorize_url(
+            "https://as.test/authorize",
+            "client-1",
+            "https://fbx.test/v1/oauth/callback",
+            "state-secret",
+            "challenge-abc",
+            "S256",
+            "https://mcp.test/mcp",
+            &["read".into(), "offline_access".into()],
+        )
+        .unwrap();
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        let q: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(parsed.path(), "/authorize");
+        assert_eq!(q["response_type"], "code");
+        assert_eq!(q["client_id"], "client-1");
+        assert_eq!(q["redirect_uri"], "https://fbx.test/v1/oauth/callback");
+        assert_eq!(q["state"], "state-secret");
+        assert_eq!(q["code_challenge"], "challenge-abc");
+        assert_eq!(q["code_challenge_method"], "S256");
+        assert_eq!(q["resource"], "https://mcp.test/mcp");
+        assert_eq!(q["scope"], "read offline_access");
+        // No scopes ⇒ no `scope` param at all (mirrors the pre-D dance).
+        let no_scope = build_authorize_url(
+            "https://as.test/authorize",
+            "c",
+            "https://fbx.test/cb",
+            "s",
+            "ch",
+            "S256",
+            "https://mcp.test",
+            &[],
+        )
+        .unwrap();
+        assert!(!no_scope.contains("scope="));
+        // A bad endpoint fails closed.
+        assert!(build_authorize_url("not a url", "c", "r", "s", "ch", "S256", "res", &[]).is_err());
+    }
+
+    #[test]
+    fn flow_cookie_header_shape() {
+        // __Host- compliant (Secure + Path=/, no Domain); the clear expires it.
+        let set = set_oauth_flow_cookie("abc123");
+        assert!(set.starts_with("__Host-fbx_oauth_flow=abc123; "));
+        assert!(set.contains("; HttpOnly"));
+        assert!(set.contains("; SameSite=Lax"));
+        assert!(set.contains("; Path=/"));
+        assert!(set.contains("; Secure"));
+        assert!(!set.contains("; Domain"));
+        assert!(set.contains(&format!("; Max-Age={STATE_TTL_SECS}")));
+        let clear = clear_oauth_flow_cookie();
+        assert!(
+            clear.contains("=gone; ")
+                && clear.contains("; Max-Age=0")
+                && clear.contains("; Secure")
+                && clear.contains("; Path=/")
+        );
+        // The reader round-trips a cookie value out of a Cookie header.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            "other=1; __Host-fbx_oauth_flow=abc123; z=2"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(oauth_flow_cookie(&headers).as_deref(), Some("abc123"));
+        assert!(oauth_flow_cookie(&HeaderMap::new()).is_none());
+    }
+
+    /// H2: the flow's activation expectation. Whatever the interleaving, the
+    /// SECOND authorization to reach the write must be refused — the CAS in
+    /// `activate_connection_oauth` enforces exactly these two predicates.
+    #[test]
+    fn a_superseded_flow_is_refused() {
+        let t0 = DateTime::parse_from_rfc3339("2026-07-20T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let t1 = t0 + Duration::seconds(30);
+
+        // Baseline: flow frozen at gen 5, connection never activated since.
+        assert!(!flow_superseded(5, None, 5, t0));
+        // …and a connection last activated BEFORE this flow started is the
+        // ordinary reconnect: allowed.
+        assert!(!flow_superseded(5, Some(t0 - Duration::seconds(1)), 5, t0));
+
+        // RECONNECT RACE: a sibling reconnect activated first and moved the
+        // generation. The loser's frozen 5 no longer matches.
+        assert!(flow_superseded(6, Some(t1), 5, t0));
+
+        // FIRST-CONNECT RACE: `pending → active` deliberately does NOT bump, so
+        // BOTH callbacks still see the frozen generation. The activation instant
+        // is what separates them — the sibling activated after this flow started.
+        assert!(
+            flow_superseded(1, Some(t1), 1, t0),
+            "generation alone cannot separate two first-connect callbacks"
+        );
+        // Equal instants are unorderable ⇒ fail closed.
+        assert!(flow_superseded(1, Some(t0), 1, t0));
+        // A flow started AFTER that activation is a genuinely newer
+        // authorization and is admitted (the newest authorization wins).
+        assert!(!flow_superseded(1, Some(t0), 1, t1));
+
+        // The stamp is read out of the connection's oauth bag, in the shape
+        // Postgres `to_jsonb(clock_timestamp())` writes.
+        assert_eq!(last_activated_at(None), None);
+        assert_eq!(last_activated_at(Some(&json!({}))), None);
+        assert_eq!(
+            last_activated_at(Some(&json!({"activated_at": null}))),
+            None
+        );
+        assert_eq!(
+            last_activated_at(Some(&json!({"activated_at": "2026-07-20T10:00:00+00:00"}))),
+            Some(t0)
+        );
+        // Unparseable ⇒ MAX ⇒ every flow reads superseded (fail closed).
+        assert_eq!(
+            last_activated_at(Some(&json!({"activated_at": "not-a-timestamp"}))),
+            Some(DateTime::<Utc>::MAX_UTC)
+        );
+        assert!(flow_superseded(
+            1,
+            last_activated_at(Some(&json!({"activated_at": "not-a-timestamp"}))),
+            1,
+            t1
+        ));
+    }
+
+    /// THE START-EPOCH RACE (re-verification, #32). The activation CAS compares
+    /// against the flow row's `created_at` — an instant stamped only AFTER
+    /// discovery + client resolution. An attempt that BEGAN before a sibling's
+    /// successful activation therefore mints a row that POST-DATES it and passes
+    /// BOTH CAS predicates, so the refusal has to happen on the start side.
+    #[test]
+    fn an_attempt_that_began_before_an_activation_is_refused_at_the_start() {
+        let t_read = DateTime::parse_from_rfc3339("2026-07-20T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // S1 and S2 both read the pending connection at `t_read` (gen 1, never
+        // activated). S1's flow activates 30s later; S2, still in discovery,
+        // inserts its flow 30s after THAT.
+        let t_activate = t_read + Duration::seconds(30);
+        let t_flow2 = t_activate + Duration::seconds(30);
+
+        // The CAS alone does NOT catch it — the hole, verbatim.
+        assert!(
+            !flow_superseded(1, Some(t_activate), 1, t_flow2),
+            "a first-connect activation leaves the generation at 1 and S2's row post-dates the \
+             stamp, so both CAS predicates pass"
+        );
+
+        // The frozen start expectation does: S2 formed its attempt against a
+        // connection that had never been activated.
+        let s2_started = StartExpectation {
+            generation: 1,
+            activated_at: None,
         };
-        let err = open_state(&s, &stale).unwrap_err();
-        assert!(err.contains("too long"));
+        let after_s1 = StartExpectation {
+            generation: 1,
+            activated_at: Some(t_activate),
+        };
+        assert!(start_expectation_moved(s2_started, Some(after_s1)));
+
+        // A concurrent start that only wrote the custody bag moves NEITHER half:
+        // two admins may both start, and the first callback to land wins at the
+        // CAS. No false refusal.
+        assert!(!start_expectation_moved(s2_started, Some(s2_started)));
+        // An attempt that began AFTER that activation is genuinely newer.
+        assert!(!start_expectation_moved(after_s1, Some(after_s1)));
+        // A sibling RECONNECT (which does bump) is caught by the same equality…
+        assert!(start_expectation_moved(
+            after_s1,
+            Some(StartExpectation {
+                generation: 2,
+                activated_at: Some(t_activate),
+            })
+        ));
+        // …as is the connection disappearing under the attempt.
+        assert!(start_expectation_moved(after_s1, None));
+        // An unparseable stamp reads as MAX and so differs from every real
+        // expectation — fail closed, exactly like the CAS.
+        assert!(start_expectation_moved(
+            s2_started,
+            Some(StartExpectation {
+                generation: 1,
+                activated_at: last_activated_at(Some(&json!({"activated_at": "not-a-timestamp"}))),
+            })
+        ));
+    }
+
+    /// THE CUSTODY-BAG HALF of the same race (#32). The bag write is a whole-bag
+    /// REPLACE closing a read-modify-write that spanned discovery: a superseded
+    /// attempt landing it would pair the WINNER's refresh token with the loser's
+    /// token endpoint + client identity. So the commit point's decision must be
+    /// "write nothing", from the SAME predicate that refuses the flow row — never
+    /// a second, independently-guarded write that could drift.
+    #[test]
+    fn a_superseded_attempt_persists_no_custody_bag() {
+        let t_read = DateTime::parse_from_rfc3339("2026-07-20T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let t_activate = t_read + Duration::seconds(30);
+
+        // S1 and S2 both froze a pending, never-activated connection at gen 1.
+        let s2_started = StartExpectation {
+            generation: 1,
+            activated_at: None,
+        };
+        // S1's callback activated while S2 was in discovery: first connect, so
+        // ONLY the stamp moved.
+        let after_s1 = StartExpectation {
+            generation: 1,
+            activated_at: Some(t_activate),
+        };
+        assert_eq!(
+            start_commit_decision(s2_started, Some(after_s1)),
+            StartCommit::Superseded,
+            "S2 must write NOTHING — not its endpoints, not its client identity"
+        );
+        // The winner itself still commits its own bag.
+        assert_eq!(
+            start_commit_decision(after_s1, Some(after_s1)),
+            StartCommit::PersistBag
+        );
+        // Un-raced first connect: the ordinary path still persists.
+        assert_eq!(
+            start_commit_decision(s2_started, Some(s2_started)),
+            StartCommit::PersistBag
+        );
+        // A sibling RECONNECT (which bumps) and a vanished connection are both
+        // refusals too — one predicate, both consequences.
+        assert_eq!(
+            start_commit_decision(
+                after_s1,
+                Some(StartExpectation {
+                    generation: 2,
+                    activated_at: Some(t_activate),
+                })
+            ),
+            StartCommit::Superseded
+        );
+        assert_eq!(
+            start_commit_decision(after_s1, None),
+            StartCommit::Superseded
+        );
+    }
+
+    /// The same interleaving against real Postgres, through the REAL
+    /// `commit_start_epoch` (self-skips without `DATABASE_URL`): a sibling
+    /// activation lands between S2's connection read and S2's flow insert.
+    /// Proves every half — that the CAS admits S2's row (so the start-side check
+    /// is load-bearing), that the commit point refuses S2 with `SUPERSEDED_MSG`,
+    /// that S2's custody bag is NOT persisted (the winner's token endpoint and
+    /// client identity survive byte-for-byte), and that the burned flow can never
+    /// be claimed. A positive control first proves the commit point is not
+    /// vacuously refusing.
+    #[tokio::test]
+    async fn db_start_epoch_race_is_refused_before_the_flow_can_be_used() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = fluidbox_db::connect(&url, None).await.expect("connect");
+        let org = fluidbox_db::identity::create_org(
+            &pool,
+            &format!("t-{}", Uuid::now_v7().simple()),
+            None,
+        )
+        .await
+        .unwrap();
+        let scope = fluidbox_db::TenantScope::assume(org.id);
+        let bag = json!({ "resource": "https://mcp.example.test/mcp" });
+        let conn = fluidbox_db::create_connection(
+            &pool,
+            scope,
+            "mcp_http",
+            &format!("acct-{}", Uuid::now_v7().simple()),
+            "start-epoch race",
+            None,
+            1,
+            &json!([]),
+            &json!({}),
+            &json!({ "base_url": "https://mcp.example.test" }),
+            None,
+            1,
+            fluidbox_db::ConnectionAuth {
+                auth_kind: "oauth",
+                status: "pending",
+                oauth: Some(&bag),
+                client_secret_sealed: None,
+                client_secret_key_version: 1,
+                registration_id: None,
+            },
+            fluidbox_db::ConnectionOwner::Organization,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Both starts read the same pending row BEFORE any outbound HTTP.
+        let s2_started = StartExpectation::of(&conn);
+        assert_eq!(s2_started.activated_at, None);
+
+        // The two attempts discovered DIFFERENT authorization servers / client
+        // identities — which is the whole point: pairing S1's refresh token with
+        // S2's endpoint + client is the corruption under test.
+        let s1_bag = json!({
+            "resource": "https://mcp.example.test/mcp",
+            "token_endpoint": "https://as-1.example.test/token",
+            "client_id": "client-1",
+        });
+        let s2_bag = json!({
+            "resource": "https://mcp.example.test/mcp",
+            "token_endpoint": "https://as-2.example.test/token",
+            "client_id": "client-2",
+        });
+
+        // POSITIVE CONTROL, with S2's exact inputs: while nothing has activated,
+        // the commit point persists the bag. So a later refusal is the race, not
+        // a commit point that refuses everything.
+        commit_start_epoch(&pool, scope, conn.id, s2_started, &s2_bag)
+            .await
+            .expect("an un-raced attempt commits its custody bag");
+        let warmed = fluidbox_db::get_connection(&pool, scope, conn.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .oauth
+            .unwrap();
+
+        let mk_flow = |tag: &'static str| {
+            let pool = pool.clone();
+            async move {
+                let (s, c) = (random_urlsafe(), random_urlsafe());
+                let row = fluidbox_db::insert_connector_oauth_flow(
+                    &pool,
+                    scope,
+                    fluidbox_db::NewConnectorOauthFlow {
+                        connection_id: conn.id,
+                        initiated_by_user_id: None,
+                        state_hash: &fluidbox_db::sha256_hex(&s),
+                        browser_hash: &fluidbox_db::sha256_hex(&c),
+                        issuer: "https://as.example.test",
+                        authorization_endpoint: "https://as.example.test/authorize",
+                        token_endpoint: "https://as.example.test/token",
+                        metadata_digest: tag,
+                        resource: "https://mcp.example.test/mcp",
+                        redirect_uri: "https://fluidbox.test/v1/oauth/callback",
+                        scopes: &json!([]),
+                        challenge: "challenge",
+                        challenge_method: "S256",
+                        client_registration_id: None,
+                        client_id: "client",
+                        pkce_verifier_sealed: b"sealed",
+                        pkce_verifier_key_version: 1,
+                        expected_generation: conn.authorization_generation,
+                        ttl_secs: 600,
+                    },
+                )
+                .await
+                .unwrap();
+                (row, s, c)
+            }
+        };
+
+        // S1's flow lands first and activates, landing ITS custody bag: first
+        // connect, so the generation deliberately stays put and only the DB-clock
+        // stamp moves.
+        let (f1, _, _) = mk_flow("f1").await;
+        let activated = fluidbox_db::activate_connection_oauth(
+            &pool,
+            scope,
+            conn.id,
+            b"sealed-refresh-1",
+            1,
+            &s1_bag,
+            &json!([]),
+            f1.expected_generation,
+            f1.created_at,
+        )
+        .await
+        .unwrap()
+        .expect("S1 activates");
+        assert_eq!(activated.authorization_generation, 1);
+
+        // S2 finally emerges from discovery and inserts ITS flow — younger than
+        // the activation it never saw.
+        let (f2, s2, c2) = mk_flow("f2").await;
+        let current = fluidbox_db::get_connection(&pool, scope, conn.id)
+            .await
+            .unwrap();
+
+        // The start-side verification refuses it…
+        let moved = start_expectation_moved(s2_started, current.as_ref().map(StartExpectation::of));
+        // …through the REAL commit point, which in the same breath must decline
+        // to persist S2's bag (#32): one transaction, one advisory lock, so no
+        // activation can slip between the proof and the write.
+        let refusal = commit_start_epoch(&pool, scope, conn.id, s2_started, &s2_bag).await;
+        let refused_with = match &refusal {
+            Err(ApiError::Conflict(m)) => Some(m.clone()),
+            _ => None,
+        };
+        let after_refusal = fluidbox_db::get_connection(&pool, scope, conn.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .oauth
+            .unwrap();
+        // …and the burn makes the row unusable for good.
+        let burned = fluidbox_db::claim_connector_oauth_flow(
+            &pool,
+            &fluidbox_db::sha256_hex(&s2),
+            &fluidbox_db::sha256_hex(&c2),
+        )
+        .await
+        .unwrap();
+        let reclaim = fluidbox_db::claim_connector_oauth_flow(
+            &pool,
+            &fluidbox_db::sha256_hex(&s2),
+            &fluidbox_db::sha256_hex(&c2),
+        )
+        .await
+        .unwrap();
+        // Without that refusal the CAS would have let S2 overwrite S1's grant.
+        let cas_admits_f2 = fluidbox_db::activate_connection_oauth(
+            &pool,
+            scope,
+            conn.id,
+            b"sealed-refresh-2",
+            1,
+            &s2_bag,
+            &json!([]),
+            f2.expected_generation,
+            f2.created_at,
+        )
+        .await
+        .unwrap()
+        .is_some();
+
+        // Children-first cleanup BEFORE the asserts (tenant FKs are NO ACTION).
+        for stmt in [
+            "delete from connector_oauth_flows where tenant_id = $1",
+            "delete from integration_connections where tenant_id = $1",
+            "delete from tenants where id = $1",
+        ] {
+            let _ = sqlx::query(stmt).bind(org.id).execute(&pool).await;
+        }
+
+        assert!(f2.created_at > f1.created_at);
+        assert_eq!(
+            warmed["token_endpoint"], "https://as-2.example.test/token",
+            "positive control: an un-raced attempt DOES persist its custody bag"
+        );
+        assert!(
+            moved,
+            "S2 froze a never-activated connection; a sibling activated since — refuse"
+        );
+        assert_eq!(
+            refused_with.as_deref(),
+            Some(SUPERSEDED_MSG),
+            "the commit point refuses with the same wording the CAS uses"
+        );
+        // THE RESIDUAL, closed: S2 wrote NOTHING. The winner's refresh token is
+        // still paired with the winner's own token endpoint + client identity, so
+        // its refresh cannot authenticate to a superseded start's AS.
+        assert_eq!(
+            after_refusal["token_endpoint"], "https://as-1.example.test/token",
+            "a superseded start must not repoint the winner's token endpoint"
+        );
+        assert_eq!(
+            after_refusal["client_id"], "client-1",
+            "a superseded start must not repoint the winner's client identity"
+        );
+        assert!(
+            after_refusal
+                .get(fluidbox_db::ACTIVATED_AT_KEY)
+                .is_some_and(|v| !v.is_null()),
+            "the winner's activation stamp survives the refused attempt"
+        );
+        assert!(burned.is_some(), "the superseded flow is consumed");
+        assert!(
+            reclaim.is_none(),
+            "a burned flow can never be claimed again"
+        );
+        assert!(
+            cas_admits_f2,
+            "the CAS alone admits S2's younger row — which is exactly why the start-side \
+             expectation is load-bearing"
+        );
+    }
+
+    #[test]
+    fn metadata_digest_is_deterministic() {
+        let mk = || AsMeta {
+            issuer: "https://as.test".into(),
+            authorization_endpoint: "https://as.test/authorize".into(),
+            token_endpoint: "https://as.test/token".into(),
+            registration_endpoint: Some("https://as.test/register".into()),
+            cimd_supported: true,
+            // Different order, same set ⇒ same digest (scopes are sorted).
+            scopes_supported: vec!["read".into(), "offline_access".into()],
+        };
+        let mut reordered = mk();
+        reordered.scopes_supported = vec!["offline_access".into(), "read".into()];
+        let a = metadata_digest(&mk());
+        assert_eq!(
+            a,
+            metadata_digest(&reordered),
+            "digest is order-independent"
+        );
+        assert!(a.starts_with("sha256:"));
+        // A changed endpoint changes the digest (binds the discovered surface).
+        let mut moved = mk();
+        moved.token_endpoint = "https://evil.test/token".into();
+        assert_ne!(a, metadata_digest(&moved));
     }
 
     #[test]
@@ -1306,18 +3152,19 @@ mod tests {
         let redirect = "https://fbx.example.com/v1/oauth/callback";
         // Healthy CIMD identity → reuse.
         assert!(!stored_identity_stale(
-            "cimd", cimd_id, None, true, cimd_id, redirect
+            "cimd", cimd_id, None, false, true, cimd_id, redirect
         ));
         // CIMD no longer presentable (e.g. the identity was minted before
         // the eligibility guard, from a loopback deployment) → stale.
         assert!(stored_identity_stale(
-            "cimd", cimd_id, None, false, cimd_id, redirect
+            "cimd", cimd_id, None, false, false, cimd_id, redirect
         ));
         // Public URL moved → the document URL no longer matches → stale.
         assert!(stored_identity_stale(
             "cimd",
             "http://127.0.0.1:8787/.well-known/fluidbox-client.json",
             None,
+            false,
             true,
             cimd_id,
             redirect
@@ -1329,6 +3176,7 @@ mod tests {
             "dcr-1",
             Some(redirect),
             false,
+            false,
             cimd_id,
             redirect
         ));
@@ -1337,11 +3185,12 @@ mod tests {
             "dcr-1",
             Some("http://127.0.0.1:8787/v1/oauth/callback"),
             false,
+            false,
             cimd_id,
             redirect
         ));
         assert!(!stored_identity_stale(
-            "dcr", "dcr-1", None, false, cimd_id, redirect
+            "dcr", "dcr-1", None, false, false, cimd_id, redirect
         ));
         // Pre-registered identities are user-owned — never auto-stale.
         assert!(!stored_identity_stale(
@@ -1349,9 +3198,59 @@ mod tests {
             "pre-7",
             Some("https://old.example/cb"),
             false,
+            false,
             cimd_id,
             redirect
         ));
+    }
+
+    #[test]
+    fn a_retired_registration_makes_every_stored_identity_stale() {
+        // `registration_missing` = the stored `oauth.registration_id` no longer
+        // resolves, i.e. an `invalid_client` retirement (or a sibling connection's)
+        // deleted the shared row. EVERY source must then re-resolve: replaying the
+        // identity that row named would replay exactly what the AS rejected, and the
+        // connection would keep a dangling pointer forever.
+        let cimd_id = "https://fbx.example.com/.well-known/fluidbox-client.json";
+        let redirect = "https://fbx.example.com/v1/oauth/callback";
+        for source in ["dcr", "cimd", "preregistered"] {
+            // Otherwise-healthy inputs (same redirect, CIMD presentable, matching
+            // document URL) — the ONLY difference is the missing row.
+            assert!(
+                !stored_identity_stale(
+                    source,
+                    cimd_id,
+                    Some(redirect),
+                    false,
+                    true,
+                    cimd_id,
+                    redirect
+                ),
+                "{source}: control — a resolvable registration reuses"
+            );
+            assert!(
+                stored_identity_stale(
+                    source,
+                    cimd_id,
+                    Some(redirect),
+                    true,
+                    true,
+                    cimd_id,
+                    redirect
+                ),
+                "{source}: a missing registration row must re-resolve"
+            );
+        }
+        // …and a stale identity never takes the Reuse arm — it falls through to
+        // CIMD/DCR, which mints or adopts a live row.
+        assert_eq!(
+            classify_client_resolution(Some("dcr-retired"), true, false),
+            ClientResolution::Dcr
+        );
+        assert_eq!(
+            classify_client_resolution(Some("dcr-retired"), true, true),
+            ClientResolution::Cimd
+        );
     }
 
     #[test]
@@ -1412,5 +3311,156 @@ mod tests {
         });
         assert_eq!(parse_resource_metadata(&prm).unwrap(), "https://as.test");
         assert!(parse_resource_metadata(&serde_json::json!({})).is_err());
+    }
+
+    fn reg_row(endpoint: Option<&str>) -> fluidbox_db::OauthClientRegistrationRow {
+        fluidbox_db::OauthClientRegistrationRow {
+            id: Uuid::now_v7(),
+            tenant_id: None,
+            issuer: "https://as.test".into(),
+            redirect_uri: "https://fbx.test/v1/oauth/callback".into(),
+            source: "dcr".into(),
+            client_id: "dcr-client".into(),
+            client_secret_sealed: None,
+            client_secret_key_version: 1,
+            registration_endpoint: endpoint.map(String::from),
+            registration_access_token_sealed: None,
+            registration_access_token_key_version: 1,
+            token_endpoint_auth_method: Some("none".into()),
+            created_at: Utc::now(),
+            last_used_at: None,
+        }
+    }
+
+    #[test]
+    fn client_resolution_priority_reuse_beats_cimd_beats_dcr() {
+        // A valid stored identity reuses — even when CIMD is presentable — so a
+        // pre-registered client wins, and a second resolve of a DCR/CIMD identity
+        // reuses the row instead of re-registering (design D6).
+        assert_eq!(
+            classify_client_resolution(Some("pre-1"), false, true),
+            ClientResolution::Reuse
+        );
+        assert_eq!(
+            classify_client_resolution(Some("dcr-1"), false, false),
+            ClientResolution::Reuse
+        );
+        // No stored identity: CIMD when presentable, else DCR.
+        assert_eq!(
+            classify_client_resolution(None, true, true),
+            ClientResolution::Cimd
+        );
+        assert_eq!(
+            classify_client_resolution(None, true, false),
+            ClientResolution::Dcr
+        );
+        // A STALE stored identity (reconnect after a public-URL move) never reuses
+        // — it falls through to CIMD if presentable, else DCR.
+        assert_eq!(
+            classify_client_resolution(Some("dcr-old"), true, true),
+            ClientResolution::Cimd
+        );
+        assert_eq!(
+            classify_client_resolution(Some("dcr-old"), true, false),
+            ClientResolution::Dcr
+        );
+    }
+
+    #[test]
+    fn invalid_client_retires_only_registration_sourced_identities() {
+        // Registration-sourced with a registration_endpoint → the row is retired so
+        // the NEXT dance re-registers a different client_id.
+        let reg = ExchangeClient {
+            client_id: "dcr-1".into(),
+            secret: None,
+            registration: Some(reg_row(Some("https://as.test/register"))),
+        };
+        assert!(invalid_client_disposition(&reg).0);
+        // Registration-sourced but no endpoint recorded (a CIMD row) → re-minting
+        // reproduces the same document-URL client_id, so retiring repairs nothing.
+        let no_ep = ExchangeClient {
+            client_id: "dcr-1".into(),
+            secret: None,
+            registration: Some(reg_row(None)),
+        };
+        assert!(!invalid_client_disposition(&no_ep).0);
+        // Per-connection legacy / pre-registered identity → no shared row at all;
+        // the AS rejected operator-supplied credentials, so a human must fix them.
+        let legacy = ExchangeClient {
+            client_id: "pre-1".into(),
+            secret: Some("shhh".into()),
+            registration: None,
+        };
+        assert!(!invalid_client_disposition(&legacy).0);
+    }
+
+    #[test]
+    fn invalid_client_never_retries_the_same_code() {
+        // The disposition is TERMINAL for every shape of rejected client: the repair
+        // (retiring the shared registration) only takes effect on the NEXT dance,
+        // and the user is told to start the flow again. Re-exchanging THIS code
+        // under a freshly registered client_id is RFC 6749 `invalid_grant` ("code
+        // was issued to another client"), so a retry could only ever have failed —
+        // there is deliberately no retry disposition to assert against.
+        for (label, client) in [
+            (
+                "dcr",
+                ExchangeClient {
+                    client_id: "dcr-1".into(),
+                    secret: None,
+                    registration: Some(reg_row(Some("https://as.test/register"))),
+                },
+            ),
+            (
+                "cimd",
+                ExchangeClient {
+                    client_id: "cimd-1".into(),
+                    secret: None,
+                    registration: Some(reg_row(None)),
+                },
+            ),
+            (
+                "preregistered",
+                ExchangeClient {
+                    client_id: "pre-1".into(),
+                    secret: Some("shhh".into()),
+                    registration: None,
+                },
+            ),
+        ] {
+            let (_, msg) = invalid_client_disposition(&client);
+            // Every message ends the flow by telling the user to start over — none
+            // promises (or performs) another exchange of the burned code.
+            assert!(
+                msg.contains("again"),
+                "{label}: the user must be told to start over, got: {msg}"
+            );
+            assert!(
+                !msg.contains("retry"),
+                "{label}: no message may imply a same-code retry, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn adopt_uses_the_rows_identity_verbatim() {
+        // A CIMD-eligible dance that FINDS a stored DCR row adopts the DCR row's
+        // client_id + source (NOT cimd_url). The authorize leg uses this value and
+        // the exchange leg loads the SAME row's client_id, so both legs match — no
+        // RFC 6749 invalid_grant "code issued to another client" mismatch.
+        let dcr = reg_row(Some("https://as.test/register"));
+        let (client_id, source) = adopt_registration(&dcr);
+        assert_eq!(
+            client_id, dcr.client_id,
+            "authorize leg carries the ROW's id"
+        );
+        assert_eq!(source, "dcr");
+        // A found CIMD row is adopted verbatim too (whichever arm found it).
+        let mut cimd = reg_row(None);
+        cimd.source = "cimd".into();
+        cimd.client_id = "https://fbx.test/.well-known/fluidbox-client.json".into();
+        let (cid, src) = adopt_registration(&cimd);
+        assert_eq!(cid, cimd.client_id);
+        assert_eq!(src, "cimd");
     }
 }

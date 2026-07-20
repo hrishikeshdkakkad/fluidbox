@@ -46,6 +46,18 @@ pub struct BrokeredAuth {
     pub oauth_connection: Option<uuid::Uuid>,
 }
 
+impl BrokeredAuth {
+    /// The bare OAuth access token this credential carries (the header value
+    /// minus its `Bearer ` scheme). Only an OAuth connection has one — a static
+    /// credential returns `None`. The reactive-401 path uses it to evict
+    /// EXACTLY the token the upstream rejected, never a fresher one a
+    /// concurrent caller just minted (`oauth::invalidate_rejected_access`).
+    fn oauth_access(&self) -> Option<&str> {
+        self.oauth_connection?;
+        self.value.strip_prefix("Bearer ")
+    }
+}
+
 /// Compose the header VALUE from the connection's scheme and the sealed
 /// raw secret: `Bearer` prefixes, `Basic` base64-encodes (the stored secret
 /// is `email:token`), empty scheme sends the bare token (the Sentry shape).
@@ -107,10 +119,19 @@ pub async fn brokered_auth(
     // no binding, so there is no generation/owner to recheck; the status read
     // below is the only live check. Phase C runs route through the binding path
     // ([`recheck_binding`] + [`call_tool_for_conn`]), never here.
-    let conn = fluidbox_db::get_connection(&state.pool, scope, *cid)
+    // Tenant known (the frozen RunSpec's scope) → scoped_tx so the RLS GUC rides
+    // the executor-generic read.
+    let mut conn_tx = fluidbox_db::scoped_tx(&state.pool, scope)
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?;
+    let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, *cid)
         .await
         .map_err(|e| format!("connection lookup failed: {e}"))?
         .ok_or_else(|| format!("capability server '{name}': connection {cid} is missing"))?;
+    conn_tx
+        .commit()
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?;
     brokered_auth_for_conn(state, scope, &conn, url)
         .await
         .map_err(|e| format!("capability server '{name}': {e}"))
@@ -169,11 +190,30 @@ pub async fn brokered_auth_for_conn(
         .sealer
         .as_ref()
         .ok_or("FLUIDBOX_CREDENTIAL_KEY not configured")?;
-    let sealed = fluidbox_db::connection_credential_sealed(&state.pool, scope, conn.id)
+    // Tenant known (the connection's own scope) → scoped_tx so the RLS GUC rides
+    // the executor-generic sealed-credential read.
+    let mut cred_tx = fluidbox_db::scoped_tx(&state.pool, scope)
+        .await
+        .map_err(|e| format!("credential lookup failed: {e}"))?;
+    let (sealed, kv) = fluidbox_db::connection_credential_sealed(&mut *cred_tx, scope, conn.id)
         .await
         .map_err(|e| format!("credential lookup failed: {e}"))?
         .ok_or("connection is not active (revoked or missing)")?;
-    let token = sealer.open(&sealed).map_err(|e| e.to_string())?;
+    cred_tx
+        .commit()
+        .await
+        .map_err(|e| format!("credential lookup failed: {e}"))?;
+    let token = sealer
+        .open(
+            &sealed,
+            kv,
+            crate::seal::SealCtx::new(
+                scope.tenant_id(),
+                crate::seal::SealFamily::ConnectionCredential,
+            ),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
     let header = conn
         .metadata
         .get("header_name")
@@ -331,10 +371,19 @@ async fn recheck_binding_pool(
     let expected_generation = binding
         .authority_generation
         .ok_or("connection binding froze no authorization generation")?;
-    let conn = fluidbox_db::get_connection(pool, scope, cid)
+    // Tenant known (the run's binding scope) → scoped_tx so the RLS GUC rides the
+    // executor-generic read.
+    let mut conn_tx = fluidbox_db::scoped_tx(pool, scope)
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?;
+    let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, cid)
         .await
         .map_err(|e| format!("connection lookup failed: {e}"))?
         .ok_or_else(|| format!("connection {cid} is missing"))?;
+    conn_tx
+        .commit()
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?;
     if conn.status != "active" {
         return Err(format!(
             "connection {} is {} — reconnect it",
@@ -861,9 +910,14 @@ async fn call_tool(
     Ok((cap_content(content), is_error))
 }
 
-/// Reactive-401 recovery, OAuth connections only: drop the cached access
+/// Reactive-401 recovery, OAuth connections only: drop the REJECTED access
 /// token and mint a fresh one. A static credential that 401s is terminal —
 /// there is nothing to refresh.
+///
+/// The eviction is compare-and-drop, not unconditional: concurrent calls all
+/// 401 on the same stale token, and wiping a token another caller has already
+/// refreshed into place would defeat `ensure_access_token`'s singleflight and
+/// rotate the refresh token once per concurrent 401.
 async fn reauth_after_401(
     state: &AppState,
     scope: fluidbox_db::TenantScope,
@@ -873,7 +927,8 @@ async fn reauth_after_401(
     let Some(cid) = auth.as_ref().and_then(|a| a.oauth_connection) else {
         return Err("mcp server rejected the credential (HTTP 401)".into());
     };
-    crate::oauth::invalidate_access(state, cid).await;
+    let rejected = auth.as_ref().and_then(|a| a.oauth_access()).unwrap_or("");
+    crate::oauth::invalidate_rejected_access(state, cid, rejected).await;
     brokered_auth(state, scope, server).await
 }
 
@@ -946,6 +1001,8 @@ pub async fn call_tool_for_conn(
 /// against the SAME connection + endpoint just rechecked. Mirrors
 /// [`reauth_after_401`] but resolves via [`brokered_auth_for_conn`] (no
 /// `CapabilityServer` in hand). A static credential that 401s is terminal.
+/// Same compare-and-drop eviction — this is the path concurrent in-sandbox
+/// brokered calls take, so it is the one that must not break singleflight.
 async fn reauth_after_401_conn(
     state: &AppState,
     scope: fluidbox_db::TenantScope,
@@ -956,7 +1013,8 @@ async fn reauth_after_401_conn(
     let Some(cid) = auth.as_ref().and_then(|a| a.oauth_connection) else {
         return Err("mcp server rejected the credential (HTTP 401)".into());
     };
-    crate::oauth::invalidate_access(state, cid).await;
+    let rejected = auth.as_ref().and_then(|a| a.oauth_access()).unwrap_or("");
+    crate::oauth::invalidate_rejected_access(state, cid, rejected).await;
     brokered_auth_for_conn(state, scope, conn, url).await
 }
 
@@ -1212,10 +1270,12 @@ mod tests {
             &format!("acct-{}", Uuid::now_v7().simple()),
             display,
             Some(b"sealed-token"),
+            1,
             &serde_json::json!([]),
             &serde_json::json!({}),
             &serde_json::json!({ "base_url": "https://mcp.example.test" }),
             None,
+            1,
             ConnectionAuth::static_active(),
             owner,
             None,
@@ -1277,7 +1337,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -1378,7 +1438,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -1434,6 +1494,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             None,
+            1,
             None,
             None,
             None,
