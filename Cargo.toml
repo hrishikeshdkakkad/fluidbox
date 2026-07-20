@@ -68,7 +68,12 @@ clap = { version = "4", features = ["derive", "env"] }
 bytes = "1"
 async-trait = "0.1"
 dotenvy = "0.15"
-chacha20poly1305 = "0.11"
+# The `zeroize` feature is NOT default: without it the cipher keeps its expanded
+# key in ordinary memory and leaves it in the allocator on drop, so the claim
+# below ("key material is scrubbed") only held for the buffers we own. With it,
+# every XChaCha20-Poly1305 instance zeroizes its key on drop — which matters
+# because a cipher is built per seal/open from a DEK, a KEK, or the legacy key.
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 base64 = "0.22"
 # Phase D (#32) envelope sealing. zeroize scrubs unwrapped DEK bytes from memory;
 # aws-sdk-kms/aws-config back the `aws` KeyWrapper (first AWS SDK in tree — the

@@ -187,13 +187,25 @@ pub struct FamilyProgress {
 }
 
 /// Live progress of the current/last re-seal run (behind `AppState.reseal_status`).
+///
+/// `state` is the TERMINAL verdict, set only when the job finishes: `completed`,
+/// `completed_with_errors`, or `failed` (`None` while running / never run). It
+/// exists because `finished_at` alone says only that the task returned — an
+/// operator (or an automation) reading "finished" must not conclude "migrated".
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ResealStatus {
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
     pub families: Vec<FamilyProgress>,
     pub last_error: Option<String>,
+    pub state: Option<String>,
 }
+
+/// Terminal verdicts a finished run reports (`ResealStatus.state`, the
+/// `reseal.finish` audit detail, and the audit row's `success` flag).
+const STATE_COMPLETED: &str = "completed";
+const STATE_COMPLETED_WITH_ERRORS: &str = "completed_with_errors";
+const STATE_FAILED: &str = "failed";
 
 /// A per-row outcome. NEVER an error — every row-level failure (unseal, seal, tx)
 /// is folded into `Failed` so one bad row cannot wedge the migration.
@@ -250,6 +262,7 @@ pub async fn start(
                 })
                 .collect(),
             last_error: None,
+            state: None,
         };
     }
     tokio::spawn(run_job(state.clone(), sealer, source_ip));
@@ -340,6 +353,14 @@ fn client_source_ip(headers: &HeaderMap, peer: SocketAddr, trust: bool) -> Optio
 /// `reseal.start` / `reseal.finish` audit rows. A drop guard ALWAYS releases the
 /// singleton flag — even on an early return or a panic — so a failed run never
 /// wedges future ones.
+///
+/// The finish is HONEST (review M5). A mid-scan paging failure used to leave a
+/// generic `last_error`, a `failed` tally of 0 (no individual ROW failed) and a
+/// `reseal.finish` audit row stamped `success: true` — so an auditor reading the
+/// log saw a clean migration where half the families were never walked. Success
+/// now requires BOTH no paging/row errors AND a final authoritative parity read
+/// confirming `legacy_total = 0`, and the verdict rides the audit row's `success`
+/// flag plus an explicit terminal `state`.
 async fn run_job(state: AppState, sealer: Sealer, source_ip: Option<String>) {
     struct RunningGuard(AppState);
     impl Drop for RunningGuard {
@@ -350,16 +371,18 @@ async fn run_job(state: AppState, sealer: Sealer, source_ip: Option<String>) {
     let _guard = RunningGuard(state.clone());
 
     let started = Utc::now();
-    audit(&state, source_ip.as_deref(), "reseal.start", None).await;
+    audit(&state, source_ip.as_deref(), "reseal.start", None, true).await;
 
     let mut families: Vec<FamilyProgress> = Vec::with_capacity(FAMILIES.len());
     let mut last_error: Option<String> = None;
+    let mut incomplete_scan = false;
     for fam in FAMILIES {
-        let (progress, err) = reseal_family(&state.pool, &sealer, fam).await;
-        if err.is_some() {
-            last_error = err;
+        let run = reseal_family(&state.pool, &sealer, fam).await;
+        if run.last_error.is_some() {
+            last_error = run.last_error;
         }
-        families.push(progress);
+        incomplete_scan |= run.paging_failed;
+        families.push(run.progress);
         // Snapshot after each family. The authoritative live counts in
         // status_body show intra-family progress; this is the running tally.
         let mut s = state.reseal_status.lock().await;
@@ -367,31 +390,89 @@ async fn run_job(state: AppState, sealer: Sealer, source_ip: Option<String>) {
         s.last_error = last_error.clone();
     }
 
+    // The authoritative parity read — the SAME counts the D4 retirement gate uses,
+    // so "completed" means exactly "the legacy key is now retirable". A read that
+    // itself fails leaves parity UNKNOWN, which can never be success.
+    let legacy_remaining =
+        match fluidbox_db::system_worker::sealed_key_version_counts(&state.pool).await {
+            Ok(counts) => Some(counts.iter().map(|c| c.legacy).sum::<i64>()),
+            Err(e) => {
+                tracing::warn!(error = %e, "re-seal: final parity read failed");
+                last_error = Some("final parity read failed".into());
+                None
+            }
+        };
+    let resealed: u64 = families.iter().map(|f| f.resealed).sum();
+    let failed: u64 = families.iter().map(|f| f.failed).sum();
+    let errors = incomplete_scan || failed > 0;
+    let verdict = terminal_state(resealed, errors, legacy_remaining);
+
     let finished = Utc::now();
-    let detail = finish_detail(&families, &last_error, started, finished);
+    let detail = finish_detail(
+        &families,
+        &last_error,
+        started,
+        finished,
+        verdict,
+        legacy_remaining,
+    );
     {
         let mut s = state.reseal_status.lock().await;
         s.families = families.clone();
         s.last_error = last_error.clone();
         s.finished_at = Some(finished);
+        s.state = Some(verdict.to_string());
     }
-    audit(&state, source_ip.as_deref(), "reseal.finish", Some(&detail)).await;
+    audit(
+        &state,
+        source_ip.as_deref(),
+        "reseal.finish",
+        Some(&detail),
+        verdict == STATE_COMPLETED,
+    )
+    .await;
+}
+
+/// The terminal verdict for a finished run (pure; unit-tested).
+///
+/// `completed` requires BOTH halves — no paging/row errors AND an authoritative
+/// parity read proving ZERO legacy rows remain. `legacy_remaining = None` means
+/// the parity read itself failed, so completion is UNPROVEN and never claimed. A
+/// run that achieved nothing and hit errors is `failed`; a run that made partial
+/// progress is `completed_with_errors`.
+fn terminal_state(resealed: u64, errors: bool, legacy_remaining: Option<i64>) -> &'static str {
+    if !errors && legacy_remaining == Some(0) {
+        STATE_COMPLETED
+    } else if resealed == 0 {
+        STATE_FAILED
+    } else {
+        STATE_COMPLETED_WITH_ERRORS
+    }
+}
+
+/// One family's outcome. `paging_failed` is tracked SEPARATELY from row failures:
+/// a paging error means the family was never fully WALKED, which no row tally can
+/// express (`failed` can legitimately stay 0 while most of the family was never
+/// looked at) — and it is exactly the condition that must forbid a "success"
+/// verdict (review M5).
+struct FamilyRun {
+    progress: FamilyProgress,
+    last_error: Option<String>,
+    paging_failed: bool,
 }
 
 /// Re-seal every still-v1 row of ONE family, keyset-paged. Returns the family's
-/// tally and the last row-level error seen (surfaced in status + the finish
-/// audit). Never returns `Err` — paging failures break the loop with the error
-/// recorded, row failures are tallied and skipped past by the cursor.
-async fn reseal_family(
-    pool: &PgPool,
-    sealer: &Sealer,
-    fam: &Family,
-) -> (FamilyProgress, Option<String>) {
+/// tally, the last error seen (surfaced in status + the finish audit) and whether
+/// the SCAN itself was cut short. Never returns `Err` — paging failures break the
+/// loop with the error recorded, row failures are tallied and skipped past by the
+/// cursor.
+async fn reseal_family(pool: &PgPool, sealer: &Sealer, fam: &Family) -> FamilyRun {
     let mut progress = FamilyProgress {
         family: fam.seal_family.to_string(),
         ..Default::default()
     };
     let mut last_error: Option<String> = None;
+    let mut paging_failed = false;
     let mut after = Uuid::nil();
     loop {
         let ids = match fluidbox_db::system_worker::reseal_candidate_ids(
@@ -412,6 +493,7 @@ async fn reseal_family(
                 // (constraint/table/connection detail) rides the log.
                 tracing::warn!(family = %fam.seal_family, error = %e, "re-seal: paging failed");
                 last_error = Some(format!("{}: paging failed", fam.seal_family));
+                paging_failed = true;
                 break;
             }
         };
@@ -433,7 +515,11 @@ async fn reseal_family(
         // re-fetched within the pass).
         after = *ids.last().expect("non-empty page");
     }
-    (progress, last_error)
+    FamilyRun {
+        progress,
+        last_error,
+        paging_failed,
+    }
 }
 
 /// Re-seal ONE row in a short transaction. Locks the row, re-checks it is still
@@ -549,18 +635,24 @@ async fn reseal_one(pool: &PgPool, sealer: &Sealer, fam: &Family, id: Uuid) -> R
     }
 }
 
-/// The `reseal.finish` audit detail: per-family tallies + totals + duration +
-/// the last error. No secrets — only counts and a family:id-shaped reason.
+/// The `reseal.finish` audit detail: per-family tallies + totals + duration + the
+/// last error + the TERMINAL VERDICT and the authoritative legacy remainder
+/// (`null` = the parity read failed, so completion is unproven). No secrets —
+/// only counts and a family:id-shaped reason.
 fn finish_detail(
     families: &[FamilyProgress],
     last_error: &Option<String>,
     started: DateTime<Utc>,
     finished: DateTime<Utc>,
+    state: &str,
+    legacy_remaining: Option<i64>,
 ) -> Value {
     let resealed: u64 = families.iter().map(|f| f.resealed).sum();
     let skipped: u64 = families.iter().map(|f| f.skipped).sum();
     let failed: u64 = families.iter().map(|f| f.failed).sum();
     json!({
+        "state": state,
+        "legacy_remaining": legacy_remaining,
         "families": families,
         "total": { "resealed": resealed, "skipped": skipped, "failed": failed },
         "duration_ms": (finished - started).num_milliseconds(),
@@ -569,8 +661,17 @@ fn finish_detail(
 }
 
 /// Append a deployment-level operator audit row (`tenant_id` NULL). Best-effort:
-/// a dead database must not panic the job task.
-async fn audit(state: &AppState, source_ip: Option<&str>, action: &str, detail: Option<&Value>) {
+/// a dead database must not panic the job task. `success` is EXPLICIT: the finish
+/// row records whether the migration actually completed, so an auditor reading
+/// `success: true` on `reseal.finish` can trust it means "zero legacy rows
+/// remain", not merely "the task returned" (review M5).
+async fn audit(
+    state: &AppState,
+    source_ip: Option<&str>,
+    action: &str,
+    detail: Option<&Value>,
+    success: bool,
+) {
     let Ok(mut conn) = state.pool.acquire().await else {
         tracing::warn!("re-seal audit '{action}' skipped: database unavailable");
         return;
@@ -585,7 +686,7 @@ async fn audit(state: &AppState, source_ip: Option<&str>, action: &str, detail: 
             request_id: None,
             action,
             target: None,
-            success: true,
+            success,
             detail,
         },
     )
@@ -692,6 +793,7 @@ mod tests {
                 failed: 0,
             }],
             last_error: Some("integration_connections.credential_sealed:… : boom".into()),
+            state: Some(STATE_COMPLETED_WITH_ERRORS.into()),
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(
@@ -702,10 +804,17 @@ mod tests {
         assert_eq!(v["families"][0]["skipped"], 1);
         assert!(v["last_error"].is_string());
         assert!(v["started_at"].is_null());
+        assert_eq!(v["state"], "completed_with_errors");
+        // A run in flight advertises NO terminal verdict.
+        let running = ResealStatus {
+            started_at: Some(Utc::now()),
+            ..Default::default()
+        };
+        assert!(serde_json::to_value(&running).unwrap()["state"].is_null());
     }
 
     #[test]
-    fn finish_detail_sums_totals() {
+    fn finish_detail_sums_totals_and_carries_the_verdict() {
         let fams = vec![
             FamilyProgress {
                 family: "a".into(),
@@ -720,12 +829,59 @@ mod tests {
                 failed: 0,
             },
         ];
-        let d = finish_detail(&fams, &Some("boom".into()), Utc::now(), Utc::now());
+        let d = finish_detail(
+            &fams,
+            &Some("boom".into()),
+            Utc::now(),
+            Utc::now(),
+            STATE_COMPLETED_WITH_ERRORS,
+            Some(4),
+        );
         assert_eq!(d["total"]["resealed"], 5);
         assert_eq!(d["total"]["skipped"], 1);
         assert_eq!(d["total"]["failed"], 1);
         assert_eq!(d["last_error"], "boom");
         assert!(d["families"].as_array().unwrap().len() == 2);
+        // The verdict + the authoritative remainder ride the audit detail, so the
+        // log itself distinguishes a finished run from a MIGRATED one.
+        assert_eq!(d["state"], "completed_with_errors");
+        assert_eq!(d["legacy_remaining"], 4);
+        // An unproven parity read is explicitly null, never a silent 0.
+        let d2 = finish_detail(&fams, &None, Utc::now(), Utc::now(), STATE_FAILED, None);
+        assert!(d2["legacy_remaining"].is_null());
+    }
+
+    #[test]
+    fn terminal_state_requires_no_errors_and_proven_zero_parity() {
+        // The exact defect (review M5): a family's paging failed midway, so the scan
+        // was incomplete — yet `failed` stayed 0 because no individual ROW failed.
+        // That must NOT be a success, whatever the row tallies say.
+        assert_eq!(
+            terminal_state(7, true, Some(0)),
+            STATE_COMPLETED_WITH_ERRORS
+        );
+        // Clean run, parity proven zero → the only "completed".
+        assert_eq!(terminal_state(7, false, Some(0)), STATE_COMPLETED);
+        assert_eq!(terminal_state(0, false, Some(0)), STATE_COMPLETED);
+        // Clean run but legacy rows remain (a concurrent writer, or rows the pass
+        // skipped) → not completed.
+        assert_eq!(
+            terminal_state(7, false, Some(3)),
+            STATE_COMPLETED_WITH_ERRORS
+        );
+        // The parity read itself failed → completion is UNPROVEN, never claimed.
+        assert_eq!(terminal_state(7, false, None), STATE_COMPLETED_WITH_ERRORS);
+        assert_eq!(terminal_state(0, false, None), STATE_FAILED);
+        // Nothing achieved + errors → failed.
+        assert_eq!(terminal_state(0, true, Some(9)), STATE_FAILED);
+        // Only `completed` may stamp the audit row success.
+        for (r, e, p) in [
+            (7u64, true, Some(0i64)),
+            (0, true, Some(9)),
+            (7, false, None),
+        ] {
+            assert_ne!(terminal_state(r, e, p), STATE_COMPLETED);
+        }
     }
 
     // ─── DB-backed job core (self-skips without DATABASE_URL) ───────────────
