@@ -69,7 +69,7 @@ Boot runs two gates: `seal::build_sealer` (config coherence) and
 | **off** | present | **OK — legacy sealing (v1).** Refuses only if any **v2** row exists (rolling back to legacy-only with KMS-sealed custody would orphan it — re-enable KMS). |
 | **off** | absent | **OK — sealing DISABLED.** Integration connections + event ingress refuse to operate (no key to seal with). |
 | **static/aws** | present | **OK — migration state.** New seals are v2; existing v1 blobs are still readable (legacy key present). Run the re-seal job here. |
-| **static/aws** | absent | **OK only if ZERO v1 rows remain.** Boot counts v1 rows across all nine sealed columns; a single leftover v1 blob is now unreadable, so boot **REFUSES** with per-family counts and points you at the re-seal job. This is the retired steady state. |
+| **static/aws** | absent | **OK only if ZERO v1 rows remain.** Boot counts v1 rows across all thirteen sealed columns; a single leftover v1 blob is now unreadable, so boot **REFUSES** with per-family counts and points you at the re-seal job. This is the retired steady state. |
 
 Config-level refusals (in `build_sealer`, before the row counts): `FLUIDBOX_KMS_MODE=static`
 without `FLUIDBOX_KMS_STATIC_KEK`, or `=aws` without `FLUIDBOX_KMS_AWS_KEY_ID`,
@@ -151,7 +151,7 @@ re-run and safe across restarts.
    POST /v1/admin/reseal          # 202 Accepted; 409 if already running or KMS off
    GET  /v1/admin/reseal          # poll: { running, legacy_total, families:[{family,legacy,envelope}], job:{…} }
    ```
-   The job walks all nine families, unsealing each v1 blob and re-sealing it v2
+   The job walks all thirteen families, unsealing each v1 blob and re-sealing it v2
    under the row's per-tenant DEK. Poll `GET` until `legacy_total == 0` (every
    family's `legacy` is 0) and `running` is `false`. A row it cannot unseal (wrong
    legacy key / corrupt blob) is tallied in `job.families[].failed` + `last_error`
@@ -278,3 +278,49 @@ org creation; a mint failure is non-fatal (the lazy path retries).
 key, swaps the sealed row (bumping `rotated_at`), evicts + re-seeds the in-memory
 cache, and best-effort deletes the old key at LiteLLM. Returns `{"rotated": true}` —
 never the key. 404 on an unknown org.
+
+---
+
+## 9. Row-Level Security (RLS) operations
+
+> Phase D (#32, #75). Companion: migration `0018_rls_enforcement.sql`, `fluidbox-db`
+> `scoped_tx`/`worker_tx` + the `connect()` owner-migrate / app-pool split.
+
+Migration 0018 enables + `FORCE`s RLS on 37 tenant-owned tables. `FORCE` binds the
+policy even against the table OWNER (a plain owner otherwise bypasses RLS — the
+reason Phase B deferred this). Enforcement is a GUC contract, transaction-local so
+a pooled connection never leaks context:
+
+- `fluidbox.tenant_id` set (`scoped_tx`) ⇒ that tenant's rows are visible/writable;
+- `fluidbox.bypass = 'system_worker'` (`worker_tx`, `pub(crate)`) ⇒ the audited
+  cross-tenant bypass — the category rides IN the GUC value, one grep-able choke point;
+- neither set ⇒ zero rows on a policy'd table.
+
+### The runtime role (opt-in — `FLUIDBOX_RUNTIME_ROLE`)
+
+Set `FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime` and every pooled connection
+`SET ROLE`s (via `after_connect`) to the migration's NOLOGIN `fluidbox_runtime`
+role — a NON-owner that cannot bypass RLS and cannot `UPDATE`/`DELETE`
+`auth_audit_log` (the 0012 deferred grant lands here). Unset = single-role mode:
+RLS still binds even the owner via `FORCE`, so a single-role deployment is fully
+enforced; the role is defense-in-depth (a compromised app process cannot `SET
+ROLE` back to the owner). Boot fails if the env var names a role that does not
+exist. On a managed host that restricts `CREATE ROLE` (Neon), the migration
+**WARNS** instead of aborting — create the role out-of-band
+(`CREATE ROLE fluidbox_runtime NOLOGIN; GRANT fluidbox_runtime TO CURRENT_USER;`
+plus the table grants), then set the env var and restart.
+
+### CONVENTION — every new tenant-owned table
+
+There is deliberately **no `ALTER DEFAULT PRIVILEGES`**: a new tenant-owned table
+shipped without its own policy is silently *unprotected* under the owner and
+silently *invisible* under the runtime role. So every migration that adds a
+tenant-owned table MUST, in the same file: (1) `ENABLE` + `FORCE ROW LEVEL
+SECURITY`; (2) attach a policy — the standard
+`current_setting('fluidbox.tenant_id')` shape, or a parent `EXISTS(...)` for a
+child table with no `tenant_id` column; and (3) `GRANT SELECT, INSERT, UPDATE,
+DELETE ... TO fluidbox_runtime` (guarded for the restricted-host case). A sealed
+column additionally joins the seal-family lockstep (§1) so it is re-seal-covered.
+
+**Pre-0018 binaries break on a 0018 database** (no tenant GUC ⇒ zero rows on every
+policy'd table) — the standard migrate-then-deploy disclosure for this repo.
