@@ -96,18 +96,43 @@ impl ConnectionViewer {
 /// binds it by ordinary means (not just FORCE). Default (`None`) = single-role mode:
 /// the owner runs everything and RLS still binds it via FORCE + the tenant GUC.
 ///
+/// **What the SET ROLE split is and is NOT** (review M4). It narrows the authority
+/// of the ordinary, fixed application queries this process issues: those run as a
+/// non-owner with enumerated DML and no BYPASSRLS, so a missing `tenant_id`
+/// predicate is contained by the policy rather than by convention. It is NOT a
+/// credential boundary. `RESET ROLE` returns the SAME connection to the migration
+/// owner, and the process still holds the owner `DATABASE_URL` and can open a
+/// fresh owner connection whenever it likes — so against process compromise, or a
+/// SQL-injection sink that can emit a second statement, the split buys nothing.
+/// Genuine separation needs two DISTINCT connection strings: a migration-owner one
+/// used only for DDL, and a runtime LOGIN role that owns no schema objects and
+/// carries no bypass attributes. That is a deployment topology change, not this
+/// function; it is deliberately not claimed here.
+///
 /// The role name is interpolated into `SET ROLE` (a SQL identifier, never a bind
-/// parameter), so it is validated to a strict identifier shape and boot REFUSES a
-/// configured-but-absent role with the exact `CREATE ROLE` fix (migration 0018
-/// creates it, but a managed host may have skipped that with a warning).
+/// parameter), so it is validated to a strict identifier shape. Boot then REFUSES
+/// a configured-but-absent role with the exact `CREATE ROLE` fix, and re-runs the
+/// migration's POSTURE validation ([`check_runtime_role_posture`]) — a role can be
+/// altered, or re-granted to another principal, long after 0018 ran.
 pub async fn connect(database_url: &str, runtime_role: Option<&str>) -> anyhow::Result<PgPool> {
     use sqlx::Connection;
     // (1) Migrations + role verification on a one-shot OWNER connection, closed
     // before the app pool exists. DDL is never attempted under the runtime role.
     let mut owner = sqlx::PgConnection::connect(database_url).await?;
-    sqlx::migrate!("../../migrations").run(&mut owner).await?;
     if let Some(role) = runtime_role {
         validate_runtime_role_name(role).map_err(|e| anyhow::anyhow!(e))?;
+        // Publish the deployment's chosen role name to migration 0018, which creates
+        // + posture-validates + grants it. Session-level (`false`) so it survives
+        // sqlx's per-migration transactions on this connection. Without it 0018
+        // falls back to the single hardcoded `fluidbox_runtime`, which on a SHARED
+        // cluster is a name collision with someone else's principal.
+        sqlx::query("select set_config('fluidbox.runtime_role', $1, false)")
+            .bind(role)
+            .execute(&mut owner)
+            .await?;
+    }
+    sqlx::migrate!("../../migrations").run(&mut owner).await?;
+    if let Some(role) = runtime_role {
         let exists: bool =
             sqlx::query_scalar("select exists(select 1 from pg_roles where rolname = $1)")
                 .bind(role)
@@ -121,8 +146,12 @@ pub async fn connect(database_url: &str, runtime_role: Option<&str>) -> anyhow::
                  the privileges, then restart:\n  \
                  CREATE ROLE {role} NOLOGIN;\n  \
                  GRANT {role} TO CURRENT_USER;\n  \
-                 -- plus the table/sequence/function grants from migrations/0018_rls_enforcement.sql"
+                 -- plus the table/function grants from migrations/0018_rls_enforcement.sql"
             );
+        }
+        if let Err(msg) = check_runtime_role_posture(&mut owner, role).await? {
+            owner.close().await.ok();
+            anyhow::bail!(msg);
         }
     }
     owner.close().await?;
@@ -172,6 +201,131 @@ pub fn validate_runtime_role_name(role: &str) -> Result<(), String> {
     }
 }
 
+/// Re-run migration 0018's POSTURE validation of the configured runtime role at
+/// every boot (review H1). Existence is not trust: PostgreSQL roles are
+/// CLUSTER-global while the grants 0018 issues are DATABASE-local, so on a shared
+/// cluster the name may belong to somebody else's principal — and even a role we
+/// created can be `ALTER ROLE`d or re-`GRANT`ed after the migration ran.
+///
+/// Refuses on (a) unsafe attributes — LOGIN (the role is meant to be reachable
+/// only via `SET ROLE` from our own connection), SUPERUSER/BYPASSRLS (policies
+/// would be skipped, making the split theatre), CREATEROLE/CREATEDB/REPLICATION;
+/// (b) any role it is a MEMBER of (inherited privileges we never granted);
+/// (c) any member OTHER than the connecting user — that principal can `SET ROLE`
+/// into it and then set `fluidbox.bypass`, i.e. read every tenant of this database.
+///
+/// Both membership questions read DIRECT `pg_auth_members` rows, not the transitive
+/// closure. That is deliberate: a transitive path necessarily runs through a role
+/// that is already an admin over the connecting user, so flagging it would refuse
+/// every managed host whose owner sits beneath a platform admin group (Neon's
+/// `neon_superuser`) while describing no capability that principal lacks.
+///
+/// `Ok(Ok(()))` = clean. `Ok(Err(message))` = a posture refusal with the fix named
+/// (the caller decides whether that is a boot abort). `Err(_)` = the catalog query
+/// itself failed.
+pub async fn check_runtime_role_posture(
+    conn: &mut sqlx::PgConnection,
+    role: &str,
+) -> sqlx::Result<Result<(), String>> {
+    let attrs: Option<(bool, bool, bool, bool, bool, bool)> = sqlx::query_as(
+        "select rolcanlogin, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb, rolreplication
+           from pg_roles where rolname = $1",
+    )
+    .bind(role)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((login, super_, bypass, createrole, createdb, replication)) = attrs else {
+        return Ok(Err(format!("role '{role}' does not exist")));
+    };
+    let bad: Vec<&str> = [
+        (login, "LOGIN"),
+        (super_, "SUPERUSER"),
+        (bypass, "BYPASSRLS"),
+        (createrole, "CREATEROLE"),
+        (createdb, "CREATEDB"),
+        (replication, "REPLICATION"),
+    ]
+    .iter()
+    .filter(|(on, _)| *on)
+    .map(|(_, n)| *n)
+    .collect();
+    if !bad.is_empty() {
+        return Ok(Err(format!(
+            "FLUIDBOX_RUNTIME_ROLE='{role}' carries unsafe attribute(s): {}. fluidbox refuses to \
+             run its pool under it — LOGIN makes it an authenticable principal, and \
+             SUPERUSER/BYPASSRLS make PostgreSQL skip every migration-0018 policy, so the role \
+             split would enforce nothing. Fix:\n  \
+             ALTER ROLE {role} NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION;\n\
+             or set FLUIDBOX_RUNTIME_ROLE to a name this deployment owns.",
+            bad.join(", ")
+        )));
+    }
+    let inherits: Vec<String> = sqlx::query_scalar(
+        "select distinct g.rolname from pg_auth_members m
+           join pg_roles g on g.oid = m.roleid
+           join pg_roles r on r.oid = m.member
+          where r.rolname = $1 order by g.rolname",
+    )
+    .bind(role)
+    .fetch_all(&mut *conn)
+    .await?;
+    if !inherits.is_empty() {
+        return Ok(Err(format!(
+            "FLUIDBOX_RUNTIME_ROLE='{role}' is a member of {}, so it silently inherits privileges \
+             fluidbox never granted. A least-privilege runtime role must be a member of nothing. \
+             Fix: REVOKE those memberships FROM {role}, or point FLUIDBOX_RUNTIME_ROLE at a \
+             deployment-specific role.",
+            inherits.join(", ")
+        )));
+    }
+    let members: Vec<String> = sqlx::query_scalar(
+        "select distinct mm.rolname from pg_auth_members m
+           join pg_roles mm on mm.oid = m.member
+           join pg_roles r on r.oid = m.roleid
+          where r.rolname = $1 and mm.rolname <> current_user order by mm.rolname",
+    )
+    .bind(role)
+    .fetch_all(&mut *conn)
+    .await?;
+    if !members.is_empty() {
+        return Ok(Err(format!(
+            "FLUIDBOX_RUNTIME_ROLE='{role}' is granted to {} — those principals can `SET ROLE \
+             {role}`, then set `fluidbox.bypass` and read EVERY tenant in this database. \
+             PostgreSQL roles are cluster-global while fluidbox's grants are database-local, so a \
+             shared cluster turns one hardcoded role name into a shared credential. Fix: REVOKE \
+             {role} FROM those roles, or set FLUIDBOX_RUNTIME_ROLE to a deployment-specific name.",
+            members.join(", ")
+        )));
+    }
+    Ok(Ok(()))
+}
+
+/// Prove the pool's EFFECTIVE role is actually bound by RLS, i.e. that migration
+/// 0018's policies run at all (review M2).
+///
+/// PostgreSQL skips every policy for a SUPERUSER or a BYPASSRLS role. Neon's
+/// default `neondb_owner`/`neon_superuser` credential is exactly that, and it is
+/// the documented posture in this repo's own setup script — so a deployment that
+/// leaves `FLUIDBOX_RUNTIME_ROLE` unset gets RLS ENABLED, FORCED, and silently
+/// INERT. A later missing `tenant_id` predicate then returns every tenant's rows
+/// instead of being contained, which is the entire failure RLS exists to stop.
+///
+/// This runs on a POOLED connection so it observes whatever `after_connect SET
+/// ROLE` produced — `current_user`, not the role in `DATABASE_URL`. Attributes are
+/// NOT inherited through membership, so reading them off `current_user` is the
+/// only correct question to ask. The caller (server boot) makes it fatal in
+/// multi-user mode and advisory otherwise.
+pub async fn pool_role_bypasses_rls(pool: &PgPool) -> sqlx::Result<Option<String>> {
+    let (user, bypasses): (String, bool) = sqlx::query_as(
+        "select current_user::text,
+                coalesce((select rolsuper or rolbypassrls from pg_roles
+                           where rolname = current_user), false)",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(bypasses.then_some(user))
+}
+
 /// Open a transaction with the tenant RLS GUC set (`fluidbox.tenant_id`),
 /// transaction-local (`set_config(..., true)`) so it auto-resets on commit/rollback
 /// and never leaks to the next borrower of a pooled connection. EVERY tenant-scoped
@@ -200,9 +354,11 @@ pub async fn scoped_tx(
 /// genuine cross-tenant scan or a principal-less credential-digest resolution see
 /// every tenant's rows. The category rides IN the GUC value — one grep-able choke
 /// point rather than a distinct BYPASSRLS role (plan D8). Used by the `system_worker`
-/// scans (Task 7) and the handful of lib.rs bootstrap resolvers that have no scope by
-/// construction (token-digest resolution, GitHub-App flow claims, the boot seed's
-/// tenant upsert).
+/// scans (Task 7) and the handful of lib.rs / identity.rs bootstrap resolvers that
+/// have no scope by construction (token-digest resolution, pre-auth flow claims, the
+/// boot seed's tenant upsert). That set is ENUMERATED in the `system_worker` module
+/// docs — every named function outside this module that reaches a bypass is listed
+/// there, so the inventory is grep-checkable rather than "somewhere in the crate".
 pub(crate) async fn worker_tx(
     pool: &PgPool,
 ) -> sqlx::Result<sqlx::Transaction<'static, sqlx::Postgres>> {
@@ -2792,38 +2948,61 @@ pub async fn github_app_registration_webhook_secret_sealed(
     }))
 }
 
-/// Mint a one-time flow (admin intent). Opportunistically sweeps expired
+/// Mint a one-time flow. Opportunistically sweeps this tenant's expired
 /// unconsumed flows immediately, and consumed ones after a 7-day audit
 /// window, so abandoned dances never accumulate.
+///
+/// TENANT-SCOPED (review L6). Minting is the AUTHENTICATED half of the GitHub-App
+/// dance — all three call sites already hold a verified tenant (two admin-token'd
+/// start endpoints via `principal.scope()`, and the manifest callback via the
+/// scope it derives from the registration row it just resolved) — so it has no
+/// business on the cross-tenant bypass. Only the two CLAIMs
+/// ([`claim_github_app_bootstrap`], [`claim_github_app_flow`]) are genuinely
+/// pre-auth: those arrive from GitHub/the browser with no principal, and the
+/// one-time flow id + browser-cookie hash ARE the auth.
+///
+/// The insert derives its `registration_id` from a row selected under the scope,
+/// so a caller cannot mint a flow against another tenant's registration even if
+/// RLS is inert (a superuser/BYPASSRLS pool role); returns [`sqlx::Error::RowNotFound`]
+/// when the registration is absent from this tenant.
 pub async fn create_github_app_flow(
     pool: &PgPool,
+    scope: TenantScope,
     registration_id: Uuid,
     purpose: &str,
     ttl_secs: i64,
 ) -> sqlx::Result<Uuid> {
-    // GitHub-App admin bootstrap flow: operates on github_app_flows (a child of
-    // github_app_registrations) with no tenant scope — the one-time flow id + the
-    // browser-cookie hash bound at `go` are the auth. Rides the audited bypass, like
-    // the connector-OAuth flow claims and the login-flow bootstrap (Task 7 category).
-    let mut tx = worker_tx(pool).await?;
+    let mut tx = scoped_tx(pool, scope).await?;
+    // Self-scoped sweep: only flows under THIS tenant's registrations (the RLS
+    // child policy composes the same predicate; the EXISTS keeps it true without it).
     sqlx::query(
-        "delete from github_app_flows
-         where (consumed_at is null and expires_at < now())
-            or expires_at < now() - interval '7 days'",
+        "delete from github_app_flows f
+         where ((f.consumed_at is null and f.expires_at < now())
+                or f.expires_at < now() - interval '7 days')
+           and exists (select 1 from github_app_registrations r
+                        where r.id = f.registration_id and r.tenant_id = $1)",
     )
+    .bind(scope.tenant_id())
     .execute(&mut *tx)
     .await?;
     let id = Uuid::now_v7();
-    sqlx::query(
+    let inserted = sqlx::query(
         "insert into github_app_flows (id, registration_id, purpose, expires_at)
-         values ($1, $2, $3, now() + make_interval(secs => $4::double precision))",
+         select $1, r.id, $3, now() + make_interval(secs => $4::double precision)
+           from github_app_registrations r
+          where r.id = $2 and r.tenant_id = $5",
     )
     .bind(id)
     .bind(registration_id)
     .bind(purpose)
     .bind(ttl_secs as f64)
+    .bind(scope.tenant_id())
     .execute(&mut *tx)
     .await?;
+    if inserted.rows_affected() != 1 {
+        tx.rollback().await.ok();
+        return Err(sqlx::Error::RowNotFound);
+    }
     tx.commit().await?;
     Ok(id)
 }
@@ -12028,5 +12207,245 @@ mod tests {
             sqlx::query(stmt).bind(tenant).execute(&mut *tx).await.ok();
         }
         tx.commit().await.unwrap();
+    }
+
+    /// Review M3: `auth_audit_log` INSERT now carries the SAME tenant floor as every
+    /// other tenant-owned write. The old `with check (true)` let a transaction scoped
+    /// to tenant A append a row stamped `tenant_id = B` — a forged entry in another
+    /// tenant's permanent security history that, because the log is append-only, the
+    /// runtime role could never retract.
+    ///
+    /// Asserted through the NON-superuser `fluidbox_runtime` role (a superuser skips
+    /// policies and would make this vacuous). NOTHING is committed: an audit row
+    /// cannot be deleted afterwards, so every case runs in its own rolled-back tx.
+    #[tokio::test]
+    async fn rls_audit_insert_carries_the_tenant_floor() {
+        use sqlx::{Connection, Executor};
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        // Apply migrations (incl. the runtime role) then drop that pool immediately.
+        connect(&url, None).await.expect("migrate").close().await;
+        let mut rt = sqlx::PgConnection::connect(&url).await.expect("rt connect");
+        rt.execute("set role fluidbox_runtime")
+            .await
+            .expect("set role");
+
+        async fn try_insert(
+            rt: &mut sqlx::PgConnection,
+            guc: Option<(&str, String)>,
+            tenant: Option<Uuid>,
+        ) -> sqlx::Result<()> {
+            let mut tx = rt.begin().await.unwrap();
+            if let Some((name, val)) = guc {
+                sqlx::query("select set_config($1, $2, true)")
+                    .bind(name)
+                    .bind(val)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+            let res = sqlx::query(
+                "insert into auth_audit_log (id, tenant_id, actor_kind, action, success)
+                 values ($1, $2, 'operator', 'rls.m3.probe', true)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(tenant)
+            .execute(&mut *tx)
+            .await
+            .map(|_| ());
+            tx.rollback().await.ok();
+            res
+        }
+        fn assert_rls_refusal(res: sqlx::Result<()>, what: &str) {
+            let err = res
+                .err()
+                .unwrap_or_else(|| panic!("{what} must be refused"));
+            assert!(
+                err.to_string()
+                    .to_lowercase()
+                    .contains("row-level security"),
+                "{what}: expected an RLS policy violation, got: {err}"
+            );
+        }
+
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        let tid = "fluidbox.tenant_id";
+        let bypass = ("fluidbox.bypass", "system_worker".to_string());
+
+        // In-tenant: the ordinary audited mutation, unchanged.
+        try_insert(&mut rt, Some((tid, a.to_string())), Some(a))
+            .await
+            .expect("an in-tenant audit row must still insert");
+        // THE FINDING: tenant A cannot write tenant B's history.
+        assert_rls_refusal(
+            try_insert(&mut rt, Some((tid, a.to_string())), Some(b)).await,
+            "a cross-tenant audit insert",
+        );
+        // A scoped tx cannot forge a deployment-level (NULL-tenant) row either.
+        assert_rls_refusal(
+            try_insert(&mut rt, Some((tid, a.to_string())), None).await,
+            "a NULL-tenant audit insert from a tenant-scoped tx",
+        );
+        // The old pool-direct path (no GUC at all) is now refused — which is why
+        // standalone audits route through `identity::insert_audit_standalone`.
+        assert_rls_refusal(
+            try_insert(&mut rt, None, Some(a)).await,
+            "an audit insert with no GUC",
+        );
+        // The audited bypass remains the one way to write deployment-level rows.
+        try_insert(&mut rt, Some(bypass.clone()), None)
+            .await
+            .expect("the system_worker bypass must still write NULL-tenant rows");
+        try_insert(&mut rt, Some(bypass), Some(b))
+            .await
+            .expect("the system_worker bypass writes any tenant's row");
+
+        rt.close().await.ok();
+    }
+
+    /// Review H1: a runtime role is only trustworthy if its POSTURE is checked, not
+    /// just its name. PostgreSQL roles are cluster-global while 0018's grants are
+    /// database-local, so on a shared cluster the name may already belong to another
+    /// principal — as LOGIN/BYPASSRLS, or granted to somebody else's owner, who could
+    /// then `SET ROLE` in and set `fluidbox.bypass`. Each shape must REFUSE.
+    ///
+    /// Probe roles are uniquely named (tests run in parallel and roles are
+    /// cluster-global) and dropped at the end.
+    #[tokio::test]
+    async fn runtime_role_posture_refuses_unsafe_roles() {
+        use sqlx::Connection;
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        // Role DDL cannot take bind parameters; the names are locally generated
+        // (`fbx_(probe|other)_<uuid-hex>`), never caller input.
+        async fn ddl(c: &mut sqlx::PgConnection, sql: String) -> sqlx::Result<()> {
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&mut *c)
+                .await
+                .map(|_| ())
+        }
+        let mut c = sqlx::PgConnection::connect(&url).await.expect("connect");
+        let probe = format!("fbx_probe_{}", Uuid::now_v7().simple());
+        let other = format!("fbx_other_{}", Uuid::now_v7().simple());
+        if ddl(&mut c, format!("create role {probe} nologin"))
+            .await
+            .is_err()
+        {
+            eprintln!("skipping: this database role cannot CREATE ROLE");
+            return;
+        }
+        ddl(&mut c, format!("create role {other} nologin"))
+            .await
+            .expect("create the second probe role");
+
+        // A freshly created NOLOGIN role with no memberships is the clean posture.
+        assert!(
+            check_runtime_role_posture(&mut c, &probe)
+                .await
+                .unwrap()
+                .is_ok(),
+            "a NOLOGIN role that is a member of nothing must pass"
+        );
+
+        // (a) attributes. LOGIN is settable by any CREATEROLE holder; BYPASSRLS needs
+        // superuser, so it is asserted only where the ALTER actually lands.
+        ddl(&mut c, format!("alter role {probe} login"))
+            .await
+            .unwrap();
+        let err = check_runtime_role_posture(&mut c, &probe)
+            .await
+            .unwrap()
+            .expect_err("a LOGIN runtime role must be refused");
+        assert!(
+            err.contains("LOGIN"),
+            "refusal must name the attribute: {err}"
+        );
+        ddl(&mut c, format!("alter role {probe} nologin"))
+            .await
+            .unwrap();
+        if ddl(&mut c, format!("alter role {probe} bypassrls"))
+            .await
+            .is_ok()
+        {
+            let err = check_runtime_role_posture(&mut c, &probe)
+                .await
+                .unwrap()
+                .expect_err("a BYPASSRLS runtime role must be refused");
+            assert!(
+                err.contains("BYPASSRLS"),
+                "refusal must name the attribute: {err}"
+            );
+            ddl(&mut c, format!("alter role {probe} nobypassrls"))
+                .await
+                .unwrap();
+        }
+
+        // (b) THE SHARED-CLUSTER SHAPE: someone else can SET ROLE into it.
+        ddl(&mut c, format!("grant {probe} to {other}"))
+            .await
+            .unwrap();
+        let err = check_runtime_role_posture(&mut c, &probe)
+            .await
+            .unwrap()
+            .expect_err("a runtime role granted to another principal must be refused");
+        assert!(
+            err.contains(&other),
+            "refusal must name the foreign member: {err}"
+        );
+        ddl(&mut c, format!("revoke {probe} from {other}"))
+            .await
+            .unwrap();
+
+        // (c) inherited privileges we never granted.
+        ddl(&mut c, format!("grant {other} to {probe}"))
+            .await
+            .unwrap();
+        let err = check_runtime_role_posture(&mut c, &probe)
+            .await
+            .unwrap()
+            .expect_err("a runtime role inheriting another role must be refused");
+        assert!(
+            err.contains(&other),
+            "refusal must name the inherited role: {err}"
+        );
+        ddl(&mut c, format!("revoke {other} from {probe}"))
+            .await
+            .unwrap();
+
+        // A name that does not exist at all is a refusal, never a silent pass.
+        assert!(check_runtime_role_posture(&mut c, "fbx_no_such_role_xyz")
+            .await
+            .unwrap()
+            .is_err());
+
+        for r in [&probe, &other] {
+            ddl(&mut c, format!("drop role {r}")).await.ok();
+        }
+        c.close().await.ok();
+    }
+
+    /// Review M2: the boot gate reads the EFFECTIVE role of a pooled connection, so
+    /// it observes `after_connect SET ROLE` rather than whatever `DATABASE_URL` says.
+    /// Under the role split the answer must be "not bypassing" — that is the whole
+    /// point of the split, and in multi-user mode boot refuses on anything else.
+    #[tokio::test]
+    async fn pool_role_bypasses_rls_reads_the_effective_role() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let rt_pool = connect(&url, Some("fluidbox_runtime"))
+            .await
+            .expect("runtime pool");
+        assert_eq!(
+            pool_role_bypasses_rls(&rt_pool).await.unwrap(),
+            None,
+            "a pool that SET ROLEs to fluidbox_runtime must be RLS-BOUND"
+        );
+        rt_pool.close().await;
     }
 }

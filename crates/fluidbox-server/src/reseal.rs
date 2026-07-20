@@ -672,12 +672,10 @@ async fn audit(
     detail: Option<&Value>,
     success: bool,
 ) {
-    let Ok(mut conn) = state.pool.acquire().await else {
-        tracing::warn!("re-seal audit '{action}' skipped: database unavailable");
-        return;
-    };
-    if let Err(e) = identity::insert_audit(
-        &mut conn,
+    // `tenant_id: None` ⇒ `insert_audit_standalone` opens the audited worker tx, so
+    // the deployment-level row satisfies the tightened RLS INSERT policy (review M3).
+    if let Err(e) = identity::insert_audit_standalone(
+        &state.pool,
         AuditEntry {
             tenant_id: None,
             actor_kind: "operator",

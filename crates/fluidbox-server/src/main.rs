@@ -84,8 +84,40 @@ async fn main() -> anyhow::Result<()> {
     let pool = fluidbox_db::connect(&cfg.database_url, cfg.runtime_role.as_deref()).await?;
     if let Some(role) = &cfg.runtime_role {
         tracing::info!(
-            "app pool runs under least-privilege role '{role}' (RLS role split enabled)"
+            "app pool runs under non-owner role '{role}' (RLS role split enabled; posture verified: \
+             NOLOGIN, no SUPERUSER/BYPASSRLS, no inherited or foreign memberships)"
         );
+    }
+    // Review M2: RLS is defence-in-depth ONLY if PostgreSQL actually evaluates the
+    // policies. It skips them entirely for a SUPERUSER/BYPASSRLS role — which is
+    // exactly what Neon's default credential is — so migration 0018 can be applied,
+    // FORCEd, and completely inert. Read the EFFECTIVE role of a pooled connection
+    // (after any `after_connect SET ROLE`), and in multi-user mode make it fatal:
+    // an unnoticed missing `tenant_id` predicate must be contained, not served.
+    match fluidbox_db::pool_role_bypasses_rls(&pool).await? {
+        None => tracing::info!("row-level security is ENFORCED for this pool (its role has neither SUPERUSER nor BYPASSRLS)"),
+        Some(user) if cfg.require_sso && !cfg.allow_rls_bypass => anyhow::bail!(
+            "REFUSING TO BOOT: FLUIDBOX_REQUIRE_SSO=1 (multi-user) but the database role this pool \
+             runs as ('{user}') is SUPERUSER or has BYPASSRLS, so PostgreSQL SKIPS every \
+             row-level-security policy from migration 0018 and tenant isolation falls back to the \
+             `where tenant_id = $n` convention alone. Fix (either one):\n  \
+             1. set FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime — migration 0018 creates that NOLOGIN \
+             least-privilege role and every pooled connection SET ROLEs to it; or\n  \
+             2. point DATABASE_URL at a role that is neither SUPERUSER nor BYPASSRLS.\n  \
+             Verify with: select rolsuper, rolbypassrls from pg_roles where rolname = current_user;\n  \
+             For local single-user operation on a superuser database, set \
+             FLUIDBOX_ALLOW_RLS_BYPASS=1 to accept this."
+        ),
+        Some(user) if cfg.require_sso => tracing::warn!(
+            "FLUIDBOX_ALLOW_RLS_BYPASS=1: pool role '{user}' bypasses RLS, so migration 0018's \
+             policies are INERT and tenant isolation rests on the query predicates alone — \
+             acceptable for local single-user operation only"
+        ),
+        Some(user) => tracing::warn!(
+            "pool role '{user}' is SUPERUSER or has BYPASSRLS, so migration 0018's RLS policies \
+             are skipped by PostgreSQL (single-user mode, tolerated). Set FLUIDBOX_RUNTIME_ROLE \
+             before enabling FLUIDBOX_REQUIRE_SSO=1, or boot will refuse."
+        ),
     }
 
     tracing::info!("seeding…");
@@ -149,7 +181,10 @@ async fn main() -> anyhow::Result<()> {
     // D4 retirement gates: refuse boot when the sealing configuration and the
     // stored custody are incoherent (KMS on with the legacy key retired but v1
     // rows remain unreadable; KMS off with KMS-only v2 rows present).
-    seal::check_retirement_gates(&cfg, &pool).await?;
+    // The sealer is passed in so the KEK probe runs on the LIVE backend + DEK cache:
+    // the unwrap the gate performs anyway warms the cache the process will use
+    // (singleflight already caps this at one Decrypt per restart).
+    seal::check_retirement_gates(&cfg, &pool, sealer.as_ref()).await?;
     match (&sealer, cfg.kms_mode) {
         (None, _) => tracing::warn!(
             "credential sealing disabled (no FLUIDBOX_CREDENTIAL_KEY, KMS off) — integration connections are disabled"

@@ -362,6 +362,9 @@ async fn resolve_org_audited(
 
 /// Audit a rejected attempt in a SEPARATE transaction committed after the
 /// refusal (design lines 398-402) — best effort against a fully dead database.
+/// Routed through `insert_audit_standalone` so the row carries the tenant GUC the
+/// tightened RLS INSERT policy requires (review M3): a known tenant gets a scoped
+/// tx, an unresolved one (`tenant_id = None`) the audited worker bypass.
 async fn reject_audit(
     state: &AppState,
     tenant_id: Option<Uuid>,
@@ -370,12 +373,9 @@ async fn reject_audit(
     target: Option<&str>,
     reason: &str,
 ) {
-    let Ok(mut conn) = state.pool.acquire().await else {
-        return;
-    };
     let detail = json!({ "reason": reason });
-    let _ = identity::insert_audit(
-        &mut conn,
+    let _ = identity::insert_audit_standalone(
+        &state.pool,
         identity::AuditEntry {
             tenant_id,
             actor_kind: "operator",
@@ -403,11 +403,8 @@ async fn accept_audit(
     action: &str,
     target: &str,
 ) {
-    let Ok(mut conn) = state.pool.acquire().await else {
-        return;
-    };
-    let _ = identity::insert_audit(
-        &mut conn,
+    let _ = identity::insert_audit_standalone(
+        &state.pool,
         identity::AuditEntry {
             tenant_id: Some(tenant_id),
             actor_kind: "operator",
