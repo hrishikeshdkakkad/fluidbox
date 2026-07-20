@@ -677,16 +677,28 @@ async fn validate_and_stage_config(
         .await);
     }
 
-    // Seal the client secret (requires the Sealer).
-    let sealed = match &body.client_secret {
+    // Seal the client secret (requires the Sealer). Carries the v2 key-version
+    // companion into the IdP config row.
+    let (client_secret_sealed, client_secret_key_version) = match &body.client_secret {
         Some(secret) => {
             let sealer = match crate::oauth::sealer(state) {
                 Ok(s) => s,
                 Err(e) => return Err(refuse(state, tenant, sip, action, None, e).await),
             };
-            Some(sealer.seal(secret))
+            match sealer
+                .seal(
+                    secret,
+                    crate::seal::SealCtx::new(tenant, crate::seal::SealFamily::IdpClientSecret),
+                )
+                .await
+            {
+                Ok(s) => (Some(s.bytes), s.key_version),
+                Err(e) => {
+                    return Err(refuse(state, tenant, sip, action, None, ApiError::from(e)).await)
+                }
+            }
         }
-        None => None,
+        None => (None, 1),
     };
 
     let scopes: Vec<String> = body.scopes.clone().unwrap_or_else(|| {
@@ -699,7 +711,8 @@ async fn validate_and_stage_config(
     let params = IdpConfigParams {
         issuer: body.issuer.trim(),
         client_id: &body.client_id,
-        client_secret_sealed: sealed,
+        client_secret_sealed,
+        client_secret_key_version,
         token_endpoint_auth: &body.token_endpoint_auth,
         scopes: &scopes,
         alg_allowlist: &algs,
@@ -963,7 +976,17 @@ pub async fn patch_idp(
                 Ok(s) => s,
                 Err(e) => return Err(bad(e).await),
             };
-            identity::SecretPatch::Set(sealer.seal(secret))
+            let sealed = match sealer
+                .seal(
+                    secret,
+                    crate::seal::SealCtx::new(org.id, crate::seal::SealFamily::IdpClientSecret),
+                )
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => return Err(bad(ApiError::from(e)).await),
+            };
+            identity::SecretPatch::Set(sealed.bytes, sealed.key_version)
         }
     };
 

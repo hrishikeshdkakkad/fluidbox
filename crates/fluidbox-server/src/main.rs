@@ -16,6 +16,7 @@ mod facade;
 mod github_app;
 mod harness;
 mod internal;
+mod kms;
 mod ledger;
 mod login;
 mod oauth;
@@ -134,15 +135,23 @@ async fn main() -> anyhow::Result<()> {
 
     let events_tx = fluidbox_db::spawn_listener(cfg.database_url.clone());
 
-    let sealer = match &cfg.credential_key {
-        Some(k) => Some(seal::Sealer::from_key_string(k)?),
-        None => {
-            tracing::warn!(
-                "FLUIDBOX_CREDENTIAL_KEY not set — integration connections are disabled"
-            );
-            None
+    // Phase D (#32): the sealer is legacy-only (KMS off), KMS-envelope (static|aws),
+    // or None (KMS off + no legacy key → sealing disabled, today's behavior). The
+    // boot/seed tenant keys transit tokens in KMS mode (see Sealer::seal_token).
+    let sealer = seal::build_sealer(&cfg, &pool, seed.tenant_id)?;
+    // D4 retirement gates: refuse boot when the sealing configuration and the
+    // stored custody are incoherent (KMS on with the legacy key retired but v1
+    // rows remain unreadable; KMS off with KMS-only v2 rows present).
+    seal::check_retirement_gates(&cfg, &pool).await?;
+    match (&sealer, cfg.kms_mode) {
+        (None, _) => tracing::warn!(
+            "credential sealing disabled (no FLUIDBOX_CREDENTIAL_KEY, KMS off) — integration connections are disabled"
+        ),
+        (Some(_), config::KmsMode::Off) => {
+            tracing::info!("credential sealing: legacy key (FLUIDBOX_KMS_MODE=off)")
         }
-    };
+        (Some(_), mode) => tracing::info!("credential sealing: KMS envelope ({mode:?})"),
+    }
 
     let state: state::AppState = Arc::new(AppStateInner {
         tenant_id: seed.tenant_id,

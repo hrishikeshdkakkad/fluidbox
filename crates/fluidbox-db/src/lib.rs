@@ -865,6 +865,9 @@ pub struct ConnectionAuth<'a> {
     pub status: &'a str,    // active | pending | suspended
     pub oauth: Option<&'a Value>,
     pub client_secret_sealed: Option<&'a [u8]>,
+    /// Envelope key-version companion for `client_secret_sealed` (1 legacy, 2
+    /// v2). Ignored when `client_secret_sealed` is None.
+    pub client_secret_key_version: i16,
     /// Set only by the seamless github_app flows (custody on the
     /// registration); legacy/manual connections leave it NULL.
     pub registration_id: Option<Uuid>,
@@ -877,6 +880,7 @@ impl ConnectionAuth<'static> {
             status: "active",
             oauth: None,
             client_secret_sealed: None,
+            client_secret_key_version: 1,
             registration_id: None,
         }
     }
@@ -890,24 +894,29 @@ pub async fn create_connection(
     external_account_id: &str,
     display_name: &str,
     credential_sealed: Option<&[u8]>,
+    credential_key_version: i16,
     granted_scopes: &Value,
     resource_selection: &Value,
     metadata: &Value,
     webhook_secret_sealed: Option<&[u8]>,
+    webhook_secret_key_version: i16,
     auth: ConnectionAuth<'_>,
     owner: ConnectionOwner,
     created_by_user_id: Option<Uuid>,
 ) -> sqlx::Result<IntegrationConnectionRow> {
     // owner_type/owner_user_id are stamped from `owner`; authorization_generation
     // starts at 1 (the column default) and bumps only on re-consent/rotation.
+    // The `_key_version` companions ride beside each sealed column (1 legacy, 2
+    // v2 envelope) so the reader can dispatch on open.
     let (owner_type, owner_user_id) = owner.parts();
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "insert into integration_connections
            (id, tenant_id, provider, external_account_id, display_name, credential_sealed,
             granted_scopes, resource_selection, metadata, webhook_secret_sealed,
             auth_kind, status, oauth, client_secret_sealed, registration_id,
-            owner_type, owner_user_id, created_by_user_id)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+            owner_type, owner_user_id, created_by_user_id,
+            credential_key_version, webhook_secret_key_version, client_secret_key_version)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
          returning {CONNECTION_COLS}"
     )))
     .bind(Uuid::now_v7())
@@ -928,6 +937,9 @@ pub async fn create_connection(
     .bind(owner_type)
     .bind(owner_user_id)
     .bind(created_by_user_id)
+    .bind(credential_key_version)
+    .bind(webhook_secret_key_version)
+    .bind(auth.client_secret_key_version)
     .fetch_one(pool)
     .await
 }
@@ -1089,6 +1101,7 @@ pub async fn activate_connection_oauth<'e, E>(
     scope: TenantScope,
     id: Uuid,
     sealed_refresh: &[u8],
+    key_version: i16,
     oauth: &Value,
     granted_scopes: &Value,
 ) -> sqlx::Result<Option<IntegrationConnectionRow>>
@@ -1097,7 +1110,7 @@ where
 {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update integration_connections
-         set credential_sealed = $2, oauth = $3, granted_scopes = $4,
+         set credential_sealed = $2, credential_key_version = $6, oauth = $3, granted_scopes = $4,
              status = 'active',
              authorization_generation =
                  authorization_generation + case when status <> 'pending' then 1 else 0 end,
@@ -1110,6 +1123,7 @@ where
     .bind(oauth)
     .bind(granted_scopes)
     .bind(scope.tenant_id())
+    .bind(key_version)
     .fetch_optional(exec)
     .await
 }
@@ -1127,13 +1141,15 @@ pub async fn rotate_connection_refresh<'e, E>(
     scope: TenantScope,
     id: Uuid,
     sealed_new: &[u8],
+    key_version: i16,
     expected_generation: i32,
 ) -> sqlx::Result<bool>
 where
     E: sqlx::PgExecutor<'e>,
 {
     let r = sqlx::query(
-        "update integration_connections set credential_sealed = $2, updated_at = now()
+        "update integration_connections
+         set credential_sealed = $2, credential_key_version = $5, updated_at = now()
          where id = $1 and status = 'active' and auth_kind = 'oauth' and tenant_id = $3
            and authorization_generation = $4",
     )
@@ -1141,6 +1157,7 @@ where
     .bind(sealed_new)
     .bind(scope.tenant_id())
     .bind(expected_generation)
+    .bind(key_version)
     .execute(exec)
     .await?;
     Ok(r.rows_affected() == 1)
@@ -1180,14 +1197,17 @@ pub async fn set_connection_client_secret(
     scope: TenantScope,
     id: Uuid,
     sealed: &[u8],
+    key_version: i16,
 ) -> sqlx::Result<()> {
     sqlx::query(
-        "update integration_connections set client_secret_sealed = $2, updated_at = now()
+        "update integration_connections
+         set client_secret_sealed = $2, client_secret_key_version = $4, updated_at = now()
          where id = $1 and status <> 'revoked' and tenant_id = $3",
     )
     .bind(id)
     .bind(sealed)
     .bind(scope.tenant_id())
+    .bind(key_version)
     .execute(pool)
     .await
     .map(|_| ())
@@ -1201,19 +1221,102 @@ pub async fn connection_client_secret_sealed<'e, E>(
     exec: E,
     scope: TenantScope,
     id: Uuid,
-) -> sqlx::Result<Option<Vec<u8>>>
+) -> sqlx::Result<Option<(Vec<u8>, i16)>>
 where
     E: sqlx::PgExecutor<'e>,
 {
     let row = sqlx::query(
-        "select client_secret_sealed from integration_connections
+        "select client_secret_sealed, client_secret_key_version from integration_connections
          where id = $1 and status <> 'revoked' and tenant_id = $2",
     )
     .bind(id)
     .bind(scope.tenant_id())
     .fetch_optional(exec)
     .await?;
-    Ok(row.and_then(|r| r.get::<Option<Vec<u8>>, _>("client_secret_sealed")))
+    Ok(row.and_then(|r| {
+        r.get::<Option<Vec<u8>>, _>("client_secret_sealed")
+            .map(|b| (b, r.get::<i16, _>("client_secret_key_version")))
+    }))
+}
+
+// ─── Per-tenant DEKs (Phase D envelope sealing, #32) ────────────────────────
+
+/// One wrapped Data Encryption Key per `(tenant, version)`. `wrapped_dek` is the
+/// DEK sealed by a KEK backend — NEVER the raw key. Not `Serialize`: it carries
+/// wrapped key material. Keyed by a raw `tenant_id` (not a `TenantScope`): the
+/// DEK orchestration in `kms::dek_for_seal`/`dek_for_open` already holds a
+/// verified tenant from a `SealCtx`, and these are single-row keyed reads, not
+/// cross-tenant scans.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TenantDekRow {
+    pub tenant_id: Uuid,
+    pub version: i32,
+    pub kek_id: String,
+    pub wrapped_dek: Vec<u8>,
+    pub created_at: DateTime<Utc>,
+    pub retired_at: Option<DateTime<Utc>>,
+}
+
+/// Read one tenant's DEK at a specific version (`None` if never minted).
+pub async fn get_tenant_dek<'e, E>(
+    exec: E,
+    tenant_id: Uuid,
+    version: i32,
+) -> sqlx::Result<Option<TenantDekRow>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(
+        "select tenant_id, version, kek_id, wrapped_dek, created_at, retired_at
+         from tenant_deks where tenant_id = $1 and version = $2",
+    )
+    .bind(tenant_id)
+    .bind(version)
+    .fetch_optional(exec)
+    .await
+}
+
+/// The highest-version DEK for a tenant (a future rotation reads the current one).
+pub async fn latest_tenant_dek<'e, E>(
+    exec: E,
+    tenant_id: Uuid,
+) -> sqlx::Result<Option<TenantDekRow>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(
+        "select tenant_id, version, kek_id, wrapped_dek, created_at, retired_at
+         from tenant_deks where tenant_id = $1 order by version desc limit 1",
+    )
+    .bind(tenant_id)
+    .fetch_optional(exec)
+    .await
+}
+
+/// Claim a `(tenant, version)` DEK row. `on conflict do nothing` makes the lazy
+/// mint race-safe: two concurrent first-seals both attempt the insert, one wins,
+/// and both callers re-read the winner (see `kms::dek_for_seal`).
+pub async fn insert_tenant_dek<'e, E>(
+    exec: E,
+    tenant_id: Uuid,
+    version: i32,
+    kek_id: &str,
+    wrapped_dek: &[u8],
+) -> sqlx::Result<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query(
+        "insert into tenant_deks (tenant_id, version, kek_id, wrapped_dek)
+         values ($1, $2, $3, $4) on conflict (tenant_id, version) do nothing",
+    )
+    .bind(tenant_id)
+    .bind(version)
+    .bind(kek_id)
+    .bind(wrapped_dek)
+    .execute(exec)
+    .await
+    .map(|_| ())
 }
 
 // ─── Connector catalog ────────────────────────────────────────────────────
@@ -1498,19 +1601,22 @@ pub async fn connection_credential_sealed<'e, E>(
     exec: E,
     scope: TenantScope,
     id: Uuid,
-) -> sqlx::Result<Option<Vec<u8>>>
+) -> sqlx::Result<Option<(Vec<u8>, i16)>>
 where
     E: sqlx::PgExecutor<'e>,
 {
     let row = sqlx::query(
-        "select credential_sealed from integration_connections
+        "select credential_sealed, credential_key_version from integration_connections
          where id = $1 and status = 'active' and tenant_id = $2",
     )
     .bind(id)
     .bind(scope.tenant_id())
     .fetch_optional(exec)
     .await?;
-    Ok(row.map(|r| r.get::<Vec<u8>, _>("credential_sealed")))
+    Ok(row.and_then(|r| {
+        r.get::<Option<Vec<u8>>, _>("credential_sealed")
+            .map(|b| (b, r.get::<i16, _>("credential_key_version")))
+    }))
 }
 
 /// The only reader of the sealed webhook secret (verified on every ingress
@@ -1519,16 +1625,19 @@ pub async fn connection_webhook_secret_sealed(
     pool: &PgPool,
     scope: TenantScope,
     id: Uuid,
-) -> sqlx::Result<Option<Vec<u8>>> {
+) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
     let row = sqlx::query(
-        "select webhook_secret_sealed from integration_connections
+        "select webhook_secret_sealed, webhook_secret_key_version from integration_connections
          where id = $1 and status = 'active' and tenant_id = $2",
     )
     .bind(id)
     .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await?;
-    Ok(row.and_then(|r| r.get::<Option<Vec<u8>>, _>("webhook_secret_sealed")))
+    Ok(row.and_then(|r| {
+        r.get::<Option<Vec<u8>>, _>("webhook_secret_sealed")
+            .map(|b| (b, r.get::<i16, _>("webhook_secret_key_version")))
+    }))
 }
 
 // ─── GitHub App registrations & flows (Phase 5.6) ─────────────────────────
@@ -1622,14 +1731,19 @@ pub async fn activate_github_app_registration(
     html_url: &str,
     owner_login: Option<&str>,
     pem_sealed: &[u8],
+    pem_key_version: i16,
     webhook_secret_sealed: Option<&[u8]>,
+    webhook_secret_key_version: i16,
     client_secret_sealed: Option<&[u8]>,
+    client_secret_key_version: i16,
 ) -> sqlx::Result<Option<GithubAppRegistrationRow>> {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update github_app_registrations
          set app_id = $2, slug = $3, name = $4, client_id = $5, html_url = $6,
              owner_login = $7, pem_sealed = $8, webhook_secret_sealed = $9,
-             client_secret_sealed = $10, status = 'active', updated_at = now()
+             client_secret_sealed = $10, pem_key_version = $12,
+             webhook_secret_key_version = $13, client_secret_key_version = $14,
+             status = 'active', updated_at = now()
          where id = $1 and status = 'pending' and tenant_id = $11
          returning {GH_REG_COLS}"
     )))
@@ -1644,6 +1758,9 @@ pub async fn activate_github_app_registration(
     .bind(webhook_secret_sealed)
     .bind(client_secret_sealed)
     .bind(scope.tenant_id())
+    .bind(pem_key_version)
+    .bind(webhook_secret_key_version)
+    .bind(client_secret_key_version)
     .fetch_optional(pool)
     .await
 }
@@ -1693,16 +1810,19 @@ pub async fn github_app_registration_pem_sealed(
     pool: &PgPool,
     scope: TenantScope,
     id: Uuid,
-) -> sqlx::Result<Option<Vec<u8>>> {
+) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
     let row = sqlx::query(
-        "select pem_sealed from github_app_registrations
+        "select pem_sealed, pem_key_version from github_app_registrations
          where id = $1 and status = 'active' and tenant_id = $2",
     )
     .bind(id)
     .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await?;
-    Ok(row.and_then(|r| r.get::<Option<Vec<u8>>, _>("pem_sealed")))
+    Ok(row.and_then(|r| {
+        r.get::<Option<Vec<u8>>, _>("pem_sealed")
+            .map(|b| (b, r.get::<i16, _>("pem_key_version")))
+    }))
 }
 
 /// Active-only reader for the app-level webhook secret (verified on every
@@ -1711,16 +1831,19 @@ pub async fn github_app_registration_webhook_secret_sealed(
     pool: &PgPool,
     scope: TenantScope,
     id: Uuid,
-) -> sqlx::Result<Option<Vec<u8>>> {
+) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
     let row = sqlx::query(
-        "select webhook_secret_sealed from github_app_registrations
+        "select webhook_secret_sealed, webhook_secret_key_version from github_app_registrations
          where id = $1 and status = 'active' and tenant_id = $2",
     )
     .bind(id)
     .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await?;
-    Ok(row.and_then(|r| r.get::<Option<Vec<u8>>, _>("webhook_secret_sealed")))
+    Ok(row.and_then(|r| {
+        r.get::<Option<Vec<u8>>, _>("webhook_secret_sealed")
+            .map(|b| (b, r.get::<i16, _>("webhook_secret_key_version")))
+    }))
 }
 
 /// Mint a one-time flow (admin intent). Opportunistically sweeps expired
@@ -1971,6 +2094,7 @@ pub async fn create_trigger_subscription(
     workspace_override: Option<&Value>,
     result_destinations: &Value,
     callback_secret_sealed: Option<&[u8]>,
+    callback_secret_key_version: i16,
     connection_id: Option<Uuid>,
     resource_selector: Option<&Value>,
     event_filter: Option<&Value>,
@@ -1987,8 +2111,9 @@ pub async fn create_trigger_subscription(
            (id, tenant_id, agent_id, name, trigger_kind, pinned_revision_id, task_template,
             allow_task_override, allow_workspace_override, autonomy, concurrency_policy,
             budget_override, workspace_override, result_destinations, callback_secret_sealed,
-            connection_id, resource_selector, event_filter, event_publish, capability_bundles)
-         select $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20
+            connection_id, resource_selector, event_filter, event_publish, capability_bundles,
+            callback_secret_key_version)
+         select $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21
          where exists (select 1 from agents a where a.id = $3 and a.tenant_id = $2)
            and ($6::uuid is null or exists (
                  select 1 from agent_revisions r where r.id = $6 and r.agent_id = $3))
@@ -2016,6 +2141,7 @@ pub async fn create_trigger_subscription(
     .bind(event_filter)
     .bind(event_publish)
     .bind(capability_bundles)
+    .bind(callback_secret_key_version)
     .fetch_one(pool)
     .await
 }
@@ -2088,16 +2214,19 @@ pub async fn subscription_callback_secret_sealed(
     pool: &PgPool,
     scope: TenantScope,
     id: Uuid,
-) -> sqlx::Result<Option<Vec<u8>>> {
+) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
     let row = sqlx::query(
-        "select callback_secret_sealed from trigger_subscriptions
+        "select callback_secret_sealed, callback_secret_key_version from trigger_subscriptions
          where id = $1 and tenant_id = $2",
     )
     .bind(id)
     .bind(scope.tenant_id())
     .fetch_optional(pool)
     .await?;
-    Ok(row.and_then(|r| r.get::<Option<Vec<u8>>, _>("callback_secret_sealed")))
+    Ok(row.and_then(|r| {
+        r.get::<Option<Vec<u8>>, _>("callback_secret_sealed")
+            .map(|b| (b, r.get::<i16, _>("callback_secret_key_version")))
+    }))
 }
 
 // ─── Run resource bindings ────────────────────────────────────────────────
@@ -5222,10 +5351,12 @@ mod tests {
             "test-account-42",
             "test-connection",
             Some(&sealed),
+            1,
             &serde_json::json!(["repo"]),
             &serde_json::json!({}),
             &serde_json::json!({"test": true}),
             None,
+            1,
             ConnectionAuth::static_active(),
             ConnectionOwner::Organization,
             None,
@@ -5245,7 +5376,7 @@ mod tests {
             .await
             .unwrap()
             .expect("active connection has credential");
-        assert_eq!(got, sealed);
+        assert_eq!(got, (sealed, 1), "legacy sealer stamps key_version 1");
 
         // Revocation is terminal for credential access.
         let revoked = revoke_connection(&pool, scope, conn.id)
@@ -5325,6 +5456,7 @@ mod tests {
             None,
             &serde_json::json!([{"kind": "signed_webhook", "url": "http://127.0.0.1:1/cb"}]),
             Some(&sealed),
+            1,
             None,
             None,
             None,
@@ -5344,7 +5476,7 @@ mod tests {
         let got = subscription_callback_secret_sealed(&pool, scope, sub.id)
             .await
             .unwrap();
-        assert_eq!(got, Some(sealed));
+        assert_eq!(got, Some((sealed, 1)));
 
         // Trigger tokens: hashed at rest, resolvable, revocable.
         create_trigger_token(&pool, scope, sub.id, "fbx_trig_testtoken123")
@@ -5441,6 +5573,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             None,
+            1,
             None,
             None,
             None,
@@ -5569,6 +5702,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             None,
+            1,
             None,
             None,
             None,
@@ -5966,6 +6100,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             None,
+            1,
             None,
             None,
             None,
@@ -6127,15 +6262,18 @@ mod tests {
             "mcp.example.test",
             "oauth-lifecycle-test",
             None,
+            1,
             &serde_json::json!([]),
             &serde_json::json!({}),
             &serde_json::json!({"base_url": "https://mcp.example.test"}),
             None,
+            1,
             ConnectionAuth {
                 auth_kind: "oauth",
                 status: "pending",
                 oauth: Some(&serde_json::json!({"resource": "https://mcp.example.test"})),
                 client_secret_sealed: Some(b"sealed-client-secret"),
+                client_secret_key_version: 1,
                 registration_id: None,
             },
             ConnectionOwner::Organization,
@@ -6155,13 +6293,16 @@ mod tests {
             connection_client_secret_sealed(&pool, scope, conn.id)
                 .await
                 .unwrap()
+                .map(|t| t.0)
                 .as_deref(),
             Some(b"sealed-client-secret".as_slice())
         );
         // Rotation refuses non-active rows.
-        assert!(!rotate_connection_refresh(&pool, scope, conn.id, b"rt1", 1)
-            .await
-            .unwrap());
+        assert!(
+            !rotate_connection_refresh(&pool, scope, conn.id, b"rt1", 1, 1)
+                .await
+                .unwrap()
+        );
 
         // Callback exchange: seal refresh + activate. First connect (from
         // `pending`) ⇒ no bump — the bump is derived from the row's pre-update
@@ -6171,6 +6312,7 @@ mod tests {
             scope,
             conn.id,
             b"sealed-rt-1",
+            1,
             &serde_json::json!({"resource": "https://mcp.example.test", "client_id": "c1"}),
             &serde_json::json!(["read"]),
         )
@@ -6186,6 +6328,7 @@ mod tests {
             connection_credential_sealed(&pool, scope, conn.id)
                 .await
                 .unwrap()
+                .map(|t| t.0)
                 .as_deref(),
             Some(b"sealed-rt-1".as_slice())
         );
@@ -6193,7 +6336,7 @@ mod tests {
         // Rotation is one atomic overwrite AT the current generation; the old
         // bytes are gone.
         assert!(
-            rotate_connection_refresh(&pool, scope, conn.id, b"sealed-rt-2", 1)
+            rotate_connection_refresh(&pool, scope, conn.id, b"sealed-rt-2", 1, 1)
                 .await
                 .unwrap()
         );
@@ -6201,13 +6344,14 @@ mod tests {
             connection_credential_sealed(&pool, scope, conn.id)
                 .await
                 .unwrap()
+                .map(|t| t.0)
                 .as_deref(),
             Some(b"sealed-rt-2".as_slice())
         );
         // A rotation naming a stale (moved) generation is refused (R3.2): the
         // grant was reauthorized underneath the in-flight refresh.
         assert!(
-            !rotate_connection_refresh(&pool, scope, conn.id, b"sealed-rt-stale", 999)
+            !rotate_connection_refresh(&pool, scope, conn.id, b"sealed-rt-stale", 1, 999)
                 .await
                 .unwrap(),
             "rotation at a superseded generation must fail closed"
@@ -6240,6 +6384,7 @@ mod tests {
             scope,
             conn.id,
             b"sealed-rt-3",
+            1,
             &serde_json::json!({"resource": "https://mcp.example.test"}),
             &serde_json::json!([]),
         )
@@ -6260,6 +6405,7 @@ mod tests {
             scope,
             conn.id,
             b"sealed-rt-4",
+            1,
             &serde_json::json!({"resource": "https://mcp.example.test"}),
             &serde_json::json!([]),
         )
@@ -6551,10 +6697,12 @@ mod tests {
             "mcp.github.test",
             "GitHub MCP",
             None,
+            1,
             &serde_json::json!([]),
             &serde_json::json!({}),
             &serde_json::json!({ "base_url": gh_url }),
             None,
+            1,
             ConnectionAuth::static_active(),
             ConnectionOwner::Organization,
             None,
@@ -6671,6 +6819,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             None,
+            1,
             None,
             None,
             None,
@@ -6980,6 +7129,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             None,
+            1,
             None,
             None,
             None,
@@ -7177,6 +7327,7 @@ mod tests {
                     None,
                     &serde_json::json!([]),
                     None,
+                    1,
                     None,
                     None,
                     None,
@@ -7313,6 +7464,7 @@ mod tests {
                     None,
                     &serde_json::json!([]),
                     None,
+                    1,
                     None,
                     None,
                     None,
@@ -7911,10 +8063,12 @@ mod tests {
             "acct",
             "disp",
             Some(&[1, 2, 3]),
+            1,
             &serde_json::json!([]),
             &serde_json::json!({}),
             &serde_json::json!({"base_url":"https://x"}),
             None,
+            1,
             ConnectionAuth::static_active(),
             ConnectionOwner::Organization,
             None,
@@ -7989,6 +8143,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             None,
+            1,
             None,
             None,
             None,
@@ -8064,6 +8219,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             None,
+            1,
             None,
             None,
             None,
@@ -8147,6 +8303,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             None,
+            1,
             None,
             None,
             None,
@@ -8290,10 +8447,12 @@ mod tests {
             "acct-org",
             "Org conn",
             None,
+            1,
             &serde_json::json!([]),
             &serde_json::json!({}),
             &serde_json::json!({}),
             None,
+            1,
             ConnectionAuth::static_active(),
             ConnectionOwner::Organization,
             None,
@@ -8307,10 +8466,12 @@ mod tests {
             "acct-alice",
             "Alice personal",
             None,
+            1,
             &serde_json::json!([]),
             &serde_json::json!({}),
             &serde_json::json!({}),
             None,
+            1,
             ConnectionAuth::static_active(),
             ConnectionOwner::User(alice),
             Some(alice),
@@ -8398,10 +8559,12 @@ mod tests {
             "acct-snap",
             "Snap conn",
             None,
+            1,
             &serde_json::json!([]),
             &serde_json::json!({}),
             &serde_json::json!({}),
             None,
+            1,
             ConnectionAuth::static_active(),
             ConnectionOwner::Organization,
             None,
@@ -8510,10 +8673,12 @@ mod tests {
             "acct-gen",
             "Gen conn",
             None,
+            1,
             &serde_json::json!([]),
             &serde_json::json!({}),
             &serde_json::json!({}),
             None,
+            1,
             ConnectionAuth::static_active(),
             ConnectionOwner::Organization,
             None,
@@ -8654,10 +8819,12 @@ mod tests {
             "acct-rb",
             "RB conn",
             None,
+            1,
             &serde_json::json!([]),
             &serde_json::json!({}),
             &serde_json::json!({}),
             None,
+            1,
             ConnectionAuth::static_active(),
             ConnectionOwner::Organization,
             None,
@@ -8905,6 +9072,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             None,
+            1,
             None,
             None,
             None,
@@ -9094,5 +9262,205 @@ mod tests {
             "B's list excludes A's custom entry"
         );
         assert!(collision.is_none(), "a global-slug collision is refused");
+    }
+
+    // ─── Phase D envelope sealing (#32) ─────────────────────────────────────
+
+    async fn new_dek_org(pool: &PgPool) -> TenantScope {
+        let slug = format!("t-{}", Uuid::now_v7().simple());
+        let org = crate::identity::create_org(pool, &slug, None)
+            .await
+            .unwrap();
+        TenantScope::assume(org.id)
+    }
+
+    // Children-first cleanup (tenant FKs are NO ACTION): tenant_deks +
+    // integration_connections before the tenant row.
+    async fn cleanup_dek_tenant(pool: &PgPool, tenant: Uuid) {
+        for stmt in [
+            "delete from tenant_deks where tenant_id = $1",
+            "delete from integration_connections where tenant_id = $1",
+            "delete from tenants where id = $1",
+        ] {
+            sqlx::query(stmt).bind(tenant).execute(pool).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn tenant_dek_get_insert_latest() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let scope = new_dek_org(&pool).await;
+        let tenant = scope.tenant_id();
+
+        assert!(get_tenant_dek(&pool, tenant, 1).await.unwrap().is_none());
+        assert!(latest_tenant_dek(&pool, tenant).await.unwrap().is_none());
+
+        insert_tenant_dek(&pool, tenant, 1, "static:abc", b"wrapped-dek-1")
+            .await
+            .unwrap();
+        let row = get_tenant_dek(&pool, tenant, 1)
+            .await
+            .unwrap()
+            .expect("row");
+        assert_eq!(row.version, 1);
+        assert_eq!(row.kek_id, "static:abc");
+        assert_eq!(row.wrapped_dek, b"wrapped-dek-1");
+        assert!(row.retired_at.is_none());
+        assert_eq!(
+            latest_tenant_dek(&pool, tenant)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            1
+        );
+        // A version that was never minted is None (open must fail closed on it).
+        assert!(get_tenant_dek(&pool, tenant, 2).await.unwrap().is_none());
+
+        cleanup_dek_tenant(&pool, tenant).await;
+    }
+
+    #[tokio::test]
+    async fn tenant_dek_insert_race_one_row_wins() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let scope = new_dek_org(&pool).await;
+        let tenant = scope.tenant_id();
+
+        // Concurrent first-mints for (tenant, 1) with DIFFERENT wrapped bytes:
+        // `on conflict do nothing` means exactly ONE row lands, and every racer
+        // that re-reads sees the SAME winner (kms::dek_for_seal relies on this to
+        // converge concurrent first-seals on one DEK).
+        let mut handles = vec![];
+        for i in 0..6u8 {
+            let p = pool.clone();
+            handles.push(tokio::spawn(async move {
+                insert_tenant_dek(&p, tenant, 1, "static:race", &[i; 16])
+                    .await
+                    .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let (n,): (i64,) =
+            sqlx::query_as("select count(*) from tenant_deks where tenant_id = $1 and version = 1")
+                .bind(tenant)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(n, 1, "exactly one DEK row survives the race");
+        let winner = get_tenant_dek(&pool, tenant, 1)
+            .await
+            .unwrap()
+            .unwrap()
+            .wrapped_dek;
+        assert_eq!(
+            get_tenant_dek(&pool, tenant, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .wrapped_dek,
+            winner,
+            "re-reads are stable — all racers unwrap the same DEK"
+        );
+
+        cleanup_dek_tenant(&pool, tenant).await;
+    }
+
+    #[tokio::test]
+    async fn sealed_column_key_version_roundtrips_and_counts() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let scope = new_dek_org(&pool).await;
+        let tenant = scope.tenant_id();
+
+        // A v2-marked credential + webhook secret round-trip their key_version.
+        let v2 = create_connection(
+            &pool,
+            scope,
+            "github",
+            "kv-acct-v2",
+            "kv-conn-v2",
+            Some(b"env-cred"),
+            2,
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            Some(b"env-webhook"),
+            2,
+            ConnectionAuth::static_active(),
+            ConnectionOwner::Organization,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            connection_credential_sealed(&pool, scope, v2.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            (b"env-cred".to_vec(), 2)
+        );
+        assert_eq!(
+            connection_webhook_secret_sealed(&pool, scope, v2.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            (b"env-webhook".to_vec(), 2)
+        );
+
+        // A legacy (v1) credential defaults its companion to 1.
+        let v1 = create_connection(
+            &pool,
+            scope,
+            "github",
+            "kv-acct-v1",
+            "kv-conn-v1",
+            Some(b"legacy-cred"),
+            1,
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            None,
+            1,
+            ConnectionAuth::static_active(),
+            ConnectionOwner::Organization,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            connection_credential_sealed(&pool, scope, v1.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            (b"legacy-cred".to_vec(), 1)
+        );
+
+        // The retirement-gate counter sees both key-versions (global scan; other
+        // tenants may add to the totals, so assert presence, not exact counts).
+        let counts = crate::system_worker::sealed_key_version_counts(&pool)
+            .await
+            .unwrap();
+        assert_eq!(counts.len(), 9, "one row per sealed column");
+        let cred = counts
+            .iter()
+            .find(|c| c.family == "integration_connections.credential_sealed")
+            .unwrap();
+        assert!(cred.legacy >= 1 && cred.envelope >= 1);
+
+        cleanup_dek_tenant(&pool, tenant).await;
     }
 }

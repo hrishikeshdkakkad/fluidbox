@@ -29,7 +29,14 @@
 //!     ONLY AFTER the signature/sealed-state verifies — the resolved row's
 //!     tenant is not trusted as scope until then.
 //!
-//! (c) **Nothing else.** A request handler that carries a principal MUST use the
+//! (c) **Re-seal migration parity (Phase D, #32).** The envelope-sealing
+//!     retirement gates and the (Task 2) re-seal job walk EVERY tenant's sealed
+//!     rows — a global scan by construction. [`sealed_key_version_counts`]
+//!     aggregates per-family legacy/envelope counts across all tenants (no
+//!     tenant predicate) to prove 100% re-seal before the legacy key retires; it
+//!     returns no credential material, only counts.
+//!
+//! (d) **Nothing else.** A request handler that carries a principal MUST use the
 //!     scoped repositories (`get_session`, `get_connection`, … with a
 //!     `TenantScope`), never these bare-id loaders.
 //!
@@ -94,14 +101,15 @@ pub async fn get_connection(
 pub async fn connection_webhook_secret_sealed(
     pool: &PgPool,
     connection_id: Uuid,
-) -> sqlx::Result<Option<Vec<u8>>> {
-    let row: Option<Option<Vec<u8>>> = sqlx::query_scalar(
-        "select webhook_secret_sealed from integration_connections where id = $1",
+) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
+    let row: Option<(Option<Vec<u8>>, i16)> = sqlx::query_as(
+        "select webhook_secret_sealed, webhook_secret_key_version
+         from integration_connections where id = $1",
     )
     .bind(connection_id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.flatten())
+    Ok(row.and_then(|(s, v)| s.map(|s| (s, v))))
 }
 
 /// Load a trigger subscription by id with NO tenant predicate — the
@@ -154,14 +162,15 @@ pub async fn get_github_app_registration(
 pub async fn github_app_registration_webhook_secret_sealed(
     pool: &PgPool,
     registration_id: Uuid,
-) -> sqlx::Result<Option<Vec<u8>>> {
-    let row: Option<Option<Vec<u8>>> = sqlx::query_scalar(
-        "select webhook_secret_sealed from github_app_registrations where id = $1",
+) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
+    let row: Option<(Option<Vec<u8>>, i16)> = sqlx::query_as(
+        "select webhook_secret_sealed, webhook_secret_key_version
+         from github_app_registrations where id = $1",
     )
     .bind(registration_id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.flatten())
+    Ok(row.and_then(|(s, v)| s.map(|s| (s, v))))
 }
 
 pub async fn sessions_in_status(pool: &PgPool, statuses: &[&str]) -> sqlx::Result<Vec<SessionRow>> {
@@ -260,6 +269,74 @@ pub async fn due_result_deliveries(
          order by next_attempt_at limit $1",
     )
     .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+// ─── Re-seal migration parity (Phase D, #32; category (d) above) ────────────
+
+/// Per-family sealed-row counts for the envelope re-seal (category (d)). One row
+/// per sealed `table.column`; `legacy` = rows still v1, `envelope` = rows already
+/// v2. Retirement is complete for a family when `legacy = 0`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FamilyKeyVersionCounts {
+    pub family: String,
+    pub legacy: i64,
+    pub envelope: i64,
+}
+
+/// Count legacy (v1) vs envelope (v2) rows for every sealed column across ALL
+/// tenants — the D4 retirement gates' input (a cross-tenant scan, no principal).
+/// One `UNION ALL` over the nine sealed columns; each family filters on its own
+/// `<col> is not null` so NULL secrets never count. Returns counts only, never a
+/// sealed byte.
+pub async fn sealed_key_version_counts(pool: &PgPool) -> sqlx::Result<Vec<FamilyKeyVersionCounts>> {
+    sqlx::query_as(
+        "select 'integration_connections.credential_sealed' as family,
+                count(*) filter (where credential_sealed is not null and credential_key_version = 1) as legacy,
+                count(*) filter (where credential_sealed is not null and credential_key_version = 2) as envelope
+           from integration_connections
+         union all
+         select 'integration_connections.webhook_secret_sealed',
+                count(*) filter (where webhook_secret_sealed is not null and webhook_secret_key_version = 1),
+                count(*) filter (where webhook_secret_sealed is not null and webhook_secret_key_version = 2)
+           from integration_connections
+         union all
+         select 'integration_connections.client_secret_sealed',
+                count(*) filter (where client_secret_sealed is not null and client_secret_key_version = 1),
+                count(*) filter (where client_secret_sealed is not null and client_secret_key_version = 2)
+           from integration_connections
+         union all
+         select 'trigger_subscriptions.callback_secret_sealed',
+                count(*) filter (where callback_secret_sealed is not null and callback_secret_key_version = 1),
+                count(*) filter (where callback_secret_sealed is not null and callback_secret_key_version = 2)
+           from trigger_subscriptions
+         union all
+         select 'github_app_registrations.pem_sealed',
+                count(*) filter (where pem_sealed is not null and pem_key_version = 1),
+                count(*) filter (where pem_sealed is not null and pem_key_version = 2)
+           from github_app_registrations
+         union all
+         select 'github_app_registrations.webhook_secret_sealed',
+                count(*) filter (where webhook_secret_sealed is not null and webhook_secret_key_version = 1),
+                count(*) filter (where webhook_secret_sealed is not null and webhook_secret_key_version = 2)
+           from github_app_registrations
+         union all
+         select 'github_app_registrations.client_secret_sealed',
+                count(*) filter (where client_secret_sealed is not null and client_secret_key_version = 1),
+                count(*) filter (where client_secret_sealed is not null and client_secret_key_version = 2)
+           from github_app_registrations
+         union all
+         select 'org_idp_configs.client_secret_sealed',
+                count(*) filter (where client_secret_sealed is not null and client_secret_key_version = 1),
+                count(*) filter (where client_secret_sealed is not null and client_secret_key_version = 2)
+           from org_idp_configs
+         union all
+         select 'login_flows.pkce_verifier_sealed',
+                count(*) filter (where pkce_verifier_sealed is not null and pkce_verifier_key_version = 1),
+                count(*) filter (where pkce_verifier_sealed is not null and pkce_verifier_key_version = 2)
+           from login_flows",
+    )
     .fetch_all(pool)
     .await
 }

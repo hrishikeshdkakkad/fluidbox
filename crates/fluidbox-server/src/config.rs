@@ -12,6 +12,28 @@ fn absolute(p: &str) -> PathBuf {
     })
 }
 
+/// Key-wrapping backend for envelope sealing (Phase D, #32). `Off` keeps the
+/// legacy single-key `FLUIDBOX_CREDENTIAL_KEY` behavior (seals stay v1,
+/// byte-identical); `Static`/`Aws` turn on per-tenant DEKs wrapped by a KEK
+/// (`FLUIDBOX_KMS_STATIC_KEK` / AWS KMS), so new seals are v2 envelopes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KmsMode {
+    Off,
+    Static,
+    Aws,
+}
+
+impl KmsMode {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "off" | "" => Some(KmsMode::Off),
+            "static" => Some(KmsMode::Static),
+            "aws" => Some(KmsMode::Aws),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind: String,
@@ -41,8 +63,21 @@ pub struct Config {
     /// the facade authenticates upstream.
     pub llm_upstream_is_anthropic: bool,
     /// 32-byte key (hex/base64) sealing connection credentials at rest.
-    /// Optional: without it, integration connections are disabled.
+    /// Optional: without it (and with KMS off), integration connections are
+    /// disabled. Once KMS is on and every row is re-sealed, this may be retired
+    /// (the D4 boot gate proves zero legacy rows before allowing its absence).
     pub credential_key: Option<String>,
+    /// Envelope-sealing key-wrapping backend (Phase D). Default `Off`.
+    pub kms_mode: KmsMode,
+    /// The 32-byte static KEK (hex/base64) that wraps per-tenant DEKs. Required
+    /// iff `kms_mode = Static` (validated in `build_sealer`).
+    pub kms_static_kek: Option<String>,
+    /// The AWS KMS key id/ARN used to wrap per-tenant DEKs. Required iff
+    /// `kms_mode = Aws`.
+    pub kms_aws_key_id: Option<String>,
+    /// Optional AWS KMS endpoint override (test seam — mirrors
+    /// `FLUIDBOX_GITHUB_API_URL`: default = real KMS, override = a local fake).
+    pub kms_aws_endpoint: Option<String>,
     /// GitHub REST base — overridable for tests/GHE.
     pub github_api_url: String,
     /// Browser-facing GitHub base (manifest form target, install URLs) —
@@ -159,6 +194,23 @@ impl Config {
             llm_upstream_key: upstream_key,
             llm_upstream_is_anthropic: is_anthropic,
             credential_key: get("FLUIDBOX_CREDENTIAL_KEY")
+                .ok()
+                .filter(|k| !k.is_empty()),
+            kms_mode: {
+                let raw = get("FLUIDBOX_KMS_MODE").unwrap_or_default();
+                KmsMode::parse(&raw).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "FLUIDBOX_KMS_MODE='{raw}' is invalid (known: off, static, aws)"
+                    )
+                })?
+            },
+            kms_static_kek: get("FLUIDBOX_KMS_STATIC_KEK")
+                .ok()
+                .filter(|k| !k.is_empty()),
+            kms_aws_key_id: get("FLUIDBOX_KMS_AWS_KEY_ID")
+                .ok()
+                .filter(|k| !k.is_empty()),
+            kms_aws_endpoint: get("FLUIDBOX_KMS_AWS_ENDPOINT")
                 .ok()
                 .filter(|k| !k.is_empty()),
             github_api_url: get("FLUIDBOX_GITHUB_API_URL")

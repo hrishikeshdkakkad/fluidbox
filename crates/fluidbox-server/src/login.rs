@@ -27,7 +27,7 @@
 use crate::auth::{AuthContext, Principal};
 use crate::error::{ApiError, ApiResult};
 use crate::oauth::{b64url, pkce_challenge, random_urlsafe};
-use crate::seal::Sealer;
+use crate::seal::{SealCtx, SealFamily, Sealer};
 use crate::state::AppState;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, State};
@@ -506,12 +506,12 @@ struct LoginState {
 /// the SAME primitives as the connector `seal_state`, but with a `purpose`/`v`
 /// discriminator so login states and connector states are mutually
 /// unredeemable (both confusion directions are unit-tested).
-fn seal_login_state(
+async fn seal_login_state(
     sealer: &Sealer,
     flow_id: Uuid,
     tenant_id: Uuid,
     idp_config_id: Uuid,
-) -> String {
+) -> Result<String, String> {
     let payload = json!({
         "purpose": "login",
         "v": 1,
@@ -520,15 +520,22 @@ fn seal_login_state(
         "idp_config_id": idp_config_id,
         "exp": Utc::now().timestamp() + LOGIN_STATE_TTL_SECS,
     });
-    b64url(&sealer.seal(&payload.to_string()))
+    // Transit-token sealing (self-describing) — survives a KMS mode flip within
+    // the state's short TTL; see `Sealer::seal_token`.
+    let sealed = sealer
+        .seal_token(&payload.to_string())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(b64url(&sealed))
 }
 
-fn open_login_state(sealer: &Sealer, param: &str) -> Result<LoginState, String> {
+async fn open_login_state(sealer: &Sealer, param: &str) -> Result<LoginState, String> {
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(param)
         .map_err(|_| "malformed state parameter")?;
     let plain = sealer
-        .open(&raw)
+        .open_token(&raw)
+        .await
         .map_err(|_| "state parameter failed verification")?;
     let v: Value = serde_json::from_str(&plain).map_err(|_| "state parameter is corrupt")?;
     if v.get("purpose").and_then(Value::as_str) != Some("login") {
@@ -1490,11 +1497,22 @@ pub async fn start(
     let cookie_nonce = random_urlsafe();
     let nonce = random_urlsafe();
     let browser_hash = sha256_hex(&cookie_nonce);
+    let sealed_verifier = match sealer
+        .seal(
+            &verifier,
+            SealCtx::new(scope.tenant_id(), SealFamily::LoginPkceVerifier),
+        )
+        .await
+    {
+        Ok(s) => s,
+        Err(_) => return neutral_unavailable(),
+    };
     let flow_id = match identity::create_login_flow(
         &state.pool,
         scope,
         config.id,
-        &sealer.seal(&verifier),
+        &sealed_verifier.bytes,
+        sealed_verifier.key_version,
         &nonce,
         &browser_hash,
         &redirect_to,
@@ -1519,7 +1537,10 @@ pub async fn start(
     if scopes.is_empty() {
         scopes = vec!["openid", "email", "profile"];
     }
-    let state_param = seal_login_state(sealer, flow_id, org.id, config.id);
+    let state_param = match seal_login_state(sealer, flow_id, org.id, config.id).await {
+        Ok(s) => s,
+        Err(_) => return neutral_unavailable(),
+    };
     let redirect_uri = format!("{}/v1/auth/callback", state.cfg.public_url);
     let Ok(mut url) = reqwest::Url::parse(&view.authorization_endpoint) else {
         return neutral_unavailable();
@@ -1611,7 +1632,7 @@ pub async fn callback(
     let Some(state_param) = p.state.as_deref() else {
         return refuse_page("Missing state.");
     };
-    let ls = match open_login_state(sealer, state_param) {
+    let ls = match open_login_state(sealer, state_param).await {
         Ok(v) => v,
         Err(e) => return refuse_page(&e),
     };
@@ -1682,7 +1703,14 @@ pub async fn callback(
     };
 
     // (4) token exchange — unseal PKCE verifier; auth per validated method.
-    let verifier = match sealer.open(&claim.pkce_verifier_sealed) {
+    let verifier = match sealer
+        .open(
+            &claim.pkce_verifier_sealed,
+            claim.pkce_verifier_key_version,
+            SealCtx::new(scope.tenant_id(), SealFamily::LoginPkceVerifier),
+        )
+        .await
+    {
         Ok(v) => v,
         Err(_) => return refuse_page_clearing("Sign-in failed.", &login_cookie),
     };
@@ -1852,11 +1880,16 @@ async fn token_exchange(
         None
     } else {
         match identity::idp_client_secret_sealed(&state.pool, scope, config.id).await {
-            Ok(Some(sealed)) => {
+            Ok(Some((sealed, kv))) => {
                 let sealer = state.sealer.as_ref().ok_or("credential key missing")?;
                 Some(
                     sealer
-                        .open(&sealed)
+                        .open(
+                            &sealed,
+                            kv,
+                            SealCtx::new(scope.tenant_id(), SealFamily::IdpClientSecret),
+                        )
+                        .await
                         .map_err(|_| "client secret unseal failed")?,
                 )
             }
@@ -2339,32 +2372,34 @@ mod tests {
     }
 
     // ─── login-state confusion (both directions) ──────────────────────────
-    #[test]
-    fn login_state_roundtrip_and_purpose_confusion() {
+    #[tokio::test]
+    async fn login_state_roundtrip_and_purpose_confusion() {
         let s = sealer();
         let flow = Uuid::now_v7();
         let tenant = Uuid::now_v7();
         let cfg = Uuid::now_v7();
-        let tok = seal_login_state(&s, flow, tenant, cfg);
-        let ls = open_login_state(&s, &tok).unwrap();
+        let tok = seal_login_state(&s, flow, tenant, cfg).await.unwrap();
+        let ls = open_login_state(&s, &tok).await.unwrap();
         assert_eq!(ls.flow_id, flow);
         assert_eq!(ls.tenant_id, tenant);
         assert_eq!(ls.idp_config_id, cfg);
 
         // A connector state ({c,v,x}) must NOT open as a login state.
-        let connector = crate::oauth::seal_state(&s, Uuid::now_v7(), "verifier");
-        assert!(open_login_state(&s, &connector).is_err());
+        let connector = crate::oauth::seal_state(&s, Uuid::now_v7(), "verifier")
+            .await
+            .unwrap();
+        assert!(open_login_state(&s, &connector).await.is_err());
         // And a login state must NOT open as a connector state (no {c}).
-        assert!(crate::oauth::open_state(&s, &tok).is_err());
+        assert!(crate::oauth::open_state(&s, &tok).await.is_err());
 
         // Tampering + wrong key fail closed.
-        assert!(open_login_state(&s, "not-base64!!").is_err());
+        assert!(open_login_state(&s, "not-base64!!").await.is_err());
         let other = Sealer::from_key_string(&"cd".repeat(32)).unwrap();
-        assert!(open_login_state(&other, &tok).is_err());
+        assert!(open_login_state(&other, &tok).await.is_err());
     }
 
-    #[test]
-    fn login_state_rejects_expiry_and_bad_version() {
+    #[tokio::test]
+    async fn login_state_rejects_expiry_and_bad_version() {
         let s = sealer();
         let stale = {
             let payload = json!({
@@ -2372,18 +2407,18 @@ mod tests {
                 "tenant_id": Uuid::now_v7(), "idp_config_id": Uuid::now_v7(),
                 "exp": Utc::now().timestamp() - 1,
             });
-            b64url(&s.seal(&payload.to_string()))
+            b64url(&s.seal_token(&payload.to_string()).await.unwrap())
         };
-        assert!(open_login_state(&s, &stale).is_err());
+        assert!(open_login_state(&s, &stale).await.is_err());
         let wrong_v = {
             let payload = json!({
                 "purpose": "login", "v": 2, "flow_id": Uuid::now_v7(),
                 "tenant_id": Uuid::now_v7(), "idp_config_id": Uuid::now_v7(),
                 "exp": Utc::now().timestamp() + 600,
             });
-            b64url(&s.seal(&payload.to_string()))
+            b64url(&s.seal_token(&payload.to_string()).await.unwrap())
         };
-        assert!(open_login_state(&s, &wrong_v).is_err());
+        assert!(open_login_state(&s, &wrong_v).await.is_err());
     }
 
     // ─── slug shape ───────────────────────────────────────────────────────
