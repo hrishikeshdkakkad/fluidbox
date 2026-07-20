@@ -54,6 +54,19 @@ server:
   # zeroEgress injects the internal Service ClusterIP here at render time; set
   # explicitly to override.
   publicControlUrl: ""
+  # RLS pool split (FLUIDBOX_RUNTIME_ROLE, migration 0018). "" = single-role mode:
+  # RLS still binds the table OWNER via FORCE, so a single-role deployment is
+  # enforced — UNLESS the DATABASE_URL role is a SUPERUSER or carries BYPASSRLS
+  # (Neon's default neon_superuser does), for which Postgres skips policies
+  # entirely. Role attributes are NOT inherited through membership, so check the
+  # role you actually connect as:
+  #   select rolsuper, rolbypassrls from pg_roles where rolname = current_user;
+  # If either is true, set this to "fluidbox_runtime" (the NOLOGIN least-privilege
+  # role 0018 creates and GRANTs to the migration owner) — every pooled connection
+  # then SET ROLEs to it. Boot FAILS if the named role does not exist; on a managed
+  # host that restricts CREATE ROLE, 0018 only WARNS, so create it out-of-band
+  # first (see docs/hosted/kms-operations.md §9).
+  runtimeRole: ""
   resources:
     requests: { cpu: "250m", memory: "512Mi" }
     limits: { cpu: "1", memory: "1Gi" }

@@ -2531,12 +2531,19 @@ pub async fn claim_pending_switch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connect;
+    // `test_connect` (NOT `connect`): the fixtures below write and read across
+    // tenants with no TenantScope, which migration 0018's FORCEd RLS refuses on a
+    // plain pool. See its doc comment on the crate root.
+    use crate::test_connect;
 
     /// Delete everything a test created under a throwaway tenant, children
     /// first (tenant FKs are NO ACTION — no cascade). `auth_audit_log` is
-    /// append-only (its trigger blocks DELETE), so tests never COMMIT audit
-    /// rows tied to a tenant — they exercise audit inside a rolled-back tx.
+    /// append-only (DELETE is denied — by the 0018 RLS policy set on an
+    /// RLS-bound role, by the 0012 trigger on one that bypasses RLS), so tests
+    /// never COMMIT audit rows tied to a tenant — they exercise audit inside a
+    /// rolled-back tx. Runs on the fixture pool: the deletes below are
+    /// cross-tenant by construction and would silently match zero rows without
+    /// the audited bypass GUC.
     async fn cleanup_tenant(pool: &PgPool, tenant: Uuid) {
         for stmt in [
             "delete from api_tokens where tenant_id = $1",
@@ -2660,8 +2667,11 @@ mod tests {
     /// isolation on the FOUR identity tables `scoped_tx` now guards
     /// (`users`/`org_memberships`/`user_sessions`/`api_tokens`): a tenant-A GUC sees
     /// ONLY tenant A's rows even with NO predicate, the audited bypass sees both,
-    /// and a no-GUC transaction sees nothing. Seeding runs on the base pool
-    /// (superuser bypasses RLS) so it is agnostic to the enforcement asserted below.
+    /// and a no-GUC transaction sees nothing. Seeding runs on the FIXTURE pool
+    /// (`test_connect`, session-level system-worker bypass) so it is agnostic to the
+    /// base role's privilege and to the enforcement asserted below — which is
+    /// asserted through a SEPARATE `SET ROLE fluidbox_runtime` connection that never
+    /// carries that GUC.
     #[tokio::test]
     async fn rls_identity_family_cross_tenant_isolation() {
         use sqlx::{Connection, Executor};
@@ -2669,7 +2679,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
 
         // Two throwaway orgs; each gets an active IdP config, a user + membership, a
         // browser session, and a PAT — one row per identity table per tenant.
@@ -2762,7 +2772,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
 
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = create_org(&pool, &slug, Some("Test Org")).await.unwrap();
@@ -2851,7 +2861,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
 
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = create_org(&pool, &slug, None).await.unwrap();
@@ -2993,16 +3003,45 @@ mod tests {
         cleanup_tenant(&pool, org.id).await;
     }
 
+    /// Append-only-ness, asserted at the depth that ACTUALLY applies to the
+    /// connecting role. Migration 0018 changed which layer fires first, so the old
+    /// "UPDATE/DELETE always raise" assertion is no longer the whole truth:
+    ///
+    /// * **RLS-BOUND role** (what FORCE RLS produces for the plain owner and for
+    ///   `fluidbox_runtime`): 0018 gives `auth_audit_log` an INSERT policy and a
+    ///   SELECT policy and NOTHING else, so UPDATE/DELETE match no policy and are
+    ///   FILTERED to zero rows. The statement returns `Ok`, the row is untouched,
+    ///   and the 0012 trigger is never reached.
+    /// * **RLS-BYPASSING role** (superuser or BYPASSRLS — CI's `postgres`, Neon's
+    ///   `neon_superuser`): policies are skipped entirely and the 0012 trigger is
+    ///   what refuses, raising `auth_audit_log is append-only`. Post-0018 that
+    ///   trigger is the BACKSTOP for exactly these roles, not the primary
+    ///   owner-path guard it was written as.
+    /// * **`fluidbox_runtime`**: refused one layer earlier still — 0018 REVOKEs
+    ///   UPDATE/DELETE from it (0012's deferred grant), so it is a privilege error.
+    ///
+    /// All three are deny. The invariant both base-role branches pin is the same:
+    /// the row survives the mutation attempt unchanged.
     #[tokio::test]
     async fn audit_log_is_append_only() {
+        use sqlx::{Connection, Executor};
         let Ok(url) = std::env::var("DATABASE_URL") else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
+
+        // Which depth applies here? Role attributes are NOT inherited through
+        // membership, so this must be read off the connecting role itself.
+        let (bypasses_rls,): (bool,) = sqlx::query_as(
+            "select rolsuper or rolbypassrls from pg_roles where rolname = current_user",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
         // Everything inside one tx we roll back — an audit row can never be
-        // deleted (the trigger blocks it), so we never commit one in a test.
+        // deleted (whichever layer refuses), so we never commit one in a test.
         let mut tx = pool.begin().await.unwrap();
         let detail = serde_json::json!({"before": "a", "after": "b"});
         let id = insert_audit(
@@ -3022,19 +3061,39 @@ mod tests {
         .await
         .unwrap();
 
-        // UPDATE is refused by the append-only trigger.
         let upd = sqlx::query("update auth_audit_log set success = false where id = $1")
             .bind(id)
             .execute(&mut *tx)
             .await;
-        assert!(
-            upd.is_err(),
-            "UPDATE must raise auth_audit_log is append-only"
-        );
-        // The failed statement poisons the tx; roll it back so nothing persists.
-        tx.rollback().await.ok();
+        if bypasses_rls {
+            assert!(
+                upd.is_err(),
+                "on an RLS-bypassing role the 0012 trigger must raise \
+                 'auth_audit_log is append-only'"
+            );
+            // The failed statement poisons the tx; roll it back so nothing persists.
+            tx.rollback().await.ok();
+        } else {
+            assert_eq!(
+                upd.expect("RLS filters the UPDATE — it must not error")
+                    .rows_affected(),
+                0,
+                "under FORCE RLS with no UPDATE policy the mutation must affect zero rows"
+            );
+            let (still_true,): (bool,) =
+                sqlx::query_as("select success from auth_audit_log where id = $1")
+                    .bind(id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
+            assert!(
+                still_true,
+                "the audit row must survive the UPDATE unchanged"
+            );
+            tx.rollback().await.ok();
+        }
 
-        // DELETE is likewise refused (fresh tx, also rolled back).
+        // DELETE is likewise denied (fresh tx, also rolled back).
         let mut tx = pool.begin().await.unwrap();
         let id2 = insert_audit(
             &mut tx,
@@ -3056,11 +3115,60 @@ mod tests {
             .bind(id2)
             .execute(&mut *tx)
             .await;
-        assert!(
-            del.is_err(),
-            "DELETE must raise auth_audit_log is append-only"
-        );
-        tx.rollback().await.ok();
+        if bypasses_rls {
+            assert!(
+                del.is_err(),
+                "on an RLS-bypassing role the 0012 trigger must raise \
+                 'auth_audit_log is append-only'"
+            );
+            tx.rollback().await.ok();
+        } else {
+            assert_eq!(
+                del.expect("RLS filters the DELETE — it must not error")
+                    .rows_affected(),
+                0,
+                "under FORCE RLS with no DELETE policy the mutation must affect zero rows"
+            );
+            let (survives,): (i64,) =
+                sqlx::query_as("select count(*) from auth_audit_log where id = $1")
+                    .bind(id2)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
+            assert_eq!(survives, 1, "the audit row must survive the DELETE");
+            tx.rollback().await.ok();
+        }
+
+        // The third depth, and the one that is deterministic on EVERY host that ran
+        // 0018: the least-privilege runtime role has UPDATE/DELETE revoked, so it is
+        // refused by the grant before either RLS or the trigger is consulted.
+        let has_role: bool =
+            sqlx::query_scalar("select exists(select 1 from pg_roles where rolname = $1)")
+                .bind("fluidbox_runtime")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        if has_role {
+            let mut rt = sqlx::PgConnection::connect(&url).await.expect("rt connect");
+            rt.execute("set role fluidbox_runtime")
+                .await
+                .expect("set role");
+            let mut rtx = rt.begin().await.unwrap();
+            let denied = sqlx::query("update auth_audit_log set success = false where id = $1")
+                .bind(Uuid::now_v7())
+                .execute(&mut *rtx)
+                .await;
+            let msg = denied
+                .map(|_| String::new())
+                .unwrap_or_else(|e| e.to_string());
+            assert!(
+                msg.to_lowercase().contains("permission denied"),
+                "fluidbox_runtime must be denied UPDATE on auth_audit_log by the 0018 \
+                 grant (got: {msg})"
+            );
+            rtx.rollback().await.ok();
+            rt.close().await.ok();
+        }
     }
 
     #[tokio::test]
@@ -3069,7 +3177,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -3133,7 +3241,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
 
         // The NEW login's org (config must be ACTIVE — the claim rechecks it).
         let slug_new = format!("t-{}", Uuid::now_v7().simple());
@@ -3341,7 +3449,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -3382,7 +3490,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -3648,7 +3756,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         migrate_case(&pool, false).await;
         migrate_case(&pool, true).await;
     }
@@ -3659,7 +3767,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -3716,7 +3824,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -3794,7 +3902,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
 
         let slug_a = format!("t-{}", Uuid::now_v7().simple());
         let slug_b = format!("t-{}", Uuid::now_v7().simple());
@@ -3904,8 +4012,8 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
-        let pool2 = connect(&url, None).await.expect("connect 2");
+        let pool = test_connect(&url).await.expect("connect");
+        let pool2 = test_connect(&url).await.expect("connect 2");
 
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = create_org(&pool, &slug, None).await.unwrap();
@@ -4065,8 +4173,8 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
-        let pool2 = connect(&url, None).await.expect("connect 2");
+        let pool = test_connect(&url).await.expect("connect");
+        let pool2 = test_connect(&url).await.expect("connect 2");
 
         // ---- FORWARD: swap holds the lock → claim blocks → fails closed. ----
         let s = seed_switch_scenario(&pool).await;
@@ -4202,9 +4310,9 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
-        let pool_a = connect(&url, None).await.expect("connect a");
-        let pool_b = connect(&url, None).await.expect("connect b");
+        let pool = test_connect(&url).await.expect("connect");
+        let pool_a = test_connect(&url).await.expect("connect a");
+        let pool_b = test_connect(&url).await.expect("connect b");
 
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = create_org(&pool, &slug, None).await.unwrap();

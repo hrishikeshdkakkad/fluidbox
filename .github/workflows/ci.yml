@@ -21,6 +21,21 @@ jobs:
     # DATABASE_URL they self-skip and the persistence layer goes untested.
     # Vanilla PG is fine here: Neon is only special in production, and
     # LISTEN/NOTIFY + the migration path are stock Postgres.
+    #
+    # RLS CAVEAT (Phase D, #32) — this job connects as the SUPERUSER `postgres`,
+    # for whom Postgres skips row-level security entirely. So nothing here proves
+    # migration 0018 enforces anything, and it never will: the fixtures write
+    # across tenants, which under FORCE RLS requires the audited bypass anyway
+    # (`fluidbox-db::test_connect` supplies it, so the suite also passes on an
+    # RLS-BOUND owner). What DOES prove enforcement:
+    #   • the four `rls_*` tests below, which open their OWN
+    #     `SET ROLE fluidbox_runtime` connection/pool — the policy actually runs
+    #     there regardless of the base user's privilege;
+    #   • the identity / bindings / secrets jobs below, whose control planes boot
+    #     with FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime, so their entire HTTP
+    #     surface — every repository fn a request touches — executes RLS-bound.
+    # Do NOT "simplify" by dropping that env var: without it a repository fn that
+    # forgot `scoped_tx` returns rows in CI and nothing in production.
     services:
       postgres:
         image: postgres:16

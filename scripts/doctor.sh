@@ -71,6 +71,23 @@ else
       if command -v psql >/dev/null 2>&1; then
         if psql "$db_url" -Atc 'select 1' >/dev/null 2>&1; then
           ok "database reachable"
+          # Is the tenant floor actually ARMED for this connection? Postgres
+          # skips RLS entirely for a SUPERUSER or a BYPASSRLS role, and role
+          # attributes are NOT inherited through membership — so "we granted
+          # the app a bound role" proves nothing about the role it connects AS.
+          # Neon's default `neon_superuser` carries BYPASSRLS, which makes
+          # migration 0018 inert. Non-fatal: a single-admin local deployment
+          # is not a tenant-isolation boundary.
+          rls_attrs=$(psql "$db_url" -Atc \
+            "select current_user || ' ' || rolsuper::text || ' ' || rolbypassrls::text
+               from pg_roles where rolname = current_user" 2>/dev/null)
+          case "${rls_attrs:-}" in
+            "")      warn "could not read the connecting role's RLS attributes" \
+                          "run: psql \"\$DATABASE_URL\" -Atc \"select rolsuper, rolbypassrls from pg_roles where rolname = current_user\"";;
+            *" f f") ok "DB role '${rls_attrs%% *}' is RLS-bound (not superuser, no BYPASSRLS)";;
+            *)       warn "DB role '${rls_attrs%% *}' bypasses row-level security (superuser and/or BYPASSRLS) — migration 0018's tenant policies never run for it" \
+                          "set FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime so the app pool SET ROLEs to the NOLOGIN least-privilege role 0018 creates (role attributes are not inherited through membership, so membership alone will not do it)";;
+          esac
         else
           warn "database not reachable right now" "Neon scale-to-zero can add a cold-start delay; retry, or check the connection string with: just db"
         fi
@@ -147,8 +164,14 @@ sys.exit(1)' "$cred" 2>/dev/null; then
       warn "FLUIDBOX_KMS_MODE=$kms_mode unrecognized" "expected: off | static | aws";;
   esac
   # Legacy (v1) parity — needs psql, a reachable DB, and migration 0014 applied.
+  # `set fluidbox.bypass` FIRST: migration 0018 FORCEs RLS on all five tables
+  # below, which binds the table OWNER too. Without the GUC every count reads 0,
+  # the `where legacy > 0` filter empties, and the operator with straggler v1
+  # rows gets no warning from the preflight whose whole job is to warn. A
+  # session-level SET on a custom (dotted) option needs no privilege.
   if command -v psql >/dev/null 2>&1 && [ -n "${db_url:-}" ]; then
-    legacy_sql="select family||' '||legacy from (
+    legacy_sql="set fluidbox.bypass = 'system_worker';
+    select family||' '||legacy from (
       select 'integration_connections.credential_sealed' as family, count(*) filter (where credential_sealed is not null and credential_key_version=1) as legacy from integration_connections
       union all select 'integration_connections.webhook_secret_sealed', count(*) filter (where webhook_secret_sealed is not null and webhook_secret_key_version=1) from integration_connections
       union all select 'integration_connections.client_secret_sealed', count(*) filter (where client_secret_sealed is not null and client_secret_key_version=1) from integration_connections
