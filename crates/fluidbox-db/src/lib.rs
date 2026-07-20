@@ -1772,15 +1772,20 @@ pub async fn insert_connector_oauth_flow(
 /// now()`: a leaked authorization URL WITHOUT the initiating browser's cookie
 /// matches ZERO rows, so it can neither complete NOR burn the flow (design
 /// :646-656). Returns the burned row on success.
-pub async fn claim_connector_oauth_flow<'e, E>(
-    exec: E,
+pub async fn claim_connector_oauth_flow(
+    pool: &PgPool,
     state_hash: &str,
     browser_hash: &str,
-) -> sqlx::Result<Option<ConnectorOauthFlowRow>>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    sqlx::query_as(
+) -> sqlx::Result<Option<ConnectorOauthFlowRow>> {
+    // Pre-auth credential-digest resolution (audited bypass): the go/callback legs
+    // are UNAUTHENTICATED — the sealed `state` IS the auth — and this UPDATE is
+    // keyed on the state/browser digests with NO principal until it resolves the
+    // flow's tenant. It rides `worker_tx` for the same reason the lib.rs
+    // token-digest resolvers do (the credential IS the key). No caller supplies a
+    // scope; changing the executor-generic parameter to `pool` is compatible
+    // (every call site passed a bare `&PgPool`).
+    let mut tx = worker_tx(pool).await?;
+    let __rls_out = sqlx::query_as(
         "update connector_oauth_flows set consumed_at = now()
          where state_hash = $1 and browser_hash = $2
            and consumed_at is null and expires_at > now()
@@ -1788,8 +1793,10 @@ where
     )
     .bind(state_hash)
     .bind(browser_hash)
-    .fetch_optional(exec)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Read a flow by `state_hash` WITHOUT mutating it (never consumes). Two callers:
@@ -1797,17 +1804,19 @@ where
 /// (2) the callback, ONLY after a failed claim, splits "wrong browser" (row still
 /// live but the cookie hash mismatched → 403, row UNBURNED) from
 /// "unknown/expired/consumed" (→ 400 generic). Pre-auth, keyed by `state_hash`.
-pub async fn peek_connector_oauth_flow<'e, E>(
-    exec: E,
+pub async fn peek_connector_oauth_flow(
+    pool: &PgPool,
     state_hash: &str,
-) -> sqlx::Result<Option<ConnectorOauthFlowRow>>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    sqlx::query_as("select * from connector_oauth_flows where state_hash = $1")
+) -> sqlx::Result<Option<ConnectorOauthFlowRow>> {
+    // Pre-auth credential-digest resolution (audited bypass), keyed by `state_hash`
+    // with no principal — see `claim_connector_oauth_flow`. Never mutates.
+    let mut tx = worker_tx(pool).await?;
+    let __rls_out = sqlx::query_as("select * from connector_oauth_flows where state_hash = $1")
         .bind(state_hash)
-        .fetch_optional(exec)
-        .await
+        .fetch_optional(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 // ─── Per-tenant DEKs (Phase D envelope sealing, #32) ────────────────────────
@@ -5388,6 +5397,13 @@ pub async fn upsert_external_result(
     Ok(__rls_out)
 }
 
+/// The LISTEN/NOTIFY relay runs on its OWN connection (outside the app pool) and
+/// needs NO tenant GUC: `LISTEN fluidbox_events` and the `pg_notify` payloads it
+/// receives (`session_id:seq`) are not table reads, so RLS never applies here. The
+/// notify is only a wakeup — the `seq` catch-up query that actually delivers events
+/// rides the RLS-scoped `events_after` on the app pool (via the SSE handlers), so
+/// this connection deliberately stays role-plain (it does not even need the runtime
+/// role; it only LISTENs).
 pub fn spawn_listener(database_url: String) -> tokio::sync::broadcast::Sender<(Uuid, i64)> {
     let (tx, _) = tokio::sync::broadcast::channel::<(Uuid, i64)>(1024);
     let tx2 = tx.clone();
@@ -11345,6 +11361,271 @@ mod tests {
             ] {
                 sqlx::query(stmt).bind(id).execute(&mut *tx).await.ok();
             }
+        }
+        tx.commit().await.unwrap();
+    }
+
+    /// Seed a throwaway tenant + one `created` session, returning both ids. The
+    /// tenant insert rides `worker_tx` (a new tenant id is no GUC's tenant); the
+    /// policy/agent/revision/session ride the scoped repositories. Runs on the base
+    /// pool (superuser bypasses RLS), so it is agnostic to the enforcement asserted.
+    async fn seed_tenant_session(pool: &PgPool) -> (Uuid, Uuid) {
+        let tenant = Uuid::now_v7();
+        {
+            let slug = format!("rls-sw-{}", tenant.simple());
+            let mut tx = worker_tx(pool).await.unwrap();
+            sqlx::query("insert into tenants (id, name, slug) values ($1, $2, $3)")
+                .bind(tenant)
+                .bind(&slug)
+                .bind(&slug)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let scope = TenantScope::assume(tenant);
+        let policy = upsert_policy(
+            pool,
+            scope,
+            "rls",
+            "name: rls",
+            &serde_json::json!({"name":"rls"}),
+        )
+        .await
+        .unwrap();
+        let agent = create_agent(pool, scope, "rls-agent", None).await.unwrap();
+        let rev = append_agent_revision(
+            pool,
+            scope,
+            agent.id,
+            "claude-agent-sdk",
+            "img:test",
+            "claude-haiku-4-5",
+            None,
+            policy.id,
+            &serde_json::json!({}),
+            None,
+            &serde_json::json!([]),
+            &serde_json::json!([]),
+        )
+        .await
+        .unwrap();
+        let repo = serde_json::json!({"kind":"none"});
+        let empty = serde_json::json!({});
+        let session = create_session(
+            pool,
+            scope,
+            agent.id,
+            rev.id,
+            "supervised",
+            "trusted",
+            "rls task",
+            &repo,
+            &empty,
+            &empty,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+        (tenant, session.id)
+    }
+
+    async fn cleanup_sw_tenant(pool: &PgPool, tenant: Uuid) {
+        let mut tx = worker_tx(pool).await.unwrap();
+        for stmt in [
+            "delete from integration_connections where tenant_id = $1",
+            "delete from sessions where tenant_id = $1",
+            "delete from agents where tenant_id = $1",
+            "delete from policies where tenant_id = $1",
+            "delete from tenants where id = $1",
+        ] {
+            sqlx::query(stmt).bind(tenant).execute(&mut *tx).await.ok();
+        }
+        tx.commit().await.unwrap();
+    }
+
+    /// Phase D (#32, #75) — RLS wave B, system_worker bypass. Proves (b) the
+    /// `system_worker` scans see cross-tenant rows THROUGH `worker_tx`, and (c) THE
+    /// EXPLICITNESS PROOF: the identically-shaped query WITHOUT `worker_tx` (a plain
+    /// runtime-role transaction, no GUC) sees ZERO rows — the bypass is a deliberate,
+    /// grep-able choice, never ambient. The `system_worker` fns are exercised through
+    /// a pool that `SET ROLE`s to the NON-owner `fluidbox_runtime` (a superuser would
+    /// bypass RLS and make the test vacuous).
+    #[tokio::test]
+    async fn rls_system_worker_bypass_is_explicit() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url, None).await.expect("connect");
+        let (ta, sa) = seed_tenant_session(&pool).await;
+        let (tb, sb) = seed_tenant_session(&pool).await;
+
+        // Runtime-role pool: the system_worker fns' internal `worker_tx` runs as
+        // fluidbox_runtime under FORCE RLS, so the bypass is actually exercised.
+        let rt_pool = connect(&url, Some("fluidbox_runtime"))
+            .await
+            .expect("runtime pool");
+
+        // (b) two representative cross-tenant scans see BOTH tenants' rows.
+        let in_status = system_worker::sessions_in_status(&rt_pool, &["created"])
+            .await
+            .unwrap();
+        assert_eq!(
+            in_status
+                .iter()
+                .filter(|s| s.id == sa || s.id == sb)
+                .count(),
+            2,
+            "sessions_in_status (worker_tx) must see BOTH tenants' sessions"
+        );
+        assert!(
+            system_worker::get_session(&rt_pool, sa)
+                .await
+                .unwrap()
+                .is_some(),
+            "get_session (worker_tx) resolves tenant A's session cross-tenant"
+        );
+        assert!(
+            system_worker::get_session(&rt_pool, sb)
+                .await
+                .unwrap()
+                .is_some(),
+            "get_session (worker_tx) resolves tenant B's session cross-tenant"
+        );
+
+        // (c) the SAME shape WITHOUT worker_tx (plain runtime-role tx, no GUC) → 0.
+        let mut plain = rt_pool.begin().await.unwrap();
+        let (n,): (i64,) = sqlx::query_as("select count(*) from sessions")
+            .fetch_one(&mut *plain)
+            .await
+            .unwrap();
+        plain.rollback().await.ok();
+        assert_eq!(
+            n, 0,
+            "a plain runtime-role tx with no bypass GUC must see zero sessions — the bypass is explicit"
+        );
+
+        cleanup_sw_tenant(&pool, ta).await;
+        cleanup_sw_tenant(&pool, tb).await;
+    }
+
+    /// Phase D (#32, #75) — RLS wave B, re-seal helpers under `worker_tx`. Seeds a
+    /// v1 sealed connection, then drives the restructured lock/CAS path
+    /// (`reseal_begin` → `reseal_lock_row` → `reseal_write_row`) as the NON-owner
+    /// runtime role: the lock RESOLVES the row and its tenant, the CAS flips exactly
+    /// one v1 row to v2, and — the explicitness half — the same lock WITHOUT
+    /// `worker_tx` (a plain runtime tx) resolves nothing.
+    #[tokio::test]
+    async fn rls_reseal_helpers_work_under_worker_tx() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url, None).await.expect("connect");
+        let tenant = Uuid::now_v7();
+        {
+            let slug = format!("rls-rs-{}", tenant.simple());
+            let mut tx = worker_tx(&pool).await.unwrap();
+            sqlx::query("insert into tenants (id, name, slug) values ($1, $2, $3)")
+                .bind(tenant)
+                .bind(&slug)
+                .bind(&slug)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let scope = TenantScope::assume(tenant);
+        let conn = create_connection(
+            &pool,
+            scope,
+            "mcp_http",
+            "acct",
+            "disp",
+            Some(&[9u8, 9, 9]),
+            1,
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            &serde_json::json!({ "base_url": "https://x" }),
+            None,
+            1,
+            ConnectionAuth {
+                auth_kind: "api_key",
+                status: "active",
+                oauth: None,
+                client_secret_sealed: None,
+                client_secret_key_version: 1,
+                registration_id: None,
+            },
+            ConnectionOwner::Organization,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rt_pool = connect(&url, Some("fluidbox_runtime"))
+            .await
+            .expect("runtime pool");
+        let (table, col, ver, key) = (
+            "integration_connections",
+            "credential_sealed",
+            "credential_key_version",
+            "id",
+        );
+
+        // lock + CAS-write through the restructured helpers (tx IS a worker_tx).
+        let mut tx = system_worker::reseal_begin(&rt_pool).await.unwrap();
+        let locked = system_worker::reseal_lock_row(&mut tx, table, col, ver, key, conn.id)
+            .await
+            .unwrap();
+        let Some((Some(bytes), kv, tid)) = locked else {
+            panic!("reseal_lock_row saw no row under worker_tx");
+        };
+        assert_eq!(kv, 1, "the seeded credential is v1");
+        assert_eq!(tid, Some(tenant), "the lock returns the row's own tenant");
+        let mut newbytes = bytes.clone();
+        newbytes.push(2);
+        let affected =
+            system_worker::reseal_write_row(&mut tx, table, col, ver, key, conn.id, &newbytes)
+                .await
+                .unwrap();
+        assert_eq!(
+            affected, 1,
+            "the CAS flips exactly one v1 row to v2 under worker_tx"
+        );
+        tx.commit().await.unwrap();
+
+        // The companion version is now 2 (read back via the superuser base pool).
+        let (after, kv2) = connection_credential_sealed(&pool, scope, conn.id)
+            .await
+            .unwrap()
+            .expect("credential still present");
+        assert_eq!(kv2, 2, "credential_key_version is 2 after the CAS");
+        assert_eq!(after, newbytes, "the re-sealed bytes landed");
+
+        // Explicitness: the SAME lock WITHOUT worker_tx (plain runtime tx) sees nothing.
+        let mut plain = rt_pool.begin().await.unwrap();
+        let none = system_worker::reseal_lock_row(&mut plain, table, col, ver, key, conn.id)
+            .await
+            .unwrap();
+        plain.rollback().await.ok();
+        assert!(
+            none.is_none(),
+            "without the bypass GUC the FOR UPDATE lock resolves no row — the reseal bypass is explicit"
+        );
+
+        let mut tx = worker_tx(&pool).await.unwrap();
+        for stmt in [
+            "delete from integration_connections where tenant_id = $1",
+            "delete from tenants where id = $1",
+        ] {
+            sqlx::query(stmt).bind(tenant).execute(&mut *tx).await.ok();
         }
         tx.commit().await.unwrap();
     }

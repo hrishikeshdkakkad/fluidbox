@@ -829,9 +829,13 @@ pub async fn start_dance(
     // (`connection_for_mutation`) or a connection this same principal just
     // created in the catalog/manual oauth branch. The dance mechanics need the
     // row regardless of the viewer lens.
-    let conn = fluidbox_db::get_connection(&state.pool, scope, conn_id)
+    // Tenant known (the initiating principal's scope) → scoped_tx so the RLS GUC
+    // rides the executor-generic read.
+    let mut conn_tx = fluidbox_db::scoped_tx(&state.pool, scope).await?;
+    let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, conn_id)
         .await?
         .ok_or(ApiError::NotFound)?;
+    conn_tx.commit().await?;
     if conn.auth_kind != "oauth" {
         return Err(ApiError::BadRequest(
             "this connection does not use OAuth — it has a static credential".into(),
@@ -1460,20 +1464,24 @@ async fn heal_invalid_client(
         o.insert("client_id_source".into(), json!("dcr"));
         o.insert("registration_id".into(), json!(new_reg_id));
     }
-    let mut resolve_conn = state
-        .pool
-        .acquire()
+    // scoped_tx: resolve_exchange_client reads the per-connection sealed secret
+    // (tenant-scoped under RLS) on this executor.
+    let mut resolve_tx = fluidbox_db::scoped_tx(&state.pool, scope)
         .await
         .map_err(|e| format!("db acquire failed: {e}"))?;
     *client = resolve_exchange_client(
         state,
-        &mut resolve_conn,
+        &mut resolve_tx,
         scope,
         conn_id,
         Some(new_reg_id),
         &new_client_id,
     )
     .await?;
+    resolve_tx
+        .commit()
+        .await
+        .map_err(|e| format!("db commit failed: {e}"))?;
     Ok(true)
 }
 
@@ -1497,10 +1505,19 @@ async fn complete_flow(
     // principal inserted it): load the connection under the row's own tenant scope,
     // NOT the cross-tenant system-worker loader the stateless state once required.
     let scope = fluidbox_db::TenantScope::assume(flow.tenant_id);
-    let conn = fluidbox_db::get_connection(&state.pool, scope, flow.connection_id)
+    // Tenant known (the flow's own, verified when the start principal inserted it)
+    // → scoped_tx so the RLS GUC rides the executor-generic read.
+    let mut conn_tx = fluidbox_db::scoped_tx(&state.pool, scope)
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?;
+    let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, flow.connection_id)
         .await
         .map_err(|e| format!("connection lookup failed: {e}"))?
         .ok_or("connection not found — it may have been removed")?;
+    conn_tx
+        .commit()
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?;
     if conn.status == "revoked" {
         return Err("connection was revoked — create a new one".into());
     }
@@ -1547,23 +1564,25 @@ async fn complete_flow(
     let resource = Some(flow.resource.as_str());
 
     // Resolve the client identity (shared registration preferred; per-connection
-    // legacy fallback) from the ROW. Uses a short-lived pooled connection — the
-    // activation critical section below takes its own, so nothing nests.
-    let mut resolve_conn = state
-        .pool
-        .acquire()
+    // legacy fallback) from the ROW. Uses a short-lived scoped transaction (the
+    // per-connection secret read is tenant-scoped under RLS) — the activation
+    // critical section below takes its own, so nothing nests.
+    let mut resolve_tx = fluidbox_db::scoped_tx(&state.pool, scope)
         .await
         .map_err(|e| format!("db acquire failed: {e}"))?;
     let mut client = resolve_exchange_client(
         state,
-        &mut resolve_conn,
+        &mut resolve_tx,
         scope,
         conn.id,
         flow.client_registration_id,
         &flow.client_id,
     )
     .await?;
-    drop(resolve_conn);
+    resolve_tx
+        .commit()
+        .await
+        .map_err(|e| format!("db commit failed: {e}"))?;
 
     // Exchange the code, with ONE `invalid_client` self-heal for a registration-
     // sourced identity (delete the stale shared client, re-register, retry once).
@@ -1671,9 +1690,10 @@ async fn complete_flow(
             locks.entry(conn.id).or_default().clone()
         };
         let _guard = lock.lock().await;
-        let mut tx = state
-            .pool
-            .begin()
+        // scoped_tx (not a bare begin): the activate UPDATE below is tenant-scoped
+        // under RLS, and the whole critical section still borrows exactly ONE pooled
+        // connection (the advisory lock + activation ride this tx).
+        let mut tx = fluidbox_db::scoped_tx(&state.pool, scope)
             .await
             .map_err(|e| format!("oauth lock txn failed: {e}"))?;
         fluidbox_db::acquire_oauth_lock(&mut tx, conn.id)
@@ -1748,14 +1768,19 @@ async fn complete_flow(
             // Status flip → error is paired with token eviction (custody
             // discipline) so nothing serves the just-cached token.
             tracing::warn!(connection = %conn.id, error = %e, "oauth callback: tool discovery failed after authorization");
-            fluidbox_db::mark_connection_error(
-                &state.pool,
-                scope,
-                conn.id,
-                "MCP tool discovery failed after authorization — reconnect this connection",
-            )
-            .await
-            .ok();
+            // Best-effort status flip → error (RLS: the write is tenant-scoped, so
+            // it rides a scoped_tx; a tx failure is swallowed like the write itself).
+            if let Ok(mut err_tx) = fluidbox_db::scoped_tx(&state.pool, scope).await {
+                fluidbox_db::mark_connection_error(
+                    &mut *err_tx,
+                    scope,
+                    conn.id,
+                    "MCP tool discovery failed after authorization — reconnect this connection",
+                )
+                .await
+                .ok();
+                err_tx.commit().await.ok();
+            }
             invalidate_access(state, conn.id).await;
             Err(
                 "authorized, but tool discovery failed — the connection is marked error; reconnect it"
@@ -1807,9 +1832,12 @@ pub async fn ensure_access_token(
         locks.entry(conn.id).or_default().clone()
     };
     let _guard = lock.lock().await;
-    let mut tx = state
-        .pool
-        .begin()
+    // scoped_tx (not a bare begin): every DB touch in this critical section — the
+    // fresh re-read and the rotation write — is tenant-scoped under RLS and rides
+    // this ONE pooled connection (the advisory lock spans it). The scope is the
+    // connection's own tenant.
+    let scope = fluidbox_db::TenantScope::assume(conn.tenant_id);
+    let mut tx = fluidbox_db::scoped_tx(&state.pool, scope)
         .await
         .map_err(|e| format!("oauth lock txn failed: {e}"))?;
     fluidbox_db::acquire_oauth_lock(&mut tx, conn.id)
@@ -1828,7 +1856,7 @@ pub async fn ensure_access_token(
     // while we waited. Operate on the FRESH row and refuse on any drift, so we
     // never unseal a superseded grant's refresh token or mint against a stale
     // binding. Early returns drop the tx (rollback releases the advisory lock).
-    let scope = fluidbox_db::TenantScope::assume(conn.tenant_id);
+    // `scope` was derived above (the connection's tenant) so it could open the tx.
     // Re-read THROUGH `tx` (the lock-holding connection), never `&state.pool`: the
     // whole critical section must borrow exactly ONE pooled connection, or N
     // concurrent refreshes — each holding one connection and reaching for a second

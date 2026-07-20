@@ -1182,18 +1182,25 @@ pub async fn decide_approval(
             // frozen-vs-live, so a stale/mislabeled org binding can never let a
             // non-owner decide under what is really a personal connection.
             match b.connection_id {
-                Some(cid) => match fluidbox_db::get_connection(&state.pool, scope, cid).await? {
-                    Some(conn) => rbac::reconcile_connection_authority(
-                        &facts,
-                        &conn.owner_type,
-                        conn.owner_user_id,
-                    ),
-                    None => {
-                        return Err(ApiError::Conflict(
-                            "this approval's connection no longer exists — cannot classify its authority".into(),
-                        ))
+                Some(cid) => {
+                    // Tenant known (the approval's scope) → scoped_tx so the RLS
+                    // GUC rides the executor-generic read.
+                    let mut conn_tx = fluidbox_db::scoped_tx(&state.pool, scope).await?;
+                    let found = fluidbox_db::get_connection(&mut *conn_tx, scope, cid).await?;
+                    conn_tx.commit().await?;
+                    match found {
+                        Some(conn) => rbac::reconcile_connection_authority(
+                            &facts,
+                            &conn.owner_type,
+                            conn.owner_user_id,
+                        ),
+                        None => {
+                            return Err(ApiError::Conflict(
+                                "this approval's connection no longer exists — cannot classify its authority".into(),
+                            ))
+                        }
                     }
-                },
+                }
                 None => rbac::classify_approval_authority(&approval.tool, Some(&facts)),
             }
         }
@@ -1254,8 +1261,15 @@ async fn personal_connection_label(
     owner_user_id: Uuid,
 ) -> String {
     if let Some(cid) = binding.and_then(|b| b.connection_id) {
-        if let Ok(Some(conn)) = fluidbox_db::get_connection(&state.pool, scope, cid).await {
-            return format!("connection '{}'", conn.display_name);
+        // Tenant known (the approval's scope) → scoped_tx so the RLS GUC rides the
+        // executor-generic read; a tx/read failure just falls through to the
+        // generic label.
+        if let Ok(mut conn_tx) = fluidbox_db::scoped_tx(&state.pool, scope).await {
+            let found = fluidbox_db::get_connection(&mut *conn_tx, scope, cid).await;
+            let _ = conn_tx.commit().await;
+            if let Ok(Some(conn)) = found {
+                return format!("connection '{}'", conn.display_name);
+            }
         }
     }
     format!("another user's personal connection (owner {owner_user_id})")
