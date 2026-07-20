@@ -10,6 +10,7 @@ mod config;
 mod connections;
 mod connectors;
 mod deliveries;
+mod egress;
 mod error;
 mod events;
 mod facade;
@@ -215,20 +216,26 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Phase E shared egress boundary: ONE policy (dev-loopback seam + operator
+    // allowlist + proxy) drives BOTH hardened clients and is stored on AppState
+    // for the broker/deliveries pre-dial admission and the git-clone derivation.
+    let egress_policy = egress::EgressPolicy::from_config(&cfg);
+    let identity_http = egress::build_identity_http(&egress_policy);
+    let egress_http = egress::build_egress_http(&egress_policy);
+
     let state: state::AppState = Arc::new(AppStateInner {
         tenant_id: seed.tenant_id,
         redactor: fluidbox_core::event::Redactor::default(),
         provider,
         approvals: ApprovalRegistry::default(),
         events_tx,
+        // Plain client for operator-configured seams (GitHub, LLM) only.
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15 * 60))
             .build()?,
-        // Dedicated per-hop-SSRF client for OIDC identity fetches. The dev
-        // (loopback-http) allowance is baked in from the public URL at build
-        // time so a local Dex on 127.0.0.1 with a loopback FLUIDBOX_PUBLIC_URL
-        // still works while every non-dev deployment rejects private targets.
-        identity_http: login::build_identity_http(&cfg.public_url),
+        identity_http,
+        egress_http,
+        egress_policy,
         sealer,
         connector_tokens: Default::default(),
         oauth_locks: Default::default(),

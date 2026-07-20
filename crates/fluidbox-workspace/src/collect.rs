@@ -250,6 +250,11 @@ fn run_git_scrubbed(
         .env("XDG_CONFIG_HOME", home)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
+        // Phase E: keep the same LFS/transport hardening on the collection path
+        // (env_clear already dropped ambient GIT_*), so a hostile worktree can
+        // never trigger an LFS smudge or a non-file transport during diff capture.
+        .env("GIT_LFS_SKIP_SMUDGE", "1")
+        .env("GIT_ALLOW_PROTOCOL", "http:https:file")
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

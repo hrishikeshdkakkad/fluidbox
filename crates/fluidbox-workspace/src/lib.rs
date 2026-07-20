@@ -14,12 +14,36 @@
 //! by every provider), and `fluidbox-core` stays I/O-free (git subprocess
 //! I/O lives here — settled Q13 of the 2026-07-15 design).
 
+use fluidbox_core::netpolicy::{ip_blocked, IpCidr};
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use uuid::Uuid;
 
 pub mod archive;
 pub mod collect;
+
+/// The clone-URL egress policy (Phase E, E4), built server-side from the shared
+/// `EgressPolicy` and passed into materialization. The git fetch runs
+/// out-of-process, so the reqwest SSRF resolver cannot cover it; instead we
+/// resolve the http(s) host and validate EVERY resolved address with the SAME
+/// `fluidbox_core::netpolicy` predicate the in-process clients use, pin git away
+/// from redirects, and (optionally) route it through the egress proxy.
+///
+/// TOCTOU residual DISCLOSED: git re-resolves the host independently at fetch
+/// time, so a DNS-rebinding name could differ between this check and git's dial;
+/// closing it fully needs an egress proxy or network-layer egress control.
+#[derive(Debug, Clone, Default)]
+pub struct GitEgressPolicy {
+    pub dev_loopback: bool,
+    pub allow_cidrs: Vec<IpCidr>,
+    /// The configured `FLUIDBOX_GITHUB_CLONE_BASE`; a `file://` clone URL is
+    /// allowed only when it starts with this prefix (or under the dev seam).
+    pub clone_base_file_prefix: Option<String>,
+    /// `FLUIDBOX_EGRESS_PROXY`, exported to the git fetch subprocess as
+    /// HTTPS_PROXY/https_proxy when present.
+    pub proxy: Option<String>,
+}
 
 pub use archive::{
     clear_dir_contents, pack_workspace, pack_workspace_to_file, unpack_archive,
@@ -71,6 +95,11 @@ fn run_git_env(
     cmd.current_dir(dir).args(args);
     // Never fall back to interactive credential prompts.
     cmd.env("GIT_TERMINAL_PROMPT", "0");
+    // Phase E hardening on EVERY git invocation: never fetch LFS objects from an
+    // arbitrary `lfs.url` via the smudge filter, and restrict transports to the
+    // three schemes we validate (no ext::/dumb/ssh helpers, incl. on redirect).
+    cmd.env("GIT_LFS_SKIP_SMUDGE", "1");
+    cmd.env("GIT_ALLOW_PROTOCOL", "http:https:file");
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -174,17 +203,99 @@ pub fn materialize_local(
     })
 }
 
-fn validate_clone_url(url: &str) -> Result<(), WorkspaceError> {
+fn validate_clone_url(url: &str, egress: &GitEgressPolicy) -> Result<(), WorkspaceError> {
     // Scheme allowlist doubles as argument-injection protection (a "URL"
     // starting with `-` would otherwise be parsed as a git option).
-    let ok = ["https://", "http://", "file://"]
-        .iter()
-        .any(|s| url.starts_with(s));
-    if !ok {
-        return Err(WorkspaceError::Invalid(format!(
+    if url.starts_with("https://") {
+        resolve_and_validate_host(url, egress)
+    } else if url.starts_with("http://") {
+        // Plain http only under the dev-loopback seam (the e2e loopback fakes).
+        if !egress.dev_loopback {
+            return Err(WorkspaceError::Invalid(
+                "refusing a plain-http clone URL (dev-loopback only)".into(),
+            ));
+        }
+        resolve_and_validate_host(url, egress)
+    } else if url.starts_with("file://") {
+        // file:// only under the configured clone base prefix (or the dev seam).
+        let allowed = egress.dev_loopback
+            || egress
+                .clone_base_file_prefix
+                .as_deref()
+                .map(|p| url.starts_with(p))
+                .unwrap_or(false);
+        if !allowed {
+            return Err(WorkspaceError::Invalid(
+                "refusing a file:// clone URL outside the configured clone base".into(),
+            ));
+        }
+        Ok(())
+    } else {
+        Err(WorkspaceError::Invalid(format!(
             "clone_url must be http(s):// or file:// (got '{}')",
             url.chars().take(40).collect::<String>()
-        )));
+        )))
+    }
+}
+
+/// Extract (host, port) from an http(s) URL without a URL-parser dependency:
+/// strip the scheme, take the authority up to the first `/?#`, drop any
+/// userinfo, and split an optional port (bracketed for IPv6 literals). The port
+/// only feeds DNS resolution (port-independent), so a missing one defaults to 443.
+fn host_and_port(url: &str) -> Option<(String, u16)> {
+    let after = url.split_once("://")?.1;
+    let authority = after.split(['/', '?', '#']).next()?;
+    let hostport = authority
+        .rsplit_once('@')
+        .map(|(_, hp)| hp)
+        .unwrap_or(authority);
+    if let Some(rest) = hostport.strip_prefix('[') {
+        let (h, tail) = rest.split_once(']')?;
+        let port = tail
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(443);
+        return Some((h.to_string(), port));
+    }
+    match hostport.rsplit_once(':') {
+        Some((h, p)) => Some((h.to_string(), p.parse().ok()?)),
+        None => Some((hostport.to_string(), 443)),
+    }
+}
+
+/// Resolve an http(s) clone URL's host and refuse if it is — or resolves to — a
+/// private/loopback/link-local/metadata address (loopback allowed only under the
+/// dev seam). A bare IP literal is checked directly (no DNS). The shared
+/// `fluidbox_core::netpolicy` predicate keeps this in lockstep with the reqwest
+/// clients. TOCTOU residual disclosed on `GitEgressPolicy`.
+fn resolve_and_validate_host(url: &str, egress: &GitEgressPolicy) -> Result<(), WorkspaceError> {
+    let (host, port) = host_and_port(url)
+        .ok_or_else(|| WorkspaceError::Invalid("clone_url has no host".into()))?;
+    if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
+        if ip_blocked(ip, egress.dev_loopback, &egress.allow_cidrs) {
+            return Err(WorkspaceError::Invalid(
+                "refusing a clone URL at a private/loopback/link-local address".into(),
+            ));
+        }
+        return Ok(());
+    }
+    let addrs: Vec<IpAddr> = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|_| WorkspaceError::Invalid("clone_url host did not resolve".into()))?
+        .map(|s| s.ip())
+        .collect();
+    if addrs.is_empty() {
+        return Err(WorkspaceError::Invalid(
+            "clone_url host did not resolve".into(),
+        ));
+    }
+    if addrs
+        .iter()
+        .any(|ip| ip_blocked(*ip, egress.dev_loopback, &egress.allow_cidrs))
+    {
+        return Err(WorkspaceError::Invalid(
+            "refusing a clone URL that resolves to a private/loopback/link-local address".into(),
+        ));
     }
     Ok(())
 }
@@ -223,14 +334,18 @@ pub fn materialize_git(
     reference: Option<&str>,
     commit_sha: Option<&str>,
     auth_header: Option<&str>,
+    egress: &GitEgressPolicy,
 ) -> Result<MaterializedWorkspace, WorkspaceError> {
-    validate_clone_url(clone_url)?;
+    // Cheap, pure hygiene (ref/sha arg-injection) BEFORE the clone-URL check,
+    // whose https branch may resolve DNS — fail fast, and never resolve a host
+    // for a request already doomed by a malformed ref/sha.
     if let Some(r) = reference {
         validate_ref(r)?;
     }
     if let Some(sha) = commit_sha {
         validate_commit_sha(sha)?;
     }
+    validate_clone_url(clone_url, egress)?;
 
     let root = session_workspace_root(data_dir, session);
     let dest = root.join("repo");
@@ -240,7 +355,7 @@ pub fn materialize_git(
     }
     std::fs::create_dir_all(&dest)?;
 
-    let result = fetch_and_checkout(&dest, clone_url, reference, commit_sha, auth_header);
+    let result = fetch_and_checkout(&dest, clone_url, reference, commit_sha, auth_header, egress);
     if result.is_err() {
         // A failed clone must not leave a half-materialized workspace behind.
         std::fs::remove_dir_all(&root).ok();
@@ -254,8 +369,12 @@ fn fetch_and_checkout(
     reference: Option<&str>,
     commit_sha: Option<&str>,
     auth_header: Option<&str>,
+    egress: &GitEgressPolicy,
 ) -> Result<MaterializedWorkspace, WorkspaceError> {
-    let auth_env: Vec<(String, String)> = match auth_header {
+    // The fetch env carries the credential (GIT_CONFIG_* http.extraheader — never
+    // argv/on-disk) plus, when configured, the egress proxy. Non-fetch git ops
+    // (init/checkout/config) do no network, so they don't need either.
+    let mut fetch_env: Vec<(String, String)> = match auth_header {
         Some(h) => vec![
             ("GIT_CONFIG_COUNT".into(), "1".into()),
             ("GIT_CONFIG_KEY_0".into(), "http.extraheader".into()),
@@ -263,10 +382,17 @@ fn fetch_and_checkout(
         ],
         None => vec![],
     };
+    if let Some(proxy) = &egress.proxy {
+        fetch_env.push(("HTTPS_PROXY".into(), proxy.clone()));
+        fetch_env.push(("https_proxy".into(), proxy.clone()));
+    }
 
     run_git(dest, &["init", "-q"])?;
     run_git(dest, &["remote", "add", "origin", clone_url])?;
 
+    // `-c http.followRedirects=false`: a smart-HTTP fetch must not follow a 3xx
+    // onto an unvalidated (internal) host — the out-of-process analogue of the
+    // reqwest `Policy::none` the in-process clients use.
     match commit_sha {
         Some(sha) => {
             // Exact-commit checkout (e.g. a PR head, immune to branch moves).
@@ -274,19 +400,30 @@ fn fetch_and_checkout(
             // so fall back to a full branch fetch and resolve the SHA there.
             let shallow = run_git_env(
                 dest,
-                &["fetch", "-q", "--depth", "1", "origin", sha],
-                &auth_env,
+                &[
+                    "-c",
+                    "http.followRedirects=false",
+                    "fetch",
+                    "-q",
+                    "--depth",
+                    "1",
+                    "origin",
+                    sha,
+                ],
+                &fetch_env,
             );
             if shallow.is_err() {
                 run_git_env(
                     dest,
                     &[
+                        "-c",
+                        "http.followRedirects=false",
                         "fetch",
                         "-q",
                         "origin",
                         "+refs/heads/*:refs/remotes/origin/*",
                     ],
-                    &auth_env,
+                    &fetch_env,
                 )?;
             }
             let commit = format!("{sha}^{{commit}}");
@@ -300,8 +437,17 @@ fn fetch_and_checkout(
             let target = reference.unwrap_or("HEAD");
             run_git_env(
                 dest,
-                &["fetch", "-q", "--depth", "1", "origin", target],
-                &auth_env,
+                &[
+                    "-c",
+                    "http.followRedirects=false",
+                    "fetch",
+                    "-q",
+                    "--depth",
+                    "1",
+                    "origin",
+                    target,
+                ],
+                &fetch_env,
             )?;
             let branch = reference.unwrap_or("fluidbox-work");
             run_git(dest, &["checkout", "-q", "-B", branch, "FETCH_HEAD"])?;
@@ -384,6 +530,17 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), WorkspaceError> {
 mod tests {
     use super::*;
 
+    /// The loopback-dev clone policy the e2e runs under: file:// and loopback
+    /// http both allowed. Keeps the existing tests (file:// fixtures) network-free.
+    fn dev_egress() -> GitEgressPolicy {
+        GitEgressPolicy {
+            dev_loopback: true,
+            allow_cidrs: vec![],
+            clone_base_file_prefix: None,
+            proxy: None,
+        }
+    }
+
     /// A local source repo with two commits on `main` and a `feature` branch,
     /// served over file:// — the full clone path without any network.
     fn git_fixture(tmp: &Path) -> (String, String, String) {
@@ -423,7 +580,7 @@ mod tests {
         let data = tmp.join("data");
         let session = Uuid::now_v7();
 
-        let ws = materialize_git(&data, session, &url, None, None, None).unwrap();
+        let ws = materialize_git(&data, session, &url, None, None, None, &dev_egress()).unwrap();
         assert_eq!(ws.base_commit.as_deref(), Some(head.as_str()));
         assert_eq!(
             std::fs::read_to_string(ws.host_dir.join("a.txt")).unwrap(),
@@ -455,8 +612,16 @@ mod tests {
         let data = tmp.join("data");
 
         // Branch ref → that branch's head, not the default branch.
-        let by_ref =
-            materialize_git(&data, Uuid::now_v7(), &url, Some("feature"), None, None).unwrap();
+        let by_ref = materialize_git(
+            &data,
+            Uuid::now_v7(),
+            &url,
+            Some("feature"),
+            None,
+            None,
+            &dev_egress(),
+        )
+        .unwrap();
         assert_eq!(by_ref.base_commit.as_deref(), Some(first.as_str()));
         assert_eq!(
             std::fs::read_to_string(by_ref.host_dir.join("a.txt")).unwrap(),
@@ -466,16 +631,32 @@ mod tests {
         // Exact commit → exactly that commit, immune to branch movement
         // (file:// doesn't serve arbitrary SHAs shallow — exercises the
         // full-fetch fallback).
-        let by_sha =
-            materialize_git(&data, Uuid::now_v7(), &url, None, Some(&first), None).unwrap();
+        let by_sha = materialize_git(
+            &data,
+            Uuid::now_v7(),
+            &url,
+            None,
+            Some(&first),
+            None,
+            &dev_egress(),
+        )
+        .unwrap();
         assert_eq!(by_sha.base_commit.as_deref(), Some(first.as_str()));
         assert_eq!(
             std::fs::read_to_string(by_sha.host_dir.join("a.txt")).unwrap(),
             "one\n"
         );
         // ref+sha together: sha wins (it's the more exact pin).
-        let both =
-            materialize_git(&data, Uuid::now_v7(), &url, Some("main"), Some(&head), None).unwrap();
+        let both = materialize_git(
+            &data,
+            Uuid::now_v7(),
+            &url,
+            Some("main"),
+            Some(&head),
+            None,
+            &dev_egress(),
+        )
+        .unwrap();
         assert_eq!(both.base_commit.as_deref(), Some(head.as_str()));
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -495,6 +676,7 @@ mod tests {
             None,
             None,
             None,
+            &dev_egress(),
         );
         assert!(err.is_err());
         assert!(
@@ -504,7 +686,15 @@ mod tests {
 
         // Bad commit in a good repo also cleans up.
         let (url, ..) = git_fixture(&tmp);
-        let err = materialize_git(&data, session, &url, None, Some("deadbeefdeadbeef"), None);
+        let err = materialize_git(
+            &data,
+            session,
+            &url,
+            None,
+            Some("deadbeefdeadbeef"),
+            None,
+            &dev_egress(),
+        );
         assert!(err.is_err());
         assert!(!data.join("workspaces").join(session.to_string()).exists());
 
@@ -519,11 +709,12 @@ mod tests {
         // Option-shaped "URL" (argument injection) and bad schemes.
         for url in ["--upload-pack=evil", "ssh://h/r.git", "git@github.com:o/r"] {
             assert!(matches!(
-                materialize_git(&data, sid, url, None, None, None),
+                materialize_git(&data, sid, url, None, None, None, &dev_egress()),
                 Err(WorkspaceError::Invalid(_))
             ));
         }
-        // Option-shaped / malformed refs and shas.
+        // Option-shaped / malformed refs and shas. The https host is never
+        // resolved here — the ref/sha hygiene fails first (validation ordering).
         for r in ["-evil", "a b", "a..b", "x:y"] {
             assert!(matches!(
                 materialize_git(
@@ -532,7 +723,8 @@ mod tests {
                     "https://github.com/o/r.git",
                     Some(r),
                     None,
-                    None
+                    None,
+                    &dev_egress()
                 ),
                 Err(WorkspaceError::Invalid(_))
             ));
@@ -545,12 +737,57 @@ mod tests {
                     "https://github.com/o/r.git",
                     None,
                     Some(sha),
-                    None
+                    None,
+                    &dev_egress()
                 ),
                 Err(WorkspaceError::Invalid(_))
             ));
         }
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// E4: the clone-URL egress policy — https host validation, the dev-loopback
+    /// http seam, the file:// clone-base gate, and the allow-CIDR override. All
+    /// cases use IP literals or file paths, so no DNS resolution occurs.
+    #[test]
+    fn clone_url_egress_policy() {
+        let dev = dev_egress();
+        let prod = GitEgressPolicy {
+            dev_loopback: false,
+            allow_cidrs: vec![],
+            clone_base_file_prefix: Some("file:///srv/mirror".into()),
+            proxy: None,
+        };
+
+        // https to a private/loopback/metadata IP literal is refused (prod)…
+        assert!(validate_clone_url("https://10.0.0.1/r.git", &prod).is_err());
+        assert!(validate_clone_url("https://169.254.169.254/r.git", &prod).is_err());
+        assert!(validate_clone_url("https://[::1]/r.git", &prod).is_err());
+        // …and metadata stays refused even in dev (loopback ≠ link-local).
+        assert!(validate_clone_url("http://169.254.169.254/r.git", &dev).is_err());
+        // loopback http is allowed ONLY under the dev seam.
+        assert!(validate_clone_url("http://127.0.0.1:9/r.git", &dev).is_ok());
+        assert!(validate_clone_url("http://127.0.0.1:9/r.git", &prod).is_err());
+
+        // file:// — dev allows any; prod only under the configured clone base.
+        assert!(validate_clone_url("file:///tmp/x", &dev).is_ok());
+        assert!(validate_clone_url("file:///tmp/x", &prod).is_err());
+        assert!(validate_clone_url("file:///srv/mirror/o/r.git", &prod).is_ok());
+
+        // Other schemes and option-injection are refused regardless of seam.
+        assert!(validate_clone_url("ssh://h/r.git", &dev).is_err());
+        assert!(validate_clone_url("--upload-pack=evil", &dev).is_err());
+
+        // FALSE-GREEN guard: the SAME private https literal that is refused above
+        // is admitted once an allow-CIDR covers it.
+        let allowed = GitEgressPolicy {
+            dev_loopback: false,
+            allow_cidrs: vec!["10.0.0.0/8".parse().unwrap()],
+            clone_base_file_prefix: None,
+            proxy: None,
+        };
+        assert!(validate_clone_url("https://10.0.0.1/r.git", &prod).is_err());
+        assert!(validate_clone_url("https://10.0.0.1/r.git", &allowed).is_ok());
     }
 
     #[test]
@@ -559,7 +796,7 @@ mod tests {
         let (url, ..) = git_fixture(&tmp);
         let data = tmp.join("data");
         let session = Uuid::now_v7();
-        materialize_git(&data, session, &url, None, None, None).unwrap();
+        materialize_git(&data, session, &url, None, None, None, &dev_egress()).unwrap();
         assert!(data.join("workspaces").join(session.to_string()).exists());
         cleanup_workspace(&data, session).unwrap();
         assert!(!data.join("workspaces").join(session.to_string()).exists());
