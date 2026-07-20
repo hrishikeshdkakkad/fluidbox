@@ -229,32 +229,29 @@ fn oauth_flow_cookie(headers: &HeaderMap) -> Option<String> {
         .map(|(_, v)| v.to_string())
 }
 
-/// `; Secure` when the public URL is https, else empty — mirrors github_app.rs's
-/// local-http special-case (a real AS requires an https redirect anyway).
-fn cookie_secure_suffix(public_url: &str) -> &'static str {
-    if public_url.starts_with("https://") {
-        "; Secure"
-    } else {
-        ""
-    }
-}
-
-/// The `Set-Cookie` header for the initiating-browser cookie. Attribute
-/// construction copied from github_app.rs's per-flow cookie (HttpOnly, SameSite,
-/// conditional Secure for local http), but forced to `Path=/` because the
-/// `__Host-` prefix requires it. On http (local dev / the curl e2e) the missing
-/// Secure is why real browsers reject `__Host-` cookies — but a real OAuth AS
-/// requires an https redirect anyway, so that scenario is not functional; the
-/// e2e's curl jars are lenient.
-fn set_oauth_flow_cookie(public_url: &str, value: &str) -> String {
-    let secure = cookie_secure_suffix(public_url);
-    format!("{OAUTH_FLOW_COOKIE}={value}; HttpOnly; SameSite=Lax; Path=/; Max-Age={STATE_TTL_SECS}{secure}")
+/// The `Set-Cookie` header for the initiating-browser cookie.
+///
+/// `Secure` is UNCONDITIONAL — it is not a deployment choice. The `__Host-`
+/// prefix is DEFINED as `Secure` + `Path=/` + no `Domain` (RFC 6265bis §4.1.3.2);
+/// a `__Host-` cookie without `Secure` is malformed and every conforming client
+/// DISCARDS it outright — browsers, and curl since 7.87. The earlier
+/// "omit Secure on local http, curl jars are lenient" special-case (copied from
+/// github_app.rs, whose cookie is plain `fbx_gh_<flow>` and so genuinely may drop
+/// it) therefore did not relax the cookie, it deleted it: on an http public URL
+/// the browser never stored the flow cookie, so `callback` saw no cookie and the
+/// dance ended at "This browser did not start the connect flow" — 400, flow
+/// unburned, connection stuck `pending`. `login.rs`'s `__Host-fbx_web` is the
+/// in-repo precedent and always sends `Secure`; browsers treat `http://localhost`
+/// / `http://127.0.0.1` as trustworthy origins, so local dev keeps working.
+fn set_oauth_flow_cookie(value: &str) -> String {
+    format!(
+        "{OAUTH_FLOW_COOKIE}={value}; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age={STATE_TTL_SECS}"
+    )
 }
 
 /// Expire the initiating-browser cookie (same name/path/Secure so it matches).
-fn clear_oauth_flow_cookie(public_url: &str) -> String {
-    let secure = cookie_secure_suffix(public_url);
-    format!("{OAUTH_FLOW_COOKIE}=gone; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure}")
+fn clear_oauth_flow_cookie() -> String {
+    format!("{OAUTH_FLOW_COOKIE}=gone; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age=0")
 }
 
 /// A deterministic sha256 fingerprint of the discovered AS metadata, frozen on
@@ -1165,10 +1162,7 @@ pub async fn go(State(state): State<AppState>, Query(q): Query<GoParams>) -> Res
         .header(axum::http::header::LOCATION, authorize)
         .header(axum::http::header::CACHE_CONTROL, "no-store")
         .header("referrer-policy", "no-referrer")
-        .header(
-            axum::http::header::SET_COOKIE,
-            set_oauth_flow_cookie(&state.cfg.public_url, &bt.c),
-        )
+        .header(axum::http::header::SET_COOKIE, set_oauth_flow_cookie(&bt.c))
         .body(Body::empty())
         .expect("static response builds")
 }
@@ -1344,7 +1338,7 @@ pub async fn callback(
         }
     };
     // The flow is now BURNED — every outcome from here clears the cookie.
-    let clear = Some(clear_oauth_flow_cookie(&state.cfg.public_url));
+    let clear = Some(clear_oauth_flow_cookie());
     match complete_flow(
         &state,
         &flow,
@@ -2295,22 +2289,22 @@ mod tests {
 
     #[test]
     fn flow_cookie_header_shape() {
-        // https ⇒ __Host- compliant (Secure + Path=/); the clear expires it.
-        let set = set_oauth_flow_cookie("https://fbx.example.com", "abc123");
+        // __Host- compliant (Secure + Path=/, no Domain); the clear expires it.
+        let set = set_oauth_flow_cookie("abc123");
         assert!(set.starts_with("__Host-fbx_oauth_flow=abc123; "));
         assert!(set.contains("; HttpOnly"));
         assert!(set.contains("; SameSite=Lax"));
         assert!(set.contains("; Path=/"));
         assert!(set.contains("; Secure"));
+        assert!(!set.contains("; Domain"));
         assert!(set.contains(&format!("; Max-Age={STATE_TTL_SECS}")));
-        let clear = clear_oauth_flow_cookie("https://fbx.example.com");
+        let clear = clear_oauth_flow_cookie();
         assert!(
             clear.contains("=gone; ")
                 && clear.contains("; Max-Age=0")
                 && clear.contains("; Secure")
+                && clear.contains("; Path=/")
         );
-        // http (local dev / curl e2e) ⇒ Secure omitted (github_app's local special-case).
-        assert!(!set_oauth_flow_cookie("http://127.0.0.1:8787", "x").contains("Secure"));
         // The reader round-trips a cookie value out of a Cookie header.
         let mut headers = HeaderMap::new();
         headers.insert(

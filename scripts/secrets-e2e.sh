@@ -548,14 +548,18 @@ sess_call() { # sid token-plaintext json → prints the tools/call response body
   curl -s -X POST -H "authorization: Bearer $2" -H 'content-type: application/json' -d "$3" "$API/internal/sessions/$1/tools/call"
 }
 # The LLM facade: the session's fake ANTHROPIC_API_KEY IS its session token
-# (x-api-key). → prints the facade response body; sets FCODE to the http code.
-FCODE=""
-facade_call() { # session-token model → body (FCODE = http code)
-  local out; out=$(curl -s -o "$UB" -w '%{http_code}' -X POST \
+# (x-api-key). Sets FCODE + FBODY, exactly like admin_post sets CODE + BODY —
+# and for the same reason it must be CALLED PLAINLY, never as `X=$(facade_call …)`:
+# a command substitution runs the function in a SUBSHELL, so the FCODE assignment
+# dies with it and the caller reads a stale (or empty) status. That is precisely
+# how a 503 refusal was asserted as a 200 while the body was right.
+FCODE=""; FBODY=""
+facade_call() { # session-token model → sets FCODE (http code) + FBODY (response body)
+  FCODE=$(curl -s -o "$UB" -w '%{http_code}' -X POST \
     -H "x-api-key: $1" -H 'content-type: application/json' \
     -d "{\"model\":\"$2\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" \
     "$API/internal/llm/v1/messages")
-  FCODE=$out; cat "$UB"
+  FBODY=$(cat "$UB")
 }
 
 # ── The forged-run + forged-session fixtures (proven CI-green in bindings-e2e) ─
@@ -1087,7 +1091,7 @@ forge_running "$DRUN" "sess-d-$$" "default" && ok "run forced running + session 
 MODEL=$(db "select run_spec->>'model' from sessions where id='$DRUN'")
 need "$MODEL" "could not read the run's frozen model" && ok "frozen model = $MODEL"
 MSG0=$(llm_field "['messages'].__len__()")
-FBODY=$(facade_call "sess-d-$$" "$MODEL")
+facade_call "sess-d-$$" "$MODEL"
 [ "$FCODE" = 200 ] && ok "facade /v1/messages → 200 (upstream reached)" || no "facade call → $FCODE: $(printf '%s' "$FBODY" | head -c160)"
 [ "$(llm_field "['messages'].__len__()")" -gt "$MSG0" ] && ok "the call reached the fake LiteLLM upstream" || no "no new /v1/messages at the upstream"
 DEF_AUTH=$(llm_field "['messages'][-1]['auth']")
@@ -1099,7 +1103,7 @@ esac
 # Rotate org-a's key → a facade call FOR org-a carries the NEW key.
 OA_SID=$(forge_tenant_session "$TID_A" "$DRUN" "sess-oa-$$")
 if need "$OA_SID" "could not forge an org-a session"; then
-  facade_call "sess-oa-$$" "$MODEL" >/dev/null
+  facade_call "sess-oa-$$" "$MODEL"
   OA_AUTH1=$(llm_field "['messages'][-1]['auth']")
   [ "$OA_AUTH1" = "Bearer $KEY_A" ] && ok "org-a's facade call presented org-a's virtual key ($KEY_A)" || no "org-a facade key wrong: '$OA_AUTH1' (want Bearer $KEY_A)"
   admin_post "/v1/admin/orgs/org-a/llm-key/rotate" '{}'
@@ -1109,7 +1113,7 @@ import sys,json
 d=json.load(sys.stdin)
 ks=[g['key'] for g in d['generate'] if g['tenant']=='$TID_A']
 print(ks[-1] if ks else '')" 2>/dev/null)
-  facade_call "sess-oa-$$" "$MODEL" >/dev/null
+  facade_call "sess-oa-$$" "$MODEL"
   OA_AUTH2=$(llm_field "['messages'][-1]['auth']")
   { [ "$OA_AUTH2" = "Bearer $KEY_A2" ] && [ "$KEY_A2" != "$KEY_A" ]; } \
     && ok "after rotate, org-a's next facade call presents the NEW key ($KEY_A2 ≠ $KEY_A)" \
@@ -1172,7 +1176,7 @@ if need "$ANY_SID" "no session to copy for the sso facade probe"; then
   SSO_SID=$(forge_tenant_session "$DEFAULT_TID" "$ANY_SID" "sess-sso-$$")
   SSO_MODEL=$(db "select run_spec->>'model' from sessions where id='$SSO_SID'")
   if need "$SSO_SID" "could not forge the sso facade session"; then
-    FBODY=$(facade_call "sess-sso-$$" "$SSO_MODEL")
+    facade_call "sess-sso-$$" "$SSO_MODEL"
     { [ "$FCODE" = 503 ] && printf '%s' "$FBODY" | grep -q "tenant_llm_keys_required"; } \
       && ok "shared mode + REQUIRE_SSO → facade → 503 with code tenant_llm_keys_required" \
       || no "sso+shared facade → $FCODE: $(printf '%s' "$FBODY" | head -c160)"
