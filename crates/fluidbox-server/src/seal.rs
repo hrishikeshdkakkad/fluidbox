@@ -14,32 +14,41 @@
 //!   - v1 (legacy): `nonce(24) || ct`, one deployment-wide XChaCha20-Poly1305 key
 //!     from `FLUIDBOX_CREDENTIAL_KEY`, no AAD. Byte-identical to pre-Phase-D.
 //!   - v2 (envelope): `[0x02][dek_version u32 BE][nonce 24][ct]`, sealed under a
-//!     per-tenant DEK (wrapped by a KEK backend, `kms.rs`). AAD binds
-//!     `"fbx:v2:{tenant_id}:{table.column}"`, so a blob transplanted across
-//!     tenants OR families fails AEAD open even under the right DEK. The leading
-//!     `0x02` is an internal sanity byte only — the companion column is the
-//!     discriminator. Ephemeral TRANSIT tokens (no column, no companion) bind
-//!     `"fbx:v2:transit:{purpose}"` instead — same idea, purpose in the family
-//!     slot (`Sealer::seal_token`).
+//!     per-tenant DEK (wrapped by a KEK backend, `kms.rs`). AAD binds the blob's
+//!     own 5-byte HEADER followed by `"fbx:v2:{tenant_id}:{table.column}"`, so a
+//!     blob transplanted across tenants OR families — or one whose declared
+//!     dek_version was rewritten in place — fails AEAD open even under the right
+//!     DEK. The leading `0x02` is an internal sanity byte only — the companion
+//!     column is the discriminator. Ephemeral TRANSIT tokens (no column, no
+//!     companion) bind `"fbx:v2:transit:{purpose}"` instead — same idea, purpose
+//!     in the family slot (`Sealer::seal_token`).
 
 use crate::config::{Config, KmsMode};
 use crate::kms::{self, AwsKms, DekCache, KeyWrapper, KmsBackend, StaticKek, DEK_VERSION};
 use anyhow::Context;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 const NONCE_LEN: usize = 24;
 /// Leading byte of a v2 envelope blob (internal sanity check, not the format
 /// discriminator — the companion `_key_version` column is).
 const V2_TAG: u8 = 0x02;
-/// v2 header = tag(1) + dek_version(4). The nonce and ciphertext follow.
+/// v2 header = tag(1) + dek_version(4). The nonce and ciphertext follow. The
+/// header is AUTHENTICATED: it is the first segment of the data cipher's AAD (see
+/// [`seal_with_dek`]), so its version bytes cannot be flipped after the fact.
 const V2_HEADER_LEN: usize = 1 + 4;
 /// Companion key-version values stored beside each sealed column.
 const KV_LEGACY: i16 = 1;
 const KV_ENVELOPE: i16 = 2;
+/// Upper bound on a decoded TRANSIT token (review H2). Every transit payload is a
+/// small JSON object (a few ids + an expiry ≈ 200 bytes); 4 KiB is far above any
+/// legitimate one. Enforced BEFORE any DB/KMS work so an unauthenticated caller
+/// cannot spend our resources on an oversized blob that was never going to open.
+const MAX_TRANSIT_TOKEN_LEN: usize = 4096;
 
 // AAD family segments for ephemeral transit tokens (see [`Sealer::seal_token`]).
 // These are deployment-level wire values with no column family, so the AAD's
@@ -148,8 +157,14 @@ impl Sealed {
 
 /// The one deployment-wide legacy key (`FLUIDBOX_CREDENTIAL_KEY`). Seals/opens v1
 /// blobs exactly as pre-Phase-D.
+///
+/// The key bytes live in a `Zeroizing` container (review M4): a plain `Key` is an
+/// ordinary array whose bytes survive in reclaimed memory after the process drops
+/// it, which contradicted the manifest's claim that key material is scrubbed. The
+/// ciphers built from it zeroize their own copies on drop (`chacha20poly1305`'s
+/// `zeroize` feature, enabled in the workspace manifest).
 struct LegacyKey {
-    key: Key,
+    key: Zeroizing<[u8; 32]>,
 }
 
 impl LegacyKey {
@@ -172,13 +187,19 @@ impl LegacyKey {
             )
         })?;
         Ok(Self {
-            key: Key::from(key),
+            key: Zeroizing::new(key),
         })
+    }
+
+    /// The cipher, built WITHOUT copying the key onto the stack: `new_from_slice`
+    /// borrows, where `Key::from(*self.key)` would materialize an unscrubbed copy.
+    fn cipher(&self) -> XChaCha20Poly1305 {
+        XChaCha20Poly1305::new_from_slice(&self.key[..]).expect("a LegacyKey is 32 bytes")
     }
 
     /// v1: `nonce(24) || ct`, fresh random nonce, no AAD.
     fn seal(&self, plaintext: &str) -> Vec<u8> {
-        let cipher = XChaCha20Poly1305::new(&self.key);
+        let cipher = self.cipher();
         let mut nonce_bytes = [0u8; NONCE_LEN];
         getrandom::fill(&mut nonce_bytes).expect("OS RNG is available");
         let nonce = XNonce::from(nonce_bytes);
@@ -198,7 +219,7 @@ impl LegacyKey {
         }
         let (nonce, ct) = sealed.split_at(NONCE_LEN);
         let nonce: [u8; NONCE_LEN] = nonce.try_into().expect("split_at guarantees length");
-        let cipher = XChaCha20Poly1305::new(&self.key);
+        let cipher = self.cipher();
         let pt = cipher
             .decrypt(&XNonce::from(nonce), ct)
             .map_err(|_| anyhow::anyhow!("credential unseal failed (wrong key or corrupt data)"))?;
@@ -414,6 +435,14 @@ impl Sealer {
     /// key (refuse) or was sealed without an AAD at all (the pre-KMS posture, where
     /// the consumers' payload discriminators are the separation).
     pub async fn open_token(&self, purpose: &str, sealed: &[u8]) -> anyhow::Result<String> {
+        // Bound the work an UNAUTHENTICATED caller can trigger (review H2): a
+        // transit token arrives on public endpoints, so anything that cannot be a
+        // legitimate token is refused HERE — before the DEK lookup that a cold
+        // cache turns into a (billable) KMS Decrypt. The version check inside
+        // `envelope_dek_version` + `kms::dek_for_open` is the other half.
+        if sealed.len() > MAX_TRANSIT_TOKEN_LEN {
+            anyhow::bail!("token failed verification");
+        }
         // v2 path when the blob announces itself AND KMS is available. Any failure
         // (parse, missing DEK, decrypt) falls through to the bounded legacy open.
         if sealed.first() == Some(&V2_TAG) {
@@ -462,33 +491,11 @@ pub fn build_sealer(
         Some(k) => Some(LegacyKey::from_key_string(k)?),
         None => None,
     };
-    let kms = match cfg.kms_mode {
-        KmsMode::Off => None,
-        KmsMode::Static => {
-            let kek = cfg.kms_static_kek.as_deref().context(
-                "FLUIDBOX_KMS_MODE=static requires FLUIDBOX_KMS_STATIC_KEK (32-byte hex/base64)",
-            )?;
-            let wrapper: Arc<dyn KeyWrapper> = Arc::new(StaticKek::from_key_string(kek)?);
-            Some(KmsBackend {
-                wrapper,
-                pool: pool.clone(),
-                cache: Arc::new(DekCache::default()),
-            })
-        }
-        KmsMode::Aws => {
-            let key_id = cfg
-                .kms_aws_key_id
-                .clone()
-                .context("FLUIDBOX_KMS_MODE=aws requires FLUIDBOX_KMS_AWS_KEY_ID")?;
-            let wrapper: Arc<dyn KeyWrapper> =
-                Arc::new(AwsKms::new(key_id, cfg.kms_aws_endpoint.clone()));
-            Some(KmsBackend {
-                wrapper,
-                pool: pool.clone(),
-                cache: Arc::new(DekCache::default()),
-            })
-        }
-    };
+    let kms = build_wrapper(cfg)?.map(|wrapper| KmsBackend {
+        wrapper,
+        pool: pool.clone(),
+        cache: Arc::new(DekCache::default()),
+    });
     if kms.is_none() && legacy.is_none() {
         return Ok(None);
     }
@@ -501,15 +508,53 @@ pub fn build_sealer(
     }))
 }
 
+/// The configured KEK backend (`None` = KMS off). Shared by [`build_sealer`] and
+/// the boot-time KEK gate in [`check_retirement_gates`] so both judge exactly the
+/// same configuration — a gate that validated a DIFFERENTLY-built wrapper would
+/// be theater.
+fn build_wrapper(cfg: &Config) -> anyhow::Result<Option<Arc<dyn KeyWrapper>>> {
+    Ok(match cfg.kms_mode {
+        KmsMode::Off => None,
+        KmsMode::Static => {
+            let kek = cfg.kms_static_kek.as_deref().context(
+                "FLUIDBOX_KMS_MODE=static requires FLUIDBOX_KMS_STATIC_KEK (32-byte hex/base64)",
+            )?;
+            Some(Arc::new(StaticKek::from_key_string(kek)?))
+        }
+        KmsMode::Aws => {
+            let key_id = cfg
+                .kms_aws_key_id
+                .clone()
+                .context("FLUIDBOX_KMS_MODE=aws requires FLUIDBOX_KMS_AWS_KEY_ID")?;
+            Some(Arc::new(AwsKms::new(key_id, cfg.kms_aws_endpoint.clone())))
+        }
+    })
+}
+
 /// D4 retirement boot gates (the DB-backed half; the config half is in
 /// [`build_sealer`]). Refuses boot when sealing state and stored custody are
 /// incoherent, so a misconfigured deployment fails loud rather than orphaning or
 /// silently dropping credentials.
 ///
-/// The counts are fetched ONLY when a key is missing: with both keys present
-/// (the migration window) every stored version is openable, so there is nothing
-/// a scan could refuse.
+/// TWO independent gates run here:
+///
+///  1. **KEK compatibility** ([`kms::check_kek_compatibility`]) — whenever KMS is
+///     configured, INDEPENDENT of the legacy key. The retirement counts below can
+///     only see key VERSIONS, never which KEK wrapped the stored DEKs, so a
+///     syntactically valid but WRONG KEK sailed through every quadrant: existing
+///     tenants failed every unwrap while new tenants happily minted DEKs under it,
+///     splitting custody across two KEKs with no recovery (review H1). This gate
+///     proves the configured backend can actually READ a stored DEK before we
+///     serve. It builds its own wrapper from the same config as `build_sealer`
+///     (an `aws` backend therefore constructs one extra lazily-initialized client
+///     at boot — one probe Decrypt, once).
+///  2. **Version retirement** — the counts are fetched ONLY when a key is missing:
+///     with both keys present (the migration window) every stored version is
+///     openable, so there is nothing a scan could refuse.
 pub async fn check_retirement_gates(cfg: &Config, pool: &PgPool) -> anyhow::Result<()> {
+    if let Some(wrapper) = build_wrapper(cfg)? {
+        kms::check_kek_compatibility(pool, wrapper.as_ref()).await?;
+    }
     let kms_on = cfg.kms_mode != KmsMode::Off;
     let legacy_present = cfg.credential_key.is_some();
     if kms_on && legacy_present {
@@ -594,9 +639,31 @@ fn transit_aad(purpose: &str) -> String {
     format!("fbx:v2:transit:{purpose}")
 }
 
-/// v2 layout: `[0x02][dek_version u32 BE][nonce 24][ct]`.
+/// The data cipher's AAD for a v2 blob: the 5-byte HEADER followed by the context
+/// string (`fbx:v2:{tenant}:{family}` or `fbx:v2:transit:{purpose}`).
+///
+/// Binding the header (review L6) is what makes the declared `dek_version`
+/// TRUSTWORTHY. Before this, the version bytes rode outside the AEAD entirely: a
+/// database-write attacker could flip them and — combined with a wrapped DEK moved
+/// between version rows — have the same raw DEK selected while the ciphertext
+/// still opened, so the format's own version metadata proved nothing. Now a
+/// single flipped header bit changes the AAD and the open fails.
+fn v2_payload_aad(header: &[u8], ctx: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(header.len() + ctx.len());
+    aad.extend_from_slice(header);
+    aad.extend_from_slice(ctx.as_bytes());
+    aad
+}
+
+/// v2 layout: `[0x02][dek_version u32 BE][nonce 24][ct]`; the header is
+/// authenticated as the AAD prefix.
 fn seal_with_dek(dek: &[u8; 32], dek_version: u32, aad: &str, plaintext: &str) -> Vec<u8> {
-    let cipher = XChaCha20Poly1305::new(&Key::from(*dek));
+    // new_from_slice BORROWS the key — Key::from(*dek) would copy it onto the
+    // stack where nothing scrubs it (review M4).
+    let cipher = XChaCha20Poly1305::new_from_slice(&dek[..]).expect("a DEK is 32 bytes");
+    let mut header = [0u8; V2_HEADER_LEN];
+    header[0] = V2_TAG;
+    header[1..].copy_from_slice(&dek_version.to_be_bytes());
     let mut nonce = [0u8; NONCE_LEN];
     getrandom::fill(&mut nonce).expect("OS RNG is available");
     let ct = cipher
@@ -604,13 +671,12 @@ fn seal_with_dek(dek: &[u8; 32], dek_version: u32, aad: &str, plaintext: &str) -
             &XNonce::from(nonce),
             Payload {
                 msg: plaintext.as_bytes(),
-                aad: aad.as_bytes(),
+                aad: &v2_payload_aad(&header, aad),
             },
         )
         .expect("XChaCha20Poly1305 encrypt is infallible for in-memory data");
     let mut out = Vec::with_capacity(V2_HEADER_LEN + NONCE_LEN + ct.len());
-    out.push(V2_TAG);
-    out.extend_from_slice(&dek_version.to_be_bytes());
+    out.extend_from_slice(&header);
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&ct);
     out
@@ -621,19 +687,22 @@ fn open_with_dek(dek: &[u8; 32], aad: &str, blob: &[u8]) -> anyhow::Result<Strin
     if blob.len() < V2_HEADER_LEN + NONCE_LEN + 16 || blob[0] != V2_TAG {
         anyhow::bail!("sealed blob is malformed");
     }
-    let nonce_start = V2_HEADER_LEN;
-    let ct_start = nonce_start + NONCE_LEN;
-    let nonce: [u8; NONCE_LEN] = blob[nonce_start..ct_start]
+    let header = &blob[..V2_HEADER_LEN];
+    let ct_start = V2_HEADER_LEN + NONCE_LEN;
+    let nonce: [u8; NONCE_LEN] = blob[V2_HEADER_LEN..ct_start]
         .try_into()
         .expect("checked length");
     let ct = &blob[ct_start..];
-    let cipher = XChaCha20Poly1305::new(&Key::from(*dek));
+    let cipher = XChaCha20Poly1305::new_from_slice(&dek[..]).expect("a DEK is 32 bytes");
     let pt = cipher
         .decrypt(
             &XNonce::from(nonce),
             Payload {
                 msg: ct,
-                aad: aad.as_bytes(),
+                // The header the blob CARRIES is authenticated, so a tampered
+                // version (or tag) fails the open rather than silently selecting a
+                // different DEK.
+                aad: &v2_payload_aad(header, aad),
             },
         )
         .map_err(|_| anyhow::anyhow!("credential unseal failed (wrong key or corrupt data)"))?;
@@ -641,17 +710,24 @@ fn open_with_dek(dek: &[u8; 32], aad: &str, blob: &[u8]) -> anyhow::Result<Strin
 }
 
 /// Read the declared `dek_version` from a v2 blob header (fail closed on a blob
-/// too short or missing the sanity tag). Returns the DB-side type (`i32`, the
-/// `tenant_deks.version` column): a header declaring a value above `i32::MAX` is
-/// MALFORMED, not a negative version — a bare `as i32` cast turned `0xFFFFFFFE`
-/// into a lookup for version `-2` and failed with a confusing "no DEK for version
-/// -2147483648"-style message instead of naming the real problem.
+/// too short, missing the sanity tag, or declaring an impossible version).
+/// Returns the DB-side type (`i32`, the `tenant_deks.version` column): a header
+/// declaring a value above `i32::MAX` is MALFORMED, not a negative version — a
+/// bare `as i32` cast turned `0xFFFFFFFE` into a lookup for version `-2` and
+/// failed with a confusing "no DEK for version -2147483648"-style message instead
+/// of naming the real problem. Version 0 is likewise MALFORMED, not "an old
+/// version" (review L6): DEK versions start at 1, so a zero header is a forged or
+/// corrupt blob and is refused before any DB/KMS access.
 fn envelope_dek_version(blob: &[u8]) -> anyhow::Result<i32> {
     if blob.len() < V2_HEADER_LEN + NONCE_LEN + 16 || blob[0] != V2_TAG {
         anyhow::bail!("sealed blob is malformed");
     }
     let raw = u32::from_be_bytes([blob[1], blob[2], blob[3], blob[4]]);
-    i32::try_from(raw).map_err(|_| anyhow::anyhow!("sealed blob is malformed"))
+    let v = i32::try_from(raw).map_err(|_| anyhow::anyhow!("sealed blob is malformed"))?;
+    if v < kms::MIN_DEK_VERSION {
+        anyhow::bail!("sealed blob is malformed");
+    }
+    Ok(v)
 }
 
 #[cfg(test)]
@@ -751,9 +827,36 @@ mod tests {
         blob[1..5].copy_from_slice(&u32::MAX.to_be_bytes());
         let err = envelope_dek_version(&blob).unwrap_err().to_string();
         assert!(err.contains("malformed"), "got: {err}");
+        // Version 0 is not "an old version" — DEK versions start at 1 (review L6).
+        blob[1..5].copy_from_slice(&0u32.to_be_bytes());
+        assert!(envelope_dek_version(&blob).is_err(), "version 0 is refused");
         // The largest representable version is still readable.
         blob[1..5].copy_from_slice(&(i32::MAX as u32).to_be_bytes());
         assert_eq!(envelope_dek_version(&blob).unwrap(), i32::MAX);
+    }
+
+    #[test]
+    fn v2_header_is_authenticated() {
+        // Review L6: the version bytes ride OUTSIDE the ciphertext, so they must be
+        // authenticated as AAD. Flipping the declared version (a database-write
+        // attacker's move, paired with a wrapped DEK copied between version rows)
+        // must break the open, not silently select a different DEK.
+        let dek = [7u8; 32];
+        let aad = aad_for(Uuid::nil(), SealFamily::ConnectionCredential);
+        let good = seal_with_dek(&dek, 1, &aad, "secret");
+        assert_eq!(open_with_dek(&dek, &aad, &good).unwrap(), "secret");
+        let mut tampered = good.clone();
+        tampered[1..5].copy_from_slice(&2u32.to_be_bytes());
+        assert!(
+            open_with_dek(&dek, &aad, &tampered).is_err(),
+            "a flipped dek_version must fail the AEAD open"
+        );
+        // Two blobs of the same plaintext under different declared versions are
+        // NOT interchangeable — the header is part of what is authenticated.
+        let v2 = seal_with_dek(&dek, 2, &aad, "secret");
+        let mut swapped = v2.clone();
+        swapped[1..5].copy_from_slice(&1u32.to_be_bytes());
+        assert!(open_with_dek(&dek, &aad, &swapped).is_err());
     }
 
     #[test]
@@ -893,6 +996,24 @@ mod tests {
         let other = Sealer::from_key_string(&"cd".repeat(32)).unwrap();
         let blob = good.seal("secret", ctx()).await.unwrap();
         assert!(other.open(&blob.bytes, KV_LEGACY, ctx()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn oversized_transit_token_refused_before_any_lookup() {
+        // Review H2: `open_token` is reachable UNAUTHENTICATED, and a cold DEK cache
+        // turns a lookup into a (billable) KMS Decrypt. Two guards run BEFORE the
+        // lookup — the length bound and the version parse — so a blob shaped like a
+        // v2 envelope but impossible on its face never reaches the DB/KMS. (The
+        // helper's pool is lazy and unreachable; these paths return without it.)
+        let s = sealer_with_static_kms(Some(&"ab".repeat(32)));
+        let mut huge = vec![V2_TAG, 0, 0, 0, 1];
+        huge.extend_from_slice(&vec![0u8; MAX_TRANSIT_TOKEN_LEN + 1]);
+        assert!(s.open_token(TRANSIT_LOGIN, &huge).await.is_err());
+        // A version-0 header is rejected at the parse (no DEK lookup); the only
+        // path left is the bounded legacy attempt, which refuses the garbage.
+        let mut zero_version = vec![V2_TAG, 0, 0, 0, 0];
+        zero_version.extend_from_slice(&[0u8; NONCE_LEN + 16]);
+        assert!(s.open_token(TRANSIT_LOGIN, &zero_version).await.is_err());
     }
 
     #[tokio::test]
