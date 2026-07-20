@@ -1328,6 +1328,14 @@ pub async fn bump_connection_generation(
 
 /// Persist non-secret OAuth custody state (discovered endpoints, client
 /// identity, pending bundle) before the connection is activated.
+///
+/// The caller's bag REPLACES the stored one — except for
+/// [`ACTIVATED_AT_KEY`], which is carried over unconditionally. That stamp is
+/// owned by [`activate_connection_oauth`] and is half of its compare-and-swap
+/// (review H2): this write is a read-modify-write in the caller (flow start
+/// reads the bag, discovers over HTTP for seconds, then writes), so an
+/// activation landing in that window would otherwise have its stamp erased by a
+/// stale bag — handing a superseded sibling flow a passing expectation.
 pub async fn update_connection_oauth(
     pool: &PgPool,
     scope: TenantScope,
@@ -1336,10 +1344,17 @@ pub async fn update_connection_oauth(
 ) -> sqlx::Result<()> {
     let mut tx = scoped_tx(pool, scope).await?;
 
-    sqlx::query(
-        "update integration_connections set oauth = $2, updated_at = now()
-         where id = $1 and status <> 'revoked' and tenant_id = $3",
-    )
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "update integration_connections
+         set oauth = case
+                 when jsonb_typeof($2::jsonb) = 'object'
+                      and (oauth -> '{ACTIVATED_AT_KEY}') is not null
+                 then jsonb_set($2::jsonb, '{{{ACTIVATED_AT_KEY}}}',
+                                oauth -> '{ACTIVATED_AT_KEY}')
+                 else $2::jsonb end,
+             updated_at = now()
+         where id = $1 and status <> 'revoked' and tenant_id = $3"
+    )))
     .bind(id)
     .bind(oauth)
     .bind(scope.tenant_id())
@@ -1364,9 +1379,37 @@ pub async fn update_connection_oauth(
 /// ⇒ no bump; reconnect (from `active`/`error`) ⇒ bump — all in ONE write, so no
 /// crash window where a reconnected grant serves the OLD generation. The returned
 /// row carries the FINAL generation the caller caches under.
+///
+/// **THE ACTIVATION IS A COMPARE-AND-SWAP** (Phase D review H2). The callback's
+/// pre-exchange generation recheck is an optimization that avoids burning a code;
+/// it is NOT the boundary, because the code exchange is a full HTTP round trip
+/// during which a sibling flow can activate. TWO predicates make the write itself
+/// the boundary, both frozen at the flow's START:
+///   - `authorization_generation = expected_generation` — the flow row's frozen
+///     generation. A sibling RECONNECT that landed first moved it, so the loser
+///     matches zero rows instead of overwriting the newer refresh token.
+///   - `activated_at < flow_started_at` — the connection's own last-activation
+///     instant (stamped by this UPDATE, DB clock, never caller-supplied) against
+///     the flow row's `created_at`. This is what covers FIRST connect, where the
+///     `pending → active` activation deliberately does NOT bump the generation:
+///     two callbacks racing on the same pending row both froze the same
+///     generation, so the generation predicate alone cannot separate them. Every
+///     successful activation stamps an instant strictly later than every
+///     in-flight flow's `created_at`, so ONE activation invalidates every sibling
+///     flow's expectation — including its own siblings' retries.
+///
+/// `None` therefore means "superseded / no longer activatable" (revoked, wrong
+/// auth_kind, reauthorized, or already activated since this flow started); the
+/// caller must tell the user to restart the connect flow, never retry blindly.
+///
+/// `activated_at` lives inside the `oauth` jsonb bag rather than its own column
+/// because this wave may not add migrations; the bag is rewritten here from the
+/// caller's value, so the stamp is applied SQL-side (`jsonb_set` +
+/// `clock_timestamp()`) and cannot be forged or dropped by the caller.
 // Executor-generic (see `get_connection`): the callback activation runs THROUGH
 // the connection that holds the OAuth advisory lock, so the critical section
 // uses exactly one pooled connection.
+#[allow(clippy::too_many_arguments)]
 pub async fn activate_connection_oauth<'e, E>(
     exec: E,
     scope: TenantScope,
@@ -1375,18 +1418,26 @@ pub async fn activate_connection_oauth<'e, E>(
     key_version: i16,
     oauth: &Value,
     granted_scopes: &Value,
+    expected_generation: i32,
+    flow_started_at: DateTime<Utc>,
 ) -> sqlx::Result<Option<IntegrationConnectionRow>>
 where
     E: sqlx::PgExecutor<'e>,
 {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update integration_connections
-         set credential_sealed = $2, credential_key_version = $6, oauth = $3, granted_scopes = $4,
+         set credential_sealed = $2, credential_key_version = $6, granted_scopes = $4,
+             oauth = jsonb_set(
+                 case when jsonb_typeof($3::jsonb) = 'object' then $3::jsonb else '{{}}'::jsonb end,
+                 '{{{ACTIVATED_AT_KEY}}}', to_jsonb(clock_timestamp())),
              status = 'active',
              authorization_generation =
                  authorization_generation + case when status <> 'pending' then 1 else 0 end,
              updated_at = now()
          where id = $1 and status <> 'revoked' and auth_kind = 'oauth' and tenant_id = $5
+           and authorization_generation = $7
+           and coalesce((oauth ->> '{ACTIVATED_AT_KEY}')::timestamptz, '-infinity'::timestamptz)
+               < $8
          returning {CONNECTION_COLS}"
     )))
     .bind(id)
@@ -1395,9 +1446,16 @@ where
     .bind(granted_scopes)
     .bind(scope.tenant_id())
     .bind(key_version)
+    .bind(expected_generation)
+    .bind(flow_started_at)
     .fetch_optional(exec)
     .await
 }
+
+/// The `oauth` jsonb key carrying the connection's last successful OAuth
+/// activation instant (DB clock). Written ONLY by [`activate_connection_oauth`],
+/// read by its CAS predicate and by the callback's pre-exchange fast refusal.
+pub const ACTIVATED_AT_KEY: &str = "activated_at";
 
 /// Refresh-token rotation: one atomic overwrite (OAuth 2.1 MUST — old token
 /// is gone the moment the new one lands). Active connections only, and ONLY
@@ -2302,6 +2360,78 @@ pub struct TenantLlmKeyInsert {
     pub we_won: bool,
 }
 
+/// A tenant's virtual-key row as the RECOVERY path needs it: the sealed bytes
+/// EXACTLY as stored (the compare-and-swap expectation — sealing is
+/// nondeterministic, so only the bytes we read can be compared), the companion
+/// version, and `minted_at` = when this key was created or last rotated.
+///
+/// `minted_at` is the DURABLE recovery cooldown (Phase D review H3): it survives
+/// restarts and is shared by every replica, so a LiteLLM outage that keeps
+/// rejecting keys cannot drive re-provisioning in a loop.
+pub struct TenantLlmKeyRow {
+    pub sealed: Vec<u8>,
+    pub key_version: i16,
+    pub minted_at: DateTime<Utc>,
+}
+
+/// Read a tenant's virtual-key row (sealed bytes + version + `minted_at`).
+/// `None` = not yet minted. Tenant-scoped by the PK.
+pub async fn tenant_llm_key_row(
+    pool: &PgPool,
+    scope: TenantScope,
+) -> sqlx::Result<Option<TenantLlmKeyRow>> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let row: Option<(Vec<u8>, i16, DateTime<Utc>)> = sqlx::query_as(
+        "select litellm_key_sealed, litellm_key_key_version, coalesce(rotated_at, created_at)
+           from tenant_llm_keys where tenant_id = $1",
+    )
+    .bind(scope.tenant_id())
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row.map(|(sealed, key_version, minted_at)| TenantLlmKeyRow {
+        sealed,
+        key_version,
+        minted_at,
+    }))
+}
+
+/// Compare-and-swap a tenant's virtual key: replace it ONLY while the stored
+/// sealed bytes are still `expected_sealed` (Phase D review M4). The reactive
+/// recovery path reads the row, proves the key LiteLLM rejected is the CURRENT
+/// one, mints a replacement, and lands it here — between the read and the write
+/// an operator rotation (or another replica's recovery) may have installed a new
+/// key, and blindly overwriting it would leak a live key and discard a
+/// successful rotation. `false` = someone else swapped first; the caller must
+/// drop its fresh mint and adopt the current key instead. Tenant-scoped by the PK.
+pub async fn rotate_tenant_llm_key_cas(
+    pool: &PgPool,
+    scope: TenantScope,
+    expected_sealed: &[u8],
+    sealed: &[u8],
+    key_version: i16,
+    key_alias: &str,
+    litellm_token_id: Option<&str>,
+) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let r = sqlx::query(
+        "update tenant_llm_keys
+            set litellm_key_sealed = $2, litellm_key_key_version = $3, key_alias = $4,
+                litellm_token_id = $5, rotated_at = now()
+          where tenant_id = $1 and litellm_key_sealed = $6",
+    )
+    .bind(scope.tenant_id())
+    .bind(sealed)
+    .bind(key_version)
+    .bind(key_alias)
+    .bind(litellm_token_id)
+    .bind(expected_sealed)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(r.rows_affected() == 1)
+}
+
 /// Read a tenant's sealed virtual key + companion version. `None` = not yet
 /// minted. Tenant-scoped: keyed on the scope's tenant (the table's PK).
 pub async fn tenant_llm_key_sealed(
@@ -2373,11 +2503,15 @@ pub async fn insert_tenant_llm_key(
 }
 
 /// Drop a tenant's sealed virtual key so the next `ensure_tenant_key` MINTS a
-/// fresh one. The facade's reactive-401 recovery (Phase D final review): a key
-/// LiteLLM no longer knows is worse than no key at all — the cached value can be
-/// evicted, but a cold cache would just re-read the same dead row and 401 forever
-/// (LiteLLM redeployed with a fresh DB, or an operator pruned keys). Deleting the
-/// row is what makes the recovery survive a restart. Tenant-scoped by the PK.
+/// fresh one. Teardown / manual-invalidation only.
+///
+/// NOT the reactive-401 recovery path any more (review M4): "evict + delete the
+/// tenant's row" is unconditional, so a stale rejection (a request that presented
+/// a key an operator had already rotated away) deleted the CURRENT row — losing a
+/// live key and superseding a successful rotation. Recovery now compare-and-swaps
+/// on the exact sealed bytes it read (`rotate_tenant_llm_key_cas`), which also
+/// keeps `coalesce(rotated_at, created_at)` as its durable cooldown stamp — a
+/// delete would reset that and re-open the loop. Tenant-scoped by the PK.
 pub async fn delete_tenant_llm_key(pool: &PgPool, scope: TenantScope) -> sqlx::Result<()> {
     let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query("delete from tenant_llm_keys where tenant_id = $1")
@@ -7384,6 +7518,17 @@ mod tests {
         // Callback exchange: seal refresh + activate. First connect (from
         // `pending`) ⇒ no bump — the bump is derived from the row's pre-update
         // status inside the UPDATE (B1), not a caller boolean.
+        // `flow_a_started` stands in for the flow row's `created_at` (frozen at
+        // START, before any activation). It is read from the DB clock, exactly
+        // like the real `connector_oauth_flows.created_at default now()` — the
+        // comparison is DB-clock vs DB-clock, never the test host's clock.
+        let db_now = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, DateTime<Utc>>("select clock_timestamp()")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        let flow_a_started = db_now(pool.clone()).await;
         let row = activate_connection_oauth(
             &pool,
             scope,
@@ -7392,6 +7537,8 @@ mod tests {
             1,
             &serde_json::json!({"resource": "https://mcp.example.test", "client_id": "c1"}),
             &serde_json::json!(["read"]),
+            1,
+            flow_a_started,
         )
         .await
         .unwrap()
@@ -7400,6 +7547,76 @@ mod tests {
         assert_eq!(
             row.authorization_generation, 1,
             "first activation stays generation 1 (no bump)"
+        );
+        // H2: a SIBLING first-connect flow — same frozen generation, started
+        // before the winner activated — is now refused by the write itself. Its
+        // generation expectation is still satisfiable (pending → active does not
+        // bump), so the activation instant is the only thing that separates them.
+        assert!(
+            activate_connection_oauth(
+                &pool,
+                scope,
+                conn.id,
+                b"sealed-rt-sibling",
+                1,
+                &serde_json::json!({"resource": "https://mcp.example.test"}),
+                &serde_json::json!([]),
+                1,
+                flow_a_started,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "a first-connect sibling flow must not overwrite the grant that activated first"
+        );
+        assert_eq!(
+            connection_credential_sealed(&pool, scope, conn.id)
+                .await
+                .unwrap()
+                .map(|t| t.0)
+                .as_deref(),
+            Some(b"sealed-rt-1".as_slice()),
+            "the superseded sibling left the winner's refresh token untouched"
+        );
+        // H2: a concurrent flow START rewrites the oauth bag from a value it read
+        // BEFORE the activation. The activation stamp must survive that
+        // read-modify-write — erasing it would hand the superseded sibling a
+        // passing expectation.
+        update_connection_oauth(
+            &pool,
+            scope,
+            conn.id,
+            &serde_json::json!({"resource": "https://mcp.example.test", "issuer": "https://as"}),
+        )
+        .await
+        .unwrap();
+        let after_start = get_connection(&pool, scope, conn.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .oauth
+            .unwrap();
+        assert!(
+            after_start.get(ACTIVATED_AT_KEY).is_some(),
+            "the activation stamp survives a flow-start bag rewrite"
+        );
+        assert_eq!(after_start["issuer"], "https://as", "the rest is replaced");
+        assert!(
+            activate_connection_oauth(
+                &pool,
+                scope,
+                conn.id,
+                b"sealed-rt-sibling-2",
+                1,
+                &serde_json::json!({"resource": "https://mcp.example.test"}),
+                &serde_json::json!([]),
+                1,
+                flow_a_started,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "the sibling is still refused after a concurrent flow start"
         );
         assert_eq!(
             connection_credential_sealed(&pool, scope, conn.id)
@@ -7456,6 +7673,26 @@ mod tests {
         // Reconnect path: activation works FROM error too, and bumps the
         // generation atomically (R1.3+R3.1) — the reconnect may be a new grant.
         // The bump is derived from the pre-update status (`error` <> `pending`).
+        let flow_b_started = db_now(pool.clone()).await;
+        // H2: a reconnect flow frozen at a STALE generation is refused by the
+        // write, even though its start-time instant is fresh.
+        assert!(
+            activate_connection_oauth(
+                &pool,
+                scope,
+                conn.id,
+                b"sealed-rt-stale-gen",
+                1,
+                &serde_json::json!({"resource": "https://mcp.example.test"}),
+                &serde_json::json!([]),
+                999,
+                flow_b_started,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "activation at a superseded generation must fail closed"
+        );
         let row = activate_connection_oauth(
             &pool,
             scope,
@@ -7464,6 +7701,8 @@ mod tests {
             1,
             &serde_json::json!({"resource": "https://mcp.example.test"}),
             &serde_json::json!([]),
+            1,
+            flow_b_started,
         )
         .await
         .unwrap()
@@ -7477,6 +7716,10 @@ mod tests {
         // B1 regression: re-activating an ALREADY-active row bumps again — proving
         // the bump is derived from the row's live status under the lock, not from
         // a pre-lock read (two racing first-connects that both saw `pending`).
+        // H2: it takes a flow that started AFTER the last activation and names the
+        // now-current generation — i.e. a genuinely newer authorization, which is
+        // exactly what the CAS admits (and the superseded ones above it refuses).
+        let flow_c_started = db_now(pool.clone()).await;
         let row = activate_connection_oauth(
             &pool,
             scope,
@@ -7485,6 +7728,8 @@ mod tests {
             1,
             &serde_json::json!({"resource": "https://mcp.example.test"}),
             &serde_json::json!([]),
+            2,
+            flow_c_started,
         )
         .await
         .unwrap()
@@ -7492,6 +7737,34 @@ mod tests {
         assert_eq!(
             row.authorization_generation, 3,
             "activating the now-active row bumps again (status <> 'pending')"
+        );
+        // H2: replaying that same flow (its instant is now older than the
+        // activation it just performed) matches nothing — one activation per flow,
+        // enforced by the write, not only by the one-time claim.
+        assert!(
+            activate_connection_oauth(
+                &pool,
+                scope,
+                conn.id,
+                b"sealed-rt-replay",
+                1,
+                &serde_json::json!({"resource": "https://mcp.example.test"}),
+                &serde_json::json!([]),
+                3,
+                flow_c_started,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "a flow cannot activate twice: its start instant is older than its own activation"
+        );
+        assert_eq!(
+            connection_credential_sealed(&pool, scope, conn.id)
+                .await
+                .unwrap()
+                .map(|t| t.0)
+                .as_deref(),
+            Some(b"sealed-rt-4".as_slice())
         );
 
         sqlx::query("delete from integration_connections where id = $1")
@@ -10707,6 +10980,7 @@ mod tests {
 
         // Not minted yet.
         assert!(tenant_llm_key_sealed(&pool, scope).await.unwrap().is_none());
+        assert!(tenant_llm_key_row(&pool, scope).await.unwrap().is_none());
 
         // First insert wins and returns our sealed bytes.
         let first = insert_tenant_llm_key(
@@ -10771,6 +11045,58 @@ mod tests {
                 .await
                 .unwrap();
         assert!(rotated_at.is_some(), "rotate bumps rotated_at");
+
+        // The row reader carries the CAS expectation + the durable cooldown
+        // stamp (Phase D review H3/M4).
+        let row = tenant_llm_key_row(&pool, scope).await.unwrap().unwrap();
+        assert_eq!(row.sealed, b"sealed-v2-c");
+        assert_eq!(row.key_version, 2);
+        assert_eq!(
+            row.minted_at,
+            rotated_at.unwrap(),
+            "minted_at is the rotation instant once rotated"
+        );
+
+        // M4: the recovery CAS only swaps while the stored bytes are still the
+        // ones the caller read. A stale expectation (the key an in-flight request
+        // presented, already rotated away) matches ZERO rows — the freshly
+        // rotated key survives instead of being silently superseded.
+        assert!(
+            !rotate_tenant_llm_key_cas(
+                &pool,
+                scope,
+                b"sealed-v1-a", // the pre-rotation key
+                b"sealed-v3-stale",
+                2,
+                "fbx-tenant-x",
+                None,
+            )
+            .await
+            .unwrap(),
+            "CAS against a superseded key must not swap"
+        );
+        assert_eq!(
+            tenant_llm_key_sealed(&pool, scope).await.unwrap().unwrap(),
+            (b"sealed-v2-c".to_vec(), 2),
+            "the winning rotation is intact"
+        );
+
+        // …and it DOES swap when the expectation is the live key.
+        assert!(rotate_tenant_llm_key_cas(
+            &pool,
+            scope,
+            b"sealed-v2-c",
+            b"sealed-v3-d",
+            2,
+            "fbx-tenant-x",
+            Some("tok-d"),
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            tenant_llm_key_sealed(&pool, scope).await.unwrap().unwrap(),
+            (b"sealed-v3-d".to_vec(), 2)
+        );
 
         cleanup_dek_tenant(&pool, tenant).await;
     }

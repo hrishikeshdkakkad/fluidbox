@@ -32,7 +32,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::Json;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -1590,6 +1590,65 @@ async fn retire_rejected_registration(state: &AppState, client: &ExchangeClient)
     }
 }
 
+/// What the user is told when this flow's activation expectation no longer
+/// holds: a newer authorization for the same connection already landed. Used by
+/// BOTH the pre-exchange fast refusal and the CAS refusal, so the two cannot
+/// drift apart.
+const SUPERSEDED_MSG: &str =
+    "this authorization was superseded by a newer one — restart the connect flow";
+
+/// The connection's last successful OAuth activation instant, as stamped by
+/// `activate_connection_oauth` (DB clock, SQL-side, never caller-supplied).
+///
+/// `None` = never activated. A present-but-unparseable stamp yields
+/// `DateTime::<Utc>::MAX_UTC`, i.e. EVERY flow reads as superseded: we cannot
+/// prove freshness, and the DB CAS's `::timestamptz` cast would hard-error on
+/// the same value — refusing with "restart the connect flow" is the honest
+/// answer, not a 500.
+fn last_activated_at(oauth: Option<&Value>) -> Option<DateTime<Utc>> {
+    let raw = oauth?.get(fluidbox_db::ACTIVATED_AT_KEY)?;
+    if raw.is_null() {
+        return None;
+    }
+    Some(
+        raw.as_str()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC),
+    )
+}
+
+/// Has a newer authorization for this connection already landed, making THIS
+/// flow's expectation stale? PURE — the same two predicates the activation CAS
+/// re-asserts inside its UPDATE (review H2):
+///   - the frozen generation moved (a RECONNECT activated), or
+///   - the connection was activated at-or-after this flow started (which is what
+///     catches FIRST connect, where `pending → active` does not bump the
+///     generation and two racing callbacks froze the same one).
+///
+/// `>=` not `>`: equal instants are unorderable, so they fail closed.
+fn flow_superseded(
+    conn_generation: i32,
+    last_activated: Option<DateTime<Utc>>,
+    expected_generation: i32,
+    flow_created_at: DateTime<Utc>,
+) -> bool {
+    conn_generation != expected_generation || last_activated.is_some_and(|t| t >= flow_created_at)
+}
+
+/// [`flow_superseded`] against a freshly read connection row + its flow.
+fn superseded_flow(
+    conn: &fluidbox_db::IntegrationConnectionRow,
+    flow: &fluidbox_db::ConnectorOauthFlowRow,
+) -> bool {
+    flow_superseded(
+        conn.authorization_generation,
+        last_activated_at(conn.oauth.as_ref()),
+        flow.expected_generation,
+        flow.created_at,
+    )
+}
+
 /// Complete a claimed flow (invariant 20): verify connection coherence + frozen
 /// generation, unseal the PKCE verifier, exchange the code AGAINST THE FROZEN ROW
 /// (its token_endpoint / client identity / resource — never re-discovered, closing
@@ -1648,10 +1707,15 @@ async fn complete_flow(
     // Generation coherence: a reconnect that landed mid-authorization bumped the
     // generation past what the flow froze — refuse rather than seal a fresh grant
     // onto a superseded binding (design :1535, generation acceptance).
-    if conn.authorization_generation != flow.expected_generation {
-        return Err(
-            "connection was reauthorized during authorization — restart the connect flow".into(),
-        );
+    //
+    // THIS CHECK IS AN OPTIMIZATION, NOT THE BOUNDARY (review H2): it runs BEFORE
+    // the code exchange — a full HTTP round trip — so a sibling flow can activate
+    // in the window between it and the write. It exists to avoid burning an
+    // authorization code we already know we cannot use; the security boundary is
+    // the compare-and-swap in `activate_connection_oauth` below, which re-asserts
+    // BOTH of these predicates in the UPDATE itself.
+    if superseded_flow(&conn, flow) {
+        return Err(SUPERSEDED_MSG.into());
     }
     let code = code.ok_or("Missing authorization code.")?;
     // Unseal the PKCE verifier (the challenge alone cannot exchange — design
@@ -1803,10 +1867,21 @@ async fn complete_flow(
             sealed_refresh.key_version,
             &clean,
             &json!(granted),
+            // THE SECURITY BOUNDARY (review H2): the activation is a
+            // compare-and-swap on the flow's OWN start-time expectation —
+            // the frozen generation AND "nothing has activated this
+            // connection since this flow started". A flow superseded by a
+            // newer authorization (a competing admin's reconnect, or a
+            // sibling first-connect on the same pending row) matches ZERO
+            // rows here, so it can never overwrite the newer grant's refresh
+            // token. Both values are frozen at START — never re-read now,
+            // which is precisely the TOCTOU the pre-exchange check has.
+            flow.expected_generation,
+            flow.created_at,
         )
         .await
         .map_err(|e| internal_page_error("activation", e))?
-        .ok_or("connection changed state during the exchange")?;
+        .ok_or(SUPERSEDED_MSG)?;
         // Commit (releasing the advisory lock) BEFORE touching the token cache:
         // a cache entry must never outlive a rolled-back activation. A failed or
         // AMBIGUOUS commit fails closed: the AS may already have invalidated the
@@ -2315,6 +2390,64 @@ mod tests {
         );
         assert_eq!(oauth_flow_cookie(&headers).as_deref(), Some("abc123"));
         assert!(oauth_flow_cookie(&HeaderMap::new()).is_none());
+    }
+
+    /// H2: the flow's activation expectation. Whatever the interleaving, the
+    /// SECOND authorization to reach the write must be refused — the CAS in
+    /// `activate_connection_oauth` enforces exactly these two predicates.
+    #[test]
+    fn a_superseded_flow_is_refused() {
+        let t0 = DateTime::parse_from_rfc3339("2026-07-20T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let t1 = t0 + Duration::seconds(30);
+
+        // Baseline: flow frozen at gen 5, connection never activated since.
+        assert!(!flow_superseded(5, None, 5, t0));
+        // …and a connection last activated BEFORE this flow started is the
+        // ordinary reconnect: allowed.
+        assert!(!flow_superseded(5, Some(t0 - Duration::seconds(1)), 5, t0));
+
+        // RECONNECT RACE: a sibling reconnect activated first and moved the
+        // generation. The loser's frozen 5 no longer matches.
+        assert!(flow_superseded(6, Some(t1), 5, t0));
+
+        // FIRST-CONNECT RACE: `pending → active` deliberately does NOT bump, so
+        // BOTH callbacks still see the frozen generation. The activation instant
+        // is what separates them — the sibling activated after this flow started.
+        assert!(
+            flow_superseded(1, Some(t1), 1, t0),
+            "generation alone cannot separate two first-connect callbacks"
+        );
+        // Equal instants are unorderable ⇒ fail closed.
+        assert!(flow_superseded(1, Some(t0), 1, t0));
+        // A flow started AFTER that activation is a genuinely newer
+        // authorization and is admitted (the newest authorization wins).
+        assert!(!flow_superseded(1, Some(t0), 1, t1));
+
+        // The stamp is read out of the connection's oauth bag, in the shape
+        // Postgres `to_jsonb(clock_timestamp())` writes.
+        assert_eq!(last_activated_at(None), None);
+        assert_eq!(last_activated_at(Some(&json!({}))), None);
+        assert_eq!(
+            last_activated_at(Some(&json!({"activated_at": null}))),
+            None
+        );
+        assert_eq!(
+            last_activated_at(Some(&json!({"activated_at": "2026-07-20T10:00:00+00:00"}))),
+            Some(t0)
+        );
+        // Unparseable ⇒ MAX ⇒ every flow reads superseded (fail closed).
+        assert_eq!(
+            last_activated_at(Some(&json!({"activated_at": "not-a-timestamp"}))),
+            Some(DateTime::<Utc>::MAX_UTC)
+        );
+        assert!(flow_superseded(
+            1,
+            last_activated_at(Some(&json!({"activated_at": "not-a-timestamp"}))),
+            1,
+            t1
+        ));
     }
 
     #[test]
