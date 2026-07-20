@@ -606,10 +606,13 @@ pub async fn approve(
     // approve applies ONLY to seamless github_app connections, which are ALWAYS
     // organization-owned (create refuses `personal` for github_app) — so the
     // unfiltered `get_connection` is equivalent to the visible variant here, and
-    // `can_mutate_resources` above is the correct (org) gate.
-    let conn = fluidbox_db::get_connection(&state.pool, scope, id)
+    // `can_mutate_resources` above is the correct (org) gate. Tenant is known →
+    // scoped_tx (RLS: set the GUC on this executor-generic read).
+    let mut conn_tx = fluidbox_db::scoped_tx(&state.pool, scope).await?;
+    let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, id)
         .await?
         .ok_or(ApiError::NotFound)?;
+    conn_tx.commit().await?;
     if conn.provider != "github_app" || conn.registration_id.is_none() {
         return Err(ApiError::BadRequest(
             "approve applies to seamless github_app connections only".into(),
@@ -710,9 +713,11 @@ pub async fn approve(
             "the github app registration was revoked during approval".into(),
         ));
     }
-    let row = fluidbox_db::get_connection(&state.pool, scope, row.id)
+    let mut reload_tx = fluidbox_db::scoped_tx(&state.pool, scope).await?;
+    let row = fluidbox_db::get_connection(&mut *reload_tx, scope, row.id)
         .await?
         .ok_or_else(|| ApiError::Conflict("connection changed state underneath".into()))?;
+    reload_tx.commit().await?;
     Ok(Json(json!({ "connection": row })))
 }
 

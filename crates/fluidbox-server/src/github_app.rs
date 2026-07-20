@@ -365,6 +365,27 @@ pub(crate) fn installation_metadata(
 }
 
 /// Upsert the ONE live connection row for a verified installation.
+/// Scoped one-shot connection read for the reconcile paths. `get_connection` is
+/// executor-generic (Task 6), so under FORCE RLS its caller must supply a GUC'd
+/// executor; the tenant is known here (the registration/row scope), so open+commit
+/// a `scoped_tx`. Keeps the three reconcile reads from repeating the tx boilerplate.
+async fn reconcile_get_connection(
+    state: &AppState,
+    scope: fluidbox_db::TenantScope,
+    id: Uuid,
+) -> Result<Option<IntegrationConnectionRow>, String> {
+    let mut tx = fluidbox_db::scoped_tx(&state.pool, scope)
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?;
+    let row = fluidbox_db::get_connection(&mut *tx, scope, id)
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?;
+    tx.commit()
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?;
+    Ok(row)
+}
+
 /// `activate` distinguishes admin-intent paths (setup with a valid flow,
 /// sync) from discovery (installation.created webhook → pending). Revoked
 /// rows are never revived here — that is the explicit approve path — and a
@@ -429,9 +450,7 @@ async fn apply_verified_installation(
             // principal), and github_app connections are always org-owned — no
             // owner-visibility filter applies.
             let updated = if row.status == desired {
-                fluidbox_db::get_connection(&state.pool, scope, row.id)
-                    .await
-                    .map_err(|e| format!("connection lookup failed: {e}"))?
+                reconcile_get_connection(state, scope, row.id).await?
             } else {
                 let from: &[&str] = match desired {
                     // Discovery never demotes an already-live row.
@@ -440,16 +459,12 @@ async fn apply_verified_installation(
                     _ => &["pending", "suspended", "error"],
                 };
                 if from.is_empty() {
-                    fluidbox_db::get_connection(&state.pool, scope, row.id)
-                        .await
-                        .map_err(|e| format!("connection lookup failed: {e}"))?
+                    reconcile_get_connection(state, scope, row.id).await?
                 } else {
                     fluidbox_db::set_connection_status(&state.pool, scope, row.id, desired, from)
                         .await
                         .map_err(|e| format!("status transition failed: {e}"))?
-                        .or(fluidbox_db::get_connection(&state.pool, scope, row.id)
-                            .await
-                            .map_err(|e| format!("connection lookup failed: {e}"))?)
+                        .or(reconcile_get_connection(state, scope, row.id).await?)
                 }
             };
             if desired == "suspended" {

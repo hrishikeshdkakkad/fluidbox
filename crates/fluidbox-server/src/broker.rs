@@ -107,10 +107,19 @@ pub async fn brokered_auth(
     // no binding, so there is no generation/owner to recheck; the status read
     // below is the only live check. Phase C runs route through the binding path
     // ([`recheck_binding`] + [`call_tool_for_conn`]), never here.
-    let conn = fluidbox_db::get_connection(&state.pool, scope, *cid)
+    // Tenant known (the frozen RunSpec's scope) → scoped_tx so the RLS GUC rides
+    // the executor-generic read.
+    let mut conn_tx = fluidbox_db::scoped_tx(&state.pool, scope)
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?;
+    let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, *cid)
         .await
         .map_err(|e| format!("connection lookup failed: {e}"))?
         .ok_or_else(|| format!("capability server '{name}': connection {cid} is missing"))?;
+    conn_tx
+        .commit()
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?;
     brokered_auth_for_conn(state, scope, &conn, url)
         .await
         .map_err(|e| format!("capability server '{name}': {e}"))
@@ -169,10 +178,19 @@ pub async fn brokered_auth_for_conn(
         .sealer
         .as_ref()
         .ok_or("FLUIDBOX_CREDENTIAL_KEY not configured")?;
-    let (sealed, kv) = fluidbox_db::connection_credential_sealed(&state.pool, scope, conn.id)
+    // Tenant known (the connection's own scope) → scoped_tx so the RLS GUC rides
+    // the executor-generic sealed-credential read.
+    let mut cred_tx = fluidbox_db::scoped_tx(&state.pool, scope)
+        .await
+        .map_err(|e| format!("credential lookup failed: {e}"))?;
+    let (sealed, kv) = fluidbox_db::connection_credential_sealed(&mut *cred_tx, scope, conn.id)
         .await
         .map_err(|e| format!("credential lookup failed: {e}"))?
         .ok_or("connection is not active (revoked or missing)")?;
+    cred_tx
+        .commit()
+        .await
+        .map_err(|e| format!("credential lookup failed: {e}"))?;
     let token = sealer
         .open(
             &sealed,
@@ -341,10 +359,19 @@ async fn recheck_binding_pool(
     let expected_generation = binding
         .authority_generation
         .ok_or("connection binding froze no authorization generation")?;
-    let conn = fluidbox_db::get_connection(pool, scope, cid)
+    // Tenant known (the run's binding scope) → scoped_tx so the RLS GUC rides the
+    // executor-generic read.
+    let mut conn_tx = fluidbox_db::scoped_tx(pool, scope)
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?;
+    let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, cid)
         .await
         .map_err(|e| format!("connection lookup failed: {e}"))?
         .ok_or_else(|| format!("connection {cid} is missing"))?;
+    conn_tx
+        .commit()
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?;
     if conn.status != "active" {
         return Err(format!(
             "connection {} is {} — reconnect it",

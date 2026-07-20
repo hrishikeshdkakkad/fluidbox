@@ -1993,7 +1993,11 @@ async fn provision(
     switch_nonce: &str,
     source_ip: String,
 ) -> sqlx::Result<Provision> {
-    let mut tx = state.pool.begin().await?;
+    // Transaction B provisions the just-authenticated user under a KNOWN tenant, so
+    // it rides `scoped_tx` (sets `fluidbox.tenant_id`): every executor-generic
+    // identity call below (lock/upsert/mint/consume) is a tenant-scoped write that
+    // RLS would otherwise refuse. The audit INSERT rides the same tx (check(true)).
+    let mut tx = fluidbox_db::scoped_tx(&state.pool, scope).await?;
 
     // Opening lock — captures status + bootstrap arm/expiry (the expiry read is
     // the ONLY authoritative one; the consume UPDATE's RETURNING would be NULL).
