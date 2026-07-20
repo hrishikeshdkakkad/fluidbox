@@ -537,7 +537,11 @@ pub async fn messages(
     // unbounded key-table growth. So the small auth-error body is buffered and
     // classified, ambiguity forwards the rejection verbatim, and
     // `recover_rejected_tenant_key` bounds what survives that (stale-rejection
-    // compare, durable per-tenant cooldown, CAS, deployment-wide mint budget).
+    // compare, durable per-tenant cooldown, CAS, per-replica mint budget).
+    //
+    // "Classified" now means LiteLLM's OWN proxy-auth structure, not a generic
+    // phrase (re-verification, #32): `{"error":{"message":"OpenAI API key not
+    // found","type":"auth_error"}}` is provider-originated and no longer qualifies.
     //
     // The replay is still EXACTLY ONCE — a 401 proves the request never executed
     // upstream, the same reasoning as the connector-token reactive 401 in
