@@ -443,13 +443,16 @@ async fn resolve_client(
             })
         }
         ClientResolution::Cimd => {
-            let client_id = cimd_client_id(state);
-            let registration_id =
-                ensure_cimd_registration(state, &meta.issuer, &redirect, &client_id).await?;
+            // ADOPT: if a row already exists for this (issuer, redirect_uri) — of
+            // ANY source — carry ITS identity on BOTH legs (never send cimd_url on
+            // authorize while the exchange resolves a stored DCR client_id).
+            let cimd_id = cimd_client_id(state);
+            let registered =
+                ensure_cimd_registration(state, &meta.issuer, &redirect, &cimd_id).await?;
             Ok(ResolvedClient {
-                client_id,
-                source: "cimd".to_string(),
-                registration_id: Some(registration_id),
+                client_id: registered.client_id,
+                source: registered.source,
+                registration_id: Some(registered.registration_id),
             })
         }
         ClientResolution::Dcr => {
@@ -471,16 +474,42 @@ async fn resolve_client(
     }
 }
 
-/// Record (or reuse) the shared registration row for a CIMD identity so the
-/// one-time state flows (Task 4) can FK the client. No advisory lock — there is
-/// no `/register` HTTP to serialize; find-or-insert with `ON CONFLICT DO NOTHING`
+/// The identity a resolution arm ADOPTS from an existing shared registration row:
+/// ALWAYS the row's own `(client_id, source)`, regardless of which arm (CIMD or
+/// DCR) found it, so the authorize and exchange legs carry the SAME identity. A
+/// CIMD arm must NEVER present `cimd_url` on the authorize leg while a stored DCR
+/// `client_id` resolves on the exchange leg — that is RFC 6749 `invalid_grant`
+/// ("code issued to another client"), which the exchange self-heal
+/// (`invalid_client` only) never catches, so every later connect to that issuer
+/// would fail forever.
+///
+/// Convergence if the adopted identity is dead at the AS: a DCR-sourced identity
+/// (it records its `registration_endpoint`) SELF-HEALS — the exchange returns
+/// `invalid_client`, `heal_invalid_client` deletes the row and re-registers via
+/// DCR, the retry runs with consistent legs, bounded to one loop. A CIMD-sourced
+/// identity has no `registration_endpoint`, so a dead one is a terminal clean
+/// `invalid_client` (NOT a mismatch) — but a CIMD `client_id` is the doc URL,
+/// which only "dies" when the AS cannot fetch it (a public-URL config problem that
+/// also moves the redirect_uri = the registration key), so a stale CIMD row is not
+/// even found for the current key.
+fn adopt_registration(row: &fluidbox_db::OauthClientRegistrationRow) -> (String, String) {
+    (row.client_id.clone(), row.source.clone())
+}
+
+/// Adopt-or-mint the shared client identity for a CIMD-eligible dance. Mirrors
+/// [`register_dcr_client`]'s ADOPT semantics: if a row already exists for
+/// (issuer, redirect_uri) — of ANY source — reuse ITS identity verbatim
+/// (see [`adopt_registration`]); only when NONE exists mint a fresh CIMD identity
+/// (client_id = the doc URL, source='cimd', no secret). The row also lets the
+/// one-time state flows (Task 4) FK the client. No advisory lock — CIMD has no
+/// `/register` HTTP to serialize; find-or-insert with `ON CONFLICT DO NOTHING`
 /// re-select is race-safe on its own.
 async fn ensure_cimd_registration(
     state: &AppState,
     issuer: &str,
     redirect: &str,
-    client_id: &str,
-) -> Result<Uuid, String> {
+    cimd_id: &str,
+) -> Result<RegisteredClient, String> {
     if let Some(r) = fluidbox_db::find_client_registration(&state.pool, issuer, redirect)
         .await
         .map_err(|e| format!("registration lookup failed: {e}"))?
@@ -488,14 +517,19 @@ async fn ensure_cimd_registration(
         fluidbox_db::touch_client_registration(&state.pool, r.id)
             .await
             .map_err(|e| format!("registration touch failed: {e}"))?;
-        return Ok(r.id);
+        let (client_id, source) = adopt_registration(&r);
+        return Ok(RegisteredClient {
+            client_id,
+            registration_id: r.id,
+            source,
+        });
     }
     let new = fluidbox_db::NewOauthClientRegistration {
         tenant_id: None,
         issuer,
         redirect_uri: redirect,
         source: "cimd",
-        client_id,
+        client_id: cimd_id,
         client_secret_sealed: None,
         client_secret_key_version: 1,
         registration_endpoint: None,
@@ -503,17 +537,22 @@ async fn ensure_cimd_registration(
         registration_access_token_key_version: 1,
         token_endpoint_auth_method: Some("none"),
     };
-    match fluidbox_db::insert_client_registration(&state.pool, new)
+    let row = match fluidbox_db::insert_client_registration(&state.pool, new)
         .await
         .map_err(|e| format!("registration insert failed: {e}"))?
     {
-        Some(r) => Ok(r.id),
+        Some(r) => r,
         None => fluidbox_db::find_client_registration(&state.pool, issuer, redirect)
             .await
             .map_err(|e| format!("registration re-select failed: {e}"))?
-            .map(|r| r.id)
-            .ok_or_else(|| "registration race lost with no winner".to_string()),
-    }
+            .ok_or("registration race lost with no winner")?,
+    };
+    let (client_id, source) = adopt_registration(&row);
+    Ok(RegisteredClient {
+        client_id,
+        registration_id: row.id,
+        source,
+    })
 }
 
 /// One RFC 7591 dynamic client registration POST. Returns `(client_id, secret?)`;
@@ -588,10 +627,11 @@ async fn register_dcr_client(
         tx.commit()
             .await
             .map_err(|e| format!("registration commit failed: {e}"))?;
+        let (client_id, source) = adopt_registration(&r);
         return Ok(RegisteredClient {
-            client_id: r.client_id,
+            client_id,
             registration_id: r.id,
-            source: r.source,
+            source,
         });
     }
     let (client_id, secret) = dcr_register(state, registration_endpoint).await?;
@@ -645,13 +685,14 @@ async fn register_dcr_client(
                 .ok_or("registration race lost with no winner")?
         }
     };
+    let (client_id, source) = adopt_registration(&row);
     tx.commit()
         .await
         .map_err(|e| format!("registration commit failed: {e}"))?;
     Ok(RegisteredClient {
-        client_id: row.client_id,
+        client_id,
         registration_id: row.id,
-        source: "dcr".to_string(),
+        source,
     })
 }
 
@@ -1979,5 +2020,27 @@ mod tests {
             registration: None,
         };
         assert!(!can_self_heal(&legacy));
+    }
+
+    #[test]
+    fn adopt_uses_the_rows_identity_verbatim() {
+        // A CIMD-eligible dance that FINDS a stored DCR row adopts the DCR row's
+        // client_id + source (NOT cimd_url). The authorize leg uses this value and
+        // the exchange leg loads the SAME row's client_id, so both legs match — no
+        // RFC 6749 invalid_grant "code issued to another client" mismatch.
+        let dcr = reg_row(Some("https://as.test/register"));
+        let (client_id, source) = adopt_registration(&dcr);
+        assert_eq!(
+            client_id, dcr.client_id,
+            "authorize leg carries the ROW's id"
+        );
+        assert_eq!(source, "dcr");
+        // A found CIMD row is adopted verbatim too (whichever arm found it).
+        let mut cimd = reg_row(None);
+        cimd.source = "cimd".into();
+        cimd.client_id = "https://fbx.test/.well-known/fluidbox-client.json".into();
+        let (cid, src) = adopt_registration(&cimd);
+        assert_eq!(cid, cimd.client_id);
+        assert_eq!(src, "cimd");
     }
 }

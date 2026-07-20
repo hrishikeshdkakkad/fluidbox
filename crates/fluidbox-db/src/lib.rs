@@ -1232,11 +1232,12 @@ where
 // PLACEMENT (reviewer note): these are principal-less GLOBAL reads, but they are
 // deliberately NOT in `system_worker` — that module is for cross-tenant scans of
 // TENANT-owned data. Client registrations are deployment INFRASTRUCTURE (like
-// `connector_catalog`'s global rows): v1 only ever writes `tenant_id NULL`, and
-// every read/insert enforces `tenant_id is null` in SQL. There is no tenant to
-// scope by, so they live here beside the connection custody they serve, unscoped
-// by construction. The nullable `tenant_id` + per-tenant partial unique are
-// forward-compat only (migration 0015).
+// `connector_catalog`'s global rows). v1 only ever WRITES `tenant_id NULL`; both
+// lookups (`find_client_registration`, `find_client_registration_by_id`) FILTER
+// `tenant_id is null`; `touch`/`delete` act on an already-resolved id. There is no
+// tenant to scope by, so they live here beside the connection custody they serve,
+// unscoped by construction. The nullable `tenant_id` + per-tenant partial unique
+// are forward-compat only (migration 0015).
 
 /// A shared OAuth client registration. Carries its sealed secret because every
 /// read IS a credential resolution (unseal for token-endpoint auth) — the row is
@@ -1301,8 +1302,11 @@ where
     .await
 }
 
-/// Load one registration by id — the exchange/refresh path resolves the identity
-/// the connection's `oauth.registration_id` points at. Unscoped (global infra).
+/// Load one GLOBAL registration by id — the exchange/refresh path resolves the
+/// identity the connection's `oauth.registration_id` points at. `and tenant_id is
+/// null` is a v1 belt: a connection only ever stores a GLOBAL registration id, so
+/// a non-global id fails closed to None rather than crossing into a future
+/// per-tenant row.
 pub async fn find_client_registration_by_id<'e, E>(
     exec: E,
     id: Uuid,
@@ -1310,7 +1314,7 @@ pub async fn find_client_registration_by_id<'e, E>(
 where
     E: sqlx::PgExecutor<'e>,
 {
-    sqlx::query_as("select * from oauth_client_registrations where id = $1")
+    sqlx::query_as("select * from oauth_client_registrations where id = $1 and tenant_id is null")
         .bind(id)
         .fetch_optional(exec)
         .await
