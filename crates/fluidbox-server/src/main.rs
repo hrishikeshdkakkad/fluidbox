@@ -181,10 +181,13 @@ async fn main() -> anyhow::Result<()> {
     // D4 retirement gates: refuse boot when the sealing configuration and the
     // stored custody are incoherent (KMS on with the legacy key retired but v1
     // rows remain unreadable; KMS off with KMS-only v2 rows present).
-    // The sealer is passed in so the KEK probe runs on the LIVE backend + DEK cache:
-    // the unwrap the gate performs anyway warms the cache the process will use
-    // (singleflight already caps this at one Decrypt per restart).
-    seal::check_retirement_gates(&cfg, &pool, sealer.as_ref()).await?;
+    // In KMS mode this also CLAIMS the deployment's KEK identity (the seed tenant's
+    // DEK row, arbitrated by the database) before we serve, so a second replica
+    // holding a different KEK refuses boot instead of quietly taking custody of half
+    // the tenants. The sealer is passed in so all of it runs on the LIVE backend +
+    // DEK cache: the unwrap the gate performs anyway warms the DEK every transit
+    // token uses (singleflight already caps this at one Decrypt per restart).
+    seal::check_retirement_gates(&cfg, &pool, sealer.as_ref(), seed.tenant_id).await?;
     match (&sealer, cfg.kms_mode) {
         (None, _) => tracing::warn!(
             "credential sealing disabled (no FLUIDBOX_CREDENTIAL_KEY, KMS off) — integration connections are disabled"

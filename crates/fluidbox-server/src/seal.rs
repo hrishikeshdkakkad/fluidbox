@@ -283,7 +283,7 @@ impl Sealer {
                 kms: Some(KmsBackend {
                     wrapper,
                     pool,
-                    cache: Arc::new(DekCache::default()),
+                    cache: DekCache::with_sweeper(),
                 }),
                 deployment_tenant,
             }),
@@ -494,7 +494,9 @@ pub fn build_sealer(
     let kms = build_wrapper(cfg)?.map(|wrapper| KmsBackend {
         wrapper,
         pool: pool.clone(),
-        cache: Arc::new(DekCache::default()),
+        // `with_sweeper`, not a bare cache: the TTL must bound how long plaintext
+        // DEKs RESIDE in this process, not merely how long they may be served.
+        cache: DekCache::with_sweeper(),
     });
     if kms.is_none() && legacy.is_none() {
         return Ok(None);
@@ -538,32 +540,51 @@ fn build_wrapper(cfg: &Config) -> anyhow::Result<Option<Arc<dyn KeyWrapper>>> {
 ///
 /// TWO independent gates run here:
 ///
-///  1. **KEK compatibility** ([`kms::check_kek_compatibility`]) — whenever KMS is
-///     configured, INDEPENDENT of the legacy key. The retirement counts below can
-///     only see key VERSIONS, never which KEK wrapped the stored DEKs, so a
-///     syntactically valid but WRONG KEK sailed through every quadrant: existing
-///     tenants failed every unwrap while new tenants happily minted DEKs under it,
-///     splitting custody across two KEKs with no recovery (review H1). This gate
-///     proves the configured backend can actually READ a stored DEK before we
-///     serve. Pass the already-built `sealer` and the probe runs on ITS backend and
-///     ITS cache, so the one unwrap the gate performs anyway warms the live DEK
-///     cache (and an `aws` deployment does not construct a second client just to
-///     probe). `None` falls back to a wrapper built from the same config.
+///  1. **KEK compatibility + the deployment KEK claim**
+///     ([`kms::check_kek_compatibility`]) — whenever KMS is configured, INDEPENDENT
+///     of the legacy key. The retirement counts below can only see key VERSIONS,
+///     never which KEK wrapped the stored DEKs, so a syntactically valid but WRONG
+///     KEK sailed through every quadrant: existing tenants failed every unwrap
+///     while new tenants happily minted DEKs under it, splitting custody across two
+///     KEKs with no recovery (review H1). That gate proves the configured backend
+///     can actually READ a stored DEK — and, because an EMPTY `tenant_deks` gave it
+///     nothing to read, it now also CLAIMS the deployment tenant's DEK, so two
+///     replicas holding different KEKs cannot both proceed from a fresh database.
+///     Pass the already-built `sealer` and everything runs on ITS backend and ITS
+///     cache, so the claim's unwrap warms the live DEK cache (and an `aws`
+///     deployment does not construct a second client just to probe). `None` falls
+///     back to a wrapper built from the same config.
 ///  2. **Version retirement** — the counts are fetched ONLY when a key is missing:
 ///     with both keys present (the migration window) every stored version is
 ///     openable, so there is nothing a scan could refuse.
+///
+/// `deployment_tenant` MUST be the tenant [`build_sealer`] was given — the tenant
+/// whose DEK keys transit tokens. The debug assertion below pins that; there is one
+/// production call site and it passes the same `seed.tenant_id` to both.
 pub async fn check_retirement_gates(
     cfg: &Config,
     pool: &PgPool,
     sealer: Option<&Sealer>,
+    deployment_tenant: Uuid,
 ) -> anyhow::Result<()> {
+    debug_assert!(
+        !matches!(sealer, Some(s) if s.inner.deployment_tenant != deployment_tenant),
+        "the gate must claim the SAME deployment tenant Sealer::seal_token keys transit tokens under"
+    );
     match sealer.and_then(|s| s.inner.kms.as_ref()) {
         Some(kms) => {
-            kms::check_kek_compatibility(pool, kms.wrapper.as_ref(), Some(&kms.cache)).await?
+            kms::check_kek_compatibility(
+                pool,
+                kms.wrapper.as_ref(),
+                Some(&kms.cache),
+                deployment_tenant,
+            )
+            .await?
         }
         None => {
             if let Some(wrapper) = build_wrapper(cfg)? {
-                kms::check_kek_compatibility(pool, wrapper.as_ref(), None).await?;
+                kms::check_kek_compatibility(pool, wrapper.as_ref(), None, deployment_tenant)
+                    .await?;
             }
         }
     }
