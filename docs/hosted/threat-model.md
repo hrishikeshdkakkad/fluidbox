@@ -89,11 +89,27 @@ Statuses: **shipped** = enforced on `main` today (`shipped (Phase B)`/`shipped (
 |---|---|---|
 | Read or bind another user's personal connection | Connection ownership (`owner_type`, `owner_user_id`); binding verification; personal connections invisible to other members — 404-not-403, admins included (they act through their own viewer lens) | shipped (Phase C) |
 | Approve an action so it runs under someone else's credential | Approval permits the proposed action under the credential already frozen into the run — never the approver's (invariant 8); approvers need `approval.decide_own`/`approval.decide_org`; no role — including admin or the operator — authorizes approval under another user's personal connection, and only its owner-who-invoked may decide it (`authorize_approval_decision`) | shipped (approval RBAC Phase B; personal-connection authority Phase C) |
-| Read another tenant's runs/events/artifacts by UUID | `TenantScope` repository signatures (primary), composite tenant FKs, cross-tenant negative test matrix; UUID unpredictability is not authorization (invariant 10); RLS now enforces the same tenant floor in the database (migration 0018: 37 tenant-owned tables `ENABLE`+`FORCE`, GUC-driven policies via `scoped_tx`/`worker_tx`; the negative tests run as the non-owner `fluidbox_runtime` role). **Two caveats, both operational:** the two tables holding cross-tenant SHARED rows (`connector_catalog`, `oauth_client_registrations`) are readable by every scope by design — writes to those global rows are bypass-only, so the floor covers mutation but not visibility of shared reference data; and RLS is **inert for a SUPERUSER or BYPASSRLS role** (Neon's default `neon_superuser`), which is not inherited through role membership — set `FLUIDBOX_RUNTIME_ROLE` and verify with `just doctor` | shipped (Phase B `TenantScope` + composite keys; Phase D RLS depth) |
+| Read another tenant's runs/events/artifacts by UUID | `TenantScope` repository signatures (primary), composite tenant FKs, cross-tenant negative test matrix; UUID unpredictability is not authorization (invariant 10); RLS now enforces the same tenant floor in the database (migration 0018: 37 tenant-owned tables `ENABLE`+`FORCE`, GUC-driven policies via `scoped_tx`/`worker_tx`; the negative tests run as the non-owner `fluidbox_runtime` role). **Two caveats, both operational:** the two tables holding cross-tenant SHARED rows (`connector_catalog`, `oauth_client_registrations`) are readable by every scope by design — writes to those global rows are bypass-only, so the floor covers mutation but not visibility of shared reference data; and RLS is **inert for a SUPERUSER or BYPASSRLS role** (Neon's default `neon_superuser`), which is not inherited through role membership — set `FLUIDBOX_RUNTIME_ROLE` and verify with `just doctor`. Multi-user boot now **REFUSES** that state (`FLUIDBOX_REQUIRE_SSO=1` + a bypassing effective pool role ⇒ `REFUSING TO BOOT`, unless `FLUIDBOX_ALLOW_RLS_BYPASS=1` accepts it for local single-user work), and the runtime role itself is posture-validated (no LOGIN/SUPERUSER/BYPASSRLS/CREATEROLE/CREATEDB/REPLICATION, no memberships, no other members) in both the migration and every boot, since PostgreSQL roles are cluster-global while the grants are database-local. **`SET ROLE` is not a credential boundary** — see below | shipped (Phase B `TenantScope` + composite keys; Phase D RLS depth) |
 | See tenant existence via login routing | The neutral entry page never enumerates organizations and answers identically for unknown and IdP-less slugs | shipped (Phase B) |
 | A trigger token used beyond its subscription | Subscription-scoped, sha256-hashed tokens: invoke exactly one subscription, poll only runs it created; invoke overrides are opt-in and can only narrow | shipped |
 | A member reads runs they shouldn't | `run.read` visibility rules (own runs; token-created runs; `subscriptions.manage`; `runs.read_all`) on every session/event/artifact/approval/SSE query | shipped (Phase B) |
 | Custom connector admitted by one tenant becomes bindable in another | Custom definitions tenant-scoped (partial unique indexes: global slug + per-tenant custom slug); unattributable legacy rows disabled at the 0013 backfill | shipped (Phase C) |
+
+> **Do not size this model around the runtime role.** `SET ROLE` narrows the
+> authority of the ordinary application queries this process issues; it is NOT a
+> credential boundary. `RESET ROLE` returns the same connection to the migration
+> owner, and the process still holds the owner `DATABASE_URL` and can open a fresh
+> owner connection — so it does not defend against process compromise or SQL
+> injection. Genuine separation needs distinct migration-owner and runtime-LOGIN
+> connection strings, with the runtime login owning no schema objects and carrying
+> no bypass attributes; fluidbox runs one `DATABASE_URL` today. What the split does
+> buy is containment of fluidbox's OWN bugs: a query that lost its tenant scope
+> returns zero rows instead of every tenant's. Operational residuals, stated plainly:
+> the role's membership checks are DIRECT-only (a transitive path runs through a
+> role that is already an admin over the connecting user, so flagging it would
+> refuse every managed host); `audit_select` remains tenant-or-null-or-bypass (the
+> INSERT floor is the one that was tightened); and the RLS-bypass boot gate is fatal
+> only under `FLUIDBOX_REQUIRE_SSO=1` — single-user deployments warn.
 
 ### T6 — the unauthenticated network
 

@@ -393,6 +393,20 @@ depends on; writing a global row is principal-less deployment work and goes thro
 differ per command, and it is why those two tables get four policies each rather
 than one `FOR ALL`.
 
+**`auth_audit_log` INSERT carries the tenant floor too.** The insert policy was
+`with check (true)`, which made this the one tenant-owned write surface whose
+database floor did not match the verified scope: a transaction scoped to tenant A
+could append a row stamped `tenant_id = B` into B's permanent history, and because
+the log is append-only the forgery could never be retracted through the runtime
+role. It now requires the tenant GUC to match, or the system-worker bypass — the
+same floor as every other tenant-owned write. Operationally: **an audit insert no
+longer works GUC-less**, so an audit that is not already inside a mutation's
+transaction goes through `identity::insert_audit_standalone` (one-statement
+`scoped_tx` when the tenant is known; `worker_tx` for deployment-level rows with
+`tenant_id IS NULL`). `audit_select` is deliberately UNCHANGED
+(tenant-or-null-or-bypass): the finding was INSERT-only, deployment-level rows carry
+no tenant data, and there is no such reader in production code.
+
 **Is RLS actually armed on YOUR database?** Postgres skips policies entirely for a
 `SUPERUSER` or `BYPASSRLS` role, and **role attributes are not inherited through
 membership** — granting the app a bound role proves nothing about the role it
@@ -403,51 +417,138 @@ connection string makes this whole section inert. Check it:
 select current_user, rolsuper, rolbypassrls from pg_roles where rolname = current_user;
 ```
 
-Both `false` ⇒ enforcing. Otherwise set `FLUIDBOX_RUNTIME_ROLE` (below). `just
-doctor` runs exactly this check and warns.
+Both `false` ⇒ enforcing. Otherwise set `FLUIDBOX_RUNTIME_ROLE` (below).
 
-### The runtime role (opt-in — `FLUIDBOX_RUNTIME_ROLE`)
+### The multi-user boot gate (`FLUIDBOX_ALLOW_RLS_BYPASS`)
+
+Under `FLUIDBOX_REQUIRE_SSO=1` that check is no longer advice. Boot reads the
+**effective** role of a POOLED connection (`current_user` *after* any
+`after_connect SET ROLE` — attributes are not inherited, so `current_user` is the
+only correct question) and REFUSES:
+
+```
+REFUSING TO BOOT: FLUIDBOX_REQUIRE_SSO=1 (multi-user) but the database role this pool runs as
+('<user>') is SUPERUSER or has BYPASSRLS, so PostgreSQL SKIPS every row-level-security policy from
+migration 0018 and tenant isolation falls back to the `where tenant_id = $n` convention alone.
+Fix (either one):
+  1. set FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime — migration 0018 creates that NOLOGIN
+     least-privilege role and every pooled connection SET ROLEs to it; or
+  2. point DATABASE_URL at a role that is neither SUPERUSER nor BYPASSRLS.
+  Verify with: select rolsuper, rolbypassrls from pg_roles where rolname = current_user;
+  For local single-user operation on a superuser database, set FLUIDBOX_ALLOW_RLS_BYPASS=1 to accept this.
+```
+
+It exists because the shipped default was fail-OPEN on exactly the posture this
+runbook documents: a stock Neon credential carries `BYPASSRLS`, so a default
+install applied 0018, `FORCE`d it, and skipped every policy — a later missing
+`tenant_id` predicate would have returned ALL tenants.
+
+- `FLUIDBOX_ALLOW_RLS_BYPASS=1` (or `true`) downgrades the refusal to a warning.
+  **Local single-user operation on a superuser database only** — it turns 0018 into
+  decoration and puts tenant isolation back on the query predicates alone.
+- **The gate is fatal ONLY under `FLUIDBOX_REQUIRE_SSO=1`.** Single-user mode warns
+  and names what will happen when SSO is turned on; a clean pool logs an INFO
+  confirming enforcement.
+- `just doctor` runs the same query against the `DATABASE_URL` role (it cannot see
+  the pool's `SET ROLE`). It **fails** — not warns — when `.env` combines
+  `FLUIDBOX_REQUIRE_SSO=1` with a bypassing role, no `FLUIDBOX_RUNTIME_ROLE`, and no
+  `FLUIDBOX_ALLOW_RLS_BYPASS`: that deployment cannot boot, so a green preflight
+  would be a lie. Every other combination stays a warning.
+
+### The runtime role (`FLUIDBOX_RUNTIME_ROLE`; chart default `fluidbox_runtime`)
 
 Set `FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime` and every pooled connection
 `SET ROLE`s (via `after_connect`) to the migration's NOLOGIN `fluidbox_runtime`
 role — a NON-owner that cannot bypass RLS and cannot `UPDATE`/`DELETE`
 `auth_audit_log` (the 0012 deferred grant lands here). Unset = single-role mode:
 RLS still binds even the owner via `FORCE`, so a single-role deployment is fully
-enforced. Boot fails if the env var names a role that does not exist. On a managed
-host that restricts `CREATE ROLE` (Neon), the migration **WARNS** instead of
-aborting — create the role out-of-band
+enforced *provided its role does not bypass RLS* (the gate above). Boot fails if
+the env var names a role that does not exist. On a managed host that restricts
+`CREATE ROLE` (Neon), the migration **WARNS** instead of aborting — create the role
+out-of-band
 (`CREATE ROLE fluidbox_runtime NOLOGIN; GRANT fluidbox_runtime TO CURRENT_USER;`
 plus the table grants), then set the env var and restart.
 
-> **`SET ROLE` is NOT a credential boundary — do not size your threat model around
-> it.** The migration grants `fluidbox_runtime` **to the connecting user** so the
-> `SET ROLE` succeeds, and the process still holds the owner's `DATABASE_URL`:
-> anything that can run SQL on a pooled connection can issue `RESET ROLE` (or
-> `SET ROLE <owner>`) and is the owner again. What the runtime role actually buys
-> is that **the default posture of every query is least-privilege** — a repository
-> function that forgets `scoped_tx` returns zero rows here and would have returned
-> rows under the owner, and a stray `UPDATE auth_audit_log` is denied outright. It
-> catches fluidbox's own bugs; it does not contain an attacker with code execution
-> in the control plane.
+**ONE ROLE NAME PER DEPLOYMENT on a shared cluster.** The name is no longer a pool
+detail: `connect()` publishes it to migration 0018 as the session GUC
+`fluidbox.runtime_role`, and 0018 creates, posture-validates and GRANTs *that* role
+(default `fluidbox_runtime` when unset). This matters because PostgreSQL roles are
+**cluster-global** while the grants are **database-local** — on a cluster hosting
+more than one fluidbox database, a single hardcoded name is a collision with
+someone else's principal, and granting it DML here would hand that principal every
+tenant's rows (`set role <name>; set fluidbox.bypass = 'system_worker';`). Give each
+deployment its own name.
+
+**Posture refusals.** 0018 raises the last three as `migration 0018: role …`
+exceptions (a role it cannot `CREATE` is a WARNING instead — the managed-host case),
+and `connect()` re-checks the same conditions at EVERY boot, because a role can be
+`ALTER`ed or re-`GRANT`ed long after the migration ran:
+
+| Boot message | Meaning | Fix |
+|---|---|---|
+| `FLUIDBOX_RUNTIME_ROLE='…' is set but the role does not exist` | 0018 could not `CREATE ROLE` (managed host) | create it out-of-band (above), restart |
+| `… carries unsafe attribute(s): …` | LOGIN / SUPERUSER / BYPASSRLS / CREATEROLE / CREATEDB / REPLICATION — LOGIN makes it an authenticable principal, SUPERUSER/BYPASSRLS make the split theatre | `ALTER ROLE … NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION;` or pick a name this deployment owns |
+| `… is a member of …` | it silently inherits privileges fluidbox never granted | `REVOKE` those memberships, or pick a deployment-specific name |
+| `… is granted to …` | the shared-cluster collision: those principals can `SET ROLE` in, then set `fluidbox.bypass` and read every tenant | `REVOKE <role> FROM` them, or pick a deployment-specific name |
+
+Both membership questions read **DIRECT** `pg_auth_members` rows, not the transitive
+closure: a transitive path necessarily runs through a role that is already an admin
+over the connecting user, so flagging it would refuse every managed host whose owner
+sits under a platform admin group (Neon's `neon_superuser`) while describing no
+capability that principal lacks. Posture is verified at boot, not continuously.
+
+**Helm defaults** (chart `deploy/helm/fluidbox`): `server.runtimeRole` now defaults
+to `"fluidbox_runtime"` — a Helm install is a hosted deployment — and
+`server.allowRlsBypass: false` renders `FLUIDBOX_ALLOW_RLS_BYPASS=1` when flipped.
+The previous default (`server.runtimeRole: ""`) left RLS **fail-open** against the
+documented Neon credential; if you pinned that value, drop the override. Set
+`runtimeRole: ""` only for a deployment whose `DATABASE_URL` role is itself neither
+SUPERUSER nor BYPASSRLS.
+
+> **`SET ROLE` narrows the authority of the ordinary application queries this
+> process issues; it is NOT a credential boundary.** `RESET ROLE` returns the same
+> connection to the migration owner, and the process still holds the owner
+> `DATABASE_URL` and can open a fresh owner connection — so it does not defend
+> against process compromise or SQL injection. Genuine separation needs distinct
+> migration-owner and runtime-LOGIN connection strings, with the runtime login
+> owning no schema objects and carrying no bypass attributes.
 >
-> Genuine role separation needs **two distinct connection strings**: a
-> migration-owner URL used only by the migrator (or by a separate job), and a
-> runtime **LOGIN** role — one that is *not* a member of the owner and cannot
-> `SET ROLE` into it — for the app pool. fluidbox does not require that split
-> today (one `DATABASE_URL` runs migrations and serves traffic), so treat the
-> runtime role as bug containment until it does.
+> What the runtime role actually buys is that **the default posture of every fixed
+> application query is least-privilege** — a repository function that forgets
+> `scoped_tx` returns zero rows here and would have returned rows under the owner,
+> and a stray `UPDATE auth_audit_log` is denied outright. It catches fluidbox's own
+> bugs. fluidbox does not require the two-connection-string split today (one
+> `DATABASE_URL` runs migrations and serves traffic), so treat the runtime role as
+> bug containment until it does.
 
 ### CONVENTION — every new tenant-owned table
 
-There is deliberately **no `ALTER DEFAULT PRIVILEGES`**: a new tenant-owned table
-shipped without its own policy is silently *unprotected* under the owner and
-silently *invisible* under the runtime role. So every migration that adds a
-tenant-owned table MUST, in the same file: (1) `ENABLE` + `FORCE ROW LEVEL
-SECURITY`; (2) attach a policy — the standard
-`current_setting('fluidbox.tenant_id')` shape, or a parent `EXISTS(...)` for a
-child table with no `tenant_id` column; and (3) `GRANT SELECT, INSERT, UPDATE,
-DELETE ... TO fluidbox_runtime` (guarded for the restricted-host case). A sealed
-column additionally joins the seal-family lockstep (§1) so it is re-seal-covered.
+There is deliberately **no `ALTER DEFAULT PRIVILEGES`** and no `GRANT … ON ALL
+TABLES IN SCHEMA public` (0018 enumerates exactly the 37 tables plus `append_event`,
+so unrelated objects in a shared `public` schema — and a deliberately revoked
+`PUBLIC EXECUTE` — are never touched). A new tenant-owned table shipped without its
+own policy is silently *unprotected* under the owner and silently *invisible* under
+the runtime role. So every migration that adds a tenant-owned table MUST, in the
+same file: (1) `ENABLE` + `FORCE ROW LEVEL SECURITY`; (2) attach a policy — the
+standard `current_setting('fluidbox.tenant_id')` shape, or a parent `EXISTS(...)`
+for a child table with no `tenant_id` column; and (3) `GRANT SELECT, INSERT, UPDATE,
+DELETE` to the **deployment's** runtime role, resolved exactly as 0018 resolves it
+(`coalesce(nullif(current_setting('fluidbox.runtime_role', true), ''),
+'fluidbox_runtime')` — `connect()` publishes that GUC session-level before running
+any migration), and guarded for the restricted-host case (`if not exists (select 1
+from pg_roles …) then return;`). A hardcoded `fluidbox_runtime` is wrong on a
+deployment that chose another name. A sealed column additionally joins the
+seal-family lockstep (§1) so it is re-seal-covered.
+
+**A drift guard enforces step 3 inside 0018**: any table carrying one of fluidbox's
+policy names (`tenant_isolation`, `catalog_*`, `registration_*`, `audit_*`) that is
+absent from the grant list ABORTS the migration with `migration 0018: fluidbox RLS
+policies exist on table(s) … that are absent from the runtime grant list` (a second
+guard aborts on a listed table that does not exist — typo/rename). It is keyed on
+our policy names, not on `relrowsecurity`, so an unrelated RLS table sharing the
+schema is none of our business. The guard only sees tables 0018 itself policies —
+a table added by a LATER migration is invisible to it, which is exactly why all
+three steps belong in that migration's own file.
 
 ### CONVENTION — a migration that seeds rows into an RLS'd table
 
