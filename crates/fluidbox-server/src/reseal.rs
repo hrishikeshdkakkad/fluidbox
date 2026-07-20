@@ -632,7 +632,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = fluidbox_db::connect(&url).await.expect("connect");
+        let pool = fluidbox_db::connect(&url, None).await.expect("connect");
         let from_counts: std::collections::BTreeSet<String> =
             fluidbox_db::system_worker::sealed_key_version_counts(&pool)
                 .await
@@ -728,7 +728,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = fluidbox_db::connect(&url).await.expect("connect");
+        let pool = fluidbox_db::connect(&url, None).await.expect("connect");
         let org = fluidbox_db::identity::create_org(
             &pool,
             &format!("t-{}", Uuid::now_v7().simple()),
@@ -939,7 +939,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = fluidbox_db::connect(&url).await.expect("connect");
+        let pool = fluidbox_db::connect(&url, None).await.expect("connect");
         // A real tenant is the DEPLOYMENT tenant here: a global row (tenant_id
         // NULL) has no DEK of its own, so it seals under this one.
         let org = fluidbox_db::identity::create_org(

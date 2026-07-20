@@ -86,14 +86,131 @@ impl ConnectionViewer {
     }
 }
 
-pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
-    let pool = PgPoolOptions::new()
+/// Connect the application pool, running migrations first.
+///
+/// Phase D (#32) splits the two identities the process used to conflate: DDL runs
+/// on a one-shot OWNER connection (migrations need ownership, and the owner is not
+/// subject to a not-yet-created runtime role), then the app pool is built. When
+/// `runtime_role` is `Some` (`FLUIDBOX_RUNTIME_ROLE`), every pooled connection
+/// `SET ROLE`s to that least-privilege NON-owner role via `after_connect`, so RLS
+/// binds it by ordinary means (not just FORCE). Default (`None`) = single-role mode:
+/// the owner runs everything and RLS still binds it via FORCE + the tenant GUC.
+///
+/// The role name is interpolated into `SET ROLE` (a SQL identifier, never a bind
+/// parameter), so it is validated to a strict identifier shape and boot REFUSES a
+/// configured-but-absent role with the exact `CREATE ROLE` fix (migration 0018
+/// creates it, but a managed host may have skipped that with a warning).
+pub async fn connect(database_url: &str, runtime_role: Option<&str>) -> anyhow::Result<PgPool> {
+    use sqlx::Connection;
+    // (1) Migrations + role verification on a one-shot OWNER connection, closed
+    // before the app pool exists. DDL is never attempted under the runtime role.
+    let mut owner = sqlx::PgConnection::connect(database_url).await?;
+    sqlx::migrate!("../../migrations").run(&mut owner).await?;
+    if let Some(role) = runtime_role {
+        validate_runtime_role_name(role).map_err(|e| anyhow::anyhow!(e))?;
+        let exists: bool =
+            sqlx::query_scalar("select exists(select 1 from pg_roles where rolname = $1)")
+                .bind(role)
+                .fetch_one(&mut owner)
+                .await?;
+        if !exists {
+            owner.close().await.ok();
+            anyhow::bail!(
+                "FLUIDBOX_RUNTIME_ROLE='{role}' is set but the role does not exist — migration 0018 \
+                 could not create it (managed hosts often restrict CREATE ROLE). Create it and grant \
+                 the privileges, then restart:\n  \
+                 CREATE ROLE {role} NOLOGIN;\n  \
+                 GRANT {role} TO CURRENT_USER;\n  \
+                 -- plus the table/sequence/function grants from migrations/0018_rls_enforcement.sql"
+            );
+        }
+    }
+    owner.close().await?;
+
+    // (2) The application pool. In runtime-role mode every connection SET ROLEs on
+    // acquisition; the tenant/bypass GUC (scoped_tx/worker_tx) then rides each tx.
+    let opts = PgPoolOptions::new()
         .max_connections(10)
-        .acquire_timeout(std::time::Duration::from_secs(15))
-        .connect(database_url)
-        .await?;
-    sqlx::migrate!("../../migrations").run(&pool).await?;
+        .acquire_timeout(std::time::Duration::from_secs(15));
+    let pool = match runtime_role {
+        Some(role) => {
+            // Validated above to ^[a-z_][a-z0-9_]*$, so plain double-quoting is safe.
+            // Leaked to `&'static str` (once per process): sqlx's after_connect future
+            // must be 'static, so the SET ROLE text cannot borrow a stack local.
+            let set_role: &'static str = Box::leak(format!("set role \"{role}\"").into_boxed_str());
+            opts.after_connect(move |conn, _meta| {
+                Box::pin(async move {
+                    use sqlx::Executor;
+                    conn.execute(set_role).await?;
+                    Ok(())
+                })
+            })
+            .connect(database_url)
+            .await?
+        }
+        None => opts.connect(database_url).await?,
+    };
     Ok(pool)
+}
+
+/// A configured runtime-role name is interpolated into `SET ROLE` DDL, so it is
+/// validated to a strict lowercase SQL-identifier shape (`^[a-z_][a-z0-9_]*$`, ≤63
+/// chars) and REFUSED otherwise — fail closed rather than build injectable DDL.
+pub fn validate_runtime_role_name(role: &str) -> Result<(), String> {
+    let ok = !role.is_empty()
+        && role.len() <= 63
+        && role
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| b == b'_' || b.is_ascii_lowercase() || (i > 0 && b.is_ascii_digit()));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "FLUIDBOX_RUNTIME_ROLE='{role}' is not a valid role name (expected ^[a-z_][a-z0-9_]*$, ≤63 chars)"
+        ))
+    }
+}
+
+/// Open a transaction with the tenant RLS GUC set (`fluidbox.tenant_id`),
+/// transaction-local (`set_config(..., true)`) so it auto-resets on commit/rollback
+/// and never leaks to the next borrower of a pooled connection. EVERY tenant-scoped
+/// read/write rides one of these: the `where tenant_id = $n` predicate stays as
+/// defense-in-depth, and the RLS policy (migration 0018) is the enforcing floor —
+/// a buggy or absent predicate is still filtered by the policy (issue #75).
+///
+/// Single-statement reads acquire one too: `SET LOCAL`/`set_config(..., true)` only
+/// takes effect inside a transaction, so the +1 round-trip is the cost of DB-enforced
+/// isolation (accepted, plan D8). The returned tx is `'static` — it owns a pooled
+/// connection — so callers keep the usual `&mut *tx` + `tx.commit()` shape.
+pub async fn scoped_tx(
+    pool: &PgPool,
+    scope: TenantScope,
+) -> sqlx::Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("select set_config('fluidbox.tenant_id', $1, true)")
+        .bind(scope.tenant_id().to_string())
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
+
+/// Open a transaction with the audited system-worker bypass GUC set
+/// (`fluidbox.bypass = 'system_worker'`), so the RLS policies' bypass arm lets a
+/// genuine cross-tenant scan or a principal-less credential-digest resolution see
+/// every tenant's rows. The category rides IN the GUC value — one grep-able choke
+/// point rather than a distinct BYPASSRLS role (plan D8). Used by the `system_worker`
+/// scans (Task 7) and the handful of lib.rs bootstrap resolvers that have no scope by
+/// construction (token-digest resolution, GitHub-App flow claims, the boot seed's
+/// tenant upsert).
+pub(crate) async fn worker_tx(
+    pool: &PgPool,
+) -> sqlx::Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("select set_config('fluidbox.bypass', 'system_worker', true)")
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
 }
 
 pub fn sha256_hex(s: &str) -> String {
@@ -296,6 +413,11 @@ pub struct UsageTotals {
 
 pub async fn ensure_default_tenant(pool: &PgPool) -> sqlx::Result<Uuid> {
     let id = Uuid::now_v7();
+    // Boot bootstrap under the audited bypass: this writes/updates the `tenants`
+    // registry ITSELF — possibly a pre-existing 'default' of unknown id via ON
+    // CONFLICT (name) — so there is no tenant scope to key on, and the tenants RLS
+    // policy's WITH CHECK would otherwise refuse the insert. The row IS the tenant.
+    let mut tx = worker_tx(pool).await?;
     // Migration 0012 made `slug` NOT NULL; the boot tenant owns slug 'default'.
     // On a live DB the migration backfilled it already — this keeps a fresh DB
     // and any hand-edited row converged.
@@ -305,9 +427,11 @@ pub async fn ensure_default_tenant(pool: &PgPool) -> sqlx::Result<Uuid> {
          returning id",
     )
     .bind(id)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
-    Ok(row.get("id"))
+    let out = row.get("id");
+    tx.commit().await?;
+    Ok(out)
 }
 
 // ─── Policies ─────────────────────────────────────────────────────────────
@@ -328,7 +452,9 @@ pub async fn upsert_policy(
     yaml_source: &str,
     parsed: &Value,
 ) -> sqlx::Result<PolicyRow> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "insert into policies (id, tenant_id, name, yaml_source, parsed)
          values ($1, $2, $3, $4, $5)
          on conflict (tenant_id, name) do update
@@ -345,8 +471,10 @@ pub async fn upsert_policy(
     .bind(name)
     .bind(yaml_source)
     .bind(parsed)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Upsert ONE exact-name override, replacing any existing decision for that
@@ -388,7 +516,8 @@ async fn write_policy_overrides(
     tool: &str,
     append: &Value,
 ) -> sqlx::Result<PolicyRow> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+    let __rls_out = sqlx::query_as(
         "with target as (
            select id,
                   coalesce(
@@ -413,8 +542,10 @@ async fn write_policy_overrides(
     .bind(name)
     .bind(tool)
     .bind(append)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Bootstrap a policy from a seed file only if it does not already exist.
@@ -430,6 +561,7 @@ pub async fn seed_policy_if_absent(
     if let Some(existing) = get_policy_by_name(pool, scope, name).await? {
         return Ok((existing, false));
     }
+    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query_as(
         "insert into policies (id, tenant_id, name, yaml_source, parsed)
          values ($1, $2, $3, $4, $5)
@@ -441,16 +573,21 @@ pub async fn seed_policy_if_absent(
     .bind(name)
     .bind(yaml_source)
     .bind(parsed)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok((row, true))
 }
 
 pub async fn list_policies(pool: &PgPool, scope: TenantScope) -> sqlx::Result<Vec<PolicyRow>> {
-    sqlx::query_as("select * from policies where tenant_id = $1 order by name")
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as("select * from policies where tenant_id = $1 order by name")
         .bind(scope.tenant_id())
-        .fetch_all(pool)
-        .await
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_policy(
@@ -458,11 +595,15 @@ pub async fn get_policy(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<PolicyRow>> {
-    sqlx::query_as("select * from policies where id = $1 and tenant_id = $2")
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as("select * from policies where id = $1 and tenant_id = $2")
         .bind(id)
         .bind(scope.tenant_id())
-        .fetch_optional(pool)
-        .await
+        .fetch_optional(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_policy_by_name(
@@ -470,11 +611,15 @@ pub async fn get_policy_by_name(
     scope: TenantScope,
     name: &str,
 ) -> sqlx::Result<Option<PolicyRow>> {
-    sqlx::query_as("select * from policies where tenant_id = $1 and name = $2")
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as("select * from policies where tenant_id = $1 and name = $2")
         .bind(scope.tenant_id())
         .bind(name)
-        .fetch_optional(pool)
-        .await
+        .fetch_optional(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Agents whose LATEST revision uses this policy — the blast radius an override
@@ -485,7 +630,9 @@ pub async fn policy_agents_using(
     scope: TenantScope,
     policy_id: Uuid,
 ) -> sqlx::Result<i64> {
-    sqlx::query_scalar(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_scalar(
         "select count(*) from agents a
           where a.tenant_id = $1
             and (
@@ -497,8 +644,10 @@ pub async fn policy_agents_using(
     )
     .bind(scope.tenant_id())
     .bind(policy_id)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// The union of `mcp__<server>__<tool>` names an agent on this policy can call —
@@ -517,6 +666,7 @@ pub async fn policy_mcp_tools(
     scope: TenantScope,
     policy_id: Uuid,
 ) -> sqlx::Result<Vec<String>> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let revs: Vec<(Value, Value)> = sqlx::query_as(
         "select r.capability_bundles, r.connection_requirements from agents a
            join lateral (
@@ -527,7 +677,7 @@ pub async fn policy_mcp_tools(
     )
     .bind(scope.tenant_id())
     .bind(policy_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
 
     let mut out: Vec<String> = Vec::new();
@@ -576,7 +726,7 @@ pub async fn policy_mcp_tools(
         )
         .bind(scope.tenant_id())
         .bind(&ids)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await?;
 
         for def in &defs {
@@ -599,6 +749,7 @@ pub async fn policy_mcp_tools(
         }
     }
 
+    tx.commit().await?;
     out.sort_unstable();
     out.dedup();
     Ok(out)
@@ -612,7 +763,9 @@ pub async fn create_agent(
     name: &str,
     description: Option<&str>,
 ) -> sqlx::Result<AgentRow> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "insert into agents (id, tenant_id, name, description) values ($1,$2,$3,$4)
          on conflict (tenant_id, name) do update set description = excluded.description
          returning *",
@@ -621,15 +774,21 @@ pub async fn create_agent(
     .bind(scope.tenant_id())
     .bind(name)
     .bind(description)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn list_agents(pool: &PgPool, scope: TenantScope) -> sqlx::Result<Vec<AgentRow>> {
-    sqlx::query_as("select * from agents where tenant_id = $1 order by name")
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as("select * from agents where tenant_id = $1 order by name")
         .bind(scope.tenant_id())
-        .fetch_all(pool)
-        .await
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_agent(
@@ -637,11 +796,15 @@ pub async fn get_agent(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<AgentRow>> {
-    sqlx::query_as("select * from agents where id = $1 and tenant_id = $2")
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as("select * from agents where id = $1 and tenant_id = $2")
         .bind(id)
         .bind(scope.tenant_id())
-        .fetch_optional(pool)
-        .await
+        .fetch_optional(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_agent_by_name(
@@ -649,11 +812,15 @@ pub async fn get_agent_by_name(
     scope: TenantScope,
     name: &str,
 ) -> sqlx::Result<Option<AgentRow>> {
-    sqlx::query_as("select * from agents where tenant_id = $1 and name = $2")
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as("select * from agents where tenant_id = $1 and name = $2")
         .bind(scope.tenant_id())
         .bind(name)
-        .fetch_optional(pool)
-        .await
+        .fetch_optional(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Appends a new immutable revision (rev = max+1). Editing an agent is
@@ -675,6 +842,8 @@ pub async fn append_agent_revision(
     capability_bundles: &Value,
     connection_requirements: &Value,
 ) -> sqlx::Result<AgentRevisionRow> {
+    let mut tx = scoped_tx(pool, scope).await?;
+
     // Revisions carry no tenant column of their own; the tenant boundary is the
     // parent agent — the insert only lands when the agent AND the referenced
     // policy both belong to the scope (a cross-tenant policy_id is proven
@@ -682,7 +851,7 @@ pub async fn append_agent_revision(
     // existing contract for a not-in-scope agent), which callers already map to
     // a 404. `connection_requirements` is validated app-side (Task 2) before it
     // reaches here.
-    sqlx::query_as(
+    let __rls_out = sqlx::query_as(
         "insert into agent_revisions
            (id, agent_id, rev, harness, runner_image, model, system_prompt, policy_id, budgets,
             default_workspace, capability_bundles, connection_requirements)
@@ -705,8 +874,10 @@ pub async fn append_agent_revision(
     .bind(capability_bundles)
     .bind(connection_requirements)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn latest_revision(
@@ -714,7 +885,9 @@ pub async fn latest_revision(
     scope: TenantScope,
     agent_id: Uuid,
 ) -> sqlx::Result<Option<AgentRevisionRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select r.* from agent_revisions r
          join agents a on a.id = r.agent_id
          where r.agent_id = $1 and a.tenant_id = $2
@@ -722,8 +895,10 @@ pub async fn latest_revision(
     )
     .bind(agent_id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn list_revisions(
@@ -731,7 +906,9 @@ pub async fn list_revisions(
     scope: TenantScope,
     agent_id: Uuid,
 ) -> sqlx::Result<Vec<AgentRevisionRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select r.* from agent_revisions r
          join agents a on a.id = r.agent_id
          where r.agent_id = $1 and a.tenant_id = $2
@@ -739,8 +916,10 @@ pub async fn list_revisions(
     )
     .bind(agent_id)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_revision(
@@ -748,15 +927,19 @@ pub async fn get_revision(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<AgentRevisionRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select r.* from agent_revisions r
          join agents a on a.id = r.agent_id
          where r.id = $1 and a.tenant_id = $2",
     )
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 // ─── Capability bundles (Phase 5: the registry) ───────────────────────────
@@ -772,7 +955,9 @@ pub async fn create_capability_bundle(
     definition: &Value,
     definition_digest: &str,
 ) -> sqlx::Result<CapabilityBundleRow> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "insert into capability_bundles
            (id, tenant_id, name, version, description, definition, definition_digest)
          values ($1, $2, $3,
@@ -787,21 +972,27 @@ pub async fn create_capability_bundle(
     .bind(description)
     .bind(definition)
     .bind(definition_digest)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn list_capability_bundles(
     pool: &PgPool,
     scope: TenantScope,
 ) -> sqlx::Result<Vec<CapabilityBundleRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from capability_bundles where tenant_id = $1
          order by name, version desc",
     )
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_capability_bundle(
@@ -809,11 +1000,16 @@ pub async fn get_capability_bundle(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<CapabilityBundleRow>> {
-    sqlx::query_as("select * from capability_bundles where id = $1 and tenant_id = $2")
-        .bind(id)
-        .bind(scope.tenant_id())
-        .fetch_optional(pool)
-        .await
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out =
+        sqlx::query_as("select * from capability_bundles where id = $1 and tenant_id = $2")
+            .bind(id)
+            .bind(scope.tenant_id())
+            .fetch_optional(&mut *tx)
+            .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn latest_capability_bundle(
@@ -821,14 +1017,18 @@ pub async fn latest_capability_bundle(
     scope: TenantScope,
     name: &str,
 ) -> sqlx::Result<Option<CapabilityBundleRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from capability_bundles where tenant_id = $1 and name = $2
          order by version desc limit 1",
     )
     .bind(scope.tenant_id())
     .bind(name)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_capability_bundle_version(
@@ -837,15 +1037,19 @@ pub async fn get_capability_bundle_version(
     name: &str,
     version: i32,
 ) -> sqlx::Result<Option<CapabilityBundleRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from capability_bundles
          where tenant_id = $1 and name = $2 and version = $3",
     )
     .bind(scope.tenant_id())
     .bind(name)
     .bind(version)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 // ─── Integration connections ──────────────────────────────────────────────
@@ -904,12 +1108,14 @@ pub async fn create_connection(
     owner: ConnectionOwner,
     created_by_user_id: Option<Uuid>,
 ) -> sqlx::Result<IntegrationConnectionRow> {
+    let mut tx = scoped_tx(pool, scope).await?;
+
     // owner_type/owner_user_id are stamped from `owner`; authorization_generation
     // starts at 1 (the column default) and bumps only on re-consent/rotation.
     // The `_key_version` companions ride beside each sealed column (1 legacy, 2
     // v2 envelope) so the reader can dispatch on open.
     let (owner_type, owner_user_id) = owner.parts();
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "insert into integration_connections
            (id, tenant_id, provider, external_account_id, display_name, credential_sealed,
             granted_scopes, resource_selection, metadata, webhook_secret_sealed,
@@ -940,21 +1146,27 @@ pub async fn create_connection(
     .bind(credential_key_version)
     .bind(webhook_secret_key_version)
     .bind(auth.client_secret_key_version)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn list_connections(
     pool: &PgPool,
     scope: TenantScope,
 ) -> sqlx::Result<Vec<IntegrationConnectionRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {CONNECTION_COLS} from integration_connections
          where tenant_id = $1 order by created_at desc"
     )))
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 // Executor-generic so a caller holding the per-connection OAuth advisory lock
@@ -984,15 +1196,19 @@ pub async fn revoke_connection(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<IntegrationConnectionRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update integration_connections set status = 'revoked', updated_at = now()
          where id = $1 and status <> 'revoked' and tenant_id = $2
          returning {CONNECTION_COLS}"
     )))
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// List connections through a visibility lens (design :274-296): `All` returns
@@ -1004,7 +1220,9 @@ pub async fn list_connections_visible(
     scope: TenantScope,
     viewer: ConnectionViewer,
 ) -> sqlx::Result<Vec<IntegrationConnectionRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {CONNECTION_COLS} from integration_connections
          where tenant_id = $1
            and ($2::uuid is null or owner_type = 'organization' or owner_user_id = $2)
@@ -1012,8 +1230,10 @@ pub async fn list_connections_visible(
     )))
     .bind(scope.tenant_id())
     .bind(viewer.user_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Read one connection through the same visibility lens as
@@ -1024,7 +1244,9 @@ pub async fn get_connection_visible(
     id: Uuid,
     viewer: ConnectionViewer,
 ) -> sqlx::Result<Option<IntegrationConnectionRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {CONNECTION_COLS} from integration_connections
          where id = $1 and tenant_id = $2
            and ($3::uuid is null or owner_type = 'organization' or owner_user_id = $3)"
@@ -1032,8 +1254,10 @@ pub async fn get_connection_visible(
     .bind(id)
     .bind(scope.tenant_id())
     .bind(viewer.user_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Bump a connection's authorization generation (design :296) — called on every
@@ -1045,6 +1269,7 @@ pub async fn bump_connection_generation(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<i32>> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query(
         "update integration_connections
          set authorization_generation = authorization_generation + 1, updated_at = now()
@@ -1053,8 +1278,9 @@ pub async fn bump_connection_generation(
     )
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.map(|r| r.get::<i32, _>("authorization_generation")))
 }
 
@@ -1066,6 +1292,8 @@ pub async fn update_connection_oauth(
     id: Uuid,
     oauth: &Value,
 ) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
+
     sqlx::query(
         "update integration_connections set oauth = $2, updated_at = now()
          where id = $1 and status <> 'revoked' and tenant_id = $3",
@@ -1073,9 +1301,10 @@ pub async fn update_connection_oauth(
     .bind(id)
     .bind(oauth)
     .bind(scope.tenant_id())
-    .execute(pool)
-    .await
-    .map(|_| ())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// The callback exchange completing: seal the rotating refresh token into
@@ -1489,6 +1718,7 @@ pub async fn insert_connector_oauth_flow(
     scope: TenantScope,
     new: NewConnectorOauthFlow<'_>,
 ) -> sqlx::Result<ConnectorOauthFlowRow> {
+    let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
         "delete from connector_oauth_flows
          where tenant_id = $1
@@ -1496,9 +1726,9 @@ pub async fn insert_connector_oauth_flow(
                 or expires_at < now() - interval '7 days')",
     )
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
-    sqlx::query_as(
+    let __rls_out = sqlx::query_as(
         "insert into connector_oauth_flows
            (id, tenant_id, connection_id, initiated_by_user_id, state_hash, browser_hash,
             issuer, authorization_endpoint, token_endpoint, metadata_digest, resource,
@@ -1530,8 +1760,10 @@ pub async fn insert_connector_oauth_flow(
     .bind(new.pkce_verifier_key_version)
     .bind(new.expected_generation)
     .bind(new.ttl_secs as f64)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// The one-time connector-OAuth-flow claim (invariant 20). Keyed by `state_hash`
@@ -1729,15 +1961,19 @@ pub async fn latest_connection_tool_snapshot(
     scope: TenantScope,
     connection_id: Uuid,
 ) -> sqlx::Result<Option<ConnectionToolSnapshotRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from connection_tool_snapshots
          where tenant_id = $1 and connection_id = $2
          order by snapshot_version desc limit 1",
     )
     .bind(scope.tenant_id())
     .bind(connection_id)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Every snapshot for a connection, newest first.
@@ -1746,15 +1982,19 @@ pub async fn list_connection_tool_snapshots(
     scope: TenantScope,
     connection_id: Uuid,
 ) -> sqlx::Result<Vec<ConnectionToolSnapshotRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from connection_tool_snapshots
          where tenant_id = $1 and connection_id = $2
          order by snapshot_version desc",
     )
     .bind(scope.tenant_id())
     .bind(connection_id)
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// One specific snapshot version for a connection (the pin a run froze).
@@ -1764,15 +2004,19 @@ pub async fn get_connection_tool_snapshot(
     connection_id: Uuid,
     version: i32,
 ) -> sqlx::Result<Option<ConnectionToolSnapshotRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from connection_tool_snapshots
          where tenant_id = $1 and connection_id = $2 and snapshot_version = $3",
     )
     .bind(scope.tenant_id())
     .bind(connection_id)
     .bind(version)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// One catalog entry — GLOBAL (tenant-less) reference data, a superset of
@@ -1820,7 +2064,9 @@ pub async fn list_catalog(
     pool: &PgPool,
     scope: TenantScope,
 ) -> sqlx::Result<Vec<ConnectorCatalogRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from connector_catalog c
          where c.disabled_at is null
            and (c.tenant_id = $1
@@ -1831,8 +2077,10 @@ pub async fn list_catalog(
          order by case tier when 'verified' then 0 when 'community' then 1 else 2 end, name",
     )
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Resolve one slug for a tenant: the tenant's custom row first, else the
@@ -1842,7 +2090,9 @@ pub async fn get_catalog_by_slug(
     scope: TenantScope,
     slug: &str,
 ) -> sqlx::Result<Option<ConnectorCatalogRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from connector_catalog
          where slug = $1 and disabled_at is null and (tenant_id = $2 or tenant_id is null)
          order by (tenant_id is not null) desc
@@ -1850,8 +2100,10 @@ pub async fn get_catalog_by_slug(
     )
     .bind(slug)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// API-added entries are always tier `custom` — verified/community are
@@ -1877,6 +2129,8 @@ pub async fn create_catalog_entry(
     tool_hints: &Value,
     sandbox_launch: Option<&Value>,
 ) -> sqlx::Result<Option<ConnectorCatalogRow>> {
+    let mut tx = scoped_tx(pool, scope).await?;
+
     // tier AND provenance are forced 'custom': verified/community are curation
     // judgements the API cannot self-award, and a 'custom' provenance keeps a
     // user's BYO entry distinguishable from both the fluidbox seed and an
@@ -1885,7 +2139,7 @@ pub async fn create_catalog_entry(
     // — so it can never clobber this custom row; see the importer). The
     // `not exists (global)` guard fails closed on a global-slug collision — a
     // tenant can never mask a curated slug with a divergent definition.
-    sqlx::query_as(
+    let __rls_out = sqlx::query_as(
         "insert into connector_catalog
            (id, tenant_id, slug, name, icon, description, categories, tier, url, transport,
             auth_mode, auth_hints, scopes, egress, tool_hints, sandbox_launch,
@@ -1911,8 +2165,10 @@ pub async fn create_catalog_entry(
     .bind(egress)
     .bind(tool_hints)
     .bind(sandbox_launch)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Delete a tenant's custom catalog entry by slug (tenant rows only — a global
@@ -1925,11 +2181,13 @@ pub async fn delete_catalog_entry(
     scope: TenantScope,
     slug: &str,
 ) -> sqlx::Result<u64> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let r = sqlx::query("delete from connector_catalog where slug = $1 and tenant_id = $2")
         .bind(slug)
         .bind(scope.tenant_id())
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(r.rows_affected())
 }
 
@@ -1965,14 +2223,16 @@ pub async fn connection_webhook_secret_sealed(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query(
         "select webhook_secret_sealed, webhook_secret_key_version from integration_connections
          where id = $1 and status = 'active' and tenant_id = $2",
     )
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.and_then(|r| {
         r.get::<Option<Vec<u8>>, _>("webhook_secret_sealed")
             .map(|b| (b, r.get::<i16, _>("webhook_secret_key_version")))
@@ -1997,13 +2257,15 @@ pub async fn tenant_llm_key_sealed(
     pool: &PgPool,
     scope: TenantScope,
 ) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let row: Option<(Vec<u8>, i16)> = sqlx::query_as(
         "select litellm_key_sealed, litellm_key_key_version from tenant_llm_keys
          where tenant_id = $1",
     )
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row)
 }
 
@@ -2020,6 +2282,7 @@ pub async fn insert_tenant_llm_key(
     litellm_token_id: Option<&str>,
 ) -> sqlx::Result<TenantLlmKeyInsert> {
     let tenant_id = scope.tenant_id();
+    let mut tx = scoped_tx(pool, scope).await?;
     let inserted: Option<(Vec<u8>, i16)> = sqlx::query_as(
         "insert into tenant_llm_keys
            (tenant_id, litellm_key_sealed, litellm_key_key_version, key_alias, litellm_token_id)
@@ -2032,9 +2295,10 @@ pub async fn insert_tenant_llm_key(
     .bind(key_version)
     .bind(key_alias)
     .bind(litellm_token_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     if let Some((s, v)) = inserted {
+        tx.commit().await?;
         return Ok(TenantLlmKeyInsert {
             sealed: s,
             key_version: v,
@@ -2047,8 +2311,9 @@ pub async fn insert_tenant_llm_key(
          where tenant_id = $1",
     )
     .bind(tenant_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(TenantLlmKeyInsert {
         sealed: s,
         key_version: v,
@@ -2070,7 +2335,7 @@ pub async fn rotate_tenant_llm_key(
     litellm_token_id: Option<&str>,
 ) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
     let tenant_id = scope.tenant_id();
-    let mut tx = pool.begin().await?;
+    let mut tx = scoped_tx(pool, scope).await?;
     let old: Option<(Vec<u8>, i16)> = sqlx::query_as(
         "select litellm_key_sealed, litellm_key_key_version from tenant_llm_keys
          where tenant_id = $1 for update",
@@ -2136,7 +2401,9 @@ pub async fn create_github_app_registration(
     target_kind: &str,
     target_org: Option<&str>,
 ) -> sqlx::Result<GithubAppRegistrationRow> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "insert into github_app_registrations (id, tenant_id, target_kind, target_org)
          values ($1, $2, $3, $4)
          returning {GH_REG_COLS}"
@@ -2145,21 +2412,27 @@ pub async fn create_github_app_registration(
     .bind(scope.tenant_id())
     .bind(target_kind)
     .bind(target_org)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn list_github_app_registrations(
     pool: &PgPool,
     scope: TenantScope,
 ) -> sqlx::Result<Vec<GithubAppRegistrationRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {GH_REG_COLS} from github_app_registrations
          where tenant_id = $1 order by created_at desc"
     )))
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_github_app_registration(
@@ -2167,13 +2440,17 @@ pub async fn get_github_app_registration(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<GithubAppRegistrationRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {GH_REG_COLS} from github_app_registrations where id = $1 and tenant_id = $2"
     )))
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// The manifest conversion landing: exactly ONE conversion may complete a
@@ -2197,7 +2474,9 @@ pub async fn activate_github_app_registration(
     client_secret_sealed: Option<&[u8]>,
     client_secret_key_version: i16,
 ) -> sqlx::Result<Option<GithubAppRegistrationRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update github_app_registrations
          set app_id = $2, slug = $3, name = $4, client_id = $5, html_url = $6,
              owner_login = $7, pem_sealed = $8, webhook_secret_sealed = $9,
@@ -2221,8 +2500,10 @@ pub async fn activate_github_app_registration(
     .bind(pem_key_version)
     .bind(webhook_secret_key_version)
     .bind(client_secret_key_version)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Revoke a registration AND its child connections in one transaction;
@@ -2234,7 +2515,7 @@ pub async fn revoke_github_app_registration(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<Vec<Uuid>>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = scoped_tx(pool, scope).await?;
     let reg = sqlx::query(
         "update github_app_registrations set status = 'revoked', updated_at = now()
          where id = $1 and status <> 'revoked' and tenant_id = $2",
@@ -2271,14 +2552,16 @@ pub async fn github_app_registration_pem_sealed(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query(
         "select pem_sealed, pem_key_version from github_app_registrations
          where id = $1 and status = 'active' and tenant_id = $2",
     )
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.and_then(|r| {
         r.get::<Option<Vec<u8>>, _>("pem_sealed")
             .map(|b| (b, r.get::<i16, _>("pem_key_version")))
@@ -2292,14 +2575,16 @@ pub async fn github_app_registration_webhook_secret_sealed(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query(
         "select webhook_secret_sealed, webhook_secret_key_version from github_app_registrations
          where id = $1 and status = 'active' and tenant_id = $2",
     )
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.and_then(|r| {
         r.get::<Option<Vec<u8>>, _>("webhook_secret_sealed")
             .map(|b| (b, r.get::<i16, _>("webhook_secret_key_version")))
@@ -2315,12 +2600,17 @@ pub async fn create_github_app_flow(
     purpose: &str,
     ttl_secs: i64,
 ) -> sqlx::Result<Uuid> {
+    // GitHub-App admin bootstrap flow: operates on github_app_flows (a child of
+    // github_app_registrations) with no tenant scope — the one-time flow id + the
+    // browser-cookie hash bound at `go` are the auth. Rides the audited bypass, like
+    // the connector-OAuth flow claims and the login-flow bootstrap (Task 7 category).
+    let mut tx = worker_tx(pool).await?;
     sqlx::query(
         "delete from github_app_flows
          where (consumed_at is null and expires_at < now())
             or expires_at < now() - interval '7 days'",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     let id = Uuid::now_v7();
     sqlx::query(
@@ -2331,8 +2621,9 @@ pub async fn create_github_app_flow(
     .bind(registration_id)
     .bind(purpose)
     .bind(ttl_secs as f64)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(id)
 }
 
@@ -2344,6 +2635,8 @@ pub async fn claim_github_app_bootstrap(
     purpose: &str,
     browser_hash: &str,
 ) -> sqlx::Result<Option<Uuid>> {
+    // Pre-auth bootstrap claim (browser cookie is the auth) — audited bypass.
+    let mut tx = worker_tx(pool).await?;
     let row = sqlx::query(
         "update github_app_flows
          set bootstrap_consumed_at = now(), browser_hash = $3
@@ -2354,8 +2647,9 @@ pub async fn claim_github_app_bootstrap(
     .bind(flow_id)
     .bind(purpose)
     .bind(browser_hash)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.map(|r| r.get::<Uuid, _>("registration_id")))
 }
 
@@ -2369,6 +2663,8 @@ pub async fn claim_github_app_flow(
     registration_id: Uuid,
     browser_hash: &str,
 ) -> sqlx::Result<bool> {
+    // Pre-auth one-time claim (browser cookie inside the predicate) — audited bypass.
+    let mut tx = worker_tx(pool).await?;
     let r = sqlx::query(
         "update github_app_flows
          set consumed_at = now()
@@ -2380,8 +2676,9 @@ pub async fn claim_github_app_flow(
     .bind(purpose)
     .bind(registration_id)
     .bind(browser_hash)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(r.rows_affected() == 1)
 }
 
@@ -2401,7 +2698,9 @@ pub async fn create_github_app_connection_if_absent(
     status: &str,
     registration_id: Uuid,
 ) -> sqlx::Result<Option<IntegrationConnectionRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         // github_app connections are ALWAYS organization-owned (system custody
         // via the registration) — owner_type is stamped explicitly, never a
         // per-user personal connection.
@@ -2424,8 +2723,10 @@ pub async fn create_github_app_connection_if_absent(
     .bind(metadata)
     .bind(status)
     .bind(registration_id)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// The single live connection row for a GitHub installation, preferring a
@@ -2436,7 +2737,9 @@ pub async fn get_github_app_connection_by_installation(
     scope: TenantScope,
     installation_id: &str,
 ) -> sqlx::Result<Option<IntegrationConnectionRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {CONNECTION_COLS} from integration_connections
          where tenant_id = $1 and provider = 'github_app' and external_account_id = $2
          order by (status <> 'revoked') desc, created_at desc
@@ -2444,8 +2747,10 @@ pub async fn get_github_app_connection_by_installation(
     )))
     .bind(scope.tenant_id())
     .bind(installation_id)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Guarded status transition: only fires when the current status is one of
@@ -2457,8 +2762,10 @@ pub async fn set_connection_status(
     status: &str,
     allowed_from: &[&str],
 ) -> sqlx::Result<Option<IntegrationConnectionRow>> {
+    let mut tx = scoped_tx(pool, scope).await?;
+
     let from: Vec<String> = allowed_from.iter().map(|s| s.to_string()).collect();
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update integration_connections set status = $2, updated_at = now()
          where id = $1 and status = any($3) and tenant_id = $4
          returning {CONNECTION_COLS}"
@@ -2467,8 +2774,10 @@ pub async fn set_connection_status(
     .bind(status)
     .bind(&from)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Refresh the display metadata a setup/sync re-verification produced.
@@ -2479,6 +2788,8 @@ pub async fn refresh_connection_metadata(
     display_name: &str,
     metadata: &Value,
 ) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
+
     sqlx::query(
         "update integration_connections
          set display_name = $2, metadata = $3, updated_at = now()
@@ -2488,9 +2799,10 @@ pub async fn refresh_connection_metadata(
     .bind(display_name)
     .bind(metadata)
     .bind(scope.tenant_id())
-    .execute(pool)
-    .await
-    .map(|_| ())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 // ─── Trigger subscriptions ────────────────────────────────────────────────
@@ -2561,12 +2873,14 @@ pub async fn create_trigger_subscription(
     event_publish: Option<&Value>,
     capability_bundles: Option<&Value>,
 ) -> sqlx::Result<TriggerSubscriptionRow> {
+    let mut tx = scoped_tx(pool, scope).await?;
+
     // Prove every referenced parent belongs to this tenant IN SQL (the handler
     // pre-validates too, but this is the relational backstop): the agent is
     // in-scope; a Some pinned_revision is a revision of THAT agent; a Some
     // connection is in-scope. A miss yields zero rows → fetch_one RowNotFound,
     // the same shape a not-in-scope agent already produced for other writes.
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "insert into trigger_subscriptions
            (id, tenant_id, agent_id, name, trigger_kind, pinned_revision_id, task_template,
             allow_task_override, allow_workspace_override, autonomy, concurrency_policy,
@@ -2602,8 +2916,10 @@ pub async fn create_trigger_subscription(
     .bind(event_publish)
     .bind(capability_bundles)
     .bind(callback_secret_key_version)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Enabled event subscriptions listening on a connection — the matcher's
@@ -2613,28 +2929,36 @@ pub async fn list_event_subscriptions(
     scope: TenantScope,
     connection: Uuid,
 ) -> sqlx::Result<Vec<TriggerSubscriptionRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {SUBSCRIPTION_COLS} from trigger_subscriptions
          where connection_id = $1 and trigger_kind = 'event' and enabled and tenant_id = $2
          order by created_at"
     )))
     .bind(connection)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn list_trigger_subscriptions(
     pool: &PgPool,
     scope: TenantScope,
 ) -> sqlx::Result<Vec<TriggerSubscriptionRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {SUBSCRIPTION_COLS} from trigger_subscriptions
          where tenant_id = $1 order by created_at desc"
     )))
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_trigger_subscription(
@@ -2642,13 +2966,17 @@ pub async fn get_trigger_subscription(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<TriggerSubscriptionRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {SUBSCRIPTION_COLS} from trigger_subscriptions where id = $1 and tenant_id = $2"
     )))
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn set_trigger_subscription_enabled(
@@ -2657,15 +2985,19 @@ pub async fn set_trigger_subscription_enabled(
     id: Uuid,
     enabled: bool,
 ) -> sqlx::Result<Option<TriggerSubscriptionRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update trigger_subscriptions set enabled = $2, updated_at = now()
          where id = $1 and tenant_id = $3 returning {SUBSCRIPTION_COLS}"
     )))
     .bind(id)
     .bind(enabled)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// The only reader of the sealed callback secret. Deliveries for in-flight
@@ -2675,14 +3007,16 @@ pub async fn subscription_callback_secret_sealed(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query(
         "select callback_secret_sealed, callback_secret_key_version from trigger_subscriptions
          where id = $1 and tenant_id = $2",
     )
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.and_then(|r| {
         r.get::<Option<Vec<u8>>, _>("callback_secret_sealed")
             .map(|b| (b, r.get::<i16, _>("callback_secret_key_version")))
@@ -2792,11 +3126,16 @@ pub async fn get_run_resource_binding(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<RunResourceBindingRow>> {
-    sqlx::query_as("select * from run_resource_bindings where id = $1 and tenant_id = $2")
-        .bind(id)
-        .bind(scope.tenant_id())
-        .fetch_optional(pool)
-        .await
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out =
+        sqlx::query_as("select * from run_resource_bindings where id = $1 and tenant_id = $2")
+            .bind(id)
+            .bind(scope.tenant_id())
+            .fetch_optional(&mut *tx)
+            .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Every binding a run resolved, ordered by slot for stable display.
@@ -2805,15 +3144,19 @@ pub async fn session_resource_bindings(
     scope: TenantScope,
     session_id: Uuid,
 ) -> sqlx::Result<Vec<RunResourceBindingRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from run_resource_bindings
          where session_id = $1 and tenant_id = $2
          order by slot_kind, requirement_slot",
     )
     .bind(session_id)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// The one binding for a run's (slot_kind, requirement_slot) — the consumer's
@@ -2825,7 +3168,9 @@ pub async fn find_session_binding(
     slot_kind: &str,
     slot: &str,
 ) -> sqlx::Result<Option<RunResourceBindingRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from run_resource_bindings
          where session_id = $1 and tenant_id = $2 and slot_kind = $3 and requirement_slot = $4",
     )
@@ -2833,8 +3178,10 @@ pub async fn find_session_binding(
     .bind(scope.tenant_id())
     .bind(slot_kind)
     .bind(slot)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 // ─── Sessions ─────────────────────────────────────────────────────────────
@@ -2858,7 +3205,7 @@ pub async fn create_session(
     bind_dispatch: Option<Uuid>,
     bindings: &[NewRunResourceBinding],
 ) -> sqlx::Result<SessionRow> {
-    let mut tx = pool.begin().await?;
+    let mut tx = scoped_tx(pool, scope).await?;
     // Prove the agent AND the pinned revision both belong to this tenant in SQL
     // (the run builder resolves them under scope first; this is the relational
     // backstop). A miss yields zero rows → fetch_one RowNotFound, surfaced via
@@ -2942,11 +3289,15 @@ pub async fn get_session(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<SessionRow>> {
-    sqlx::query_as("select * from sessions where id = $1 and tenant_id = $2")
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as("select * from sessions where id = $1 and tenant_id = $2")
         .bind(id)
         .bind(scope.tenant_id())
-        .fetch_optional(pool)
-        .await
+        .fetch_optional(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// List a tenant's sessions, newest first. `invoked_by` narrows to a single
@@ -2958,7 +3309,9 @@ pub async fn list_sessions(
     invoked_by: Option<Uuid>,
     limit: i64,
 ) -> sqlx::Result<Vec<SessionRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from sessions
          where tenant_id = $1 and ($2::uuid is null or invoked_by_user_id = $2)
          order by created_at desc limit $3",
@@ -2966,8 +3319,10 @@ pub async fn list_sessions(
     .bind(scope.tenant_id())
     .bind(invoked_by)
     .bind(limit)
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// The single status writer. Validates the transition inside a transaction;
@@ -2980,7 +3335,7 @@ pub async fn transition_session(
     next: SessionStatus,
     reason: Option<&str>,
 ) -> sqlx::Result<Option<(SessionStatus, SessionRow)>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = scoped_tx(pool, scope).await?;
     let row: Option<(String,)> =
         sqlx::query_as("select status from sessions where id = $1 and tenant_id = $2 for update")
             .bind(id)
@@ -3036,7 +3391,7 @@ pub async fn set_sandbox_handle(
     handle: &Value,
 ) -> sqlx::Result<bool> {
     use fluidbox_core::state::SessionStatus;
-    let mut tx = pool.begin().await?;
+    let mut tx = scoped_tx(pool, scope).await?;
     let locked: Option<(String,)> =
         sqlx::query_as("select status from sessions where id = $1 and tenant_id = $2 for update")
             .bind(id)
@@ -3092,6 +3447,7 @@ pub async fn adopt_sandbox_handle(
     id: Uuid,
     handle: &Value,
 ) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let res = sqlx::query(
         "update sessions set sandbox_handle = $2, updated_at = now()
          where id = $1 and tenant_id = $3 and sandbox_handle is null
@@ -3100,8 +3456,9 @@ pub async fn adopt_sandbox_handle(
     .bind(id)
     .bind(handle)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -3111,6 +3468,7 @@ pub async fn set_base_commit(
     id: Uuid,
     commit: &str,
 ) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
         "update sessions set base_commit = $2, updated_at = now()
          where id = $1 and tenant_id = $3",
@@ -3118,8 +3476,9 @@ pub async fn set_base_commit(
     .bind(id)
     .bind(commit)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -3129,6 +3488,7 @@ pub async fn set_result_summary(
     id: Uuid,
     summary: &str,
 ) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
         "update sessions set result_summary = $2, updated_at = now()
          where id = $1 and tenant_id = $3",
@@ -3136,20 +3496,23 @@ pub async fn set_result_summary(
     .bind(id)
     .bind(summary)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
 pub async fn heartbeat(pool: &PgPool, scope: TenantScope, id: Uuid) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
         "update sessions set last_heartbeat_at = now(), updated_at = now()
          where id = $1 and tenant_id = $2",
     )
     .bind(id)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -3209,7 +3572,7 @@ pub async fn begin_finalization(
     quiesce_deadline_secs: i64,
 ) -> sqlx::Result<BeginFinalization> {
     use fluidbox_core::state::SessionStatus;
-    let mut tx = pool.begin().await?;
+    let mut tx = scoped_tx(pool, scope).await?;
     let locked: Option<(String, Option<Value>)> = sqlx::query_as(
         "select status, sandbox_handle from sessions where id = $1 and tenant_id = $2 for update",
     )
@@ -3268,15 +3631,19 @@ pub async fn get_finalization(
     scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<Option<FinalizationRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from session_finalizations
          where session_id = $1
            and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $2)",
     )
     .bind(session)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Claim a finalization for driving: succeeds when the row is unclaimed OR its
@@ -3290,7 +3657,9 @@ pub async fn claim_finalization(
     session: Uuid,
     stale_secs: i64,
 ) -> sqlx::Result<Option<FinalizationRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "update session_finalizations
             set claimed_at = now(), attempts = attempts + 1
           where session_id = $1
@@ -3301,8 +3670,10 @@ pub async fn claim_finalization(
     .bind(session)
     .bind(stale_secs as f64)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Release a driver's claim early — for DELIBERATE deferrals (e.g. the
@@ -3313,6 +3684,7 @@ pub async fn release_finalization_claim(
     scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
         "update session_finalizations set claimed_at = null
          where session_id = $1
@@ -3320,8 +3692,9 @@ pub async fn release_finalization_claim(
     )
     .bind(session)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -3330,6 +3703,7 @@ pub async fn delete_finalization(
     scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
         "delete from session_finalizations
          where session_id = $1
@@ -3337,8 +3711,9 @@ pub async fn delete_finalization(
     )
     .bind(session)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -3379,6 +3754,7 @@ pub async fn diff_artifact_content(
     scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<Option<String>> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let row: Option<(String,)> = sqlx::query_as(
         "select content from artifacts
          where session_id = $1 and kind = 'diff'
@@ -3387,8 +3763,9 @@ pub async fn diff_artifact_content(
     )
     .bind(session)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.map(|(c,)| c))
 }
 
@@ -3401,7 +3778,7 @@ pub async fn upsert_artifact(
     content: &str,
     content_type: &str,
 ) -> sqlx::Result<ArtifactRow> {
-    let mut tx = pool.begin().await?;
+    let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
         "delete from artifacts
          where session_id = $1 and kind = $2 and name = $3
@@ -3445,7 +3822,10 @@ pub async fn append_event(
     // Gate the append on the session belonging to the caller's tenant. The
     // `where exists(...)` guards the target list, so the side-effecting
     // `append_event(...)` function is NOT invoked on a scope miss (no seq bump,
-    // no NOTIFY) — zero rows → RowNotFound, which the ledger helper logs.
+    // no NOTIFY) — zero rows → RowNotFound, which the ledger helper logs. The scoped
+    // tx also sets the tenant GUC so the plpgsql function's `update sessions` +
+    // `insert events` (SECURITY INVOKER, subject to RLS) pass under the policies.
+    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query(
         "select append_event($1, $2, $3, $4, $5, $6) as seq
          where exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $7)",
@@ -3457,8 +3837,9 @@ pub async fn append_event(
     .bind(&payload)
     .bind(env.occurred_at)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     match row {
         Some(r) => Ok(r.get::<i64, _>("seq")),
         None => Err(sqlx::Error::RowNotFound),
@@ -3472,7 +3853,9 @@ pub async fn events_after(
     after_seq: i64,
     limit: i64,
 ) -> sqlx::Result<Vec<EventRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select event_id, session_id, seq, actor, type, payload, occurred_at
          from events
          where session_id = $1 and seq > $2
@@ -3483,8 +3866,10 @@ pub async fn events_after(
     .bind(after_seq)
     .bind(limit)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 // ─── Approvals & tool-call intents ────────────────────────────────────────
@@ -3522,6 +3907,7 @@ pub async fn register_tool_intent(
     summary: &str,
     input_digest: &str,
 ) -> sqlx::Result<(ApprovalRow, bool)> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let inserted: Option<ApprovalRow> = sqlx::query_as(concat!(
         "insert into approvals
            (id, session_id, tool_call_id, tool, summary, input_digest, scope, scope_key,
@@ -3539,9 +3925,10 @@ pub async fn register_tool_intent(
     .bind(summary)
     .bind(input_digest)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     if let Some(row) = inserted {
+        tx.commit().await?;
         return Ok((row, true));
     }
     let existing: ApprovalRow = sqlx::query_as(concat!(
@@ -3554,8 +3941,9 @@ pub async fn register_tool_intent(
     .bind(session)
     .bind(tool_call_id)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok((existing, false))
 }
 
@@ -3572,7 +3960,9 @@ pub async fn promote_intent_to_pending(
     scope_key: &str,
     ttl_secs: i64,
 ) -> sqlx::Result<Option<ApprovalRow>> {
-    sqlx::query_as(concat!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(concat!(
         "update approvals
             set status = 'pending', risk = $2, scope = $3, scope_key = $4,
                 expires_at = now() + make_interval(secs => $5)
@@ -3588,8 +3978,10 @@ pub async fn promote_intent_to_pending(
     .bind(scope_key)
     .bind(ttl_secs as f64)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Record the gate's own verdict on an intent ('auto_allowed'/'auto_denied').
@@ -3604,6 +3996,7 @@ pub async fn record_intent_verdict(
     id: Uuid,
     status: &str,
 ) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let res = sqlx::query(
         "update approvals set status = $2, decided_at = now(), decided_by = 'gate'
          where id = $1 and status = 'intent'
@@ -3613,8 +4006,9 @@ pub async fn record_intent_verdict(
     .bind(id)
     .bind(status)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -3625,7 +4019,9 @@ pub async fn decide_approval(
     status: &str,
     decided_by: &str,
 ) -> sqlx::Result<Option<ApprovalRow>> {
-    sqlx::query_as(concat!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(concat!(
         "update approvals set status = $2, decided_at = now(), decided_by = $3
          where id = $1 and status = 'pending'
            and exists (select 1 from sessions s
@@ -3637,8 +4033,10 @@ pub async fn decide_approval(
     .bind(status)
     .bind(decided_by)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_approval(
@@ -3646,7 +4044,9 @@ pub async fn get_approval(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<ApprovalRow>> {
-    sqlx::query_as(concat!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(concat!(
         "select ",
         approval_cols!(),
         " from approvals
@@ -3656,8 +4056,10 @@ pub async fn get_approval(
     ))
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Human-lifecycle rows only: intent bookkeeping ('intent'/'auto_*') is the
@@ -3667,7 +4069,9 @@ pub async fn session_approvals(
     scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<Vec<ApprovalRow>> {
-    sqlx::query_as(concat!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(concat!(
         "select ",
         approval_cols!(),
         " from approvals
@@ -3677,8 +4081,10 @@ pub async fn session_approvals(
     ))
     .bind(session)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// The tenant-scoped approvals inbox (the org approval queue). The
@@ -3689,7 +4095,9 @@ pub async fn pending_approvals(
     pool: &PgPool,
     scope: TenantScope,
 ) -> sqlx::Result<Vec<ApprovalRow>> {
-    sqlx::query_as(concat!(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(concat!(
         "select ",
         approval_cols!(),
         " from approvals
@@ -3699,8 +4107,10 @@ pub async fn pending_approvals(
          order by requested_at"
     ))
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Has this session already granted `approved_session` for this scope key?
@@ -3710,6 +4120,7 @@ pub async fn has_session_grant(
     session: Uuid,
     scope_key: &str,
 ) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query(
         "select exists(
            select 1 from approvals
@@ -3720,8 +4131,9 @@ pub async fn has_session_grant(
     .bind(session)
     .bind(scope_key)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.get::<bool, _>("granted"))
 }
 
@@ -3736,7 +4148,9 @@ pub async fn add_artifact(
     content: &str,
     content_type: &str,
 ) -> sqlx::Result<ArtifactRow> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "insert into artifacts (id, session_id, kind, name, content, content_type)
          select $1,$2,$3,$4,$5,$6
          where exists (select 1 from sessions s where s.id = $2 and s.tenant_id = $7)
@@ -3749,8 +4163,10 @@ pub async fn add_artifact(
     .bind(content)
     .bind(content_type)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn list_artifacts(
@@ -3758,7 +4174,9 @@ pub async fn list_artifacts(
     scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<Vec<ArtifactRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from artifacts
          where session_id = $1
            and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $2)
@@ -3766,8 +4184,10 @@ pub async fn list_artifacts(
     )
     .bind(session)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn get_artifact(
@@ -3775,15 +4195,19 @@ pub async fn get_artifact(
     scope: TenantScope,
     id: Uuid,
 ) -> sqlx::Result<Option<ArtifactRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from artifacts a
          where a.id = $1
            and exists (select 1 from sessions s where s.id = a.session_id and s.tenant_id = $2)",
     )
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 // ─── Usage ────────────────────────────────────────────────────────────────
@@ -3802,6 +4226,7 @@ pub async fn add_usage(
     source: &str,
     external_id: Option<&str>,
 ) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let res = sqlx::query(
         "insert into usage_entries
            (id, session_id, model, input_tokens, output_tokens, cache_read_tokens,
@@ -3821,8 +4246,9 @@ pub async fn add_usage(
     .bind(source)
     .bind(external_id)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -3831,7 +4257,9 @@ pub async fn usage_totals(
     scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<UsageTotals> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select coalesce(sum(input_tokens),0)::bigint as input_tokens,
                 coalesce(sum(output_tokens),0)::bigint as output_tokens,
                 coalesce(sum(cache_read_tokens),0)::bigint as cache_read_tokens,
@@ -3844,8 +4272,10 @@ pub async fn usage_totals(
     )
     .bind(session)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Unique persistent tool-call INTENTS (one approvals row per tool_call_id)
@@ -3856,6 +4286,7 @@ pub async fn tool_call_count(
     scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<i64> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query(
         "select count(*)::bigint as n from approvals
          where session_id = $1
@@ -3863,8 +4294,9 @@ pub async fn tool_call_count(
     )
     .bind(session)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.get::<i64, _>("n"))
 }
 
@@ -3877,6 +4309,7 @@ pub async fn create_session_token(
     token_plain: &str,
     ttl_secs: i64,
 ) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
         "insert into api_tokens (id, tenant_id, kind, session_id, token_sha256, expires_at)
          values ($1, $2, 'session', $3, $4, now() + make_interval(secs => $5))",
@@ -3886,8 +4319,9 @@ pub async fn create_session_token(
     .bind(session)
     .bind(sha256_hex(token_plain))
     .bind(ttl_secs as f64)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -3912,13 +4346,19 @@ pub async fn session_for_token_incl_revoked(
     pool: &PgPool,
     token_plain: &str,
 ) -> sqlx::Result<Option<SessionTokenAuth>> {
+    // Credential-digest bootstrap resolution: keyed purely on the token sha256, with
+    // NO tenant scope (the caller has no principal until this resolves the tenant).
+    // Rides the audited bypass so api_tokens is visible across tenants — the digest
+    // IS the credential (documented TenantScope bootstrap exception).
+    let mut tx = worker_tx(pool).await?;
     let row = sqlx::query(
         "select session_id, tenant_id from api_tokens
          where kind = 'session' and token_sha256 = $1",
     )
     .bind(sha256_hex(token_plain))
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.and_then(|r| {
         r.get::<Option<Uuid>, _>("session_id")
             .map(|session_id| SessionTokenAuth {
@@ -3934,6 +4374,9 @@ pub async fn session_for_token(
     pool: &PgPool,
     token_plain: &str,
 ) -> sqlx::Result<Option<SessionTokenAuth>> {
+    // Credential-digest bootstrap resolution (audited bypass) — see
+    // `session_for_token_incl_revoked`.
+    let mut tx = worker_tx(pool).await?;
     let row = sqlx::query(
         "select session_id, tenant_id from api_tokens
          where kind = 'session' and token_sha256 = $1
@@ -3941,8 +4384,9 @@ pub async fn session_for_token(
            and (expires_at is null or expires_at > now())",
     )
     .bind(sha256_hex(token_plain))
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.and_then(|r| {
         r.get::<Option<Uuid>, _>("session_id")
             .map(|session_id| SessionTokenAuth {
@@ -3957,14 +4401,18 @@ pub async fn extend_session_token(
     token_plain: &str,
     ttl_secs: i64,
 ) -> sqlx::Result<bool> {
+    // Keyed on the token digest with no principal scope — audited bypass, like the
+    // session-token resolvers above.
+    let mut tx = worker_tx(pool).await?;
     let res = sqlx::query(
         "update api_tokens set expires_at = now() + make_interval(secs => $2)
          where kind = 'session' and token_sha256 = $1 and revoked_at is null",
     )
     .bind(sha256_hex(token_plain))
     .bind(ttl_secs as f64)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -3977,6 +4425,7 @@ pub async fn revoke_session_tokens(
     scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<u64> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let res = sqlx::query(
         "update api_tokens set revoked_at = now()
          where kind = 'session' and session_id = $1 and revoked_at is null
@@ -3984,8 +4433,9 @@ pub async fn revoke_session_tokens(
     )
     .bind(session)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(res.rows_affected())
 }
 
@@ -4018,6 +4468,7 @@ pub async fn claim_invocation(
     idempotency_key: &str,
     request_digest: &str,
 ) -> sqlx::Result<InvocationClaim> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let inserted = sqlx::query(
         "insert into trigger_invocations (id, subscription_id, idempotency_key, request_digest)
          select $1, $2, $3, $4
@@ -4030,12 +4481,12 @@ pub async fn claim_invocation(
     .bind(idempotency_key)
     .bind(request_digest)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     if let Some(row) = inserted {
-        return Ok(InvocationClaim::Claimed {
-            invocation_id: row.get("id"),
-        });
+        let invocation_id: Uuid = row.get("id");
+        tx.commit().await?;
+        return Ok(InvocationClaim::Claimed { invocation_id });
     }
     let existing = sqlx::query(
         "select id, session_id, request_digest, skip_reason, created_at from trigger_invocations
@@ -4045,15 +4496,18 @@ pub async fn claim_invocation(
     .bind(subscription)
     .bind(idempotency_key)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     if let Some(session_id) = existing.get::<Option<Uuid>, _>("session_id") {
+        let request_digest: String = existing.get("request_digest");
+        tx.commit().await?;
         return Ok(InvocationClaim::Replay {
             session_id,
-            request_digest: existing.get("request_digest"),
+            request_digest,
         });
     }
     if let Some(reason) = existing.get::<Option<String>, _>("skip_reason") {
+        tx.commit().await?;
         return Ok(InvocationClaim::Skipped { reason });
     }
     // Unbound claim: take it over only once it is stale (crashed creator).
@@ -4071,14 +4525,16 @@ pub async fn claim_invocation(
     .bind(idempotency_key)
     .bind(request_digest)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    Ok(match takeover {
+    let out = match takeover {
         Some(row) => InvocationClaim::Claimed {
             invocation_id: row.get("id"),
         },
         None => InvocationClaim::InFlight,
-    })
+    };
+    tx.commit().await?;
+    Ok(out)
 }
 
 /// A skipped firing is the terminal state of its claim row: visibly
@@ -4090,6 +4546,7 @@ pub async fn mark_invocation_skipped(
     invocation: Uuid,
     reason: &str,
 ) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
         "update trigger_invocations set skip_reason = $2
          where id = $1 and session_id is null
@@ -4100,8 +4557,9 @@ pub async fn mark_invocation_skipped(
     .bind(invocation)
     .bind(reason)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -4121,7 +4579,9 @@ pub async fn list_subscription_invocations(
     subscription: Uuid,
     limit: i64,
 ) -> sqlx::Result<Vec<TriggerInvocationRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select id, subscription_id, idempotency_key, session_id, skip_reason, created_at
          from trigger_invocations where subscription_id = $1
            and exists (select 1 from trigger_subscriptions where id = $1 and tenant_id = $3)
@@ -4130,8 +4590,10 @@ pub async fn list_subscription_invocations(
     .bind(subscription)
     .bind(limit)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Non-terminal runs of a subscription — the concurrency-policy input.
@@ -4140,7 +4602,9 @@ pub async fn active_subscription_sessions(
     scope: TenantScope,
     subscription: Uuid,
 ) -> sqlx::Result<Vec<SessionRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select s.* from sessions s
          join trigger_invocations i on i.session_id = s.id
          where i.subscription_id = $1 and s.tenant_id = $2
@@ -4149,8 +4613,10 @@ pub async fn active_subscription_sessions(
     )
     .bind(subscription)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Free a claim whose run creation failed, so an immediate retry can re-try.
@@ -4159,6 +4625,7 @@ pub async fn release_invocation(
     scope: TenantScope,
     invocation: Uuid,
 ) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
         "delete from trigger_invocations where id = $1 and session_id is null
            and exists (select 1 from trigger_subscriptions sub
@@ -4167,8 +4634,9 @@ pub async fn release_invocation(
     )
     .bind(invocation)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -4178,7 +4646,9 @@ pub async fn list_subscription_sessions(
     subscription: Uuid,
     limit: i64,
 ) -> sqlx::Result<Vec<SessionRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select s.* from sessions s
          join trigger_invocations i on i.session_id = s.id
          where i.subscription_id = $1 and s.tenant_id = $3
@@ -4187,8 +4657,10 @@ pub async fn list_subscription_sessions(
     .bind(subscription)
     .bind(limit)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Scopes the trigger-token polling endpoint to runs this subscription made.
@@ -4198,6 +4670,7 @@ pub async fn subscription_owns_session(
     subscription: Uuid,
     session: Uuid,
 ) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query(
         "select exists(
            select 1 from trigger_invocations ti
@@ -4208,8 +4681,9 @@ pub async fn subscription_owns_session(
     .bind(subscription)
     .bind(session)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.get::<bool, _>("owned"))
 }
 
@@ -4243,6 +4717,7 @@ pub async fn result_delivery_exists_for(
     session: Uuid,
     destination: &Value,
 ) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let (exists,): (bool,) = sqlx::query_as(
         "select exists(select 1 from result_deliveries
            where session_id = $1 and destination = $2
@@ -4251,8 +4726,9 @@ pub async fn result_delivery_exists_for(
     .bind(session)
     .bind(destination)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(exists)
 }
 
@@ -4264,14 +4740,16 @@ pub async fn has_run_result_event(
     scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let (exists,): (bool,) = sqlx::query_as(
         "select exists(select 1 from events where session_id = $1 and type = 'run.result'
            and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $2))",
     )
     .bind(session)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(exists)
 }
 
@@ -4282,11 +4760,13 @@ pub async fn enqueue_result_delivery(
     subscription: Option<Uuid>,
     destination: &Value,
 ) -> sqlx::Result<ResultDeliveryRow> {
+    let mut tx = scoped_tx(pool, scope).await?;
+
     // The session must be in scope AND — when a subscription is named — it must
     // belong to the SAME tenant (a cross-tenant subscription is proven
     // impossible here, not just Rust-side). A miss → fetch_one RowNotFound, the
     // existing not-in-scope-session shape.
-    sqlx::query_as(
+    let __rls_out = sqlx::query_as(
         "insert into result_deliveries (id, session_id, subscription_id, destination)
          select $1, $2, $3, $4
          where exists (select 1 from sessions s where s.id = $2 and s.tenant_id = $5)
@@ -4299,8 +4779,10 @@ pub async fn enqueue_result_delivery(
     .bind(subscription)
     .bind(destination)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Record one attempt. ok → delivered; failure → attempts+1 and either
@@ -4316,7 +4798,9 @@ pub async fn mark_delivery_attempt(
     retry_in_secs: i64,
     max_attempts: i32,
 ) -> sqlx::Result<Option<ResultDeliveryRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "update result_deliveries set
             attempts = attempts + 1,
             status = case when $2 then 'delivered'
@@ -4339,8 +4823,10 @@ pub async fn mark_delivery_attempt(
     .bind(retry_in_secs as f64)
     .bind(max_attempts)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn list_session_deliveries(
@@ -4348,15 +4834,19 @@ pub async fn list_session_deliveries(
     scope: TenantScope,
     session: Uuid,
 ) -> sqlx::Result<Vec<ResultDeliveryRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from result_deliveries where session_id = $1
            and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $2)
          order by created_at",
     )
     .bind(session)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn list_subscription_deliveries(
@@ -4365,7 +4855,9 @@ pub async fn list_subscription_deliveries(
     subscription: Uuid,
     limit: i64,
 ) -> sqlx::Result<Vec<ResultDeliveryRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from result_deliveries where subscription_id = $1
            and exists (select 1 from trigger_subscriptions sub
                        where sub.id = $1 and sub.tenant_id = $3)
@@ -4374,8 +4866,10 @@ pub async fn list_subscription_deliveries(
     .bind(subscription)
     .bind(limit)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 // ─── Schedules (Phase 3: the clock on a subscription) ────────────────────
@@ -4402,7 +4896,9 @@ pub async fn create_schedule(
     next_fire_at: DateTime<Utc>,
     missed_run_policy: &str,
 ) -> sqlx::Result<ScheduleRow> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "insert into schedules (id, subscription_id, cron, timezone, next_fire_at, missed_run_policy)
          select $1, $2, $3, $4, $5, $6
          where exists (select 1 from trigger_subscriptions where id = $2 and tenant_id = $7)
@@ -4415,8 +4911,10 @@ pub async fn create_schedule(
     .bind(next_fire_at)
     .bind(missed_run_policy)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn schedule_for_subscription(
@@ -4424,29 +4922,37 @@ pub async fn schedule_for_subscription(
     scope: TenantScope,
     subscription: Uuid,
 ) -> sqlx::Result<Option<ScheduleRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from schedules where subscription_id = $1
            and exists (select 1 from trigger_subscriptions sub
                        where sub.id = $1 and sub.tenant_id = $2)",
     )
     .bind(subscription)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn schedules_for_tenant(
     pool: &PgPool,
     scope: TenantScope,
 ) -> sqlx::Result<Vec<ScheduleRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select sc.* from schedules sc
          join trigger_subscriptions sub on sub.id = sc.subscription_id
          where sub.tenant_id = $1",
     )
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// CAS advance: only moves the clock if next_fire_at is still the fire time
@@ -4460,6 +4966,7 @@ pub async fn advance_schedule(
     to: Option<DateTime<Utc>>,
     fired_at: Option<DateTime<Utc>>,
 ) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let res = sqlx::query(
         "update schedules set
             next_fire_at = $2,
@@ -4474,8 +4981,9 @@ pub async fn advance_schedule(
     .bind(fired_at)
     .bind(from)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -4485,6 +4993,7 @@ pub async fn create_trigger_token(
     subscription: Uuid,
     token_plain: &str,
 ) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
         "insert into api_tokens (id, tenant_id, kind, subscription_id, token_sha256)
          values ($1, $2, 'trigger', $3, $4)",
@@ -4493,8 +5002,9 @@ pub async fn create_trigger_token(
     .bind(scope.tenant_id())
     .bind(subscription)
     .bind(sha256_hex(token_plain))
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -4517,6 +5027,9 @@ pub async fn subscription_for_token(
     pool: &PgPool,
     token_plain: &str,
 ) -> sqlx::Result<Option<TriggerTokenAuth>> {
+    // Credential-digest bootstrap resolution (audited bypass): the trigger token's
+    // sha256 is the only key; the verified tenant rides out on the returned row.
+    let mut tx = worker_tx(pool).await?;
     let row = sqlx::query(
         "select id, subscription_id, tenant_id from api_tokens
          where kind = 'trigger' and token_sha256 = $1
@@ -4524,8 +5037,9 @@ pub async fn subscription_for_token(
            and (expires_at is null or expires_at > now())",
     )
     .bind(sha256_hex(token_plain))
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.and_then(|r| {
         r.get::<Option<Uuid>, _>("subscription_id")
             .map(|subscription_id| TriggerTokenAuth {
@@ -4548,6 +5062,7 @@ pub async fn trigger_token_active(
     scope: TenantScope,
     token_id: Uuid,
 ) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query(
         "select exists (
              select 1
@@ -4562,8 +5077,9 @@ pub async fn trigger_token_active(
     )
     .bind(token_id)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.get::<bool, _>("ok"))
 }
 
@@ -4573,6 +5089,7 @@ pub async fn revoke_trigger_tokens(
     scope: TenantScope,
     subscription: Uuid,
 ) -> sqlx::Result<u64> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let res = sqlx::query(
         "update api_tokens set revoked_at = now()
          where kind = 'trigger' and subscription_id = $1 and revoked_at is null
@@ -4581,8 +5098,9 @@ pub async fn revoke_trigger_tokens(
     )
     .bind(subscription)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(res.rows_affected())
 }
 
@@ -4630,6 +5148,7 @@ pub async fn insert_trigger_delivery(
     payload_digest: &str,
     occurred_at: Option<DateTime<Utc>>,
 ) -> sqlx::Result<(TriggerDeliveryRow, bool)> {
+    let mut tx = scoped_tx(pool, scope).await?;
     let inserted: Option<TriggerDeliveryRow> = sqlx::query_as(
         "insert into trigger_deliveries
            (id, connection_id, external_event_id, event_type, payload, payload_digest, occurred_at)
@@ -4646,9 +5165,10 @@ pub async fn insert_trigger_delivery(
     .bind(payload_digest)
     .bind(occurred_at)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     if let Some(row) = inserted {
+        tx.commit().await?;
         return Ok((row, true));
     }
     let existing = sqlx::query_as(
@@ -4658,8 +5178,9 @@ pub async fn insert_trigger_delivery(
     .bind(connection)
     .bind(external_event_id)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok((existing, false))
 }
 
@@ -4678,6 +5199,7 @@ pub async fn claim_trigger_dispatch(
     // tenant (the delivery→connection→tenant join is the same proof
     // `list_delivery_dispatches` uses). A miss → zero rows → None, the existing
     // no-claim shape.
+    let mut tx = scoped_tx(pool, scope).await?;
     let inserted: Option<TriggerDispatchRow> = sqlx::query_as(
         "insert into trigger_dispatches (id, delivery_id, subscription_id)
          select $1,$2,$3
@@ -4693,12 +5215,13 @@ pub async fn claim_trigger_dispatch(
     .bind(delivery)
     .bind(subscription)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     if inserted.is_some() {
+        tx.commit().await?;
         return Ok(inserted);
     }
-    sqlx::query_as(
+    let __rls_out = sqlx::query_as(
         "update trigger_dispatches
             set created_at = now()
           where delivery_id = $1 and subscription_id = $2
@@ -4714,8 +5237,10 @@ pub async fn claim_trigger_dispatch(
     .bind(delivery)
     .bind(subscription)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Terminal bookkeeping for a claimed-but-not-run dispatch (skipped |
@@ -4727,6 +5252,7 @@ pub async fn mark_dispatch_outcome(
     status: &str,
     skip_reason: Option<&str>,
 ) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
         "update trigger_dispatches set status = $2, skip_reason = $3
          where id = $1 and session_id is null
@@ -4737,8 +5263,9 @@ pub async fn mark_dispatch_outcome(
     .bind(status)
     .bind(skip_reason)
     .bind(scope.tenant_id())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -4747,7 +5274,9 @@ pub async fn list_delivery_dispatches(
     scope: TenantScope,
     delivery: Uuid,
 ) -> sqlx::Result<Vec<TriggerDispatchRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from trigger_dispatches where delivery_id = $1
            and exists (select 1 from trigger_deliveries d
                        join integration_connections c on c.id = d.connection_id
@@ -4756,8 +5285,10 @@ pub async fn list_delivery_dispatches(
     )
     .bind(delivery)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn list_connection_deliveries(
@@ -4766,7 +5297,9 @@ pub async fn list_connection_deliveries(
     connection: Uuid,
     limit: i64,
 ) -> sqlx::Result<Vec<TriggerDeliveryRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from trigger_deliveries where connection_id = $1
            and exists (select 1 from integration_connections c where c.id = $1 and c.tenant_id = $3)
          order by received_at desc limit $2",
@@ -4774,8 +5307,10 @@ pub async fn list_connection_deliveries(
     .bind(connection)
     .bind(limit)
     .bind(scope.tenant_id())
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 // ─── External results (§17 #3: stable update-in-place identity) ───────────
@@ -4799,7 +5334,9 @@ pub async fn get_external_result(
     kind: &str,
     resource_key: &str,
 ) -> sqlx::Result<Option<ExternalResultRow>> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "select * from external_results
          where subscription_id = $1 and kind = $2 and resource_key = $3
            and exists (select 1 from trigger_subscriptions sub
@@ -4809,8 +5346,10 @@ pub async fn get_external_result(
     .bind(kind)
     .bind(resource_key)
     .bind(scope.tenant_id())
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub async fn upsert_external_result(
@@ -4822,7 +5361,9 @@ pub async fn upsert_external_result(
     external_id: &str,
     external_url: Option<&str>,
 ) -> sqlx::Result<ExternalResultRow> {
-    sqlx::query_as(
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let __rls_out = sqlx::query_as(
         "insert into external_results
            (id, subscription_id, kind, resource_key, external_id, external_url)
          select $1,$2,$3,$4,$5,$6
@@ -4841,8 +5382,10 @@ pub async fn upsert_external_result(
     .bind(external_id)
     .bind(external_url)
     .bind(scope.tenant_id())
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 pub fn spawn_listener(database_url: String) -> tokio::sync::broadcast::Sender<(Uuid, i64)> {
@@ -4903,7 +5446,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -5187,7 +5730,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
 
@@ -5279,7 +5822,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -5376,7 +5919,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -5519,7 +6062,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -5696,7 +6239,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -5799,7 +6342,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
 
@@ -5867,7 +6410,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -5986,7 +6529,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -6140,7 +6683,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let agent = create_agent(&pool, scope, "test-sched-agent", None)
@@ -6266,7 +6809,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -6392,7 +6935,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -6468,7 +7011,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let name = format!("test-bundle-{}", Uuid::now_v7());
@@ -6600,7 +7143,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         // The curated seeds are GLOBAL (tenant_id null); any valid scope sees
         // them via the tenant-or-global reader.
         let tenant = ensure_default_tenant(&pool).await.unwrap();
@@ -6710,7 +7253,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
 
@@ -6893,7 +7436,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let yaml = "name: ov-test\ntools: []\n";
@@ -6977,7 +7520,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
 
@@ -7042,7 +7585,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
 
@@ -7136,7 +7679,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = identity::create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -7447,7 +7990,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = identity::create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -7717,7 +8260,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = identity::create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -8226,7 +8769,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
 
         let slug_a = format!("t-{}", Uuid::now_v7().simple());
         let slug_b = format!("t-{}", Uuid::now_v7().simple());
@@ -8416,7 +8959,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -8458,7 +9001,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -8506,7 +9049,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -8574,7 +9117,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -8650,7 +9193,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -8734,7 +9277,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -8881,7 +9424,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = identity::create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -9004,7 +9547,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let slug_a = format!("t-{}", Uuid::now_v7().simple());
         let slug_b = format!("t-{}", Uuid::now_v7().simple());
         let org_a = identity::create_org(&pool, &slug_a, None).await.unwrap();
@@ -9121,7 +9664,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = identity::create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -9212,7 +9755,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let slug_a = format!("t-{}", Uuid::now_v7().simple());
         let slug_b = format!("t-{}", Uuid::now_v7().simple());
         let org_a = identity::create_org(&pool, &slug_a, None).await.unwrap();
@@ -9485,7 +10028,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = identity::create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -9644,7 +10187,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let slug_a = format!("t-{}", Uuid::now_v7().simple());
         let slug_b = format!("t-{}", Uuid::now_v7().simple());
         let org_a = identity::create_org(&pool, &slug_a, None).await.unwrap();
@@ -9753,7 +10296,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let scope = new_dek_org(&pool).await;
         let tenant = scope.tenant_id();
 
@@ -9791,7 +10334,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let scope = new_dek_org(&pool).await;
         let tenant = scope.tenant_id();
 
@@ -9843,7 +10386,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let scope = new_dek_org(&pool).await;
         let tenant = scope.tenant_id();
 
@@ -9936,7 +10479,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let scope = new_dek_org(&pool).await;
         let tenant = scope.tenant_id();
 
@@ -10072,7 +10615,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let scope = new_dek_org(&pool).await;
         let tenant = scope.tenant_id();
 
@@ -10152,7 +10695,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let scope = new_dek_org(&pool).await;
         let tenant = scope.tenant_id();
 
@@ -10202,7 +10745,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let issuer = format!("https://as-{}.test", Uuid::now_v7().simple());
         let redirect = "https://fbx.test/v1/oauth/callback";
 
@@ -10266,7 +10809,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -10327,7 +10870,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let issuer = format!("https://as-{}.test", Uuid::now_v7().simple());
         let redirect = "https://fbx.test/v1/oauth/callback";
         let key = registration_lock_key(&issuer, redirect);
@@ -10415,7 +10958,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -10582,5 +11125,227 @@ mod tests {
         ] {
             sqlx::query(stmt).bind(org.id).execute(&pool).await.unwrap();
         }
+    }
+
+    /// Phase D (#32, #75) — the RLS acceptance core. Proves DB-enforced tenant
+    /// isolation, NOT the Rust `where tenant_id = $n` predicate: every assertion query
+    /// OMITS the predicate on purpose (the buggy-predicate proof).
+    ///
+    /// TEST-ROLE GOTCHA (resolution 9): a Postgres SUPERUSER bypasses RLS entirely,
+    /// even under FORCE — and CI's DB user is the superuser `postgres`. So the
+    /// assertions run through a dedicated connection that `SET ROLE fluidbox_runtime`
+    /// (the 0018 NON-owner role, `GRANT`ed to the owner so SET ROLE works on any
+    /// Postgres). Only then does the policy actually run, so this proves the policy
+    /// logic under the REAL runtime role regardless of the base user's privilege.
+    /// Seeding runs under the audited bypass (`worker_tx`) so it works whether the
+    /// base pool is a superuser (RLS off) or the table owner under FORCE RLS.
+    /// `connect()` here applies migrations 0014-0018 from scratch — a failed 0018
+    /// would fail this test at `.expect("connect")` (the migration smoke check).
+    #[tokio::test]
+    async fn rls_enforces_tenant_isolation_under_runtime_role() {
+        use sqlx::{Connection, Executor};
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url, None).await.expect("connect");
+
+        // Two throwaway tenants + one session + one event each.
+        let a = Uuid::now_v7();
+        let b = Uuid::now_v7();
+        {
+            let mut tx = worker_tx(&pool).await.unwrap();
+            for id in [a, b] {
+                let slug = format!("rls-{}", id.simple());
+                sqlx::query("insert into tenants (id, name, slug) values ($1, $2, $3)")
+                    .bind(id)
+                    .bind(&slug)
+                    .bind(&slug)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+        for id in [a, b] {
+            let scope = TenantScope::assume(id);
+            let policy = upsert_policy(
+                &pool,
+                scope,
+                "rls",
+                "name: rls",
+                &serde_json::json!({"name":"rls"}),
+            )
+            .await
+            .unwrap();
+            let agent = create_agent(&pool, scope, "rls-agent", None).await.unwrap();
+            let rev = append_agent_revision(
+                &pool,
+                scope,
+                agent.id,
+                "claude-agent-sdk",
+                "img:test",
+                "claude-haiku-4-5",
+                None,
+                policy.id,
+                &serde_json::json!({}),
+                None,
+                &serde_json::json!([]),
+                &serde_json::json!([]),
+            )
+            .await
+            .unwrap();
+            let repo = serde_json::json!({"kind":"none"});
+            let empty = serde_json::json!({});
+            let session = create_session(
+                &pool,
+                scope,
+                agent.id,
+                rev.id,
+                "supervised",
+                "trusted",
+                "rls task",
+                &repo,
+                &empty,
+                &empty,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
+            .await
+            .unwrap();
+            // One event per session (a child-table row for the parent-composed policy).
+            let mut tx = worker_tx(&pool).await.unwrap();
+            sqlx::query(
+                "insert into events (event_id, session_id, seq, actor, type, payload, occurred_at)
+                 values ($1, $2, 1, 'system', 'rls.test', '{}'::jsonb, now())",
+            )
+            .bind(Uuid::now_v7())
+            .bind(session.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+
+        // Assert through the NON-superuser runtime role — otherwise RLS is bypassed.
+        let mut rt = sqlx::PgConnection::connect(&url).await.expect("rt connect");
+        rt.execute("set role fluidbox_runtime")
+            .await
+            .expect("set role");
+
+        async fn count_as(
+            rt: &mut sqlx::PgConnection,
+            guc: Option<(&str, String)>,
+            sql: &'static str,
+        ) -> i64 {
+            let mut tx = rt.begin().await.unwrap();
+            if let Some((name, val)) = guc {
+                sqlx::query("select set_config($1, $2, true)")
+                    .bind(name)
+                    .bind(val)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+            let (n,): (i64,) = sqlx::query_as(sql).fetch_one(&mut *tx).await.unwrap();
+            tx.rollback().await.ok();
+            n
+        }
+        let a_str = a.to_string();
+        let tid = "fluidbox.tenant_id";
+
+        // (a) A-scope sees ONLY tenant A's session — with NO where clause (#75 proof).
+        assert_eq!(
+            count_as(
+                &mut rt,
+                Some((tid, a_str.clone())),
+                "select count(*) from sessions"
+            )
+            .await,
+            1,
+            "A-scope must see only tenant A's session even without a predicate"
+        );
+        // (c) child table (events) follows the parent (sessions) policy.
+        assert_eq!(
+            count_as(
+                &mut rt,
+                Some((tid, a_str.clone())),
+                "select count(*) from events"
+            )
+            .await,
+            1,
+            "A-scope sees only A's events (parent-composed EXISTS policy)"
+        );
+        // (f) tenants keys on its own id — A-scope sees exactly its own row.
+        assert_eq!(
+            count_as(
+                &mut rt,
+                Some((tid, a_str.clone())),
+                "select count(*) from tenants"
+            )
+            .await,
+            1,
+            "A-scope sees exactly the tenants row whose id matches"
+        );
+        // (d) the audited bypass sees BOTH tenants' rows.
+        assert!(
+            count_as(
+                &mut rt,
+                Some(("fluidbox.bypass", "system_worker".into())),
+                "select count(*) from sessions"
+            )
+            .await
+                >= 2,
+            "the system_worker bypass sees every tenant"
+        );
+        // (e) no GUC → zero rows on a policy'd table.
+        assert_eq!(
+            count_as(&mut rt, None, "select count(*) from sessions").await,
+            0,
+            "a transaction with no GUC sees nothing"
+        );
+
+        // (b) INSERT of a cross-tenant row is refused by WITH CHECK.
+        let mut tx = rt.begin().await.unwrap();
+        sqlx::query("select set_config('fluidbox.tenant_id', $1, true)")
+            .bind(&a_str)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let res = sqlx::query(
+            "insert into settings (tenant_id, key, value) values ($1, 'rls-check', '{}'::jsonb)",
+        )
+        .bind(b) // tenant B under the tenant-A GUC
+        .execute(&mut *tx)
+        .await;
+        tx.rollback().await.ok();
+        let err = res.expect_err("a cross-tenant insert must be refused by RLS WITH CHECK");
+        assert!(
+            err.to_string()
+                .to_lowercase()
+                .contains("row-level security"),
+            "expected an RLS policy violation, got: {err}"
+        );
+
+        rt.close().await.ok();
+
+        // Cleanup, children-first, under the bypass (FKs are NO ACTION; sessions
+        // cascade events, agents cascade revisions).
+        let mut tx = worker_tx(&pool).await.unwrap();
+        for id in [a, b] {
+            for stmt in [
+                "delete from sessions where tenant_id = $1",
+                "delete from agents where tenant_id = $1",
+                "delete from policies where tenant_id = $1",
+                "delete from tenants where id = $1",
+            ] {
+                sqlx::query(stmt).bind(id).execute(&mut *tx).await.ok();
+            }
+        }
+        tx.commit().await.unwrap();
     }
 }
