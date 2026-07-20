@@ -34,6 +34,28 @@ impl KmsMode {
     }
 }
 
+/// How the facade authenticates each upstream model request (Phase D, #32; plan
+/// D7). `Shared` presents ONE deployment key (`llm_upstream_key`) on every call —
+/// today's behavior, now an explicit choice. `Tenant` selects a per-tenant LiteLLM
+/// virtual key from the authenticated session's tenant (minted on demand,
+/// `llm_keys.rs`), so the LiteLLM master key never rides a routine model request —
+/// it only provisions virtual keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmKeyMode {
+    Shared,
+    Tenant,
+}
+
+impl LlmKeyMode {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "shared" | "" => Some(LlmKeyMode::Shared),
+            "tenant" => Some(LlmKeyMode::Tenant),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind: String,
@@ -62,6 +84,24 @@ pub struct Config {
     /// Whether the upstream speaks native Anthropic (fallback) — governs how
     /// the facade authenticates upstream.
     pub llm_upstream_is_anthropic: bool,
+    /// Per-request upstream-auth mode (Phase D, #32; plan D7). `Shared` (default)
+    /// presents `llm_upstream_key` on every call; `Tenant` selects a per-tenant
+    /// LiteLLM virtual key and confines the master key to provisioning.
+    pub llm_key_mode: LlmKeyMode,
+    /// LiteLLM ADMIN base URL for virtual-key provisioning (`/key/generate`,
+    /// `/key/delete`). Defaults to `llm_upstream_url` — split it out only when the
+    /// admin plane lives at a different address (test seam mirrors
+    /// `FLUIDBOX_GITHUB_API_URL`). Only read by `llm_keys.rs`.
+    pub llm_admin_url: String,
+    /// Tenant-mode `/key/generate` knobs — serialized into the mint body ONLY when
+    /// set. `models` = the virtual key's model allowlist (CSV → Vec; empty = no
+    /// allowlist restriction). All optional; a `None`/empty knob is absent from the
+    /// request (LiteLLM applies its own default).
+    pub llm_tenant_models: Vec<String>,
+    pub llm_tenant_max_budget: Option<f64>,
+    pub llm_tenant_budget_duration: Option<String>,
+    pub llm_tenant_tpm: Option<i64>,
+    pub llm_tenant_rpm: Option<i64>,
     /// 32-byte key (hex/base64) sealing connection credentials at rest.
     /// Optional: without it (and with KMS off), integration connections are
     /// disabled. Once KMS is on and every row is re-sealed, this may be retired
@@ -159,6 +199,20 @@ impl Config {
         } else {
             get("LITELLM_MASTER_KEY").unwrap_or_default()
         };
+        // D7: the per-request upstream-auth mode is an EXPLICIT choice, not a
+        // silent URL-substring outcome. Parse it (invalid → boot error) and refuse
+        // boot on an incoherent LLM-key config (the empty-shared-key refusal kills
+        // the old silent `unwrap_or_default("")`).
+        let llm_key_mode = {
+            let raw = get("FLUIDBOX_LLM_KEY_MODE").unwrap_or_default();
+            LlmKeyMode::parse(&raw).ok_or_else(|| {
+                anyhow::anyhow!("FLUIDBOX_LLM_KEY_MODE='{raw}' is invalid (known: shared, tenant)")
+            })?
+        };
+        validate_llm_key_config(llm_key_mode, is_anthropic, upstream_key.is_empty())
+            .map_err(|m| anyhow::anyhow!("{m}"))?;
+        // Admin plane for virtual-key provisioning defaults to the data-plane URL.
+        let llm_admin_url = get("FLUIDBOX_LLM_ADMIN_URL").unwrap_or_else(|_| upstream.clone());
         let provider = get("FLUIDBOX_PROVIDER")
             .unwrap_or_else(|_| "docker".into())
             .to_lowercase();
@@ -193,6 +247,32 @@ impl Config {
             llm_upstream_url: upstream,
             llm_upstream_key: upstream_key,
             llm_upstream_is_anthropic: is_anthropic,
+            llm_key_mode,
+            llm_admin_url,
+            llm_tenant_models: get("FLUIDBOX_LLM_TENANT_MODELS")
+                .ok()
+                .map(|s| {
+                    s.split(',')
+                        .map(|m| m.trim().to_string())
+                        .filter(|m| !m.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            llm_tenant_max_budget: parse_opt_f64(
+                "FLUIDBOX_LLM_TENANT_MAX_BUDGET",
+                get("FLUIDBOX_LLM_TENANT_MAX_BUDGET").ok(),
+            )?,
+            llm_tenant_budget_duration: get("FLUIDBOX_LLM_TENANT_BUDGET_DURATION")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            llm_tenant_tpm: parse_opt_i64(
+                "FLUIDBOX_LLM_TENANT_TPM",
+                get("FLUIDBOX_LLM_TENANT_TPM").ok(),
+            )?,
+            llm_tenant_rpm: parse_opt_i64(
+                "FLUIDBOX_LLM_TENANT_RPM",
+                get("FLUIDBOX_LLM_TENANT_RPM").ok(),
+            )?,
             credential_key: get("FLUIDBOX_CREDENTIAL_KEY")
                 .ok()
                 .filter(|k| !k.is_empty()),
@@ -313,6 +393,76 @@ fn parse_i64_env(name: &str, raw: Option<String>, default: i64) -> anyhow::Resul
     }
 }
 
+/// Optional f64 knob (tenant virtual-key budget): absent/empty → `None`; a
+/// malformed value FAILS BOOT rather than silently dropping the knob.
+fn parse_opt_f64(name: &str, raw: Option<String>) -> anyhow::Result<Option<f64>> {
+    match raw.filter(|v| !v.is_empty()) {
+        None => Ok(None),
+        Some(v) => v
+            .parse()
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("{name}='{v}' is not a valid f64: {e}")),
+    }
+}
+
+/// Optional i64 knob (tenant virtual-key tpm/rpm): absent/empty → `None`; a
+/// malformed value fails boot.
+fn parse_opt_i64(name: &str, raw: Option<String>) -> anyhow::Result<Option<i64>> {
+    match raw.filter(|v| !v.is_empty()) {
+        None => Ok(None),
+        Some(v) => v
+            .parse()
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("{name}='{v}' is not a valid i64: {e}")),
+    }
+}
+
+/// D7 boot coherence for the LLM-key mode (pure, unit-tested). `Shared` refuses
+/// an empty resolved upstream key (kills the silent `unwrap_or_default("")`),
+/// naming the variable the operator must set. `Tenant` requires a LiteLLM upstream
+/// (direct Anthropic cannot mint virtual keys) AND a non-empty master key (the
+/// provisioning credential). Returns the operator-facing boot-error message.
+fn validate_llm_key_config(
+    mode: LlmKeyMode,
+    is_anthropic: bool,
+    upstream_key_empty: bool,
+) -> Result<(), String> {
+    match mode {
+        LlmKeyMode::Shared => {
+            if upstream_key_empty {
+                let var = if is_anthropic {
+                    "ANTHROPIC_API_KEY"
+                } else {
+                    "LITELLM_MASTER_KEY"
+                };
+                return Err(format!(
+                    "FLUIDBOX_LLM_KEY_MODE=shared but the resolved upstream key is empty — set \
+                     {var} (the facade presents it on every model request; there is no silent \
+                     fallback)"
+                ));
+            }
+        }
+        LlmKeyMode::Tenant => {
+            if is_anthropic {
+                return Err(
+                    "FLUIDBOX_LLM_KEY_MODE=tenant requires a LiteLLM upstream (LLM_UPSTREAM_URL), \
+                     not direct Anthropic — virtual keys are a LiteLLM feature and direct \
+                     Anthropic cannot mint them"
+                        .into(),
+                );
+            }
+            if upstream_key_empty {
+                return Err(
+                    "FLUIDBOX_LLM_KEY_MODE=tenant requires LITELLM_MASTER_KEY (the virtual-key \
+                     provisioning credential)"
+                        .into(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +475,52 @@ mod tests {
         // A typo'd cap must be a boot error, never a silent fallback to the
         // (possibly much wider) default.
         assert!(parse_u64_env("X", Some("2GiB".into()), 7).is_err());
+    }
+
+    #[test]
+    fn llm_key_mode_parses_known_and_rejects_unknown() {
+        assert_eq!(LlmKeyMode::parse("shared"), Some(LlmKeyMode::Shared));
+        assert_eq!(LlmKeyMode::parse(""), Some(LlmKeyMode::Shared));
+        assert_eq!(LlmKeyMode::parse("TENANT"), Some(LlmKeyMode::Tenant));
+        assert_eq!(LlmKeyMode::parse("  tenant "), Some(LlmKeyMode::Tenant));
+        // An unknown mode is a boot error, never a silent default.
+        assert_eq!(LlmKeyMode::parse("virtual"), None);
+        assert_eq!(LlmKeyMode::parse("per-user"), None);
+    }
+
+    #[test]
+    fn shared_mode_refuses_empty_upstream_key() {
+        // Empty key + non-anthropic upstream → name LITELLM_MASTER_KEY.
+        let e = validate_llm_key_config(LlmKeyMode::Shared, false, true).unwrap_err();
+        assert!(e.contains("LITELLM_MASTER_KEY"), "got: {e}");
+        // Empty key + anthropic-direct upstream → name ANTHROPIC_API_KEY.
+        let e = validate_llm_key_config(LlmKeyMode::Shared, true, true).unwrap_err();
+        assert!(e.contains("ANTHROPIC_API_KEY"), "got: {e}");
+        // Non-empty key → OK (today's behavior, now explicit).
+        assert!(validate_llm_key_config(LlmKeyMode::Shared, false, false).is_ok());
+        assert!(validate_llm_key_config(LlmKeyMode::Shared, true, false).is_ok());
+    }
+
+    #[test]
+    fn tenant_mode_requires_litellm_and_master_key() {
+        // Direct-Anthropic upstream cannot mint virtual keys → refuse.
+        let e = validate_llm_key_config(LlmKeyMode::Tenant, true, false).unwrap_err();
+        assert!(e.contains("LiteLLM"), "got: {e}");
+        // LiteLLM upstream but no master key → refuse naming it.
+        let e = validate_llm_key_config(LlmKeyMode::Tenant, false, true).unwrap_err();
+        assert!(e.contains("LITELLM_MASTER_KEY"), "got: {e}");
+        // LiteLLM upstream + master key present → OK.
+        assert!(validate_llm_key_config(LlmKeyMode::Tenant, false, false).is_ok());
+    }
+
+    #[test]
+    fn tenant_knob_parsing_optional_and_fail_closed() {
+        assert_eq!(parse_opt_f64("B", None).unwrap(), None);
+        assert_eq!(parse_opt_f64("B", Some(String::new())).unwrap(), None);
+        assert_eq!(parse_opt_f64("B", Some("12.5".into())).unwrap(), Some(12.5));
+        assert!(parse_opt_f64("B", Some("lots".into())).is_err());
+        assert_eq!(parse_opt_i64("R", None).unwrap(), None);
+        assert_eq!(parse_opt_i64("R", Some("100".into())).unwrap(), Some(100));
+        assert!(parse_opt_i64("R", Some("fast".into())).is_err());
     }
 }

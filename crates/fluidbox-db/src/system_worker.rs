@@ -292,12 +292,13 @@ pub struct FamilyKeyVersionCounts {
 
 /// Count legacy (v1) vs envelope (v2) rows for every sealed column across ALL
 /// tenants — the D4 retirement gates' input (a cross-tenant scan, no principal).
-/// One `UNION ALL` over the eleven sealed columns (the nine tenant-owned ones
-/// plus Task 3's two deployment-global `oauth_client_registrations` columns);
-/// each family filters on its own `<col> is not null` so NULL secrets never
-/// count. Returns counts only, never a sealed byte. MUST stay in lockstep with
-/// `reseal::FAMILIES`, or a v1 row of an uncounted family would escape both the
-/// re-seal job AND the retirement gate and orphan when the legacy key retires.
+/// One `UNION ALL` over the twelve sealed columns (the nine tenant-owned ones,
+/// Task 3's two deployment-global `oauth_client_registrations` columns, and Task
+/// 5's `tenant_llm_keys.litellm_key_sealed`); each family filters on its own
+/// `<col> is not null` so NULL secrets never count. Returns counts only, never a
+/// sealed byte. MUST stay in lockstep with `reseal::FAMILIES`, or a v1 row of an
+/// uncounted family would escape both the re-seal job AND the retirement gate and
+/// orphan when the legacy key retires.
 pub async fn sealed_key_version_counts(pool: &PgPool) -> sqlx::Result<Vec<FamilyKeyVersionCounts>> {
     sqlx::query_as(
         "select 'integration_connections.credential_sealed' as family,
@@ -353,7 +354,12 @@ pub async fn sealed_key_version_counts(pool: &PgPool) -> sqlx::Result<Vec<Family
          select 'oauth_client_registrations.registration_access_token_sealed',
                 count(*) filter (where registration_access_token_sealed is not null and registration_access_token_key_version = 1),
                 count(*) filter (where registration_access_token_sealed is not null and registration_access_token_key_version = 2)
-           from oauth_client_registrations",
+           from oauth_client_registrations
+         union all
+         select 'tenant_llm_keys.litellm_key_sealed',
+                count(*) filter (where litellm_key_sealed is not null and litellm_key_key_version = 1),
+                count(*) filter (where litellm_key_sealed is not null and litellm_key_key_version = 2)
+           from tenant_llm_keys",
     )
     .fetch_all(pool)
     .await
@@ -361,38 +367,45 @@ pub async fn sealed_key_version_counts(pool: &PgPool) -> sqlx::Result<Vec<Family
 
 // ─── Re-seal migration paging + per-row lock/CAS (Phase D, #32; category (c)) ──
 //
-// `table`/`column`/`version_column` in these three fns come EXCLUSIVELY from the
-// server's compile-time `reseal::FAMILIES` const array (the nine sealed
-// `table.column` pairs). They are never request data, so the `format!`-built SQL
-// is injection-safe (the values — ids, the cursor, the new sealed bytes — are all
-// bound parameters). Keeping them dynamic (vs nine hand-written fns) lets one job
-// loop walk every family; the server owns the crypto so the (table, column,
-// SealFamily) mapping has exactly one home. `AssertSqlSafe` records the promise.
+// `table`/`column`/`version_column`/`key_column` in these three fns come
+// EXCLUSIVELY from the server's compile-time `reseal::FAMILIES` const array (the
+// twelve sealed `table.column` pairs). They are never request data, so the
+// `format!`-built SQL is injection-safe (the values — the paging cursor, the row
+// key, the new sealed bytes — are all bound parameters). Keeping them dynamic (vs
+// twelve hand-written fns) lets one job loop walk every family; the server owns
+// the crypto so the (table, column, SealFamily) mapping has exactly one home.
+// `AssertSqlSafe` records the promise. `key_column` is the row's stable unique key
+// the job pages/locks/CAS-writes by — `id` for every family EXCEPT
+// `tenant_llm_keys`, which is keyed by its `tenant_id` primary key (no `id`
+// column); it is a Uuid either way.
 
-/// One page of ids for a sealed family still at v1, keyset-paged past `after`.
-/// `WHERE <col> is not null and <col>_key_version = 1 and id > $after ORDER BY id`.
+/// One page of keys for a sealed family still at v1, keyset-paged past `after`.
+/// `WHERE <col> is not null and <col>_key_version = 1 and <key_column> > $after
+/// ORDER BY <key_column>`. `key_column` is the family's row key (`id`, or
+/// `tenant_id` for `tenant_llm_keys`); the returned Uuids feed `reseal_lock_row`.
 ///
 /// The `_key_version = 1` predicate is what makes the whole job restart-safe and
 /// idempotent: an already-re-sealed (v2) row is excluded, so a crash-and-restart
-/// simply re-scans and skips finished rows — no cursor to persist. The `id >
-/// $after` cursor is what guarantees FORWARD PROGRESS within a pass: a row the job
-/// cannot re-seal (a corrupt blob / wrong legacy key) stays v1, and without the
-/// cursor a pure `kv = 1` page would re-fetch it forever and wedge the migration.
-/// Together: skip finished rows across restarts, never re-fetch a bad row within a
-/// pass (a re-run re-attempts it from `after = nil`). Seed `after` with the nil
-/// UUID (the minimum) and advance it to the last id of each page.
+/// simply re-scans and skips finished rows — no cursor to persist. The
+/// `<key_column> > $after` cursor is what guarantees FORWARD PROGRESS within a
+/// pass: a row the job cannot re-seal (a corrupt blob / wrong legacy key) stays v1,
+/// and without the cursor a pure `kv = 1` page would re-fetch it forever and wedge
+/// the migration. Together: skip finished rows across restarts, never re-fetch a
+/// bad row within a pass (a re-run re-attempts it from `after = nil`). Seed `after`
+/// with the nil UUID (the minimum) and advance it to the last key of each page.
 pub async fn reseal_candidate_ids(
     pool: &PgPool,
     table: &str,
     column: &str,
     version_column: &str,
+    key_column: &str,
     after: Uuid,
     limit: i64,
 ) -> sqlx::Result<Vec<Uuid>> {
     let rows: Vec<(Uuid,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "select id from {table}
-         where {column} is not null and {version_column} = 1 and id > $1
-         order by id limit $2"
+        "select {key_column} from {table}
+         where {column} is not null and {version_column} = 1 and {key_column} > $1
+         order by {key_column} limit $2"
     )))
     .bind(after)
     .bind(limit)
@@ -423,11 +436,12 @@ pub async fn reseal_lock_row(
     table: &str,
     column: &str,
     version_column: &str,
+    key_column: &str,
     id: Uuid,
 ) -> sqlx::Result<Option<(Option<Vec<u8>>, i16, Option<Uuid>)>> {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {column}, {version_column}, tenant_id from {table}
-         where id = $1 for update"
+         where {key_column} = $1 for update"
     )))
     .bind(id)
     .fetch_optional(&mut *tx)
@@ -444,12 +458,13 @@ pub async fn reseal_write_row(
     table: &str,
     column: &str,
     version_column: &str,
+    key_column: &str,
     id: Uuid,
     new_sealed: &[u8],
 ) -> sqlx::Result<u64> {
     let res = sqlx::query(sqlx::AssertSqlSafe(format!(
         "update {table} set {column} = $2, {version_column} = 2
-         where id = $1 and {version_column} = 1"
+         where {key_column} = $1 and {version_column} = 1"
     )))
     .bind(id)
     .bind(new_sealed)
