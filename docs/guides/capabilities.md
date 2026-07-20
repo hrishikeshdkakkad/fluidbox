@@ -22,10 +22,12 @@ All examples assume `API=http://127.0.0.1:8787` and `H="authorization: Bearer $F
 curl -s -X POST $API/v1/catalog/fx-sentry/connect -H "$H" \
   -H "content-type: application/json" -d '{"token": "sntrys_…"}'
 
-# oauth connector: returns {connection, authorize_url} — open the URL, approve,
-# the callback completes the connection and photographs the snapshot
+# oauth connector: returns {connection, go_url} — open go_url (a control-plane
+# page that binds your browser to the one-time flow, then redirects to the
+# provider's consent screen); approve, and the callback completes + photographs
 curl -s -X POST $API/v1/catalog/fx-notion/connect -H "$H" \
   -H "content-type: application/json" -d '{}'
+# (the raw path POST /v1/connections/{id}/oauth/start likewise returns {go_url})
 ```
 
 A rejected api_key rolls the connection back; nothing half-connected survives. Custom entries can be added with `POST /v1/catalog` (they're forced to `tier=custom`, **tenant-scoped**, and adding one needs admin/owner — catalog data is reference data, not trust; one org's custom row is never visible or bindable to another).
