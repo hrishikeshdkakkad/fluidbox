@@ -337,6 +337,14 @@ PYEOF
 as_state() { curl -s "$AS_BASE/admin/state"; }
 as_field() { as_state | python3 -c "import sys,json;d=json.load(sys.stdin);print(d$1)" 2>/dev/null; }
 as_admin() { curl -s -X POST -H 'content-type: application/json' -d "${2:-{\}}" "$AS_BASE/admin/$1" >/dev/null; }
+# Count the tools/call requests the fake MCP server actually EXECUTED (ok=true).
+# `S["mcp"]` records every request — handshake traffic (initialize,
+# notifications/initialized, tools/list) and 401s too, and a reactive-401 retry
+# records BOTH legs — so a raw `len(mcp)` delta cannot count executions. This can.
+as_tool_calls() { as_state | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print(sum(1 for m in d.get('mcp',[]) if m.get('method')=='tools/call' and m.get('ok')))" 2>/dev/null; }
 
 # ── Fake GitHub (manifest conversions) ────────────────────────────────────────
 # The manifest dance ends by POSTing to {github_api}/app-manifests/{code}/
@@ -446,6 +454,17 @@ PYEOF
 }
 llm_state() { curl -s "$LLM_BASE/admin/state"; }
 llm_field() { llm_state | python3 -c "import sys,json;d=json.load(sys.stdin);print(d$1)" 2>/dev/null; }
+# EVERY recorded call on a provisioning endpoint carried the expected credential.
+# The fake accepts any Authorization, so checking one record (e.g. `generate[0]`)
+# leaves every later mint — the second org, the default tenant's lazy mint, the
+# rotation re-mint, the key deletion — free to present the WRONG credential with
+# the suite still green. $1 = endpoint record list, $2 = expected Authorization.
+# Prints "OK <n>", "NONE" (endpoint never called), or "BAD <first-offender>".
+llm_all_auth() { llm_state | python3 -c "
+import sys,json
+d=json.load(sys.stdin); rs=d.get('$1') or []
+bad=[r.get('auth','') for r in rs if r.get('auth','') != '$2']
+print('NONE' if not rs else 'BAD %s' % bad[0] if bad else 'OK %d' % len(rs))" 2>/dev/null; }
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Server boots. CI passes FLUIDBOX_SERVER_BIN (a prebuilt binary) so the script
@@ -746,6 +765,7 @@ forge_running "$HRUN" "sess-h-$$" "fxn" && ok "run forced running + session toke
 # (h1) singleflight: expire the AS access token, fire TWO concurrent brokered
 # calls → the per-connection oauth lock coalesces them into ONE refresh grant.
 RG0=$(as_field "['refresh_grants']")
+TC0=$(as_tool_calls)
 as_admin expire-access
 ( sess_call "$HRUN" "sess-h-$$" '{"tool_call_id":"h1a","tool":"mcp__fxn__nt_search","input":{"query":"a"}}' > "$WORK/h1a" 2>/dev/null ) &
 P1=$!
@@ -754,7 +774,18 @@ P2=$!
 wait "$P1"; wait "$P2"
 RG1=$(as_field "['refresh_grants']")
 [ "$((RG1-RG0))" = 1 ] && ok "two concurrent brokered calls → EXACTLY ONE refresh grant (singleflight)" || no "refresh-grant delta = $((RG1-RG0)) (want 1 — singleflight)"
-{ grep -qi '"ok": *true' "$WORK/h1a" || grep -qi '"ok": *true' "$WORK/h1b"; } && ok "at least one concurrent call executed (connection stayed active across the refresh)" || no "neither concurrent call executed: $(cat "$WORK/h1a" "$WORK/h1b")"
+# BOTH waiters must succeed, not just one. Singleflight means the loser WAITS for
+# the winner's rotated token and then executes with it; a loser that dies (401,
+# dead-token race, lock timeout) while the winner survives is exactly the
+# production bug this section caught — and an `either-or` assertion reports that
+# bug as a pass. Same reason the upstream execution count must be 2, not ≥1.
+{ grep -qi '"ok": *true' "$WORK/h1a" && grep -qi '"ok": *true' "$WORK/h1b"; } \
+  && ok "BOTH concurrent calls executed (the singleflight loser rode the winner's rotated token)" \
+  || no "a concurrent call did NOT execute (both must): $(cat "$WORK/h1a" "$WORK/h1b")"
+TC1=$(as_tool_calls)
+[ "$((TC1-TC0))" = 2 ] \
+  && ok "exactly TWO tools/call executions reached the upstream (one per concurrent call)" \
+  || no "upstream tools/call delta = $((TC1-TC0)) (want exactly 2 — one execution per concurrent call)"
 # The AS holds exactly ONE valid refresh token (rotation: the old one died).
 [ "$(as_field "['refresh'].__len__()")" = 1 ] && ok "the AS holds exactly one refresh token (old rotated out)" || no "AS refresh tokens = $(as_field "['refresh']") (want 1 — rotation)"
 # (h2) generation fail-closed: bump the connection's authorization_generation past
@@ -1025,6 +1056,16 @@ for f in $SEED_FAMILIES; do
   L=$(fam_legacy "$f")
   [ "${L:-0}" -ge 1 ] && ok "  before: $f legacy=$L" || no "  $f legacy=$L before reseal (want ≥1)"
 done
+# The connector-OAuth PKCE-verifier family gets the SAME before-state precondition
+# as the seeded families. Its after-state (legacy=0, below) is a FALSE GREEN on its
+# own: with zero legacy flow rows reaching the job, "counted + drained" passes
+# without the job re-sealing a single verifier — precisely the state the assertion
+# exists to rule out. The dance sections (d/e/f) left in-flight v1 rows behind, so
+# this must be ≥1 here; 'NA' means the family is not counted at all.
+CFLOW_L0=$(fam_legacy "connector_oauth_flows.pkce_verifier_sealed")
+[ "${CFLOW_L0:-0}" -ge 1 ] 2>/dev/null \
+  && ok "  before: connector_oauth_flows.pkce_verifier_sealed legacy=$CFLOW_L0 (v1 rows for the job to drain)" \
+  || no "  connector_oauth_flows.pkce_verifier_sealed legacy=$CFLOW_L0 before reseal (want ≥1; 'NA' ⇒ uncounted family — the after-state check below would be vacuous)"
 # Start the job → 202.
 admin_post "/v1/admin/reseal" '{}'
 [ "$CODE" = 202 ] && ok "POST /v1/admin/reseal → 202 Accepted (job started)" || no "reseal start → $CODE: $BODY"
@@ -1051,9 +1092,9 @@ done
 # legacy_total==0 poll above. Were it still uncounted, fam_legacy would return 'NA'
 # (a stale v1 flow row would then escape BOTH the re-seal job and the D4 gate).
 CFLOW_L=$(fam_legacy "connector_oauth_flows.pkce_verifier_sealed")
-[ "$CFLOW_L" = 0 ] \
-  && ok "  after: connector_oauth_flows.pkce_verifier_sealed legacy=0 (counted + drained in lockstep)" \
-  || no "  connector_oauth_flows.pkce_verifier_sealed not drained/counted (legacy=$CFLOW_L; want 0 — 'NA' ⇒ still uncounted)"
+{ [ "$CFLOW_L" = 0 ] && [ "${CFLOW_L0:-0}" -ge 1 ]; } 2>/dev/null \
+  && ok "  after: connector_oauth_flows.pkce_verifier_sealed legacy=0 (drained the $CFLOW_L0 v1 row(s) counted before the job)" \
+  || no "  connector_oauth_flows.pkce_verifier_sealed not drained/counted (before=$CFLOW_L0 after=$CFLOW_L; want ≥1 → 0 — 'NA' ⇒ still uncounted)"
 stop_server
 
 # ── (c/D4) Retirement gate — legacy key retires cleanly once parity is zero ────
@@ -1099,9 +1140,16 @@ admin_post "/v1/admin/orgs" "{\"slug\":\"org-b\",\"display_name\":\"Org B\"}"
 [ "$CODE" = 200 ] && ok "org 'org-b' created (tenant mode → eager virtual-key mint)" || no "org-b → $CODE: $BODY"
 TID_A=$(db "select id from tenants where slug='org-a'")
 TID_B=$(db "select id from tenants where slug='org-b'")
-# The fake LiteLLM saw the MASTER key ONLY on /key/generate.
-GEN_MASTER=$(llm_field "['generate'][0]['auth']")
-[ "$GEN_MASTER" = "Bearer $MASTER_KEY" ] && ok "/key/generate authenticated with the MASTER key (Bearer master)" || no "/key/generate master auth wrong: '$GEN_MASTER'"
+# The fake LiteLLM saw the MASTER key ONLY on /key/generate — and on EVERY
+# /key/generate, not merely the first. The fake accepts any Authorization, so a
+# `generate[0]` spot-check would stay green while org-b's mint (and every later
+# one) presented the wrong credential.
+GEN_AUTH=$(llm_all_auth generate "Bearer $MASTER_KEY")
+case "$GEN_AUTH" in
+  "OK "*) ok "EVERY /key/generate so far authenticated with the MASTER key (${GEN_AUTH#OK } call(s))";;
+  NONE)   no "no /key/generate calls recorded — the eager per-tenant mint never happened";;
+  *)      no "a /key/generate call used the WRONG credential: '${GEN_AUTH#BAD }'";;
+esac
 KEY_A=$(llm_state | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
@@ -1153,6 +1201,23 @@ print(ks[-1] if ks else '')" 2>/dev/null)
     && ok "after rotate, org-a's next facade call presents the NEW key ($KEY_A2 ≠ $KEY_A)" \
     || no "rotate did not change the presented key (was $KEY_A, now '$OA_AUTH2', new mint '$KEY_A2')"
 fi
+# Provisioning-credential sweep over EVERY recorded admin call in this phase —
+# the eager org-a/org-b mints, the default tenant's lazy mint, the rotation
+# re-mint, and the rotation's best-effort delete of the superseded key. The
+# master key is provisioning-only: it must appear on all of them and (asserted
+# above + in section (k)) on no model request.
+GEN_AUTH=$(llm_all_auth generate "Bearer $MASTER_KEY")
+case "$GEN_AUTH" in
+  "OK "*) ok "EVERY /key/generate call used the MASTER key (${GEN_AUTH#OK } call(s): eager mints + lazy mint + rotation)";;
+  NONE)   no "no /key/generate calls recorded at all — the virtual-key assertions would be vacuous";;
+  *)      no "a /key/generate call used the WRONG credential: '${GEN_AUTH#BAD }'";;
+esac
+DEL_AUTH=$(llm_all_auth delete "Bearer $MASTER_KEY")
+case "$DEL_AUTH" in
+  "OK "*) ok "EVERY /key/delete call used the MASTER key (${DEL_AUTH#OK } call(s): the rotation's old-key cleanup)";;
+  NONE)   no "no /key/delete recorded, yet the rotation above returned {rotated:true} — rotate_tenant_key awaits the superseded key's delete before returning, so org-a's old key is now a live orphan at LiteLLM";;
+  *)      no "a /key/delete call used the WRONG credential: '${DEL_AUTH#BAD }'";;
+esac
 
 # ── (j) RLS — the runtime role sees only its tenant; GUC bypass; audit is append-only ─
 # #32 (j). SET ROLE fluidbox_runtime (NOLOGIN, granted to the CI superuser by
@@ -1235,10 +1300,23 @@ for GT in connector_catalog oauth_client_registrations; do
 done
 # INSERT: a scoped transaction may not MINT a global row (WITH CHECK raises, so
 # this one surfaces as an error, not a zero row count). Rolled back either way.
-GINS=$(psql "$DATABASE_URL" -X -q -A -t -c "set role fluidbox_runtime; begin; set local fluidbox.tenant_id = '$TID_A'; insert into connector_catalog (slug, name, tier) values ('rls-global-probe-$$', 'RLS global probe', 'custom'); rollback;" 2>&1)
-echo "$GINS" | grep -qi "row-level security" \
-  && ok "connector_catalog: a tenant-scoped INSERT of a GLOBAL row → refused by row-level security" \
-  || no "a tenant-scoped INSERT minted a global catalog row (or failed for another reason): $GINS"
+#
+# BOTH mixed tables are probed. The SELECT/UPDATE/DELETE loop above passes on
+# `oauth_client_registrations` no matter what `registration_insert` says, so a
+# `tenant_id IS NULL` arm creeping back into that ONE policy — while every other
+# policy stayed correct — would leave the whole section green while a tenant-scoped
+# transaction could mint a GLOBAL client identity: the row that holds the
+# deployment-wide OAuth client_id and its sealed client_secret.
+for GI in \
+  "connector_catalog|slug, name, tier|'rls-global-probe-$$', 'RLS global probe', 'custom'" \
+  "oauth_client_registrations|id, issuer, redirect_uri, source, client_id|gen_random_uuid(), 'https://rls-global-probe-$$.invalid', 'https://rls-global-probe-$$.invalid/cb', 'dcr', 'rls-global-probe'"
+do
+  GT="${GI%%|*}"; GI_REST="${GI#*|}"; GCOLS="${GI_REST%%|*}"; GVALS="${GI_REST#*|}"
+  GINS=$(psql "$DATABASE_URL" -X -q -A -t -c "set role fluidbox_runtime; begin; set local fluidbox.tenant_id = '$TID_A'; insert into $GT ($GCOLS) values ($GVALS); rollback;" 2>&1)
+  echo "$GINS" | grep -qi "row-level security" \
+    && ok "  $GT: a tenant-scoped INSERT of a GLOBAL row → refused by row-level security" \
+    || no "  $GT: a tenant-scoped INSERT minted a global row (or failed for another reason): $GINS"
+done
 # The runtime role cannot UPDATE the append-only audit log.
 AUDIT_ERR=$(psql "$DATABASE_URL" -X -q -c "set role fluidbox_runtime; update auth_audit_log set action = action" 2>&1)
 echo "$AUDIT_ERR" | grep -qi "permission denied" && ok "runtime role UPDATE on auth_audit_log → permission denied (append-only)" || no "audit UPDATE not denied: $AUDIT_ERR"
