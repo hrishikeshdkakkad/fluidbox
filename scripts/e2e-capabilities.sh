@@ -34,7 +34,11 @@ cargo build -q -p fluidbox-server || exit 1
 B=/tmp/fbx-cap-body.json
 post()  { curl -s -o "$B" -w "%{http_code}" -X POST -H "$H" -H "$CT" -d "$2" "$API/v1$1"; }
 get()   { curl -s -H "$H" "$API/v1$1"; }
-pq()    { psql "$DATABASE_URL" -qtA -c "$1" | head -1; }
+# Migration 0018 FORCEs RLS on every tenant table, which binds the table OWNER
+# too: a GUC-less psql session reads zero rows and every write trips the policy.
+# The bypass GUC is a session-level SET on a custom (dotted) option — no
+# privilege required — so it rides INSIDE the helper and every call carries it.
+pq()    { psql "$DATABASE_URL" -qtA -c "set fluidbox.bypass = 'system_worker'; $1" | head -1; }
 jb()    { python3 -c "import sys,json;d=json.load(open('$B'));print(d$1)" 2>/dev/null; }
 sfield(){ curl -s -H "$H" "$API/v1/sessions/$1" | j "['session']$2"; }
 

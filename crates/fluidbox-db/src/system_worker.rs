@@ -50,12 +50,20 @@
 //! `fluidbox.tenant_id` or `fluidbox.bypass` GUC sees ZERO rows — so EVERY function
 //! in this module opens its transaction with [`crate::worker_tx`], which sets
 //! `fluidbox.bypass = 'system_worker'` transaction-locally. That is the audited
-//! bypass: the category lives IN the GUC value, `worker_tx` is `pub(crate)` (never
-//! constructed ad-hoc in the server crate — a server path that needs cross-tenant
-//! access calls one of these named functions), and this is the ONLY module whose
-//! functions legitimately span tenants. The bypass is deliberate and grep-able, not
-//! ambient: prove it by running one of these queries WITHOUT `worker_tx` and it
-//! returns nothing (there is a test for exactly that).
+//! bypass: the category lives IN the GUC value, and this is the ONLY module whose
+//! functions legitimately span tenants.
+//!
+//! Be precise about the guarantee: `worker_tx` is `pub(crate)`, so the server crate
+//! cannot ASSEMBLE a bypass ad-hoc — it must go through a function named here. That
+//! is NOT the same as "the server can never hold a bypass-armed transaction": a few
+//! entry points in this module ([`reseal_begin`], [`global_registration_tx`]) are
+//! `pub` and deliberately HAND ONE OUT, because their callers drive a multi-statement
+//! critical section (a row lock + CAS; an advisory lock + find-or-insert) that cannot
+//! be expressed as a single call. The property is therefore "a short, named,
+//! grep-able set of escape hatches, each with a documented consumer" — not
+//! "unreachable". The bypass is deliberate and grep-able, not ambient: prove it by
+//! running one of these queries WITHOUT `worker_tx` and it returns nothing (there is
+//! a test for exactly that).
 //!
 //! These DB-resolved rows are just ONE of the documented ways a
 //! [`TenantScope`](crate::TenantScope) is constructed without a principal
@@ -553,4 +561,63 @@ pub async fn reseal_write_row(
     .execute(&mut *tx)
     .await?;
     Ok(res.rows_affected())
+}
+
+// ─── (e) deployment-global OAuth client registrations ───────────────────────
+// `oauth_client_registrations` v1 rows are ALWAYS global (`tenant_id NULL`): one
+// deployment-wide client identity per (issuer, redirect_uri), shared by every
+// tenant's dance. Migration 0018 lets any scope READ a global row but restricts
+// INSERT/UPDATE/DELETE to tenant-or-bypass — a tenant-scoped transaction must not
+// be able to mint a global row or mutate/retire one another tenant depends on. The
+// DCR/CIMD resolution that legitimately writes them is principal-less by
+// construction (it runs mid-dance, before any connection is active), so it takes
+// the audited escape hatch here, exactly like every other cross-tenant writer.
+//
+// Reads are deliberately NOT wrapped: `find_client_registration`/`_by_id` are
+// executor-generic and the SELECT policy already admits `tenant_id is null` from
+// any scope.
+
+/// Open the find-or-register transaction with the audited system-worker bypass GUC
+/// already set — the drop-in for a bare `pool.begin()` in the DCR path, which takes
+/// the registration advisory lock and then reads/inserts the GLOBAL row inside one
+/// transaction. Without the GUC the insert is refused ("new row violates
+/// row-level security policy") under 0018's `registration_insert` policy.
+pub async fn global_registration_tx(
+    pool: &PgPool,
+) -> sqlx::Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+    crate::worker_tx(pool).await
+}
+
+/// Insert the shared GLOBAL registration under the audited bypass — the pool-direct
+/// counterpart of [`global_registration_tx`], for the CIMD arm (no advisory lock:
+/// CIMD has no `/register` HTTP to serialize). Same `ON CONFLICT DO NOTHING`
+/// semantics as [`crate::insert_client_registration`]: `None` means a concurrent
+/// dance won and the caller re-selects.
+pub async fn insert_global_registration(
+    pool: &PgPool,
+    new: crate::NewOauthClientRegistration<'_>,
+) -> sqlx::Result<Option<crate::OauthClientRegistrationRow>> {
+    let mut tx = crate::worker_tx(pool).await?;
+    let out = crate::insert_client_registration(&mut *tx, new).await?;
+    tx.commit().await?;
+    Ok(out)
+}
+
+/// Bump `last_used_at` on a GLOBAL registration under the audited bypass. An UPDATE
+/// filtered by RLS would silently affect zero rows, so this is a correctness fix as
+/// well as an access one.
+pub async fn touch_global_registration(pool: &PgPool, id: Uuid) -> sqlx::Result<()> {
+    let mut tx = crate::worker_tx(pool).await?;
+    crate::touch_client_registration(&mut *tx, id).await?;
+    tx.commit().await
+}
+
+/// Delete a GLOBAL registration whose client the AS rejected (`invalid_client`
+/// self-heal) under the audited bypass, so the next dance mints a fresh identity.
+/// Without the GUC the DELETE is filtered to zero rows and the dead identity is
+/// adopted forever.
+pub async fn delete_global_registration(pool: &PgPool, id: Uuid) -> sqlx::Result<()> {
+    let mut tx = crate::worker_tx(pool).await?;
+    crate::delete_client_registration(&mut *tx, id).await?;
+    tx.commit().await
 }

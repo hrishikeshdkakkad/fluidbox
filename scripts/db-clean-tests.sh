@@ -56,6 +56,12 @@ echo "fixture bundles: pmt-bundle-%"
 echo
 
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -P pager=off <<SQL
+-- Migration 0018 FORCEs RLS on every table below, which binds the table OWNER
+-- too. Without this GUC the counts all read 0 and every DELETE silently affects
+-- 0 rows — a cleanup that reports SUCCESS while deleting nothing. Session-level
+-- SET on a custom (dotted) option: no privilege required, survives the
+-- begin/rollback below (it is set outside that transaction).
+set fluidbox.bypass = 'system_worker';
 \echo '── WILL DELETE ────────────────────────'
 select 'fixture agents' t, count(*) n from agents where name in ($FIXTURE_AGENTS)
 union all select 'their sessions', count(*) from sessions s

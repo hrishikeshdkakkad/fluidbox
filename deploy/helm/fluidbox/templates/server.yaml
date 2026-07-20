@@ -175,6 +175,11 @@ spec:
             {{- with $up }}
             - { name: LLM_UPSTREAM_URL, value: {{ . | quote }} }
             {{- end }}
+            {{- with .Values.server.runtimeRole }}
+            # RLS pool split (migration 0018): every pooled connection SET ROLEs to
+            # this NON-owner role. Boot FAILS if it does not exist.
+            - { name: FLUIDBOX_RUNTIME_ROLE, value: {{ . | quote }} }
+            {{- end }}
             - name: DATABASE_URL
               valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.databaseUrl | quote }} } }
             - name: FLUIDBOX_ADMIN_TOKEN
