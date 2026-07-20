@@ -250,15 +250,17 @@ fn run_git_scrubbed(
         .env("XDG_CONFIG_HOME", home)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
-        // Phase E: keep the same LFS/transport hardening on the collection path
-        // (env_clear already dropped ambient GIT_*), so a hostile worktree can
-        // never trigger an LFS smudge or a non-file transport during diff capture.
-        .env("GIT_LFS_SKIP_SMUDGE", "1")
-        .env("GIT_ALLOW_PROTOCOL", "http:https:file")
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Phase E: keep the same LFS/transport hardening on the collection path
+    // (env_clear already dropped ambient GIT_*), so a hostile worktree can never
+    // trigger an LFS smudge or a non-file transport during diff capture. Shares
+    // ONE source with the materialize path (`crate::transport_hardening_env`).
+    for (k, v) in crate::transport_hardening_env() {
+        cmd.env(k, v);
+    }
 
     let mut child = cmd.spawn()?;
     let mut stdout_pipe = child.stdout.take().expect("stdout piped");
@@ -351,6 +353,20 @@ mod tests {
 
     fn root_of(ws: &crate::MaterializedWorkspace) -> &Path {
         ws.host_dir.parent().unwrap()
+    }
+
+    // I1b: `run_git_scrubbed` applies `crate::transport_hardening_env()` (the same
+    // source the materialize path uses), so the collection path keeps the LFS
+    // smudge off + the transport allowlist even after `env_clear`. Asserting the
+    // shared fn's pairs guards both builders against a silent drop.
+    #[test]
+    fn collection_path_keeps_transport_hardening() {
+        let env = crate::transport_hardening_env();
+        assert!(env.contains(&("GIT_LFS_SKIP_SMUDGE", "1")), "{env:?}");
+        assert!(
+            env.contains(&("GIT_ALLOW_PROTOCOL", "http:https:file")),
+            "{env:?}"
+        );
     }
 
     #[test]

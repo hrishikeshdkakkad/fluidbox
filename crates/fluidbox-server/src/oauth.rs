@@ -389,6 +389,23 @@ fn origin_and_path(url: &str) -> Result<(String, String), String> {
     ))
 }
 
+/// Pre-dial egress admission for a connector-OAuth identity fetch (Phase E, C1).
+///
+/// `state.identity_http` filters DNS *names* at resolve time and re-validates
+/// redirect hops, but reqwest dials an IP *literal* in the INITIAL request URL
+/// directly — the resolver is never consulted for a literal — so an
+/// `https://169.254.169.254/…` target would otherwise slip straight past the
+/// per-hop guard. `egress::admit_url` closes that on the first hop (scheme
+/// policy + host-literal block), and MUST be called immediately before every
+/// `identity_http` request whose URL is attacker-influenced (the mcp_url probe,
+/// PRM/AS-metadata discovery, DCR, code exchange, and the stored-bag refresh).
+///
+/// The denial reason is a static class from `admit_url` (never a resolved IP);
+/// we surface it as `egress blocked: <class>` so no internal address leaks.
+fn admit_oauth(url: &str, policy: &crate::egress::EgressPolicy) -> Result<(), String> {
+    crate::egress::admit_url(url, policy).map_err(|e| format!("egress blocked: {e}"))
+}
+
 // ─── Discovery (network) ──────────────────────────────────────────────────
 
 /// 401-probe the MCP endpoint, walk RFC 9728 → RFC 8414/OIDC, and return
@@ -398,7 +415,13 @@ pub async fn discover(state: &AppState, mcp_url: &str) -> Result<AsMeta, String>
     let mut prm_urls: Vec<String> = Vec::new();
     // Phase E: connector-OAuth traffic rides the per-hop-SSRF `identity_http`
     // (the same client OIDC uses). A PRM/AS-metadata document can point discovery
-    // anywhere, so every hop's scheme + resolved address is now validated.
+    // anywhere, so every hop's scheme + resolved address is now validated — AND
+    // the initial-hop literal is admitted here (C1) since reqwest dials a literal
+    // IP without consulting the resolver. The mcp_url is the user's declared
+    // target: a private/plain-http one is a hard discovery failure, not a probe
+    // we silently skip (the same-origin PRM URLs derived below would all block
+    // anyway).
+    admit_oauth(mcp_url, &state.egress_policy)?;
     if let Ok(res) = state
         .identity_http
         .get(mcp_url)
@@ -427,6 +450,12 @@ pub async fn discover(state: &AppState, mcp_url: &str) -> Result<AsMeta, String>
 
     let mut as_base = None;
     for pu in &prm_urls {
+        // A PRM candidate can be attacker-supplied (the WWW-Authenticate one) —
+        // a blocked target is skipped like any non-answer; if ALL are blocked the
+        // loop falls through to the discovery-failure error below (C1).
+        if admit_oauth(pu, &state.egress_policy).is_err() {
+            continue;
+        }
         let Ok(res) = state
             .identity_http
             .get(pu)
@@ -462,6 +491,12 @@ pub async fn discover(state: &AppState, mcp_url: &str) -> Result<AsMeta, String>
     meta_urls.push(format!("{a_origin}/.well-known/oauth-authorization-server"));
     meta_urls.push(format!("{a_origin}/.well-known/openid-configuration"));
     for mu in &meta_urls {
+        // `as_base` came from the (attacker-influenced) PRM document, so admit
+        // each metadata candidate before dialing; a blocked one is skipped and
+        // the loop falls through to the discovery-failure error below (C1).
+        if admit_oauth(mu, &state.egress_policy).is_err() {
+            continue;
+        }
         let Ok(res) = state
             .identity_http
             .get(mu)
@@ -714,6 +749,9 @@ async fn dcr_register(
     state: &AppState,
     registration_endpoint: &str,
 ) -> Result<(String, Option<String>), String> {
+    // The registration_endpoint is read from (attacker-influenced) AS metadata —
+    // admit it before POSTing (C1); a denial surfaces as a registration failure.
+    admit_oauth(registration_endpoint, &state.egress_policy)?;
     let body = json!({
         "client_name": "fluidbox",
         "redirect_uris": [redirect_uri(state)],
@@ -1495,6 +1533,11 @@ async fn do_code_exchange(
     redirect: &str,
     resource: Option<&str>,
 ) -> ExchangeOutcome {
+    // Admit the token endpoint before dialing (C1). It was frozen from AS
+    // metadata at flow start; a denial maps to the exchange-failure shape.
+    if let Err(e) = admit_oauth(token_endpoint, &state.egress_policy) {
+        return ExchangeOutcome::Other(e);
+    }
     let mut form: Vec<(&str, &str)> = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -2377,6 +2420,10 @@ async fn refresh_access_token(
         .get("token_endpoint")
         .and_then(Value::as_str)
         .ok_or("connection has no token endpoint — reconnect it")?;
+    // Admit the token endpoint read from the STORED oauth bag before dialing
+    // (C1). Defense in depth for pre-Phase-E rows sealed before admission
+    // existed — a stored private/plain-http endpoint is refused here too.
+    admit_oauth(token_endpoint, &state.egress_policy)?;
     let resource = oauth.get("resource").and_then(Value::as_str);
     // Resolve the client identity (shared registration preferred, per-connection
     // legacy fallback) THROUGH `db` — the refresh stays on its single lock-holding
@@ -2523,6 +2570,49 @@ mod tests {
 
     fn test_sealer() -> Sealer {
         Sealer::from_key_string(&"ab".repeat(32)).unwrap()
+    }
+
+    fn egress_policy(dev: bool) -> crate::egress::EgressPolicy {
+        crate::egress::EgressPolicy {
+            dev_loopback: dev,
+            allow_cidrs: vec![],
+            github_clone_base: None,
+            proxy: None,
+        }
+    }
+
+    // C1: every connector-OAuth surface (discover probe / PRM / AS-metadata /
+    // DCR / code exchange / stored-bag refresh) funnels its pre-dial admission
+    // through `admit_oauth`, so proving it here proves the whole class. reqwest
+    // dials an IP LITERAL without the resolver, so admit_url is the ONLY thing
+    // standing between a `https://<private-ip>` target and an open socket.
+    #[test]
+    fn admit_oauth_refuses_private_literals_and_plain_http_outside_dev() {
+        let prod = egress_policy(false);
+        // Private + metadata IP literals over https are refused in prod, with a
+        // static-classed reason (no IP echoed) under the `egress blocked:` prefix.
+        let blocked = admit_oauth("https://169.254.169.254/token", &prod).unwrap_err();
+        assert!(blocked.starts_with("egress blocked:"), "{blocked}");
+        assert!(
+            !blocked.contains("169.254"),
+            "reason leaked the target: {blocked}"
+        );
+        assert!(admit_oauth("https://10.0.0.1/register", &prod).is_err());
+        assert!(admit_oauth("https://[::1]/token", &prod).is_err());
+        // Plain http is refused in prod (E3); a public https AS is fine.
+        assert!(admit_oauth("http://as.example.com/token", &prod).is_err());
+        assert!(admit_oauth("https://as.example.com/token", &prod).is_ok());
+    }
+
+    #[test]
+    fn admit_oauth_allows_loopback_only_under_dev_seam() {
+        let dev = egress_policy(true);
+        // The e2e fake AS on loopback http is admitted under the dev seam…
+        assert!(admit_oauth("http://127.0.0.1:8899/token", &dev).is_ok());
+        // …but metadata/link-local stays blocked even in dev (loopback ≠ link-local)…
+        assert!(admit_oauth("http://169.254.169.254/latest", &dev).is_err());
+        // …and a non-loopback private http host is still refused in dev.
+        assert!(admit_oauth("http://10.0.0.1/token", &dev).is_err());
     }
 
     // A malicious authorization server can echo the sealed state / a bearer into

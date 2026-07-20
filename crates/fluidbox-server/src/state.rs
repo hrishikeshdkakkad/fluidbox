@@ -62,9 +62,15 @@ pub struct AppStateInner {
     pub http: reqwest::Client,
     /// Per-hop-SSRF client for identity fetches (OIDC discovery, JWKS, token) AND
     /// connector-OAuth (discovery, PRM, AS metadata, DCR, code exchange, refresh —
-    /// Phase E). A custom redirect policy re-validates every hop and a custom DNS
-    /// resolver filters resolved addresses at connect time (see
-    /// `egress::build_identity_http`).
+    /// Phase E). Three complementary layers cover the SSRF surface, none of which
+    /// is sufficient alone: (1) the INITIAL hop's host literal is checked by
+    /// `egress::admit_url` PRE-FLIGHT at each call site — reqwest dials an IP
+    /// literal directly, so the resolver never sees it and the literal MUST be
+    /// caught before the request (oauth.rs/login.rs do this); (2) a DNS *name* is
+    /// filtered at resolve time by the custom resolver (rebinding-safe); (3) every
+    /// REDIRECT hop is re-validated by the custom redirect policy. See
+    /// `egress::build_identity_http` — callers into attacker-influenced endpoints
+    /// admit_url the target first.
     pub identity_http: reqwest::Client,
     /// Hardened client for connector traffic to ARBITRARY user endpoints: broker
     /// MCP calls, snapshot/probe discovery, and delivery webhook publish (Phase
