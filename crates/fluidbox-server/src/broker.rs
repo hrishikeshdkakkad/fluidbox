@@ -494,8 +494,14 @@ async fn post_rpc(
     session: Option<&McpSession>,
     body: &Value,
 ) -> Result<(reqwest::StatusCode, Option<String>, Value), String> {
+    // Phase E: post_rpc is the SINGLE MCP dial funnel — admit the destination
+    // here (scheme policy + host-literal IP block) so every path (call_tool,
+    // discover_snapshot, probe_tools, handshake, retry) is covered, then dial
+    // the hardened `egress_http` (refuses redirects, filters resolved addresses
+    // at connect time). admit_url's message is non-secret (never echoes the URL).
+    crate::egress::admit_url(url, &state.egress_policy).map_err(|e| e.to_string())?;
     let mut req = state
-        .http
+        .egress_http
         .post(url)
         .timeout(MCP_TIMEOUT)
         .header("content-type", "application/json")
@@ -511,12 +517,25 @@ async fn post_rpc(
             req = req.header("mcp-protocol-version", v);
         }
     }
-    let res = req
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| format!("mcp server unreachable: {e}"))?;
+    let res = match req.json(body).send().await {
+        Ok(r) => r,
+        // `Policy::none` can surface a refused redirect as an error; never echo
+        // the Location target — log a digest of the request URL at debug only.
+        Err(e) if e.is_redirect() => {
+            tracing::debug!(target: "broker", "mcp upstream redirect refused (req {})", msg_digest(url));
+            return Err("upstream attempted redirect (refused)".into());
+        }
+        Err(e) => return Err(format!("mcp server unreachable: {e}")),
+    };
     let status = res.status();
+    // A redirect the client did NOT follow comes back as a 3xx response under
+    // `Policy::none`; refuse it identically and never echo the Location header.
+    if status.is_redirection() {
+        if let Some(loc) = res.headers().get("location").and_then(|v| v.to_str().ok()) {
+            tracing::debug!(target: "broker", "mcp upstream redirect refused (loc {})", msg_digest(loc));
+        }
+        return Err("upstream attempted redirect (refused)".into());
+    }
     let session_id = res
         .headers()
         .get("mcp-session-id")

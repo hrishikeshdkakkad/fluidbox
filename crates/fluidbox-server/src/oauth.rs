@@ -396,8 +396,11 @@ fn origin_and_path(url: &str) -> Result<(String, String), String> {
 /// this runs interactively from the dashboard Connect flow.
 pub async fn discover(state: &AppState, mcp_url: &str) -> Result<AsMeta, String> {
     let mut prm_urls: Vec<String> = Vec::new();
+    // Phase E: connector-OAuth traffic rides the per-hop-SSRF `identity_http`
+    // (the same client OIDC uses). A PRM/AS-metadata document can point discovery
+    // anywhere, so every hop's scheme + resolved address is now validated.
     if let Ok(res) = state
-        .http
+        .identity_http
         .get(mcp_url)
         .timeout(HTTP_TIMEOUT)
         .header("accept", "application/json, text/event-stream")
@@ -424,7 +427,13 @@ pub async fn discover(state: &AppState, mcp_url: &str) -> Result<AsMeta, String>
 
     let mut as_base = None;
     for pu in &prm_urls {
-        let Ok(res) = state.http.get(pu).timeout(HTTP_TIMEOUT).send().await else {
+        let Ok(res) = state
+            .identity_http
+            .get(pu)
+            .timeout(HTTP_TIMEOUT)
+            .send()
+            .await
+        else {
             continue;
         };
         if !res.status().is_success() {
@@ -453,7 +462,13 @@ pub async fn discover(state: &AppState, mcp_url: &str) -> Result<AsMeta, String>
     meta_urls.push(format!("{a_origin}/.well-known/oauth-authorization-server"));
     meta_urls.push(format!("{a_origin}/.well-known/openid-configuration"));
     for mu in &meta_urls {
-        let Ok(res) = state.http.get(mu).timeout(HTTP_TIMEOUT).send().await else {
+        let Ok(res) = state
+            .identity_http
+            .get(mu)
+            .timeout(HTTP_TIMEOUT)
+            .send()
+            .await
+        else {
             continue;
         };
         if !res.status().is_success() {
@@ -707,7 +722,7 @@ async fn dcr_register(
         "token_endpoint_auth_method": "none",
     });
     let res = state
-        .http
+        .identity_http
         .post(registration_endpoint)
         .timeout(HTTP_TIMEOUT)
         .json(&body)
@@ -1491,7 +1506,7 @@ async fn do_code_exchange(
         form.push(("resource", r));
     }
     let mut req = state
-        .http
+        .identity_http
         .post(token_endpoint)
         .timeout(HTTP_TIMEOUT)
         .header("content-type", "application/x-www-form-urlencoded")
@@ -2390,7 +2405,7 @@ async fn refresh_access_token(
         form.push(("resource", r));
     }
     let mut req = state
-        .http
+        .identity_http
         .post(token_endpoint)
         .timeout(HTTP_TIMEOUT)
         .header("content-type", "application/x-www-form-urlencoded")

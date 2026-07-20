@@ -1343,6 +1343,16 @@ async fn materialize_workspace(
                 },
             };
             let (url, rf, sha) = (clone_url.clone(), r#ref.clone(), commit_sha.clone());
+            // Phase E: derive the clone egress policy from the shared boundary
+            // (dev seam + operator allowlist + proxy). The configured clone base
+            // becomes the file:// prefix gate; git runs out-of-process, so this
+            // resolve-and-validate is its SSRF boundary (TOCTOU residual disclosed).
+            let git_egress = fluidbox_workspace::GitEgressPolicy {
+                dev_loopback: state.egress_policy.dev_loopback,
+                allow_cidrs: state.egress_policy.allow_cidrs.clone(),
+                clone_base_file_prefix: state.egress_policy.github_clone_base.clone(),
+                proxy: state.egress_policy.proxy.clone(),
+            };
             let ws = tokio::task::spawn_blocking(move || {
                 fluidbox_workspace::materialize_git(
                     &data_dir,
@@ -1351,6 +1361,7 @@ async fn materialize_workspace(
                     rf.as_deref(),
                     sha.as_deref(),
                     auth_header.as_deref(),
+                    &git_egress,
                 )
             })
             .await??;
