@@ -912,6 +912,16 @@ stop_server
 # restored sealed row still opens.
 # ═════════════════════════════════════════════════════════════════════════════
 say "(a/b) Boot matrix — KMS STATIC boots healthy; envelope seals are v2 (P2)"
+# The DEK drill's clean-DB precondition, made EXPLICIT instead of left to
+# whatever the CI database happened to contain: "a tenant DEK row appeared"
+# below only means something if there were none to begin with. Safe here and
+# nowhere later — Phase 1 ran KMS OFF, so nothing legitimate has wrapped a DEK
+# yet and no v2 blob exists to orphan — and it runs with the server DOWN so no
+# in-memory DEK cache can outlive the wipe. (It cannot move any earlier: the
+# table only exists once a boot has run the migrations.)
+db "delete from tenant_deks" >/dev/null
+DEKPRE=$(db "select count(*) from tenant_deks")
+[ "${DEKPRE:-1}" = 0 ] && ok "clean-DB precondition: zero tenant_deks rows before the first KMS-mode seal" || no "tenant_deks is not empty entering the KMS phase (count=$DEKPRE)"
 boot "p2" static 1 shared 0 "$MASTER_KEY" || { no "KMS-static boot failed: $(tail -20 "$SERVER_LOG")"; exit 1; }
 ok "control plane up (KMS static, legacy present)"
 # (b1) A fresh oauth connection sealed under KMS static → credential_key_version=2.
@@ -944,17 +954,41 @@ fi
 # (b3) Dumped-row restore: capture the sealed bytes, wipe to garbage (unseal must
 # FAIL), restore the exact bytes (unseal must SUCCEED again). Proves the v2 blob is
 # what opens, portably, given the same KEK + wrapped DEK.
+#
+# The drill MUST run on a COLD access-token cache, which is the only thing the
+# restart below buys — and it is load-bearing. `/tools/refresh` reaches the sealed
+# credential ONLY when `oauth::ensure_access_token` has no live cached token: an
+# entry is keyed (connection, generation) and served for its whole lifetime, and
+# `/admin/expire-access` expires tokens AT THE AS — it cannot reach into the
+# control plane's memory. On a warm cache (which is exactly what (b2)'s successful
+# refresh leaves behind) discovery photographs with the stale cached bearer, the
+# fake MCP 401s, and BOTH steps then report on that 401 instead of on the sealed
+# bytes: the garbage step "passes" without ever opening the blob, and the restore
+# step fails though the blob is byte-perfect. Cold cache instead ⇒ the garbage
+# attempt fails AT THE UNSEAL without leaving the process (grant delta 0), and
+# because a failed unseal caches nothing the restore attempt is still cold and
+# genuinely mints. A restart is also the honest DR framing: the dumped bytes are
+# restored into a process that never saw them sealed.
 say "(b) Dumped-row restore — the exact sealed bytes open; garbage does not"
+stop_server
+boot "p2c" static 1 shared 0 "$MASTER_KEY" || { no "KMS-static restore-drill boot failed: $(tail -20 "$SERVER_LOG")"; exit 1; }
+ok "control plane restarted for the restore drill (access-token cache cold)"
 if need "${V2CONN:-}" "no v2 connection for the restore drill"; then
   DUMP=$(db "select encode(credential_sealed,'hex') from integration_connections where id='$V2CONN'")
   if need "$DUMP" "could not dump the sealed credential"; then
-    as_admin expire-access
+    RG_G0=$(as_field "['refresh_grants']")
     db "update integration_connections set credential_sealed = decode('00','hex') where id='$V2CONN'" >/dev/null
     admin_post "/v1/connections/$V2CONN/tools/refresh" '{}'
-    [ "$CODE" != 200 ] && ok "a garbage sealed blob → unseal FAILS ($CODE)" || no "garbage blob unexpectedly unsealed: $BODY"
+    { [ "$CODE" != 200 ] && echo "$BODY" | grep -qi unseal; } \
+      && ok "a garbage sealed blob → the UNSEAL refuses ($CODE)" \
+      || no "garbage blob did not fail at the unseal → $CODE: $BODY"
+    # …and the refusal is LOCAL: a blob that will not open never becomes egress.
+    RG_G1=$(as_field "['refresh_grants']")
+    [ "$RG_G1" = "$RG_G0" ] \
+      && ok "the garbage-blob refusal never reached the AS (refresh-grant delta 0)" \
+      || no "a garbage sealed blob still hit the AS (grants $RG_G0 → $RG_G1)"
     db "update integration_connections set credential_sealed = decode('$DUMP','hex'), status='active' where id='$V2CONN'" >/dev/null
     RG_R0=$(as_field "['refresh_grants']")
-    as_admin expire-access
     admin_post "/v1/connections/$V2CONN/tools/refresh" '{}'
     { [ "$CODE" = 200 ] && [ "$(as_field "['refresh_grants']")" -gt "$RG_R0" ]; } \
       && ok "restoring the exact dumped bytes → unseal SUCCEEDS again (the blob is portable)" \
@@ -1136,21 +1170,75 @@ TOTAL=$(db "select count(*) from sessions")
 # db_raw (NOT db): these four assert on what the policy alone allows, so the
 # connection must carry no ambient bypass GUC — db() would set one and every
 # count would come back as the cross-tenant total.
-RLS_A=$(db_raw "set role fluidbox_runtime; begin; set local fluidbox.tenant_id = '$TID_A'; select count(*) from sessions; commit;")
-{ [ "$RLS_A" = "$CNT_A" ] && [ "$RLS_A" != "$TOTAL" ]; } \
-  && ok "runtime role + tenant-A GUC sees ONLY A's sessions ($RLS_A == A=$CNT_A, ≠ total=$TOTAL)" \
-  || no "RLS tenant-A read = $RLS_A (A=$CNT_A total=$TOTAL)"
-# Symmetric: tenant-B GUC sees ONLY B's sessions (isolation, not a fixed subset).
-RLS_B=$(db_raw "set role fluidbox_runtime; begin; set local fluidbox.tenant_id = '$TID_B'; select count(*) from sessions; commit;")
-{ [ "$RLS_B" = "$CNT_B" ] && [ "$RLS_B" != "$TOTAL" ]; } \
-  && ok "runtime role + tenant-B GUC sees ONLY B's sessions ($RLS_B == B=$CNT_B, ≠ total=$TOTAL)" \
-  || no "RLS tenant-B read = $RLS_B (B=$CNT_B total=$TOTAL)"
-# No GUC → RLS denies everything.
-RLS_NONE=$(db_raw "set role fluidbox_runtime; select count(*) from sessions;")
-[ "$RLS_NONE" = 0 ] && ok "runtime role with NO tenant GUC → 0 rows (fail closed)" || no "no-GUC read = $RLS_NONE (want 0)"
-# Bypass GUC → the audited system_worker lens sees all.
-RLS_ALL=$(db_raw "set role fluidbox_runtime; begin; set local fluidbox.bypass = 'system_worker'; select count(*) from sessions; commit;")
-[ "$RLS_ALL" = "$TOTAL" ] && ok "runtime role + bypass GUC → all $RLS_ALL rows (system_worker lens)" || no "bypass read = $RLS_ALL (want total=$TOTAL)"
+#
+# BOTH sides must be non-empty first. `RLS_A == CNT_A` is a vacuous pass at
+# 0 == 0 (and so is `RLS_ALL == TOTAL` on an empty table): the comparison would
+# report isolation while proving nothing, and the surviving `!=` guard against
+# TOTAL would be the only real content. One loud failure, then skip the four.
+if { [ "${CNT_A:-0}" -gt 0 ] && [ "${CNT_B:-0}" -gt 0 ] && [ "${TOTAL:-0}" -gt "${CNT_A:-0}" ]; }; then
+  ok "RLS fixture is non-degenerate (A=$CNT_A, B=$CNT_B, total=$TOTAL — both tenants own rows)"
+  RLS_A=$(db_raw "set role fluidbox_runtime; begin; set local fluidbox.tenant_id = '$TID_A'; select count(*) from sessions; commit;")
+  { [ "$RLS_A" = "$CNT_A" ] && [ "$RLS_A" != "$TOTAL" ]; } \
+    && ok "runtime role + tenant-A GUC sees ONLY A's sessions ($RLS_A == A=$CNT_A, ≠ total=$TOTAL)" \
+    || no "RLS tenant-A read = $RLS_A (A=$CNT_A total=$TOTAL)"
+  # Symmetric: tenant-B GUC sees ONLY B's sessions (isolation, not a fixed subset).
+  RLS_B=$(db_raw "set role fluidbox_runtime; begin; set local fluidbox.tenant_id = '$TID_B'; select count(*) from sessions; commit;")
+  { [ "$RLS_B" = "$CNT_B" ] && [ "$RLS_B" != "$TOTAL" ]; } \
+    && ok "runtime role + tenant-B GUC sees ONLY B's sessions ($RLS_B == B=$CNT_B, ≠ total=$TOTAL)" \
+    || no "RLS tenant-B read = $RLS_B (B=$CNT_B total=$TOTAL)"
+  # No GUC → RLS denies everything.
+  RLS_NONE=$(db_raw "set role fluidbox_runtime; select count(*) from sessions;")
+  [ "$RLS_NONE" = 0 ] && ok "runtime role with NO tenant GUC → 0 rows (fail closed)" || no "no-GUC read = $RLS_NONE (want 0)"
+  # Bypass GUC → the audited system_worker lens sees all.
+  RLS_ALL=$(db_raw "set role fluidbox_runtime; begin; set local fluidbox.bypass = 'system_worker'; select count(*) from sessions; commit;")
+  [ "$RLS_ALL" = "$TOTAL" ] && ok "runtime role + bypass GUC → all $RLS_ALL rows (system_worker lens)" || no "bypass read = $RLS_ALL (want total=$TOTAL)"
+else
+  no "RLS fixture is degenerate (A=$CNT_A B=$CNT_B total=$TOTAL) — the tenant-isolation comparisons would be vacuous; skipping them"
+fi
+# ── The GLOBAL-row read/write SPLIT (0018 :222-247) ───────────────────────────
+# The two MIXED tables (`connector_catalog`, `oauth_client_registrations`) carry
+# `tenant_id IS NULL` rows every tenant must READ and no tenant may WRITE. That
+# split is the single place in 0018 where SELECT and INSERT/UPDATE/DELETE differ,
+# so nothing else in this suite covers it: a `for all` policy (whose USING also
+# filters UPDATE/DELETE) would read identically here and quietly make global rows
+# mutable by any scoped transaction. Every probe below rides `db_raw` + SET ROLE
+# (policies bind the runtime role) and every mutation is rolled back.
+for GT in connector_catalog oauth_client_registrations; do
+  GLOBALS=$(db "select count(*) from $GT where tenant_id is null")
+  if [ "${GLOBALS:-0}" -gt 0 ] 2>/dev/null; then
+    # READ: a tenant-scoped transaction sees every global row (shared reference
+    # data — this is also why the catalog renders before a scope exists).
+    GSEE=$(db_raw "set role fluidbox_runtime; begin; set local fluidbox.tenant_id = '$TID_A'; select count(*) from $GT where tenant_id is null; commit;")
+    [ "$GSEE" = "$GLOBALS" ] \
+      && ok "  $GT: a tenant-scoped read SEES all $GLOBALS global row(s)" \
+      || no "  $GT: scoped read saw $GSEE of $GLOBALS global rows (want all — global rows are shared reference data)"
+    # UPDATE: the policy's USING filters the global rows out, so a scoped UPDATE
+    # matches ZERO rows (silently — RLS narrows, it does not raise, on U/D).
+    GUPD=$(db_raw "set role fluidbox_runtime; begin; set local fluidbox.tenant_id = '$TID_A'; with u as (update $GT set created_at = created_at where tenant_id is null returning 1) select count(*) from u; rollback;")
+    [ "$GUPD" = 0 ] \
+      && ok "  $GT: a tenant-scoped UPDATE of global rows touches 0 rows" \
+      || no "  $GT: a tenant-scoped UPDATE mutated $GUPD global row(s) — the read/write split is broken"
+    # DELETE: same filter (rolled back regardless, so a broken policy cannot eat
+    # the catalog the rest of this run depends on).
+    GDEL=$(db_raw "set role fluidbox_runtime; begin; set local fluidbox.tenant_id = '$TID_A'; with d as (delete from $GT where tenant_id is null returning 1) select count(*) from d; rollback;")
+    [ "$GDEL" = 0 ] \
+      && ok "  $GT: a tenant-scoped DELETE of global rows removes 0 rows" \
+      || no "  $GT: a tenant-scoped DELETE removed $GDEL global row(s) — the read/write split is broken"
+    # BYPASS: the audited system_worker lens is the ONE writer of global rows.
+    GBYP=$(db_raw "set role fluidbox_runtime; begin; set local fluidbox.bypass = 'system_worker'; with u as (update $GT set created_at = created_at where tenant_id is null returning 1) select count(*) from u; rollback;")
+    [ "${GBYP:-0}" -gt 0 ] \
+      && ok "  $GT: the system_worker bypass CAN mutate global rows ($GBYP)" \
+      || no "  $GT: the bypass could not mutate global rows (got '$GBYP') — deployment writes would fail closed"
+  else
+    no "  $GT has no global (tenant_id IS NULL) rows — the read/write-split probes would be vacuous"
+  fi
+done
+# INSERT: a scoped transaction may not MINT a global row (WITH CHECK raises, so
+# this one surfaces as an error, not a zero row count). Rolled back either way.
+GINS=$(psql "$DATABASE_URL" -X -q -A -t -c "set role fluidbox_runtime; begin; set local fluidbox.tenant_id = '$TID_A'; insert into connector_catalog (slug, name, tier) values ('rls-global-probe-$$', 'RLS global probe', 'custom'); rollback;" 2>&1)
+echo "$GINS" | grep -qi "row-level security" \
+  && ok "connector_catalog: a tenant-scoped INSERT of a GLOBAL row → refused by row-level security" \
+  || no "a tenant-scoped INSERT minted a global catalog row (or failed for another reason): $GINS"
 # The runtime role cannot UPDATE the append-only audit log.
 AUDIT_ERR=$(psql "$DATABASE_URL" -X -q -c "set role fluidbox_runtime; update auth_audit_log set action = action" 2>&1)
 echo "$AUDIT_ERR" | grep -qi "permission denied" && ok "runtime role UPDATE on auth_audit_log → permission denied (append-only)" || no "audit UPDATE not denied: $AUDIT_ERR"
