@@ -701,9 +701,8 @@ pub async fn manifest_go(State(state): State<AppState>, Query(q): Query<GoParams
             return refusal("Something went wrong — try again from the dashboard.");
         }
     }
-    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
     let reg =
-        match fluidbox_db::get_github_app_registration(&state.pool, scope, reg_id).await {
+        match fluidbox_db::system_worker::get_github_app_registration(&state.pool, reg_id).await {
             Ok(Some(r)) if r.status == "pending" => r,
             Ok(Some(r)) if r.status == "active" => return page(
                 StatusCode::OK,
@@ -822,14 +821,16 @@ pub async fn manifest_callback(
             return refusal("Something went wrong — try again from the dashboard.");
         }
     }
-    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
-    let reg = match fluidbox_db::get_github_app_registration(&state.pool, scope, reg_id).await {
+    let reg = match fluidbox_db::system_worker::get_github_app_registration(&state.pool, reg_id).await {
         Ok(Some(r)) => r,
         _ => return refusal("Unknown registration."),
     };
     if reg.status != "pending" {
         return refusal("This registration already completed.");
     }
+    // Scope comes FROM the resolved row, never from the boot tenant: a
+    // registration started by a user in any org must resolve in that org.
+    let scope = fluidbox_db::TenantScope::assume(reg.tenant_id);
 
     // Exchange the one-hour, single-use code. Unauthenticated by GitHub's
     // design; the flow claim above is OUR auth. The code rides a
@@ -995,8 +996,7 @@ pub async fn install_go(State(state): State<AppState>, Query(q): Query<GoParams>
             return refusal("Something went wrong — try again from the dashboard.");
         }
     }
-    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
-    let reg = match fluidbox_db::get_github_app_registration(&state.pool, scope, reg_id).await {
+    let reg = match fluidbox_db::system_worker::get_github_app_registration(&state.pool, reg_id).await {
         Ok(Some(r)) if r.status == "active" => r,
         _ => return refusal("Unknown or inactive registration."),
     };
@@ -1099,8 +1099,7 @@ pub async fn setup(
             return refusal("Something went wrong — try again from the dashboard.");
         }
     }
-    let scope = fluidbox_db::TenantScope::assume(state.tenant_id);
-    let reg = match fluidbox_db::get_github_app_registration(&state.pool, scope, id).await {
+    let reg = match fluidbox_db::system_worker::get_github_app_registration(&state.pool, id).await {
         Ok(Some(r)) => r,
         _ => return refusal("Unknown registration."),
     };
