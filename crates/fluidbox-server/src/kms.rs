@@ -424,48 +424,15 @@ impl KeyWrapper for AwsKms {
 
 /// One distinct KEK present in `tenant_deks`, with a sample row to probe.
 /// `wrapped_dek` is WRAPPED key material (what is already stored); no plaintext.
-struct KekSample {
-    kek_id: String,
-    tenant_id: Uuid,
-    version: i32,
-    wrapped_dek: Vec<u8>,
-}
-
-/// Census of the DISTINCT KEKs that wrapped the stored per-tenant DEKs, with one
-/// sample row each.
 ///
-/// Cross-tenant by construction (it is a deployment-wide key-management question,
-/// asked at boot with no principal), so it rides the audited system-worker bypass
-/// via `system_worker::reseal_begin` — without it, FORCE RLS returns ZERO rows and
-/// the gate would fail OPEN, which is precisely the failure it exists to prevent.
-/// It returns key IDENTIFIERS plus already-wrapped bytes — never a plaintext key.
-///
-/// The SQL lives here rather than in `fluidbox-db` only because that crate was
-/// owned by a parallel change in this review wave; its natural home is a named
-/// `system_worker::dek_kek_census()` (see the review report).
-async fn dek_kek_census(pool: &PgPool) -> anyhow::Result<Vec<KekSample>> {
-    let mut tx = fluidbox_db::system_worker::reseal_begin(pool)
-        .await
-        .context("opening the DEK census transaction")?;
-    let rows: Vec<(String, Uuid, i32, Vec<u8>)> = sqlx::query_as(
-        "select distinct on (kek_id) kek_id, tenant_id, version, wrapped_dek
-           from tenant_deks
-          order by kek_id, tenant_id, version",
-    )
-    .fetch_all(&mut *tx)
-    .await
-    .context("reading tenant_deks")?;
-    tx.commit().await.context("committing the DEK census")?;
-    Ok(rows
-        .into_iter()
-        .map(|(kek_id, tenant_id, version, wrapped_dek)| KekSample {
-            kek_id,
-            tenant_id,
-            version,
-            wrapped_dek,
-        })
-        .collect())
-}
+/// The census SQL is a NAMED `fluidbox-db` entry point —
+/// [`fluidbox_db::system_worker::dek_kek_census`] — not ad-hoc SQL riding
+/// `reseal_begin`'s bypass hand-out. That matters beyond tidiness: the read is
+/// cross-tenant by construction, and without the audited system-worker GUC, FORCE
+/// RLS returns ZERO rows, which this gate would read as "no DEKs stored yet" and
+/// FAIL OPEN — precisely the split-key boot it exists to refuse. Keeping it named
+/// in `system_worker` is what keeps that GUC attached to the query.
+type KekSample = fluidbox_db::system_worker::DekKekSample;
 
 /// Boot gate: refuse to serve unless the CONFIGURED KEK can actually read the
 /// DEKs already stored (review H1).
@@ -482,11 +449,20 @@ async fn dek_kek_census(pool: &PgPool) -> anyhow::Result<Vec<KekSample>> {
 ///     grant or the key material is usable).
 ///   - more than one → refuse. There is no multi-KEK routing or re-wrap tooling;
 ///     serving would mean silently reading some tenants and orphaning others.
+///
+/// `cache` is the LIVE process DEK cache when the caller already built the
+/// `Sealer` (boot does). The probe then runs through [`dek_for_open`] instead of a
+/// bare `wrapper.unwrap`, so the unwrap this gate performs anyway also WARMS the
+/// cache: the first real request after a restart no longer pays a second
+/// (billable) KMS Decrypt for the same tenant. The singleflight already caps the
+/// cost at one Decrypt per restart either way — this just makes it the useful one.
+/// `None` keeps the bare probe (a caller with no sealer, e.g. a unit test).
 pub async fn check_kek_compatibility(
     pool: &PgPool,
     wrapper: &dyn KeyWrapper,
+    cache: Option<&DekCache>,
 ) -> anyhow::Result<()> {
-    let samples = dek_kek_census(pool)
+    let samples: Vec<KekSample> = fluidbox_db::system_worker::dek_kek_census(pool)
         .await
         .context("KEK compatibility gate: could not read tenant_deks")?;
     match samples.len() {
@@ -506,14 +482,21 @@ pub async fn check_kek_compatibility(
             )?;
             // The PROBE. An id match is not proof: the AWS grant may be missing,
             // the key disabled, or the wrapping format changed. One unwrap settles it.
-            wrapper
-                .unwrap(&s.wrapped_dek, &s.kek_id, s.tenant_id, s.version)
-                .await
-                .context(
-                    "the configured KEK could not unwrap a stored per-tenant DEK — refusing to \
-                     serve (every sealed v2 credential would be unreadable and new tenants would \
-                     mint DEKs the old ones cannot share)",
-                )?;
+            let probe = match cache {
+                // Through the live cache: same unwrap, but the result is retained.
+                Some(cache) => dek_for_open(pool, wrapper, cache, s.tenant_id, s.version)
+                    .await
+                    .map(|_| ()),
+                None => wrapper
+                    .unwrap(&s.wrapped_dek, &s.kek_id, s.tenant_id, s.version)
+                    .await
+                    .map(|_| ()),
+            };
+            probe.context(
+                "the configured KEK could not unwrap a stored per-tenant DEK — refusing to \
+                 serve (every sealed v2 credential would be unreadable and new tenants would \
+                 mint DEKs the old ones cannot share)",
+            )?;
             tracing::info!(
                 kek_id = %wrapper.kek_id(),
                 "KMS: KEK compatibility probe passed (a stored per-tenant DEK unwrapped)"
