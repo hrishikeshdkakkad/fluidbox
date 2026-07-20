@@ -65,6 +65,14 @@ Snapshots are **append-only** and force a real MCP `initialize`, so each records
 
 **Reauthorization bumps the generation.** Reconnecting an OAuth connection that was ever activated increments its `authorization_generation` (a rotation *within* the same account does not; proving a *different* account cannot preserve the generation — fail closed). Runs bound to the old generation then refuse at call time with `connection … was reauthorized after this run started — its binding is stale`. If you see that, the connection was re-consented mid-run: start a new run, which binds the current generation. (GitHub App connections never bump — the installation identity is proven, not re-consented.)
 
+**Only the newest authorization can activate.** Start two connect flows for the same connection (a stale browser tab, a double-clicked Connect, a retry after a timeout) and only one may land. The activation is a compare-and-swap against the connection's frozen generation *and* its last-activation instant, so a callback whose flow was overtaken is refused — before the token exchange when we can already tell, and again inside the activating `UPDATE` when we cannot — with:
+
+```
+this authorization was superseded by a newer one — restart the connect flow
+```
+
+That is a benign, expected outcome, not an error to debug: the connection is already active under the authorization that won. Close the stale tab and re-`connect` only if you actually meant to change accounts. (Equal timestamps are unorderable, so they fail closed — the refusal is preferred over guessing which grant is newer.)
+
 ## Declare what an agent needs: connection requirements
 
 An agent revision declares the brokered connections it needs — by **slot**, connector, required tools, and **binding mode** — never by connection id:
