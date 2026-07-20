@@ -46,6 +46,18 @@ pub struct BrokeredAuth {
     pub oauth_connection: Option<uuid::Uuid>,
 }
 
+impl BrokeredAuth {
+    /// The bare OAuth access token this credential carries (the header value
+    /// minus its `Bearer ` scheme). Only an OAuth connection has one — a static
+    /// credential returns `None`. The reactive-401 path uses it to evict
+    /// EXACTLY the token the upstream rejected, never a fresher one a
+    /// concurrent caller just minted (`oauth::invalidate_rejected_access`).
+    fn oauth_access(&self) -> Option<&str> {
+        self.oauth_connection?;
+        self.value.strip_prefix("Bearer ")
+    }
+}
+
 /// Compose the header VALUE from the connection's scheme and the sealed
 /// raw secret: `Bearer` prefixes, `Basic` base64-encodes (the stored secret
 /// is `email:token`), empty scheme sends the bare token (the Sentry shape).
@@ -898,9 +910,14 @@ async fn call_tool(
     Ok((cap_content(content), is_error))
 }
 
-/// Reactive-401 recovery, OAuth connections only: drop the cached access
+/// Reactive-401 recovery, OAuth connections only: drop the REJECTED access
 /// token and mint a fresh one. A static credential that 401s is terminal —
 /// there is nothing to refresh.
+///
+/// The eviction is compare-and-drop, not unconditional: concurrent calls all
+/// 401 on the same stale token, and wiping a token another caller has already
+/// refreshed into place would defeat `ensure_access_token`'s singleflight and
+/// rotate the refresh token once per concurrent 401.
 async fn reauth_after_401(
     state: &AppState,
     scope: fluidbox_db::TenantScope,
@@ -910,7 +927,8 @@ async fn reauth_after_401(
     let Some(cid) = auth.as_ref().and_then(|a| a.oauth_connection) else {
         return Err("mcp server rejected the credential (HTTP 401)".into());
     };
-    crate::oauth::invalidate_access(state, cid).await;
+    let rejected = auth.as_ref().and_then(|a| a.oauth_access()).unwrap_or("");
+    crate::oauth::invalidate_rejected_access(state, cid, rejected).await;
     brokered_auth(state, scope, server).await
 }
 
@@ -983,6 +1001,8 @@ pub async fn call_tool_for_conn(
 /// against the SAME connection + endpoint just rechecked. Mirrors
 /// [`reauth_after_401`] but resolves via [`brokered_auth_for_conn`] (no
 /// `CapabilityServer` in hand). A static credential that 401s is terminal.
+/// Same compare-and-drop eviction — this is the path concurrent in-sandbox
+/// brokered calls take, so it is the one that must not break singleflight.
 async fn reauth_after_401_conn(
     state: &AppState,
     scope: fluidbox_db::TenantScope,
@@ -993,7 +1013,8 @@ async fn reauth_after_401_conn(
     let Some(cid) = auth.as_ref().and_then(|a| a.oauth_connection) else {
         return Err("mcp server rejected the credential (HTTP 401)".into());
     };
-    crate::oauth::invalidate_access(state, cid).await;
+    let rejected = auth.as_ref().and_then(|a| a.oauth_access()).unwrap_or("");
+    crate::oauth::invalidate_rejected_access(state, cid, rejected).await;
     brokered_auth_for_conn(state, scope, conn, url).await
 }
 

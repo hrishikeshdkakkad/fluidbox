@@ -1973,6 +1973,46 @@ pub async fn invalidate_access(state: &AppState, connection_id: Uuid) {
         .retain(|(cid, _generation), _| *cid != connection_id);
 }
 
+/// KEEP predicate for [`invalidate_rejected_access`], factored out so the
+/// singleflight-preserving semantic is unit-testable without an `AppState`:
+/// an entry survives unless it belongs to `connection_id` AND still holds the
+/// exact token the upstream rejected.
+fn survives_rejection(
+    entry_conn: Uuid,
+    entry_token: &str,
+    connection_id: Uuid,
+    rejected: &str,
+) -> bool {
+    entry_conn != connection_id || entry_token != rejected
+}
+
+/// Reactive-401 eviction: drop the cached access token for `connection_id` ONLY
+/// when the cache still holds the EXACT token the upstream just rejected.
+///
+/// The unconditional [`invalidate_access`] is wrong here and defeats the
+/// singleflight it sits next to. N concurrent brokered calls all resolve the
+/// same cached token, all 401 together, and then serialize through this path:
+/// caller A evicts, refreshes, and caches a FRESH token — and caller B, arriving
+/// a moment later, would blow that fresh token away and rotate the refresh token
+/// a second time. `ensure_access_token`'s double-check never gets to fire,
+/// because the entry it would have hit was just deleted. The result is one
+/// refresh grant per concurrent 401 (a refresh storm, and needless rotation
+/// churn against authorization servers that keep only a bounded number of valid
+/// refresh tokens). Comparing the token makes B's eviction a no-op, so B's
+/// `ensure_access_token` hits A's freshly-cached token and the retry rides it.
+///
+/// Every OTHER eviction (revoke, error, suspend, generation bump, re-consent)
+/// stays unconditional — those invalidate the AUTHORITY, not one minted token.
+pub async fn invalidate_rejected_access(state: &AppState, connection_id: Uuid, rejected: &str) {
+    state
+        .connector_tokens
+        .lock()
+        .await
+        .retain(|(cid, _generation), (tok, _exp)| {
+            survives_rejection(*cid, tok, connection_id, rejected)
+        });
+}
+
 /// Return a live access token for an OAuth connection: cache hit inside the
 /// expiry margin, else refresh — serialized per connection so rotation
 /// never races itself.
@@ -2283,6 +2323,26 @@ mod tests {
         assert_eq!(known_oauth_error(smuggled), "other");
         assert_eq!(known_oauth_error("invalid_grant"), "invalid_grant");
         assert_eq!(known_oauth_error("access_denied"), "access_denied");
+    }
+
+    // Reactive-401 eviction must not defeat the refresh singleflight. Two
+    // concurrent brokered calls resolve the SAME cached access token and 401
+    // together; the first evicts + refreshes + caches a fresh token, and the
+    // second's eviction must then be a NO-OP so `ensure_access_token`'s
+    // double-check serves the fresh token instead of rotating a second time.
+    #[test]
+    fn rejected_eviction_spares_a_concurrently_refreshed_token() {
+        let conn = Uuid::now_v7();
+        let other = Uuid::now_v7();
+        // The token that actually 401'd → evicted (the normal, uncontended case).
+        assert!(!survives_rejection(conn, "acc-1", conn, "acc-1"));
+        // A FRESHER token, already refreshed in by a concurrent caller → kept.
+        assert!(survives_rejection(conn, "acc-2", conn, "acc-1"));
+        // Another connection's token is never collateral, same token bytes or not.
+        assert!(survives_rejection(other, "acc-1", conn, "acc-1"));
+        // A non-OAuth (or missing) credential yields an empty "rejected" probe —
+        // it must match nothing rather than everything.
+        assert!(survives_rejection(conn, "acc-1", conn, ""));
     }
 
     #[tokio::test]
