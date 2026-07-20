@@ -34,7 +34,12 @@
 //!     rows — a global scan by construction. [`sealed_key_version_counts`]
 //!     aggregates per-family legacy/envelope counts across all tenants (no
 //!     tenant predicate) to prove 100% re-seal before the legacy key retires; it
-//!     returns no credential material, only counts.
+//!     returns no credential material, only counts. The job's paged reader
+//!     [`reseal_candidate_ids`] and per-row lock/CAS pair
+//!     [`reseal_lock_row`]/[`reseal_write_row`] are cross-tenant by the same
+//!     construction — they carry the row's `tenant_id` back out so the SERVER
+//!     unseals/re-seals under the right per-tenant DEK; plaintext NEVER transits
+//!     this crate (sealed bytes out, sealed bytes back in).
 //!
 //! (d) **Nothing else.** A request handler that carries a principal MUST use the
 //!     scoped repositories (`get_session`, `get_connection`, … with a
@@ -339,4 +344,99 @@ pub async fn sealed_key_version_counts(pool: &PgPool) -> sqlx::Result<Vec<Family
     )
     .fetch_all(pool)
     .await
+}
+
+// ─── Re-seal migration paging + per-row lock/CAS (Phase D, #32; category (c)) ──
+//
+// `table`/`column`/`version_column` in these three fns come EXCLUSIVELY from the
+// server's compile-time `reseal::FAMILIES` const array (the nine sealed
+// `table.column` pairs). They are never request data, so the `format!`-built SQL
+// is injection-safe (the values — ids, the cursor, the new sealed bytes — are all
+// bound parameters). Keeping them dynamic (vs nine hand-written fns) lets one job
+// loop walk every family; the server owns the crypto so the (table, column,
+// SealFamily) mapping has exactly one home. `AssertSqlSafe` records the promise.
+
+/// One page of ids for a sealed family still at v1, keyset-paged past `after`.
+/// `WHERE <col> is not null and <col>_key_version = 1 and id > $after ORDER BY id`.
+///
+/// The `_key_version = 1` predicate is what makes the whole job restart-safe and
+/// idempotent: an already-re-sealed (v2) row is excluded, so a crash-and-restart
+/// simply re-scans and skips finished rows — no cursor to persist. The `id >
+/// $after` cursor is what guarantees FORWARD PROGRESS within a pass: a row the job
+/// cannot re-seal (a corrupt blob / wrong legacy key) stays v1, and without the
+/// cursor a pure `kv = 1` page would re-fetch it forever and wedge the migration.
+/// Together: skip finished rows across restarts, never re-fetch a bad row within a
+/// pass (a re-run re-attempts it from `after = nil`). Seed `after` with the nil
+/// UUID (the minimum) and advance it to the last id of each page.
+pub async fn reseal_candidate_ids(
+    pool: &PgPool,
+    table: &str,
+    column: &str,
+    version_column: &str,
+    after: Uuid,
+    limit: i64,
+) -> sqlx::Result<Vec<Uuid>> {
+    let rows: Vec<(Uuid,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "select id from {table}
+         where {column} is not null and {version_column} = 1 and id > $1
+         order by id limit $2"
+    )))
+    .bind(after)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// Lock ONE candidate row and read its sealed bytes + companion version + tenant,
+/// inside the caller's transaction (`SELECT … FOR UPDATE`). Returns the version
+/// so the caller can re-check it is STILL 1 under the lock — the page read
+/// [`reseal_candidate_ids`] was unlocked, so a concurrent writer may have
+/// re-sealed the row since. `None` (outer) = the row vanished (deleted) between
+/// paging and locking; `None` (inner, the bytes) = the column is now NULL.
+///
+/// The row lock plus the caller's CAS write ([`reseal_write_row`]) make a separate
+/// oauth advisory lock unnecessary for the concurrent-rotation hot spot: a live
+/// OAuth refresh rotation (which, with KMS on, itself writes a v2 blob) blocks on
+/// this `FOR UPDATE` and, once the re-seal tx commits, overwrites with its own
+/// fresh v2 seal — the re-sealed old token is superseded, never clobbering the
+/// rotation and never restoring a stale refresh token.
+pub async fn reseal_lock_row(
+    tx: &mut sqlx::PgConnection,
+    table: &str,
+    column: &str,
+    version_column: &str,
+    id: Uuid,
+) -> sqlx::Result<Option<(Option<Vec<u8>>, i16, Uuid)>> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "select {column}, {version_column}, tenant_id from {table}
+         where id = $1 for update"
+    )))
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await
+}
+
+/// CAS-write the re-sealed (v2) bytes for ONE row, flipping its companion version
+/// 1 → 2 in the same `WHERE … and <col>_key_version = 1` predicate. Returns
+/// rows-affected: 1 = re-sealed; 0 = a concurrent writer already moved it off v1
+/// (the caller counts that as SKIPPED, never an error). Runs inside the caller's
+/// transaction, holding the same row lock as [`reseal_lock_row`].
+pub async fn reseal_write_row(
+    tx: &mut sqlx::PgConnection,
+    table: &str,
+    column: &str,
+    version_column: &str,
+    id: Uuid,
+    new_sealed: &[u8],
+) -> sqlx::Result<u64> {
+    let res = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "update {table} set {column} = $2, {version_column} = 2
+         where id = $1 and {version_column} = 1"
+    )))
+    .bind(id)
+    .bind(new_sealed)
+    .execute(&mut *tx)
+    .await?;
+    Ok(res.rows_affected())
 }

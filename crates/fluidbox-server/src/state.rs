@@ -88,6 +88,15 @@ pub struct AppStateInner {
     /// refresh + negative-kid cache) and the fixed-window login rate counters.
     /// In-memory, single-replica (v1); a restart re-seeds from the DB caches.
     pub oidc: crate::login::OidcRuntime,
+    /// Legacy→KMS re-seal singleton flag (Phase D, #32). `POST /v1/admin/reseal`
+    /// claims it with a compare-and-swap; a second POST while a job runs gets a
+    /// 409. The job is restart-safe by construction (predicate-driven paging), so
+    /// this flag lives only in memory — a crash mid-job leaves no lock to clear.
+    pub reseal_running: std::sync::atomic::AtomicBool,
+    /// Live progress of the current/last re-seal run (per-family
+    /// resealed/skipped/failed + last_error), surfaced by `GET /v1/admin/reseal`
+    /// alongside the authoritative live parity counts.
+    pub reseal_status: Mutex<crate::reseal::ResealStatus>,
 }
 
 pub type AppState = Arc<AppStateInner>;
