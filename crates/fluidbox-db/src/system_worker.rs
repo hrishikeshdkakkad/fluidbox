@@ -90,7 +90,10 @@
 //!   yet); `get_org_by_slug`, `list_orgs`, `active_idp_config` (pre-auth login
 //!   routing — slug → org → active IdP, before any principal); `claim_login_flow`,
 //!   `claim_pending_switch` (browser-bound one-time claims); `resolve_web_session`,
-//!   `resolve_pat` (cookie/PAT digest resolution).
+//!   `resolve_pat` (cookie/PAT digest resolution); `insert_audit_standalone` — ONLY
+//!   on its `tenant_id: None` branch, which is a DEPLOYMENT-level operator row that
+//!   belongs to no tenant (a rejected login, an admin refusal, a re-seal run); the
+//!   `Some(tenant)` branch is scoped like any other write.
 //! * **everything in this module**, including the two `pub` tx hand-outs.
 //!
 //! Anything NOT on that list is scoped, and adding to it is a review event. The
