@@ -16,6 +16,7 @@
 use crate::error::{ApiError, ApiResult};
 use crate::harness;
 use crate::ledger;
+use crate::llm_keys;
 use crate::state::AppState;
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -96,6 +97,36 @@ fn dialect_error(dialect: Dialect, status: StatusCode, message: &str) -> Respons
     };
     Response::builder()
         .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// A 503 facade refusal carrying a STABLE machine-readable `code`
+/// (`tenant_llm_key_unavailable` / `tenant_llm_keys_required`), dialect-shaped so
+/// the runner SDK still parses it. The code rides the dialect's machine-readable
+/// slot (Anthropic `error.type`, OpenAI `error.code`) AND the message, so a
+/// consumer keys on it regardless of dialect. This is the D7 fail-closed exit: a
+/// tenant-key resolution failure, or the forbidden SSO+shared posture, stops the
+/// call cold — NEVER a fallback to the shared/master key.
+fn facade_refusal(dialect: Dialect, code: &str, message: &str) -> Response {
+    let full = format!("{message} ({code})");
+    let body = match dialect {
+        Dialect::Anthropic => json!({
+            "type": "error",
+            "error": { "type": code, "message": full }
+        }),
+        Dialect::OpenAi => json!({
+            "error": {
+                "message": full,
+                "type": "invalid_request_error",
+                "param": null,
+                "code": code
+            }
+        }),
+    };
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()
@@ -380,6 +411,42 @@ pub async fn messages(
         suffix
     );
 
+    // Resolve the outbound credential ONCE, before dialect dispatch (D7). Shared
+    // mode presents the deployment key (today's behavior, now explicit); tenant
+    // mode resolves/mints the session tenant's LiteLLM virtual key so the master
+    // key never rides a model request; SSO+shared is the forbidden hosted posture.
+    // Every failure is fail-closed — a 503 with a stable code, NEVER the master
+    // key as a fallback.
+    let upstream_key: String = match llm_keys::key_source(
+        state.cfg.llm_key_mode,
+        state.cfg.require_sso,
+    ) {
+        llm_keys::KeySource::Shared => state.cfg.llm_upstream_key.clone(),
+        llm_keys::KeySource::Tenant => {
+            match llm_keys::ensure_tenant_key(&state, sess_auth.tenant_id).await {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::warn!(
+                        "facade: tenant LLM key unavailable for tenant {}: {e}",
+                        sess_auth.tenant_id
+                    );
+                    return Ok(facade_refusal(
+                        dialect,
+                        "tenant_llm_key_unavailable",
+                        "the tenant's LLM key could not be provisioned",
+                    ));
+                }
+            }
+        }
+        llm_keys::KeySource::RefuseSsoShared => {
+            return Ok(facade_refusal(
+                dialect,
+                "tenant_llm_keys_required",
+                "this deployment requires per-tenant LLM keys (set FLUIDBOX_LLM_KEY_MODE=tenant)",
+            ));
+        }
+    };
+
     let mut req = state.http.post(&upstream).body(upstream_body);
     req = req.header("content-type", "application/json");
     match dialect {
@@ -397,22 +464,16 @@ pub async fn messages(
                 req = req.header("anthropic-beta", b);
             }
             if state.cfg.llm_upstream_is_anthropic {
-                req = req.header("x-api-key", &state.cfg.llm_upstream_key);
+                req = req.header("x-api-key", &upstream_key);
             } else {
                 req = req
-                    .header(
-                        "authorization",
-                        format!("Bearer {}", state.cfg.llm_upstream_key),
-                    )
-                    .header("x-api-key", &state.cfg.llm_upstream_key);
+                    .header("authorization", format!("Bearer {upstream_key}"))
+                    .header("x-api-key", &upstream_key);
             }
         }
         Dialect::OpenAi => {
             // Bearer only — the OpenAI dialect never sees x-api-key.
-            req = req.header(
-                "authorization",
-                format!("Bearer {}", state.cfg.llm_upstream_key),
-            );
+            req = req.header("authorization", format!("Bearer {upstream_key}"));
         }
     }
 
@@ -845,6 +906,33 @@ impl OpenAiAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn facade_refusal_is_503_with_machine_code_per_dialect() {
+        // Both D7 refusal codes, both dialects: status 503, code in the dialect's
+        // machine-readable slot AND the message (never the master key as fallback).
+        for (dialect, code) in [
+            (Dialect::Anthropic, "tenant_llm_keys_required"),
+            (Dialect::OpenAi, "tenant_llm_key_unavailable"),
+        ] {
+            let resp = facade_refusal(dialect, code, "nope");
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&bytes).unwrap();
+            match dialect {
+                Dialect::Anthropic => {
+                    assert_eq!(v["type"], "error");
+                    assert_eq!(v["error"]["type"], code);
+                }
+                Dialect::OpenAi => {
+                    assert_eq!(v["error"]["code"], code);
+                }
+            }
+            assert!(v["error"]["message"].as_str().unwrap().contains(code));
+        }
+    }
 
     #[test]
     fn suffix_allowlist_is_exact_per_dialect() {

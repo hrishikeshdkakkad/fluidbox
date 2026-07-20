@@ -391,6 +391,38 @@ async fn reject_audit(
     .await;
 }
 
+/// Audit an ACCEPTED operator mutation that has no in-transaction audit of its
+/// own. Most `/v1/admin/orgs*` mutations audit inside their identity transaction;
+/// the LLM-key rotate touches LiteLLM + the sealed `tenant_llm_keys` row (no
+/// identity tx), so it records its success here. Best effort, mirrors
+/// [`reject_audit`]'s shape.
+async fn accept_audit(
+    state: &AppState,
+    tenant_id: Uuid,
+    source_ip: Option<&str>,
+    action: &str,
+    target: &str,
+) {
+    let Ok(mut conn) = state.pool.acquire().await else {
+        return;
+    };
+    let _ = identity::insert_audit(
+        &mut conn,
+        identity::AuditEntry {
+            tenant_id: Some(tenant_id),
+            actor_kind: "operator",
+            actor_id: None,
+            source_ip,
+            request_id: None,
+            action,
+            target: Some(target),
+            success: true,
+            detail: None,
+        },
+    )
+    .await;
+}
+
 /// Audit an authorized-but-unfulfillable request that resolves to a missing
 /// target (a `LifecycleOutcome::NotFound`, or a config/membership that does not
 /// exist under this tenant) and return the 404. A terse reason, no body echo —
@@ -514,7 +546,22 @@ pub async fn create_org(
     )
     .await?
     {
-        identity::CreateOrgOutcome::Created(org) => Ok(Json(json!({ "org": org }))),
+        identity::CreateOrgOutcome::Created(org) => {
+            // Eager, best-effort LiteLLM virtual-key mint (tenant mode only): warm
+            // the new tenant's key so its first model call doesn't pay the mint
+            // latency. A failure is non-fatal — the lazy facade path
+            // (`llm_keys::ensure_tenant_key`) provisions on first use — so it only
+            // warns and never fails org creation (design D7 resolution 5).
+            if state.cfg.llm_key_mode == crate::config::LlmKeyMode::Tenant {
+                if let Err(e) = crate::llm_keys::ensure_tenant_key(&state, org.id).await {
+                    tracing::warn!(
+                        "eager LLM virtual-key mint for new org {} failed (lazy path will retry): {e}",
+                        org.id
+                    );
+                }
+            }
+            Ok(Json(json!({ "org": org })))
+        }
         identity::CreateOrgOutcome::SlugConflict => {
             reject_audit(
                 &state,
@@ -535,6 +582,28 @@ pub async fn create_org(
 pub async fn list_orgs(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let orgs = identity::list_orgs(&state.pool).await?;
     Ok(Json(json!({ "orgs": orgs })))
+}
+
+/// `POST /v1/admin/orgs/{slug}/llm-key/rotate` — rotate a tenant's LiteLLM virtual
+/// key (operator only; Phase D, #32). Mints a fresh key, swaps the sealed row,
+/// evicts+re-seeds the cache, and best-effort retires the old key at LiteLLM. 404
+/// on an unknown org; a provisioning failure surfaces as 502/503. Never returns
+/// the key — the response is `{"rotated": true}`.
+pub async fn rotate_llm_key(
+    _: Admin,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(slug): Path<String>,
+    State(state): State<AppState>,
+) -> ApiResult<Json<Value>> {
+    let sip = source_ip(&headers, peer, state.cfg.trust_forwarded_for);
+    let action = "org.llm_key.rotate";
+    let org = resolve_org_audited(&state, sip.as_deref(), action, &slug).await?;
+    if let Err(e) = crate::llm_keys::rotate_tenant_key(&state, org.id).await {
+        return Err(refuse(&state, org.id, sip.as_deref(), action, Some(&slug), e).await);
+    }
+    accept_audit(&state, org.id, sip.as_deref(), action, &slug).await;
+    Ok(Json(json!({ "rotated": true })))
 }
 
 // ─── IdP configs ──────────────────────────────────────────────────────────────

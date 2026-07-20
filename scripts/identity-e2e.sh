@@ -190,6 +190,10 @@ start_server() {
     # peer is authoritative and every curl would share one bucket and trip.
     export FLUIDBOX_TRUST_FORWARDED_FOR=1
     export FLUIDBOX_REQUIRE_SSO="$require_sso"
+    # Phase D (#32): the default (shared) LLM key mode refuses to boot on an EMPTY
+    # upstream key. This suite boots keyless and makes NO model calls, so a
+    # non-empty placeholder is all the empty-key boot gate needs.
+    export LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-sk-fbx-ci-placeholder}"
     export RUST_LOG="${RUST_LOG:-warn,fluidbox_server=info}"
     if [ -n "${FLUIDBOX_SERVER_BIN:-}" ] && [ -x "${FLUIDBOX_SERVER_BIN}" ]; then
       exec "$FLUIDBOX_SERVER_BIN"

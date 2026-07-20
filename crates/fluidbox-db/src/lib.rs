@@ -1979,6 +1979,127 @@ pub async fn connection_webhook_secret_sealed(
     }))
 }
 
+// ─── Per-tenant LiteLLM virtual keys (Phase D, #32) ───────────────────────
+
+/// The outcome of an insert-or-adopt of a tenant's virtual key: the winning row's
+/// sealed bytes + companion version, and whether OUR insert is the one that
+/// persisted. A mint race (two concurrent first-uses) resolves here — one insert
+/// wins, the loser reads `we_won = false` + the winner's sealed key to adopt.
+pub struct TenantLlmKeyInsert {
+    pub sealed: Vec<u8>,
+    pub key_version: i16,
+    pub we_won: bool,
+}
+
+/// Read a tenant's sealed virtual key + companion version. `None` = not yet
+/// minted. Tenant-scoped: keyed on the scope's tenant (the table's PK).
+pub async fn tenant_llm_key_sealed(
+    pool: &PgPool,
+    scope: TenantScope,
+) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
+    let row: Option<(Vec<u8>, i16)> = sqlx::query_as(
+        "select litellm_key_sealed, litellm_key_key_version from tenant_llm_keys
+         where tenant_id = $1",
+    )
+    .bind(scope.tenant_id())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Insert a tenant's freshly minted+sealed virtual key, or adopt the winner of a
+/// mint race. `ON CONFLICT (tenant_id) DO NOTHING RETURNING` tells us whether our
+/// row persisted; on a conflict we re-read the winner's sealed key so the caller
+/// can adopt it (and drop its own orphaned LiteLLM key). Tenant-scoped by the PK.
+pub async fn insert_tenant_llm_key(
+    pool: &PgPool,
+    scope: TenantScope,
+    sealed: &[u8],
+    key_version: i16,
+    key_alias: &str,
+    litellm_token_id: Option<&str>,
+) -> sqlx::Result<TenantLlmKeyInsert> {
+    let tenant_id = scope.tenant_id();
+    let inserted: Option<(Vec<u8>, i16)> = sqlx::query_as(
+        "insert into tenant_llm_keys
+           (tenant_id, litellm_key_sealed, litellm_key_key_version, key_alias, litellm_token_id)
+         values ($1, $2, $3, $4, $5)
+         on conflict (tenant_id) do nothing
+         returning litellm_key_sealed, litellm_key_key_version",
+    )
+    .bind(tenant_id)
+    .bind(sealed)
+    .bind(key_version)
+    .bind(key_alias)
+    .bind(litellm_token_id)
+    .fetch_optional(pool)
+    .await?;
+    if let Some((s, v)) = inserted {
+        return Ok(TenantLlmKeyInsert {
+            sealed: s,
+            key_version: v,
+            we_won: true,
+        });
+    }
+    // Conflict: another minter won. Re-read the winner's sealed key to adopt.
+    let (s, v): (Vec<u8>, i16) = sqlx::query_as(
+        "select litellm_key_sealed, litellm_key_key_version from tenant_llm_keys
+         where tenant_id = $1",
+    )
+    .bind(tenant_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(TenantLlmKeyInsert {
+        sealed: s,
+        key_version: v,
+        we_won: false,
+    })
+}
+
+/// Swap a tenant's sealed virtual key for a freshly minted one (rotation),
+/// bumping `rotated_at`. Returns the OLD sealed bytes + version so the caller can
+/// retire the old key at LiteLLM; `None` = the tenant had no prior key (this
+/// created it). Reads-old-then-upserts under a row lock so a concurrent rotate
+/// can't lose the old value it must delete. Tenant-scoped by the PK.
+pub async fn rotate_tenant_llm_key(
+    pool: &PgPool,
+    scope: TenantScope,
+    sealed: &[u8],
+    key_version: i16,
+    key_alias: &str,
+    litellm_token_id: Option<&str>,
+) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
+    let tenant_id = scope.tenant_id();
+    let mut tx = pool.begin().await?;
+    let old: Option<(Vec<u8>, i16)> = sqlx::query_as(
+        "select litellm_key_sealed, litellm_key_key_version from tenant_llm_keys
+         where tenant_id = $1 for update",
+    )
+    .bind(tenant_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    sqlx::query(
+        "insert into tenant_llm_keys
+           (tenant_id, litellm_key_sealed, litellm_key_key_version, key_alias, litellm_token_id)
+         values ($1, $2, $3, $4, $5)
+         on conflict (tenant_id) do update set
+           litellm_key_sealed = excluded.litellm_key_sealed,
+           litellm_key_key_version = excluded.litellm_key_key_version,
+           key_alias = excluded.key_alias,
+           litellm_token_id = excluded.litellm_token_id,
+           rotated_at = now()",
+    )
+    .bind(tenant_id)
+    .bind(sealed)
+    .bind(key_version)
+    .bind(key_alias)
+    .bind(litellm_token_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(old)
+}
+
 // ─── GitHub App registrations & flows (Phase 5.6) ─────────────────────────
 
 /// The App identity created via GitHub's manifest flow. Secrets (pem,
@@ -9613,10 +9734,11 @@ mod tests {
         TenantScope::assume(org.id)
     }
 
-    // Children-first cleanup (tenant FKs are NO ACTION): tenant_deks +
-    // integration_connections before the tenant row.
+    // Children-first cleanup (tenant FKs are NO ACTION): tenant_llm_keys +
+    // tenant_deks + integration_connections before the tenant row.
     async fn cleanup_dek_tenant(pool: &PgPool, tenant: Uuid) {
         for stmt in [
+            "delete from tenant_llm_keys where tenant_id = $1",
             "delete from tenant_deks where tenant_id = $1",
             "delete from integration_connections where tenant_id = $1",
             "delete from tenants where id = $1",
@@ -9847,29 +9969,32 @@ mod tests {
         let tbl = "integration_connections";
         let col = "credential_sealed";
         let ver = "credential_key_version";
+        let key = "id"; // integration_connections is keyed by id
 
         // Keyset cursor: `id > after` is exclusive. After ids[0], a large page
         // includes ids[1]/ids[2] but never ids[0].
-        let after0 = crate::system_worker::reseal_candidate_ids(&pool, tbl, col, ver, ids[0], 1000)
-            .await
-            .unwrap();
+        let after0 =
+            crate::system_worker::reseal_candidate_ids(&pool, tbl, col, ver, key, ids[0], 1000)
+                .await
+                .unwrap();
         assert!(!after0.contains(&ids[0]), "cursor is exclusive");
         assert!(after0.contains(&ids[1]) && after0.contains(&ids[2]));
         // After the last id, none of ours can appear (all <= ids[2]).
         let after_last =
-            crate::system_worker::reseal_candidate_ids(&pool, tbl, col, ver, ids[2], 1000)
+            crate::system_worker::reseal_candidate_ids(&pool, tbl, col, ver, key, ids[2], 1000)
                 .await
                 .unwrap();
         assert!(ids.iter().all(|i| !after_last.contains(i)));
         // `limit` caps the page (≥1 v1 row exists past ids[0] — ids[1]).
-        let capped = crate::system_worker::reseal_candidate_ids(&pool, tbl, col, ver, ids[0], 1)
-            .await
-            .unwrap();
+        let capped =
+            crate::system_worker::reseal_candidate_ids(&pool, tbl, col, ver, key, ids[0], 1)
+                .await
+                .unwrap();
         assert_eq!(capped.len(), 1, "limit bounds the page");
 
         // Lock + read one row inside a tx, then CAS the v2 bytes in.
         let mut tx = pool.begin().await.unwrap();
-        let locked = crate::system_worker::reseal_lock_row(&mut tx, tbl, col, ver, ids[0])
+        let locked = crate::system_worker::reseal_lock_row(&mut tx, tbl, col, ver, key, ids[0])
             .await
             .unwrap()
             .expect("row exists");
@@ -9880,10 +10005,17 @@ mod tests {
             Some(tenant),
             "carries the row's tenant for the seal ctx (Some for a tenant-owned family)"
         );
-        let affected =
-            crate::system_worker::reseal_write_row(&mut tx, tbl, col, ver, ids[0], b"v2-bytes")
-                .await
-                .unwrap();
+        let affected = crate::system_worker::reseal_write_row(
+            &mut tx,
+            tbl,
+            col,
+            ver,
+            key,
+            ids[0],
+            b"v2-bytes",
+        )
+        .await
+        .unwrap();
         assert_eq!(affected, 1, "CAS flips 1 → 2");
         tx.commit().await.unwrap();
 
@@ -9899,21 +10031,140 @@ mod tests {
         // A second CAS on the now-v2 row is a no-op (a concurrent writer already
         // moved it off v1) — 0 rows, the caller counts it as skipped.
         let mut tx2 = pool.begin().await.unwrap();
-        let noop =
-            crate::system_worker::reseal_write_row(&mut tx2, tbl, col, ver, ids[0], b"v2-again")
-                .await
-                .unwrap();
+        let noop = crate::system_worker::reseal_write_row(
+            &mut tx2,
+            tbl,
+            col,
+            ver,
+            key,
+            ids[0],
+            b"v2-again",
+        )
+        .await
+        .unwrap();
         assert_eq!(noop, 0, "CAS no-op when the row already left v1");
         tx2.commit().await.unwrap();
 
         // The re-sealed row drops out of the candidate predicate; the other two
         // remain (idempotent restart-safety: re-scans skip finished rows).
-        let remaining =
-            crate::system_worker::reseal_candidate_ids(&pool, tbl, col, ver, Uuid::nil(), 1000)
-                .await
-                .unwrap();
+        let remaining = crate::system_worker::reseal_candidate_ids(
+            &pool,
+            tbl,
+            col,
+            ver,
+            key,
+            Uuid::nil(),
+            1000,
+        )
+        .await
+        .unwrap();
         assert!(!remaining.contains(&ids[0]));
         assert!(remaining.contains(&ids[1]) && remaining.contains(&ids[2]));
+
+        cleanup_dek_tenant(&pool, tenant).await;
+    }
+
+    // Per-tenant LiteLLM virtual keys (Task 5): insert-or-adopt + rotate row
+    // semantics, with ARBITRARY bytes (the crypto roundtrip is server-side).
+    #[tokio::test]
+    async fn tenant_llm_key_insert_adopt_and_rotate() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let scope = new_dek_org(&pool).await;
+        let tenant = scope.tenant_id();
+
+        // Not minted yet.
+        assert!(tenant_llm_key_sealed(&pool, scope).await.unwrap().is_none());
+
+        // First insert wins and returns our sealed bytes.
+        let first = insert_tenant_llm_key(
+            &pool,
+            scope,
+            b"sealed-v1-a",
+            1,
+            "fbx-tenant-x",
+            Some("tok-a"),
+        )
+        .await
+        .unwrap();
+        assert!(first.we_won, "first insert wins");
+        assert_eq!(first.sealed, b"sealed-v1-a");
+        assert_eq!(first.key_version, 1);
+        assert_eq!(
+            tenant_llm_key_sealed(&pool, scope).await.unwrap().unwrap(),
+            (b"sealed-v1-a".to_vec(), 1)
+        );
+
+        // A racing second insert loses (ON CONFLICT DO NOTHING) and ADOPTS the
+        // winner's sealed bytes — its own minted key would be orphaned.
+        let second = insert_tenant_llm_key(
+            &pool,
+            scope,
+            b"sealed-v1-b",
+            1,
+            "fbx-tenant-x",
+            Some("tok-b"),
+        )
+        .await
+        .unwrap();
+        assert!(!second.we_won, "second insert loses the race");
+        assert_eq!(second.sealed, b"sealed-v1-a", "adopts the winner's key");
+        // The stored row is unchanged (still the winner's).
+        assert_eq!(
+            tenant_llm_key_sealed(&pool, scope).await.unwrap().unwrap(),
+            (b"sealed-v1-a".to_vec(), 1)
+        );
+
+        // Rotate: returns the OLD sealed for LiteLLM cleanup, swaps in the new,
+        // bumps rotated_at, records the new companion version.
+        let old = rotate_tenant_llm_key(
+            &pool,
+            scope,
+            b"sealed-v2-c",
+            2,
+            "fbx-tenant-x",
+            Some("tok-c"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(old, Some((b"sealed-v1-a".to_vec(), 1)), "old key returned");
+        assert_eq!(
+            tenant_llm_key_sealed(&pool, scope).await.unwrap().unwrap(),
+            (b"sealed-v2-c".to_vec(), 2)
+        );
+        let rotated_at: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("select rotated_at from tenant_llm_keys where tenant_id = $1")
+                .bind(tenant)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(rotated_at.is_some(), "rotate bumps rotated_at");
+
+        cleanup_dek_tenant(&pool, tenant).await;
+    }
+
+    #[tokio::test]
+    async fn tenant_llm_key_rotate_creates_when_absent() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let scope = new_dek_org(&pool).await;
+        let tenant = scope.tenant_id();
+
+        // Rotate on a tenant with no key: nothing to delete (None), creates it.
+        let old = rotate_tenant_llm_key(&pool, scope, b"sealed-new", 2, "fbx-tenant-y", None)
+            .await
+            .unwrap();
+        assert_eq!(old, None, "no prior key to retire");
+        assert_eq!(
+            tenant_llm_key_sealed(&pool, scope).await.unwrap().unwrap(),
+            (b"sealed-new".to_vec(), 2)
+        );
 
         cleanup_dek_tenant(&pool, tenant).await;
     }

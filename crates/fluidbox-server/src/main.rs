@@ -18,6 +18,7 @@ mod harness;
 mod internal;
 mod kms;
 mod ledger;
+mod llm_keys;
 mod login;
 mod oauth;
 mod orchestrator;
@@ -153,6 +154,23 @@ async fn main() -> anyhow::Result<()> {
         }
         (Some(_), mode) => tracing::info!("credential sealing: KMS envelope ({mode:?})"),
     }
+    // Phase D (#32) LLM upstream-auth mode. In tenant mode the facade selects a
+    // per-tenant LiteLLM virtual key and the master key is confined to
+    // provisioning; shared mode presents the deployment key on every call.
+    match cfg.llm_key_mode {
+        config::LlmKeyMode::Shared => tracing::info!(
+            "LLM upstream auth: shared key (FLUIDBOX_LLM_KEY_MODE=shared)"
+        ),
+        config::LlmKeyMode::Tenant => tracing::info!(
+            "LLM upstream auth: per-tenant virtual keys (FLUIDBOX_LLM_KEY_MODE=tenant); master key confined to provisioning at {}",
+            cfg.llm_admin_url
+        ),
+    }
+    if cfg.require_sso && cfg.llm_key_mode == config::LlmKeyMode::Shared {
+        tracing::warn!(
+            "FLUIDBOX_REQUIRE_SSO=1 with FLUIDBOX_LLM_KEY_MODE=shared — the facade will refuse every model request (tenant_llm_keys_required); set FLUIDBOX_LLM_KEY_MODE=tenant for hosted deployments"
+        );
+    }
 
     let state: state::AppState = Arc::new(AppStateInner {
         tenant_id: seed.tenant_id,
@@ -171,6 +189,7 @@ async fn main() -> anyhow::Result<()> {
         sealer,
         connector_tokens: Default::default(),
         oauth_locks: Default::default(),
+        tenant_llm_keys: Default::default(),
         // Docker needs no netpol gate; Kubernetes starts unverified and the
         // worker below flips it once the CNI is proven to enforce policy.
         netpol_verified: std::sync::atomic::AtomicBool::new(!is_k8s),
@@ -281,6 +300,13 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/admin/orgs/{slug}/members/{membership_id}/roles",
             post(admin_orgs::set_member_roles),
+        )
+        // Rotate a tenant's LiteLLM virtual key (Phase D, #32): mint a fresh key,
+        // swap the sealed row, retire the old at LiteLLM. Operator-only; 404 on an
+        // unknown org; never returns the key.
+        .route(
+            "/admin/orgs/{slug}/llm-key/rotate",
+            post(admin_orgs::rotate_llm_key),
         )
         // Legacy→KMS re-seal (Phase D, #32): operator-only. POST starts the
         // background job (409 if already running / KMS off); GET reports live

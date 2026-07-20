@@ -207,3 +207,74 @@ same unwrap-from-persisted path. Run this drill after any KEK/key-policy change.
   Kubernetes). No KMS access is ever granted to a sandbox.
 - **`static` mode** is for local dev and CI only — it is a plaintext 32-byte key in
   the environment, not a managed KEK.
+
+---
+
+## 8. Per-tenant LiteLLM virtual keys
+
+> Phase D (#32). Companion code: `crates/fluidbox-server/src/llm_keys.rs`, `facade.rs`,
+> migration `0017_tenant_llm_keys.sql`. Same custody theme as the KEK above: confine a
+> privileged credential (here the LiteLLM **master key**) to a narrow provisioning
+> role so it never rides a routine request.
+
+Per-run budget stops in the facade do not provide tenant FAIRNESS on a shared
+gateway. `FLUIDBOX_LLM_KEY_MODE` selects how the facade authenticates each upstream
+model request:
+
+| `FLUIDBOX_LLM_KEY_MODE` | Facade behavior |
+|---|---|
+| `shared` (default) | Presents ONE deployment key (`LLM_UPSTREAM_URL`'s `LITELLM_MASTER_KEY`, or `ANTHROPIC_API_KEY` for the direct-Anthropic fallback) on every call. Today's behavior, now an explicit choice. |
+| `tenant` | Selects a per-tenant **LiteLLM virtual key** (one per tenant, minted on demand) from the authenticated session's tenant. The master key is used ONLY to mint/delete those virtual keys — **never on a routine model request** (design :1093). |
+
+Each tenant virtual key carries its own server-side spend/token/rate ceiling, so a
+noisy tenant cannot starve others on the shared gateway. It is the fairness
+**backstop**, not the per-run budget-race fix (durable reservations, Phase E).
+
+### The master-key confinement model
+
+- The virtual key is minted with `POST {admin}/key/generate` (master-key bearer),
+  sealed at rest (`tenant_llm_keys.litellm_key_sealed`, versioned + envelope-sealed
+  under the tenant's own DEK exactly like every §1 custody column), and cached
+  UNSEALED in memory. It is never returned in an API response and never enters a
+  sandbox (the facade swaps it in upstream, the same inversion as git fetch / the
+  KEK broker).
+- The forbidden act — a routine model request on a shared key in a HOSTED
+  deployment — is refused AT THE FACADE: `FLUIDBOX_REQUIRE_SSO=1` + `shared` mode ⇒
+  every facade call returns `503 tenant_llm_keys_required`. Set
+  `FLUIDBOX_LLM_KEY_MODE=tenant` for hosted deployments.
+- Boot fails closed on an incoherent config: `shared` mode with an EMPTY resolved
+  upstream key (kills the old silent empty-key boot), `tenant` mode without
+  `LITELLM_MASTER_KEY`, or `tenant` mode against a direct-Anthropic upstream
+  (virtual keys are a LiteLLM feature; direct Anthropic cannot mint them).
+
+### Deployment prerequisite — LiteLLM needs its OWN Postgres
+
+**`tenant` mode requires the LiteLLM proxy to be backed by its own Postgres**
+(`DATABASE_URL` + `store_model_in_db`), because the `/key/*` CRUD is a
+Postgres-backed LiteLLM feature. **None of the current deployments wire this** — the
+dev compose (`deploy/docker-compose.dev.yml`), the eval compose, and the Helm chart
+all run LiteLLM without a database. Wiring a Postgres to the LiteLLM container (a
+DEDICATED LiteLLM database — never the fluidbox app DB; LiteLLM manages its own
+schema) is a hard prerequisite before enabling `tenant` mode. The local default
+stays `shared` (zero deployment churn).
+
+### Config knobs (all optional; serialized into `/key/generate` only when set)
+
+| Env | Meaning |
+|---|---|
+| `FLUIDBOX_LLM_KEY_MODE` | `shared` (default) \| `tenant`. |
+| `FLUIDBOX_LLM_ADMIN_URL` | LiteLLM admin base for `/key/*`. Defaults to `LLM_UPSTREAM_URL`. |
+| `FLUIDBOX_LLM_TENANT_MODELS` | CSV model allowlist for the virtual key. |
+| `FLUIDBOX_LLM_TENANT_MAX_BUDGET` | USD spend cap (f64). |
+| `FLUIDBOX_LLM_TENANT_BUDGET_DURATION` | Budget window, e.g. `30d`. |
+| `FLUIDBOX_LLM_TENANT_TPM` / `_RPM` | Tokens/requests-per-minute ceilings (i64). |
+
+A key is minted lazily on a tenant's first model call and eagerly (best-effort) at
+org creation; a mint failure is non-fatal (the lazy path retries).
+
+### Rotation
+
+`POST /v1/admin/orgs/{slug}/llm-key/rotate` (operator only): mints a fresh virtual
+key, swaps the sealed row (bumping `rotated_at`), evicts + re-seeds the in-memory
+cache, and best-effort deletes the old key at LiteLLM. Returns `{"rotated": true}` —
+never the key. 404 on an unknown org.

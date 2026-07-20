@@ -84,6 +84,22 @@ litellm:
 llm:
   upstreamUrl: ""      # e.g. http://litellm.example:4000 ; empty + litellm.enabled uses the bundled one
   # The facade authenticates upstream with LITELLM_MASTER_KEY from the Secret.
+  #
+  # Per-tenant LiteLLM virtual keys (Phase D, #32; docs/hosted/kms-operations.md §8).
+  # Default `shared` = today's behavior (facade presents LITELLM_MASTER_KEY on every
+  # call). `tenant` = per-tenant virtual keys; the master key is confined to
+  # provisioning (/key/generate|delete). To enable tenant mode, wire these into the
+  # server env (server.yaml) and back the LiteLLM proxy with its OWN Postgres (a
+  # DEDICATED LiteLLM database — /key/* is a Postgres-backed LiteLLM feature; NOT
+  # wired in this chart today, and never the fluidbox app DB):
+  # keyMode: shared            # shared | tenant
+  # adminUrl: ""               # FLUIDBOX_LLM_ADMIN_URL; defaults to upstreamUrl
+  # tenant:
+  #   models: []               # FLUIDBOX_LLM_TENANT_MODELS (CSV) — virtual-key allowlist
+  #   maxBudget: ""            # FLUIDBOX_LLM_TENANT_MAX_BUDGET (USD)
+  #   budgetDuration: ""       # FLUIDBOX_LLM_TENANT_BUDGET_DURATION, e.g. 30d
+  #   tpm: ""                  # FLUIDBOX_LLM_TENANT_TPM
+  #   rpm: ""                  # FLUIDBOX_LLM_TENANT_RPM
 
 ingress:
   enabled: false
