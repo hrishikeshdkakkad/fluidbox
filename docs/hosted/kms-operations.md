@@ -373,10 +373,15 @@ a pooled connection never leaks context:
 - `fluidbox.bypass = 'system_worker'` (`worker_tx`) ⇒ the audited cross-tenant
   bypass — the category rides IN the GUC value, one grep-able choke point. `worker_tx`
   is `pub(crate)`, so the server crate cannot assemble a bypass ad-hoc; it reaches one
-  only through a NAMED `fluidbox-db::system_worker` function. A couple of those
-  (`reseal_begin`, `global_registration_tx`) are `pub` and deliberately hand out a
-  bypass-armed transaction, because their callers drive a multi-statement critical
-  section. The property is "a short, named, grep-able set of escape hatches", not
+  only through a NAMED, `pub` `fluidbox-db` entry point. **Most, but not all, of those
+  live in `system_worker`**: `reseal_begin` and `global_registration_tx` are `pub` and
+  deliberately hand out a bypass-armed transaction (their callers drive a
+  multi-statement critical section), and outside that module
+  `identity::insert_audit_standalone` is `pub` and takes the bypass path whenever
+  `entry.tenant_id` is `None` (deployment-level audit rows — see the audit paragraph
+  below). Treat the inventory in the `fluidbox-db::system_worker` module docs as the
+  authority and keep it complete; "only `system_worker`" is a slogan, not the
+  boundary. The property is "a short, named, grep-able set of escape hatches", not
   "unreachable";
 - neither set ⇒ zero rows on a policy'd table.
 
@@ -449,11 +454,22 @@ install applied 0018, `FORCE`d it, and skipped every policy — a later missing
 - **The gate is fatal ONLY under `FLUIDBOX_REQUIRE_SSO=1`.** Single-user mode warns
   and names what will happen when SSO is turned on; a clean pool logs an INFO
   confirming enforcement.
-- `just doctor` runs the same query against the `DATABASE_URL` role (it cannot see
-  the pool's `SET ROLE`). It **fails** — not warns — when `.env` combines
-  `FLUIDBOX_REQUIRE_SSO=1` with a bypassing role, no `FLUIDBOX_RUNTIME_ROLE`, and no
-  `FLUIDBOX_ALLOW_RLS_BYPASS`: that deployment cannot boot, so a green preflight
-  would be a lie. Every other combination stays a warning.
+- `just doctor` asks the same question about the same role. With
+  `FLUIDBOX_RUNTIME_ROLE` set it validates **that** role — name shape, existence,
+  and boot's posture refusals (unsafe attributes, memberships in either direction)
+  — then reads `current_user`'s attributes behind a `SET ROLE` inside a rolled-back
+  transaction, which is exactly the pool's effective role. Unset (single-role mode)
+  it reads the `DATABASE_URL` role. It **fails** — not warns — for every state boot
+  refuses: a runtime role that is missing, unsafe, un-`SET ROLE`-able, or bypassing
+  (that last one is fatal in *every* mode, because `connect()` posture-validates the
+  runtime role before `FLUIDBOX_ALLOW_RLS_BYPASS` is ever consulted); and, in
+  single-role mode, `FLUIDBOX_REQUIRE_SSO=1` + a bypassing role + no
+  `FLUIDBOX_ALLOW_RLS_BYPASS`. Every other combination stays a warning.
+  <br>Until #32 it inspected only the `DATABASE_URL` role, which misreported in
+  both directions: a Neon `BYPASSRLS` owner plus a correctly configured runtime
+  role — an ENFORCING deployment — was reported inert with a fix that was already
+  applied, and an RLS-bound owner whose configured runtime role was absent or
+  unsafe — a REFUSED boot — was reported safe.
 
 ### The runtime role (`FLUIDBOX_RUNTIME_ROLE`; chart default `fluidbox_runtime`)
 

@@ -119,7 +119,7 @@ Statuses: **shipped** = enforced on `main` today (`shipped (Phase B)`/`shipped (
 | Replayed webhook duplicates fan-out | Two DB-unique dedup levels bound to the session insert in one transaction — retries heal, never duplicate | shipped |
 | Login CSRF / forced login into an attacker's session | Session replacement is never silent: `pending_login_switches` one-time browser-bound confirmation (cookie hash inside the claim predicate, 120 s expiry, current-session equality in the predicate) | shipped (Phase B) |
 | Replayed / attacker-completed OAuth or login callback | One-time server-side state rows; a per-flow `HttpOnly` `__Host-fbx_oauth_flow` cookie whose sha256 sits inside the atomic single-use claim predicate — a leaked authorization URL can neither complete nor burn a flow. Connector OAuth (invariant 20) freezes its full binding set into the `connector_oauth_flows` row at start — authorization/token endpoints, resolved client, `resource`, sealed PKCE verifier, and the connection's `authorization_generation` — and the callback exchanges against the frozen row (closing AS mix-up) and refuses a moved generation; the GitHub App and login flows use the same one-time cookie-hash claim mechanism with their own, flow-appropriate binding sets | shipped (GitHub App, login; connector OAuth Phase D, invariant 20) |
-| Cross-user grant injection (victim's consent seals into attacker's connection) | The completing browser must prove it started the flow — the same `__Host-fbx_oauth_flow` cookie-hash predicate binds consent to the initiating browser (shipped). A displayed connected-account confirmation before activation is NOT built — the callback activates directly (see the go-URL-lure residual below) | shipped (Phase D — browser binding); account-confirmation display deferred |
+| Cross-user grant injection (victim's consent seals into attacker's connection) | The completing browser must prove it started the flow — the `__Host-fbx_oauth_flow` cookie-hash predicate sits inside the one-time claim, so a *leaked* authorization URL can neither complete nor burn a flow (shipped). It does NOT stop a **transferable `go_url`**: the `/go` boot token carries the cookie plaintext, so whichever browser opens the link *becomes* the initiating browser. The callback then activates directly, with no connected-account confirmation — and a confirmation only helps under the conditions spelled out in the [residual below](#residual-detail--the-transferable-connector-oauth-go_url) | partially shipped (Phase D — leaked-URL binding); **transferable-`go_url` lure OPEN** |
 | CSRF against cookie-authenticated APIs | Custom header + `Origin` check on every cookie-authenticated non-GET; `CorsLayer::permissive()` removed in the same change; GET writes limited to the enumerated protocol-forced flows, each with its own one-time claims | shipped (Phase B) |
 | SSRF via crafted endpoints, discovery documents, redirects, or DNS rebinding | Admission address-class rules enforced at resolution time on every fetch; redirect re-validation; egress proxy | **Phase E** (Gap 7); policy stated now in the [admission policy](connector-admission-policy.md) |
 | Amplification via unauthenticated login/callback endpoints | Rate limits per IP and per org; caps on outstanding unconsumed flows; flow claims commit before any IdP I/O so slow IdPs cannot hold DB connections | shipped (Phase B) |
@@ -175,8 +175,59 @@ A compromised org IdP mints valid identities **for that organization only** — 
 | **VPC CNI standard-mode pod-start window** (EKS): a just-created pod is briefly fail-open until the node agent programs its eBPF rules | Observed live on EKS; strict mode is worse (it starves system pods). No duration or ordering guarantee relative to runner startup is claimed — the boot gate and long-lived probes are the authoritative enforcement signals, and the shipped isolation row above is qualified by this window |
 | **Result delivery is at-least-once** | Receivers dedup on `x-fluidbox-delivery`; provider idempotency / deterministic markers cover the crash window between remote creation and recording |
 | **Pre-Phase-C in-flight runs use the legacy broker path**: a run created before the Phase C cutover froze no `run_resource_bindings` row, so its brokered calls resolve the `connection_id` embedded in the RunSpec and recheck only live status — not authorization generation or owner membership | Bounded and self-draining: only runs already in flight at the cutover; historical RunSpecs are never rewritten; every new run freezes bindings and gets the full status+generation+membership recheck, and a revision still pinning a brokered bundle is refused at creation, so no new legacy-path run can start |
+| **Transferable connector-OAuth `go_url`**: an attacker starts Connect on their OWN pending connection and sends the returned `go_url` to a victim; the victim's browser is bound as "the initiating browser", the victim consents at the authorization server, and the victim's refresh grant seals into the ATTACKER's connection | Requires a social step against a signed-in target and yields an attacker-held connection to the victim's account, not the reverse. The shipped binding removes the passive variants (a leaked or replayed authorization URL, a replayed callback, an attacker-completed callback). Detail, and the closure path, below |
 
 Not a residual: the **approval `approval.decided` double-emission** inside one process is a *current known defect* with an assigned fix — the transactional outbox in the Phase E statelessness work (Gap 13) — not an accepted post-mitigation risk.
+
+### Residual detail — the transferable connector-OAuth `go_url`
+
+**Correction (2026-07-20, #32).** Earlier revisions of this document and of
+`CLAUDE.md` recorded this residual as closed by the deferred "connected-account
+confirmation before activation" UI. That was wrong as stated, and the correction
+matters because it changes what has to be built:
+
+> A connected-account confirmation closes the transferable-`go_url` lure ONLY if it
+> gives the EXTERNAL ACCOUNT HOLDER informed consent — i.e. it is shown to the
+> browser COMPLETING the flow, or it binds an expected external subject captured at
+> start. A confirmation shown to the flow's INITIATOR closes nothing: in the lure
+> the initiator IS the attacker, who would simply confirm the victim's account.
+
+**Why the binding does not already stop it.** The `/go` boot token is AEAD-sealed
+but *transferable*: it carries the flow-cookie plaintext (`c`), and the `/go` page
+is what sets `__Host-fbx_oauth_flow`. Anyone who opens the link therefore becomes
+the initiating browser. The cookie predicate defeats a *leaked authorization URL*
+(the AS leg), not a *deliberately shared start URL*.
+
+**Why the obvious fixes do not work.** `__Host-` cookies are host-locked, and in
+`FLUIDBOX_WEB_MODE=sso` the dashboard proxy hands each `Set-Cookie` back to the
+browser — so the session cookie lives on the DASHBOARD origin while
+`/v1/oauth/go` and `/v1/oauth/callback` live on the CONTROL-PLANE origin. Both
+one-line fixes die on that split: the control plane cannot see the session cookie
+at `/go` (which is why the flow cookie is minted there rather than at the
+authenticated start), and a flow cookie set on the authenticated start would be
+stored against the dashboard origin and never sent to a control-plane callback.
+Whichever end you move the cookie to, the callback has to move with it.
+
+**Known closure path (proposed, NOT built).** Move the browser-facing leg onto the
+origin that already holds the session:
+
+1. make the browser-facing OAuth callback URI **configurable** (today it is
+   derived from `FLUIDBOX_PUBLIC_URL` as `/v1/oauth/callback`);
+2. in hosted mode place it on the **dashboard origin**, behind the existing
+   same-origin proxy;
+3. set the HttpOnly flow cookie on the **authenticated start response** — where the
+   browser stores it against the dashboard origin, bound to the session that
+   started the flow;
+4. have the authorization server redirect to that dashboard-origin proxy callback,
+   which forwards the cookie to the control plane;
+5. **drop `c` from the `/go` token**, so the start URL stops being a bearer of the
+   browser binding;
+6. keep today's control-plane callback for direct/local deployments.
+
+Cost: a dashboard-proxy cookie-allowlist change and a **registered** dashboard
+callback URI at every authorization server (a redirect-URI change is an
+operational event for pre-registered clients). Not scheduled here — recorded so the
+follow-up starts from the real mechanism rather than from the confirmation UI.
 
 ## Gap register
 
