@@ -27,8 +27,10 @@ use crate::auth::Principal;
 use crate::error::{ApiError, ApiResult};
 use crate::seal::{SealCtx, SealFamily, Sealer};
 use crate::state::AppState;
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::response::Html;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::Response;
 use axum::Json;
 use chrono::{Duration, Utc};
 use serde::Deserialize;
@@ -36,6 +38,11 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 const STATE_TTL_SECS: i64 = 600;
+/// The initiating-browser cookie (invariant 20). Fixed name (`__Host-` requires
+/// Path=/ + Secure): the connector dance is one-at-a-time per browser, so a
+/// per-flow name is unnecessary and the callback reads it without knowing the
+/// flow id up front.
+const OAUTH_FLOW_COOKIE: &str = "__Host-fbx_oauth_flow";
 /// Refresh proactively when the cached access token has less than this left.
 const EXPIRY_MARGIN_SECS: i64 = 300;
 const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -147,22 +154,29 @@ pub fn canonical_resource(url: &str) -> Result<String, String> {
     Ok(format!("{}://{host}{port}{path}", u.scheme()))
 }
 
-/// The opaque signed `state` parameter: AEAD-sealed (tamper-proof AND
-/// unreadable to the AS/browser it transits), carrying the connection and
-/// the PKCE verifier — stateless, so a control-plane restart mid-dance
-/// changes nothing.
-pub async fn seal_state(
+/// The sealed one-time boot token the go endpoint unseals: `{f: flow_id, s, c,
+/// x: exp}`. `s` and `c` are two INDEPENDENT 32-byte randoms — the state secret
+/// (its sha256 is the flow row's `state_hash` lookup key) and the per-flow cookie
+/// value (its sha256 is `browser_hash`). The row stores ONLY the hashes; the
+/// plaintexts live solely inside this AEAD-sealed transit token (and, for `c`,
+/// the browser cookie the go page sets). Sealed via `seal_token` (self-describing,
+/// deployment DEK) so it survives a KMS mode flip within the flow's TTL. `exp` is
+/// the row's exact `expires_at` — the go page double-checks it, but the row's own
+/// `expires_at` is the authority for liveness.
+pub(crate) struct BootToken {
+    pub flow_id: Uuid,
+    pub s: String,
+    pub c: String,
+}
+
+async fn seal_boot_token(
     sealer: &Sealer,
-    connection_id: Uuid,
-    verifier: &str,
+    flow_id: Uuid,
+    s: &str,
+    c: &str,
+    exp: i64,
 ) -> Result<String, String> {
-    let payload = json!({
-        "c": connection_id,
-        "v": verifier,
-        "x": Utc::now().timestamp() + STATE_TTL_SECS,
-    });
-    // Transit-token sealing (self-describing) — survives a KMS mode flip within
-    // the dance's short TTL; see `Sealer::seal_token`.
+    let payload = json!({ "f": flow_id, "s": s, "c": c, "x": exp });
     let sealed = sealer
         .seal_token(&payload.to_string())
         .await
@@ -170,26 +184,115 @@ pub async fn seal_state(
     Ok(b64url(&sealed))
 }
 
-pub async fn open_state(sealer: &Sealer, state_param: &str) -> Result<(Uuid, String), String> {
+async fn open_boot_token(sealer: &Sealer, token: &str) -> Result<BootToken, String> {
     use base64::Engine;
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(state_param)
-        .map_err(|_| "malformed state parameter")?;
+        .decode(token)
+        .map_err(|_| "malformed token")?;
     let plain = sealer
         .open_token(&raw)
         .await
-        .map_err(|_| "state parameter failed verification")?;
-    let v: Value = serde_json::from_str(&plain).map_err(|_| "state parameter is corrupt")?;
-    let exp = v["x"].as_i64().ok_or("state parameter is corrupt")?;
+        .map_err(|_| "token failed verification")?;
+    let v: Value = serde_json::from_str(&plain).map_err(|_| "token is corrupt")?;
+    let exp = v["x"].as_i64().ok_or("token is corrupt")?;
     if Utc::now().timestamp() > exp {
-        return Err("authorization took too long — start the connect flow again".into());
+        return Err("this link expired — start the connect flow again".into());
     }
-    let cid = v["c"]
+    let flow_id = v["f"]
         .as_str()
         .and_then(|s| Uuid::parse_str(s).ok())
-        .ok_or("state parameter is corrupt")?;
-    let verifier = v["v"].as_str().ok_or("state parameter is corrupt")?;
-    Ok((cid, verifier.to_string()))
+        .ok_or("token is corrupt")?;
+    let s = v["s"].as_str().ok_or("token is corrupt")?.to_string();
+    let c = v["c"].as_str().ok_or("token is corrupt")?.to_string();
+    Ok(BootToken { flow_id, s, c })
+}
+
+/// Read the initiating-browser cookie value from the request headers.
+fn oauth_flow_cookie(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    raw.split(';')
+        .filter_map(|p| p.trim().split_once('='))
+        .find(|(k, _)| *k == OAUTH_FLOW_COOKIE)
+        .map(|(_, v)| v.to_string())
+}
+
+/// `; Secure` when the public URL is https, else empty — mirrors github_app.rs's
+/// local-http special-case (a real AS requires an https redirect anyway).
+fn cookie_secure_suffix(public_url: &str) -> &'static str {
+    if public_url.starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    }
+}
+
+/// The `Set-Cookie` header for the initiating-browser cookie. Attribute
+/// construction copied from github_app.rs's per-flow cookie (HttpOnly, SameSite,
+/// conditional Secure for local http), but forced to `Path=/` because the
+/// `__Host-` prefix requires it. On http (local dev / the curl e2e) the missing
+/// Secure is why real browsers reject `__Host-` cookies — but a real OAuth AS
+/// requires an https redirect anyway, so that scenario is not functional; the
+/// e2e's curl jars are lenient.
+fn set_oauth_flow_cookie(public_url: &str, value: &str) -> String {
+    let secure = cookie_secure_suffix(public_url);
+    format!("{OAUTH_FLOW_COOKIE}={value}; HttpOnly; SameSite=Lax; Path=/; Max-Age={STATE_TTL_SECS}{secure}")
+}
+
+/// Expire the initiating-browser cookie (same name/path/Secure so it matches).
+fn clear_oauth_flow_cookie(public_url: &str) -> String {
+    let secure = cookie_secure_suffix(public_url);
+    format!("{OAUTH_FLOW_COOKIE}=gone; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure}")
+}
+
+/// A deterministic sha256 fingerprint of the discovered AS metadata, frozen on
+/// the flow row at start (design :636-641 — the state must bind a metadata
+/// digest). Canonicalizes the binding-relevant fields (scopes sorted) so the same
+/// discovery always yields the same digest.
+fn metadata_digest(meta: &AsMeta) -> String {
+    let mut scopes = meta.scopes_supported.clone();
+    scopes.sort();
+    let canonical = json!({
+        "issuer": meta.issuer,
+        "authorization_endpoint": meta.authorization_endpoint,
+        "token_endpoint": meta.token_endpoint,
+        "registration_endpoint": meta.registration_endpoint,
+        "cimd_supported": meta.cimd_supported,
+        "scopes_supported": scopes,
+    });
+    format!("sha256:{}", fluidbox_db::sha256_hex(&canonical.to_string()))
+}
+
+/// Rebuild the authorization-endpoint URL from the frozen flow fields (design D5:
+/// the go page rebuilds FROM THE ROW so start and callback share one issuer +
+/// client + redirect + resource, closing AS mix-up and discovery-change races).
+/// Pure + unit-tested. `scopes` is space-joined when non-empty (mirrors the pre-D
+/// dance, incl. `offline_access`).
+#[allow(clippy::too_many_arguments)]
+fn build_authorize_url(
+    authorization_endpoint: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    state_param: &str,
+    challenge: &str,
+    challenge_method: &str,
+    resource: &str,
+    scopes: &[String],
+) -> Result<String, String> {
+    let mut url = reqwest::Url::parse(authorization_endpoint)
+        .map_err(|_| "AS authorization_endpoint is not a valid URL".to_string())?;
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", client_id)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("state", state_param)
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", challenge_method)
+        .append_pair("resource", resource);
+    if !scopes.is_empty() {
+        url.query_pairs_mut()
+            .append_pair("scope", &scopes.join(" "));
+    }
+    Ok(url.to_string())
 }
 
 /// Pull `resource_metadata="…"` out of a `WWW-Authenticate` challenge
@@ -706,12 +809,18 @@ pub(crate) fn sealer(state: &AppState) -> ApiResult<&Sealer> {
     })
 }
 
-/// Shared by the start endpoint and the catalog Connect flow: run discovery
-/// and client-identity resolution (idempotent — results persist on the
-/// connection), then mint the PKCE pair and return the authorize URL.
+/// Shared by the start endpoint and the catalog Connect flow: run discovery and
+/// client-identity resolution (idempotent — results persist on the connection),
+/// then mint a one-time server-side flow row (invariant 20) and return the
+/// `go_url`. `initiated_by_user_id` is the initiating fluidbox user (None for the
+/// operator/admin token — the cookie still binds the browser). The authorize URL
+/// is NOT built here: the go endpoint rebuilds it FROM THE ROW after binding the
+/// browser cookie, so a leaked authorization URL can neither complete nor burn
+/// the flow (design D5 / :646-656).
 pub async fn start_dance(
     state: &AppState,
     scope: fluidbox_db::TenantScope,
+    initiated_by_user_id: Option<Uuid>,
     conn_id: Uuid,
 ) -> ApiResult<String> {
     let sealer_ref = sealer(state)?;
@@ -794,29 +903,61 @@ pub async fn start_dance(
     o.insert("scopes".into(), json!(scopes));
     fluidbox_db::update_connection_oauth(&state.pool, scope, conn.id, &oauth).await?;
 
+    // Mint the PKCE pair. The challenge is PUBLIC (rides the authorize URL); the
+    // verifier is custody (performs the exchange) and is sealed at rest so a leaked
+    // flow row cannot exchange (design :638-639).
     let verifier = random_urlsafe();
-    let state_param = seal_state(sealer_ref, conn.id, &verifier)
+    let challenge = pkce_challenge(&verifier);
+    let sealed_verifier = sealer_ref
+        .seal(
+            &verifier,
+            SealCtx::new(scope.tenant_id(), SealFamily::OauthFlowPkceVerifier),
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to seal PKCE verifier: {e}")))?;
+    // Two independent 32-byte randoms: the state `s` (its hash is the row's lookup
+    // key) and the cookie `c` (its hash binds the initiating browser). The row
+    // stores ONLY the hashes; the plaintext rides the sealed boot token.
+    let s = random_urlsafe();
+    let c = random_urlsafe();
+    let digest = metadata_digest(&meta);
+    let flow = fluidbox_db::insert_connector_oauth_flow(
+        &state.pool,
+        scope,
+        fluidbox_db::NewConnectorOauthFlow {
+            connection_id: conn.id,
+            initiated_by_user_id,
+            state_hash: &fluidbox_db::sha256_hex(&s),
+            browser_hash: &fluidbox_db::sha256_hex(&c),
+            issuer: &meta.issuer,
+            authorization_endpoint: &meta.authorization_endpoint,
+            token_endpoint: &meta.token_endpoint,
+            metadata_digest: &digest,
+            resource: &resource,
+            redirect_uri: &redirect_uri(state),
+            scopes: &json!(scopes),
+            challenge: &challenge,
+            challenge_method: "S256",
+            client_registration_id: registration_id,
+            client_id: &client_id,
+            pkce_verifier_sealed: &sealed_verifier.bytes,
+            pkce_verifier_key_version: sealed_verifier.key_version,
+            expected_generation: conn.authorization_generation,
+            ttl_secs: STATE_TTL_SECS,
+        },
+    )
+    .await?;
+    // The boot token's expiry is the row's exact `expires_at` — one TTL.
+    let boot = seal_boot_token(sealer_ref, flow.id, &s, &c, flow.expires_at.timestamp())
         .await
         .map_err(ApiError::Internal)?;
-    let mut url = reqwest::Url::parse(&meta.authorization_endpoint)
-        .map_err(|_| ApiError::BadRequest("AS authorization_endpoint is not a valid URL".into()))?;
-    url.query_pairs_mut()
-        .append_pair("response_type", "code")
-        .append_pair("client_id", &client_id)
-        .append_pair("redirect_uri", &redirect_uri(state))
-        .append_pair("state", &state_param)
-        .append_pair("code_challenge", &pkce_challenge(&verifier))
-        .append_pair("code_challenge_method", "S256")
-        .append_pair("resource", &resource);
-    if !scopes.is_empty() {
-        url.query_pairs_mut()
-            .append_pair("scope", &scopes.join(" "));
-    }
-    Ok(url.to_string())
+    Ok(format!("{}/v1/oauth/go?f={}", state.cfg.public_url, boot))
 }
 
-/// `POST /v1/connections/{id}/oauth/start` (admin) → `{authorize_url}`.
-/// Also the RECONNECT path: an errored connection redoes the dance in place.
+/// `POST /v1/connections/{id}/oauth/start` (admin) → `{go_url}`.
+/// Also the RECONNECT path: an errored connection redoes the dance in place. The
+/// browser navigates to `go_url` (the control-plane origin), which binds a
+/// per-flow cookie before redirecting to the authorization server.
 pub async fn start(
     principal: Principal,
     State(state): State<AppState>,
@@ -831,8 +972,106 @@ pub async fn start(
         "starting or reconnecting the OAuth flow for",
     )
     .await?;
-    let authorize_url = start_dance(&state, principal.scope(), conn.id).await?;
-    Ok(Json(json!({ "authorize_url": authorize_url })))
+    // The initiating user (None for the operator) is bound onto the flow row.
+    let go_url = start_dance(&state, principal.scope(), principal.user_id(), conn.id).await?;
+    Ok(Json(json!({ "go_url": go_url })))
+}
+
+#[derive(Deserialize)]
+pub struct GoParams {
+    #[serde(default)]
+    pub f: Option<String>,
+}
+
+/// `GET /v1/oauth/go` — the interstitial that binds the initiating browser and
+/// launches the dance. Unauthenticated by design: the AEAD-sealed boot token in
+/// `f` IS the auth (a browser redirect can't carry the API token), same pattern
+/// as the callback + github_app go legs. It verifies the flow row is LIVE (never
+/// consuming it — the callback is the sole consumer), sets the per-flow HttpOnly
+/// cookie on the CONTROL-PLANE origin (why the dashboard can't set it), and 302s
+/// to the authorization endpoint rebuilt FROM THE ROW with `state=s` (design D5).
+pub async fn go(State(state): State<AppState>, Query(q): Query<GoParams>) -> Response {
+    let Some(sealer_ref) = state.sealer.as_ref() else {
+        return page(
+            StatusCode::BAD_REQUEST,
+            "Connection failed",
+            "FLUIDBOX_CREDENTIAL_KEY is not configured.",
+            None,
+        );
+    };
+    let Some(boot) = q.f.as_deref() else {
+        return page(
+            StatusCode::BAD_REQUEST,
+            "Connection failed",
+            "Missing token.",
+            None,
+        );
+    };
+    let bt = match open_boot_token(sealer_ref, boot).await {
+        Ok(v) => v,
+        Err(e) => return page(StatusCode::BAD_REQUEST, "Connection failed", &e, None),
+    };
+    let state_hash = fluidbox_db::sha256_hex(&bt.s);
+    // Peek (NEVER consume) and verify the row is live AND the one the token names.
+    let row = match fluidbox_db::peek_connector_oauth_flow(&state.pool, &state_hash).await {
+        Ok(Some(r))
+            if r.id == bt.flow_id && r.consumed_at.is_none() && r.expires_at > Utc::now() =>
+        {
+            r
+        }
+        Ok(_) => {
+            return page(
+                StatusCode::BAD_REQUEST,
+                "Connection failed",
+                "This link expired or was already used — start the connect flow again.",
+                None,
+            )
+        }
+        Err(e) => {
+            tracing::error!("oauth go: flow lookup failed: {e}");
+            return page(
+                StatusCode::BAD_REQUEST,
+                "Connection failed",
+                "Something went wrong — try again from the dashboard.",
+                None,
+            );
+        }
+    };
+    let scopes: Vec<String> = row
+        .scopes
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let authorize = match build_authorize_url(
+        &row.authorization_endpoint,
+        &row.client_id,
+        &row.redirect_uri,
+        &bt.s,
+        &row.challenge,
+        &row.challenge_method,
+        &row.resource,
+        &scopes,
+    ) {
+        Ok(u) => u,
+        Err(e) => return page(StatusCode::BAD_REQUEST, "Connection failed", &e, None),
+    };
+    // 302 to the AS, binding this browser via the per-flow cookie.
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header(axum::http::header::LOCATION, authorize)
+        .header(axum::http::header::CACHE_CONTROL, "no-store")
+        .header("referrer-policy", "no-referrer")
+        .header(
+            axum::http::header::SET_COOKIE,
+            set_oauth_flow_cookie(&state.cfg.public_url, &bt.c),
+        )
+        .body(Body::empty())
+        .expect("static response builds")
 }
 
 #[derive(Deserialize)]
@@ -869,25 +1108,27 @@ fn escape_html(s: &str) -> String {
 /// HTML-escaped, and the response carries a strict CSP — `default-src 'none'`
 /// with `style-src 'unsafe-inline'` for the single inline `style` attribute the
 /// page uses — so even a hypothetical escape gap cannot execute script. Only
-/// server-authored, non-secret, non-upstream text ever reaches `body`.
-fn page(status: axum::http::StatusCode, title: &str, body: &str) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    let html = Html(format!(
+/// server-authored, non-secret, non-upstream text ever reaches `body`. `cookie`
+/// carries an optional `Set-Cookie` (the flow-cookie clear, on flow-ending
+/// outcomes).
+fn page(status: StatusCode, title: &str, body: &str, cookie: Option<String>) -> Response {
+    let html = format!(
         "<!doctype html><meta charset=\"utf-8\"><title>fluidbox — {t}</title>\
          <body style=\"font-family:system-ui;max-width:38rem;margin:4rem auto;line-height:1.5\">\
          <h2>{t}</h2><p>{b}</p></body>",
         t = escape_html(title),
         b = escape_html(body),
-    ));
-    (
-        status,
-        [(
-            axum::http::header::CONTENT_SECURITY_POLICY,
-            "default-src 'none'; style-src 'unsafe-inline'",
-        )],
-        html,
-    )
-        .into_response()
+    );
+    let mut builder = Response::builder().status(status).header(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        "default-src 'none'; style-src 'unsafe-inline'",
+    );
+    if let Some(c) = cookie {
+        builder = builder.header(axum::http::header::SET_COOKIE, c);
+    }
+    builder
+        .body(Body::from(html))
+        .expect("static response builds")
 }
 
 /// Collapse an authorization-server-supplied `error` code to a known OAuth 2.0
@@ -906,23 +1147,41 @@ fn known_oauth_error(code: &str) -> &'static str {
     }
 }
 
-/// `GET /v1/oauth/callback` — THE one stable redirect URI. Unauthenticated
-/// by design (a browser redirect can't carry the admin token); the sealed
-/// `state` parameter is the authentication, and nothing is trusted before
-/// it verifies. Browser-facing: answers HTML, never JSON errors. Upstream-
-/// derived text (the AS `error`/`error_description`, MCP discovery errors) is
-/// NEVER reflected — it goes to the server log and the browser sees a generic
-/// line (R3.4).
+/// `GET /v1/oauth/callback` — THE one stable redirect URI. Unauthenticated by
+/// design (a browser redirect can't carry the admin token). The authentication is
+/// the ONE-TIME flow claim with the initiating-browser cookie hash INSIDE the
+/// predicate (invariant 20): nothing is trusted before it claims. Browser-facing:
+/// answers HTML, never JSON errors. Upstream-derived text is NEVER reflected — it
+/// goes to the server log and the browser sees a generic line (R3.4).
+///
+/// Ordering is load-bearing (design D5): read cookie → claim (one-time + browser)
+/// → on miss, `peek` splits wrong-browser (403, row UNBURNED, cookie kept) from
+/// unknown/expired/consumed (400 generic) → on a claimed row, verify connection
+/// coherence + generation, surface an AS error (burned), else exchange FROM THE
+/// ROW. Every flow-ending outcome clears the cookie; the wrong-browser 403 does
+/// NOT (the right browser may still complete).
 pub async fn callback(
     State(state): State<AppState>,
     Query(p): Query<CallbackParams>,
-) -> axum::response::Response {
-    use axum::http::StatusCode;
-    let Some(sealer_ref) = state.sealer.as_ref() else {
+    headers: HeaderMap,
+) -> Response {
+    if state.sealer.is_none() {
         return page(
             StatusCode::BAD_REQUEST,
             "Connection failed",
             "FLUIDBOX_CREDENTIAL_KEY is not configured.",
+            None,
+        );
+    }
+    // The initiating-browser cookie is the second factor. Missing → 400 generic;
+    // we do NOT touch the row (the claim's browser predicate needs it, and we must
+    // not peek-and-reveal without it) — design :646-656.
+    let Some(cookie) = oauth_flow_cookie(&headers) else {
+        return page(
+            StatusCode::BAD_REQUEST,
+            "Connection failed",
+            "This browser did not start the connect flow — start again from the dashboard.",
+            None,
         );
     };
     let Some(state_param) = p.state.as_deref() else {
@@ -930,49 +1189,68 @@ pub async fn callback(
             StatusCode::BAD_REQUEST,
             "Connection failed",
             "Missing state parameter.",
+            None,
         );
     };
-    let (conn_id, verifier) = match open_state(sealer_ref, state_param).await {
-        Ok(v) => v,
-        Err(e) => return page(StatusCode::BAD_REQUEST, "Connection failed", &e),
+    let state_hash = fluidbox_db::sha256_hex(state_param);
+    let browser_hash = fluidbox_db::sha256_hex(&cookie);
+    // The one-time claim: `browser_hash` sits INSIDE the single-use predicate, so a
+    // wrong browser matches nothing and BURNS NOTHING (invariant 20).
+    let flow = match fluidbox_db::claim_connector_oauth_flow(
+        &state.pool,
+        &state_hash,
+        &browser_hash,
+    )
+    .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            // Split wrong-browser (row still live → 403, UNBURNED, cookie KEPT so
+            // the right browser can still complete) from unknown/expired/consumed
+            // (→ 400 generic).
+            return match fluidbox_db::peek_connector_oauth_flow(&state.pool, &state_hash).await {
+                Ok(Some(r)) if r.consumed_at.is_none() && r.expires_at > Utc::now() => page(
+                    StatusCode::FORBIDDEN,
+                    "Connection failed",
+                    "This authorization was not started by this browser.",
+                    None,
+                ),
+                _ => page(
+                    StatusCode::BAD_REQUEST,
+                    "Connection failed",
+                    "This authorization link is invalid, expired, or already used.",
+                    None,
+                ),
+            };
+        }
+        Err(e) => {
+            tracing::error!("oauth callback: flow claim failed: {e}");
+            return page(
+                StatusCode::BAD_REQUEST,
+                "Connection failed",
+                "Something went wrong — try again from the dashboard.",
+                None,
+            );
+        }
     };
-    if let Some(err) = &p.error {
-        // The AS `error`/`error_description` are attacker-influenceable (they ride
-        // the redirect query) and can echo the sealed state, the authorization
-        // code, the PKCE verifier, or the client secret. Log ONLY an allowlisted
-        // error code + a bounded digest of the raw text — never the verbatim
-        // strings (R3.4, parity with the broker boundary in d87fb88). The browser
-        // sees a generic line.
-        let detail = p
-            .error_description
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(err.as_str());
-        tracing::warn!(
-            oauth_error = known_oauth_error(err),
-            detail = %crate::broker::msg_digest(detail),
-            "oauth callback: authorization server refused"
-        );
-        return page(
-            StatusCode::BAD_REQUEST,
-            "Authorization refused",
-            "The authorization server refused the request. You can close this tab and try again.",
-        );
-    }
-    let Some(code) = p.code.as_deref() else {
-        return page(
-            StatusCode::BAD_REQUEST,
-            "Connection failed",
-            "Missing authorization code.",
-        );
-    };
-    match complete_dance(&state, conn_id, &verifier, code).await {
-        Ok(bundle_note) => page(
+    // The flow is now BURNED — every outcome from here clears the cookie.
+    let clear = Some(clear_oauth_flow_cookie(&state.cfg.public_url));
+    match complete_flow(
+        &state,
+        &flow,
+        p.code.as_deref(),
+        p.error.as_deref(),
+        p.error_description.as_deref(),
+    )
+    .await
+    {
+        Ok(note) => page(
             StatusCode::OK,
             "Connected",
-            &format!("The connection is active.{bundle_note} You can close this tab."),
+            &format!("The connection is active.{note} You can close this tab."),
+            clear,
         ),
-        Err(e) => page(StatusCode::BAD_REQUEST, "Connection failed", &e),
+        Err(e) => page(StatusCode::BAD_REQUEST, "Connection failed", &e, clear),
     }
 }
 
@@ -987,25 +1265,24 @@ struct ExchangeClient {
 }
 
 /// Resolve the client identity for a code exchange / refresh. Prefers the shared
-/// registration row (`oauth.registration_id`) — unsealing ITS secret under the
-/// deployment DEK — and falls back to the per-connection legacy fields for
-/// connections created before Task 3 (or a `registration_id` whose row a
-/// different connection's self-heal deleted; a public client keeps working on the
-/// stored `client_id` alone). Reads run THROUGH `db` so a refresh stays on its
+/// registration row (`registration_id`) — unsealing ITS secret under the
+/// deployment DEK — and falls back to `client_id` + the per-connection legacy
+/// secret for connections created before Task 3 (or a `registration_id` whose row
+/// a different connection's self-heal deleted; a public client keeps working on
+/// the stored `client_id` alone). The callback passes these OFF THE FROZEN FLOW
+/// ROW (the row is the authority — invariant 20); the refresh path passes them off
+/// the connection's `oauth` bag. Reads run THROUGH `db` so a refresh stays on its
 /// single lock-holding connection (design D6).
 async fn resolve_exchange_client(
     state: &AppState,
     db: &mut sqlx::PgConnection,
     scope: fluidbox_db::TenantScope,
     conn_id: Uuid,
-    oauth: &Value,
+    registration_id: Option<Uuid>,
+    client_id: &str,
 ) -> Result<ExchangeClient, String> {
     let sealer_ref = state.sealer.as_ref().ok_or("credential key missing")?;
-    if let Some(reg_id) = oauth
-        .get("registration_id")
-        .and_then(Value::as_str)
-        .and_then(|s| Uuid::parse_str(s).ok())
-    {
+    if let Some(reg_id) = registration_id {
         if let Some(reg) = fluidbox_db::find_client_registration_by_id(&mut *db, reg_id)
             .await
             .map_err(|e| format!("client registration lookup failed: {e}"))?
@@ -1030,13 +1307,8 @@ async fn resolve_exchange_client(
             });
         }
         // The row is gone (another connection's self-heal deleted it): fall
-        // through to the connection's stored client_id.
+        // through to the passed `client_id` + per-connection legacy secret.
     }
-    let client_id = oauth
-        .get("client_id")
-        .and_then(Value::as_str)
-        .ok_or("connection has no client identity — start the connect flow again")?
-        .to_string();
     let secret = match fluidbox_db::connection_client_secret_sealed(&mut *db, scope, conn_id)
         .await
         .map_err(|e| format!("client secret lookup failed: {e}"))?
@@ -1054,7 +1326,7 @@ async fn resolve_exchange_client(
         None => None,
     };
     Ok(ExchangeClient {
-        client_id,
+        client_id: client_id.to_string(),
         secret,
         registration: None,
     })
@@ -1133,7 +1405,7 @@ async fn do_code_exchange(
 /// REGISTRATION-sourced identity that records its `registration_endpoint` can be
 /// re-registered. A per-connection pre-registered/legacy secret cannot (nothing
 /// to re-register — the AS rejected operator-supplied credentials). The heal
-/// itself is bounded to ONE retry by `complete_dance`'s single non-looping site.
+/// itself is bounded to ONE retry by `complete_flow`'s single non-looping site.
 fn can_self_heal(client: &ExchangeClient) -> bool {
     client
         .registration
@@ -1178,80 +1450,132 @@ async fn heal_invalid_client(
         .map_err(|e| format!("registration cleanup failed: {e}"))?;
     let registered =
         register_dcr_client(state, &reg.issuer, &redirect_uri(state), &reg_endpoint).await?;
+    // Rewrite the CONNECTION's oauth identity so a later refresh uses the fresh
+    // registration (activation persists this `oauth`); the frozen flow row keeps
+    // its now-stale pointer, but a single-use flow is never replayed.
+    let new_reg_id = registered.registration_id;
+    let new_client_id = registered.client_id.clone();
     if let Some(o) = oauth.as_object_mut() {
-        o.insert("client_id".into(), json!(registered.client_id));
+        o.insert("client_id".into(), json!(new_client_id));
         o.insert("client_id_source".into(), json!("dcr"));
-        o.insert("registration_id".into(), json!(registered.registration_id));
+        o.insert("registration_id".into(), json!(new_reg_id));
     }
     let mut resolve_conn = state
         .pool
         .acquire()
         .await
         .map_err(|e| format!("db acquire failed: {e}"))?;
-    *client = resolve_exchange_client(state, &mut resolve_conn, scope, conn_id, oauth).await?;
+    *client = resolve_exchange_client(
+        state,
+        &mut resolve_conn,
+        scope,
+        conn_id,
+        Some(new_reg_id),
+        &new_client_id,
+    )
+    .await?;
     Ok(true)
 }
 
-/// Exchange the code, seal the rotating refresh token, activate the connection,
-/// bump the authorization generation on a RECONNECT (fail-closed — a re-consent
-/// may change the account/issuer/audience, so any in-flight run bound to the old
-/// generation must fail closed; design :294-296), and photograph the pending
-/// snapshot with the freshly minted access token (Phase C: snapshots replace the
-/// old brokered-bundle auto-register).
-async fn complete_dance(
+/// Complete a claimed flow (invariant 20): verify connection coherence + frozen
+/// generation, unseal the PKCE verifier, exchange the code AGAINST THE FROZEN ROW
+/// (its token_endpoint / client identity / resource — never re-discovered, closing
+/// AS mix-up + discovery-change races), then seal the rotating refresh token,
+/// activate (a RECONNECT bumps the generation — a re-consent may change the
+/// account/issuer/audience, so any in-flight run bound to the old generation fails
+/// closed; design :294-296), and photograph the pending snapshot. The caller has
+/// already burned the flow; this never touches the flow row again.
+async fn complete_flow(
     state: &AppState,
-    conn_id: Uuid,
-    verifier: &str,
-    code: &str,
+    flow: &fluidbox_db::ConnectorOauthFlowRow,
+    code: Option<&str>,
+    error: Option<&str>,
+    error_description: Option<&str>,
 ) -> Result<String, String> {
     let sealer_ref = state.sealer.as_ref().ok_or("credential key missing")?;
-    // The AEAD-sealed `state` param carrying conn_id IS the auth (like a webhook
-    // signature) — this browser leg has no principal. Resolve the connection
-    // cross-tenant (UUID-only system-worker loader), then its OWN tenant is the
-    // operative scope for the exchange, exactly parallel to events.rs ingress.
-    let conn = fluidbox_db::system_worker::get_connection(&state.pool, conn_id)
+    // The ROW is the authority now (its tenant was verified when the start
+    // principal inserted it): load the connection under the row's own tenant scope,
+    // NOT the cross-tenant system-worker loader the stateless state once required.
+    let scope = fluidbox_db::TenantScope::assume(flow.tenant_id);
+    let conn = fluidbox_db::get_connection(&state.pool, scope, flow.connection_id)
         .await
         .map_err(|e| format!("connection lookup failed: {e}"))?
-        .ok_or("connection not found")?;
-    let scope = fluidbox_db::TenantScope::assume(conn.tenant_id);
+        .ok_or("connection not found — it may have been removed")?;
     if conn.status == "revoked" {
         return Err("connection was revoked — create a new one".into());
     }
+    // Generation coherence: a reconnect that landed mid-authorization bumped the
+    // generation past what the flow froze — refuse rather than seal a fresh grant
+    // onto a superseded binding (design :1535, generation acceptance).
+    if conn.authorization_generation != flow.expected_generation {
+        return Err(
+            "connection was reauthorized during authorization — restart the connect flow".into(),
+        );
+    }
+    // The AS returned an error (denied consent, etc.). The flow is already claimed
+    // (burned) — a denied consent is terminal for it. Log ONLY an allowlisted code
+    // + a bounded digest (the AS text is attacker-influenceable and can echo the
+    // state/code/verifier/secret); the browser sees a generic line (R3.4).
+    if let Some(err) = error {
+        let detail = error_description.filter(|s| !s.is_empty()).unwrap_or(err);
+        tracing::warn!(
+            oauth_error = known_oauth_error(err),
+            detail = %crate::broker::msg_digest(detail),
+            "oauth callback: authorization server refused"
+        );
+        return Err(
+            "The authorization server refused the request. You can close this tab and try again."
+                .into(),
+        );
+    }
+    let code = code.ok_or("Missing authorization code.")?;
+    // Unseal the PKCE verifier (the challenge alone cannot exchange — design
+    // :638-639). ROW tenant ctx.
+    let verifier = sealer_ref
+        .open(
+            &flow.pkce_verifier_sealed,
+            flow.pkce_verifier_key_version,
+            SealCtx::new(flow.tenant_id, SealFamily::OauthFlowPkceVerifier),
+        )
+        .await
+        .map_err(|_| "PKCE verifier unseal failed — start the connect flow again")?;
+
+    // The connection's oauth bag (for the self-heal persistence + granted-scope
+    // fallback); token_endpoint / client identity / resource / redirect come from
+    // the FROZEN ROW.
     let mut oauth = conn.oauth.clone().unwrap_or_else(|| json!({}));
-    let token_endpoint = oauth
-        .get("token_endpoint")
-        .and_then(Value::as_str)
-        .ok_or("connection has no token endpoint — start the connect flow again")?
-        .to_string();
-    let resource = oauth
-        .get("resource")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let ru = redirect_uri(state);
+    let resource = Some(flow.resource.as_str());
 
     // Resolve the client identity (shared registration preferred; per-connection
-    // legacy fallback). Uses a short-lived pooled connection — the activation
-    // critical section below takes its own, so nothing nests.
+    // legacy fallback) from the ROW. Uses a short-lived pooled connection — the
+    // activation critical section below takes its own, so nothing nests.
     let mut resolve_conn = state
         .pool
         .acquire()
         .await
         .map_err(|e| format!("db acquire failed: {e}"))?;
-    let mut client =
-        resolve_exchange_client(state, &mut resolve_conn, scope, conn.id, &oauth).await?;
+    let mut client = resolve_exchange_client(
+        state,
+        &mut resolve_conn,
+        scope,
+        conn.id,
+        flow.client_registration_id,
+        &flow.client_id,
+    )
+    .await?;
     drop(resolve_conn);
 
     // Exchange the code, with ONE `invalid_client` self-heal for a registration-
     // sourced identity (delete the stale shared client, re-register, retry once).
     let v = match do_code_exchange(
         state,
-        &token_endpoint,
+        &flow.token_endpoint,
         &client.client_id,
         client.secret.as_deref(),
         code,
-        verifier,
-        &ru,
-        resource.as_deref(),
+        &verifier,
+        &flow.redirect_uri,
+        resource,
     )
     .await
     {
@@ -1265,13 +1589,13 @@ async fn complete_dance(
             }
             match do_code_exchange(
                 state,
-                &token_endpoint,
+                &flow.token_endpoint,
                 &client.client_id,
                 client.secret.as_deref(),
                 code,
-                verifier,
-                &ru,
-                resource.as_deref(),
+                &verifier,
+                &flow.redirect_uri,
+                resource,
             )
             .await
             {
@@ -1602,7 +1926,19 @@ async fn refresh_access_token(
     // legacy fallback) THROUGH `db` — the refresh stays on its single lock-holding
     // connection. A refresh-path `invalid_client` is handled below (mark error;
     // NEVER re-register mid-refresh — no user is present to re-consent; design D6).
-    let client = resolve_exchange_client(state, &mut *db, scope, conn.id, &oauth).await?;
+    // The refresh reads its client identity off the connection's `oauth` bag (the
+    // frozen flow row belongs to the initial dance only).
+    let registration_id = oauth
+        .get("registration_id")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok());
+    let client_id = oauth
+        .get("client_id")
+        .and_then(Value::as_str)
+        .ok_or("connection has no client identity — reconnect it")?;
+    let client =
+        resolve_exchange_client(state, &mut *db, scope, conn.id, registration_id, client_id)
+            .await?;
 
     let mut form: Vec<(&str, &str)> = vec![
         ("grant_type", "refresh_token"),
@@ -1753,37 +2089,136 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn state_roundtrip_tamper_and_expiry() {
+    async fn boot_token_roundtrips_and_fails_closed() {
         let s = test_sealer();
-        let cid = Uuid::now_v7();
-        let tok = seal_state(&s, cid, "verifier-123").await.unwrap();
-        let (got_cid, got_v) = open_state(&s, &tok).await.unwrap();
-        assert_eq!(got_cid, cid);
-        assert_eq!(got_v, "verifier-123");
-        // Opaque: the verifier is not readable from the parameter.
-        assert!(!tok.contains("verifier-123"));
+        let flow = Uuid::now_v7();
+        let exp = Utc::now().timestamp() + STATE_TTL_SECS;
+        let tok = seal_boot_token(&s, flow, "state-secret", "cookie-secret", exp)
+            .await
+            .unwrap();
+        let bt = open_boot_token(&s, &tok).await.unwrap();
+        assert_eq!(bt.flow_id, flow);
+        assert_eq!(bt.s, "state-secret");
+        assert_eq!(bt.c, "cookie-secret");
+        // Opaque: neither secret is readable from the sealed token.
+        assert!(!tok.contains("state-secret") && !tok.contains("cookie-secret"));
         // Tampering breaks verification.
         let mut chars: Vec<char> = tok.chars().collect();
         let mid = chars.len() / 2;
         chars[mid] = if chars[mid] == 'A' { 'B' } else { 'A' };
-        assert!(open_state(&s, &chars.into_iter().collect::<String>())
+        assert!(open_boot_token(&s, &chars.into_iter().collect::<String>())
             .await
             .is_err());
-        // Garbage and wrong-key states fail closed.
-        assert!(open_state(&s, "not-base64!!").await.is_err());
+        // Garbage and wrong-key tokens fail closed.
+        assert!(open_boot_token(&s, "not-base64!!").await.is_err());
         let other = Sealer::from_key_string(&"cd".repeat(32)).unwrap();
-        assert!(open_state(&other, &tok).await.is_err());
-        // Expired states are refused.
-        let stale = {
-            use base64::Engine;
-            let payload = serde_json::json!({
-                "c": cid, "v": "x", "x": Utc::now().timestamp() - 1,
-            });
-            base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .encode(s.seal_token(&payload.to_string()).await.unwrap())
+        assert!(open_boot_token(&other, &tok).await.is_err());
+        // Expired boot tokens are refused (BootToken deliberately isn't Debug — it
+        // carries plaintext secrets — so match rather than unwrap_err).
+        let stale = seal_boot_token(&s, flow, "x", "y", Utc::now().timestamp() - 1)
+            .await
+            .unwrap();
+        match open_boot_token(&s, &stale).await {
+            Err(m) => assert!(m.contains("expired")),
+            Ok(_) => panic!("expired boot token must be refused"),
+        }
+    }
+
+    #[test]
+    fn authorize_url_rebuilds_every_param_from_the_row() {
+        let url = build_authorize_url(
+            "https://as.test/authorize",
+            "client-1",
+            "https://fbx.test/v1/oauth/callback",
+            "state-secret",
+            "challenge-abc",
+            "S256",
+            "https://mcp.test/mcp",
+            &["read".into(), "offline_access".into()],
+        )
+        .unwrap();
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        let q: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(parsed.path(), "/authorize");
+        assert_eq!(q["response_type"], "code");
+        assert_eq!(q["client_id"], "client-1");
+        assert_eq!(q["redirect_uri"], "https://fbx.test/v1/oauth/callback");
+        assert_eq!(q["state"], "state-secret");
+        assert_eq!(q["code_challenge"], "challenge-abc");
+        assert_eq!(q["code_challenge_method"], "S256");
+        assert_eq!(q["resource"], "https://mcp.test/mcp");
+        assert_eq!(q["scope"], "read offline_access");
+        // No scopes ⇒ no `scope` param at all (mirrors the pre-D dance).
+        let no_scope = build_authorize_url(
+            "https://as.test/authorize",
+            "c",
+            "https://fbx.test/cb",
+            "s",
+            "ch",
+            "S256",
+            "https://mcp.test",
+            &[],
+        )
+        .unwrap();
+        assert!(!no_scope.contains("scope="));
+        // A bad endpoint fails closed.
+        assert!(build_authorize_url("not a url", "c", "r", "s", "ch", "S256", "res", &[]).is_err());
+    }
+
+    #[test]
+    fn flow_cookie_header_shape() {
+        // https ⇒ __Host- compliant (Secure + Path=/); the clear expires it.
+        let set = set_oauth_flow_cookie("https://fbx.example.com", "abc123");
+        assert!(set.starts_with("__Host-fbx_oauth_flow=abc123; "));
+        assert!(set.contains("; HttpOnly"));
+        assert!(set.contains("; SameSite=Lax"));
+        assert!(set.contains("; Path=/"));
+        assert!(set.contains("; Secure"));
+        assert!(set.contains(&format!("; Max-Age={STATE_TTL_SECS}")));
+        let clear = clear_oauth_flow_cookie("https://fbx.example.com");
+        assert!(
+            clear.contains("=gone; ")
+                && clear.contains("; Max-Age=0")
+                && clear.contains("; Secure")
+        );
+        // http (local dev / curl e2e) ⇒ Secure omitted (github_app's local special-case).
+        assert!(!set_oauth_flow_cookie("http://127.0.0.1:8787", "x").contains("Secure"));
+        // The reader round-trips a cookie value out of a Cookie header.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            "other=1; __Host-fbx_oauth_flow=abc123; z=2"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(oauth_flow_cookie(&headers).as_deref(), Some("abc123"));
+        assert!(oauth_flow_cookie(&HeaderMap::new()).is_none());
+    }
+
+    #[test]
+    fn metadata_digest_is_deterministic() {
+        let mk = || AsMeta {
+            issuer: "https://as.test".into(),
+            authorization_endpoint: "https://as.test/authorize".into(),
+            token_endpoint: "https://as.test/token".into(),
+            registration_endpoint: Some("https://as.test/register".into()),
+            cimd_supported: true,
+            // Different order, same set ⇒ same digest (scopes are sorted).
+            scopes_supported: vec!["read".into(), "offline_access".into()],
         };
-        let err = open_state(&s, &stale).await.unwrap_err();
-        assert!(err.contains("too long"));
+        let mut reordered = mk();
+        reordered.scopes_supported = vec!["offline_access".into(), "read".into()];
+        let a = metadata_digest(&mk());
+        assert_eq!(
+            a,
+            metadata_digest(&reordered),
+            "digest is order-independent"
+        );
+        assert!(a.starts_with("sha256:"));
+        // A changed endpoint changes the digest (binds the discovered surface).
+        let mut moved = mk();
+        moved.token_endpoint = "https://evil.test/token".into();
+        assert_ne!(a, metadata_digest(&moved));
     }
 
     #[test]

@@ -336,8 +336,11 @@ async fn main() -> anyhow::Result<()> {
             post(github_app::app_ingress),
         )
         // Unauthenticated by design: a browser redirect can't carry the
-        // admin token — the AEAD-sealed `state` parameter is the auth
-        // (same pattern as webhook-signature ingress below).
+        // admin token. The go leg's sealed boot token and the callback's
+        // one-time flow claim (with the initiating-browser cookie hash inside
+        // the predicate) ARE the auth (invariant 20; same pattern as the
+        // github/app go/callback legs and webhook-signature ingress).
+        .route("/oauth/go", get(oauth::go))
         .route("/oauth/callback", get(oauth::callback))
         .route("/catalog", get(catalog::list).post(catalog::create))
         .route("/catalog/{slug}", get(catalog::get))

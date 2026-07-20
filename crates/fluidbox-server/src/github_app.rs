@@ -1595,10 +1595,16 @@ mod tests {
         assert!(open_flow_token(&s, TAG_MANIFEST, &boot).await.is_err());
         assert!(open_flow_token(&s, TAG_BOOT, &manifest).await.is_err());
         assert!(open_flow_token(&s, TAG_INSTALL, &manifest).await.is_err());
-        // Cross-module: an oauth.rs state ({c,v,x}) is refused too.
-        let oauth_state = crate::oauth::seal_state(&s, Uuid::now_v7(), "v")
+        // Cross-module: a foreign sealed token (an oauth.rs-shaped {c,v,x} transit
+        // blob) is refused as a gh-manifest token (no `t` tag).
+        let oauth_state = crate::oauth::b64url(
+            &s.seal_token(
+                &serde_json::json!({ "c": Uuid::now_v7(), "v": "v", "x": 9_999_999_999i64 })
+                    .to_string(),
+            )
             .await
-            .unwrap();
+            .unwrap(),
+        );
         assert!(open_flow_token(&s, TAG_MANIFEST, &oauth_state)
             .await
             .is_err());

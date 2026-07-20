@@ -588,10 +588,13 @@ async fn connect_entry(
                 owner.created_by_user_id,
             )
             .await?;
-            let authorize_url = crate::oauth::start_dance(state, scope, row.id).await?;
+            // The initiating user (from the resolved owner; None for the operator)
+            // is bound onto the one-time flow row (invariant 20).
+            let go_url =
+                crate::oauth::start_dance(state, scope, owner.created_by_user_id, row.id).await?;
             Ok(Json(json!({
                 "connection": row,
-                "authorize_url": authorize_url,
+                "go_url": go_url,
             })))
         }
         other => Err(ApiError::BadRequest(format!(
