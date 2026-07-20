@@ -66,6 +66,12 @@ pub struct Config {
     /// §"Dual listener"). The public bind still serves both for Docker.
     pub internal_bind: String,
     pub database_url: String,
+    /// Least-privilege Postgres role the app pool SET ROLEs to (Phase D, #32; plan
+    /// D8). `None` (default, `FLUIDBOX_RUNTIME_ROLE` unset) = single-role mode: the
+    /// owner runs everything, RLS still binds it via FORCE + the tenant GUC. `Some`
+    /// opts into the role split — migration 0018 creates `fluidbox_runtime`, and boot
+    /// verifies the role exists then `SET ROLE`s via `after_connect`.
+    pub runtime_role: Option<String>,
     pub admin_token: String,
     /// URL sandboxes use to reach this control plane (e.g. host.docker.internal).
     pub public_control_url: String,
@@ -231,6 +237,18 @@ impl Config {
             }),
             database_url: get("DATABASE_URL")
                 .map_err(|_| anyhow::anyhow!("DATABASE_URL is required"))?,
+            // Validated at parse time (fail closed with a clear boot error) since it
+            // is interpolated into `SET ROLE` DDL, never a bind parameter.
+            runtime_role: {
+                match get("FLUIDBOX_RUNTIME_ROLE").ok().filter(|s| !s.is_empty()) {
+                    None => None,
+                    Some(role) => {
+                        fluidbox_db::validate_runtime_role_name(&role)
+                            .map_err(|m| anyhow::anyhow!("{m}"))?;
+                        Some(role)
+                    }
+                }
+            },
             admin_token: get("FLUIDBOX_ADMIN_TOKEN")
                 .map_err(|_| anyhow::anyhow!("FLUIDBOX_ADMIN_TOKEN is required"))?,
             public_control_url: get("FLUIDBOX_PUBLIC_CONTROL_URL")
