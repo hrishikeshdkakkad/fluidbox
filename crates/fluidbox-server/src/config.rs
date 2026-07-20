@@ -154,6 +154,11 @@ pub struct Config {
     /// Optional outbound egress proxy (`FLUIDBOX_EGRESS_PROXY`, Phase E) applied to
     /// BOTH hardened reqwest clients and exported as HTTPS_PROXY on the git fetch
     /// subprocess — route all control-plane→internet dials through one waypoint.
+    /// Validated at boot (a malformed URL fails boot). NOTE: with a proxy set,
+    /// target DNS resolution moves to the PROXY, so the SSRF DNS resolver's
+    /// name-filtering no longer applies to proxied requests (`admit_url`'s
+    /// literal+scheme checks still do) — the proxy becomes the egress control
+    /// point, so point it at an allowlisting forward proxy.
     pub egress_proxy: Option<String>,
     /// Execution backend: `docker` (default) or `kubernetes`. Selects which
     /// `ExecutionProvider` `AppState.provider` holds. Dual-provider permanence
@@ -349,7 +354,10 @@ impl Config {
                 "FLUIDBOX_EGRESS_ALLOW_CIDRS",
                 get("FLUIDBOX_EGRESS_ALLOW_CIDRS").ok(),
             )?,
-            egress_proxy: get("FLUIDBOX_EGRESS_PROXY").ok().filter(|s| !s.is_empty()),
+            egress_proxy: parse_egress_proxy(
+                "FLUIDBOX_EGRESS_PROXY",
+                get("FLUIDBOX_EGRESS_PROXY").ok(),
+            )?,
             provider,
             network_mode: get("FLUIDBOX_NETWORK_MODE")
                 .ok()
@@ -477,6 +485,20 @@ fn parse_egress_cidrs(
                 .map_err(|e| anyhow::anyhow!("{name}: {e}"))
         })
         .collect()
+}
+
+/// Validate `FLUIDBOX_EGRESS_PROXY` at BOOT (like `FLUIDBOX_EGRESS_ALLOW_CIDRS`):
+/// empty ⇒ `None`; otherwise it must be a proxy URL reqwest accepts — the SAME
+/// `Proxy::all` the client builders call — so a malformed value is a named boot
+/// error, never a first-dial panic. The pre-validated string flows to
+/// `egress::build_*_http`, which then only needs a defensive (unreachable)
+/// error-map rather than an `expect`.
+fn parse_egress_proxy(name: &str, raw: Option<String>) -> anyhow::Result<Option<String>> {
+    let Some(v) = raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    reqwest::Proxy::all(&v).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+    Ok(Some(v))
 }
 
 /// D7 boot coherence for the LLM-key mode (pure, unit-tested). `Shared` refuses

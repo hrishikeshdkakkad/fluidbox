@@ -494,14 +494,39 @@ async fn post_rpc(
     session: Option<&McpSession>,
     body: &Value,
 ) -> Result<(reqwest::StatusCode, Option<String>, Value), String> {
-    // Phase E: post_rpc is the SINGLE MCP dial funnel — admit the destination
-    // here (scheme policy + host-literal IP block) so every path (call_tool,
-    // discover_snapshot, probe_tools, handshake, retry) is covered, then dial
-    // the hardened `egress_http` (refuses redirects, filters resolved addresses
-    // at connect time). admit_url's message is non-secret (never echoes the URL).
-    crate::egress::admit_url(url, &state.egress_policy).map_err(|e| e.to_string())?;
-    let mut req = state
-        .egress_http
+    // post_rpc is the SINGLE MCP dial funnel; it threads the hardened client +
+    // policy into `dial_rpc` so the admission + redirect-refusal contract is
+    // unit-testable against a fake server without a full AppState (I1a). This is
+    // the only production caller.
+    dial_rpc(
+        &state.egress_http,
+        &state.egress_policy,
+        url,
+        auth,
+        session,
+        body,
+    )
+    .await
+}
+
+/// The dial core of `post_rpc`: admit the destination (scheme policy +
+/// host-literal IP block) so every path (call_tool, discover_snapshot,
+/// probe_tools, handshake, retry) is covered, then dial the hardened
+/// `egress_http` (refuses redirects via `Policy::none`, filters resolved
+/// addresses at connect time) and bounded-read the body. Taking the client +
+/// policy directly — not `&AppState` — lets the redirect-refusal contract be
+/// asserted end-to-end against a fake server. admit_url's message is non-secret
+/// (never echoes the URL).
+async fn dial_rpc(
+    client: &reqwest::Client,
+    policy: &crate::egress::EgressPolicy,
+    url: &str,
+    auth: Option<&BrokeredAuth>,
+    session: Option<&McpSession>,
+    body: &Value,
+) -> Result<(reqwest::StatusCode, Option<String>, Value), String> {
+    crate::egress::admit_url(url, policy).map_err(|e| e.to_string())?;
+    let mut req = client
         .post(url)
         .timeout(MCP_TIMEOUT)
         .header("content-type", "application/json")
@@ -1125,6 +1150,65 @@ mod tests {
             e2.contains("code -32000") && e2.contains("sha256:"),
             "sanitized unwrap error dropped code/digest: {e2}"
         );
+    }
+
+    // I1a: a hardened `egress_http` (Policy::none) must REFUSE an upstream 3xx
+    // and NEVER follow the Location — a redirect is the classic SSRF pivot onto
+    // an internal host. A raw-TCP fake returns 302 + Location and counts every
+    // connection; the real `dial_rpc` path (post_rpc's core) must error and leave
+    // the fake having seen exactly ONE request.
+    #[tokio::test]
+    async fn dial_rpc_refuses_upstream_redirect_and_never_follows() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits_srv = hits.clone();
+        let srv = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                hits_srv.fetch_add(1, Ordering::SeqCst);
+                // Best-effort drain of the request line/headers before replying.
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                // Location points BACK at this same fake so that a following
+                // policy would re-hit it (hits >= 2) — making the count assertion
+                // load-bearing (Policy::none keeps it at exactly 1).
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{addr}/next\r\ncontent-length: 0\r\n\r\n"
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        // Dev seam so the loopback fake is admissible; the client itself is
+        // Policy::none, which is what refuses the redirect.
+        let policy = crate::egress::EgressPolicy {
+            dev_loopback: true,
+            allow_cidrs: vec![],
+            github_clone_base: None,
+            proxy: None,
+        };
+        let client = crate::egress::build_egress_http(&policy);
+        let url = format!("http://{addr}/mcp");
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+        let err = dial_rpc(&client, &policy, &url, None, None, &body)
+            .await
+            .expect_err("a 302 must be refused, not followed");
+        assert!(
+            err.contains("redirect") && err.contains("refused"),
+            "expected a redirect-refused error, got: {err}"
+        );
+        // The decisive assertion: Policy::none did NOT dial the Location target.
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the client followed the redirect (saw a second request)"
+        );
+        srv.abort();
     }
 
     #[test]

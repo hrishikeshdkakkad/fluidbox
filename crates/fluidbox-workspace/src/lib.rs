@@ -83,6 +83,46 @@ fn run_git(dir: &Path, args: &[&str]) -> Result<String, WorkspaceError> {
     run_git_env(dir, args, &[])
 }
 
+/// The Phase-E transport-hardening env applied on EVERY git invocation, on BOTH
+/// the materialize path (`run_git_env`, this file) and the diff-collection path
+/// (`collect::run_git_scrubbed`): never smudge-fetch LFS objects from an
+/// arbitrary `lfs.url`, and restrict git transports to the three schemes we
+/// validate (no ext::/dumb/ssh helpers, incl. on redirect). SINGLE-SOURCED here
+/// so a deletion breaks both real builders AND the tests that assert them —
+/// there is deliberately no parallel constant to drift against.
+pub(crate) fn transport_hardening_env() -> [(&'static str, &'static str); 2] {
+    [
+        ("GIT_LFS_SKIP_SMUDGE", "1"),
+        ("GIT_ALLOW_PROTOCOL", "http:https:file"),
+    ]
+}
+
+/// Build a smart-HTTP fetch argv with the mandatory SSRF guard prefix
+/// `-c http.followRedirects=false` — the out-of-process analogue of the reqwest
+/// `Policy::none` the in-process clients use: a fetch must not follow a 3xx onto
+/// an unvalidated (internal) host. EVERY network fetch is built through this one
+/// helper (via `run_fetch`) so the flag is single-sourced and a test asserting
+/// this fn's output breaks the moment the prefix is dropped from the real path.
+fn fetch_argv(tail: &[&str]) -> Vec<String> {
+    ["-c", "http.followRedirects=false"]
+        .iter()
+        .chain(tail.iter())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Run one git fetch: the argv is built through `fetch_argv` (redirect guard) and
+/// the credential/proxy env is threaded as usual.
+fn run_fetch(
+    dir: &Path,
+    tail: &[&str],
+    envs: &[(String, String)],
+) -> Result<String, WorkspaceError> {
+    let argv = fetch_argv(tail);
+    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    run_git_env(dir, &refs, envs)
+}
+
 /// `envs` is how credentials reach git: via GIT_CONFIG_* variables, never on
 /// the command line (visible in `ps`) and never in on-disk config (the .git
 /// dir is mounted into the sandbox). Error text includes args, never envs.
@@ -95,11 +135,11 @@ fn run_git_env(
     cmd.current_dir(dir).args(args);
     // Never fall back to interactive credential prompts.
     cmd.env("GIT_TERMINAL_PROMPT", "0");
-    // Phase E hardening on EVERY git invocation: never fetch LFS objects from an
-    // arbitrary `lfs.url` via the smudge filter, and restrict transports to the
-    // three schemes we validate (no ext::/dumb/ssh helpers, incl. on redirect).
-    cmd.env("GIT_LFS_SKIP_SMUDGE", "1");
-    cmd.env("GIT_ALLOW_PROTOCOL", "http:https:file");
+    // Phase E hardening on EVERY git invocation (LFS smudge off + transport
+    // allowlist), single-sourced so tests assert exactly what the real path sets.
+    for (k, v) in transport_hardening_env() {
+        cmd.env(k, v);
+    }
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -390,34 +430,23 @@ fn fetch_and_checkout(
     run_git(dest, &["init", "-q"])?;
     run_git(dest, &["remote", "add", "origin", clone_url])?;
 
-    // `-c http.followRedirects=false`: a smart-HTTP fetch must not follow a 3xx
-    // onto an unvalidated (internal) host — the out-of-process analogue of the
-    // reqwest `Policy::none` the in-process clients use.
+    // Every fetch below goes through `run_fetch`, which prefixes the mandatory
+    // `-c http.followRedirects=false` guard (see `fetch_argv`): a smart-HTTP
+    // fetch must not follow a 3xx onto an unvalidated (internal) host.
     match commit_sha {
         Some(sha) => {
             // Exact-commit checkout (e.g. a PR head, immune to branch moves).
             // GitHub serves arbitrary SHAs shallow; generic servers may not,
             // so fall back to a full branch fetch and resolve the SHA there.
-            let shallow = run_git_env(
+            let shallow = run_fetch(
                 dest,
-                &[
-                    "-c",
-                    "http.followRedirects=false",
-                    "fetch",
-                    "-q",
-                    "--depth",
-                    "1",
-                    "origin",
-                    sha,
-                ],
+                &["fetch", "-q", "--depth", "1", "origin", sha],
                 &fetch_env,
             );
             if shallow.is_err() {
-                run_git_env(
+                run_fetch(
                     dest,
                     &[
-                        "-c",
-                        "http.followRedirects=false",
                         "fetch",
                         "-q",
                         "origin",
@@ -435,18 +464,9 @@ fn fetch_and_checkout(
         None => {
             // Exact ref (branch/tag) or the remote HEAD when unspecified.
             let target = reference.unwrap_or("HEAD");
-            run_git_env(
+            run_fetch(
                 dest,
-                &[
-                    "-c",
-                    "http.followRedirects=false",
-                    "fetch",
-                    "-q",
-                    "--depth",
-                    "1",
-                    "origin",
-                    target,
-                ],
+                &["fetch", "-q", "--depth", "1", "origin", target],
                 &fetch_env,
             )?;
             let branch = reference.unwrap_or("fluidbox-work");
@@ -529,6 +549,32 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), WorkspaceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // I1b: assert on what the PRODUCTION fetch/env builders return (no parallel
+    // constants). `run_fetch` builds every network fetch through `fetch_argv`,
+    // and `run_git_env` applies `transport_hardening_env` — so these break the
+    // moment the SSRF flag or the LFS/protocol env is dropped from the real path.
+    #[test]
+    fn fetch_argv_prefixes_the_redirect_guard() {
+        let argv = fetch_argv(&["fetch", "-q", "--depth", "1", "origin", "main"]);
+        // The guard is the first `-c` pair, ahead of the fetch subcommand.
+        assert_eq!(
+            &argv[..2],
+            &["-c".to_string(), "http.followRedirects=false".to_string()]
+        );
+        assert!(argv.contains(&"http.followRedirects=false".to_string()));
+        assert_eq!(argv.last().unwrap(), "main"); // the tail is preserved intact
+    }
+
+    #[test]
+    fn transport_hardening_env_pins_lfs_and_protocol() {
+        let env = transport_hardening_env();
+        assert!(env.contains(&("GIT_LFS_SKIP_SMUDGE", "1")), "{env:?}");
+        assert!(
+            env.contains(&("GIT_ALLOW_PROTOCOL", "http:https:file")),
+            "{env:?}"
+        );
+    }
 
     /// The loopback-dev clone policy the e2e runs under: file:// and loopback
     /// http both allowed. Keeps the existing tests (file:// fixtures) network-free.

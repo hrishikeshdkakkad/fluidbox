@@ -568,7 +568,12 @@ async fn open_login_state(sealer: &Sealer, param: &str) -> Result<LoginState, St
 // redirect validator, validate_fetch_target, read_json_bounded, and the
 // identity/egress client builders) moved to `crate::egress` in Phase E so the
 // broker, deliveries, and git-clone paths share ONE boundary. login.rs consults
-// it below; the OIDC behavior is unchanged.
+// it below. This is NOT purely a refactor: OIDC fetches now also enforce the
+// EXTENDED reserved-range matrix (E2 — metadata, 0.0.0.0/8, v4/v6 multicast,
+// 240/4 reserved, 198.18/15 benchmarking, 2001:db8::/32, fec0::/10, …) and honor
+// FLUIDBOX_EGRESS_ALLOW_CIDRS. Both are strictly TIGHTER than before (more ranges
+// blocked; the allow-list only re-opens operator-chosen CIDRs), so no
+// previously-legitimate issuer breaks.
 
 /// Save-time endpoint validation: parse `url` and apply the SAME https + SSRF
 /// policy the login fetches use (loopback under the same `dev_loopback` gating).

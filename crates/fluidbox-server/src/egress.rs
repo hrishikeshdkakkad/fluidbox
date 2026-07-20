@@ -228,11 +228,26 @@ impl reqwest::dns::Resolve for SsrfDnsResolver {
 }
 
 /// Apply the optional egress proxy (`FLUIDBOX_EGRESS_PROXY`) to both hardened
-/// clients. A malformed proxy URL is a boot-time panic (`expect`) rather than a
-/// silent no-proxy — the operator asked for egress to route through it.
+/// clients. The value is VALIDATED at boot (`config::parse_egress_proxy` runs the
+/// same `Proxy::all`), so a rejection here is unreachable in practice — we log
+/// and skip rather than panic (M1: defense in depth, never a first-dial crash;
+/// the builder receives a pre-validated value).
+///
+/// M2 — proxy semantics: when a proxy IS set, target DNS resolution moves to the
+/// PROXY, so this client's [`SsrfDnsResolver`] name-filtering no longer applies
+/// to proxied requests (the resolver only runs for direct connections). The
+/// `admit_url` literal + scheme checks still apply, and the proxy becomes the
+/// egress control point — operators point `FLUIDBOX_EGRESS_PROXY` at an
+/// allowlisting forward proxy to regain destination control for proxied traffic.
 fn with_proxy(mut b: reqwest::ClientBuilder, policy: &EgressPolicy) -> reqwest::ClientBuilder {
     if let Some(p) = &policy.proxy {
-        b = b.proxy(reqwest::Proxy::all(p).expect("FLUIDBOX_EGRESS_PROXY is a valid proxy URL"));
+        match reqwest::Proxy::all(p) {
+            Ok(proxy) => b = b.proxy(proxy),
+            Err(e) => tracing::error!(
+                "FLUIDBOX_EGRESS_PROXY rejected at client build \
+                 (should have failed boot in config::parse_egress_proxy): {e}"
+            ),
+        }
     }
     b
 }
