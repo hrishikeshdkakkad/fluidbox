@@ -74,7 +74,16 @@ base64 = "0.22"
 # aws-sdk-kms/aws-config back the `aws` KeyWrapper (first AWS SDK in tree — the
 # credential chain supports IRSA). Static-KEK + local dev never touch these.
 zeroize = "1"
-aws-sdk-kms = "1"
+# default-features=false drops aws-sdk-kms's `rustls` feature, which is the
+# LEGACY stack (aws-smithy-runtime/tls-rustls → aws-smithy-http-client/
+# legacy-rustls-ring → hyper 0.14 + rustls 0.21 + rustls-webpki 0.101, the line
+# RUSTSEC-2026-0098/0099/0104 flag). `default-https-client` is the modern one
+# (hyper 1.x + rustls 0.23 + aws-lc-rs) and is what aws-config already pulls, so
+# the SDK reuses the tree's existing 0.23 stack instead of adding a second.
+aws-sdk-kms = { version = "1", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 # v10 requires choosing exactly one crypto provider; rust_crypto keeps the
 # whole tree on the pure-Rust stack (rustls/RustCrypto), no C toolchain.

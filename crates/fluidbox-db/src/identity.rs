@@ -2709,10 +2709,14 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+            // `api_tokens_kind_shape` (0012) demands the FULL pat shape — name +
+            // display_prefix + a finite expiry — so the fixture mirrors `mint_pat`.
             sqlx::query(
                 "insert into api_tokens
-                   (id, tenant_id, kind, membership_id, user_id, token_sha256, expires_at)
-                 values ($1, $2, 'pat', $3, $4, $5, now() + interval '1 day')",
+                   (id, tenant_id, kind, membership_id, user_id, name, display_prefix,
+                    token_sha256, expires_at)
+                 values ($1, $2, 'pat', $3, $4, 'rls-pat', 'fbx_pat_rls0', $5,
+                         now() + interval '1 day')",
             )
             .bind(Uuid::now_v7())
             .bind(org.id)
