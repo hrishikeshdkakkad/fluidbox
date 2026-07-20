@@ -9463,4 +9463,118 @@ mod tests {
 
         cleanup_dek_tenant(&pool, tenant).await;
     }
+
+    // The re-seal job's DB mechanics (Task 2): keyset paging, the FOR UPDATE
+    // lock/read, and the CAS write — exercised with arbitrary bytes (the DB
+    // layer never sees plaintext; the crypto roundtrip is tested server-side).
+    // Assertions are written to be robust against OTHER tenants sharing the
+    // table (the test DB is shared): filter/relate to our own seeded ids only.
+    #[tokio::test]
+    async fn reseal_paging_lock_and_cas() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let scope = new_dek_org(&pool).await;
+        let tenant = scope.tenant_id();
+
+        // Three v1 credential rows under a throwaway tenant.
+        let mut ids = vec![];
+        for i in 0..3 {
+            let c = create_connection(
+                &pool,
+                scope,
+                "custom",
+                &format!("rs-acct-{i}"),
+                &format!("rs-conn-{i}"),
+                Some(format!("legacy-cred-{i}").as_bytes()),
+                1,
+                &serde_json::json!([]),
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+                None,
+                1,
+                ConnectionAuth::static_active(),
+                ConnectionOwner::Organization,
+                None,
+            )
+            .await
+            .unwrap();
+            ids.push(c.id);
+        }
+        ids.sort(); // reseal_candidate_ids orders by id
+
+        let tbl = "integration_connections";
+        let col = "credential_sealed";
+        let ver = "credential_key_version";
+
+        // Keyset cursor: `id > after` is exclusive. After ids[0], a large page
+        // includes ids[1]/ids[2] but never ids[0].
+        let after0 = crate::system_worker::reseal_candidate_ids(&pool, tbl, col, ver, ids[0], 1000)
+            .await
+            .unwrap();
+        assert!(!after0.contains(&ids[0]), "cursor is exclusive");
+        assert!(after0.contains(&ids[1]) && after0.contains(&ids[2]));
+        // After the last id, none of ours can appear (all <= ids[2]).
+        let after_last =
+            crate::system_worker::reseal_candidate_ids(&pool, tbl, col, ver, ids[2], 1000)
+                .await
+                .unwrap();
+        assert!(ids.iter().all(|i| !after_last.contains(i)));
+        // `limit` caps the page (≥1 v1 row exists past ids[0] — ids[1]).
+        let capped = crate::system_worker::reseal_candidate_ids(&pool, tbl, col, ver, ids[0], 1)
+            .await
+            .unwrap();
+        assert_eq!(capped.len(), 1, "limit bounds the page");
+
+        // Lock + read one row inside a tx, then CAS the v2 bytes in.
+        let mut tx = pool.begin().await.unwrap();
+        let locked = crate::system_worker::reseal_lock_row(&mut tx, tbl, col, ver, ids[0])
+            .await
+            .unwrap()
+            .expect("row exists");
+        assert_eq!(locked.0.as_deref(), Some(b"legacy-cred-0".as_ref()));
+        assert_eq!(locked.1, 1, "still v1 under the lock");
+        assert_eq!(
+            locked.2, tenant,
+            "carries the row's tenant for the seal ctx"
+        );
+        let affected =
+            crate::system_worker::reseal_write_row(&mut tx, tbl, col, ver, ids[0], b"v2-bytes")
+                .await
+                .unwrap();
+        assert_eq!(affected, 1, "CAS flips 1 → 2");
+        tx.commit().await.unwrap();
+
+        // The reader sees the new bytes at v2.
+        assert_eq!(
+            connection_credential_sealed(&pool, scope, ids[0])
+                .await
+                .unwrap()
+                .unwrap(),
+            (b"v2-bytes".to_vec(), 2)
+        );
+
+        // A second CAS on the now-v2 row is a no-op (a concurrent writer already
+        // moved it off v1) — 0 rows, the caller counts it as skipped.
+        let mut tx2 = pool.begin().await.unwrap();
+        let noop =
+            crate::system_worker::reseal_write_row(&mut tx2, tbl, col, ver, ids[0], b"v2-again")
+                .await
+                .unwrap();
+        assert_eq!(noop, 0, "CAS no-op when the row already left v1");
+        tx2.commit().await.unwrap();
+
+        // The re-sealed row drops out of the candidate predicate; the other two
+        // remain (idempotent restart-safety: re-scans skip finished rows).
+        let remaining =
+            crate::system_worker::reseal_candidate_ids(&pool, tbl, col, ver, Uuid::nil(), 1000)
+                .await
+                .unwrap();
+        assert!(!remaining.contains(&ids[0]));
+        assert!(remaining.contains(&ids[1]) && remaining.contains(&ids[2]));
+
+        cleanup_dek_tenant(&pool, tenant).await;
+    }
 }

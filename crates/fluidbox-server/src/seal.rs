@@ -227,6 +227,32 @@ impl Sealer {
         })
     }
 
+    /// Test-only: a Sealer carrying BOTH the legacy key and a static-KEK KMS
+    /// backend over a REAL (connected) pool — exactly what the re-seal job holds
+    /// (open v1 with the legacy key, seal v2 under a per-tenant DEK). Production
+    /// builds this via [`build_sealer`]; `reseal.rs`'s DB-backed job-core tests
+    /// build one directly since the private inner is module-scoped.
+    #[cfg(test)]
+    pub fn for_test_static_kms(
+        legacy: Option<&str>,
+        static_kek: &str,
+        pool: PgPool,
+        deployment_tenant: Uuid,
+    ) -> anyhow::Result<Self> {
+        let wrapper: Arc<dyn KeyWrapper> = Arc::new(StaticKek::from_key_string(static_kek)?);
+        Ok(Self {
+            inner: Arc::new(SealerInner {
+                legacy: legacy.map(LegacyKey::from_key_string).transpose()?,
+                kms: Some(KmsBackend {
+                    wrapper,
+                    pool,
+                    cache: Arc::new(DekCache::default()),
+                }),
+                deployment_tenant,
+            }),
+        })
+    }
+
     /// Seal a durable custody value. KMS off → v1 (`key_version = 1`); KMS on → v2
     /// under the tenant's DEK (`key_version = 2`). The returned `key_version` MUST
     /// be persisted in the column's companion so [`open`](Self::open) can dispatch.

@@ -22,6 +22,7 @@ mod login;
 mod oauth;
 mod orchestrator;
 mod rbac;
+mod reseal;
 mod run_service;
 mod scheduler;
 mod seal;
@@ -174,6 +175,10 @@ async fn main() -> anyhow::Result<()> {
         // worker below flips it once the CNI is proven to enforce policy.
         netpol_verified: std::sync::atomic::AtomicBool::new(!is_k8s),
         oidc: Default::default(),
+        // Phase D (#32) legacy→KMS re-seal: the singleton claim flag + live
+        // progress, both in-memory (the job is restart-safe by construction).
+        reseal_running: std::sync::atomic::AtomicBool::new(false),
+        reseal_status: tokio::sync::Mutex::new(reseal::ResealStatus::default()),
         pool,
         cfg,
     });
@@ -277,6 +282,11 @@ async fn main() -> anyhow::Result<()> {
             "/admin/orgs/{slug}/members/{membership_id}/roles",
             post(admin_orgs::set_member_roles),
         )
+        // Legacy→KMS re-seal (Phase D, #32): operator-only. POST starts the
+        // background job (409 if already running / KMS off); GET reports live
+        // count parity + job progress. The D4 retirement boot gate
+        // (seal::check_retirement_gates) reads the same counts.
+        .route("/admin/reseal", get(reseal::status).post(reseal::start))
         .route(
             "/capabilities",
             get(capabilities::list).post(capabilities::create),
