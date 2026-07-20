@@ -201,7 +201,9 @@ enum RowOutcome {
     Resealed,
     Skipped,
     /// A redaction-safe reason (`family:id` + a generic class — never bytes,
-    /// plaintext, or the underlying crypto error text).
+    /// plaintext, or the underlying crypto OR sqlx error text). It is DURABLE:
+    /// it lands in the `reseal.finish` audit detail and in `GET /v1/admin/reseal`,
+    /// so the underlying error is logged, never interpolated here.
     Failed(String),
 }
 
@@ -405,7 +407,11 @@ async fn reseal_family(
         {
             Ok(v) => v,
             Err(e) => {
-                last_error = Some(format!("{}: paging failed: {e}", fam.seal_family));
+                // The reason is DURABLE (it lands in the `reseal.finish` audit row
+                // and in GET /v1/admin/reseal): a class label only — the sqlx text
+                // (constraint/table/connection detail) rides the log.
+                tracing::warn!(family = %fam.seal_family, error = %e, "re-seal: paging failed");
+                last_error = Some(format!("{}: paging failed", fam.seal_family));
                 break;
             }
         };
@@ -440,9 +446,16 @@ async fn reseal_one(pool: &PgPool, sealer: &Sealer, fam: &Family, id: Uuid) -> R
     // transaction carries the audited system-worker bypass GUC — opened inside
     // fluidbox-db (`reseal_begin` → `worker_tx`) so the bypass stays one grep-able
     // choke point. Without it the `SELECT … FOR UPDATE` sees no row under FORCE RLS.
+    // Every row-level reason below is DURABLE (the `reseal.finish` audit detail +
+    // GET /v1/admin/reseal), so it stays `family:id` + a CLASS label — never the
+    // sqlx error text, matching what the crypto branches already do. The full
+    // error goes to the log.
     let mut tx = match fluidbox_db::system_worker::reseal_begin(pool).await {
         Ok(t) => t,
-        Err(e) => return RowOutcome::Failed(format!("{family}:{id}: begin failed: {e}")),
+        Err(e) => {
+            tracing::warn!(%family, row = %id, error = %e, "re-seal: begin failed");
+            return RowOutcome::Failed(format!("{family}:{id}: begin failed"));
+        }
     };
     let locked = match fluidbox_db::system_worker::reseal_lock_row(
         &mut tx,
@@ -457,7 +470,8 @@ async fn reseal_one(pool: &PgPool, sealer: &Sealer, fam: &Family, id: Uuid) -> R
         Ok(l) => l,
         Err(e) => {
             let _ = tx.rollback().await;
-            return RowOutcome::Failed(format!("{family}:{id}: lock failed: {e}"));
+            tracing::warn!(%family, row = %id, error = %e, "re-seal: row lock failed");
+            return RowOutcome::Failed(format!("{family}:{id}: lock failed"));
         }
     };
     // Row vanished since paging, column now NULL, or already re-sealed (the
@@ -519,11 +533,13 @@ async fn reseal_one(pool: &PgPool, sealer: &Sealer, fam: &Family, id: Uuid) -> R
         Ok(n) => n,
         Err(e) => {
             let _ = tx.rollback().await;
-            return RowOutcome::Failed(format!("{family}:{id}: write failed: {e}"));
+            tracing::warn!(%family, row = %id, error = %e, "re-seal: write failed");
+            return RowOutcome::Failed(format!("{family}:{id}: write failed"));
         }
     };
     if let Err(e) = tx.commit().await {
-        return RowOutcome::Failed(format!("{family}:{id}: commit failed: {e}"));
+        tracing::warn!(%family, row = %id, error = %e, "re-seal: commit failed");
+        return RowOutcome::Failed(format!("{family}:{id}: commit failed"));
     }
     // rows-affected 0 = a concurrent writer won the CAS (already off v1) → skip.
     if affected == 1 {

@@ -260,6 +260,54 @@ fn validate_body(
     Ok(())
 }
 
+/// Build and send ONE upstream model request with the given credential. Extracted
+/// from `messages` so the reactive tenant-key recovery can replay the identical
+/// request under a freshly minted key (see
+/// [`llm_keys::should_remint_tenant_key`]) — the dialect's auth-header shape lives
+/// here, in one place, rather than being duplicated at the retry site.
+async fn send_upstream(
+    state: &AppState,
+    dialect: Dialect,
+    upstream: &str,
+    headers: &HeaderMap,
+    body: axum::body::Bytes,
+    upstream_key: &str,
+) -> reqwest::Result<reqwest::Response> {
+    let mut req = state
+        .http
+        .post(upstream)
+        .body(body)
+        .header("content-type", "application/json");
+    match dialect {
+        Dialect::Anthropic => {
+            // Forward version + beta headers verbatim (native contract).
+            if let Some(v) = headers
+                .get("anthropic-version")
+                .and_then(|h| h.to_str().ok())
+            {
+                req = req.header("anthropic-version", v);
+            } else {
+                req = req.header("anthropic-version", "2023-06-01");
+            }
+            if let Some(b) = headers.get("anthropic-beta").and_then(|h| h.to_str().ok()) {
+                req = req.header("anthropic-beta", b);
+            }
+            if state.cfg.llm_upstream_is_anthropic {
+                req = req.header("x-api-key", upstream_key);
+            } else {
+                req = req
+                    .header("authorization", format!("Bearer {upstream_key}"))
+                    .header("x-api-key", upstream_key);
+            }
+        }
+        Dialect::OpenAi => {
+            // Bearer only — the OpenAI dialect never sees x-api-key.
+            req = req.header("authorization", format!("Bearer {upstream_key}"));
+        }
+    }
+    req.send().await
+}
+
 /// POST /internal/llm/{*rest} — both dialects, one route.
 pub async fn messages(
     Path(rest): Path<String>,
@@ -417,65 +465,44 @@ pub async fn messages(
     // key never rides a model request; SSO+shared is the forbidden hosted posture.
     // Every failure is fail-closed — a 503 with a stable code, NEVER the master
     // key as a fallback.
-    let upstream_key: String =
-        match llm_keys::key_source(state.cfg.llm_key_mode, state.cfg.require_sso) {
-            llm_keys::KeySource::Shared => state.cfg.llm_upstream_key.clone(),
-            llm_keys::KeySource::Tenant => {
-                match llm_keys::ensure_tenant_key(&state, sess_auth.tenant_id).await {
-                    Ok(k) => k,
-                    Err(e) => {
-                        tracing::warn!(
-                            "facade: tenant LLM key unavailable for tenant {}: {e}",
-                            sess_auth.tenant_id
-                        );
-                        return Ok(facade_refusal(
-                            dialect,
-                            "tenant_llm_key_unavailable",
-                            "the tenant's LLM key could not be provisioned",
-                        ));
-                    }
+    let key_source = llm_keys::key_source(state.cfg.llm_key_mode, state.cfg.require_sso);
+    let upstream_key: String = match key_source {
+        llm_keys::KeySource::Shared => state.cfg.llm_upstream_key.clone(),
+        llm_keys::KeySource::Tenant => {
+            match llm_keys::ensure_tenant_key(&state, sess_auth.tenant_id).await {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::warn!(
+                        "facade: tenant LLM key unavailable for tenant {}: {e}",
+                        sess_auth.tenant_id
+                    );
+                    return Ok(facade_refusal(
+                        dialect,
+                        "tenant_llm_key_unavailable",
+                        "the tenant's LLM key could not be provisioned",
+                    ));
                 }
             }
-            llm_keys::KeySource::RefuseSsoShared => {
-                return Ok(facade_refusal(
+        }
+        llm_keys::KeySource::RefuseSsoShared => {
+            return Ok(facade_refusal(
                 dialect,
                 "tenant_llm_keys_required",
                 "this deployment requires per-tenant LLM keys (set FLUIDBOX_LLM_KEY_MODE=tenant)",
             ));
-            }
-        };
-
-    let mut req = state.http.post(&upstream).body(upstream_body);
-    req = req.header("content-type", "application/json");
-    match dialect {
-        Dialect::Anthropic => {
-            // Forward version + beta headers verbatim (native contract).
-            if let Some(v) = headers
-                .get("anthropic-version")
-                .and_then(|h| h.to_str().ok())
-            {
-                req = req.header("anthropic-version", v);
-            } else {
-                req = req.header("anthropic-version", "2023-06-01");
-            }
-            if let Some(b) = headers.get("anthropic-beta").and_then(|h| h.to_str().ok()) {
-                req = req.header("anthropic-beta", b);
-            }
-            if state.cfg.llm_upstream_is_anthropic {
-                req = req.header("x-api-key", &upstream_key);
-            } else {
-                req = req
-                    .header("authorization", format!("Bearer {upstream_key}"))
-                    .header("x-api-key", &upstream_key);
-            }
         }
-        Dialect::OpenAi => {
-            // Bearer only — the OpenAI dialect never sees x-api-key.
-            req = req.header("authorization", format!("Bearer {upstream_key}"));
-        }
-    }
+    };
 
-    let resp = match req.send().await {
+    let mut resp = match send_upstream(
+        &state,
+        dialect,
+        &upstream,
+        &headers,
+        upstream_body.clone(),
+        &upstream_key,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
             return Ok(dialect_error(
@@ -485,6 +512,59 @@ pub async fn messages(
             ));
         }
     };
+    // Reactive tenant-key recovery (tenant mode only): a 401/403 means the virtual
+    // key we presented is dead at LiteLLM — redeployed with a fresh database, or an
+    // operator pruned keys — and nothing else would ever recover it (a cold cache
+    // re-reads the same sealed row, so even a restart keeps 401ing). Discard it
+    // (cache AND sealed row), mint a fresh one, and replay this request EXACTLY
+    // ONCE: `should_remint_tenant_key`'s `already_reminted` makes a mint loop
+    // impossible, and the auth status proves the request never executed upstream —
+    // the same reasoning as the connector-token reactive 401 in `oauth.rs`.
+    //
+    // Accepted cost: an auth failure that is really the GATEWAY's own upstream
+    // provider credential (a bad ANTHROPIC_API_KEY inside LiteLLM also surfaces as
+    // 401) trips this too — one extra round trip, and one virtual key orphaned at
+    // LiteLLM, per failing request. fluidbox still keeps exactly ONE row per tenant
+    // (the discard deletes it before the mint), the requests were failing anyway,
+    // and it clears the moment the operator fixes the gateway. Distinguishing the
+    // two would mean parsing LiteLLM's error body — a far more brittle dependency
+    // than an orphaned key.
+    if llm_keys::should_remint_tenant_key(key_source, resp.status().as_u16(), false) {
+        tracing::warn!(
+            tenant = %sess_auth.tenant_id,
+            status = %resp.status(),
+            "facade: upstream rejected the tenant LLM key — re-minting once"
+        );
+        llm_keys::discard_tenant_llm_key(&state, sess_auth.tenant_id).await;
+        match llm_keys::ensure_tenant_key(&state, sess_auth.tenant_id).await {
+            Ok(fresh) => {
+                match send_upstream(&state, dialect, &upstream, &headers, upstream_body, &fresh)
+                    .await
+                {
+                    // Whatever this answers is FINAL — `already_reminted = true`.
+                    Ok(r) => resp = r,
+                    Err(e) => {
+                        return Ok(dialect_error(
+                            dialect,
+                            StatusCode::BAD_GATEWAY,
+                            &format!("upstream request failed: {e}"),
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "facade: tenant LLM key could not be re-minted for tenant {}: {e}",
+                    sess_auth.tenant_id
+                );
+                return Ok(facade_refusal(
+                    dialect,
+                    "tenant_llm_key_unavailable",
+                    "the tenant's LLM key could not be provisioned",
+                ));
+            }
+        }
+    }
     let status = resp.status();
     let is_stream = resp
         .headers()

@@ -18,7 +18,9 @@
 //!     `"fbx:v2:{tenant_id}:{table.column}"`, so a blob transplanted across
 //!     tenants OR families fails AEAD open even under the right DEK. The leading
 //!     `0x02` is an internal sanity byte only — the companion column is the
-//!     discriminator.
+//!     discriminator. Ephemeral TRANSIT tokens (no column, no companion) bind
+//!     `"fbx:v2:transit:{purpose}"` instead — same idea, purpose in the family
+//!     slot (`Sealer::seal_token`).
 
 use crate::config::{Config, KmsMode};
 use crate::kms::{self, AwsKms, DekCache, KeyWrapper, KmsBackend, StaticKek, DEK_VERSION};
@@ -39,10 +41,19 @@ const V2_HEADER_LEN: usize = 1 + 4;
 const KV_LEGACY: i16 = 1;
 const KV_ENVELOPE: i16 = 2;
 
-/// AAD family segment for ephemeral transit tokens (see [`Sealer::seal_token`]).
-/// These are deployment-level wire values with no column family, so they use one
-/// fixed AAD; their tenant binding comes from the deployment tenant's DEK.
-const TRANSIT_AAD: &str = "fbx:v2:transit";
+// AAD family segments for ephemeral transit tokens (see [`Sealer::seal_token`]).
+// These are deployment-level wire values with no column family, so the AAD's
+// family segment is the token's PURPOSE; their tenant binding comes from the
+// deployment tenant's DEK. Distinct purposes are cryptographically
+// non-interchangeable (a token sealed for one purpose fails AEAD open under
+// another, even under the same DEK) — the payload discriminators each consumer
+// checks are then a second, independent line rather than the only one.
+/// The `login.rs` OIDC `state` parameter.
+pub const TRANSIT_LOGIN: &str = "login";
+/// The `oauth.rs` connector-dance boot token (`/v1/oauth/go?f=`).
+pub const TRANSIT_OAUTH_BOOT: &str = "oauth-boot";
+/// The `github_app.rs` flow tokens (`gh-boot` / `gh-manifest` / `gh-install`).
+pub const TRANSIT_GITHUB_APP_FLOW: &str = "github-app-flow";
 
 /// The sealed families = the sealed `table.column` pairs. `Display` renders
 /// `"table.column"` — the AAD's family segment and the human label in boot-gate
@@ -315,7 +326,7 @@ impl Sealer {
                     kms.wrapper.as_ref(),
                     &kms.cache,
                     ctx.tenant_id,
-                    dek_version as i32,
+                    dek_version,
                 )
                 .await?;
                 let aad = aad_for(ctx.tenant_id, ctx.family);
@@ -357,7 +368,19 @@ impl Sealer {
     /// these tokens live minutes (TTL), so a KMS mode flip mid-flow just makes the
     /// user restart the flow. Stored custody columns NEVER first-byte-dispatch:
     /// their version is the companion column (D1).
-    pub async fn seal_token(&self, plaintext: &str) -> anyhow::Result<Vec<u8>> {
+    ///
+    /// `purpose` binds the token's KIND into the AAD (`TRANSIT_LOGIN`,
+    /// `TRANSIT_OAUTH_BOOT`, `TRANSIT_GITHUB_APP_FLOW`): one DEK seals all three
+    /// kinds, so without it any transit token would open as any other and only the
+    /// consumers' payload discriminators would separate them. `open_token` MUST be
+    /// called with the same purpose.
+    ///
+    /// FORMAT CHANGE (Phase D final review): the v2 AAD gained the purpose
+    /// segment, so a token sealed by a BUILD BEFORE this change fails to open
+    /// after the upgrade (KMS mode only — legacy seals carry no AAD). That is
+    /// acceptable: all three transit tokens are minutes-TTL flow tokens, so an
+    /// in-flight one simply fails verification and the user restarts the flow.
+    pub async fn seal_token(&self, purpose: &str, plaintext: &str) -> anyhow::Result<Vec<u8>> {
         match &self.inner.kms {
             None => {
                 let legacy = self
@@ -378,7 +401,7 @@ impl Sealer {
                 Ok(seal_with_dek(
                     &dek,
                     DEK_VERSION as u32,
-                    TRANSIT_AAD,
+                    &transit_aad(purpose),
                     plaintext,
                 ))
             }
@@ -386,7 +409,11 @@ impl Sealer {
     }
 
     /// Open an ephemeral transit token (see [`seal_token`](Self::seal_token)).
-    pub async fn open_token(&self, sealed: &[u8]) -> anyhow::Result<String> {
+    /// `purpose` MUST match the one it was sealed with — a mismatch fails the AEAD
+    /// open (KMS mode) and falls through to the legacy attempt, which either has no
+    /// key (refuse) or was sealed without an AAD at all (the pre-KMS posture, where
+    /// the consumers' payload discriminators are the separation).
+    pub async fn open_token(&self, purpose: &str, sealed: &[u8]) -> anyhow::Result<String> {
         // v2 path when the blob announces itself AND KMS is available. Any failure
         // (parse, missing DEK, decrypt) falls through to the bounded legacy open.
         if sealed.first() == Some(&V2_TAG) {
@@ -397,11 +424,11 @@ impl Sealer {
                         kms.wrapper.as_ref(),
                         &kms.cache,
                         self.inner.deployment_tenant,
-                        v as i32,
+                        v,
                     )
                     .await
                     {
-                        if let Ok(pt) = open_with_dek(&dek, TRANSIT_AAD, sealed) {
+                        if let Ok(pt) = open_with_dek(&dek, &transit_aad(purpose), sealed) {
                             return Ok(pt);
                         }
                     }
@@ -478,54 +505,93 @@ pub fn build_sealer(
 /// [`build_sealer`]). Refuses boot when sealing state and stored custody are
 /// incoherent, so a misconfigured deployment fails loud rather than orphaning or
 /// silently dropping credentials.
+///
+/// The counts are fetched ONLY when a key is missing: with both keys present
+/// (the migration window) every stored version is openable, so there is nothing
+/// a scan could refuse.
 pub async fn check_retirement_gates(cfg: &Config, pool: &PgPool) -> anyhow::Result<()> {
     let kms_on = cfg.kms_mode != KmsMode::Off;
     let legacy_present = cfg.credential_key.is_some();
-
-    if kms_on && !legacy_present {
-        // (a) KMS on, legacy retired: every row MUST be v2 — a leftover v1 row is
-        // unreadable now. Refuse with per-family legacy counts.
-        let counts = fluidbox_db::system_worker::sealed_key_version_counts(pool).await?;
-        let stragglers: Vec<_> = counts.iter().filter(|c| c.legacy > 0).collect();
-        if !stragglers.is_empty() {
-            let total: i64 = stragglers.iter().map(|c| c.legacy).sum();
-            let detail = stragglers
-                .iter()
-                .map(|c| format!("{}={}", c.family, c.legacy))
-                .collect::<Vec<_>>()
-                .join(", ");
-            anyhow::bail!(
-                "FLUIDBOX_KMS_MODE is on but FLUIDBOX_CREDENTIAL_KEY is absent while {total} \
-                 legacy (v1) sealed row(s) remain — they are now unreadable. Run the re-seal job \
-                 to completion (parity zero) before retiring the legacy key. Per-family: {detail}"
-            );
-        }
-    } else if !kms_on && legacy_present {
-        // (b) KMS off, legacy present: a v2 row can't be opened without KMS. A
-        // rollback to legacy-only with KMS-sealed custody is broken custody.
-        let counts = fluidbox_db::system_worker::sealed_key_version_counts(pool).await?;
-        let stragglers: Vec<_> = counts.iter().filter(|c| c.envelope > 0).collect();
-        if !stragglers.is_empty() {
-            let total: i64 = stragglers.iter().map(|c| c.envelope).sum();
-            let detail = stragglers
-                .iter()
-                .map(|c| format!("{}={}", c.family, c.envelope))
-                .collect::<Vec<_>>()
-                .join(", ");
-            anyhow::bail!(
-                "FLUIDBOX_KMS_MODE=off but {total} v2 (envelope) sealed row(s) exist that only KMS \
-                 can open — re-enable FLUIDBOX_KMS_MODE. Rolling back to legacy-only with \
-                 KMS-sealed custody would orphan them. Per-family: {detail}"
-            );
-        }
+    if kms_on && legacy_present {
+        return Ok(());
+    }
+    let counts = fluidbox_db::system_worker::sealed_key_version_counts(pool).await?;
+    if let Some(msg) = retirement_refusal(kms_on, legacy_present, &counts) {
+        anyhow::bail!(msg);
     }
     Ok(())
+}
+
+/// The PURE half of the retirement gate (unit-tested without a DB): the refusal
+/// message for a sealing posture + the per-family key-version counts, or `None`
+/// to boot.
+///
+/// TWO INDEPENDENT checks, deliberately NOT an if/else chain — each key's absence
+/// is judged on its own, so all FOUR config quadrants are covered:
+///   - legacy key absent + v1 rows exist → refuse (unreadable), whatever KMS does;
+///   - KMS off + v2 rows exist → refuse (unreadable), whatever the legacy key does.
+///
+/// The chain this replaced left `!kms_on && !legacy_present` unchecked, so dropping
+/// BOTH variables on a KMS deployment booted "successfully" with every stored
+/// credential unreadable behind a "connections disabled" warning. Both checks are
+/// no-ops on a healthy deployment, and the `kms_on && legacy_present` migration
+/// window never reaches here at all.
+fn retirement_refusal(
+    kms_on: bool,
+    legacy_present: bool,
+    counts: &[fluidbox_db::system_worker::FamilyKeyVersionCounts],
+) -> Option<String> {
+    fn tally(rows: impl Iterator<Item = (String, i64)>) -> Option<(i64, String)> {
+        let present: Vec<(String, i64)> = rows.filter(|(_, n)| *n > 0).collect();
+        if present.is_empty() {
+            return None;
+        }
+        let total = present.iter().map(|(_, n)| *n).sum();
+        let detail = present
+            .iter()
+            .map(|(f, n)| format!("{f}={n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some((total, detail))
+    }
+    // (a) The legacy key is gone: every v1 row is unreadable NOW — whether KMS is
+    // on (the retirement path: re-seal first) or off (sealing disabled entirely).
+    if !legacy_present {
+        if let Some((total, detail)) = tally(counts.iter().map(|c| (c.family.clone(), c.legacy))) {
+            return Some(format!(
+                "FLUIDBOX_CREDENTIAL_KEY is absent while {total} legacy (v1) sealed row(s) remain \
+                 — they are now unreadable. Restore the legacy key; on a KMS deployment, run the \
+                 re-seal job to completion (parity zero) BEFORE retiring it. Per-family: {detail}"
+            ));
+        }
+    }
+    // (b) KMS is off: every v2 row is unreadable NOW — whether the legacy key is
+    // present (a rollback to legacy-only) or absent (both dropped).
+    if !kms_on {
+        if let Some((total, detail)) = tally(counts.iter().map(|c| (c.family.clone(), c.envelope)))
+        {
+            return Some(format!(
+                "FLUIDBOX_KMS_MODE=off but {total} v2 (envelope) sealed row(s) exist that only KMS \
+                 can open — set FLUIDBOX_KMS_MODE (static|aws) and provide its KEK. Rolling back \
+                 to legacy-only with KMS-sealed custody would orphan them. Per-family: {detail}"
+            ));
+        }
+    }
+    None
 }
 
 // ─── pure envelope helpers (unit-tested without a DB) ───────────────────────
 
 fn aad_for(tenant_id: Uuid, family: SealFamily) -> String {
     format!("fbx:v2:{tenant_id}:{family}")
+}
+
+/// AAD for an ephemeral transit token of a given purpose. The purpose takes the
+/// family segment's place (transit tokens have no column family) so distinct
+/// kinds of transit token cannot open as one another (see
+/// [`Sealer::seal_token`]).
+fn transit_aad(purpose: &str) -> String {
+    format!("fbx:v2:transit:{purpose}")
 }
 
 /// v2 layout: `[0x02][dek_version u32 BE][nonce 24][ct]`.
@@ -575,12 +641,17 @@ fn open_with_dek(dek: &[u8; 32], aad: &str, blob: &[u8]) -> anyhow::Result<Strin
 }
 
 /// Read the declared `dek_version` from a v2 blob header (fail closed on a blob
-/// too short or missing the sanity tag).
-fn envelope_dek_version(blob: &[u8]) -> anyhow::Result<u32> {
+/// too short or missing the sanity tag). Returns the DB-side type (`i32`, the
+/// `tenant_deks.version` column): a header declaring a value above `i32::MAX` is
+/// MALFORMED, not a negative version — a bare `as i32` cast turned `0xFFFFFFFE`
+/// into a lookup for version `-2` and failed with a confusing "no DEK for version
+/// -2147483648"-style message instead of naming the real problem.
+fn envelope_dek_version(blob: &[u8]) -> anyhow::Result<i32> {
     if blob.len() < V2_HEADER_LEN + NONCE_LEN + 16 || blob[0] != V2_TAG {
         anyhow::bail!("sealed blob is malformed");
     }
-    Ok(u32::from_be_bytes([blob[1], blob[2], blob[3], blob[4]]))
+    let raw = u32::from_be_bytes([blob[1], blob[2], blob[3], blob[4]]);
+    i32::try_from(raw).map_err(|_| anyhow::anyhow!("sealed blob is malformed"))
 }
 
 #[cfg(test)]
@@ -670,6 +741,106 @@ mod tests {
         assert!(open_with_dek(&dek, &aad, &blob).is_err());
         assert!(open_with_dek(&dek, &aad, &[V2_TAG; 10]).is_err());
         assert!(envelope_dek_version(&[V2_TAG; 3]).is_err());
+    }
+
+    #[test]
+    fn v2_out_of_range_dek_version_is_malformed() {
+        // A header declaring a version above i32::MAX is MALFORMED — never a
+        // negative version handed to the DEK lookup.
+        let mut blob = seal_with_dek(&[7u8; 32], 1, "aad", "secret");
+        blob[1..5].copy_from_slice(&u32::MAX.to_be_bytes());
+        let err = envelope_dek_version(&blob).unwrap_err().to_string();
+        assert!(err.contains("malformed"), "got: {err}");
+        // The largest representable version is still readable.
+        blob[1..5].copy_from_slice(&(i32::MAX as u32).to_be_bytes());
+        assert_eq!(envelope_dek_version(&blob).unwrap(), i32::MAX);
+    }
+
+    #[test]
+    fn v2_transit_purpose_transplant_refused() {
+        // One DEK seals every transit token, so the AAD's purpose segment is the
+        // ONLY thing making a login state and an oauth boot token cryptographically
+        // distinct: a blob sealed for one purpose must not open under another.
+        let dek = [7u8; 32];
+        let blob = seal_with_dek(&dek, 1, &transit_aad(TRANSIT_LOGIN), "state");
+        assert_eq!(
+            open_with_dek(&dek, &transit_aad(TRANSIT_LOGIN), &blob).unwrap(),
+            "state"
+        );
+        for other in [TRANSIT_OAUTH_BOOT, TRANSIT_GITHUB_APP_FLOW] {
+            assert!(
+                open_with_dek(&dek, &transit_aad(other), &blob).is_err(),
+                "purpose '{other}' must not open a '{TRANSIT_LOGIN}' token"
+            );
+        }
+        // The three purposes are distinct strings under one namespace.
+        let aads = [TRANSIT_LOGIN, TRANSIT_OAUTH_BOOT, TRANSIT_GITHUB_APP_FLOW]
+            .map(transit_aad)
+            .to_vec();
+        assert!(aads.iter().all(|a| a.starts_with("fbx:v2:transit:")));
+        let unique: std::collections::HashSet<_> = aads.iter().collect();
+        assert_eq!(unique.len(), 3, "transit purposes must not collide");
+    }
+
+    // ─── D4 retirement gate (the pure half — all four quadrants) ────────────
+
+    fn fam(
+        name: &str,
+        legacy: i64,
+        envelope: i64,
+    ) -> fluidbox_db::system_worker::FamilyKeyVersionCounts {
+        fluidbox_db::system_worker::FamilyKeyVersionCounts {
+            family: name.into(),
+            legacy,
+            envelope,
+        }
+    }
+
+    #[test]
+    fn retirement_gate_covers_every_quadrant() {
+        let v1_only = vec![fam("integration_connections.credential_sealed", 3, 0)];
+        let v2_only = vec![fam("integration_connections.credential_sealed", 0, 4)];
+        let mixed = vec![
+            fam("integration_connections.credential_sealed", 3, 0),
+            fam("tenant_llm_keys.litellm_key_sealed", 0, 4),
+        ];
+        let empty: Vec<_> = vec![fam("integration_connections.credential_sealed", 0, 0)];
+
+        // (1) KMS on + legacy present (the migration window): never refuses — both
+        // versions are openable.
+        assert!(retirement_refusal(true, true, &mixed).is_none());
+
+        // (2) KMS on + legacy retired: a leftover v1 row is unreadable.
+        let msg = retirement_refusal(true, false, &v1_only).expect("must refuse");
+        assert!(msg.contains("FLUIDBOX_CREDENTIAL_KEY is absent"), "{msg}");
+        assert!(
+            msg.contains("integration_connections.credential_sealed=3"),
+            "per-family counts: {msg}"
+        );
+        // Fully re-sealed → boots.
+        assert!(retirement_refusal(true, false, &v2_only).is_none());
+
+        // (3) KMS off + legacy present: a v2 row is unreadable.
+        let msg = retirement_refusal(false, true, &v2_only).expect("must refuse");
+        assert!(msg.contains("FLUIDBOX_KMS_MODE=off"), "{msg}");
+        assert!(
+            msg.contains("integration_connections.credential_sealed=4"),
+            "per-family counts: {msg}"
+        );
+        assert!(retirement_refusal(false, true, &v1_only).is_none());
+
+        // (4) THE PREVIOUSLY UNGUARDED QUADRANT — both dropped. Sealing is disabled
+        // and EVERY stored credential is unreadable, so any sealed row refuses boot
+        // instead of booting behind a "connections disabled" warning.
+        assert!(retirement_refusal(false, false, &v1_only).is_some());
+        assert!(retirement_refusal(false, false, &v2_only).is_some());
+        assert!(retirement_refusal(false, false, &mixed).is_some());
+        // …but a deployment with NO sealed custody at all still boots (sealing
+        // simply stays disabled) — in every quadrant.
+        for (kms_on, legacy) in [(true, true), (true, false), (false, true), (false, false)] {
+            assert!(retirement_refusal(kms_on, legacy, &empty).is_none());
+            assert!(retirement_refusal(kms_on, legacy, &[]).is_none());
+        }
     }
 
     // ─── Sealer dispatch (no pool touched) ──────────────────────────────────
