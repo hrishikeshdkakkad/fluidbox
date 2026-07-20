@@ -502,10 +502,10 @@ struct LoginState {
     idp_config_id: Uuid,
 }
 
-/// `{purpose:"login", v:1, flow_id, tenant_id, idp_config_id, exp}` — sealed on
-/// the SAME primitives as the connector `seal_state`, but with a `purpose`/`v`
-/// discriminator so login states and connector states are mutually
-/// unredeemable (both confusion directions are unit-tested).
+/// `{purpose:"login", v:1, flow_id, tenant_id, idp_config_id, exp}` — sealed via
+/// the shared `Sealer::seal_token` transit primitive, but carrying a `purpose`/`v`
+/// discriminator so login states and any other sealed transit token (e.g. the
+/// connector OAuth boot token) are mutually unredeemable (unit-tested).
 async fn seal_login_state(
     sealer: &Sealer,
     flow_id: Uuid,
@@ -2384,13 +2384,17 @@ mod tests {
         assert_eq!(ls.tenant_id, tenant);
         assert_eq!(ls.idp_config_id, cfg);
 
-        // A connector state ({c,v,x}) must NOT open as a login state.
-        let connector = crate::oauth::seal_state(&s, Uuid::now_v7(), "verifier")
+        // A foreign sealed token (a connector-shaped {c,v,x} transit blob) must NOT
+        // open as a login state (no `p` purpose tag).
+        let connector = crate::oauth::b64url(
+            &s.seal_token(
+                &serde_json::json!({ "c": Uuid::now_v7(), "v": "verifier", "x": 9_999_999_999i64 })
+                    .to_string(),
+            )
             .await
-            .unwrap();
+            .unwrap(),
+        );
         assert!(open_login_state(&s, &connector).await.is_err());
-        // And a login state must NOT open as a connector state (no {c}).
-        assert!(crate::oauth::open_state(&s, &tok).await.is_err());
 
         // Tampering + wrong key fail closed.
         assert!(open_login_state(&s, "not-base64!!").await.is_err());

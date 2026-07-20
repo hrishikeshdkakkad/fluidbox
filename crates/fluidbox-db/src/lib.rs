@@ -1412,6 +1412,172 @@ pub async fn acquire_registration_lock(
     Ok(())
 }
 
+// ─── Connector OAuth flows (Phase D Task 4, #32 — invariant 20) ─────────────
+//
+// One-time server-side OAuth state rows, browser-bound like login_flows /
+// github_app_flows. Replaces the stateless AEAD `state` param. The claim/peek
+// fns are PRE-AUTH — keyed by `state_hash` (the opaque random the AS echoes back
+// as `state`), which is the row's OWN authenticator (the row IS the auth, like a
+// webhook signature). They take no `TenantScope`: the callback has no principal
+// (a browser redirect can't carry the API token), and the verified tenant rides
+// out ON the returned row. This mirrors how `claim_login_flow` (identity.rs)
+// takes a raw id rather than a scope, for the same bootstrap reason.
+
+/// A one-time connector-OAuth-flow row. NOT `Serialize` — it carries sealed key
+/// material (`pkce_verifier_sealed`) and one-time secrets' hashes; nothing here
+/// ever reaches an API response.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ConnectorOauthFlowRow {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub connection_id: Uuid,
+    pub initiated_by_user_id: Option<Uuid>,
+    pub state_hash: String,
+    pub browser_hash: String,
+    pub issuer: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub metadata_digest: String,
+    pub resource: String,
+    pub redirect_uri: String,
+    pub scopes: Value,
+    pub challenge: String,
+    pub challenge_method: String,
+    pub client_registration_id: Option<Uuid>,
+    pub client_id: String,
+    pub pkce_verifier_sealed: Vec<u8>,
+    pub pkce_verifier_key_version: i16,
+    pub expected_generation: i32,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
+/// Values for a new flow row. The PKCE verifier is pre-sealed by the caller
+/// (server owns the crypto); `ttl_secs` sets `expires_at = now() + ttl` DB-side so
+/// the returned row's exact expiry seeds the boot token.
+pub struct NewConnectorOauthFlow<'a> {
+    pub connection_id: Uuid,
+    pub initiated_by_user_id: Option<Uuid>,
+    pub state_hash: &'a str,
+    pub browser_hash: &'a str,
+    pub issuer: &'a str,
+    pub authorization_endpoint: &'a str,
+    pub token_endpoint: &'a str,
+    pub metadata_digest: &'a str,
+    pub resource: &'a str,
+    pub redirect_uri: &'a str,
+    pub scopes: &'a Value,
+    pub challenge: &'a str,
+    pub challenge_method: &'a str,
+    pub client_registration_id: Option<Uuid>,
+    pub client_id: &'a str,
+    pub pkce_verifier_sealed: &'a [u8],
+    pub pkce_verifier_key_version: i16,
+    pub expected_generation: i32,
+    pub ttl_secs: i64,
+}
+
+/// Insert a one-time flow, returning the persisted row (its `id` + `expires_at`
+/// seed the boot token). GC-on-insert (login_flows precedent) sweeps this tenant's
+/// abandoned flows first — scoped to the inserting tenant so a per-request write
+/// never touches another org's rows. Takes a `TenantScope` (the start principal's
+/// verified tenant) which is stamped into `tenant_id` for the composite FK and a
+/// future RLS `WITH CHECK`.
+pub async fn insert_connector_oauth_flow(
+    pool: &PgPool,
+    scope: TenantScope,
+    new: NewConnectorOauthFlow<'_>,
+) -> sqlx::Result<ConnectorOauthFlowRow> {
+    sqlx::query(
+        "delete from connector_oauth_flows
+         where tenant_id = $1
+           and ((consumed_at is null and expires_at < now())
+                or expires_at < now() - interval '7 days')",
+    )
+    .bind(scope.tenant_id())
+    .execute(pool)
+    .await?;
+    sqlx::query_as(
+        "insert into connector_oauth_flows
+           (id, tenant_id, connection_id, initiated_by_user_id, state_hash, browser_hash,
+            issuer, authorization_endpoint, token_endpoint, metadata_digest, resource,
+            redirect_uri, scopes, challenge, challenge_method, client_registration_id,
+            client_id, pkce_verifier_sealed, pkce_verifier_key_version, expected_generation,
+            expires_at)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+                 now() + make_interval(secs => $21::double precision))
+         returning *",
+    )
+    .bind(Uuid::now_v7())
+    .bind(scope.tenant_id())
+    .bind(new.connection_id)
+    .bind(new.initiated_by_user_id)
+    .bind(new.state_hash)
+    .bind(new.browser_hash)
+    .bind(new.issuer)
+    .bind(new.authorization_endpoint)
+    .bind(new.token_endpoint)
+    .bind(new.metadata_digest)
+    .bind(new.resource)
+    .bind(new.redirect_uri)
+    .bind(new.scopes)
+    .bind(new.challenge)
+    .bind(new.challenge_method)
+    .bind(new.client_registration_id)
+    .bind(new.client_id)
+    .bind(new.pkce_verifier_sealed)
+    .bind(new.pkce_verifier_key_version)
+    .bind(new.expected_generation)
+    .bind(new.ttl_secs as f64)
+    .fetch_one(pool)
+    .await
+}
+
+/// The one-time connector-OAuth-flow claim (invariant 20). Keyed by `state_hash`
+/// (pre-auth — see the module note above). The cookie `browser_hash` sits INSIDE
+/// the single-use predicate alongside `consumed_at is null` and `expires_at >
+/// now()`: a leaked authorization URL WITHOUT the initiating browser's cookie
+/// matches ZERO rows, so it can neither complete NOR burn the flow (design
+/// :646-656). Returns the burned row on success.
+pub async fn claim_connector_oauth_flow<'e, E>(
+    exec: E,
+    state_hash: &str,
+    browser_hash: &str,
+) -> sqlx::Result<Option<ConnectorOauthFlowRow>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(
+        "update connector_oauth_flows set consumed_at = now()
+         where state_hash = $1 and browser_hash = $2
+           and consumed_at is null and expires_at > now()
+         returning *",
+    )
+    .bind(state_hash)
+    .bind(browser_hash)
+    .fetch_optional(exec)
+    .await
+}
+
+/// Read a flow by `state_hash` WITHOUT mutating it (never consumes). Two callers:
+/// (1) the go page checks liveness before it sets the cookie + redirects, and
+/// (2) the callback, ONLY after a failed claim, splits "wrong browser" (row still
+/// live but the cookie hash mismatched → 403, row UNBURNED) from
+/// "unknown/expired/consumed" (→ 400 generic). Pre-auth, keyed by `state_hash`.
+pub async fn peek_connector_oauth_flow<'e, E>(
+    exec: E,
+    state_hash: &str,
+) -> sqlx::Result<Option<ConnectorOauthFlowRow>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as("select * from connector_oauth_flows where state_hash = $1")
+        .bind(state_hash)
+        .fetch_optional(exec)
+        .await
+}
+
 // ─── Per-tenant DEKs (Phase D envelope sealing, #32) ────────────────────────
 
 /// One wrapped Data Encryption Key per `(tenant, version)`. `wrapped_dek` is the
@@ -9950,5 +10116,220 @@ mod tests {
             .unwrap();
         assert!(freed, "the lock is free after tx1 released");
         tx3.rollback().await.unwrap();
+    }
+
+    // ─── Connector OAuth flows (Phase D Task 4, #32 — invariant 20) ──────────
+
+    // A flow-row template borrowing the caller's per-case hashes/scopes (one
+    // shared lifetime); string/byte literals are 'static and coerce in.
+    fn new_flow<'a>(
+        connection_id: Uuid,
+        expected_generation: i32,
+        state_hash: &'a str,
+        browser_hash: &'a str,
+        scopes: &'a Value,
+        ttl_secs: i64,
+    ) -> NewConnectorOauthFlow<'a> {
+        NewConnectorOauthFlow {
+            connection_id,
+            initiated_by_user_id: None,
+            state_hash,
+            browser_hash,
+            issuer: "https://as.test",
+            authorization_endpoint: "https://as.test/authorize",
+            token_endpoint: "https://as.test/token",
+            metadata_digest: "sha256:abc",
+            resource: "https://mcp.test",
+            redirect_uri: "https://fbx.test/v1/oauth/callback",
+            scopes,
+            challenge: "chal",
+            challenge_method: "S256",
+            client_registration_id: None,
+            client_id: "client-1",
+            pkce_verifier_sealed: &[1, 2, 3],
+            pkce_verifier_key_version: 1,
+            expected_generation,
+            ttl_secs,
+        }
+    }
+
+    // The full claim matrix: happy path consumes once; replay refused; a WRONG
+    // browser_hash matches nothing AND leaves consumed_at null (then the right
+    // browser still completes — the no-burn proof); expired refused; peek never
+    // consumes; and the row FREEZES the connection's generation so a mid-flow
+    // reconnect (bump) is detectable by the callback's coherence check.
+    #[tokio::test]
+    async fn connector_oauth_flow_claim_matrix() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
+            .await
+            .unwrap();
+        let scope = TenantScope::assume(org.id);
+        // A connection to satisfy the composite (tenant_id, connection_id) FK.
+        let conn = create_connection(
+            &pool,
+            scope,
+            "mcp_http",
+            "acct",
+            "disp",
+            None,
+            1,
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            &serde_json::json!({ "base_url": "https://x" }),
+            None,
+            1,
+            ConnectionAuth {
+                auth_kind: "oauth",
+                status: "pending",
+                oauth: None,
+                client_secret_sealed: None,
+                client_secret_key_version: 1,
+                registration_id: None,
+            },
+            ConnectionOwner::Organization,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let scopes = serde_json::json!(["read", "offline_access"]);
+        let gen = conn.authorization_generation;
+        let s_hash = sha256_hex("state-secret");
+        let b_hash = sha256_hex("cookie-secret");
+
+        // Insert returns the persisted row (its expires_at seeds the boot token).
+        let row = insert_connector_oauth_flow(
+            &pool,
+            scope,
+            new_flow(conn.id, gen, &s_hash, &b_hash, &scopes, 600),
+        )
+        .await
+        .unwrap();
+        assert_eq!(row.tenant_id, org.id);
+        assert_eq!(row.connection_id, conn.id);
+        assert!(row.consumed_at.is_none());
+        assert!(row.expires_at > Utc::now());
+
+        // peek returns the row and does NOT consume it.
+        let peeked = peek_connector_oauth_flow(&pool, &s_hash)
+            .await
+            .unwrap()
+            .expect("peek finds the live flow");
+        assert_eq!(peeked.id, row.id);
+        assert!(peeked.consumed_at.is_none(), "peek never consumes");
+        assert_eq!(peeked.pkce_verifier_sealed, vec![1, 2, 3]);
+
+        // WRONG browser_hash: matches nothing AND burns nothing.
+        assert!(
+            claim_connector_oauth_flow(&pool, &s_hash, &sha256_hex("attacker"))
+                .await
+                .unwrap()
+                .is_none(),
+            "wrong browser is refused"
+        );
+        let unburned = peek_connector_oauth_flow(&pool, &s_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            unburned.consumed_at.is_none(),
+            "a wrong-browser claim burns NOTHING (the no-burn proof)"
+        );
+
+        // RIGHT browser then still completes — consumes exactly once.
+        let claimed = claim_connector_oauth_flow(&pool, &s_hash, &b_hash)
+            .await
+            .unwrap()
+            .expect("the right browser claims after a wrong-browser attempt");
+        assert_eq!(claimed.client_id, "client-1");
+        assert_eq!(claimed.scopes, scopes);
+        assert_eq!(claimed.expected_generation, conn.authorization_generation);
+        assert!(claimed.consumed_at.is_some(), "claim consumes the row");
+
+        // REPLAY (correct browser, second time) is refused.
+        assert!(
+            claim_connector_oauth_flow(&pool, &s_hash, &b_hash)
+                .await
+                .unwrap()
+                .is_none(),
+            "replay of a consumed flow is refused"
+        );
+
+        // Unknown state_hash: no claim, no peek row.
+        assert!(
+            claim_connector_oauth_flow(&pool, &sha256_hex("nope"), &b_hash)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(peek_connector_oauth_flow(&pool, &sha256_hex("nope"))
+            .await
+            .unwrap()
+            .is_none());
+
+        // Expired flow: claim refused; peek still SEES it (peek is a plain read,
+        // it never filters — the caller classifies).
+        let s_exp = sha256_hex("state-expired");
+        insert_connector_oauth_flow(
+            &pool,
+            scope,
+            new_flow(conn.id, gen, &s_exp, &b_hash, &scopes, -5),
+        )
+        .await
+        .unwrap();
+        assert!(
+            claim_connector_oauth_flow(&pool, &s_exp, &b_hash)
+                .await
+                .unwrap()
+                .is_none(),
+            "an already-expired flow is refused"
+        );
+        assert!(
+            peek_connector_oauth_flow(&pool, &s_exp)
+                .await
+                .unwrap()
+                .is_some(),
+            "peek never filters — it returns the expired row so the caller can 400"
+        );
+
+        // Generation drift: the row froze the connection's generation; a reconnect
+        // bumps it, so the callback's `authorization_generation == expected_generation`
+        // coherence check detects the drift and refuses.
+        let s_gen = sha256_hex("state-gen");
+        let gen_flow = insert_connector_oauth_flow(
+            &pool,
+            scope,
+            new_flow(conn.id, gen, &s_gen, &b_hash, &scopes, 600),
+        )
+        .await
+        .unwrap();
+        let new_gen = bump_connection_generation(&pool, scope, conn.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let fresh = get_connection(&pool, scope, conn.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.authorization_generation, new_gen);
+        assert_ne!(
+            fresh.authorization_generation, gen_flow.expected_generation,
+            "a reconnect (generation bump) drifts past the flow's frozen expected_generation"
+        );
+
+        // Cleanup: children-first (FKs are NO ACTION) — flows, then the connection,
+        // then the tenant.
+        for stmt in [
+            "delete from connector_oauth_flows where tenant_id = $1",
+            "delete from integration_connections where tenant_id = $1",
+            "delete from tenants where id = $1",
+        ] {
+            sqlx::query(stmt).bind(org.id).execute(&pool).await.unwrap();
+        }
     }
 }

@@ -251,9 +251,10 @@ export function AddServerWizard({
         setStep("done");
         return;
       }
-      // OAuth: hand the browser to the AS, then watch the connection go active
-      // (the callback photographs the snapshot).
-      if (r.authorize_url) window.open(r.authorize_url, "_blank", "noopener");
+      // OAuth: hand the browser to the go endpoint (it binds the per-flow cookie,
+      // then redirects to the AS), then watch the connection go active (the
+      // callback photographs the snapshot).
+      if (r.go_url) window.open(r.go_url, "_blank", "noopener");
       setDoneSlug(r.slug ?? null);
       setBusy(false);
       watchUntilActive(r.connection?.id);
