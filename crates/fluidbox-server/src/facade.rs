@@ -102,6 +102,18 @@ fn dialect_error(dialect: Dialect, status: StatusCode, message: &str) -> Respons
         .unwrap()
 }
 
+/// Forward an upstream response we had to BUFFER (the tenant-key rejection
+/// classifier reads the body before deciding). Same shape the non-streaming path
+/// forwards with: verbatim status + bytes, `application/json`. Used only for
+/// small auth-error bodies — never a stream.
+fn forward_buffered(status: reqwest::StatusCode, body: axum::body::Bytes) -> Response {
+    Response::builder()
+        .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::UNAUTHORIZED))
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
 /// A 503 facade refusal carrying a STABLE machine-readable `code`
 /// (`tenant_llm_key_unavailable` / `tenant_llm_keys_required`), dialect-shaped so
 /// the runner SDK still parses it. The code rides the dialect's machine-readable
@@ -262,9 +274,9 @@ fn validate_body(
 
 /// Build and send ONE upstream model request with the given credential. Extracted
 /// from `messages` so the reactive tenant-key recovery can replay the identical
-/// request under a freshly minted key (see
-/// [`llm_keys::should_remint_tenant_key`]) — the dialect's auth-header shape lives
-/// here, in one place, rather than being duplicated at the retry site.
+/// request under a re-provisioned key (see
+/// [`llm_keys::recover_rejected_tenant_key`]) — the dialect's auth-header shape
+/// lives here, in one place, rather than being duplicated at the retry site.
 async fn send_upstream(
     state: &AppState,
     dialect: Dialect,
@@ -512,55 +524,66 @@ pub async fn messages(
             ));
         }
     };
-    // Reactive tenant-key recovery (tenant mode only): a 401/403 means the virtual
-    // key we presented is dead at LiteLLM — redeployed with a fresh database, or an
-    // operator pruned keys — and nothing else would ever recover it (a cold cache
-    // re-reads the same sealed row, so even a restart keeps 401ing). Discard it
-    // (cache AND sealed row), mint a fresh one, and replay this request EXACTLY
-    // ONCE: `should_remint_tenant_key`'s `already_reminted` makes a mint loop
-    // impossible, and the auth status proves the request never executed upstream —
-    // the same reasoning as the connector-token reactive 401 in `oauth.rs`.
+    // Reactive tenant-key recovery (tenant mode only). A 401 whose body proves
+    // LITELLM'S OWN key check rejected the virtual key we presented — LiteLLM
+    // redeployed with a fresh database, or an operator pruned keys — is the one
+    // failure nothing else recovers from: a cold cache re-reads the same sealed
+    // row, so even a restart keeps 401ing.
     //
-    // Accepted cost: an auth failure that is really the GATEWAY's own upstream
-    // provider credential (a bad ANTHROPIC_API_KEY inside LiteLLM also surfaces as
-    // 401) trips this too — one extra round trip, and one virtual key orphaned at
-    // LiteLLM, per failing request. fluidbox still keeps exactly ONE row per tenant
-    // (the discard deletes it before the mint), the requests were failing anyway,
-    // and it clears the moment the operator fixes the gateway. Distinguishing the
-    // two would mean parsing LiteLLM's error body — a far more brittle dependency
-    // than an orphaned key.
-    if llm_keys::should_remint_tenant_key(key_source, resp.status().as_u16(), false) {
+    // The proof requirement is the point (review H3). LiteLLM answers 401 for
+    // BOTH that and "my own upstream provider credential was refused", and 403 for
+    // policy/budget refusals; re-provisioning on all of them let one authenticated
+    // tenant amplify a provider outage into unbounded `/key/generate` traffic and
+    // unbounded key-table growth. So the small auth-error body is buffered and
+    // classified, ambiguity forwards the rejection verbatim, and
+    // `recover_rejected_tenant_key` bounds what survives that (stale-rejection
+    // compare, durable per-tenant cooldown, CAS, deployment-wide mint budget).
+    //
+    // The replay is still EXACTLY ONCE — a 401 proves the request never executed
+    // upstream, the same reasoning as the connector-token reactive 401 in
+    // `oauth.rs` — and whatever the replay answers is final.
+    if key_source == llm_keys::KeySource::Tenant && resp.status().as_u16() == 401 {
+        let status = resp.status();
+        let body = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                return Ok(dialect_error(
+                    dialect,
+                    StatusCode::BAD_GATEWAY,
+                    &format!("upstream body read failed: {e}"),
+                ));
+            }
+        };
+        if !llm_keys::virtual_key_rejected(key_source, status.as_u16(), &body) {
+            // Not our key: an upstream/provider or otherwise unattributable 401.
+            // Forward it verbatim — never re-provision on a guess.
+            return Ok(forward_buffered(status, body));
+        }
         tracing::warn!(
             tenant = %sess_auth.tenant_id,
-            status = %resp.status(),
-            "facade: upstream rejected the tenant LLM key — re-minting once"
+            "facade: LiteLLM rejected the tenant's virtual key — attempting recovery"
         );
-        llm_keys::discard_tenant_llm_key(&state, sess_auth.tenant_id).await;
-        match llm_keys::ensure_tenant_key(&state, sess_auth.tenant_id).await {
-            Ok(fresh) => {
-                match send_upstream(&state, dialect, &upstream, &headers, upstream_body, &fresh)
-                    .await
-                {
-                    // Whatever this answers is FINAL — `already_reminted = true`.
-                    Ok(r) => resp = r,
-                    Err(e) => {
-                        return Ok(dialect_error(
-                            dialect,
-                            StatusCode::BAD_GATEWAY,
-                            &format!("upstream request failed: {e}"),
-                        ));
-                    }
+        let fresh =
+            match llm_keys::recover_rejected_tenant_key(&state, sess_auth.tenant_id, &upstream_key)
+                .await
+            {
+                llm_keys::KeyRecovery::Retry(k) => k,
+                llm_keys::KeyRecovery::Refused(reason) => {
+                    tracing::warn!(
+                        tenant = %sess_auth.tenant_id,
+                        reason,
+                        "facade: tenant LLM key not re-provisioned — forwarding the rejection"
+                    );
+                    return Ok(forward_buffered(status, body));
                 }
-            }
+            };
+        match send_upstream(&state, dialect, &upstream, &headers, upstream_body, &fresh).await {
+            Ok(r) => resp = r,
             Err(e) => {
-                tracing::warn!(
-                    "facade: tenant LLM key could not be re-minted for tenant {}: {e}",
-                    sess_auth.tenant_id
-                );
-                return Ok(facade_refusal(
+                return Ok(dialect_error(
                     dialect,
-                    "tenant_llm_key_unavailable",
-                    "the tenant's LLM key could not be provisioned",
+                    StatusCode::BAD_GATEWAY,
+                    &format!("upstream request failed: {e}"),
                 ));
             }
         }
