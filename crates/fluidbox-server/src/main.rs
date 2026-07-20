@@ -16,11 +16,14 @@ mod facade;
 mod github_app;
 mod harness;
 mod internal;
+mod kms;
 mod ledger;
+mod llm_keys;
 mod login;
 mod oauth;
 mod orchestrator;
 mod rbac;
+mod reseal;
 mod run_service;
 mod scheduler;
 mod seal;
@@ -78,7 +81,44 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&cfg.data_dir).ok();
 
     tracing::info!("connecting to database…");
-    let pool = fluidbox_db::connect(&cfg.database_url).await?;
+    let pool = fluidbox_db::connect(&cfg.database_url, cfg.runtime_role.as_deref()).await?;
+    if let Some(role) = &cfg.runtime_role {
+        tracing::info!(
+            "app pool runs under non-owner role '{role}' (RLS role split enabled; posture verified: \
+             NOLOGIN, no SUPERUSER/BYPASSRLS, no inherited or foreign memberships)"
+        );
+    }
+    // Review M2: RLS is defence-in-depth ONLY if PostgreSQL actually evaluates the
+    // policies. It skips them entirely for a SUPERUSER/BYPASSRLS role — which is
+    // exactly what Neon's default credential is — so migration 0018 can be applied,
+    // FORCEd, and completely inert. Read the EFFECTIVE role of a pooled connection
+    // (after any `after_connect SET ROLE`), and in multi-user mode make it fatal:
+    // an unnoticed missing `tenant_id` predicate must be contained, not served.
+    match fluidbox_db::pool_role_bypasses_rls(&pool).await? {
+        None => tracing::info!("row-level security is ENFORCED for this pool (its role has neither SUPERUSER nor BYPASSRLS)"),
+        Some(user) if cfg.require_sso && !cfg.allow_rls_bypass => anyhow::bail!(
+            "REFUSING TO BOOT: FLUIDBOX_REQUIRE_SSO=1 (multi-user) but the database role this pool \
+             runs as ('{user}') is SUPERUSER or has BYPASSRLS, so PostgreSQL SKIPS every \
+             row-level-security policy from migration 0018 and tenant isolation falls back to the \
+             `where tenant_id = $n` convention alone. Fix (either one):\n  \
+             1. set FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime — migration 0018 creates that NOLOGIN \
+             least-privilege role and every pooled connection SET ROLEs to it; or\n  \
+             2. point DATABASE_URL at a role that is neither SUPERUSER nor BYPASSRLS.\n  \
+             Verify with: select rolsuper, rolbypassrls from pg_roles where rolname = current_user;\n  \
+             For local single-user operation on a superuser database, set \
+             FLUIDBOX_ALLOW_RLS_BYPASS=1 to accept this."
+        ),
+        Some(user) if cfg.require_sso => tracing::warn!(
+            "FLUIDBOX_ALLOW_RLS_BYPASS=1: pool role '{user}' bypasses RLS, so migration 0018's \
+             policies are INERT and tenant isolation rests on the query predicates alone — \
+             acceptable for local single-user operation only"
+        ),
+        Some(user) => tracing::warn!(
+            "pool role '{user}' is SUPERUSER or has BYPASSRLS, so migration 0018's RLS policies \
+             are skipped by PostgreSQL (single-user mode, tolerated). Set FLUIDBOX_RUNTIME_ROLE \
+             before enabling FLUIDBOX_REQUIRE_SSO=1, or boot will refuse."
+        ),
+    }
 
     tracing::info!("seeding…");
     // The curated seed agent rides the harness registry like any other
@@ -134,15 +174,46 @@ async fn main() -> anyhow::Result<()> {
 
     let events_tx = fluidbox_db::spawn_listener(cfg.database_url.clone());
 
-    let sealer = match &cfg.credential_key {
-        Some(k) => Some(seal::Sealer::from_key_string(k)?),
-        None => {
-            tracing::warn!(
-                "FLUIDBOX_CREDENTIAL_KEY not set — integration connections are disabled"
-            );
-            None
+    // Phase D (#32): the sealer is legacy-only (KMS off), KMS-envelope (static|aws),
+    // or None (KMS off + no legacy key → sealing disabled, today's behavior). The
+    // boot/seed tenant keys transit tokens in KMS mode (see Sealer::seal_token).
+    let sealer = seal::build_sealer(&cfg, &pool, seed.tenant_id)?;
+    // D4 retirement gates: refuse boot when the sealing configuration and the
+    // stored custody are incoherent (KMS on with the legacy key retired but v1
+    // rows remain unreadable; KMS off with KMS-only v2 rows present).
+    // In KMS mode this also CLAIMS the deployment's KEK identity (the seed tenant's
+    // DEK row, arbitrated by the database) before we serve, so a second replica
+    // holding a different KEK refuses boot instead of quietly taking custody of half
+    // the tenants. The sealer is passed in so all of it runs on the LIVE backend +
+    // DEK cache: the unwrap the gate performs anyway warms the DEK every transit
+    // token uses (singleflight already caps this at one Decrypt per restart).
+    seal::check_retirement_gates(&cfg, &pool, sealer.as_ref(), seed.tenant_id).await?;
+    match (&sealer, cfg.kms_mode) {
+        (None, _) => tracing::warn!(
+            "credential sealing disabled (no FLUIDBOX_CREDENTIAL_KEY, KMS off) — integration connections are disabled"
+        ),
+        (Some(_), config::KmsMode::Off) => {
+            tracing::info!("credential sealing: legacy key (FLUIDBOX_KMS_MODE=off)")
         }
-    };
+        (Some(_), mode) => tracing::info!("credential sealing: KMS envelope ({mode:?})"),
+    }
+    // Phase D (#32) LLM upstream-auth mode. In tenant mode the facade selects a
+    // per-tenant LiteLLM virtual key and the master key is confined to
+    // provisioning; shared mode presents the deployment key on every call.
+    match cfg.llm_key_mode {
+        config::LlmKeyMode::Shared => tracing::info!(
+            "LLM upstream auth: shared key (FLUIDBOX_LLM_KEY_MODE=shared)"
+        ),
+        config::LlmKeyMode::Tenant => tracing::info!(
+            "LLM upstream auth: per-tenant virtual keys (FLUIDBOX_LLM_KEY_MODE=tenant); master key confined to provisioning at {}",
+            cfg.llm_admin_url
+        ),
+    }
+    if cfg.require_sso && cfg.llm_key_mode == config::LlmKeyMode::Shared {
+        tracing::warn!(
+            "FLUIDBOX_REQUIRE_SSO=1 with FLUIDBOX_LLM_KEY_MODE=shared — the facade will refuse every model request (tenant_llm_keys_required); set FLUIDBOX_LLM_KEY_MODE=tenant for hosted deployments"
+        );
+    }
 
     let state: state::AppState = Arc::new(AppStateInner {
         tenant_id: seed.tenant_id,
@@ -161,10 +232,15 @@ async fn main() -> anyhow::Result<()> {
         sealer,
         connector_tokens: Default::default(),
         oauth_locks: Default::default(),
+        tenant_llm_keys: Default::default(),
         // Docker needs no netpol gate; Kubernetes starts unverified and the
         // worker below flips it once the CNI is proven to enforce policy.
         netpol_verified: std::sync::atomic::AtomicBool::new(!is_k8s),
         oidc: Default::default(),
+        // Phase D (#32) legacy→KMS re-seal: the singleton claim flag + live
+        // progress, both in-memory (the job is restart-safe by construction).
+        reseal_running: std::sync::atomic::AtomicBool::new(false),
+        reseal_status: tokio::sync::Mutex::new(reseal::ResealStatus::default()),
         pool,
         cfg,
     });
@@ -268,6 +344,18 @@ async fn main() -> anyhow::Result<()> {
             "/admin/orgs/{slug}/members/{membership_id}/roles",
             post(admin_orgs::set_member_roles),
         )
+        // Rotate a tenant's LiteLLM virtual key (Phase D, #32): mint a fresh key,
+        // swap the sealed row, retire the old at LiteLLM. Operator-only; 404 on an
+        // unknown org; never returns the key.
+        .route(
+            "/admin/orgs/{slug}/llm-key/rotate",
+            post(admin_orgs::rotate_llm_key),
+        )
+        // Legacy→KMS re-seal (Phase D, #32): operator-only. POST starts the
+        // background job (409 if already running / KMS off); GET reports live
+        // count parity + job progress. The D4 retirement boot gate
+        // (seal::check_retirement_gates) reads the same counts.
+        .route("/admin/reseal", get(reseal::status).post(reseal::start))
         .route(
             "/capabilities",
             get(capabilities::list).post(capabilities::create),
@@ -317,8 +405,11 @@ async fn main() -> anyhow::Result<()> {
             post(github_app::app_ingress),
         )
         // Unauthenticated by design: a browser redirect can't carry the
-        // admin token — the AEAD-sealed `state` parameter is the auth
-        // (same pattern as webhook-signature ingress below).
+        // admin token. The go leg's sealed boot token and the callback's
+        // one-time flow claim (with the initiating-browser cookie hash inside
+        // the predicate) ARE the auth (invariant 20; same pattern as the
+        // github/app go/callback legs and webhook-signature ingress).
+        .route("/oauth/go", get(oauth::go))
         .route("/oauth/callback", get(oauth::callback))
         .route("/catalog", get(catalog::list).post(catalog::create))
         .route("/catalog/{slug}", get(catalog::get))

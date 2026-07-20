@@ -16,6 +16,7 @@
 use crate::error::{ApiError, ApiResult};
 use crate::harness;
 use crate::ledger;
+use crate::llm_keys;
 use crate::state::AppState;
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -96,6 +97,48 @@ fn dialect_error(dialect: Dialect, status: StatusCode, message: &str) -> Respons
     };
     Response::builder()
         .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// Forward an upstream response we had to BUFFER (the tenant-key rejection
+/// classifier reads the body before deciding). Same shape the non-streaming path
+/// forwards with: verbatim status + bytes, `application/json`. Used only for
+/// small auth-error bodies — never a stream.
+fn forward_buffered(status: reqwest::StatusCode, body: axum::body::Bytes) -> Response {
+    Response::builder()
+        .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::UNAUTHORIZED))
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// A 503 facade refusal carrying a STABLE machine-readable `code`
+/// (`tenant_llm_key_unavailable` / `tenant_llm_keys_required`), dialect-shaped so
+/// the runner SDK still parses it. The code rides the dialect's machine-readable
+/// slot (Anthropic `error.type`, OpenAI `error.code`) AND the message, so a
+/// consumer keys on it regardless of dialect. This is the D7 fail-closed exit: a
+/// tenant-key resolution failure, or the forbidden SSO+shared posture, stops the
+/// call cold — NEVER a fallback to the shared/master key.
+fn facade_refusal(dialect: Dialect, code: &str, message: &str) -> Response {
+    let full = format!("{message} ({code})");
+    let body = match dialect {
+        Dialect::Anthropic => json!({
+            "type": "error",
+            "error": { "type": code, "message": full }
+        }),
+        Dialect::OpenAi => json!({
+            "error": {
+                "message": full,
+                "type": "invalid_request_error",
+                "param": null,
+                "code": code
+            }
+        }),
+    };
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()
@@ -227,6 +270,54 @@ fn validate_body(
         }
     }
     Ok(())
+}
+
+/// Build and send ONE upstream model request with the given credential. Extracted
+/// from `messages` so the reactive tenant-key recovery can replay the identical
+/// request under a re-provisioned key (see
+/// [`llm_keys::recover_rejected_tenant_key`]) — the dialect's auth-header shape
+/// lives here, in one place, rather than being duplicated at the retry site.
+async fn send_upstream(
+    state: &AppState,
+    dialect: Dialect,
+    upstream: &str,
+    headers: &HeaderMap,
+    body: axum::body::Bytes,
+    upstream_key: &str,
+) -> reqwest::Result<reqwest::Response> {
+    let mut req = state
+        .http
+        .post(upstream)
+        .body(body)
+        .header("content-type", "application/json");
+    match dialect {
+        Dialect::Anthropic => {
+            // Forward version + beta headers verbatim (native contract).
+            if let Some(v) = headers
+                .get("anthropic-version")
+                .and_then(|h| h.to_str().ok())
+            {
+                req = req.header("anthropic-version", v);
+            } else {
+                req = req.header("anthropic-version", "2023-06-01");
+            }
+            if let Some(b) = headers.get("anthropic-beta").and_then(|h| h.to_str().ok()) {
+                req = req.header("anthropic-beta", b);
+            }
+            if state.cfg.llm_upstream_is_anthropic {
+                req = req.header("x-api-key", upstream_key);
+            } else {
+                req = req
+                    .header("authorization", format!("Bearer {upstream_key}"))
+                    .header("x-api-key", upstream_key);
+            }
+        }
+        Dialect::OpenAi => {
+            // Bearer only — the OpenAI dialect never sees x-api-key.
+            req = req.header("authorization", format!("Bearer {upstream_key}"));
+        }
+    }
+    req.send().await
 }
 
 /// POST /internal/llm/{*rest} — both dialects, one route.
@@ -380,43 +471,50 @@ pub async fn messages(
         suffix
     );
 
-    let mut req = state.http.post(&upstream).body(upstream_body);
-    req = req.header("content-type", "application/json");
-    match dialect {
-        Dialect::Anthropic => {
-            // Forward version + beta headers verbatim (native contract).
-            if let Some(v) = headers
-                .get("anthropic-version")
-                .and_then(|h| h.to_str().ok())
-            {
-                req = req.header("anthropic-version", v);
-            } else {
-                req = req.header("anthropic-version", "2023-06-01");
-            }
-            if let Some(b) = headers.get("anthropic-beta").and_then(|h| h.to_str().ok()) {
-                req = req.header("anthropic-beta", b);
-            }
-            if state.cfg.llm_upstream_is_anthropic {
-                req = req.header("x-api-key", &state.cfg.llm_upstream_key);
-            } else {
-                req = req
-                    .header(
-                        "authorization",
-                        format!("Bearer {}", state.cfg.llm_upstream_key),
-                    )
-                    .header("x-api-key", &state.cfg.llm_upstream_key);
+    // Resolve the outbound credential ONCE, before dialect dispatch (D7). Shared
+    // mode presents the deployment key (today's behavior, now explicit); tenant
+    // mode resolves/mints the session tenant's LiteLLM virtual key so the master
+    // key never rides a model request; SSO+shared is the forbidden hosted posture.
+    // Every failure is fail-closed — a 503 with a stable code, NEVER the master
+    // key as a fallback.
+    let key_source = llm_keys::key_source(state.cfg.llm_key_mode, state.cfg.require_sso);
+    let upstream_key: String = match key_source {
+        llm_keys::KeySource::Shared => state.cfg.llm_upstream_key.clone(),
+        llm_keys::KeySource::Tenant => {
+            match llm_keys::ensure_tenant_key(&state, sess_auth.tenant_id).await {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::warn!(
+                        "facade: tenant LLM key unavailable for tenant {}: {e}",
+                        sess_auth.tenant_id
+                    );
+                    return Ok(facade_refusal(
+                        dialect,
+                        "tenant_llm_key_unavailable",
+                        "the tenant's LLM key could not be provisioned",
+                    ));
+                }
             }
         }
-        Dialect::OpenAi => {
-            // Bearer only — the OpenAI dialect never sees x-api-key.
-            req = req.header(
-                "authorization",
-                format!("Bearer {}", state.cfg.llm_upstream_key),
-            );
+        llm_keys::KeySource::RefuseSsoShared => {
+            return Ok(facade_refusal(
+                dialect,
+                "tenant_llm_keys_required",
+                "this deployment requires per-tenant LLM keys (set FLUIDBOX_LLM_KEY_MODE=tenant)",
+            ));
         }
-    }
+    };
 
-    let resp = match req.send().await {
+    let mut resp = match send_upstream(
+        &state,
+        dialect,
+        &upstream,
+        &headers,
+        upstream_body.clone(),
+        &upstream_key,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
             return Ok(dialect_error(
@@ -426,6 +524,74 @@ pub async fn messages(
             ));
         }
     };
+    // Reactive tenant-key recovery (tenant mode only). A 401 whose body proves
+    // LITELLM'S OWN key check rejected the virtual key we presented — LiteLLM
+    // redeployed with a fresh database, or an operator pruned keys — is the one
+    // failure nothing else recovers from: a cold cache re-reads the same sealed
+    // row, so even a restart keeps 401ing.
+    //
+    // The proof requirement is the point (review H3). LiteLLM answers 401 for
+    // BOTH that and "my own upstream provider credential was refused", and 403 for
+    // policy/budget refusals; re-provisioning on all of them let one authenticated
+    // tenant amplify a provider outage into unbounded `/key/generate` traffic and
+    // unbounded key-table growth. So the small auth-error body is buffered and
+    // classified, ambiguity forwards the rejection verbatim, and
+    // `recover_rejected_tenant_key` bounds what survives that (stale-rejection
+    // compare, durable per-tenant cooldown, CAS, per-replica mint budget).
+    //
+    // "Classified" now means LiteLLM's OWN proxy-auth structure, not a generic
+    // phrase (re-verification, #32): `{"error":{"message":"OpenAI API key not
+    // found","type":"auth_error"}}` is provider-originated and no longer qualifies.
+    //
+    // The replay is still EXACTLY ONCE — a 401 proves the request never executed
+    // upstream, the same reasoning as the connector-token reactive 401 in
+    // `oauth.rs` — and whatever the replay answers is final.
+    if key_source == llm_keys::KeySource::Tenant && resp.status().as_u16() == 401 {
+        let status = resp.status();
+        let body = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                return Ok(dialect_error(
+                    dialect,
+                    StatusCode::BAD_GATEWAY,
+                    &format!("upstream body read failed: {e}"),
+                ));
+            }
+        };
+        if !llm_keys::virtual_key_rejected(key_source, status.as_u16(), &body) {
+            // Not our key: an upstream/provider or otherwise unattributable 401.
+            // Forward it verbatim — never re-provision on a guess.
+            return Ok(forward_buffered(status, body));
+        }
+        tracing::warn!(
+            tenant = %sess_auth.tenant_id,
+            "facade: LiteLLM rejected the tenant's virtual key — attempting recovery"
+        );
+        let fresh =
+            match llm_keys::recover_rejected_tenant_key(&state, sess_auth.tenant_id, &upstream_key)
+                .await
+            {
+                llm_keys::KeyRecovery::Retry(k) => k,
+                llm_keys::KeyRecovery::Refused(reason) => {
+                    tracing::warn!(
+                        tenant = %sess_auth.tenant_id,
+                        reason,
+                        "facade: tenant LLM key not re-provisioned — forwarding the rejection"
+                    );
+                    return Ok(forward_buffered(status, body));
+                }
+            };
+        match send_upstream(&state, dialect, &upstream, &headers, upstream_body, &fresh).await {
+            Ok(r) => resp = r,
+            Err(e) => {
+                return Ok(dialect_error(
+                    dialect,
+                    StatusCode::BAD_GATEWAY,
+                    &format!("upstream request failed: {e}"),
+                ));
+            }
+        }
+    }
     let status = resp.status();
     let is_stream = resp
         .headers()
@@ -845,6 +1011,33 @@ impl OpenAiAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn facade_refusal_is_503_with_machine_code_per_dialect() {
+        // Both D7 refusal codes, both dialects: status 503, code in the dialect's
+        // machine-readable slot AND the message (never the master key as fallback).
+        for (dialect, code) in [
+            (Dialect::Anthropic, "tenant_llm_keys_required"),
+            (Dialect::OpenAi, "tenant_llm_key_unavailable"),
+        ] {
+            let resp = facade_refusal(dialect, code, "nope");
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&bytes).unwrap();
+            match dialect {
+                Dialect::Anthropic => {
+                    assert_eq!(v["type"], "error");
+                    assert_eq!(v["error"]["type"], code);
+                }
+                Dialect::OpenAi => {
+                    assert_eq!(v["error"]["code"], code);
+                }
+            }
+            assert!(v["error"]["message"].as_str().unwrap().contains(code));
+        }
+    }
 
     #[test]
     fn suffix_allowlist_is_exact_per_dialect() {

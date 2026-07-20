@@ -414,7 +414,7 @@ async fn deliver_signed_webhook(
             );
         }
     }
-    let sealed = fluidbox_db::subscription_callback_secret_sealed(&state.pool, scope, sub_id)
+    let (sealed, kv) = fluidbox_db::subscription_callback_secret_sealed(&state.pool, scope, sub_id)
         .await
         .map_err(|e| format!("secret lookup failed: {e}"))?
         .ok_or("subscription has no callback secret")?;
@@ -422,7 +422,17 @@ async fn deliver_signed_webhook(
         .sealer
         .as_ref()
         .ok_or("FLUIDBOX_CREDENTIAL_KEY not configured")?;
-    let secret = sealer.open(&sealed).map_err(|e| e.to_string())?;
+    let secret = sealer
+        .open(
+            &sealed,
+            kv,
+            crate::seal::SealCtx::new(
+                scope.tenant_id(),
+                crate::seal::SealFamily::SubscriptionCallbackSecret,
+            ),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
 
     let payload = result_payload(state, session, Some(d.id), Some(d.attempts + 1))
         .await

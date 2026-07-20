@@ -398,11 +398,14 @@ async fn resolve_workspace_binding(
                 conn
             } else {
                 // Server-derived id (trigger/schedule/event) → unfiltered read.
-                let conn = fluidbox_db::get_connection(pool, scope, *cid)
+                // Tenant known → scoped_tx so the RLS GUC rides the executor-generic read.
+                let mut conn_tx = fluidbox_db::scoped_tx(pool, scope).await?;
+                let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, *cid)
                     .await?
                     .ok_or_else(|| {
                         ApiError::BadRequest(format!("workspace connection {cid} is missing"))
                     })?;
+                conn_tx.commit().await?;
                 // R2.1: personal-connection delegation is omitted in v1 — an
                 // unattended (trigger/schedule/event) run must never fetch under
                 // a member's personal grant. Require an organization connection.
@@ -452,13 +455,16 @@ async fn resolve_publish_binding(
         ResultDestination::GitHubPrComment { connection_id, .. }
         | ResultDestination::GitHubCheck { connection_id, .. } => {
             // Server-derived github_app connection (subscription/event config).
-            let conn = fluidbox_db::get_connection(pool, scope, *connection_id)
+            // Tenant known → scoped_tx so the RLS GUC rides the executor-generic read.
+            let mut conn_tx = fluidbox_db::scoped_tx(pool, scope).await?;
+            let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, *connection_id)
                 .await?
                 .ok_or_else(|| {
                     ApiError::BadRequest(format!(
                         "result destination {index}: connection {connection_id} is missing"
                     ))
                 })?;
+            conn_tx.commit().await?;
             if conn.status != "active" {
                 return Err(ApiError::BadRequest(format!(
                     "result destination {index}: connection {connection_id} is {} — reconnect it",
@@ -1149,10 +1155,12 @@ mod tests {
             &format!("acct-{}", Uuid::now_v7().simple()),
             display,
             Some(b"sealed-token"),
+            1,
             &json!([]),
             &json!({"projects": ["p1"]}),
             &json!({ "base_url": base_url }),
             None,
+            1,
             ConnectionAuth::static_active(),
             owner,
             None,
@@ -1275,7 +1283,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -1381,7 +1389,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -1430,7 +1438,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -1478,7 +1486,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -1525,7 +1533,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -1558,7 +1566,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -1604,7 +1612,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -1635,7 +1643,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -1679,7 +1687,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -1777,7 +1785,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -1853,7 +1861,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -1878,6 +1886,7 @@ mod tests {
             None,
             &json!([]),
             Some(b"sealed-callback"),
+            1,
             None,
             None,
             None,
@@ -1902,6 +1911,7 @@ mod tests {
             None,
             &json!([]),
             None,
+            1,
             None,
             None,
             None,

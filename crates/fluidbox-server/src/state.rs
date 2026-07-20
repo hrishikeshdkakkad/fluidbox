@@ -60,9 +60,11 @@ pub struct AppStateInner {
     /// custom redirect policy re-validates every hop and a custom DNS resolver
     /// filters resolved addresses at connect time (see `login::build_identity_http`).
     pub identity_http: reqwest::Client,
-    /// Seals/unseals connection credentials. None until
-    /// FLUIDBOX_CREDENTIAL_KEY is configured — connection endpoints and
-    /// connection-backed workspaces refuse to operate without it.
+    /// Seals/unseals connection credentials (Phase D versioned envelope). Built
+    /// by `seal::build_sealer`: a legacy key (KMS off), a KMS-envelope backend
+    /// (static|aws), or None — sealing disabled — ONLY when KMS is off AND
+    /// FLUIDBOX_CREDENTIAL_KEY is unset. When None, connection endpoints and
+    /// connection-backed workspaces refuse to operate.
     pub sealer: Option<crate::seal::Sealer>,
     /// Short-lived provider tokens minted per connection (GitHub App
     /// installation tokens ~1h, OAuth access tokens) — a cache only; the
@@ -78,6 +80,14 @@ pub struct AppStateInner {
     /// concurrent brokered calls must mint ONE new refresh token, not race
     /// each other into invalid_grant (Notion keeps ≤2 valid).
     pub oauth_locks: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
+    /// Per-tenant LiteLLM virtual keys, cached UNSEALED in memory (Phase D, #32),
+    /// keyed by tenant_id. The durable key stays sealed in `tenant_llm_keys`; this
+    /// is a read-through of that sealed column (re-seeded on a cold cache /
+    /// restart) so the facade avoids an unseal per model request. No TTL — a
+    /// virtual key is durable; rotation is the only invalidation
+    /// (`llm_keys::rotate_tenant_key` re-seeds it, `evict_tenant_llm_key` drops it).
+    /// Only populated in `FLUIDBOX_LLM_KEY_MODE=tenant`.
+    pub tenant_llm_keys: Mutex<HashMap<Uuid, String>>,
     /// Kubernetes netpol run-gate: false until a probe proves the CNI enforces
     /// NetworkPolicy. `create_run` refuses while false + require_enforced_netpol
     /// (fails closed). Always true for Docker (a different isolation model).
@@ -86,6 +96,15 @@ pub struct AppStateInner {
     /// refresh + negative-kid cache) and the fixed-window login rate counters.
     /// In-memory, single-replica (v1); a restart re-seeds from the DB caches.
     pub oidc: crate::login::OidcRuntime,
+    /// Legacy→KMS re-seal singleton flag (Phase D, #32). `POST /v1/admin/reseal`
+    /// claims it with a compare-and-swap; a second POST while a job runs gets a
+    /// 409. The job is restart-safe by construction (predicate-driven paging), so
+    /// this flag lives only in memory — a crash mid-job leaves no lock to clear.
+    pub reseal_running: std::sync::atomic::AtomicBool,
+    /// Live progress of the current/last re-seal run (per-family
+    /// resealed/skipped/failed + last_error), surfaced by `GET /v1/admin/reseal`
+    /// alongside the authoritative live parity counts.
+    pub reseal_status: Mutex<crate::reseal::ResealStatus>,
 }
 
 pub type AppState = Arc<AppStateInner>;

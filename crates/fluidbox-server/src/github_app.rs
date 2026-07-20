@@ -22,7 +22,7 @@ use crate::auth::Principal;
 use crate::connectors::github;
 use crate::error::{ApiError, ApiResult};
 use crate::rbac;
-use crate::seal::Sealer;
+use crate::seal::{SealCtx, SealFamily, Sealer, TRANSIT_GITHUB_APP_FLOW};
 use crate::state::AppState;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -83,22 +83,31 @@ pub(crate) fn valid_org_name(org: &str) -> bool {
 /// never goes to GitHub; `S` (gh-manifest / gh-install) rides through
 /// GitHub. Tags make them non-interchangeable — and non-interchangeable
 /// with oauth.rs's `{c,v,x}` states.
-pub(crate) fn seal_flow_token(
+pub(crate) async fn seal_flow_token(
     sealer: &Sealer,
     tag: &str,
     flow: Uuid,
     registration: Uuid,
-) -> String {
+) -> Result<String, String> {
     let payload = json!({
         "t": tag,
         "f": flow,
         "r": registration,
         "x": Utc::now().timestamp() + FLOW_TTL_SECS,
     });
-    crate::oauth::b64url(&sealer.seal(&payload.to_string()))
+    // Transit-token sealing (self-describing, versionless companion): survives a
+    // KMS mode flip within the flow's short TTL — see `Sealer::seal_token`. The
+    // AAD purpose separates these from login states / connector boot tokens
+    // cryptographically; the in-payload `t` tag separates the THREE github_app
+    // steps from each other (one purpose, three tags).
+    let sealed = sealer
+        .seal_token(TRANSIT_GITHUB_APP_FLOW, &payload.to_string())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(crate::oauth::b64url(&sealed))
 }
 
-pub(crate) fn open_flow_token(
+pub(crate) async fn open_flow_token(
     sealer: &Sealer,
     tag: &str,
     token: &str,
@@ -107,7 +116,10 @@ pub(crate) fn open_flow_token(
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(token)
         .map_err(|_| "malformed token")?;
-    let plain = sealer.open(&raw).map_err(|_| "token failed verification")?;
+    let plain = sealer
+        .open_token(TRANSIT_GITHUB_APP_FLOW, &raw)
+        .await
+        .map_err(|_| "token failed verification")?;
     let v: Value = serde_json::from_str(&plain).map_err(|_| "token is corrupt")?;
     if v["t"].as_str() != Some(tag) {
         return Err("token is not valid for this step".into());
@@ -308,7 +320,7 @@ async fn registration_signing(
         .as_ref()
         .ok_or("FLUIDBOX_CREDENTIAL_KEY not configured")?;
     let scope = fluidbox_db::TenantScope::assume(reg.tenant_id);
-    let sealed = fluidbox_db::github_app_registration_pem_sealed(&state.pool, scope, reg.id)
+    let (sealed, kv) = fluidbox_db::github_app_registration_pem_sealed(&state.pool, scope, reg.id)
         .await
         .map_err(|e| format!("registration key lookup failed: {e}"))?
         .ok_or("github app registration key unavailable — recreate the app")?;
@@ -316,7 +328,14 @@ async fn registration_signing(
         .app_id
         .clone()
         .ok_or("github app registration is incomplete")?;
-    Ok((app_id, sealer.open(&sealed).map_err(|e| e.to_string())?))
+    let ctx = SealCtx::new(reg.tenant_id, SealFamily::GithubAppPem);
+    Ok((
+        app_id,
+        sealer
+            .open(&sealed, kv, ctx)
+            .await
+            .map_err(|e| e.to_string())?,
+    ))
 }
 
 /// Re-verify an installation under this registration's JWT — the approve
@@ -349,6 +368,27 @@ pub(crate) fn installation_metadata(
 }
 
 /// Upsert the ONE live connection row for a verified installation.
+/// Scoped one-shot connection read for the reconcile paths. `get_connection` is
+/// executor-generic (Task 6), so under FORCE RLS its caller must supply a GUC'd
+/// executor; the tenant is known here (the registration/row scope), so open+commit
+/// a `scoped_tx`. Keeps the three reconcile reads from repeating the tx boilerplate.
+async fn reconcile_get_connection(
+    state: &AppState,
+    scope: fluidbox_db::TenantScope,
+    id: Uuid,
+) -> Result<Option<IntegrationConnectionRow>, String> {
+    let mut tx = fluidbox_db::scoped_tx(&state.pool, scope)
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?;
+    let row = fluidbox_db::get_connection(&mut *tx, scope, id)
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?;
+    tx.commit()
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?;
+    Ok(row)
+}
+
 /// `activate` distinguishes admin-intent paths (setup with a valid flow,
 /// sync) from discovery (installation.created webhook → pending). Revoked
 /// rows are never revived here — that is the explicit approve path — and a
@@ -413,9 +453,7 @@ async fn apply_verified_installation(
             // principal), and github_app connections are always org-owned — no
             // owner-visibility filter applies.
             let updated = if row.status == desired {
-                fluidbox_db::get_connection(&state.pool, scope, row.id)
-                    .await
-                    .map_err(|e| format!("connection lookup failed: {e}"))?
+                reconcile_get_connection(state, scope, row.id).await?
             } else {
                 let from: &[&str] = match desired {
                     // Discovery never demotes an already-live row.
@@ -424,16 +462,12 @@ async fn apply_verified_installation(
                     _ => &["pending", "suspended", "error"],
                 };
                 if from.is_empty() {
-                    fluidbox_db::get_connection(&state.pool, scope, row.id)
-                        .await
-                        .map_err(|e| format!("connection lookup failed: {e}"))?
+                    reconcile_get_connection(state, scope, row.id).await?
                 } else {
                     fluidbox_db::set_connection_status(&state.pool, scope, row.id, desired, from)
                         .await
                         .map_err(|e| format!("status transition failed: {e}"))?
-                        .or(fluidbox_db::get_connection(&state.pool, scope, row.id)
-                            .await
-                            .map_err(|e| format!("connection lookup failed: {e}"))?)
+                        .or(reconcile_get_connection(state, scope, row.id).await?)
                 }
             };
             if desired == "suspended" {
@@ -520,12 +554,15 @@ pub async fn manifest_start(
             .await?;
     let flow = fluidbox_db::create_github_app_flow(
         &state.pool,
+        scope,
         registration.id,
         PURPOSE_MANIFEST,
         FLOW_TTL_SECS,
     )
     .await?;
-    let boot = seal_flow_token(sealer_ref, TAG_BOOT, flow, registration.id);
+    let boot = seal_flow_token(sealer_ref, TAG_BOOT, flow, registration.id)
+        .await
+        .map_err(ApiError::Internal)?;
     let go_url = format!(
         "{}/v1/github/app/manifest/go?boot={boot}",
         state.cfg.public_url
@@ -556,10 +593,17 @@ pub async fn install_start(
             reg.status
         )));
     }
-    let flow =
-        fluidbox_db::create_github_app_flow(&state.pool, reg.id, PURPOSE_INSTALL, FLOW_TTL_SECS)
-            .await?;
-    let boot = seal_flow_token(sealer_ref, TAG_BOOT, flow, reg.id);
+    let flow = fluidbox_db::create_github_app_flow(
+        &state.pool,
+        scope,
+        reg.id,
+        PURPOSE_INSTALL,
+        FLOW_TTL_SECS,
+    )
+    .await?;
+    let boot = seal_flow_token(sealer_ref, TAG_BOOT, flow, reg.id)
+        .await
+        .map_err(ApiError::Internal)?;
     let go_url = format!(
         "{}/v1/github/app/install/go?boot={boot}",
         state.cfg.public_url
@@ -679,7 +723,7 @@ pub async fn manifest_go(State(state): State<AppState>, Query(q): Query<GoParams
     let Some(boot) = q.boot.as_deref() else {
         return refusal("Missing token.");
     };
-    let (flow, reg_id) = match open_flow_token(sealer_ref, TAG_BOOT, boot) {
+    let (flow, reg_id) = match open_flow_token(sealer_ref, TAG_BOOT, boot).await {
         Ok(v) => v,
         Err(e) => return refusal(&e),
     };
@@ -714,7 +758,10 @@ pub async fn manifest_go(State(state): State<AppState>, Query(q): Query<GoParams
             _ => return refusal("Unknown or revoked registration."),
         };
     let manifest = build_manifest(&state.cfg.public_url, reg.id);
-    let state_param = seal_flow_token(sealer_ref, TAG_MANIFEST, flow, reg.id);
+    let state_param = match seal_flow_token(sealer_ref, TAG_MANIFEST, flow, reg.id).await {
+        Ok(s) => s,
+        Err(e) => return refusal(&e),
+    };
     let action = manifest_action_url(
         &state.cfg.github_web_url,
         reg.target_org.as_deref(),
@@ -792,7 +839,7 @@ pub async fn manifest_callback(
     if code.is_empty() || code.len() > 200 {
         return refusal("Malformed code parameter.");
     }
-    let (flow, reg_id) = match open_flow_token(sealer_ref, TAG_MANIFEST, state_param) {
+    let (flow, reg_id) = match open_flow_token(sealer_ref, TAG_MANIFEST, state_param).await {
         Ok(v) => v,
         Err(e) => return refusal(&e),
     };
@@ -821,10 +868,11 @@ pub async fn manifest_callback(
             return refusal("Something went wrong — try again from the dashboard.");
         }
     }
-    let reg = match fluidbox_db::system_worker::get_github_app_registration(&state.pool, reg_id).await {
-        Ok(Some(r)) => r,
-        _ => return refusal("Unknown registration."),
-    };
+    let reg =
+        match fluidbox_db::system_worker::get_github_app_registration(&state.pool, reg_id).await {
+            Ok(Some(r)) => r,
+            _ => return refusal("Unknown registration."),
+        };
     if reg.status != "pending" {
         return refusal("This registration already completed.");
     }
@@ -884,15 +932,42 @@ pub async fn manifest_callback(
     };
     let slug = conv.slug.clone().unwrap_or_else(|| conv.name.clone());
     let owner_login = conv.owner.as_ref().and_then(|o| o.login.clone());
-    let pem_sealed = sealer_ref.seal(&conv.pem);
+    let tenant = scope.tenant_id();
+    let pem_sealed = match sealer_ref
+        .seal(&conv.pem, SealCtx::new(tenant, SealFamily::GithubAppPem))
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => return refusal(&e.to_string()),
+    };
     // If the manifest omitted the webhook (local deployment), a secret in
     // the response is meaningless — never custody what we didn't wire.
     let webhook_sealed = if webhook_capable(&state.cfg.public_url) {
-        conv.webhook_secret.as_deref().map(|s| sealer_ref.seal(s))
+        match conv.webhook_secret.as_deref() {
+            Some(s) => match sealer_ref
+                .seal(s, SealCtx::new(tenant, SealFamily::GithubAppWebhookSecret))
+                .await
+            {
+                Ok(sealed) => Some(sealed),
+                Err(e) => return refusal(&e.to_string()),
+            },
+            None => None,
+        }
     } else {
         None
     };
-    let client_sealed = conv.client_secret.as_deref().map(|s| sealer_ref.seal(s));
+    let client_sealed = match conv.client_secret.as_deref() {
+        Some(s) => match sealer_ref
+            .seal(s, SealCtx::new(tenant, SealFamily::GithubAppClientSecret))
+            .await
+        {
+            Ok(sealed) => Some(sealed),
+            Err(e) => return refusal(&e.to_string()),
+        },
+        None => None,
+    };
+    let (webhook_bytes, webhook_kv) = crate::seal::Sealed::split(&webhook_sealed);
+    let (client_bytes, client_kv) = crate::seal::Sealed::split(&client_sealed);
     let activated = fluidbox_db::activate_github_app_registration(
         &state.pool,
         scope,
@@ -903,9 +978,12 @@ pub async fn manifest_callback(
         conv.client_id.as_deref(),
         &conv.html_url,
         owner_login.as_deref(),
-        &pem_sealed,
-        webhook_sealed.as_deref(),
-        client_sealed.as_deref(),
+        &pem_sealed.bytes,
+        pem_sealed.key_version,
+        webhook_bytes,
+        webhook_kv,
+        client_bytes,
+        client_kv,
     )
     .await;
     match activated {
@@ -928,22 +1006,23 @@ pub async fn manifest_callback(
     // the browser gets bound to the new flow (never a direct GitHub link).
     let install_note = match fluidbox_db::create_github_app_flow(
         &state.pool,
+        scope,
         reg.id,
         PURPOSE_INSTALL,
         FLOW_TTL_SECS,
     )
     .await
     {
-        Ok(f2) => {
-            let boot2 = seal_flow_token(sealer_ref, TAG_BOOT, f2, reg.id);
-            format!(
+        Ok(f2) => match seal_flow_token(sealer_ref, TAG_BOOT, f2, reg.id).await {
+            Ok(boot2) => format!(
                 "<p><a href=\"{href}\" style=\"font-size:1rem\">Install it now →</a></p>",
                 href = html_escape(&format!(
                     "{}/v1/github/app/install/go?boot={boot2}",
                     state.cfg.public_url
                 )),
-            )
-        }
+            ),
+            Err(_) => String::new(),
+        },
         Err(_) => String::new(),
     };
     let degraded = if !webhook_capable(&state.cfg.public_url) {
@@ -976,7 +1055,7 @@ pub async fn install_go(State(state): State<AppState>, Query(q): Query<GoParams>
     let Some(boot) = q.boot.as_deref() else {
         return refusal("Missing token.");
     };
-    let (flow, reg_id) = match open_flow_token(sealer_ref, TAG_BOOT, boot) {
+    let (flow, reg_id) = match open_flow_token(sealer_ref, TAG_BOOT, boot).await {
         Ok(v) => v,
         Err(e) => return refusal(&e),
     };
@@ -996,14 +1075,18 @@ pub async fn install_go(State(state): State<AppState>, Query(q): Query<GoParams>
             return refusal("Something went wrong — try again from the dashboard.");
         }
     }
-    let reg = match fluidbox_db::system_worker::get_github_app_registration(&state.pool, reg_id).await {
-        Ok(Some(r)) if r.status == "active" => r,
-        _ => return refusal("Unknown or inactive registration."),
-    };
+    let reg =
+        match fluidbox_db::system_worker::get_github_app_registration(&state.pool, reg_id).await {
+            Ok(Some(r)) if r.status == "active" => r,
+            _ => return refusal("Unknown or inactive registration."),
+        };
     let Some(slug) = reg.slug.as_deref() else {
         return refusal("Registration is incomplete.");
     };
-    let state_param = seal_flow_token(sealer_ref, TAG_INSTALL, flow, reg.id);
+    let state_param = match seal_flow_token(sealer_ref, TAG_INSTALL, flow, reg.id).await {
+        Ok(s) => s,
+        Err(e) => return refusal(&e),
+    };
     let mut url = match reqwest::Url::parse(&format!(
         "{}/apps/{slug}/installations/new",
         state.cfg.github_web_url
@@ -1059,15 +1142,14 @@ pub async fn setup(
     let Some(sealer_ref) = state.sealer.as_ref() else {
         return refusal("FLUIDBOX_CREDENTIAL_KEY is not configured.");
     };
-    let (flow, reg_from_state) = match p
-        .state
-        .as_deref()
-        .map(|s| open_flow_token(sealer_ref, TAG_INSTALL, s))
-    {
-        Some(Ok(v)) => v,
+    let (flow, reg_from_state) = match p.state.as_deref() {
         // No state (GitHub-initiated install / update, or GitHub dropped
         // it) or an invalid one: the guidance page, nothing else.
-        _ => return guidance(),
+        Some(s) => match open_flow_token(sealer_ref, TAG_INSTALL, s).await {
+            Ok(v) => v,
+            Err(_) => return guidance(),
+        },
+        None => return guidance(),
     };
     if reg_from_state != id {
         return refusal("This link belongs to a different registration.");
@@ -1182,20 +1264,24 @@ pub async fn app_ingress(
         };
     // Verification material only — a tenant-less reader, because there is no
     // verified tenant yet (the signature has not been checked).
-    let sealed = match fluidbox_db::system_worker::github_app_registration_webhook_secret_sealed(
-        &state.pool,
-        reg.id,
-    )
-    .await
-    {
-        Ok(Some(s)) => s,
-        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
-        Err(e) => {
-            tracing::error!("webhook secret lookup failed: {e}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-    let secret = match sealer_ref.open(&sealed) {
+    let (sealed, kv) =
+        match fluidbox_db::system_worker::github_app_registration_webhook_secret_sealed(
+            &state.pool,
+            reg.id,
+        )
+        .await
+        {
+            Ok(Some(s)) => s,
+            Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+            Err(e) => {
+                tracing::error!("webhook secret lookup failed: {e}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+    // The registration's tenant seals its custody; the row resolved it (scope is
+    // trusted only after this HMAC verifies, but the DEK/AAD need the tenant now).
+    let open_ctx = SealCtx::new(reg.tenant_id, SealFamily::GithubAppWebhookSecret);
+    let secret = match sealer_ref.open(&sealed, kv, open_ctx).await {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("webhook secret unseal failed: {e}");
@@ -1517,30 +1603,42 @@ mod tests {
         );
     }
 
-    #[test]
-    fn flow_tokens_are_tagged_one_purpose_each() {
+    #[tokio::test]
+    async fn flow_tokens_are_tagged_one_purpose_each() {
         let s = test_sealer();
         let (f, r) = (Uuid::now_v7(), Uuid::now_v7());
-        let boot = seal_flow_token(&s, TAG_BOOT, f, r);
-        let manifest = seal_flow_token(&s, TAG_MANIFEST, f, r);
+        let boot = seal_flow_token(&s, TAG_BOOT, f, r).await.unwrap();
+        let manifest = seal_flow_token(&s, TAG_MANIFEST, f, r).await.unwrap();
         // Round-trips under the right tag…
-        assert_eq!(open_flow_token(&s, TAG_BOOT, &boot).unwrap(), (f, r));
+        assert_eq!(open_flow_token(&s, TAG_BOOT, &boot).await.unwrap(), (f, r));
         assert_eq!(
-            open_flow_token(&s, TAG_MANIFEST, &manifest).unwrap(),
+            open_flow_token(&s, TAG_MANIFEST, &manifest).await.unwrap(),
             (f, r)
         );
         // …and is refused under every other tag (boot can never drive a
         // callback; a GitHub-transited state can never re-bootstrap).
-        assert!(open_flow_token(&s, TAG_MANIFEST, &boot).is_err());
-        assert!(open_flow_token(&s, TAG_BOOT, &manifest).is_err());
-        assert!(open_flow_token(&s, TAG_INSTALL, &manifest).is_err());
-        // Cross-module: an oauth.rs state ({c,v,x}) is refused too.
-        let oauth_state = crate::oauth::seal_state(&s, Uuid::now_v7(), "v");
-        assert!(open_flow_token(&s, TAG_MANIFEST, &oauth_state).is_err());
+        assert!(open_flow_token(&s, TAG_MANIFEST, &boot).await.is_err());
+        assert!(open_flow_token(&s, TAG_BOOT, &manifest).await.is_err());
+        assert!(open_flow_token(&s, TAG_INSTALL, &manifest).await.is_err());
+        // Cross-module: a foreign sealed token (an oauth.rs-shaped {c,v,x} transit
+        // blob sealed under the OAuth-boot AAD purpose) is refused as a gh-manifest
+        // token — by the AAD purpose in KMS mode, by the missing `t` tag in legacy.
+        let oauth_state = crate::oauth::b64url(
+            &s.seal_token(
+                crate::seal::TRANSIT_OAUTH_BOOT,
+                &serde_json::json!({ "c": Uuid::now_v7(), "v": "v", "x": 9_999_999_999i64 })
+                    .to_string(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(open_flow_token(&s, TAG_MANIFEST, &oauth_state)
+            .await
+            .is_err());
         // Tampering and wrong keys fail closed.
-        assert!(open_flow_token(&s, TAG_BOOT, "junk!!").is_err());
+        assert!(open_flow_token(&s, TAG_BOOT, "junk!!").await.is_err());
         let other = Sealer::from_key_string(&"cd".repeat(32)).unwrap();
-        assert!(open_flow_token(&other, TAG_BOOT, &boot).is_err());
+        assert!(open_flow_token(&other, TAG_BOOT, &boot).await.is_err());
     }
 
     #[test]

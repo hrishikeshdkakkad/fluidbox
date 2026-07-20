@@ -655,6 +655,17 @@ authorization URL can then neither complete nor burn the flow — and show the
 connected external account for human confirmation before the connection
 activates.
 
+> **Correction (2026-07-20, #32).** As shipped, the cookie is minted by the
+> `/v1/oauth/go` page and its plaintext rides the transferable `/go` token, so the
+> binding stops a leaked *authorization* URL but not a deliberately shared *start*
+> URL — the lure described in this very paragraph survives. Nor does the
+> confirmation close it as worded: a connected-account confirmation closes the lure
+> only if the EXTERNAL ACCOUNT HOLDER gives informed consent — shown to the browser
+> COMPLETING the flow, or binding an expected external subject captured at start.
+> Shown to the flow's INITIATOR it closes nothing, because in the lure the
+> initiator IS the attacker. Residual detail and the closure path:
+> `docs/hosted/threat-model.md`.
+
 ### OAuth client identity versus user grant
 
 OAuth client registration and end-user grants are different objects.
