@@ -425,7 +425,11 @@ async fn reseal_family(
 /// job continues); an already-v2 row or a lost CAS is `Skipped`.
 async fn reseal_one(pool: &PgPool, sealer: &Sealer, fam: &Family, id: Uuid) -> RowOutcome {
     let family = fam.seal_family;
-    let mut tx = match pool.begin().await {
+    // The per-row lock + CAS are cross-tenant (the job walks every tenant), so the
+    // transaction carries the audited system-worker bypass GUC — opened inside
+    // fluidbox-db (`reseal_begin` → `worker_tx`) so the bypass stays one grep-able
+    // choke point. Without it the `SELECT … FOR UPDATE` sees no row under FORCE RLS.
+    let mut tx = match fluidbox_db::system_worker::reseal_begin(pool).await {
         Ok(t) => t,
         Err(e) => return RowOutcome::Failed(format!("{family}:{id}: begin failed: {e}")),
     };

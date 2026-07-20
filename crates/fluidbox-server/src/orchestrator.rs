@@ -1531,10 +1531,13 @@ async fn connection_auth_header(
 ) -> anyhow::Result<String> {
     // Unfiltered read by design: workspace init runs from the frozen RunSpec's
     // resolved binding (control-plane side, no request principal) — authority is
-    // the binding, not an owner-visibility viewer.
-    let conn = fluidbox_db::get_connection(&state.pool, scope, connection_id)
+    // the binding, not an owner-visibility viewer. The tenant is known (the run's
+    // scope), so this executor-generic read rides a scoped_tx (RLS: set the GUC).
+    let mut conn_tx = fluidbox_db::scoped_tx(&state.pool, scope).await?;
+    let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, connection_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("connection {connection_id} not found"))?;
+    conn_tx.commit().await?;
     crate::connectors::fetch_auth_header(state, &conn).await
 }
 

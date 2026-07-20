@@ -398,11 +398,14 @@ async fn resolve_workspace_binding(
                 conn
             } else {
                 // Server-derived id (trigger/schedule/event) → unfiltered read.
-                let conn = fluidbox_db::get_connection(pool, scope, *cid)
+                // Tenant known → scoped_tx so the RLS GUC rides the executor-generic read.
+                let mut conn_tx = fluidbox_db::scoped_tx(pool, scope).await?;
+                let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, *cid)
                     .await?
                     .ok_or_else(|| {
                         ApiError::BadRequest(format!("workspace connection {cid} is missing"))
                     })?;
+                conn_tx.commit().await?;
                 // R2.1: personal-connection delegation is omitted in v1 — an
                 // unattended (trigger/schedule/event) run must never fetch under
                 // a member's personal grant. Require an organization connection.
@@ -452,13 +455,16 @@ async fn resolve_publish_binding(
         ResultDestination::GitHubPrComment { connection_id, .. }
         | ResultDestination::GitHubCheck { connection_id, .. } => {
             // Server-derived github_app connection (subscription/event config).
-            let conn = fluidbox_db::get_connection(pool, scope, *connection_id)
+            // Tenant known → scoped_tx so the RLS GUC rides the executor-generic read.
+            let mut conn_tx = fluidbox_db::scoped_tx(pool, scope).await?;
+            let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, *connection_id)
                 .await?
                 .ok_or_else(|| {
                     ApiError::BadRequest(format!(
                         "result destination {index}: connection {connection_id} is missing"
                     ))
                 })?;
+            conn_tx.commit().await?;
             if conn.status != "active" {
                 return Err(ApiError::BadRequest(format!(
                     "result destination {index}: connection {connection_id} is {} — reconnect it",

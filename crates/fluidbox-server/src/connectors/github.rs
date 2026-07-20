@@ -343,10 +343,19 @@ async fn unsealed_credential(
         .as_ref()
         .ok_or("FLUIDBOX_CREDENTIAL_KEY not configured")?;
     let scope = fluidbox_db::TenantScope::assume(conn.tenant_id);
-    let (sealed, kv) = fluidbox_db::connection_credential_sealed(&state.pool, scope, conn.id)
+    // Tenant known (the connection's own) → scoped_tx so the RLS GUC rides the
+    // executor-generic sealed-credential read.
+    let mut cred_tx = fluidbox_db::scoped_tx(&state.pool, scope)
+        .await
+        .map_err(|e| format!("credential lookup failed: {e}"))?;
+    let (sealed, kv) = fluidbox_db::connection_credential_sealed(&mut *cred_tx, scope, conn.id)
         .await
         .map_err(|e| format!("credential lookup failed: {e}"))?
         .ok_or("connection is not active (revoked or missing)")?;
+    cred_tx
+        .commit()
+        .await
+        .map_err(|e| format!("credential lookup failed: {e}"))?;
     sealer
         .open(
             &sealed,
@@ -376,11 +385,19 @@ pub async fn installation_token(
     // tenant scopes the re-read and the registration lookup.
     let scope = fluidbox_db::TenantScope::assume(conn.tenant_id);
     // The caller's row may be stale (revoked/suspended out from under a
-    // cached token) — re-read status from the database first.
-    let conn = fluidbox_db::get_connection(&state.pool, scope, conn.id)
+    // cached token) — re-read status from the database first. Tenant known →
+    // scoped_tx so the RLS GUC rides the executor-generic read.
+    let mut conn_tx = fluidbox_db::scoped_tx(&state.pool, scope)
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?;
+    let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, conn.id)
         .await
         .map_err(|e| format!("connection lookup failed: {e}"))?
         .ok_or("connection is gone")?;
+    conn_tx
+        .commit()
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?;
     if conn.status != "active" {
         return Err(format!(
             "connection is {} — reconnect it in Connections",
@@ -772,10 +789,17 @@ async fn app_connection(
     scope: fluidbox_db::TenantScope,
     connection_id: uuid::Uuid,
 ) -> Result<IntegrationConnectionRow, String> {
-    let conn = fluidbox_db::get_connection(&state.pool, scope, connection_id)
+    let mut conn_tx = fluidbox_db::scoped_tx(&state.pool, scope)
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?;
+    let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, connection_id)
         .await
         .map_err(|e| format!("connection lookup failed: {e}"))?
         .ok_or("destination connection is missing")?;
+    conn_tx
+        .commit()
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?;
     if conn.provider != "github_app" {
         return Err("publishing requires a github_app connection (§17 #1: App identity)".into());
     }

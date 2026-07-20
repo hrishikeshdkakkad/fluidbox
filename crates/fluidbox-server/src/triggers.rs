@@ -422,9 +422,11 @@ pub async fn create(
             // owner-membership recheck (Task 6), not Task 4's connection-object
             // viewer. Subscription create is admin/owner-gated already. See
             // task-4-report "Deferred / flagged".
-            let conn = fluidbox_db::get_connection(&state.pool, scope, cid)
+            let mut conn_tx = fluidbox_db::scoped_tx(&state.pool, scope).await?;
+            let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, cid)
                 .await?
                 .ok_or_else(|| ApiError::BadRequest(format!("unknown connection {cid}")))?;
+            conn_tx.commit().await?;
             if conn.status != "active" {
                 return Err(ApiError::BadRequest(format!(
                     "connection is {} — reconnect it first",

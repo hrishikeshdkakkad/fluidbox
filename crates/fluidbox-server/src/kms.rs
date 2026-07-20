@@ -236,7 +236,14 @@ pub async fn dek_for_seal(
     if let Some(dek) = cache.lock().await.get(&(tenant_id, DEK_VERSION)) {
         return Ok(dek.clone());
     }
-    if let Some(row) = fluidbox_db::get_tenant_dek(pool, tenant_id, DEK_VERSION).await? {
+    // `tenant_deks` is a tenant-owned table under RLS; the tenant is verified (it
+    // came from a SealCtx), so the executor-generic DEK readers/writers ride a
+    // scoped_tx (assume) that sets the tenant GUC.
+    let scope = fluidbox_db::TenantScope::assume(tenant_id);
+    let mut get_tx = fluidbox_db::scoped_tx(pool, scope).await?;
+    let existing = fluidbox_db::get_tenant_dek(&mut *get_tx, tenant_id, DEK_VERSION).await?;
+    get_tx.commit().await?;
+    if let Some(row) = existing {
         return unwrap_and_cache(wrapper, cache, tenant_id, row).await;
     }
     // Mint a fresh DEK, wrap it, and try to claim the row. `fresh` is zeroized on
@@ -245,11 +252,21 @@ pub async fn dek_for_seal(
     let mut fresh: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
     getrandom::fill(&mut fresh[..]).context("OS RNG unavailable")?;
     let wrapped = wrapper.wrap(&fresh[..], tenant_id).await?;
-    fluidbox_db::insert_tenant_dek(pool, tenant_id, DEK_VERSION, wrapper.kek_id(), &wrapped)
-        .await?;
-    let row = fluidbox_db::get_tenant_dek(pool, tenant_id, DEK_VERSION)
+    // Insert (ON CONFLICT DO NOTHING) + re-read in ONE scoped tx: the re-read sees
+    // our row or a concurrent winner's, so all racers converge on one DEK.
+    let mut ins_tx = fluidbox_db::scoped_tx(pool, scope).await?;
+    fluidbox_db::insert_tenant_dek(
+        &mut *ins_tx,
+        tenant_id,
+        DEK_VERSION,
+        wrapper.kek_id(),
+        &wrapped,
+    )
+    .await?;
+    let row = fluidbox_db::get_tenant_dek(&mut *ins_tx, tenant_id, DEK_VERSION)
         .await?
         .context("tenant DEK missing immediately after insert")?;
+    ins_tx.commit().await?;
     unwrap_and_cache(wrapper, cache, tenant_id, row).await
 }
 
@@ -266,11 +283,15 @@ pub async fn dek_for_open(
     if let Some(dek) = cache.lock().await.get(&(tenant_id, version)) {
         return Ok(dek.clone());
     }
-    let row = fluidbox_db::get_tenant_dek(pool, tenant_id, version)
+    // Tenant-scoped read under RLS (tenant verified from the SealCtx) → scoped_tx.
+    let scope = fluidbox_db::TenantScope::assume(tenant_id);
+    let mut get_tx = fluidbox_db::scoped_tx(pool, scope).await?;
+    let row = fluidbox_db::get_tenant_dek(&mut *get_tx, tenant_id, version)
         .await?
         .with_context(|| {
             format!("no DEK for tenant {tenant_id} version {version} — cannot unseal")
         })?;
+    get_tx.commit().await?;
     unwrap_and_cache(wrapper, cache, tenant_id, row).await
 }
 

@@ -45,6 +45,18 @@
 //!     scoped repositories (`get_session`, `get_connection`, … with a
 //!     `TenantScope`), never these bare-id loaders.
 //!
+//! **GUC-bypass contract (Phase D, #32, #75).** Under the migration-0018 RLS
+//! policies (ENABLE + FORCE on every tenant-owned table), a query with NO
+//! `fluidbox.tenant_id` or `fluidbox.bypass` GUC sees ZERO rows — so EVERY function
+//! in this module opens its transaction with [`crate::worker_tx`], which sets
+//! `fluidbox.bypass = 'system_worker'` transaction-locally. That is the audited
+//! bypass: the category lives IN the GUC value, `worker_tx` is `pub(crate)` (never
+//! constructed ad-hoc in the server crate — a server path that needs cross-tenant
+//! access calls one of these named functions), and this is the ONLY module whose
+//! functions legitimately span tenants. The bypass is deliberate and grep-able, not
+//! ambient: prove it by running one of these queries WITHOUT `worker_tx` and it
+//! returns nothing (there is a test for exactly that).
+//!
 //! These DB-resolved rows are just ONE of the documented ways a
 //! [`TenantScope`](crate::TenantScope) is constructed without a principal
 //! credential — see its type docs for the full, precise set (the two
@@ -69,10 +81,13 @@ use uuid::Uuid;
 /// from which the caller builds the `TenantScope` for every subsequent scoped
 /// call. Request handlers must use the scoped [`get_session`](crate::get_session).
 pub async fn get_session(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<SessionRow>> {
-    sqlx::query_as("select * from sessions where id = $1")
+    let mut tx = crate::worker_tx(pool).await?;
+    let out = sqlx::query_as("select * from sessions where id = $1")
         .bind(id)
-        .fetch_optional(pool)
-        .await
+        .fetch_optional(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(out)
 }
 
 /// Load a connection by id with NO tenant predicate — the cross-tenant loader
@@ -87,12 +102,15 @@ pub async fn get_connection(
     pool: &PgPool,
     id: Uuid,
 ) -> sqlx::Result<Option<IntegrationConnectionRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = crate::worker_tx(pool).await?;
+    let out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {CONNECTION_COLS} from integration_connections where id = $1"
     )))
     .bind(id)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(out)
 }
 
 /// Verification-material reader for the UNAUTHENTICATED per-connection webhook
@@ -107,13 +125,15 @@ pub async fn connection_webhook_secret_sealed(
     pool: &PgPool,
     connection_id: Uuid,
 ) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
+    let mut tx = crate::worker_tx(pool).await?;
     let row: Option<(Option<Vec<u8>>, i16)> = sqlx::query_as(
         "select webhook_secret_sealed, webhook_secret_key_version
          from integration_connections where id = $1",
     )
     .bind(connection_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.and_then(|(s, v)| s.map(|s| (s, v))))
 }
 
@@ -128,12 +148,15 @@ pub async fn get_trigger_subscription(
     pool: &PgPool,
     id: Uuid,
 ) -> sqlx::Result<Option<TriggerSubscriptionRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = crate::worker_tx(pool).await?;
+    let out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {SUBSCRIPTION_COLS} from trigger_subscriptions where id = $1"
     )))
     .bind(id)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(out)
 }
 
 /// Load a GitHub App registration by id with NO tenant predicate — the
@@ -149,12 +172,15 @@ pub async fn get_github_app_registration(
     pool: &PgPool,
     id: Uuid,
 ) -> sqlx::Result<Option<GithubAppRegistrationRow>> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let mut tx = crate::worker_tx(pool).await?;
+    let out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {GH_REG_COLS} from github_app_registrations where id = $1"
     )))
     .bind(id)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(out)
 }
 
 /// Verification-material reader for the UNAUTHENTICATED app-level GitHub
@@ -168,22 +194,27 @@ pub async fn github_app_registration_webhook_secret_sealed(
     pool: &PgPool,
     registration_id: Uuid,
 ) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
+    let mut tx = crate::worker_tx(pool).await?;
     let row: Option<(Option<Vec<u8>>, i16)> = sqlx::query_as(
         "select webhook_secret_sealed, webhook_secret_key_version
          from github_app_registrations where id = $1",
     )
     .bind(registration_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.and_then(|(s, v)| s.map(|s| (s, v))))
 }
 
 pub async fn sessions_in_status(pool: &PgPool, statuses: &[&str]) -> sqlx::Result<Vec<SessionRow>> {
     let list: Vec<String> = statuses.iter().map(|s| s.to_string()).collect();
-    sqlx::query_as("select * from sessions where status = any($1)")
+    let mut tx = crate::worker_tx(pool).await?;
+    let out = sqlx::query_as("select * from sessions where status = any($1)")
         .bind(&list)
-        .fetch_all(pool)
-        .await
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(out)
 }
 
 /// Sessions stuck before launch. The orchestrator moves created →
@@ -199,7 +230,8 @@ pub async fn stale_nonstarted_sessions(
     pool: &PgPool,
     max_age_mins: i32,
 ) -> sqlx::Result<Vec<SessionRow>> {
-    sqlx::query_as(
+    let mut tx = crate::worker_tx(pool).await?;
+    let out = sqlx::query_as(
         "select * from sessions
          where status = any($1) and created_at < now() - make_interval(mins => $2)",
     )
@@ -209,8 +241,10 @@ pub async fn stale_nonstarted_sessions(
         "initializing".to_string(),
     ])
     .bind(max_age_mins)
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(out)
 }
 
 /// Every persisted finalization intent, oldest first — the restart-recovery
@@ -221,22 +255,27 @@ pub async fn stale_nonstarted_sessions(
 /// Both must be re-driven; the intent row is deleted only once nothing is
 /// owed, so this list self-drains.
 pub async fn pending_finalizations(pool: &PgPool) -> sqlx::Result<Vec<Uuid>> {
+    let mut tx = crate::worker_tx(pool).await?;
     let rows: Vec<(Uuid,)> =
         sqlx::query_as("select session_id from session_finalizations order by created_at asc")
-            .fetch_all(pool)
+            .fetch_all(&mut *tx)
             .await?;
+    tx.commit().await?;
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
 pub async fn expire_stale_approvals(pool: &PgPool) -> sqlx::Result<Vec<ApprovalRow>> {
-    sqlx::query_as(concat!(
+    let mut tx = crate::worker_tx(pool).await?;
+    let out = sqlx::query_as(concat!(
         "update approvals set status = 'expired', decided_at = now(), decided_by = 'timeout'
          where status = 'pending' and expires_at < now()
          returning ",
         approval_cols!()
     ))
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(out)
 }
 
 /// Due work for the (single, sequential) scheduler worker — a cross-tenant
@@ -247,15 +286,18 @@ pub async fn expire_stale_approvals(pool: &PgPool) -> sqlx::Result<Vec<ApprovalR
 /// Each row carries its subscription; the caller resolves the owning tenant
 /// (via `get_trigger_subscription`) before firing through `create_run`.
 pub async fn due_schedules(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<ScheduleRow>> {
-    sqlx::query_as(
+    let mut tx = crate::worker_tx(pool).await?;
+    let out = sqlx::query_as(
         "select sc.* from schedules sc
          join trigger_subscriptions sub on sub.id = sc.subscription_id
          where sc.next_fire_at is not null and sc.next_fire_at <= now() and sub.enabled
          order by sc.next_fire_at limit $1",
     )
     .bind(limit)
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(out)
 }
 
 /// Due work for the (single, sequential) delivery worker — a cross-tenant
@@ -268,14 +310,17 @@ pub async fn due_result_deliveries(
     pool: &PgPool,
     limit: i64,
 ) -> sqlx::Result<Vec<ResultDeliveryRow>> {
-    sqlx::query_as(
+    let mut tx = crate::worker_tx(pool).await?;
+    let out = sqlx::query_as(
         "select * from result_deliveries
          where status = 'pending' and next_attempt_at <= now()
          order by next_attempt_at limit $1",
     )
     .bind(limit)
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(out)
 }
 
 // ─── Re-seal migration parity (Phase D, #32; category (d) above) ────────────
@@ -411,6 +456,9 @@ pub async fn reseal_candidate_ids(
     after: Uuid,
     limit: i64,
 ) -> sqlx::Result<Vec<Uuid>> {
+    // Cross-tenant paging by construction — the re-seal job walks EVERY tenant's v1
+    // rows for a family (category (c)); rides the audited system-worker bypass.
+    let mut tx = crate::worker_tx(pool).await?;
     let rows: Vec<(Uuid,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {key_column} from {table}
          where {column} is not null and {version_column} = 1 and {key_column} > $1
@@ -418,14 +466,32 @@ pub async fn reseal_candidate_ids(
     )))
     .bind(after)
     .bind(limit)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
+/// Open the per-row re-seal transaction with the audited system-worker bypass GUC
+/// already set. The re-seal job locks + CAS-writes rows across EVERY tenant
+/// (category (c)) and the server can't reach `worker_tx` (it is `pub(crate)`), so
+/// this is the fluidbox-db entry point that keeps the audited bypass a single
+/// grep-able choke point INSIDE this crate. The caller drives
+/// [`reseal_lock_row`]/[`reseal_write_row`] on the returned tx (via `&mut *tx`) and
+/// owns the commit/rollback — the lock and CAS semantics are unchanged; only the
+/// GUC now rides the transaction so the `FOR UPDATE` and the CAS see the row under
+/// FORCE RLS. Without it the lock read returns `None` (row "vanished") for every
+/// row and the migration silently no-ops.
+pub async fn reseal_begin(
+    pool: &PgPool,
+) -> sqlx::Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+    crate::worker_tx(pool).await
+}
+
 /// Lock ONE candidate row and read its sealed bytes + companion version + tenant,
-/// inside the caller's transaction (`SELECT … FOR UPDATE`). Returns the version
-/// so the caller can re-check it is STILL 1 under the lock — the page read
+/// inside the caller's transaction (`SELECT … FOR UPDATE`; open it with
+/// [`reseal_begin`] so the bypass GUC rides it). Returns the version so the caller
+/// can re-check it is STILL 1 under the lock — the page read
 /// [`reseal_candidate_ids`] was unlocked, so a concurrent writer may have
 /// re-sealed the row since. `None` (outer) = the row vanished (deleted) between
 /// paging and locking; `None` (inner, the bytes) = the column is now NULL. The
