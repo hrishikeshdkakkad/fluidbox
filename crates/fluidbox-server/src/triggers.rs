@@ -561,6 +561,13 @@ pub async fn create(
             if !(url.starts_with("http://") || url.starts_with("https://")) {
                 return Err(ApiError::BadRequest("callback_url must be http(s)".into()));
             }
+            // I2 / E3: admit the callback destination at SAVE time — a private/
+            // metadata/plain-http (outside the dev seam) target is refused here,
+            // mirroring the dial-time admission in the delivery worker. Existing
+            // rows are untouched and still enforced at dial. admit_url is
+            // literal+scheme only (no blocking DNS in the request handler).
+            crate::egress::admit_url(url, &state.egress_policy)
+                .map_err(|e| ApiError::BadRequest(format!("callback_url rejected: {e}")))?;
             let sealer = state.sealer.as_ref().ok_or_else(|| {
                 ApiError::BadRequest(
                     "signed callbacks are disabled: set FLUIDBOX_CREDENTIAL_KEY on the server"
