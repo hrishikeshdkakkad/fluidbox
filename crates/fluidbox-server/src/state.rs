@@ -54,12 +54,27 @@ pub struct AppStateInner {
     pub approvals: ApprovalRegistry,
     /// LISTEN/NOTIFY wakeups (session_id, seq) for SSE fanout.
     pub events_tx: broadcast::Sender<(Uuid, i64)>,
+    /// The plain client for OPERATOR-configured seams only (GitHub REST/App, LLM
+    /// facade + admin). Those hosts are operator-set (GHES, a private LiteLLM),
+    /// never attacker input, so they are deliberately NOT run through the SSRF
+    /// private-IP block. Attacker-influenced destinations ride the hardened
+    /// clients below.
     pub http: reqwest::Client,
-    /// The ONE HTTP client for identity fetches (OIDC discovery, JWKS, token
-    /// endpoint) — nothing else uses it. Built with per-hop SSRF enforcement: a
-    /// custom redirect policy re-validates every hop and a custom DNS resolver
-    /// filters resolved addresses at connect time (see `login::build_identity_http`).
+    /// Per-hop-SSRF client for identity fetches (OIDC discovery, JWKS, token) AND
+    /// connector-OAuth (discovery, PRM, AS metadata, DCR, code exchange, refresh —
+    /// Phase E). A custom redirect policy re-validates every hop and a custom DNS
+    /// resolver filters resolved addresses at connect time (see
+    /// `egress::build_identity_http`).
     pub identity_http: reqwest::Client,
+    /// Hardened client for connector traffic to ARBITRARY user endpoints: broker
+    /// MCP calls, snapshot/probe discovery, and delivery webhook publish (Phase
+    /// E). Refuses ALL redirects (`Policy::none`) and filters resolved addresses
+    /// via the same DNS resolver (see `egress::build_egress_http`).
+    pub egress_http: reqwest::Client,
+    /// The resolved egress boundary, built once in `main.rs` from config. The
+    /// broker/deliveries consult it via `egress::admit_url`; the orchestrator
+    /// derives the workspace `GitEgressPolicy` from it.
+    pub egress_policy: crate::egress::EgressPolicy,
     /// Seals/unseals connection credentials (Phase D versioned envelope). Built
     /// by `seal::build_sealer`: a legacy key (KMS off), a KMS-envelope backend
     /// (static|aws), or None — sealing disabled — ONLY when KMS is off AND

@@ -146,6 +146,15 @@ pub struct Config {
     /// Feeds the OAuth redirect_uri and the CIMD client_id document — both
     /// are fetched by parties that can't use host.docker.internal.
     pub public_url: String,
+    /// Operator egress allowlist (`FLUIDBOX_EGRESS_ALLOW_CIDRS`, Phase E): CIDR
+    /// blocks the shared SSRF predicate treats as public even when they fall in a
+    /// private/metadata range — a private LiteLLM/GHES/MCP endpoint the deployment
+    /// opts into. Parsed once at boot (a malformed entry fails boot); default empty.
+    pub egress_allow_cidrs: Vec<fluidbox_core::netpolicy::IpCidr>,
+    /// Optional outbound egress proxy (`FLUIDBOX_EGRESS_PROXY`, Phase E) applied to
+    /// BOTH hardened reqwest clients and exported as HTTPS_PROXY on the git fetch
+    /// subprocess — route all control-plane→internet dials through one waypoint.
+    pub egress_proxy: Option<String>,
     /// Execution backend: `docker` (default) or `kubernetes`. Selects which
     /// `ExecutionProvider` `AppState.provider` holds. Dual-provider permanence
     /// (settled Q17): Docker is never replaced.
@@ -336,6 +345,11 @@ impl Config {
                 .unwrap_or_else(|_| "http://127.0.0.1:8787".into())
                 .trim_end_matches('/')
                 .to_string(),
+            egress_allow_cidrs: parse_egress_cidrs(
+                "FLUIDBOX_EGRESS_ALLOW_CIDRS",
+                get("FLUIDBOX_EGRESS_ALLOW_CIDRS").ok(),
+            )?,
+            egress_proxy: get("FLUIDBOX_EGRESS_PROXY").ok().filter(|s| !s.is_empty()),
             provider,
             network_mode: get("FLUIDBOX_NETWORK_MODE")
                 .ok()
@@ -445,6 +459,26 @@ fn parse_opt_i64(name: &str, raw: Option<String>) -> anyhow::Result<Option<i64>>
     }
 }
 
+/// Parse the comma-separated egress allowlist (Phase E). Empty/absent → no
+/// entries; a malformed CIDR FAILS BOOT naming the variable (an operator typo in
+/// an egress escape hatch must never silently widen or narrow the boundary).
+fn parse_egress_cidrs(
+    name: &str,
+    raw: Option<String>,
+) -> anyhow::Result<Vec<fluidbox_core::netpolicy::IpCidr>> {
+    let Some(raw) = raw.filter(|v| !v.trim().is_empty()) else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<fluidbox_core::netpolicy::IpCidr>()
+                .map_err(|e| anyhow::anyhow!("{name}: {e}"))
+        })
+        .collect()
+}
+
 /// D7 boot coherence for the LLM-key mode (pure, unit-tested). `Shared` refuses
 /// an empty resolved upstream key (kills the silent `unwrap_or_default("")`),
 /// naming the variable the operator must set. `Tenant` requires a LiteLLM upstream
@@ -539,6 +573,20 @@ mod tests {
         assert!(e.contains("LITELLM_MASTER_KEY"), "got: {e}");
         // LiteLLM upstream + master key present → OK.
         assert!(validate_llm_key_config(LlmKeyMode::Tenant, false, false).is_ok());
+    }
+
+    #[test]
+    fn egress_cidrs_parse_and_fail_closed() {
+        assert!(parse_egress_cidrs("X", None).unwrap().is_empty());
+        assert!(parse_egress_cidrs("X", Some("  ".into()))
+            .unwrap()
+            .is_empty());
+        let v = parse_egress_cidrs("X", Some("10.0.0.0/8, 169.254.169.254/32".into())).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].prefix, 8);
+        // A malformed entry is a boot error, never a silently dropped rule.
+        assert!(parse_egress_cidrs("X", Some("10.0.0.0/8,nonsense".into())).is_err());
+        assert!(parse_egress_cidrs("X", Some("10.0.0.0/40".into())).is_err());
     }
 
     #[test]

@@ -442,8 +442,13 @@ async fn deliver_signed_webhook(
     let ts = chrono::Utc::now().timestamp();
     let sig = sign_payload(&secret, ts, &body);
 
+    // Phase E: the callback URL is user-supplied — admit it (SSRF: scheme +
+    // host-literal IP) before dialing the hardened `egress_http` (redirects
+    // refused, resolved addresses filtered). A denial is a normal failed attempt
+    // via the Err path below; the message is non-secret (no URL echoed).
+    crate::egress::admit_url(url, &state.egress_policy).map_err(|e| e.to_string())?;
     let res = state
-        .http
+        .egress_http
         .post(url)
         .timeout(DELIVERY_TIMEOUT)
         .header("content-type", "application/json")

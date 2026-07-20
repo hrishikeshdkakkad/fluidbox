@@ -8,6 +8,7 @@
 
 pub mod capability;
 pub mod event;
+pub mod netpolicy;
 pub mod policy;
 pub mod schedule;
 pub mod spec;

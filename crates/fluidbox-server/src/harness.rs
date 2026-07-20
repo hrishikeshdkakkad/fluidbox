@@ -183,6 +183,8 @@ mod tests {
             github_clone_base: String::new(),
             keep_workspaces: false,
             public_url: String::new(),
+            egress_allow_cidrs: Vec::new(),
+            egress_proxy: None,
             provider: "docker".into(),
             network_mode: fluidbox_core::traits::NetworkMode::HostDev,
             require_enforced_netpol: false,
