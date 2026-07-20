@@ -928,7 +928,7 @@ u_post "$jarA" "/v1/sessions" "{\"agent\":\"needs-missing\",\"task\":\"t\",\"rep
   && ok "run creation → $CODE naming the missing tool (satisfaction:all, before any spend)" \
   || no "missing-tool run → $CODE: $BODY (want 4xx / missing required tools)"
 SESS_AFTER=$(db "select count(*) from sessions where tenant_id='$TID'")
-[ "$SESS_BEFORE" = "$SESS_AFTER" ] && ok "zero new session rows (no half-created run: $SESS_BEFORE→$SESS_AFTER)" || no "a session row leaked ($SESS_BEFORE→$SESS_AFTER)"
+[ "$SESS_BEFORE" = "$SESS_AFTER" ] && ok "zero new session rows (no half-created run: ${SESS_BEFORE}→$SESS_AFTER)" || no "a session row leaked (${SESS_BEFORE}→$SESS_AFTER)"
 
 # Zero-candidate: a requirement whose connector url matches NO connection refuses
 # at creation, naming the slot, with zero new sessions (R3.7).
@@ -941,7 +941,7 @@ u_post "$jarA" "/v1/sessions" "{\"agent\":\"zero-cand\",\"task\":\"t\",\"repo\":
   && ok "zero-candidate run → $CODE naming the slot (no connection matches the connector)" \
   || no "zero-candidate run → $CODE: $BODY (want 4xx naming requirement 'kb')"
 SESS_AFTER=$(db "select count(*) from sessions where tenant_id='$TID'")
-[ "$SESS_BEFORE" = "$SESS_AFTER" ] && ok "zero-candidate: no session row leaked ($SESS_BEFORE→$SESS_AFTER)" || no "zero-candidate leaked a session ($SESS_BEFORE→$SESS_AFTER)"
+[ "$SESS_BEFORE" = "$SESS_AFTER" ] && ok "zero-candidate: no session row leaked (${SESS_BEFORE}→$SESS_AFTER)" || no "zero-candidate leaked a session (${SESS_BEFORE}→$SESS_AFTER)"
 
 # Ambiguous: a SECOND org connection to the SAME fake-MCP url makes org resolution
 # ambiguous, refusing at creation and naming the candidates, with zero new
@@ -960,7 +960,7 @@ if need "$ORG_CONN2" "second org connection id missing"; then
     && ok "ambiguous run → $CODE naming the candidate connections (disambiguate)" \
     || no "ambiguous run → $CODE: $BODY (want 4xx / multiple)"
   SESS_AFTER=$(db "select count(*) from sessions where tenant_id='$TID'")
-  [ "$SESS_BEFORE" = "$SESS_AFTER" ] && ok "ambiguous: no session row leaked ($SESS_BEFORE→$SESS_AFTER)" || no "ambiguous leaked a session ($SESS_BEFORE→$SESS_AFTER)"
+  [ "$SESS_BEFORE" = "$SESS_AFTER" ] && ok "ambiguous: no session row leaked (${SESS_BEFORE}→$SESS_AFTER)" || no "ambiguous leaked a session (${SESS_BEFORE}→$SESS_AFTER)"
   # Revoke the second org connection (precondition: it is active) so downstream
   # org resolution is unambiguous again.
   PRE=$(db "select status from integration_connections where id='$ORG_CONN2'")

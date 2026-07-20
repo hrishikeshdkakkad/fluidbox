@@ -639,12 +639,25 @@ pub async fn create(
     };
 
     // token + callback_secret appear ONLY here, once, at creation.
+    //
+    // The absolute URLs are built server-side from FLUIDBOX_PUBLIC_URL: the
+    // control plane is the only party that knows its own browser/caller-facing
+    // address (the dashboard reaches it through a same-origin proxy, so it
+    // cannot derive it), and an integration contract with a placeholder host is
+    // not a contract. Trailing slashes are trimmed so joins never double up.
+    let base = state.cfg.public_url.trim_end_matches('/');
     Ok(Json(json!({
         "subscription": sub,
         "schedule": schedule_row,
         "token": token,
         "callback_secret": secret_plain,
         "ingress_path": ingress_path,
+        "base_url": base,
+        "invoke_url": format!("{base}/v1/triggers/{}/invoke", sub.id),
+        "poll_url_template": format!("{base}/v1/triggers/{}/runs/{{session_id}}", sub.id),
+        "ingress_url": ingress_path
+            .as_ref()
+            .map(|path| format!("{base}{path}")),
     })))
 }
 
@@ -746,7 +759,17 @@ pub async fn rotate_token(
     let revoked = fluidbox_db::revoke_trigger_tokens(&state.pool, scope, sub.id).await?;
     let token = random_hex_token(TOKEN_PREFIX);
     fluidbox_db::create_trigger_token(&state.pool, scope, sub.id, &token).await?;
-    Ok(Json(json!({ "token": token, "revoked": revoked })))
+    // A rotated token needs the same contract as a freshly-created one — the
+    // caller has to re-wire an integration either way, and the dashboard cannot
+    // derive these URLs itself.
+    let base = state.cfg.public_url.trim_end_matches('/');
+    Ok(Json(json!({
+        "token": token,
+        "revoked": revoked,
+        "base_url": base,
+        "invoke_url": format!("{base}/v1/triggers/{}/invoke", sub.id),
+        "poll_url_template": format!("{base}/v1/triggers/{}/runs/{{session_id}}", sub.id),
+    })))
 }
 
 // ─── Scoped: invoke & poll ────────────────────────────────────────────────
