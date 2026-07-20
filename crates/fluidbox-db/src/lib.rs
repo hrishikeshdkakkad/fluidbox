@@ -1190,28 +1190,10 @@ where
     .map(|_| ())
 }
 
-/// Store a (DCR-minted) client secret after connection creation. Sealed by
-/// the caller; readable only via `connection_client_secret_sealed`.
-pub async fn set_connection_client_secret(
-    pool: &PgPool,
-    scope: TenantScope,
-    id: Uuid,
-    sealed: &[u8],
-    key_version: i16,
-) -> sqlx::Result<()> {
-    sqlx::query(
-        "update integration_connections
-         set client_secret_sealed = $2, client_secret_key_version = $4, updated_at = now()
-         where id = $1 and status <> 'revoked' and tenant_id = $3",
-    )
-    .bind(id)
-    .bind(sealed)
-    .bind(scope.tenant_id())
-    .bind(key_version)
-    .execute(pool)
-    .await
-    .map(|_| ())
-}
+// (`set_connection_client_secret` retired in Phase D Task 3 (#32): DCR client
+// secrets now live on the shared `oauth_client_registrations` row, not the
+// connection. Pre-registered confidential secrets are still written per-connection
+// at CREATE time via `ConnectionAuth.client_secret_sealed`, and read below.)
 
 /// The only reader of the sealed client secret (confidential OAuth clients).
 /// Client identity outlives token state — the dance needs it while the row
@@ -1237,6 +1219,193 @@ where
         r.get::<Option<Vec<u8>>, _>("client_secret_sealed")
             .map(|b| (b, r.get::<i16, _>("client_secret_key_version")))
     }))
+}
+
+// ─── Reusable OAuth client registrations (Phase D Task 3, #32; design D6) ────
+//
+// A shared client identity keyed on (issuer, redirect_uri): the first OAuth
+// connection to an authorization server registers (or resolves CIMD) once and
+// every later connection to the same issuer reuses the row instead of minting
+// its own per-connection DCR client. Pre-registered (operator-pasted) identities
+// stay per-connection custody and get NO row.
+//
+// PLACEMENT (reviewer note): these are principal-less GLOBAL reads, but they are
+// deliberately NOT in `system_worker` — that module is for cross-tenant scans of
+// TENANT-owned data. Client registrations are deployment INFRASTRUCTURE (like
+// `connector_catalog`'s global rows): v1 only ever writes `tenant_id NULL`, and
+// every read/insert enforces `tenant_id is null` in SQL. There is no tenant to
+// scope by, so they live here beside the connection custody they serve, unscoped
+// by construction. The nullable `tenant_id` + per-tenant partial unique are
+// forward-compat only (migration 0015).
+
+/// A shared OAuth client registration. Carries its sealed secret because every
+/// read IS a credential resolution (unseal for token-endpoint auth) — the row is
+/// internal deployment infrastructure and NEVER crosses an API boundary, so
+/// unlike `IntegrationConnectionRow` it does not hide the sealed bytea behind a
+/// dedicated reader (and is deliberately NOT `Serialize`).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct OauthClientRegistrationRow {
+    pub id: Uuid,
+    /// NULL = deployment-global (v1 always). Present only for a future per-tenant
+    /// client identity.
+    pub tenant_id: Option<Uuid>,
+    pub issuer: String,
+    pub redirect_uri: String,
+    pub source: String, // dcr | cimd | preregistered
+    pub client_id: String,
+    pub client_secret_sealed: Option<Vec<u8>>,
+    pub client_secret_key_version: i16,
+    pub registration_endpoint: Option<String>,
+    pub registration_access_token_sealed: Option<Vec<u8>>,
+    pub registration_access_token_key_version: i16,
+    pub token_endpoint_auth_method: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+}
+
+/// Values for a new registration row. Sealed bytes are pre-sealed by the caller
+/// (server owns the crypto); the companion key-versions ride beside them.
+pub struct NewOauthClientRegistration<'a> {
+    /// v1 always passes `None` (global). Present only for a future per-tenant row.
+    pub tenant_id: Option<Uuid>,
+    pub issuer: &'a str,
+    pub redirect_uri: &'a str,
+    pub source: &'a str, // dcr | cimd | preregistered
+    pub client_id: &'a str,
+    pub client_secret_sealed: Option<&'a [u8]>,
+    pub client_secret_key_version: i16,
+    pub registration_endpoint: Option<&'a str>,
+    pub registration_access_token_sealed: Option<&'a [u8]>,
+    pub registration_access_token_key_version: i16,
+    pub token_endpoint_auth_method: Option<&'a str>,
+}
+
+/// Find the shared registration for an (issuer, redirect_uri). Global rows only
+/// in v1 (`tenant_id is null`). Executor-generic so the DCR resolution can run it
+/// THROUGH the advisory-lock-holding transaction (`&mut *tx`).
+pub async fn find_client_registration<'e, E>(
+    exec: E,
+    issuer: &str,
+    redirect_uri: &str,
+) -> sqlx::Result<Option<OauthClientRegistrationRow>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(
+        "select * from oauth_client_registrations
+         where tenant_id is null and issuer = $1 and redirect_uri = $2",
+    )
+    .bind(issuer)
+    .bind(redirect_uri)
+    .fetch_optional(exec)
+    .await
+}
+
+/// Load one registration by id — the exchange/refresh path resolves the identity
+/// the connection's `oauth.registration_id` points at. Unscoped (global infra).
+pub async fn find_client_registration_by_id<'e, E>(
+    exec: E,
+    id: Uuid,
+) -> sqlx::Result<Option<OauthClientRegistrationRow>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as("select * from oauth_client_registrations where id = $1")
+        .bind(id)
+        .fetch_optional(exec)
+        .await
+}
+
+/// Insert a shared registration. `ON CONFLICT DO NOTHING` returns `None` when a
+/// concurrent connect already registered this (issuer, redirect_uri) — the caller
+/// re-selects the winner (and abandons its own AS-side minted client). Global rows
+/// only in v1 (`tenant_id NULL`); the partial unique enforces one per key.
+pub async fn insert_client_registration<'e, E>(
+    exec: E,
+    new: NewOauthClientRegistration<'_>,
+) -> sqlx::Result<Option<OauthClientRegistrationRow>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(
+        "insert into oauth_client_registrations
+           (id, tenant_id, issuer, redirect_uri, source, client_id,
+            client_secret_sealed, client_secret_key_version,
+            registration_endpoint,
+            registration_access_token_sealed, registration_access_token_key_version,
+            token_endpoint_auth_method, last_used_at)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, now())
+         on conflict do nothing
+         returning *",
+    )
+    .bind(Uuid::now_v7())
+    .bind(new.tenant_id)
+    .bind(new.issuer)
+    .bind(new.redirect_uri)
+    .bind(new.source)
+    .bind(new.client_id)
+    .bind(new.client_secret_sealed)
+    .bind(new.client_secret_key_version)
+    .bind(new.registration_endpoint)
+    .bind(new.registration_access_token_sealed)
+    .bind(new.registration_access_token_key_version)
+    .bind(new.token_endpoint_auth_method)
+    .fetch_optional(exec)
+    .await
+}
+
+/// Mark a registration reused this dance (`last_used_at`).
+pub async fn touch_client_registration<'e, E>(exec: E, id: Uuid) -> sqlx::Result<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query("update oauth_client_registrations set last_used_at = now() where id = $1")
+        .bind(id)
+        .execute(exec)
+        .await
+        .map(|_| ())
+}
+
+/// Delete a registration whose client the AS rejected (`invalid_client` self-heal
+/// at code exchange) so the next resolution mints a fresh one.
+pub async fn delete_client_registration<'e, E>(exec: E, id: Uuid) -> sqlx::Result<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query("delete from oauth_client_registrations where id = $1")
+        .bind(id)
+        .execute(exec)
+        .await
+        .map(|_| ())
+}
+
+/// Stable 64-bit advisory-lock key for a registration's (issuer, redirect_uri) —
+/// mirrors [`oauth_lock_key`]'s fold-leading-8-bytes construction, over a sha256
+/// of `issuer‖NUL‖redirect_uri` (the NUL separator keeps `a‖bc` ≠ `ab‖c`).
+pub fn registration_lock_key(issuer: &str, redirect_uri: &str) -> i64 {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(issuer.as_bytes());
+    h.update([0u8]);
+    h.update(redirect_uri.as_bytes());
+    let d = h.finalize();
+    i64::from_be_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]])
+}
+
+/// Take a transaction-scoped advisory lock on (issuer, redirect_uri) — serializes
+/// DCR across connects (and replicas) so the first connect registers and later
+/// ones reuse, yielding ONE `/register` per issuer. Releases when `tx` commits or
+/// drops; the caller holds it across the find → DCR HTTP → insert window.
+pub async fn acquire_registration_lock(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    issuer: &str,
+    redirect_uri: &str,
+) -> sqlx::Result<()> {
+    sqlx::query("select pg_advisory_xact_lock($1)")
+        .bind(registration_lock_key(issuer, redirect_uri))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 // ─── Per-tenant DEKs (Phase D envelope sealing, #32) ────────────────────────
@@ -9537,8 +9706,9 @@ mod tests {
         assert_eq!(locked.0.as_deref(), Some(b"legacy-cred-0".as_ref()));
         assert_eq!(locked.1, 1, "still v1 under the lock");
         assert_eq!(
-            locked.2, tenant,
-            "carries the row's tenant for the seal ctx"
+            locked.2,
+            Some(tenant),
+            "carries the row's tenant for the seal ctx (Some for a tenant-owned family)"
         );
         let affected =
             crate::system_worker::reseal_write_row(&mut tx, tbl, col, ver, ids[0], b"v2-bytes")
@@ -9576,5 +9746,205 @@ mod tests {
         assert!(remaining.contains(&ids[1]) && remaining.contains(&ids[2]));
 
         cleanup_dek_tenant(&pool, tenant).await;
+    }
+
+    // ─── OAuth client registrations (Phase D Task 3, #32) ───────────────────
+
+    fn new_reg<'a>(
+        tenant_id: Option<Uuid>,
+        issuer: &'a str,
+        redirect: &'a str,
+        client_id: &'a str,
+    ) -> NewOauthClientRegistration<'a> {
+        NewOauthClientRegistration {
+            tenant_id,
+            issuer,
+            redirect_uri: redirect,
+            source: "dcr",
+            client_id,
+            client_secret_sealed: None,
+            client_secret_key_version: 1,
+            registration_endpoint: Some("https://as.test/register"),
+            registration_access_token_sealed: None,
+            registration_access_token_key_version: 1,
+            token_endpoint_auth_method: Some("none"),
+        }
+    }
+
+    // Two transactions inserting the SAME (issuer, redirect): exactly one row
+    // lands and the loser's ON CONFLICT DO NOTHING yields None, so the caller
+    // re-selects the winner (never a duplicate DCR client). Each `&pool` insert
+    // is its own transaction.
+    #[tokio::test]
+    async fn client_registration_insert_race_keeps_one_row() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let issuer = format!("https://as-{}.test", Uuid::now_v7().simple());
+        let redirect = "https://fbx.test/v1/oauth/callback";
+
+        let first = insert_client_registration(&pool, new_reg(None, &issuer, redirect, "client-a"))
+            .await
+            .unwrap();
+        assert!(first.is_some(), "first insert wins");
+        assert!(
+            first.as_ref().unwrap().last_used_at.is_some(),
+            "last_used_at set"
+        );
+
+        // The loser conflicts on the global partial unique → None.
+        let second =
+            insert_client_registration(&pool, new_reg(None, &issuer, redirect, "client-b"))
+                .await
+                .unwrap();
+        assert!(
+            second.is_none(),
+            "second insert conflicts (ON CONFLICT DO NOTHING)"
+        );
+
+        // Re-select returns the ONE winner, and there is exactly one row.
+        let winner = find_client_registration(&pool, &issuer, redirect)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(winner.client_id, "client-a");
+        let (n,): (i64,) = sqlx::query_as(
+            "select count(*) from oauth_client_registrations
+             where issuer = $1 and redirect_uri = $2",
+        )
+        .bind(&issuer)
+        .bind(redirect)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1);
+
+        // by-id load + touch + delete round-trip.
+        let by_id = find_client_registration_by_id(&pool, winner.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_id.client_id, "client-a");
+        assert!(by_id.tenant_id.is_none(), "v1 rows are global");
+        touch_client_registration(&pool, winner.id).await.unwrap();
+        delete_client_registration(&pool, winner.id).await.unwrap();
+        assert!(find_client_registration(&pool, &issuer, redirect)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    // The two partial uniques are INDEPENDENT: a global row (tenant_id NULL) and a
+    // per-tenant row can share the same (issuer, redirect_uri); a second row within
+    // the same scope conflicts; and the v1 reader sees ONLY the global row.
+    #[tokio::test]
+    async fn client_registration_partial_uniques_are_independent() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
+            .await
+            .unwrap();
+        let tenant = org.id;
+        let issuer = format!("https://as-{}.test", Uuid::now_v7().simple());
+        let redirect = "https://fbx.test/v1/oauth/callback";
+
+        let global =
+            insert_client_registration(&pool, new_reg(None, &issuer, redirect, "g-client"))
+                .await
+                .unwrap();
+        assert!(global.is_some(), "global row inserts");
+        // A per-tenant row with the SAME key coexists (different partial index).
+        let tenant_row =
+            insert_client_registration(&pool, new_reg(Some(tenant), &issuer, redirect, "t-client"))
+                .await
+                .unwrap();
+        assert!(
+            tenant_row.is_some(),
+            "a per-tenant row is independent of the same-key global row"
+        );
+        // A second GLOBAL row for the key conflicts.
+        assert!(
+            insert_client_registration(&pool, new_reg(None, &issuer, redirect, "g-dupe"))
+                .await
+                .unwrap()
+                .is_none(),
+            "a second global row for the key is refused"
+        );
+        // The v1 reader returns ONLY the global row (tenant_id is null).
+        let found = find_client_registration(&pool, &issuer, redirect)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.client_id, "g-client");
+        assert!(found.tenant_id.is_none());
+
+        // Cleanup (registration rows before the tenant — FKs are NO ACTION).
+        sqlx::query("delete from oauth_client_registrations where issuer = $1")
+            .bind(&issuer)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("delete from tenants where id = $1")
+            .bind(tenant)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    // The advisory lock serializes DCR per (issuer, redirect_uri): while one
+    // transaction holds it, a second connection cannot take the SAME key but CAN
+    // take a different one; it frees on transaction end. This is what collapses
+    // concurrent connects to ONE `/register`.
+    #[tokio::test]
+    async fn registration_lock_serializes_same_key() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = connect(&url).await.expect("connect");
+        let issuer = format!("https://as-{}.test", Uuid::now_v7().simple());
+        let redirect = "https://fbx.test/v1/oauth/callback";
+        let key = registration_lock_key(&issuer, redirect);
+        assert_ne!(
+            key,
+            registration_lock_key(&issuer, "https://other.test/cb"),
+            "distinct (issuer, redirect) fold to distinct keys"
+        );
+
+        let mut tx1 = pool.begin().await.unwrap();
+        acquire_registration_lock(&mut tx1, &issuer, redirect)
+            .await
+            .unwrap();
+        // A second connection cannot take the held key, but a different key is free.
+        let mut c2 = pool.acquire().await.unwrap();
+        let (same,): (bool,) = sqlx::query_as("select pg_try_advisory_xact_lock($1)")
+            .bind(key)
+            .fetch_one(&mut *c2)
+            .await
+            .unwrap();
+        assert!(!same, "same-key lock is held by tx1");
+        let (other,): (bool,) = sqlx::query_as("select pg_try_advisory_xact_lock($1)")
+            .bind(registration_lock_key(&issuer, "https://other.test/cb"))
+            .fetch_one(&mut *c2)
+            .await
+            .unwrap();
+        assert!(other, "a different (issuer, redirect) key is independent");
+        drop(c2);
+
+        // Releasing tx1 frees the key.
+        tx1.rollback().await.unwrap();
+        let mut tx3 = pool.begin().await.unwrap();
+        let (freed,): (bool,) = sqlx::query_as("select pg_try_advisory_xact_lock($1)")
+            .bind(key)
+            .fetch_one(&mut *tx3)
+            .await
+            .unwrap();
+        assert!(freed, "the lock is free after tx1 released");
+        tx3.rollback().await.unwrap();
     }
 }

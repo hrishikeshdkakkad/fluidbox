@@ -358,47 +358,170 @@ pub async fn discover(state: &AppState, mcp_url: &str) -> Result<AsMeta, String>
     ))
 }
 
-/// Resolve the client identity for this connection against this AS.
-/// Priority: whatever the connection already carries (pre-registered or a
-/// previously minted DCR id — never re-register while it's still valid) →
-/// CIMD when advertised AND presentable from this deployment → DCR.
-/// Returns (client_id, source).
-async fn resolve_client(
-    state: &AppState,
-    scope: fluidbox_db::TenantScope,
-    conn_id: Uuid,
-    oauth: &Value,
-    meta: &AsMeta,
-) -> Result<(String, String), String> {
-    let cimd_ok = meta.cimd_supported && cimd_eligible(&state.cfg.public_url);
-    if let Some(existing) = oauth.get("client_id").and_then(Value::as_str) {
-        let source = oauth
-            .get("client_id_source")
-            .and_then(Value::as_str)
-            .unwrap_or("preregistered");
-        if !stored_identity_stale(
-            source,
-            existing,
-            oauth.get("redirect_uri").and_then(Value::as_str),
-            cimd_ok,
-            &cimd_client_id(state),
-            &redirect_uri(state),
-        ) {
-            return Ok((existing.to_string(), source.to_string()));
-        }
-        // Stale — fall through and mint a fresh identity (reconnect after
-        // an ineligible-CIMD dance or a public-URL move lands here).
+/// The resolved OAuth client identity for a dance. `registration_id` points at
+/// the shared `oauth_client_registrations` row that dedups this identity (Some
+/// for cimd/dcr — the reusable identities); pre-registered identities are
+/// per-connection custody and carry None (design D6).
+struct ResolvedClient {
+    client_id: String,
+    source: String,
+    registration_id: Option<Uuid>,
+}
+
+/// Which arm resolves the client identity for a dance — the PURE priority
+/// decision (unit-tested). `Reuse` short-circuits with the stored identity;
+/// `Cimd`/`Dcr` do the network/DB work. Priority is UNCHANGED from before
+/// Task 3: a non-stale stored identity (pre-registered or a previously resolved
+/// cimd/dcr id) wins, then CIMD when presentable, then DCR.
+#[derive(Debug, PartialEq, Eq)]
+enum ClientResolution {
+    Reuse,
+    Cimd,
+    Dcr,
+}
+
+fn classify_client_resolution(
+    stored: Option<&str>,
+    stale: bool,
+    cimd_ok: bool,
+) -> ClientResolution {
+    if stored.is_some() && !stale {
+        return ClientResolution::Reuse;
     }
     if cimd_ok {
-        return Ok((cimd_client_id(state), "cimd".to_string()));
+        ClientResolution::Cimd
+    } else {
+        ClientResolution::Dcr
     }
-    let Some(reg) = &meta.registration_endpoint else {
-        return Err(
-            "authorization server supports neither CIMD nor dynamic client registration — \
-             supply a pre-registered client_id on the connection"
-                .into(),
-        );
+}
+
+/// Resolve the client identity for this connection against this AS. Priority
+/// UNCHANGED (reuse a valid stored identity → CIMD → DCR); only the CIMD and DCR
+/// arms changed — they now dedup into the shared `oauth_client_registrations`
+/// table (design D6) instead of minting per-connection, and return the shared
+/// row id so the connection can reference it. Pre-registered identities stay
+/// per-connection custody (no row).
+async fn resolve_client(
+    state: &AppState,
+    oauth: &Value,
+    meta: &AsMeta,
+) -> Result<ResolvedClient, String> {
+    let cimd_ok = meta.cimd_supported && cimd_eligible(&state.cfg.public_url);
+    let stored = oauth.get("client_id").and_then(Value::as_str);
+    let source = oauth
+        .get("client_id_source")
+        .and_then(Value::as_str)
+        .unwrap_or("preregistered");
+    // No stored identity ⇒ treat as "stale" so classify falls through to CIMD/DCR.
+    let stale = stored
+        .map(|cid| {
+            stored_identity_stale(
+                source,
+                cid,
+                oauth.get("redirect_uri").and_then(Value::as_str),
+                cimd_ok,
+                &cimd_client_id(state),
+                &redirect_uri(state),
+            )
+        })
+        .unwrap_or(true);
+    let redirect = redirect_uri(state);
+    match classify_client_resolution(stored, stale, cimd_ok) {
+        ClientResolution::Reuse => {
+            // Reuse the stored identity AND carry forward the shared registration
+            // row it points at (if any — pre-registered identities have none).
+            let registration_id = oauth
+                .get("registration_id")
+                .and_then(Value::as_str)
+                .and_then(|s| Uuid::parse_str(s).ok());
+            Ok(ResolvedClient {
+                client_id: stored
+                    .expect("Reuse implies a stored client_id")
+                    .to_string(),
+                source: source.to_string(),
+                registration_id,
+            })
+        }
+        ClientResolution::Cimd => {
+            let client_id = cimd_client_id(state);
+            let registration_id =
+                ensure_cimd_registration(state, &meta.issuer, &redirect, &client_id).await?;
+            Ok(ResolvedClient {
+                client_id,
+                source: "cimd".to_string(),
+                registration_id: Some(registration_id),
+            })
+        }
+        ClientResolution::Dcr => {
+            let Some(reg_endpoint) = &meta.registration_endpoint else {
+                return Err(
+                    "authorization server supports neither CIMD nor dynamic client registration — \
+                     supply a pre-registered client_id on the connection"
+                        .into(),
+                );
+            };
+            let registered =
+                register_dcr_client(state, &meta.issuer, &redirect, reg_endpoint).await?;
+            Ok(ResolvedClient {
+                client_id: registered.client_id,
+                source: registered.source,
+                registration_id: Some(registered.registration_id),
+            })
+        }
+    }
+}
+
+/// Record (or reuse) the shared registration row for a CIMD identity so the
+/// one-time state flows (Task 4) can FK the client. No advisory lock — there is
+/// no `/register` HTTP to serialize; find-or-insert with `ON CONFLICT DO NOTHING`
+/// re-select is race-safe on its own.
+async fn ensure_cimd_registration(
+    state: &AppState,
+    issuer: &str,
+    redirect: &str,
+    client_id: &str,
+) -> Result<Uuid, String> {
+    if let Some(r) = fluidbox_db::find_client_registration(&state.pool, issuer, redirect)
+        .await
+        .map_err(|e| format!("registration lookup failed: {e}"))?
+    {
+        fluidbox_db::touch_client_registration(&state.pool, r.id)
+            .await
+            .map_err(|e| format!("registration touch failed: {e}"))?;
+        return Ok(r.id);
+    }
+    let new = fluidbox_db::NewOauthClientRegistration {
+        tenant_id: None,
+        issuer,
+        redirect_uri: redirect,
+        source: "cimd",
+        client_id,
+        client_secret_sealed: None,
+        client_secret_key_version: 1,
+        registration_endpoint: None,
+        registration_access_token_sealed: None,
+        registration_access_token_key_version: 1,
+        token_endpoint_auth_method: Some("none"),
     };
+    match fluidbox_db::insert_client_registration(&state.pool, new)
+        .await
+        .map_err(|e| format!("registration insert failed: {e}"))?
+    {
+        Some(r) => Ok(r.id),
+        None => fluidbox_db::find_client_registration(&state.pool, issuer, redirect)
+            .await
+            .map_err(|e| format!("registration re-select failed: {e}"))?
+            .map(|r| r.id)
+            .ok_or_else(|| "registration race lost with no winner".to_string()),
+    }
+}
+
+/// One RFC 7591 dynamic client registration POST. Returns `(client_id, secret?)`;
+/// the secret is rare with `token_endpoint_auth_method: "none"` (public client).
+async fn dcr_register(
+    state: &AppState,
+    registration_endpoint: &str,
+) -> Result<(String, Option<String>), String> {
     let body = json!({
         "client_name": "fluidbox",
         "redirect_uris": [redirect_uri(state)],
@@ -408,7 +531,7 @@ async fn resolve_client(
     });
     let res = state
         .http
-        .post(reg)
+        .post(registration_endpoint)
         .timeout(HTTP_TIMEOUT)
         .json(&body)
         .send()
@@ -425,29 +548,111 @@ async fn resolve_client(
         .as_str()
         .ok_or("registration response has no client_id")?
         .to_string();
-    // A DCR-minted secret (rare with auth method "none") is custodied like
-    // any other: sealed, never echoed.
-    if let Some(secret) = v["client_secret"].as_str() {
-        if let Some(sealer) = &state.sealer {
-            let sealed = sealer
+    Ok((client_id, v["client_secret"].as_str().map(String::from)))
+}
+
+/// A found-or-registered shared DCR client.
+struct RegisteredClient {
+    client_id: String,
+    registration_id: Uuid,
+    source: String,
+}
+
+/// Find-or-register the shared client for (issuer, redirect_uri): take the
+/// advisory lock, reuse an existing row (bumping `last_used_at`), else DCR at
+/// `registration_endpoint` and insert. The advisory lock + `ON CONFLICT DO
+/// NOTHING` re-select collapse concurrent connects to the same issuer down to ONE
+/// `/register`. The DCR HTTP runs UNDER the lock (like the refresh path) so a
+/// second connect blocks and then reuses THIS row rather than double-registering.
+async fn register_dcr_client(
+    state: &AppState,
+    issuer: &str,
+    redirect: &str,
+    registration_endpoint: &str,
+) -> Result<RegisteredClient, String> {
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| format!("registration txn failed: {e}"))?;
+    fluidbox_db::acquire_registration_lock(&mut tx, issuer, redirect)
+        .await
+        .map_err(|e| format!("registration lock failed: {e}"))?;
+    if let Some(r) = fluidbox_db::find_client_registration(&mut *tx, issuer, redirect)
+        .await
+        .map_err(|e| format!("registration lookup failed: {e}"))?
+    {
+        fluidbox_db::touch_client_registration(&mut *tx, r.id)
+            .await
+            .map_err(|e| format!("registration touch failed: {e}"))?;
+        tx.commit()
+            .await
+            .map_err(|e| format!("registration commit failed: {e}"))?;
+        return Ok(RegisteredClient {
+            client_id: r.client_id,
+            registration_id: r.id,
+            source: r.source,
+        });
+    }
+    let (client_id, secret) = dcr_register(state, registration_endpoint).await?;
+    // Seal the (rare) confidential secret under the DEPLOYMENT DEK — registrations
+    // are global rows (tenant_id NULL). The deployment DEK is warm from transit-
+    // token sealing (every dance seals a state param), so this near-never reaches
+    // for a second pooled connection while the lock's is held; and it only runs
+    // for the uncommon auth-method secret at all.
+    let sealer_ref = state.sealer.as_ref().ok_or("credential key missing")?;
+    let sealed = match &secret {
+        Some(s) => Some(
+            sealer_ref
                 .seal(
-                    secret,
-                    SealCtx::new(scope.tenant_id(), SealFamily::ConnectionClientSecret),
+                    s,
+                    sealer_ref.deployment_ctx(SealFamily::RegistrationClientSecret),
                 )
                 .await
-                .map_err(|e| format!("failed to seal client secret: {e}"))?;
-            fluidbox_db::set_connection_client_secret(
-                &state.pool,
-                scope,
-                conn_id,
-                &sealed.bytes,
-                sealed.key_version,
-            )
-            .await
-            .map_err(|e| format!("failed to store client secret: {e}"))?;
+                .map_err(|e| format!("failed to seal client secret: {e}"))?,
+        ),
+        None => None,
+    };
+    let (sealed_bytes, kv) = match &sealed {
+        Some(s) => (Some(s.bytes.as_slice()), s.key_version),
+        None => (None, 1),
+    };
+    let new = fluidbox_db::NewOauthClientRegistration {
+        tenant_id: None,
+        issuer,
+        redirect_uri: redirect,
+        source: "dcr",
+        client_id: &client_id,
+        client_secret_sealed: sealed_bytes,
+        client_secret_key_version: kv,
+        registration_endpoint: Some(registration_endpoint),
+        registration_access_token_sealed: None,
+        registration_access_token_key_version: 1,
+        token_endpoint_auth_method: Some("none"),
+    };
+    let row = match fluidbox_db::insert_client_registration(&mut *tx, new)
+        .await
+        .map_err(|e| format!("registration insert failed: {e}"))?
+    {
+        Some(r) => r,
+        None => {
+            // A racer won the (issuer, redirect_uri) key: adopt its row and abandon
+            // the client we just minted at the AS (a harmless orphan — log at debug).
+            tracing::debug!(%issuer, "oauth registration race: adopting the winner's client");
+            fluidbox_db::find_client_registration(&mut *tx, issuer, redirect)
+                .await
+                .map_err(|e| format!("registration re-select failed: {e}"))?
+                .ok_or("registration race lost with no winner")?
         }
-    }
-    Ok((client_id, "dcr".to_string()))
+    };
+    tx.commit()
+        .await
+        .map_err(|e| format!("registration commit failed: {e}"))?;
+    Ok(RegisteredClient {
+        client_id: row.client_id,
+        registration_id: row.id,
+        source: "dcr".to_string(),
+    })
 }
 
 // ─── The dance ────────────────────────────────────────────────────────────
@@ -497,7 +702,11 @@ pub async fn start_dance(
     let meta = discover(state, &resource)
         .await
         .map_err(ApiError::BadRequest)?;
-    let (client_id, client_source) = resolve_client(state, scope, conn.id, &oauth, &meta)
+    let ResolvedClient {
+        client_id,
+        source: client_source,
+        registration_id,
+    } = resolve_client(state, &oauth, &meta)
         .await
         .map_err(ApiError::BadRequest)?;
 
@@ -531,6 +740,16 @@ pub async fn start_dance(
     // The redirect this identity was resolved for — staleness detection
     // re-registers a DCR client if the public URL later moves.
     o.insert("redirect_uri".into(), json!(redirect_uri(state)));
+    // The shared registration row this identity dedups into (cimd/dcr); cleared
+    // for a per-connection pre-registered identity so a stale pointer never rides.
+    match registration_id {
+        Some(rid) => {
+            o.insert("registration_id".into(), json!(rid));
+        }
+        None => {
+            o.remove("registration_id");
+        }
+    }
     o.insert("scopes".into(), json!(scopes));
     fluidbox_db::update_connection_oauth(&state.pool, scope, conn.id, &oauth).await?;
 
@@ -716,6 +935,222 @@ pub async fn callback(
     }
 }
 
+/// The client identity resolved for a token exchange / refresh: the `client_id`
+/// and the (transient, unsealed) confidential `secret` if any. `registration` is
+/// the shared row when the identity is registration-sourced — the exchange's
+/// `invalid_client` self-heal needs it to re-register.
+struct ExchangeClient {
+    client_id: String,
+    secret: Option<String>,
+    registration: Option<fluidbox_db::OauthClientRegistrationRow>,
+}
+
+/// Resolve the client identity for a code exchange / refresh. Prefers the shared
+/// registration row (`oauth.registration_id`) — unsealing ITS secret under the
+/// deployment DEK — and falls back to the per-connection legacy fields for
+/// connections created before Task 3 (or a `registration_id` whose row a
+/// different connection's self-heal deleted; a public client keeps working on the
+/// stored `client_id` alone). Reads run THROUGH `db` so a refresh stays on its
+/// single lock-holding connection (design D6).
+async fn resolve_exchange_client(
+    state: &AppState,
+    db: &mut sqlx::PgConnection,
+    scope: fluidbox_db::TenantScope,
+    conn_id: Uuid,
+    oauth: &Value,
+) -> Result<ExchangeClient, String> {
+    let sealer_ref = state.sealer.as_ref().ok_or("credential key missing")?;
+    if let Some(reg_id) = oauth
+        .get("registration_id")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok())
+    {
+        if let Some(reg) = fluidbox_db::find_client_registration_by_id(&mut *db, reg_id)
+            .await
+            .map_err(|e| format!("client registration lookup failed: {e}"))?
+        {
+            let secret = match &reg.client_secret_sealed {
+                Some(bytes) => Some(
+                    sealer_ref
+                        .open(
+                            bytes,
+                            reg.client_secret_key_version,
+                            sealer_ref.deployment_ctx(SealFamily::RegistrationClientSecret),
+                        )
+                        .await
+                        .map_err(|_| "registration client secret unseal failed")?,
+                ),
+                None => None,
+            };
+            return Ok(ExchangeClient {
+                client_id: reg.client_id.clone(),
+                secret,
+                registration: Some(reg),
+            });
+        }
+        // The row is gone (another connection's self-heal deleted it): fall
+        // through to the connection's stored client_id.
+    }
+    let client_id = oauth
+        .get("client_id")
+        .and_then(Value::as_str)
+        .ok_or("connection has no client identity — start the connect flow again")?
+        .to_string();
+    let secret = match fluidbox_db::connection_client_secret_sealed(&mut *db, scope, conn_id)
+        .await
+        .map_err(|e| format!("client secret lookup failed: {e}"))?
+    {
+        Some((bytes, kv)) => Some(
+            sealer_ref
+                .open(
+                    &bytes,
+                    kv,
+                    SealCtx::new(scope.tenant_id(), SealFamily::ConnectionClientSecret),
+                )
+                .await
+                .map_err(|_| "client secret unseal failed")?,
+        ),
+        None => None,
+    };
+    Ok(ExchangeClient {
+        client_id,
+        secret,
+        registration: None,
+    })
+}
+
+/// Outcome of a code exchange. `InvalidClient` is surfaced typed so the caller
+/// can self-heal (re-register) ONCE; `Other` carries a browser-safe message.
+enum ExchangeOutcome {
+    Ok(Value),
+    InvalidClient,
+    Other(String),
+}
+
+/// One authorization-code exchange round trip. Upstream error text is sanitized
+/// exactly as before (allowlisted code + status + digest to the log; generic to
+/// the browser). A token-endpoint `invalid_client` is returned typed.
+#[allow(clippy::too_many_arguments)]
+async fn do_code_exchange(
+    state: &AppState,
+    token_endpoint: &str,
+    client_id: &str,
+    secret: Option<&str>,
+    code: &str,
+    verifier: &str,
+    redirect: &str,
+    resource: Option<&str>,
+) -> ExchangeOutcome {
+    let mut form: Vec<(&str, &str)> = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("client_id", client_id),
+        ("code_verifier", verifier),
+        ("redirect_uri", redirect),
+    ];
+    if let Some(r) = resource {
+        form.push(("resource", r));
+    }
+    let mut req = state
+        .http
+        .post(token_endpoint)
+        .timeout(HTTP_TIMEOUT)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(form_body(&form));
+    if let Some(s) = secret {
+        req = req.basic_auth(client_id, Some(s));
+    }
+    let res = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return ExchangeOutcome::Other(format!("token exchange failed: {e}")),
+    };
+    let status = res.status();
+    let v: Value = res.json().await.unwrap_or(Value::Null);
+    if status.is_success() {
+        return ExchangeOutcome::Ok(v);
+    }
+    // The token endpoint's JSON is attacker-controlled: a malicious AS can put the
+    // code, PKCE verifier, or client secret into `error`. Log ONLY an allowlisted
+    // code + status + a bounded digest — never the verbatim value (R3.4).
+    let err = v["error"].as_str().unwrap_or("");
+    let raw = v.get("error").map(ToString::to_string).unwrap_or_default();
+    tracing::warn!(
+        %status,
+        oauth_error = known_oauth_error(err),
+        detail = %crate::broker::msg_digest(&raw),
+        "oauth callback: token exchange rejected"
+    );
+    if err == "invalid_client" {
+        return ExchangeOutcome::InvalidClient;
+    }
+    ExchangeOutcome::Other(
+        "the authorization server rejected the token exchange — reconnect and try again".into(),
+    )
+}
+
+/// Whether an exchange `invalid_client` can self-heal (pure decision): only a
+/// REGISTRATION-sourced identity that records its `registration_endpoint` can be
+/// re-registered. A per-connection pre-registered/legacy secret cannot (nothing
+/// to re-register — the AS rejected operator-supplied credentials). The heal
+/// itself is bounded to ONE retry by `complete_dance`'s single non-looping site.
+fn can_self_heal(client: &ExchangeClient) -> bool {
+    client
+        .registration
+        .as_ref()
+        .is_some_and(|r| r.registration_endpoint.is_some())
+}
+
+/// Self-heal a token-endpoint `invalid_client` for a REGISTRATION-sourced client:
+/// delete the rejected shared registration, re-register ONCE (fresh DCR), rewrite
+/// the connection's `oauth` identity in place, and re-resolve `client` from the
+/// fresh row. Returns false when the identity was NOT registration-sourced (a
+/// per-connection pre-registered/legacy secret — nothing to re-register, the AS
+/// simply rejected operator-supplied credentials). Bounded: the caller retries
+/// the exchange at most once and never loops (no user is present on this browser
+/// leg to re-consent). A REFRESH-path `invalid_client` deliberately does NOT come
+/// here — it flips the connection to `error` and waits for human re-consent
+/// (design D6; there is no user present mid-refresh to re-authorize).
+async fn heal_invalid_client(
+    state: &AppState,
+    scope: fluidbox_db::TenantScope,
+    conn_id: Uuid,
+    oauth: &mut Value,
+    client: &mut ExchangeClient,
+) -> Result<bool, String> {
+    if !can_self_heal(client) {
+        return Ok(false);
+    }
+    let reg = client
+        .registration
+        .take()
+        .expect("can_self_heal proved the registration is present");
+    let reg_endpoint = reg
+        .registration_endpoint
+        .clone()
+        .expect("can_self_heal proved the registration_endpoint is present");
+    tracing::info!(
+        connection = %conn_id,
+        "oauth callback: invalid_client — re-registering the shared client once"
+    );
+    fluidbox_db::delete_client_registration(&state.pool, reg.id)
+        .await
+        .map_err(|e| format!("registration cleanup failed: {e}"))?;
+    let registered =
+        register_dcr_client(state, &reg.issuer, &redirect_uri(state), &reg_endpoint).await?;
+    if let Some(o) = oauth.as_object_mut() {
+        o.insert("client_id".into(), json!(registered.client_id));
+        o.insert("client_id_source".into(), json!("dcr"));
+        o.insert("registration_id".into(), json!(registered.registration_id));
+    }
+    let mut resolve_conn = state
+        .pool
+        .acquire()
+        .await
+        .map_err(|e| format!("db acquire failed: {e}"))?;
+    *client = resolve_exchange_client(state, &mut resolve_conn, scope, conn_id, oauth).await?;
+    Ok(true)
+}
+
 /// Exchange the code, seal the rotating refresh token, activate the connection,
 /// bump the authorization generation on a RECONNECT (fail-closed — a re-consent
 /// may change the account/issuer/audience, so any in-flight run bound to the old
@@ -741,71 +1176,74 @@ async fn complete_dance(
     if conn.status == "revoked" {
         return Err("connection was revoked — create a new one".into());
     }
-    let oauth = conn.oauth.clone().unwrap_or_else(|| json!({}));
+    let mut oauth = conn.oauth.clone().unwrap_or_else(|| json!({}));
     let token_endpoint = oauth
         .get("token_endpoint")
         .and_then(Value::as_str)
-        .ok_or("connection has no token endpoint — start the connect flow again")?;
-    let client_id = oauth
-        .get("client_id")
+        .ok_or("connection has no token endpoint — start the connect flow again")?
+        .to_string();
+    let resource = oauth
+        .get("resource")
         .and_then(Value::as_str)
-        .ok_or("connection has no client identity — start the connect flow again")?;
-    let resource = oauth.get("resource").and_then(Value::as_str);
-
-    let mut form: Vec<(&str, &str)> = vec![
-        ("grant_type", "authorization_code"),
-        ("code", code),
-        ("client_id", client_id),
-        ("code_verifier", verifier),
-    ];
+        .map(str::to_string);
     let ru = redirect_uri(state);
-    form.push(("redirect_uri", &ru));
-    if let Some(r) = resource {
-        form.push(("resource", r));
-    }
-    let mut req = state
-        .http
-        .post(token_endpoint)
-        .timeout(HTTP_TIMEOUT)
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(form_body(&form));
-    if let Some((sealed, kv)) =
-        fluidbox_db::connection_client_secret_sealed(&state.pool, scope, conn.id)
-            .await
-            .map_err(|e| format!("client secret lookup failed: {e}"))?
+
+    // Resolve the client identity (shared registration preferred; per-connection
+    // legacy fallback). Uses a short-lived pooled connection — the activation
+    // critical section below takes its own, so nothing nests.
+    let mut resolve_conn = state
+        .pool
+        .acquire()
+        .await
+        .map_err(|e| format!("db acquire failed: {e}"))?;
+    let mut client =
+        resolve_exchange_client(state, &mut resolve_conn, scope, conn.id, &oauth).await?;
+    drop(resolve_conn);
+
+    // Exchange the code, with ONE `invalid_client` self-heal for a registration-
+    // sourced identity (delete the stale shared client, re-register, retry once).
+    let v = match do_code_exchange(
+        state,
+        &token_endpoint,
+        &client.client_id,
+        client.secret.as_deref(),
+        code,
+        verifier,
+        &ru,
+        resource.as_deref(),
+    )
+    .await
     {
-        let secret = sealer_ref
-            .open(
-                &sealed,
-                kv,
-                SealCtx::new(scope.tenant_id(), SealFamily::ConnectionClientSecret),
+        ExchangeOutcome::Ok(v) => v,
+        ExchangeOutcome::Other(msg) => return Err(msg),
+        ExchangeOutcome::InvalidClient => {
+            if !heal_invalid_client(state, scope, conn.id, &mut oauth, &mut client).await? {
+                return Err(
+                    "the authorization server rejected the client — reconnect and try again".into(),
+                );
+            }
+            match do_code_exchange(
+                state,
+                &token_endpoint,
+                &client.client_id,
+                client.secret.as_deref(),
+                code,
+                verifier,
+                &ru,
+                resource.as_deref(),
             )
             .await
-            .map_err(|_| "client secret unseal failed")?;
-        req = req.basic_auth(client_id, Some(secret));
-    }
-    let res = req
-        .send()
-        .await
-        .map_err(|e| format!("token exchange failed: {e}"))?;
-    let status = res.status();
-    let v: Value = res.json().await.unwrap_or(Value::Null);
-    if !status.is_success() {
-        // The token endpoint's JSON is attacker-controlled: a malicious AS can put
-        // the code, PKCE verifier, or client secret into the `error` value. Log
-        // ONLY an allowlisted code + status + a bounded digest of the raw error
-        // text — never the verbatim value (R3.4). The browser gets a generic line.
-        let raw = v.get("error").map(ToString::to_string).unwrap_or_default();
-        tracing::warn!(
-            %status,
-            oauth_error = known_oauth_error(v["error"].as_str().unwrap_or("")),
-            detail = %crate::broker::msg_digest(&raw),
-            "oauth callback: token exchange rejected"
-        );
-        return Err(
-            "the authorization server rejected the token exchange — reconnect and try again".into(),
-        );
-    }
+            {
+                ExchangeOutcome::Ok(v) => v,
+                _ => {
+                    return Err(
+                        "the authorization server rejected the token exchange — reconnect and try again"
+                            .into(),
+                    )
+                }
+            }
+        }
+    };
     let access = v["access_token"]
         .as_str()
         .ok_or("token response has no access_token")?
@@ -1118,16 +1556,17 @@ async fn refresh_access_token(
         .get("token_endpoint")
         .and_then(Value::as_str)
         .ok_or("connection has no token endpoint — reconnect it")?;
-    let client_id = oauth
-        .get("client_id")
-        .and_then(Value::as_str)
-        .ok_or("connection has no client identity — reconnect it")?;
     let resource = oauth.get("resource").and_then(Value::as_str);
+    // Resolve the client identity (shared registration preferred, per-connection
+    // legacy fallback) THROUGH `db` — the refresh stays on its single lock-holding
+    // connection. A refresh-path `invalid_client` is handled below (mark error;
+    // NEVER re-register mid-refresh — no user is present to re-consent; design D6).
+    let client = resolve_exchange_client(state, &mut *db, scope, conn.id, &oauth).await?;
 
     let mut form: Vec<(&str, &str)> = vec![
         ("grant_type", "refresh_token"),
         ("refresh_token", &refresh),
-        ("client_id", client_id),
+        ("client_id", &client.client_id),
     ];
     if let Some(r) = resource {
         form.push(("resource", r));
@@ -1138,20 +1577,8 @@ async fn refresh_access_token(
         .timeout(HTTP_TIMEOUT)
         .header("content-type", "application/x-www-form-urlencoded")
         .body(form_body(&form));
-    if let Some((sealed_secret, cs_kv)) =
-        fluidbox_db::connection_client_secret_sealed(&mut *db, scope, conn.id)
-            .await
-            .map_err(|e| format!("client secret lookup failed: {e}"))?
-    {
-        let secret = sealer_ref
-            .open(
-                &sealed_secret,
-                cs_kv,
-                SealCtx::new(conn.tenant_id, SealFamily::ConnectionClientSecret),
-            )
-            .await
-            .map_err(|_| "client secret unseal failed")?;
-        req = req.basic_auth(client_id, Some(secret));
+    if let Some(secret) = &client.secret {
+        req = req.basic_auth(&client.client_id, Some(secret));
     }
     let res = req
         .send()
@@ -1473,5 +1900,84 @@ mod tests {
         });
         assert_eq!(parse_resource_metadata(&prm).unwrap(), "https://as.test");
         assert!(parse_resource_metadata(&serde_json::json!({})).is_err());
+    }
+
+    fn reg_row(endpoint: Option<&str>) -> fluidbox_db::OauthClientRegistrationRow {
+        fluidbox_db::OauthClientRegistrationRow {
+            id: Uuid::now_v7(),
+            tenant_id: None,
+            issuer: "https://as.test".into(),
+            redirect_uri: "https://fbx.test/v1/oauth/callback".into(),
+            source: "dcr".into(),
+            client_id: "dcr-client".into(),
+            client_secret_sealed: None,
+            client_secret_key_version: 1,
+            registration_endpoint: endpoint.map(String::from),
+            registration_access_token_sealed: None,
+            registration_access_token_key_version: 1,
+            token_endpoint_auth_method: Some("none".into()),
+            created_at: Utc::now(),
+            last_used_at: None,
+        }
+    }
+
+    #[test]
+    fn client_resolution_priority_reuse_beats_cimd_beats_dcr() {
+        // A valid stored identity reuses — even when CIMD is presentable — so a
+        // pre-registered client wins, and a second resolve of a DCR/CIMD identity
+        // reuses the row instead of re-registering (design D6).
+        assert_eq!(
+            classify_client_resolution(Some("pre-1"), false, true),
+            ClientResolution::Reuse
+        );
+        assert_eq!(
+            classify_client_resolution(Some("dcr-1"), false, false),
+            ClientResolution::Reuse
+        );
+        // No stored identity: CIMD when presentable, else DCR.
+        assert_eq!(
+            classify_client_resolution(None, true, true),
+            ClientResolution::Cimd
+        );
+        assert_eq!(
+            classify_client_resolution(None, true, false),
+            ClientResolution::Dcr
+        );
+        // A STALE stored identity (reconnect after a public-URL move) never reuses
+        // — it falls through to CIMD if presentable, else DCR.
+        assert_eq!(
+            classify_client_resolution(Some("dcr-old"), true, true),
+            ClientResolution::Cimd
+        );
+        assert_eq!(
+            classify_client_resolution(Some("dcr-old"), true, false),
+            ClientResolution::Dcr
+        );
+    }
+
+    #[test]
+    fn invalid_client_self_heals_only_for_registration_sourced_identities() {
+        // Registration-sourced with a registration_endpoint → can re-register once.
+        let reg = ExchangeClient {
+            client_id: "dcr-1".into(),
+            secret: None,
+            registration: Some(reg_row(Some("https://as.test/register"))),
+        };
+        assert!(can_self_heal(&reg));
+        // Registration-sourced but no endpoint recorded → cannot re-register.
+        let no_ep = ExchangeClient {
+            client_id: "dcr-1".into(),
+            secret: None,
+            registration: Some(reg_row(None)),
+        };
+        assert!(!can_self_heal(&no_ep));
+        // Per-connection legacy / pre-registered identity → NOT registration-sourced;
+        // the AS rejected operator-supplied credentials, so there is nothing to heal.
+        let legacy = ExchangeClient {
+            client_id: "pre-1".into(),
+            secret: Some("shhh".into()),
+            registration: None,
+        };
+        assert!(!can_self_heal(&legacy));
     }
 }
