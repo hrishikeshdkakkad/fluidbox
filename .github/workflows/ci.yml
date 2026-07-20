@@ -149,6 +149,55 @@ jobs:
           FLUIDBOX_SERVER_BIN: ${{ github.workspace }}/target/debug/fluidbox-server
         run: bash scripts/bindings-e2e.sh
 
+  # Phase D acceptance: the secrets/KMS control plane, driven end-to-end over HTTP
+  # against python-stdlib fakes (OAuth AS + MCP + OIDC issuer, GitHub manifest
+  # conversions, LiteLLM virtual-key admin). It proves the #32 matrix — the KMS
+  # boot matrix + versioned envelope sealing + resumable re-seal with count parity
+  # + the D4 retirement gate, invariant-20 one-time browser-bound OAuth flows
+  # (replay/wrong-browser/expired/tampered/cross-flow), reusable client
+  # registrations, refresh singleflight/rotation/generation/revoke, per-tenant
+  # LiteLLM virtual keys (master confined to provisioning), RLS tenant isolation,
+  # and log-hygiene redaction. Hermetic (no Dex, no docker, no model spend — runs
+  # never launch a sandbox), so it runs on every PR like the other cheap gates. A
+  # distinct Postgres DB name keeps it isolated.
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: fluidbox_secrets
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/fluidbox_secrets
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Share the debug build cache with the `rust` job — same profile.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: debug
+      - name: build server
+        run: cargo build -p fluidbox-server
+      # psql is REQUIRED by the acceptance script (it PROVES key_version flips, RLS
+      # visibility, the forged session/token fixtures, and the retirement-gate matrix).
+      - name: install postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: secrets acceptance (KMS + envelope + reseal + invariant-20 + virtual keys + RLS)
+        env:
+          # Reuse the just-built binary so the script `exec`s it directly (clean
+          # single-process lifecycle across the many boots the KMS/LLM matrix needs).
+          FLUIDBOX_SERVER_BIN: ${{ github.workspace }}/target/debug/fluidbox-server
+        run: bash scripts/secrets-e2e.sh
+
   web:
     runs-on: ubuntu-latest
     defaults:
