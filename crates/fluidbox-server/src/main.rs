@@ -81,7 +81,12 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&cfg.data_dir).ok();
 
     tracing::info!("connecting to database…");
-    let pool = fluidbox_db::connect(&cfg.database_url).await?;
+    let pool = fluidbox_db::connect(&cfg.database_url, cfg.runtime_role.as_deref()).await?;
+    if let Some(role) = &cfg.runtime_role {
+        tracing::info!(
+            "app pool runs under least-privilege role '{role}' (RLS role split enabled)"
+        );
+    }
 
     tracing::info!("seeding…");
     // The curated seed agent rides the harness registry like any other

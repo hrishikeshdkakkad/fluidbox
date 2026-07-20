@@ -417,35 +417,33 @@ pub async fn messages(
     // key never rides a model request; SSO+shared is the forbidden hosted posture.
     // Every failure is fail-closed — a 503 with a stable code, NEVER the master
     // key as a fallback.
-    let upstream_key: String = match llm_keys::key_source(
-        state.cfg.llm_key_mode,
-        state.cfg.require_sso,
-    ) {
-        llm_keys::KeySource::Shared => state.cfg.llm_upstream_key.clone(),
-        llm_keys::KeySource::Tenant => {
-            match llm_keys::ensure_tenant_key(&state, sess_auth.tenant_id).await {
-                Ok(k) => k,
-                Err(e) => {
-                    tracing::warn!(
-                        "facade: tenant LLM key unavailable for tenant {}: {e}",
-                        sess_auth.tenant_id
-                    );
-                    return Ok(facade_refusal(
-                        dialect,
-                        "tenant_llm_key_unavailable",
-                        "the tenant's LLM key could not be provisioned",
-                    ));
+    let upstream_key: String =
+        match llm_keys::key_source(state.cfg.llm_key_mode, state.cfg.require_sso) {
+            llm_keys::KeySource::Shared => state.cfg.llm_upstream_key.clone(),
+            llm_keys::KeySource::Tenant => {
+                match llm_keys::ensure_tenant_key(&state, sess_auth.tenant_id).await {
+                    Ok(k) => k,
+                    Err(e) => {
+                        tracing::warn!(
+                            "facade: tenant LLM key unavailable for tenant {}: {e}",
+                            sess_auth.tenant_id
+                        );
+                        return Ok(facade_refusal(
+                            dialect,
+                            "tenant_llm_key_unavailable",
+                            "the tenant's LLM key could not be provisioned",
+                        ));
+                    }
                 }
             }
-        }
-        llm_keys::KeySource::RefuseSsoShared => {
-            return Ok(facade_refusal(
+            llm_keys::KeySource::RefuseSsoShared => {
+                return Ok(facade_refusal(
                 dialect,
                 "tenant_llm_keys_required",
                 "this deployment requires per-tenant LLM keys (set FLUIDBOX_LLM_KEY_MODE=tenant)",
             ));
-        }
-    };
+            }
+        };
 
     let mut req = state.http.post(&upstream).body(upstream_body);
     req = req.header("content-type", "application/json");

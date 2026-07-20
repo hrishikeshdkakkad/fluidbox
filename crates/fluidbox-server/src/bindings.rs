@@ -1277,7 +1277,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -1383,7 +1383,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -1432,7 +1432,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -1480,7 +1480,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -1527,7 +1527,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -1560,7 +1560,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -1606,7 +1606,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -1637,7 +1637,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -1681,7 +1681,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -1779,7 +1779,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -1855,7 +1855,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url).await.expect("connect");
+        let pool = connect(&url, None).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();

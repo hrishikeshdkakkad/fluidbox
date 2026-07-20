@@ -300,7 +300,14 @@ pub struct FamilyKeyVersionCounts {
 /// uncounted family would escape both the re-seal job AND the retirement gate and
 /// orphan when the legacy key retires.
 pub async fn sealed_key_version_counts(pool: &PgPool) -> sqlx::Result<Vec<FamilyKeyVersionCounts>> {
-    sqlx::query_as(
+    // BOOT-PATH CARVE-OUT (Phase D Task 6, plan resolution 2): the D4 retirement
+    // gates call this BEFORE serving. It is a cross-tenant aggregate over every
+    // sealed column; under RLS with no GUC it would count ZERO rows and fail OPEN
+    // (retire the legacy key while v1 rows still exist). It rides the audited bypass
+    // so the counts stay truthful. The remaining system_worker scans adopt worker_tx
+    // in Task 7; this one is converted now because it gates boot.
+    let mut tx = crate::worker_tx(pool).await?;
+    let out = sqlx::query_as(
         "select 'integration_connections.credential_sealed' as family,
                 count(*) filter (where credential_sealed is not null and credential_key_version = 1) as legacy,
                 count(*) filter (where credential_sealed is not null and credential_key_version = 2) as envelope
@@ -361,8 +368,10 @@ pub async fn sealed_key_version_counts(pool: &PgPool) -> sqlx::Result<Vec<Family
                 count(*) filter (where litellm_key_sealed is not null and litellm_key_key_version = 2)
            from tenant_llm_keys",
     )
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(out)
 }
 
 // ─── Re-seal migration paging + per-row lock/CAS (Phase D, #32; category (c)) ──
