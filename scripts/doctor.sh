@@ -173,6 +173,49 @@ sys.exit(1)' "$cred" 2>/dev/null; then
     fi
   fi
 
+  # LLM upstream auth (Phase D). Non-fatal hints; variable NAMES only, never values.
+  say "LLM upstream auth"
+  llm_mode=$(env_get "$ENV" FLUIDBOX_LLM_KEY_MODE); llm_mode=${llm_mode:-shared}
+  upstream_url=$(env_get "$ENV" LLM_UPSTREAM_URL)
+  case "$llm_mode" in
+    shared|"")
+      ok "FLUIDBOX_LLM_KEY_MODE=shared (facade presents one upstream key on every model request)"
+      # D7: shared mode refuses to boot on an EMPTY resolved upstream key.
+      case "$upstream_url" in
+        *api.anthropic.com*)
+          [ -n "$(env_get "$ENV" ANTHROPIC_API_KEY)" ] \
+            || warn "shared mode + direct-Anthropic upstream but ANTHROPIC_API_KEY empty — the server refuses to boot" "set ANTHROPIC_API_KEY (the facade presents it on every request)";;
+        *)
+          [ -n "$(env_get "$ENV" LITELLM_MASTER_KEY)" ] \
+            || warn "shared mode but LITELLM_MASTER_KEY empty — the server refuses to boot" "set LITELLM_MASTER_KEY (the facade presents it on every request)";;
+      esac
+      [ "$(env_get "$ENV" FLUIDBOX_REQUIRE_SSO)" = 1 ] \
+        && warn "FLUIDBOX_REQUIRE_SSO=1 with shared LLM mode — the facade returns 503 (tenant_llm_keys_required) for EVERY model request" "set FLUIDBOX_LLM_KEY_MODE=tenant for hosted deployments";;
+    tenant)
+      ok "FLUIDBOX_LLM_KEY_MODE=tenant (per-tenant LiteLLM virtual keys; master key confined to provisioning)"
+      case "$upstream_url" in
+        *api.anthropic.com*)
+          warn "tenant mode requires a LiteLLM upstream, not direct Anthropic — the server refuses to boot" "virtual keys are a LiteLLM feature; point LLM_UPSTREAM_URL at LiteLLM";;
+      esac
+      [ -n "$(env_get "$ENV" LITELLM_MASTER_KEY)" ] \
+        && ok "LITELLM_MASTER_KEY set (virtual-key provisioning credential)" \
+        || warn "tenant mode but LITELLM_MASTER_KEY empty — the server refuses to boot" "set LITELLM_MASTER_KEY (mints virtual keys via /key/generate)"
+      admin_url=$(env_get "$ENV" FLUIDBOX_LLM_ADMIN_URL)
+      [ -n "$admin_url" ] \
+        && ok "FLUIDBOX_LLM_ADMIN_URL set (virtual-key admin plane)" \
+        || ok "FLUIDBOX_LLM_ADMIN_URL unset — defaults to LLM_UPSTREAM_URL"
+      warn "tenant mode needs LiteLLM backed by its OWN Postgres for /key/* — not wired in the default dev compose" "prerequisite; see docs/hosted/kms-operations.md §8 (per-tenant LiteLLM virtual keys)";;
+    *)
+      warn "FLUIDBOX_LLM_KEY_MODE=$llm_mode unrecognized" "expected: shared | tenant";;
+  esac
+  # A REAL-browser OAuth Connect needs an https public URL: the __Host- flow cookie
+  # is dropped by browsers on http. curl-based e2e is unaffected (Task 4 review).
+  pub_url=$(env_get "$ENV" FLUIDBOX_PUBLIC_URL); pub_url=${pub_url:-http://127.0.0.1:8787}
+  case "$pub_url" in
+    https://*) : ;;
+    *) warn "FLUIDBOX_PUBLIC_URL is http — a REAL-browser OAuth Connect drops the __Host-fbx_oauth_flow cookie" "local curl-based flows work; a hosted deployment needs an https FLUIDBOX_PUBLIC_URL";;
+  esac
+
   if [ "$docker_up" = 1 ]; then
     say "docker images"
     sandbox_image=$(env_get "$ENV" FLUIDBOX_SANDBOX_IMAGE); sandbox_image=${sandbox_image:-fluidbox-sandbox-runner:dev}

@@ -80,6 +80,14 @@ pub struct AppStateInner {
     /// concurrent brokered calls must mint ONE new refresh token, not race
     /// each other into invalid_grant (Notion keeps ≤2 valid).
     pub oauth_locks: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
+    /// Per-tenant LiteLLM virtual keys, cached UNSEALED in memory (Phase D, #32),
+    /// keyed by tenant_id. The durable key stays sealed in `tenant_llm_keys`; this
+    /// is a read-through of that sealed column (re-seeded on a cold cache /
+    /// restart) so the facade avoids an unseal per model request. No TTL — a
+    /// virtual key is durable; rotation is the only invalidation
+    /// (`llm_keys::rotate_tenant_key` re-seeds it, `evict_tenant_llm_key` drops it).
+    /// Only populated in `FLUIDBOX_LLM_KEY_MODE=tenant`.
+    pub tenant_llm_keys: Mutex<HashMap<Uuid, String>>,
     /// Kubernetes netpol run-gate: false until a probe proves the CNI enforces
     /// NetworkPolicy. `create_run` refuses while false + require_enforced_netpol
     /// (fails closed). Always true for Docker (a different isolation model).

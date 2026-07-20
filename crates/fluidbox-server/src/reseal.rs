@@ -5,7 +5,7 @@
 //! before the flip is still a v1 (legacy) blob. Retiring `FLUIDBOX_CREDENTIAL_KEY`
 //! is only safe once ZERO v1 blobs remain (the D4 boot gate in
 //! `seal::check_retirement_gates` refuses otherwise). This module is the bridge:
-//! a resumable, CAS-guarded job that walks all eleven sealed families, unseals
+//! a resumable, CAS-guarded job that walks all twelve sealed families, unseals
 //! each v1 blob and re-seals it v2 under the row's per-tenant DEK (deployment-
 //! global rows re-seal under the deployment tenant's DEK), plus the operator
 //! endpoints that start it and report count parity.
@@ -52,17 +52,19 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 /// One sealed family the job walks: its table, the sealed `bytea` column, that
-/// column's `_key_version` companion, and the [`SealFamily`] whose per-tenant DEK
-/// and AAD re-seal it. EVERY field is a compile-time constant — the `fluidbox-db`
-/// layer builds its `format!` SQL from these (never request data), which is
-/// exactly why that SQL is injection-safe. This array IS the re-seal coverage
-/// set; it must stay in lockstep with the eleven families
-/// `system_worker::sealed_key_version_counts` counts (a unit test enforces the
-/// `table.column` ↔ `SealFamily` correspondence).
+/// column's `_key_version` companion, the row's stable unique KEY column
+/// (`id` for every family except `tenant_llm_keys`, keyed by its `tenant_id`
+/// primary key), and the [`SealFamily`] whose per-tenant DEK and AAD re-seal it.
+/// EVERY field is a compile-time constant — the `fluidbox-db` layer builds its
+/// `format!` SQL from these (never request data), which is exactly why that SQL is
+/// injection-safe. This array IS the re-seal coverage set; it must stay in lockstep
+/// with the twelve families `system_worker::sealed_key_version_counts` counts (a
+/// unit test enforces the `table.column` ↔ `SealFamily` correspondence).
 struct Family {
     table: &'static str,
     column: &'static str,
     version_column: &'static str,
+    key_column: &'static str,
     seal_family: SealFamily,
 }
 
@@ -71,54 +73,63 @@ const FAMILIES: &[Family] = &[
         table: "integration_connections",
         column: "credential_sealed",
         version_column: "credential_key_version",
+        key_column: "id",
         seal_family: SealFamily::ConnectionCredential,
     },
     Family {
         table: "integration_connections",
         column: "webhook_secret_sealed",
         version_column: "webhook_secret_key_version",
+        key_column: "id",
         seal_family: SealFamily::ConnectionWebhookSecret,
     },
     Family {
         table: "integration_connections",
         column: "client_secret_sealed",
         version_column: "client_secret_key_version",
+        key_column: "id",
         seal_family: SealFamily::ConnectionClientSecret,
     },
     Family {
         table: "trigger_subscriptions",
         column: "callback_secret_sealed",
         version_column: "callback_secret_key_version",
+        key_column: "id",
         seal_family: SealFamily::SubscriptionCallbackSecret,
     },
     Family {
         table: "github_app_registrations",
         column: "pem_sealed",
         version_column: "pem_key_version",
+        key_column: "id",
         seal_family: SealFamily::GithubAppPem,
     },
     Family {
         table: "github_app_registrations",
         column: "webhook_secret_sealed",
         version_column: "webhook_secret_key_version",
+        key_column: "id",
         seal_family: SealFamily::GithubAppWebhookSecret,
     },
     Family {
         table: "github_app_registrations",
         column: "client_secret_sealed",
         version_column: "client_secret_key_version",
+        key_column: "id",
         seal_family: SealFamily::GithubAppClientSecret,
     },
     Family {
         table: "org_idp_configs",
         column: "client_secret_sealed",
         version_column: "client_secret_key_version",
+        key_column: "id",
         seal_family: SealFamily::IdpClientSecret,
     },
     Family {
         table: "login_flows",
         column: "pkce_verifier_sealed",
         version_column: "pkce_verifier_key_version",
+        key_column: "id",
         seal_family: SealFamily::LoginPkceVerifier,
     },
     // Deployment-global (tenant_id NULL) — Task 3. `reseal_one` resolves the NULL
@@ -127,13 +138,23 @@ const FAMILIES: &[Family] = &[
         table: "oauth_client_registrations",
         column: "client_secret_sealed",
         version_column: "client_secret_key_version",
+        key_column: "id",
         seal_family: SealFamily::RegistrationClientSecret,
     },
     Family {
         table: "oauth_client_registrations",
         column: "registration_access_token_sealed",
         version_column: "registration_access_token_key_version",
+        key_column: "id",
         seal_family: SealFamily::RegistrationAccessToken,
+    },
+    // Tenant-owned, keyed by `tenant_id` (the PK — no `id` column) — Task 5.
+    Family {
+        table: "tenant_llm_keys",
+        column: "litellm_key_sealed",
+        version_column: "litellm_key_key_version",
+        key_column: "tenant_id",
+        seal_family: SealFamily::TenantLlmKey,
     },
 ];
 
@@ -365,6 +386,7 @@ async fn reseal_family(
             fam.table,
             fam.column,
             fam.version_column,
+            fam.key_column,
             after,
             PAGE,
         )
@@ -412,6 +434,7 @@ async fn reseal_one(pool: &PgPool, sealer: &Sealer, fam: &Family, id: Uuid) -> R
         fam.table,
         fam.column,
         fam.version_column,
+        fam.key_column,
         id,
     )
     .await
@@ -472,6 +495,7 @@ async fn reseal_one(pool: &PgPool, sealer: &Sealer, fam: &Family, id: Uuid) -> R
         fam.table,
         fam.column,
         fam.version_column,
+        fam.key_column,
         id,
         &sealed.bytes,
     )
@@ -572,9 +596,9 @@ mod tests {
     #[test]
     fn families_cover_all_sealed_columns() {
         // Nine tenant-owned families + Task 3's two deployment-global
-        // oauth_client_registrations columns. MUST match
+        // oauth_client_registrations columns + Task 5's tenant_llm_keys. MUST match
         // system_worker::sealed_key_version_counts (both feed the retirement gate).
-        assert_eq!(FAMILIES.len(), 11, "one entry per sealed column");
+        assert_eq!(FAMILIES.len(), 12, "one entry per sealed column");
         for f in FAMILIES {
             // The SealFamily Display IS "table.column" — keep the triple coherent.
             assert_eq!(
@@ -587,6 +611,13 @@ mod tests {
                 f.version_column,
                 f.column.replace("_sealed", "_key_version"),
                 "companion column derives from the sealed column"
+            );
+            // Every family has a Uuid row key the job pages/locks/CAS-writes by.
+            assert!(
+                f.key_column == "id" || f.key_column == "tenant_id",
+                "unexpected key column '{}' for {}",
+                f.key_column,
+                f.seal_family
             );
         }
     }
