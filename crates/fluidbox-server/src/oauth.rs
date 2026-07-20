@@ -639,6 +639,12 @@ fn adopt_registration(row: &fluidbox_db::OauthClientRegistrationRow) -> (String,
 /// one-time state flows (Task 4) FK the client. No advisory lock — CIMD has no
 /// `/register` HTTP to serialize; find-or-insert with `ON CONFLICT DO NOTHING`
 /// re-select is race-safe on its own.
+///
+/// The two WRITES take the audited system-worker entry points: migration 0018
+/// grants global rows (`tenant_id is null`) SELECT from any scope but
+/// INSERT/UPDATE/DELETE only under the bypass GUC, and this resolution is
+/// principal-less by construction (it runs mid-dance, before any connection is
+/// active). The reads stay pool-direct — the SELECT policy already admits them.
 async fn ensure_cimd_registration(
     state: &AppState,
     issuer: &str,
@@ -649,7 +655,7 @@ async fn ensure_cimd_registration(
         .await
         .map_err(|e| format!("registration lookup failed: {e}"))?
     {
-        fluidbox_db::touch_client_registration(&state.pool, r.id)
+        fluidbox_db::system_worker::touch_global_registration(&state.pool, r.id)
             .await
             .map_err(|e| format!("registration touch failed: {e}"))?;
         let (client_id, source) = adopt_registration(&r);
@@ -672,7 +678,7 @@ async fn ensure_cimd_registration(
         registration_access_token_key_version: 1,
         token_endpoint_auth_method: Some("none"),
     };
-    let row = match fluidbox_db::insert_client_registration(&state.pool, new)
+    let row = match fluidbox_db::system_worker::insert_global_registration(&state.pool, new)
         .await
         .map_err(|e| format!("registration insert failed: {e}"))?
     {
@@ -738,15 +744,20 @@ struct RegisteredClient {
 /// NOTHING` re-select collapse concurrent connects to the same issuer down to ONE
 /// `/register`. The DCR HTTP runs UNDER the lock (like the refresh path) so a
 /// second connect blocks and then reuses THIS row rather than double-registering.
+///
+/// The transaction is opened through `system_worker::global_registration_tx`, so
+/// the audited bypass GUC spans the whole critical section — 0018 admits an INSERT
+/// of a global row (`tenant_id is null`) only under it, and the UPDATE behind
+/// `touch` would otherwise be filtered to zero rows in silence. Everything this tx
+/// touches is the deployment-global registration (the lock, the find, the touch,
+/// the insert, the re-select); no tenant-owned row is read or written under it.
 async fn register_dcr_client(
     state: &AppState,
     issuer: &str,
     redirect: &str,
     registration_endpoint: &str,
 ) -> Result<RegisteredClient, String> {
-    let mut tx = state
-        .pool
-        .begin()
+    let mut tx = fluidbox_db::system_worker::global_registration_tx(&state.pool)
         .await
         .map_err(|e| format!("registration txn failed: {e}"))?;
     fluidbox_db::acquire_registration_lock(&mut tx, issuer, redirect)
@@ -1550,6 +1561,11 @@ fn invalid_client_disposition(client: &ExchangeClient) -> (bool, &'static str) {
 /// find the row missing on their next dance and re-resolve
 /// ([`stored_identity_stale`]'s `registration_missing`), so nothing dangles.
 ///
+/// The DELETE rides the audited system-worker entry point: 0018 admits mutation of
+/// a global row (`tenant_id is null`) only under the bypass GUC, and a filtered
+/// DELETE would "succeed" against zero rows — leaving the dead identity adopted
+/// forever, which is exactly the bug this function exists to prevent.
+///
 /// Best effort: a failed delete is logged and reported as "not retired" — the user
 /// still restarts the flow, and the next attempt simply meets the same live row.
 /// A REFRESH-path `invalid_client` deliberately does NOT come here — it flips the
@@ -1567,7 +1583,7 @@ async fn retire_rejected_registration(state: &AppState, client: &ExchangeClient)
         registration = %reg.id,
         "oauth callback: invalid_client — retiring the rejected shared client registration"
     );
-    match fluidbox_db::delete_client_registration(&state.pool, reg.id).await {
+    match fluidbox_db::system_worker::delete_global_registration(&state.pool, reg.id).await {
         Ok(()) => true,
         Err(e) => {
             tracing::warn!(
