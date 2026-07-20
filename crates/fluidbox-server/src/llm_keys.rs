@@ -12,8 +12,9 @@
 //!
 //! A tenant's key is:
 //!   - minted on demand (`POST {llm_admin_url}/key/generate`, master-key bearer),
-//!     with the tenant's id in `metadata` + an `fbx-tenant-{uuid}` alias, and the
-//!     configured spend/rate knobs only when set;
+//!     with the tenant's id in `metadata` + an `fbx-tenant-{uuid}-{op}` alias (the
+//!     tenant prefix plus a client-generated operation id — see [`mint_alias`]),
+//!     and the configured spend/rate knobs only when set;
 //!   - sealed at rest (`tenant_llm_keys.litellm_key_sealed`, family `TenantLlmKey`,
 //!     under the tenant's OWN DEK) — never returned in an API response;
 //!   - cached unsealed in memory (`AppState.tenant_llm_keys`, keyed by tenant_id),
@@ -23,10 +24,14 @@
 //! minting is reachable from an authenticated request path:
 //!   - a per-tenant singleflight lock, so a stampede is ONE mint;
 //!   - a durable per-tenant cooldown (the row's `coalesce(rotated_at,
-//!     created_at)`) plus a deployment-wide mint budget, so repeated upstream
+//!     created_at)`) — that one IS deployment-wide, being a DB stamp every
+//!     replica reads — plus a PER-REPLICA mint budget, so repeated upstream
 //!     rejections cannot re-provision in a loop;
-//!   - a post-mint cleanup guard, so a key that is minted but not durably
-//!     adopted is deleted rather than left live and unreferenced.
+//!   - a mint guard armed BEFORE the request is dispatched and disarmed only on
+//!     durable adoption, so a key that LiteLLM created but we never adopted —
+//!     including one whose response timed out, arrived truncated, or whose caller
+//!     was cancelled mid-flight — is retired rather than left live and
+//!     unreferenced.
 //!
 //! This is the tenant-fairness BACKSTOP (each virtual key carries its own
 //! spend/tpm/rpm ceiling server-side); it is NOT the per-run budget-race fix
@@ -84,19 +89,28 @@ pub fn key_source(mode: LlmKeyMode, require_sso: bool) -> KeySource {
     }
 }
 
-/// Substrings that prove LiteLLM's OWN virtual-key check rejected the key we
-/// presented (its proxy-auth layer, before any provider call). Matched
-/// case-insensitively against the bounded error text.
-const VIRTUAL_KEY_REJECTED_MARKERS: &[&str] = &[
-    // Unknown key: "Invalid proxy server token passed. Received API Key = …,
-    // Unable to find token in cache or `LiteLLM_VerificationTokenTable`".
-    "invalid proxy server token",
-    "unable to find token",
-    "key not found",
-    // Key present but no longer usable as an identity.
-    "expiredkeyerror",
-    "expired key",
-];
+/// LiteLLM's proxy-auth refusal message for a virtual key it does not know:
+/// "Authentication Error, Invalid proxy server token passed. Received API Key =
+/// …, Key Hash = …, Unable to find token in cache or
+/// `LiteLLM_VerificationTokenTable`". Matched case-insensitively against the
+/// bounded error text.
+///
+/// BOTH halves are required (re-verification, #32). The first half alone is not
+/// proof — and generic markers ("key not found", "expired key") are not proof at
+/// all: a provider can emit them verbatim through the gateway. The concrete
+/// counterexample that used to qualify: `{"error":{"message":"OpenAI API key not
+/// found","type":"auth_error"}}` with a 401. The second half names LiteLLM's OWN
+/// cache/verification table, so it cannot be provider-originated text — that is
+/// the structure the decision now rests on, and `auth_error` is deliberately NOT
+/// part of it (the counterexample carries `auth_error` too; it is the weakest of
+/// the three signals, not a discriminator).
+const PROXY_AUTH_REFUSAL: &str = "invalid proxy server token";
+const PROXY_AUTH_DIAGNOSTICS: &[&str] = &["unable to find token", "litellm_verificationtokentable"];
+
+/// LiteLLM's own exception class for a key whose expiry has passed. A LiteLLM
+/// SDK class name, not prose — a provider body cannot produce it. (The bare
+/// phrase "expired key" can, and no longer qualifies.)
+const EXPIRED_KEY_CLASS: &str = "expiredkeyerror";
 
 /// Substrings that prove the 401 came from the GATEWAY'S OWN upstream provider
 /// credential (LiteLLM maps provider exceptions into its error body), NOT from
@@ -113,10 +127,19 @@ const UPSTREAM_PROVIDER_MARKERS: &[&str] = &[
 /// and keeps a giant body from turning into a giant lowercase allocation.
 const ERROR_SCAN_BYTES: usize = 8 * 1024;
 
-/// Deployment-wide ceiling on `/key/generate` calls, and its window. A blast
-/// door, not a quota: legitimate provisioning is once per tenant (plus operator
-/// rotations), so any deployment approaching this is looping. Applies to EVERY
-/// mint path — first use, operator rotation, and reactive recovery.
+/// PER-REPLICA ceiling on `/key/generate` calls, and its window. A blast door,
+/// not a quota: legitimate provisioning is once per tenant (plus operator
+/// rotations), so any replica approaching this is looping. Applies to EVERY mint
+/// path — first use, operator rotation, and reactive recovery.
+///
+/// It is honestly per-replica and nothing more (re-verification, #32 — the
+/// earlier "deployment-wide" claim was false). That is deliberate, not a gap
+/// waiting on shared state: the bound that actually caps re-provisioning ACROSS
+/// the deployment is [`RECOVERY_COOLDOWN_SECS`], a durable per-tenant DB stamp
+/// every replica honors, so a fleet of N replicas still cannot re-mint a given
+/// tenant more than once per cooldown. This window only stops ONE process from
+/// hammering LiteLLM when something local goes wrong — a job a distributed
+/// counter would do no better and would pay a DB round trip per mint for.
 const MINT_WINDOW: Duration = Duration::from_secs(60);
 const MINT_MAX_PER_WINDOW: u32 = 60;
 
@@ -138,8 +161,9 @@ const RECOVERY_COOLDOWN_SECS: i64 = 300;
 static PROVISION_LOCKS: LazyLock<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>> =
     LazyLock::new(Default::default);
 
-/// The deployment-wide mint budget (fixed window). In-process by construction —
-/// it bounds what THIS replica can do to LiteLLM.
+/// The per-replica mint budget (fixed window). In-process by construction — it
+/// bounds what THIS replica can do to LiteLLM, and says nothing about the fleet
+/// (see the constants above for why that is the right split).
 static MINT_BUDGET: LazyLock<Mutex<MintWindow>> = LazyLock::new(|| {
     Mutex::new(MintWindow {
         started: Instant::now(),
@@ -205,11 +229,12 @@ fn error_text(body: &[u8]) -> String {
 /// live key that was never deleted.
 ///
 /// So: status must be exactly 401 (403 never re-provisions), the body must carry
-/// a marker of LiteLLM's own key check failing, and no provider-origin marker may
-/// be present. Ambiguity ⇒ false ⇒ the 401 is forwarded verbatim, which is the
-/// honest answer. Recovery is bounded AGAIN downstream by
-/// [`recover_rejected_tenant_key`]'s cooldown and mint budget, so even a marker
-/// we misread cannot loop.
+/// LiteLLM's own proxy-auth STRUCTURE (see [`PROXY_AUTH_REFUSAL`] /
+/// [`EXPIRED_KEY_CLASS`] for why generic markers were removed), and no
+/// provider-origin marker may be present. Ambiguity ⇒ false ⇒ the 401 is
+/// forwarded verbatim, which is the honest answer. Recovery is bounded AGAIN
+/// downstream by [`recover_rejected_tenant_key`]'s durable cooldown and this
+/// replica's mint budget, so even a marker we misread cannot loop.
 pub fn virtual_key_rejected(source: KeySource, status: u16, body: &[u8]) -> bool {
     if source != KeySource::Tenant || status != 401 {
         return false;
@@ -218,14 +243,36 @@ pub fn virtual_key_rejected(source: KeySource, status: u16, body: &[u8]) -> bool
     if UPSTREAM_PROVIDER_MARKERS.iter().any(|m| text.contains(m)) {
         return false;
     }
-    VIRTUAL_KEY_REJECTED_MARKERS
-        .iter()
-        .any(|m| text.contains(m))
+    let unknown_key = text.contains(PROXY_AUTH_REFUSAL)
+        && PROXY_AUTH_DIAGNOSTICS.iter().any(|d| text.contains(d));
+    unknown_key || text.contains(EXPIRED_KEY_CLASS)
 }
 
-/// The tenant-key alias LiteLLM stores for attribution/debugging.
-fn key_alias(tenant_id: Uuid) -> String {
+/// The stable per-tenant alias PREFIX LiteLLM stores for attribution/debugging.
+/// Every alias this module mints starts with it, so an operator can still find a
+/// tenant's keys by prefix; `metadata.tenant_id` remains the authoritative
+/// attribution.
+fn key_alias_prefix(tenant_id: Uuid) -> String {
     format!("fbx-tenant-{tenant_id}")
+}
+
+/// The alias for ONE mint attempt: the tenant prefix plus a client-generated
+/// operation id.
+///
+/// Per-ATTEMPT, not per-tenant, and that is the whole point (re-verification,
+/// #32). After an ambiguous `/key/generate` the alias is the only handle we have
+/// on a key LiteLLM may have created — we never learned its value — so cleanup
+/// must delete by alias. A tenant-stable alias would make that indiscriminate:
+/// rotation and reactive recovery both mint while the tenant's PREVIOUS key is
+/// still live under the same name, so retiring "the tenant's alias" could delete
+/// the live key. An operation id makes the retire provably scoped to the one
+/// attempt that went ambiguous.
+fn mint_alias(tenant_id: Uuid) -> String {
+    format!(
+        "{}-{}",
+        key_alias_prefix(tenant_id),
+        Uuid::now_v7().simple()
+    )
 }
 
 /// The configured `/key/generate` knobs (spend/rate limits + model allowlist).
@@ -252,9 +299,9 @@ fn knobs_from_cfg(cfg: &Config) -> TenantKeyKnobs {
 /// always present; every optional knob is inserted ONLY when configured, so an
 /// unset knob is ABSENT from the JSON (LiteLLM applies its own default). Pure +
 /// unit-tested at the serialized-byte level.
-fn mint_body(tenant_id: Uuid, knobs: &TenantKeyKnobs) -> Value {
+fn mint_body(tenant_id: Uuid, alias: &str, knobs: &TenantKeyKnobs) -> Value {
     let mut body = json!({
-        "key_alias": key_alias(tenant_id),
+        "key_alias": alias,
         "metadata": { "tenant_id": tenant_id.to_string() },
     });
     let obj = body.as_object_mut().expect("mint body is an object");
@@ -276,25 +323,78 @@ fn mint_body(tenant_id: Uuid, knobs: &TenantKeyKnobs) -> Value {
     body
 }
 
-/// A freshly minted virtual key + the optional `litellm_token_id` from the mint
-/// response (informational only — deletion uses the key value itself).
+/// A freshly minted virtual key, the alias this attempt chose (persisted with the
+/// row, and the handle an ambiguous-result retire uses), and the optional
+/// `litellm_token_id` from the mint response (informational only).
 struct Minted {
     key: String,
     token_id: Option<String>,
+    alias: String,
+}
+
+/// The mint guard (re-verification, #32). Armed BEFORE `/key/generate` is
+/// dispatched and disarmed only once the key is durably adopted AND published;
+/// everything in between retires the attempt's alias at LiteLLM on drop:
+///
+///   - LiteLLM created the key and the response then timed out, or a proxy
+///     truncated/mangled the successful JSON (the old cleanup only armed AFTER a
+///     `Minted` existed, so these left a live, unreferenced key);
+///   - sealing, the insert/CAS, or unsealing the winner failed;
+///   - the caller's future was DROPPED between mint and adoption (client
+///     disconnect / cancellation), which no manual cleanup branch can catch.
+///
+/// Retiring by ALIAS is what makes firing on an AMBIGUOUS result safe: we may
+/// never have learned the key value, but we chose the alias, and it belongs to
+/// exactly one attempt — so a retire can never delete the tenant's live key.
+struct MintGuard {
+    state: AppState,
+    alias: String,
+    armed: bool,
+}
+
+impl MintGuard {
+    fn arm(state: &AppState, alias: String) -> Self {
+        Self {
+            state: state.clone(),
+            alias,
+            armed: true,
+        }
+    }
+
+    /// The key is durable and published — this attempt owns nothing to clean up.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for MintGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let state = self.state.clone();
+        let alias = std::mem::take(&mut self.alias);
+        // `Drop` cannot await, and the future we are inside may itself be being
+        // cancelled — so the retire is DETACHED. Outside a runtime there is
+        // nothing to spawn onto (and nothing was ever minted).
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move { retire_alias_at_litellm(&state, &alias).await });
+        }
+    }
 }
 
 /// Mint a virtual key at LiteLLM with the MASTER key (the one master-key use).
 /// Never logs the key or the master. A non-2xx or a missing `key` field is an
 /// upstream error (502) — fail closed, never a shared-key fallback.
 ///
-/// EVERY mint passes the deployment-wide budget first (review H3): whatever a
-/// caller believes, this replica cannot create more than [`MINT_MAX_PER_WINDOW`]
-/// virtual keys per [`MINT_WINDOW`].
+/// EVERY mint passes this replica's budget first (review H3): whatever a caller
+/// believes, this process cannot create more than [`MINT_MAX_PER_WINDOW`] virtual
+/// keys per [`MINT_WINDOW`].
 async fn mint_at_litellm(
     state: &AppState,
     tenant_id: Uuid,
     knobs: &TenantKeyKnobs,
-) -> ApiResult<Minted> {
+) -> ApiResult<(Minted, MintGuard)> {
     {
         let mut budget = MINT_BUDGET.lock().await;
         if !try_consume_mint(
@@ -305,8 +405,9 @@ async fn mint_at_litellm(
         ) {
             tracing::error!(
                 tenant = %tenant_id,
-                "llm key provisioning rate limit hit ({MINT_MAX_PER_WINDOW}/{}s) — refusing to \
-                 mint; something is looping or LiteLLM is unhealthy",
+                "llm key provisioning rate limit hit on this replica \
+                 ({MINT_MAX_PER_WINDOW}/{}s) — refusing to mint; something is looping or \
+                 LiteLLM is unhealthy",
                 MINT_WINDOW.as_secs()
             );
             return Err(ApiError::ServiceUnavailable(
@@ -318,6 +419,11 @@ async fn mint_at_litellm(
         "{}/key/generate",
         state.cfg.llm_admin_url.trim_end_matches('/')
     );
+    let alias = mint_alias(tenant_id);
+    // ARMED BEFORE DISPATCH: from here on, every exit that is not a durable
+    // adoption retires this alias — including the one that matters most, a
+    // request that created the key and then failed to tell us about it.
+    let guard = MintGuard::arm(state, alias.clone());
     let resp = state
         .http
         .post(&url)
@@ -327,12 +433,19 @@ async fn mint_at_litellm(
             format!("Bearer {}", state.cfg.llm_upstream_key),
         )
         .header("content-type", "application/json")
-        .json(&mint_body(tenant_id, knobs))
+        .json(&mint_body(tenant_id, &alias, knobs))
         .send()
         .await
         .map_err(|e| ApiError::Upstream(format!("litellm /key/generate request failed: {e}")))?;
     let status = resp.status();
     if !status.is_success() {
+        // A 4xx is LiteLLM validating and refusing BEFORE it inserts a key (bad
+        // knob, bad master key): nothing exists to retire, so don't spend a
+        // pointless `/key/delete`. 5xx and transport/parse failures stay
+        // AMBIGUOUS and keep the guard armed.
+        if status.is_client_error() {
+            guard.disarm();
+        }
         return Err(ApiError::Upstream(format!(
             "litellm /key/generate returned {status}"
         )));
@@ -354,13 +467,57 @@ async fn mint_at_litellm(
         .or_else(|| v.get("token"))
         .and_then(|t| t.as_str())
         .map(|s| s.to_string());
-    Ok(Minted { key, token_id })
+    Ok((
+        Minted {
+            key,
+            token_id,
+            alias,
+        },
+        guard,
+    ))
 }
 
-/// Best-effort delete of a virtual key at LiteLLM (`/key/delete` takes the key
-/// value). Used for a mint-race loser's orphan and a rotated-out old key. Failure
-/// leaves an orphaned virtual key at LiteLLM (harmless, unreachable) — warn, never
-/// fail the caller, never log the key.
+/// Retire a mint attempt's key by ALIAS — the reconciliation for an AMBIGUOUS
+/// `/key/generate` (see [`MintGuard`]). `/key/delete` accepts `key_aliases`
+/// alongside `keys`; the alias is per-attempt, so this deletes at most the one
+/// key that attempt may have created and never the tenant's live key. A
+/// not-found alias (nothing was created) answers non-2xx — logged, never fatal,
+/// and the key value is never logged because we do not have one.
+async fn retire_alias_at_litellm(state: &AppState, alias: &str) {
+    let url = format!(
+        "{}/key/delete",
+        state.cfg.llm_admin_url.trim_end_matches('/')
+    );
+    match state
+        .http
+        .post(&url)
+        .timeout(HTTP_TIMEOUT)
+        .header(
+            "authorization",
+            format!("Bearer {}", state.cfg.llm_upstream_key),
+        )
+        .header("content-type", "application/json")
+        .json(&json!({ "key_aliases": [alias] }))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => {}
+        Ok(r) => tracing::warn!(
+            alias,
+            "litellm /key/delete (by alias) returned {} — either nothing was minted under this \
+             alias, or an orphaned virtual key remains at LiteLLM",
+            r.status()
+        ),
+        Err(e) => tracing::warn!(alias, "litellm /key/delete (by alias) request failed: {e}"),
+    }
+}
+
+/// Best-effort delete of a virtual key at LiteLLM BY VALUE (`/key/delete` takes
+/// `keys`). The one caller left is the rotated-out OLD key, whose value we hold
+/// and whose alias we do not (aliases are per mint attempt now); everything
+/// minted-but-not-adopted goes through [`MintGuard`]'s alias retire instead.
+/// Failure leaves an orphaned virtual key at LiteLLM (harmless, unreachable) —
+/// warn, never fail the caller, never log the key.
 async fn delete_at_litellm(state: &AppState, key: &str) {
     let url = format!(
         "{}/key/delete",
@@ -444,31 +601,29 @@ async fn ensure_locked(state: &AppState, tenant_id: Uuid) -> ApiResult<String> {
         return Ok(key);
     }
 
-    // 3. Mint, seal, insert-or-adopt — under the cleanup guard.
+    // 3. Mint, seal, insert-or-adopt — under the mint guard (review M5, widened
+    //    in #32). `guard` is armed before `/key/generate` is even dispatched and
+    //    is disarmed ONLY on the adoption path below; every other exit — a
+    //    failure in sealing / the insert / unsealing the winner, a losing race, an
+    //    ambiguous mint, or this future being cancelled — drops it, which retires
+    //    the attempt's alias. Without that, a retry would mint another live key
+    //    nothing references.
     let knobs = knobs_from_cfg(&state.cfg);
-    let minted = mint_at_litellm(state, tenant_id, &knobs).await?;
+    let (minted, guard) = mint_at_litellm(state, tenant_id, &knobs).await?;
     match adopt_minted(state, tenant_id, scope, &minted).await {
         Ok(Adoption::Ours(key)) => {
             publish_key(state, tenant_id, &key).await;
+            guard.disarm();
             Ok(key)
         }
         Ok(Adoption::Other(winner)) => {
-            // A concurrent minter (another replica) won: adopt its sealed key
-            // and drop our orphan.
-            delete_at_litellm(state, &minted.key).await;
+            // A concurrent minter (another replica) won: adopt its sealed key.
+            // Our orphan carries OUR alias, so the guard's retire targets exactly
+            // it and never the winner's key.
             publish_key(state, tenant_id, &winner).await;
             Ok(winner)
         }
-        // THE CLEANUP GUARD (review M5): `/key/generate` already succeeded, so a
-        // failure in sealing / the insert / unsealing the winner would otherwise
-        // leave a LIVE virtual key nothing references — and every retry would
-        // mint another. The guard is armed the moment the mint returns and
-        // disarmed only once the key is durably adopted AND published; until
-        // then EVERY error path deletes it.
-        Err(e) => {
-            delete_at_litellm(state, &minted.key).await;
-            Err(e)
-        }
+        Err(e) => Err(e),
     }
 }
 
@@ -502,7 +657,7 @@ async fn adopt_minted(
         scope,
         &sealed.bytes,
         sealed.key_version,
-        &key_alias(tenant_id),
+        &minted.alias,
         minted.token_id.as_deref(),
     )
     .await?;
@@ -564,7 +719,7 @@ pub enum KeyRecovery {
 ///    concurrent recoveries (or a recovery racing an operator rotation) cannot
 ///    delete each other's winner; the loser drops its own fresh mint.
 ///
-/// Plus the deployment-wide mint budget inside `mint_at_litellm`.
+/// Plus this replica's mint budget inside `mint_at_litellm`.
 ///
 /// The rejected key is deliberately NOT deleted at LiteLLM: by hypothesis LiteLLM
 /// does not know it, and if the marker was misread it may still be a live key —
@@ -589,6 +744,15 @@ pub async fn recover_rejected_tenant_key(
         // through the normal path — still budget-bounded, and the row it writes
         // starts this tenant's cooldown.
         Ok(None) => {
+            // LOW (#32): the durable row is gone (an operator deleted it) but the
+            // REJECTED key may still be cached — and `ensure_locked`'s first act
+            // is a cache read, which would hand back the very key LiteLLM just
+            // refused and wedge this tenant until eviction or restart.
+            // COMPARE-and-drop, never unconditional: a concurrent provisioner may
+            // have published a GOOD key between the rejection and here, and
+            // dropping that one is the exact race class that already produced a
+            // real singleflight bug in this codebase.
+            evict_rejected_key(state, tenant_id, rejected).await;
             return match ensure_locked(state, tenant_id).await {
                 Ok(k) => KeyRecovery::Retry(k),
                 Err(e) => {
@@ -629,21 +793,18 @@ pub async fn recover_rejected_tenant_key(
     }
 
     let knobs = knobs_from_cfg(&state.cfg);
-    let minted = match mint_at_litellm(state, tenant_id, &knobs).await {
+    let (minted, guard) = match mint_at_litellm(state, tenant_id, &knobs).await {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(tenant = %tenant_id, error = %e, "llm key recovery: mint failed");
             return KeyRecovery::Refused("mint failed");
         }
     };
-    // The cleanup guard again (M5): from here every failure deletes the fresh
-    // key before returning, so a failing recovery cannot leave live orphans.
+    // The mint guard again: from here every exit that is not a won CAS retires
+    // the fresh key's alias, so a failing recovery cannot leave live orphans.
     let sealed = match sealer.seal(&minted.key, ctx).await {
         Ok(s) => s,
-        Err(_) => {
-            delete_at_litellm(state, &minted.key).await;
-            return KeyRecovery::Refused("seal failed");
-        }
+        Err(_) => return KeyRecovery::Refused("seal failed"),
     };
     match fluidbox_db::rotate_tenant_llm_key_cas(
         &state.pool,
@@ -651,19 +812,20 @@ pub async fn recover_rejected_tenant_key(
         &row.sealed,
         &sealed.bytes,
         sealed.key_version,
-        &key_alias(tenant_id),
+        &minted.alias,
         minted.token_id.as_deref(),
     )
     .await
     {
         Ok(true) => {
             publish_key(state, tenant_id, &minted.key).await;
+            guard.disarm();
             KeyRecovery::Retry(minted.key)
         }
         Ok(false) => {
             // Someone else swapped first (another replica's recovery, or an
-            // operator rotation). Theirs wins; ours is an orphan.
-            delete_at_litellm(state, &minted.key).await;
+            // operator rotation). Theirs wins; ours is an orphan the guard
+            // retires by alias.
             evict_tenant_llm_key(state, tenant_id).await;
             match ensure_locked(state, tenant_id).await {
                 Ok(k) => KeyRecovery::Retry(k),
@@ -674,7 +836,6 @@ pub async fn recover_rejected_tenant_key(
             }
         }
         Err(e) => {
-            delete_at_litellm(state, &minted.key).await;
             tracing::warn!(tenant = %tenant_id, error = %e, "llm key recovery: persist failed");
             KeyRecovery::Refused("persist failed")
         }
@@ -701,39 +862,30 @@ pub async fn rotate_tenant_key(state: &AppState, tenant_id: Uuid) -> ApiResult<(
     let _guard = lock.lock().await;
 
     let knobs = knobs_from_cfg(&state.cfg);
-    let minted = mint_at_litellm(state, tenant_id, &knobs).await?;
+    let (minted, guard) = mint_at_litellm(state, tenant_id, &knobs).await?;
 
-    // The cleanup guard (review M5): the mint has already created a live key, so
+    // The mint guard (review M5): the mint may already have created a live key, so
     // a failed seal or a failed swap must retire it — otherwise every retry of a
     // transient KMS/DB incident leaves another live orphan behind.
     let sealed = match sealer.seal(&minted.key, ctx).await {
         Ok(s) => s,
-        Err(_) => {
-            delete_at_litellm(state, &minted.key).await;
-            return Err(ApiError::Internal("tenant llm key seal failed".into()));
-        }
+        Err(_) => return Err(ApiError::Internal("tenant llm key seal failed".into())),
     };
-    let old = match fluidbox_db::rotate_tenant_llm_key(
+    let old = fluidbox_db::rotate_tenant_llm_key(
         &state.pool,
         scope,
         &sealed.bytes,
         sealed.key_version,
-        &key_alias(tenant_id),
+        &minted.alias,
         minted.token_id.as_deref(),
     )
-    .await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            delete_at_litellm(state, &minted.key).await;
-            return Err(e.into());
-        }
-    };
+    .await?;
 
     // Re-seed the cache with the new key (the old entry is now stale). Doing this
     // BEFORE the LiteLLM delete keeps in-flight facade calls on the new key — and
     // it is what disarms the guard: the key is now durable AND published.
     publish_key(state, tenant_id, &minted.key).await;
+    guard.disarm();
 
     // Best-effort retire the old key at LiteLLM (unseal it first; never fail the
     // rotation on a LiteLLM hiccup). `None` = the tenant had no prior key.
@@ -755,6 +907,22 @@ pub async fn rotate_tenant_key(state: &AppState, tenant_id: Uuid) -> ApiResult<(
 /// freshly rotated key. Recovery now compare-and-swaps instead.
 pub async fn evict_tenant_llm_key(state: &AppState, tenant_id: Uuid) {
     state.tenant_llm_keys.lock().await.remove(&tenant_id);
+}
+
+/// COMPARE-and-drop: evict the tenant's cached key only if it is STILL the one
+/// that was rejected. PURE (the caller owns the map) so the race is testable.
+fn drop_if_rejected(cache: &mut HashMap<Uuid, String>, tenant_id: Uuid, rejected: &str) -> bool {
+    if cache.get(&tenant_id).is_some_and(|k| k == rejected) {
+        cache.remove(&tenant_id);
+        return true;
+    }
+    false
+}
+
+/// [`drop_if_rejected`] against the live cache.
+async fn evict_rejected_key(state: &AppState, tenant_id: Uuid, rejected: &str) -> bool {
+    let mut cache = state.tenant_llm_keys.lock().await;
+    drop_if_rejected(&mut cache, tenant_id, rejected)
 }
 
 #[cfg(test)]
@@ -780,6 +948,11 @@ mod tests {
     /// A 401 that is really the GATEWAY's own upstream provider credential.
     const PROVIDER_401: &[u8] = br#"{"error":{"message":"litellm.AuthenticationError: AnthropicException - {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"}}","type":"None","param":"None","code":"401"}}"#;
 
+    /// A 401 that is really the PROVIDER's, phrased so it trips every generic
+    /// marker the classifier used to carry — the re-verification counterexample.
+    const PROVIDER_KEY_NOT_FOUND: &[u8] =
+        br#"{"error":{"message":"OpenAI API key not found","type":"auth_error"}}"#;
+
     #[test]
     fn only_a_proven_virtual_key_rejection_re_provisions() {
         // The one case re-provisioning can fix.
@@ -787,6 +960,45 @@ mod tests {
             KeySource::Tenant,
             401,
             LITELLM_UNKNOWN_KEY
+        ));
+
+        // #32: provider-originated text that reads like a key rejection. It
+        // carries `auth_error` and "key not found" and trips NONE of the provider
+        // veto strings — under the old generic markers it re-provisioned, so a
+        // persistent provider fault minted one live orphan per cooldown.
+        assert!(
+            !virtual_key_rejected(KeySource::Tenant, 401, PROVIDER_KEY_NOT_FOUND),
+            "a provider can say 'key not found'; only LiteLLM's own proxy-auth structure counts"
+        );
+        for generic in [
+            &br#"{"error":{"message":"api key not found","type":"auth_error"}}"#[..],
+            &br#"{"error":{"message":"expired key","type":"auth_error"}}"#[..],
+            &br#"{"detail":"Key not found"}"#[..],
+        ] {
+            assert!(
+                !virtual_key_rejected(KeySource::Tenant, 401, generic),
+                "generic phrasing is not proof of a virtual-key rejection"
+            );
+        }
+        // Half the proxy-auth structure is not proof either: the refusal line
+        // alone could be echoed, the LiteLLM cache/table diagnostic could not.
+        assert!(!virtual_key_rejected(
+            KeySource::Tenant,
+            401,
+            br#"{"error":{"message":"Invalid proxy server token passed.","type":"auth_error"}}"#
+        ));
+        // Both halves, either diagnostic spelling ⇒ proof.
+        assert!(virtual_key_rejected(
+            KeySource::Tenant,
+            401,
+            br#"{"error":{"message":"Invalid proxy server token passed. Key Hash = h, not in LiteLLM_VerificationTokenTable","type":"auth_error"}}"#
+        ));
+        // LiteLLM's own exception class for an expired key stands alone — a
+        // provider body cannot produce a LiteLLM class name.
+        assert!(virtual_key_rejected(
+            KeySource::Tenant,
+            401,
+            br#"{"error":{"message":"ExpiredKeyError: Authentication Error - Expired Key","type":"auth_error"}}"#
         ));
 
         // H3: LiteLLM accepted our virtual key and its OWN provider credential was
@@ -821,8 +1033,16 @@ mod tests {
         for source in [KeySource::Shared, KeySource::RefuseSsoShared] {
             assert!(!virtual_key_rejected(source, 401, LITELLM_UNKNOWN_KEY));
         }
-        // Non-JSON bodies still scan (LiteLLM behind a proxy that rewrote it).
+        // Non-JSON bodies still scan (LiteLLM behind a proxy that rewrote the
+        // envelope) — but the SAME structure is required, so a rewrite that kept
+        // only the headline sentence is ambiguous and forwards.
         assert!(virtual_key_rejected(
+            KeySource::Tenant,
+            401,
+            b"Authentication Error, Invalid proxy server token passed. Received API Key = sk-x, \
+              Unable to find token in cache or `LiteLLM_VerificationTokenTable`"
+        ));
+        assert!(!virtual_key_rejected(
             KeySource::Tenant,
             401,
             b"Authentication Error, Invalid proxy server token passed."
@@ -830,7 +1050,32 @@ mod tests {
     }
 
     #[test]
-    fn mint_budget_is_a_deployment_wide_fixed_window() {
+    fn a_rejected_cached_key_is_compare_and_dropped() {
+        let (t, other) = (Uuid::now_v7(), Uuid::now_v7());
+        let mut cache: HashMap<Uuid, String> = HashMap::new();
+        cache.insert(t, "sk-rejected".into());
+        cache.insert(other, "sk-other".into());
+
+        // The rejected value is still cached ⇒ drop it, so recovery's cache-first
+        // read cannot hand the dead key straight back (#32 LOW).
+        assert!(drop_if_rejected(&mut cache, t, "sk-rejected"));
+        assert!(!cache.contains_key(&t));
+        // Another tenant's entry is untouched.
+        assert_eq!(cache.get(&other).map(String::as_str), Some("sk-other"));
+
+        // A concurrent provisioner already published a GOOD key: the stale
+        // rejection must NOT evict it (an unconditional evict here is the race
+        // class that produced a real singleflight bug).
+        cache.insert(t, "sk-fresh".into());
+        assert!(!drop_if_rejected(&mut cache, t, "sk-rejected"));
+        assert_eq!(cache.get(&t).map(String::as_str), Some("sk-fresh"));
+        // Nothing cached at all is a no-op, not a panic.
+        cache.remove(&t);
+        assert!(!drop_if_rejected(&mut cache, t, "sk-rejected"));
+    }
+
+    #[test]
+    fn mint_budget_is_a_per_replica_fixed_window() {
         let t0 = Instant::now();
         let mut win = MintWindow {
             started: t0,
@@ -880,7 +1125,8 @@ mod tests {
     #[test]
     fn mint_body_omits_unset_knobs() {
         let tid = Uuid::now_v7();
-        let body = mint_body(tid, &TenantKeyKnobs::default());
+        let alias = mint_alias(tid);
+        let body = mint_body(tid, &alias, &TenantKeyKnobs::default());
         // Assert against the SERIALIZED bytes: no knob key appears at all.
         let s = serde_json::to_string(&body).unwrap();
         assert!(s.contains(&format!("fbx-tenant-{tid}")), "alias present");
@@ -909,8 +1155,9 @@ mod tests {
             tpm_limit: Some(100_000),
             rpm_limit: Some(500),
         };
-        let body = mint_body(tid, &knobs);
-        assert_eq!(body["key_alias"], format!("fbx-tenant-{tid}"));
+        let alias = mint_alias(tid);
+        let body = mint_body(tid, &alias, &knobs);
+        assert_eq!(body["key_alias"], alias);
         assert_eq!(body["metadata"]["tenant_id"], tid.to_string());
         assert_eq!(body["models"][0], "claude-haiku-4-5");
         assert_eq!(body["models"][1], "gpt-5.4-mini");
@@ -921,8 +1168,18 @@ mod tests {
     }
 
     #[test]
-    fn key_alias_is_stable_per_tenant() {
+    fn mint_aliases_are_per_attempt_under_a_stable_tenant_prefix() {
         let tid = Uuid::now_v7();
-        assert_eq!(key_alias(tid), format!("fbx-tenant-{tid}"));
+        let prefix = key_alias_prefix(tid);
+        assert_eq!(prefix, format!("fbx-tenant-{tid}"));
+        let (a, b) = (mint_alias(tid), mint_alias(tid));
+        assert!(
+            a.starts_with(&prefix) && b.starts_with(&prefix),
+            "still attributable by prefix"
+        );
+        // Distinct per attempt — this is what makes an ambiguous-result retire
+        // provably scoped to the one attempt instead of to the tenant's LIVE key.
+        assert_ne!(a, b);
+        assert_ne!(a, prefix);
     }
 }
