@@ -32,10 +32,14 @@ pub async fn photograph_connection(
 ) -> ApiResult<fluidbox_db::ConnectionToolSnapshotRow> {
     // Unfiltered read by design: this internal helper runs only AFTER a create
     // or a mutation authorization (`connection_for_mutation`) has established
-    // authority — it photographs the row the caller already owns/created.
-    let conn = fluidbox_db::get_connection(&state.pool, scope, connection_id)
+    // authority — it photographs the row the caller already owns/created. Tenant is
+    // known → scoped_tx (RLS: set the GUC). Read + insert take separate short txns
+    // so the discovery HTTP round-trip below never holds a DB transaction open.
+    let mut read_tx = fluidbox_db::scoped_tx(&state.pool, scope).await?;
+    let conn = fluidbox_db::get_connection(&mut *read_tx, scope, connection_id)
         .await?
         .ok_or(ApiError::NotFound)?;
+    read_tx.commit().await?;
     if conn.status != "active" {
         return Err(ApiError::Conflict(format!(
             "connection is {} — only an active connection can be photographed",
@@ -65,8 +69,9 @@ pub async fn photograph_connection(
     // is still at `conn.authorization_generation`); a concurrent reconnect that
     // moved the generation, or a concurrent refresh that already took the next
     // version, both map to one actionable retry error (R1.7).
+    let mut ins_tx = fluidbox_db::scoped_tx(&state.pool, scope).await?;
     let row = fluidbox_db::insert_connection_tool_snapshot(
-        &state.pool,
+        &mut *ins_tx,
         scope,
         conn.id,
         conn.authorization_generation,
@@ -76,6 +81,7 @@ pub async fn photograph_connection(
     )
     .await
     .map_err(map_snapshot_insert_err)?;
+    ins_tx.commit().await?;
     Ok(row)
 }
 

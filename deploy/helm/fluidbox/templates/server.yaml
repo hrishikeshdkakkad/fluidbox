@@ -175,6 +175,18 @@ spec:
             {{- with $up }}
             - { name: LLM_UPSTREAM_URL, value: {{ . | quote }} }
             {{- end }}
+            {{- with .Values.server.runtimeRole }}
+            # RLS pool split (migration 0018): every pooled connection SET ROLEs to
+            # this NON-owner role. Boot FAILS if it does not exist, or if its posture
+            # is unsafe (LOGIN/SUPERUSER/BYPASSRLS/inherited or foreign memberships).
+            - { name: FLUIDBOX_RUNTIME_ROLE, value: {{ . | quote }} }
+            {{- end }}
+            {{- if .Values.server.allowRlsBypass }}
+            # Review M2 escape hatch: accept a pool role that bypasses RLS even in
+            # multi-user mode. Local/single-user only — a hosted install must instead
+            # set server.runtimeRole (or a non-superuser DATABASE_URL).
+            - { name: FLUIDBOX_ALLOW_RLS_BYPASS, value: "1" }
+            {{- end }}
             - name: DATABASE_URL
               valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.databaseUrl | quote }} } }
             - name: FLUIDBOX_ADMIN_TOKEN

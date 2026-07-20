@@ -38,11 +38,49 @@ cargo build -q -p fluidbox-server || exit 1
 B=/tmp/fbx-conn-body.json
 post()  { curl -s -o "$B" -w "%{http_code}" -X POST -H "$H" -H "$CT" -d "$2" "$API/v1$1"; }
 get()   { curl -s -H "$H" "$API/v1$1"; }
-pq()    { psql "$DATABASE_URL" -qtA -c "$1" | head -1; }
+# Migration 0018 FORCEs RLS on every tenant table, which binds the table OWNER
+# too: a GUC-less psql session reads zero rows and every write trips the policy.
+# The bypass GUC is a session-level SET on a custom (dotted) option — no
+# privilege required — so it rides INSIDE the helper and every call carries it.
+pq()    { psql "$DATABASE_URL" -qtA -c "set fluidbox.bypass = 'system_worker'; $1" | head -1; }
+# Same GUC, for the two raw non-capturing psql writes below.
+pqw()   { psql "$DATABASE_URL" -qc "set fluidbox.bypass = 'system_worker'; $1"; }
 jb()    { python3 -c "import sys,json;d=json.load(open('$B'));print(d$1)" 2>/dev/null; }
 sfield(){ curl -s -H "$H" "$API/v1/sessions/$1" | j "['session']$2"; }
 
 CONN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fbx-conn.XXXXXX")
+
+# ── Driving the OAuth dance (invariant 20: start → go(cookie) → callback) ─────
+# The start/connect endpoints no longer hand back an `authorize_url` the script
+# can curl: they return a `go_url` on the CONTROL-PLANE origin, and GET-ing it is
+# what mints the browser-binding `__Host-fbx_oauth_flow` cookie before the 302 to
+# the authorization server. The callback REQUIRES that cookie, so every leg of a
+# dance must ride ONE curl cookie jar — a jar IS a browser here.
+location_from_headers() { grep -i '^location:' "$1" | head -1 | sed -E 's/^[Ll]ocation: *//' | tr -d '\r'; }
+new_jar() { local p="$CONN_DIR/jar-$1.txt"; : > "$p"; echo "$p"; }
+# go_authz: GET go_url in `jar` (the flow cookie lands in the jar) and echo the AS
+# authorize URL from the 302 Location WITHOUT following it — the assertions below
+# read the authorize URL's params, exactly as they used to read `authorize_url`.
+go_authz() { # jar go_url → authorize URL ("" on failure)
+  curl -s -c "$1" -b "$1" -D "$CONN_DIR/h.go" -o /dev/null "$2"
+  location_from_headers "$CONN_DIR/h.go"
+}
+# cb_from_authz: the fake AS auto-consents (302 straight to our callback);
+# %{redirect_url} yields that URL without fetching it, so the caller completes the
+# callback itself — in the jar that carries the flow cookie.
+cb_from_authz() { curl -s -o /dev/null -w '%{redirect_url}' "$1"; }
+complete_cb()   { curl -s -c "$1" -b "$1" "$2"; }
+# One-shot: start (or catalog-connect) response is already in $B → drive the whole
+# dance in a fresh jar and echo the callback page body.
+drive_dance() { # jar-name → callback body ("" on failure)
+  local jar authz cb
+  jar=$(new_jar "$1")
+  authz=$(go_authz "$jar" "$(jb "['go_url']")")
+  [ -z "$authz" ] && { echo ""; return 1; }
+  cb=$(cb_from_authz "$authz")
+  [ -z "$cb" ] && { echo ""; return 1; }
+  complete_cb "$jar" "$cb"
+}
 
 # ── Fake Sentry-shaped MCP (static key via CUSTOM header) ─────────────────
 SN_PORT=8896
@@ -305,7 +343,7 @@ as_admin() { curl -s -X POST -d "${2:-{\}}" "http://127.0.0.1:$AS_PORT/admin/$1"
 export FLUIDBOX_PUBLIC_URL="http://127.0.0.1:8787"
 # Rerun hygiene: custom catalog slugs are DB-unique and the API is
 # deliberately create-only — drop this suite's previous test entries.
-psql "$DATABASE_URL" -qc "delete from connector_catalog where tier='custom' and (slug like 'fx-%' or slug like 'byo-%')" 2>/dev/null
+pqw "delete from connector_catalog where tier='custom' and (slug like 'fx-%' or slug like 'byo-%')" 2>/dev/null
 start_server || exit 1
 ok "stack up (control plane + fake sentry :$SN_PORT + fake oauth AS/MCP :$AS_PORT)"
 
@@ -520,10 +558,16 @@ CODE=$(post "/agents" "{\"name\":\"byo-match-$$\",\"policy\":\"conn-e2e\",\"harn
 say "OAUTH DANCE — 401 → PRM → AS metadata → PKCE+resource → callback → sealed rotating refresh"
 as_admin mode '{"cimd": false, "access_ttl": 3600}'
 CODE=$(post "/catalog/fx-notion/connect" "{\"display_name\":\"fx-notion-main\"}")
-[ "$CODE" = "200" ] && ok "oauth connect → pending connection + authorize_url" || { no "connect → $CODE: $(cat "$B")"; exit 1; }
+[ "$CODE" = "200" ] && ok "oauth connect → pending connection + go_url" || { no "connect → $CODE: $(cat "$B")"; exit 1; }
 NTCONN=$(jb "['connection']['id']")
-AUTH_URL=$(jb "['authorize_url']")
 [ "$(jb "['connection']['status']")" = "pending" ] && ok "connection starts pending (fail-closed until the exchange)" || no "status: $(jb "['connection']['status']")"
+# The "browser" for this dance. GET-ing go_url is what binds it (the
+# __Host-fbx_oauth_flow cookie lands in the jar); the callback below refuses
+# without that cookie, so both legs ride the SAME jar.
+JAR_NT=$(new_jar nt)
+AUTH_URL=$(go_authz "$JAR_NT" "$(jb "['go_url']")")
+[ -n "$AUTH_URL" ] && grep -qi '__Host-fbx_oauth_flow' "$JAR_NT" \
+  && ok "go leg bound the browser (per-flow cookie) and 302'd to the AS" || { no "go leg: authz='$AUTH_URL' jar=$(cat "$JAR_NT")"; exit 1; }
 echo "$AUTH_URL" | grep -q "code_challenge_method=S256" && echo "$AUTH_URL" | grep -q "code_challenge=" \
   && ok "authorize URL carries PKCE S256" || no "authorize url: $AUTH_URL"
 echo "$AUTH_URL" | grep -q "resource=http%3A%2F%2F127.0.0.1%3A$AS_PORT%2Fmcp" \
@@ -534,11 +578,11 @@ echo "$AUTH_URL" | grep -q "client_id=dcr-client-" \
 echo "$AUTH_URL" | grep -q "offline_access" \
   && ok "offline_access requested (AS advertises it)" || no "no offline_access in scope"
 
-# The "browser": follow the auto-consent redirect, then hit our callback.
-CB_URL=$(curl -s -o /dev/null -w '%{redirect_url}' "$AUTH_URL")
+# Follow the auto-consent redirect, then hit our callback IN THE SAME JAR.
+CB_URL=$(cb_from_authz "$AUTH_URL")
 echo "$CB_URL" | grep -q "^http://127.0.0.1:8787/v1/oauth/callback?" \
   && ok "AS redirected to THE one stable callback" || { no "redirect: $CB_URL"; exit 1; }
-CB_BODY=$(curl -s "$CB_URL")
+CB_BODY=$(complete_cb "$JAR_NT" "$CB_URL")
 echo "$CB_BODY" | grep -q "Connected" && ok "callback (unauthenticated route) completed the exchange" || { no "callback: $CB_BODY"; exit 1; }
 # Phase C: the callback photographs the pending_snapshot (not a brokered bundle)
 # with the freshly minted access token — the "Connected" page reports the count.
@@ -634,7 +678,8 @@ CODE=$(post "/connections" "{\"provider\":\"mcp_http\",\"auth_kind\":\"oauth\",\
 [ "$CODE" = "200" ] && ok "direct oauth connection created (non-catalog path)" || { no "conn → $CODE: $(cat "$B")"; exit 1; }
 CIMDCONN=$(jb "['connection']['id']")
 CODE=$(post "/connections/$CIMDCONN/oauth/start" "{}")
-AUTH_URL2=$(jb "['authorize_url']")
+JAR_CIMD=$(new_jar cimd)
+AUTH_URL2=$(go_authz "$JAR_CIMD" "$(jb "['go_url']")")
 # The AS advertises CIMD, but this deployment's public URL is loopback
 # http — an AS could never FETCH our client document (real Notion answered
 # "Unknown OAuth client" to exactly this). The eligibility guard must fall
@@ -643,14 +688,14 @@ echo "$AUTH_URL2" | grep -q "client_id=dcr-client-" \
   && ok "CIMD advertised but public URL is loopback http → DCR used (eligibility guard)" || no "guard client_id: $AUTH_URL2"
 [ "$(as_field "['register'].__len__()")" = "$((REG_BEFORE + 1))" ] \
   && ok "fresh DCR registration minted for the new connection" || no "register count: $(as_field "['register'].__len__()")"
-CB2=$(curl -s "$(curl -s -o /dev/null -w '%{redirect_url}' "$AUTH_URL2")")
+CB2=$(complete_cb "$JAR_CIMD" "$(cb_from_authz "$AUTH_URL2")")
 echo "$CB2" | grep -q "Connected" && ok "guarded dance completed" || no "guarded callback: $CB2"
 # Reconnect re-resolution: seed the pre-guard footgun — a STORED CIMD
 # identity from a loopback deployment — and start again; it must be
 # re-resolved to DCR, never replayed at the AS.
-psql "$DATABASE_URL" -qc "update integration_connections set oauth = oauth || '{\"client_id\": \"http://127.0.0.1:8787/.well-known/fluidbox-client.json\", \"client_id_source\": \"cimd\"}'::jsonb where id = '$CIMDCONN'"
+pqw "update integration_connections set oauth = oauth || '{\"client_id\": \"http://127.0.0.1:8787/.well-known/fluidbox-client.json\", \"client_id_source\": \"cimd\"}'::jsonb where id = '$CIMDCONN'"
 post "/connections/$CIMDCONN/oauth/start" "{}" >/dev/null
-AUTH_URL2B=$(jb "['authorize_url']")
+AUTH_URL2B=$(go_authz "$(new_jar cimd2)" "$(jb "['go_url']")")
 echo "$AUTH_URL2B" | grep -q "client_id=dcr-client-" \
   && ok "stale stored CIMD identity re-resolved on reconnect (not replayed)" || no "stale reuse: $AUTH_URL2B"
 
@@ -659,10 +704,11 @@ CODE=$(post "/connections" "{\"provider\":\"mcp_http\",\"auth_kind\":\"oauth\",\
   \"display_name\":\"fx-notion-conf\",\"client_id\":\"pre-client-7\",\"client_secret\":\"$PRE_SECRET\"}")
 CONFCONN=$(jb "['connection']['id']")
 post "/connections/$CONFCONN/oauth/start" "{}" >/dev/null
-AUTH_URL3=$(jb "['authorize_url']")
+JAR_CONF=$(new_jar conf)
+AUTH_URL3=$(go_authz "$JAR_CONF" "$(jb "['go_url']")")
 echo "$AUTH_URL3" | grep -q "client_id=pre-client-7" \
   && ok "pre-registered client_id wins over CIMD/DCR (priority order)" || no "conf client_id: $AUTH_URL3"
-CB3=$(curl -s "$(curl -s -o /dev/null -w '%{redirect_url}' "$AUTH_URL3")")
+CB3=$(complete_cb "$JAR_CONF" "$(cb_from_authz "$AUTH_URL3")")
 echo "$CB3" | grep -q "Connected" && ok "confidential dance completed" || no "conf callback: $CB3"
 CONF_AUTH=$(as_state | python3 -c "
 import sys, json, base64
@@ -698,8 +744,7 @@ CODE=$(post "/sessions" "{\"agent\":\"conn-nt-$$\",\"task\":\"should fail closed
 
 CODE=$(post "/connections/$NTCONN/oauth/start" "{}")
 [ "$CODE" = "200" ] && ok "reconnect: the dance restarts on the SAME connection" || { no "restart → $CODE: $(cat "$B")"; exit 1; }
-AUTH_URL4=$(jb "['authorize_url']")
-CB4=$(curl -s "$(curl -s -o /dev/null -w '%{redirect_url}' "$AUTH_URL4")")
+CB4=$(drive_dance reconnect)
 echo "$CB4" | grep -q "Connected" && ok "reconnect dance completed" || no "reconnect callback: $CB4"
 NTSTATUS=$(get "/connections" | python3 -c "
 import sys, json

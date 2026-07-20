@@ -22,11 +22,29 @@ All examples assume `API=http://127.0.0.1:8787` and `H="authorization: Bearer $F
 curl -s -X POST $API/v1/catalog/fx-sentry/connect -H "$H" \
   -H "content-type: application/json" -d '{"token": "sntrys_…"}'
 
-# oauth connector: returns {connection, authorize_url} — open the URL, approve,
-# the callback completes the connection and photographs the snapshot
+# oauth connector: returns {connection, go_url} — open go_url (a control-plane
+# page that binds your browser to the one-time flow, then redirects to the
+# provider's consent screen); approve, and the callback completes + photographs
 curl -s -X POST $API/v1/catalog/fx-notion/connect -H "$H" \
   -H "content-type: application/json" -d '{}'
+# (the raw path POST /v1/connections/{id}/oauth/start likewise returns {go_url})
 ```
+
+> **An OAuth connect needs https or loopback for `FLUIDBOX_PUBLIC_URL`.** The
+> `go_url` page binds your browser to the one-time flow with a
+> `__Host-fbx_oauth_flow` cookie, and the callback refuses without it. That cookie
+> is always sent `Secure` — the `__Host-` prefix is *defined* as Secure + `Path=/`
+> + no Domain, and every conforming client (browsers, and `curl` since 7.87)
+> discards a `__Host-` cookie that lacks it. Loopback origins
+> (`http://127.0.0.1:8787`, the stock local default) are treated as trustworthy, so
+> `Secure` is accepted there and local dev completes; a **non-loopback plain-http**
+> origin is the one that cannot finish the dance. Put the control plane behind https
+> (an ngrok/Cloudflare tunnel is enough locally) and set `FLUIDBOX_PUBLIC_URL` to
+> that https origin *before* starting the dance; it is also what the provider's
+> `redirect_uri` must match. Two more reasons the https origin matters: an
+> authorization server can only fetch the CIMD client document over https +
+> non-loopback (local deployments always fall back to DCR), and many providers
+> reject an `http://` redirect_uri outright.
 
 A rejected api_key rolls the connection back; nothing half-connected survives. Custom entries can be added with `POST /v1/catalog` (they're forced to `tier=custom`, **tenant-scoped**, and adding one needs admin/owner — catalog data is reference data, not trust; one org's custom row is never visible or bindable to another).
 
@@ -46,6 +64,14 @@ curl -s -X POST $API/v1/connections/$CONN/tools/refresh -H "$H"   # POST — app
 Snapshots are **append-only** and force a real MCP `initialize`, so each records the negotiated protocol version; a `tools/list` that never finishes paginating **fails** rather than freezing a partial set. A refresh appends a new version — it never mutates an in-flight run's frozen tools.
 
 **Reauthorization bumps the generation.** Reconnecting an OAuth connection that was ever activated increments its `authorization_generation` (a rotation *within* the same account does not; proving a *different* account cannot preserve the generation — fail closed). Runs bound to the old generation then refuse at call time with `connection … was reauthorized after this run started — its binding is stale`. If you see that, the connection was re-consented mid-run: start a new run, which binds the current generation. (GitHub App connections never bump — the installation identity is proven, not re-consented.)
+
+**Only the newest authorization can activate.** Start two connect flows for the same connection (a stale browser tab, a double-clicked Connect, a retry after a timeout) and only one may land. The activation is a compare-and-swap against the connection's frozen generation *and* its last-activation instant, so a callback whose flow was overtaken is refused — before the token exchange when we can already tell, and again inside the activating `UPDATE` when we cannot — with:
+
+```
+this authorization was superseded by a newer one — restart the connect flow
+```
+
+That is a benign, expected outcome, not an error to debug: the connection is already active under the authorization that won. Close the stale tab and re-`connect` only if you actually meant to change accounts. (Equal timestamps are unorderable, so they fail closed — the refusal is preferred over guessing which grant is newer.)
 
 ## Declare what an agent needs: connection requirements
 
