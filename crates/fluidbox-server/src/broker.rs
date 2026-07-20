@@ -169,11 +169,21 @@ pub async fn brokered_auth_for_conn(
         .sealer
         .as_ref()
         .ok_or("FLUIDBOX_CREDENTIAL_KEY not configured")?;
-    let sealed = fluidbox_db::connection_credential_sealed(&state.pool, scope, conn.id)
+    let (sealed, kv) = fluidbox_db::connection_credential_sealed(&state.pool, scope, conn.id)
         .await
         .map_err(|e| format!("credential lookup failed: {e}"))?
         .ok_or("connection is not active (revoked or missing)")?;
-    let token = sealer.open(&sealed).map_err(|e| e.to_string())?;
+    let token = sealer
+        .open(
+            &sealed,
+            kv,
+            crate::seal::SealCtx::new(
+                scope.tenant_id(),
+                crate::seal::SealFamily::ConnectionCredential,
+            ),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
     let header = conn
         .metadata
         .get("header_name")
@@ -1212,10 +1222,12 @@ mod tests {
             &format!("acct-{}", Uuid::now_v7().simple()),
             display,
             Some(b"sealed-token"),
+            1,
             &serde_json::json!([]),
             &serde_json::json!({}),
             &serde_json::json!({ "base_url": "https://mcp.example.test" }),
             None,
+            1,
             ConnectionAuth::static_active(),
             owner,
             None,
@@ -1434,6 +1446,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             None,
+            1,
             None,
             None,
             None,

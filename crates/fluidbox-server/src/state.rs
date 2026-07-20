@@ -60,9 +60,11 @@ pub struct AppStateInner {
     /// custom redirect policy re-validates every hop and a custom DNS resolver
     /// filters resolved addresses at connect time (see `login::build_identity_http`).
     pub identity_http: reqwest::Client,
-    /// Seals/unseals connection credentials. None until
-    /// FLUIDBOX_CREDENTIAL_KEY is configured — connection endpoints and
-    /// connection-backed workspaces refuse to operate without it.
+    /// Seals/unseals connection credentials (Phase D versioned envelope). Built
+    /// by `seal::build_sealer`: a legacy key (KMS off), a KMS-envelope backend
+    /// (static|aws), or None — sealing disabled — ONLY when KMS is off AND
+    /// FLUIDBOX_CREDENTIAL_KEY is unset. When None, connection endpoints and
+    /// connection-backed workspaces refuse to operate.
     pub sealer: Option<crate::seal::Sealer>,
     /// Short-lived provider tokens minted per connection (GitHub App
     /// installation tokens ~1h, OAuth access tokens) — a cache only; the

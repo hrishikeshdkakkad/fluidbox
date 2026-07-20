@@ -127,6 +127,8 @@ pub struct LoginFlowRow {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct LoginFlowClaim {
     pub pkce_verifier_sealed: Vec<u8>,
+    /// Envelope key-version companion for `pkce_verifier_sealed`.
+    pub pkce_verifier_key_version: i16,
     pub nonce: String,
     pub redirect_to: String,
     pub created_at: DateTime<Utc>,
@@ -260,6 +262,8 @@ pub struct IdpConfigParams<'a> {
     pub issuer: &'a str,
     pub client_id: &'a str,
     pub client_secret_sealed: Option<Vec<u8>>,
+    /// Envelope key-version companion for `client_secret_sealed` (1 legacy, 2 v2).
+    pub client_secret_key_version: i16,
     pub token_endpoint_auth: &'a str,
     pub scopes: &'a [String],
     pub alg_allowlist: &'a [String],
@@ -354,10 +358,10 @@ pub async fn create_idp_config(
            (id, tenant_id, generation, issuer, client_id, client_secret_sealed,
             token_endpoint_auth, scopes, alg_allowlist, claim_mappings,
             bootstrap_owner_email, bootstrap_owner_expires_at, status, created_by,
-            discovered_metadata, jwks, discovered_at)
+            discovered_metadata, jwks, discovered_at, client_secret_key_version)
          select $1, $2,
                 coalesce((select max(generation) from org_idp_configs where tenant_id = $2), 0) + 1,
-                $3, $4, $5, $6, $7, $8, $9, $10, $11, 'staged', $12, $13, $14, $15
+                $3, $4, $5, $6, $7, $8, $9, $10, $11, 'staged', $12, $13, $14, $15, $16
          returning {IDP_CONFIG_COLS}"
     )))
     .bind(Uuid::now_v7())
@@ -375,6 +379,7 @@ pub async fn create_idp_config(
     .bind(params.discovered_metadata)
     .bind(params.jwks)
     .bind(params.discovered_at)
+    .bind(params.client_secret_key_version)
     .fetch_one(&mut *conn)
     .await
 }
@@ -478,15 +483,16 @@ pub async fn idp_client_secret_sealed(
     pool: &PgPool,
     scope: TenantScope,
     id: Uuid,
-) -> sqlx::Result<Option<Vec<u8>>> {
-    let row: Option<(Option<Vec<u8>>,)> = sqlx::query_as(
-        "select client_secret_sealed from org_idp_configs where tenant_id = $1 and id = $2",
+) -> sqlx::Result<Option<(Vec<u8>, i16)>> {
+    let row: Option<(Option<Vec<u8>>, i16)> = sqlx::query_as(
+        "select client_secret_sealed, client_secret_key_version
+         from org_idp_configs where tenant_id = $1 and id = $2",
     )
     .bind(scope.tenant_id())
     .bind(id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.and_then(|(s,)| s))
+    Ok(row.and_then(|(s, v)| s.map(|s| (s, v))))
 }
 
 /// Count a tenant's still-claimable login flows — the per-org outstanding-flow
@@ -521,6 +527,7 @@ pub async fn create_login_flow(
     scope: TenantScope,
     idp_config_id: Uuid,
     pkce_verifier_sealed: &[u8],
+    pkce_verifier_key_version: i16,
     nonce: &str,
     browser_hash: &str,
     redirect_to: &str,
@@ -560,8 +567,9 @@ pub async fn create_login_flow(
     let id = Uuid::now_v7();
     sqlx::query(
         "insert into login_flows
-           (id, tenant_id, idp_config_id, pkce_verifier_sealed, nonce, browser_hash, redirect_to, expires_at)
-         values ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(secs => $8::double precision))",
+           (id, tenant_id, idp_config_id, pkce_verifier_sealed, nonce, browser_hash, redirect_to,
+            expires_at, pkce_verifier_key_version)
+         values ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(secs => $8::double precision), $9)",
     )
     .bind(id)
     .bind(scope.tenant_id())
@@ -571,6 +579,7 @@ pub async fn create_login_flow(
     .bind(browser_hash)
     .bind(redirect_to)
     .bind(ttl_secs as f64)
+    .bind(pkce_verifier_key_version)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -600,7 +609,7 @@ pub async fn claim_login_flow(
            and f.consumed_at is null
            and f.browser_hash = $4
            and f.expires_at > now()
-         returning f.pkce_verifier_sealed, f.nonce, f.redirect_to, f.created_at",
+         returning f.pkce_verifier_sealed, f.pkce_verifier_key_version, f.nonce, f.redirect_to, f.created_at",
     )
     .bind(flow_id)
     .bind(tenant_id)
@@ -1080,7 +1089,8 @@ pub struct MemberRow {
 pub enum SecretPatch {
     Keep,
     Clear,
-    Set(Vec<u8>),
+    /// New sealed bytes + their envelope key-version companion.
+    Set(Vec<u8>, i16),
 }
 
 /// The mutable-field patch for an IdP config (identity fields are refused by the
@@ -1721,7 +1731,7 @@ pub async fn patch_idp_config(
     // the LOCKED current row. Borrow `patch.client_secret` here (the move-match
     // for the UPDATE comes after).
     let secret_present_post = match &patch.client_secret {
-        SecretPatch::Set(_) => true,
+        SecretPatch::Set(..) => true,
         SecretPatch::Clear => false,
         SecretPatch::Keep => has_secret_now,
     };
@@ -1750,15 +1760,18 @@ pub async fn patch_idp_config(
     // Client-secret tri-state: Clear ⇒ null; Set ⇒ new sealed bytes; Keep ⇒
     // coalesce($3 = null) leaves the current value. `coalesce` alone cannot
     // express Clear, so a `$4::bool` flag forces null ahead of the coalesce.
-    let (clear_secret, set_secret): (bool, Option<Vec<u8>>) = match patch.client_secret {
-        SecretPatch::Keep => (false, None),
-        SecretPatch::Clear => (true, None),
-        SecretPatch::Set(bytes) => (false, Some(bytes)),
-    };
+    let (clear_secret, set_secret, set_version): (bool, Option<Vec<u8>>, Option<i16>) =
+        match patch.client_secret {
+            SecretPatch::Keep => (false, None, None),
+            SecretPatch::Clear => (true, None, None),
+            SecretPatch::Set(bytes, version) => (false, Some(bytes), Some(version)),
+        };
     let row: OrgIdpConfigRow = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update org_idp_configs set
            client_secret_sealed = case when $4::bool then null
                                        else coalesce($3::bytea, client_secret_sealed) end,
+           client_secret_key_version = case when $4::bool then 1
+                                       else coalesce($9::smallint, client_secret_key_version) end,
            token_endpoint_auth = coalesce($5::text, token_endpoint_auth),
            scopes = coalesce($6::text[], scopes),
            claim_mappings = coalesce($7::jsonb, claim_mappings),
@@ -1774,6 +1787,7 @@ pub async fn patch_idp_config(
     .bind(patch.scopes.map(<[String]>::to_vec))
     .bind(patch.claim_mappings)
     .bind(patch.alg_allowlist.map(<[String]>::to_vec))
+    .bind(set_version)
     .fetch_one(&mut *tx)
     .await?;
 
@@ -2455,6 +2469,7 @@ mod tests {
                 issuer: "https://issuer.example",
                 client_id: "client-abc",
                 client_secret_sealed: Some(vec![1, 2, 3]),
+                client_secret_key_version: 1,
                 token_endpoint_auth: "client_secret_basic",
                 scopes: &scopes,
                 alg_allowlist: &algs,
@@ -2549,6 +2564,7 @@ mod tests {
             scope,
             cfg.id,
             &[9, 8, 7],
+            1,
             "nonce-1",
             &good_hash,
             "/dashboard",
@@ -2583,6 +2599,7 @@ mod tests {
             scope,
             cfg.id,
             &[1],
+            1,
             "nonce-2",
             &good_hash,
             "/",
@@ -3186,6 +3203,7 @@ mod tests {
             scope,
             cfg.id,
             &[1],
+            1,
             "flow-n",
             &sha256_hex("y"),
             "/",
@@ -3287,6 +3305,7 @@ mod tests {
             scope,
             old.id,
             &[1],
+            1,
             "mig-flow",
             &flow_bh,
             "/",
