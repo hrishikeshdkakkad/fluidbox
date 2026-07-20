@@ -76,8 +76,14 @@ else
           # attributes are NOT inherited through membership — so "we granted
           # the app a bound role" proves nothing about the role it connects AS.
           # Neon's default `neon_superuser` carries BYPASSRLS, which makes
-          # migration 0018 inert. Non-fatal: a single-admin local deployment
-          # is not a tenant-isolation boundary.
+          # migration 0018 inert. Non-fatal by default: a single-admin local
+          # deployment is not a tenant-isolation boundary. But with
+          # FLUIDBOX_REQUIRE_SSO=1 the server now REFUSES TO BOOT in exactly
+          # this state, so a warning would report "ready" for a deployment
+          # that cannot start — escalate to a failure unless the pool SET
+          # ROLEs away from this role (FLUIDBOX_RUNTIME_ROLE, which boot
+          # posture-validates as non-bypassing) or the operator accepted it
+          # (FLUIDBOX_ALLOW_RLS_BYPASS).
           rls_attrs=$(psql "$db_url" -Atc \
             "select current_user || ' ' || rolsuper::text || ' ' || rolbypassrls::text
                from pg_roles where rolname = current_user" 2>/dev/null)
@@ -85,8 +91,19 @@ else
             "")      warn "could not read the connecting role's RLS attributes" \
                           "run: psql \"\$DATABASE_URL\" -Atc \"select rolsuper, rolbypassrls from pg_roles where rolname = current_user\"";;
             *" f f") ok "DB role '${rls_attrs%% *}' is RLS-bound (not superuser, no BYPASSRLS)";;
-            *)       warn "DB role '${rls_attrs%% *}' bypasses row-level security (superuser and/or BYPASSRLS) — migration 0018's tenant policies never run for it" \
-                          "set FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime so the app pool SET ROLEs to the NOLOGIN least-privilege role 0018 creates (role attributes are not inherited through membership, so membership alone will not do it)";;
+            *)
+              rls_msg="DB role '${rls_attrs%% *}' bypasses row-level security (superuser and/or BYPASSRLS) — migration 0018's tenant policies never run for it"
+              rls_fix="set FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime so the app pool SET ROLEs to the NOLOGIN least-privilege role 0018 creates (role attributes are not inherited through membership, so membership alone will not do it)"
+              allow_bypass=$(env_get "$ENV" FLUIDBOX_ALLOW_RLS_BYPASS)
+              case "$allow_bypass" in 1|[Tt][Rr][Uu][Ee]) accepted=1;; *) accepted=0;; esac
+              if [ "$(env_get "$ENV" FLUIDBOX_REQUIRE_SSO)" = 1 ] \
+                 && [ -z "$(env_get "$ENV" FLUIDBOX_RUNTIME_ROLE)" ] \
+                 && [ "$accepted" = 0 ]; then
+                bad "$rls_msg — with FLUIDBOX_REQUIRE_SSO=1 the server REFUSES TO BOOT in this state" \
+                    "$rls_fix; or point DATABASE_URL at a non-superuser role; or, for local single-user work only, accept it with FLUIDBOX_ALLOW_RLS_BYPASS=1"
+              else
+                warn "$rls_msg" "$rls_fix"
+              fi;;
           esac
         else
           warn "database not reachable right now" "Neon scale-to-zero can add a cold-start delay; retry, or check the connection string with: just db"
