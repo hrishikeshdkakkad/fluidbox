@@ -203,6 +203,22 @@ same unwrap-from-persisted path. Run this drill after any KEK/key-policy change.
   The seed tenant is a real `tenants` row, so its DEK mints lazily like any other.
   A KMS mode flip mid-flight invalidates in-flight transit tokens — they live
   minutes (TTL), so a user simply restarts the login/connect flow.
+- **⚠ Do not rename the boot tenant.** The deployment tenant is resolved at boot by
+  `ensure_default_tenant`, which upserts `on conflict (name)` — i.e. by the MUTABLE
+  key `name = 'default'`. Rename that row (or hand-edit it) and the next boot seeds
+  a *different* tenant, whose DEK cannot open anything sealed under the old one:
+  every deployment-global secret (the `oauth_client_registrations` client secret and
+  registration access token) and every in-flight transit token becomes unopenable.
+  It fails closed, not silently — but the only recovery is renaming the row back. If
+  you need a friendlier display name, add it elsewhere; leave `name='default'` alone.
+- **⚠ Rolling deploys: flip `FLUIDBOX_KMS_MODE` on ALL replicas and finish the
+  restart BEFORE starting the re-seal job.** The KMS boot matrix (§2) is a
+  **boot-time** gate, not a runtime one: a replica that started with KMS off keeps
+  serving happily against a database that is filling with v2 rows, and only fails
+  when it happens to touch one (unsealing a v2 blob with KMS off fails closed). A
+  half-rolled fleet therefore produces intermittent, replica-dependent custody
+  errors that look like data corruption. Order: set the mode + KEK everywhere →
+  confirm every replica has restarted → only then `POST /v1/admin/reseal`.
 - **`aws` mode** needs the control plane's role wired to the KEK per §3 (IRSA on
   Kubernetes). No KMS access is ever granted to a sandbox.
 - **`static` mode** is for local dev and CI only — it is a plaintext 32-byte key in
@@ -292,9 +308,41 @@ reason Phase B deferred this). Enforcement is a GUC contract, transaction-local 
 a pooled connection never leaks context:
 
 - `fluidbox.tenant_id` set (`scoped_tx`) ⇒ that tenant's rows are visible/writable;
-- `fluidbox.bypass = 'system_worker'` (`worker_tx`, `pub(crate)`) ⇒ the audited
-  cross-tenant bypass — the category rides IN the GUC value, one grep-able choke point;
+- `fluidbox.bypass = 'system_worker'` (`worker_tx`) ⇒ the audited cross-tenant
+  bypass — the category rides IN the GUC value, one grep-able choke point. `worker_tx`
+  is `pub(crate)`, so the server crate cannot assemble a bypass ad-hoc; it reaches one
+  only through a NAMED `fluidbox-db::system_worker` function. A couple of those
+  (`reseal_begin`, `global_registration_tx`) are `pub` and deliberately hand out a
+  bypass-armed transaction, because their callers drive a multi-statement critical
+  section. The property is "a short, named, grep-able set of escape hatches", not
+  "unreachable";
 - neither set ⇒ zero rows on a policy'd table.
+
+**Two tables split read from write.** `connector_catalog` and
+`oauth_client_registrations` hold cross-tenant SHARED state: rows with `tenant_id
+NULL` are deployment-global (curated catalog entries; the deployment-wide OAuth
+`client_id` and its sealed `client_secret`). Their policies are therefore split —
+`FOR SELECT` is tenant-or-global-or-bypass (every tenant reads shared reference
+data), but `FOR INSERT/UPDATE/DELETE` is tenant-or-**bypass only**. A tenant-scoped
+transaction can neither mint a global row nor mutate/delete one another tenant
+depends on; writing a global row is principal-less deployment work and goes through
+`system_worker` (`insert_/touch_/delete_global_registration`,
+`global_registration_tx`). This is the only place in 0018 where USING and WITH CHECK
+differ per command, and it is why those two tables get four policies each rather
+than one `FOR ALL`.
+
+**Is RLS actually armed on YOUR database?** Postgres skips policies entirely for a
+`SUPERUSER` or `BYPASSRLS` role, and **role attributes are not inherited through
+membership** — granting the app a bound role proves nothing about the role it
+connects *as*. Neon's default `neon_superuser` carries `BYPASSRLS`, so a stock Neon
+connection string makes this whole section inert. Check it:
+
+```sql
+select current_user, rolsuper, rolbypassrls from pg_roles where rolname = current_user;
+```
+
+Both `false` ⇒ enforcing. Otherwise set `FLUIDBOX_RUNTIME_ROLE` (below). `just
+doctor` runs exactly this check and warns.
 
 ### The runtime role (opt-in — `FLUIDBOX_RUNTIME_ROLE`)
 
@@ -322,5 +370,37 @@ child table with no `tenant_id` column; and (3) `GRANT SELECT, INSERT, UPDATE,
 DELETE ... TO fluidbox_runtime` (guarded for the restricted-host case). A sealed
 column additionally joins the seal-family lockstep (§1) so it is re-seal-covered.
 
-**Pre-0018 binaries break on a 0018 database** (no tenant GUC ⇒ zero rows on every
-policy'd table) — the standard migrate-then-deploy disclosure for this repo.
+### CONVENTION — a migration that seeds rows into an RLS'd table
+
+Migrations run as the table OWNER with no GUC, and `FORCE` binds the owner. Any
+migration that writes DATA into a table 0018 (or a later migration) protects must
+open with:
+
+```sql
+set local fluidbox.bypass = 'system_worker';
+```
+
+Otherwise every INSERT is refused (`new row violates row-level security policy`)
+and every UPDATE/DELETE silently affects zero rows. This bites hardest on the two
+global tables — a generated `just catalog-import` file inserts `tenant_id NULL`
+rows into `connector_catalog`, which the write-side policy admits only under the
+bypass. Migrations that only run DDL need nothing.
+
+### Deploy order — STOP the old binary, migrate, THEN deploy
+
+0018 is **not** a migrate-then-deploy. Two independent reasons:
+
+1. **Pre-0018 binaries break on a 0018 database** — they set no GUC, so every
+   policy'd table reads zero rows. An old replica left running does not error; it
+   serves empty results.
+2. **The migration can be blocked by the old binary.** 0018 takes `ACCESS EXCLUSIVE`
+   on all 37 tables in one transaction, and the pre-Phase-D OAuth paths hold a
+   transaction open across outbound HTTP (the token exchange; the DCR `/register`).
+   A slow authorization server therefore parks the migration behind a lock request
+   that in turn queues every subsequent query — a full stall. The migration sets
+   `lock_timeout = '3s'` so this surfaces as a fast, retryable failure instead, but
+   the ordering is what avoids it.
+
+The changes themselves are catalog-only (no table rewrite): with no competing
+traffic, 0018 is milliseconds. Roll back by dropping the policies, not by
+redeploying the old binary against the new schema.

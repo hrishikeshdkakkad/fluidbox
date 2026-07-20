@@ -25,12 +25,27 @@
 --    RLS still binds the owner via the GUC, so single-role deployments are fully
 --    enforced without the role.
 --
--- OLD BINARIES against a 0018 database break (no GUC → zero rows) — the standard
--- migrate-then-deploy disclosure for this repo.
+-- DEPLOY ORDER — STOP THE OLD BINARY, MIGRATE, THEN DEPLOY. This is NOT a
+-- migrate-then-deploy: an old binary against a 0018 database sets no GUC and so
+-- reads zero rows from every table, AND it holds transactions open across outbound
+-- HTTP (the OAuth token exchange and the DCR /register both span a tx touching
+-- tables locked below). A slow authorization server would therefore park this
+-- migration behind an ACCESS EXCLUSIVE lock request that in turn blocks ALL
+-- traffic. `lock_timeout` below bounds that to a fast, retryable failure instead of
+-- a stall — but the ordering above is what avoids it.
+--
+-- 37×(ENABLE + FORCE) + the CREATE POLICYs run in sqlx's single migration
+-- transaction and each takes ACCESS EXCLUSIVE on its table. They are catalog-only
+-- (no table rewrite), so with no competing traffic this is milliseconds.
 --
 -- NOTE: migrations run BEFORE the boot seed and on the migration OWNER connection
 -- (fluidbox-db `connect()` splits owner-migrate from the app pool). This file assumes
 -- no `default` tenant exists yet and creates no data.
+
+-- Bound the worst case above: fail fast and retryably rather than queue behind a
+-- long-running transaction (and take the whole database's traffic with it).
+-- Transaction-local — sqlx runs each migration inside one transaction.
+set local lock_timeout = '3s';
 
 -- ─── (a) least-privilege runtime role + grants (plan D8) ─────────────────────
 -- Created NOLOGIN + granted here so `SET ROLE fluidbox_runtime` works for the
@@ -145,38 +160,93 @@ create policy tenant_isolation on tenants as permissive for all to public
     with check (id::text = current_setting('fluidbox.tenant_id', true)
            or current_setting('fluidbox.bypass', true) = 'system_worker');
 
--- connector_catalog: MIXED. Curated/imported rows are GLOBAL (tenant_id NULL) and
--- visible to every tenant; custom BYO rows are tenant-owned (0013). A NULL row is
--- readable/writable with no GUC at all, which is why the catalog reads work pre-scope.
+-- The two MIXED tables — `connector_catalog` and `oauth_client_registrations` —
+-- hold cross-tenant SHARED state: rows with `tenant_id NULL` are deployment-global
+-- (curated catalog entries; the deployment-wide OAuth client_id + its sealed
+-- client_secret) and every tenant reads them. READ and WRITE are therefore split
+-- deliberately, and this is the ONLY place in the file where they differ:
+--
+--   FOR SELECT  → tenant-or-GLOBAL-or-bypass. Global rows are shared reference
+--                 data; a scoped read must see them (this is also why catalog
+--                 reads work pre-scope).
+--   FOR INSERT/UPDATE/DELETE → tenant-or-bypass, NEVER "or tenant_id is null".
+--                 A tenant-scoped transaction must not be able to create a global
+--                 row, nor mutate/delete one another tenant depends on. Writing a
+--                 global row is principal-less deployment work, so it takes the one
+--                 audited escape hatch (`fluidbox.bypass = 'system_worker'`, via
+--                 `fluidbox-db::system_worker`) like every other cross-tenant write.
+-- A single `for all` policy cannot express this: its USING clause is what filters
+-- UPDATE/DELETE, so a read-permissive USING would also make global rows mutable.
+--
+-- Who writes what, so the split stays checkable:
+--   connector_catalog          — `create_catalog_entry`/`delete_catalog_entry` are
+--                                scoped_tx + explicitly tenant-bound; global rows
+--                                are written ONLY by migrations (pre-RLS DDL).
+--   oauth_client_registrations — v1 rows are ALWAYS global, and the DCR/CIMD
+--                                resolution is principal-less, so all four writers
+--                                go through `system_worker::*_global_registration`.
+--
+-- CONSEQUENCE FOR FUTURE MIGRATIONS: a migration that seeds GLOBAL rows into
+-- either table (e.g. a generated `just catalog-import` file) runs as the table
+-- OWNER with no GUC, and FORCE binds the owner — so it MUST open with
+--   set local fluidbox.bypass = 'system_worker';
+-- or every INSERT is refused. Migrations 0007/0013 predate this file and are
+-- unaffected (RLS was not yet enabled when they ran).
+
 alter table connector_catalog enable row level security;
 alter table connector_catalog force row level security;
-create policy tenant_isolation on connector_catalog as permissive for all to public
+create policy catalog_read on connector_catalog as permissive for select to public
     using (tenant_id is null
-           or tenant_id::text = current_setting('fluidbox.tenant_id', true)
-           or current_setting('fluidbox.bypass', true) = 'system_worker')
-    with check (tenant_id is null
            or tenant_id::text = current_setting('fluidbox.tenant_id', true)
            or current_setting('fluidbox.bypass', true) = 'system_worker');
+create policy catalog_insert on connector_catalog as permissive for insert to public
+    with check (tenant_id::text = current_setting('fluidbox.tenant_id', true)
+           or current_setting('fluidbox.bypass', true) = 'system_worker');
+create policy catalog_update on connector_catalog as permissive for update to public
+    using (tenant_id::text = current_setting('fluidbox.tenant_id', true)
+           or current_setting('fluidbox.bypass', true) = 'system_worker')
+    with check (tenant_id::text = current_setting('fluidbox.tenant_id', true)
+           or current_setting('fluidbox.bypass', true) = 'system_worker');
+create policy catalog_delete on connector_catalog as permissive for delete to public
+    using (tenant_id::text = current_setting('fluidbox.tenant_id', true)
+           or current_setting('fluidbox.bypass', true) = 'system_worker');
 
--- oauth_client_registrations: v1 rows are always GLOBAL (tenant_id NULL, deployment
--- infrastructure). Same tenant-or-null shape as connector_catalog so the principal-
--- less DCR resolution (find/insert/touch/delete, no GUC) sees + writes global rows.
 alter table oauth_client_registrations enable row level security;
 alter table oauth_client_registrations force row level security;
-create policy tenant_isolation on oauth_client_registrations as permissive for all to public
+create policy registration_read on oauth_client_registrations as permissive for select to public
     using (tenant_id is null
            or tenant_id::text = current_setting('fluidbox.tenant_id', true)
+           or current_setting('fluidbox.bypass', true) = 'system_worker');
+create policy registration_insert on oauth_client_registrations as permissive for insert to public
+    with check (tenant_id::text = current_setting('fluidbox.tenant_id', true)
+           or current_setting('fluidbox.bypass', true) = 'system_worker');
+create policy registration_update on oauth_client_registrations as permissive for update to public
+    using (tenant_id::text = current_setting('fluidbox.tenant_id', true)
            or current_setting('fluidbox.bypass', true) = 'system_worker')
-    with check (tenant_id is null
-           or tenant_id::text = current_setting('fluidbox.tenant_id', true)
+    with check (tenant_id::text = current_setting('fluidbox.tenant_id', true)
+           or current_setting('fluidbox.bypass', true) = 'system_worker');
+create policy registration_delete on oauth_client_registrations as permissive for delete to public
+    using (tenant_id::text = current_setting('fluidbox.tenant_id', true)
            or current_setting('fluidbox.bypass', true) = 'system_worker');
 
 -- auth_audit_log: append-only, tenant_id NULLABLE (operator actions carry none).
 -- INSERT is ALWAYS allowed (the writer may be pool-direct with no GUC, e.g. a
--- rejected-attempt audit) — the append-only guarantee is the 0012 triggers + the
--- runtime role's INSERT/SELECT-only grant, not RLS. SELECT is tenant-or-null-or-bypass.
--- No UPDATE/DELETE policy exists, so those commands are denied under FORCE RLS
--- (belt for the triggers).
+-- rejected-attempt audit). SELECT is tenant-or-null-or-bypass.
+--
+-- This migration REORDERS the append-only defence, so 0012's framing ("the
+-- triggers are the real guard — only a trigger can stop the owner") now describes
+-- only one of three layers. Post-0018:
+--   • RLS-BOUND role (the FORCEd owner, and fluidbox_runtime): no UPDATE/DELETE
+--     policy exists at all, so those commands match no rows and are FILTERED to
+--     zero — they return OK, the row is untouched, and the 0012 trigger is never
+--     reached. This is the primary guard on the normal path.
+--   • RLS-BYPASSING role (superuser / BYPASSRLS — Neon's neon_superuser, CI's
+--     postgres): policies are skipped entirely and the 0012 trigger is what
+--     refuses. It is now the BACKSTOP for exactly these roles.
+--   • fluidbox_runtime: refused one layer earlier still, by the UPDATE/DELETE
+--     revoke above (0012:208-210's deferred grant).
+-- identity.rs::audit_log_is_append_only asserts whichever layer applies to the
+-- connecting role, plus the grant layer unconditionally.
 alter table auth_audit_log enable row level security;
 alter table auth_audit_log force row level security;
 create policy audit_insert on auth_audit_log as permissive for insert to public

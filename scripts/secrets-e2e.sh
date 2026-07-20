@@ -98,7 +98,14 @@ j() { python3 -c "import sys,json;d=json.load(sys.stdin);print(d$1)" 2>/dev/null
 # psql shortcut. -q suppresses the command tag (else "INSERT 0 1" poisons a
 # RETURNING capture); -A -t keep tuples-only/unaligned; -X skips ~/.psqlrc.
 # stderr flows to the log (not swallowed) so a broken query is visible.
-db() { psql "$DATABASE_URL" -X -q -A -t -c "$1"; }
+# db_raw is the BARE connection (no GUC) — only section (j)'s RLS negatives want
+# it, because they SET ROLE and assert on what the policy alone allows.
+db_raw() { psql "$DATABASE_URL" -X -q -A -t -c "$1"; }
+# db() carries the audited bypass GUC: migration 0018 FORCEs RLS on every tenant
+# table, which binds the table OWNER too, so a GUC-less fixture read returns zero
+# rows and a fixture INSERT is refused. A session-level SET on a custom (dotted)
+# option needs no privilege, so it rides INSIDE the helper — every call carries it.
+db() { db_raw "set fluidbox.bypass = 'system_worker'; $1"; }
 
 # ── Cleanup ──────────────────────────────────────────────────────────────────
 # shellcheck disable=SC2329  # invoked via the EXIT/INT/TERM trap
@@ -459,6 +466,15 @@ _spawn() {
     export FLUIDBOX_ADMIN_TOKEN="$ADMIN_TOKEN"
     export FLUIDBOX_PROVIDER=docker
     export FLUIDBOX_DATA_DIR="$DATA_DIR"
+    # Phase D (#32): run the app pool as the NON-superuser role migration 0018
+    # creates, so every HTTP request in this suite executes with RLS actually
+    # ENFORCED. Without it the whole surface runs RLS-free (CI's DB user is the
+    # superuser `postgres`, for whom policies are skipped entirely) and a
+    # repository fn that forgot `scoped_tx` would return rows here and empty in
+    # production. 0018 grants the role to current_user, so `SET ROLE` works as-is;
+    # if a managed host could not create it the server refuses to boot naming the
+    # exact CREATE ROLE fix, which is the signal we want.
+    export FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime
     # A dead-registry image ref makes provisioning fail in milliseconds (no runner
     # image in CI), so the forged-run fixtures settle terminal fast.
     export FLUIDBOX_SANDBOX_IMAGE=localhost:1/fluidbox-absent:ci
@@ -1113,20 +1129,23 @@ TOTAL=$(db "select count(*) from sessions")
 # With tenant-A GUC, an unfiltered scan sees ONLY tenant A (the buggy-predicate
 # negative). SET LOCAL on the dotted custom GUC (unquoted class.name) emits no row,
 # so `select count(*)` is the sole output — the RLS policy keys on this GUC.
-RLS_A=$(db "set role fluidbox_runtime; begin; set local fluidbox.tenant_id = '$TID_A'; select count(*) from sessions; commit;")
+# db_raw (NOT db): these four assert on what the policy alone allows, so the
+# connection must carry no ambient bypass GUC — db() would set one and every
+# count would come back as the cross-tenant total.
+RLS_A=$(db_raw "set role fluidbox_runtime; begin; set local fluidbox.tenant_id = '$TID_A'; select count(*) from sessions; commit;")
 { [ "$RLS_A" = "$CNT_A" ] && [ "$RLS_A" != "$TOTAL" ]; } \
   && ok "runtime role + tenant-A GUC sees ONLY A's sessions ($RLS_A == A=$CNT_A, ≠ total=$TOTAL)" \
   || no "RLS tenant-A read = $RLS_A (A=$CNT_A total=$TOTAL)"
 # Symmetric: tenant-B GUC sees ONLY B's sessions (isolation, not a fixed subset).
-RLS_B=$(db "set role fluidbox_runtime; begin; set local fluidbox.tenant_id = '$TID_B'; select count(*) from sessions; commit;")
+RLS_B=$(db_raw "set role fluidbox_runtime; begin; set local fluidbox.tenant_id = '$TID_B'; select count(*) from sessions; commit;")
 { [ "$RLS_B" = "$CNT_B" ] && [ "$RLS_B" != "$TOTAL" ]; } \
   && ok "runtime role + tenant-B GUC sees ONLY B's sessions ($RLS_B == B=$CNT_B, ≠ total=$TOTAL)" \
   || no "RLS tenant-B read = $RLS_B (B=$CNT_B total=$TOTAL)"
 # No GUC → RLS denies everything.
-RLS_NONE=$(db "set role fluidbox_runtime; select count(*) from sessions;")
+RLS_NONE=$(db_raw "set role fluidbox_runtime; select count(*) from sessions;")
 [ "$RLS_NONE" = 0 ] && ok "runtime role with NO tenant GUC → 0 rows (fail closed)" || no "no-GUC read = $RLS_NONE (want 0)"
 # Bypass GUC → the audited system_worker lens sees all.
-RLS_ALL=$(db "set role fluidbox_runtime; begin; set local fluidbox.bypass = 'system_worker'; select count(*) from sessions; commit;")
+RLS_ALL=$(db_raw "set role fluidbox_runtime; begin; set local fluidbox.bypass = 'system_worker'; select count(*) from sessions; commit;")
 [ "$RLS_ALL" = "$TOTAL" ] && ok "runtime role + bypass GUC → all $RLS_ALL rows (system_worker lens)" || no "bypass read = $RLS_ALL (want total=$TOTAL)"
 # The runtime role cannot UPDATE the append-only audit log.
 AUDIT_ERR=$(psql "$DATABASE_URL" -X -q -c "set role fluidbox_runtime; update auth_audit_log set action = action" 2>&1)

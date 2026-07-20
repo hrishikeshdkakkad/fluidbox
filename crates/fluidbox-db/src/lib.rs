@@ -213,6 +213,48 @@ pub(crate) async fn worker_tx(
     Ok(tx)
 }
 
+/// The TEST-FIXTURE lane (Phase D, #32): `connect()` plus the audited system-worker
+/// bypass GUC (`fluidbox.bypass = 'system_worker'`) set at SESSION level on every
+/// pooled connection. Compiled only for this crate's own `#[cfg(test)]` module.
+///
+/// Why it exists: migration 0018 ENABLEs + FORCEs RLS on 37 tables, and FORCE binds
+/// the table OWNER too. A fixture writes and reads ACROSS tenants and predates any
+/// [`TenantScope`], so on a plain pool every fixture INSERT is refused outright
+/// ("new row violates row-level security policy") and every fixture SELECT/DELETE
+/// silently matches ZERO rows — the second is the nastier failure, because a cleanup
+/// helper then reports success while deleting nothing. Neither shape surfaces today:
+/// CI connects as the superuser `postgres` (RLS skipped entirely) and Neon's default
+/// role carries BYPASSRLS. This lane is what makes the suite work on an RLS-BOUND
+/// owner, which is the posture 0018 exists for.
+///
+/// It does not weaken what the suite proves. RLS enforcement is asserted by the four
+/// tests that open their OWN `SET ROLE fluidbox_runtime` connection or runtime-role
+/// pool (`rls_enforces_tenant_isolation_under_runtime_role`,
+/// `rls_system_worker_bypass_is_explicit`, `rls_reseal_helpers_work_under_worker_tx`,
+/// and identity's `rls_identity_family_cross_tenant_isolation`) — none of which route
+/// their ASSERTIONS through this pool — and end-to-end by the acceptance suites that
+/// boot the server with `FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime`.
+#[cfg(test)]
+pub(crate) async fn test_connect(database_url: &str) -> anyhow::Result<PgPool> {
+    use sqlx::Executor;
+    // Migrations + role validation exactly as production does; the pool it builds is
+    // closed immediately — only the migration side effect is wanted here.
+    connect(database_url, None).await?.close().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(10)
+        .acquire_timeout(std::time::Duration::from_secs(15))
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                conn.execute("set fluidbox.bypass = 'system_worker'")
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(database_url)
+        .await?;
+    Ok(pool)
+}
+
 pub fn sha256_hex(s: &str) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(s.as_bytes()))
@@ -5478,7 +5520,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -5762,7 +5804,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
 
@@ -5854,7 +5896,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -5951,7 +5993,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -6094,7 +6136,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -6271,7 +6313,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -6374,7 +6416,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
 
@@ -6442,7 +6484,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -6561,7 +6603,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -6715,7 +6757,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let agent = create_agent(&pool, scope, "test-sched-agent", None)
@@ -6841,7 +6883,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -6967,7 +7009,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let policy = upsert_policy(
@@ -7043,7 +7085,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let name = format!("test-bundle-{}", Uuid::now_v7());
@@ -7175,7 +7217,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         // The curated seeds are GLOBAL (tenant_id null); any valid scope sees
         // them via the tenant-or-global reader.
         let tenant = ensure_default_tenant(&pool).await.unwrap();
@@ -7285,7 +7327,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
 
@@ -7468,7 +7510,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
         let yaml = "name: ov-test\ntools: []\n";
@@ -7552,7 +7594,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
 
@@ -7617,7 +7659,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = ensure_default_tenant(&pool).await.unwrap();
         let scope = TenantScope::assume(tenant);
 
@@ -7711,7 +7753,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = identity::create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -8022,7 +8064,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = identity::create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -8292,7 +8334,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = identity::create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -8801,7 +8843,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
 
         let slug_a = format!("t-{}", Uuid::now_v7().simple());
         let slug_b = format!("t-{}", Uuid::now_v7().simple());
@@ -8991,7 +9033,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -9033,7 +9075,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -9081,7 +9123,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -9149,7 +9191,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -9225,7 +9267,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -9309,7 +9351,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let org_a = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -9456,7 +9498,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = identity::create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -9579,7 +9621,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug_a = format!("t-{}", Uuid::now_v7().simple());
         let slug_b = format!("t-{}", Uuid::now_v7().simple());
         let org_a = identity::create_org(&pool, &slug_a, None).await.unwrap();
@@ -9696,7 +9738,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = identity::create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -9787,7 +9829,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug_a = format!("t-{}", Uuid::now_v7().simple());
         let slug_b = format!("t-{}", Uuid::now_v7().simple());
         let org_a = identity::create_org(&pool, &slug_a, None).await.unwrap();
@@ -10060,7 +10102,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug = format!("t-{}", Uuid::now_v7().simple());
         let org = identity::create_org(&pool, &slug, None).await.unwrap();
         let scope = TenantScope::assume(org.id);
@@ -10219,7 +10261,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let slug_a = format!("t-{}", Uuid::now_v7().simple());
         let slug_b = format!("t-{}", Uuid::now_v7().simple());
         let org_a = identity::create_org(&pool, &slug_a, None).await.unwrap();
@@ -10328,7 +10370,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let scope = new_dek_org(&pool).await;
         let tenant = scope.tenant_id();
 
@@ -10366,7 +10408,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let scope = new_dek_org(&pool).await;
         let tenant = scope.tenant_id();
 
@@ -10418,7 +10460,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let scope = new_dek_org(&pool).await;
         let tenant = scope.tenant_id();
 
@@ -10511,7 +10553,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let scope = new_dek_org(&pool).await;
         let tenant = scope.tenant_id();
 
@@ -10647,7 +10689,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let scope = new_dek_org(&pool).await;
         let tenant = scope.tenant_id();
 
@@ -10727,7 +10769,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let scope = new_dek_org(&pool).await;
         let tenant = scope.tenant_id();
 
@@ -10777,7 +10819,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let issuer = format!("https://as-{}.test", Uuid::now_v7().simple());
         let redirect = "https://fbx.test/v1/oauth/callback";
 
@@ -10841,7 +10883,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -10902,7 +10944,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let issuer = format!("https://as-{}.test", Uuid::now_v7().simple());
         let redirect = "https://fbx.test/v1/oauth/callback";
         let key = registration_lock_key(&issuer, redirect);
@@ -10990,7 +11032,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let org = identity::create_org(&pool, &format!("t-{}", Uuid::now_v7().simple()), None)
             .await
             .unwrap();
@@ -11169,8 +11211,10 @@ mod tests {
     /// (the 0018 NON-owner role, `GRANT`ed to the owner so SET ROLE works on any
     /// Postgres). Only then does the policy actually run, so this proves the policy
     /// logic under the REAL runtime role regardless of the base user's privilege.
-    /// Seeding runs under the audited bypass (`worker_tx`) so it works whether the
-    /// base pool is a superuser (RLS off) or the table owner under FORCE RLS.
+    /// Seeding runs under the audited bypass (`worker_tx`, on the `test_connect`
+    /// fixture pool) so it works whether the base role is a superuser (RLS skipped)
+    /// or the table owner under FORCE RLS — and the assertions below never touch
+    /// that pool, so the bypass cannot leak into what they prove.
     /// `connect()` here applies migrations 0014-0018 from scratch — a failed 0018
     /// would fail this test at `.expect("connect")` (the migration smoke check).
     #[tokio::test]
@@ -11180,7 +11224,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
 
         // Two throwaway tenants + one session + one event each.
         let a = Uuid::now_v7();
@@ -11478,7 +11522,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let (ta, sa) = seed_tenant_session(&pool).await;
         let (tb, sb) = seed_tenant_session(&pool).await;
 
@@ -11543,7 +11587,7 @@ mod tests {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
-        let pool = connect(&url, None).await.expect("connect");
+        let pool = test_connect(&url).await.expect("connect");
         let tenant = Uuid::now_v7();
         {
             let slug = format!("rls-rs-{}", tenant.simple());
