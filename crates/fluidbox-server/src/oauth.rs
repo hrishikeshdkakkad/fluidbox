@@ -25,7 +25,7 @@
 
 use crate::auth::Principal;
 use crate::error::{ApiError, ApiResult};
-use crate::seal::Sealer;
+use crate::seal::{SealCtx, SealFamily, Sealer};
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::response::Html;
@@ -151,22 +151,33 @@ pub fn canonical_resource(url: &str) -> Result<String, String> {
 /// unreadable to the AS/browser it transits), carrying the connection and
 /// the PKCE verifier — stateless, so a control-plane restart mid-dance
 /// changes nothing.
-pub fn seal_state(sealer: &Sealer, connection_id: Uuid, verifier: &str) -> String {
+pub async fn seal_state(
+    sealer: &Sealer,
+    connection_id: Uuid,
+    verifier: &str,
+) -> Result<String, String> {
     let payload = json!({
         "c": connection_id,
         "v": verifier,
         "x": Utc::now().timestamp() + STATE_TTL_SECS,
     });
-    b64url(&sealer.seal(&payload.to_string()))
+    // Transit-token sealing (self-describing) — survives a KMS mode flip within
+    // the dance's short TTL; see `Sealer::seal_token`.
+    let sealed = sealer
+        .seal_token(&payload.to_string())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(b64url(&sealed))
 }
 
-pub fn open_state(sealer: &Sealer, state_param: &str) -> Result<(Uuid, String), String> {
+pub async fn open_state(sealer: &Sealer, state_param: &str) -> Result<(Uuid, String), String> {
     use base64::Engine;
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(state_param)
         .map_err(|_| "malformed state parameter")?;
     let plain = sealer
-        .open(&raw)
+        .open_token(&raw)
+        .await
         .map_err(|_| "state parameter failed verification")?;
     let v: Value = serde_json::from_str(&plain).map_err(|_| "state parameter is corrupt")?;
     let exp = v["x"].as_i64().ok_or("state parameter is corrupt")?;
@@ -418,11 +429,19 @@ async fn resolve_client(
     // any other: sealed, never echoed.
     if let Some(secret) = v["client_secret"].as_str() {
         if let Some(sealer) = &state.sealer {
+            let sealed = sealer
+                .seal(
+                    secret,
+                    SealCtx::new(scope.tenant_id(), SealFamily::ConnectionClientSecret),
+                )
+                .await
+                .map_err(|e| format!("failed to seal client secret: {e}"))?;
             fluidbox_db::set_connection_client_secret(
                 &state.pool,
                 scope,
                 conn_id,
-                &sealer.seal(secret),
+                &sealed.bytes,
+                sealed.key_version,
             )
             .await
             .map_err(|e| format!("failed to store client secret: {e}"))?;
@@ -516,7 +535,9 @@ pub async fn start_dance(
     fluidbox_db::update_connection_oauth(&state.pool, scope, conn.id, &oauth).await?;
 
     let verifier = random_urlsafe();
-    let state_param = seal_state(sealer_ref, conn.id, &verifier);
+    let state_param = seal_state(sealer_ref, conn.id, &verifier)
+        .await
+        .map_err(ApiError::Internal)?;
     let mut url = reqwest::Url::parse(&meta.authorization_endpoint)
         .map_err(|_| ApiError::BadRequest("AS authorization_endpoint is not a valid URL".into()))?;
     url.query_pairs_mut()
@@ -651,7 +672,7 @@ pub async fn callback(
             "Missing state parameter.",
         );
     };
-    let (conn_id, verifier) = match open_state(sealer_ref, state_param) {
+    let (conn_id, verifier) = match open_state(sealer_ref, state_param).await {
         Ok(v) => v,
         Err(e) => return page(StatusCode::BAD_REQUEST, "Connection failed", &e),
     };
@@ -748,12 +769,18 @@ async fn complete_dance(
         .timeout(HTTP_TIMEOUT)
         .header("content-type", "application/x-www-form-urlencoded")
         .body(form_body(&form));
-    if let Some(sealed) = fluidbox_db::connection_client_secret_sealed(&state.pool, scope, conn.id)
-        .await
-        .map_err(|e| format!("client secret lookup failed: {e}"))?
+    if let Some((sealed, kv)) =
+        fluidbox_db::connection_client_secret_sealed(&state.pool, scope, conn.id)
+            .await
+            .map_err(|e| format!("client secret lookup failed: {e}"))?
     {
         let secret = sealer_ref
-            .open(&sealed)
+            .open(
+                &sealed,
+                kv,
+                SealCtx::new(scope.tenant_id(), SealFamily::ConnectionClientSecret),
+            )
+            .await
             .map_err(|_| "client secret unseal failed")?;
         req = req.basic_auth(client_id, Some(secret));
     }
@@ -816,6 +843,17 @@ async fn complete_dance(
     if let Some(o) = clean.as_object_mut() {
         o.remove("error");
     }
+    // Seal the rotating refresh token BEFORE entering the advisory-lock critical
+    // section: in KMS mode the seal may mint/unwrap this tenant's DEK on a
+    // SEPARATE pooled connection, which must not run while the lock's connection
+    // is held (the same fixed-pool hazard the activation UPDATE routes around).
+    let sealed_refresh = sealer_ref
+        .seal(
+            refresh,
+            SealCtx::new(scope.tenant_id(), SealFamily::ConnectionCredential),
+        )
+        .await
+        .map_err(|e| format!("failed to seal refresh token: {e}"))?;
 
     // Serialize the activation against the refresh path (R3.2): acquire the SAME
     // per-connection in-process mutex + Postgres advisory lock `ensure_access_token`
@@ -850,7 +888,8 @@ async fn complete_dance(
             &mut *tx,
             scope,
             conn.id,
-            &sealer_ref.seal(refresh),
+            &sealed_refresh.bytes,
+            sealed_refresh.key_version,
             &clean,
             &json!(granted),
         )
@@ -1062,12 +1101,17 @@ async fn refresh_access_token(
     // The connection row is already resolved and trusted (the broker fetched it
     // under the run's scope); derive the scope from its own tenant.
     let scope = fluidbox_db::TenantScope::assume(conn.tenant_id);
-    let sealed = fluidbox_db::connection_credential_sealed(&mut *db, scope, conn.id)
+    let (sealed, kv) = fluidbox_db::connection_credential_sealed(&mut *db, scope, conn.id)
         .await
         .map_err(|e| format!("credential lookup failed: {e}"))?
         .ok_or("connection is not active — reconnect it in Connections")?;
     let refresh = sealer_ref
-        .open(&sealed)
+        .open(
+            &sealed,
+            kv,
+            SealCtx::new(conn.tenant_id, SealFamily::ConnectionCredential),
+        )
+        .await
         .map_err(|_| "refresh token unseal failed (credential key rotated?) — reconnect")?;
     let oauth = conn.oauth.clone().unwrap_or_else(|| json!({}));
     let token_endpoint = oauth
@@ -1094,13 +1138,18 @@ async fn refresh_access_token(
         .timeout(HTTP_TIMEOUT)
         .header("content-type", "application/x-www-form-urlencoded")
         .body(form_body(&form));
-    if let Some(sealed_secret) =
+    if let Some((sealed_secret, cs_kv)) =
         fluidbox_db::connection_client_secret_sealed(&mut *db, scope, conn.id)
             .await
             .map_err(|e| format!("client secret lookup failed: {e}"))?
     {
         let secret = sealer_ref
-            .open(&sealed_secret)
+            .open(
+                &sealed_secret,
+                cs_kv,
+                SealCtx::new(conn.tenant_id, SealFamily::ConnectionClientSecret),
+            )
+            .await
             .map_err(|_| "client secret unseal failed")?;
         req = req.basic_auth(client_id, Some(secret));
     }
@@ -1137,25 +1186,34 @@ async fn refresh_access_token(
         .to_string();
     let expires_in = v["expires_in"].as_i64().unwrap_or(3600);
     if let Some(new_refresh) = v["refresh_token"].as_str() {
-        if new_refresh != refresh
-            && !fluidbox_db::rotate_connection_refresh(
+        if new_refresh != refresh {
+            let sealed_new = sealer_ref
+                .seal(
+                    new_refresh,
+                    SealCtx::new(conn.tenant_id, SealFamily::ConnectionCredential),
+                )
+                .await
+                .map_err(|e| format!("failed to seal rotated refresh token: {e}"))?;
+            if !fluidbox_db::rotate_connection_refresh(
                 &mut *db,
                 scope,
                 conn.id,
-                &sealer_ref.seal(new_refresh),
+                &sealed_new.bytes,
+                sealed_new.key_version,
                 conn.authorization_generation,
             )
             .await
             .map_err(|e| format!("rotation persist failed: {e}"))?
-        {
-            // 0 rows: the connection was revoked/errored OR reauthorized (its
-            // generation moved) beneath this in-flight refresh (R3.2). The token
-            // just minted rides a grant that is no longer current — evict and
-            // fail closed rather than persist a rotated OLD refresh token that
-            // would restore a superseded grant. The caller retries and re-mints
-            // under the new generation.
-            invalidate_access(state, conn.id).await;
-            return Err("connection was reauthorized during refresh — retry".into());
+            {
+                // 0 rows: the connection was revoked/errored OR reauthorized (its
+                // generation moved) beneath this in-flight refresh (R3.2). The token
+                // just minted rides a grant that is no longer current — evict and
+                // fail closed rather than persist a rotated OLD refresh token that
+                // would restore a superseded grant. The caller retries and re-mints
+                // under the new generation.
+                invalidate_access(state, conn.id).await;
+                return Err("connection was reauthorized during refresh — retry".into());
+            }
         }
     }
     // Re-verify the binding is STILL the one we entered with, INDEPENDENT of
@@ -1226,12 +1284,12 @@ mod tests {
         assert_eq!(known_oauth_error("access_denied"), "access_denied");
     }
 
-    #[test]
-    fn state_roundtrip_tamper_and_expiry() {
+    #[tokio::test]
+    async fn state_roundtrip_tamper_and_expiry() {
         let s = test_sealer();
         let cid = Uuid::now_v7();
-        let tok = seal_state(&s, cid, "verifier-123");
-        let (got_cid, got_v) = open_state(&s, &tok).unwrap();
+        let tok = seal_state(&s, cid, "verifier-123").await.unwrap();
+        let (got_cid, got_v) = open_state(&s, &tok).await.unwrap();
         assert_eq!(got_cid, cid);
         assert_eq!(got_v, "verifier-123");
         // Opaque: the verifier is not readable from the parameter.
@@ -1240,20 +1298,23 @@ mod tests {
         let mut chars: Vec<char> = tok.chars().collect();
         let mid = chars.len() / 2;
         chars[mid] = if chars[mid] == 'A' { 'B' } else { 'A' };
-        assert!(open_state(&s, &chars.into_iter().collect::<String>()).is_err());
+        assert!(open_state(&s, &chars.into_iter().collect::<String>())
+            .await
+            .is_err());
         // Garbage and wrong-key states fail closed.
-        assert!(open_state(&s, "not-base64!!").is_err());
+        assert!(open_state(&s, "not-base64!!").await.is_err());
         let other = Sealer::from_key_string(&"cd".repeat(32)).unwrap();
-        assert!(open_state(&other, &tok).is_err());
+        assert!(open_state(&other, &tok).await.is_err());
         // Expired states are refused.
         let stale = {
             use base64::Engine;
             let payload = serde_json::json!({
                 "c": cid, "v": "x", "x": Utc::now().timestamp() - 1,
             });
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s.seal(&payload.to_string()))
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(s.seal_token(&payload.to_string()).await.unwrap())
         };
-        let err = open_state(&s, &stale).unwrap_err();
+        let err = open_state(&s, &stale).await.unwrap_err();
         assert!(err.contains("too long"));
     }
 

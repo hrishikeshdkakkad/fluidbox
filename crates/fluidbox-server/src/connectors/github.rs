@@ -343,11 +343,21 @@ async fn unsealed_credential(
         .as_ref()
         .ok_or("FLUIDBOX_CREDENTIAL_KEY not configured")?;
     let scope = fluidbox_db::TenantScope::assume(conn.tenant_id);
-    let sealed = fluidbox_db::connection_credential_sealed(&state.pool, scope, conn.id)
+    let (sealed, kv) = fluidbox_db::connection_credential_sealed(&state.pool, scope, conn.id)
         .await
         .map_err(|e| format!("credential lookup failed: {e}"))?
         .ok_or("connection is not active (revoked or missing)")?;
-    sealer.open(&sealed).map_err(|e| e.to_string())
+    sealer
+        .open(
+            &sealed,
+            kv,
+            crate::seal::SealCtx::new(
+                conn.tenant_id,
+                crate::seal::SealFamily::ConnectionCredential,
+            ),
+        )
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Mint (or reuse) the installation access token for an App connection.
@@ -412,7 +422,7 @@ pub async fn installation_token(
                 .sealer
                 .as_ref()
                 .ok_or("FLUIDBOX_CREDENTIAL_KEY not configured")?;
-            let sealed =
+            let (sealed, kv) =
                 fluidbox_db::github_app_registration_pem_sealed(&state.pool, scope, reg.id)
                     .await
                     .map_err(|e| format!("registration key lookup failed: {e}"))?
@@ -421,7 +431,20 @@ pub async fn installation_token(
                 .app_id
                 .clone()
                 .ok_or("github app registration is incomplete")?;
-            (app_id, sealer.open(&sealed).map_err(|e| e.to_string())?)
+            (
+                app_id,
+                sealer
+                    .open(
+                        &sealed,
+                        kv,
+                        crate::seal::SealCtx::new(
+                            reg.tenant_id,
+                            crate::seal::SealFamily::GithubAppPem,
+                        ),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?,
+            )
         }
         None => {
             let app_id = app_metadata(&conn, "app_id")?.to_string();

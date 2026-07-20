@@ -19,7 +19,7 @@ use crate::auth::Principal;
 use crate::connectors;
 use crate::error::{ApiError, ApiResult};
 use crate::rbac;
-use crate::seal::Sealer;
+use crate::seal::{SealCtx, SealFamily, Sealer};
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::Json;
@@ -283,12 +283,23 @@ async fn create_mcp_http(
                 oauth["client_id"] = json!(cid);
                 oauth["client_id_source"] = json!("preregistered");
             }
-            let sealed_secret = req
+            let sealed_secret = match req
                 .client_secret
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(|s| sealer.seal(s));
+            {
+                Some(s) => Some(
+                    sealer
+                        .seal(
+                            s,
+                            SealCtx::new(scope.tenant_id(), SealFamily::ConnectionClientSecret),
+                        )
+                        .await?,
+                ),
+                None => None,
+            };
+            let (cs_bytes, cs_kv) = crate::seal::Sealed::split(&sealed_secret);
             let row = fluidbox_db::create_connection(
                 &state.pool,
                 scope,
@@ -296,15 +307,18 @@ async fn create_mcp_http(
                 &host,
                 req.display_name.as_deref().unwrap_or(&host),
                 None,
+                1,
                 &json!([]),
                 &json!({}),
                 &json!({ "base_url": base_url }),
                 None,
+                1,
                 fluidbox_db::ConnectionAuth {
                     auth_kind: "oauth",
                     status: "pending",
                     oauth: Some(&oauth),
-                    client_secret_sealed: sealed_secret.as_deref(),
+                    client_secret_sealed: cs_bytes,
+                    client_secret_key_version: cs_kv,
                     registration_id: None,
                 },
                 owner.owner,
@@ -385,18 +399,25 @@ pub(crate) async fn create_mcp_http_connection(
             metadata["scheme"] = json!(s);
         }
     }
-    let sealed = sealer.seal(token);
+    let sealed = sealer
+        .seal(
+            token,
+            SealCtx::new(scope.tenant_id(), SealFamily::ConnectionCredential),
+        )
+        .await?;
     Ok(fluidbox_db::create_connection(
         &state.pool,
         scope,
         "mcp_http",
         &host,
         req.display_name.as_deref().unwrap_or(&host),
-        Some(&sealed),
+        Some(&sealed.bytes),
+        sealed.key_version,
         &json!([]),
         &json!({}),
         &metadata,
         None,
+        1,
         fluidbox_db::ConnectionAuth::static_active(),
         owner.owner,
         owner.created_by_user_id,
@@ -421,18 +442,25 @@ async fn create_github_pat(
         .await
         .map_err(ApiError::BadRequest)?;
 
-    let sealed = sealer.seal(token);
+    let sealed = sealer
+        .seal(
+            token,
+            SealCtx::new(scope.tenant_id(), SealFamily::ConnectionCredential),
+        )
+        .await?;
     let row = fluidbox_db::create_connection(
         &state.pool,
         scope,
         &req.provider,
         &account_id,
         req.display_name.as_deref().unwrap_or(&login),
-        Some(&sealed),
+        Some(&sealed.bytes),
+        sealed.key_version,
         &serde_json::to_value(&scopes)?,
         &json!({}),
         &json!({ "login": login }),
         None,
+        1,
         fluidbox_db::ConnectionAuth::static_active(),
         owner.owner,
         owner.created_by_user_id,
@@ -477,8 +505,18 @@ async fn create_github_app(
         .unwrap_or("unknown")
         .to_string();
 
-    let sealed_key = sealer.seal(&private_key);
-    let sealed_webhook = sealer.seal(&webhook_secret);
+    let sealed_key = sealer
+        .seal(
+            &private_key,
+            SealCtx::new(scope.tenant_id(), SealFamily::ConnectionCredential),
+        )
+        .await?;
+    let sealed_webhook = sealer
+        .seal(
+            &webhook_secret,
+            SealCtx::new(scope.tenant_id(), SealFamily::ConnectionWebhookSecret),
+        )
+        .await?;
     let row = match fluidbox_db::create_connection(
         &state.pool,
         scope,
@@ -487,11 +525,13 @@ async fn create_github_app(
         req.display_name
             .as_deref()
             .unwrap_or(&format!("{app_slug} → {account}")),
-        Some(&sealed_key),
+        Some(&sealed_key.bytes),
+        sealed_key.key_version,
         &json!([]),
         &json!({}),
         &metadata,
-        Some(&sealed_webhook),
+        Some(&sealed_webhook.bytes),
+        sealed_webhook.key_version,
         fluidbox_db::ConnectionAuth::static_active(),
         // github_app connections are ALWAYS organization-owned (system custody);
         // `resolve_owner` has already refused a `personal` request for this
