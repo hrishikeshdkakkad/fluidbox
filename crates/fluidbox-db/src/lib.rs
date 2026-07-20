@@ -8191,6 +8191,80 @@ mod tests {
             .is_empty());
     }
 
+    /// Run migration 0013's legacy-bundle conversion RLS-BOUND — the ONLY
+    /// sanctioned way for a test to invoke it (see the source guard
+    /// `conversion_is_only_ever_invoked_rls_bound`).
+    ///
+    /// WHY (CI round 4, #32). The conversion is a deliberately tenant-LESS
+    /// maintenance scan — `for v_agent in select id, tenant_id from agents` — and it
+    /// allocates each appended revision's `rev` from a per-agent counter seeded by
+    /// the current `max(rev)`. Called bare on the shared test database it therefore
+    /// converts EVERY other test's agents as well as its own, and two calls in
+    /// flight at the same moment both read `max(rev) = 1` and both insert rev 2: the
+    /// loser waits on `agent_revisions_agent_id_rev_key` and dies with 23505. That
+    /// is exactly how CI failed — the three conversion tests all ran within 300 ms
+    /// of each other and one of them had its own agent converted out from under it.
+    ///
+    /// The confinement has to be RLS, because the function takes no tenant
+    /// argument. A DEDICATED connection `SET ROLE`s to migration 0018's runtime role
+    /// — CI's base user is the SUPERUSER `postgres`, for whom Postgres skips every
+    /// policy, so the `SET ROLE` is what makes the policy run at all — and then sets
+    /// `fluidbox.tenant_id`. The function is SECURITY INVOKER, so every read and
+    /// write inside it is policy-filtered to `tenant`: a test can now only ever
+    /// convert its own throwaway org, whatever else is running beside it.
+    ///
+    /// The connection is dedicated, never borrowed from the fixture pool, because
+    /// `SET ROLE` is SESSION state and would ride a pooled connection back to the
+    /// next borrower.
+    ///
+    /// `tenant: None` sets NO GUC at all. That is used once, on purpose, to prove
+    /// the degraded mode of a GUC-less caller: zero visible `agents` rows means the
+    /// loop body never runs, so the conversion is a silent NO-OP rather than a
+    /// miscomputed append.
+    async fn convert_legacy_bundles_rls_bound(url: &str, tenant: Option<Uuid>) {
+        use sqlx::{Connection, Executor};
+        let mut conn = sqlx::PgConnection::connect(url)
+            .await
+            .expect("conversion connection");
+        conn.execute("set role fluidbox_runtime")
+            .await
+            .expect("set role fluidbox_runtime (migration 0018 creates + grants it)");
+        let mut tx = conn.begin().await.expect("begin conversion tx");
+        if let Some(t) = tenant {
+            sqlx::query("select set_config('fluidbox.tenant_id', $1, true)")
+                .bind(t.to_string())
+                .execute(&mut *tx)
+                .await
+                .expect("tenant guc");
+        }
+        sqlx::query("select fluidbox_convert_legacy_bundles()")
+            .execute(&mut *tx)
+            .await
+            .expect("conversion");
+        tx.commit().await.expect("commit conversion tx");
+        conn.close().await.ok();
+    }
+
+    /// Source guard for the CI-round-4 class (#32). The conversion is tenant-less
+    /// and races on `max(rev)`, so ANY caller outside
+    /// `convert_legacy_bundles_rls_bound` reintroduces the cross-test collision.
+    /// This is a source assertion, not a DB test: it runs even without
+    /// `DATABASE_URL`, so a re-added bare caller fails CI immediately instead of
+    /// flaking. The needle is assembled from two halves so this guard is not itself
+    /// an occurrence of it.
+    #[test]
+    fn conversion_is_only_ever_invoked_rls_bound() {
+        let needle = concat!("select fluidbox_convert_legacy", "_bundles()");
+        let n = include_str!("lib.rs").matches(needle).count();
+        assert_eq!(
+            n, 1,
+            "`{needle}` must appear exactly ONCE in fluidbox-db (inside \
+             convert_legacy_bundles_rls_bound) — found {n}. Route the new call through that \
+             helper: a bare pool call converts every other test's agents and races them for \
+             the next rev (23505 on agent_revisions_agent_id_rev_key)."
+        );
+    }
+
     /// Migration 0013 appendix (`fluidbox_convert_legacy_bundles`): a legacy
     /// agent whose LATEST revision pins a brokered bundle gets an APPENDED
     /// sandbox-only revision whose brokered servers became
@@ -8358,11 +8432,10 @@ mod tests {
         .await
         .unwrap();
 
-        // ── Convert (the DB test calls the function 0013 defined + already ran) ──
-        sqlx::query("select fluidbox_convert_legacy_bundles()")
-            .execute(&pool)
-            .await
-            .unwrap();
+        // ── Convert (the DB test calls the function 0013 defined + already ran),
+        // RLS-BOUND and confined to this org so it cannot reach — or race — the
+        // other conversion tests' agents. ──
+        convert_legacy_bundles_rls_bound(&url, Some(org.id)).await;
 
         let latest = latest_revision(&pool, scope, agent.id)
             .await
@@ -8375,10 +8448,7 @@ mod tests {
         let revs_after = list_revisions(&pool, scope, agent.id).await.unwrap();
 
         // Idempotence: a SECOND call must not append again.
-        sqlx::query("select fluidbox_convert_legacy_bundles()")
-            .execute(&pool)
-            .await
-            .unwrap();
+        convert_legacy_bundles_rls_bound(&url, Some(org.id)).await;
         let revs_after2 = list_revisions(&pool, scope, agent.id).await.unwrap();
         let latest2 = latest_revision(&pool, scope, agent.id)
             .await
@@ -8508,8 +8578,12 @@ mod tests {
     /// agent in the same call also converts (both get new revisions); (d) an
     /// agent with NO subscription converts cleanly (nothing to repoint); (e) an
     /// unresolvable BundleRef object AND a non-numeric `name@abc` string pin
-    /// (Finding 3) are both dropped without aborting, the other pins converting.
-    /// One conversion call; throwaway org; children-first cleanup BEFORE asserts.
+    /// (Finding 3) are both dropped without aborting, the other pins converting;
+    /// (f) the RLS degraded mode — the same function on an RLS-bound connection with
+    /// NO GUC converts NOTHING (a silent no-op, never a partial append).
+    /// One conversion call (RLS-bound, confined to this org — see
+    /// `convert_legacy_bundles_rls_bound`); throwaway org; children-first cleanup
+    /// BEFORE asserts.
     #[tokio::test]
     async fn convert_legacy_bundles_covers_skip_dedup_multiagent_and_unresolvable() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
@@ -8668,11 +8742,26 @@ mod tests {
         .await
         .unwrap();
 
-        // ── One conversion call processes BOTH agents (c). ──
-        sqlx::query("select fluidbox_convert_legacy_bundles()")
-            .execute(&pool)
+        // ── (f) GUC guard, asserted below: the SAME function on an RLS-BOUND
+        // connection with NEITHER GUC set sees zero `agents` rows, so its loop body
+        // never runs and it converts NOTHING. Pinning that here keeps the degraded
+        // mode honest — a GUC-less caller is a silent NO-OP, never a partial or
+        // miscomputed append — and proves the confinement below is real RLS rather
+        // than coincidence. ──
+        convert_legacy_bundles_rls_bound(&url, None).await;
+        let revs_a_gucless = list_revisions(&pool, scope, agent_a.id)
             .await
-            .unwrap();
+            .unwrap()
+            .len();
+        let revs_b_gucless = list_revisions(&pool, scope, agent_b.id)
+            .await
+            .unwrap()
+            .len();
+
+        // ── One conversion call processes BOTH agents (c) — RLS-BOUND and confined
+        // to this org, so it can neither reach nor race the other conversion
+        // tests' agents (they are in their own throwaway orgs). ──
+        convert_legacy_bundles_rls_bound(&url, Some(org.id)).await;
 
         let latest_a = latest_revision(&pool, scope, agent_a.id)
             .await
@@ -8706,6 +8795,15 @@ mod tests {
             .unwrap();
 
         // ── Asserts ──
+        // (f) The GUC-less call converted NOTHING: both agents still stood at their
+        // single seed revision when the confined call ran. This is the fail-closed
+        // direction of the RLS contract — invisible rows mean no work, not wrong work.
+        assert_eq!(
+            (revs_a_gucless, revs_b_gucless),
+            (1, 1),
+            "a GUC-less conversion must be a silent NO-OP (RLS hides every agent row)"
+        );
+
         // (c) BOTH agents converted in the single call — each has exactly two
         // revisions, the new one appended at rev+1.
         assert_eq!(revs_a.len(), 2, "agent A converted (rev appended)");
@@ -9014,11 +9112,11 @@ mod tests {
             mk_float(agent_r.id, "float-empty", Some(serde_json::json!([]))).await;
         let sub_float_null = mk_float(agent_r.id, "float-null", None).await;
 
-        // ── Convert, then re-convert for idempotence (v). ──
-        sqlx::query("select fluidbox_convert_legacy_bundles()")
-            .execute(&pool)
-            .await
-            .unwrap();
+        // ── Convert, then re-convert for idempotence (v). RLS-BOUND and confined to
+        // this org: the fixtures below are built across several statements, and an
+        // unconfined conversion from a sibling test could otherwise repoint them
+        // mid-build (or race this call for the next rev). ──
+        convert_legacy_bundles_rls_bound(&url, Some(org.id)).await;
 
         let p_revs = list_revisions(&pool, scope, agent_p.id).await.unwrap();
         let p_latest = latest_revision(&pool, scope, agent_p.id)
@@ -9069,10 +9167,7 @@ mod tests {
             .unwrap();
 
         // Idempotence: a second run appends nothing and moves no pin.
-        sqlx::query("select fluidbox_convert_legacy_bundles()")
-            .execute(&pool)
-            .await
-            .unwrap();
+        convert_legacy_bundles_rls_bound(&url, Some(org.id)).await;
         let p_revs2 = list_revisions(&pool, scope, agent_p.id).await.unwrap();
         let q_revs2 = list_revisions(&pool, scope, agent_q.id).await.unwrap();
         let r_revs2 = list_revisions(&pool, scope, agent_r.id).await.unwrap();
