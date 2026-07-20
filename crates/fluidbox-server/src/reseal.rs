@@ -5,7 +5,7 @@
 //! before the flip is still a v1 (legacy) blob. Retiring `FLUIDBOX_CREDENTIAL_KEY`
 //! is only safe once ZERO v1 blobs remain (the D4 boot gate in
 //! `seal::check_retirement_gates` refuses otherwise). This module is the bridge:
-//! a resumable, CAS-guarded job that walks all twelve sealed families, unseals
+//! a resumable, CAS-guarded job that walks all thirteen sealed families, unseals
 //! each v1 blob and re-seals it v2 under the row's per-tenant DEK (deployment-
 //! global rows re-seal under the deployment tenant's DEK), plus the operator
 //! endpoints that start it and report count parity.
@@ -58,7 +58,7 @@ use zeroize::Zeroizing;
 /// EVERY field is a compile-time constant — the `fluidbox-db` layer builds its
 /// `format!` SQL from these (never request data), which is exactly why that SQL is
 /// injection-safe. This array IS the re-seal coverage set; it must stay in lockstep
-/// with the twelve families `system_worker::sealed_key_version_counts` counts (a
+/// with the thirteen families `system_worker::sealed_key_version_counts` counts (a
 /// unit test enforces the `table.column` ↔ `SealFamily` correspondence).
 struct Family {
     table: &'static str,
@@ -131,6 +131,17 @@ const FAMILIES: &[Family] = &[
         version_column: "pkce_verifier_key_version",
         key_column: "id",
         seal_family: SealFamily::LoginPkceVerifier,
+    },
+    // The connector-OAuth-dance PKCE verifier (Phase D Task 4) — structurally the
+    // twin of login_flows above: an ephemeral, tenant-owned, `id`-keyed flow row
+    // whose sealed verifier is envelope-native. Counted + walked in lockstep so a
+    // v1 in-flight flow row cannot escape the re-seal job or the D4 retirement gate.
+    Family {
+        table: "connector_oauth_flows",
+        column: "pkce_verifier_sealed",
+        version_column: "pkce_verifier_key_version",
+        key_column: "id",
+        seal_family: SealFamily::OauthFlowPkceVerifier,
     },
     // Deployment-global (tenant_id NULL) — Task 3. `reseal_one` resolves the NULL
     // tenant to the deployment tenant's DEK via `Sealer::row_ctx`.
@@ -599,10 +610,11 @@ mod tests {
 
     #[test]
     fn families_cover_all_sealed_columns() {
-        // Nine tenant-owned families + Task 3's two deployment-global
-        // oauth_client_registrations columns + Task 5's tenant_llm_keys. MUST match
-        // system_worker::sealed_key_version_counts (both feed the retirement gate).
-        assert_eq!(FAMILIES.len(), 12, "one entry per sealed column");
+        // Ten tenant-owned families (incl. both PKCE-verifier flow twins) + Task 3's
+        // two deployment-global oauth_client_registrations columns + Task 5's
+        // tenant_llm_keys. MUST match system_worker::sealed_key_version_counts (both
+        // feed the retirement gate).
+        assert_eq!(FAMILIES.len(), 13, "one entry per sealed column");
         for f in FAMILIES {
             // The SealFamily Display IS "table.column" — keep the triple coherent.
             assert_eq!(
@@ -983,13 +995,14 @@ mod tests {
         .await
         .unwrap();
 
-        // FAMILIES[9] is oauth_client_registrations.client_secret_sealed.
+        // FAMILIES[10] is oauth_client_registrations.client_secret_sealed (index 9
+        // is now connector_oauth_flows.pkce_verifier_sealed, inserted after login_flows).
         assert_eq!(
-            FAMILIES[9].seal_family.to_string(),
+            FAMILIES[10].seal_family.to_string(),
             "oauth_client_registrations.client_secret_sealed"
         );
         assert!(matches!(
-            reseal_one(&pool, &sealer, &FAMILIES[9], reg_id).await,
+            reseal_one(&pool, &sealer, &FAMILIES[10], reg_id).await,
             RowOutcome::Resealed
         ));
 

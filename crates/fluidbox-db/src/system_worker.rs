@@ -337,9 +337,11 @@ pub struct FamilyKeyVersionCounts {
 
 /// Count legacy (v1) vs envelope (v2) rows for every sealed column across ALL
 /// tenants — the D4 retirement gates' input (a cross-tenant scan, no principal).
-/// One `UNION ALL` over the twelve sealed columns (the nine tenant-owned ones,
-/// Task 3's two deployment-global `oauth_client_registrations` columns, and Task
-/// 5's `tenant_llm_keys.litellm_key_sealed`); each family filters on its own
+/// One `UNION ALL` over the thirteen sealed columns (the ten tenant-owned ones —
+/// including both PKCE-verifier flow twins, `login_flows` and
+/// `connector_oauth_flows` — Task 3's two deployment-global
+/// `oauth_client_registrations` columns, and Task 5's
+/// `tenant_llm_keys.litellm_key_sealed`); each family filters on its own
 /// `<col> is not null` so NULL secrets never count. Returns counts only, never a
 /// sealed byte. MUST stay in lockstep with `reseal::FAMILIES`, or a v1 row of an
 /// uncounted family would escape both the re-seal job AND the retirement gate and
@@ -398,6 +400,11 @@ pub async fn sealed_key_version_counts(pool: &PgPool) -> sqlx::Result<Vec<Family
                 count(*) filter (where pkce_verifier_sealed is not null and pkce_verifier_key_version = 2)
            from login_flows
          union all
+         select 'connector_oauth_flows.pkce_verifier_sealed',
+                count(*) filter (where pkce_verifier_sealed is not null and pkce_verifier_key_version = 1),
+                count(*) filter (where pkce_verifier_sealed is not null and pkce_verifier_key_version = 2)
+           from connector_oauth_flows
+         union all
          select 'oauth_client_registrations.client_secret_sealed',
                 count(*) filter (where client_secret_sealed is not null and client_secret_key_version = 1),
                 count(*) filter (where client_secret_sealed is not null and client_secret_key_version = 2)
@@ -423,10 +430,10 @@ pub async fn sealed_key_version_counts(pool: &PgPool) -> sqlx::Result<Vec<Family
 //
 // `table`/`column`/`version_column`/`key_column` in these three fns come
 // EXCLUSIVELY from the server's compile-time `reseal::FAMILIES` const array (the
-// twelve sealed `table.column` pairs). They are never request data, so the
+// thirteen sealed `table.column` pairs). They are never request data, so the
 // `format!`-built SQL is injection-safe (the values — the paging cursor, the row
 // key, the new sealed bytes — are all bound parameters). Keeping them dynamic (vs
-// twelve hand-written fns) lets one job loop walk every family; the server owns
+// thirteen hand-written fns) lets one job loop walk every family; the server owns
 // the crypto so the (table, column, SealFamily) mapping has exactly one home.
 // `AssertSqlSafe` records the promise. `key_column` is the row's stable unique key
 // the job pages/locks/CAS-writes by — `id` for every family EXCEPT

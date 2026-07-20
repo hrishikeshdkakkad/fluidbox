@@ -989,6 +989,17 @@ for f in $SEED_FAMILIES; do
   L=$(fam_legacy "$f"); E=$(fam_envelope "$f")
   { [ "$L" = 0 ] && [ "${E:-0}" -ge 1 ]; } && ok "  after: $f legacy=0 envelope=$E (flipped)" || no "  $f did not flip (legacy=$L envelope=$E)"
 done
+# The connector-OAuth-dance PKCE verifier (connector_oauth_flows.pkce_verifier_sealed)
+# is now a COUNTED + re-sealed family, in lockstep with reseal::FAMILIES (Phase D
+# review fix, #32) — it is NO LONGER "uncounted by design". The P1 dance sections
+# (d/e/f) left in-flight v1 flow rows behind; the re-seal job now walks that family
+# too and drains them to v2, so it reports zero legacy here and rides the
+# legacy_total==0 poll above. Were it still uncounted, fam_legacy would return 'NA'
+# (a stale v1 flow row would then escape BOTH the re-seal job and the D4 gate).
+CFLOW_L=$(fam_legacy "connector_oauth_flows.pkce_verifier_sealed")
+[ "$CFLOW_L" = 0 ] \
+  && ok "  after: connector_oauth_flows.pkce_verifier_sealed legacy=0 (counted + drained in lockstep)" \
+  || no "  connector_oauth_flows.pkce_verifier_sealed not drained/counted (legacy=$CFLOW_L; want 0 — 'NA' ⇒ still uncounted)"
 stop_server
 
 # ── (c/D4) Retirement gate — legacy key retires cleanly once parity is zero ────
