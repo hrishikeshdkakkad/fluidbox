@@ -35,6 +35,11 @@
 --    set fluidbox.bypass = 'system_worker'`). So the role is also POSTURE-VALIDATED
 --    below — attributes and memberships, not just existence — and boot re-validates
 --    (`connect()`), because a role can be altered after the migration ran.
+-- 4. Records the GUC contract of the pre-existing SECURITY INVOKER plpgsql
+--    functions ON THE OBJECTS themselves (section (f)). RLS changes what a function
+--    SEES, and a function that reads rows to COMPUTE a value would answer wrongly
+--    rather than fail — so section (f) audits every one of them (none miscomputes)
+--    and attaches the contract where `\df+` will show it.
 --
 -- DEPLOY ORDER — STOP THE OLD BINARY, MIGRATE, THEN DEPLOY. This is NOT a
 -- migrate-then-deploy: an old binary against a 0018 database sets no GUC and so
@@ -385,7 +390,15 @@ declare
     -- Functions the APPLICATION invokes (`select append_event(...)`). The 0013
     -- `fluidbox_convert_*` helpers are migration-only and the 0012 trigger function
     -- is fired by the engine (EXECUTE is checked when the trigger is created, not
-    -- when it fires) — neither is granted.
+    -- when it fires) — neither is re-granted here.
+    --
+    -- "Not granted here" is NOT "not executable": CREATE FUNCTION grants EXECUTE to
+    -- PUBLIC by default, and this file does not revoke it, so the runtime role can
+    -- still call the 0013 helpers. That is deliberate and not an escalation — they
+    -- are SECURITY INVOKER, so every statement inside them is filtered by the
+    -- policies above exactly like a statement the role wrote itself (see the
+    -- function comments in section (f)). fluidbox-db's conversion tests rely on
+    -- precisely that to run the conversion confined to one tenant.
     v_functions text[] := array['append_event'];
     v_missing text;
     v_absent text;
@@ -441,3 +454,42 @@ begin
         execute format('grant execute on function %s to %I', r.sig, v_role);
     end loop;
 end $$;
+
+-- ─── (f) GUC contract of the pre-existing plpgsql functions ─────────────────
+-- Every function here is SECURITY INVOKER, so its OWN reads and writes execute
+-- under the caller's role and the caller's GUCs — i.e. under the policies above.
+-- Enabling RLS therefore changes what these functions SEE, and for a function that
+-- reads rows in order to COMPUTE a value the failure mode is a wrong answer rather
+-- than an error. The audit, and why nothing here silently miscomputes:
+--
+--   • fluidbox_convert_legacy_bundles() (0013) is a tenant-LESS maintenance scan
+--     (`for v_agent in select id, tenant_id from agents`) and seeds a per-agent rev
+--     counter from `max(rev)`. Post-0018 a caller with NEITHER GUC sees zero
+--     `agents` rows, so the loop body never runs and the conversion is a silent
+--     NO-OP: it reports success and converts nothing. It cannot miscompute, because
+--     `agent_revisions` composes its PARENT's policy (section (c)) — an agent is
+--     never visible without ALL of its revisions, so the counter is always seeded
+--     from a COMPLETE max(rev), whether the caller is scoped, bypassing, or blind.
+--     A caller that sets `fluidbox.tenant_id` converts exactly that tenant; one that
+--     sets `fluidbox.bypass = 'system_worker'` reproduces the original cross-tenant
+--     semantics. No deployment has ever run it under RLS: 0013 invoked it in its own
+--     DO block, which ran BEFORE this file existed (0013 < 0018 and sqlx never
+--     re-runs an applied migration), and no application code path calls it. Anyone
+--     re-running it by hand afterwards must pick a scope — hence the comment
+--     attached to the object below, where `\df+` will show it.
+--   • append_event() (0001) reads nothing to compute its value: it row-locks the
+--     session and increments `sessions.event_seq` IN PLACE, then RAISES when that
+--     UPDATE matched no row. Under RLS a GUC-less or wrong-tenant caller therefore
+--     gets a loud `session % not found` — never a duplicate or restarted seq. Its
+--     one Rust caller already rides `scoped_tx` (fluidbox-db::append_event).
+--   • auth_audit_log_reject_mutation() (0012) only RAISEs; it reads nothing.
+--
+-- COMMENT ON is metadata only — no behaviour changes here.
+comment on function fluidbox_convert_legacy_bundles() is
+$c$Migration-0013 legacy capability-bundle conversion. SECURITY INVOKER + tenant-less scan, so post-0018 it converts only what the CALLER's RLS context can see. Run it under `set local fluidbox.bypass = 'system_worker';` for the original cross-tenant semantics, or `set local fluidbox.tenant_id = '<uuid>';` for exactly one tenant. With NEITHER GUC it is a silent no-op (zero visible agents), never a partial conversion.$c$;
+comment on function fluidbox_convert_derive(uuid, uuid, jsonb, jsonb) is
+$c$Helper of fluidbox_convert_legacy_bundles(): derives surviving sandbox pins + brokered requirements for one revision. Reads capability_bundles and connector_catalog under the CALLER's RLS context — same GUC contract as its caller.$c$;
+comment on function fluidbox_convert_append(uuid, uuid, integer, jsonb, jsonb) is
+$c$Helper of fluidbox_convert_legacy_bundles(): appends ONE converted revision at the rev the CALLER computed (0013 explains why rev assignment cannot live here). Same GUC contract as its caller.$c$;
+comment on function append_event(uuid, uuid, text, text, jsonb, timestamptz) is
+$c$Assigns the gapless per-session event seq under a row lock and pg_notify()s. SECURITY INVOKER: call it inside a tenant-scoped transaction (fluidbox-db::scoped_tx). Under RLS a session the caller cannot see makes the seq UPDATE match zero rows and the function RAISES — it never restarts or duplicates a seq.$c$;
