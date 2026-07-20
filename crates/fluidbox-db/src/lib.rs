@@ -1485,21 +1485,35 @@ pub async fn bump_connection_generation(
 /// Persist non-secret OAuth custody state (discovered endpoints, client
 /// identity, pending bundle) before the connection is activated.
 ///
+/// **Executor-generic on purpose, and the production caller MUST pass a
+/// transaction that already holds this connection's OAuth advisory lock**
+/// (`oauth::commit_start_epoch` — see `acquire_oauth_lock`). This write is the
+/// tail of a read-modify-write that spans seconds of outbound discovery HTTP:
+/// the bag it lands was assembled from a read taken BEFORE that HTTP, so it may
+/// only be committed once the caller has proven — under the same lock the
+/// activation path takes — that nothing re-authorized the connection meanwhile.
+/// Riding the caller's lock-holding transaction makes the proof and the write
+/// ONE atomic step. A standalone round trip on `&PgPool` (what this used to be)
+/// leaves a window in which a SUPERSEDED start clobbers the winner's token
+/// endpoint / client identity, so its refresh would authenticate to the wrong
+/// endpoint under the wrong client (review #32).
+///
 /// The caller's bag REPLACES the stored one — except for
 /// [`ACTIVATED_AT_KEY`], which is carried over unconditionally. That stamp is
 /// owned by [`activate_connection_oauth`] and is half of its compare-and-swap
-/// (review H2): this write is a read-modify-write in the caller (flow start
-/// reads the bag, discovers over HTTP for seconds, then writes), so an
-/// activation landing in that window would otherwise have its stamp erased by a
-/// stale bag — handing a superseded sibling flow a passing expectation.
-pub async fn update_connection_oauth(
-    pool: &PgPool,
+/// (review H2): an activation landing in the read-modify-write window would
+/// otherwise have its stamp erased by a stale bag — handing a superseded sibling
+/// flow a passing expectation. Belt-and-braces now that the write rides the
+/// lock, and the only protection left for any caller that does not.
+pub async fn update_connection_oauth<'e, E>(
+    exec: E,
     scope: TenantScope,
     id: Uuid,
     oauth: &Value,
-) -> sqlx::Result<()> {
-    let mut tx = scoped_tx(pool, scope).await?;
-
+) -> sqlx::Result<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "update integration_connections
          set oauth = case
@@ -1514,9 +1528,8 @@ pub async fn update_connection_oauth(
     .bind(id)
     .bind(oauth)
     .bind(scope.tenant_id())
-    .execute(&mut *tx)
+    .execute(exec)
     .await?;
-    tx.commit().await?;
     Ok(())
 }
 
@@ -7757,10 +7770,12 @@ mod tests {
             Some(b"sealed-rt-1".as_slice()),
             "the superseded sibling left the winner's refresh token untouched"
         );
-        // H2: a concurrent flow START rewrites the oauth bag from a value it read
-        // BEFORE the activation. The activation stamp must survive that
-        // read-modify-write — erasing it would hand the superseded sibling a
-        // passing expectation.
+        // H2: a flow START rewrites the oauth bag from a value it read BEFORE the
+        // activation. The activation stamp must survive that read-modify-write —
+        // erasing it would hand the superseded sibling a passing expectation.
+        // In production this write now rides the start's lock-holding transaction
+        // (#32), so the carry-over is belt-and-braces there; it stays the ONLY
+        // protection for a caller that passes a bare pool, as here.
         update_connection_oauth(
             &pool,
             scope,

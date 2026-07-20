@@ -887,7 +887,7 @@ pub async fn start_dance(
     // row's `created_at` is NOT this instant: it is stamped seconds later, after
     // those round trips, so an attempt that began BEFORE a sibling's successful
     // activation would otherwise mint a flow row that POST-DATES that activation
-    // and sail through the activation CAS. See `verify_start_epoch`.
+    // and sail through the activation CAS. See `commit_start_epoch`.
     let started_with = StartExpectation::of(&conn);
     if conn.auth_kind != "oauth" {
         return Err(ApiError::BadRequest(
@@ -1006,23 +1006,16 @@ pub async fn start_dance(
 
     // THE COMMIT POINT for this attempt (review: start-epoch race). Nothing the
     // attempt produced is honored until the connection is proven un-reauthorized
-    // since `started_with`. A refusal burns the flow row we just inserted AND
-    // skips the custody write below, so a superseded attempt leaves neither a
-    // usable flow nor a repointed connection.
-    if let Err(refusal) = verify_start_epoch(state, scope, conn.id, started_with).await {
+    // since `started_with` — and the custody bag write RIDES THAT PROOF'S
+    // TRANSACTION, under the same advisory lock, so the two are ONE atomic step.
+    // A refusal burns the flow row we just inserted and writes nothing, so a
+    // superseded attempt leaves neither a usable flow nor a repointed connection.
+    if let Err(refusal) =
+        commit_start_epoch(&state.pool, scope, conn.id, started_with, &oauth).await
+    {
         burn_flow(state, &s, &c).await?;
         return Err(refusal);
     }
-
-    // Persist the discovered custody state (idempotent re-runs overwrite with
-    // fresh endpoints; the client identity sticks). AFTER the commit point on
-    // purpose: this is a whole-bag REPLACE, and a bag that lands on a connection
-    // a sibling flow just activated would pair THAT grant's refresh token with
-    // THIS attempt's token endpoint + client identity. (The remaining exposure —
-    // an activation landing between the verification and this write — closes only
-    // with a conditional `update_connection_oauth`; see the report for the exact
-    // db-side predicate.)
-    fluidbox_db::update_connection_oauth(&state.pool, scope, conn.id, &oauth).await?;
 
     // The boot token's expiry is the row's exact `expires_at` — one TTL.
     let boot = seal_boot_token(sealer_ref, flow.id, &s, &c, flow.expires_at.timestamp())
@@ -1717,54 +1710,116 @@ fn start_expectation_moved(
     current != Some(started_with)
 }
 
+/// What the commit point does with an attempt, as a VALUE — the whole decision,
+/// pure, so "a superseded attempt writes nothing" is testable without a database.
+/// [`commit_start_epoch`] only executes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartCommit {
+    /// Nothing activated since the attempt began ⇒ persist its custody bag, in
+    /// the very transaction that proved it.
+    PersistBag,
+    /// A newer authorization landed ⇒ write NOTHING (no bag, no repointed token
+    /// endpoint or client identity) and refuse with [`SUPERSEDED_MSG`].
+    Superseded,
+}
+
+/// The commit point's decision. ONE predicate gates BOTH consequences — whether
+/// this attempt's flow row survives and whether its custody bag is persisted —
+/// so the two can never drift apart.
+fn start_commit_decision(
+    started_with: StartExpectation,
+    current: Option<StartExpectation>,
+) -> StartCommit {
+    if start_expectation_moved(started_with, current) {
+        StartCommit::Superseded
+    } else {
+        StartCommit::PersistBag
+    }
+}
+
 /// An authorization attempt's COMMIT POINT: prove the connection has not been
-/// re-authorized since [`StartExpectation`] was frozen, with the flow row already
-/// inserted.
+/// re-authorized since [`StartExpectation`] was frozen (the flow row is already
+/// inserted), and — in the SAME transaction, under the SAME lock — persist the
+/// custody bag this attempt discovered: endpoints, client identity, registration
+/// pointer.
+///
+/// **The bag write rides this transaction rather than taking its own round trip
+/// (review #32).** It is a whole-bag REPLACE closing a read-modify-write that
+/// spanned discovery, so landing it on a connection a sibling flow has just
+/// activated would pair THAT grant's refresh token with THIS attempt's token
+/// endpoint + client identity — the winner's refresh would then authenticate to
+/// the wrong client at the wrong endpoint. Guarding it with its own predicate
+/// would work, but a second guarded round trip is strictly weaker than being
+/// inside the transaction that already holds the lock: here there is no interval
+/// between the proof and the write for an activation to occupy at all.
 ///
 /// It is ordered against EVERY activation by the connection's OAuth advisory
 /// lock, which `complete_flow` holds across its activation UPDATE *and* that
-/// transaction's commit. So at this point every activation `A` is in exactly one
-/// of two classes:
+/// transaction's commit. So for a given attempt every activation `A` is in
+/// exactly one of two classes:
 ///
 ///   - `A` committed before we take the lock ⇒ our re-read OBSERVES it (`A` could
 ///     not have been mid-UPDATE without us blocking on the lock), the frozen
-///     expectation differs, and the caller refuses + burns the flow row — whose
-///     callback can then never claim it.
-///   - `A` takes the lock only after we release it ⇒ its `clock_timestamp()`
-///     activation stamp is strictly later than this read, hence later than our
-///     flow row's `created_at` (inserted before this call), so the activation CAS
-///     `activated_at < flow.created_at` refuses OUR flow.
+///     expectation differs, and we refuse — writing no bag — while the caller
+///     burns the flow row, whose callback can then never claim it.
+///   - `A` takes the lock only after we RELEASE it (at this transaction's commit,
+///     which is also when the bag lands) ⇒ its `clock_timestamp()` activation
+///     stamp is strictly later than this read, hence later than our flow row's
+///     `created_at` (inserted before this call), so the activation CAS
+///     `activated_at < flow.created_at` refuses OUR flow. `A` then writes its own
+///     bag over ours, which is the correct outcome: the newest authorization owns
+///     the connection's custody state.
 ///
-/// There is no third class, so "one activation invalidates every sibling flow"
-/// finally holds for attempts that merely BEGAN before it, not only for flow rows
-/// that already existed when it landed.
+/// There is no third class — no activation can interleave between the proof and
+/// the bag write, because they are the same transaction — so "one activation
+/// invalidates every sibling flow" finally holds for attempts that merely BEGAN
+/// before it, not only for flow rows that already existed when it landed.
 ///
 /// THIS RESTS ON: `activate_connection_oauth` is only ever called while holding
 /// `acquire_oauth_lock` for the same connection (today exactly one call site —
 /// `complete_flow`). A second, unlocked activation writer would silently reopen
 /// the race.
 ///
-/// One pooled connection at a time (lock + read + commit, nothing nested): the
-/// fixed-size-pool hazard `complete_flow`'s activation documents applies here
-/// too, so the custody write and the burn both run AFTER this transaction ends.
-async fn verify_start_epoch(
-    state: &AppState,
+/// One pooled connection at a time (lock + read + update + commit, nothing
+/// nested — no HTTP, no seal, no second acquire): the fixed-size-pool hazard
+/// `complete_flow`'s activation documents applies here too, so the burn runs
+/// AFTER this transaction ends. Lock-then-row is also the ordering every other
+/// oauth writer uses, so the extra row lock introduces no deadlock cycle.
+async fn commit_start_epoch(
+    pool: &sqlx::PgPool,
     scope: fluidbox_db::TenantScope,
     conn_id: Uuid,
     started_with: StartExpectation,
+    oauth: &Value,
 ) -> ApiResult<()> {
-    let mut tx = fluidbox_db::scoped_tx(&state.pool, scope).await?;
+    let mut tx = fluidbox_db::scoped_tx(pool, scope).await?;
     fluidbox_db::acquire_oauth_lock(&mut tx, conn_id).await?;
     let current = fluidbox_db::get_connection(&mut *tx, scope, conn_id).await?;
-    tx.commit().await?;
-    if start_expectation_moved(started_with, current.as_ref().map(StartExpectation::of)) {
-        tracing::info!(
-            connection = %conn_id,
-            "oauth start: the connection was reauthorized while this attempt was in discovery — refusing it"
-        );
-        return Err(ApiError::Conflict(SUPERSEDED_MSG.into()));
+    match start_commit_decision(started_with, current.as_ref().map(StartExpectation::of)) {
+        StartCommit::Superseded => {
+            // Release the connection explicitly before returning: the caller
+            // burns the flow row next and that needs a pooled connection this
+            // one must not still be holding. Nothing was written, so a failed
+            // rollback changes no outcome — it is logged, never allowed to
+            // replace the refusal the caller must surface.
+            if let Err(e) = tx.rollback().await {
+                tracing::warn!(error = %e, "oauth start: rollback after a superseded refusal failed");
+            }
+            tracing::info!(
+                connection = %conn_id,
+                "oauth start: the connection was reauthorized while this attempt was in discovery — refusing it"
+            );
+            Err(ApiError::Conflict(SUPERSEDED_MSG.into()))
+        }
+        StartCommit::PersistBag => {
+            // Idempotent re-runs overwrite with fresh endpoints; the client
+            // identity sticks. `update_connection_oauth` is executor-generic
+            // precisely so this rides `tx` — see its doc comment.
+            fluidbox_db::update_connection_oauth(&mut *tx, scope, conn_id, oauth).await?;
+            tx.commit().await?;
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 /// Retire a flow row this attempt inserted but must not honor, through the SAME
@@ -1978,9 +2033,10 @@ async fn complete_flow(
     // uses, so a concurrent in-flight refresh rotating the OLD grant's token can
     // never clobber the NEW grant landing here (which would restore a superseded
     // grant). THE ADVISORY LOCK IS ALSO WHAT ORDERS THIS ACTIVATION AGAINST THE
-    // START SIDE — `verify_start_epoch` takes it to prove no activation slipped
-    // under an in-flight attempt — so `activate_connection_oauth` must never be
-    // called outside this lock. Held only across the activation write + cache
+    // START SIDE — `commit_start_epoch` takes it to prove no activation slipped
+    // under an in-flight attempt AND to land that attempt's custody bag in the
+    // same transaction — so `activate_connection_oauth` must never be called
+    // outside this lock. Held only across the activation write + cache
     // update; released
     // BEFORE the photograph, which re-mints under its own lock (a nested acquire
     // of the same in-process mutex would deadlock).
@@ -2720,11 +2776,72 @@ mod tests {
         ));
     }
 
-    /// The same interleaving against real Postgres (self-skips without
-    /// `DATABASE_URL`): a sibling activation lands between S2's connection read
-    /// and S2's flow insert. Proves BOTH halves — that the CAS admits S2's row
-    /// (so the start-side check is load-bearing) and that the frozen expectation
-    /// refuses it, after which the burned flow can never be claimed.
+    /// THE CUSTODY-BAG HALF of the same race (#32). The bag write is a whole-bag
+    /// REPLACE closing a read-modify-write that spanned discovery: a superseded
+    /// attempt landing it would pair the WINNER's refresh token with the loser's
+    /// token endpoint + client identity. So the commit point's decision must be
+    /// "write nothing", from the SAME predicate that refuses the flow row — never
+    /// a second, independently-guarded write that could drift.
+    #[test]
+    fn a_superseded_attempt_persists_no_custody_bag() {
+        let t_read = DateTime::parse_from_rfc3339("2026-07-20T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let t_activate = t_read + Duration::seconds(30);
+
+        // S1 and S2 both froze a pending, never-activated connection at gen 1.
+        let s2_started = StartExpectation {
+            generation: 1,
+            activated_at: None,
+        };
+        // S1's callback activated while S2 was in discovery: first connect, so
+        // ONLY the stamp moved.
+        let after_s1 = StartExpectation {
+            generation: 1,
+            activated_at: Some(t_activate),
+        };
+        assert_eq!(
+            start_commit_decision(s2_started, Some(after_s1)),
+            StartCommit::Superseded,
+            "S2 must write NOTHING — not its endpoints, not its client identity"
+        );
+        // The winner itself still commits its own bag.
+        assert_eq!(
+            start_commit_decision(after_s1, Some(after_s1)),
+            StartCommit::PersistBag
+        );
+        // Un-raced first connect: the ordinary path still persists.
+        assert_eq!(
+            start_commit_decision(s2_started, Some(s2_started)),
+            StartCommit::PersistBag
+        );
+        // A sibling RECONNECT (which bumps) and a vanished connection are both
+        // refusals too — one predicate, both consequences.
+        assert_eq!(
+            start_commit_decision(
+                after_s1,
+                Some(StartExpectation {
+                    generation: 2,
+                    activated_at: Some(t_activate),
+                })
+            ),
+            StartCommit::Superseded
+        );
+        assert_eq!(
+            start_commit_decision(after_s1, None),
+            StartCommit::Superseded
+        );
+    }
+
+    /// The same interleaving against real Postgres, through the REAL
+    /// `commit_start_epoch` (self-skips without `DATABASE_URL`): a sibling
+    /// activation lands between S2's connection read and S2's flow insert.
+    /// Proves every half — that the CAS admits S2's row (so the start-side check
+    /// is load-bearing), that the commit point refuses S2 with `SUPERSEDED_MSG`,
+    /// that S2's custody bag is NOT persisted (the winner's token endpoint and
+    /// client identity survive byte-for-byte), and that the burned flow can never
+    /// be claimed. A positive control first proves the commit point is not
+    /// vacuously refusing.
     #[tokio::test]
     async fn db_start_epoch_race_is_refused_before_the_flow_can_be_used() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
@@ -2772,6 +2889,33 @@ mod tests {
         let s2_started = StartExpectation::of(&conn);
         assert_eq!(s2_started.activated_at, None);
 
+        // The two attempts discovered DIFFERENT authorization servers / client
+        // identities — which is the whole point: pairing S1's refresh token with
+        // S2's endpoint + client is the corruption under test.
+        let s1_bag = json!({
+            "resource": "https://mcp.example.test/mcp",
+            "token_endpoint": "https://as-1.example.test/token",
+            "client_id": "client-1",
+        });
+        let s2_bag = json!({
+            "resource": "https://mcp.example.test/mcp",
+            "token_endpoint": "https://as-2.example.test/token",
+            "client_id": "client-2",
+        });
+
+        // POSITIVE CONTROL, with S2's exact inputs: while nothing has activated,
+        // the commit point persists the bag. So a later refusal is the race, not
+        // a commit point that refuses everything.
+        commit_start_epoch(&pool, scope, conn.id, s2_started, &s2_bag)
+            .await
+            .expect("an un-raced attempt commits its custody bag");
+        let warmed = fluidbox_db::get_connection(&pool, scope, conn.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .oauth
+            .unwrap();
+
         let mk_flow = |tag: &'static str| {
             let pool = pool.clone();
             async move {
@@ -2807,8 +2951,9 @@ mod tests {
             }
         };
 
-        // S1's flow lands first and activates: first connect, so the generation
-        // deliberately stays put and only the DB-clock stamp moves.
+        // S1's flow lands first and activates, landing ITS custody bag: first
+        // connect, so the generation deliberately stays put and only the DB-clock
+        // stamp moves.
         let (f1, _, _) = mk_flow("f1").await;
         let activated = fluidbox_db::activate_connection_oauth(
             &pool,
@@ -2816,7 +2961,7 @@ mod tests {
             conn.id,
             b"sealed-refresh-1",
             1,
-            &bag,
+            &s1_bag,
             &json!([]),
             f1.expected_generation,
             f1.created_at,
@@ -2835,6 +2980,20 @@ mod tests {
 
         // The start-side verification refuses it…
         let moved = start_expectation_moved(s2_started, current.as_ref().map(StartExpectation::of));
+        // …through the REAL commit point, which in the same breath must decline
+        // to persist S2's bag (#32): one transaction, one advisory lock, so no
+        // activation can slip between the proof and the write.
+        let refusal = commit_start_epoch(&pool, scope, conn.id, s2_started, &s2_bag).await;
+        let refused_with = match &refusal {
+            Err(ApiError::Conflict(m)) => Some(m.clone()),
+            _ => None,
+        };
+        let after_refusal = fluidbox_db::get_connection(&pool, scope, conn.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .oauth
+            .unwrap();
         // …and the burn makes the row unusable for good.
         let burned = fluidbox_db::claim_connector_oauth_flow(
             &pool,
@@ -2857,7 +3016,7 @@ mod tests {
             conn.id,
             b"sealed-refresh-2",
             1,
-            &bag,
+            &s2_bag,
             &json!([]),
             f2.expected_generation,
             f2.created_at,
@@ -2876,9 +3035,35 @@ mod tests {
         }
 
         assert!(f2.created_at > f1.created_at);
+        assert_eq!(
+            warmed["token_endpoint"], "https://as-2.example.test/token",
+            "positive control: an un-raced attempt DOES persist its custody bag"
+        );
         assert!(
             moved,
             "S2 froze a never-activated connection; a sibling activated since — refuse"
+        );
+        assert_eq!(
+            refused_with.as_deref(),
+            Some(SUPERSEDED_MSG),
+            "the commit point refuses with the same wording the CAS uses"
+        );
+        // THE RESIDUAL, closed: S2 wrote NOTHING. The winner's refresh token is
+        // still paired with the winner's own token endpoint + client identity, so
+        // its refresh cannot authenticate to a superseded start's AS.
+        assert_eq!(
+            after_refusal["token_endpoint"], "https://as-1.example.test/token",
+            "a superseded start must not repoint the winner's token endpoint"
+        );
+        assert_eq!(
+            after_refusal["client_id"], "client-1",
+            "a superseded start must not repoint the winner's client identity"
+        );
+        assert!(
+            after_refusal
+                .get(fluidbox_db::ACTIVATED_AT_KEY)
+                .is_some_and(|v| !v.is_null()),
+            "the winner's activation stamp survives the refused attempt"
         );
         assert!(burned.is_some(), "the superseded flow is consumed");
         assert!(
