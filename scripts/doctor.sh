@@ -126,6 +126,53 @@ sys.exit(1)' "$cred" 2>/dev/null; then
     *) ok "LITELLM_MASTER_KEY set";;
   esac
 
+  # KMS / envelope sealing (Phase D). All hints here are non-fatal — KMS is an
+  # opt-in hardening. Variable NAMES only, never values.
+  say "KMS / envelope sealing"
+  kms_mode=$(env_get "$ENV" FLUIDBOX_KMS_MODE); kms_mode=${kms_mode:-off}
+  case "$kms_mode" in
+    off|"")
+      ok "FLUIDBOX_KMS_MODE=off (legacy single-key sealing; FLUIDBOX_CREDENTIAL_KEY seals at rest)";;
+    static)
+      ok "FLUIDBOX_KMS_MODE=static (per-tenant DEKs wrapped by a static KEK)"
+      [ -n "$(env_get "$ENV" FLUIDBOX_KMS_STATIC_KEK)" ] \
+        && ok "FLUIDBOX_KMS_STATIC_KEK set" \
+        || warn "FLUIDBOX_KMS_STATIC_KEK empty — the server will refuse to boot" "static mode needs a 32-byte KEK: openssl rand -hex 32";;
+    aws)
+      ok "FLUIDBOX_KMS_MODE=aws (per-tenant DEKs wrapped by AWS KMS)"
+      [ -n "$(env_get "$ENV" FLUIDBOX_KMS_AWS_KEY_ID)" ] \
+        && ok "FLUIDBOX_KMS_AWS_KEY_ID set" \
+        || warn "FLUIDBOX_KMS_AWS_KEY_ID empty — the server will refuse to boot" "aws mode needs the KMS key id/ARN (see docs/hosted/kms-operations.md §3 for the IAM grant)";;
+    *)
+      warn "FLUIDBOX_KMS_MODE=$kms_mode unrecognized" "expected: off | static | aws";;
+  esac
+  # Legacy (v1) parity — needs psql, a reachable DB, and migration 0014 applied.
+  if command -v psql >/dev/null 2>&1 && [ -n "${db_url:-}" ]; then
+    legacy_sql="select family||' '||legacy from (
+      select 'integration_connections.credential_sealed' as family, count(*) filter (where credential_sealed is not null and credential_key_version=1) as legacy from integration_connections
+      union all select 'integration_connections.webhook_secret_sealed', count(*) filter (where webhook_secret_sealed is not null and webhook_secret_key_version=1) from integration_connections
+      union all select 'integration_connections.client_secret_sealed', count(*) filter (where client_secret_sealed is not null and client_secret_key_version=1) from integration_connections
+      union all select 'trigger_subscriptions.callback_secret_sealed', count(*) filter (where callback_secret_sealed is not null and callback_secret_key_version=1) from trigger_subscriptions
+      union all select 'github_app_registrations.pem_sealed', count(*) filter (where pem_sealed is not null and pem_key_version=1) from github_app_registrations
+      union all select 'github_app_registrations.webhook_secret_sealed', count(*) filter (where webhook_secret_sealed is not null and webhook_secret_key_version=1) from github_app_registrations
+      union all select 'github_app_registrations.client_secret_sealed', count(*) filter (where client_secret_sealed is not null and client_secret_key_version=1) from github_app_registrations
+      union all select 'org_idp_configs.client_secret_sealed', count(*) filter (where client_secret_sealed is not null and client_secret_key_version=1) from org_idp_configs
+      union all select 'login_flows.pkce_verifier_sealed', count(*) filter (where pkce_verifier_sealed is not null and pkce_verifier_key_version=1) from login_flows
+    ) s where legacy > 0"
+    legacy_rows=$(psql "$db_url" -Atc "$legacy_sql" 2>/dev/null)
+    if [ -z "$legacy_rows" ]; then
+      : # all zero, DB unreachable, or 0014 not applied — stay quiet (non-fatal)
+    else
+      total=$(printf '%s\n' "$legacy_rows" | awk '{s+=$2} END{print s}')
+      if [ "$kms_mode" != off ]; then
+        warn "$total legacy (v1) sealed row(s) remain under KMS mode" "run the re-seal to retire FLUIDBOX_CREDENTIAL_KEY: POST /v1/admin/reseal, then GET /v1/admin/reseal until legacy_total=0 (docs/hosted/kms-operations.md §5). Per-family:"
+        printf '%s\n' "$legacy_rows" | while read -r fam n; do printf "        %s: %s\n" "$fam" "$n"; done
+      else
+        ok "$total legacy (v1) sealed row(s) — expected with KMS off"
+      fi
+    fi
+  fi
+
   if [ "$docker_up" = 1 ]; then
     say "docker images"
     sandbox_image=$(env_get "$ENV" FLUIDBOX_SANDBOX_IMAGE); sandbox_image=${sandbox_image:-fluidbox-sandbox-runner:dev}
