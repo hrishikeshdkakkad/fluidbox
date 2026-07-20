@@ -30,18 +30,21 @@ curl -s -X POST $API/v1/catalog/fx-notion/connect -H "$H" \
 # (the raw path POST /v1/connections/{id}/oauth/start likewise returns {go_url})
 ```
 
-> **An OAuth connect needs an https `FLUIDBOX_PUBLIC_URL`.** The `go_url` page binds
-> your browser to the one-time flow with a `__Host-fbx_oauth_flow` cookie, and the
-> callback refuses without it. Browsers reject `__Host-` cookies that are not
-> `Secure`, so on a stock local deployment (`FLUIDBOX_PUBLIC_URL=http://127.0.0.1:8787`)
-> the consent screen completes but the callback fails — in a **real browser**. Put the
-> control plane behind https (an ngrok/Cloudflare tunnel is enough locally) and set
-> `FLUIDBOX_PUBLIC_URL` to that https origin *before* starting the dance; it is also
-> what the provider's `redirect_uri` must match. (`curl` ignores the `__Host-` prefix
-> rule, which is why the e2e suites drive the same flow over http.) Two more reasons
-> the https origin matters: an authorization server can only fetch the CIMD client
-> document over https + non-loopback (local deployments always fall back to DCR), and
-> many providers reject an `http://` redirect_uri outright.
+> **An OAuth connect needs https or loopback for `FLUIDBOX_PUBLIC_URL`.** The
+> `go_url` page binds your browser to the one-time flow with a
+> `__Host-fbx_oauth_flow` cookie, and the callback refuses without it. That cookie
+> is always sent `Secure` — the `__Host-` prefix is *defined* as Secure + `Path=/`
+> + no Domain, and every conforming client (browsers, and `curl` since 7.87)
+> discards a `__Host-` cookie that lacks it. Loopback origins
+> (`http://127.0.0.1:8787`, the stock local default) are treated as trustworthy, so
+> `Secure` is accepted there and local dev completes; a **non-loopback plain-http**
+> origin is the one that cannot finish the dance. Put the control plane behind https
+> (an ngrok/Cloudflare tunnel is enough locally) and set `FLUIDBOX_PUBLIC_URL` to
+> that https origin *before* starting the dance; it is also what the provider's
+> `redirect_uri` must match. Two more reasons the https origin matters: an
+> authorization server can only fetch the CIMD client document over https +
+> non-loopback (local deployments always fall back to DCR), and many providers
+> reject an `http://` redirect_uri outright.
 
 A rejected api_key rolls the connection back; nothing half-connected survives. Custom entries can be added with `POST /v1/catalog` (they're forced to `tier=custom`, **tenant-scoped**, and adding one needs admin/owner — catalog data is reference data, not trust; one org's custom row is never visible or bindable to another).
 

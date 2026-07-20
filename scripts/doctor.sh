@@ -231,12 +231,15 @@ sys.exit(1)' "$cred" 2>/dev/null; then
     *)
       warn "FLUIDBOX_LLM_KEY_MODE=$llm_mode unrecognized" "expected: shared | tenant";;
   esac
-  # A REAL-browser OAuth Connect needs an https public URL: the __Host- flow cookie
-  # is dropped by browsers on http. curl-based e2e is unaffected (Task 4 review).
+  # The __Host-fbx_oauth_flow cookie is always Secure (the prefix REQUIRES it —
+  # without it browsers AND curl discard the cookie outright, which is what broke
+  # the dance before). Loopback http is fine: browsers and curl both treat
+  # localhost/127.0.0.1 as a trustworthy origin and accept Secure there. A
+  # NON-loopback plain-http origin is what actually cannot complete Connect.
   pub_url=$(env_get "$ENV" FLUIDBOX_PUBLIC_URL); pub_url=${pub_url:-http://127.0.0.1:8787}
   case "$pub_url" in
-    https://*) : ;;
-    *) warn "FLUIDBOX_PUBLIC_URL is http — a REAL-browser OAuth Connect drops the __Host-fbx_oauth_flow cookie" "local curl-based flows work; a hosted deployment needs an https FLUIDBOX_PUBLIC_URL";;
+    https://*|http://127.0.0.1*|http://localhost*|http://\[::1\]*) : ;;
+    *) warn "FLUIDBOX_PUBLIC_URL is non-loopback http — the Secure __Host-fbx_oauth_flow cookie is refused there, so OAuth Connect cannot complete" "use https (or loopback for local dev)";;
   esac
 
   if [ "$docker_up" = 1 ]; then

@@ -10532,7 +10532,19 @@ mod tests {
         let counts = crate::system_worker::sealed_key_version_counts(&pool)
             .await
             .unwrap();
-        assert_eq!(counts.len(), 9, "one row per sealed column");
+        // THIRTEEN sealed columns today (Tasks 3/4/5 added the two
+        // oauth_client_registrations twins, the connector_oauth_flows PKCE
+        // verifier, and tenant_llm_keys). `reseal::FAMILIES` is the authority and
+        // `reseal::tests::counts_and_families_cover_the_same_set` enforces
+        // set-equality with this fn; here we only pin the shape.
+        assert_eq!(counts.len(), 13, "one row per sealed column");
+        let distinct: std::collections::BTreeSet<&str> =
+            counts.iter().map(|c| c.family.as_str()).collect();
+        assert_eq!(
+            distinct.len(),
+            counts.len(),
+            "every counted family is distinct — no double-counted column"
+        );
         let cred = counts
             .iter()
             .find(|c| c.family == "integration_connections.credential_sealed")
@@ -11616,7 +11628,9 @@ mod tests {
             None,
             1,
             ConnectionAuth {
-                auth_kind: "api_key",
+                // `integration_connections_auth_kind_shape` (0013) allows only
+                // static | oauth | none; a pasted-secret connection is 'static'.
+                auth_kind: "static",
                 status: "active",
                 oauth: None,
                 client_secret_sealed: None,
