@@ -71,34 +71,100 @@ else
       if command -v psql >/dev/null 2>&1; then
         if psql "$db_url" -Atc 'select 1' >/dev/null 2>&1; then
           ok "database reachable"
-          # Is the tenant floor actually ARMED for this connection? Postgres
-          # skips RLS entirely for a SUPERUSER or a BYPASSRLS role, and role
-          # attributes are NOT inherited through membership — so "we granted
-          # the app a bound role" proves nothing about the role it connects AS.
-          # Neon's default `neon_superuser` carries BYPASSRLS, which makes
-          # migration 0018 inert. Non-fatal by default: a single-admin local
-          # deployment is not a tenant-isolation boundary. But with
-          # FLUIDBOX_REQUIRE_SSO=1 the server now REFUSES TO BOOT in exactly
-          # this state, so a warning would report "ready" for a deployment
-          # that cannot start — escalate to a failure unless the pool SET
-          # ROLEs away from this role (FLUIDBOX_RUNTIME_ROLE, which boot
-          # posture-validates as non-bypassing) or the operator accepted it
-          # (FLUIDBOX_ALLOW_RLS_BYPASS).
-          rls_attrs=$(psql "$db_url" -Atc \
-            "select current_user || ' ' || rolsuper::text || ' ' || rolbypassrls::text
-               from pg_roles where rolname = current_user" 2>/dev/null)
+          # Is the tenant floor actually ARMED for the role the SERVER runs as?
+          # Postgres skips RLS entirely for a SUPERUSER or a BYPASSRLS role, and
+          # role attributes are NOT inherited through membership — so "we granted
+          # the app a bound role" proves nothing about the role it runs AS.
+          #
+          # The boot gate (fluidbox-db::pool_role_bypasses_rls) reads the pool's
+          # EFFECTIVE role: `current_user` AFTER the `after_connect SET ROLE`, not
+          # the role in DATABASE_URL. Asking the DATABASE_URL question instead
+          # misreports BOTH ways: a Neon BYPASSRLS owner with a correct
+          # FLUIDBOX_RUNTIME_ROLE is SAFE (boot enforces) yet would be reported
+          # inert, and an RLS-bound owner with an absent/unsafe runtime role is a
+          # REFUSED BOOT yet would be reported ready. So: in runtime-role mode
+          # validate THAT role and probe it behind a SET ROLE; inspect the base
+          # connection role only in single-role mode.
+          runtime_role=$(env_get "$ENV" FLUIDBOX_RUNTIME_ROLE)
+          role_probe="select current_user || ' ' || rolsuper::text || ' ' || rolbypassrls::text
+                        from pg_roles where rolname = current_user"
+          rls_attrs=""
+          if [ -n "$runtime_role" ]; then
+            case "$runtime_role" in
+              # connect() refuses anything outside ^[a-z_][a-z0-9_]*$ before it
+              # builds the SET ROLE — and so does this probe, which interpolates
+              # the same identifier.
+              [!a-z_]*|*[!a-z0-9_]*)
+                bad "FLUIDBOX_RUNTIME_ROLE='$runtime_role' is not a valid role name — the server REFUSES TO BOOT" \
+                    "expected ^[a-z_][a-z0-9_]*\$ (<=63 chars): the name is interpolated into SET ROLE, so fluidbox fails closed rather than build injectable DDL";;
+              *)
+                # Boot's refusals, in boot's order: name -> exists -> posture -> effective role.
+                if [ "${#runtime_role}" -gt 63 ]; then
+                  bad "FLUIDBOX_RUNTIME_ROLE is ${#runtime_role} chars — the server REFUSES TO BOOT" \
+                      "shorten it to <=63 (a Postgres identifier is 63 bytes)"
+                elif [ "$(psql "$db_url" -Atc "select 1 from pg_roles where rolname = '$runtime_role'" 2>/dev/null)" != 1 ]; then
+                  bad "FLUIDBOX_RUNTIME_ROLE='$runtime_role' does not exist — the server REFUSES TO BOOT" \
+                      "migration 0018 could not CREATE it (managed hosts restrict CREATE ROLE): CREATE ROLE $runtime_role NOLOGIN; GRANT $runtime_role TO CURRENT_USER; plus the table grants in migrations/0018_rls_enforcement.sql"
+                else
+                  # Same posture questions migration 0018 and connect() ask, minus
+                  # SUPERUSER/BYPASSRLS (the effective-role probe below reports
+                  # those, with the fix the operator needs).
+                  posture=$(psql "$db_url" -Atc \
+                    "select coalesce(array_to_string(array_remove(array[
+                              case when rolcanlogin then 'LOGIN' end,
+                              case when rolcreaterole then 'CREATEROLE' end,
+                              case when rolcreatedb then 'CREATEDB' end,
+                              case when rolreplication then 'REPLICATION' end], null), ', '), '')
+                            || '|' || coalesce((select string_agg(g.rolname, ', ' order by g.rolname)
+                                                  from pg_auth_members m join pg_roles g on g.oid = m.roleid
+                                                 where m.member = r.oid), '')
+                            || '|' || coalesce((select string_agg(mm.rolname, ', ' order by mm.rolname)
+                                                  from pg_auth_members m join pg_roles mm on mm.oid = m.member
+                                                 where m.roleid = r.oid and mm.rolname <> current_user), '')
+                       from pg_roles r where r.rolname = '$runtime_role'" 2>/dev/null)
+                  unsafe="${posture%%|*}"; rest="${posture#*|}"
+                  memberof="${rest%%|*}"; grantedto="${rest#*|}"
+                  # An unreadable posture must not look like a clean one.
+                  [ -n "$posture" ] || warn "could not read the posture attributes of FLUIDBOX_RUNTIME_ROLE='$runtime_role'" \
+                    "run: psql \"\$DATABASE_URL\" -Atc \"select rolcanlogin, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb, rolreplication from pg_roles where rolname = '$runtime_role'\""
+                  [ -n "$unsafe" ] && bad "FLUIDBOX_RUNTIME_ROLE='$runtime_role' carries unsafe attribute(s): $unsafe — the server REFUSES TO BOOT" \
+                    "ALTER ROLE $runtime_role NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION; (LOGIN makes it an authenticable principal; the rest are privileges the runtime role must not hold)"
+                  [ -n "$memberof" ] && bad "FLUIDBOX_RUNTIME_ROLE='$runtime_role' is a member of $memberof, so it inherits privileges fluidbox never granted — the server REFUSES TO BOOT" \
+                    "REVOKE those memberships FROM $runtime_role, or point FLUIDBOX_RUNTIME_ROLE at a deployment-specific role"
+                  [ -n "$grantedto" ] && bad "FLUIDBOX_RUNTIME_ROLE='$runtime_role' is granted to $grantedto — those principals can SET ROLE in, set fluidbox.bypass and read EVERY tenant — the server REFUSES TO BOOT" \
+                    "REVOKE $runtime_role FROM them, or pick a deployment-specific role name (Postgres roles are cluster-global; fluidbox's grants are database-local)"
+                  # The effective role: exactly what the app pool's connections run
+                  # as. Rolled back — the probe is a read.
+                  rls_attrs=$(psql "$db_url" -Atc \
+                    "begin; set local role \"$runtime_role\"; $role_probe; rollback;" 2>/dev/null)
+                  [ -n "$rls_attrs" ] || bad "cannot SET ROLE to '$runtime_role' from the DATABASE_URL role — the app pool SET ROLEs on EVERY connection, so the server cannot start" \
+                    "GRANT $runtime_role TO CURRENT_USER; (run it as the database owner)"
+                fi;;
+            esac
+          else
+            rls_attrs=$(psql "$db_url" -Atc "$role_probe" 2>/dev/null)
+          fi
           case "${rls_attrs:-}" in
-            "")      warn "could not read the connecting role's RLS attributes" \
+            # In runtime-role mode the exact refusal was already reported above;
+            # only single-role mode can reach here with nothing said.
+            "")      [ -n "$runtime_role" ] || warn "could not read the connecting role's RLS attributes" \
                           "run: psql \"\$DATABASE_URL\" -Atc \"select rolsuper, rolbypassrls from pg_roles where rolname = current_user\"";;
-            *" f f") ok "DB role '${rls_attrs%% *}' is RLS-bound (not superuser, no BYPASSRLS)";;
+            *" f f") if [ -n "$runtime_role" ]; then
+                       ok "pool's EFFECTIVE role '${rls_attrs%% *}' (via FLUIDBOX_RUNTIME_ROLE SET ROLE) is RLS-bound — 0018's policies enforce"
+                     else
+                       ok "DB role '${rls_attrs%% *}' is RLS-bound (not superuser, no BYPASSRLS)"
+                     fi;;
             *)
               rls_msg="DB role '${rls_attrs%% *}' bypasses row-level security (superuser and/or BYPASSRLS) — migration 0018's tenant policies never run for it"
               rls_fix="set FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime so the app pool SET ROLEs to the NOLOGIN least-privilege role 0018 creates (role attributes are not inherited through membership, so membership alone will not do it)"
               allow_bypass=$(env_get "$ENV" FLUIDBOX_ALLOW_RLS_BYPASS)
               case "$allow_bypass" in 1|[Tt][Rr][Uu][Ee]) accepted=1;; *) accepted=0;; esac
-              if [ "$(env_get "$ENV" FLUIDBOX_REQUIRE_SSO)" = 1 ] \
-                 && [ -z "$(env_get "$ENV" FLUIDBOX_RUNTIME_ROLE)" ] \
-                 && [ "$accepted" = 0 ]; then
+              if [ -n "$runtime_role" ]; then
+                # This IS the pool's effective role, and boot posture-validates it
+                # unconditionally — FLUIDBOX_ALLOW_RLS_BYPASS does not reach here.
+                bad "$rls_msg — and it is the pool's EFFECTIVE role (FLUIDBOX_RUNTIME_ROLE='$runtime_role'), so the server REFUSES TO BOOT in every mode" \
+                    "ALTER ROLE $runtime_role NOSUPERUSER NOBYPASSRLS; or point FLUIDBOX_RUNTIME_ROLE at a least-privilege role this deployment owns"
+              elif [ "$(env_get "$ENV" FLUIDBOX_REQUIRE_SSO)" = 1 ] && [ "$accepted" = 0 ]; then
                 bad "$rls_msg — with FLUIDBOX_REQUIRE_SSO=1 the server REFUSES TO BOOT in this state" \
                     "$rls_fix; or point DATABASE_URL at a non-superuser role; or, for local single-user work only, accept it with FLUIDBOX_ALLOW_RLS_BYPASS=1"
               else
