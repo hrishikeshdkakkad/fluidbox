@@ -5,8 +5,9 @@
 //! before the flip is still a v1 (legacy) blob. Retiring `FLUIDBOX_CREDENTIAL_KEY`
 //! is only safe once ZERO v1 blobs remain (the D4 boot gate in
 //! `seal::check_retirement_gates` refuses otherwise). This module is the bridge:
-//! a resumable, CAS-guarded job that walks all nine sealed families, unseals each
-//! v1 blob and re-seals it v2 under the row's per-tenant DEK, plus the operator
+//! a resumable, CAS-guarded job that walks all eleven sealed families, unseals
+//! each v1 blob and re-seals it v2 under the row's per-tenant DEK (deployment-
+//! global rows re-seal under the deployment tenant's DEK), plus the operator
 //! endpoints that start it and report count parity.
 //!
 //! Design properties (plan D3):
@@ -35,7 +36,7 @@
 use crate::auth::Admin;
 use crate::config::KmsMode;
 use crate::error::{ApiError, ApiResult};
-use crate::seal::{SealCtx, SealFamily, Sealer};
+use crate::seal::{SealFamily, Sealer};
 use crate::state::AppState;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -55,7 +56,7 @@ use zeroize::Zeroizing;
 /// and AAD re-seal it. EVERY field is a compile-time constant — the `fluidbox-db`
 /// layer builds its `format!` SQL from these (never request data), which is
 /// exactly why that SQL is injection-safe. This array IS the re-seal coverage
-/// set; it must stay in lockstep with the nine families
+/// set; it must stay in lockstep with the eleven families
 /// `system_worker::sealed_key_version_counts` counts (a unit test enforces the
 /// `table.column` ↔ `SealFamily` correspondence).
 struct Family {
@@ -119,6 +120,20 @@ const FAMILIES: &[Family] = &[
         column: "pkce_verifier_sealed",
         version_column: "pkce_verifier_key_version",
         seal_family: SealFamily::LoginPkceVerifier,
+    },
+    // Deployment-global (tenant_id NULL) — Task 3. `reseal_one` resolves the NULL
+    // tenant to the deployment tenant's DEK via `Sealer::row_ctx`.
+    Family {
+        table: "oauth_client_registrations",
+        column: "client_secret_sealed",
+        version_column: "client_secret_key_version",
+        seal_family: SealFamily::RegistrationClientSecret,
+    },
+    Family {
+        table: "oauth_client_registrations",
+        column: "registration_access_token_sealed",
+        version_column: "registration_access_token_key_version",
+        seal_family: SealFamily::RegistrationAccessToken,
     },
 ];
 
@@ -423,7 +438,10 @@ async fn reseal_one(pool: &PgPool, sealer: &Sealer, fam: &Family, id: Uuid) -> R
         return RowOutcome::Skipped;
     };
 
-    let ctx = SealCtx::new(tenant_id, family);
+    // A deployment-global row (oauth_client_registrations) carries a NULL tenant;
+    // `row_ctx` resolves it to the deployment tenant's DEK. Tenant-owned rows keep
+    // their own tenant.
+    let ctx = sealer.row_ctx(tenant_id, family);
     // Unseal v1 → re-seal v2. A per-row unseal failure (wrong legacy key / corrupt
     // blob) is recorded and the migration CONTINUES.
     let plaintext = match sealer.open(&bytes, 1, ctx).await {
@@ -525,6 +543,7 @@ async fn audit(state: &AppState, source_ip: Option<&str>, action: &str, detail: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::seal::SealCtx;
 
     // ─── pure unit tests (no DB) ────────────────────────────────────────────
 
@@ -551,8 +570,11 @@ mod tests {
     }
 
     #[test]
-    fn families_cover_the_nine_sealed_columns() {
-        assert_eq!(FAMILIES.len(), 9, "one entry per sealed column");
+    fn families_cover_all_sealed_columns() {
+        // Nine tenant-owned families + Task 3's two deployment-global
+        // oauth_client_registrations columns. MUST match
+        // system_worker::sealed_key_version_counts (both feed the retirement gate).
+        assert_eq!(FAMILIES.len(), 11, "one entry per sealed column");
         for f in FAMILIES {
             // The SealFamily Display IS "table.column" — keep the triple coherent.
             assert_eq!(
@@ -851,6 +873,93 @@ mod tests {
             RowOutcome::Resealed
         ));
 
+        cleanup(&pool, tenant).await;
+    }
+
+    #[tokio::test]
+    async fn job_reseals_a_global_registration_row_under_the_deployment_dek() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = fluidbox_db::connect(&url).await.expect("connect");
+        // A real tenant is the DEPLOYMENT tenant here: a global row (tenant_id
+        // NULL) has no DEK of its own, so it seals under this one.
+        let org = fluidbox_db::identity::create_org(
+            &pool,
+            &format!("t-{}", Uuid::now_v7().simple()),
+            None,
+        )
+        .await
+        .unwrap();
+        let tenant = org.id;
+
+        let legacy = Sealer::from_key_string(&legacy_hex()).unwrap();
+        let sealer =
+            Sealer::for_test_static_kms(Some(&legacy_hex()), &kek_hex(), pool.clone(), tenant)
+                .unwrap();
+
+        // Seed a v1 GLOBAL registration row carrying a confidential secret.
+        let secret_v1 = legacy
+            .seal(
+                "reg-secret",
+                SealCtx::new(tenant, SealFamily::RegistrationClientSecret),
+            )
+            .await
+            .unwrap()
+            .bytes;
+        let reg_id = Uuid::now_v7();
+        sqlx::query(
+            "insert into oauth_client_registrations
+               (id, tenant_id, issuer, redirect_uri, source, client_id,
+                client_secret_sealed, client_secret_key_version)
+             values ($1, null, 'https://as.reseal.test', 'https://fbx.test/v1/oauth/callback',
+                     'dcr', 'dcr-client-reseal', $2, 1)",
+        )
+        .bind(reg_id)
+        .bind(secret_v1.as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // FAMILIES[9] is oauth_client_registrations.client_secret_sealed.
+        assert_eq!(
+            FAMILIES[9].seal_family.to_string(),
+            "oauth_client_registrations.client_secret_sealed"
+        );
+        assert!(matches!(
+            reseal_one(&pool, &sealer, &FAMILIES[9], reg_id).await,
+            RowOutcome::Resealed
+        ));
+
+        // The row is now v2 and re-opens under the DEPLOYMENT ctx (NULL tenant →
+        // deployment tenant's DEK), proving row_ctx resolved the global row.
+        let (bytes, kv): (Vec<u8>, i16) = sqlx::query_as(
+            "select client_secret_sealed, client_secret_key_version
+             from oauth_client_registrations where id = $1",
+        )
+        .bind(reg_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(kv, 2);
+        assert_eq!(
+            sealer
+                .open(
+                    &bytes,
+                    2,
+                    sealer.deployment_ctx(SealFamily::RegistrationClientSecret)
+                )
+                .await
+                .unwrap(),
+            "reg-secret"
+        );
+
+        sqlx::query("delete from oauth_client_registrations where id = $1")
+            .bind(reg_id)
+            .execute(&pool)
+            .await
+            .unwrap();
         cleanup(&pool, tenant).await;
     }
 
