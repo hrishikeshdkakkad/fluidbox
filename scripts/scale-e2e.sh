@@ -488,6 +488,7 @@ if forge_fast "$RUN" "$FORGE_N" "(a)"; then
   # Backgrounded curl only — db() is never called from a subshell (it shares one
   # stderr file, and a subshell's fail counter would be lost).
   IDX=0
+  BURST_PIDS=""
   while IFS= read -r SID; do
     [ -n "$SID" ] || continue
     IDX=$((IDX + 1))
@@ -507,8 +508,16 @@ if forge_fast "$RUN" "$FORGE_N" "(a)"; then
         -d "{\"tool_call_id\":\"$TAG-a-$IDX\",\"tool\":\"Read\",\"input\":{\"file_path\":\"/workspace/README.md\"}}" \
         "$API/internal/sessions/$SID/permission" > "$RESP/$IDX.code"
     ) &
+    BURST_PIDS="$BURST_PIDS $!"
   done <<< "$FORGED_IDS"
-  wait
+  # `wait $BURST_PIDS`, NEVER a bare `wait`. This section runs with the control
+  # plane ALIVE in the background (boot() started it with `&`), and a bare `wait`
+  # waits for EVERY background job — including that server, which never exits. The
+  # first cut used a bare `wait`, and the job hung to the 45-min CI timeout with
+  # every curl already returned: --max-time on the curls could not save it,
+  # because the process `wait` was blocked on was the server, not a request.
+  # shellcheck disable=SC2086
+  wait $BURST_PIDS
 
   # The recorder must be non-empty BEFORE any "exactly N" claim is made of it.
   RESP_FILES=$(find "$RESP" -name '*.code' | wc -l | tr -d ' ')
