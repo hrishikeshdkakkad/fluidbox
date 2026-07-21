@@ -14,7 +14,7 @@
 //! policy, kid-less single-key acceptance, negative-kid cache, azp-when-present,
 //! `at_hash`-without-access-token) is implemented in the [`verify`] wrapper —
 //! the doc wins. Every identity fetch (discovery, JWKS, token endpoint) rides
-//! ONE dedicated client, `state.identity_http` ([`build_identity_http`]), that
+//! ONE dedicated client, `state.identity_http` (`egress::build_identity_http`), that
 //! enforces the SSRF policy on EVERY hop, not just the request URL: its custom
 //! redirect policy re-validates each hop's scheme + host literal, and its custom
 //! DNS resolver rejects private/loopback/link-local/CGNAT/metadata addresses at
@@ -25,6 +25,7 @@
 //! clients are disabled (`default-features=off`).
 
 use crate::auth::{AuthContext, Principal};
+use crate::egress;
 use crate::error::{ApiError, ApiResult};
 use crate::oauth::{b64url, pkce_challenge, random_urlsafe};
 use crate::seal::{SealCtx, SealFamily, Sealer, TRANSIT_LOGIN};
@@ -42,7 +43,6 @@ use openidconnect::{AccessToken, AccessTokenHash, JsonWebKey, JsonWebKeyAlgorith
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -61,9 +61,6 @@ const MAX_OUTSTANDING_FLOWS_PER_ORG: i64 = 100;
 const MAX_JWKS_BYTES: usize = 256 * 1024;
 const MAX_JWKS_KEYS: usize = 32;
 const NEGATIVE_KID_TTL_SECS: i64 = 120;
-// Byte ceiling on any identity fetch (discovery, JWKS, token endpoint),
-// enforced BEFORE fully buffering the body (design 806-814).
-const MAX_HTTP_BODY_BYTES: usize = 256 * 1024;
 // Per-org callback rate bucket, applied once open_state names the org (design
 // 494-496, 849-854) — distinct from start's per-org bucket.
 const RATE_PER_ORG_CALLBACK_PER_MIN: u32 = 60;
@@ -566,161 +563,17 @@ async fn open_login_state(sealer: &Sealer, param: &str) -> Result<LoginState, St
 }
 
 // ─── SSRF-validated fetch (design 811-814) ──────────────────────────────────
-
-fn host_is_loopback(u: &reqwest::Url) -> bool {
-    match u.host_str() {
-        Some(h) if h.eq_ignore_ascii_case("localhost") => true,
-        Some(h) => h
-            .trim_matches(['[', ']'])
-            .parse::<IpAddr>()
-            .map(|ip| ip.is_loopback())
-            .unwrap_or(false),
-        None => false,
-    }
-}
-
-/// Login start refuses plain http unless the deployment IS loopback dev — the
-/// same exception `cimd_eligible` makes for the public URL.
-fn dev_loopback(public_url: &str) -> bool {
-    let Ok(u) = reqwest::Url::parse(public_url) else {
-        return false;
-    };
-    u.scheme() == "http" && host_is_loopback(&u)
-}
-
-/// Reject private/loopback/link-local/metadata/CGNAT ranges. Loopback is
-/// permitted only in loopback-dev (`dev`). Stable-only checks (IPv6 ULA/link
-/// local computed by hand — the std helpers are nightly).
-fn ip_blocked(ip: IpAddr, dev: bool) -> bool {
-    let blocked = match ip {
-        IpAddr::V4(a) => {
-            let o = a.octets();
-            a.is_loopback()
-                || a.is_private()
-                || a.is_link_local()
-                || a.is_broadcast()
-                || a.is_documentation()
-                || a.is_unspecified()
-                || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64/10 CGNAT
-        }
-        IpAddr::V6(a) => {
-            if let Some(v4) = a.to_ipv4_mapped() {
-                return ip_blocked(IpAddr::V4(v4), dev);
-            }
-            let s0 = a.segments()[0];
-            a.is_loopback()
-                || a.is_unspecified()
-                || (s0 & 0xfe00) == 0xfc00 // fc00::/7 unique-local
-                || (s0 & 0xffc0) == 0xfe80 // fe80::/10 link-local
-        }
-    };
-    blocked && !(dev && ip.is_loopback())
-}
-
-async fn validate_fetch_target(u: &reqwest::Url, dev: bool) -> Result<(), String> {
-    match u.scheme() {
-        "https" => {}
-        "http" if dev && host_is_loopback(u) => {}
-        _ => return Err("OIDC endpoints must be https".into()),
-    }
-    let host = u.host_str().ok_or("URL has no host")?;
-    let port = u.port_or_known_default().ok_or("URL has no port")?;
-    let addrs: Vec<IpAddr> = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|_| "could not resolve host".to_string())?
-        .map(|s| s.ip())
-        .collect();
-    if addrs.is_empty() {
-        return Err("host did not resolve".into());
-    }
-    if addrs.iter().any(|ip| ip_blocked(*ip, dev)) {
-        return Err("refusing to fetch a private/loopback/link-local address".into());
-    }
-    Ok(())
-}
-
-/// The addresses that survive the SSRF filter: every private/loopback/link-local/
-/// CGNAT/metadata/reserved address is dropped (loopback kept only in dev). The
-/// pure core of the identity client's DNS resolver — tested without a network.
-fn filter_public_addrs(
-    addrs: impl Iterator<Item = std::net::SocketAddr>,
-    dev: bool,
-) -> Vec<std::net::SocketAddr> {
-    addrs.filter(|s| !ip_blocked(s.ip(), dev)).collect()
-}
-
-/// One redirect hop's scheme + host-literal gate: https always (loopback http
-/// only in dev), and a host that is a private/loopback/link-local IP literal is
-/// refused — the same host-literal checks `validate_fetch_target` applies to the
-/// request URL. The DNS resolver still filters the *resolved* addresses at
-/// connect time; this is the cheap host-literal defense-in-depth on every hop.
-fn redirect_hop_allowed(u: &reqwest::Url, dev: bool) -> Result<(), String> {
-    match u.scheme() {
-        "https" => {}
-        "http" if dev && host_is_loopback(u) => {}
-        _ => return Err("redirect to a non-https identity endpoint refused".into()),
-    }
-    if let Some(host) = u.host_str() {
-        if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
-            if ip_blocked(ip, dev) {
-                return Err("redirect to a private/loopback address refused".into());
-            }
-        }
-    }
-    Ok(())
-}
-
-/// A `reqwest::dns::Resolve` that resolves via the system resolver and drops
-/// every non-public address at resolution time — DNS-rebinding and per-hop
-/// private targets die here (loopback survives only in dev). Empty after the
-/// filter ⇒ a resolution error, so the connection never opens.
-struct SsrfDnsResolver {
-    dev: bool,
-}
-
-impl reqwest::dns::Resolve for SsrfDnsResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let dev = self.dev;
-        let host = name.as_str().to_string();
-        Box::pin(async move {
-            // Port 0: reqwest overrides it with the URL's port; we only care
-            // about the resolved IPs.
-            let resolved = tokio::net::lookup_host((host.as_str(), 0)).await?;
-            let allowed = filter_public_addrs(resolved, dev);
-            if allowed.is_empty() {
-                return Err("refusing to resolve to a private/loopback/link-local address".into());
-            }
-            let addrs: reqwest::dns::Addrs = Box::new(allowed.into_iter());
-            Ok(addrs)
-        })
-    }
-}
-
-/// Build the ONE HTTP client used for identity fetches (discovery, JWKS, token
-/// endpoint — nothing else). Per-hop SSRF: a custom redirect policy re-validates
-/// every hop's scheme + host literal (capped at 10 hops), and a custom DNS
-/// resolver filters resolved addresses at connect time, closing the
-/// intermediate-hop TOCTOU. No cookie store (the default with the `cookies`
-/// feature off). The dev (loopback-http) allowance is config-static, so it is
-/// baked into both the redirect closure and the resolver here at build time.
-pub fn build_identity_http(public_url: &str) -> reqwest::Client {
-    let dev = dev_loopback(public_url);
-    let policy = reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() >= 10 {
-            return attempt.error("too many redirects");
-        }
-        match redirect_hop_allowed(attempt.url(), dev) {
-            Ok(()) => attempt.follow(),
-            Err(e) => attempt.error(e),
-        }
-    });
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(15 * 60))
-        .redirect(policy)
-        .dns_resolver(Arc::new(SsrfDnsResolver { dev }))
-        .build()
-        .expect("identity HTTP client builds")
-}
+//
+// The per-hop SSRF machinery (ip_blocked, dev_loopback, the DNS resolver, the
+// redirect validator, validate_fetch_target, read_json_bounded, and the
+// identity/egress client builders) moved to `crate::egress` in Phase E so the
+// broker, deliveries, and git-clone paths share ONE boundary. login.rs consults
+// it below. This is NOT purely a refactor: OIDC fetches now also enforce the
+// EXTENDED reserved-range matrix (E2 — metadata, 0.0.0.0/8, v4/v6 multicast,
+// 240/4 reserved, 198.18/15 benchmarking, 2001:db8::/32, fec0::/10, …) and honor
+// FLUIDBOX_EGRESS_ALLOW_CIDRS. Both are strictly TIGHTER than before (more ranges
+// blocked; the allow-list only re-opens operator-chosen CIDRs), so no
+// previously-legitimate issuer breaks.
 
 /// Save-time endpoint validation: parse `url` and apply the SAME https + SSRF
 /// policy the login fetches use (loopback under the same `dev_loopback` gating).
@@ -728,12 +581,12 @@ pub fn build_identity_http(public_url: &str) -> reqwest::Client {
 /// `token_endpoint` / `jwks_uri` so a config advertising a private/loopback/
 /// non-https endpoint is refused at SAVE time — the discovery save only *fetches*
 /// jwks_uri, so authorize/token would otherwise first fail (or exfiltrate) at
-/// redirect/callback time. Reuses `validate_fetch_target` — the SSRF policy is
-/// never duplicated.
+/// redirect/callback time. Reuses `egress::validate_fetch_target` — the SSRF
+/// policy is never duplicated.
 pub(crate) async fn validate_endpoint_target(state: &AppState, url: &str) -> Result<(), String> {
-    let dev = dev_loopback(&state.cfg.public_url);
+    let dev = egress::dev_loopback(&state.cfg.public_url);
     let u = reqwest::Url::parse(url).map_err(|_| format!("'{url}' is not a valid URL"))?;
-    validate_fetch_target(&u, dev).await
+    egress::validate_fetch_target(&u, dev, &state.egress_policy.allow_cidrs).await
 }
 
 /// GET a JSON document under the SSRF policy over `state.identity_http`, whose
@@ -741,9 +594,10 @@ pub(crate) async fn validate_endpoint_target(state: &AppState, url: &str) -> Res
 /// URL is pre-validated and the response's FINAL url re-validated as cheap
 /// defense in depth (the per-hop client is the real guard).
 async fn fetch_json_ssrf(state: &AppState, url: &str) -> Result<Value, String> {
-    let dev = dev_loopback(&state.cfg.public_url);
+    let dev = egress::dev_loopback(&state.cfg.public_url);
+    let allow = &state.egress_policy.allow_cidrs;
     let u = reqwest::Url::parse(url).map_err(|_| format!("'{url}' is not a valid URL"))?;
-    validate_fetch_target(&u, dev).await?;
+    egress::validate_fetch_target(&u, dev, allow).await?;
     let mut res = state
         .identity_http
         .get(url)
@@ -752,36 +606,11 @@ async fn fetch_json_ssrf(state: &AppState, url: &str) -> Result<Value, String> {
         .send()
         .await
         .map_err(|e| format!("fetch failed: {e}"))?;
-    validate_fetch_target(&res.url().clone(), dev).await?;
+    egress::validate_fetch_target(&res.url().clone(), dev, allow).await?;
     if !res.status().is_success() {
         return Err(format!("fetch returned HTTP {}", res.status()));
     }
-    read_json_bounded(&mut res).await
-}
-
-/// Read a JSON body under the byte ceiling ENFORCED BEFORE full buffering: a
-/// declared `Content-Length` over the cap is refused up front, and the body is
-/// then read chunk-by-chunk with the running total re-checked, so a lying or
-/// absent length cannot smuggle an oversized document past the bound (design
-/// 806-814).
-async fn read_json_bounded(res: &mut reqwest::Response) -> Result<Value, String> {
-    if let Some(len) = res.content_length() {
-        if len > MAX_HTTP_BODY_BYTES as u64 {
-            return Err("identity response exceeds the size bound".into());
-        }
-    }
-    let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = res
-        .chunk()
-        .await
-        .map_err(|e| format!("response read failed: {e}"))?
-    {
-        if buf.len() + chunk.len() > MAX_HTTP_BODY_BYTES {
-            return Err("identity response exceeds the size bound".into());
-        }
-        buf.extend_from_slice(&chunk);
-    }
-    serde_json::from_slice::<Value>(&buf).map_err(|e| format!("response was not JSON: {e}"))
+    egress::read_json_bounded(&mut res).await
 }
 
 // ─── Discovery freshness (design 805-814) ───────────────────────────────────
@@ -1479,7 +1308,7 @@ pub async fn start(
         Err(_) => return neutral_unavailable(),
     };
     // Hosted SSO requires https (loopback dev exempt).
-    if state.cfg.public_url.starts_with("http://") && !dev_loopback(&state.cfg.public_url) {
+    if state.cfg.public_url.starts_with("http://") && !egress::dev_loopback(&state.cfg.public_url) {
         return neutral_unavailable();
     }
     // Validate redirect_to.
@@ -1862,10 +1691,10 @@ async fn token_exchange(
 ) -> Result<Tokens, String> {
     // SSRF-validate the token endpoint before posting to it (the identity
     // client re-validates every redirect hop + resolved address underneath).
-    let dev = dev_loopback(&state.cfg.public_url);
+    let dev = egress::dev_loopback(&state.cfg.public_url);
     let u =
         reqwest::Url::parse(token_endpoint).map_err(|_| "invalid token endpoint".to_string())?;
-    validate_fetch_target(&u, dev).await?;
+    egress::validate_fetch_target(&u, dev, &state.egress_policy.allow_cidrs).await?;
 
     let redirect_uri = format!("{}/v1/auth/callback", state.cfg.public_url);
     let mut form: Vec<(&str, &str)> = vec![
@@ -1922,7 +1751,8 @@ async fn token_exchange(
         .map_err(|e| format!("token exchange failed: {e}"))?;
     // Final-URL re-validation for symmetry with fetch_json_ssrf (defense in
     // depth on top of the per-hop identity client).
-    validate_fetch_target(&res.url().clone(), dev).await?;
+    egress::validate_fetch_target(&res.url().clone(), dev, &state.egress_policy.allow_cidrs)
+        .await?;
     let status = res.status();
     let v: Value = res.json().await.unwrap_or(Value::Null);
     if !status.is_success() {
@@ -2451,23 +2281,8 @@ mod tests {
         }
     }
 
-    // ─── SSRF ip ranges ───────────────────────────────────────────────────
-    #[test]
-    fn ssrf_blocks_internal_ranges() {
-        let b = |s: &str| ip_blocked(s.parse().unwrap(), false);
-        assert!(b("127.0.0.1"));
-        assert!(b("10.0.0.5"));
-        assert!(b("192.168.1.1"));
-        assert!(b("169.254.169.254")); // link-local metadata
-        assert!(b("100.64.1.1")); // CGNAT
-        assert!(b("::1"));
-        assert!(b("fe80::1")); // link-local
-        assert!(b("fc00::1")); // unique-local
-        assert!(!b("93.184.216.34")); // public
-                                      // loopback allowed only in dev.
-        assert!(ip_blocked("127.0.0.1".parse().unwrap(), false));
-        assert!(!ip_blocked("127.0.0.1".parse().unwrap(), true));
-    }
+    // (SSRF ip-range, redirect-hop, and DNS-filter tests moved with the code to
+    // `crate::egress` / `fluidbox_core::netpolicy` in Phase E.)
 
     // ─── ID-token verification (a static test RSA key + its JWK) ───────────
     // A throwaway 2048-bit RSA key generated once (openssl) and embedded so the
@@ -2901,48 +2716,7 @@ uIATiz1iFxtbjHI9UNGig2aiz3j22PuZSNeJqpxryrgzfWd1s828kecc31+KEIP6
         assert!(verify::verify(&inputs(&allow, now), &tok, &keys(&tk)).is_ok());
     }
 
-    // ─── per-hop SSRF: redirect closure + DNS filter (pure fns) ────────────
-    #[test]
-    fn redirect_hop_validation() {
-        let u = |s: &str| reqwest::Url::parse(s).unwrap();
-        // https public host → allowed.
-        assert!(redirect_hop_allowed(&u("https://issuer.example/x"), false).is_ok());
-        // http public host, not dev → refused.
-        assert!(redirect_hop_allowed(&u("http://issuer.example/x"), false).is_err());
-        // https to a private / metadata / loopback IP literal → refused.
-        assert!(redirect_hop_allowed(&u("https://169.254.169.254/latest"), false).is_err());
-        assert!(redirect_hop_allowed(&u("https://10.0.0.1/x"), false).is_err());
-        assert!(redirect_hop_allowed(&u("https://[::1]/x"), false).is_err());
-        // http loopback in dev → allowed; the same not-in-dev → refused.
-        assert!(redirect_hop_allowed(&u("http://127.0.0.1:5556/x"), true).is_ok());
-        assert!(redirect_hop_allowed(&u("http://127.0.0.1:5556/x"), false).is_err());
-    }
-
-    #[test]
-    fn dns_filter_range_logic() {
-        use std::net::SocketAddr;
-        let p = |s: &str| s.parse::<SocketAddr>().unwrap();
-        let addrs = || {
-            vec![
-                p("93.184.216.34:443"),   // public
-                p("10.0.0.1:443"),        // private
-                p("127.0.0.1:443"),       // loopback
-                p("169.254.169.254:443"), // link-local metadata
-            ]
-            .into_iter()
-        };
-        // Not dev: only the public address survives.
-        assert_eq!(
-            filter_public_addrs(addrs(), false),
-            vec![p("93.184.216.34:443")]
-        );
-        // Dev: public + loopback survive; private / link-local still dropped.
-        let out = filter_public_addrs(addrs(), true);
-        assert!(out.contains(&p("93.184.216.34:443")));
-        assert!(out.contains(&p("127.0.0.1:443")));
-        assert!(!out.contains(&p("10.0.0.1:443")));
-        assert!(!out.contains(&p("169.254.169.254:443")));
-    }
+    // (redirect-hop + DNS-filter tests moved with the code to `crate::egress`.)
 
     // ─── client_ip trust decision table (pure fn) ─────────────────────────
     #[test]

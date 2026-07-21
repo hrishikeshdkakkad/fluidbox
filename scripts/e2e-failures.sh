@@ -37,9 +37,13 @@ wait_container() { # session -> running container id
   done
   echo ""
 }
-token_for() { # container -> session token
+# Gap 10: the sandbox carries FOUR audience-scoped tokens and each internal route
+# accepts exactly one of them. This script IS the runner, so it must extract BOTH
+# credentials it drives: FLUIDBOX_SESSION_TOKEN (runner-control → /events) and
+# FLUIDBOX_TOOL_TOKEN (tool-intent → /permission). Using one for both now 403s.
+token_for() { # container [env-var, default FLUIDBOX_SESSION_TOKEN] -> token
   docker inspect "$1" --format '{{range .Config.Env}}{{println .}}{{end}}' \
-    | grep '^FLUIDBOX_SESSION_TOKEN=' | head -1 | cut -d= -f2-
+    | grep "^${2:-FLUIDBOX_SESSION_TOKEN}=" | head -1 | cut -d= -f2-
 }
 status_of() { curl -s -H "$H" "$API/v1/sessions/$1" | j "['session']['status']"; }
 reason_of() { curl -s -H "$H" "$API/v1/sessions/$1" | j "['session']['status_reason']"; }
@@ -55,12 +59,12 @@ containers_for() { docker ps -a --filter "label=fluidbox.session=$1" -q | wc -l 
 # tool_call_id crossing the gate); runner-posted tool.requested events are
 # DROPPED at ingest. The posts below stay to prove exactly that — if they
 # counted, call 2 would already blow a budget of 2.
-emit_tool_requested() { # token session call_id
+emit_tool_requested() { # runner-control token, session, call_id
   curl -s -X POST -H "authorization: Bearer $1" -H 'content-type: application/json' \
     -d "{\"actor\":\"agent\",\"body\":{\"type\":\"tool.requested\",\"data\":{\"tool_call_id\":\"$3\",\"tool\":\"Read\",\"summary\":\"budget probe\",\"input_digest\":\"\"}}}" \
     "$API/internal/sessions/$2/events" >/dev/null
 }
-perm() { # token session body -> decision json
+perm() { # tool-intent token, session, body -> decision json
   curl -s -X POST -H "authorization: Bearer $1" -H 'content-type: application/json' \
     -d "$3" "$API/internal/sessions/$2/permission"
 }
@@ -71,11 +75,12 @@ S1=$(new_session "budget probe — reply DONE, use no tools" '{"max_tool_calls":
 [ -n "$S1" ] && ok "session created ($S1)" || { no "session create failed"; exit 1; }
 C1=$(wait_container "$S1")
 [ -n "$C1" ] && ok "sandbox launched" || { no "no sandbox"; exit 1; }
-T1=$(token_for "$C1")
+T1=$(token_for "$C1")                            # runner-control → /events
+TT1=$(token_for "$C1" FLUIDBOX_TOOL_TOKEN)       # tool-intent    → /permission
 docker kill "$C1" >/dev/null 2>&1   # silence the real runner; this script IS the runner now
 for i in 1 2 3; do
   emit_tool_requested "$T1" "$S1" "bp$i"
-  D=$(perm "$T1" "$S1" "{\"tool_call_id\":\"bp$i\",\"tool\":\"Read\",\"input\":{\"file_path\":\"/workspace/f$i\"}}")
+  D=$(perm "$TT1" "$S1" "{\"tool_call_id\":\"bp$i\",\"tool\":\"Read\",\"input\":{\"file_path\":\"/workspace/f$i\"}}")
   DEC=$(echo "$D" | j "['decision']")
   if [ "$i" -le 2 ]; then
     [ "$DEC" = "allow" ] && ok "call $i → allow (within budget)" || no "call $i expected allow, got $DEC"

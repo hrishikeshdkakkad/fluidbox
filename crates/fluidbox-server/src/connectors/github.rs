@@ -811,8 +811,80 @@ fn short_sha(sha: Option<&str>) -> String {
         .unwrap_or_else(|| "-".into())
 }
 
+/// The DETERMINISTIC marker every published comment carries (Phase E, #33; Gap
+/// 13; design :1082-1084). An HTML comment, so GitHub renders nothing, keyed on
+/// the subscription — which is exactly the identity §17 #3 makes stable ("one
+/// comment per (subscription, PR), updated in place").
+///
+/// It exists to close the create-path crash window: the external POST necessarily
+/// precedes the `external_results` row that records its id, so a crash in between
+/// used to leave the retry with no record and produce a DUPLICATE comment. There
+/// is no distributed transaction to be had here, so the fix is reconciliation —
+/// before creating, look for this marker among the PR's comments and ADOPT the
+/// match instead. GitHub's issue-comment API offers no idempotency key, which is
+/// the alternative the design names.
+pub(crate) fn subscription_marker(subscription_id: uuid::Uuid) -> String {
+    format!("<!-- fluidbox:sub:{subscription_id} -->")
+}
+
+/// Find a previously-created comment of OURS in a PR comment listing — the
+/// reconcile half of reconcile-before-create. Returns `(external_id, html_url)`.
+///
+/// Pure and total: a malformed/partial listing (not an array, missing `id`, a
+/// non-string `body`) yields `None`, which degrades to today's behavior (create a
+/// fresh comment) rather than to an error.
+///
+/// WHAT ACTUALLY MAKES THIS SAFE (corrected — the first cut claimed the marker
+/// "contains no user text, so it cannot be spoofed", which is false). The marker
+/// carries no user text, but the BODY WE SEARCH DOES: [`comment_body`] embeds
+/// `summary` (raw agent output) and `subscription_name` (user text). An agent that
+/// writes another subscription's marker literal into its summary therefore plants
+/// that marker in a comment we ourselves post, and the victim subscription would
+/// adopt-and-PATCH it. Two things stop that:
+///   1. **The subscription id is an unguessable UUIDv7.** This is the real
+///      defense, and it is the only one that would survive on its own: the marker
+///      is `<!-- fluidbox:sub:{uuid} -->`, so spoofing requires knowing the target
+///      subscription's id — which no agent is ever told (it is not in the RunSpec's
+///      task, not in the workspace, and not in the comment we publish).
+///   2. **Position the agent cannot reach.** [`comment_body`] appends the marker
+///      LAST, after the footer, so a genuine marker is always the final
+///      non-whitespace token of the body; agent text is always ABOVE the footer.
+///      Requiring the trailing position (below) therefore rejects an injected
+///      marker structurally, without depending on (1) — the belt to that brace.
+///
+/// RESIDUAL, precisely. A trailing-position match still trusts that the comment
+/// was authored by us. Anyone able to comment on the PR could post a comment whose
+/// body ENDS with our marker and have the next reconcile adopt (and overwrite)
+/// theirs — but that again needs the unguessable subscription id, and the payoff
+/// is that we edit their comment into our own report. An author-identity check
+/// (`performed_via_github_app` / the bot login) was considered and NOT added: it
+/// does not close the vector this review found, because in that vector the
+/// polluted comment IS authored by our App, and it would trade a real duplicate-
+/// comment risk (adoption failing whenever GitHub omits the field) for coverage of
+/// the weaker case only. If it is ever added, it must be IN ADDITION to the
+/// positional check, never instead of it.
+fn find_marker_comment(listing: &Value, marker: &str) -> Option<(String, String)> {
+    listing.as_array()?.iter().find_map(|c| {
+        let body = c.get("body").and_then(|b| b.as_str())?;
+        // Trailing position only — `contains` would adopt a marker planted in the
+        // agent-controlled summary. `trim_end` tolerates the trailing newline we
+        // write and any whitespace GitHub normalizes onto the end.
+        if !body.trim_end().ends_with(marker) {
+            return None;
+        }
+        let id = c.get("id").and_then(|i| i.as_i64())?.to_string();
+        let url = c
+            .get("html_url")
+            .and_then(|u| u.as_str())
+            .unwrap_or_default()
+            .to_string();
+        Some((id, url))
+    })
+}
+
 /// The attributable comment body: agent name up top, run identity in the
-/// footer. One agent's failure appears only here, on its own comment.
+/// footer, and (Phase E) the deterministic per-subscription reconcile marker.
+/// One agent's failure appears only here, on its own comment.
 fn comment_body(ctx: &super::PublishContext) -> String {
     let status_note = if ctx.status == "completed" {
         String::new()
@@ -827,14 +899,22 @@ fn comment_body(ctx: &super::PublishContext) -> String {
         .as_deref()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("(no summary produced)");
+    // The marker is appended LAST and only when a subscription identifies the
+    // comment (a subscription-less publish has nothing stable to reconcile
+    // against, and `publish_pr_comment` already refuses it upstream).
+    let marker = match ctx.subscription_id {
+        Some(id) => format!("\n{}\n", subscription_marker(id)),
+        None => String::new(),
+    };
     format!(
-        "### 🤖 {agent} review\n{status_note}\n{body}\n\n---\n_fluidbox · trigger **{sub}** · run `{run}` · commit `{sha}`_\n",
+        "### 🤖 {agent} review\n{status_note}\n{body}\n\n---\n_fluidbox · trigger **{sub}** · run `{run}` · commit `{sha}`_\n{marker}",
         agent = ctx.agent_name,
         status_note = status_note,
         body = body,
         sub = ctx.subscription_name,
         run = ctx.session_id,
         sha = short_sha(ctx.commit_sha.as_deref()),
+        marker = marker,
     )
 }
 
@@ -868,7 +948,7 @@ async fn publish_pr_comment(
 
     // §17 #3: one stable comment per (subscription, PR) — update it in
     // place; recreate only if it was deleted out from under us.
-    if let Some(existing) = fluidbox_db::get_external_result(
+    let recorded = fluidbox_db::get_external_result(
         &state.pool,
         ctx.scope,
         sub_id,
@@ -877,15 +957,41 @@ async fn publish_pr_comment(
     )
     .await
     .map_err(|e| format!("external result lookup failed: {e}"))?
-    {
+    .map(|r| (r.external_id, r.external_url));
+
+    // RECONCILE BEFORE CREATE (Phase E, #33; Gap 13; design :1082-1084). No
+    // recorded id does NOT prove no comment exists: the POST necessarily precedes
+    // the row that records it, so a crash (or a lost delivery claim) in that
+    // window leaves a real comment with no local record — and the retry would
+    // post a DUPLICATE. Before creating, list the PR's comments and adopt a
+    // marker match.
+    //
+    // A LISTING ERROR FAILS THE ATTEMPT (#33 review 2). It used to warn and fall
+    // through to the create, which quietly reinstated the duplicate this exists to
+    // prevent: a transient list timeout on a RETRY is indistinguishable from "no
+    // comment exists", and treating it as proof-of-absence posts a second comment.
+    // Only `Ok(None)` — a completed walk that found nothing — is proof. Delivery
+    // is at-least-once with backoff, so failing here costs a delayed comment and
+    // buys never posting two; a duplicate is the worse outcome and it is not
+    // repairable afterwards.
+    let existing = match recorded {
+        Some(r) => Some(r),
+        None => reconcile_existing_comment(state, &auth, repository, pr_number, sub_id)
+            .await
+            .map_err(|e| {
+                format!(
+                    "pr comment reconcile for {repository}#{pr_number} failed ({e}); \
+                     refusing to create — a retry will re-reconcile"
+                )
+            })?,
+    };
+
+    if let Some((external_id, external_url)) = existing {
         let (status, body, _) = api(
             state,
             reqwest::Method::PATCH,
             &auth,
-            &format!(
-                "/repos/{repository}/issues/comments/{}",
-                existing.external_id
-            ),
+            &format!("/repos/{repository}/issues/comments/{external_id}"),
             Some(&payload),
         )
         .await?;
@@ -893,7 +999,7 @@ async fn publish_pr_comment(
             let url = body["html_url"]
                 .as_str()
                 .map(str::to_string)
-                .or(existing.external_url.clone())
+                .or(external_url)
                 .unwrap_or_default();
             fluidbox_db::upsert_external_result(
                 &state.pool,
@@ -901,7 +1007,7 @@ async fn publish_pr_comment(
                 sub_id,
                 "github_pr_comment",
                 &resource_key,
-                &existing.external_id,
+                &external_id,
                 Some(&url),
             )
             .await
@@ -950,6 +1056,146 @@ async fn publish_pr_comment(
     })
 }
 
+/// Comment pages walked while reconciling. 100 per page × 10 = 1000 comments,
+/// far past any real review thread; the cap keeps a pathological PR from turning
+/// one delivery attempt into an unbounded crawl.
+const RECONCILE_MAX_PAGES: u32 = 10;
+
+/// Worst-case wall clock ONE GitHub publish attempt can occupy, in seconds — the
+/// number the delivery worker's claim TTL must clear (review I2). Every GitHub
+/// call this path makes is capped by [`GITHUB_TIMEOUT`], and the longest path is
+/// `publish_pr_comment`:
+///
+/// | leg                                              | calls |
+/// |--------------------------------------------------|-------|
+/// | `installation_token` mint (cache miss)            | 1     |
+/// | `reconcile_existing_comment` pages                | `RECONCILE_MAX_PAGES` |
+/// | PATCH an adopted comment that 404s, then POST     | 2     |
+///
+/// The CHECK path has the same shape but a smaller cap
+/// (`RECONCILE_CHECK_MAX_PAGES`, and its listing is name-filtered), so it stays
+/// strictly under this bound and does not move the number.
+///
+/// Lives here, next to the constants it derives from, so raising the page cap or
+/// the timeout moves this number — and fails `deliveries`' TTL assertion — without
+/// anyone having to remember the coupling. DB round trips are excluded; the TTL
+/// carries explicit headroom for them.
+pub(crate) const fn worst_case_publish_secs() -> i64 {
+    GITHUB_TIMEOUT.as_secs() as i64 * (1 + RECONCILE_MAX_PAGES as i64 + 2)
+}
+
+/// Look for a comment WE created on this PR by its deterministic marker — the
+/// reconcile half of reconcile-before-create. `Ok(None)` means "walked the whole
+/// thread, ours is genuinely not there" (create is correct); `Err` means we could
+/// not tell, and the caller degrades to create rather than failing the delivery.
+async fn reconcile_existing_comment(
+    state: &AppState,
+    auth: &str,
+    repository: &str,
+    pr_number: i64,
+    subscription_id: uuid::Uuid,
+) -> Result<Option<(String, Option<String>)>, String> {
+    let marker = subscription_marker(subscription_id);
+    for page in 1..=RECONCILE_MAX_PAGES {
+        let (status, body, _) = api(
+            state,
+            reqwest::Method::GET,
+            auth,
+            &format!("/repos/{repository}/issues/{pr_number}/comments?per_page=100&page={page}"),
+            None,
+        )
+        .await?;
+        if !status.is_success() {
+            return Err(format!("github comment list returned {status}"));
+        }
+        if let Some((id, url)) = find_marker_comment(&body, &marker) {
+            return Ok(Some((id, Some(url).filter(|u| !u.is_empty()))));
+        }
+        // Short page (or not an array) ⇒ the listing is exhausted.
+        if body.as_array().map(|a| a.len()).unwrap_or(0) < 100 {
+            break;
+        }
+    }
+    Ok(None)
+}
+
+/// The app-controlled identity stamped on every check run we create, and the key
+/// [`reconcile_existing_check`] adopts on. GitHub's check-run API gives apps an
+/// `external_id` field verbatim, which is a far better handle than the display
+/// name: the name is `fluidbox/<subscription_name>` (USER text — two orgs could
+/// collide, and any other app may publish a check with the same name), while this
+/// carries the subscription's unguessable UUIDv7. Same defense as the comment
+/// marker, on a field no agent output can reach.
+pub(crate) fn check_external_id(subscription_id: uuid::Uuid) -> String {
+    format!("fluidbox:sub:{subscription_id}")
+}
+
+/// Check runs walked while reconciling one head SHA. GitHub returns at most 100
+/// per page and the listing is already filtered to OUR check name, so one page is
+/// generous; the cap exists for the same reason the comment one does.
+const RECONCILE_CHECK_MAX_PAGES: u32 = 3;
+
+/// Find the check run WE already created for this head SHA, by `external_id`.
+/// `Ok(None)` means the (name-filtered) listing was walked to the end and ours is
+/// genuinely absent — the only state in which creating is correct. `Err` means we
+/// could not tell, and the caller must NOT create.
+async fn reconcile_existing_check(
+    state: &AppState,
+    auth: &str,
+    repository: &str,
+    head_sha: &str,
+    name: &str,
+    subscription_id: uuid::Uuid,
+) -> Result<Option<String>, String> {
+    let want = check_external_id(subscription_id);
+    for page in 1..=RECONCILE_CHECK_MAX_PAGES {
+        // `name` is `fluidbox/<subscription_name>` — USER text, so it is
+        // percent-encoded rather than interpolated. `Url::parse_with_params`
+        // against a throwaway base is the encoder already in the tree (no new
+        // dependency); only its query string is used.
+        let query = reqwest::Url::parse_with_params(
+            "https://github.invalid/",
+            &[
+                ("check_name", name),
+                ("per_page", "100"),
+                ("page", &page.to_string()),
+            ],
+        )
+        .map_err(|e| format!("check list url build failed: {e}"))?;
+        let (status, body, _) = api(
+            state,
+            reqwest::Method::GET,
+            auth,
+            &format!(
+                "/repos/{repository}/commits/{head_sha}/check-runs?{}",
+                query.query().unwrap_or_default()
+            ),
+            None,
+        )
+        .await?;
+        if !status.is_success() {
+            return Err(format!("github check list returned {status}"));
+        }
+        let runs = body["check_runs"].as_array().cloned().unwrap_or_default();
+        if let Some(id) = find_marker_check(&runs, &want) {
+            return Ok(Some(id));
+        }
+        if runs.len() < 100 {
+            break;
+        }
+    }
+    Ok(None)
+}
+
+/// Pure adoption rule for a `check_runs` page: our `external_id`, and an id we can
+/// actually address. Extracted so the matching is unit-testable without GitHub.
+fn find_marker_check(runs: &[Value], want: &str) -> Option<String> {
+    runs.iter()
+        .find(|r| r["external_id"].as_str() == Some(want))
+        .and_then(|r| r["id"].as_i64())
+        .map(|id| id.to_string())
+}
+
 async fn publish_check(
     state: &AppState,
     connection_id: uuid::Uuid,
@@ -957,6 +1203,13 @@ async fn publish_check(
     head_sha: &str,
     ctx: &super::PublishContext,
 ) -> Result<super::PublishOutcome, String> {
+    // Same requirement as the comment path, and for the same reason: §17 #3's
+    // contract is ONE check per (subscription, head SHA), so without a
+    // subscription there is no identity to reconcile against and every retry
+    // would create another check run.
+    let sub_id = ctx
+        .subscription_id
+        .ok_or("check publishing requires a subscription (stable identity is per subscription)")?;
     let conn = app_connection(state, ctx.scope, connection_id).await?;
     let token = installation_token(state, &conn).await?;
     // Stable name per subscription; one run per head SHA (that's how
@@ -973,6 +1226,7 @@ async fn publish_check(
     let payload = json!({
         "name": name,
         "head_sha": head_sha,
+        "external_id": check_external_id(sub_id),
         "status": "completed",
         "conclusion": check_conclusion(&ctx.status),
         "completed_at": Utc::now().to_rfc3339(),
@@ -982,19 +1236,99 @@ async fn publish_check(
         },
     });
     let digest = format!("sha256:{}", fluidbox_db::sha256_hex(&payload.to_string()));
-    let (status, body, _) = api(
-        state,
-        reqwest::Method::POST,
-        &format!("Bearer {token}"),
-        &format!("/repos/{repository}/check-runs"),
-        Some(&payload),
+    let auth = format!("Bearer {token}");
+    let resource_key = format!("{repository}@{head_sha}");
+
+    // RECONCILE BEFORE CREATE — the same treatment the comment path gets (#33
+    // review 2). Checks used to POST unconditionally with no idempotency key and
+    // no adoption, so a crash after GitHub accepted the create (or any retry of a
+    // delivery whose recording leg failed) added ANOTHER check run to the same
+    // commit. They reconcile exactly as well as comments do: `external_id` is an
+    // app-controlled field GitHub returns verbatim, and check runs are listable
+    // per commit filtered by name, so `(head_sha, name, external_id)` is a
+    // complete, deterministic identity. An UPDATE is a PATCH to the run's id, and
+    // a completed run may be re-completed, so re-publishing is an in-place edit.
+    //
+    // A listing error FAILS the attempt, never falls through to create.
+    let recorded = fluidbox_db::get_external_result(
+        &state.pool,
+        ctx.scope,
+        sub_id,
+        "github_check_run",
+        &resource_key,
     )
-    .await?;
-    if !status.is_success() {
-        return Err(format!("github check create returned {status}"));
+    .await
+    .map_err(|e| format!("external result lookup failed: {e}"))?
+    .map(|r| r.external_id);
+    let existing = match recorded {
+        Some(id) => Some(id),
+        None => reconcile_existing_check(state, &auth, repository, head_sha, &name, sub_id)
+            .await
+            .map_err(|e| {
+                format!(
+                    "check reconcile for {repository}@{head_sha} failed ({e}); \
+                     refusing to create — a retry will re-reconcile"
+                )
+            })?,
+    };
+
+    let mut url: Option<String> = None;
+    let mut external_id: Option<String> = None;
+    if let Some(id) = existing {
+        let (status, body, _) = api(
+            state,
+            reqwest::Method::PATCH,
+            &auth,
+            &format!("/repos/{repository}/check-runs/{id}"),
+            Some(&payload),
+        )
+        .await?;
+        if status.is_success() {
+            url = Some(body["html_url"].as_str().unwrap_or("").to_string());
+            external_id = Some(id);
+        } else if status != reqwest::StatusCode::NOT_FOUND && status != reqwest::StatusCode::GONE {
+            return Err(format!("github check update returned {status}"));
+        }
+        // 404/410 ⇒ deleted out from under us; fall through and create a fresh one.
+    }
+
+    if external_id.is_none() {
+        let (status, body, _) = api(
+            state,
+            reqwest::Method::POST,
+            &auth,
+            &format!("/repos/{repository}/check-runs"),
+            Some(&payload),
+        )
+        .await?;
+        if !status.is_success() {
+            return Err(format!("github check create returned {status}"));
+        }
+        url = Some(body["html_url"].as_str().unwrap_or("").to_string());
+        // A create whose id we cannot read is still a real check run, so it MUST
+        // NOT be recorded as absent — but it is reconcilable on the next attempt
+        // via `external_id`, which is why that is the load-bearing handle here.
+        external_id = body["id"].as_i64().map(|i| i.to_string());
+    }
+
+    // Record LAST: this row is only the fast path. The POST necessarily precedes
+    // it, so a crash in between is exactly the window `reconcile_existing_check`
+    // closes — the row is an optimization, not the source of truth.
+    if let Some(id) = &external_id {
+        fluidbox_db::upsert_external_result(
+            &state.pool,
+            ctx.scope,
+            sub_id,
+            "github_check_run",
+            &resource_key,
+            id,
+            url.as_deref(),
+        )
+        .await
+        .map_err(|e| format!("external result record failed: {e}"))?;
     }
     Ok(super::PublishOutcome {
-        external_url: body["html_url"].as_str().unwrap_or("").to_string(),
+        external_url: url.unwrap_or_default(),
         digest,
     })
 }
@@ -1012,6 +1346,99 @@ mod tests {
         h.insert("x-github-delivery", delivery.parse().unwrap());
         h.insert("x-github-event", event.parse().unwrap());
         h
+    }
+
+    /// #33 review 2, the checks half. Checks used to POST unconditionally with no
+    /// idempotency key at all, so a crash after GitHub accepted the create added a
+    /// SECOND check run to the same commit on every retry. Adoption keys on the
+    /// app-controlled `external_id`, never on the display name (user text, and any
+    /// app may publish a check with the same one).
+    #[test]
+    fn a_check_run_is_adopted_by_its_external_id_and_nothing_else() {
+        let sub = Uuid::now_v7();
+        let other = Uuid::now_v7();
+        let want = check_external_id(sub);
+        assert!(
+            want.contains(&sub.to_string()),
+            "the identity carries the unguessable subscription id"
+        );
+
+        let ours = json!({"id": 77, "name": "fluidbox/x", "external_id": want.clone()});
+        assert_eq!(
+            find_marker_check(std::slice::from_ref(&ours), &want),
+            Some("77".into())
+        );
+
+        // Another subscription's check on the same commit is NOT ours.
+        let theirs = json!({"id": 78, "name": "fluidbox/x",
+                            "external_id": check_external_id(other)});
+        assert_eq!(
+            find_marker_check(std::slice::from_ref(&theirs), &want),
+            None
+        );
+        assert_eq!(
+            find_marker_check(&[theirs, ours], &want),
+            Some("77".into()),
+            "ours is picked out of a mixed page"
+        );
+
+        // A same-NAMED check from another app carries no external_id of ours —
+        // adopting it would PATCH someone else's check run.
+        assert_eq!(
+            find_marker_check(&[json!({"id": 79, "name": "fluidbox/x"})], &want),
+            None
+        );
+        // No usable id ⇒ not adoptable (we could not address it anyway).
+        assert_eq!(
+            find_marker_check(&[json!({"external_id": want.clone()})], &want),
+            None
+        );
+        assert_eq!(find_marker_check(&[], &want), None);
+    }
+
+    /// A reconciliation ERROR must never be read as proof-of-absence (#33 review
+    /// 2). Both publish paths route the `Err` arm into `?` — no `unwrap_or`, no
+    /// `None` fallback, no warn-and-continue — because a transient list timeout on
+    /// a RETRY is indistinguishable from "nothing is there", and guessing wrong
+    /// posts a duplicate that cannot be repaired afterwards. Asserted against the
+    /// source because the failure needs a flaky GitHub to reproduce; needles are
+    /// split so this test is not its own evidence.
+    #[test]
+    fn a_reconcile_error_never_falls_through_to_create() {
+        let src = include_str!("github.rs");
+        for (open, close, what) in [
+            (
+                concat!("async fn publish_pr_", "comment("),
+                concat!("issues/{pr_number}/", "comments\""),
+                "comment",
+            ),
+            (
+                concat!("async fn publish_", "check("),
+                concat!("reqwest::Method::", "POST,"),
+                "check",
+            ),
+        ] {
+            let start = src.find(open).expect("the publish fn exists");
+            let end = src[start..]
+                .find(close)
+                .map(|i| start + i)
+                .expect("its create call follows");
+            let slice = &src[start..end];
+            assert!(
+                slice.contains(concat!("refusing to ", "create")),
+                "the {what} path must FAIL the attempt when reconciliation errors"
+            );
+            for banned in [
+                concat!("Ok(found) =", "> found"),
+                concat!("tracing::", "warn!"),
+            ] {
+                assert!(
+                    !slice.contains(banned),
+                    "the {what} path swallows a reconcile error (`{banned}`) and \
+                     falls through to create — that is the duplicate this closes"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1287,6 +1714,123 @@ o+rncG5hSLaqG1A2w8vlQ3BS7Q==
         assert!(body.contains("⚠️"));
         assert!(body.contains("`failed`"));
         assert!(body.contains("(no summary produced)"));
+    }
+
+    /// Reconcile-before-create (Phase E, #33; Gap 13): the published body carries
+    /// the deterministic per-subscription marker, and the reconciler finds OUR
+    /// comment by it in a recorded GitHub listing — which is what stops a crash
+    /// between the POST and the `external_results` write from producing a
+    /// duplicate comment on retry.
+    #[test]
+    fn comment_marker_round_trips_through_a_recorded_listing() {
+        let sub = Uuid::now_v7();
+        let other_sub = Uuid::now_v7();
+        let ctx = super::super::PublishContext {
+            scope: fluidbox_db::TenantScope::assume(Uuid::now_v7()),
+            session_id: Uuid::now_v7(),
+            subscription_id: Some(sub),
+            subscription_name: "security-review".into(),
+            agent_name: "sec-agent".into(),
+            status: "completed".into(),
+            summary: Some("ok".into()),
+            commit_sha: None,
+        };
+        let body = comment_body(&ctx);
+        let marker = subscription_marker(sub);
+        assert!(
+            body.contains(&marker),
+            "every published body carries its marker"
+        );
+        assert!(marker.starts_with("<!--"), "the marker renders as nothing");
+
+        // A recorded GitHub `GET /issues/{n}/comments` page: a human comment, a
+        // DIFFERENT subscription's fluidbox comment, then ours.
+        let listing = json!([
+            {"id": 1, "html_url": "https://github.test/c/1", "body": "LGTM"},
+            {"id": 2, "html_url": "https://github.test/c/2",
+             "body": format!("### 🤖 other review\n{}", subscription_marker(other_sub))},
+            {"id": 3, "html_url": "https://github.test/c/3", "body": body},
+        ]);
+        assert_eq!(
+            find_marker_comment(&listing, &marker),
+            Some(("3".into(), "https://github.test/c/3".into())),
+            "adopt OUR comment, never another subscription's"
+        );
+        // Nothing of ours on the PR ⇒ None ⇒ the caller creates (today's path).
+        assert_eq!(
+            find_marker_comment(&listing, &subscription_marker(Uuid::now_v7())),
+            None
+        );
+
+        // Total on malformed input: never panics, never adopts a stranger.
+        assert_eq!(
+            find_marker_comment(&json!({"message": "Not Found"}), &marker),
+            None
+        );
+        assert_eq!(find_marker_comment(&json!([]), &marker), None);
+        assert_eq!(
+            find_marker_comment(&json!([{"body": marker.clone()}]), &marker),
+            None,
+            "a comment with no usable id is not adoptable"
+        );
+        assert_eq!(
+            find_marker_comment(&json!([{"id": 9, "body": marker.clone()}]), &marker),
+            Some(("9".into(), String::new())),
+            "a missing html_url still adopts (the id is what prevents the duplicate)"
+        );
+
+        // A subscription-less publish has no stable identity to reconcile
+        // against — no marker is emitted (and publish_pr_comment refuses it).
+        let anon = super::super::PublishContext {
+            subscription_id: None,
+            ..ctx
+        };
+        assert!(!comment_body(&anon).contains("<!-- fluidbox:sub:"));
+    }
+
+    /// The searched BODY carries agent output (`summary`) and user text
+    /// (`subscription_name`), so "the marker contains no user text" never made
+    /// adoption unspoofable. Adoption is restricted to a marker in the TRAILING
+    /// position — which `comment_body` puts below the footer, out of the agent's
+    /// reach — so a marker planted mid-body is not adopted (review Minor B).
+    #[test]
+    fn an_agent_planted_marker_is_not_adopted() {
+        let victim = Uuid::now_v7();
+        let attacker = Uuid::now_v7();
+        let victim_marker = subscription_marker(victim);
+
+        // The attacker's run emits the VICTIM's marker inside its summary; we
+        // publish that text ourselves, so the body genuinely contains it — above
+        // our own footer and our own trailing marker.
+        let planted = super::super::PublishContext {
+            scope: fluidbox_db::TenantScope::assume(Uuid::now_v7()),
+            session_id: Uuid::now_v7(),
+            subscription_id: Some(attacker),
+            subscription_name: "attacker".into(),
+            agent_name: "agent".into(),
+            status: "completed".into(),
+            summary: Some(format!("here is my report {victim_marker}")),
+            commit_sha: None,
+        };
+        let body = comment_body(&planted);
+        assert!(
+            body.contains(&victim_marker),
+            "the planted marker really is in the body — otherwise this test proves nothing"
+        );
+        let listing = json!([{"id": 42, "html_url": "https://github.test/c/42", "body": body}]);
+        assert_eq!(
+            find_marker_comment(&listing, &victim_marker),
+            None,
+            "a marker in agent-controlled text must NOT be adopted — the victim \
+             subscription would PATCH another subscription's comment"
+        );
+        // The attacker's OWN trailing marker still adopts: the check is positional,
+        // not a blanket refusal of bodies that mention a marker.
+        assert_eq!(
+            find_marker_comment(&listing, &subscription_marker(attacker)),
+            Some(("42".into(), "https://github.test/c/42".into())),
+            "our own trailing marker still reconciles"
+        );
     }
 
     #[test]

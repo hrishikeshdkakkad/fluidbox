@@ -121,6 +121,19 @@ class Gh(http.server.BaseHTTPRequestHandler):
             return self._send(200, {"repositories": [
                 {"id": 500, "full_name": "acme/site", "private": False,
                  "default_branch": "main", "html_url": "https://x/acme/site"}]})
+        # Reconcile-before-create listings (#33 review 2). The publisher now
+        # treats a listing ERROR as "I cannot tell" and REFUSES to create, so
+        # these must answer — a 404 here would stall every comment and check.
+        # They answer EMPTY, which is the honest state for this fixture: the
+        # fake stores nothing, so "ours is not there" is true and the create
+        # path is exercised exactly as before this change. Adoption itself is
+        # unit-tested (find_marker_comment / find_marker_check); what matters
+        # here is that a live listing endpoint keeps publishing working.
+        if re.fullmatch(r"/repos/[^/]+/[^/]+/issues/\d+/comments", self.path.split("?")[0]):
+            return self._send(200, [])
+        if re.fullmatch(r"/repos/[^/]+/[^/]+/commits/[^/]+/check-runs",
+                        self.path.split("?")[0]):
+            return self._send(200, {"total_count": 0, "check_runs": []})
         return self._send(404, {"message": "not found"})
     def do_POST(self):
         global comment_seq
@@ -180,6 +193,13 @@ class Gh(http.server.BaseHTTPRequestHandler):
         if m:
             return self._send(200, {"id": int(m.group(2)),
                 "html_url": f"https://x/{m.group(1)}#c{m.group(2)}"})
+        # Checks are now updated in place when we already hold their id, exactly
+        # like comments (#33 review 2) — without this a redelivery against the
+        # same head SHA would 404 and fall through to a second check run.
+        m = re.fullmatch(r"/repos/([^/]+/[^/]+)/check-runs/(\d+)", self.path)
+        if m:
+            return self._send(200, {"id": int(m.group(2)),
+                "html_url": f"https://x/{m.group(1)}/checks/{m.group(2)}"})
         return self._send(404, {"message": "not found"})
     def log_message(self, *a): pass
 # Threading matters: reqwest keeps pooled connections alive; a serial
@@ -410,10 +430,12 @@ if [ -n "$SF" ]; then
   [ "$(pq "select trust_tier from sessions where id='$SF'")" = "read_only" ] && ok "sessions.trust_tier = read_only" || no "column not set"
   [ "$(sfield "$SF" "['run_spec']['workspace']['checkout_mode']")" = "read_only" ] && ok "checkout_mode = read_only" || no "checkout mode wrong"
   # Probe the real permission gate with the run's own session token.
+  # Gap 10: /permission is the TOOL-INTENT audience, so take FLUIDBOX_TOOL_TOKEN
+  # (the runner-control token in FLUIDBOX_SESSION_TOKEN would now 403 here).
   TOK=""
   for _ in $(seq 1 30); do
     CID=$(docker ps --filter "label=fluidbox.session=$SF" --format '{{.ID}}' | head -1)
-    [ -n "$CID" ] && { TOK=$(docker inspect "$CID" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^FLUIDBOX_SESSION_TOKEN=' | cut -d= -f2-); break; }
+    [ -n "$CID" ] && { TOK=$(docker inspect "$CID" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^FLUIDBOX_TOOL_TOKEN=' | cut -d= -f2-); break; }
     sleep 1
   done
   if [ -n "$TOK" ]; then

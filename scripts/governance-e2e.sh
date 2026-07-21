@@ -25,8 +25,14 @@ new_session() { # autonomy -> session_id
     "$API/v1/sessions" | j "['session']['id']"
 }
 
-token_for() { # session_id -> session token from the launched container env
-  local sid=$1 cid tok
+# Gap 10: the sandbox now carries FOUR audience-scoped tokens. This script drives
+# the runner contract itself, and the ONLY internal-gateway route it calls is
+# /permission — the TOOL-INTENT audience — so it extracts FLUIDBOX_TOOL_TOKEN.
+# (Its /events reads go through the admin `/v1` API, not the internal gateway,
+# so no runner-control credential is needed here.) The env var name is a
+# parameter so a future control-plane call can ask for FLUIDBOX_SESSION_TOKEN.
+token_for() { # session_id [env-var, default FLUIDBOX_TOOL_TOKEN] -> token
+  local sid=$1 var=${2:-FLUIDBOX_TOOL_TOKEN} cid
   for _ in $(seq 1 30); do
     cid=$(docker ps --filter "label=fluidbox.session=$sid" --format '{{.ID}}' | head -1)
     [ -n "$cid" ] && break
@@ -34,10 +40,10 @@ token_for() { # session_id -> session token from the launched container env
   done
   [ -z "$cid" ] && { echo ""; return; }
   docker inspect "$cid" --format '{{range .Config.Env}}{{println .}}{{end}}' \
-    | grep '^FLUIDBOX_SESSION_TOKEN=' | head -1 | cut -d= -f2-
+    | grep "^${var}=" | head -1 | cut -d= -f2-
 }
 
-perm() { # token session_id json-body  -> prints decision json
+perm() { # tool-audience token, session_id, json-body -> prints decision json
   curl -s -X POST -H "authorization: Bearer $1" -H 'content-type: application/json' \
     -d "$3" "$API/internal/sessions/$2/permission"
 }
@@ -230,7 +236,7 @@ rm -f "$GB"
 say "SUPERVISED — policy verdicts + approval pause/resume"
 S=$(new_session false); echo "  session $S"
 T=$(token_for "$S")
-[ -n "$T" ] && ok "sandbox launched; got session token" || { no "no token"; exit 1; }
+[ -n "$T" ] && ok "sandbox launched; got tool-audience session token" || { no "no token"; exit 1; }
 silence_runner "$S"
 
 # safe tool → allow

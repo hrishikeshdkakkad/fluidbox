@@ -75,6 +75,13 @@ pub struct ToolSnapshot {
     pub description: String,
     #[serde(default = "empty_object")]
     pub input_schema: Value,
+    /// The MCP `outputSchema` (2025-06-18+): the JSON Schema a tool's
+    /// `structuredContent` result conforms to. Preserved through the photograph
+    /// (Phase E, E7) so a run's frozen surface carries it; `None` for tools that
+    /// declare none. Part of the tools digest ONLY when `Some`, so pre-E
+    /// snapshots (no output schema) digest byte-identically to before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotations: Option<Value>,
 }
@@ -342,11 +349,19 @@ pub fn tools_digest(tools: &[ToolSnapshot]) -> String {
     let canonical: Vec<Value> = tools
         .iter()
         .map(|t| {
-            serde_json::json!({
+            let mut obj = serde_json::json!({
                 "name": t.name,
                 "description": t.description,
                 "input_schema": t.input_schema,
-            })
+            });
+            // E7: fold in `output_schema` ONLY when present, so a tool that
+            // declares none digests exactly as it did before this field existed
+            // (historical snapshots stay stable) while a tool that DOES declare
+            // one — and any later drift of it — is covered.
+            if let Some(os) = &t.output_schema {
+                obj["output_schema"] = os.clone();
+            }
+            obj
         })
         .collect();
     sha256_of(&serde_json::to_string(&canonical).unwrap_or_default())
@@ -599,6 +614,7 @@ mod tests {
             name: name.into(),
             description: format!("does {name}"),
             input_schema: json!({"type": "object", "properties": {}}),
+            output_schema: None,
             annotations: None,
         }
     }
@@ -847,6 +863,7 @@ mod tests {
                 r#"{"type":"object","properties":{"a":{"type":"string"}}}"#,
             )
             .unwrap(),
+            output_schema: None,
             annotations: None,
         };
         let t2 = ToolSnapshot {
@@ -864,7 +881,32 @@ mod tests {
         // Annotations are display-only: not part of the digest.
         let mut t4 = t1.clone();
         t4.annotations = Some(json!({"readOnlyHint": true}));
-        assert_eq!(tools_digest(&[t1]), tools_digest(&[t4]));
+        assert_eq!(tools_digest(std::slice::from_ref(&t1)), tools_digest(&[t4]));
+
+        // E7 back-compat: a tool with NO output_schema digests to the exact
+        // fixture value pre-change tools_digest produced (guards against the new
+        // field ever perturbing historical snapshot digests).
+        assert_eq!(
+            tools_digest(std::slice::from_ref(&t1)),
+            "sha256:ea1be7b9add671db75008caa4917c813a29960a3b914135db046d436c0d4129f",
+            "output_schema=None must digest identically to the pre-E7 canonical form"
+        );
+        // …and adding an output_schema DOES change the digest (drift-sensitive).
+        let mut t5 = t1.clone();
+        t5.output_schema =
+            Some(json!({"type": "object", "properties": {"n": {"type": "integer"}}}));
+        assert_ne!(
+            tools_digest(std::slice::from_ref(&t1)),
+            tools_digest(std::slice::from_ref(&t5)),
+            "an output_schema must be covered by the digest"
+        );
+        // Re-ordering output_schema keys does NOT change it (Value canonicalizes).
+        let mut t6 = t1.clone();
+        t6.output_schema = Some(
+            serde_json::from_str(r#"{"properties":{"n":{"type":"integer"}},"type":"object"}"#)
+                .unwrap(),
+        );
+        assert_eq!(tools_digest(&[t5]), tools_digest(&[t6]));
 
         let def = CapabilityBundleDef {
             servers: vec![sandbox("ws", vec![tool("count")])],
@@ -1025,6 +1067,7 @@ mod tests {
             snapshot_version: 3,
             tools: vec![tool("get_pr")],
             tools_digest: "sha256:abc".into(),
+            protocol_version: None,
         }];
 
         // Built-ins pass through (None), both attachment paths resolve.

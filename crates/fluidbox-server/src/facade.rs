@@ -144,6 +144,218 @@ fn facade_refusal(dialect: Dialect, code: &str, message: &str) -> Response {
         .unwrap()
 }
 
+/// A 429 reservation refusal, dialect-shaped like [`facade_refusal`] so the runner
+/// SDK parses it and (correctly) retries with backoff. This is the ADDITIVE Gap-14
+/// exit: it means "not right now — other requests on this run have the remaining
+/// budget booked", never "this run is over". The terminal budget verdict keeps its
+/// own pre-existing 400 wording and its `BudgetExceeded` ledger event.
+fn reservation_refusal(dialect: Dialect, code: &str, message: &str) -> Response {
+    let full = format!("{message} ({code})");
+    let body = match dialect {
+        Dialect::Anthropic => json!({
+            "type": "error",
+            "error": { "type": code, "message": full }
+        }),
+        Dialect::OpenAi => json!({
+            "error": {
+                "message": full,
+                "type": "rate_limit_error",
+                "param": null,
+                "code": code
+            }
+        }),
+    };
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+// ─── Gap 14: conservative per-request budget reservations ──────────────────
+
+/// Default for how many reservations one session may hold at once. The bound
+/// design :1118 asks for — a finite ceiling on concurrent reservations — NOT a
+/// per-session mutex, which design :1113-1115 explicitly forbids because parallel
+/// subagent calls are legitimate. 32 is comfortably above any harness's real
+/// fan-out. Overridable per deployment via `FLUIDBOX_LLM_MAX_CONCURRENT_
+/// RESERVATIONS`, which `config.rs` parses at BOOT (a malformed or non-positive
+/// value fails boot naming the variable — see `parse_positive_i64_env`).
+pub const DEFAULT_MAX_CONCURRENT_RESERVATIONS: i64 = 32;
+
+/// Reservation lifetime. MUST comfortably exceed the facade's upstream request
+/// timeout ([`crate::config::UPSTREAM_HTTP_TIMEOUT_SECS`]): the expiry sweep
+/// converts a still-`reserved` row into a CONSERVATIVE charge, and because both
+/// are keyed on the request id, that over-charge would then STICK against the real
+/// usage arriving later. 30 minutes means an expired reservation is proof the
+/// process died, not that a request is slow. The relationship is asserted against
+/// the real timeout constant, so raising the timeout fails that test rather than
+/// silently breaking the guarantee.
+const RESERVATION_TTL_SECS: i64 = 1800;
+
+/// Declared-output fallback when a request names no output cap. Anthropic REQUIRES
+/// `max_tokens`, and codex sends `max_output_tokens`, so this is the defensive
+/// branch — deliberately large, because guessing low would under-reserve.
+const FALLBACK_MAX_OUTPUT_TOKENS: i64 = 32_768;
+
+/// Upper clamp on the declared output allowance, so a runner that declares an
+/// absurd `max_tokens` cannot book a nonsensical reservation (it would only ever
+/// starve its own run, but the arithmetic should stay sane).
+const MAX_RESERVABLE_OUTPUT_TOKENS: i64 = 1_000_000;
+
+/// Bytes of serialized request charged as ONE input token.
+///
+/// **1, and it has to be 1** (#33 review 1). The previous value was 4 — the
+/// well-known AVERAGE for English prose — which is not an upper bound at all:
+/// dense CJK, minified JSON, base64, or deliberately adversarial text tokenizes
+/// far denser, so two requests could each reserve ~a quarter of what they went on
+/// to spend and both be admitted against a budget neither could afford. Design
+/// :1117 asks for a CONSERVATIVE MAXIMUM, so the ratio must be one no input can
+/// beat.
+///
+/// 1 byte per token is that bound, and it is a property of the tokenizer family
+/// rather than a guess: every production LLM tokenizer here is byte-level BPE,
+/// whose vocabulary contains all 256 single bytes as atomic tokens. BPE only ever
+/// MERGES adjacent tokens, so an N-byte payload can never encode to more than N
+/// tokens — the worst case (nothing merges) is exactly one token per byte. There
+/// is no input, adversarial or otherwise, that exceeds it.
+///
+/// COST OF OVER-RESERVING, stated plainly: for ordinary English a reservation is
+/// now ~4× the request's real input, so a session's CONCURRENT fan-out against a
+/// tight token budget shrinks by roughly that factor. What that costs is bounded
+/// on three sides. (1) The sole-claimant carve-out means a request with NO live
+/// sibling skips the reservation arms entirely — an over-estimate can never
+/// refuse a serial run, only a parallel one. (2) The booking is transient: it
+/// reconciles against authoritative usage the moment the response completes, so
+/// the over-count exists for one request's latency, not for the run. (3) The
+/// refusal it can cause is a retryable `429 budget_reservation`, explicitly NOT
+/// the terminal `BudgetExceeded` verdict. Under-reserving has no comparable
+/// bound: it silently overspends the hard budget, which is the whole point of
+/// Gap 14.
+const BYTES_PER_INPUT_TOKEN: usize = 1;
+
+/// The conservative maximum this request could cost, booked BEFORE it is
+/// forwarded (design :1117). Deliberately pessimistic — an over-reservation only
+/// delays a concurrent sibling and is reconciled away the moment authoritative
+/// usage lands, whereas an under-reservation reopens the very race this closes.
+///
+/// `reserved = declared_max_output + ceil(body_len / BYTES_PER_INPUT_TOKEN)`,
+/// priced with `estimate_cost_usd` when the model is in the price table.
+///
+/// ASSUMPTIONS, all erring high on purpose:
+///   * **Every byte of the serialized request is billable input**, at
+///     [`BYTES_PER_INPUT_TOKEN`] = 1 byte per token — a genuine upper bound for
+///     byte-level BPE, not an average (see that constant for why, and for what
+///     over-reserving costs). JSON punctuation, tool schemas and base64 image
+///     payloads are all counted as text tokens; images actually bill by pixel and
+///     base64 inflates the byte count ~4/3, so this over-counts them further.
+///   * **Nothing is cache-hit.** Prompt-cached input reads at a fraction of the
+///     input price; pricing the whole estimate as fresh input over-counts a
+///     cache-heavy turn (which is the common shape for an agent loop).
+///   * **The full declared output allowance is produced.** Real completions are
+///     usually far shorter.
+///   * **An unpriced model reserves NO cost** (`estimate_cost_usd` → `None`). The
+///     cost arm of admission then cannot bind for this request — the same
+///     degradation the pre-existing cost budget already has — and the token arm
+///     carries the weight.
+fn conservative_reservation(
+    dialect: Dialect,
+    parsed: &Value,
+    body_len: usize,
+    model: &str,
+) -> (i64, Option<f64>) {
+    let declared = match dialect {
+        Dialect::Anthropic => parsed.get("max_tokens"),
+        Dialect::OpenAi => parsed.get("max_output_tokens"),
+    }
+    .and_then(|v| v.as_u64())
+    .filter(|n| *n > 0)
+    .map(|n| (n as i64).min(MAX_RESERVABLE_OUTPUT_TOKENS))
+    .unwrap_or(FALLBACK_MAX_OUTPUT_TOKENS);
+    let input = body_len.div_ceil(BYTES_PER_INPUT_TOKEN) as i64;
+    let usage = UsageDelta {
+        input_tokens: input as u64,
+        output_tokens: declared as u64,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+    };
+    (input + declared, estimate_cost_usd(model, &usage))
+}
+
+/// Settle a reservation as never-spent. Legal ONLY where non-dispatch is
+/// POSITIVELY PROVEN (design :1121) — see the release-set enumeration in
+/// [`messages`]. A failure here is not fatal: the row stays `reserved` and the
+/// expiry sweep converts it into a conservative charge, which is the safe
+/// direction.
+async fn release_reservation(state: &AppState, scope: TenantScope, request_id: Uuid) {
+    if let Err(e) = fluidbox_db::release_llm_reservation(&state.pool, scope, request_id).await {
+        tracing::warn!(
+            "facade: releasing LLM reservation {request_id} failed: {e} — it will be swept \
+             as a conservative charge"
+        );
+    }
+}
+
+/// May a reservation retire to `charged`? ONLY once its authoritative usage row
+/// is DURABLE.
+///
+/// Extracted as a pure fn so the decision is testable with no database: the
+/// failure it guards (`add_usage` erroring) cannot be injected into
+/// [`reconcile_reservation`] without one. Charging on a FAILED usage write is the
+/// worst outcome in the whole reservation lifecycle and it is UNRECOVERABLE — the
+/// row reads `charged`, so the expiry sweeper skips it, and the spend is absent
+/// from `usage_entries` permanently. Leaving it `reserved` instead hands it to the
+/// sweeper's conservative conversion, which is design :1122's never-assume-zero
+/// fallback and errs in the safe direction (a disclosed over-charge).
+const fn should_charge_reservation(usage_written: bool) -> bool {
+    usage_written
+}
+
+/// Reconcile a reservation against AUTHORITATIVE usage (design :1120).
+///
+/// ORDER IS LOAD-BEARING: the usage row lands FIRST, keyed `external_id =
+/// <request id>` (idempotent through the partial-unique `usage_external` index),
+/// and only then does the reservation CAS to `charged`. A crash between the two
+/// leaves a `reserved` row whose sweep re-attempts the same insert as a no-op —
+/// so the two settle identically in EITHER order. Reversed, a crash after the CAS
+/// would retire the booking with no usage recorded: a silent under-charge, the
+/// exact failure Gap 14 exists to prevent.
+///
+/// SUCCESS IS EQUALLY LOAD-BEARING (review I1): ordering alone bought nothing
+/// while `record_usage` swallowed its error, because a transient insert failure
+/// still fell through to the CAS and produced exactly that unrecorded under-charge
+/// — durably, since a `charged` row is invisible to the sweeper. The gate is
+/// [`should_charge_reservation`].
+async fn reconcile_reservation(
+    state: &AppState,
+    scope: TenantScope,
+    session_id: Uuid,
+    model: &str,
+    usage: UsageDelta,
+    request_id: Uuid,
+) {
+    let usage_written = record_usage(
+        state,
+        scope,
+        session_id,
+        model,
+        usage,
+        Some(&request_id.to_string()),
+    )
+    .await;
+    if !should_charge_reservation(usage_written) {
+        tracing::warn!(
+            "facade: usage for LLM reservation {request_id} did not persist — leaving the \
+             reservation `reserved` so the expiry sweep converts it into a conservative \
+             charge (charging now would lose the spend permanently)"
+        );
+        return;
+    }
+    if let Err(e) = fluidbox_db::charge_llm_reservation(&state.pool, scope, request_id).await {
+        tracing::warn!("facade: charging LLM reservation {request_id} failed: {e}");
+    }
+}
+
 /// Is a tool entry a CLIENT-executed (governed) tool for this dialect? Client
 /// tools run in the sandbox and cross the permission gate; server-executed
 /// tools (web_search, file_search, computer use, code interpreter, MCP
@@ -331,6 +543,13 @@ pub async fn messages(
     let sess_auth = fluidbox_db::session_for_token(&state.pool, &token)
         .await?
         .ok_or(ApiError::Unauthorized)?;
+    // Gap 10: model egress is the LLM audience. The sandbox's fake provider key
+    // is now the LLM-scoped token ONLY — a runner-control or tool-intent
+    // credential can no longer spend the run's model budget. Refused at the auth
+    // layer (like an unresolvable token), not as a dialect-shaped body.
+    if !crate::auth::audience_allows(crate::auth::AUD_LLM, &sess_auth.audience) {
+        return Err(ApiError::Forbidden("wrong_audience".into()));
+    }
     let session_id = sess_auth.session_id;
     let scope = TenantScope::assume(sess_auth.tenant_id);
 
@@ -471,6 +690,107 @@ pub async fn messages(
         suffix
     );
 
+    // ─── Gap 14: book the conservative reservation ─────────────────────────
+    //
+    // Placement is deliberate. Everything above this line is a screen that can
+    // reject the request outright — the `llm` audience check (Task 5), the
+    // terminal-session refusal, the harness/upstream sanity checks, the
+    // accumulated-usage budget stop, the suffix allowlist, JSON parsing, and
+    // `validate_body`. None of them ever books, so a 403 or a malformed body
+    // cannot leave a reservation behind. From here the request is a genuine
+    // dispatch candidate.
+    //
+    // `request_id` is minted EXACTLY ONCE (there is a source-guard test) and is
+    // reused by the tenant-key 401 replay below, so that exactly-once retry can
+    // neither double-reserve nor double-charge; it also becomes
+    // `usage_entries.external_id` at reconcile time.
+    //
+    // ── THE RELEASE SET ────────────────────────────────────────────────────
+    // Every exit between here and the response, and how each settles. A release
+    // requires POSITIVELY-PROVEN non-dispatch (design :1121); anything short of
+    // proof RETAINS the booking for the expiry sweep to convert into a
+    // conservative charge (design :1122 — never assume zero). ADDING AN EARLY
+    // RETURN IN THIS RANGE MEANS ADDING IT HERE.
+    //
+    //   R1  tenant key unavailable      → 503 → RELEASE (nothing was sent)
+    //   R2  SSO+shared refusal          → 503 → RELEASE (nothing was sent)
+    //   R3  send_upstream transport err → 502 → RELEASE iff `is_connect()`
+    //                                            (proof no bytes were written —
+    //                                            the same test Task 4's claim
+    //                                            classifier uses), else RETAIN
+    //   R4  401 path, body read failed  → 502 → RELEASE (the 401 status itself is
+    //                                            the proof; see R5)
+    //   R5  401 not our virtual key     → 401 → RELEASE — this file already
+    //                                            asserts "a 401 proves the request
+    //                                            never executed upstream" as the
+    //                                            basis for the exactly-once replay
+    //   R6  401, recovery refused       → 401 → RELEASE (same proof as R5)
+    //   R7  replay transport error      → 502 → RELEASE iff `is_connect()`, else RETAIN
+    //   R8  final status == 401         → 401 → RELEASE (shared-mode 401, or a
+    //                                            replay that 401'd again)
+    //   R9  non-stream body read failed → 502 → RETAIN (sent; outcome unknown)
+    //   R10 non-stream, usage parsed    → 2xx → CHARGE (authoritative)
+    //   R11 non-stream, no usage parsed →     → RETAIN (a definitive non-401 error
+    //                                            status is *probably* zero-usage;
+    //                                            we do not treat "probably" as
+    //                                            proof — disclosed over-charge)
+    //   R12 stream drain, meter.any()   →     → CHARGE (authoritative, incl. the
+    //                                            client-disconnect drain)
+    //   R13 stream drain, no usage      →     → RETAIN — the "usage unparsed"
+    //                                            zero marker must NEVER release
+    //                                            (design :1122; source-guarded)
+    let request_id = Uuid::now_v7();
+    let (reserved_tokens, reserved_cost) =
+        conservative_reservation(dialect, &parsed, upstream_body.len(), &run_spec.model);
+    match fluidbox_db::reserve_llm_budget(
+        &state.pool,
+        scope,
+        session_id,
+        request_id,
+        &run_spec.model,
+        reserved_tokens,
+        reserved_cost,
+        state.cfg.llm_max_concurrent_reservations,
+        run_spec.budgets.max_tokens.map(|t| t as i64),
+        run_spec.budgets.max_cost_usd,
+        RESERVATION_TTL_SECS,
+    )
+    .await?
+    {
+        fluidbox_db::ReserveOutcome::Reserved => {}
+        // The run wound down between the status check above and the booking —
+        // same refusal the pre-existing check emits, byte for byte.
+        fluidbox_db::ReserveOutcome::SessionTerminal => {
+            return Ok(dialect_error(
+                dialect,
+                StatusCode::BAD_REQUEST,
+                "session is not active",
+            ));
+        }
+        fluidbox_db::ReserveOutcome::CeilingExceeded { active, ceiling } => {
+            return Ok(reservation_refusal(
+                dialect,
+                "llm_reservation_ceiling_exceeded",
+                &format!(
+                    "this run already has {active} model requests in flight (limit {ceiling}) — retry shortly"
+                ),
+            ));
+        }
+        // TRANSIENT by construction: with no competing reservation the
+        // sole-claimant rule admits, so this only fires when siblings hold the
+        // remaining budget. They reconcile (or expire) and the retry proceeds —
+        // or the accumulated check / budget sweeper stops the run for real.
+        fluidbox_db::ReserveOutcome::BudgetExceeded { budget, active } => {
+            return Ok(reservation_refusal(
+                dialect,
+                "llm_budget_reservation_exceeded",
+                &format!(
+                    "{budget} budget is fully reserved by {active} in-flight model request(s) — retry shortly"
+                ),
+            ));
+        }
+    }
+
     // Resolve the outbound credential ONCE, before dialect dispatch (D7). Shared
     // mode presents the deployment key (today's behavior, now explicit); tenant
     // mode resolves/mints the session tenant's LiteLLM virtual key so the master
@@ -488,6 +808,8 @@ pub async fn messages(
                         "facade: tenant LLM key unavailable for tenant {}: {e}",
                         sess_auth.tenant_id
                     );
+                    // R1: refused before any byte left the process.
+                    release_reservation(&state, scope, request_id).await;
                     return Ok(facade_refusal(
                         dialect,
                         "tenant_llm_key_unavailable",
@@ -497,6 +819,8 @@ pub async fn messages(
             }
         }
         llm_keys::KeySource::RefuseSsoShared => {
+            // R2: the forbidden hosted posture — nothing was sent.
+            release_reservation(&state, scope, request_id).await;
             return Ok(facade_refusal(
                 dialect,
                 "tenant_llm_keys_required",
@@ -517,6 +841,13 @@ pub async fn messages(
     {
         Ok(r) => r,
         Err(e) => {
+            // R3: a CONNECT failure is positive proof no request was written —
+            // the same test Task 4's claim classifier uses for
+            // `failed_before_send`. Any other transport error (timeout, body
+            // write, mid-response decode) is not proof: retain.
+            if e.is_connect() {
+                release_reservation(&state, scope, request_id).await;
+            }
             return Ok(dialect_error(
                 dialect,
                 StatusCode::BAD_GATEWAY,
@@ -551,6 +882,8 @@ pub async fn messages(
         let body = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
+                // R4: the 401 status already proves the request never executed.
+                release_reservation(&state, scope, request_id).await;
                 return Ok(dialect_error(
                     dialect,
                     StatusCode::BAD_GATEWAY,
@@ -561,6 +894,8 @@ pub async fn messages(
         if !llm_keys::virtual_key_rejected(key_source, status.as_u16(), &body) {
             // Not our key: an upstream/provider or otherwise unattributable 401.
             // Forward it verbatim — never re-provision on a guess.
+            // R5: still a 401, so still proof of non-execution.
+            release_reservation(&state, scope, request_id).await;
             return Ok(forward_buffered(status, body));
         }
         tracing::warn!(
@@ -578,12 +913,21 @@ pub async fn messages(
                         reason,
                         "facade: tenant LLM key not re-provisioned — forwarding the rejection"
                     );
+                    // R6: same 401 proof as R5.
+                    release_reservation(&state, scope, request_id).await;
                     return Ok(forward_buffered(status, body));
                 }
             };
+        // The replay rides the SAME `request_id` — no second reservation, and its
+        // reconcile lands under the one external_id, so the exactly-once retry can
+        // neither double-book nor double-charge.
         match send_upstream(&state, dialect, &upstream, &headers, upstream_body, &fresh).await {
             Ok(r) => resp = r,
             Err(e) => {
+                // R7: same connect-only proof rule as R3.
+                if e.is_connect() {
+                    release_reservation(&state, scope, request_id).await;
+                }
                 return Ok(dialect_error(
                     dialect,
                     StatusCode::BAD_GATEWAY,
@@ -593,6 +937,11 @@ pub async fn messages(
         }
     }
     let status = resp.status();
+    // R8: any surviving 401 (shared mode, or a replay that 401'd again). The
+    // exactly-once replay reasoning above is exactly this proof.
+    if status.as_u16() == 401 {
+        release_reservation(&state, scope, request_id).await;
+    }
     let is_stream = resp
         .headers()
         .get("content-type")
@@ -607,6 +956,7 @@ pub async fn messages(
         let bytes = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
+                // R9: the request WAS sent — retain and let the sweep charge it.
                 return Ok(dialect_error(
                     dialect,
                     StatusCode::BAD_GATEWAY,
@@ -614,9 +964,11 @@ pub async fn messages(
                 ));
             }
         };
+        // R10 (usage parsed → reconcile) / R11 (no usage → retain).
         if status.is_success() {
             if let Some(usage) = parse_usage_json(dialect, &bytes) {
-                record_usage(&state, scope, session_id, &model_hint, usage, None).await;
+                reconcile_reservation(&state, scope, session_id, &model_hint, usage, request_id)
+                    .await;
             }
         }
         let mut builder = Response::builder().status(status);
@@ -657,16 +1009,23 @@ pub async fn messages(
         decoder.finish(|line| meter.on_line(line));
         // Meter on stream end.
         if meter.any() {
-            record_usage(
+            // R12: authoritative usage — including the client-disconnect drain,
+            // which is why the drain exists at all.
+            reconcile_reservation(
                 &state2,
                 scope,
                 session_id,
                 &model2,
                 meter.into_delta(),
-                None,
+                request_id,
             )
             .await;
         } else {
+            // R13: RETAIN. The stream ended without a single usage event, so the
+            // provider's spend is UNKNOWN — design :1122 forbids assuming zero.
+            // The reservation stays `reserved` and the expiry sweep converts it
+            // into the conservative charge. Do NOT release here (source-guarded).
+            //
             // Still record a zero-usage marker so we know a call happened.
             ledger::record(
                 &state2,
@@ -756,6 +1115,12 @@ async fn trigger_budget_stop(
     }
 }
 
+/// Persist authoritative usage and ledger the model response.
+///
+/// RETURNS whether the `usage_entries` row is DURABLE — the caller's reservation
+/// gate depends on it, so this must never swallow the error (review I1). The
+/// ledger event is emitted either way: it is the operator-visible record that a
+/// call happened, and suppressing it would hide the failure entirely.
 async fn record_usage(
     state: &AppState,
     scope: TenantScope,
@@ -763,9 +1128,9 @@ async fn record_usage(
     model: &str,
     usage: UsageDelta,
     external_id: Option<&str>,
-) {
+) -> bool {
     let cost = estimate_cost_usd(model, &usage);
-    fluidbox_db::add_usage(
+    let written = match fluidbox_db::add_usage(
         &state.pool,
         scope,
         session_id,
@@ -779,7 +1144,13 @@ async fn record_usage(
         external_id,
     )
     .await
-    .ok();
+    {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("facade: recording usage for session {session_id} failed: {e}");
+            false
+        }
+    };
     ledger::record(
         state,
         scope,
@@ -795,6 +1166,7 @@ async fn record_usage(
         },
     )
     .await;
+    written
 }
 
 // ─── Usage parsing ─────────────────────────────────────────────────────────
@@ -1037,6 +1409,301 @@ mod tests {
             }
             assert!(v["error"]["message"].as_str().unwrap().contains(code));
         }
+    }
+
+    // ─── Gap 14: reservations ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn reservation_refusal_is_429_with_machine_code_per_dialect() {
+        // ADDITIVE to the D7 503s: a reservation refusal is TRANSIENT, so it gets
+        // a 429 (which every runner SDK retries with backoff) and its own stable
+        // codes. The 503 codes and the terminal 400 budget wording are untouched.
+        for (dialect, code) in [
+            (Dialect::Anthropic, "llm_reservation_ceiling_exceeded"),
+            (Dialect::OpenAi, "llm_budget_reservation_exceeded"),
+        ] {
+            let resp = reservation_refusal(dialect, code, "retry shortly");
+            assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&bytes).unwrap();
+            match dialect {
+                Dialect::Anthropic => assert_eq!(v["error"]["type"], code),
+                Dialect::OpenAi => {
+                    assert_eq!(v["error"]["code"], code);
+                    assert_eq!(v["error"]["type"], "rate_limit_error");
+                }
+            }
+            assert!(v["error"]["message"].as_str().unwrap().contains(code));
+        }
+    }
+
+    #[test]
+    fn conservative_reservation_uses_declared_output_plus_input_estimate() {
+        // Anthropic: `max_tokens` is required by that API and is the declared
+        // output allowance; input is body_len / BYTES_PER_INPUT_TOKEN, rounded UP.
+        let body = json!({"model": "claude-haiku-4-5", "max_tokens": 1000, "messages": []});
+        let len = 401usize;
+        let (tokens, cost) =
+            conservative_reservation(Dialect::Anthropic, &body, len, "claude-haiku-4-5");
+        assert_eq!(tokens, 1000 + 401, "declared output + ceil(401/1)");
+        assert!(cost.unwrap() > 0.0, "a priced model reserves cost too");
+
+        // Codex declares `max_output_tokens`; `max_tokens` must NOT be read for it
+        // — neither preferentially nor as a fallback (the two fields mean
+        // different things across the dialects, and Responses ignores max_tokens).
+        let body = json!({"model": "m", "max_output_tokens": 64, "max_tokens": 999_999});
+        let (tokens, _) = conservative_reservation(Dialect::OpenAi, &body, 40, "m");
+        assert_eq!(tokens, 64 + 40);
+        let body = json!({"model": "m", "max_tokens": 999_999});
+        let (tokens, _) = conservative_reservation(Dialect::OpenAi, &body, 0, "m");
+        assert_eq!(
+            tokens, FALLBACK_MAX_OUTPUT_TOKENS,
+            "an OpenAI request with only max_tokens has declared NO output cap"
+        );
+        // …and the mirror image: Anthropic must not read max_output_tokens.
+        let body = json!({"model": "m", "max_output_tokens": 64});
+        let (tokens, _) = conservative_reservation(Dialect::Anthropic, &body, 0, "m");
+        assert_eq!(tokens, FALLBACK_MAX_OUTPUT_TOKENS);
+
+        // No declared cap → the deliberately large fallback, never a small guess.
+        let (tokens, _) = conservative_reservation(Dialect::Anthropic, &json!({}), 0, "m");
+        assert_eq!(tokens, FALLBACK_MAX_OUTPUT_TOKENS);
+        // Zero / absurd declarations are clamped, not trusted.
+        let (tokens, _) =
+            conservative_reservation(Dialect::Anthropic, &json!({"max_tokens": 0}), 0, "m");
+        assert_eq!(tokens, FALLBACK_MAX_OUTPUT_TOKENS);
+        let (tokens, _) = conservative_reservation(
+            Dialect::Anthropic,
+            &json!({"max_tokens": 9_999_999_999u64}),
+            0,
+            "m",
+        );
+        assert_eq!(tokens, MAX_RESERVABLE_OUTPUT_TOKENS);
+
+        // An UNPRICED model reserves tokens but no cost — the cost arm of
+        // admission simply cannot bind, exactly as the pre-existing cost budget
+        // already degrades (estimate_cost_usd → None).
+        let (tokens, cost) = conservative_reservation(
+            Dialect::Anthropic,
+            &json!({"max_tokens": 10}),
+            0,
+            "not-a-real-model",
+        );
+        assert_eq!(tokens, 10);
+        assert!(cost.is_none());
+    }
+
+    /// The input estimate must be an UPPER BOUND, not an average (#33 review 1).
+    ///
+    /// The property asserted is the tokenizer fact [`BYTES_PER_INPUT_TOKEN`]
+    /// documents: byte-level BPE has all 256 single bytes in its vocabulary and
+    /// only ever MERGES, so an N-byte request can never bill more than N input
+    /// tokens. Therefore `reserved − declared_output ≥ body_len` for EVERY body
+    /// length. Any ratio above 1 — including the 4 this shipped with — fails here
+    /// at every non-trivial length, which is exactly the regression to catch:
+    /// with 4, two 2400-byte requests declaring 64 output tokens each reserve 664
+    /// apiece and both fit a 1500-token budget while spending well past it.
+    #[test]
+    fn the_input_estimate_is_an_upper_bound_not_an_average() {
+        const DECLARED: i64 = 64;
+        let body = json!({"max_tokens": DECLARED});
+        for len in [0usize, 1, 3, 4, 5, 189, 401, 2400, 1_048_576] {
+            let (tokens, _) = conservative_reservation(Dialect::Anthropic, &body, len, "m");
+            let input = tokens - DECLARED;
+            assert!(
+                input >= len as i64,
+                "a {len}-byte request reserved only {input} input tokens — an \
+                 adversarially dense payload can bill one token per byte, so this \
+                 is an average, not a conservative maximum"
+            );
+        }
+        // …and it is not gratuitously above the bound either: exactly 1:1 keeps
+        // the over-reservation cost documented in BYTES_PER_INPUT_TOKEN honest.
+        let (tokens, _) = conservative_reservation(Dialect::Anthropic, &body, 2400, "m");
+        assert_eq!(tokens, DECLARED + 2400);
+    }
+
+    /// The reservation is minted and booked EXACTLY ONCE per request, which is
+    /// what makes the exactly-once tenant-key 401 replay safe: it reuses the same
+    /// `request_id`, so it can neither double-book nor (through the unique
+    /// `external_id`) double-charge. A source guard, so it needs no server.
+    #[test]
+    fn the_401_replay_cannot_mint_a_second_request_id_or_reservation() {
+        let body = messages_body();
+        assert_eq!(
+            body.matches("Uuid::now_v7()").count(),
+            1,
+            "the request id is minted once and REUSED by the 401 replay — a second \
+             mint would double-reserve and double-charge the retry"
+        );
+        assert_eq!(
+            body.matches("reserve_llm_budget(").count(),
+            1,
+            "exactly one admission per request"
+        );
+        // …and the ceiling it passes is the BOOT-PARSED knob, not the raw default:
+        // reverting to the const would silently ignore
+        // `FLUIDBOX_LLM_MAX_CONCURRENT_RESERVATIONS`, which only the e2e would catch.
+        assert!(
+            body.contains("state.cfg.llm_max_concurrent_reservations,"),
+            "admission must take the ceiling from Config (boot-validated), never from \
+             DEFAULT_MAX_CONCURRENT_RESERVATIONS directly"
+        );
+    }
+
+    /// The `usage unparsed` zero marker must RETAIN the reservation: the stream
+    /// ended without a single usage event, so provider spend is UNKNOWN and
+    /// design :1122 forbids assuming zero. The expiry sweep converts it instead.
+    #[test]
+    fn the_zero_usage_marker_path_never_releases_the_reservation() {
+        let body = messages_body();
+        // Slice the WHOLE else-branch, from the `} else {` that closes the
+        // `meter.any()` reconcile — anchoring on the marker comment instead would
+        // miss a settle inserted above it (caught by mutating this very guard).
+        let arm = body
+            .find("if meter.any() {")
+            .expect("the drain task meters on stream end");
+        let start = body[arm..]
+            .find("} else {")
+            .map(|i| arm + i)
+            .expect("the no-usage branch exists");
+        let end = body[start..]
+            .find("let body_stream")
+            .map(|i| start + i)
+            .expect("the drain task is delimited by the response build");
+        let branch = &body[start..end];
+        assert!(
+            !branch.contains("release_reservation("),
+            "the zero-usage marker path must NOT release — unknown usage is retained \
+             as a conservative charge (design :1122), never assumed to be zero"
+        );
+        assert!(
+            !branch.contains("charge_llm_reservation("),
+            "and it must not charge either — the sweeper owns that conversion"
+        );
+    }
+
+    /// Reconcile writes the usage row BEFORE it retires the booking. Reversed, a
+    /// crash between the two would settle the reservation with no usage recorded
+    /// — a silent under-charge, the exact failure Gap 14 exists to prevent.
+    ///
+    /// The ordering half is a source guard; the CONDITION half (review I1) is
+    /// pinned both here — the CAS must sit behind the `should_charge_reservation`
+    /// gate — and by the pure-fn test below.
+    #[test]
+    fn reconcile_records_usage_before_it_charges_the_reservation() {
+        let src = include_str!("facade.rs");
+        let start = src
+            .find("async fn reconcile_reservation(")
+            .expect("reconcile_reservation exists");
+        let end = src[start..]
+            .find("/// Is a tool entry a CLIENT-executed")
+            .map(|i| start + i)
+            .expect("the next item delimits the body");
+        let body = &src[start..end];
+        let usage = body.find("record_usage(").expect("records usage");
+        let gate = body
+            .find("if !should_charge_reservation(usage_written) {")
+            .expect(
+                "the CAS must be GATED on a durable usage write — an ungated charge after a \
+                 failed insert retires the booking with no usage row, and the sweeper skips \
+                 `charged` rows, so the spend is lost permanently",
+            );
+        let charge = body
+            .find("charge_llm_reservation(")
+            .expect("charges the reservation");
+        assert!(
+            usage < gate && gate < charge,
+            "order must be: record usage → gate on its durability → charge"
+        );
+        // The gate is only a gate if it can stop the charge.
+        assert!(
+            body[gate..charge].contains("return;"),
+            "the failed-write branch must RETURN, leaving the reservation `reserved` for the \
+             sweeper's conservative conversion (design :1122)"
+        );
+    }
+
+    /// The reconcile decision itself: charge ONLY on a durable usage write. The
+    /// `add_usage` failure cannot be injected without a database, so the decision
+    /// is a pure fn and this is the half that rides every local `cargo test`.
+    #[test]
+    fn a_reservation_is_charged_only_when_its_usage_row_is_durable() {
+        assert!(should_charge_reservation(true));
+        assert!(
+            !should_charge_reservation(false),
+            "a failed usage write must leave the reservation `reserved` — charging it is an \
+             UNRECOVERABLE under-charge (the sweeper skips `charged` rows)"
+        );
+    }
+
+    /// …and the input to that decision must be TRUTHFUL. `record_usage` swallowed
+    /// its insert error (`add_usage(…).await.ok()`), which is what made the
+    /// reconcile ORDERING worthless: the error vanished and the CAS ran anyway.
+    #[test]
+    fn record_usage_reports_a_failed_insert_rather_than_swallowing_it() {
+        let src = include_str!("facade.rs");
+        let start = src
+            .find("async fn record_usage(")
+            .expect("record_usage exists");
+        let end = src[start..]
+            .find("// ─── Usage parsing")
+            .map(|i| start + i)
+            .expect("the section header delimits the body");
+        let body = &src[start..end];
+        let arm = body.find("Err(e) => {").expect(
+            "the add_usage result must be MATCHED, never swallowed with `.ok()` — the \
+             reservation gate is only as good as the bool it is handed",
+        );
+        let arm_end = body[arm..]
+            .find("    };")
+            .map(|i| arm + i)
+            .expect("the match closes");
+        let arm = &body[arm..arm_end];
+        assert!(
+            arm.contains("false") && !arm.contains("true"),
+            "a failed usage insert must report FALSE, so the reservation stays `reserved` \
+             for the sweeper instead of retiring with no usage row"
+        );
+    }
+
+    /// The body of `messages`, for the source guards above.
+    fn messages_body() -> &'static str {
+        let src = include_str!("facade.rs");
+        let start = src
+            .find("pub async fn messages(")
+            .expect("the facade route exists");
+        let end = src[start..]
+            .find("fn session_token(")
+            .map(|i| start + i)
+            .expect("the next item delimits the route body");
+        &src[start..end]
+    }
+
+    /// The TTL must outlive the facade's upstream request timeout, or the sweeper
+    /// would conservatively charge a request that is still legitimately in flight
+    /// — and because both are keyed on the request id, that over-charge would
+    /// then STICK against the real usage arriving afterwards.
+    ///
+    /// DERIVED from the real constant (review M1), not from a copy of its value:
+    /// raising the upstream timeout past the TTL now fails HERE instead of
+    /// silently voiding the guarantee.
+    #[test]
+    fn reservation_ttl_exceeds_the_upstream_request_timeout() {
+        let upstream_timeout_secs = crate::config::UPSTREAM_HTTP_TIMEOUT_SECS as i64;
+        assert!(
+            RESERVATION_TTL_SECS > upstream_timeout_secs,
+            "RESERVATION_TTL_SECS ({RESERVATION_TTL_SECS}) must exceed the upstream \
+             timeout (UPSTREAM_HTTP_TIMEOUT_SECS = {upstream_timeout_secs}s)"
+        );
+        // …with real margin, not by a second: the sweep tick and the DB round trips
+        // that settle a late drain both land after the timeout fires.
+        assert!(
+            RESERVATION_TTL_SECS - upstream_timeout_secs >= 600,
+            "the TTL must clear the upstream timeout by at least 10 minutes"
+        );
     }
 
     #[test]

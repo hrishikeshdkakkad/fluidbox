@@ -34,6 +34,25 @@ import {
 const env = loadRunnerEnv();
 const client = new RunnerClient(env);
 const MODEL = env.MODEL || "gpt-5.4-mini";
+
+// Gap 10 / invariant 19: capture the runner-control credential in memory
+// (env.TOKEN, held by the RunnerClient) and REMOVE it from process.env before
+// ANY spawn — the codex child below and the MCP shims (whose env is built from
+// process.env at module load) must never inherit it, because codex runs under
+// sandbox_mode=danger-full-access and its exec children inherit its env.
+// Afterwards codex sees only the LLM token (its model-provider env_key) and the
+// tool-intent token; neither can post /result, forge /events, or renew tokens.
+//
+// DISCLOSED RESIDUALS, both of them:
+//  1. This is an env-VISIBILITY boundary, not a process one. Same-uid children
+//     can still read THIS process's INITIAL environment via /proc/<pid>/environ,
+//     which the delete does not rewrite; true isolation needs a uid split or a
+//     sidecar, which the current cap_drop=ALL + no-new-privileges hardening
+//     blocks (design :1326-1329). Identical to the claude runner's residual.
+//  2. codex COUPLES model egress and exec — it needs the LLM credential in its
+//     env, so codex-spawned shells can read the LLM token. That is inherent to
+//     env_key auth (survey B §5). Runner-control is what this delete closes.
+delete process.env.FLUIDBOX_SESSION_TOKEN;
 const CONTROL = env.CONTROL.replace(/\/$/, "");
 // Codex appends /responses to base_url; the facade route is /internal/llm/{*rest}.
 const FACADE_BASE = `${CONTROL}/internal/llm/v1`;
@@ -374,7 +393,10 @@ function spawnCodex() {
     "-c", `model_providers.fluidbox.base_url=${FACADE_BASE}`,
     "-c", "model_providers.fluidbox.wire_api=responses",
     "-c", "model_providers.fluidbox.requires_openai_auth=false",
-    "-c", "model_providers.fluidbox.env_key=FLUIDBOX_SESSION_TOKEN",
+    // Gap 10: model egress authenticates with the LLM-AUDIENCE token. This used
+    // to be FLUIDBOX_SESSION_TOKEN, which is now runner-control only (and is
+    // deleted from the env above, so codex could not read it even by name).
+    "-c", "model_providers.fluidbox.env_key=FLUIDBOX_LLM_TOKEN",
     "-c", "approval_policy=untrusted",
     "-c", "approvals_reviewer=user",
     // Codex's own sandbox is OFF: bubblewrap can't run under the container's
@@ -389,7 +411,10 @@ function spawnCodex() {
   ];
   child = spawn("codex", args, {
     cwd: env.WORKSPACE,
-    env: { ...process.env, FLUIDBOX_SESSION_TOKEN: env.TOKEN },
+    // process.env no longer holds the runner-control token (deleted at load);
+    // codex receives the LLM-audience credential its env_key names, and that is
+    // the only credential it needs.
+    env: { ...process.env, FLUIDBOX_LLM_TOKEN: env.LLM_TOKEN },
     stdio: ["pipe", "pipe", "inherit"],
   });
   let buf = "";

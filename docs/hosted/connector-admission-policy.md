@@ -1,10 +1,22 @@
 # Connector admission policy
 
-**Date:** 2026-07-17
-**Status:** Phase A deliverable of the multi-user MCP control plane epic (#28)
+**Date:** 2026-07-21
+**Status:** Phase A deliverable of the multi-user MCP control plane epic (#28); **enforced in code as of Phase E** (it was policy-only before)
 **Authority:** [`../plans/2026-07-14-multi-user-mcp-control-plane-design.md`](../plans/2026-07-14-multi-user-mcp-control-plane-design.md) (v4). This document states the settled admission boundary for remote MCP connectors in the hosted deployment; it decides nothing new.
 
 Admission answers one question: **which remote MCP endpoints may the fluidbox broker ever contact, and on whose say-so?** It deliberately answers nothing else — an admitted connector still has no credential, no attached agent, and no allowed tool call until the connection, binding, policy, and approval layers each say yes.
+
+## Where the rules below are enforced (shipped, Phase E)
+
+Until Phase E this document described a boundary the code did not yet implement. It now does, at three points:
+
+| Point | What runs | What is refused |
+|---|---|---|
+| **Connection create** (both `mcp_http` paths, catalog Connect and manual) | Save-time admission of the connector base URL — scheme policy + host-literal address class. DNS is deliberately **not** resolved in a request handler | A non-`http(s)` scheme, an unparsable URL, plain `http` outside the dev-loopback seam, and any URL whose host is a literal in a forbidden class (private, loopback, link-local, multicast, reserved, benchmarking, documentation, IPv6 site-local, cloud metadata) |
+| **Subscription callback save** | The same literal + scheme admission on a result-callback URL (`400` on refusal) | Same set. Pre-existing rows are untouched and still checked at dial |
+| **Every dial** | `admit_url` pre-flight *plus* an address-filtering DNS resolver on the hardened client. Both are needed: reqwest dials an IP literal without ever consulting a resolver, so the literal check is what stops `https://169.254.169.254/…` | The same set, re-checked at resolution time; **plus** any redirect — the broker client refuses a 3xx outright rather than following it, and never logs the `Location` target |
+
+The same pre-flight fronts the connector-OAuth fetches (protected-resource metadata, authorization-server metadata, dynamic client registration, token exchange, refresh) and the delivery-callback publish. Operator escape hatches: `FLUIDBOX_EGRESS_ALLOW_CIDRS` (opt a deliberately-private endpoint back in; a malformed entry fails boot) and `FLUIDBOX_EGRESS_PROXY` (one waypoint for both hardened clients and the git subprocess — note that a proxy moves DNS resolution to itself, so it must be an allowlisting forward proxy).
 
 ## Principles
 
@@ -33,9 +45,9 @@ Both tiers must satisfy all of the following to be admissible for hosted use. Th
 | Redirects | Every redirect target is re-validated against the same rules. Credentials never follow a redirect off the admitted base. |
 | OAuth discovery | Where OAuth is used: RFC 9728 protected-resource metadata → RFC 8414/OIDC authorization-server metadata; authorization servers without PKCE S256 are refused; RFC 8707 `resource=` binds both legs. Discovery and metadata fetches obey the same SSRF rules as tool traffic. |
 | Headers | Connector-supplied custom headers are restricted: they can never overwrite MCP transport headers or the authorization header the broker manages. |
-| Egress path | Hosted broker egress routes through an egress proxy / network firewall (Phase E formalizes the full boundary — Gap 7). |
+| Egress path | Hosted broker egress optionally routes through an egress proxy / network firewall (`FLUIDBOX_EGRESS_PROXY`, shipped Phase E). |
 
-The same IP/redirect/DNS validation applies to **workspace clone URLs**: a credentialless (`authority: none`) fetch of a "public" repo still executes from the control plane and is still egress. Git fetch credentials additionally never follow cross-origin redirects and never reach submodule or LFS endpoints without a separate admission decision and binding — cloning an admitted repo is not authority over arbitrary hosts its metadata points at.
+The same IP validation applies to **workspace clone URLs**: a credentialless (`authority: none`) fetch of a "public" repo still executes from the control plane and is still egress. The shipped guard resolves the clone host and validates *every* returned address before `git` runs, allows `file://` only under the configured `FLUIDBOX_GITHUB_CLONE_BASE` prefix (or the dev-loopback seam), and hardens the subprocess with `-c http.followRedirects=false`, `GIT_LFS_SKIP_SMUDGE=1`, and `GIT_ALLOW_PROTOCOL=http:https:file`. **Disclosed residual:** because `git` is out-of-process it re-resolves the host independently, so this is resolve-then-validate, not a single atomic check. Cloning an admitted repo is still not authority over arbitrary hosts its metadata points at — submodule and LFS endpoints need their own admission decision and binding.
 
 ## Always refused
 
@@ -79,14 +91,16 @@ If user-supplied stdio servers inside sandboxes are ever supported, each require
 - **Snapshots are append-only.** Reauthorization or a deliberate refresh may create a new snapshot; an in-flight run never gains newly advertised tools (invariant 14).
 - **Reauthorization is fail-closed on identity.** Deciding "same account" requires a positively proven external account identity. When identity cannot be proven identical, `authorization_generation` bumps and runs bound to the old generation fail closed. "Probably the same account" never preserves a generation.
 - **Snapshot staleness.** Binding may enforce an optional per-connector or per-tenant maximum snapshot age; a too-stale snapshot fails binding visibly ("refresh required"). The default is no age limit — staleness is a UX concern, not a safety one, because a vanished tool already fails visibly at call time.
-- **Insufficient scope is terminal, never auto-escalated.** An insufficient-scope challenge (SEP-835 incremental consent) fails the call and marks the connection "reconnect with more scopes" for its owner. The broker never escalates a frozen grant.
+- **Insufficient scope is terminal, never auto-escalated (shipped, Phase E).** An SEP-835 `insufficient_scope` challenge on a 401/403 fails the call with no re-mint and no retry, and evicts the cached token. **For an OAuth connection** it also sets the connection to `status='error'` with the note `insufficient_scope: reconnect with more scopes` (the scopes the server asked for are recorded in the note only), under an `authorization_generation` CAS so a challenge from a superseded generation cannot mark a reconnected connection. **For a STATIC credential (API key / custom header / Basic) the connection is deliberately NOT marked**: there is no scope grant to widen, the reconnect remedy is not actionable, and — since a hostile server chooses its own `WWW-Authenticate` header — marking would hand any upstream a one-header kill switch on an org's connection. The call is terminal either way. The broker never escalates a frozen grant. **Consequence worth knowing:** the refusal is a definitive upstream response, so its execution claim settles `failed_upstream` — terminal and not re-claimable. After the owner reconnects with more scopes, a replay of the *same* `tool_call_id` + arguments adopts the stored refusal; a fresh model turn (new `tool_call_id`) proceeds normally.
 - **Revocation is immediate.** Revoking a connection prevents future secret reads and fails active-run calls visibly. Every credentialed use rechecks live status, generation, and (for user-owned connections) the owner's active tenant membership immediately before secret access.
 
 ## Abuse controls at the egress plane
 
-- Rate limits per tenant, per user, per connection, and per upstream host.
-- Circuit breakers on unhealthy upstreams.
-- Shared upstream HTTP transport carries no ambient state — no cookie jars, no cached per-host authentication; every request's authority comes from its binding resolution alone (invariant 22).
+- **Rate limits (shipped, Phase E):** three *independent* token buckets — per tenant, per connection, per upstream host — checked before each brokered dial. All three are peeked before any is charged, so a refusal costs nothing; `0` on a dimension disables that dimension (it never means "block everything"). Knobs: `FLUIDBOX_EGRESS_RATE_{TENANT,CONNECTION,HOST}_PER_MIN` (defaults 120 / 60 / 120). **Per-user limiting is not implemented** — the tenant bucket is the coarser stand-in.
+- **Circuit breakers (shipped, Phase E):** keyed `(connection, upstream host)` — strictly finer than per-connection. They count *transport* failures only (connect refused, timeout, mid-stream read failure, refused redirect, inadmissible URL, HTTP 5xx); a JSON-RPC error, a 4xx, a 401/SEP-835 challenge, or a tool result that merely reports `isError` all mean the upstream is **healthy** and never trip it. Open for `FLUIDBOX_EGRESS_BREAKER_OPEN_SECS` (default 60) after `FLUIDBOX_EGRESS_BREAKER_THRESHOLD` (default 5) consecutive failures, then one half-open probe carrying a deadline so a lost probe cannot wedge it shut.
+- **Both are per-replica, in-memory.** With N replicas the deployment-wide ceiling is N× the configured value — the same class as the pre-existing per-replica `MINT_BUDGET`. They are a fairness/abuse control, not a quota system; durable cross-replica limiting is Phase F.
+- A refusal from either lands as a **`failed_before_send` execution claim** (positively never sent, therefore re-claimable) and surfaces to the model as a retryable tool error naming the scope and a retry delay, with the host as a `sha256:` digest — never the raw host.
+- Shared upstream HTTP transport carries no ambient state — no cookie jars (the `cookies` feature is off workspace-wide), no cached per-host authentication; every request's authority comes from its binding resolution alone (invariant 22).
 - Logs record destination identity and digests — never tokens or payloads.
 
 ## What admission never grants

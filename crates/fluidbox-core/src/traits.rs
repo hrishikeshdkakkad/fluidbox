@@ -18,11 +18,32 @@ pub struct SandboxHandle {
     pub attrs: Value,
 }
 
+/// The four audience-scoped session credentials a run is provisioned with
+/// (Phase E, Gap 10, invariant 19). Each is a distinct `api_tokens` row valid
+/// ONLY on its audience's routes: `control` (events/heartbeat/result/renew),
+/// `tool` (the /permission + /tools/call gate), `llm` (the facade), `workspace`
+/// (the init container's archive fetch). The provider needs the plaintext set —
+/// not just `env` — because (a) on Kubernetes each rides its OWN Secret key and
+/// (b) the `workspace` token is NEVER in the runner container's env (it reaches
+/// the init container ONLY), so it cannot be recovered from `SandboxSpec::env`.
+#[derive(Debug, Clone)]
+pub struct SandboxTokens {
+    pub control: String,
+    pub tool: String,
+    pub llm: String,
+    pub workspace: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SandboxSpec {
     pub session_id: Uuid,
     pub image: String,
     pub env: Vec<(String, String)>,
+    /// The audience-scoped session tokens (Gap 10). `env` already carries
+    /// control/tool/llm under their env-var names; this is the structured set
+    /// the provider routes to per-audience Secret keys and the source of the
+    /// init-container-only `workspace` token.
+    pub tokens: SandboxTokens,
     /// Host workspace directory to mount at /workspace (provider-internal
     /// optimization; archive-based providers pull an immutable archive
     /// instead).

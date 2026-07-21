@@ -115,6 +115,13 @@ pub struct Config {
     pub llm_tenant_budget_duration: Option<String>,
     pub llm_tenant_tpm: Option<i64>,
     pub llm_tenant_rpm: Option<i64>,
+    /// How many LLM budget reservations one session may hold at once (Phase E,
+    /// #33; Gap 14) — the finite ceiling design :1118 asks for, NOT a per-session
+    /// mutex. Lives here rather than behind a lazy `OnceLock` in `facade.rs` so a
+    /// malformed value FAILS BOOT naming the variable (and is therefore visible to
+    /// `just doctor`) instead of logging once at the first model request and
+    /// tolerating the typo for the life of the process. Must be ≥ 1.
+    pub llm_max_concurrent_reservations: i64,
     /// 32-byte key (hex/base64) sealing connection credentials at rest.
     /// Optional: without it (and with KMS off), integration connections are
     /// disabled. Once KMS is on and every row is re-sealed, this may be retired
@@ -146,6 +153,35 @@ pub struct Config {
     /// Feeds the OAuth redirect_uri and the CIMD client_id document — both
     /// are fetched by parties that can't use host.docker.internal.
     pub public_url: String,
+    /// Operator egress allowlist (`FLUIDBOX_EGRESS_ALLOW_CIDRS`, Phase E): CIDR
+    /// blocks the shared SSRF predicate treats as public even when they fall in a
+    /// private/metadata range — a private LiteLLM/GHES/MCP endpoint the deployment
+    /// opts into. Parsed once at boot (a malformed entry fails boot); default empty.
+    pub egress_allow_cidrs: Vec<fluidbox_core::netpolicy::IpCidr>,
+    /// Optional outbound egress proxy (`FLUIDBOX_EGRESS_PROXY`, Phase E) applied to
+    /// BOTH hardened reqwest clients and exported as HTTPS_PROXY on the git fetch
+    /// subprocess — route all control-plane→internet dials through one waypoint.
+    /// Validated at boot (a malformed URL fails boot). NOTE: with a proxy set,
+    /// target DNS resolution moves to the PROXY, so the SSRF DNS resolver's
+    /// name-filtering no longer applies to proxied requests (`admit_url`'s
+    /// literal+scheme checks still do) — the proxy becomes the egress control
+    /// point, so point it at an allowlisting forward proxy.
+    pub egress_proxy: Option<String>,
+    /// Outbound brokered-dial ceilings, per minute, for the in-memory
+    /// `EgressGovernor` (`FLUIDBOX_EGRESS_RATE_{TENANT,CONNECTION,HOST}_PER_MIN`,
+    /// Phase E). Defaults 120 / 60 / 120. **A value of 0 DISABLES that
+    /// dimension** (see `governor::GovernorLimits::from_config` for why zero is
+    /// not "block everything"); a malformed value fails boot.
+    pub egress_rate_tenant_per_min: u32,
+    pub egress_rate_connection_per_min: u32,
+    pub egress_rate_host_per_min: u32,
+    /// Per-connection circuit breaker (`FLUIDBOX_EGRESS_BREAKER_THRESHOLD`,
+    /// `FLUIDBOX_EGRESS_BREAKER_OPEN_SECS`, Phase E): consecutive transport/5xx
+    /// failures that open it (default 5) and how long it stays open before
+    /// admitting one half-open probe (default 60s). Zero on EITHER disables the
+    /// breaker; a malformed value fails boot.
+    pub egress_breaker_threshold: u32,
+    pub egress_breaker_open_secs: u64,
     /// Execution backend: `docker` (default) or `kubernetes`. Selects which
     /// `ExecutionProvider` `AppState.provider` holds. Dual-provider permanence
     /// (settled Q17): Docker is never replaced.
@@ -199,6 +235,19 @@ pub struct Config {
 /// caps a Secret/env at ~1 MiB. 512 KiB leaves headroom and fails a bloated
 /// run closed at zero model spend rather than at an opaque kubelet error.
 pub const MAX_RUNNER_ENV_BYTES: usize = 512 * 1024;
+
+/// Request timeout on the plain outbound client (`AppStateInner::http`) used for
+/// operator-configured seams — GitHub and, load-bearingly, the LLM upstream that
+/// the facade forwards to. A long-running model turn must not be cut off.
+///
+/// NAMED rather than typed inline at the one use site (`main.rs`) because
+/// `facade::RESERVATION_TTL_SECS` must comfortably EXCEED it: the expiry sweep
+/// converts a still-`reserved` row into a conservative charge, so a TTL shorter
+/// than this timeout would over-charge a request that is merely slow — and,
+/// because both settle under the same request id, that over-charge would stick.
+/// `facade`'s test derives its assertion from this constant, so raising the
+/// timeout past the TTL fails there instead of silently breaking the guarantee.
+pub const UPSTREAM_HTTP_TIMEOUT_SECS: u64 = 15 * 60;
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
@@ -301,6 +350,11 @@ impl Config {
                 "FLUIDBOX_LLM_TENANT_RPM",
                 get("FLUIDBOX_LLM_TENANT_RPM").ok(),
             )?,
+            llm_max_concurrent_reservations: parse_positive_i64_env(
+                "FLUIDBOX_LLM_MAX_CONCURRENT_RESERVATIONS",
+                get("FLUIDBOX_LLM_MAX_CONCURRENT_RESERVATIONS").ok(),
+                crate::facade::DEFAULT_MAX_CONCURRENT_RESERVATIONS,
+            )?,
             credential_key: get("FLUIDBOX_CREDENTIAL_KEY")
                 .ok()
                 .filter(|k| !k.is_empty()),
@@ -336,6 +390,39 @@ impl Config {
                 .unwrap_or_else(|_| "http://127.0.0.1:8787".into())
                 .trim_end_matches('/')
                 .to_string(),
+            egress_allow_cidrs: parse_egress_cidrs(
+                "FLUIDBOX_EGRESS_ALLOW_CIDRS",
+                get("FLUIDBOX_EGRESS_ALLOW_CIDRS").ok(),
+            )?,
+            egress_proxy: parse_egress_proxy(
+                "FLUIDBOX_EGRESS_PROXY",
+                get("FLUIDBOX_EGRESS_PROXY").ok(),
+            )?,
+            egress_rate_tenant_per_min: parse_u32_env(
+                "FLUIDBOX_EGRESS_RATE_TENANT_PER_MIN",
+                get("FLUIDBOX_EGRESS_RATE_TENANT_PER_MIN").ok(),
+                crate::governor::DEFAULT_TENANT_PER_MIN,
+            )?,
+            egress_rate_connection_per_min: parse_u32_env(
+                "FLUIDBOX_EGRESS_RATE_CONNECTION_PER_MIN",
+                get("FLUIDBOX_EGRESS_RATE_CONNECTION_PER_MIN").ok(),
+                crate::governor::DEFAULT_CONNECTION_PER_MIN,
+            )?,
+            egress_rate_host_per_min: parse_u32_env(
+                "FLUIDBOX_EGRESS_RATE_HOST_PER_MIN",
+                get("FLUIDBOX_EGRESS_RATE_HOST_PER_MIN").ok(),
+                crate::governor::DEFAULT_HOST_PER_MIN,
+            )?,
+            egress_breaker_threshold: parse_u32_env(
+                "FLUIDBOX_EGRESS_BREAKER_THRESHOLD",
+                get("FLUIDBOX_EGRESS_BREAKER_THRESHOLD").ok(),
+                crate::governor::DEFAULT_BREAKER_THRESHOLD,
+            )?,
+            egress_breaker_open_secs: parse_u64_env(
+                "FLUIDBOX_EGRESS_BREAKER_OPEN_SECS",
+                get("FLUIDBOX_EGRESS_BREAKER_OPEN_SECS").ok(),
+                crate::governor::DEFAULT_BREAKER_OPEN_SECS,
+            )?,
             provider,
             network_mode: get("FLUIDBOX_NETWORK_MODE")
                 .ok()
@@ -411,6 +498,18 @@ fn parse_u64_env(name: &str, raw: Option<String>, default: u64) -> anyhow::Resul
     }
 }
 
+/// Same fail-boot-on-malformed discipline for the u32 governor knobs (Phase E):
+/// a typo in an intended egress rate limit must fail boot naming the variable,
+/// never silently restore the default ceiling.
+fn parse_u32_env(name: &str, raw: Option<String>, default: u32) -> anyhow::Result<u32> {
+    match raw.filter(|v| !v.is_empty()) {
+        None => Ok(default),
+        Some(v) => v
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{name}='{v}' is not a valid u32: {e}")),
+    }
+}
+
 /// Same fail-boot-on-malformed discipline for i64 duration knobs.
 fn parse_i64_env(name: &str, raw: Option<String>, default: i64) -> anyhow::Result<i64> {
     match raw.filter(|v| !v.is_empty()) {
@@ -419,6 +518,19 @@ fn parse_i64_env(name: &str, raw: Option<String>, default: i64) -> anyhow::Resul
             .parse()
             .map_err(|e| anyhow::anyhow!("{name}='{v}' is not a valid i64: {e}")),
     }
+}
+
+/// An i64 knob that must be at least 1. `parse_i64_env` accepts any integer, but
+/// a 0 (or negative) concurrency ceiling admits NOTHING and would wedge every run
+/// — so it fails boot naming the variable rather than silently restoring the
+/// default, which is the whole reason this knob moved out of `facade.rs`'s
+/// `OnceLock` (a log line at the first model request is not a boot signal).
+fn parse_positive_i64_env(name: &str, raw: Option<String>, default: i64) -> anyhow::Result<i64> {
+    let v = parse_i64_env(name, raw, default)?;
+    if v < 1 {
+        anyhow::bail!("{name}='{v}' must be at least 1 (0 or negative admits no work at all)");
+    }
+    Ok(v)
 }
 
 /// Optional f64 knob (tenant virtual-key budget): absent/empty → `None`; a
@@ -443,6 +555,40 @@ fn parse_opt_i64(name: &str, raw: Option<String>) -> anyhow::Result<Option<i64>>
             .map(Some)
             .map_err(|e| anyhow::anyhow!("{name}='{v}' is not a valid i64: {e}")),
     }
+}
+
+/// Parse the comma-separated egress allowlist (Phase E). Empty/absent → no
+/// entries; a malformed CIDR FAILS BOOT naming the variable (an operator typo in
+/// an egress escape hatch must never silently widen or narrow the boundary).
+fn parse_egress_cidrs(
+    name: &str,
+    raw: Option<String>,
+) -> anyhow::Result<Vec<fluidbox_core::netpolicy::IpCidr>> {
+    let Some(raw) = raw.filter(|v| !v.trim().is_empty()) else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<fluidbox_core::netpolicy::IpCidr>()
+                .map_err(|e| anyhow::anyhow!("{name}: {e}"))
+        })
+        .collect()
+}
+
+/// Validate `FLUIDBOX_EGRESS_PROXY` at BOOT (like `FLUIDBOX_EGRESS_ALLOW_CIDRS`):
+/// empty ⇒ `None`; otherwise it must be a proxy URL reqwest accepts — the SAME
+/// `Proxy::all` the client builders call — so a malformed value is a named boot
+/// error, never a first-dial panic. The pre-validated string flows to
+/// `egress::build_*_http`, which then only needs a defensive (unreachable)
+/// error-map rather than an `expect`.
+fn parse_egress_proxy(name: &str, raw: Option<String>) -> anyhow::Result<Option<String>> {
+    let Some(v) = raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    reqwest::Proxy::all(&v).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+    Ok(Some(v))
 }
 
 /// D7 boot coherence for the LLM-key mode (pure, unit-tested). `Shared` refuses
@@ -539,6 +685,102 @@ mod tests {
         assert!(e.contains("LITELLM_MASTER_KEY"), "got: {e}");
         // LiteLLM upstream + master key present → OK.
         assert!(validate_llm_key_config(LlmKeyMode::Tenant, false, false).is_ok());
+    }
+
+    #[test]
+    fn egress_cidrs_parse_and_fail_closed() {
+        assert!(parse_egress_cidrs("X", None).unwrap().is_empty());
+        assert!(parse_egress_cidrs("X", Some("  ".into()))
+            .unwrap()
+            .is_empty());
+        let v = parse_egress_cidrs("X", Some("10.0.0.0/8, 169.254.169.254/32".into())).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].prefix, 8);
+        // A malformed entry is a boot error, never a silently dropped rule.
+        assert!(parse_egress_cidrs("X", Some("10.0.0.0/8,nonsense".into())).is_err());
+        assert!(parse_egress_cidrs("X", Some("10.0.0.0/40".into())).is_err());
+    }
+
+    #[test]
+    fn governor_knobs_default_and_fail_closed() {
+        // Absent/empty ⇒ the documented default …
+        assert_eq!(parse_u32_env("G", None, 120).unwrap(), 120);
+        assert_eq!(parse_u32_env("G", Some(String::new()), 60).unwrap(), 60);
+        // … an explicit value wins, INCLUDING the "disabled" zero …
+        assert_eq!(parse_u32_env("G", Some("7".into()), 120).unwrap(), 7);
+        assert_eq!(parse_u32_env("G", Some("0".into()), 120).unwrap(), 0);
+        // … and a malformed value is a NAMED boot error, never the default (the
+        // `FLUIDBOX_EGRESS_ALLOW_CIDRS` precedent: an egress knob typo must not
+        // silently widen the ceiling).
+        let e = parse_u32_env(
+            "FLUIDBOX_EGRESS_RATE_HOST_PER_MIN",
+            Some("lots".into()),
+            120,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("FLUIDBOX_EGRESS_RATE_HOST_PER_MIN") && e.contains("lots"),
+            "got: {e}"
+        );
+        assert!(parse_u32_env("G", Some("-1".into()), 120).is_err());
+        assert!(parse_u32_env("G", Some("4294967296".into()), 120).is_err());
+    }
+
+    /// The LLM concurrency ceiling (Gap 14). Drives the REAL parse — the earlier
+    /// facade-side test re-implemented the match in its own body, so relaxing the
+    /// production check to accept 0 (a ceiling that wedges every run, the exact
+    /// case the test named) still passed it.
+    #[test]
+    fn llm_reservation_ceiling_defaults_and_fails_boot_on_bad_values() {
+        // Absent/empty ⇒ the shipped default (32), which is what the const says.
+        assert_eq!(
+            parse_positive_i64_env(
+                "C",
+                None,
+                crate::facade::DEFAULT_MAX_CONCURRENT_RESERVATIONS
+            )
+            .unwrap(),
+            32
+        );
+        assert_eq!(
+            parse_positive_i64_env("C", Some(String::new()), 32).unwrap(),
+            32
+        );
+        // An explicit positive value wins.
+        assert_eq!(
+            parse_positive_i64_env("C", Some("8".into()), 32).unwrap(),
+            8
+        );
+        assert_eq!(
+            parse_positive_i64_env("C", Some("1".into()), 32).unwrap(),
+            1
+        );
+        // Junk is a NAMED boot error, never the default.
+        let e = parse_positive_i64_env(
+            "FLUIDBOX_LLM_MAX_CONCURRENT_RESERVATIONS",
+            Some("nope".into()),
+            32,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("FLUIDBOX_LLM_MAX_CONCURRENT_RESERVATIONS") && e.contains("nope"),
+            "got: {e}"
+        );
+        // …and so is a non-positive ceiling: 0 would admit no model request at all.
+        let e = parse_positive_i64_env(
+            "FLUIDBOX_LLM_MAX_CONCURRENT_RESERVATIONS",
+            Some("0".into()),
+            32,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("FLUIDBOX_LLM_MAX_CONCURRENT_RESERVATIONS") && e.contains("at least 1"),
+            "got: {e}"
+        );
+        assert!(parse_positive_i64_env("C", Some("-1".into()), 32).is_err());
     }
 
     #[test]

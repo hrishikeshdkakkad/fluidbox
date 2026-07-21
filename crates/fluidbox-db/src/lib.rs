@@ -131,6 +131,10 @@ pub async fn connect(database_url: &str, runtime_role: Option<&str>) -> anyhow::
             .execute(&mut owner)
             .await?;
     }
+    // `migrate!` BAKES the migrations directory into the binary at COMPILE time —
+    // adding a .sql file only takes effect once this crate recompiles, so any
+    // change under migrations/ must touch this file. Latest: 0020 (api_tokens
+    // audience column — Gap 10 audience-scoped sandbox credentials).
     sqlx::migrate!("../../migrations").run(&mut owner).await?;
     if let Some(role) = runtime_role {
         let exists: bool =
@@ -3764,6 +3768,145 @@ pub async fn transition_session(
     Ok(Some((current, updated)))
 }
 
+/// The epoch-fenced sibling of [`transition_session`] (Phase E, #33; Gap 13).
+/// Identical semantics plus ONE extra condition: the session's
+/// `orchestrator_epoch` must still equal the epoch the caller acquired with its
+/// lease. A driver that was paused, partitioned, or simply slow — and whose lease
+/// another replica then stole — carries a STALE epoch, so its lifecycle mutation
+/// matches zero rows and returns `Ok(None)` instead of overwriting the new
+/// owner's work. The epoch is checked UNDER the same `for update` row lock the
+/// status guard uses, so the fence and the state-machine check see one snapshot.
+///
+/// Deliberately a separate entry point rather than an `Option<i64>` parameter on
+/// `transition_session`: request-side intent writes (cancel, `finalize_forced`,
+/// `maybe_resume`) are NOT driver mutations and must stay unfenced — they are
+/// idempotent CAS inserts whose whole job is to be accepted from any replica.
+pub async fn transition_session_fenced(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    next: SessionStatus,
+    reason: Option<&str>,
+    expected_epoch: i64,
+) -> sqlx::Result<Option<(SessionStatus, SessionRow)>> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let row: Option<(String, i64)> = sqlx::query_as(
+        "select status, orchestrator_epoch from sessions
+         where id = $1 and tenant_id = $2 for update",
+    )
+    .bind(id)
+    .bind(scope.tenant_id())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((current, epoch)) = row else {
+        return Ok(None);
+    };
+    if epoch != expected_epoch {
+        tx.rollback().await.ok();
+        return Ok(None);
+    }
+    let current = SessionStatus::parse(&current).unwrap_or(SessionStatus::Failed);
+    if !current.can_transition_to(next) {
+        tx.rollback().await.ok();
+        return Ok(None);
+    }
+    let updated: SessionRow = sqlx::query_as(
+        "update sessions set
+            status = $2,
+            status_reason = $3,
+            updated_at = now(),
+            started_at = case when $2 = 'running'
+                              then coalesce(started_at, now()) else started_at end,
+            finished_at = case when $2 in ('completed','failed','cancelled','budget_exceeded')
+                               then now() else finished_at end
+         where id = $1 and tenant_id = $4 and orchestrator_epoch = $5 returning *",
+    )
+    .bind(id)
+    .bind(next.as_str())
+    .bind(reason)
+    .bind(scope.tenant_id())
+    .bind(expected_epoch)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some((current, updated)))
+}
+
+/// Acquire, STEAL, or renew this replica's driver lease on one session, and
+/// return the fencing epoch to carry (Phase E, #33; Gap 13; design :1067-1078).
+///
+/// Predicate — take it iff the lease is free, expired, or already mine:
+/// `owner is null OR lease_until < now() OR owner = $me`. `None` means another
+/// replica holds an UNEXPIRED lease: this driver must not mutate the session.
+///
+/// **The epoch increments ONLY on an owner CHANGE.** A renew by the same owner
+/// keeps it, so a healthy driver's fence never moves under its own feet.
+/// Re-taking a lease of OURS that merely lapsed (nobody stole it) also keeps the
+/// epoch — the bump is gated on the owner actually changing. A takeover by a
+/// DIFFERENT replica bumps it, which instantly invalidates every mutation the
+/// previous holder had in flight. That asymmetry is what makes the epoch a
+/// fencing TOKEN rather than a counter.
+///
+/// Time-based takeover, exactly like `claim_finalization` — NEVER a Postgres
+/// advisory lock. The design rejects advisory locks here (`:1067-1072`): they are
+/// tied to one connection, fragile under pool reconnects and Neon scale-to-zero,
+/// and poorly observable. A lease column survives all three and is queryable.
+/// Beneath this replica-scope fence the Kubernetes provider's UID-preconditioned
+/// delete stays as the PROVIDER-scope fence.
+pub async fn acquire_session_lease(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    owner: Uuid,
+    ttl_secs: i64,
+) -> sqlx::Result<Option<i64>> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let row: Option<(i64,)> = sqlx::query_as(
+        "update sessions set
+            orchestrator_owner_id = $3,
+            orchestrator_lease_until = now() + make_interval(secs => $4),
+            orchestrator_epoch = case
+                when orchestrator_owner_id is distinct from $3
+                then orchestrator_epoch + 1 else orchestrator_epoch end,
+            updated_at = now()
+         where id = $1 and tenant_id = $2
+           and (orchestrator_owner_id is null
+                or orchestrator_lease_until is null
+                or orchestrator_lease_until < now()
+                or orchestrator_owner_id = $3)
+         returning orchestrator_epoch",
+    )
+    .bind(id)
+    .bind(scope.tenant_id())
+    .bind(owner)
+    .bind(ttl_secs.max(1) as f64)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row.map(|(e,)| e))
+}
+
+/// The session's current lease holder + fencing epoch — the read half of
+/// [`acquire_session_lease`], used by tests and by side-effect guards that want to
+/// confirm ownership without extending the lease.
+pub async fn session_lease(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+) -> sqlx::Result<Option<(Option<Uuid>, Option<DateTime<Utc>>, i64)>> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let row: Option<(Option<Uuid>, Option<DateTime<Utc>>, i64)> = sqlx::query_as(
+        "select orchestrator_owner_id, orchestrator_lease_until, orchestrator_epoch
+         from sessions where id = $1 and tenant_id = $2",
+    )
+    .bind(id)
+    .bind(scope.tenant_id())
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
 /// Attach the sandbox handle — REFUSED (returns false) unless the session is
 /// still in an ACTIVE (pre-wind-down) state AND no finalization intent
 /// exists: the intent is the single source of truth for ownership, and it
@@ -4209,16 +4352,43 @@ pub async fn append_event(
     scope: TenantScope,
     event: Redacted<EventEnvelope>,
 ) -> sqlx::Result<i64> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let seq = append_event_in_tx(&mut tx, scope, event).await?;
+    tx.commit().await?;
+    Ok(seq)
+}
+
+/// The LISTEN/NOTIFY channel a committed approval DECISION announces itself on
+/// (Phase E, #33; Gap 13). Payload = the approval id, so every replica can wake
+/// its own local waiters for that row. Deliberately separate from
+/// `fluidbox_events` (payload `session:seq`): approvals key on the approval id,
+/// and a listener that had to parse two payload shapes off one channel would be a
+/// silent-misroute hazard. Like SSE, the NOTIFY is ONLY a wakeup — the wait loop's
+/// ≤2 s poll re-read of Postgres stays the delivery truth (missed notifies, Neon
+/// scale-to-zero).
+pub const APPROVALS_CHANNEL: &str = "fluidbox_approvals";
+
+/// `append_event` on an EXISTING transaction — the in-tx emission primitive the
+/// approval decision transactions ride (Phase E, #33; Gap 13, plan E12), so the
+/// canonical ledger event commits atomically with the decision CAS that produced
+/// it and a loser of that CAS emits nothing.
+///
+/// The caller MUST already have set the tenant GUC on this connection
+/// (`scoped_tx`) or the audited bypass (`worker_tx`): the plpgsql
+/// `append_event(...)` is SECURITY INVOKER, so its `update sessions` +
+/// `insert events` run under the caller's policies.
+///
+/// Gate: the `where exists(...)` guards the target list, so the side-effecting
+/// function is NOT invoked on a scope miss (no seq bump, no NOTIFY) — zero rows →
+/// `RowNotFound`.
+async fn append_event_in_tx(
+    tx: &mut sqlx::PgConnection,
+    scope: TenantScope,
+    event: Redacted<EventEnvelope>,
+) -> sqlx::Result<i64> {
     let env = event.into_inner();
     let payload = serde_json::to_value(&env.body).unwrap_or(Value::Null);
     let type_name = env.body.type_name();
-    // Gate the append on the session belonging to the caller's tenant. The
-    // `where exists(...)` guards the target list, so the side-effecting
-    // `append_event(...)` function is NOT invoked on a scope miss (no seq bump,
-    // no NOTIFY) — zero rows → RowNotFound, which the ledger helper logs. The scoped
-    // tx also sets the tenant GUC so the plpgsql function's `update sessions` +
-    // `insert events` (SECURITY INVOKER, subject to RLS) pass under the policies.
-    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query(
         "select append_event($1, $2, $3, $4, $5, $6) as seq
          where exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $7)",
@@ -4232,7 +4402,6 @@ pub async fn append_event(
     .bind(scope.tenant_id())
     .fetch_optional(&mut *tx)
     .await?;
-    tx.commit().await?;
     match row {
         Some(r) => Ok(r.get::<i64, _>("seq")),
         None => Err(sqlx::Error::RowNotFound),
@@ -4283,9 +4452,6 @@ macro_rules! approval_cols {
          scope, scope_key, status, requested_at, expires_at, decided_at, decided_by"
     };
 }
-// Re-exported by path so the `system_worker` module's approval scans share the
-// same compile-time column literal.
-pub(crate) use approval_cols;
 
 /// Register a tool-call intent, idempotent by (session_id, tool_call_id).
 /// Returns (row, inserted). When `inserted` is false the caller MUST compare
@@ -4405,16 +4571,43 @@ pub async fn record_intent_verdict(
     Ok(res.rows_affected() > 0)
 }
 
-pub async fn decide_approval(
+/// Decide a pending approval AND emit its canonical ledger events in ONE
+/// transaction (Phase E, #33; Gap 13, plan E12). This is the single-emission fix:
+/// before it, every awakened waiter emitted its own `approval.decided` +
+/// `tool.decision`, so two handlers re-attached to one pending row double-ledgered
+/// **inside a single process** (design :1058-1066) — a current bug, not merely a
+/// multi-replica one. Now the DECISION CAS is the emitter: a loser of the CAS
+/// affects zero rows and appends nothing, and waiters emit neither event.
+///
+/// `events` are pre-scrubbed by the caller (the `Redacted` newtype is
+/// constructible only through `Redactor::scrub`, so the ledger invariant holds)
+/// and are DISCARDED untouched when the CAS loses.
+///
+/// LOCK ORDER — BINDING (Phase E, #33): **approvals CAS FIRST, then
+/// `append_event`** (which locks the `sessions` row to assign the gapless seq).
+/// Every decision site in this codebase uses that order: this function, its
+/// [`expire_approval_tx`] sibling, and the waiter timeout path (which calls this
+/// one). See [`claim_tool_execution`]'s LOCK-ORDER ANALYSIS for why this cannot
+/// cycle with the claim/cancellation order: that transaction takes `sessions`
+/// FIRST and then `tool_execution_claims`, and NEVER touches `approvals`, so the
+/// two orderings operate on DISJOINT resource pairs — `{approvals, sessions}` here
+/// versus `{sessions, tool_execution_claims}` there — and a cycle needs both
+/// transactions to want each other's held resource.
+///
+/// The commit also `pg_notify`s [`APPROVALS_CHANNEL`] so waiters on OTHER replicas
+/// wake immediately instead of riding the ≤2 s poll floor (which stays as the
+/// missed-notify backstop).
+pub async fn decide_approval_tx(
     pool: &PgPool,
     scope: TenantScope,
     id: Uuid,
     status: &str,
     decided_by: &str,
+    events: Vec<Redacted<EventEnvelope>>,
 ) -> sqlx::Result<Option<ApprovalRow>> {
     let mut tx = scoped_tx(pool, scope).await?;
 
-    let __rls_out = sqlx::query_as(concat!(
+    let decided: Option<ApprovalRow> = sqlx::query_as(concat!(
         "update approvals set status = $2, decided_at = now(), decided_by = $3
          where id = $1 and status = 'pending'
            and exists (select 1 from sessions s
@@ -4428,8 +4621,131 @@ pub async fn decide_approval(
     .bind(scope.tenant_id())
     .fetch_optional(&mut *tx)
     .await?;
+    let Some(row) = decided else {
+        // Lost the CAS (already decided/expired, or another tenant). Nothing is
+        // written and NOTHING is ledgered — that is the whole point.
+        tx.commit().await?;
+        return Ok(None);
+    };
+    emit_and_notify(&mut tx, scope, id, events).await?;
     tx.commit().await?;
-    Ok(__rls_out)
+    Ok(Some(row))
+}
+
+/// Expire ONE pending approval past its deadline and emit its ledger events in
+/// the same transaction — the cross-replica-safe expiry decision site (Phase E,
+/// #33). Single-winner by the `status = 'pending' and expires_at < now()` CAS, so
+/// N replicas sweeping the same row produce exactly one decision and one pair of
+/// events. Same binding lock order as [`decide_approval_tx`].
+pub async fn expire_approval_tx(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    events: Vec<Redacted<EventEnvelope>>,
+) -> sqlx::Result<Option<ApprovalRow>> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let expired: Option<ApprovalRow> = sqlx::query_as(concat!(
+        "update approvals set status = 'expired', decided_at = now(), decided_by = 'timeout'
+         where id = $1 and status = 'pending' and expires_at < now()
+           and exists (select 1 from sessions s
+                       where s.id = approvals.session_id and s.tenant_id = $2)
+         returning ",
+        approval_cols!()
+    ))
+    .bind(id)
+    .bind(scope.tenant_id())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(row) = expired else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    emit_and_notify(&mut tx, scope, id, events).await?;
+    tx.commit().await?;
+    Ok(Some(row))
+}
+
+/// Shared tail of every decision transaction: append the pre-scrubbed events (in
+/// order, so `approval.decided` precedes `tool.decision` exactly as the old waiter
+/// emission did) and announce the decision on [`APPROVALS_CHANNEL`]. Runs AFTER
+/// the approvals CAS, inside its transaction — the binding lock order.
+///
+/// DELIBERATE BEHAVIOR CHANGE (Phase E, #33; review Minor E): the `?` below is
+/// inside the decision's transaction, so a failed ledger append now ROLLS BACK THE
+/// DECISION ITSELF — the approve/deny CAS and its audit rows commit together or
+/// not at all, making the ledger a hard dependency of deciding an approval. That
+/// is chosen fail-closed: a decision the timeline cannot prove is worse than a
+/// decision that must be retried (the runner re-attaches to the still-pending row
+/// and the human's verdict is re-appliable), and the previous split — CAS commits,
+/// then a best-effort `ledger::record` swallows its error — could silently diverge
+/// the audit trail from the durable verdict.
+async fn emit_and_notify(
+    tx: &mut sqlx::PgConnection,
+    scope: TenantScope,
+    approval_id: Uuid,
+    events: Vec<Redacted<EventEnvelope>>,
+) -> sqlx::Result<()> {
+    for ev in events {
+        append_event_in_tx(&mut *tx, scope, ev).await?;
+    }
+    sqlx::query("select pg_notify($1, $2)")
+        .bind(APPROVALS_CHANNEL)
+        .bind(approval_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    Ok(())
+}
+
+/// Claim the RIGHT to ledger the post-approval-wait terminality deny AND emit it,
+/// in ONE transaction, exactly once (Phase E, #33; plan E12 "M4"). The session can
+/// terminalize DURING a minutes-long approval wait, in which case an approved call
+/// must still be refused — but EVERY re-attached waiter computes that same
+/// refusal, so the ledger write needs a single-winner CAS just like the
+/// deterministic gate paths. `terminal_deny_at` (migration 0021) is that marker: it
+/// is NOT a verdict (the human decision stays immutable in `status`), only a record
+/// that the deny was ledgered. Returns true iff THIS caller won and emitted.
+///
+/// IN-TX BY THE SAME RULE AS ITS THREE SIBLINGS (review Minor A): the first cut
+/// committed the marker and then called `ledger::record` in a separate,
+/// error-swallowing transaction, so a crash (or a transient append failure) between
+/// them lost the event PERMANENTLY — the marker blocks every other waiter from
+/// emitting, and nothing ever re-emits. Appending inside the claim's own
+/// transaction makes marker-and-event atomic: a failed append rolls the marker back
+/// and the next waiter (or the runner's retry) re-claims and re-emits. Same
+/// fail-closed trade as [`emit_and_notify`], and the same binding lock order
+/// (approvals FIRST, then `append_event`'s `sessions` row lock).
+///
+/// No `pg_notify` here, unlike [`emit_and_notify`]: this is not a decision, so no
+/// waiter is blocked on it — every waiter reaching this point has already left the
+/// wait loop.
+pub async fn claim_terminal_deny_tx(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    events: Vec<Redacted<EventEnvelope>>,
+) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let res = sqlx::query(
+        "update approvals set terminal_deny_at = now()
+         where id = $1 and terminal_deny_at is null
+           and exists (select 1 from sessions s
+                       where s.id = approvals.session_id and s.tenant_id = $2)",
+    )
+    .bind(id)
+    .bind(scope.tenant_id())
+    .execute(&mut *tx)
+    .await?;
+    if res.rows_affected() == 0 {
+        // Lost the claim — another waiter already ledgered this deny. The events
+        // are DISCARDED untouched, exactly as a lost decision CAS discards its own.
+        tx.commit().await?;
+        return Ok(false);
+    }
+    for ev in events {
+        append_event_in_tx(&mut tx, scope, ev).await?;
+    }
+    tx.commit().await?;
+    Ok(true)
 }
 
 pub async fn get_approval(
@@ -4453,6 +4769,363 @@ pub async fn get_approval(
     .await?;
     tx.commit().await?;
     Ok(__rls_out)
+}
+
+// ─── Durable tool execution claims (Phase E, #33; Gap 11) ───────────────────
+// The four-state (+ambiguous) claim that fences every brokered dispatch: exactly
+// one send per (session, tool_call_id, input_digest), taken under the SAME
+// sessions-row lock order as cancellation, refused once the session stops
+// accepting work, carrying the settled outcome so a duplicate ADOPTS it.
+// Migration 0019. Every fn is tenant-scoped (`scoped_tx` + `tenant_id` predicate);
+// the cross-tenant stale-claim sweep lives in `system_worker`.
+
+/// One `tool_execution_claims` row (migration 0019).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ToolExecutionClaimRow {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub session_id: Uuid,
+    pub tool_call_id: String,
+    pub input_digest: String,
+    pub state: String,
+    pub attempt: i32,
+    pub claimed_at: DateTime<Utc>,
+    pub claim_expires_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub result_digest: Option<String>,
+    pub is_error: Option<bool>,
+    pub result_content: Option<Value>,
+    pub error_message: Option<String>,
+}
+
+/// The outcome of [`claim_tool_execution`]: whether THIS caller won the single
+/// dispatch, found an existing claim to reconcile against, or hit a session that
+/// no longer accepts work.
+#[derive(Debug, Clone)]
+pub enum ClaimOutcome {
+    /// This caller inserted the claim and owns the one dispatch.
+    Won { claim_id: Uuid },
+    /// A claim already exists — the caller adopts a terminal outcome, re-claims a
+    /// `failed_before_send` row, or polls a `claimed` one. Boxed (the row is large
+    /// and this variant is the cold path).
+    Existing(Box<ToolExecutionClaimRow>),
+    /// The session stopped accepting work (cancelled/finalizing/terminal) before
+    /// the claim could be taken — the brokered dispatch is refused.
+    SessionTerminal,
+}
+
+/// Take (or find) the durable execution claim for one brokered dispatch. ONE
+/// short transaction, NEVER held across the upstream HTTP call:
+///   1. lock the sessions row `FOR UPDATE` (the cancellation lock order), then
+///   2. re-read status in a SECOND statement (the [`set_sandbox_handle`]
+///      lock-then-read discipline — a single-statement predicate keeps a stale
+///      command snapshot past a blocked lock, so a just-committed wind-down could
+///      be missed) — refuse with [`ClaimOutcome::SessionTerminal`] if it no
+///      longer `accepts_work()`, then
+///   3. `insert … on conflict do nothing returning id` → [`ClaimOutcome::Won`],
+///      else read the existing row → [`ClaimOutcome::Existing`].
+///
+/// LOCK-ORDER ANALYSIS (why this cannot deadlock with cancellation, the ledger,
+/// or approvals — Phase E, #33):
+///   - This tx acquires `sessions` (FOR UPDATE) → then `tool_execution_claims`
+///     (INSERT/read). It NEVER touches `approvals` and NEVER calls `append_event`.
+///     `reclaim_failed_before_send` uses the identical order.
+///   - Cancellation (`transition_session`, `begin_finalization`) also takes the
+///     SAME `sessions` row FOR UPDATE first. Two writers on one session therefore
+///     SERIALIZE on that row: a cancel that commits first is SEEN here as
+///     terminal (refuse); a claim that commits first means the dispatch was taken
+///     under a proven-nonterminal snapshot. Same row, same order ⇒ no cycle.
+///   - `append_event` (the ledger) locks `sessions` → `events` in a SEPARATE
+///     transaction (record_brokered_exec runs AFTER this claim tx commits and
+///     after `complete_tool_execution`, never nested). No tx ever holds a claim
+///     row while waiting on `sessions`, so it can never block a cancel that holds
+///     `sessions` while wanting a claim row — the classic cycle never forms.
+///   - The stale-claim sweep (`system_worker`) updates claim rows + reads
+///     `approvals`; it does NOT lock `sessions`, so it never waits on the lock
+///     this tx holds. (Task 6's E12 nests `append_event` inside the approvals CAS
+///     — approvals → sessions — which is a DIFFERENT resource pair; the claim tx's
+///     never touching approvals keeps the two orderings disjoint.)
+pub async fn claim_tool_execution(
+    pool: &PgPool,
+    scope: TenantScope,
+    session_id: Uuid,
+    tool_call_id: &str,
+    input_digest: &str,
+    ttl_secs: i64,
+) -> sqlx::Result<ClaimOutcome> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let locked: Option<(String,)> =
+        sqlx::query_as("select status from sessions where id = $1 and tenant_id = $2 for update")
+            .bind(session_id)
+            .bind(scope.tenant_id())
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((status,)) = locked else {
+        return Ok(ClaimOutcome::SessionTerminal);
+    };
+    if !SessionStatus::parse(&status).is_some_and(|s| s.accepts_work()) {
+        return Ok(ClaimOutcome::SessionTerminal);
+    }
+    let expires = Utc::now() + chrono::Duration::seconds(ttl_secs.max(1));
+    let won: Option<(Uuid,)> = sqlx::query_as(
+        "insert into tool_execution_claims
+             (tenant_id, session_id, tool_call_id, input_digest, state, claim_expires_at)
+         values ($1, $2, $3, $4, 'claimed', $5)
+         on conflict (session_id, tool_call_id, input_digest) do nothing
+         returning id",
+    )
+    .bind(scope.tenant_id())
+    .bind(session_id)
+    .bind(tool_call_id)
+    .bind(input_digest)
+    .bind(expires)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let outcome = match won {
+        Some((claim_id,)) => ClaimOutcome::Won { claim_id },
+        None => {
+            let row: ToolExecutionClaimRow = sqlx::query_as(
+                "select * from tool_execution_claims
+                 where session_id = $1 and tool_call_id = $2 and input_digest = $3
+                   and tenant_id = $4",
+            )
+            .bind(session_id)
+            .bind(tool_call_id)
+            .bind(input_digest)
+            .bind(scope.tenant_id())
+            .fetch_one(&mut *tx)
+            .await?;
+            ClaimOutcome::Existing(Box::new(row))
+        }
+    };
+    tx.commit().await?;
+    Ok(outcome)
+}
+
+/// The outcome of [`complete_tool_execution`] (Phase E, #33; review I3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettleOutcome {
+    /// This dispatcher landed the `claimed → terminal` transition. Its locally
+    /// computed result IS the durable one.
+    Settled,
+    /// The CAS lost: something else already made this claim terminal — in
+    /// practice the stale-claim sweep, which moved an expired claim to
+    /// `ambiguous` and ledgered that. The caller MUST answer from these durable
+    /// columns, never from its own completion: the sweep's row is what every
+    /// duplicate adopts and what the ledger says, so returning the local result
+    /// would hand the original caller a success the audit trail contradicts.
+    Superseded {
+        state: String,
+        result_content: Option<Value>,
+        error_message: Option<String>,
+    },
+}
+
+impl SettleOutcome {
+    /// Did THIS caller land the transition? (The ledger writes on true only —
+    /// a superseded dispatcher must not double-ledger the sweep's outcome.)
+    pub fn settled(&self) -> bool {
+        matches!(self, SettleOutcome::Settled)
+    }
+}
+
+/// Settle a WON claim from `claimed` to a terminal state (CAS on
+/// `state = 'claimed'`). `result_content` MUST be pre-capped by the caller
+/// (reuse the broker's 256 KiB cap).
+///
+/// [`SettleOutcome::Settled`] iff this call landed the transition. A loser
+/// (already swept to `ambiguous`, or a duplicate) gets
+/// [`SettleOutcome::Superseded`] carrying the DURABLE row read in the SAME
+/// transaction as the failed CAS — the claim is terminal by then, so that read
+/// is stable, and it is the only answer the caller may return (review I3:
+/// returning the local completion made the original caller see `succeeded`
+/// while the ledger and every duplicate saw `ambiguous`). A vanished row (no
+/// delete path exists for claims) degrades to `ambiguous`: we dispatched and
+/// cannot prove the outcome, which is exactly what `ambiguous` means.
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_tool_execution(
+    pool: &PgPool,
+    scope: TenantScope,
+    claim_id: Uuid,
+    state: &str,
+    result_digest: Option<&str>,
+    is_error: Option<bool>,
+    result_content: Option<&Value>,
+    error_message: Option<&str>,
+) -> sqlx::Result<SettleOutcome> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let res = sqlx::query(
+        "update tool_execution_claims
+            set state = $2, result_digest = $3, is_error = $4, result_content = $5,
+                error_message = $6, completed_at = now()
+          where id = $1 and tenant_id = $7 and state = 'claimed'",
+    )
+    .bind(claim_id)
+    .bind(state)
+    .bind(result_digest)
+    .bind(is_error)
+    .bind(result_content)
+    .bind(error_message)
+    .bind(scope.tenant_id())
+    .execute(&mut *tx)
+    .await?;
+    if res.rows_affected() == 1 {
+        tx.commit().await?;
+        return Ok(SettleOutcome::Settled);
+    }
+    // Lost the CAS → the row is ALREADY terminal. Read the durable outcome here,
+    // inside the same transaction, so the caller can adopt it verbatim.
+    let durable: Option<(String, Option<Value>, Option<String>)> = sqlx::query_as(
+        "select state, result_content, error_message from tool_execution_claims
+          where id = $1 and tenant_id = $2",
+    )
+    .bind(claim_id)
+    .bind(scope.tenant_id())
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(match durable {
+        Some((state, result_content, error_message)) => SettleOutcome::Superseded {
+            state,
+            result_content,
+            error_message,
+        },
+        None => SettleOutcome::Superseded {
+            state: "ambiguous".to_string(),
+            result_content: None,
+            error_message: None,
+        },
+    })
+}
+
+/// The outcome of [`reclaim_failed_before_send`] (Phase E, #33; review I1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReclaimOutcome {
+    /// This call won the re-claim: the row is `claimed` again and `attempt`
+    /// carries the (bumped) number of the dispatch the caller now owns.
+    Reclaimed { attempt: i32 },
+    /// The row is still `failed_before_send` and has SPENT its attempt budget —
+    /// no further dispatch may be taken for this `(session, tool_call_id,
+    /// input_digest)`. The caller answers with a terminal-shaped tool error.
+    Exhausted { attempt: i32 },
+    /// Somebody else moved the row (a concurrent re-claim won it, a dispatcher
+    /// re-settled it) or the session stopped accepting work — the caller polls.
+    Lost,
+}
+
+/// Re-claim a `failed_before_send` row for a fresh dispatch — the ONLY
+/// re-claimable state (positive proof nothing was sent). CAS
+/// `failed_before_send → claimed`, `attempt + 1`, fresh expiry, and the result
+/// columns reset, INSIDE the same sessions-`FOR UPDATE` nonterminal tx shape as
+/// [`claim_tool_execution`].
+///
+/// **BOUNDED (review I1).** `max_attempts` caps the dispatches ONE claim row may
+/// ever take: the CAS carries `attempt < $6`, so re-claiming is impossible past
+/// the cap no matter how many handlers race. Without it a sandbox looping
+/// `/tools/call` on one `tool_call_id` against a sick upstream re-claimed for
+/// free forever — a breaker refusal charges no budget and emits no ledger event,
+/// so each iteration cost only two exclusive `sessions`-row locks (this one plus
+/// [`claim_tool_execution`]'s), taken on the very row `transition_session`,
+/// `begin_finalization` and `append_event` need. The cap turns that unbounded
+/// churn into a small constant, and `attempt` — previously written and read by
+/// nothing — becomes the thing that bounds it.
+///
+/// HONEST SCOPE (review, minor): this function has NO reachable production caller
+/// today. `images/runner-lib/broker-shim.mjs` mints a fresh `bkr_<uuid>`
+/// `tool_call_id` for every MCP request, so a shipped runner never re-presents the
+/// same `(tool_call_id, input_digest)` and never lands on an existing claim row.
+/// The re-claimable property is therefore correct but VACUOUS in production; it
+/// exists for a harness that does re-present an id (the runner contract permits
+/// it, and `/permission`'s idempotency assumes it) and for the DB-gated tests.
+/// Keep it — and keep it bounded.
+pub async fn reclaim_failed_before_send(
+    pool: &PgPool,
+    scope: TenantScope,
+    session_id: Uuid,
+    tool_call_id: &str,
+    input_digest: &str,
+    ttl_secs: i64,
+    max_attempts: i32,
+) -> sqlx::Result<ReclaimOutcome> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let locked: Option<(String,)> =
+        sqlx::query_as("select status from sessions where id = $1 and tenant_id = $2 for update")
+            .bind(session_id)
+            .bind(scope.tenant_id())
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((status,)) = locked else {
+        return Ok(ReclaimOutcome::Lost);
+    };
+    if !SessionStatus::parse(&status).is_some_and(|s| s.accepts_work()) {
+        return Ok(ReclaimOutcome::Lost);
+    }
+    let expires = Utc::now() + chrono::Duration::seconds(ttl_secs.max(1));
+    let reclaimed: Option<i32> = sqlx::query_scalar(
+        "update tool_execution_claims
+            set state = 'claimed', attempt = attempt + 1, claim_expires_at = $5,
+                claimed_at = now(), completed_at = null, result_digest = null,
+                is_error = null, result_content = null, error_message = null
+          where session_id = $1 and tool_call_id = $2 and input_digest = $3
+            and tenant_id = $4 and state = 'failed_before_send' and attempt < $6
+        returning attempt",
+    )
+    .bind(session_id)
+    .bind(tool_call_id)
+    .bind(input_digest)
+    .bind(scope.tenant_id())
+    .bind(expires)
+    .bind(max_attempts)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(attempt) = reclaimed {
+        tx.commit().await?;
+        return Ok(ReclaimOutcome::Reclaimed { attempt });
+    }
+    // Zero rows: either the cap is spent or somebody else moved the row. Tell the
+    // two apart from the row itself so the caller can refuse TERMINALLY instead of
+    // polling for 30 s on a claim that will never move again.
+    let row: Option<(String, i32)> = sqlx::query_as(
+        "select state, attempt from tool_execution_claims
+          where session_id = $1 and tool_call_id = $2 and input_digest = $3 and tenant_id = $4",
+    )
+    .bind(session_id)
+    .bind(tool_call_id)
+    .bind(input_digest)
+    .bind(scope.tenant_id())
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(match row {
+        Some((state, attempt)) if state == "failed_before_send" && attempt >= max_attempts => {
+            ReclaimOutcome::Exhausted { attempt }
+        }
+        _ => ReclaimOutcome::Lost,
+    })
+}
+
+/// Read a claim by its natural key (the loser's bounded poll of an in-flight
+/// `claimed` row, and the duplicate's adoption read).
+pub async fn get_tool_execution(
+    pool: &PgPool,
+    scope: TenantScope,
+    session_id: Uuid,
+    tool_call_id: &str,
+    input_digest: &str,
+) -> sqlx::Result<Option<ToolExecutionClaimRow>> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let row = sqlx::query_as(
+        "select * from tool_execution_claims
+         where session_id = $1 and tool_call_id = $2 and input_digest = $3 and tenant_id = $4",
+    )
+    .bind(session_id)
+    .bind(tool_call_id)
+    .bind(input_digest)
+    .bind(scope.tenant_id())
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row)
 }
 
 /// Human-lifecycle rows only: intent bookkeeping ('intent'/'auto_*') is the
@@ -4481,7 +5154,7 @@ pub async fn session_approvals(
 }
 
 /// The tenant-scoped approvals inbox (the org approval queue). The
-/// cross-tenant expiry sweep runs off [`system_worker::expire_stale_approvals`];
+/// cross-tenant expiry scan runs off [`system_worker::expired_pending_approvals`];
 /// this one is what a request handler shows an approver, and it never crosses a
 /// tenant boundary.
 pub async fn pending_approvals(
@@ -4693,25 +5366,318 @@ pub async fn tool_call_count(
     Ok(row.get::<i64, _>("n"))
 }
 
+// ─── LLM budget reservations (Phase E, #33; Gap 14) ───────────────────────
+// Migration 0022. The facade's check-then-record budget was raceable: N
+// concurrent requests all read the same remaining budget and all passed. These
+// functions replace the check with a durable, request-ID-keyed ATOMIC admission
+// so concurrent requests see each other's bookings. Every fn is tenant-scoped
+// (`scoped_tx` + `tenant_id` predicate); the cross-tenant expiry sweep lives in
+// `system_worker`.
+
+/// One `llm_reservations` row (migration 0022).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct LlmReservationRow {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub session_id: Uuid,
+    pub model: String,
+    pub reserved_tokens: i64,
+    pub reserved_cost_usd: Option<f64>,
+    pub state: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Live (`state = 'reserved'`) reservation totals for one session — the spend that
+/// is booked but not yet in `usage_entries`. The budget sweeper adds these to
+/// `usage_totals` so its projection sees in-flight requests, not just settled ones.
+#[derive(Debug, Clone, Copy, Default, sqlx::FromRow)]
+pub struct ReservationTotals {
+    pub tokens: i64,
+    pub cost_usd: f64,
+    pub active: i64,
+}
+
+/// The verdict of [`reserve_llm_budget`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReserveOutcome {
+    /// Booked. The caller owns the reservation and MUST settle it (charge on
+    /// authoritative usage, release only on positively-proven non-dispatch).
+    Reserved,
+    /// The projection `recorded usage + live reservations + this request` exceeds
+    /// the named budget. `active` is how many live reservations were counted —
+    /// always ≥ 1, because a request with no competitors is admitted by the
+    /// sole-claimant rule (see the fn docs).
+    BudgetExceeded { budget: &'static str, active: i64 },
+    /// Too many reservations already outstanding for this session.
+    CeilingExceeded { active: i64, ceiling: i64 },
+    /// The session stopped accepting work (or is not this tenant's) before the
+    /// reservation could be booked.
+    SessionTerminal,
+}
+
+/// Book a conservative maximum against a run's LLM budget, atomically.
+///
+/// TWO STATEMENTS, and both halves are load-bearing:
+///
+///   1. `select status from sessions … for update` — the SERIALIZER. A CTE alone
+///      does NOT close the race: under READ COMMITTED two concurrent transactions
+///      each take their own snapshot and neither sees the other's uncommitted
+///      insert, so both would pass an identical guard. Locking the session row
+///      first makes concurrent admissions for one session queue on that row, and
+///      the SECOND statement then runs on a fresh command snapshot that includes
+///      everything the previous holder committed. (A single statement would keep
+///      the stale pre-lock snapshot for the rows it reads — the same hazard
+///      `claim_tool_execution` and `set_sandbox_handle` document.) The lock is
+///      held for one short statement and NEVER across the upstream model call, so
+///      this is not "serialize requests per session", which design :1113-1115
+///      forbids: parallel subagent calls still run in parallel, they just take
+///      their bookings in a defined order.
+///   2. ONE atomic CTE that computes recorded usage + live reservations + the
+///      ceiling and inserts the row only if every guard passes — decision and
+///      booking can never be separated by another writer.
+///
+/// LOCK ORDER: `sessions` (FOR UPDATE) → `llm_reservations`. Identical to
+/// `claim_tool_execution` (`sessions` → `tool_execution_claims`) and to
+/// cancellation (`transition_session` / `begin_finalization`, which also take the
+/// session row first), so all four serialize on the same row in the same order and
+/// no cycle can form. This tx never touches `approvals` and never calls
+/// `append_event`, so it is disjoint from the approvals→sessions ordering the
+/// decision sites use.
+///
+/// THE SOLE-CLAIMANT RULE (a deliberate refinement of the plan's literal
+/// predicate). The budget arms are skipped when there are ZERO other live
+/// reservations. Gap 14 is a CONCURRENCY race, and the pre-existing accumulated
+/// check (`recorded usage >= budget`, unchanged, evaluated moments earlier in the
+/// facade) has already ruled on whether the run may proceed at all. Without this
+/// carve-out a run whose per-request conservative estimate alone exceeds its
+/// remaining budget could never make a single request — it would be refused
+/// forever with nothing in flight to drain, livelocking instead of stopping. The
+/// terminal "this run is out of budget" verdict therefore stays where it already
+/// lives (the accumulated check plus the budget sweeper, which now counts live
+/// reservations and so still stops an over-projecting sole claimant — once,
+/// cleanly, with a ledgered `BudgetExceeded`).
+///
+/// `budget_tokens` / `budget_cost` are the RunSpec's frozen caps (`None` = no
+/// cap). `reserved_cost` is `None` for an unpriced model; NULL contributes 0 to
+/// the cost projection, which is why the token arm carries the weight there.
+#[allow(clippy::too_many_arguments)]
+pub async fn reserve_llm_budget(
+    pool: &PgPool,
+    scope: TenantScope,
+    session_id: Uuid,
+    request_id: Uuid,
+    model: &str,
+    reserved_tokens: i64,
+    reserved_cost: Option<f64>,
+    ceiling: i64,
+    budget_tokens: Option<i64>,
+    budget_cost: Option<f64>,
+    ttl_secs: i64,
+) -> sqlx::Result<ReserveOutcome> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let locked: Option<(String,)> =
+        sqlx::query_as("select status from sessions where id = $1 and tenant_id = $2 for update")
+            .bind(session_id)
+            .bind(scope.tenant_id())
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((status,)) = locked else {
+        return Ok(ReserveOutcome::SessionTerminal);
+    };
+    if !SessionStatus::parse(&status).is_some_and(|s| s.accepts_work()) {
+        return Ok(ReserveOutcome::SessionTerminal);
+    }
+    let expires = Utc::now() + chrono::Duration::seconds(ttl_secs.max(1));
+    let row = sqlx::query(
+        "with used as (
+             select coalesce(sum(input_tokens + output_tokens
+                                 + cache_read_tokens + cache_write_tokens), 0)::bigint as tokens,
+                    coalesce(sum(cost_usd), 0)::float8 as cost
+               from usage_entries
+              where session_id = $2
+                and exists (select 1 from sessions s where s.id = $2 and s.tenant_id = $3)
+         ),
+         active as (
+             select coalesce(sum(reserved_tokens), 0)::bigint as tokens,
+                    coalesce(sum(reserved_cost_usd), 0)::float8 as cost,
+                    count(*)::bigint as n
+               from llm_reservations
+              where session_id = $2 and state = 'reserved'
+                and exists (select 1 from sessions s where s.id = $2 and s.tenant_id = $3)
+         ),
+         guard as (
+             select a.n as active_n,
+                    a.n < $8::bigint as under_ceiling,
+                    ($9::bigint is null or a.n = 0
+                       or u.tokens + a.tokens + $6::bigint <= $9::bigint) as under_tokens,
+                    ($10::float8 is null or a.n = 0
+                       or u.cost + a.cost + coalesce($7::float8, 0) <= $10::float8) as under_cost
+               from used u, active a
+         ),
+         ins as (
+             insert into llm_reservations
+                 (id, tenant_id, session_id, model, reserved_tokens, reserved_cost_usd,
+                  state, expires_at)
+             select $1::uuid, $3::uuid, $2::uuid, $5::text, $6::bigint, $7::float8,
+                    'reserved', $4::timestamptz
+               from guard g
+              where g.under_ceiling and g.under_tokens and g.under_cost
+                and exists (select 1 from sessions s where s.id = $2 and s.tenant_id = $3)
+             returning id
+         )
+         select (select count(*) from ins)::bigint as inserted,
+                g.active_n, g.under_ceiling, g.under_tokens, g.under_cost
+           from guard g",
+    )
+    .bind(request_id)
+    .bind(session_id)
+    .bind(scope.tenant_id())
+    .bind(expires)
+    .bind(model)
+    .bind(reserved_tokens)
+    .bind(reserved_cost)
+    .bind(ceiling)
+    .bind(budget_tokens)
+    .bind(budget_cost)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    let inserted: i64 = row.get("inserted");
+    let active: i64 = row.get("active_n");
+    let outcome = if inserted == 1 {
+        ReserveOutcome::Reserved
+    } else if !row.get::<bool, _>("under_ceiling") {
+        ReserveOutcome::CeilingExceeded { active, ceiling }
+    } else if !row.get::<bool, _>("under_tokens") {
+        ReserveOutcome::BudgetExceeded {
+            budget: "max_tokens",
+            active,
+        }
+    } else if !row.get::<bool, _>("under_cost") {
+        ReserveOutcome::BudgetExceeded {
+            budget: "max_cost_usd",
+            active,
+        }
+    } else {
+        // Every guard passed but the insert's tenant/session predicate did not —
+        // the session vanished or is not this tenant's. Fail closed.
+        ReserveOutcome::SessionTerminal
+    };
+    Ok(outcome)
+}
+
+/// Settle a reservation as SPENT (CAS `reserved → charged`). The caller MUST have
+/// already written the matching `usage_entries` row keyed `external_id = id`; this
+/// only retires the booking so it stops being counted twice. Returns true iff this
+/// call landed the transition (false = the sweeper already converted it).
+pub async fn charge_llm_reservation(
+    pool: &PgPool,
+    scope: TenantScope,
+    request_id: Uuid,
+) -> sqlx::Result<bool> {
+    cas_reservation_state(pool, scope, request_id, "charged").await
+}
+
+/// Settle a reservation as NEVER SPENT (CAS `reserved → released`). Legal ONLY on
+/// positively-proven non-dispatch (design :1121) — a pre-send refusal or an
+/// upstream 401, which the facade already treats as proof the request never
+/// executed. "We could not parse usage" is NOT proof and must retain instead.
+pub async fn release_llm_reservation(
+    pool: &PgPool,
+    scope: TenantScope,
+    request_id: Uuid,
+) -> sqlx::Result<bool> {
+    cas_reservation_state(pool, scope, request_id, "released").await
+}
+
+async fn cas_reservation_state(
+    pool: &PgPool,
+    scope: TenantScope,
+    request_id: Uuid,
+    state: &str,
+) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let res = sqlx::query(
+        "update llm_reservations set state = $3
+          where id = $1 and tenant_id = $2 and state = 'reserved'",
+    )
+    .bind(request_id)
+    .bind(scope.tenant_id())
+    .bind(state)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// Live reservation totals for one session (the budget sweeper's projection input,
+/// and the tests' observation window).
+pub async fn active_reservation_totals(
+    pool: &PgPool,
+    scope: TenantScope,
+    session: Uuid,
+) -> sqlx::Result<ReservationTotals> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let out = sqlx::query_as(
+        "select coalesce(sum(reserved_tokens), 0)::bigint as tokens,
+                coalesce(sum(reserved_cost_usd), 0)::float8 as cost_usd,
+                count(*)::bigint as active
+           from llm_reservations
+          where session_id = $1 and state = 'reserved'
+            and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $2)",
+    )
+    .bind(session)
+    .bind(scope.tenant_id())
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(out)
+}
+
+/// Read one reservation by its request id (tests + operator introspection).
+pub async fn get_llm_reservation(
+    pool: &PgPool,
+    scope: TenantScope,
+    request_id: Uuid,
+) -> sqlx::Result<Option<LlmReservationRow>> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let out = sqlx::query_as("select * from llm_reservations where id = $1 and tenant_id = $2")
+        .bind(request_id)
+        .bind(scope.tenant_id())
+        .fetch_optional(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(out)
+}
+
 // ─── Tokens ───────────────────────────────────────────────────────────────
 
+/// Mint one audience-scoped session token (Gap 10, invariant 19). `audience` is
+/// one of `control|tool|llm|workspace` (or `all` for a legacy single token) and
+/// is enforced per-route by the auth extractors. A run mints FOUR of these, one
+/// per audience, all sharing the `fbx_sess_` prefix (the Redactor scrubs by
+/// prefix, so all four are covered).
 pub async fn create_session_token(
     pool: &PgPool,
     scope: TenantScope,
     session: Uuid,
     token_plain: &str,
     ttl_secs: i64,
+    audience: &str,
 ) -> sqlx::Result<()> {
     let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
-        "insert into api_tokens (id, tenant_id, kind, session_id, token_sha256, expires_at)
-         values ($1, $2, 'session', $3, $4, now() + make_interval(secs => $5))",
+        "insert into api_tokens (id, tenant_id, kind, session_id, token_sha256, expires_at, audience)
+         values ($1, $2, 'session', $3, $4, now() + make_interval(secs => $5), $6)",
     )
     .bind(Uuid::now_v7())
     .bind(scope.tenant_id())
     .bind(session)
     .bind(sha256_hex(token_plain))
     .bind(ttl_secs as f64)
+    .bind(audience)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -4723,10 +5689,14 @@ pub async fn create_session_token(
 /// extractor / facade / `/result`) can build a `TenantScope` without a second
 /// query — the "bootstrap exception" pattern (token resolution keys purely on
 /// the sha256, then hands back a verified tenant).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SessionTokenAuth {
     pub session_id: Uuid,
     pub tenant_id: Uuid,
+    /// Which routes this token opens (Gap 10): `control|tool|llm|workspace`, or
+    /// the legacy `all` (pre-split tokens + e2e forgers via the column DEFAULT).
+    /// The caller enforces it per-route (auth.rs `audience_allows`).
+    pub audience: String,
 }
 
 /// Resolve a session token to its session IGNORING revoked_at/expiry — used
@@ -4745,7 +5715,7 @@ pub async fn session_for_token_incl_revoked(
     // IS the credential (documented TenantScope bootstrap exception).
     let mut tx = worker_tx(pool).await?;
     let row = sqlx::query(
-        "select session_id, tenant_id from api_tokens
+        "select session_id, tenant_id, audience from api_tokens
          where kind = 'session' and token_sha256 = $1",
     )
     .bind(sha256_hex(token_plain))
@@ -4757,12 +5727,13 @@ pub async fn session_for_token_incl_revoked(
             .map(|session_id| SessionTokenAuth {
                 session_id,
                 tenant_id: r.get::<Uuid, _>("tenant_id"),
+                audience: r.get::<String, _>("audience"),
             })
     }))
 }
 
-/// Returns the session (and its tenant) a valid (unexpired, unrevoked) token
-/// belongs to.
+/// Returns the session (and its tenant + audience) a valid (unexpired,
+/// unrevoked) token belongs to.
 pub async fn session_for_token(
     pool: &PgPool,
     token_plain: &str,
@@ -4771,7 +5742,7 @@ pub async fn session_for_token(
     // `session_for_token_incl_revoked`.
     let mut tx = worker_tx(pool).await?;
     let row = sqlx::query(
-        "select session_id, tenant_id from api_tokens
+        "select session_id, tenant_id, audience from api_tokens
          where kind = 'session' and token_sha256 = $1
            and revoked_at is null
            and (expires_at is null or expires_at > now())",
@@ -4785,10 +5756,18 @@ pub async fn session_for_token(
             .map(|session_id| SessionTokenAuth {
                 session_id,
                 tenant_id: r.get::<Uuid, _>("tenant_id"),
+                audience: r.get::<String, _>("audience"),
             })
     }))
 }
 
+/// Renew a session's tokens ahead of expiry. Gap 10 renewal contract: ONE renew
+/// call (the runner presents its `control` token) extends EVERY live token for
+/// that session — all four audiences move together in a single statement, so the
+/// four never drift apart and the runner keeps one renew loop. Resolves the
+/// session from the presented (unrevoked) token's digest, then bumps expiry on
+/// all of that session's unrevoked session-kind rows. A revoked/bogus token
+/// resolves no session ⇒ zero rows ⇒ `false` (never resurrects a revoked set).
 pub async fn extend_session_token(
     pool: &PgPool,
     token_plain: &str,
@@ -4799,7 +5778,11 @@ pub async fn extend_session_token(
     let mut tx = worker_tx(pool).await?;
     let res = sqlx::query(
         "update api_tokens set expires_at = now() + make_interval(secs => $2)
-         where kind = 'session' and token_sha256 = $1 and revoked_at is null",
+         where kind = 'session' and revoked_at is null
+           and session_id in (
+             select session_id from api_tokens
+              where kind = 'session' and token_sha256 = $1 and revoked_at is null
+           )",
     )
     .bind(sha256_hex(token_plain))
     .bind(ttl_secs as f64)
@@ -5178,13 +6161,78 @@ pub async fn enqueue_result_delivery(
     Ok(__rls_out)
 }
 
+/// RE-STAMP this replica's claim on ONE delivery row, immediately before its
+/// attempt (Phase E, #33; review I2). Returns true iff we still own it.
+///
+/// WHY THIS EXISTS. [`system_worker::claim_due_deliveries`] stamps a whole BATCH
+/// at once, but the worker then attempts the rows SEQUENTIALLY: the last row of a
+/// batch of 10 can sit unattempted for nine attempts' worth of wall clock, so a
+/// TTL measured from the batch is long expired by the time its turn comes. Two
+/// failures follow from that, and both are user-visible:
+///   * another replica steals the row and delivers it AGAIN (a second GitHub
+///     comment, a second webhook POST) — the exact duplicate the claim exists to
+///     prevent; and
+///   * whichever replica finishes second loses [`mark_delivery_attempt`]'s owner
+///     guard, so `attempts` and `next_attempt_at` DO NOT MOVE. The row is
+///     immediately due again, and with every replica overrunning its claim the
+///     cycle repeats forever: the backoff never advances, `max_attempts` is never
+///     reached, and the external side effect repeats on every pass.
+///
+/// Re-stamping per row makes the TTL measure ONE attempt instead of a whole batch,
+/// which is what lets the caller size it against a single worst-case attempt.
+///
+/// STRICTLY OWNER-GUARDED, never a steal: if another replica already took the row
+/// (`claimed_by` moved), this matches zero rows and the caller SKIPS it without
+/// performing the external side effect — the new owner does it exactly once. The
+/// CAS is atomic against a concurrent claim scan: whoever takes the row lock first
+/// wins, and the loser's predicate no longer holds.
+pub async fn extend_delivery_claim(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    owner: Uuid,
+    ttl_secs: i64,
+) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let res = sqlx::query(
+        "update result_deliveries
+            set claimed_until = now() + make_interval(secs => $3),
+                updated_at = now()
+          where id = $1 and claimed_by = $2 and status = 'pending'
+            and exists (select 1 from sessions s
+                        where s.id = result_deliveries.session_id and s.tenant_id = $4)",
+    )
+    .bind(id)
+    .bind(owner)
+    .bind(ttl_secs.max(1) as f64)
+    .bind(scope.tenant_id())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(res.rows_affected() > 0)
+}
+
 /// Record one attempt. ok → delivered; failure → attempts+1 and either
 /// rescheduled (`retry_in_secs`) or terminally 'failed' at `max_attempts`.
+///
+/// GUARDED on the caller still holding the row's claim (Phase E, #33; Gap 13).
+/// `owner` is the replica id that
+/// [`system_worker::claim_due_deliveries`] stamped; a replica whose claim expired
+/// and was stolen mid-attempt matches zero rows and gets `None`, so it can never
+/// stomp the new owner's attempt counter or backoff. The claim is RELEASED here
+/// (both columns nulled) so the next backoff window is open to any replica.
+///
+/// `None` IS A REAL FAILURE MODE, NOT A NO-OP (review I2): nothing was recorded,
+/// so neither `attempts` nor `next_attempt_at` moved — the caller MUST log it
+/// (see `deliveries::attempt`) and rely on the new owner to record the attempt it
+/// is running. [`extend_delivery_claim`] makes this rare by re-stamping the claim
+/// per attempt; it stays possible when an attempt outruns even that fresh TTL.
 #[allow(clippy::too_many_arguments)]
 pub async fn mark_delivery_attempt(
     pool: &PgPool,
     scope: TenantScope,
     id: Uuid,
+    owner: Uuid,
     ok: bool,
     error: Option<&str>,
     payload_digest: Option<&str>,
@@ -5203,8 +6251,10 @@ pub async fn mark_delivery_attempt(
             last_error = $3,
             payload_digest = coalesce($4, payload_digest),
             next_attempt_at = now() + make_interval(secs => $5),
+            claimed_by = null,
+            claimed_until = null,
             updated_at = now()
-         where id = $1
+         where id = $1 and claimed_by = $8
            and exists (select 1 from sessions s
                        where s.id = result_deliveries.session_id and s.tenant_id = $7)
          returning *",
@@ -5216,6 +6266,7 @@ pub async fn mark_delivery_attempt(
     .bind(retry_in_secs as f64)
     .bind(max_attempts)
     .bind(scope.tenant_id())
+    .bind(owner)
     .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -5789,37 +6840,72 @@ pub async fn upsert_external_result(
 /// this connection deliberately stays role-plain (it does not even need the runtime
 /// role; it only LISTENs).
 pub fn spawn_listener(database_url: String) -> tokio::sync::broadcast::Sender<(Uuid, i64)> {
-    let (tx, _) = tokio::sync::broadcast::channel::<(Uuid, i64)>(1024);
+    spawn_channel_listener(database_url, "fluidbox_events", |payload| {
+        let (sid, seq) = payload.split_once(':')?;
+        Some((Uuid::parse_str(sid).ok()?, seq.parse::<i64>().ok()?))
+    })
+}
+
+/// The cross-replica approval-decision wakeup (Phase E, #33; Gap 13, plan E12).
+/// Every committed decision transaction `pg_notify`s [`APPROVALS_CHANNEL`] with
+/// the approval id; this listener relays it so EVERY replica can wake its own
+/// local `/permission` waiters, not just the one that happened to serve the
+/// decision request. Same discipline as `spawn_listener` above: a dedicated
+/// connection outside the app pool, role-plain, LISTEN-only, auto-reconnecting.
+///
+/// It is a LATENCY optimization, never the correctness mechanism — the wait loop's
+/// ≤2 s Postgres re-read stays the source of truth and the missed-notify /
+/// scale-to-zero backstop, exactly as `events_after` does for SSE.
+pub fn spawn_approval_listener(database_url: String) -> tokio::sync::broadcast::Sender<Uuid> {
+    spawn_channel_listener(database_url, APPROVALS_CHANNEL, |payload| {
+        Uuid::parse_str(payload).ok()
+    })
+}
+
+/// The shared LISTEN relay both channels ride. Runs on its OWN connection (outside
+/// the app pool) and needs NO tenant GUC: `LISTEN` and the `pg_notify` payloads it
+/// receives are not table reads, so RLS never applies here (the RLS-scoped
+/// catch-up queries that actually deliver run on the app pool). Undeliverable
+/// payloads are dropped, and a dropped connection reconnects with a 3 s backoff —
+/// a missed notify only costs the consumer's polling interval.
+fn spawn_channel_listener<T, F>(
+    database_url: String,
+    channel: &'static str,
+    parse: F,
+) -> tokio::sync::broadcast::Sender<T>
+where
+    T: Clone + Send + 'static,
+    F: Fn(&str) -> Option<T> + Send + 'static,
+{
+    let (tx, _) = tokio::sync::broadcast::channel::<T>(1024);
     let tx2 = tx.clone();
     tokio::spawn(async move {
         loop {
             match PgListener::connect(&database_url).await {
                 Ok(mut listener) => {
-                    if listener.listen("fluidbox_events").await.is_err() {
+                    if listener.listen(channel).await.is_err() {
                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                         continue;
                     }
-                    tracing::info!("pg listener connected");
+                    tracing::info!("pg listener connected ({channel})");
                     loop {
                         match listener.recv().await {
                             Ok(n) => {
-                                if let Some((sid, seq)) = n.payload().split_once(':') {
-                                    if let (Ok(sid), Ok(seq)) =
-                                        (Uuid::parse_str(sid), seq.parse::<i64>())
-                                    {
-                                        let _ = tx2.send((sid, seq));
-                                    }
+                                if let Some(v) = parse(n.payload()) {
+                                    let _ = tx2.send(v);
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!("pg listener dropped: {e}; reconnecting");
+                                tracing::warn!(
+                                    "pg listener ({channel}) dropped: {e}; reconnecting"
+                                );
                                 break;
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("pg listener connect failed: {e}; retrying");
+                    tracing::warn!("pg listener ({channel}) connect failed: {e}; retrying");
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -5834,6 +6920,134 @@ pub fn spawn_listener(database_url: String) -> tokio::sync::broadcast::Sender<(U
 mod tests {
     use super::*;
     use fluidbox_core::event::{Actor, EventBody, EventEnvelope, Redactor};
+
+    // ─── Tenant-less global scans in a SHARED database (#33) ────────────────
+    //
+    // Every `system_worker` scan is a TENANT-LESS GLOBAL scan, and that is the
+    // production contract: one worker tick sweeps every tenant on every replica,
+    // and each returned row carries its own `tenant_id`/`session_id` so the
+    // caller ledgers it under the right scope. Nothing below argues with that.
+    //
+    // But `cargo test` runs this module's tests CONCURRENTLY against ONE
+    // database, so a scan issued by one test also sees — and converts, and
+    // CLAIMS — the rows of every test running beside it. That produces two
+    // distinct failures, both reproduced on a scratch Postgres:
+    //
+    //   * EXTRA rows. A sibling's expired row lands in my batch, so any assertion
+    //     about the batch's LENGTH is really an assertion about the whole
+    //     database. This is what broke CI: `sweep_converts_…` counted 2 and its
+    //     sibling counted 0 — one sweep statement had converted BOTH tests'
+    //     reservations (identical `usage_entries.created_at` to the microsecond,
+    //     i.e. one transaction, across two different tenants).
+    //     Cured by [`GLOBAL_SCAN`]-guarded helpers that FILTER every batch down to
+    //     the rows the calling test owns.
+    //
+    //   * STOLEN rows. A sibling's scan converts/claims MY row in the window
+    //     between my making it scannable and my own scan — measured at 3/6 runs
+    //     for the stale-claim pair and 6/6 for the delivery trio — so filtering
+    //     alone still leaves "my scan reported my row" flaky, and for the claim
+    //     scans it also hands my row's LEASE to another owner id.
+    //     Cured by [`GLOBAL_SCAN`].
+    //
+    // The tests are NOT serialized: they seed, reserve, assert and clean up
+    // concurrently as before. Only the window in which one test's rows are
+    // scannable-but-not-yet-scanned is mutually exclusive, and every scan runs
+    // inside one — which is exactly the condition under which a global scan can
+    // be reasoned about locally. `tenant_less_scans_go_through_the_scoped_helpers`
+    // below keeps it that way.
+    static GLOBAL_SCAN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// This session's slice of a global expired-reservation sweep. The sweep and
+    /// its `Utc::now()` cutoff are the real ones — only the ROWS are narrowed, so
+    /// every property the callers assert (what was converted, with which tokens,
+    /// under which tenant/session, and that a second sweep reports nothing more)
+    /// survives intact while a sibling tenant's booking in the same batch stops
+    /// being this test's business. Call under a [`GLOBAL_SCAN`] guard taken before
+    /// the reservation was expired.
+    async fn sweep_reservations(
+        pool: &PgPool,
+        session: Uuid,
+    ) -> Vec<system_worker::SweptReservation> {
+        system_worker::sweep_expired_llm_reservations(pool, Utc::now(), 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.session_id == session)
+            .collect()
+    }
+
+    /// This session's slice of a global stale-execution-claim sweep — same
+    /// narrowing, same reasons, same guard discipline as [`sweep_reservations`].
+    async fn sweep_stale_claims(
+        pool: &PgPool,
+        session: Uuid,
+    ) -> Vec<(Uuid, Uuid, String, Option<String>)> {
+        system_worker::sweep_stale_execution_claims(pool, Utc::now(), 200)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|(_, s, _, _)| *s == session)
+            .collect()
+    }
+
+    /// The rows THIS test enqueued that `owner` just claimed. The claim scan is
+    /// the real one — `owner`, `limit` and `ttl_secs` reach it untouched, so the
+    /// `limit`/`skip locked`/lease behaviour under test is unchanged — but a
+    /// sibling test's delivery that happened to be due is not this test's row and
+    /// is dropped from the answer. Call under a [`GLOBAL_SCAN`] guard taken before
+    /// the deliveries were enqueued: unlike the sweeps, a stolen delivery is not
+    /// merely unobserved, it is LEASED to another owner id, which no filter can
+    /// undo.
+    async fn claim_deliveries(
+        pool: &PgPool,
+        owner: Uuid,
+        limit: i64,
+        ttl_secs: i64,
+        mine: &[Uuid],
+    ) -> Vec<ResultDeliveryRow> {
+        system_worker::claim_due_deliveries(pool, owner, limit, ttl_secs)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| mine.contains(&r.id))
+            .collect()
+    }
+
+    /// Source guard for the #33 class, in the shape of the #32 one above: a scan
+    /// with no tenant predicate must never be called bare from a test, because a
+    /// bare call asserts about every OTHER test's rows and races them for their
+    /// own. This is a source assertion, not a DB test — it runs without
+    /// `DATABASE_URL`, so a re-added bare caller fails immediately instead of
+    /// flaking one CI run in eight. Each needle is assembled from two halves so
+    /// the guard is not itself an occurrence.
+    #[test]
+    fn tenant_less_scans_go_through_the_scoped_helpers() {
+        let src = include_str!("lib.rs");
+        for (needle, helper) in [
+            (
+                concat!("sweep_expired_llm", "_reservations("),
+                "sweep_reservations",
+            ),
+            (
+                concat!("sweep_stale_execution", "_claims("),
+                "sweep_stale_claims",
+            ),
+            (concat!("claim_due", "_deliveries("), "claim_deliveries"),
+            (
+                concat!("expired_pending", "_approvals("),
+                "the single containment-only caller",
+            ),
+        ] {
+            let n = src.matches(needle).count();
+            assert_eq!(
+                n, 1,
+                "`{needle}` must appear exactly ONCE in fluidbox-db — inside {helper} — \
+                 found {n}. Route the new call through that helper and hold GLOBAL_SCAN \
+                 from the moment your rows become scannable: a bare call counts every \
+                 other test's rows into your batch and converts/claims them out of theirs."
+            );
+        }
+    }
 
     /// The durable-finalizer DB contract (PR #47 fix batch 2 — H3/H5):
     /// single-winner intent under the session row lock, quiesce computed from
@@ -6274,36 +7488,142 @@ mod tests {
         .await
         .unwrap();
 
-        let token = format!("fbx_sess_{}", Uuid::now_v7().simple());
-        create_session_token(&pool, scope, session.id, &token, 3600)
+        // Gap 10: a run mints FOUR audience-scoped tokens. Mint two here + forge
+        // a legacy (no-audience) row to exercise the whole contract.
+        let control = format!("fbx_sess_{}", Uuid::now_v7().simple());
+        let tool = format!("fbx_sess_{}", Uuid::now_v7().simple());
+        create_session_token(&pool, scope, session.id, &control, 3600, "control")
             .await
             .unwrap();
+        create_session_token(&pool, scope, session.id, &tool, 3600, "tool")
+            .await
+            .unwrap();
+
+        // Audience is PERSISTED and RETURNED by the resolver.
+        let a = session_for_token(&pool, &control).await.unwrap().unwrap();
+        assert_eq!(a.session_id, session.id);
+        assert_eq!(a.audience, "control");
         assert_eq!(
-            session_for_token(&pool, &token)
+            session_for_token(&pool, &tool)
                 .await
                 .unwrap()
-                .map(|a| a.session_id),
-            Some(session.id)
+                .unwrap()
+                .audience,
+            "tool"
         );
-        // A live token extends.
-        assert!(extend_session_token(&pool, &token, 3600).await.unwrap());
 
-        // Terminal transition revokes it — the runner can no longer auth.
+        // A legacy row inserted WITHOUT an audience gets the column DEFAULT 'all'
+        // (in-flight compat + the e2e forgers rely on this forever).
+        let legacy = format!("fbx_sess_{}", Uuid::now_v7().simple());
+        {
+            let mut tx = worker_tx(&pool).await.unwrap();
+            sqlx::query(
+                "insert into api_tokens (id, tenant_id, kind, session_id, token_sha256, expires_at)
+                 values ($1, $2, 'session', $3, $4, now() + interval '1 hour')",
+            )
+            .bind(Uuid::now_v7())
+            .bind(tenant)
+            .bind(session.id)
+            .bind(sha256_hex(&legacy))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+        assert_eq!(
+            session_for_token(&pool, &legacy)
+                .await
+                .unwrap()
+                .unwrap()
+                .audience,
+            "all"
+        );
+
+        // Renew contract: presenting ONE token (control) extends EVERY token for
+        // the session — the tool token we did NOT present must move too.
+        let expiry = |sha: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+                    "select expires_at from api_tokens where token_sha256 = $1",
+                )
+                .bind(sha)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        // A SECOND session with its own control token. "Renew extends all" is
+        // scoped to ONE session: without this, a renew that dropped the
+        // `session_id in (…)` predicate and extended every live session token in
+        // the table would pass every assertion above. Same tenant on purpose —
+        // tenant scoping cannot be what saves us here.
+        let other_session = create_session(
+            &pool,
+            scope,
+            agent.id,
+            rev.id,
+            "autonomous",
+            "trusted",
+            "t2",
+            &serde_json::json!({"kind":"none"}),
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+        let other_control = format!("fbx_sess_{}", Uuid::now_v7().simple());
+        create_session_token(
+            &pool,
+            scope,
+            other_session.id,
+            &other_control,
+            3600,
+            "control",
+        )
+        .await
+        .unwrap();
+
+        let tool_before = expiry(sha256_hex(&tool)).await;
+        let other_before = expiry(sha256_hex(&other_control)).await;
+        assert!(extend_session_token(&pool, &control, 7200).await.unwrap());
+        let tool_after = expiry(sha256_hex(&tool)).await;
+        assert!(
+            tool_after > tool_before,
+            "renewing via control must extend the tool token too (renew-extends-all)"
+        );
+        assert_eq!(
+            expiry(sha256_hex(&other_control)).await,
+            other_before,
+            "a renew must NOT touch another session's tokens (extends-all is per-SESSION)"
+        );
+
+        // Terminal transition revokes ALL the session's tokens (control + tool +
+        // legacy = 3) — every audience loses access at once, and only this
+        // session's: the count excludes the other session's live token.
         assert_eq!(
             revoke_session_tokens(&pool, scope, session.id)
                 .await
                 .unwrap(),
-            1
+            3
         );
-        assert_eq!(
-            session_for_token(&pool, &token)
+        assert!(session_for_token(&pool, &control).await.unwrap().is_none());
+        assert!(session_for_token(&pool, &tool).await.unwrap().is_none());
+        assert!(
+            session_for_token(&pool, &other_control)
                 .await
                 .unwrap()
-                .map(|a| a.session_id),
-            None
+                .is_some(),
+            "another session's token must survive this session's terminal revoke"
         );
-        // And a renew can never resurrect a revoked token.
-        assert!(!extend_session_token(&pool, &token, 3600).await.unwrap());
+        // And a renew can never resurrect a revoked set.
+        assert!(!extend_session_token(&pool, &control, 3600).await.unwrap());
         // Revoking again is a no-op (idempotent).
         assert_eq!(
             revoke_session_tokens(&pool, scope, session.id)
@@ -6434,7 +7754,7 @@ mod tests {
                 .is_none(),
             "second promotion is a no-op"
         );
-        let decided = decide_approval(&pool, scope, row2.id, "approved_once", "tester")
+        let decided = decide_approval_tx(&pool, scope, row2.id, "approved_once", "tester", vec![])
             .await
             .unwrap()
             .expect("pending row decides");
@@ -7261,6 +8581,11 @@ mod tests {
         .await
         .unwrap();
 
+        // A due delivery is visible to every replica's claim scan, which in a test
+        // process means every sibling test's scan too — so the enqueue and the
+        // claim that must win it sit inside one GLOBAL_SCAN window, and the batch
+        // is read back through the owning helper.
+        let scan = GLOBAL_SCAN.lock().await;
         let dest = serde_json::json!({"kind": "signed_webhook", "url": "http://127.0.0.1:1/cb"});
         let d = enqueue_result_delivery(&pool, scope, session.id, None, &dest)
             .await
@@ -7268,10 +8593,10 @@ mod tests {
         assert_eq!(d.status, "pending");
         assert_eq!(d.attempts, 0);
 
-        // Due immediately.
-        let due = system_worker::due_result_deliveries(&pool, 10)
-            .await
-            .unwrap();
+        // Due immediately — and the poll now CLAIMS (Phase E): every attempt is
+        // recorded by the replica that holds the row.
+        let me = Uuid::now_v7();
+        let due = claim_deliveries(&pool, me, 10, 300, &[d.id]).await;
         assert!(due.iter().any(|x| x.id == d.id));
 
         // Failure → still pending, attempts=1, pushed into the future (not due).
@@ -7279,6 +8604,7 @@ mod tests {
             &pool,
             scope,
             d.id,
+            me,
             false,
             Some("connection refused"),
             None,
@@ -7289,30 +8615,38 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!((after.status.as_str(), after.attempts), ("pending", 1));
-        assert!(!system_worker::due_result_deliveries(&pool, 50)
+        assert!(!claim_deliveries(&pool, me, 50, 300, &[d.id])
             .await
-            .unwrap()
             .iter()
             .any(|x| x.id == d.id));
+        drop(scan);
 
-        // Exhausting attempts → failed, terminal for the delivery only.
-        mark_delivery_attempt(&pool, scope, d.id, false, Some("refused"), None, 30, 3)
+        // Exhausting attempts → failed, terminal for the delivery only. Each
+        // attempt re-claims first: recording one RELEASES the claim (so the next
+        // backoff window is open to any replica), and the row is no longer due, so
+        // the claim is re-stamped directly rather than via the due scan.
+        stamp_delivery_claim(&pool, d.id, me).await;
+        mark_delivery_attempt(&pool, scope, d.id, me, false, Some("refused"), None, 30, 3)
             .await
             .unwrap();
-        let last = mark_delivery_attempt(&pool, scope, d.id, false, Some("refused"), None, 30, 3)
-            .await
-            .unwrap()
-            .unwrap();
+        stamp_delivery_claim(&pool, d.id, me).await;
+        let last =
+            mark_delivery_attempt(&pool, scope, d.id, me, false, Some("refused"), None, 30, 3)
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!((last.status.as_str(), last.attempts), ("failed", 3));
 
         // Success path on a second delivery.
         let d2 = enqueue_result_delivery(&pool, scope, session.id, None, &dest)
             .await
             .unwrap();
-        let okd = mark_delivery_attempt(&pool, scope, d2.id, true, None, Some("sha256:x"), 0, 3)
-            .await
-            .unwrap()
-            .unwrap();
+        stamp_delivery_claim(&pool, d2.id, me).await;
+        let okd =
+            mark_delivery_attempt(&pool, scope, d2.id, me, true, None, Some("sha256:x"), 0, 3)
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(okd.status, "delivered");
         assert!(okd.delivered_at.is_some());
         assert_eq!(okd.payload_digest.as_deref(), Some("sha256:x"));
@@ -12557,5 +13891,1873 @@ mod tests {
             "a pool that SET ROLEs to fluidbox_runtime must be RLS-BOUND"
         );
         rt_pool.close().await;
+    }
+
+    // ─── Durable execution claims (Phase E, #33; Gap 11) ────────────────────
+    // DB-backed; self-skip when DATABASE_URL is unset (CI proves them).
+
+    /// Stamp a delivery row's claim directly (bypassing the due scan) so a test
+    /// can record consecutive attempts without waiting out the backoff. Under
+    /// `worker_tx` (RLS bypass), like the sweeps.
+    async fn stamp_delivery_claim(pool: &PgPool, delivery_id: Uuid, owner: Uuid) {
+        let mut tx = worker_tx(pool).await.unwrap();
+        sqlx::query(
+            "update result_deliveries
+                set claimed_by = $2, claimed_until = now() + interval '5 minutes'
+              where id = $1",
+        )
+        .bind(delivery_id)
+        .bind(owner)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    /// Read the claim + backoff columns a delivery row does not expose on
+    /// [`ResultDeliveryRow`] (they are coordination state, deliberately not part of
+    /// the serialized API shape). Under `worker_tx`, like the sweeps.
+    async fn delivery_claim_state(
+        pool: &PgPool,
+        delivery_id: Uuid,
+    ) -> (
+        Option<Uuid>,
+        Option<DateTime<Utc>>,
+        i32,
+        DateTime<Utc>,
+        String,
+    ) {
+        let mut tx = worker_tx(pool).await.unwrap();
+        let row = sqlx::query(
+            "select claimed_by, claimed_until, attempts, next_attempt_at, status
+               from result_deliveries where id = $1",
+        )
+        .bind(delivery_id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        (
+            row.get("claimed_by"),
+            row.get("claimed_until"),
+            row.get("attempts"),
+            row.get("next_attempt_at"),
+            row.get("status"),
+        )
+    }
+
+    /// Force a session's status (state-machine-bypassing) so a test can drive
+    /// terminality directly. Under `worker_tx` (RLS bypass), like the sweeps.
+    async fn force_session_status(pool: &PgPool, session_id: Uuid, status: &str) {
+        let mut tx = worker_tx(pool).await.unwrap();
+        sqlx::query("update sessions set status = $2 where id = $1")
+            .bind(session_id)
+            .bind(status)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn claim_won_completed_then_duplicate_adopts_without_redispatch() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+
+        // Won.
+        let claim_id =
+            match claim_tool_execution(&pool, scope, session_id, "tc1", "sha256:aaa", 600)
+                .await
+                .unwrap()
+            {
+                ClaimOutcome::Won { claim_id } => claim_id,
+                o => panic!("expected Won, got {o:?}"),
+            };
+        let result = serde_json::json!({
+            "content": [{"type":"text","text":"the answer"}], "is_error": false
+        });
+        assert!(complete_tool_execution(
+            &pool,
+            scope,
+            claim_id,
+            "succeeded",
+            Some("sha256:res"),
+            Some(false),
+            Some(&result),
+            None,
+        )
+        .await
+        .unwrap()
+        .settled());
+
+        // A duplicate for the SAME (session, tool_call_id, digest) adopts the
+        // stored outcome — and, the false-green guard: the claim was NOT
+        // re-dispatched (attempt stays 1; the stored result is byte-identical).
+        // The LIVE single-upstream-request proof rides the hardening e2e (T9 §f).
+        match claim_tool_execution(&pool, scope, session_id, "tc1", "sha256:aaa", 600)
+            .await
+            .unwrap()
+        {
+            ClaimOutcome::Existing(row) => {
+                assert_eq!(row.state, "succeeded");
+                assert_eq!(
+                    row.attempt, 1,
+                    "a duplicate must not re-dispatch (attempt stays 1)"
+                );
+                assert_eq!(
+                    row.result_content.as_ref(),
+                    Some(&result),
+                    "the duplicate adopts the exact stored result"
+                );
+            }
+            o => panic!("expected Existing(succeeded), got {o:?}"),
+        }
+        cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    #[tokio::test]
+    async fn claim_refuses_a_terminal_session() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        // Cancel-during-approval, brokered half: a terminal (or winding-down)
+        // session refuses the claim in the same lock-holding tx as cancellation.
+        force_session_status(&pool, session_id, "cancelled").await;
+        assert!(
+            matches!(
+                claim_tool_execution(&pool, scope, session_id, "tc1", "sha256:aaa", 600)
+                    .await
+                    .unwrap(),
+                ClaimOutcome::SessionTerminal
+            ),
+            "a cancelled session must refuse the claim"
+        );
+        // Winding-down also refuses.
+        force_session_status(&pool, session_id, "finalizing").await;
+        assert!(matches!(
+            claim_tool_execution(&pool, scope, session_id, "tc2", "sha256:bbb", 600)
+                .await
+                .unwrap(),
+            ClaimOutcome::SessionTerminal
+        ));
+        cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    #[tokio::test]
+    async fn reclaim_is_only_for_failed_before_send() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+
+        // failed_before_send IS re-claimable (same row, attempt+1).
+        let id = match claim_tool_execution(&pool, scope, session_id, "fbs", "sha256:1", 600)
+            .await
+            .unwrap()
+        {
+            ClaimOutcome::Won { claim_id } => claim_id,
+            o => panic!("expected Won, got {o:?}"),
+        };
+        assert!(complete_tool_execution(
+            &pool,
+            scope,
+            id,
+            "failed_before_send",
+            None,
+            Some(false),
+            None,
+            Some("connect refused"),
+        )
+        .await
+        .unwrap()
+        .settled());
+        assert_eq!(
+            reclaim_failed_before_send(&pool, scope, session_id, "fbs", "sha256:1", 600, 3)
+                .await
+                .unwrap(),
+            ReclaimOutcome::Reclaimed { attempt: 2 },
+            "a failed_before_send row must be re-claimable"
+        );
+        let row = get_tool_execution(&pool, scope, session_id, "fbs", "sha256:1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, "claimed");
+        assert_eq!(row.attempt, 2, "a re-claim bumps attempt");
+
+        // Every OTHER state refuses the re-claim.
+        // 'claimed' (the row we just re-claimed).
+        assert_eq!(
+            reclaim_failed_before_send(&pool, scope, session_id, "fbs", "sha256:1", 600, 3)
+                .await
+                .unwrap(),
+            ReclaimOutcome::Lost
+        );
+        // 'succeeded'.
+        assert!(complete_tool_execution(
+            &pool,
+            scope,
+            row.id,
+            "succeeded",
+            None,
+            Some(false),
+            None,
+            None
+        )
+        .await
+        .unwrap()
+        .settled());
+        assert_eq!(
+            reclaim_failed_before_send(&pool, scope, session_id, "fbs", "sha256:1", 600, 3)
+                .await
+                .unwrap(),
+            ReclaimOutcome::Lost
+        );
+        // 'ambiguous' (a separate claim).
+        let id2 = match claim_tool_execution(&pool, scope, session_id, "amb", "sha256:2", 600)
+            .await
+            .unwrap()
+        {
+            ClaimOutcome::Won { claim_id } => claim_id,
+            o => panic!("expected Won, got {o:?}"),
+        };
+        assert!(complete_tool_execution(
+            &pool,
+            scope,
+            id2,
+            "ambiguous",
+            None,
+            Some(true),
+            None,
+            None
+        )
+        .await
+        .unwrap()
+        .settled());
+        assert_eq!(
+            reclaim_failed_before_send(&pool, scope, session_id, "amb", "sha256:2", 600, 3)
+                .await
+                .unwrap(),
+            ReclaimOutcome::Lost
+        );
+        cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    /// Review I1: the re-claim budget is BOUNDED. A client that keeps
+    /// re-presenting one `(session, tool_call_id, input_digest)` against a sick
+    /// upstream must stop winning re-claims at the cap — that is what stops the
+    /// unmetered `sessions`-row lock churn — and the refusal must be
+    /// DISTINGUISHABLE from losing a race, so the caller can answer terminally
+    /// instead of polling a row that will never move again.
+    #[tokio::test]
+    async fn reclaim_is_capped_at_max_attempts() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        const CAP: i32 = 2;
+
+        let id = match claim_tool_execution(&pool, scope, session_id, "cap", "sha256:c", 600)
+            .await
+            .unwrap()
+        {
+            ClaimOutcome::Won { claim_id } => claim_id,
+            o => panic!("expected Won, got {o:?}"),
+        };
+        // Attempt 1 (the insert) failed before send → one re-claim is left.
+        assert!(complete_tool_execution(
+            &pool,
+            scope,
+            id,
+            "failed_before_send",
+            None,
+            Some(true),
+            None,
+            Some("connect refused"),
+        )
+        .await
+        .unwrap()
+        .settled());
+        assert_eq!(
+            reclaim_failed_before_send(&pool, scope, session_id, "cap", "sha256:c", 600, CAP)
+                .await
+                .unwrap(),
+            ReclaimOutcome::Reclaimed { attempt: 2 },
+            "re-claims within the cap must still be granted"
+        );
+        // Attempt 2 also failed before send → the budget is spent.
+        assert!(complete_tool_execution(
+            &pool,
+            scope,
+            id,
+            "failed_before_send",
+            None,
+            Some(true),
+            None,
+            Some("connect refused"),
+        )
+        .await
+        .unwrap()
+        .settled());
+        assert_eq!(
+            reclaim_failed_before_send(&pool, scope, session_id, "cap", "sha256:c", 600, CAP)
+                .await
+                .unwrap(),
+            ReclaimOutcome::Exhausted { attempt: CAP },
+            "past the cap the re-claim must be refused, not granted"
+        );
+        // …and refused WITHOUT churning the row: it stays exactly where the last
+        // dispatch left it, so nothing accumulates per rejected retry.
+        let row = get_tool_execution(&pool, scope, session_id, "cap", "sha256:c")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (row.state.as_str(), row.attempt),
+            ("failed_before_send", CAP)
+        );
+        cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    #[tokio::test]
+    async fn stale_claim_sweep_marks_ambiguous() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        let id = match claim_tool_execution(&pool, scope, session_id, "stale", "sha256:s", 600)
+            .await
+            .unwrap()
+        {
+            ClaimOutcome::Won { claim_id } => claim_id,
+            o => panic!("expected Won, got {o:?}"),
+        };
+        // Force it past expiry, then sweep: a crashed dispatcher's claim → ambiguous.
+        // The sweep is a tenant-less GLOBAL scan and the test beside this one
+        // expires a claim of its own, so both halves of the GLOBAL_SCAN discipline
+        // apply: guard from before the row is stale, read the batch session-scoped.
+        let scan = GLOBAL_SCAN.lock().await;
+        {
+            let mut tx = worker_tx(&pool).await.unwrap();
+            sqlx::query(
+                "update tool_execution_claims set claim_expires_at = now() - interval '1 minute' where id = $1",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let swept = sweep_stale_claims(&pool, session_id).await;
+        drop(scan);
+        assert!(
+            swept
+                .iter()
+                .any(|(t, s, tc, _)| *t == tenant && *s == session_id && tc == "stale"),
+            "the stale claim must be swept and returned with its tenant/session"
+        );
+        let row = get_tool_execution(&pool, scope, session_id, "stale", "sha256:s")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.state, "ambiguous",
+            "a swept stale claim lands in ambiguous"
+        );
+        cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    #[tokio::test]
+    async fn late_complete_loses_to_a_sweep_flipped_row() {
+        // T4 rider: a dispatcher that CASes `complete` AFTER the sweeper already
+        // flipped its expired claim to `ambiguous` must LOSE — the CAS keys on
+        // state='claimed', which the sweep changed. finish_won_claim relies on
+        // this false to skip a second (double) tool.brokered ledger row.
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        let id = match claim_tool_execution(&pool, scope, session_id, "late", "sha256:l", 600)
+            .await
+            .unwrap()
+        {
+            ClaimOutcome::Won { claim_id } => claim_id,
+            o => panic!("expected Won, got {o:?}"),
+        };
+        // The sweeper wins the row (expire → sweep → ambiguous). Guarded even
+        // though this test ignores the batch: an unguarded sweep here is what
+        // STOLE the neighbouring test's stale claim (3 runs in 6 — GLOBAL_SCAN).
+        let scan = GLOBAL_SCAN.lock().await;
+        {
+            let mut tx = worker_tx(&pool).await.unwrap();
+            sqlx::query(
+                "update tool_execution_claims set claim_expires_at = now() - interval '1 minute' where id = $1",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+        assert_eq!(
+            sweep_stale_claims(&pool, session_id).await.len(),
+            1,
+            "this test's own claim is the one the sweep flipped"
+        );
+        drop(scan);
+        // The dispatcher's late completion CAS finds no 'claimed' row → false.
+        assert!(
+            !complete_tool_execution(&pool, scope, id, "succeeded", None, Some(false), None, None)
+                .await
+                .unwrap()
+                .settled(),
+            "a late complete must lose to the sweep's ambiguous row"
+        );
+        // The durable truth stays `ambiguous` (the swept row was not overwritten).
+        let row = get_tool_execution(&pool, scope, session_id, "late", "sha256:l")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, "ambiguous");
+        cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    #[tokio::test]
+    async fn claim_two_tx_race_yields_exactly_one_winner() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        let pool2 = pool.clone();
+        // Two concurrent transactions on the SAME natural key: the unique index +
+        // `on conflict do nothing` make exactly one Win and one adopt (Existing).
+        let (a, b) = tokio::join!(
+            claim_tool_execution(&pool, scope, session_id, "race", "sha256:r", 600),
+            claim_tool_execution(&pool2, scope, session_id, "race", "sha256:r", 600),
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        let mut wins = 0;
+        let mut existings = 0;
+        for o in [&a, &b] {
+            match o {
+                ClaimOutcome::Won { .. } => wins += 1,
+                ClaimOutcome::Existing(_) => existings += 1,
+                ClaimOutcome::SessionTerminal => {}
+            }
+        }
+        assert_eq!(
+            wins, 1,
+            "exactly one concurrent claim wins the single dispatch"
+        );
+        assert_eq!(existings, 1, "the loser adopts the existing row");
+        cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    // ─── Multi-replica coordination (Phase E, #33; Gap 13) ──────────────────
+    // DB-backed; self-skip when DATABASE_URL is unset (CI proves them).
+
+    /// Put an approvals row into `pending` the way the gate does (register the
+    /// intent, then promote it), returning the row.
+    async fn seed_pending_approval(
+        pool: &PgPool,
+        scope: TenantScope,
+        session_id: Uuid,
+        tool_call_id: &str,
+        ttl_secs: i64,
+    ) -> ApprovalRow {
+        let (intent, inserted) = register_tool_intent(
+            pool,
+            scope,
+            session_id,
+            tool_call_id,
+            "Bash",
+            "git push",
+            "sha256:args",
+        )
+        .await
+        .unwrap();
+        assert!(inserted, "fresh intent");
+        promote_intent_to_pending(
+            pool,
+            scope,
+            intent.id,
+            Some("high"),
+            "once",
+            "Bash",
+            ttl_secs,
+        )
+        .await
+        .unwrap()
+        .expect("promoted to pending")
+    }
+
+    /// Count this session's ledger rows by event type.
+    async fn count_events(pool: &PgPool, scope: TenantScope, session_id: Uuid, ty: &str) -> usize {
+        events_after(pool, scope, session_id, 0, 500)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.r#type == ty)
+            .count()
+    }
+
+    fn decision_events(
+        session_id: Uuid,
+        approval_id: Uuid,
+        decision: &str,
+        decided_by: &str,
+    ) -> Vec<Redacted<EventEnvelope>> {
+        let r = Redactor::default();
+        vec![
+            r.scrub(EventEnvelope::new(
+                session_id,
+                Actor::Human,
+                EventBody::ApprovalDecided {
+                    approval_id,
+                    tool_call_id: "tc-decide".into(),
+                    decision: decision.into(),
+                    decided_by: decided_by.into(),
+                },
+            )),
+            r.scrub(EventEnvelope::new(
+                session_id,
+                Actor::System,
+                EventBody::ToolDecision {
+                    tool_call_id: "tc-decide".into(),
+                    tool: "Bash".into(),
+                    verdict: "allow".into(),
+                    source: "human".into(),
+                    original_verdict: None,
+                    reason: Some(format!("human:{decided_by}")),
+                },
+            )),
+        ]
+    }
+
+    /// **THE load-bearing Gap-13 test.** A decided approval ledgers EXACTLY ONE
+    /// `approval.decided` and ONE `tool.decision`, no matter how many handlers are
+    /// attached to the row.
+    ///
+    /// Why this would have FAILED before the change: emission used to live in
+    /// `await_pending_decision`, which ran it UNCONDITIONALLY for every awakened
+    /// waiter — and two waiters on one pending row is an ordinary occurrence (a
+    /// `/permission` retry across a runner restart re-attaches while the first
+    /// call still blocks; both the has-session-grant branch and the
+    /// lost-the-promotion branch fall through to the same wait). Both would wake
+    /// on one decision and both would append, giving 2 + 2 (design :1058-1066 —
+    /// a single-process bug, not merely a multi-replica one). The events are now
+    /// carried BY the decision CAS, so the sequence below — three deciders
+    /// racing/retrying one row, exactly as N waiters would — writes one pair.
+    #[tokio::test]
+    async fn decided_approval_ledgers_exactly_one_pair_however_many_deciders() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        let approval = seed_pending_approval(&pool, scope, session_id, "tc-decide", 600).await;
+
+        // Two GENUINELY concurrent deciders (separate pool handles), each carrying
+        // its own copy of the events — the shape two re-attached waiters had.
+        let pool2 = pool.clone();
+        let (a, b) = tokio::join!(
+            decide_approval_tx(
+                &pool,
+                scope,
+                approval.id,
+                "approved_once",
+                "human:alice",
+                decision_events(session_id, approval.id, "approved_once", "alice"),
+            ),
+            decide_approval_tx(
+                &pool2,
+                scope,
+                approval.id,
+                "approved_once",
+                "human:alice",
+                decision_events(session_id, approval.id, "approved_once", "alice"),
+            ),
+        );
+        let winners = [a.unwrap(), b.unwrap()]
+            .iter()
+            .filter(|o| o.is_some())
+            .count();
+
+        // A third, LATER decider (the waiter's own timeout CAS racing a human who
+        // already won) must also emit nothing.
+        let late = decide_approval_tx(
+            &pool,
+            scope,
+            approval.id,
+            "denied",
+            "timeout",
+            decision_events(session_id, approval.id, "denied", "timeout"),
+        )
+        .await
+        .unwrap();
+
+        let decided = count_events(&pool, scope, session_id, "approval.decided").await;
+        let tool_dec = count_events(&pool, scope, session_id, "tool.decision").await;
+        cleanup_sw_tenant(&pool, tenant).await;
+
+        assert_eq!(winners, 1, "exactly one concurrent decider wins the CAS");
+        assert!(
+            late.is_none(),
+            "a decider that lost the CAS decides nothing"
+        );
+        assert_eq!(
+            decided, 1,
+            "exactly ONE approval.decided per decided approval (was 1-per-waiter)"
+        );
+        assert_eq!(
+            tool_dec, 1,
+            "exactly ONE tool.decision per decided approval (was 1-per-waiter)"
+        );
+    }
+
+    /// The expiry decision site obeys the same rule: single-winner CAS, one pair
+    /// of events, and a loser (a human who decided first) writes nothing.
+    #[tokio::test]
+    async fn expiry_decision_is_single_winner_and_emits_once() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        // Already past its deadline.
+        let approval = seed_pending_approval(&pool, scope, session_id, "tc-decide", -60).await;
+
+        // Tenant-less global scan too, but the ONE that needs no GLOBAL_SCAN guard
+        // (see the module note): since Phase E it only READS — the decision moved
+        // to the scoped, single-winner `expire_approval_tx` below — so a sibling's
+        // scan cannot take this row away, and asking whether MY approval is in the
+        // batch is already immune to whatever else is in it.
+        let scanned = system_worker::expired_pending_approvals(&pool, 100)
+            .await
+            .unwrap();
+        let seen = scanned.iter().any(|r| r.id == approval.id);
+
+        let pool2 = pool.clone();
+        let (a, b) = tokio::join!(
+            expire_approval_tx(
+                &pool,
+                scope,
+                approval.id,
+                decision_events(session_id, approval.id, "expired", "timeout"),
+            ),
+            expire_approval_tx(
+                &pool2,
+                scope,
+                approval.id,
+                decision_events(session_id, approval.id, "expired", "timeout"),
+            ),
+        );
+        let winners = [a.unwrap(), b.unwrap()]
+            .iter()
+            .filter(|o| o.is_some())
+            .count();
+        let decided = count_events(&pool, scope, session_id, "approval.decided").await;
+        let tool_dec = count_events(&pool, scope, session_id, "tool.decision").await;
+        // The post-wait terminal deny: one winner, and (review Minor A) the event
+        // now rides the claim's OWN transaction, so "won the marker" and "the event
+        // exists" can no longer diverge. Two waiters, two event vectors, one event.
+        let deny_event = || {
+            vec![Redactor::default().scrub(EventEnvelope::new(
+                session_id,
+                Actor::System,
+                EventBody::ToolDecision {
+                    tool_call_id: "tc-decide".into(),
+                    tool: "Bash".into(),
+                    verdict: "deny".into(),
+                    source: "session_terminal".into(),
+                    original_verdict: Some("allow".into()),
+                    reason: Some("session stopped accepting work during the approval wait".into()),
+                },
+            ))]
+        };
+        let m1 = claim_terminal_deny_tx(&pool, scope, approval.id, deny_event())
+            .await
+            .unwrap();
+        let m2 = claim_terminal_deny_tx(&pool, scope, approval.id, deny_event())
+            .await
+            .unwrap();
+        let after_deny = count_events(&pool, scope, session_id, "tool.decision").await;
+        cleanup_sw_tenant(&pool, tenant).await;
+
+        assert!(
+            seen,
+            "the cross-tenant scan finds an over-deadline approval"
+        );
+        assert_eq!(winners, 1, "exactly one replica expires the row");
+        assert_eq!(decided, 1, "expiry ledgers ONE approval.decided");
+        assert_eq!(tool_dec, 1, "expiry ledgers ONE tool.decision");
+        assert!(m1, "the first terminal-deny claim wins");
+        assert!(!m2, "a second waiter's terminal-deny claim emits nothing");
+        assert_eq!(
+            after_deny,
+            tool_dec + 1,
+            "the winning claim appended EXACTLY ONE tool.decision, in its own \
+             transaction; the loser appended none"
+        );
+    }
+
+    /// Lease steal matrix + the epoch's defining asymmetry: it moves ONLY on an
+    /// owner change. Fresh / self-renew / held-by-another-unexpired / expired.
+    #[tokio::test]
+    async fn session_lease_steals_on_expiry_and_epoch_moves_only_on_owner_change() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+
+        // (1) FRESH: no owner → acquired, epoch 0 → 1 (owner changed null → A).
+        let e1 = acquire_session_lease(&pool, scope, session_id, a, 300)
+            .await
+            .unwrap();
+        // (2) SELF-RENEW: same owner keeps the epoch (the fence must not move
+        //     under a healthy driver's own feet).
+        let e2 = acquire_session_lease(&pool, scope, session_id, a, 300)
+            .await
+            .unwrap();
+        // (3) HELD BY ANOTHER, UNEXPIRED: refused outright.
+        let held = acquire_session_lease(&pool, scope, session_id, b, 300)
+            .await
+            .unwrap();
+        // (4) EXPIRED: force the deadline into the past, then B steals — epoch+1.
+        {
+            let mut tx = worker_tx(&pool).await.unwrap();
+            sqlx::query(
+                "update sessions set orchestrator_lease_until = now() - interval '1 minute'
+                 where id = $1",
+            )
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let e3 = acquire_session_lease(&pool, scope, session_id, b, 300)
+            .await
+            .unwrap();
+        let after = session_lease(&pool, scope, session_id).await.unwrap();
+        cleanup_sw_tenant(&pool, tenant).await;
+
+        assert_eq!(
+            e1,
+            Some(1),
+            "a fresh acquire is an owner change: epoch 0 → 1"
+        );
+        assert_eq!(e2, Some(1), "a self-renew must NOT move the epoch");
+        assert_eq!(
+            held, None,
+            "an unexpired lease held by another replica is refused"
+        );
+        assert_eq!(
+            e3,
+            Some(2),
+            "a steal after expiry is an owner change: epoch+1"
+        );
+        let (owner, _, epoch) = after.expect("session row");
+        assert_eq!(owner, Some(b), "the steal recorded the new owner");
+        assert_eq!(epoch, 2);
+    }
+
+    /// Source guards for the two Gap-13 SQL predicates whose behavioral tests are
+    /// DB-gated (they self-skip without `DATABASE_URL`, so CI is where they run).
+    /// These assert the predicates themselves, so deleting either one fails
+    /// IMMEDIATELY — with or without a database — instead of silently passing a
+    /// skipped suite. Needles are split so this guard is not itself an occurrence.
+    #[test]
+    fn coordination_sql_predicates_are_present() {
+        let src = include_str!("lib.rs");
+
+        // (1) The epoch is a FENCING TOKEN, not a counter: it moves only when the
+        // owner changes. Drop the conditional and a healthy driver's own renew
+        // invalidates its in-flight fence — every renew would look like a takeover.
+        let epoch_guard = concat!("orchestrator_owner_id is distinct ", "from $3");
+        assert!(
+            src.contains(epoch_guard),
+            "acquire_session_lease must bump orchestrator_epoch ONLY on an owner \
+             change (`{epoch_guard}`); an unconditional bump makes a self-renew \
+             fence the renewing driver out of its own session"
+        );
+
+        // (2) A delivery attempt is recorded only by the replica that HOLDS the
+        // row's claim. Drop the guard and a replica whose claim expired mid-attempt
+        // stomps the new owner's attempt counter and backoff.
+        let claim_guard = concat!("where id = $1 and claimed_", "by = $8");
+        assert!(
+            src.contains(claim_guard),
+            "mark_delivery_attempt must be owner-guarded (`{claim_guard}`) or two \
+             replicas can both record attempts on one delivery row"
+        );
+
+        // (3) SKIP LOCKED is what makes two replicas' claimed sets DISJOINT; a
+        // plain FOR UPDATE would serialize them onto the same rows instead.
+        // Scoped to the STATEMENT (the prose above it mentions the clause too, so a
+        // whole-file `contains` would be satisfied by the doc comment alone).
+        let sw = include_str!("system_worker.rs");
+        let stmt_start = sw.find("with due as (").expect("the claim CTE exists");
+        let stmt_end = sw[stmt_start..]
+            .find("returning d.*")
+            .map(|i| stmt_start + i)
+            .expect("the claim CTE returns its rows");
+        let skip_locked = concat!("for update skip ", "locked");
+        assert!(
+            sw[stmt_start..stmt_end].contains(skip_locked),
+            "claim_due_deliveries's CTE must use `{skip_locked}` so replicas take \
+             disjoint slices rather than queueing on each other"
+        );
+
+        // (4) The claim scan must EXCLUDE rows another replica currently holds.
+        // Without the `claimed_until` half, a replica re-picks a row it just lost
+        // and re-runs the external side effect every 3 s tick (review I2); without
+        // the `claimed_by = $1` half, our own re-stamped row becomes unreachable to
+        // us on the very next pass.
+        let scan_pred = "(claimed_until is null or claimed_until < now() or claimed_by = $1)";
+        assert!(
+            sw[stmt_start..stmt_end].contains(scan_pred),
+            "claim_due_deliveries must skip rows another replica holds (`{scan_pred}`)"
+        );
+
+        // (5) The per-row re-stamp (review I2) is a strict OWNER CAS, never a
+        // steal: a row taken over by another replica must match ZERO rows so the
+        // caller skips it BEFORE performing the external side effect. Sliced to the
+        // statement — the prose above it discusses `claimed_by` at length.
+        let ext_start = src
+            .find("pub async fn extend_delivery_claim(")
+            .expect("the per-row claim re-stamp exists");
+        let ext_end = src[ext_start..]
+            .find(".bind(id)")
+            .map(|i| ext_start + i)
+            .expect("the re-stamp binds its row id");
+        let restamp_stmt = &src[ext_start..ext_end];
+        let owner_cas = concat!(
+            "where id = $1 and claimed_by = $2 and ",
+            "status = 'pending'"
+        );
+        assert!(
+            restamp_stmt.contains(owner_cas),
+            "extend_delivery_claim must be a strict owner CAS (`{owner_cas}`); a \
+             predicate that also matches an EXPIRED claim held by someone else would \
+             steal a row mid-flight and duplicate its external side effect"
+        );
+        let ttl_stamp = "claimed_until = now() + make_interval(secs => $3)";
+        assert!(
+            restamp_stmt.contains(ttl_stamp),
+            "extend_delivery_claim must actually MOVE the deadline (`{ttl_stamp}`), \
+             or the TTL still measures from the batch claim rather than this attempt"
+        );
+    }
+
+    /// Source guard for the review-I1 re-claim CAP. The behavioral test
+    /// (`reclaim_is_capped_at_max_attempts`) is DB-gated and self-skips without
+    /// `DATABASE_URL`, so deleting the predicate would pass a skipped suite
+    /// silently. Sliced to the STATEMENT — the doc comment above it explains the
+    /// cap at length and would satisfy a whole-file `contains` on its own.
+    #[test]
+    fn the_reclaim_attempt_cap_predicate_is_present() {
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("pub async fn reclaim_failed_before_send(")
+            .expect("the re-claim exists");
+        let end = src[start..]
+            .find(".bind(max_attempts)")
+            .map(|i| start + i)
+            .expect("the re-claim binds its cap");
+        let stmt = &src[start..end];
+        let cap = concat!("state = 'failed_before_send' and ", "attempt < $6");
+        assert!(
+            stmt.contains(cap),
+            "reclaim_failed_before_send's CAS must carry the attempt cap (`{cap}`). \
+             Without it a client looping /tools/call on ONE (tool_call_id, \
+             input_digest) against a sick upstream re-claims forever — free of \
+             budget, free of ledger, two exclusive sessions-row locks per \
+             iteration on the row cancellation itself needs."
+        );
+    }
+
+    /// I2, behaviorally: a LOST delivery claim must be caught by the per-row
+    /// re-stamp (before the external side effect), because the alternative — the
+    /// old owner discovering it at `mark_delivery_attempt` — silently drops the
+    /// BACKOFF as well as the attempt record, leaving the row immediately due
+    /// again in a ~3 s-tick loop that never reaches `max_attempts` and repeats the
+    /// external effect every pass.
+    #[tokio::test]
+    async fn a_lost_delivery_claim_is_caught_before_the_attempt_and_freezes_no_backoff() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        // Enqueue → claim inside one GLOBAL_SCAN window: until the renewal below
+        // lands, this row is due (then briefly leased for only 5 s) and any
+        // sibling test's claim scan would take it out from under this one.
+        let scan = GLOBAL_SCAN.lock().await;
+        let dest = serde_json::json!({"kind": "signed_webhook", "url": "http://127.0.0.1:1/cb"});
+        let row = enqueue_result_delivery(&pool, scope, session_id, None, &dest)
+            .await
+            .unwrap();
+        let (mine, thief) = (Uuid::now_v7(), Uuid::now_v7());
+
+        // Claimed by us with a DELIBERATELY short TTL (5 s) — the batch stamp the
+        // worker starts from; the re-stamp then renews it for the attempt itself.
+        let claimed = claim_deliveries(&pool, mine, 10, 5, &[row.id]).await;
+        assert!(claimed.iter().any(|c| c.id == row.id), "we claimed the row");
+        let before = delivery_claim_state(&pool, row.id).await;
+        let renewed = extend_delivery_claim(&pool, scope, row.id, mine, 300)
+            .await
+            .unwrap();
+        let after_renew = delivery_claim_state(&pool, row.id).await;
+        drop(scan);
+
+        // Now the thief takes it (as an expired-claim steal would).
+        stamp_delivery_claim(&pool, row.id, thief).await;
+        let restamp_after_theft = extend_delivery_claim(&pool, scope, row.id, mine, 300)
+            .await
+            .unwrap();
+        // …and the old owner's attempt record is refused, changing NOTHING.
+        let marked = mark_delivery_attempt(
+            &pool,
+            scope,
+            row.id,
+            mine,
+            false,
+            Some("stale replica"),
+            None,
+            30,
+            6,
+        )
+        .await
+        .unwrap();
+        let after_theft = delivery_claim_state(&pool, row.id).await;
+        cleanup_sw_tenant(&pool, tenant).await;
+
+        assert!(renewed, "the holder re-stamps its own claim");
+        assert_eq!(before.0, Some(mine), "the batch claim named us");
+        assert!(
+            after_renew.1 > before.1,
+            "the re-stamp must MOVE the deadline (the TTL measures THIS attempt, \
+             not the batch claim): {:?} → {:?}",
+            before.1,
+            after_renew.1
+        );
+        assert!(
+            !restamp_after_theft,
+            "a row taken over by another replica must fail the re-stamp — that is \
+             the skip that stops the duplicate external call"
+        );
+        assert!(
+            marked.is_none(),
+            "the owner guard refuses the stale replica's attempt record"
+        );
+        assert_eq!(
+            (after_theft.2, after_theft.3),
+            (after_renew.2, after_renew.3),
+            "a refused record leaves attempts AND next_attempt_at untouched — the \
+             row stays immediately due, which is precisely why the re-stamp above \
+             must catch this first"
+        );
+        assert_eq!(
+            after_theft.0,
+            Some(thief),
+            "the thief still owns the row (nothing was stomped)"
+        );
+    }
+
+    /// The fencing token does its job: a driver carrying a STALE epoch mutates
+    /// nothing, while the current holder's identical call succeeds.
+    #[tokio::test]
+    async fn epoch_fence_rejects_a_stale_driver_and_admits_the_holder() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+
+        let stale = acquire_session_lease(&pool, scope, session_id, a, 300)
+            .await
+            .unwrap()
+            .unwrap();
+        // A steals, stalls; B takes over (epoch moves) — A's token is now stale.
+        {
+            let mut tx = worker_tx(&pool).await.unwrap();
+            sqlx::query(
+                "update sessions set orchestrator_lease_until = now() - interval '1 minute'
+                 where id = $1",
+            )
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let fresh = acquire_session_lease(&pool, scope, session_id, b, 300)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let by_stale = transition_session_fenced(
+            &pool,
+            scope,
+            session_id,
+            SessionStatus::Provisioning,
+            Some("stale driver"),
+            stale,
+        )
+        .await
+        .unwrap();
+        let by_holder = transition_session_fenced(
+            &pool,
+            scope,
+            session_id,
+            SessionStatus::Provisioning,
+            Some("current holder"),
+            fresh,
+        )
+        .await
+        .unwrap();
+        let status = get_session(&pool, scope, session_id)
+            .await
+            .unwrap()
+            .map(|s| (s.status, s.status_reason));
+        cleanup_sw_tenant(&pool, tenant).await;
+
+        assert_ne!(stale, fresh, "a takeover must move the epoch");
+        assert!(
+            by_stale.is_none(),
+            "a stale-epoch driver's lifecycle mutation must affect ZERO rows"
+        );
+        assert!(by_holder.is_some(), "the current lease holder proceeds");
+        assert_eq!(
+            status,
+            Some(("provisioning".into(), Some("current holder".into()))),
+            "only the holder's write landed"
+        );
+    }
+
+    /// Two replicas polling one due-delivery backlog take DISJOINT sets, and a
+    /// replica that no longer holds a row's claim cannot record its attempt.
+    #[tokio::test]
+    async fn delivery_claims_are_disjoint_and_attempts_are_owner_guarded() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+
+        // The backlog these two replicas race for must be exactly the four rows
+        // below — a sibling test's due delivery would otherwise eat replica A's
+        // `limit` (the scan is FIFO by `next_attempt_at`, so an older foreign row
+        // sorts FIRST) and leave A holding rows of a tenant this test cannot even
+        // address. Enqueue and both claims therefore share one GLOBAL_SCAN window,
+        // and each batch is read back through the owning helper.
+        let scan = GLOBAL_SCAN.lock().await;
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let d = enqueue_result_delivery(
+                &pool,
+                scope,
+                session_id,
+                None,
+                &serde_json::json!({"kind":"signed_webhook","url":format!("https://x.test/{i}")}),
+            )
+            .await
+            .unwrap();
+            ids.push(d.id);
+        }
+
+        // Replica A claims two, replica B claims the rest: SKIP LOCKED + the
+        // claim stamp make the sets disjoint (B cannot see A's claimed rows).
+        let claimed_a = claim_deliveries(&pool, a, 2, 300, &ids).await;
+        let claimed_b = claim_deliveries(&pool, b, 10, 300, &ids).await;
+        drop(scan);
+        let set_a: std::collections::HashSet<Uuid> = claimed_a.iter().map(|r| r.id).collect();
+        let set_b: std::collections::HashSet<Uuid> = claimed_b.iter().map(|r| r.id).collect();
+        let overlap = set_a.intersection(&set_b).count();
+
+        // B cannot record an attempt on a row A holds.
+        let stolen = mark_delivery_attempt(
+            &pool,
+            scope,
+            *set_a.iter().next().unwrap(),
+            b,
+            false,
+            Some("not mine"),
+            None,
+            30,
+            3,
+        )
+        .await
+        .unwrap();
+        // A can, and doing so RELEASES the claim.
+        let own_id = *set_a.iter().next().unwrap();
+        let mine =
+            mark_delivery_attempt(&pool, scope, own_id, a, false, Some("refused"), None, 30, 3)
+                .await
+                .unwrap();
+        let released: Option<(Option<Uuid>,)> = {
+            let mut tx = worker_tx(&pool).await.unwrap();
+            let r = sqlx::query_as("select claimed_by from result_deliveries where id = $1")
+                .bind(own_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            r
+        };
+        cleanup_sw_tenant(&pool, tenant).await;
+
+        assert_eq!(set_a.len(), 2, "the limit bounds a replica's claimed slice");
+        assert_eq!(set_b.len(), 2, "the other replica takes what is left");
+        assert_eq!(overlap, 0, "two replicas never claim the same delivery row");
+        assert!(
+            stolen.is_none(),
+            "a replica that does not hold the claim cannot record an attempt"
+        );
+        assert!(mine.is_some(), "the claim holder records its attempt");
+        assert_eq!(
+            released,
+            Some((None,)),
+            "recording an attempt releases the claim for the next backoff window"
+        );
+    }
+
+    // ─── LLM budget reservations (Phase E, #33; Gap 14) ─────────────────────
+    // DB-backed; self-skip when DATABASE_URL is unset (CI proves them). The
+    // no-DB SOURCE GUARD below keeps the admission predicate mutation-provable
+    // locally.
+
+    /// The body of `reserve_llm_budget`, for the source guards below.
+    fn reserve_llm_budget_body() -> &'static str {
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("pub async fn reserve_llm_budget(")
+            .expect("reserve_llm_budget exists");
+        let end = src[start..]
+            .find("pub async fn charge_llm_reservation(")
+            .map(|i| start + i)
+            .expect("the next fn delimits the body");
+        &src[start..end]
+    }
+
+    /// The admission statement is the whole fix, so its load-bearing predicates
+    /// are asserted from source — a mutation that drops the ceiling guard or
+    /// stops counting live reservations fails HERE, with no database.
+    #[test]
+    fn reserve_llm_budget_sql_keeps_its_load_bearing_predicates() {
+        let body = reserve_llm_budget_body();
+        for (needle, why) in [
+            (
+                "for update",
+                "the sessions row lock is the SERIALIZER — a CTE alone cannot see a \
+                 concurrent transaction's uncommitted reservation, so without this both \
+                 racers pass the same guard (Gap 14 returns)",
+            ),
+            (
+                "a.n < $8::bigint as under_ceiling",
+                "the finite ceiling on concurrent reservations (design :1118)",
+            ),
+            (
+                "u.tokens + a.tokens + $6::bigint <= $9::bigint",
+                "the token projection must include LIVE RESERVATIONS, not just recorded usage",
+            ),
+            (
+                "u.cost + a.cost + coalesce($7::float8, 0) <= $10::float8",
+                "the cost projection must include LIVE RESERVATIONS, not just recorded usage",
+            ),
+        ] {
+            assert!(
+                body.contains(needle),
+                "reserve_llm_budget's SQL lost `{needle}` — {why}"
+            );
+        }
+    }
+
+    /// `active` counts by STATE ALONE. Narrowing it with an expiry predicate
+    /// (`… and expires_at > now()`) reopens an UNBUDGETED window between a
+    /// reservation expiring and the sweeper converting it: the row would stop
+    /// counting against the projection while its spend is still unsettled.
+    ///
+    /// Review I2: the first cut asserted the bare prefix
+    /// `where session_id = $2 and state = 'reserved'`, which that exact mutation
+    /// still CONTAINS — the guard passed on the drift it existed to catch. It now
+    /// slices the whole `active` sub-select and pins the clause through its
+    /// newline terminator, plus a direct refusal of any `expires_at` narrowing.
+    #[test]
+    fn reserve_llm_budget_counts_active_reservations_by_state_alone() {
+        let body = reserve_llm_budget_body();
+        let start = body.find("active as (").expect("the `active` CTE exists");
+        let end = body[start..]
+            .find("guard as (")
+            .map(|i| start + i)
+            .expect("the `guard` CTE delimits `active`");
+        let active = &body[start..end];
+        assert!(
+            active.contains("where session_id = $2 and state = 'reserved'\n"),
+            "the `active` sub-select's WHERE must END at `state = 'reserved'` — anything \
+             appended to it (an expiry predicate above all) stops expired-but-unswept rows \
+             counting, which is precisely the unbudgeted window this closes"
+        );
+        assert!(
+            !active.contains("expires_at"),
+            "`active` must not read expires_at AT ALL: expiry is the SWEEPER's business, \
+             and every form of narrowing here reopens the same window"
+        );
+    }
+
+    /// The SOLE-CLAIMANT carve-out (`a.n = 0`) — the most consequential deviation
+    /// from the plan's literal predicate, and the reason a run whose per-request
+    /// conservative estimate alone exceeds its remaining budget stops cleanly
+    /// instead of livelocking: with nothing else in flight there is nothing to
+    /// drain, so refusing forever would never become admitting. Its DB test
+    /// discriminates but self-skips without `DATABASE_URL`; this rides every run.
+    #[test]
+    fn reserve_llm_budget_keeps_the_sole_claimant_carve_out() {
+        let body = reserve_llm_budget_body();
+        let start = body.find("guard as (").expect("the `guard` CTE exists");
+        let end = body[start..]
+            .find("ins as (")
+            .map(|i| start + i)
+            .expect("the `ins` CTE delimits `guard`");
+        let guard = &body[start..end];
+        for (needle, arm) in [
+            ("($9::bigint is null or a.n = 0", "token"),
+            ("($10::float8 is null or a.n = 0", "cost"),
+        ] {
+            assert!(
+                guard.contains(needle),
+                "the {arm} budget arm lost its `a.n = 0` sole-claimant disjunct — a lone \
+                 request would then be refused by its own conservative estimate with no \
+                 sibling to drain, livelocking the run instead of stopping it"
+            );
+        }
+        // The carve-out is a DISJUNCT of the budget arms only — it must never
+        // reach the ceiling guard, which has to bind even the first request.
+        assert!(
+            guard.contains("a.n < $8::bigint as under_ceiling"),
+            "the ceiling arm must stay unconditional"
+        );
+    }
+
+    /// Seed a session plus a scope, and give it a settled usage row so the
+    /// projection has a non-zero `used` component.
+    async fn seed_reservation_session(
+        pool: &PgPool,
+        used_tokens: i64,
+    ) -> (Uuid, Uuid, TenantScope) {
+        let (tenant, session_id) = seed_tenant_session(pool).await;
+        let scope = TenantScope::assume(tenant);
+        if used_tokens > 0 {
+            add_usage(
+                pool,
+                scope,
+                session_id,
+                "claude-haiku-4-5",
+                used_tokens,
+                0,
+                0,
+                0,
+                Some(0.01),
+                "facade",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        (tenant, session_id, scope)
+    }
+
+    /// Reserve with the fixture's fixed model and TTL — the tests vary only the
+    /// numbers they assert on.
+    #[allow(clippy::too_many_arguments)]
+    async fn reserve(
+        pool: &PgPool,
+        scope: TenantScope,
+        session: Uuid,
+        id: Uuid,
+        tokens: i64,
+        cost: Option<f64>,
+        ceiling: i64,
+        budget_tokens: Option<i64>,
+        budget_cost: Option<f64>,
+    ) -> ReserveOutcome {
+        reserve_llm_budget(
+            pool,
+            scope,
+            session,
+            id,
+            "claude-haiku-4-5",
+            tokens,
+            cost,
+            ceiling,
+            budget_tokens,
+            budget_cost,
+            600,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Push a reservation's expiry into the past (what a crashed facade request
+    /// looks like to the sweeper).
+    async fn expire_reservation(pool: &PgPool, id: Uuid) {
+        let mut tx = worker_tx(pool).await.unwrap();
+        sqlx::query(
+            "update llm_reservations set expires_at = now() - interval '1 minute' where id = $1",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reserve_llm_budget_books_and_settles() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id, scope) = seed_reservation_session(&pool, 100).await;
+
+        let req = Uuid::now_v7();
+        assert_eq!(
+            reserve(
+                &pool,
+                scope,
+                session_id,
+                req,
+                500,
+                Some(0.02),
+                32,
+                Some(10_000),
+                Some(1.0)
+            )
+            .await,
+            ReserveOutcome::Reserved
+        );
+        let totals = active_reservation_totals(&pool, scope, session_id)
+            .await
+            .unwrap();
+        assert_eq!((totals.tokens, totals.active), (500, 1));
+
+        // Charge is a one-way CAS: the second call finds no `reserved` row.
+        assert!(charge_llm_reservation(&pool, scope, req).await.unwrap());
+        assert!(!charge_llm_reservation(&pool, scope, req).await.unwrap());
+        assert!(
+            !release_llm_reservation(&pool, scope, req).await.unwrap(),
+            "a charged reservation can never be released back"
+        );
+        let row = get_llm_reservation(&pool, scope, req)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, "charged");
+        let after = active_reservation_totals(&pool, scope, session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            (after.tokens, after.active),
+            (0, 0),
+            "a charged row stops being active"
+        );
+
+        // Release is the mirror image, on a fresh booking.
+        let req2 = Uuid::now_v7();
+        assert_eq!(
+            reserve(
+                &pool,
+                scope,
+                session_id,
+                req2,
+                500,
+                Some(0.02),
+                32,
+                Some(10_000),
+                Some(1.0)
+            )
+            .await,
+            ReserveOutcome::Reserved
+        );
+        assert!(release_llm_reservation(&pool, scope, req2).await.unwrap());
+        assert_eq!(
+            get_llm_reservation(&pool, scope, req2)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "released"
+        );
+        assert_eq!(
+            active_reservation_totals(&pool, scope, session_id)
+                .await
+                .unwrap()
+                .active,
+            0
+        );
+        cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    #[tokio::test]
+    async fn reserve_llm_budget_counts_recorded_usage_and_live_reservations() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        // 600 tokens already recorded against a 1000-token budget.
+        let (tenant, session_id, scope) = seed_reservation_session(&pool, 600).await;
+
+        // First booking fits: 600 recorded + 0 live + 300 = 900 <= 1000.
+        assert_eq!(
+            reserve(
+                &pool,
+                scope,
+                session_id,
+                Uuid::now_v7(),
+                300,
+                None,
+                32,
+                Some(1000),
+                None
+            )
+            .await,
+            ReserveOutcome::Reserved
+        );
+        // Second is individually small but 600 + 300 + 300 = 1200 > 1000. It is
+        // refused ONLY because the LIVE reservation is counted — recorded usage
+        // alone (600 + 300) would have passed.
+        assert_eq!(
+            reserve(
+                &pool,
+                scope,
+                session_id,
+                Uuid::now_v7(),
+                300,
+                None,
+                32,
+                Some(1000),
+                None
+            )
+            .await,
+            ReserveOutcome::BudgetExceeded {
+                budget: "max_tokens",
+                active: 1
+            }
+        );
+        // The cost arm binds the same way, on its own.
+        let (t2, s2, sc2) = seed_reservation_session(&pool, 0).await;
+        assert_eq!(
+            reserve(
+                &pool,
+                sc2,
+                s2,
+                Uuid::now_v7(),
+                1,
+                Some(0.90),
+                32,
+                None,
+                Some(1.0)
+            )
+            .await,
+            ReserveOutcome::Reserved
+        );
+        assert_eq!(
+            reserve(
+                &pool,
+                sc2,
+                s2,
+                Uuid::now_v7(),
+                1,
+                Some(0.90),
+                32,
+                None,
+                Some(1.0)
+            )
+            .await,
+            ReserveOutcome::BudgetExceeded {
+                budget: "max_cost_usd",
+                active: 1
+            }
+        );
+        // A run with NO caps is never refused by the budget arms.
+        assert_eq!(
+            reserve(
+                &pool,
+                sc2,
+                s2,
+                Uuid::now_v7(),
+                1_000_000,
+                Some(999.0),
+                32,
+                None,
+                None
+            )
+            .await,
+            ReserveOutcome::Reserved
+        );
+        cleanup_sw_tenant(&pool, tenant).await;
+        cleanup_sw_tenant(&pool, t2).await;
+    }
+
+    /// The SOLE-CLAIMANT rule: with nothing else in flight the budget arms are
+    /// skipped, so a lone request whose conservative estimate alone exceeds the
+    /// remaining budget still gets to run (it would otherwise 429-livelock with
+    /// nothing to drain). The moment a sibling exists, the projection binds.
+    #[tokio::test]
+    async fn reserve_llm_budget_admits_the_sole_claimant_then_binds() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id, scope) = seed_reservation_session(&pool, 900).await;
+        // 900 recorded, budget 1000, this request alone wants 5000.
+        assert_eq!(
+            reserve(
+                &pool,
+                scope,
+                session_id,
+                Uuid::now_v7(),
+                5000,
+                None,
+                32,
+                Some(1000),
+                None
+            )
+            .await,
+            ReserveOutcome::Reserved,
+            "a lone request is admitted — the accumulated check already ruled"
+        );
+        assert!(matches!(
+            reserve(
+                &pool,
+                scope,
+                session_id,
+                Uuid::now_v7(),
+                1,
+                None,
+                32,
+                Some(1000),
+                None
+            )
+            .await,
+            ReserveOutcome::BudgetExceeded { .. }
+        ));
+        cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    #[tokio::test]
+    async fn reserve_llm_budget_enforces_the_concurrency_ceiling() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id, scope) = seed_reservation_session(&pool, 0).await;
+        // Ceiling 2, no budget caps at all — only the ceiling can refuse.
+        for _ in 0..2 {
+            assert_eq!(
+                reserve(
+                    &pool,
+                    scope,
+                    session_id,
+                    Uuid::now_v7(),
+                    1,
+                    None,
+                    2,
+                    None,
+                    None
+                )
+                .await,
+                ReserveOutcome::Reserved
+            );
+        }
+        assert_eq!(
+            reserve(
+                &pool,
+                scope,
+                session_id,
+                Uuid::now_v7(),
+                1,
+                None,
+                2,
+                None,
+                None
+            )
+            .await,
+            ReserveOutcome::CeilingExceeded {
+                active: 2,
+                ceiling: 2
+            }
+        );
+        cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    /// THE GAP-14 ACCEPTANCE. Two genuinely concurrent transactions on separate
+    /// connections, each individually inside the budget, jointly over it: exactly
+    /// ONE may book. This is the race the facade's check-then-record budget lost
+    /// every time.
+    #[tokio::test]
+    async fn reserve_llm_budget_two_tx_race_yields_exactly_one_winner() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id, scope) = seed_reservation_session(&pool, 0).await;
+        let pool2 = pool.clone();
+        // Budget 1000; each request books 600 — either alone fits, both do not.
+        let (a, b) = tokio::join!(
+            reserve(
+                &pool,
+                scope,
+                session_id,
+                Uuid::now_v7(),
+                600,
+                None,
+                32,
+                Some(1000),
+                None
+            ),
+            reserve(
+                &pool2,
+                scope,
+                session_id,
+                Uuid::now_v7(),
+                600,
+                None,
+                32,
+                Some(1000),
+                None
+            ),
+        );
+        let wins = [&a, &b]
+            .iter()
+            .filter(|o| ***o == ReserveOutcome::Reserved)
+            .count();
+        assert_eq!(
+            wins, 1,
+            "exactly one concurrent reservation may take the shared budget (got {a:?} / {b:?})"
+        );
+        assert!(
+            [&a, &b]
+                .iter()
+                .any(|o| matches!(o, ReserveOutcome::BudgetExceeded { .. })),
+            "the loser is refused on the BUDGET, not on some other arm (got {a:?} / {b:?})"
+        );
+        let totals = active_reservation_totals(&pool, scope, session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            (totals.active, totals.tokens),
+            (1, 600),
+            "only the winner's booking exists"
+        );
+        cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    #[tokio::test]
+    async fn sweep_converts_expired_reservations_conservatively() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id, scope) = seed_reservation_session(&pool, 0).await;
+        let req = Uuid::now_v7();
+        reserve(
+            &pool,
+            scope,
+            session_id,
+            req,
+            4242,
+            Some(0.25),
+            32,
+            None,
+            None,
+        )
+        .await;
+
+        // The sweep is a tenant-less GLOBAL scan, so hold the scan guard from
+        // before this booking can be swept until this test has swept it, and read
+        // every batch through the session-scoped helper (see GLOBAL_SCAN).
+        let _scan = GLOBAL_SCAN.lock().await;
+
+        // A live reservation is NOT swept.
+        assert!(sweep_reservations(&pool, session_id).await.is_empty());
+
+        expire_reservation(&pool, req).await;
+        let swept = sweep_reservations(&pool, session_id).await;
+        assert_eq!(swept.len(), 1);
+        assert_eq!(swept[0].reserved_tokens, 4242);
+        assert_eq!(swept[0].session_id, session_id);
+        assert_eq!(
+            swept[0].tenant_id, tenant,
+            "the swept row carries its OWN tenant — the worker ledgers the \
+             conservative charge under exactly this scope"
+        );
+
+        // The conservative charge is now real, budget-visible usage…
+        let totals = usage_totals(&pool, scope, session_id).await.unwrap();
+        assert_eq!(totals.output_tokens, 4242);
+        assert!((totals.cost_usd - 0.25).abs() < 1e-9);
+        // …and the reservation is settled, so it is no longer double-counted.
+        assert_eq!(
+            get_llm_reservation(&pool, scope, req)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "charged"
+        );
+        assert_eq!(
+            active_reservation_totals(&pool, scope, session_id)
+                .await
+                .unwrap()
+                .active,
+            0
+        );
+        // Idempotent: a second sweep of the same instant finds nothing.
+        assert!(sweep_reservations(&pool, session_id).await.is_empty());
+        drop(_scan);
+        cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    /// The sweeper and a late drain settle the SAME request id, so `add_usage`'s
+    /// `on conflict (external_id) do nothing` makes them idempotent in EITHER
+    /// order — never a double charge, never a lost charge.
+    #[tokio::test]
+    async fn sweep_and_late_drain_are_idempotent_in_either_order() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+
+        // Order A — sweeper first, drain late. The conservative charge stands;
+        // the drain's real usage is the no-op and its CAS loses.
+        let (ta, sa, sca) = seed_reservation_session(&pool, 0).await;
+        let ra = Uuid::now_v7();
+        reserve(&pool, sca, sa, ra, 5000, Some(0.50), 32, None, None).await;
+        // Guarded + session-scoped like every other global-scan read (GLOBAL_SCAN):
+        // the guard is taken before the booking becomes sweepable and released
+        // once this test has swept it.
+        let scan_a = GLOBAL_SCAN.lock().await;
+        expire_reservation(&pool, ra).await;
+        assert_eq!(sweep_reservations(&pool, sa).await.len(), 1);
+        drop(scan_a);
+        assert!(
+            !add_usage(
+                &pool,
+                sca,
+                sa,
+                "claude-haiku-4-5",
+                7,
+                11,
+                0,
+                0,
+                Some(0.001),
+                "facade",
+                Some(&ra.to_string()),
+            )
+            .await
+            .unwrap(),
+            "the late drain's usage row is refused by the external_id conflict"
+        );
+        assert!(
+            !charge_llm_reservation(&pool, sca, ra).await.unwrap(),
+            "the late drain's CAS finds an already-charged reservation"
+        );
+        let a = usage_totals(&pool, sca, sa).await.unwrap();
+        assert_eq!(
+            (a.requests, a.output_tokens, a.input_tokens),
+            (1, 5000, 0),
+            "exactly one usage row, and it is the conservative one"
+        );
+
+        // Order B — drain first, sweeper late. The REAL usage stands and the
+        // sweeper's conservative row is the no-op.
+        let (tb, sb, scb) = seed_reservation_session(&pool, 0).await;
+        let rb = Uuid::now_v7();
+        reserve(&pool, scb, sb, rb, 5000, Some(0.50), 32, None, None).await;
+        assert!(add_usage(
+            &pool,
+            scb,
+            sb,
+            "claude-haiku-4-5",
+            7,
+            11,
+            0,
+            0,
+            Some(0.001),
+            "facade",
+            Some(&rb.to_string()),
+        )
+        .await
+        .unwrap());
+        // …crash before the CAS: the row is still `reserved`, so the sweep runs.
+        let scan_b = GLOBAL_SCAN.lock().await;
+        expire_reservation(&pool, rb).await;
+        assert_eq!(sweep_reservations(&pool, sb).await.len(), 1);
+        drop(scan_b);
+        let b = usage_totals(&pool, scb, sb).await.unwrap();
+        assert_eq!(
+            (b.requests, b.input_tokens, b.output_tokens),
+            (1, 7, 11),
+            "exactly one usage row, and the authoritative numbers won"
+        );
+        assert_eq!(
+            get_llm_reservation(&pool, scb, rb)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "charged"
+        );
+        cleanup_sw_tenant(&pool, ta).await;
+        cleanup_sw_tenant(&pool, tb).await;
     }
 }

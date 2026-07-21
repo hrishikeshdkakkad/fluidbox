@@ -202,6 +202,30 @@ pub async fn create(
     }
 }
 
+/// Parse + admit a connector `base_url` at SAVE time (I2 — the E3 admission
+/// layer). Beyond the http(s) scheme gate, `egress::admit_url` refuses a
+/// plain-http target outside the dev-loopback seam and a private/loopback/
+/// metadata IP LITERAL, so a hostile destination is rejected at admission rather
+/// than first-dial. DNS is deliberately NOT resolved here (admit_url is
+/// literal+scheme only, keeping the request handler non-blocking); a name that
+/// later resolves to a private address is still caught at dial by the hardened
+/// broker client. Every mcp_http entry point (direct create + catalog Connect,
+/// both auth kinds) funnels through here, so all inherit the admission. Returns
+/// the parsed URL for host extraction / resource canonicalization.
+fn admit_connector_base_url(
+    base_url: &str,
+    policy: &crate::egress::EgressPolicy,
+) -> ApiResult<reqwest::Url> {
+    let parsed = reqwest::Url::parse(base_url)
+        .map_err(|_| ApiError::BadRequest("base_url is not a valid URL".into()))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ApiError::BadRequest("base_url must be http(s)".into()));
+    }
+    crate::egress::admit_url(base_url, policy)
+        .map_err(|e| ApiError::BadRequest(format!("base_url rejected: {e}")))?;
+    Ok(parsed)
+}
+
 /// A sealed credential for BROKERED MCP servers (design §8.3 class 2),
 /// pinned to a base URL. The broker sends this credential only to server
 /// URLs under `base_url` (audience binding — our RFC-8707 equivalent), so a
@@ -224,11 +248,7 @@ async fn create_mcp_http(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| ApiError::BadRequest("base_url is required for mcp_http".into()))?;
-    let parsed = reqwest::Url::parse(base_url)
-        .map_err(|_| ApiError::BadRequest("base_url is not a valid URL".into()))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(ApiError::BadRequest("base_url must be http(s)".into()));
-    }
+    let parsed = admit_connector_base_url(base_url, &state.egress_policy)?;
     match req.auth_kind.as_deref().unwrap_or("static") {
         "static" => {
             // Own the endpoint before `req` moves; a static mcp_http endpoint IS
@@ -352,11 +372,7 @@ pub(crate) async fn create_mcp_http_connection(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| ApiError::BadRequest("base_url is required for mcp_http".into()))?;
-    let parsed = reqwest::Url::parse(base_url)
-        .map_err(|_| ApiError::BadRequest("base_url is not a valid URL".into()))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(ApiError::BadRequest("base_url must be http(s)".into()));
-    }
+    let parsed = admit_connector_base_url(base_url, &state.egress_policy)?;
     let sealer = sealer(state)?;
     let host = parsed.host_str().unwrap_or("mcp").to_string();
     let token = req.token.as_deref().map(str::trim).unwrap_or_default();
@@ -781,6 +797,64 @@ mod tests {
         Principal::Operator {
             scope: TenantScope::assume(Uuid::now_v7()),
         }
+    }
+
+    fn egress_policy(dev: bool) -> crate::egress::EgressPolicy {
+        crate::egress::EgressPolicy {
+            dev_loopback: dev,
+            allow_cidrs: vec![],
+            github_clone_base: None,
+            proxy: None,
+        }
+    }
+
+    // I2: base_url admission at SAVE time. Both mcp_http create paths funnel
+    // through `admit_connector_base_url`, so a private/metadata/plain-http
+    // destination is a 400 at admission — and the e2e's loopback URLs still save
+    // under the dev seam (the seam we must not break).
+    #[test]
+    fn base_url_admission_refuses_hostile_destinations() {
+        let prod = egress_policy(false);
+        // Bad scheme / unparseable → the pre-existing clear messages.
+        assert!(matches!(
+            admit_connector_base_url("ftp://mcp.example/x", &prod),
+            Err(ApiError::BadRequest(m)) if m.contains("http(s)")
+        ));
+        assert!(matches!(
+            admit_connector_base_url("not a url", &prod),
+            Err(ApiError::BadRequest(_))
+        ));
+        // Private/metadata IP literals + plain-http are refused with the
+        // admission reason (E3), and never echo the target.
+        for u in [
+            "https://169.254.169.254/mcp",
+            "https://10.0.0.1/mcp",
+            "http://mcp.example.com/mcp",
+        ] {
+            match admit_connector_base_url(u, &prod) {
+                Err(ApiError::BadRequest(m)) => assert!(m.contains("base_url rejected"), "{m}"),
+                other => panic!("{u} should be refused, got {other:?}"),
+            }
+        }
+        // A public https server is admitted and the parsed URL flows back.
+        let ok = admit_connector_base_url("https://mcp.example.com/mcp", &prod).unwrap();
+        assert_eq!(ok.host_str(), Some("mcp.example.com"));
+        // Hostname-FREE form of the same admit/refuse pair. `admit_connector_base_url`
+        // is a synchronous parse + literal range check and deliberately resolves
+        // NOTHING (see its doc comment and the hermeticity note in `egress::tests`),
+        // so no assertion in this test can perform a live lookup.
+        let ok = admit_connector_base_url("https://93.184.216.34/mcp", &prod).unwrap();
+        assert_eq!(ok.host_str(), Some("93.184.216.34"));
+        assert!(admit_connector_base_url("http://93.184.216.34/mcp", &prod).is_err());
+    }
+
+    #[test]
+    fn base_url_admission_preserves_the_dev_loopback_seam() {
+        let dev = egress_policy(true);
+        // The e2e saves loopback URLs; the dev seam must keep admitting them.
+        assert!(admit_connector_base_url("http://127.0.0.1:8899/mcp", &dev).is_ok());
+        // Metadata stays blocked even in dev.
+        assert!(admit_connector_base_url("http://169.254.169.254/mcp", &dev).is_err());
     }
 
     fn user(roles: &[&str]) -> Principal {
