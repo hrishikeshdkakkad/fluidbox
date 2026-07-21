@@ -989,8 +989,11 @@ _spawn() { # [public-port] [internal-port] [logfile] → sets SPAWN_PID
     # skipped entirely). Migration 0019's claims table carries the same triple,
     # so section (f) exercises it under the runtime role too.
     export FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime
-    # A dead-registry image ref makes provisioning fail in milliseconds (no
-    # runner image in CI), so the forged-run fixtures settle terminal fast.
+    # A dead-registry image ref makes PROVISIONING fail in milliseconds (there is
+    # no runner image in CI). That is necessary but NOT sufficient for a fast
+    # fixture: a run that already materialized a workspace still pays the
+    # finalizer's 120 s provision-settle grace before it quiesces. See the
+    # `create_run` default workspace for the other half.
     export FLUIDBOX_SANDBOX_IMAGE=localhost:1/fluidbox-absent:ci
     export FLUIDBOX_CODEX_SANDBOX_IMAGE=localhost:1/fluidbox-absent:ci
     # The file:// clone-base seam section (a) asserts the POSITIVE half of.
@@ -1296,9 +1299,35 @@ aud_matrix() { # label required-audience token-prefix method path [json-body]
 # $2 REPLACES the default workspace fragment — `workspace` and the legacy `repo`
 # are mutually exclusive (sending both is a 400), so the clone-policy runs pass
 # their own `"workspace":{…}` instead of appending to the default.
+#
+# The default names a local_copy path that does not exist, and that choice is a
+# RUNTIME BUDGET decision, not an accident. Every `live_run` first waits for its
+# run to reach a quiescent terminal state (`forge_running`) before forging the
+# row into `running`, so the fixture pays whatever the real failure path costs:
+#
+#   * `"repo":{"kind":"none"}` → WorkspaceSpec::Scratch → `materialize_local`
+#     git-inits the scratch dir and commits, so `set_base_commit` lands. The
+#     provider then fails (the runner image is unreachable) WITHOUT storing a
+#     sandbox handle, and the finalizer sees `expected_diff = base_commit.is_some()`
+#     → true with `StoredHandle::None`, so it defers under
+#     `PROVISION_SETTLE_SECS = 120` (orchestrator.rs) and re-defers on each 20 s
+#     finalize_worker tick. Each run therefore takes ~140 s to quiesce; at ~41
+#     live_run sites that is ~95 minutes, and the 45-minute CI job is CANCELED
+#     part-way through — which is exactly how this suite first ran.
+#   * a local_copy whose source is absent fails in `materialize_local`'s
+#     `if !source.exists()` guard (WorkspaceError::NoSource) DURING `initializing`,
+#     before any base commit, handle, or `started_at`. `expected_diff` is false,
+#     the first drive terminalizes, and the run quiesces in ~1 s.
+#
+# Nothing in this file reads `/workspace` or asserts on the default run's
+# `repo_source`/`base_commit` — the one run whose base_commit is asserted (the
+# file:// clone-base run) passes its own fragment — and `forge_running` overwrites
+# `status_reason` anyway. The path is admitted at creation: `resolve_workspace_input`
+# checks only operator authority + a non-empty path, so this is a 200 that fails
+# later, which is what the fixture needs.
 RUN=""
 create_run() { # agent [workspace-or-repo-json-fragment]
-  local ws=${2:-'"repo":{"kind":"none"}'}
+  local ws=${2:-'"workspace":{"kind":"local_copy","path":"/nonexistent-fluidbox-hardening-fixture"}'}
   admin_post "/v1/sessions" "{\"agent\":\"$1\",\"task\":\"hardening-e2e\",$ws}"
   RUN=$(echo "$BODY" | j "['session']['id']")
 }
@@ -1356,9 +1385,18 @@ print(rows[0]['id'] if rows else '')" 2>/dev/null)
 # The execution-claim row for one (session, tool_call_id) — migration 0019.
 claim_state()   { db "select state   from tool_execution_claims where session_id='$1' and tool_call_id='$2'"; }
 claim_attempt() { db "select attempt from tool_execution_claims where session_id='$1' and tool_call_id='$2'"; }
-# The ledgered gate `source` for one tool.decision (events.payload is the
-# internally-tagged EventBody, so `source` sits at the payload top level).
-decision_source() { db "select payload->>'source' from events where session_id='$1' and type='tool.decision' and payload->>'tool_call_id'='$2' order by seq desc limit 1"; }
+# The ledgered gate `source` for one tool.decision.
+#
+# `events.payload` is the ADJACENTLY-tagged `EventBody` — fluidbox-core
+# event.rs:8 is `#[serde(tag = "type", content = "data")]`, and
+# fluidbox-db append_event_in_tx stores `serde_json::to_value(&env.body)`
+# verbatim. So a row's payload is `{"type":"tool.decision","data":{…}}` and
+# EVERY body field sits one level down, under `->'data'`. Reading them at the
+# top level is not a near-miss: `payload->>'source'` is SQL NULL (prints as the
+# empty string) and `payload->>'tool_call_id' = 'x'` matches ZERO rows, so an
+# equality check against a real source silently fails and a `count(*)` silently
+# reads 0 — which is how this helper produced twelve false readings at once.
+decision_source() { db "select payload->'data'->>'source' from events where session_id='$1' and type='tool.decision' and payload->'data'->>'tool_call_id'='$2' order by seq desc limit 1"; }
 
 # ═════════════════════════════════════════════════════════════════════════════
 say "BOOT — fake MCP (x2) + redirector + control plane"
@@ -1431,9 +1469,19 @@ admin_post "/v1/catalog/$SLUG2/connect" "{\"token\":\"$TOK_HQ2\",\"display_name\
 CONN2=$(echo "$BODY" | j "['connection']['id']")
 need "$CONN2" "no connection id for the killable upstream ($BODY)" || exit 1
 
+# BOTH fake tools are REQUIRED, and that is load-bearing rather than tidy.
+# `bindings.rs::resolve_snapshot_surface` freezes "EXACTLY the required subset in
+# requirement order" — the effective surface is `required_tools`, NOT the whole
+# photographed snapshot. So a tool the fake advertises but no requirement names
+# is absent from `RunSpec.brokered[].tools`, and the ONE gate rejects it at the
+# frozen-set stage ("not in this run's frozen capability set") BEFORE the schema
+# stage it was meant to exercise. Section (e) needs two tools to violate two
+# distinct schema shapes — `hq_search` for a missing REQUIRED property, `hq_count`
+# for a wrong-TYPED one — so both must be required here or (e) proves only that
+# the frozen-set stage works, which section (d) already covers.
 mk_agent() { # name policy connector-url slug
   admin_post "/v1/agents" \
-    "{\"name\":\"$1\",\"policy\":\"$2\",\"connection_requirements\":[{\"slot\":\"hq\",\"connector\":{\"url\":\"$3\",\"slug\":\"$4\"},\"required_tools\":[\"hq_search\"],\"binding_mode\":\"organization\"}]}"
+    "{\"name\":\"$1\",\"policy\":\"$2\",\"connection_requirements\":[{\"slot\":\"hq\",\"connector\":{\"url\":\"$3\",\"slug\":\"$4\"},\"required_tools\":[\"hq_search\",\"hq_count\"],\"binding_mode\":\"organization\"}]}"
   [ "$CODE" = 200 ] && ok "agent '$1' created (slot hq → $4)" || no "agent $1 → $CODE: $BODY"
 }
 mk_agent hq-agent      hq-allow   "$MCP_URL"  "$SLUG"
@@ -2096,12 +2144,43 @@ fi
 # recheck_binding → brokered_auth_for_conn, the same resolution a live call makes,
 # and that is exactly where an expired OAuth token is re-minted.
 
-say "(d) SEP-835 — an insufficient_scope challenge is TERMINAL and marks the connection"
+say "(d) SEP-835 — an insufficient_scope challenge is TERMINAL, and marks ONLY an OAuth connection"
 # The piece Task 2 deliberately deferred to this suite. broker.rs auth_error →
-# CallErr::InsufficientScope → mark_insufficient_scope (broker.rs:1185-1209),
-# which writes integration_connections.status='error' + the oauth.error note
-# "insufficient_scope: reconnect with more scopes (server asked for: …)". There
-# must be NO re-mint retry — exactly ONE tools/call on the wire.
+# CallErr::InsufficientScope → `insufficient_scope_outcome`, which is TERMINAL on
+# every path (a `Definitive` error — no re-mint, no retry), and
+# `insufficient_scope_target`, which decides whether the connection is also
+# MARKED. Those two halves are deliberately NOT the same condition:
+#
+#   fn insufficient_scope_target(auth: Option<&BrokeredAuth>) -> Option<Uuid> {
+#       auth.and_then(|a| a.oauth_connection)
+#   }
+#
+# `oauth_connection` is `Some` only on the OAuth arm of `brokered_auth`. A
+# hostile MCP server picks its own `WWW-Authenticate` header, so this predicate
+# is the entire blast radius of that choice: for a STATIC credential there is no
+# scope grant to widen, "reconnect with more scopes" is not an actionable
+# remedy, and marking would hand any upstream a ONE-HEADER KILL SWITCH on an
+# org's connection. Narrowing keeps the design's terminal-call property and drops
+# the remote DoS.
+#
+# Every connection in this suite is a STATIC api_key connection (the catalog
+# entries above are `"auth_mode":"api_key"` → catalog.rs `auth_kind: "static"`),
+# so what this section can prove on live wire is the NARROWING — the challenge is
+# terminal for the CALL and the org's connection SURVIVES it. That is the
+# security-relevant half, and it is asserted positively below rather than as a
+# `!=`: a control plane that had marked the connection would fail these.
+#
+# NOT ASSERTED — "an OAuth connection IS marked status='error' with the
+# reconnect note naming the challenge scope". Reaching the marking arm needs
+# `auth_kind='oauth'`, i.e. a real fake authorization server (RFC 9728 PRM +
+# RFC 8414 metadata + a token endpoint that mints and rotates), which this file
+# deliberately does not carry — connector OAuth has its own coverage. Forging
+# `auth_kind='oauth'` by hand in psql would not prove it either: the token would
+# have to mint before a tools/call is ever dispatched, so the fixture would be
+# testing the forgery, not the product. The marking half is covered by the unit
+# test `broker.rs::insufficient_scope_marks_only_an_oauth_connection`, which
+# pins BOTH directions of the predicate (OAuth → Some(id), static → None,
+# authless → None) and asserts the two dispatch arms share the one helper.
 mcp_mode "$PROTO_SNAP" insufficient_scope
 if live_run hq-agent "sess-d8-$$" "d/scope"; then
   D_SCOPE="$RUN"
@@ -2114,35 +2193,32 @@ if live_run hq-agent "sess-d8-$$" "d/scope"; then
   [ "$SCOPE_CALLS" = 1 ] \
     && ok "exactly ONE tools/call reached the upstream — no re-mint retry after a scope challenge" \
     || no "tools/call count = $SCOPE_CALLS (want exactly 1; >1 means a forbidden retry)"
+  # The NARROWING, asserted positively on both columns the marking arm would
+  # have written. `auth_kind` is read first and asserted, not assumed: if a
+  # future edit turns this fixture into an OAuth connection, the expectations
+  # below invert, and a silent flip would make the two asserts vacuous.
+  CKIND=$(db "select coalesce(auth_kind,'') from integration_connections where id='$CONN'")
+  [ "$CKIND" = static ] \
+    && ok "precondition: the connection under test carries a STATIC credential (auth_kind='static')" \
+    || no "precondition unmet — auth_kind='$CKIND' (want 'static'; an OAuth fixture would invert the two asserts below)"
   CSTAT=$(db "select status from integration_connections where id='$CONN'")
   CNOTE=$(db "select coalesce(oauth->>'error','') from integration_connections where id='$CONN'")
-  [ "$CSTAT" = error ] \
-    && ok "the connection landed status='error' (create_run/photograph/broker now fail closed off it)" \
-    || no "connection status='$CSTAT' after the scope challenge (want error)"
-  { echo "$CNOTE" | grep -q "insufficient_scope: reconnect with more scopes" \
-      && echo "$CNOTE" | grep -q "hq:write"; } \
-    && ok "the reconnect note records the challenge scope verbatim-but-sanitized ('$CNOTE')" \
-    || no "connection note = '$CNOTE' (want the insufficient_scope reconnect note naming the scope)"
-  # A NEW run against the errored connection must be refused at creation.
-  # Stated as a POSITIVE refusal set, not `!= 200`: the binding refusal is an
-  # ApiError::BadRequest raised by bindings.rs (either "connection '…' is error —
-  # reconnect it" on an explicit slot, or the no-satisfying-connection arm), so
-  # the answer must be a 4xx the HANDLER produced. `!= 200` also accepted 000 —
-  # a control plane that had died would have "proven" fail-closed behaviour.
+  [ "$CSTAT" = active ] \
+    && ok "the STATIC connection SURVIVED the challenge (status still 'active') — no one-header kill switch" \
+    || no "connection status='$CSTAT' after the scope challenge (want 'active': a static credential has no scope grant to widen, so a hostile upstream must not be able to mark it)"
+  [ -z "$CNOTE" ] \
+    && ok "…and no reconnect note was written for a credential that cannot be re-consented" \
+    || no "connection note = '$CNOTE' (want empty: the reconnect remedy is not actionable for a static credential)"
+  # POSITIVE CONTROL for those two: the connection is not merely un-marked, it is
+  # still BINDABLE. A new run must still be CREATED — stated as an explicit 200
+  # with a session id, not `!= 4xx`, so a dead control plane (000) cannot pass.
+  # This is the assertion that would fail if the challenge became a remote DoS:
+  # `bindings.rs` fails closed off `status`, so a marked connection refuses here.
   admin_post "/v1/sessions" "{\"agent\":\"hq-agent\",\"task\":\"t\",\"repo\":{\"kind\":\"none\"}}"
-  case "$CODE" in
-    400|409|422)
-      { [ -n "$BODY" ] && ok "a new run bound to the errored connection → $CODE (fail closed off status): $BODY"; } \
-        || no "the run was refused with $CODE but an EMPTY body — no refusal reason was rendered";;
-    *)
-      no "a new run against the errored connection → $CODE: $BODY (want a 400/409/422 refusal; 2xx = it was created, 000 = nothing answered)";;
-  esac
-  # Restore the connection so the remaining sections can bind it. This is a
-  # documented fixture, not a product path (reconnect is the product path).
-  db "update integration_connections set status='active', oauth = coalesce(oauth,'{}'::jsonb) - 'error', updated_at=now() where id='$CONN'" >/dev/null
-  [ "$(db "select status from integration_connections where id='$CONN'")" = active ] \
-    && ok "fixture: the connection was restored to active for the remaining sections" \
-    || no "fixture restore failed — sections (e)/(f) will fail at binding"
+  SURV=$(echo "$BODY" | j "['session']['id']")
+  { [ "$CODE" = 200 ] && [ -n "$SURV" ]; } \
+    && ok "POSITIVE CONTROL: a new run still binds the surviving connection → 200 ($SURV) — the challenge cost the CALL, not the org's integration" \
+    || no "a new run against the surviving connection → $CODE: $BODY (want 200 + a session id; a refusal means the static connection WAS marked and the upstream got a kill switch)"
 fi
 mcp_mode "$PROTO_SNAP" ok
 
@@ -2177,8 +2253,8 @@ if live_run hq-agent "sess-e-$$" "e/schema"; then
   # "prove" boundedness. The floor is the companion row count (the ledger row must
   # EXIST) plus a non-empty reason, and the reason must still name the schema
   # rejection rather than being any old short string.
-  E1_ROWS=$(db "select count(*) from events where session_id='$E_RUN' and type='tool.decision' and payload->>'tool_call_id'='e1'")
-  E1_REASON=$(db "select coalesce(payload->>'reason','') from events where session_id='$E_RUN' and type='tool.decision' and payload->>'tool_call_id'='e1'")
+  E1_ROWS=$(db "select count(*) from events where session_id='$E_RUN' and type='tool.decision' and payload->'data'->>'tool_call_id'='e1'")
+  E1_REASON=$(db "select coalesce(payload->'data'->>'reason','') from events where session_id='$E_RUN' and type='tool.decision' and payload->'data'->>'tool_call_id'='e1'")
   if gt0 "$E1_ROWS" "tool.decision ledger rows for the schema-rejected intent"; then
     { [ "${#E1_REASON}" -ge 1 ] && [ "${#E1_REASON}" -le 600 ] \
         && echo "$E1_REASON" | grep -q "frozen schema"; } \
@@ -2962,7 +3038,7 @@ if [ "$H_OK" = 1 ] && live_run hq-agent "sess-h2-$$" "h/retention"; then
     || no "usage-free SSE request → $CODE: $BODY"
   H2_MARKER=0
   for _ in $(seq 1 40); do
-    [ "$(db "select count(*) from events where session_id='$H2' and type='agent.message' and payload->>'text'='model stream completed (usage unparsed)'")" -ge 1 ] \
+    [ "$(db "select count(*) from events where session_id='$H2' and type='agent.message' and payload->'data'->>'text'='model stream completed (usage unparsed)'")" -ge 1 ] \
       && { H2_MARKER=1; break; }
     sleep 0.5
   done
@@ -3156,6 +3232,15 @@ perm_body() { # tool_call_id
 # optionally narrowed by one payload field. Deliberately the API and not psql: the
 # single-emission property is a claim about what an operator (and the SSE stream
 # built on the same `events_after` query) sees.
+#
+# The API returns the `events.payload` column verbatim (EventRow.payload is a raw
+# jsonb `Value`), and that column is the ADJACENTLY-tagged EventBody — see
+# `decision_source` above. So the body fields live under payload['data'], NOT at
+# the payload top level. A narrowing key read one level too high matches nothing
+# and turns every count into 0, which reads as "exactly zero emissions" — a
+# false green for any `-eq 0` and a false red for any `-ge 1`. The `data` lookup
+# is asserted, not defaulted: a payload without it raises rather than silently
+# counting 0.
 ev_count() { # sid type [payload-key] [payload-value]
   admin_get "/v1/sessions/$1/events?limit=1000"
   echo "$BODY" | python3 -c "
@@ -3165,8 +3250,14 @@ n = 0
 for r in json.load(sys.stdin).get('events', []):
     if r.get('type') != t:
         continue
-    if k and str((r.get('payload') or {}).get(k, '')) != v:
-        continue
+    if k:
+        body = r.get('payload') or {}
+        if 'data' not in body:
+            raise SystemExit(
+                'event payload has no \'data\' member — the EventBody tagging '
+                'changed; narrowing by %r would silently count 0' % (k,))
+        if str((body['data'] or {}).get(k, '')) != v:
+            continue
     n += 1
 print(n)
 " "$2" "${3:-}" "${4:-}" 2>/dev/null
