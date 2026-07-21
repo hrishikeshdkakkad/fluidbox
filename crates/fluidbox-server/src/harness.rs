@@ -205,6 +205,7 @@ mod tests {
             llm_tenant_budget_duration: None,
             llm_tenant_tpm: None,
             llm_tenant_rpm: None,
+            llm_max_concurrent_reservations: crate::facade::DEFAULT_MAX_CONCURRENT_RESERVATIONS,
             credential_key: None,
             kms_mode: crate::config::KmsMode::Off,
             kms_static_kek: None,
