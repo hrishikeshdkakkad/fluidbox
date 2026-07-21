@@ -40,10 +40,25 @@ export const SANDBOX_GATE_SHIM = fileURLToPath(new URL("./sandbox-gate-shim.mjs"
 /// Parse the shared FLUIDBOX_* env into one object. CAPABILITIES is the
 /// FROZEN manifest (the control plane already stripped broker internals — no
 /// upstream URLs or credentials reach this process).
+///
+/// AUDIENCE-SCOPED CREDENTIALS (Gap 10). The control plane now mints one token
+/// per audience and the routes enforce which is accepted:
+///   TOKEN      (FLUIDBOX_SESSION_TOKEN) — runner-control: events, heartbeat,
+///              result, token renew. The harness DELETES this var from
+///              process.env before spawning the agent, so it lives only here.
+///   TOOL_TOKEN (FLUIDBOX_TOOL_TOKEN)    — tool intent: /permission, /tools/call.
+///   LLM_TOKEN  (FLUIDBOX_LLM_TOKEN)     — model egress at the facade (codex;
+///              claude's SDK reads ANTHROPIC_API_KEY directly).
+/// Both scoped vars fall back to TOKEN so a NEW image still runs against an OLD
+/// server, where the single legacy token carries audience 'all' and every route
+/// accepts it. (The reverse — an OLD image on a NEW server — is unsupported and
+/// fails closed at the tool gate; see harness.rs.)
 export function loadRunnerEnv() {
   const CONTROL = requireEnv("FLUIDBOX_CONTROL_URL");
   const SESSION = requireEnv("FLUIDBOX_SESSION_ID");
   const TOKEN = requireEnv("FLUIDBOX_SESSION_TOKEN");
+  const TOOL_TOKEN = process.env.FLUIDBOX_TOOL_TOKEN || TOKEN;
+  const LLM_TOKEN = process.env.FLUIDBOX_LLM_TOKEN || TOKEN;
   const TASK = requireEnv("FLUIDBOX_TASK");
   const capabilities = (() => {
     const raw = process.env.FLUIDBOX_CAPABILITIES;
@@ -60,6 +75,8 @@ export function loadRunnerEnv() {
     CONTROL,
     SESSION,
     TOKEN,
+    TOOL_TOKEN,
+    LLM_TOKEN,
     TASK,
     AUTONOMY: process.env.FLUIDBOX_AUTONOMY || "supervised",
     MODEL: process.env.FLUIDBOX_MODEL || "",
@@ -157,7 +174,10 @@ export class RunnerClient {
     return `${this.env.CONTROL.replace(/\/$/, "")}/internal/sessions/${this.env.SESSION}`;
   }
 
-  async #post(url, body, { retries = 0, timeoutMs = 30000 } = {}) {
+  // `token` selects the AUDIENCE this call authenticates with (Gap 10). It
+  // defaults to the runner-control credential, which is what events, heartbeat,
+  // result and token-renew need; the tool gate passes TOOL_TOKEN explicitly.
+  async #post(url, body, { retries = 0, timeoutMs = 30000, token = this.env.TOKEN } = {}) {
     for (let attempt = 0; ; attempt++) {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -166,7 +186,7 @@ export class RunnerClient {
           method: "POST",
           headers: {
             "content-type": "application/json",
-            authorization: `Bearer ${this.env.TOKEN}`,
+            authorization: `Bearer ${token}`,
           },
           body: JSON.stringify(body),
           signal: ctrl.signal,
@@ -212,8 +232,10 @@ export class RunnerClient {
     const body = { tool_call_id: toolCallId, tool: toolName, input };
     for (let attempt = 0; ; attempt++) {
       try {
+        // The gate is the TOOL-INTENT audience — never the control credential.
         return await this.#post(`${this.sessionBase()}/permission`, body, {
           timeoutMs: 12 * 60 * 1000,
+          token: this.env.TOOL_TOKEN,
         });
       } catch (e) {
         // A terminal 401/403 means the session is gone (token revoked on the
@@ -301,10 +323,13 @@ export class RunnerClient {
 
 /// Env a brokered server's broker-shim needs. Shared by every harness — the
 /// broker path is identical for claude and codex (control-plane gate +
-/// execute; the shim holds only the session token).
+/// execute). The shim calls /tools/call, so it receives the TOOL-INTENT token
+/// EXPLICITLY: `process.env` no longer carries the control credential (the
+/// harness deleted it before any spawn), and the shim must never hold one.
 export function brokerShimEnv(env, srv) {
   return {
     ...process.env,
+    FLUIDBOX_TOOL_TOKEN: env.TOOL_TOKEN,
     FLUIDBOX_BROKER_SERVER: srv.name,
     FLUIDBOX_BROKER_TOOLS: JSON.stringify(srv.tools || []),
   };
@@ -313,9 +338,12 @@ export function brokerShimEnv(env, srv) {
 /// Env a sandbox server's gate-shim needs (codex path — the shim gates each
 /// call via /permission before spawning the real stdio subprocess). Claude
 /// runs sandbox servers directly and gates them through canUseTool instead.
+/// Like the broker shim it preflights a TOOL-INTENT route, so it gets that
+/// token explicitly and never the runner-control one.
 export function gateShimEnv(env, srv) {
   return {
     ...process.env,
+    FLUIDBOX_TOOL_TOKEN: env.TOOL_TOKEN,
     FLUIDBOX_GATE_SERVER: srv.name,
     FLUIDBOX_GATE_COMMAND: srv.command,
     FLUIDBOX_GATE_ARGS: JSON.stringify(srv.args || []),

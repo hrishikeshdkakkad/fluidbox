@@ -331,6 +331,13 @@ pub async fn messages(
     let sess_auth = fluidbox_db::session_for_token(&state.pool, &token)
         .await?
         .ok_or(ApiError::Unauthorized)?;
+    // Gap 10: model egress is the LLM audience. The sandbox's fake provider key
+    // is now the LLM-scoped token ONLY — a runner-control or tool-intent
+    // credential can no longer spend the run's model budget. Refused at the auth
+    // layer (like an unresolvable token), not as a dialect-shaped body.
+    if !crate::auth::audience_allows("llm", &sess_auth.audience) {
+        return Err(ApiError::Forbidden("wrong_audience".into()));
+    }
     let session_id = sess_auth.session_id;
     let scope = TenantScope::assume(sess_auth.tenant_id);
 

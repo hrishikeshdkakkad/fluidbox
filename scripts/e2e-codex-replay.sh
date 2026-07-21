@@ -86,9 +86,19 @@ for _ in $(seq 1 100); do C=$(docker ps -a --filter "label=fluidbox.session=$SID
 # AND removes in any state (a plain `docker kill` no-ops on a 'created'
 # container and leaves an 'exited' one lingering), so the real supervisor can't
 # terminalize the session before our manual run, and no container is left behind.
-TOK=$(docker inspect "$C" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | grep '^FLUIDBOX_SESSION_TOKEN=' | cut -d= -f2-)
+# Gap 10: the orchestrator mints FOUR audience-scoped tokens and each internal
+# route accepts exactly one. The replayed supervisor drives runner-control
+# (/events, /heartbeat, /result, /token/renew), the tool gate (/permission), and
+# codex's model egress — so ALL THREE runner-side credentials must be re-injected
+# or the manual run 403s. (The workspace token is init-container-only; the replay
+# never fetches an archive.)
+sess_env() { docker inspect "$1" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | grep "^$2=" | cut -d= -f2-; }
+TOK=$(sess_env "$C" FLUIDBOX_SESSION_TOKEN)
+TOOLTOK=$(sess_env "$C" FLUIDBOX_TOOL_TOKEN)
+LLMTOK=$(sess_env "$C" FLUIDBOX_LLM_TOKEN)
 docker rm -f "$C" >/dev/null 2>&1
 [ -n "$TOK" ] || { rno "no session token for replay"; exit 1; }
+[ -n "$TOOLTOK" ] || { rno "no tool-audience token for replay"; exit 1; }
 
 # Run the real supervisor in a manual container: fake codex shadows the real
 # binary; the session env points at the control plane (host.docker.internal).
@@ -98,6 +108,7 @@ docker run --rm --add-host host.docker.internal:host-gateway \
   -e FAKE_OUT=/out/replies.jsonl \
   -e FLUIDBOX_CONTROL_URL="$FLUIDBOX_PUBLIC_CONTROL_URL" \
   -e FLUIDBOX_SESSION_ID="$SID" -e FLUIDBOX_SESSION_TOKEN="$TOK" \
+  -e FLUIDBOX_TOOL_TOKEN="$TOOLTOK" -e FLUIDBOX_LLM_TOKEN="$LLMTOK" \
   -e FLUIDBOX_TASK="replay" -e FLUIDBOX_AUTONOMY=autonomous \
   -e FLUIDBOX_MODEL=gpt-5.4-mini -e FLUIDBOX_WORKSPACE=/workspace \
   "$CIMG" >/dev/null 2>&1 || true

@@ -48,13 +48,19 @@ tok_for() { # session -> token. Read the token from the container env, then
     [ -n "$cid" ] && break; sleep 0.15
   done
   [ -z "$cid" ] && { echo ""; return; }
-  tok=$(docker inspect "$cid" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
-        | grep '^FLUIDBOX_SESSION_TOKEN=' | head -1 | cut -d= -f2-)
+  # Gap 10: the sandbox holds FOUR audience-scoped tokens and this phase drives
+  # TWO different audiences — the gate (/permission → tool) and the facade
+  # (/internal/llm → llm). Both must be read in ONE pass, because the container
+  # is force-removed below and a second inspect would find nothing.
+  local envdump llm
+  envdump=$(docker inspect "$cid" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null)
+  tok=$(echo "$envdump" | grep '^FLUIDBOX_TOOL_TOKEN=' | head -1 | cut -d= -f2-)
+  llm=$(echo "$envdump" | grep '^FLUIDBOX_LLM_TOKEN=' | head -1 | cut -d= -f2-)
   docker rm -f "$cid" >/dev/null 2>&1
-  echo "$tok"
+  echo "$tok $llm"
 }
 perm() { curl -s -X POST -H "authorization: Bearer $1" -H 'content-type: application/json' -d "$3" "$API/internal/sessions/$2/permission"; }
-facade() { # token suffix body -> "HTTP <code>"
+facade() { # llm-audience token, suffix, body -> "HTTP <code>"
   curl -s -o /dev/null -w "%{http_code}" -X POST -H "authorization: Bearer $1" -H 'content-type: application/json' -d "$3" "$API/internal/llm/$2"
 }
 
@@ -72,7 +78,7 @@ BAD=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "$H" -H 'content-type: a
 # a codex session (autonomous) — the supervisor spawns codex, hits the model
 # facade (LiteLLM has no gpt key in tier-1 → the run fails at model time, but we
 # only need the launched session's token to probe the gate + facade).
-S=$(new_codex_session true trusted); T=$(tok_for "$S")
+S=$(new_codex_session true trusted); read -r T TL <<<"$(tok_for "$S")"
 [ -n "$T" ] && ok "codex sandbox launched; got session token" || { no "no codex session token"; }
 if [ -n "$T" ]; then
   # (tok_for already force-removed the container, so the real supervisor can't
@@ -95,13 +101,13 @@ if [ -n "$T" ]; then
 
   # facade codex dialect
   RS='{"model":"gpt-5.4-mini","input":[{"type":"text","text":"hi"}]}'
-  C=$(facade "$T" "v1/responses" '{"model":"gpt-4o","input":[]}'); [ "$C" = "422" ] && ok "facade codex: model mismatch → 422" || no "model mismatch got $C"
-  C=$(facade "$T" "v1/messages" "$RS"); [ "$C" = "404" ] && ok "facade codex: v1/messages suffix → 404 (wrong dialect)" || no "suffix got $C"
-  C=$(facade "$T" "v1/responses" '{"model":"gpt-5.4-mini","previous_response_id":"resp_x","input":[]}'); [ "$C" = "422" ] && ok "facade codex: previous_response_id → 422 (stateless)" || no "stateless got $C"
+  C=$(facade "$TL" "v1/responses" '{"model":"gpt-4o","input":[]}'); [ "$C" = "422" ] && ok "facade codex: model mismatch → 422" || no "model mismatch got $C"
+  C=$(facade "$TL" "v1/messages" "$RS"); [ "$C" = "404" ] && ok "facade codex: v1/messages suffix → 404 (wrong dialect)" || no "suffix got $C"
+  C=$(facade "$TL" "v1/responses" '{"model":"gpt-5.4-mini","previous_response_id":"resp_x","input":[]}'); [ "$C" = "422" ] && ok "facade codex: previous_response_id → 422 (stateless)" || no "stateless got $C"
 fi
 
 # ReadOnly trust tier (fork PR analog) — a fresh codex session frozen ReadOnly
-S2=$(new_codex_session true read_only); T2=$(tok_for "$S2")
+S2=$(new_codex_session true read_only); read -r T2 _ <<<"$(tok_for "$S2")"
 if [ -n "$T2" ]; then
   D=$(perm "$T2" "$S2" '{"tool_call_id":"r1","tool":"Bash","input":{"command":"git diff","cwd":"/workspace"}}' | j "['decision']")
   [ "$D" = "allow" ] && ok "ReadOnly: canonical Bash{git diff} → allow" || no "ReadOnly git diff got $D"

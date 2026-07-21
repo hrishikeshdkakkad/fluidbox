@@ -33,7 +33,9 @@ function requireEnv(k) {
 
 const CONTROL = requireEnv("FLUIDBOX_CONTROL_URL");
 const SESSION = requireEnv("FLUIDBOX_SESSION_ID");
-const TOKEN = requireEnv("FLUIDBOX_SESSION_TOKEN");
+// Gap 10: this shim preflights /permission, so it holds the TOOL-INTENT
+// credential only — never the runner-control token.
+const TOKEN = requireEnv("FLUIDBOX_TOOL_TOKEN");
 const SERVER_NAME = requireEnv("FLUIDBOX_GATE_SERVER");
 const CHILD_COMMAND = requireEnv("FLUIDBOX_GATE_COMMAND");
 const CHILD_ARGS = JSON.parse(process.env.FLUIDBOX_GATE_ARGS || "[]");

@@ -1384,7 +1384,7 @@ async fn call_tool(
         .unwrap_or(false);
     let content = result.get("content").cloned().unwrap_or(json!([]));
     let structured = result.get("structuredContent").cloned();
-    Ok((cap_content(content), is_error, structured))
+    Ok((cap_content(content), is_error, cap_structured(structured)))
 }
 
 /// Reactive-401 recovery, OAuth connections only: drop the REJECTED access
@@ -1640,6 +1640,29 @@ async fn reauth_after_401_conn(
 /// Oversized results are replaced by a truncated text block so a hostile or
 /// chatty server can't balloon the runner/context; the ledger stores only a
 /// digest either way.
+/// Cap `structuredContent` under the SAME 256 KiB ceiling as `content` (T4
+/// rider). Without this an untrusted MCP server could hand back an unbounded
+/// structured payload that we then persist verbatim into the execution claim's
+/// `result_content` (the duplicate-adoption copy) and stream to the runner.
+///
+/// Unlike a `content` array — a list of typed blocks we can truncate down to one
+/// text block — `structuredContent` is a single opaque JSON value paired with the
+/// tool's `outputSchema`; truncating its interior would yield a value that no
+/// longer satisfies that schema and could not be told apart from real data. So an
+/// oversize payload is REPLACED WHOLESALE with an explicit truncation marker: the
+/// paired (already capped) `content` still carries the human-readable result, and
+/// the result digest covers whatever we actually stored.
+fn cap_structured(structured: Option<Value>) -> Option<Value> {
+    let s = structured?;
+    if s.to_string().len() <= MAX_RESULT_BYTES {
+        return Some(s);
+    }
+    Some(json!({
+        "fluidbox_truncated": true,
+        "reason": "structuredContent exceeded the 256 KiB result ceiling and was dropped by the fluidbox broker",
+    }))
+}
+
 fn cap_content(content: Value) -> Value {
     let serialized = content.to_string();
     if serialized.len() <= MAX_RESULT_BYTES {
@@ -2029,6 +2052,25 @@ mod tests {
         let s = capped.to_string();
         assert!(s.len() < MAX_RESULT_BYTES);
         assert!(s.contains("truncated by fluidbox broker"));
+    }
+
+    #[test]
+    fn oversized_structured_content_is_capped_to_a_marker() {
+        // Absent stays absent; a small payload passes through byte-identical.
+        assert_eq!(cap_structured(None), None);
+        let small = serde_json::json!({ "answer": 42 });
+        assert_eq!(cap_structured(Some(small.clone())), Some(small));
+        // Oversize is REPLACED wholesale (never truncated in place — that would
+        // silently violate the tool's outputSchema).
+        let big = serde_json::json!({ "blob": "x".repeat(MAX_RESULT_BYTES + 1) });
+        let capped = cap_structured(Some(big)).unwrap();
+        let s = capped.to_string();
+        assert!(
+            s.len() < MAX_RESULT_BYTES,
+            "capped structured content must fit the ceiling"
+        );
+        assert_eq!(capped["fluidbox_truncated"], serde_json::json!(true));
+        assert!(!s.contains("xxxxxxxx"), "no oversize payload survives");
     }
 
     // ── Session-manager conformance (raw-TCP fake MCP server, no DB) ──────────

@@ -352,14 +352,40 @@ impl FromRequestParts<AppState> for TriggerAuth {
     }
 }
 
+/// True iff a token carrying `actual` audience may act on a route requiring
+/// `required` (Gap 10, invariant 19). The legacy `'all'` audience — a pre-split
+/// token minted before this deploy, or an e2e forger relying on the column
+/// DEFAULT — satisfies EVERY route (in-flight compat); otherwise the audiences
+/// must match exactly. Pure, so it is unit-tested without a DB.
+pub fn audience_allows(required: &str, actual: &str) -> bool {
+    actual == "all" || actual == required
+}
+
 /// Per-session authentication for the internal gateway. Resolves the bearer
 /// token to the session it belongs to (unexpired, unrevoked) AND its owning
 /// tenant — `scope` is derived from the token's row, never `state.tenant_id`,
-/// so every internal-plane DB call scopes to the runner's real tenant.
+/// so every internal-plane DB call scopes to the runner's real tenant. The
+/// token's `audience` (Gap 10) is carried so each handler enforces its route's
+/// required audience via [`SessionAuth::require_audience`].
 pub struct SessionAuth {
     pub session_id: Uuid,
     pub token: String,
     pub scope: TenantScope,
+    pub audience: String,
+}
+
+impl SessionAuth {
+    /// Enforce the route's audience. A token whose audience is neither `all` nor
+    /// `required` is refused with a machine-readable 403 `{"error":"wrong_audience"}`
+    /// — so a leaked LLM or tool-intent credential can never reach a
+    /// runner-control route (the invariant-19 acceptance bullet).
+    pub fn require_audience(&self, required: &str) -> Result<(), ApiError> {
+        if audience_allows(required, &self.audience) {
+            Ok(())
+        } else {
+            Err(ApiError::Forbidden("wrong_audience".into()))
+        }
+    }
 }
 
 impl FromRequestParts<AppState> for SessionAuth {
@@ -384,6 +410,7 @@ impl FromRequestParts<AppState> for SessionAuth {
             session_id: auth.session_id,
             token,
             scope: TenantScope::assume(auth.tenant_id),
+            audience: auth.audience,
         })
     }
 }
@@ -457,6 +484,64 @@ mod tests {
     }
 
     const PUB: &str = "https://app.example.com";
+
+    #[test]
+    fn audience_matrix_allow_deny_and_legacy_all() {
+        // The four route classes, as the plan's enforcement table (§Task 5).
+        for required in ["control", "tool", "llm", "workspace"] {
+            // Exact match allows.
+            assert!(
+                audience_allows(required, required),
+                "{required} == {required}"
+            );
+            // Legacy 'all' passes EVERY route (in-flight compat).
+            assert!(audience_allows(required, "all"), "all satisfies {required}");
+            // Every OTHER scoped audience is refused on this route.
+            for actual in ["control", "tool", "llm", "workspace"] {
+                if actual != required {
+                    assert!(
+                        !audience_allows(required, actual),
+                        "{actual} must NOT satisfy {required}"
+                    );
+                }
+            }
+        }
+        // The load-bearing cell: neither a tool nor an llm token reaches
+        // runner-control, and control reaches neither the gate nor the facade.
+        assert!(!audience_allows("control", "tool"));
+        assert!(!audience_allows("control", "llm"));
+        assert!(!audience_allows("tool", "control"));
+        assert!(!audience_allows("llm", "control"));
+    }
+
+    #[test]
+    fn require_audience_body_is_machine_readable() {
+        use axum::response::IntoResponse;
+        let sa = SessionAuth {
+            session_id: Uuid::nil(),
+            token: "fbx_sess_x".into(),
+            scope: TenantScope::assume(Uuid::nil()),
+            audience: "tool".into(),
+        };
+        // A matching / legacy audience passes; a mismatch is 403 whose BODY
+        // carries the machine-readable `wrong_audience` code (not just a status).
+        assert!(sa.require_audience("tool").is_ok());
+        let err = sa.require_audience("control").unwrap_err();
+        assert_eq!(err.to_string(), "wrong_audience", "the 403 body error code");
+        assert_eq!(
+            err.into_response().status(),
+            axum::http::StatusCode::FORBIDDEN
+        );
+        // 'all' passes everywhere.
+        let legacy = SessionAuth {
+            session_id: Uuid::nil(),
+            token: "fbx_sess_y".into(),
+            scope: TenantScope::assume(Uuid::nil()),
+            audience: "all".into(),
+        };
+        assert!(legacy.require_audience("control").is_ok());
+        assert!(legacy.require_audience("llm").is_ok());
+    }
 
     #[test]
     fn csrf_allows_safe_methods_regardless_of_headers() {

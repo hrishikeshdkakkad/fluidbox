@@ -374,11 +374,12 @@ CODE=$(post "/policies" "{\"name\":\"conn-e2e\",\"yaml\":$PY}")
 [ "$CODE" = "200" ] && ok "conn-e2e policy created" || { no "policy → $CODE: $(cat "$B")"; exit 1; }
 
 PROBE_BUDGET='{"max_wall_clock_secs": 240, "max_cost_usd": 0.05}'
-token_for() { # session → token (kills the runner so probes own the contract)
+token_for() { # session → TOOL-audience token (kills the runner so probes own the contract)
+  # Gap 10: this phase drives /tools/call only — the TOOL-INTENT audience.
   local sid=$1 cid tok=""
   for _ in $(seq 1 30); do
     cid=$(docker ps -a --filter "label=fluidbox.session=$sid" --format '{{.ID}}' | head -1)
-    [ -n "$cid" ] && { tok=$(docker inspect "$cid" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^FLUIDBOX_SESSION_TOKEN=' | cut -d= -f2-); break; }
+    [ -n "$cid" ] && { tok=$(docker inspect "$cid" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^FLUIDBOX_TOOL_TOKEN=' | cut -d= -f2-); break; }
     sleep 1
   done
   [ -n "$cid" ] && docker kill "$cid" >/dev/null 2>&1

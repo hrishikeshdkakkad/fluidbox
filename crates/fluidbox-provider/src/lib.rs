@@ -81,7 +81,23 @@ impl ExecutionProvider for DockerProvider {
         let internal = matches!(spec.network, NetworkMode::Hardened);
         self.ensure_network(&net_name, internal).await?;
 
-        let env: Vec<String> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        // Flat env, one container, one uid — unchanged by the Gap 10 audience
+        // split. The runner env already carries the control/tool/llm tokens under
+        // their own vars; the WORKSPACE token is appended here so the HostDev
+        // container holds the complete set.
+        //
+        // Docker deliberately does NOT get the k8s per-audience isolation: it
+        // bind-mounts the workspace (no init container, no `workspaced` fetch, so
+        // this var is inert here), and `HostDev` is explicitly NEVER a hosted
+        // security boundary (design :834) — one process, one uid, one env. The
+        // audience split still buys real blast-radius reduction here (a leaked
+        // llm/tool token cannot post /result or forge /events), but true
+        // per-audience process isolation is a hardened-provider property only.
+        let mut env: Vec<String> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        env.push(format!(
+            "FLUIDBOX_WORKSPACE_TOKEN={}",
+            spec.tokens.workspace
+        ));
 
         let mut labels = HashMap::new();
         labels.insert(SESSION_LABEL.to_string(), spec.session_id.to_string());
