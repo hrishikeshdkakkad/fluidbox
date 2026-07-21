@@ -81,9 +81,41 @@ server:
   # Leave false: it turns migration 0018's policies into decoration. Only for a
   # local/single-user cluster whose database credential is unavoidably a superuser.
   allowRlsBypass: false
+  # Sized for the STARTER tier (see "Capacity tiers" under sandbox.quota below).
+  # The control plane holds, concurrently: one SSE tee per connected BROWSER (not
+  # per run), one buffered request body per in-flight request (≤ maxRequestBodyBytes,
+  # 2 MiB by default — 300 concurrent model requests is a 600 MiB envelope on its
+  # own), the connection pool, and the per-replica egress/MCP registries. 1 CPU /
+  # 1 GiB is a starter figure and does NOT cover the 300-run tier; raise both
+  # together with sandbox.quota, per the table below.
   resources:
     requests: { cpu: "250m", memory: "512Mi" }
     limits: { cpu: "1", memory: "1Gi" }
+  # Application connection-pool sizing (FLUIDBOX_DB_*, Phase F). "" = the server's
+  # own default, so the number lives in ONE place (crates/fluidbox-db PoolSettings)
+  # rather than being duplicated here and drifting.
+  #
+  # The figure that has to fit your Postgres is NOT this one — it is
+  #   replicas × (maxConnections + 2)
+  # the +2 being the two LISTEN/NOTIFY connections each replica holds outside the
+  # pool. Neon's smallest compute (0.25 CU) allows 112 connections in total, so the
+  # server default (25) supports three replicas with headroom for migrations and
+  # psql. Raise it on a larger compute; see the tier table below.
+  #
+  # The other four pool knobs are deliberately not chart fields — set them through
+  # extraEnv if you need them: FLUIDBOX_DB_MIN_CONNECTIONS,
+  # FLUIDBOX_DB_ACQUIRE_TIMEOUT_SECS, FLUIDBOX_DB_IDLE_TIMEOUT_SECS,
+  # FLUIDBOX_DB_MAX_LIFETIME_SECS. All five fail BOOT on a malformed or
+  # self-contradictory value rather than falling back to a default.
+  dbPool:
+    maxConnections: ""
+  # Ceiling on a buffered request body, in bytes ("" = the server default, 2 MiB —
+  # which is exactly what axum was already enforcing invisibly, so leaving this
+  # empty changes nothing). The LLM facade buffers the whole model request, so a
+  # long agent conversation is what actually reaches 2 MiB. Raising it multiplies
+  # by concurrency: budget `maxRequestBodyBytes × concurrent runs` against
+  # server.resources.limits.memory above before you move it.
+  maxRequestBodyBytes: ""
   # Archive PVC (survives Recreate upgrades so init can still pull).
   archivePvc:
     size: 10Gi
@@ -155,7 +187,42 @@ sandbox:
   # BYTES, default 2Gi) PLUS the unpacked staging tree PLUS the baseline
   # during init — size it for archive + ~2× the unpacked workspace.
   volumeSizeLimit: 10Gi
-  # Namespace ResourceQuota + application concurrent-run limit.
+  # Namespace ResourceQuota. This is the ONLY admission gate on concurrent runs —
+  # there is deliberately no application-side counter (an earlier revision of this
+  # comment claimed one; it never existed). The quota is enforced by the API server
+  # for every replica at once and cannot be bypassed by any code path, which an
+  # in-process counter could not match; the price is that it counts PODS, not runs,
+  # and it REJECTS rather than queues: once `pods` is reached, pod creation returns
+  # 403 and the run FAILS at provisioning (it is not held and retried). Size the
+  # tier you actually want rather than relying on the quota as a waiting room.
+  #
+  # requestsCpu / requestsMemory must be kept CONSISTENT with pods and with
+  # sandbox.resources.requests above — the quota counts REQUESTS, so the three are
+  # one setting expressed three ways:
+  #   requestsCpu    = pods × sandbox.resources.requests.cpu     (default 500m)
+  #   requestsMemory = pods × sandbox.resources.requests.memory  (default 1Gi)
+  # Leaving one behind silently caps you at whichever binds first.
+  #
+  # ── Capacity tiers ──────────────────────────────────────────────────────────
+  # From the design's planning assumptions (docs/plans/2026-07-14-multi-user-mcp-
+  # control-plane-design.md, "Derived working set"): 30–60 concurrent sandboxes is
+  # the normal 300-seat load, 300 is the full-seat stress case. The DEFAULT below
+  # is the starter tier — a namespace that can schedule 300 pods is its own hazard,
+  # so the larger tiers are opt-in and require cluster capacity you have checked.
+  #
+  #   tier      runs  quota.pods  requestsCpu  requestsMemory  server limits   server.dbPool.maxConnections
+  #   starter     20        "20"         "10"          "20Gi"  1 / 1Gi         "" (25)
+  #   normal      60        "60"         "30"          "60Gi"  2 / 2Gi         "" (25)
+  #   full-seat  300       "300"        "150"         "300Gi"  4 / 4Gi         "60"
+  #
+  # The memory column is the SCHEDULING envelope (requests), not utilisation: the
+  # design notes actual use is expected to be lower. The 300-run tier needs ~300 GiB
+  # of schedulable sandbox memory across the cluster — check that before setting it.
+  # Server limits rise because the control plane's per-run costs (SSE tees, buffered
+  # request bodies, pool) scale with concurrency; dbPool rises because pool
+  # throughput is maxConnections / mean query time and the per-run pollers at 300
+  # runs are hundreds of queries a second. Confirm the database can take
+  # `replicas × (maxConnections + 2)` before raising the last column.
   quota:
     enabled: true
     pods: "20"

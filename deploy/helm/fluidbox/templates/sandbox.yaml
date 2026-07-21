@@ -79,6 +79,14 @@ spec:
     {{- end }}
 ---
 {{- if .Values.sandbox.quota.enabled }}
+# The ONLY admission gate on concurrent runs (there is no application-side
+# counter — see values.yaml sandbox.quota). It counts PODS and REJECTS: past
+# `pods`, the API server answers pod creation with 403 and the run fails at
+# provisioning rather than queueing. The three `hard` entries are one setting
+# expressed three ways — requestsCpu/requestsMemory must equal `pods` × the
+# per-pod requests in the LimitRange below, or whichever binds first is the real
+# ceiling. Helm cannot do the unit arithmetic to check that here; values.yaml
+# carries the tier table with the three numbers pre-computed.
 apiVersion: v1
 kind: ResourceQuota
 metadata:

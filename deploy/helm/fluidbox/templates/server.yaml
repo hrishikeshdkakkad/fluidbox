@@ -181,6 +181,18 @@ spec:
             # is unsafe (LOGIN/SUPERUSER/BYPASSRLS/inherited or foreign memberships).
             - { name: FLUIDBOX_RUNTIME_ROLE, value: {{ . | quote }} }
             {{- end }}
+            {{- with .Values.server.dbPool.maxConnections }}
+            # Phase F capacity knob. Rendered ONLY when set, so an unset value keeps
+            # the server's own default rather than pinning a copy of it in the chart.
+            # The deployment-wide figure is replicas × (this + 2 listener
+            # connections) — that is what has to fit the Postgres/Neon compute.
+            - { name: FLUIDBOX_DB_MAX_CONNECTIONS, value: {{ . | quote }} }
+            {{- end }}
+            {{- with .Values.server.maxRequestBodyBytes }}
+            # Buffered-body ceiling. Costs `value × concurrent requests` of server
+            # memory — raise server.resources.limits.memory with it.
+            - { name: FLUIDBOX_MAX_REQUEST_BODY_BYTES, value: {{ . | quote }} }
+            {{- end }}
             {{- if .Values.server.allowRlsBypass }}
             # Review M2 escape hatch: accept a pool role that bypasses RLS even in
             # multi-user mode. Local/single-user only — a hosted install must instead
