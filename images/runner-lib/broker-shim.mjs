@@ -15,6 +15,11 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import crypto from "node:crypto";
+import {
+  audienceMismatchDiagnostic,
+  isWrongAudienceRefusal,
+  EXIT_AUDIENCE_MISMATCH,
+} from "./contract.mjs";
 
 function requireEnv(k) {
   const v = process.env[k];
@@ -60,7 +65,25 @@ async function forward(toolName, args) {
       }),
       signal: ctrl.signal,
     });
-    const body = await res.json().catch(() => null);
+    // Read the body as TEXT first: a `wrong_audience` refusal has to be told
+    // apart from an ordinary refusal BEFORE it is flattened into an isError
+    // result the model would read as "denied by policy" and route around.
+    const text = await res.text().catch(() => "");
+    if (isWrongAudienceRefusal(res.status, text)) {
+      // Gap 10 fatal (same treatment as the runner contract): the shim's
+      // TOOL-INTENT credential is not the one this control plane's route
+      // guards expect. Exiting takes the stdio MCP server down loudly instead
+      // of serving denials for the rest of the run.
+      console.error(audienceMismatchDiagnostic(`${SERVER_NAME} tools/call`));
+      process.exit(EXIT_AUDIENCE_MISMATCH);
+    }
+    const body = (() => {
+      try {
+        return JSON.parse(text);
+      } catch {
+        return null;
+      }
+    })();
     if (!res.ok || !body) {
       return errText(`fluidbox broker returned HTTP ${res.status}`);
     }

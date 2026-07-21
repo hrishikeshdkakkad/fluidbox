@@ -43,9 +43,15 @@ const MODEL = env.MODEL || "gpt-5.4-mini";
 // Afterwards codex sees only the LLM token (its model-provider env_key) and the
 // tool-intent token; neither can post /result, forge /events, or renew tokens.
 //
-// DISCLOSED RESIDUAL: codex COUPLES model egress and exec — it needs the LLM
-// credential in its env, so codex-spawned shells can read the LLM token. That is
-// inherent to env_key auth (survey B §5); runner-control is what this closes.
+// DISCLOSED RESIDUALS, both of them:
+//  1. This is an env-VISIBILITY boundary, not a process one. Same-uid children
+//     can still read THIS process's INITIAL environment via /proc/<pid>/environ,
+//     which the delete does not rewrite; true isolation needs a uid split or a
+//     sidecar, which the current cap_drop=ALL + no-new-privileges hardening
+//     blocks (design :1326-1329). Identical to the claude runner's residual.
+//  2. codex COUPLES model egress and exec — it needs the LLM credential in its
+//     env, so codex-spawned shells can read the LLM token. That is inherent to
+//     env_key auth (survey B §5). Runner-control is what this delete closes.
 delete process.env.FLUIDBOX_SESSION_TOKEN;
 const CONTROL = env.CONTROL.replace(/\/$/, "");
 // Codex appends /responses to base_url; the facade route is /internal/llm/{*rest}.

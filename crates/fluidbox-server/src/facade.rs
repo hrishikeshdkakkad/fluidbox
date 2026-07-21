@@ -335,7 +335,7 @@ pub async fn messages(
     // is now the LLM-scoped token ONLY — a runner-control or tool-intent
     // credential can no longer spend the run's model budget. Refused at the auth
     // layer (like an unresolvable token), not as a dialect-shaped body.
-    if !crate::auth::audience_allows("llm", &sess_auth.audience) {
+    if !crate::auth::audience_allows(crate::auth::AUD_LLM, &sess_auth.audience) {
         return Err(ApiError::Forbidden("wrong_audience".into()));
     }
     let session_id = sess_auth.session_id;

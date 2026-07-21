@@ -82,22 +82,25 @@ impl ExecutionProvider for DockerProvider {
         self.ensure_network(&net_name, internal).await?;
 
         // Flat env, one container, one uid — unchanged by the Gap 10 audience
-        // split. The runner env already carries the control/tool/llm tokens under
-        // their own vars; the WORKSPACE token is appended here so the HostDev
-        // container holds the complete set.
+        // split. The runner env already carries the control/tool/llm tokens
+        // under their own vars, and that is ALL this container gets.
         //
-        // Docker deliberately does NOT get the k8s per-audience isolation: it
-        // bind-mounts the workspace (no init container, no `workspaced` fetch, so
-        // this var is inert here), and `HostDev` is explicitly NEVER a hosted
-        // security boundary (design :834) — one process, one uid, one env. The
-        // audience split still buys real blast-radius reduction here (a leaked
-        // llm/tool token cannot post /result or forge /events), but true
-        // per-audience process isolation is a hardened-provider property only.
-        let mut env: Vec<String> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-        env.push(format!(
-            "FLUIDBOX_WORKSPACE_TOKEN={}",
-            spec.tokens.workspace
-        ));
+        // The WORKSPACE token is deliberately NOT here. Docker is a HostDir
+        // transport: it bind-mounts /workspace, so no archive is ever packed
+        // (`orchestrator::run` skips `pack_and_store_archive`), the workspace
+        // route would 404 for these sessions, there is no init container, and
+        // nothing in either runner image reads `FLUIDBOX_WORKSPACE_TOKEN`. The
+        // token bought this container exactly nothing, so it does not get one —
+        // the same rule the k8s provider enforces structurally (workspace token
+        // to the init container ONLY), applied here by omission.
+        //
+        // Docker still does NOT get k8s's per-audience process isolation:
+        // `HostDev` is explicitly NEVER a hosted security boundary (design
+        // :834) — one process, one uid, one env. The audience split buys real
+        // blast-radius reduction here anyway (a leaked llm/tool token cannot
+        // post /result or forge /events); true per-audience process isolation
+        // is a hardened-provider property only.
+        let env: Vec<String> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
 
         let mut labels = HashMap::new();
         labels.insert(SESSION_LABEL.to_string(), spec.session_id.to_string());

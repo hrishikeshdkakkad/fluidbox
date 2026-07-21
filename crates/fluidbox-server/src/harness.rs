@@ -138,12 +138,23 @@ pub fn model_belongs(harness: &str, model: &str) -> bool {
 /// the CURRENT in-repo runner image (`default_runner_image` resolves from this
 /// deployment's config), and an in-flight session that predates the deploy holds
 /// a legacy `'all'` token that every route still accepts. The unsupported cell is
-/// an OLD image PINNED onto a NEW server: that image's runner-lib reads only
-/// `FLUIDBOX_SESSION_TOKEN` and would present the runner-CONTROL token at the
-/// tool gate, earning a 403 `wrong_audience`. We deliberately do NOT widen the
-/// guards to accept it — that would gut the split and the invariant-19
-/// acceptance bullet. Images ship IN this repo and deploy WITH the server; pin
-/// an old runner image across this boundary and the run fails closed, loudly.
+/// an OLD image PINNED onto a NEW server — reachable without a bad deploy, since
+/// `runner_image` is a per-revision API field that `inherit_unless_switched`
+/// carries forward: that image's runner-lib reads only `FLUIDBOX_SESSION_TOKEN`
+/// and presents the runner-CONTROL token at the tool gate, earning a 403
+/// `wrong_audience`. We deliberately do NOT widen the guards to accept it — that
+/// would gut the split and the invariant-19 acceptance bullet.
+///
+/// What that cell does, precisely: the runner-lib treats a `wrong_audience` body
+/// code as a FATAL misconfiguration — it logs a named diagnostic, records it on
+/// the run's timeline, and exits non-zero (`EXIT_AUDIENCE_MISMATCH`), so the run
+/// aborts at the first tool call and the heartbeat watchdog terminalizes it. The
+/// broker and sandbox-gate shims exit the same way. **Honest residual:** that
+/// behavior lives in the IMAGE, so it protects images built at or after it. An
+/// image built BEFORE it maps any 401/403 to `{decision:"deny"}` and would run
+/// to completion with every tool denied while model spend proceeded — the exact
+/// wrong-result-that-looks-right this closes going forward, and the reason the
+/// runner-lib change and this note ship together.
 pub fn runner_env(
     harness: &str,
     control_url: &str,
@@ -298,11 +309,13 @@ mod tests {
 
     #[test]
     fn default_runner_images_are_this_deployment_s_configured_images() {
-        // Gap 10 compat cell (see `runner_env`): the audience split is a coupled
-        // server+image change. A new session ALWAYS resolves its image from this
-        // server's own config, so a new server launches the runner images shipped
-        // with it — the only broken cell is an operator PINNING a pre-split image
-        // on a revision, which fails closed at the tool gate.
+        // What this pins, exactly: the DEFAULT image for each harness resolves
+        // from THIS deployment's config — nothing more. That is the half of the
+        // Gap 10 compat story this file owns (an unpinned revision therefore
+        // launches the runner image shipped with the running server). It says
+        // NOTHING about a PINNED image, whose skew behavior lives in the runner
+        // image and is asserted route-by-route by the CI `hardening` job; see
+        // `runner_env`'s doc for that cell.
         let mut cfg = test_cfg();
         cfg.sandbox_image = "ghcr.io/fluidbox/sandbox-runner:v9".into();
         cfg.codex_sandbox_image = "ghcr.io/fluidbox/codex-runner:v9".into();

@@ -352,13 +352,41 @@ impl FromRequestParts<AppState> for TriggerAuth {
     }
 }
 
+// ─── Audience names (Gap 10, invariant 19) ────────────────────────────────
+//
+// The audience a route requires is a NAMED constant, never a bare string
+// literal at the call site. The literals are indistinguishable to the compiler
+// and to every existing test — `events` asking for `"tool"` would build clean
+// and pass the whole suite — so this removes that typo class, and nothing more.
+//
+// It does NOT prove the mapping is right. That each route demands the audience
+// it SHOULD is proven route-by-route by the CI `hardening` job's negative
+// matrix (`scripts/hardening-e2e.sh`, plan Task 9) — that suite is the
+// authority on the mapping; these constants only make it hard to fat-finger.
+//
+// The values are the wire/DB vocabulary: migration 0020's CHECK constrains the
+// `api_tokens.audience` column to exactly this set, so changing a value here
+// without changing that CHECK breaks minting (pinned by a test below).
+
+/// Tool intent: `/permission` and `/tools/call`.
+pub const AUD_TOOL: &str = "tool";
+/// Runner control: `/events`, `/heartbeat`, `/result`, `/token/renew`.
+pub const AUD_CONTROL: &str = "control";
+/// Model egress at the LLM facade.
+pub const AUD_LLM: &str = "llm";
+/// The workspace archive route — the init container's ONLY credential.
+pub const AUD_WORKSPACE: &str = "workspace";
+/// The pre-split legacy audience: the `api_tokens.audience` column DEFAULT, so
+/// an in-flight session's single token (and the e2e forgers' rows) carry it.
+pub const AUD_ALL: &str = "all";
+
 /// True iff a token carrying `actual` audience may act on a route requiring
 /// `required` (Gap 10, invariant 19). The legacy `'all'` audience — a pre-split
 /// token minted before this deploy, or an e2e forger relying on the column
 /// DEFAULT — satisfies EVERY route (in-flight compat); otherwise the audiences
 /// must match exactly. Pure, so it is unit-tested without a DB.
 pub fn audience_allows(required: &str, actual: &str) -> bool {
-    actual == "all" || actual == required
+    actual == AUD_ALL || actual == required
 }
 
 /// Per-session authentication for the internal gateway. Resolves the bearer
@@ -488,16 +516,19 @@ mod tests {
     #[test]
     fn audience_matrix_allow_deny_and_legacy_all() {
         // The four route classes, as the plan's enforcement table (§Task 5).
-        for required in ["control", "tool", "llm", "workspace"] {
+        for required in [AUD_CONTROL, AUD_TOOL, AUD_LLM, AUD_WORKSPACE] {
             // Exact match allows.
             assert!(
                 audience_allows(required, required),
                 "{required} == {required}"
             );
             // Legacy 'all' passes EVERY route (in-flight compat).
-            assert!(audience_allows(required, "all"), "all satisfies {required}");
+            assert!(
+                audience_allows(required, AUD_ALL),
+                "all satisfies {required}"
+            );
             // Every OTHER scoped audience is refused on this route.
-            for actual in ["control", "tool", "llm", "workspace"] {
+            for actual in [AUD_CONTROL, AUD_TOOL, AUD_LLM, AUD_WORKSPACE] {
                 if actual != required {
                     assert!(
                         !audience_allows(required, actual),
@@ -508,10 +539,22 @@ mod tests {
         }
         // The load-bearing cell: neither a tool nor an llm token reaches
         // runner-control, and control reaches neither the gate nor the facade.
-        assert!(!audience_allows("control", "tool"));
-        assert!(!audience_allows("control", "llm"));
-        assert!(!audience_allows("tool", "control"));
-        assert!(!audience_allows("llm", "control"));
+        assert!(!audience_allows(AUD_CONTROL, AUD_TOOL));
+        assert!(!audience_allows(AUD_CONTROL, AUD_LLM));
+        assert!(!audience_allows(AUD_TOOL, AUD_CONTROL));
+        assert!(!audience_allows(AUD_LLM, AUD_CONTROL));
+    }
+
+    #[test]
+    fn audience_constants_match_the_migration_0020_check_vocabulary() {
+        // These constants ARE the wire/DB values: migration 0020 constrains
+        // `api_tokens.audience` to `('all','llm','tool','control','workspace')`,
+        // so renaming a value here without amending that CHECK would make token
+        // minting fail at runtime — a failure no other unit test would catch
+        // (they all read the same constants). Pinned against those literals.
+        let mut names = [AUD_ALL, AUD_LLM, AUD_TOOL, AUD_CONTROL, AUD_WORKSPACE];
+        names.sort_unstable();
+        assert_eq!(names, ["all", "control", "llm", "tool", "workspace"]);
     }
 
     #[test]
@@ -521,12 +564,12 @@ mod tests {
             session_id: Uuid::nil(),
             token: "fbx_sess_x".into(),
             scope: TenantScope::assume(Uuid::nil()),
-            audience: "tool".into(),
+            audience: AUD_TOOL.into(),
         };
         // A matching / legacy audience passes; a mismatch is 403 whose BODY
         // carries the machine-readable `wrong_audience` code (not just a status).
-        assert!(sa.require_audience("tool").is_ok());
-        let err = sa.require_audience("control").unwrap_err();
+        assert!(sa.require_audience(AUD_TOOL).is_ok());
+        let err = sa.require_audience(AUD_CONTROL).unwrap_err();
         assert_eq!(err.to_string(), "wrong_audience", "the 403 body error code");
         assert_eq!(
             err.into_response().status(),
@@ -537,10 +580,10 @@ mod tests {
             session_id: Uuid::nil(),
             token: "fbx_sess_y".into(),
             scope: TenantScope::assume(Uuid::nil()),
-            audience: "all".into(),
+            audience: AUD_ALL.into(),
         };
-        assert!(legacy.require_audience("control").is_ok());
-        assert!(legacy.require_audience("llm").is_ok());
+        assert!(legacy.require_audience(AUD_CONTROL).is_ok());
+        assert!(legacy.require_audience(AUD_LLM).is_ok());
     }
 
     #[test]

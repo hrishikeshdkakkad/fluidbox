@@ -963,20 +963,23 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
 
     // Mint the FOUR audience-scoped credentials the sandbox authenticates with
     // (Gap 10, invariant 19). One `api_tokens` row per audience, each valid ONLY
-    // on its routes; all keep the `fbx_sess_` prefix so the event.rs Redactor
-    // (which scrubs by prefix) covers every one. `revoke_session_tokens` revokes
-    // by session_id, so the terminal transition kills all four together.
+    // on its routes; all are built from `SESSION_TOKEN_PREFIX` — the SAME
+    // constant the event.rs redaction test derives its samples from — so the
+    // Redactor (which scrubs by prefix) covers every one and cannot silently
+    // drift off them. `revoke_session_tokens` revokes by session_id, so the
+    // terminal transition kills all four together.
+    let prefix = fluidbox_core::event::SESSION_TOKEN_PREFIX;
     let tokens = SandboxTokens {
-        control: format!("fbx_sess_{}", uuid_token()),
-        tool: format!("fbx_sess_{}", uuid_token()),
-        llm: format!("fbx_sess_{}", uuid_token()),
-        workspace: format!("fbx_sess_{}", uuid_token()),
+        control: format!("{prefix}{}", uuid_token()),
+        tool: format!("{prefix}{}", uuid_token()),
+        llm: format!("{prefix}{}", uuid_token()),
+        workspace: format!("{prefix}{}", uuid_token()),
     };
     for (token, audience) in [
-        (&tokens.control, "control"),
-        (&tokens.tool, "tool"),
-        (&tokens.llm, "llm"),
-        (&tokens.workspace, "workspace"),
+        (&tokens.control, crate::auth::AUD_CONTROL),
+        (&tokens.tool, crate::auth::AUD_TOOL),
+        (&tokens.llm, crate::auth::AUD_LLM),
+        (&tokens.workspace, crate::auth::AUD_WORKSPACE),
     ] {
         fluidbox_db::create_session_token(
             &state.pool,
@@ -1042,7 +1045,10 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
         env,
         // The provider routes these per-audience (k8s: one Secret key each) and
         // is the ONLY path the `workspace` token takes — it is deliberately
-        // absent from `env`, so the runner container never receives it.
+        // absent from `env`, and NEITHER provider puts it in the runner
+        // container: k8s hands it to the init container alone, Docker (a
+        // HostDir transport with no init container and no packed archive) does
+        // not hand it out at all.
         tokens: tokens.clone(),
         workspace_host_dir: workspace_dir.as_ref().map(|p| p.display().to_string()),
         workspace_archive,
