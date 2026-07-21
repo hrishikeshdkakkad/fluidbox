@@ -871,6 +871,7 @@ mod tests {
             name: name.into(),
             description: format!("does {name}"),
             input_schema: json!({"type": "object"}),
+            output_schema: None,
             annotations: None,
         }
     }
