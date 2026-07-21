@@ -544,6 +544,7 @@ pub async fn create(
             &state,
             scope,
             fluidbox_db::ConnectionViewer::All,
+            crate::api::LocalPathAuthority::of(&principal),
             input,
         )
         .await?

@@ -32,6 +32,24 @@ const MAX_SCHEMA_DEPTH: usize = 32;
 const MAX_ARGS_BYTES: usize = 1024 * 1024;
 /// Argument-blob nesting ceiling (design `:1352`), checked ITERATIVELY.
 const MAX_ARGS_DEPTH: usize = 64;
+/// Frozen-schema NODE ceiling — every object member and array element counted in
+/// the same traversal that bounds depth. Size and depth alone do not bound the
+/// *number of keywords*: a ≤256 KiB, ≤32-deep schema can still carry tens of
+/// thousands of assertions. The largest real MCP tool schemas are tens to low
+/// hundreds of nodes, so 20 000 is ~100× headroom over anything legitimate.
+const MAX_SCHEMA_NODES: usize = 20_000;
+/// Frozen-schema REGEX ceiling: every `pattern`/`propertyNames` occurrence plus
+/// every member of a `patternProperties` object. This is the multiplicand in the
+/// blowup — each pattern may be tried against each instance member — so it is
+/// bounded separately and tightly. A legitimate tool schema uses a handful of
+/// patterns; 64 is already far past plausible.
+const MAX_SCHEMA_PATTERNS: usize = 64;
+/// Argument-blob NODE ceiling — the other multiplicand. 1 MiB of
+/// `{"a1":1,"a2":1,…}` is >100 000 members; a real tool call is tens. With
+/// [`MAX_SCHEMA_PATTERNS`] this caps whole-validation regex work at
+/// 64 × 10 000 = 640 000 linear (`regex`-crate, backtracking-free) matches over
+/// short keys — bounded milliseconds, decided BEFORE the first regex runs.
+const MAX_ARGS_NODES: usize = 10_000;
 /// Cap on the JSON-pointer paths reported for a rejected argument blob — bounded
 /// so a hostile schema cannot balloon the gate's deny message.
 const MAX_POINTERS: usize = 8;
@@ -73,15 +91,26 @@ pub fn dialect_for(protocol_version: Option<&str>) -> SchemaDialect {
 /// Rejects, in ONE iterative traversal (an explicit stack — never recurses, so a
 /// pathologically deep tree returns `Err` instead of overflowing the stack):
 /// - nesting deeper than [`MAX_SCHEMA_DEPTH`];
+/// - more than [`MAX_SCHEMA_NODES`] members/elements in total;
+/// - more than [`MAX_SCHEMA_PATTERNS`] regex-bearing keywords;
 /// - a `$ref` or `$dynamicRef` whose STRING value does not start with `#`
 ///   (external references are refused; a non-string value under those keys is a
 ///   property literally named `$ref`, not a reference, and is left alone).
 ///
 /// Then, once depth is known bounded, a serialized-size check ≤ [`MAX_SCHEMA_BYTES`].
+///
+/// The node + pattern counts are what bound VALIDATION COST, not just parse
+/// cost: bytes and depth leave the keyword count free, and the pinned
+/// `jsonschema` collects a keyword's errors eagerly, so `iter_errors`'
+/// 8-pointer break happens far too late to help. Both counters are decided in
+/// this pre-compile pass, before any regex is built or run.
 pub fn guard_schema(schema: &Value) -> Result<(), String> {
-    // ONE iterative DFS: bound depth AND screen every $ref/$dynamicRef. The
-    // depth screen runs BEFORE any serialization, so a pathologically deep tree
-    // is rejected here and the size check below never recurses into it.
+    // ONE iterative DFS: bound depth + node count + pattern count AND screen
+    // every $ref/$dynamicRef. The depth screen runs BEFORE any serialization, so
+    // a pathologically deep tree is rejected here and the size check below never
+    // recurses into it.
+    let mut nodes: usize = 0;
+    let mut patterns: usize = 0;
     let mut stack: Vec<(&Value, usize)> = vec![(schema, 1)];
     while let Some((node, depth)) = stack.pop() {
         if depth > MAX_SCHEMA_DEPTH {
@@ -89,8 +118,32 @@ pub fn guard_schema(schema: &Value) -> Result<(), String> {
                 "frozen schema nests deeper than {MAX_SCHEMA_DEPTH} levels"
             ));
         }
+        nodes += 1;
+        if nodes > MAX_SCHEMA_NODES {
+            return Err(format!(
+                "frozen schema carries more than {MAX_SCHEMA_NODES} nodes"
+            ));
+        }
         match node {
             Value::Object(map) => {
+                // Regex-bearing keywords: `pattern`/`propertyNames` count once;
+                // `patternProperties` counts ONE PER MEMBER (each member key is
+                // its own regex). Counted whatever the value's type — a hostile
+                // schema does not get to hide behind a wrong-typed value.
+                if map.contains_key("pattern") {
+                    patterns += 1;
+                }
+                if map.contains_key("propertyNames") {
+                    patterns += 1;
+                }
+                if let Some(Value::Object(pp)) = map.get("patternProperties") {
+                    patterns += pp.len();
+                }
+                if patterns > MAX_SCHEMA_PATTERNS {
+                    return Err(format!(
+                        "frozen schema carries more than {MAX_SCHEMA_PATTERNS} regex patterns"
+                    ));
+                }
                 for (key, val) in map {
                     if (key == "$ref" || key == "$dynamicRef") && val.is_string() {
                         // A STRING value under $ref/$dynamicRef IS a reference —
@@ -127,12 +180,20 @@ pub fn guard_schema(schema: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// Iteratively confirm `value` nests no deeper than `max_depth` (explicit stack,
-/// never recurses). The pre-guard for both frozen schemas and argument blobs.
-fn within_depth(value: &Value, max_depth: usize) -> bool {
+/// Iteratively confirm `value` nests no deeper than `max_depth` AND carries no
+/// more than `max_nodes` members/elements (explicit stack, never recurses). The
+/// node count is the argument-side half of the validation-cost bound: it is what
+/// stops a 1 MiB blob of 100 000 tiny members from being matched against every
+/// pattern the frozen schema declares.
+fn within_bounds(value: &Value, max_depth: usize, max_nodes: usize) -> bool {
+    let mut nodes: usize = 0;
     let mut stack: Vec<(&Value, usize)> = vec![(value, 1)];
     while let Some((node, depth)) = stack.pop() {
         if depth > max_depth {
+            return false;
+        }
+        nodes += 1;
+        if nodes > max_nodes {
             return false;
         }
         match node {
@@ -182,13 +243,14 @@ impl ArgsRejection {
 
 /// Validate `args` against a pre-compiled frozen-schema `validator`. Pre-guards
 /// the argument blob (untrusted from the model/sandbox) to [`MAX_ARGS_BYTES`] /
-/// [`MAX_ARGS_DEPTH`] first, then collects up to [`MAX_POINTERS`] distinct
-/// failing JSON-pointer paths. `Ok(())` = the args satisfy the schema.
+/// [`MAX_ARGS_DEPTH`] / [`MAX_ARGS_NODES`] first, then collects up to
+/// [`MAX_POINTERS`] distinct failing JSON-pointer paths. `Ok(())` = the args
+/// satisfy the schema.
 pub fn validate_instance(validator: &Validator, args: &Value) -> Result<(), ArgsRejection> {
-    // Pre-guard the untrusted argument blob: depth FIRST (iterative — a deep
-    // blob is rejected here, never overflowing the validator's recursion), then
-    // size once depth is bounded.
-    if !within_depth(args, MAX_ARGS_DEPTH)
+    // Pre-guard the untrusted argument blob: depth + node count FIRST (one
+    // iterative pass — a deep blob is rejected here, never overflowing the
+    // validator's recursion; a wide one never reaches a regex), then size.
+    if !within_bounds(args, MAX_ARGS_DEPTH, MAX_ARGS_NODES)
         || serde_json::to_vec(args)
             .map(|v| v.len())
             .unwrap_or(usize::MAX)
@@ -457,6 +519,109 @@ mod tests {
             "a 10k-deep tree must be rejected iteratively, not crash"
         );
         std::mem::forget(a);
+    }
+
+    /// The combinatorial-cost bomb (NOT ReDoS): a schema that is legal, small
+    /// (well under 256 KiB), shallow (2 levels) and whose every regex is trivial
+    /// and linear — but which declares THOUSANDS of `patternProperties`, each of
+    /// which the validator would try against EVERY member of a ≤1 MiB argument
+    /// object. Bytes + depth do not bound that product; the node/pattern
+    /// counters do, and they decide before a single regex is compiled or run.
+    fn cost_bomb() -> (Value, Value) {
+        let mut pp = serde_json::Map::new();
+        for i in 0..3_000 {
+            pp.insert(format!("^k{i}x"), json!({"type": "string"}));
+        }
+        let schema = json!({"type": "object", "patternProperties": pp});
+        let mut args = serde_json::Map::new();
+        for i in 0..30_000 {
+            args.insert(format!("k{i}x"), json!(1));
+        }
+        (schema, Value::Object(args))
+    }
+
+    #[test]
+    fn keyword_and_property_bomb_is_refused_before_any_regex_runs() {
+        let (schema, args) = cost_bomb();
+        // Preconditions: the bomb passes EVERY pre-existing bound, so this test
+        // is about the new counters and not about size/depth catching it.
+        assert!(
+            serde_json::to_vec(&schema).unwrap().len() < MAX_SCHEMA_BYTES,
+            "the bomb schema must be under the byte cap or it proves nothing"
+        );
+        assert!(within_bounds(&schema, MAX_SCHEMA_DEPTH, usize::MAX));
+        assert!(serde_json::to_vec(&args).unwrap().len() < MAX_ARGS_BYTES);
+        assert!(within_bounds(&args, MAX_ARGS_DEPTH, usize::MAX));
+
+        let start = std::time::Instant::now();
+        let err = guard_schema(&schema).expect_err("the pattern bomb must be refused");
+        assert!(err.contains("regex patterns"), "got: {err}");
+        // The schema never compiles, so validate_args reports the compile-free
+        // refusal path; the whole decision is counting, not matching.
+        assert!(validate_args(&schema, &args, SchemaDialect::Draft2020_12).is_err());
+        // A cache MISS runs the same guard (the gate's real path).
+        let cache = SchemaCache::new(4);
+        assert!(cache
+            .get_or_compile("dbomb", "t", &schema, SchemaDialect::Draft2020_12)
+            .is_err());
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "the bomb must be refused by COUNTING, not by validating: took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_node_counts_are_refused_on_both_sides() {
+        // Schema side: many nodes, no patterns at all, still refused.
+        let mut props = serde_json::Map::new();
+        for i in 0..(MAX_SCHEMA_NODES + 10) {
+            props.insert(format!("p{i}"), json!({}));
+        }
+        let wide = json!({"type": "object", "properties": props});
+        let err = guard_schema(&wide).expect_err("a node bomb must be refused");
+        assert!(err.contains("nodes"), "got: {err}");
+        // Argument side: a wide blob is refused by the pre-guard, under the
+        // byte cap, against a schema with no keywords to blow up on.
+        let mut args = serde_json::Map::new();
+        for i in 0..(MAX_ARGS_NODES + 10) {
+            args.insert(format!("a{i}"), json!(1));
+        }
+        let args = Value::Object(args);
+        assert!(serde_json::to_vec(&args).unwrap().len() < MAX_ARGS_BYTES);
+        assert!(validate_args(&json!({"type": "object"}), &args, SchemaDialect::Draft7).is_err());
+        // FALSE-GREEN guard: the SAME shapes just under the caps still pass, so
+        // the two refusals above are about the ceilings, not about width itself.
+        let mut ok_props = serde_json::Map::new();
+        for i in 0..100 {
+            ok_props.insert(format!("p{i}"), json!({}));
+        }
+        guard_schema(&json!({"type": "object", "properties": ok_props})).unwrap();
+        let mut ok_args = serde_json::Map::new();
+        for i in 0..100 {
+            ok_args.insert(format!("a{i}"), json!(1));
+        }
+        validate_args(
+            &json!({"type": "object"}),
+            &Value::Object(ok_args),
+            SchemaDialect::Draft7,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn ordinary_pattern_keywords_still_pass() {
+        // A realistic tool schema with a few patterns is unaffected.
+        guard_schema(&json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "pattern": "^[a-z0-9-]+$"},
+                "tag": {"type": "string", "pattern": "^v\\d+$"}
+            },
+            "patternProperties": {"^x-": {"type": "string"}},
+            "propertyNames": {"pattern": "^[a-z]"}
+        }))
+        .unwrap();
     }
 
     // ── validate_args: both dialects, valid + invalid ───────────────────────

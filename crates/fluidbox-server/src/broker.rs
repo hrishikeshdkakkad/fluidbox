@@ -70,6 +70,12 @@ pub struct BrokeredAuth {
     pub header: String,
     pub value: String,
     pub oauth_connection: Option<uuid::Uuid>,
+    /// The connection's `authorization_generation` AS OF resolution. Carried so
+    /// a status write derived from this credential's outcome can be conditioned
+    /// on it: a hostile server can hold a request open while the owner
+    /// reconnects, then answer `insufficient_scope`, and an unconditional write
+    /// would mark the NEW, freshly-authorized generation `error`.
+    pub generation: i32,
 }
 
 impl BrokeredAuth {
@@ -224,6 +230,7 @@ pub async fn brokered_auth_for_conn(
             header: "authorization".into(),
             value: format!("Bearer {access}"),
             oauth_connection: Some(conn.id),
+            generation: conn.authorization_generation,
         }));
     }
     let sealer = state
@@ -269,6 +276,7 @@ pub async fn brokered_auth_for_conn(
         header,
         value: compose_header_value(scheme, &token),
         oauth_connection: None,
+        generation: conn.authorization_generation,
     }))
 }
 
@@ -789,8 +797,9 @@ async fn dial_rpc(
     let session_id = header_str(&res, "mcp-session-id");
     let www_authenticate = header_str(&res, "www-authenticate");
     let content_type = header_str(&res, "content-type").unwrap_or_default();
-    let is_sse = content_type.contains("event-stream");
-    let is_json = content_type.contains("application/json");
+    let media_type = media_type_of(&content_type);
+    let is_sse = media_type == "text/event-stream";
+    let is_json = media_type == "application/json";
     // R3.3: refuse an over-large advertised body BEFORE buffering it in memory.
     // Sent + a response received but unusable ⇒ Ambiguous.
     if let Some(len) = res.content_length() {
@@ -842,6 +851,23 @@ async fn dial_rpc(
         www_authenticate,
         value,
     })
+}
+
+/// The bare media type of a `Content-Type` header: parameters (`; charset=…`)
+/// dropped, surrounding whitespace trimmed, ASCII-lowercased (RFC 9110 §8.3 —
+/// the type is case-insensitive, its parameters are not our business).
+///
+/// This must be an EXACT comparison, never a substring one: `contains
+/// ("application/json")` also accepts `application/jsonp`,
+/// `application/json-seq`, `x-application/json` and `application/json+evil`,
+/// none of which is the JSON-RPC framing we parse.
+fn media_type_of(header: &str) -> String {
+    header
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
 }
 
 /// Build the POST with content-type/accept + auth + session headers.
@@ -1040,9 +1066,13 @@ fn unwrap_result(value: Value, method: &str) -> Result<Value, String> {
 
 /// How the negotiated protocol version is validated after `initialize`.
 enum VersionPolicy<'a> {
-    /// Discovery/photograph: accept ANY non-empty version (it is what the
-    /// snapshot RECORDS — survey A §2e), so a server speaking a valid-but-
-    /// non-standard revision can still be photographed.
+    /// Discovery/photograph: the version is what the snapshot RECORDS, so it
+    /// must be one we actually speak ([`SUPPORTED_PROTOCOLS`]). Recording an
+    /// arbitrary string would let a hostile server PERSIST a version outside the
+    /// supported set and then be honored forever by the runtime snapshot-equality
+    /// check — and `schema_guard::dialect_for` would silently interpret its
+    /// schemas as draft-07. Gap 8's supported-set requirement is enforced on BOTH
+    /// paths, not just at runtime.
     Record,
     /// A runtime call: the negotiated version must be one we speak
     /// ([`SUPPORTED_PROTOCOLS`]), OR — once Task 3 threads it — exactly the
@@ -1050,26 +1080,33 @@ enum VersionPolicy<'a> {
     Enforce { snapshot: Option<&'a str> },
 }
 
-/// Validate a runtime-call negotiated version (E5). `snapshot` is the frozen
-/// surface's `protocol_version` when present (Task 3 threads it): when it is
-/// `Some`, the ONLY requirement is an exact match (a server that photographed as
-/// X must still speak X — otherwise it drifted); when `None`, membership in
-/// [`SUPPORTED_PROTOCOLS`]. Never enforced on the discovery path (see
-/// [`VersionPolicy::Record`]).
+/// Validate a runtime-call negotiated version (E5). Membership in
+/// [`SUPPORTED_PROTOCOLS`] is required UNCONDITIONALLY — a snapshot match is an
+/// ADDITIONAL requirement, never a substitute for one. (It used to be a
+/// substitute: a snapshot frozen before the discovery path enforced the
+/// supported set, or written by an older binary, could pin `"attacker-version"`,
+/// and exact equality alone then kept honoring it — while
+/// `schema_guard::dialect_for` read anything non-`2025-11-25` as draft-07.)
+/// `snapshot` is the frozen surface's `protocol_version` when present: `Some` ⇒
+/// supported AND equal (a server that photographed as X must still speak X,
+/// otherwise it drifted); `None` (legacy surfaces / the embedded-connection
+/// path) ⇒ supported.
 fn check_negotiated(negotiated: &str, snapshot: Option<&str>) -> Result<(), String> {
     if negotiated.is_empty() {
         return Err("mcp server negotiated no protocol version".into());
     }
+    if !SUPPORTED_PROTOCOLS.contains(&negotiated) {
+        return Err(format!(
+            "mcp server negotiated unsupported protocol version '{negotiated}' (supported: {})",
+            SUPPORTED_PROTOCOLS.join(", ")
+        ));
+    }
     match snapshot.filter(|s| !s.is_empty()) {
+        None => Ok(()),
         Some(snap) if negotiated == snap => Ok(()),
         Some(snap) => Err(format!(
             "mcp protocol drift: server now negotiates '{negotiated}' but this run's frozen \
              snapshot recorded '{snap}' — run POST /v1/connections/{{id}}/tools/refresh to re-photograph"
-        )),
-        None if SUPPORTED_PROTOCOLS.contains(&negotiated) => Ok(()),
-        None => Err(format!(
-            "mcp server negotiated unsupported protocol version '{negotiated}' (supported: {})",
-            SUPPORTED_PROTOCOLS.join(", ")
         )),
     }
 }
@@ -1157,6 +1194,28 @@ async fn ensure_initialized(
             if negotiated.is_empty() {
                 return Err(CallErr::Other(
                     "mcp server negotiated no protocolVersion at initialize — cannot record a trustworthy snapshot".into(),
+                ));
+            }
+            // The recorded version must be one we SPEAK: a snapshot is
+            // long-lived and is later honored by exact match, so an
+            // out-of-set string persisted here would be an unsupported
+            // version accepted forever (and read as draft-07 by
+            // `schema_guard::dialect_for`).
+            if !SUPPORTED_PROTOCOLS.contains(&negotiated.as_str()) {
+                return Err(CallErr::Other(format!(
+                    "mcp server negotiated unsupported protocol version '{negotiated}' (supported: {}) — refusing to record it",
+                    SUPPORTED_PROTOCOLS.join(", ")
+                )));
+            }
+            // A tool surface is only photographable from a server that
+            // DECLARES the `tools` capability (MCP `initialize` result). Not
+            // enforced on the runtime path: the frozen snapshot is already
+            // proof the server declared it when photographed, and re-checking
+            // there would break in-flight runs over a server's cosmetic reply
+            // change rather than over anything security-relevant.
+            if result.pointer("/capabilities/tools").is_none() {
+                return Err(CallErr::Other(
+                    "mcp server did not declare the 'tools' capability at initialize — refusing to photograph a tool surface".into(),
                 ));
             }
         }
@@ -1451,13 +1510,21 @@ async fn insufficient_scope_outcome(
 ) -> DispatchOutcome {
     if let Some(cid) = insufficient_scope_target(auth) {
         let rejected = auth.and_then(|a| a.oauth_access()).unwrap_or("");
-        mark_insufficient_scope(state, scope, cid, rejected, challenge_scope).await;
+        let generation = auth.map(|a| a.generation).unwrap_or(0);
+        mark_insufficient_scope(state, scope, cid, generation, rejected, challenge_scope).await;
     }
     DispatchOutcome::Definitive {
         content: err_content("insufficient scope — reconnect the connection with more scopes"),
         is_error: true,
         structured: None,
     }
+}
+
+/// The generation CAS predicate for a credential-outcome status write: the
+/// connection's CURRENT generation must be exactly the one the credential was
+/// resolved at. `None` (row unreadable/gone) is FAIL-CLOSED — no write.
+fn generation_unchanged(current: Option<i32>, expected: i32) -> bool {
+    current == Some(expected)
 }
 
 /// SEP-835 (E8): mark a connection `status='error'` with a reconnect-with-more-
@@ -1468,6 +1535,7 @@ async fn mark_insufficient_scope(
     state: &AppState,
     scope: fluidbox_db::TenantScope,
     connection_id: uuid::Uuid,
+    expected_generation: i32,
     rejected_token: &str,
     challenge_scope: Option<String>,
 ) {
@@ -1478,9 +1546,29 @@ async fn mark_insufficient_scope(
         None => "insufficient_scope: reconnect with more scopes".to_string(),
     };
     if let Ok(mut tx) = fluidbox_db::scoped_tx(&state.pool, scope).await {
-        if fluidbox_db::mark_connection_error(&mut *tx, scope, connection_id, &note)
+        // GENERATION GATE: this challenge answers the credential resolved at
+        // `expected_generation`. A malicious server can stall the request while
+        // the owner reconnects (which BUMPS the generation and re-activates the
+        // connection); writing unconditionally would then disable an authority
+        // this response says nothing about. Read the current generation in the
+        // SAME transaction as the write and skip when it has moved.
+        //
+        // RESIDUAL, stated honestly: under READ COMMITTED the read and the
+        // update are separate statements, so a bump committing between them can
+        // still slip through. Closing it fully needs the predicate IN the write:
+        // `fluidbox_db::mark_connection_error` should take an
+        // `expected_generation` and add `and authorization_generation = $n` to
+        // its UPDATE (that crate is owned elsewhere). This gate turns an
+        // unbounded stall-then-write into a microsecond window.
+        let current = fluidbox_db::get_connection(&mut *tx, scope, connection_id)
             .await
-            .is_ok()
+            .ok()
+            .flatten()
+            .map(|c| c.authorization_generation);
+        if generation_unchanged(current, expected_generation)
+            && fluidbox_db::mark_connection_error(&mut *tx, scope, connection_id, &note)
+                .await
+                .is_ok()
         {
             tx.commit().await.ok();
         }
@@ -1595,9 +1683,10 @@ async fn discover_tools(
 
 /// The forced-negotiation photograph (design :298-343; Phase C). Rides the SAME
 /// initialize-first machinery as the runtime call path ([`ensure_initialized`]);
-/// records a REAL negotiated protocol version (`Record` accepts any non-empty
-/// one, so a valid-but-non-standard revision can still be photographed — survey
-/// A §2e), and — per design :1282-1283 — fails when a `nextCursor` still remains
+/// records a REAL negotiated protocol version — one from [`SUPPORTED_PROTOCOLS`]
+/// (a snapshot is later honored by exact match, so recording an out-of-set
+/// string would make an unsupported version permanently acceptable), and — per
+/// design :1282-1283 — fails when a `nextCursor` still remains
 /// after the page cap (freeze the whole surface or none). The remote list is
 /// untrusted input: it passes core's IDENTICAL `validate_tools` screen (charset,
 /// poison-screen, caps) before it can become a snapshot. Uses a throwaway
@@ -1768,9 +1857,7 @@ pub async fn call_tool_auth(
         None,
     )
     .await;
-    state
-        .governor
-        .report(&host, breaker_signal(&first));
+    state.governor.report(&host, breaker_signal(&first));
     match first {
         Err(CallErr::Unauthorized) => {
             // A 401 proves the tool never executed. Static credential ⇒ terminal
@@ -1797,9 +1884,7 @@ pub async fn call_tool_auth(
                         None,
                     )
                     .await;
-                    state
-                        .governor
-                        .report(&host, breaker_signal(&retry));
+                    state.governor.report(&host, breaker_signal(&retry));
                     outcome_from_call(retry)
                 }
                 // Re-mint failure = auth resolution failure ⇒ never sent.
@@ -1871,9 +1956,7 @@ pub async fn call_tool_for_conn(
         snapshot,
     )
     .await;
-    state
-        .governor
-        .report(&host, breaker_signal(&first));
+    state.governor.report(&host, breaker_signal(&first));
     match first {
         Err(CallErr::Unauthorized) => {
             // A 401 proves the tool never executed. Static credential ⇒ terminal
@@ -1906,9 +1989,7 @@ pub async fn call_tool_for_conn(
                         snapshot,
                     )
                     .await;
-                    state
-                        .governor
-                        .report(&host, breaker_signal(&retry));
+                    state.governor.report(&host, breaker_signal(&retry));
                     outcome_from_call(retry)
                 }
                 Err(e) => DispatchOutcome::NeverSent(e),
@@ -2132,6 +2213,51 @@ mod tests {
         assert!(SERVER_REQUEST_REPLY_BUDGET + MCP_DELETE_TIMEOUT < Duration::from_secs(600));
     }
 
+    /// A stale SEP-835 response must not disable a FRESHLY REAUTHORIZED
+    /// connection. A malicious server can hold a request open while the owner
+    /// reconnects — which bumps `authorization_generation` and re-activates the
+    /// connection — and then answer `insufficient_scope`. The write is therefore
+    /// conditioned on the generation the CREDENTIAL was resolved at, and the
+    /// credential carries it (`BrokeredAuth::generation`).
+    #[test]
+    fn insufficient_scope_write_is_generation_conditioned() {
+        // Same generation ⇒ the response is about the authority we used.
+        assert!(generation_unchanged(Some(3), 3));
+        // Moved (owner reconnected mid-call) ⇒ never write.
+        assert!(!generation_unchanged(Some(4), 3));
+        assert!(!generation_unchanged(Some(2), 3));
+        // Unreadable/gone ⇒ FAIL CLOSED, not "assume it matches".
+        assert!(!generation_unchanged(None, 3));
+
+        // The credential must actually carry a generation to condition on…
+        let auth = BrokeredAuth {
+            generation: 7,
+            header: "authorization".into(),
+            value: "Bearer x".into(),
+            oauth_connection: Some(uuid::Uuid::now_v7()),
+        };
+        assert_eq!(auth.generation, 7);
+        // …and the ONE status write on this path must be gated by the predicate,
+        // never called bare.
+        // The needle is assembled at runtime so this assertion does not count
+        // its own source text (the same trick the neighbouring source test uses).
+        let src = include_str!("broker.rs");
+        let needle = format!(
+            "fluidbox_db::{}(&mut *tx, scope, connection_id",
+            "mark_connection_error"
+        );
+        assert_eq!(
+            src.matches(&needle).count(),
+            1,
+            "broker's insufficient-scope write must stay a single, gated call site"
+        );
+        let at = src.find(&needle).expect("the write exists");
+        assert!(
+            src[at.saturating_sub(200)..at].contains("generation_unchanged"),
+            "the status write is not guarded by the generation CAS"
+        );
+    }
+
     #[test]
     fn insufficient_scope_marks_only_an_oauth_connection() {
         // I6: a hostile MCP server picks its own WWW-Authenticate header, so this
@@ -2141,11 +2267,13 @@ mod tests {
         // exactly the case the SEP-835 remedy was written for.
         let cid = uuid::Uuid::now_v7();
         let oauth = BrokeredAuth {
+            generation: 1,
             header: "authorization".into(),
             value: "Bearer tok".into(),
             oauth_connection: Some(cid),
         };
         let static_key = BrokeredAuth {
+            generation: 1,
             header: "x-api-key".into(),
             value: "sk-static".into(),
             oauth_connection: None,
@@ -2189,28 +2317,29 @@ mod tests {
         );
         // Empty negotiated is always a failure.
         assert!(check_negotiated("", None).is_err());
-        // With a frozen snapshot, an EXACT match passes even if non-standard
-        // (a server photographed at X must still speak X) …
-        assert!(check_negotiated("2025-06-18-fakekb-1", Some("2025-06-18-fakekb-1")).is_ok());
+        // With a frozen snapshot, an EXACT match passes — but ONLY for a
+        // SUPPORTED version: equality is an ADDITIONAL requirement, never a
+        // substitute for membership.
+        assert!(check_negotiated("2025-06-18", Some("2025-06-18")).is_ok());
         // … and any divergence is protocol drift (remedy names /tools/refresh).
         let e = check_negotiated("2025-11-25", Some("2025-06-18")).unwrap_err();
         assert!(
             e.contains("drift") && e.contains("tools/refresh"),
             "got: {e}"
         );
-        // The bindings-e2e fakekb scenario in miniature (Gap 12): a NON-standard
-        // negotiated version is ACCEPTED only because Task 3 threads the frozen
-        // surface's `protocol_version` as the snapshot — with plain SUPPORTED-set
-        // membership (None), the SAME version would be rejected. This is exactly
-        // the flip `call_tool_for_conn` now performs by passing the surface's
-        // `protocol_version` down.
-        let fakekb = "2025-06-18-fakekb-1";
+        // A NON-standard version is refused on BOTH paths now. It used to be
+        // accepted whenever the frozen snapshot recorded the same string, which
+        // is what let a hostile server persist its own "version" at discovery
+        // and then be honored forever (and read as draft-07 by
+        // `schema_guard::dialect_for`). The bindings-e2e fake was the only user
+        // of that latitude and now negotiates a supported revision.
+        let nonstandard = "2025-06-18-fakekb-1";
         assert!(
-            check_negotiated(fakekb, Some(fakekb)).is_ok(),
-            "the frozen surface version must accept the fakekb negotiation"
+            check_negotiated(nonstandard, Some(nonstandard)).is_err(),
+            "snapshot equality must NOT substitute for supported-set membership"
         );
         assert!(
-            check_negotiated(fakekb, None).is_err(),
+            check_negotiated(nonstandard, None).is_err(),
             "without the threaded snapshot, plain SUPPORTED membership rejects fakekb"
         );
     }
@@ -3188,6 +3317,214 @@ mod tests {
         assert!(good.is_ok(), "2025-06-18 must be accepted: {good:?}");
     }
 
+    /// Gap 8's supported-set requirement must bind on BOTH paths. A hostile
+    /// server used to be able to negotiate `"attacker-version"` at DISCOVERY
+    /// (`VersionPolicy::Record` accepted any non-empty string), persist it into
+    /// the snapshot, and then keep executing forever because the runtime check
+    /// was satisfied by exact snapshot EQUALITY before any membership test —
+    /// while `schema_guard::dialect_for` read that same string as draft-07.
+    #[tokio::test]
+    async fn unsupported_version_is_refused_at_record_and_at_runtime_despite_snapshot_match() {
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let record = |url: String| {
+            let (client, policy) = (client.clone(), policy.clone());
+            async move {
+                let mut sess = McpUpstreamSession::fresh(&url);
+                ensure_initialized(
+                    &client,
+                    &policy,
+                    &url,
+                    None,
+                    &mut sess,
+                    VersionPolicy::Record,
+                )
+                .await
+                .map_err(|e| e.into_msg())
+            }
+        };
+        let runtime = |url: String, snapshot: &'static str| {
+            let (client, policy) = (client.clone(), policy.clone());
+            async move {
+                let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
+                managed_call(
+                    &client,
+                    &policy,
+                    &url,
+                    None,
+                    &entry,
+                    "tools/call",
+                    json!({ "name": "x", "arguments": {} }),
+                    Some(snapshot),
+                )
+                .await
+                .map_err(|e| e.into_msg())
+            }
+        };
+
+        // 1. DISCOVERY refuses to RECORD an out-of-set version.
+        let (bad_url, bad_recs, jh1) = spawn_fake(basic_handler("attacker-version")).await;
+        let rec_err = record(bad_url.clone())
+            .await
+            .expect_err("recording an unsupported version must be refused");
+        assert!(
+            rec_err.contains("attacker-version") && rec_err.contains("unsupported"),
+            "got: {rec_err}"
+        );
+        // 2. RUNTIME refuses it too, even though the snapshot matches EXACTLY —
+        //    the pre-existing rows a stricter discovery path cannot retract.
+        let run_err = runtime(bad_url, "attacker-version")
+            .await
+            .expect_err("an unsupported version must not be honored via snapshot equality");
+        assert!(
+            run_err.contains("attacker-version") && run_err.contains("unsupported"),
+            "got: {run_err}"
+        );
+        jh1.abort();
+        assert!(count_rpc(&bad_recs, "initialize") > 0, "dead bad fake");
+
+        // FALSE-GREEN guard: a SUPPORTED version records and runs, so the two
+        // refusals above are about the supported set and not about the fixture.
+        let (ok_url, ok_recs, jh2) = spawn_fake(basic_handler("2025-06-18")).await;
+        record(ok_url.clone())
+            .await
+            .expect("a supported version records");
+        assert!(
+            runtime(ok_url, "2025-06-18").await.is_ok(),
+            "a supported, snapshot-matching version must still run"
+        );
+        jh2.abort();
+        assert!(count_rpc(&ok_recs, "initialize") > 0, "dead ok fake");
+    }
+
+    /// MCP conformance: a server must DECLARE `tools` in its `initialize`
+    /// capabilities before we photograph a tool surface from it. Enforced on the
+    /// discovery path only — a frozen snapshot is already proof the server
+    /// declared it when photographed, and re-checking at runtime would break
+    /// in-flight runs over a cosmetic reply change.
+    #[tokio::test]
+    async fn photographing_requires_a_declared_tools_capability() {
+        let no_tools: Handler =
+            Arc::new(move |_idx, rec: &Recorded| match rec.rpc_method.as_str() {
+                "initialize" => FakeReply::json(
+                    200,
+                    rpc_result(
+                        rec,
+                        json!({
+                            "protocolVersion": "2025-11-25",
+                            "capabilities": { "prompts": {} },
+                            "serverInfo": { "name": "no-tools", "version": "1" },
+                        }),
+                    ),
+                ),
+                "notifications/initialized" => FakeReply::empty(202),
+                "tools/call" => FakeReply::json(
+                    200,
+                    rpc_result(
+                        rec,
+                        json!({ "content": [{"type":"text","text":"ok"}], "isError": false }),
+                    ),
+                ),
+                _ => FakeReply::empty(202),
+            });
+        let (url, recs, jh) = spawn_fake(no_tools).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+
+        let mut sess = McpUpstreamSession::fresh(&url);
+        let err = ensure_initialized(
+            &client,
+            &policy,
+            &url,
+            None,
+            &mut sess,
+            VersionPolicy::Record,
+        )
+        .await
+        .expect_err("a server that declares no tools capability is not photographable")
+        .into_msg();
+        assert!(err.contains("tools"), "got: {err}");
+
+        // The runtime path is deliberately unchanged (an already-frozen surface
+        // keeps working).
+        let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
+        let out = managed_call(
+            &client,
+            &policy,
+            &url,
+            None,
+            &entry,
+            "tools/call",
+            json!({ "name": "x", "arguments": {} }),
+            Some("2025-11-25"),
+        )
+        .await;
+        jh.abort();
+        assert!(
+            out.is_ok(),
+            "the runtime path must NOT have grown a capability requirement: {:?}",
+            out.err().map(|e| e.into_msg())
+        );
+        assert!(count_rpc(&recs, "initialize") > 0, "dead fake");
+    }
+
+    #[test]
+    fn media_type_is_exact_not_substring() {
+        assert_eq!(media_type_of("application/json"), "application/json");
+        assert_eq!(
+            media_type_of(" Application/JSON ; charset=utf-8"),
+            "application/json"
+        );
+        assert_eq!(media_type_of("text/event-stream;x=1"), "text/event-stream");
+        // The look-alikes a `contains()` check used to accept.
+        for bogus in [
+            "application/jsonp",
+            "application/json-seq",
+            "x-application/json",
+            "application/json+evil",
+            "text/event-streaming",
+        ] {
+            let m = media_type_of(bogus);
+            assert!(
+                m != "application/json" && m != "text/event-stream",
+                "'{bogus}' must not pass as a JSON-RPC framing"
+            );
+        }
+    }
+
+    /// Over the wire: a reply labelled `application/jsonp` is NOT parsed as
+    /// JSON-RPC, even though its body is valid JSON-RPC — the substring match
+    /// used to accept it.
+    #[tokio::test]
+    async fn jsonp_content_type_is_refused_over_the_wire() {
+        let jsonp: Handler = Arc::new(move |_idx, rec: &Recorded| {
+            let mut reply = FakeReply::json(200, init_result(rec, "2025-11-25"));
+            reply.content_type = "application/jsonp";
+            reply
+        });
+        let (url, recs, jh) = spawn_fake(jsonp).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
+        let out = managed_call(
+            &client,
+            &policy,
+            &url,
+            None,
+            &entry,
+            "tools/call",
+            json!({ "name": "x", "arguments": {} }),
+            None,
+        )
+        .await;
+        jh.abort();
+        let err = out
+            .expect_err("application/jsonp must not be accepted as JSON-RPC")
+            .into_msg();
+        assert!(err.contains("content-type"), "got: {err}");
+        assert!(count_rpc(&recs, "initialize") > 0, "dead fake");
+    }
+
     #[tokio::test]
     async fn request_ids_are_distinct_and_protocol_header_present() {
         let (url, records, jh) = spawn_fake(basic_handler("2025-11-25")).await;
@@ -3488,6 +3825,7 @@ mod tests {
         delete_upstream_sessions(client, policy, drained, move |_peer, _url| async move {
             match resolved {
                 Ok(Some((header, value))) => Ok(Some(BrokeredAuth {
+                    generation: 1,
                     header: header.into(),
                     value: value.into(),
                     oauth_connection: None,

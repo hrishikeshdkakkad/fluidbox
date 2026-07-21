@@ -233,21 +233,34 @@ impl reqwest::dns::Resolve for SsrfDnsResolver {
 /// and skip rather than panic (M1: defense in depth, never a first-dial crash;
 /// the builder receives a pre-validated value).
 ///
-/// M2 — proxy semantics: when a proxy IS set, target DNS resolution moves to the
-/// PROXY, so this client's [`SsrfDnsResolver`] name-filtering no longer applies
-/// to proxied requests (the resolver only runs for direct connections). The
-/// `admit_url` literal + scheme checks still apply, and the proxy becomes the
-/// egress control point — operators point `FLUIDBOX_EGRESS_PROXY` at an
-/// allowlisting forward proxy to regain destination control for proxied traffic.
+/// M2 — proxy semantics, BOTH cases:
+/// - A proxy IS configured: target DNS resolution moves to the PROXY, so this
+///   client's [`SsrfDnsResolver`] name-filtering no longer applies to proxied
+///   requests (the resolver only runs for direct connections). The `admit_url`
+///   literal + scheme checks still apply, and the proxy becomes the egress
+///   control point — operators point `FLUIDBOX_EGRESS_PROXY` at an allowlisting
+///   forward proxy to regain destination control for proxied traffic.
+/// - NO proxy configured: `.no_proxy()` is MANDATORY. reqwest otherwise reads
+///   the ambient `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` environment, which would
+///   silently move target resolution to a proxy nobody configured and bypass
+///   [`SsrfDnsResolver`] entirely for MCP, discovery/probe, OAuth and delivery
+///   traffic. The proxy is therefore an EXPLICIT, boot-validated setting or
+///   nothing at all — never inherited from the process environment.
 fn with_proxy(mut b: reqwest::ClientBuilder, policy: &EgressPolicy) -> reqwest::ClientBuilder {
-    if let Some(p) = &policy.proxy {
-        match reqwest::Proxy::all(p) {
+    match &policy.proxy {
+        Some(p) => match reqwest::Proxy::all(p) {
             Ok(proxy) => b = b.proxy(proxy),
-            Err(e) => tracing::error!(
-                "FLUIDBOX_EGRESS_PROXY rejected at client build \
-                 (should have failed boot in config::parse_egress_proxy): {e}"
-            ),
-        }
+            Err(e) => {
+                tracing::error!(
+                    "FLUIDBOX_EGRESS_PROXY rejected at client build \
+                     (should have failed boot in config::parse_egress_proxy): {e}"
+                );
+                // A rejected value must NOT silently fall back to the ambient
+                // environment's proxy — fail closed onto a direct client.
+                b = b.no_proxy();
+            }
+        },
+        None => b = b.no_proxy(),
     }
     b
 }
@@ -462,6 +475,142 @@ mod tests {
         let mut res = reqwest::Response::from(small);
         let v = read_json_bounded(&mut res).await.expect("under cap parses");
         assert_eq!(v["pad"].as_str().map(str::len), Some(16));
+    }
+
+    /// The AMBIENT-PROXY bypass (M2): reqwest reads `HTTP_PROXY`/`HTTPS_PROXY`/
+    /// `ALL_PROXY` from the process environment unless told not to. A proxied
+    /// request resolves the TARGET at the proxy, so [`SsrfDnsResolver`] never
+    /// sees the name and the whole DNS boundary is bypassed — for MCP, probe/
+    /// discovery, OAuth and delivery alike. Both hardened clients must therefore
+    /// use ONLY an explicitly configured proxy.
+    ///
+    /// The probe: point `HTTPS_PROXY` at a listener we own and dial an
+    /// unresolvable `.invalid` host. A client that honors the ambient proxy
+    /// CONNECTs to the listener (it never resolves the target itself); a client
+    /// with `.no_proxy()` resolves directly, fails, and touches nothing. So
+    /// "zero accepted connections" is the discriminator.
+    #[tokio::test]
+    async fn hardened_clients_ignore_ambient_proxy_env() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let seen_bg = seen.clone();
+        tokio::spawn(async move {
+            while listener.accept().await.is_ok() {
+                seen_bg.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        // The env window is kept to the two `build`s (reqwest reads the
+        // environment there, not at request time) so a concurrently-building
+        // client in another test is not caught by it.
+        let prev = std::env::var("HTTPS_PROXY").ok();
+        std::env::set_var("HTTPS_PROXY", format!("http://127.0.0.1:{port}"));
+        let policy = prod_policy(vec![]);
+        let egress = build_egress_http(&policy);
+        let identity = build_identity_http(&policy);
+        match prev {
+            Some(v) => std::env::set_var("HTTPS_PROXY", v),
+            None => std::env::remove_var("HTTPS_PROXY"),
+        }
+
+        // `.invalid` is RFC 2606 — guaranteed never to resolve, so a direct
+        // client fails locally without emitting a packet.
+        for client in [&egress, &identity] {
+            let _ = client
+                .get("https://fluidbox-egress-probe.invalid/x")
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await;
+        }
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            0,
+            "a hardened client dialed the ambient HTTPS_PROXY — target DNS would \
+             happen at that proxy, bypassing SsrfDnsResolver entirely"
+        );
+    }
+
+    /// The property the OAuth token legs depend on: `build_egress_http` REFUSES
+    /// a 3xx (it never re-sends the body to the redirect target), while
+    /// `build_identity_http` follows one. On 307/308 the body is replayed
+    /// verbatim, so "which client" decides whether an authorization code, PKCE
+    /// verifier or refresh token can be walked to another host.
+    #[tokio::test]
+    async fn egress_client_refuses_a_307_that_identity_client_follows() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Second hop: counts the bodies it receives.
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let replayed = Arc::new(AtomicUsize::new(0));
+        let replayed_bg = replayed.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut sock, _)) = target.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                if String::from_utf8_lossy(&buf[..n]).contains("secret=leaked") {
+                    replayed_bg.fetch_add(1, Ordering::SeqCst);
+                }
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}")
+                    .await;
+            }
+        });
+        // First hop: 307s to the second, preserving method + body.
+        let hop = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hop_url = format!(
+            "http://127.0.0.1:{}/token",
+            hop.local_addr().unwrap().port()
+        );
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut sock, _)) = hop.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 307 Temporary Redirect\r\nlocation: \
+                             http://127.0.0.1:{target_port}/token\r\ncontent-length: 0\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+        });
+
+        let policy = dev_policy(vec![]); // loopback http admitted, as in the e2e
+        let post = |c: reqwest::Client, url: String| async move {
+            c.post(url)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body("secret=leaked")
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await
+        };
+        // identity_http FOLLOWS: the body lands on the second host.
+        let followed = post(build_identity_http(&policy), hop_url.clone()).await;
+        assert!(
+            followed.is_ok(),
+            "the identity client should follow the 307"
+        );
+        assert_eq!(
+            replayed.load(Ordering::SeqCst),
+            1,
+            "fixture is inert — the redirect-following client did not replay the body"
+        );
+        // egress_http does NOT: the 3xx is returned as-is, nothing is replayed.
+        let res = post(build_egress_http(&policy), hop_url)
+            .await
+            .expect("a 3xx is a response, not a transport error");
+        assert_eq!(res.status().as_u16(), 307);
+        assert_eq!(
+            replayed.load(Ordering::SeqCst),
+            1,
+            "the no-redirect client replayed the request body to the redirect target"
+        );
     }
 
     #[test]
