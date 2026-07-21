@@ -63,6 +63,15 @@ curl -s -X POST $API/v1/connections/$CONN/tools/refresh -H "$H"   # POST — app
 
 Snapshots are **append-only** and force a real MCP `initialize`, so each records the negotiated protocol version; a `tools/list` that never finishes paginating **fails** rather than freezing a partial set. A refresh appends a new version — it never mutates an in-flight run's frozen tools.
 
+**A server that changes protocol version mid-life denies the call, and the message names the fix.** fluidbox offers `2025-11-25` and accepts `{2025-11-25, 2025-06-18}`; at run time the version the server negotiates must equal the one recorded in the snapshot this run froze. If the upstream upgrades (or downgrades) after the photograph, the call is refused with:
+
+```
+mcp protocol drift: server now negotiates '<new>' but this run's frozen snapshot
+recorded '<old>' — run POST /v1/connections/{id}/tools/refresh to re-photograph
+```
+
+That is deliberate, not a bug: the frozen schemas — and the JSON Schema dialect they are validated under — belong to the version that was negotiated when they were photographed. Re-photograph the connection (`POST /v1/connections/{id}/tools/refresh`) and start a new run; the new run freezes the new version. There is no automatic re-photograph and no compatibility adapter. (A surface frozen before this field existed has no recorded version and simply has to land inside the supported set.)
+
 **Reauthorization bumps the generation.** Reconnecting an OAuth connection that was ever activated increments its `authorization_generation` (a rotation *within* the same account does not; proving a *different* account cannot preserve the generation — fail closed). Runs bound to the old generation then refuse at call time with `connection … was reauthorized after this run started — its binding is stale`. If you see that, the connection was re-consented mid-run: start a new run, which binds the current generation. (GitHub App connections never bump — the installation identity is proven, not re-consented.)
 
 **Only the newest authorization can activate.** Start two connect flows for the same connection (a stale browser tab, a double-clicked Connect, a retry after a timeout) and only one may land. The activation is a compare-and-swap against the connection's frozen generation *and* its last-activation instant, so a callback whose flow was overtaken is refused — before the token exchange when we can already tell, and again inside the activating `UPDATE` when we cannot — with:
@@ -139,7 +148,7 @@ Bundles attach to **agent revisions** and are **pinned at attach time**:
 
 ## What the run actually gets (and why drift can't hurt you)
 
-At run creation the RunSpec freezes the resolved brokered surfaces (each carrying its binding id, snapshot version, tool set, and digest) **plus** the pinned sandbox bundles' full schemas and digests. At the gate, every `mcp__<server>__<tool>` call is checked against that frozen set *before* trust tier and policy — a tool that drifted upstream or was rug-pulled since the photograph is **denied** (`source=capability`/`source=binding`), never silently forwarded. For a brokered call the broker additionally **rechecks the binding immediately before touching the credential**: the connection must still be active, still on the frozen `authorization_generation`, and (for a personal connection) its owner's membership still active — any failure denies the call. The decision and execution happen server-side (the sandbox can't self-approve), and the ledger records `tool.requested → tool.decision → tool.brokered` with latency and result digests, never payloads or secrets.
+At run creation the RunSpec freezes the resolved brokered surfaces (each carrying its binding id, snapshot version, tool set, and digest) **plus** the pinned sandbox bundles' full schemas and digests. At the gate, every `mcp__<server>__<tool>` call is checked against that frozen set *before* trust tier and policy — a tool that drifted upstream or was rug-pulled since the photograph is **denied** (`source=capability`/`source=binding`), never silently forwarded — and its **arguments are then validated against the frozen input schema** (`source=schema`; the dialect follows the snapshot's protocol version). For a brokered call the broker additionally **rechecks the binding immediately before touching the credential**: the connection must still be active, still on the frozen `authorization_generation`, and (for a personal connection) its owner's membership still active — any failure denies the call. The decision and execution happen server-side (the sandbox can't self-approve), and the ledger records `tool.requested → tool.decision → tool.brokered` with latency and result digests, never payloads or secrets.
 
 Two boundaries worth knowing:
 
