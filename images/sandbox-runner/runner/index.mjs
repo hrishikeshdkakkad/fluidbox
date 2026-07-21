@@ -18,20 +18,31 @@ const env = loadRunnerEnv();
 const client = new RunnerClient(env);
 const MODEL = env.MODEL || "claude-haiku-4-5";
 
-// Gap 10 / invariant 19: the runner-control credential is now captured in
-// memory (env.TOKEN, held by the RunnerClient) and REMOVED from process.env
-// BEFORE anything else spawns. The Agent SDK runs the agent's Bash/Edit tools
-// and every stdio MCP server as children of THIS process with an inherited env,
-// so leaving it there would hand agent-authored shell the ability to post
-// /result or forge /events. After this delete those children see only the
-// tool-intent token and the model key (ANTHROPIC_API_KEY) — neither of which
-// any runner-control route accepts.
+// Gap 10 / invariant 19: the runner-control credential is captured in memory
+// (env.TOKEN, held by the RunnerClient) and REMOVED from process.env BEFORE
+// anything else spawns. The Agent SDK runs the agent's Bash/Edit tools and every
+// stdio MCP server as children of THIS process with an inherited env, so leaving
+// it there would hand agent-authored shell the ability to post /result or forge
+// /events. After this delete those children see only the tool-intent token and
+// the model key (ANTHROPIC_API_KEY) — neither of which any runner-control route
+// accepts.
 //
-// DISCLOSED RESIDUAL: this is an env-visibility boundary, not a process one.
-// Same-uid children can still read THIS process's initial environment via
-// /proc/<pid>/environ; true isolation needs a uid split or a sidecar, which the
-// current cap_drop=ALL + no-new-privileges hardening blocks (design :1326-1329).
+// PHASE F: under the shipped image the credential never reached this
+// environment in the first place — lib/entrypoint.sh hands it over on an
+// unlinked-file descriptor and execve's this process with an environ region that
+// never held it, so /proc/<pid>/environ is now clean too. The delete below stays
+// because it is still exactly right for (a) the COMPATIBILITY path, where the
+// entrypoint was bypassed and the token really is in the environment, and (b)
+// the spawned environment either way. FLUIDBOX_SESSION_TOKEN_FD goes with it:
+// the descriptor is already closed, so an inherited pointer to it would only
+// mislead.
+//
+// DISCLOSED RESIDUAL, narrowed but not gone: a same-uid child can still
+// ptrace(2) this process and read the token out of live memory. cap_drop=ALL,
+// no-new-privileges and seccomp RuntimeDefault do not block same-uid ptrace —
+// only a uid split or a separate container (its own PID namespace) does.
 delete process.env.FLUIDBOX_SESSION_TOKEN;
+delete process.env.FLUIDBOX_SESSION_TOKEN_FD;
 
 function textFromMessage(msg) {
   // BetaMessage content is an array of blocks.
