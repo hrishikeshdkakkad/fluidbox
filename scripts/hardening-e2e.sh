@@ -13,10 +13,10 @@
 #       404-reinit, server→client -32601, SSE, DELETE, SEP-835)       [Task 2]
 #   (e) frozen-schema argument enforcement + its GATE ORDER           [Task 3]
 #   (f) durable four-state execution claims                           [Task 4]
-#   (g) audience negatives   — Task 5  (placeholder at the end)
+#   (g) per-route audience negatives (the route→audience mapping)     [Task 5]
 #   (h) LLM reservations     — Task 7  (placeholder at the end)
 #   (i) two-replica          — Task 6  (placeholder at the end)
-#   (j) breaker / rate       — Task 8  (placeholder at the end)
+#   (j) outbound rate limits + per-connection circuit breakers        [Task 8]
 #
 # House style mirrors scripts/secrets-e2e.sh + scripts/bindings-e2e.sh:
 # pass/fail counters, a `db()` psql helper carrying the audited bypass GUC
@@ -609,8 +609,16 @@ start_redirect() {
 # Server boot. CI passes FLUIDBOX_SERVER_BIN (a prebuilt binary) so the script
 # `exec`s it (clean single-process lifecycle); otherwise `cargo run`.
 # ═════════════════════════════════════════════════════════════════════════════
+
+# Per-boot egress-governor overrides, consumed by `_spawn`. EMPTY ⇒ leave the
+# server's own defaults (governor.rs DEFAULT_*). The governor is IN-MEMORY and
+# PER-REPLICA and its limits are resolved once at boot
+# (`GovernorLimits::from_config`) — there is deliberately no runtime knob — so
+# section (j) sets these and RESTARTS rather than mutating a live process.
+GOV_TENANT=""; GOV_CONN=""; GOV_HOST=""; GOV_THRESHOLD=""; GOV_OPEN_SECS=""
+
 _spawn() {
-  : > "$SERVER_LOG"
+  printf '\n===== control plane (re)start =====\n' >> "$SERVER_LOG"
   (
     cd "$ROOT" || exit 1
     export DATABASE_URL="$DATABASE_URL"
@@ -646,6 +654,14 @@ _spawn() {
     export LITELLM_MASTER_KEY="$MASTER_KEY"
     export LLM_UPSTREAM_URL="http://127.0.0.1:$LLM_PORT"
     export RUST_LOG="${RUST_LOG:-warn,fluidbox_server=info}"
+    # Section (j)'s governor knobs. Unset here on the FIRST boot, so sections
+    # (a)-(g) run against the shipped defaults (tenant 120 / connection 60 /
+    # host 120 per minute, breaker 5 → 60 s) and cannot be throttled by them.
+    [ -n "$GOV_TENANT" ]    && export FLUIDBOX_EGRESS_RATE_TENANT_PER_MIN="$GOV_TENANT"
+    [ -n "$GOV_CONN" ]      && export FLUIDBOX_EGRESS_RATE_CONNECTION_PER_MIN="$GOV_CONN"
+    [ -n "$GOV_HOST" ]      && export FLUIDBOX_EGRESS_RATE_HOST_PER_MIN="$GOV_HOST"
+    [ -n "$GOV_THRESHOLD" ] && export FLUIDBOX_EGRESS_BREAKER_THRESHOLD="$GOV_THRESHOLD"
+    [ -n "$GOV_OPEN_SECS" ] && export FLUIDBOX_EGRESS_BREAKER_OPEN_SECS="$GOV_OPEN_SECS"
     if [ -n "${FLUIDBOX_SERVER_BIN:-}" ] && [ -x "${FLUIDBOX_SERVER_BIN}" ]; then
       exec "$FLUIDBOX_SERVER_BIN"
     fi
@@ -662,6 +678,34 @@ boot() {
     sleep 1
   done
   return 1
+}
+
+# Stop the control plane and boot it again on the SAME port + DB, picking up any
+# GOV_* knobs set since. Used ONLY by section (j) (the governor's limits are
+# boot-resolved). Safe for the fixtures already in the DB: the forged runs carry
+# NULL started_at/last_heartbeat_at (no watchdog or wall-clock sweeper touches
+# them) and never provisioned a sandbox (so the boot orphan sweep, which walks the
+# PROVIDER's live sandboxes, sees nothing of theirs) — and section (j) forges its
+# own runs after the restart regardless.
+restart_server() { # label → 0 if the new process is healthy
+  [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
+  SERVER_PID=""
+  # Wait for the LISTENER to go away, not just the pid: under `cargo run` the pid
+  # is cargo and the kill may not reach the server, in which case the rebind would
+  # fail. CI sets FLUIDBOX_SERVER_BIN (the subshell `exec`s the binary, so the
+  # signal lands on the server itself). A port that never frees is a LOUD failure,
+  # never a silent skip.
+  for _ in $(seq 1 60); do
+    curl -sf "$API/v1/health" >/dev/null 2>&1 || break
+    sleep 0.5
+  done
+  if curl -sf "$API/v1/health" >/dev/null 2>&1; then
+    no "$1: the previous control plane still holds :$API_PORT (set FLUIDBOX_SERVER_BIN so the kill reaches the server, not cargo)"
+    return 1
+  fi
+  boot || { no "$1: the control plane did not come back up: $(tail -30 "$SERVER_LOG")"; return 1; }
+  ok "$1"
+  return 0
 }
 
 # ── HTTP helpers ─────────────────────────────────────────────────────────────
@@ -686,8 +730,9 @@ sess_perm() { # sid token-plaintext json → prints the /permission response bod
 # last_heartbeat_at stay NULL, so no watchdog / wall-clock sweeper reaps it.
 # Finally psql-forge a session token exactly how the orchestrator mints one
 # (kind 'session', token_sha256 = sha256(plaintext)); the plaintext is never
-# echoed. NOTE for Task 5: `api_tokens.audience` defaults to 'all', which every
-# audience-guarded route accepts — this forger keeps working unchanged.
+# echoed. `api_tokens.audience` is left to its migration-0020 DEFAULT 'all',
+# which every audience-guarded route accepts (in-flight compat) — so this forger
+# keeps working unchanged AND doubles as section (g)'s LEGACY token.
 forge_running() { # sid token-plaintext label
   local sid=$1 tok=$2 label=$3 cnt st fin settled=0 sha tid
   need "$sid" "no session id for the $label run" || return 1
@@ -708,6 +753,101 @@ forge_running() { # sid token-plaintext label
   db "insert into api_tokens (id, tenant_id, kind, session_id, token_sha256, expires_at)
       values (gen_random_uuid(), '$tid', 'session', '$sid', '$sha', now() + interval '2 hours')" >/dev/null
   return 0
+}
+
+# ── Audience-scoped token forgers (section (g), migration 0020) ──────────────
+# The FOUR scoped audiences. `all` is deliberately NOT in this list: it is the
+# column DEFAULT the forger above already produces, and section (g) treats it as
+# the legacy in-flight case rather than as one of the scoped audiences.
+AUDIENCES="llm tool control workspace"
+# The exact 403 body the guards emit (auth.rs `require_audience` /
+# internal.rs::result / facade.rs → `ApiError::Forbidden("wrong_audience")`,
+# rendered by error.rs as `Json(json!({"error": msg}))`). Asserted VERBATIM, not
+# by status: images/runner-lib/contract.mjs keys its fatal abort off this exact
+# BODY code (`parsed.error === "wrong_audience"`), so a body-shape change would
+# silently restore the "every tool call looks like a deny" bug.
+WRONG_AUD='{"error":"wrong_audience"}'
+
+# Forge ONE session token with an EXPLICIT audience — the same row shape the
+# orchestrator mints (kind 'session', token_sha256 = sha256(plaintext)) plus the
+# 0020 column. `revoked` (any non-empty value) stamps revoked_at, which only
+# `/result`'s idempotent terminal ack still resolves.
+forge_audience_token() { # sid audience token-plaintext [revoked]
+  local sid=$1 aud=$2 tok=$3 rev=${4:-} sha tid rcol="null"
+  [ -n "$rev" ] && rcol="now()"
+  sha=$(printf '%s' "$tok" | openssl dgst -sha256 | awk '{print $NF}')
+  tid=$(db "select tenant_id from sessions where id='$sid'")
+  need "$tid" "no tenant for session $sid — cannot forge the '$aud' token" || return 1
+  db "insert into api_tokens (id, tenant_id, kind, session_id, token_sha256, audience, expires_at, revoked_at)
+      values (gen_random_uuid(), '$tid', 'session', '$sid', '$sha', '$aud', now() + interval '2 hours', $rcol)" >/dev/null
+  [ "$(db "select audience from api_tokens where token_sha256='$sha'")" = "$aud" ]
+}
+# One token per scoped audience for a run, named "<prefix>-<audience>". The
+# run's own `live_run` token is "<prefix>-all" — the legacy row — so a single
+# prefix names the whole five-token set.
+forge_audience_set() { # sid prefix
+  local sid=$1 pfx=$2 a rc=0
+  for a in $AUDIENCES; do
+    forge_audience_token "$sid" "$a" "$pfx-$a" || rc=1
+  done
+  [ "$rc" = 0 ] \
+    && ok "forged one api_tokens row per audience for '$pfx' (llm/tool/control/workspace) + the legacy 'all' from live_run" \
+    || no "audience token forge failed for '$pfx' — every assertion using it would be meaningless"
+  return $rc
+}
+
+# One internal-plane request as a given token. Sets CODE + BODY like admin_*.
+aud_curl() { # method path token [json-body]
+  local m=$1 p=$2 t=$3 b=${4:-}
+  [ -n "$b" ] || b='{}'
+  if [ "$m" = GET ]; then
+    CODE=$(curl -s -o "$UB" -w '%{http_code}' -H "authorization: Bearer $t" "$API$p")
+  else
+    CODE=$(curl -s -o "$UB" -w '%{http_code}' -X "$m" -H "authorization: Bearer $t" \
+      -H 'content-type: application/json' -d "$b" "$API$p")
+  fi
+  BODY=$(cat "$UB")
+}
+wrong_aud_body() { case "$1" in *wrong_audience*) return 0;; esac; return 1; }
+
+# Running tally of the init container's blast radius, accumulated BY the matrix
+# (never by a second pass — the bodies differ per route, and an invalid body is
+# rejected by the Json extractor BEFORE the handler's audience guard, which would
+# read as a false "refused"). WS_TRIED is the >0 precondition.
+WS_TRIED=0; WS_LEAK=0; WS_OWN_OK=0
+
+# ONE route × EVERY audience. The route's own audience must be ACCEPTED (any
+# non-403 that is not a wrong_audience body — the route's own downstream 200/400/
+# 404/502 is irrelevant to the mapping), every OTHER scoped audience must be
+# refused 403 with the body code VERBATIM, and the legacy 'all' must pass.
+# "non-403 = accepted" is precise, not loose: `wrong_audience` is the ONLY
+# ApiError::Forbidden anywhere on the internal plane (internal.rs + facade.rs
+# carry no other), so a 403 on these routes can mean nothing else.
+# Self-checking: a broken forge shows up as 401s on the three negatives, so the
+# "accepted" arms can never pass vacuously.
+aud_matrix() { # label required-audience token-prefix method path [json-body]
+  local label=$1 want=$2 pfx=$3 m=$4 p=$5 b=${6:-} a
+  for a in $AUDIENCES all; do
+    aud_curl "$m" "$p" "$pfx-$a" "$b"
+    if [ "$a" = "$want" ]; then
+      { [ "$CODE" != 403 ] && ! wrong_aud_body "$BODY"; } \
+        && ok "$label ← '$a' (the route's OWN audience): accepted ($CODE)" \
+        || no "$label ← '$a' (the route's OWN audience) was REFUSED → $CODE: $BODY"
+      [ "$a" = workspace ] && WS_OWN_OK=1
+    elif [ "$a" = all ]; then
+      { [ "$CODE" != 403 ] && ! wrong_aud_body "$BODY"; } \
+        && ok "$label ← legacy 'all': accepted ($CODE) — in-flight sessions keep working" \
+        || no "$label ← legacy 'all' was REFUSED → $CODE: $BODY (breaks every run spanning the deploy)"
+    else
+      { [ "$CODE" = 403 ] && [ "$BODY" = "$WRONG_AUD" ]; } \
+        && ok "$label ← '$a': 403 $WRONG_AUD" \
+        || no "$label ← '$a': $CODE '$BODY' (want 403 $WRONG_AUD)"
+      if [ "$a" = workspace ]; then
+        WS_TRIED=$((WS_TRIED+1))
+        [ "$CODE" = 403 ] || WS_LEAK=$((WS_LEAK+1))
+      fi
+    fi
+  done
 }
 
 # Create a run as the operator; sets RUN to the session id (empty on failure).
@@ -736,6 +876,24 @@ wait_terminal() { # sid [deadline_secs] → prints the terminal status
     sleep 2
   done
   echo "timeout(last=$st)"; return 1
+}
+
+# Terminal AND its finalization intent cleared — the same quiescent point
+# `forge_running` waits for, and a STRICTLY STRONGER anchor than wait_terminal:
+# `delete_finalization` is the terminal reconcile's LAST step, so once the intent
+# is gone everything that reconcile drives (token revoke, delivery enqueue, the
+# spawned MCP teardown, reap, workspace/archive cleanup) has been issued.
+wait_settled() { # sid [deadline_secs] → prints the terminal status
+  local deadline=$(( $(date +%s) + ${2:-300} )) st="" fin=""
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    st=$(db "select status from sessions where id='$1'")
+    fin=$(db "select count(*) from session_finalizations where session_id='$1'")
+    case "$st" in
+      completed|failed|cancelled|budget_exceeded) [ "$fin" = 0 ] && { echo "$st"; return 0; };;
+    esac
+    sleep 1
+  done
+  echo "timeout(last=$st,finalizations=$fin)"; return 1
 }
 
 # Poll a run's approvals for the first pending id (operator lens).
@@ -1113,10 +1271,12 @@ PYEOF
       || no "session isolation broken (run1=[$S1_ONLY] n=$N1, run2=[$S2] n=$N2)"
   fi
   # Every POST in BOTH windows carried an Authorization header. Scoped to POSTs
-  # deliberately: the terminal session DELETE (broker.rs cleanup_run_sessions)
-  # sends mcp-session-id + mcp-protocol-version and NO credential, so a blanket
-  # "every request" assertion would encode that as required behavior. The
-  # "OK n"/"NONE" shape carries its own >0 precondition.
+  # only because this window CONTAINS only POSTs (neither isolation run is
+  # cancelled here, so no teardown DELETE lands in it) — NOT because the DELETE
+  # is credential-free. Since 2dbe42b the terminal session DELETE carries the
+  # same re-resolved authorization a live call does, and section (d)'s
+  # "Terminal DELETE" blocks assert exactly that. The "OK n"/"NONE" shape carries
+  # its own >0 precondition.
   AUTHED=$(rec "$C_MARK1" all_have auth http=POST)
   case "$AUTHED" in
     OK\ *) ok "every recorded POST in the isolation window carried Authorization ($AUTHED)";;
@@ -1304,13 +1464,135 @@ if live_run hq-agent "sess-d7-$$" "d/delete"; then
     [ "$(rec "$D_MARK" count http=DELETE)" -gt 0 ] && { DEL_SEEN=1; break; }
     sleep 1
   done
+  CALL_AUTH=$(rec "$D_MARK" first auth rpc=tools/call)
   if need "$UPSTREAM_SID" "no upstream mcp-session-id was ever issued to this run"; then
     { [ "$DEL_SEEN" = 1 ] \
         && [ "$(rec "$D_MARK" count http=DELETE session="$UPSTREAM_SID")" -ge 1 ]; } \
       && ok "run terminal → the fake recorded a DELETE for the run's upstream session ($UPSTREAM_SID)" \
       || no "no DELETE recorded for the terminated run's upstream session (seen=$DEL_SEEN)"
+    # 2dbe42b: the teardown DELETE is AUTHORIZED — it carries the same
+    # authorization header a live call carries, re-resolved at teardown through
+    # `terminal_peer_auth` → recheck_binding → brokered_auth_for_conn (never
+    # cached on the registry entry — invariant 9). Before that fix the DELETE went
+    # out bare and a conforming upstream 401'd it, leaking the session upstream.
+    DEL_AUTH=$(rec "$D_MARK" first auth http=DELETE session="$UPSTREAM_SID")
+    if need "$CALL_AUTH" "the run's tools/call recorded no authorization header (nothing to compare the DELETE against)"; then
+      [ "$DEL_AUTH" = "$CALL_AUTH" ] \
+        && ok "the teardown DELETE carried the SAME authorization as the run's tools/call ('$DEL_AUTH')" \
+        || no "teardown DELETE authorization='$DEL_AUTH' but the run's tools/call carried '$CALL_AUTH'"
+      [ "$DEL_AUTH" = "Bearer $TOK_HQ" ] \
+        && ok "…and it is the connection's sealed credential verbatim, not a stale or empty header" \
+        || no "teardown DELETE presented '$DEL_AUTH' (want 'Bearer \$TOK_HQ')"
+    fi
   fi
 fi
+
+say "(d) Terminal DELETE — a REVOKED connection sends NO credential, and no DELETE at all"
+# The fail-closed half of the same fix: at teardown the credential is re-resolved
+# LIVE, so a connection revoked between a run's last call and its terminalization
+# resolves to nothing and the DELETE is SKIPPED entirely — an unauthorized DELETE
+# would just 401, and a revoked connection is precisely where a credential must
+# not go. Both halves are asserted (the absence AND that the run still
+# terminalized), so an absent DELETE can never be confused with a wedged run.
+#
+# Everything here runs against the SECOND fake so the primary's recorder windows
+# stay untouched, and the ORDER is load-bearing: the positive control (B) runs
+# BEFORE the zero (A) is asserted and its DELETE is polled for, so by the time the
+# zero is read the terminal-cleanup path has provably completed at least once on
+# this replica — the zero cannot be "the DELETE simply has not happened yet".
+mcp2_mode "$PROTO_SNAP" ok
+D_REV_MARK=""; D_REV_SID=""
+if live_run hq2-agent "sess-d9-$$" "d/delete-revoked"; then
+  D_REV="$RUN"
+  D_REV_MARK=$(mark2)
+  R=$(sess_call "$D_REV" "sess-d9-$$" '{"tool_call_id":"d9","tool":"mcp__hq__hq_search","input":{"query":"x"}}')
+  echo "$R" | grep -q '"ok": *true' \
+    && ok "the to-be-revoked run opened an upstream session on the second fake" \
+    || no "delete-revoked run's call: $R"
+  D_REV_SID=$(rec2 "$D_REV_MARK" first session rpc=tools/call)
+  # Revoked by direct status write, not the API: `/revoke` is exercised in (a),
+  # and a plain status flip leaves authorization_generation untouched so the
+  # restore below returns the connection to EXACTLY its prior state for (f).
+  db "update integration_connections set status='revoked', updated_at=now() where id='$CONN2'" >/dev/null
+  [ "$(db "select status from integration_connections where id='$CONN2'")" = revoked ] \
+    && ok "fixture: the connection was revoked while its run's upstream session was still live" \
+    || no "fixture failed — the connection is not revoked, so the skip cannot be attributed"
+  admin_post "/v1/sessions/$D_REV/cancel" '{}'
+  # `wait_settled`, not `wait_terminal`: the teardown is spawned by the terminal
+  # reconcile and the reconcile only clears the finalization intent as its LAST
+  # step, so waiting for the QUIESCENT point puts a full reap + workspace/archive
+  # cleanup between the teardown's spawn and the restore below. (Honest residual:
+  # the teardown is fire-and-forget with no DB trace, so this is an ordering
+  # ANCHOR, not a barrier — three local DB reads racing a provider round trip.
+  # A hard barrier would need the cleanup to leave an observable mark, which is
+  # a product change, not a test change.)
+  D_REV_ST=$(wait_settled "$D_REV" 300)
+  case "$D_REV_ST" in
+    cancelled|failed|completed|budget_exceeded)
+      ok "the run still TERMINALIZED ('$D_REV_ST') and its terminal reconcile ran to completion — a skipped DELETE never wedges teardown";;
+    *)
+      no "the run did not reach a quiescent terminal state after the cancel ($D_REV_ST)";;
+  esac
+  db "update integration_connections set status='active', oauth = coalesce(oauth,'{}'::jsonb) - 'error', updated_at=now() where id='$CONN2'" >/dev/null
+  [ "$(db "select status from integration_connections where id='$CONN2'")" = active ] \
+    && ok "fixture: the second connection was restored to active (the control below and section (f) bind it)" \
+    || no "fixture restore failed — the positive control and section (f) will fail at binding"
+fi
+# B) POSITIVE CONTROL on the SAME recorder, same verb: with the connection active,
+# the teardown DELETE arrives AND carries the connection's sealed credential.
+if live_run hq2-agent "sess-d10-$$" "d/delete-authed"; then
+  D_AUTHED="$RUN"
+  D_A_MARK=$(mark2)
+  R=$(sess_call "$D_AUTHED" "sess-d10-$$" '{"tool_call_id":"d10","tool":"mcp__hq__hq_search","input":{"query":"x"}}')
+  echo "$R" | grep -q '"ok": *true' \
+    && ok "POSITIVE CONTROL: the control run opened an upstream session" \
+    || no "delete-authed run's call: $R"
+  D_A_SID=$(rec2 "$D_A_MARK" first session rpc=tools/call)
+  D_A_CALL_AUTH=$(rec2 "$D_A_MARK" first auth rpc=tools/call)
+  admin_post "/v1/sessions/$D_AUTHED/cancel" '{}'
+  D_A_SEEN=0
+  for _ in $(seq 1 90); do
+    [ "$(rec2 "$D_A_MARK" count http=DELETE)" -gt 0 ] && { D_A_SEEN=1; break; }
+    sleep 1
+  done
+  if need "$D_A_SID" "the control run was issued no upstream mcp-session-id" \
+     && need "$D_A_CALL_AUTH" "the control run's tools/call recorded no authorization header"; then
+    D_A_DEL_AUTH=$(rec2 "$D_A_MARK" first auth http=DELETE session="$D_A_SID")
+    { [ "$D_A_SEEN" = 1 ] && [ "$D_A_DEL_AUTH" = "$D_A_CALL_AUTH" ]; } \
+      && ok "POSITIVE CONTROL: the DELETE landed on the second fake carrying the SAME authorization as the run's tools/call ('$D_A_CALL_AUTH')" \
+      || no "control DELETE seen=$D_A_SEEN authorization='$D_A_DEL_AUTH' (want '$D_A_CALL_AUTH')"
+    [ "$D_A_DEL_AUTH" = "Bearer $TOK_HQ2" ] \
+      && ok "…and it is the second connection's sealed credential verbatim" \
+      || no "control DELETE presented '$D_A_DEL_AUTH' (want 'Bearer \$TOK_HQ2')"
+  fi
+fi
+# …and only NOW the ZERO, with the recorder demonstrably recording DELETEs.
+if [ -n "$D_REV_MARK" ]; then
+  if need "$D_REV_SID" "the revoked run never opened an upstream session — the ZERO assertion would be vacuous"; then
+    D_REV_DELS=$(rec2 "$D_REV_MARK" count http=DELETE session="$D_REV_SID")
+    [ "$D_REV_DELS" = 0 ] \
+      && ok "the REVOKED connection's run produced ZERO upstream DELETEs for its session ($D_REV_SID) — fail-closed, no credential leaves for a revoked connection" \
+      || no "$D_REV_DELS DELETE(s) went out for a run whose connection was revoked"
+  fi
+fi
+# NOT ASSERTED — "the registry entry was EVICTED". `drain_run_sessions` evicts
+# under the map lock before any I/O, but the registry is a per-replica in-memory
+# map with no read surface (no admin route, no gauge), so from outside the process
+# the only observable would be a second teardown re-DELETEing the same session —
+# which the terminal reconcile never re-drives. Making it fail-capable needs an
+# introspection seam, not a cleverer curl. What actually matters operationally IS
+# asserted: the run terminalizes even when the DELETE is skipped.
+#
+# NOT ASSERTED — "an OAuth access token that expired mid-run is RE-MINTED for the
+# DELETE rather than sent stale". Every connection in this suite is a STATIC
+# api_key connection; proving a re-mint needs a fake authorization server (RFC 9728
+# PRM + RFC 8414 metadata + a rotating token endpoint), which this file
+# deliberately does not carry — connector OAuth has its own coverage. The weaker
+# proxy available here (assert only that SOME authorization rides the DELETE)
+# would pass just as happily with a stale token, so it is omitted rather than
+# faked. The re-resolution PATH is exercised above: `terminal_peer_auth` runs
+# recheck_binding → brokered_auth_for_conn, the same resolution a live call makes,
+# and that is exactly where an expired OAuth token is re-minted.
 
 say "(d) SEP-835 — an insufficient_scope challenge is TERMINAL and marks the connection"
 # The piece Task 2 deliberately deferred to this suite. broker.rs auth_error →
@@ -1626,19 +1908,182 @@ if live_run hq-appr-agent "sess-f5-$$" "f/cancel"; then
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
-# LATER TASKS APPEND BELOW. Each placeholder owns its acceptance bullet; the
-# harness above (fakes, recorders, boot, forgers, psql helpers) is shared —
-# extend it rather than duplicating. Nothing about unshipped behavior is
-# asserted here: an empty section is honest, a guessed one is not.
+# SECTIONS (g) AND (j) FOLLOW; (h) AND (i) ARE STILL PLACEHOLDERS — their
+# behavior (durable LLM reservations, multi-replica coordination) has not landed,
+# and an empty section is honest where a guessed one is not. Each placeholder
+# owns its acceptance bullet; the harness above (fakes, recorders, boot, forgers,
+# psql helpers) is shared — extend it rather than duplicating. Section (j) runs
+# LAST because it REBOOTS the control plane with low egress ceilings.
 # ═════════════════════════════════════════════════════════════════════════════
 
-# SECTION (g) audience negatives — Task 5 (audience-scoped sandbox credentials,
-# migration 0020). Append here: psql-forge one `api_tokens` row per audience
-# (`llm`/`tool`/`control`/`workspace`) for a live run, then assert per-route
-# 403s (control token on /permission, llm on /result, tool on the facade,
-# workspace ONLY on /workspace) and that a legacy `audience='all'` row still
-# passes everywhere. `forge_running` above already writes an audience-defaulted
-# row, which is the legacy case.
+# ═════════════════════════════════════════════════════════════════════════════
+# (g) Per-route audience negatives (Gap 10, invariant 19; migration 0020).
+#     Acceptance bullet: "a leaked LLM or tool-intent credential can never reach
+#     a runner-control route."
+#
+#     THIS SECTION IS THE SOLE PROOF OF THE ROUTE→AUDIENCE MAPPING, and it is
+#     deliberately EXHAUSTIVE rather than a sample. auth.rs says so itself
+#     (auth.rs:357-365): the audience constants remove a typo class and nothing
+#     more — wiring `events` to `AUD_TOOL` compiles clean and passes every Rust
+#     unit test, because `audience_matrix_allow_deny_and_legacy_all` tests the
+#     PREDICATE, never the wiring. So every route in the internal Router
+#     (main.rs:467-482) appears below, each crossed with every audience:
+#
+#       route                                    required audience   enforced at
+#       /internal/sessions/{id}/permission       tool                internal.rs:714
+#       /internal/sessions/{id}/tools/call       tool                internal.rs:770
+#       /internal/sessions/{id}/events           control             internal.rs:1525
+#       /internal/sessions/{id}/heartbeat        control             internal.rs:1608
+#       /internal/sessions/{id}/result           control             internal.rs:1659
+#       /internal/sessions/{id}/workspace  (GET) workspace           internal.rs:1562
+#       /internal/token/renew                    control             internal.rs:1753
+#       /internal/llm/{*rest}                    llm                 facade.rs:338
+#       /internal/llm-usage                      (none — see below)  callback.rs:22
+#
+#     `/llm-usage` is the ONE deliberately-unguarded route: it is LiteLLM's
+#     callback and authenticates on the deployment's shared LiteLLM secret, not
+#     on a session token at all. The meaningful negative there is that a session
+#     token — ANY audience — does not authenticate it, with the shared secret as
+#     the positive control.
+# ═════════════════════════════════════════════════════════════════════════════
+say "(g) Audience negatives — every internal route × every audience"
+mcp_mode "$PROTO_SNAP" ok
+G_PFX="sess-g-$$"
+if live_run hq-agent "$G_PFX-all" "g/audiences" && forge_audience_set "$RUN" "$G_PFX"; then
+  G_MAIN="$RUN"
+  G_SESS="/internal/sessions/$G_MAIN"
+
+  aud_matrix "POST /internal/sessions/{id}/permission" tool "$G_PFX" \
+    POST "$G_SESS/permission" \
+    '{"tool_call_id":"gperm","tool":"Read","input":{"file_path":"/workspace/x"}}'
+
+  # tools/call additionally proves the guard runs BEFORE the broker: the three
+  # wrong-audience attempts must contact the upstream zero times, and the one
+  # accepted attempt is this window's own positive control (exactly 1 tools/call,
+  # which is both the >0 precondition and the ceiling).
+  G_MARK=$(mark)
+  aud_matrix "POST /internal/sessions/{id}/tools/call" tool "$G_PFX" \
+    POST "$G_SESS/tools/call" \
+    '{"tool_call_id":"gcall","tool":"mcp__hq__hq_search","input":{"query":"g"}}'
+  G_CALLS=$(rec "$G_MARK" count rpc=tools/call)
+  [ "$G_CALLS" = 1 ] \
+    && ok "across the whole tools/call audience matrix the upstream saw EXACTLY ONE tools/call — the wrong-audience attempts never reached the broker" \
+    || no "the tools/call matrix produced $G_CALLS upstream tools/call (want exactly 1: only the 'tool' token dispatches)"
+
+  aud_matrix "POST /internal/sessions/{id}/events" control "$G_PFX" \
+    POST "$G_SESS/events" '{"actor":"agent","body":{"type":"unknown"}}'
+  aud_matrix "POST /internal/sessions/{id}/heartbeat" control "$G_PFX" \
+    POST "$G_SESS/heartbeat" '{}'
+  aud_matrix "POST /internal/token/renew" control "$G_PFX" \
+    POST "/internal/token/renew" '{"ttl_secs":600}'
+  # The init container's ONLY credential. A 404 here is the archive being absent
+  # (these runs never provisioned) — the mapping question is only ever 403-or-not.
+  aud_matrix "GET  /internal/sessions/{id}/workspace" workspace "$G_PFX" \
+    GET "$G_SESS/workspace"
+  # Model egress. Nothing listens on :$LLM_PORT in this boot, so the accepted
+  # arm fails at the upstream dial — again, not a 403, which is the whole claim.
+  aud_matrix "POST /internal/llm/{*rest}" llm "$G_PFX" \
+    POST "/internal/llm/v1/messages" \
+    '{"model":"claude-haiku-4-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
+
+  # The init container's blast radius, as ONE verdict over the matrix above: the
+  # workspace token opened /workspace and was refused by every other guarded
+  # route it was offered to. Stated separately because "the archive credential
+  # cannot do anything else" is the property the split exists for.
+  if gt0 "$WS_TRIED" "guarded routes the workspace token was offered to"; then
+    { [ "$WS_LEAK" = 0 ] && [ "$WS_OWN_OK" = 1 ]; } \
+      && ok "the workspace token reaches ONLY /workspace ($WS_TRIED sibling routes refused it; the archive route accepted it)" \
+      || no "workspace-token containment broken: $WS_LEAK of $WS_TRIED sibling routes accepted it (own-route accepted=$WS_OWN_OK)"
+  fi
+fi
+
+say "(g) /internal/llm-usage — the deliberately-unguarded route rejects session tokens"
+# Not a session-token route at all: `litellm_usage` (callback.rs:22-29) accepts a
+# bearer that CONTAINS the deployment's LiteLLM key and otherwise answers
+# `{"ignored":"unauthenticated"}` without writing anything. The negative that
+# matters is that no audience of session token authenticates it.
+if [ -n "${G_MAIN:-}" ]; then
+  G_USAGE_BAD=0
+  for G_A in $AUDIENCES all; do
+    aud_curl POST "/internal/llm-usage" "$G_PFX-$G_A" '{"id":"g-usage","spend":0}'
+    echo "$BODY" | grep -q '"ignored"' || G_USAGE_BAD=$((G_USAGE_BAD+1))
+  done
+  [ "$G_USAGE_BAD" = 0 ] \
+    && ok "no session token (llm/tool/control/workspace/all) authenticates /internal/llm-usage — all 5 answered 'ignored: unauthenticated'" \
+    || no "$G_USAGE_BAD session token(s) were ACCEPTED by /internal/llm-usage (it must key on the LiteLLM shared secret only)"
+  # POSITIVE CONTROL: the shared secret DOES authenticate it — without this the
+  # five refusals above could just be a route that ignores everything.
+  aud_curl POST "/internal/llm-usage" "$MASTER_KEY" '{"id":"g-usage-ok","spend":0}'
+  { echo "$BODY" | grep -q '"ok"' && ! echo "$BODY" | grep -q '"ignored"'; } \
+    && ok "POSITIVE CONTROL: the LiteLLM shared secret IS accepted there (ok:true) — the refusals above are real" \
+    || no "the LiteLLM shared secret was not accepted at /internal/llm-usage → $CODE: $BODY"
+fi
+
+say "(g) /result ordering — a revoked CONTROL token still ACKs; a wrong audience never does"
+# /result is the one route with token LENIENCY (internal.rs:1644-1660): it
+# resolves through `session_for_token_incl_revoked` so a runner whose token was
+# revoked by the terminal transition can still ack idempotently. The audience
+# check sits on the RESOLVED row ABOVE that leniency, and that ORDER is the
+# assertion: a revoked CONTROL token acks, while an llm/tool token — revoked or
+# live — is refused before ever reaching the ack. If the check moved below the
+# terminal-ack branch, the revoked LLM token would get a 200 "already terminal".
+if live_run hq-agent "sess-gv-$$-all" "g/result-leniency" && forge_audience_set "$RUN" "sess-gv-$$"; then
+  G_REV="$RUN"
+  admin_post "/v1/sessions/$G_REV/cancel" '{}'
+  G_REV_ST=$(wait_terminal "$G_REV" 300)
+  case "$G_REV_ST" in completed|failed|cancelled|budget_exceeded)
+    ok "the leniency fixture's run is terminal ('$G_REV_ST') — the state the ack exists for";;
+  *) no "the leniency fixture's run did not terminalize (status='$G_REV_ST')";; esac
+  # The terminal transition revokes EVERY session token (revoke_session_tokens),
+  # which is exactly the state under test — assert it rather than assume it.
+  # Polled, not read once: the revoke happens INSIDE the terminal reconcile, a
+  # step after the status write `wait_terminal` returns on.
+  G_LIVE_TOKS=""
+  for _ in $(seq 1 60); do
+    G_LIVE_TOKS=$(db "select count(*) from api_tokens where session_id='$G_REV' and kind='session' and revoked_at is null")
+    [ "$G_LIVE_TOKS" = 0 ] && break
+    sleep 1
+  done
+  [ "$G_LIVE_TOKS" = 0 ] \
+    && ok "terminalization revoked all of that run's session tokens (the leniency precondition holds)" \
+    || no "$G_LIVE_TOKS token(s) survived terminalization — the 'revoked token' halves below would not be testing revocation"
+  aud_curl POST "/internal/sessions/$G_REV/result" "sess-gv-$$-control" '{"outcome":"completed","summary":"g"}'
+  { [ "$CODE" = 200 ] && echo "$BODY" | grep -q '"ok"'; } \
+    && ok "a REVOKED 'control' token still ACKs /result on a terminal run ($BODY) — the idempotent ack the runner retries into" \
+    || no "revoked control token on /result → $CODE: $BODY (want a 200 ack)"
+  aud_curl POST "/internal/sessions/$G_REV/result" "sess-gv-$$-llm" '{"outcome":"completed","summary":"g"}'
+  { [ "$CODE" = 403 ] && [ "$BODY" = "$WRONG_AUD" ]; } \
+    && ok "a REVOKED 'llm' token on the SAME terminal run → 403 $WRONG_AUD (refused ABOVE the leniency, never acked)" \
+    || no "revoked llm token on /result → $CODE: $BODY (want 403 $WRONG_AUD — a 200 ack means the audience check sank below the leniency)"
+  aud_curl POST "/internal/sessions/$G_REV/result" "sess-gv-$$-tool" '{"outcome":"completed","summary":"g"}'
+  { [ "$CODE" = 403 ] && [ "$BODY" = "$WRONG_AUD" ]; } \
+    && ok "…and a REVOKED 'tool' token likewise → 403 $WRONG_AUD" \
+    || no "revoked tool token on /result → $CODE: $BODY (want 403 $WRONG_AUD)"
+fi
+# A LIVE (unrevoked) llm/tool token is refused the same way — the other half of
+# "revoked-or-live". Uses the still-running g/audiences run, whose tokens are live.
+if [ -n "${G_MAIN:-}" ]; then
+  aud_curl POST "/internal/sessions/$G_MAIN/result" "$G_PFX-llm" '{"outcome":"completed","summary":"g"}'
+  { [ "$CODE" = 403 ] && [ "$BODY" = "$WRONG_AUD" ]; } \
+    && ok "a LIVE 'llm' token on a NON-terminal run's /result → 403 $WRONG_AUD (model egress can never terminalize a run)" \
+    || no "live llm token on /result → $CODE: $BODY (want 403 $WRONG_AUD)"
+  aud_curl POST "/internal/sessions/$G_MAIN/result" "$G_PFX-tool" '{"outcome":"completed","summary":"g"}'
+  { [ "$CODE" = 403 ] && [ "$BODY" = "$WRONG_AUD" ]; } \
+    && ok "a LIVE 'tool' token on the same route → 403 $WRONG_AUD" \
+    || no "live tool token on /result → $CODE: $BODY (want 403 $WRONG_AUD)"
+  # A /result that got through persists a finalization INTENT before ACKing
+  # (internal.rs `finalize_reported`), so zero intents is the observable proof
+  # that neither refused post drove the run one step toward terminal.
+  [ "$(db "select count(*) from session_finalizations where session_id='$G_MAIN'")" = 0 ] \
+    && ok "…and neither refused /result post left a finalization intent behind (the run was never driven toward terminal)" \
+    || no "a wrong-audience /result post persisted a finalization intent"
+fi
+# The /result AUDIENCE MATRIX itself runs LAST and on its OWN run, because its
+# accepted arms (control, then legacy 'all') genuinely finalize the session.
+if live_run hq-agent "sess-gr-$$-all" "g/result-matrix" && forge_audience_set "$RUN" "sess-gr-$$"; then
+  aud_matrix "POST /internal/sessions/{id}/result" control "sess-gr-$$" \
+    POST "/internal/sessions/$RUN/result" '{"outcome":"completed","summary":"g"}'
+fi
 
 # SECTION (h) reservations — Task 7 (durable request-keyed LLM budget
 # reservations, migration 0022). Append here: start a fake LiteLLM on
@@ -1653,12 +2098,193 @@ fi
 # assert exactly ONE `approval.decided` event per decision, one POST per
 # delivery at a signed-webhook sink, and that a stale-epoch mutation is refused.
 
-# SECTION (j) breaker/rate — Task 8 (outbound rate limits + per-connection
-# circuit breakers). Append here: use the fake's `http_500` / `hang` control
-# modes to drive consecutive transport failures until the breaker opens (the
-# refusal is a pre-write proof ⇒ claim state `failed_before_send`), then prove
-# the half-open probe closes it. Timing-sensitive: prefer counting the fake's
-# recorder over sleeping on wall-clock windows.
+# ═════════════════════════════════════════════════════════════════════════════
+# (j) Outbound rate limits + per-connection circuit breakers (Task 8, E14).
+#     Acceptance bullet: "outbound dials are rate-limited per tenant/connection/
+#     host and a repeatedly-failing upstream is circuit-broken."
+#
+#     The governor is IN-MEMORY, PER-REPLICA and BOOT-RESOLVED (governor.rs
+#     `GovernorLimits::from_config`) — there is no runtime knob by design — so
+#     this section RESTARTS the control plane with low ceilings. It runs LAST for
+#     that reason: everything above keeps the shipped defaults.
+#
+#     Knob layout, and why each value:
+#       TENANT_PER_MIN=0, HOST_PER_MIN=0 — DISABLED. Both are proven disabled
+#         (a zero-capacity bucket would refuse the very first dial with
+#         "scope tenant"), and disabling HOST is also a NECESSITY here: host_key
+#         drops the port (broker.rs `host_key`), so BOTH fakes share the single
+#         bucket "127.0.0.1" and an enabled host ceiling would couple the two
+#         independent sub-tests below.
+#       CONNECTION_PER_MIN=12 — the only bucket left binding, and per connection,
+#         so the rate sub-test (on the FIRST connection) and the breaker
+#         sub-tests (on the SECOND) cannot spend each other's budget.
+#       BREAKER_THRESHOLD=3, OPEN_SECS=60 — three consecutive transport failures
+#         open it; 60 s is long enough that no assertion here races the
+#         half-open promotion.
+# ═════════════════════════════════════════════════════════════════════════════
+say "(j) Rate limits + circuit breakers"
+GOV_TENANT=0; GOV_CONN=12; GOV_HOST=0; GOV_THRESHOLD=3; GOV_OPEN_SECS=60
+if restart_server "control plane rebooted with tenant=0 host=0 connection=12/min, breaker 3 → 60s"; then
+
+  # (j.1) `0` MEANS DISABLED, per dimension — never "refuse everything"
+  # (GovernorLimits::from_config's contract). With TWO dimensions at 0, a
+  # zero-capacity reading would refuse this very first dial with "scope tenant".
+  mcp_mode "$PROTO_SNAP" ok
+  if live_run hq-agent "sess-j1-$$" "j/zero-disabled"; then
+    J_ZERO="$RUN"
+    J_MARK=$(mark)
+    R=$(sess_call "$J_ZERO" "sess-j1-$$" '{"tool_call_id":"j1","tool":"mcp__hq__hq_search","input":{"query":"z"}}')
+    { echo "$R" | grep -q '"ok": *true' && ! echo "$R" | grep -q "outbound rate limit reached"; } \
+      && ok "0 = DISABLED: with the tenant AND host ceilings at 0 the dial is ADMITTED (a zero-capacity bucket would have refused it 'scope tenant')" \
+      || no "a ceiling of 0 refused a dial — 0 must mean disabled, not 'refuse everything': $R"
+    J1_CALLS=$(rec "$J_MARK" count rpc=tools/call)
+    [ "$J1_CALLS" = 1 ] \
+      && ok "…and it really reached the upstream (exactly 1 tools/call)" \
+      || no "the admitted dial produced $J1_CALLS tools/call (want 1)"
+  fi
+
+  # (j.2) THE BOUNDARY THAT MATTERS: an `isError` tool result is NOT a transport
+  # failure. broker.rs `breaker_signal` maps every `Ok(_)` — isError or not — to
+  # Outcome::Ok, because an upstream that answers is demonstrably healthy. Four
+  # consecutive isErrors is MORE than the threshold of 3, so if that rule were
+  # inverted the fourth call (and the healthy one after it) would be refused
+  # "circuit breaker open" instead of executing.
+  mcp2_mode "$PROTO_SNAP" is_error
+  if live_run hq2-agent "sess-j2-$$" "j/iserror-not-a-failure"; then
+    J_IE="$RUN"
+    J_MARK2=$(mark2)
+    J_IE_BAD=0
+    for J_N in 1 2 3 4; do
+      R=$(sess_call "$J_IE" "sess-j2-$$" "{\"tool_call_id\":\"j2-$J_N\",\"tool\":\"mcp__hq__hq_search\",\"input\":{\"query\":\"e\"}}")
+      { echo "$R" | grep -q '"ok": *true' && echo "$R" | grep -q '"is_error": *true'; } \
+        || J_IE_BAD=$((J_IE_BAD+1))
+    done
+    J2_CALLS=$(rec2 "$J_MARK2" count rpc=tools/call)
+    if gt0 "$J2_CALLS" "tools/call recorded in the isError window"; then
+      { [ "$J_IE_BAD" = 0 ] && [ "$J2_CALLS" = 4 ]; } \
+        && ok "FOUR consecutive isError results (> the threshold of 3) ALL dispatched — a healthy upstream rejecting a call is not a transport failure" \
+        || no "isError handling wrong: $J_IE_BAD malformed response(s), $J2_CALLS tools/call reached the upstream (want 0 and 4)"
+    fi
+    # …and the healthy call after them still flows: the breaker never opened.
+    mcp2_mode "$PROTO_SNAP" ok
+    J_MARK2B=$(mark2)
+    R=$(sess_call "$J_IE" "sess-j2-$$" '{"tool_call_id":"j2-ok","tool":"mcp__hq__hq_search","input":{"query":"ok"}}')
+    { echo "$R" | grep -q '"ok": *true' && ! echo "$R" | grep -q "circuit breaker open"; } \
+      && ok "the call AFTER four isErrors succeeded — the breaker is still CLOSED" \
+      || no "the post-isError call was refused (the breaker opened on definitive tool errors): $R"
+    [ "$(rec2 "$J_MARK2B" count rpc=tools/call)" = 1 ] \
+      && ok "…and it was really dispatched (1 tools/call)" \
+      || no "the post-isError call did not reach the upstream"
+  fi
+
+  # (j.3) TRANSPORT failures DO open it. HTTP 5xx ⇒ CallErr::UpstreamUnavailable
+  # ⇒ Outcome::TransportFailure (broker.rs `breaker_signal`); three consecutive
+  # ones hit the threshold, and the NEXT dial must be refused with the fake's
+  # request count FROZEN — the refusal happens in `governor_gate`, before the
+  # per-peer session mutex and before any bytes leave.
+  mcp2_mode "$PROTO_SNAP" http_500
+  if live_run hq2-agent "sess-j3-$$" "j/breaker"; then
+    J_BR="$RUN"
+    J_MARK3=$(mark2)
+    for J_N in 1 2 3; do
+      sess_call "$J_BR" "sess-j3-$$" "{\"tool_call_id\":\"j3-$J_N\",\"tool\":\"mcp__hq__hq_search\",\"input\":{\"query\":\"boom\"}}" >/dev/null
+    done
+    J3_FAILS=$(rec2 "$J_MARK3" count rpc=tools/call)
+    if gt0 "$J3_FAILS" "tools/call recorded while driving the breaker's failures"; then
+      [ "$J3_FAILS" = 3 ] \
+        && ok "three consecutive HTTP 500s reached the upstream (the breaker's only input, and its threshold)" \
+        || no "the failure window recorded $J3_FAILS tools/call (want exactly 3)"
+      J_MARK3B=$(mark2)
+      R=$(sess_call "$J_BR" "sess-j3-$$" '{"tool_call_id":"j3-open","tool":"mcp__hq__hq_search","input":{"query":"after"}}')
+      J3_FROZEN=$(rec2 "$J_MARK3B" count)
+      [ "$J3_FROZEN" = 0 ] \
+        && ok "the post-threshold call reached the upstream ZERO times — the fake's request count is FROZEN (it recorded $J3_FAILS a moment earlier, so it was demonstrably still recording)" \
+        || no "$J3_FROZEN request(s) reached the upstream after the breaker should have opened"
+      echo "$R" | grep -q "upstream circuit breaker open after repeated transport failures" \
+        && ok "the refusal is the breaker's own message ('upstream circuit breaker open after repeated transport failures …')" \
+        || no "breaker refusal text wrong: $R"
+      echo "$R" | grep -q "(scope breaker" \
+        && ok "…naming scope 'breaker' (not a rate scope — the two are distinguishable by the runner)" \
+        || no "the breaker refusal did not name scope 'breaker': $R"
+      echo "$R" | grep -qE "retry after [0-9]+s" \
+        && ok "…and carrying a retry-after hint" \
+        || no "the breaker refusal carried no 'retry after Ns' hint: $R"
+      { echo "$R" | grep -q "upstream sha256:" && ! echo "$R" | grep -q "127.0.0.1"; } \
+        && ok "the upstream appears ONLY as a sha256: digest — the raw host never reaches the runner" \
+        || no "the refusal leaked the raw upstream host (or dropped the digest): $R"
+      [ "$(claim_state "$J_BR" j3-open)" = failed_before_send ] \
+        && ok "the breaker refusal settled the claim at 'failed_before_send' — pre-write proof, so the intent stays RE-CLAIMABLE (section (f) proves that state re-dispatches)" \
+        || no "claim state after a breaker refusal = '$(claim_state "$J_BR" j3-open)' (want failed_before_send)"
+    fi
+  fi
+
+  # (j.4) Breaker state does not LEAK across connections. The breaker key is
+  # (connection, host) — strictly finer than per-connection — so with the second
+  # connection's breaker open, the first connection's dials to the SAME host
+  # (127.0.0.1, one shared host bucket, which is why HOST is disabled here) are
+  # untouched.
+  mcp_mode "$PROTO_SNAP" ok
+  if live_run hq-agent "sess-j4-$$" "j/no-leak"; then
+    J_NL="$RUN"
+    J_MARK4=$(mark)
+    R=$(sess_call "$J_NL" "sess-j4-$$" '{"tool_call_id":"j4","tool":"mcp__hq__hq_search","input":{"query":"other"}}')
+    { echo "$R" | grep -q '"ok": *true' && ! echo "$R" | grep -q "circuit breaker open"; } \
+      && ok "with the SECOND connection's breaker open, a dial on the FIRST connection still succeeds — breaker state is per (connection, host)" \
+      || no "an open breaker leaked onto another connection: $R"
+    [ "$(rec "$J_MARK4" count rpc=tools/call)" = 1 ] \
+      && ok "…and it really dispatched (1 tools/call on the first fake)" \
+      || no "the cross-connection dial did not reach its upstream"
+  fi
+
+  # (j.5) The per-connection RATE bucket. Drives dials until the bucket runs dry
+  # (capacity 12, refilling one token per 5 s — the loop's 30-call ceiling is far
+  # more than a fast local fake needs to outrun the refill, and stopping at the
+  # FIRST refusal keeps this independent of exactly where it lands).
+  if live_run hq-agent "sess-j5-$$" "j/rate"; then
+    J_RATE="$RUN"
+    J_THROTTLED=""; J_PASSED=0; J_RESP=""
+    for J_N in $(seq 1 30); do
+      R=$(sess_call "$J_RATE" "sess-j5-$$" "{\"tool_call_id\":\"j5-$J_N\",\"tool\":\"mcp__hq__hq_search\",\"input\":{\"query\":\"r\"}}")
+      if echo "$R" | grep -q "outbound rate limit reached"; then
+        J_THROTTLED="j5-$J_N"; J_RESP="$R"; break
+      fi
+      echo "$R" | grep -q '"ok": *true' && J_PASSED=$((J_PASSED+1))
+    done
+    if gt0 "$J_PASSED" "dials ADMITTED before the connection bucket ran dry"; then
+      [ -n "$J_THROTTLED" ] \
+        && ok "the per-connection bucket ran dry after $J_PASSED admitted dials — '$J_THROTTLED' was refused" \
+        || no "30 consecutive dials, none refused: the 12/min connection ceiling never bound"
+    fi
+    if [ -n "$J_THROTTLED" ]; then
+      echo "$J_RESP" | grep -q "outbound rate limit reached (scope connection" \
+        && ok "the refusal is the rate limiter's own message naming scope 'connection'" \
+        || no "rate-limit refusal text/scope wrong: $J_RESP"
+      echo "$J_RESP" | grep -qE "retry after [0-9]+s" \
+        && ok "…and carries the 'retry after Ns' hint a client can act on" \
+        || no "the rate-limit refusal carried no retry-after hint: $J_RESP"
+      { echo "$J_RESP" | grep -q "upstream sha256:" && ! echo "$J_RESP" | grep -q "127.0.0.1"; } \
+        && ok "…with the upstream as a sha256: digest only" \
+        || no "the rate-limit refusal leaked the raw upstream host: $J_RESP"
+      echo "$J_RESP" | grep -qE "scope (tenant|host)" \
+        && no "a refusal named scope tenant/host, which are set to 0 (DISABLED) — 0 is being read as zero capacity" \
+        || ok "no refusal ever named the DISABLED tenant/host scopes across $J_PASSED+ dials — the '0 = disabled' contract holds under load"
+      [ "$(claim_state "$J_RATE" "$J_THROTTLED")" = failed_before_send ] \
+        && ok "the throttled intent's claim row reads 'failed_before_send' — RE-CLAIMABLE, which is what makes acting on 'retry after Ns' safe" \
+        || no "claim state for the throttled intent = '$(claim_state "$J_RATE" "$J_THROTTLED")' (want failed_before_send)"
+    fi
+  fi
+  # NOT ASSERTED — "the half-open probe CLOSES the breaker". Closing needs the
+  # full 60 s open window to elapse (the window is boot-resolved with the same
+  # ceilings, and OPEN_SECS is clamped in seconds), so proving it live means
+  # either a >60 s sleep in CI or a third boot whose only purpose is a 1-second
+  # window — and a 1 s window races every assertion around it. The state machine
+  # (Open → HalfOpen on the first dial past the window, single-probe
+  # exclusivity, probe-success ⇒ Closed{0}, probe-failure ⇒ a FRESH window) is
+  # driven exhaustively against an injected clock in governor.rs's own tests,
+  # which is the right place for a pure-timing property. What only an e2e can
+  # show — that a real refusal never touches the socket, carries the digest, and
+  # leaves a re-claimable claim — is asserted above.
+fi
 
 # ── Result ───────────────────────────────────────────────────────────────────
 say "RESULT"
