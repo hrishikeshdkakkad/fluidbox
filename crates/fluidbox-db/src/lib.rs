@@ -4902,10 +4902,46 @@ pub async fn claim_tool_execution(
     Ok(outcome)
 }
 
+/// The outcome of [`complete_tool_execution`] (Phase E, #33; review I3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettleOutcome {
+    /// This dispatcher landed the `claimed → terminal` transition. Its locally
+    /// computed result IS the durable one.
+    Settled,
+    /// The CAS lost: something else already made this claim terminal — in
+    /// practice the stale-claim sweep, which moved an expired claim to
+    /// `ambiguous` and ledgered that. The caller MUST answer from these durable
+    /// columns, never from its own completion: the sweep's row is what every
+    /// duplicate adopts and what the ledger says, so returning the local result
+    /// would hand the original caller a success the audit trail contradicts.
+    Superseded {
+        state: String,
+        result_content: Option<Value>,
+        error_message: Option<String>,
+    },
+}
+
+impl SettleOutcome {
+    /// Did THIS caller land the transition? (The ledger writes on true only —
+    /// a superseded dispatcher must not double-ledger the sweep's outcome.)
+    pub fn settled(&self) -> bool {
+        matches!(self, SettleOutcome::Settled)
+    }
+}
+
 /// Settle a WON claim from `claimed` to a terminal state (CAS on
 /// `state = 'claimed'`). `result_content` MUST be pre-capped by the caller
-/// (reuse the broker's 256 KiB cap). Returns true iff this call landed the
-/// transition — a loser (already swept to `ambiguous`, or a duplicate) gets false.
+/// (reuse the broker's 256 KiB cap).
+///
+/// [`SettleOutcome::Settled`] iff this call landed the transition. A loser
+/// (already swept to `ambiguous`, or a duplicate) gets
+/// [`SettleOutcome::Superseded`] carrying the DURABLE row read in the SAME
+/// transaction as the failed CAS — the claim is terminal by then, so that read
+/// is stable, and it is the only answer the caller may return (review I3:
+/// returning the local completion made the original caller see `succeeded`
+/// while the ledger and every duplicate saw `ambiguous`). A vanished row (no
+/// delete path exists for claims) degrades to `ambiguous`: we dispatched and
+/// cannot prove the outcome, which is exactly what `ambiguous` means.
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_tool_execution(
     pool: &PgPool,
@@ -4916,7 +4952,7 @@ pub async fn complete_tool_execution(
     is_error: Option<bool>,
     result_content: Option<&Value>,
     error_message: Option<&str>,
-) -> sqlx::Result<bool> {
+) -> sqlx::Result<SettleOutcome> {
     let mut tx = scoped_tx(pool, scope).await?;
     let res = sqlx::query(
         "update tool_execution_claims
@@ -4933,8 +4969,33 @@ pub async fn complete_tool_execution(
     .bind(scope.tenant_id())
     .execute(&mut *tx)
     .await?;
+    if res.rows_affected() == 1 {
+        tx.commit().await?;
+        return Ok(SettleOutcome::Settled);
+    }
+    // Lost the CAS → the row is ALREADY terminal. Read the durable outcome here,
+    // inside the same transaction, so the caller can adopt it verbatim.
+    let durable: Option<(String, Option<Value>, Option<String>)> = sqlx::query_as(
+        "select state, result_content, error_message from tool_execution_claims
+          where id = $1 and tenant_id = $2",
+    )
+    .bind(claim_id)
+    .bind(scope.tenant_id())
+    .fetch_optional(&mut *tx)
+    .await?;
     tx.commit().await?;
-    Ok(res.rows_affected() == 1)
+    Ok(match durable {
+        Some((state, result_content, error_message)) => SettleOutcome::Superseded {
+            state,
+            result_content,
+            error_message,
+        },
+        None => SettleOutcome::Superseded {
+            state: "ambiguous".to_string(),
+            result_content: None,
+            error_message: None,
+        },
+    })
 }
 
 /// The outcome of [`reclaim_failed_before_send`] (Phase E, #33; review I1).
@@ -13931,7 +13992,8 @@ mod tests {
             None,
         )
         .await
-        .unwrap());
+        .unwrap()
+        .settled());
 
         // A duplicate for the SAME (session, tool_call_id, digest) adopts the
         // stored outcome — and, the false-green guard: the claim was NOT
@@ -14019,7 +14081,8 @@ mod tests {
             Some("connect refused"),
         )
         .await
-        .unwrap());
+        .unwrap()
+        .settled());
         assert_eq!(
             reclaim_failed_before_send(&pool, scope, session_id, "fbs", "sha256:1", 600, 3)
                 .await
@@ -14054,7 +14117,8 @@ mod tests {
             None
         )
         .await
-        .unwrap());
+        .unwrap()
+        .settled());
         assert_eq!(
             reclaim_failed_before_send(&pool, scope, session_id, "fbs", "sha256:1", 600, 3)
                 .await
@@ -14080,7 +14144,8 @@ mod tests {
             None
         )
         .await
-        .unwrap());
+        .unwrap()
+        .settled());
         assert_eq!(
             reclaim_failed_before_send(&pool, scope, session_id, "amb", "sha256:2", 600, 3)
                 .await
@@ -14126,7 +14191,8 @@ mod tests {
             Some("connect refused"),
         )
         .await
-        .unwrap());
+        .unwrap()
+        .settled());
         assert_eq!(
             reclaim_failed_before_send(&pool, scope, session_id, "cap", "sha256:c", 600, CAP)
                 .await
@@ -14146,7 +14212,8 @@ mod tests {
             Some("connect refused"),
         )
         .await
-        .unwrap());
+        .unwrap()
+        .settled());
         assert_eq!(
             reclaim_failed_before_send(&pool, scope, session_id, "cap", "sha256:c", 600, CAP)
                 .await
@@ -14263,7 +14330,8 @@ mod tests {
         assert!(
             !complete_tool_execution(&pool, scope, id, "succeeded", None, Some(false), None, None)
                 .await
-                .unwrap(),
+                .unwrap()
+                .settled(),
             "a late complete must lose to the sweep's ambiguous row"
         );
         // The durable truth stays `ambiguous` (the swept row was not overwritten).
