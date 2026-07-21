@@ -226,7 +226,13 @@ jobs:
   # re-claimable, ambiguous never re-dispatched, cancel-during-approval).
   hardening:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # 45, not the 25 this job was created with. The budget has to cover a
+    # cache-MISS debug build of the workspace (10-18 min on its own) plus the
+    # script, which has grown from 1666 to ~3650 lines, 25 to 43 runs, ~5 s to
+    # ~36 s of fixed sleeps, and 1 to 3 boots of replica A plus a second replica.
+    # A timeout kill is indistinguishable from a hang in the log, so headroom
+    # here is what keeps a slow runner from reading as a broker deadlock.
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:16
@@ -262,6 +268,23 @@ jobs:
           # single-process lifecycle across the boots the matrix needs).
           FLUIDBOX_SERVER_BIN: ${{ github.workspace }}/target/debug/fluidbox-server
         run: bash scripts/hardening-e2e.sh
+      # FORENSICS. The script owns its stack in a mktemp dir and its EXIT trap
+      # `rm -rf`s it, so a CI-only failure used to leave nothing but the pass/fail
+      # lines — no control-plane log, no recorder JSONL, nothing to reconstruct
+      # which upstream request did or did not happen. The script now copies those
+      # files to a FIXED path (hardening-e2e-artifacts/) before deleting the work
+      # dir, but ONLY when the run failed and only under CI — which is why this
+      # step is `if: failure()` and why a green run uploads nothing. Copy-out was
+      # chosen over "keep the work dir": upload-artifact needs a path known when
+      # this YAML is written, and the work dir's name is random.
+      - name: upload hardening forensics (server logs + recorder JSONLs)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hardening-e2e-logs
+          path: hardening-e2e-artifacts/
+          if-no-files-found: warn
+          retention-days: 7
 
   web:
     runs-on: ubuntu-latest
