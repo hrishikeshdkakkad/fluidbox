@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-21 · **State:** implementation, acceptance, whole-branch review, Codex gate and fix waves COMPLETE. **PR #84 open, CI FULLY GREEN** on head `0f0da8e` (rust · hardening · identity · bindings · secrets · kind-calico · unit · web · deny · chart), mergeable and awaiting review.
 
-Epic #28 (multi-user MCP control plane). Phases A/B/C/D merged into `release/multi-user-mcp-control-plane`; **Phase E is branch `feat/mu-phase-E`** off `825ce56`, 29 commits, migrations 0019–0022, head `343c80d`. Never PR to `main` — the epic lands on the release branch (PR #27).
+Epic #28 (multi-user MCP control plane). Phases A/B/C/D merged into `release/multi-user-mcp-control-plane`; **Phase E is branch `feat/mu-phase-E`** off `825ce56`, 32 commits, migrations 0019–0022, head `0f0da8e`. Never PR to `main` — the epic lands on the release branch (PR #27).
 
 Final local bar at `0f0da8e`, `DATABASE_URL` proven unset: fmt ✓ · clippy `--workspace --all-targets -D warnings` ✓ · `cargo test --workspace` **655 passed / 0 failed** · `pnpm build` ✓ · vitest 34/34 · `bash -n` all scripts ✓ · shellcheck clean.
 
@@ -12,15 +12,15 @@ Final local bar at `0f0da8e`, `DATABASE_URL` proven unset: fmt ✓ · clippy `--
 
 Shipped, all on by default (no feature flags): shared **egress boundary** — two hardened clients, `admit_url` pre-flight at every dial, redirect refusal, save-time admission on connection/callback URLs, git clone-URL admission (Gap 7) · **per-run MCP session manager** + 2025-11-25 conformance, bounded SSE assembler, `-32601`, `outputSchema`/`structuredContent` preserved, SEP-835 terminal (Gap 8) · **server-side frozen-schema argument validation**, dialect by snapshot protocol version (Gap 12) · **durable four-state execution claims** keyed `(session, tool_call_id, input_digest)` (Gap 11) · **audience-scoped sandbox credentials** `llm|tool|control|workspace` (Gap 10) · **multi-replica coordination**: approval single-emission inside the decision CAS + `fluidbox_approvals` `pg_notify`, session lease + epoch fencing, delivery claims (Gap 13) · **durable request-keyed LLM budget reservations** (Gap 14) · per-tenant/connection/host rate limits + per-`(connection, host)` circuit breakers.
 
-Every #33 acceptance bullet maps to a lettered section of `scripts/hardening-e2e.sh` (sections a–j), plus a new `hardening` CI job on its own database. **The script has never been executed** — CI on the PR is its first run, exactly as `secrets`/`identity`/`bindings` were.
+Every #33 acceptance bullet maps to a lettered section of `scripts/hardening-e2e.sh` (sections a–j), plus a new `hardening` CI job on its own database. It has now run for real: **272/272 assertions pass** in CI. Its first three runs found only script defects (an event payload read at the wrong nesting so several asserts compared empty-to-empty, a stale expectation against the same-day OAuth-only narrowing of SEP-835 marking, a fixture missing a required tool, and a lease assertion demanding a state its own fixture cannot produce) — no production regression.
 
-The per-task local bar (fmt · clippy `-D warnings` · `cargo test --workspace` with `DATABASE_URL` proven unset) was green at each implementation commit; **this docs task did not re-run it** (docs-only diff). The whole-branch bar has not been re-run since the last fix round.
+The bar above was re-run at the final head; all ten CI jobs are green.
 
 **Migration deploy order is safe in either direction** — unlike 0018. 0019/0022 create new tables, 0020/0021 add nullable-or-defaulted columns, and a pre-Phase-E binary simply never reads them. **The runner images are the coupled half:** rebuild them (`just sandbox-build`) — a pinned pre-Phase-E image on a new server aborts at the first tool call (see residuals).
 
 ## Owner actions
 
-1. **Review and merge PR #84** (merge commit) once CI is green on `343c80d`. The closeout — whole-branch review, Codex gate, and all fix waves — is done; nothing is outstanding but your review and the merge.
+1. **Review and merge PR #84** (merge commit) — CI is fully green on `0f0da8e`. The closeout — whole-branch review, Codex gate, and all fix waves — is done; nothing is outstanding but your review and the merge.
 2. **Close #33 manually** on merge — release-branch base means closing keywords don't fire. #32/#75 from Phase D may still be open.
 3. Rebuild runner images before any deploy that carries this branch (`just sandbox-build`, `just codex-build`) and check that no agent revision pins an older `runner_image`.
 4. Optional knobs, all default-off/default-safe: `FLUIDBOX_EGRESS_ALLOW_CIDRS`, `FLUIDBOX_EGRESS_PROXY`, `FLUIDBOX_EGRESS_RATE_*`, `FLUIDBOX_EGRESS_BREAKER_*`, `FLUIDBOX_LLM_MAX_CONCURRENT_RESERVATIONS`. Every one **fails boot** on a malformed value; the reservation ceiling also refuses `0`, while `0` on a rate/breaker knob means "disable that dimension".
