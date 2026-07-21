@@ -88,6 +88,9 @@ pub fn spawn_all(state: AppState) {
     tokio::spawn(watchdog(state.clone()));
     tokio::spawn(budget_sweeper(state.clone()));
     tokio::spawn(approval_expiry(state.clone()));
+    // Cross-replica approval wakeups (Gap 13): every replica wakes its OWN
+    // waiters off the shared NOTIFY channel.
+    spawn_approval_wakeups(state.clone());
     // Archive-transport providers only: host-dir providers (Docker) never
     // store archives, so the sweep would scan an absent directory forever.
     if state.provider.workspace_transport() == fluidbox_core::traits::WorkspaceTransport::Archive {
@@ -561,19 +564,76 @@ async fn budget_sweeper(state: AppState) {
 }
 
 /// Expire pending approvals whose deadline passed, and wake their waiters.
+///
+/// Phase E (#33; Gap 13): the sweep is now a cross-tenant READ followed by a
+/// per-row, tenant-SCOPED decision transaction. Three things fall out of that
+/// split, all of them the point:
+///   * the expiry decision emits its canonical `approval.decided` +
+///     `tool.decision` INSIDE the CAS that makes it, like every other decision
+///     site — waiters no longer emit, so this is the only place those rows can
+///     come from on the timeout path;
+///   * the CAS (`status = 'pending' and expires_at < now()`) is the single-winner
+///     test, so N replicas sweeping the same row still produce ONE decision and
+///     ONE pair of events;
+///   * the same transaction `pg_notify`s `fluidbox_approvals`, so a waiter on
+///     ANOTHER replica wakes on the expiry instead of only on its ≤2 s poll floor
+///     (the local `wake` below stays as the zero-latency path for this replica).
 async fn approval_expiry(state: AppState) {
     let mut tick = tokio::time::interval(Duration::from_secs(5));
     loop {
         tick.tick().await;
-        match fluidbox_db::system_worker::expire_stale_approvals(&state.pool).await {
-            Ok(expired) => {
-                for a in expired {
-                    state.approvals.wake(a.id).await;
+        let due =
+            match fluidbox_db::system_worker::expired_pending_approvals(&state.pool, 200).await {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("approval expiry scan failed: {e}");
+                    continue;
                 }
+            };
+        for a in due {
+            let scope = TenantScope::assume(a.tenant_id);
+            let events = crate::internal::approval_decision_events(
+                &state,
+                a.session_id,
+                a.id,
+                &a.tool_call_id,
+                &a.tool,
+                "expired",
+                "timeout",
+            );
+            match fluidbox_db::expire_approval_tx(&state.pool, scope, a.id, events).await {
+                // Lost the CAS (a human decided it, or another replica expired it
+                // first) — that winner ledgered and notified; nothing owed here.
+                Ok(None) => {}
+                Ok(Some(_)) => state.approvals.wake(a.id).await,
+                Err(e) => tracing::warn!("approval {} expiry failed: {e}", a.id),
             }
-            Err(e) => tracing::warn!("approval expiry sweep failed: {e}"),
         }
     }
+}
+
+/// Relay committed approval decisions from the `fluidbox_approvals` LISTEN
+/// channel into THIS replica's in-memory waiter registry (Phase E, #33; Gap 13).
+///
+/// Without it, a `/permission` handler blocked on replica B never learns that
+/// replica A served the approve — it only discovers the decision on its next
+/// ≤2 s poll. That poll stays (it is the missed-notify and Neon scale-to-zero
+/// backstop, exactly as `events_after` is for SSE); this makes the common case
+/// immediate. A lagged/closed broadcast receiver is not an error: the poll floor
+/// covers it, so the loop just keeps consuming.
+pub fn spawn_approval_wakeups(state: AppState) {
+    tokio::spawn(async move {
+        let mut rx = state.approvals_tx.subscribe();
+        loop {
+            match rx.recv().await {
+                Ok(id) => state.approvals.wake(id).await,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!("approval wakeup relay lagged {n} notifications; waiters fall back to the poll floor");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    });
 }
 
 /// Kubernetes netpol run-gate (design 2026-07-15): probe that the CNI enforces
@@ -669,6 +729,60 @@ async fn finalize_worker(state: AppState) {
 mod tests {
     use super::*;
     use fluidbox_core::state::SessionStatus;
+
+    /// The Gap-13 worker rule, asserted rather than asserted-in-prose (Phase E,
+    /// #33; design :1094-1096): the three PERIODIC lifecycle workers — watchdog,
+    /// budget sweeper, approval expiry — run on EVERY replica and must never
+    /// perform a side effect themselves. They may only record a single-winner
+    /// intent (`orchestrator::fail` / `orchestrator::finalize_forced`, both of
+    /// which reduce to `begin_finalization`'s `on conflict do nothing`) or CAS an
+    /// approval; the cleanup / artifact collection / publication that follows is
+    /// performed by `drive_finalization` alone, under the finalization claim AND
+    /// the epoch-fenced session lease. So two replicas double-firing a worker is
+    /// benign by construction.
+    ///
+    /// A source guard, so it runs without a database. It slices each worker's
+    /// body and refuses any provider MUTATION in it. `state()` (a read probe) is
+    /// deliberately allowed — the watchdog must confirm a sandbox is dead before
+    /// recording its verdict.
+    ///
+    /// NOT covered, deliberately: `boot_orphan_sweep` and `reconcile_managed` DO
+    /// terminate sandboxes without a lease. They are not lifecycle drivers — they
+    /// reap sandboxes whose session is already terminal or unknown, which is
+    /// durable truth rather than a race, and their mutation is idempotent
+    /// (terminate treats already-gone as success) and UID-preconditioned on
+    /// Kubernetes against name reuse.
+    #[test]
+    fn periodic_lifecycle_workers_perform_no_provider_side_effects() {
+        let src = include_str!("workers.rs");
+        for (worker, next_item) in [
+            ("async fn watchdog(", "async fn sandbox_dead("),
+            ("async fn budget_sweeper(", "/// Expire pending approvals"),
+            ("async fn approval_expiry(", "/// Relay committed approval"),
+        ] {
+            let start = src
+                .find(worker)
+                .unwrap_or_else(|| panic!("{worker} exists"));
+            let end = src[start..]
+                .find(next_item)
+                .map(|i| start + i)
+                .unwrap_or_else(|| panic!("{worker} body is delimited by {next_item}"));
+            let body = &src[start..end];
+            for mutation in [
+                ".provider.terminate(",
+                ".provider.provision(",
+                ".provider.collect_artifacts(",
+            ] {
+                assert!(
+                    !body.contains(mutation),
+                    "{worker} must not call {mutation}: a periodic worker runs on every \
+                     replica, so its side effects would fire N times. Record the intent \
+                     (fail / finalize_forced) and let the lease-holding finalization \
+                     driver act."
+                );
+            }
+        }
+    }
 
     #[test]
     fn reconcile_decision_table() {

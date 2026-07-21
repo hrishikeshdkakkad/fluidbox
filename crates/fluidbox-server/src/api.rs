@@ -1219,10 +1219,26 @@ pub async fn decide_approval(
     // `decided_by` is DERIVED from the authenticated principal — never
     // request-supplied (parent design line 581).
     let decided_by = principal.decided_by();
-    let row = fluidbox_db::decide_approval(&state.pool, scope, id, status, &decided_by)
+    // Phase E (#33; Gap 13): the DECISION transaction is the ledger emitter. The
+    // canonical `approval.decided` + `tool.decision` pair commits atomically with
+    // this compare-and-set and `pg_notify`s every replica's waiters — so a decided
+    // approval produces exactly ONE pair no matter how many `/permission` handlers
+    // are re-attached to the row, and a waiter on ANOTHER replica wakes
+    // immediately instead of riding its ≤2 s poll floor.
+    let events = crate::internal::approval_decision_events(
+        &state,
+        session.id,
+        id,
+        &approval.tool_call_id,
+        &approval.tool,
+        status,
+        &decided_by,
+    );
+    let row = fluidbox_db::decide_approval_tx(&state.pool, scope, id, status, &decided_by, events)
         .await?
         .ok_or_else(|| ApiError::Conflict("approval is not pending".into()))?;
-    // Wake the blocked permission handler.
+    // Wake this replica's blocked permission handler without waiting for the
+    // NOTIFY round trip (other replicas ride the channel).
     state.approvals.wake(id).await;
     Ok(Json(json!({ "approval": row })))
 }

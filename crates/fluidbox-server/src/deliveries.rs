@@ -99,30 +99,55 @@ pub async fn enqueue_for_session(state: &AppState, session_id: Uuid) -> bool {
     all_present
 }
 
-/// The delivery worker: single sequential loop (no locking needed — see
-/// due_result_deliveries). At-least-once semantics; receivers dedup on
-/// x-fluidbox-delivery.
+/// How long a claimed delivery row stays off other replicas' scans. Comfortably
+/// over one attempt (`DELIVERY_TIMEOUT` 10 s plus the GitHub reconcile round
+/// trips) so a healthy attempt never has its row stolen mid-flight, and short
+/// enough that a crashed replica's rows return to the pool within a few ticks.
+const DELIVERY_CLAIM_TTL_SECS: i64 = 120;
+
+/// The delivery worker: one loop per replica, each taking a CLAIMED, DISJOINT
+/// slice of the due rows (Phase E, #33; Gap 13).
+///
+/// Before this it was an explicitly single-process sequential loop with no row
+/// claim, so two replicas polled the SAME due rows and both attempted them.
+/// `claim_due_deliveries` stamps `claimed_by`/`claimed_until` under
+/// `for update skip locked` in one transaction, and `mark_delivery_attempt` is
+/// guarded on that owner — so concurrent attempts are fenced and a crashed
+/// replica's claims expire back into the pool.
+///
+/// Delivery stays AT-LEAST-ONCE across crashes by design (the external call
+/// precedes the durable record; there is no distributed transaction to be had):
+/// webhook receivers dedup on `x-fluidbox-delivery`, and the GitHub comment
+/// create path closes its own crash window by reconcile-before-create against a
+/// deterministic per-subscription marker.
 pub fn spawn_worker(state: AppState) {
     tokio::spawn(async move {
+        let owner = crate::orchestrator::replica_id();
         let mut tick = tokio::time::interval(Duration::from_secs(3));
         loop {
             tick.tick().await;
-            let due = match fluidbox_db::system_worker::due_result_deliveries(&state.pool, 10).await
+            let due = match fluidbox_db::system_worker::claim_due_deliveries(
+                &state.pool,
+                owner,
+                10,
+                DELIVERY_CLAIM_TTL_SECS,
+            )
+            .await
             {
                 Ok(d) => d,
                 Err(e) => {
-                    tracing::warn!("delivery poll failed: {e}");
+                    tracing::warn!("delivery claim poll failed: {e}");
                     continue;
                 }
             };
             for d in due {
-                attempt(&state, &d).await;
+                attempt(&state, &d, owner).await;
             }
         }
     });
 }
 
-async fn attempt(state: &AppState, d: &fluidbox_db::ResultDeliveryRow) {
+async fn attempt(state: &AppState, d: &fluidbox_db::ResultDeliveryRow, owner: Uuid) {
     // The delivery row carries only a session id; resolve the owning tenant
     // (cross-tenant worker load) so the scoped calls below key off the right
     // tenant. A vanished session (never happens — sessions are retained) leaves
@@ -144,10 +169,14 @@ async fn attempt(state: &AppState, d: &fluidbox_db::ResultDeliveryRow) {
         Err(e) => (false, Some(e.as_str()), None, None),
     };
     let next_attempt = d.attempts + 1;
+    // Guarded on OUR claim: a replica whose claim expired and was stolen
+    // mid-attempt records nothing (`None`) rather than stomping the new owner's
+    // attempt counter and backoff.
     let updated = fluidbox_db::mark_delivery_attempt(
         &state.pool,
         scope,
         d.id,
+        owner,
         ok,
         err,
         digest,

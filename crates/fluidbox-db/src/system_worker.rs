@@ -13,13 +13,17 @@
 //! There are exactly THREE sanctioned categories of caller:
 //!
 //! (a) **Background workers that derive scope from the returned row.** The
-//!     heartbeat watchdog, wall-clock budget sweeper, approval-expiry sweep,
-//!     the stale-execution-claim sweep ([`sweep_stale_execution_claims`], Gap 11
-//!     — CAS a crashed `claimed` row to `ambiguous` past its expiry), the
-//!     restart-recoverable finalize driver, the managed-sandbox reconciler, and
-//!     the delivery worker each act on ids/status across ALL tenants by
-//!     construction (a global scan), then scope every mutation to the
-//!     `tenant_id` of the row they just fetched.
+//!     heartbeat watchdog, wall-clock budget sweeper, approval-expiry scan
+//!     ([`expired_pending_approvals`] — READ ONLY since Phase E; the decision
+//!     itself is the scoped, single-winner `expire_approval_tx` so it can emit
+//!     its ledger events in the same transaction), the stale-execution-claim
+//!     sweep ([`sweep_stale_execution_claims`], Gap 11 — CAS a crashed `claimed`
+//!     row to `ambiguous` past its expiry), the restart-recoverable finalize
+//!     driver, the managed-sandbox reconciler, and the delivery worker
+//!     ([`claim_due_deliveries`] — Phase E: the scan now STAMPS a per-row claim
+//!     under `for update skip locked` so replicas take disjoint sets) each act on
+//!     ids/status across ALL tenants by construction (a global scan), then scope
+//!     every mutation to the `tenant_id` of the row they just fetched.
 //!
 //! (b) **Credential-verification bootstrap resolvers for UNAUTHENTICATED
 //!     ingress/callbacks.** Webhook ingress (HMAC via [`get_connection`]),
@@ -111,10 +115,9 @@
 //! surfaces; and the boot seed). None expose a tenant-owned resource without a
 //! verified tenant id.
 
-use crate::approval_cols;
 use crate::{
-    ApprovalRow, GithubAppRegistrationRow, IntegrationConnectionRow, ResultDeliveryRow,
-    ScheduleRow, SessionRow, TriggerSubscriptionRow,
+    GithubAppRegistrationRow, IntegrationConnectionRow, ResultDeliveryRow, ScheduleRow, SessionRow,
+    TriggerSubscriptionRow,
 };
 use crate::{CONNECTION_COLS, GH_REG_COLS, SUBSCRIPTION_COLS};
 use chrono::{DateTime, Utc};
@@ -311,14 +314,42 @@ pub async fn pending_finalizations(pool: &PgPool) -> sqlx::Result<Vec<Uuid>> {
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
-pub async fn expire_stale_approvals(pool: &PgPool) -> sqlx::Result<Vec<ApprovalRow>> {
+/// One pending approval past its deadline, plus the tenant its session belongs to
+/// and the facts the ledger events need. The tenant rides the row so the caller
+/// can decide it under a SCOPED transaction (`expire_approval_tx`) instead of
+/// bulk-expiring cross-tenant.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ExpiredApprovalRow {
+    pub tenant_id: Uuid,
+    pub id: Uuid,
+    pub session_id: Uuid,
+    pub tool_call_id: String,
+    pub tool: String,
+}
+
+/// Pending approvals whose deadline has passed — a cross-tenant READ scan; it
+/// decides nothing (Phase E, #33; Gap 13).
+///
+/// Deliberately split from the write: the old shape was one bulk cross-tenant
+/// UPDATE, which cannot emit the canonical `approval.decided` / `tool.decision`
+/// events in its own transaction (the ledger only accepts `Redacted` envelopes the
+/// SERVER builds per row, and each row belongs to a different tenant). The worker
+/// now scans here and calls the scoped, single-winner `expire_approval_tx` per
+/// row, so the expiry decision emits its events atomically like every other
+/// decision site, and N replicas sweeping the same row still produce exactly ONE
+/// decision — the CAS in that function is the winner test.
+pub async fn expired_pending_approvals(
+    pool: &PgPool,
+    limit: i64,
+) -> sqlx::Result<Vec<ExpiredApprovalRow>> {
     let mut tx = crate::worker_tx(pool).await?;
-    let out = sqlx::query_as(concat!(
-        "update approvals set status = 'expired', decided_at = now(), decided_by = 'timeout'
-         where status = 'pending' and expires_at < now()
-         returning ",
-        approval_cols!()
-    ))
+    let out = sqlx::query_as(
+        "select s.tenant_id, a.id, a.session_id, a.tool_call_id, a.tool
+           from approvals a join sessions s on s.id = a.session_id
+          where a.status = 'pending' and a.expires_at < now()
+          order by a.expires_at limit $1",
+    )
+    .bind(limit)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -377,23 +408,55 @@ pub async fn due_schedules(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<Schedu
     Ok(out)
 }
 
-/// Due work for the (single, sequential) delivery worker — a cross-tenant
-/// global scan. No row locking: there is one worker task per server and
-/// attempts are awaited one at a time, so a row can never be attempted twice
-/// concurrently. Delivery is at-least-once by design — receivers dedup on the
-/// delivery id. Each row carries its session; the caller derives the owning
-/// tenant from it before touching any scoped repository.
-pub async fn due_result_deliveries(
+/// CLAIM due work for the delivery worker — a cross-tenant global scan that now
+/// takes a per-row lease in the SAME transaction (Phase E, #33; Gap 13; design
+/// :1079-1084). Previously an unlocked `select`: with two replicas both polled the
+/// same due rows and both POSTed them.
+///
+/// `for update skip locked` inside the CTE is what makes the sets DISJOINT — a row
+/// another replica is claiming in a concurrent transaction is skipped, never
+/// waited on, so neither worker blocks. The claim is then stamped
+/// (`claimed_by`/`claimed_until`) so the row stays off other replicas' scans for
+/// `ttl_secs` even after this transaction commits; `mark_delivery_attempt` is
+/// guarded on that owner and releases the claim.
+///
+/// A claim whose holder crashed simply expires (`claimed_until < now()`) and the
+/// row returns to the pool — time-based takeover, the same discipline as the
+/// finalization claim and the session lease, and for the same reason (advisory
+/// locks are rejected: design :1067-1072).
+///
+/// This fences concurrent ATTEMPTS. Delivery remains at-least-once across crashes
+/// (a crash between the external POST and `mark_delivery_attempt` re-attempts):
+/// webhook receivers dedup on `x-fluidbox-delivery`, and the GitHub create path
+/// closes its own crash window by reconcile-before-create against a deterministic
+/// comment marker.
+pub async fn claim_due_deliveries(
     pool: &PgPool,
+    owner: Uuid,
     limit: i64,
+    ttl_secs: i64,
 ) -> sqlx::Result<Vec<ResultDeliveryRow>> {
     let mut tx = crate::worker_tx(pool).await?;
     let out = sqlx::query_as(
-        "select * from result_deliveries
-         where status = 'pending' and next_attempt_at <= now()
-         order by next_attempt_at limit $1",
+        "with due as (
+             select id from result_deliveries
+              where status = 'pending' and next_attempt_at <= now()
+                and (claimed_until is null or claimed_until < now() or claimed_by = $1)
+              order by next_attempt_at
+              limit $2
+              for update skip locked
+         )
+         update result_deliveries d
+            set claimed_by = $1,
+                claimed_until = now() + make_interval(secs => $3),
+                updated_at = now()
+           from due
+          where d.id = due.id
+         returning d.*",
     )
+    .bind(owner)
     .bind(limit)
+    .bind(ttl_secs.max(1) as f64)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;

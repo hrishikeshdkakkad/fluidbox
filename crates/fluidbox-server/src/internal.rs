@@ -37,6 +37,13 @@ struct GateDecision {
     /// approval's digest. Empty until stamped by [`decide_tool_call`]; only the
     /// brokered `tool_call` path reads it.
     input_digest: String,
+    /// This deny is "the session stopped accepting work", not a policy refusal
+    /// (Phase E, #33). It exists so the post-approval-wait terminality deny
+    /// answers with the SAME wire shape as the handler-top terminal guard —
+    /// `{"decision":"deny","message":"session is not active"}` on `/permission`,
+    /// a `400 session is not active` on `/tools/call` — instead of the two guards
+    /// disagreeing about what a terminal session looks like to a runner.
+    session_terminal: bool,
 }
 
 impl GateDecision {
@@ -45,6 +52,7 @@ impl GateDecision {
             allowed: true,
             message: None,
             input_digest: String::new(),
+            session_terminal: false,
         }
     }
     fn deny(message: impl Into<String>) -> Self {
@@ -52,9 +60,23 @@ impl GateDecision {
             allowed: false,
             message: Some(message.into()),
             input_digest: String::new(),
+            session_terminal: false,
+        }
+    }
+    /// The session went terminal (cancel / budget / watchdog) — wording and shape
+    /// identical to the handler-top guard.
+    fn terminal_deny() -> Self {
+        Self {
+            allowed: false,
+            message: Some(TERMINAL_MESSAGE.into()),
+            input_digest: String::new(),
+            session_terminal: true,
         }
     }
 }
+
+/// The ONE wording both terminal guards use (handler-top and post-approval-wait).
+const TERMINAL_MESSAGE: &str = "session is not active";
 
 /// A reference into the run's FROZEN set for one `mcp__*` tool: the untrusted
 /// input schema, the snapshot's protocol version (the dialect selector), and a
@@ -596,9 +618,73 @@ async fn adopt_terminal_or_deny(
     Ok(decision_from_status(&row.status))
 }
 
+/// The canonical ledger pair ONE approval decision produces (Phase E, #33; Gap
+/// 13, plan E12): `approval.decided` then `tool.decision`, in that order — the
+/// same order and the same shapes the waiter used to emit, so timelines and the
+/// governance e2e are unchanged.
+///
+/// **Who calls this is the whole fix.** These events are built by the site that is
+/// ABOUT to run the decision compare-and-set — `api.rs::decide_approval` (human),
+/// the waiter's expiry/timeout CAS, and the approval-expiry worker — and are
+/// handed to the DB so they commit INSIDE that CAS's transaction. A loser of the
+/// CAS writes nothing. Before this, every awakened waiter emitted its own copy, so
+/// two handlers re-attached to one pending row double-ledgered even in a single
+/// process (design :1058-1066).
+///
+/// `source` is unconditionally `"human"` and `original_verdict` unconditionally
+/// `None` because this pair only exists on the human-approval path, and that path
+/// is reachable ONLY when the policy's EFFECTIVE verdict is `RequireApproval` —
+/// which `Policy::evaluate` guarantees implies `autonomy_rewritten == false` (an
+/// autonomous run rewrites RequireApproval to its fallback INSIDE evaluate and
+/// never reaches an approval row). The autonomy-rewrite ledger shape belongs to
+/// the deterministic gate paths, which still emit it via `emit_decision`.
+pub(crate) fn approval_decision_events(
+    state: &AppState,
+    session_id: uuid::Uuid,
+    approval_id: uuid::Uuid,
+    tool_call_id: &str,
+    tool: &str,
+    decision: &str,
+    decided_by: &str,
+) -> Vec<fluidbox_core::event::Redacted<fluidbox_core::event::EventEnvelope>> {
+    use fluidbox_core::event::EventEnvelope;
+    let allowed = decision == "approved_once" || decision == "approved_session";
+    vec![
+        state.redactor.scrub(EventEnvelope::new(
+            session_id,
+            Actor::Human,
+            EventBody::ApprovalDecided {
+                approval_id,
+                tool_call_id: tool_call_id.to_string(),
+                decision: decision.to_string(),
+                decided_by: decided_by.to_string(),
+            },
+        )),
+        state.redactor.scrub(EventEnvelope::new(
+            session_id,
+            Actor::System,
+            EventBody::ToolDecision {
+                tool_call_id: tool_call_id.to_string(),
+                tool: tool.to_string(),
+                verdict: if allowed { "allow" } else { "deny" }.into(),
+                source: "human".into(),
+                original_verdict: None,
+                reason: Some(format!("human:{decided_by}")),
+            },
+        )),
+    ]
+}
+
 /// Block on a pending approval row until it is decided (DB is truth; the
-/// Notify only wakes us early), then record the human decision and return
-/// it. Shared by the promoter and any handler that adopts a pending row.
+/// Notify only wakes us early), then return the decision. Shared by the promoter
+/// and any handler that adopts a pending row.
+///
+/// **Waiters emit NOTHING** (Phase E, #33): both `approval.decided` and
+/// `tool.decision` are now written by the decision CAS itself (see
+/// [`approval_decision_events`]), so N re-attached waiters produce N returns and
+/// exactly ONE pair of ledger rows. The only ledger write left on this path is the
+/// post-wait terminality deny below, which is itself single-winner via
+/// `claim_terminal_deny_emission`.
 async fn await_pending_decision(
     state: &AppState,
     scope: TenantScope,
@@ -618,11 +704,28 @@ async fn await_pending_decision(
         }
         if cur.expires_at <= chrono::Utc::now() {
             // Timeout → auto-deny (fail-safe), but as a CAS: if a human
-            // decision won the row between our read and here, decide_approval
+            // decision won the row between our read and here, the CAS
             // affects nothing — adopt the human's verdict rather than
-            // fabricating a deny that contradicts the durable row.
-            match fluidbox_db::decide_approval(&state.pool, scope, approval.id, "denied", "timeout")
-                .await?
+            // fabricating a deny that contradicts the durable row. The events
+            // ride INSIDE that CAS's transaction, so a loser ledgers nothing.
+            let events = approval_decision_events(
+                state,
+                session_id,
+                approval.id,
+                tool_call_id,
+                tool,
+                "denied",
+                "timeout",
+            );
+            match fluidbox_db::decide_approval_tx(
+                &state.pool,
+                scope,
+                approval.id,
+                "denied",
+                "timeout",
+                events,
+            )
+            .await?
             {
                 Some(_) => break "denied".to_string(),
                 None => {
@@ -644,50 +747,50 @@ async fn await_pending_decision(
     };
     state.approvals.forget(approval.id).await;
 
-    let decided_by = fluidbox_db::get_approval(&state.pool, scope, approval.id)
-        .await?
-        .and_then(|a| a.decided_by)
-        .unwrap_or_else(|| "system".into());
-    ledger::record(
-        state,
-        scope,
-        session_id,
-        Actor::Human,
-        EventBody::ApprovalDecided {
-            approval_id: approval.id,
-            tool_call_id: tool_call_id.to_string(),
-            decision: final_status.clone(),
-            decided_by: decided_by.clone(),
-        },
-    )
-    .await;
-
     let allowed = final_status == "approved_once" || final_status == "approved_session";
     // E12 slice (Task 4, plan): the session may have terminalized DURING a
     // minutes-long wait (cancel / budget sweep). A post-wait ALLOW must not
     // execute against a tearing-down run — re-read status and deny if it no longer
-    // accepts work, mirroring the handler-top terminal guard (a deny with no fresh
-    // tool.decision; the human's approval, already ledgered above, was real). This
-    // closes the sandbox-tool half; the brokered half is additionally fenced by
-    // the execution claim's in-tx nonterminal check (E10).
+    // accepts work, mirroring the handler-top terminal guard. The human's approval
+    // itself was real and is already ledgered by the decision transaction; what
+    // this records is the SEPARATE, later fact that the allow was not honored.
+    //
+    // Task 6 (M4) closes two loose ends here: that deny now carries its own
+    // `tool.decision` (it previously vanished from the timeline, leaving an
+    // `allow` the runner never received), and it is CAS-gated on
+    // `approvals.terminal_deny_at` so N re-attached waiters — the very race this
+    // task exists to fix — emit it exactly ONCE. The response shape is
+    // `GateDecision::terminal_deny`, byte-identical to the handler-top guard.
+    // This closes the sandbox-tool half; the brokered half is additionally fenced
+    // by the execution claim's in-tx nonterminal check (E10).
     if allowed {
         if let Some(sess) = fluidbox_db::get_session(&state.pool, scope, session_id).await? {
             if !sess.status_enum().accepts_work() {
-                return Ok(GateDecision::deny("session terminal during approval wait"));
+                if fluidbox_db::claim_terminal_deny_emission(&state.pool, scope, approval.id)
+                    .await?
+                {
+                    ledger::record(
+                        state,
+                        scope,
+                        session_id,
+                        Actor::System,
+                        EventBody::ToolDecision {
+                            tool_call_id: tool_call_id.to_string(),
+                            tool: tool.to_string(),
+                            verdict: "deny".into(),
+                            source: "session_terminal".into(),
+                            original_verdict: Some(outcome.original.name().into()),
+                            reason: Some(
+                                "session stopped accepting work during the approval wait".into(),
+                            ),
+                        },
+                    )
+                    .await;
+                }
+                return Ok(GateDecision::terminal_deny());
             }
         }
     }
-    emit_decision(
-        state,
-        scope,
-        session_id,
-        tool_call_id,
-        tool,
-        outcome,
-        if allowed { "allow" } else { "deny" },
-        Some(&format!("human:{decided_by}")),
-    )
-    .await;
 
     maybe_resume(state, scope, session_id).await;
     Ok(decision_from_status(&final_status))
@@ -721,7 +824,7 @@ pub async fn permission(
     if !session.status_enum().accepts_work() {
         return Ok(Json(json!({
             "decision": "deny",
-            "message": "session is not active",
+            "message": TERMINAL_MESSAGE,
         })));
     }
     let run_spec: RunSpec = serde_json::from_value(session.run_spec.clone())
@@ -772,7 +875,7 @@ pub async fn tool_call(
         .await?
         .ok_or(ApiError::NotFound)?;
     if !session.status_enum().accepts_work() {
-        return Err(ApiError::BadRequest("session is not active".into()));
+        return Err(ApiError::BadRequest(TERMINAL_MESSAGE.into()));
     }
     let run_spec: RunSpec = serde_json::from_value(session.run_spec.clone())
         .map_err(|e| ApiError::Internal(format!("bad run_spec: {e}")))?;
@@ -820,6 +923,12 @@ pub async fn tool_call(
     )
     .await?;
     if !decision.allowed {
+        // A session that terminalized DURING the approval wait answers with the
+        // SAME shape as the handler-top terminal guard above (a 400, not a
+        // policy-deny 200) — the two guards must be indistinguishable to a runner.
+        if decision.session_terminal {
+            return Err(ApiError::BadRequest(TERMINAL_MESSAGE.into()));
+        }
         return Ok(Json(json!({
             "ok": false,
             "denied": true,
@@ -1765,6 +1874,59 @@ pub async fn token_renew(
 }
 
 // ─── Frozen-schema gate decision (Gap 12, plan E9) — pure, no DB ───────────
+#[cfg(test)]
+mod approval_emission_guards {
+    /// Source guard for the Gap-13 single-emission fix (Phase E, #33). Runs
+    /// WITHOUT a database, so a regression fails CI immediately instead of
+    /// depending on a race being observed.
+    ///
+    /// The `ApprovalDecided` event body must be constructed in exactly ONE place
+    /// in this module — inside `approval_decision_events`, whose output is handed to
+    /// the decision CAS transaction. Re-adding an emission to
+    /// `await_pending_decision` (the pre-Phase-E behavior, where EVERY awakened
+    /// waiter appended its own copy and two re-attached handlers double-ledgered
+    /// inside one process — design :1058-1066) makes the count 2 and fails here.
+    ///
+    /// The needle is assembled from two halves so this guard is not itself an
+    /// occurrence of it.
+    #[test]
+    fn approval_decided_is_constructed_in_exactly_one_place() {
+        let needle = concat!("EventBody::Approval", "Decided");
+        let n = include_str!("internal.rs").matches(needle).count();
+        assert_eq!(
+            n, 1,
+            "`{needle}` must appear exactly ONCE in internal.rs (inside \
+             approval_decision_events, whose events ride the decision CAS's own \
+             transaction) — found {n}. A waiter that emits its own copy re-introduces \
+             the double-ledger: N re-attached /permission handlers wake on one \
+             decision and each append."
+        );
+    }
+
+    /// The companion half: the post-approval `tool.decision` is emitted by the
+    /// decision CAS too, so `emit_decision` — the deterministic gate paths'
+    /// helper — must NOT be reachable from the approval wait. Its call sites are
+    /// exactly the five CAS-gated deterministic verdicts in `gate_tool_call`
+    /// (policy allow, policy deny, session-scope grant) plus its own definition.
+    #[test]
+    fn emit_decision_is_not_called_from_the_approval_wait() {
+        let src = include_str!("internal.rs");
+        let start = src
+            .find("async fn await_pending_decision(")
+            .expect("the approval wait exists");
+        let end = src[start..]
+            .find("\npub struct PermissionReq")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(
+            !body.contains(concat!("emit_", "decision(")),
+            "the approval wait must not emit tool.decision — it belongs to the decision \
+             transaction (approval_decision_events), or N waiters emit N copies"
+        );
+    }
+}
+
 #[cfg(test)]
 mod schema_gate_tests {
     use super::*;

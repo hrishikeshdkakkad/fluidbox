@@ -811,8 +811,49 @@ fn short_sha(sha: Option<&str>) -> String {
         .unwrap_or_else(|| "-".into())
 }
 
+/// The DETERMINISTIC marker every published comment carries (Phase E, #33; Gap
+/// 13; design :1082-1084). An HTML comment, so GitHub renders nothing, keyed on
+/// the subscription — which is exactly the identity §17 #3 makes stable ("one
+/// comment per (subscription, PR), updated in place").
+///
+/// It exists to close the create-path crash window: the external POST necessarily
+/// precedes the `external_results` row that records its id, so a crash in between
+/// used to leave the retry with no record and produce a DUPLICATE comment. There
+/// is no distributed transaction to be had here, so the fix is reconciliation —
+/// before creating, look for this marker among the PR's comments and ADOPT the
+/// match instead. GitHub's issue-comment API offers no idempotency key, which is
+/// the alternative the design names.
+pub(crate) fn subscription_marker(subscription_id: uuid::Uuid) -> String {
+    format!("<!-- fluidbox:sub:{subscription_id} -->")
+}
+
+/// Find a previously-created comment of OURS in a PR comment listing — the
+/// reconcile half of reconcile-before-create. Returns `(external_id, html_url)`.
+///
+/// Pure and total: a malformed/partial listing (not an array, missing `id`, a
+/// non-string `body`) yields `None`, which degrades to today's behavior (create a
+/// fresh comment) rather than to an error. Matching is a plain substring test on
+/// the marker — the marker is ours and contains no user text, so it cannot be
+/// spoofed into matching a different subscription's comment.
+fn find_marker_comment(listing: &Value, marker: &str) -> Option<(String, String)> {
+    listing.as_array()?.iter().find_map(|c| {
+        let body = c.get("body").and_then(|b| b.as_str())?;
+        if !body.contains(marker) {
+            return None;
+        }
+        let id = c.get("id").and_then(|i| i.as_i64())?.to_string();
+        let url = c
+            .get("html_url")
+            .and_then(|u| u.as_str())
+            .unwrap_or_default()
+            .to_string();
+        Some((id, url))
+    })
+}
+
 /// The attributable comment body: agent name up top, run identity in the
-/// footer. One agent's failure appears only here, on its own comment.
+/// footer, and (Phase E) the deterministic per-subscription reconcile marker.
+/// One agent's failure appears only here, on its own comment.
 fn comment_body(ctx: &super::PublishContext) -> String {
     let status_note = if ctx.status == "completed" {
         String::new()
@@ -827,14 +868,22 @@ fn comment_body(ctx: &super::PublishContext) -> String {
         .as_deref()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("(no summary produced)");
+    // The marker is appended LAST and only when a subscription identifies the
+    // comment (a subscription-less publish has nothing stable to reconcile
+    // against, and `publish_pr_comment` already refuses it upstream).
+    let marker = match ctx.subscription_id {
+        Some(id) => format!("\n{}\n", subscription_marker(id)),
+        None => String::new(),
+    };
     format!(
-        "### 🤖 {agent} review\n{status_note}\n{body}\n\n---\n_fluidbox · trigger **{sub}** · run `{run}` · commit `{sha}`_\n",
+        "### 🤖 {agent} review\n{status_note}\n{body}\n\n---\n_fluidbox · trigger **{sub}** · run `{run}` · commit `{sha}`_\n{marker}",
         agent = ctx.agent_name,
         status_note = status_note,
         body = body,
         sub = ctx.subscription_name,
         run = ctx.session_id,
         sha = short_sha(ctx.commit_sha.as_deref()),
+        marker = marker,
     )
 }
 
@@ -868,7 +917,7 @@ async fn publish_pr_comment(
 
     // §17 #3: one stable comment per (subscription, PR) — update it in
     // place; recreate only if it was deleted out from under us.
-    if let Some(existing) = fluidbox_db::get_external_result(
+    let recorded = fluidbox_db::get_external_result(
         &state.pool,
         ctx.scope,
         sub_id,
@@ -877,15 +926,37 @@ async fn publish_pr_comment(
     )
     .await
     .map_err(|e| format!("external result lookup failed: {e}"))?
-    {
+    .map(|r| (r.external_id, r.external_url));
+
+    // RECONCILE BEFORE CREATE (Phase E, #33; Gap 13; design :1082-1084). No
+    // recorded id does NOT prove no comment exists: the POST necessarily precedes
+    // the row that records it, so a crash (or a lost delivery claim) in that
+    // window leaves a real comment with no local record — and the retry used to
+    // post a DUPLICATE. Before creating, list the PR's comments and adopt a
+    // marker match. A listing failure is NOT fatal: reconciliation is a
+    // best-effort improvement on at-least-once, so we fall through to the create
+    // path (today's behavior) rather than failing an otherwise-healthy delivery.
+    let existing = match recorded {
+        Some(r) => Some(r),
+        None => match reconcile_existing_comment(state, &auth, repository, pr_number, sub_id).await
+        {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::warn!(
+                    "pr comment reconcile for {repository}#{pr_number} failed ({e}); \
+                     falling back to create (a duplicate is possible)"
+                );
+                None
+            }
+        },
+    };
+
+    if let Some((external_id, external_url)) = existing {
         let (status, body, _) = api(
             state,
             reqwest::Method::PATCH,
             &auth,
-            &format!(
-                "/repos/{repository}/issues/comments/{}",
-                existing.external_id
-            ),
+            &format!("/repos/{repository}/issues/comments/{external_id}"),
             Some(&payload),
         )
         .await?;
@@ -893,7 +964,7 @@ async fn publish_pr_comment(
             let url = body["html_url"]
                 .as_str()
                 .map(str::to_string)
-                .or(existing.external_url.clone())
+                .or(external_url)
                 .unwrap_or_default();
             fluidbox_db::upsert_external_result(
                 &state.pool,
@@ -901,7 +972,7 @@ async fn publish_pr_comment(
                 sub_id,
                 "github_pr_comment",
                 &resource_key,
-                &existing.external_id,
+                &external_id,
                 Some(&url),
             )
             .await
@@ -948,6 +1019,46 @@ async fn publish_pr_comment(
         external_url: url,
         digest,
     })
+}
+
+/// Comment pages walked while reconciling. 100 per page × 10 = 1000 comments,
+/// far past any real review thread; the cap keeps a pathological PR from turning
+/// one delivery attempt into an unbounded crawl.
+const RECONCILE_MAX_PAGES: u32 = 10;
+
+/// Look for a comment WE created on this PR by its deterministic marker — the
+/// reconcile half of reconcile-before-create. `Ok(None)` means "walked the whole
+/// thread, ours is genuinely not there" (create is correct); `Err` means we could
+/// not tell, and the caller degrades to create rather than failing the delivery.
+async fn reconcile_existing_comment(
+    state: &AppState,
+    auth: &str,
+    repository: &str,
+    pr_number: i64,
+    subscription_id: uuid::Uuid,
+) -> Result<Option<(String, Option<String>)>, String> {
+    let marker = subscription_marker(subscription_id);
+    for page in 1..=RECONCILE_MAX_PAGES {
+        let (status, body, _) = api(
+            state,
+            reqwest::Method::GET,
+            auth,
+            &format!("/repos/{repository}/issues/{pr_number}/comments?per_page=100&page={page}"),
+            None,
+        )
+        .await?;
+        if !status.is_success() {
+            return Err(format!("github comment list returned {status}"));
+        }
+        if let Some((id, url)) = find_marker_comment(&body, &marker) {
+            return Ok(Some((id, Some(url).filter(|u| !u.is_empty()))));
+        }
+        // Short page (or not an array) ⇒ the listing is exhausted.
+        if body.as_array().map(|a| a.len()).unwrap_or(0) < 100 {
+            break;
+        }
+    }
+    Ok(None)
 }
 
 async fn publish_check(
@@ -1287,6 +1398,78 @@ o+rncG5hSLaqG1A2w8vlQ3BS7Q==
         assert!(body.contains("⚠️"));
         assert!(body.contains("`failed`"));
         assert!(body.contains("(no summary produced)"));
+    }
+
+    /// Reconcile-before-create (Phase E, #33; Gap 13): the published body carries
+    /// the deterministic per-subscription marker, and the reconciler finds OUR
+    /// comment by it in a recorded GitHub listing — which is what stops a crash
+    /// between the POST and the `external_results` write from producing a
+    /// duplicate comment on retry.
+    #[test]
+    fn comment_marker_round_trips_through_a_recorded_listing() {
+        let sub = Uuid::now_v7();
+        let other_sub = Uuid::now_v7();
+        let ctx = super::super::PublishContext {
+            scope: fluidbox_db::TenantScope::assume(Uuid::now_v7()),
+            session_id: Uuid::now_v7(),
+            subscription_id: Some(sub),
+            subscription_name: "security-review".into(),
+            agent_name: "sec-agent".into(),
+            status: "completed".into(),
+            summary: Some("ok".into()),
+            commit_sha: None,
+        };
+        let body = comment_body(&ctx);
+        let marker = subscription_marker(sub);
+        assert!(
+            body.contains(&marker),
+            "every published body carries its marker"
+        );
+        assert!(marker.starts_with("<!--"), "the marker renders as nothing");
+
+        // A recorded GitHub `GET /issues/{n}/comments` page: a human comment, a
+        // DIFFERENT subscription's fluidbox comment, then ours.
+        let listing = json!([
+            {"id": 1, "html_url": "https://github.test/c/1", "body": "LGTM"},
+            {"id": 2, "html_url": "https://github.test/c/2",
+             "body": format!("### 🤖 other review\n{}", subscription_marker(other_sub))},
+            {"id": 3, "html_url": "https://github.test/c/3", "body": body},
+        ]);
+        assert_eq!(
+            find_marker_comment(&listing, &marker),
+            Some(("3".into(), "https://github.test/c/3".into())),
+            "adopt OUR comment, never another subscription's"
+        );
+        // Nothing of ours on the PR ⇒ None ⇒ the caller creates (today's path).
+        assert_eq!(
+            find_marker_comment(&listing, &subscription_marker(Uuid::now_v7())),
+            None
+        );
+
+        // Total on malformed input: never panics, never adopts a stranger.
+        assert_eq!(
+            find_marker_comment(&json!({"message": "Not Found"}), &marker),
+            None
+        );
+        assert_eq!(find_marker_comment(&json!([]), &marker), None);
+        assert_eq!(
+            find_marker_comment(&json!([{"body": marker.clone()}]), &marker),
+            None,
+            "a comment with no usable id is not adoptable"
+        );
+        assert_eq!(
+            find_marker_comment(&json!([{"id": 9, "body": marker.clone()}]), &marker),
+            Some(("9".into(), String::new())),
+            "a missing html_url still adopts (the id is what prevents the duplicate)"
+        );
+
+        // A subscription-less publish has no stable identity to reconcile
+        // against — no marker is emitted (and publish_pr_comment refuses it).
+        let anon = super::super::PublishContext {
+            subscription_id: None,
+            ..ctx
+        };
+        assert!(!comment_body(&anon).contains("<!-- fluidbox:sub:"));
     }
 
     #[test]
