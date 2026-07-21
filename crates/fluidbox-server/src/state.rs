@@ -187,6 +187,12 @@ pub struct AppStateInner {
     /// refresh + negative-kid cache) and the fixed-window login rate counters.
     /// In-memory, single-replica (v1); a restart re-seeds from the DB caches.
     pub oidc: crate::login::OidcRuntime,
+    /// Compiled frozen-schema validator LRU (Phase E, Gap 12). Keyed
+    /// `(tools_digest, tool)` so a `/tools/refresh` (new digest) never reuses a
+    /// stale compilation; caps at 256 entries. The gate consults it to validate a
+    /// brokered `mcp__*` call's arguments against the run's FROZEN inputSchema
+    /// before the trust-tier/policy stages. Replica-local, rebuilt on restart.
+    pub schema_cache: fluidbox_core::schema_guard::SchemaCache,
     /// Legacy→KMS re-seal singleton flag (Phase D, #32). `POST /v1/admin/reseal`
     /// claims it with a compare-and-swap; a second POST while a job runs gets a
     /// 409. The job is restart-safe by construction (predicate-driven paging), so

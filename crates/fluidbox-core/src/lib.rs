@@ -11,6 +11,7 @@ pub mod event;
 pub mod netpolicy;
 pub mod policy;
 pub mod schedule;
+pub mod schema_guard;
 pub mod spec;
 pub mod state;
 pub mod tools;

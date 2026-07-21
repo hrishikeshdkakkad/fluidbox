@@ -48,6 +48,93 @@ impl GateDecision {
     }
 }
 
+/// A reference into the run's FROZEN set for one `mcp__*` tool: the untrusted
+/// input schema, the snapshot's protocol version (the dialect selector), and a
+/// stable digest for the compiled-validator cache key. Resolved from EITHER
+/// attachment path — a Phase C binding-backed surface (precedence, matching
+/// `tool_call`'s routing) or a legacy frozen capability bundle.
+struct FrozenToolRef<'a> {
+    schema: &'a Value,
+    protocol_version: Option<&'a str>,
+    digest: &'a str,
+}
+
+/// Locate the frozen `inputSchema` (and its dialect + cache digest) for an
+/// `mcp__*` tool. `None` for a non-`mcp__` (built-in) tool, or an `mcp__` tool
+/// not in the frozen set — the latter was already denied by the availability
+/// check, so a `None` here means "no schema to enforce", never "not attached".
+fn locate_frozen_schema<'a>(run_spec: &'a RunSpec, tool: &str) -> Option<FrozenToolRef<'a>> {
+    let (server, tool_name) = capability::parse_mcp_tool(tool)?;
+    // Phase C brokered surface first (same precedence `tool_call` routes on): its
+    // frozen `protocol_version` selects the JSON Schema dialect.
+    if let Some(surface) = run_spec.find_brokered_surface(server) {
+        if let Some(t) = surface.tools.iter().find(|t| t.name == tool_name) {
+            return Some(FrozenToolRef {
+                schema: &t.input_schema,
+                protocol_version: surface.protocol_version.as_deref(),
+                digest: &surface.tools_digest,
+            });
+        }
+    }
+    // Legacy capability bundle: no protocol version was frozen, so the dialect
+    // defaults to 2020-12 (SEP-1613). The bundle's definition digest keys the
+    // cache (drift ⇒ a new digest ⇒ a fresh compilation).
+    for bundle in &run_spec.capabilities {
+        for srv in &bundle.servers {
+            if srv.name() == server {
+                if let Some(t) = srv.tools().iter().find(|t| t.name == tool_name) {
+                    return Some(FrozenToolRef {
+                        schema: &t.input_schema,
+                        protocol_version: None,
+                        digest: &bundle.definition_digest,
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The frozen-schema gate decision for one tool call (Gap 12; PURE — no DB, so
+/// it is unit-tested directly). `None` = no schema objection (built-in, non-mcp,
+/// no frozen schema, or the args satisfy it) → the call proceeds to the
+/// trust-tier/policy stages. `Some(reason)` = a `source="schema"` deny, in one of
+/// two shapes: the frozen schema is itself invalid/uncompilable ("frozen schema
+/// invalid — refresh the snapshot") vs the args violate a valid schema
+/// ("arguments rejected by frozen schema: <bounded JSON-pointer paths>", never
+/// argument values). Deterministic on the frozen set + args, so a faithful retry
+/// recomputes the identical verdict.
+fn schema_gate_decision(
+    cache: &fluidbox_core::schema_guard::SchemaCache,
+    run_spec: &RunSpec,
+    tool: &str,
+    input: &Value,
+) -> Option<String> {
+    use fluidbox_core::schema_guard as sg;
+    let frozen = locate_frozen_schema(run_spec, tool)?;
+    // 1. Screen the untrusted frozen schema (size/depth/local-$ref).
+    if sg::guard_schema(frozen.schema).is_err() {
+        return Some("frozen schema invalid — refresh the snapshot".to_string());
+    }
+    // 2. Compile (cached) under the snapshot's dialect. A compile failure is a
+    //    SCHEMA problem (malformed but past the guard), not an args problem — it
+    //    shares the schema-invalid deny.
+    let dialect = sg::dialect_for(frozen.protocol_version);
+    let validator = match cache.get_or_compile(frozen.digest, tool, frozen.schema, dialect) {
+        Ok(v) => v,
+        Err(_) => return Some("frozen schema invalid — refresh the snapshot".to_string()),
+    };
+    // 3. Validate the args (size/depth pre-guarded inside). Report bounded
+    //    JSON-pointer PATHS — never values (secrets-adjacent).
+    match sg::validate_instance(&validator, input) {
+        Ok(()) => None,
+        Err(rej) => Some(format!(
+            "arguments rejected by frozen schema: {}",
+            rej.summary()
+        )),
+    }
+}
+
 /// The heart of the system: one decision per tool call, made server-side
 /// against the FROZEN RunSpec (never live config). Idempotent by
 /// tool_call_id through the approvals table, so retries re-attach instead
@@ -238,6 +325,40 @@ async fn decide_tool_call(
         // Lost the CAS to a concurrent handler for the same intent. A
         // capability denial is deterministic on the frozen set, so the
         // durable outcome is the matching terminal deny — adopt it.
+        return adopt_terminal_or_deny(state, scope, intent.id).await;
+    }
+
+    // Frozen-schema argument enforcement (Gap 12, invariants 13/17; design
+    // `:1352`, plan E9). For an `mcp__*` call whose tool carries a frozen
+    // inputSchema, the arguments must satisfy that schema — under the dialect the
+    // snapshot's MCP protocol version selects — BEFORE the trust-tier floor and
+    // the policy verdict. Placed AFTER availability (it needs the ToolSnapshot the
+    // frozen set yields) and BEFORE trust tier: the ONE sanctioned insertion in
+    // the load-bearing gate order. Built-in tools are never `mcp__`-prefixed and
+    // carry no frozen schema, so they bypass entirely. The decision is
+    // deterministic on the frozen set + args, so it CASes-then-ledgers exactly
+    // like the capability denial above: only the verdict-CAS winner writes
+    // `tool.decision` (source="schema"); a concurrent loser — or a faithful retry
+    // — adopts the durable terminal deny.
+    if let Some(reason) = schema_gate_decision(&state.schema_cache, run_spec, tool, input) {
+        if fluidbox_db::record_intent_verdict(&state.pool, scope, intent.id, "auto_denied").await? {
+            ledger::record(
+                state,
+                scope,
+                session.id,
+                Actor::System,
+                EventBody::ToolDecision {
+                    tool_call_id: tool_call_id.to_string(),
+                    tool: tool.to_string(),
+                    verdict: "deny".into(),
+                    source: "schema".into(),
+                    original_verdict: None,
+                    reason: Some(reason.clone()),
+                },
+            )
+            .await;
+            return Ok(GateDecision::deny(reason));
+        }
         return adopt_terminal_or_deny(state, scope, intent.id).await;
     }
 
@@ -804,6 +925,9 @@ async fn broker_call_via_binding(
         tool_name,
         &req.input,
         &binding,
+        // Gap 12: pin the runtime MCP negotiation to the version the surface
+        // froze; the legacy `call_tool_auth` path has no frozen version (None).
+        surface.protocol_version.as_deref(),
     )
     .await;
     let latency_ms = started.elapsed().as_millis() as u64;
@@ -1260,4 +1384,215 @@ pub async fn token_renew(
     let ttl = req.ttl_secs.clamp(1, MAX_RENEW_TTL_SECS);
     let ok = fluidbox_db::extend_session_token(&state.pool, &auth.token, ttl).await?;
     Ok(Json(json!({ "renewed": ok, "ttl_secs": ttl })))
+}
+
+// ─── Frozen-schema gate decision (Gap 12, plan E9) — pure, no DB ───────────
+#[cfg(test)]
+mod schema_gate_tests {
+    use super::*;
+    use fluidbox_core::capability::{CapabilityServer, FrozenBundle, ToolSnapshot};
+    use fluidbox_core::schema_guard::SchemaCache;
+    use fluidbox_core::spec::{Autonomy, BrokeredSurface, Budgets, TrustTier, WorkspaceSpec};
+    use uuid::Uuid;
+
+    fn base_spec(trust_tier: TrustTier) -> RunSpec {
+        RunSpec {
+            agent_id: Uuid::now_v7(),
+            agent_revision_id: Uuid::now_v7(),
+            agent_name: "a".into(),
+            harness: "claude-agent-sdk".into(),
+            runner_image: "img".into(),
+            model: "m".into(),
+            system_prompt: None,
+            task: "t".into(),
+            workspace: WorkspaceSpec::Scratch,
+            autonomy: Autonomy::Supervised,
+            trust_tier,
+            budgets: Budgets::default(),
+            policy_id: Uuid::now_v7(),
+            policy_version: 1,
+            policy_snapshot: fluidbox_core::policy::Policy::parse_yaml("name: p").unwrap(),
+            invocation: Default::default(),
+            result_destinations: vec![],
+            capabilities: vec![],
+            brokered: vec![],
+        }
+    }
+
+    fn surface(schema: Value, protocol_version: Option<&str>) -> BrokeredSurface {
+        BrokeredSurface {
+            slot: "gh".into(),
+            url: "https://mcp.test/mcp".into(),
+            binding_id: Uuid::now_v7(),
+            snapshot_version: 1,
+            tools: vec![ToolSnapshot {
+                name: "act".into(),
+                description: "d".into(),
+                input_schema: schema,
+                output_schema: None,
+                annotations: None,
+            }],
+            // Unique digest per surface so distinct schemas key distinct cache
+            // entries (the gate never mixes compilations across surfaces).
+            tools_digest: format!("sha256:{}", Uuid::now_v7().simple()),
+            protocol_version: protocol_version.map(str::to_string),
+        }
+    }
+
+    /// A run with one brokered surface exposing `mcp__gh__act` under `schema`.
+    fn brokered_run(schema: Value, protocol_version: Option<&str>) -> RunSpec {
+        let mut spec = base_spec(TrustTier::Trusted);
+        spec.brokered = vec![surface(schema, protocol_version)];
+        spec
+    }
+
+    /// An object schema that requires an integer member `n`.
+    fn int_field_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {"n": {"type": "integer"}},
+            "required": ["n"]
+        })
+    }
+
+    #[test]
+    fn bad_args_are_denied_with_a_schema_reason() {
+        let cache = SchemaCache::new(8);
+        let spec = brokered_run(int_field_schema(), Some("2025-11-25"));
+        let reason = schema_gate_decision(&cache, &spec, "mcp__gh__act", &json!({"n": "notint"}))
+            .expect("bad args must be denied");
+        assert!(
+            reason.starts_with("arguments rejected by frozen schema:"),
+            "got: {reason}"
+        );
+        // A JSON-pointer PATH to the failing member, never the value.
+        assert!(
+            reason.contains("/n"),
+            "expected a pointer to /n, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn good_args_proceed() {
+        let cache = SchemaCache::new(8);
+        let spec = brokered_run(int_field_schema(), Some("2025-11-25"));
+        assert_eq!(
+            schema_gate_decision(&cache, &spec, "mcp__gh__act", &json!({"n": 7})),
+            None,
+            "valid args must proceed to the next gate stage"
+        );
+    }
+
+    #[test]
+    fn builtins_bypass_schema_entirely() {
+        let cache = SchemaCache::new(8);
+        // Even a run that HAS a brokered surface must not schema-check built-ins:
+        // they are never mcp__-prefixed and carry no frozen schema.
+        let spec = brokered_run(int_field_schema(), Some("2025-11-25"));
+        for (tool, input) in [
+            ("Bash", json!({"command": "ls"})),
+            (
+                "Edit",
+                json!({"file_path": "/x", "old_string": "a", "new_string": "b"}),
+            ),
+            ("Read", json!({"file_path": "/x"})),
+        ] {
+            assert_eq!(
+                schema_gate_decision(&cache, &spec, tool, &input),
+                None,
+                "built-in {tool} must bypass schema validation"
+            );
+        }
+    }
+
+    #[test]
+    fn an_invalid_frozen_schema_denies_with_refresh_hint() {
+        let cache = SchemaCache::new(8);
+        // `type` must be a string; a number is not a valid schema → uncompilable.
+        let spec = brokered_run(json!({"type": 123}), Some("2025-11-25"));
+        let reason = schema_gate_decision(&cache, &spec, "mcp__gh__act", &json!({"n": 1}))
+            .expect("an invalid frozen schema must deny");
+        assert_eq!(reason, "frozen schema invalid — refresh the snapshot");
+    }
+
+    #[test]
+    fn a_non_local_ref_schema_denies_before_reaching_args() {
+        let cache = SchemaCache::new(8);
+        // A remote $ref is refused by guard_schema — the tool is un-callable.
+        let spec = brokered_run(
+            json!({"$ref": "https://evil.test/s.json"}),
+            Some("2025-11-25"),
+        );
+        assert_eq!(
+            schema_gate_decision(&cache, &spec, "mcp__gh__act", &json!({"anything": true})),
+            Some("frozen schema invalid — refresh the snapshot".to_string())
+        );
+    }
+
+    #[test]
+    fn order_readonly_records_the_schema_denial_not_trust_tier() {
+        // A ReadOnly-tier run with bad mcp args: the schema decision is produced
+        // regardless of tier, and in `decide_tool_call` it is consulted BEFORE the
+        // trust-tier floor — so the SCHEMA deny wins (proving placement-before-tier).
+        let cache = SchemaCache::new(8);
+        let mut spec = base_spec(TrustTier::ReadOnly);
+        spec.brokered = vec![surface(int_field_schema(), Some("2025-11-25"))];
+        let reason = schema_gate_decision(&cache, &spec, "mcp__gh__act", &json!({"n": "bad"}))
+            .expect("the schema decision must be available before the tier check");
+        assert!(
+            reason.starts_with("arguments rejected by frozen schema:"),
+            "a ReadOnly run with bad args must record the SCHEMA denial, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn deterministic_so_a_faithful_retry_adopts_the_same_verdict() {
+        // The decision is a pure function of (frozen set, args) — a faithful retry
+        // recomputes the identical deny, so the CAS-then-ledger adoption is safe.
+        let cache = SchemaCache::new(8);
+        let spec = brokered_run(int_field_schema(), Some("2025-11-25"));
+        let first = schema_gate_decision(&cache, &spec, "mcp__gh__act", &json!({"n": "x"}));
+        let second = schema_gate_decision(&cache, &spec, "mcp__gh__act", &json!({"n": "x"}));
+        assert!(first.is_some());
+        assert_eq!(first, second, "the schema verdict must be deterministic");
+    }
+
+    #[test]
+    fn legacy_bundle_without_protocol_version_validates_under_2020_12() {
+        // A legacy capability bundle carries NO protocol_version ⇒ dialect_for
+        // defaults it to 2020-12. `prefixItems` is a 2020-12 assertion (ignored by
+        // draft-07), so a run under the 2020-12 default MUST enforce it.
+        let cache = SchemaCache::new(8);
+        let mut spec = base_spec(TrustTier::Trusted);
+        let bundle = FrozenBundle {
+            id: Uuid::now_v7(),
+            name: "kb-tools".into(),
+            version: 1,
+            definition_digest: format!("sha256:{}", Uuid::now_v7().simple()),
+            servers: vec![CapabilityServer::Sandbox {
+                name: "kb".into(),
+                command: "node".into(),
+                args: vec![],
+                identity: None,
+                tools: vec![ToolSnapshot {
+                    name: "search".into(),
+                    description: "d".into(),
+                    input_schema: json!({"type": "array", "prefixItems": [{"type": "string"}]}),
+                    output_schema: None,
+                    annotations: None,
+                }],
+            }],
+        };
+        spec.capabilities = vec![bundle];
+        // A numeric item-0 violates prefixItems under 2020-12 → denied.
+        assert!(
+            schema_gate_decision(&cache, &spec, "mcp__kb__search", &json!([42])).is_some(),
+            "legacy bundle must validate under the 2020-12 default"
+        );
+        // A string item-0 satisfies it → proceeds.
+        assert_eq!(
+            schema_gate_decision(&cache, &spec, "mcp__kb__search", &json!(["ok"])),
+            None
+        );
+    }
 }

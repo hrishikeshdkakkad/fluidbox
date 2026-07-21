@@ -903,9 +903,10 @@ async fn ensure_initialized(
                 ));
             }
         }
-        // Task 3 wires run-time snapshot match: thread the frozen surface's
-        // `protocol_version` into `snapshot` here (it is `None` until then, so
-        // the check is SUPPORTED-set membership).
+        // Runtime call: `snapshot` is the frozen surface's `protocol_version`
+        // (threaded from `call_tool_for_conn` since Task 3, Gap 12). `Some(v)` ⇒
+        // the negotiated version must equal `v` exactly (drift ⇒ deny); `None` ⇒
+        // SUPPORTED-set membership (legacy surfaces / the embedded-connection path).
         VersionPolicy::Enforce { snapshot } => {
             check_negotiated(&negotiated, snapshot).map_err(CallErr::Other)?;
         }
@@ -1404,6 +1405,7 @@ pub async fn call_tool_auth(
 /// [`recheck_binding`] before re-minting — a revoke/reauthorize/deactivate that
 /// lands between the first call and the 401 fails the retry closed. It re-mints
 /// against the FRESH connection row the recheck returns.
+#[allow(clippy::too_many_arguments)]
 pub async fn call_tool_for_conn(
     state: &AppState,
     scope: fluidbox_db::TenantScope,
@@ -1412,15 +1414,18 @@ pub async fn call_tool_for_conn(
     tool: &str,
     arguments: &Value,
     binding: &fluidbox_db::RunResourceBindingRow,
+    protocol_version: Option<&str>,
 ) -> Result<(Value, bool, Option<Value>), String> {
     let auth = brokered_auth_for_conn(state, scope, conn, url).await?;
     let entry = session_entry(state, binding.session_id, McpPeer::Binding(binding.id), url).await;
     let client = &state.egress_http;
     let policy = &state.egress_policy;
-    // Task 3 wires run-time snapshot match: thread the frozen surface's
-    // `protocol_version` here (None until the BrokeredSurface field lands, so
-    // negotiation is SUPPORTED-set membership).
-    let snapshot: Option<&str> = None;
+    // Task 3 (Gap 12): the frozen `BrokeredSurface.protocol_version` the gate
+    // resolved is threaded in as the negotiation snapshot. When `Some`, the
+    // runtime `initialize` MUST negotiate exactly that version (drift ⇒ deny,
+    // remedy /tools/refresh); when `None` (a surface frozen before the field
+    // existed), negotiation falls back to SUPPORTED-set membership.
+    let snapshot: Option<&str> = protocol_version;
     match call_tool(
         client,
         policy,
@@ -1575,6 +1580,21 @@ mod tests {
         assert!(
             e.contains("drift") && e.contains("tools/refresh"),
             "got: {e}"
+        );
+        // The bindings-e2e fakekb scenario in miniature (Gap 12): a NON-standard
+        // negotiated version is ACCEPTED only because Task 3 threads the frozen
+        // surface's `protocol_version` as the snapshot — with plain SUPPORTED-set
+        // membership (None), the SAME version would be rejected. This is exactly
+        // the flip `call_tool_for_conn` now performs by passing the surface's
+        // `protocol_version` down.
+        let fakekb = "2025-06-18-fakekb-1";
+        assert!(
+            check_negotiated(fakekb, Some(fakekb)).is_ok(),
+            "the frozen surface version must accept the fakekb negotiation"
+        );
+        assert!(
+            check_negotiated(fakekb, None).is_err(),
+            "without the threaded snapshot, plain SUPPORTED membership rejects fakekb"
         );
     }
 

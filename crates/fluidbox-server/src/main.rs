@@ -241,6 +241,8 @@ async fn main() -> anyhow::Result<()> {
         connector_tokens: Default::default(),
         oauth_locks: Default::default(),
         mcp_sessions: Default::default(),
+        // Gap 12: compiled frozen-schema validators, cap 256 (Default).
+        schema_cache: Default::default(),
         tenant_llm_keys: Default::default(),
         // Docker needs no netpol gate; Kubernetes starts unverified and the
         // worker below flips it once the CNI is proven to enforce policy.
