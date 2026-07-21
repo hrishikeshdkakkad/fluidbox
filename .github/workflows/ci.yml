@@ -307,6 +307,15 @@ jobs:
       # (webMode strictness, cookie allowlist, no-bearer forward, Set-Cookie
       # propagation) is unit-tested; run it in CI alongside the build.
       - run: pnpm test
+      # The runner-lib credential hand-off (Phase F). node:test, zero deps, so it
+      # rides the Node this job already set up rather than earning its own job.
+      # THREE of its assertions are Linux-only (procfs: that the exec'd process's
+      # /proc/self/environ is clean, and that the hand-off file is unlinked and
+      # 0600 while the descriptor is open) and self-skip elsewhere — this runner
+      # is Linux, so CI is where they actually execute. They are the assertions
+      # that prove the residual is closed, so a green `web` job is their proof.
+      - run: node --test images/runner-lib/*.test.mjs
+        working-directory: .
 
   # Supply-chain gate: advisories, licenses, bans, sources (deny.toml).
   deny:
