@@ -239,6 +239,15 @@ impl<T> Redacted<T> {
     }
 }
 
+/// The prefix EVERY runner session credential carries, whichever audience it
+/// is scoped to (Gap 10 mints four per run). This constant is what the MINTING
+/// site builds its tokens from (`fluidbox-server`'s `orchestrator::run`), and
+/// what the redaction test below derives its samples from — while the
+/// Redactor's own rule stays a DELIBERATELY independent regex literal. That
+/// independence is the point: change the minted prefix here and the samples
+/// move while the rule does not, so the test fails instead of moving with it.
+pub const SESSION_TOKEN_PREFIX: &str = "fbx_sess_";
+
 /// Scrubs secret-shaped strings out of event payloads. Model prompts never
 /// reach the ledger at all (the facade streams bytes without persisting);
 /// this catches secrets that leak into tool summaries or agent text.
@@ -428,24 +437,34 @@ mod tests {
     fn redactor_scrubs_fluidbox_token_prefixes() {
         let r = Redactor::default();
         // Runner-session, trigger, browser-session, and PAT tokens all scrub.
-        // The FOUR audience-scoped session credentials (Gap 10: control, tool,
-        // llm, workspace) are covered here BY CONSTRUCTION: the rule keys on the
-        // shared `fbx_sess_` prefix, and every audience keeps that prefix (see
-        // orchestrator::run). The four sample tokens below assert exactly that,
-        // so a future audience that dropped the prefix would fail this test.
+        //
+        // What the session-token half PINS: the Redactor's rule (an independent
+        // regex literal above) still matches a credential built the way the
+        // MINTING site builds one — i.e. `SESSION_TOKEN_PREFIX` + random. The
+        // samples are DERIVED from that constant rather than typed out, so
+        // changing the minted prefix breaks this test instead of silently
+        // sailing past a rule that no longer covers the tokens we issue.
+        //
+        // What it does NOT pin: the audience NAMES. Those live in the server
+        // crate (auth.rs's `AUD_*`), which core cannot see; the four suffixes
+        // below are hand-maintained labels making the samples readable, and a
+        // fifth audience added there would not fail anything here. It costs
+        // nothing, because a new audience is covered the moment it is minted
+        // from this constant — the rule keys on the PREFIX, not the audience.
+        let p = SESSION_TOKEN_PREFIX;
         for tok in [
-            "fbx_sess_0123456789abcdef",
-            // one sample per minted audience — all share the prefix
-            "fbx_sess_control0123456789abcdef",
-            "fbx_sess_tool0123456789abcdef",
-            "fbx_sess_llm0123456789abcdef",
-            "fbx_sess_workspace0123456789abcdef",
-            "fbx_trig_0123456789abcdef",
-            "fbx_web_0123456789abcdef",
-            "fbx_pat_0123456789abcdef",
+            format!("{p}0123456789abcdef"),
+            // one sample per minted audience — all built from the same prefix
+            format!("{p}control0123456789abcdef"),
+            format!("{p}tool0123456789abcdef"),
+            format!("{p}llm0123456789abcdef"),
+            format!("{p}workspace0123456789abcdef"),
+            "fbx_trig_0123456789abcdef".to_string(),
+            "fbx_web_0123456789abcdef".to_string(),
+            "fbx_pat_0123456789abcdef".to_string(),
         ] {
             let out = r.scrub_text(&format!("token {tok} end"));
-            assert!(!out.contains(tok), "{tok} must be redacted");
+            assert!(!out.contains(&tok), "{tok} must be redacted");
             assert!(out.contains("‹redacted›"));
         }
     }
