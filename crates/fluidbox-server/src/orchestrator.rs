@@ -934,6 +934,15 @@ async fn collect_and_terminalize(
         // terminalized, cleanup may still be owed; a transient failure
         // leaves the intent for the next drive. H2: the intent (and the
         // workspace, archive, and sandbox) are NEVER destroyed on this path.
+        //
+        // NOTE the honest scope of the epoch fence: it gates the TRANSITION,
+        // not every terminal side effect. A driver fenced out here still runs
+        // `finish_terminal_cleanup` once it observes the session terminal — by
+        // design, because cleanup is the retry ticket and is idempotent
+        // throughout (token revocation is an UPDATE, delivery enqueue is
+        // deduped, provider deletes are UID-preconditioned). Do NOT "tighten"
+        // this into a fenced-only path: that would strand cleanup whenever the
+        // winner died between transitioning and finishing.
         match fluidbox_db::get_session(&state.pool, scope, id).await {
             Ok(Some(s)) if s.status_enum().is_terminal() => {
                 finish_terminal_cleanup(state, &s, intent).await;

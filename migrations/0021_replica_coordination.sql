@@ -86,13 +86,18 @@ alter table result_deliveries
     add column claimed_by uuid,
     add column claimed_until timestamptz;
 
--- The claim scan is `status='pending' and next_attempt_at <= now() and (claim free
--- or mine)` ordered by next_attempt_at. 0003's `result_deliveries_due` partial
--- index already covers the (status, next_attempt_at) selection; this one lets the
--- claim predicate discard rows another replica holds without a heap visit.
-create index result_deliveries_claim
-    on result_deliveries (claimed_until)
-    where status = 'pending';
+-- NO new index for the claim scan, deliberately. The scan is
+--   status='pending' and next_attempt_at <= now()
+--   and (claimed_until is null or claimed_until < now() or claimed_by = $1)
+--   order by next_attempt_at limit N for update skip locked
+-- 0003's `result_deliveries_due (next_attempt_at) where status='pending'` already
+-- supplies both the range predicate AND the ordering, and the LIMIT stops the scan
+-- early. An index on `claimed_until` could not serve the claim predicate anyway —
+-- it is a three-way OR spanning `claimed_until` and `claimed_by`, and there is no
+-- `claimed_by` index to BitmapOr against — and it would supply no ordering. Nor
+-- could it avoid a heap visit: `for update` always visits and locks the heap tuple.
+-- It would therefore be pure write amplification, since every claim and every
+-- per-attempt re-stamp writes `claimed_until`.
 
 -- ─── (c) post-approval-wait terminality-deny single-emission marker ─────────
 -- NOT a verdict: `status` keeps the immutable decision. This records that the
