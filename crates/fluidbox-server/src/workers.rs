@@ -8,6 +8,29 @@ use fluidbox_core::spec::RunSpec;
 use fluidbox_core::traits::SandboxHandle;
 use fluidbox_db::TenantScope;
 use std::time::Duration;
+use tokio::time::MissedTickBehavior;
+
+/// How many rows one tick of a periodic sweep may take. Each swept row costs at
+/// least one SERIAL follow-up write (a ledger append), so the batch — not the
+/// backlog — is what a tick's duration is sized against.
+const SWEEP_BATCH: i64 = 200;
+
+/// Every periodic worker uses this. `tokio::time::interval` defaults to `Burst`:
+/// after a tick that overran its period, the missed ticks fire BACK-TO-BACK to
+/// "catch up", so one slow sweep is immediately followed by several with no gap —
+/// exactly when the database is least able to take them. `Delay` re-phases from
+/// the moment the slow tick finished, guaranteeing a full period of breathing
+/// room afterwards.
+///
+/// `Delay` rather than `Skip` because every one of these ticks is a scan of
+/// "whatever is due NOW" — never work bound to a wall-clock slot — so nothing is
+/// lost by re-phasing, and `Skip` (which preserves the original phase) can still
+/// leave a fraction-of-a-period gap after a long tick.
+fn periodic(period: Duration) -> tokio::time::Interval {
+    let mut tick = tokio::time::interval(period);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    tick
+}
 
 /// Reap any sandboxes the provider manages that have no matching live session
 /// (or whose session is already terminal), and resume any finalization the
@@ -145,7 +168,7 @@ fn reconcile_action(session: SessionLookup, has_handle: bool) -> ReconcileAction
 /// pod nobody owned; and a cancel-during-provisioning reaped before the
 /// handle landed, leaking the pod until the next restart.
 async fn reconcile_managed(state: AppState) {
-    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    let mut tick = periodic(Duration::from_secs(60));
     loop {
         tick.tick().await;
         let managed = match state.provider.list_managed().await {
@@ -265,7 +288,7 @@ async fn archive_ttl_sweep(state: AppState) {
             "FLUIDBOX_ARCHIVE_TTL_SECS={configured} is below the {ARCHIVE_TTL_FLOOR_SECS}s floor; using the floor"
         );
     }
-    let mut tick = tokio::time::interval(Duration::from_secs(3600));
+    let mut tick = periodic(Duration::from_secs(3600));
     loop {
         tick.tick().await;
         let data_dir = state.cfg.data_dir.clone();
@@ -340,7 +363,7 @@ fn stale_launch_mins() -> i32 {
 /// Fail sessions whose sandbox died or whose heartbeat went stale.
 async fn watchdog(state: AppState) {
     let stale_launch_mins = stale_launch_mins();
-    let mut tick = tokio::time::interval(Duration::from_secs(15));
+    let mut tick = periodic(Duration::from_secs(15));
     loop {
         tick.tick().await;
         let active = match fluidbox_db::system_worker::sessions_in_status(
@@ -416,7 +439,7 @@ async fn sandbox_dead(state: &AppState, handle_json: &Option<serde_json::Value>)
 /// Enforce wall-clock budgets (token/cost budgets are enforced inline in the
 /// facade; tool-call budgets inline in the permission gate).
 async fn budget_sweeper(state: AppState) {
-    let mut tick = tokio::time::interval(Duration::from_secs(10));
+    let mut tick = periodic(Duration::from_secs(10));
     loop {
         tick.tick().await;
 
@@ -424,9 +447,13 @@ async fn budget_sweeper(state: AppState) {
         // cadence. A `claimed` row whose control-plane dispatcher crashed
         // mid-flight is CAS'd to `ambiguous` past its TTL (never auto-retried —
         // invariant 15) and ledgered so the timeline records the unknown outcome.
+        // BOUNDED like the reservation sweep below (review, minor): each swept row
+        // costs a SERIAL ledger append, so an unbounded batch could make one tick
+        // outrun its own 10 s period. A backlog drains over several ticks instead.
         match fluidbox_db::system_worker::sweep_stale_execution_claims(
             &state.pool,
             chrono::Utc::now(),
+            SWEEP_BATCH,
         )
         .await
         {
@@ -470,7 +497,7 @@ async fn budget_sweeper(state: AppState) {
         match fluidbox_db::system_worker::sweep_expired_llm_reservations(
             &state.pool,
             chrono::Utc::now(),
-            200,
+            SWEEP_BATCH,
         )
         .await
         {
@@ -558,9 +585,23 @@ async fn budget_sweeper(state: AppState) {
             // Phase E (#33; Gap 14): the projection now includes LIVE reservations
             // (`state='reserved'`), not just recorded usage — a budget check that
             // ignores booked-but-unreported spend is the very bug Gap 14 names.
-            // Disclosed consequence: within one conservative reservation of the
-            // ceiling this stops a run whose in-flight request would have fit,
-            // which is the "over-charge in the safe direction" the design asks for
+            //
+            // DISCLOSED CONSEQUENCE, at its real bound (review, minor). In steady
+            // state a healthy run holds one reservation at a time, so this stops it
+            // within ONE conservative reservation of the ceiling. That is NOT the
+            // worst case: a reservation is drained by the facade request that made
+            // it, so a control-plane RESTART (or any crash between booking and
+            // drain) leaves reservations stranded `reserved` until the 30-min TTL
+            // sweep converts them — and up to the per-session ceiling
+            // (`FLUIDBOX_LLM_MAX_CONCURRENT_RESERVATIONS`, default 32) can be
+            // stranded at once. Every stranded booking counts here immediately, so a
+            // run whose SANDBOX survived the restart can be `finalize_forced` early
+            // by up to `ceiling` conservative reservations' worth of phantom spend,
+            // not one. It self-heals as the sweep charges them (they become real
+            // usage rows, so the projection stops double-counting) — but the early
+            // stop happens on the tick, not after the heal.
+            //
+            // Still the "over-charge in the safe direction" the design asks for
             // (:1122-1123) and the counterpart to the facade's sole-claimant
             // admission — that carve-out keeps a lone request from livelocking on
             // 429s, and this is where such a run is stopped properly instead:
@@ -633,7 +674,7 @@ async fn budget_sweeper(state: AppState) {
 ///     ANOTHER replica wakes on the expiry instead of only on its ≤2 s poll floor
 ///     (the local `wake` below stays as the zero-latency path for this replica).
 async fn approval_expiry(state: AppState) {
-    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    let mut tick = periodic(Duration::from_secs(5));
     loop {
         tick.tick().await;
         let due =
@@ -772,7 +813,7 @@ pub fn spawn_netpol_gate(state: AppState) {
 /// (stale claim). The claim in `drive_finalization` makes this idempotent —
 /// a healthy in-progress finalization is never disturbed.
 async fn finalize_worker(state: AppState) {
-    let mut tick = tokio::time::interval(Duration::from_secs(20));
+    let mut tick = periodic(Duration::from_secs(20));
     loop {
         tick.tick().await;
         recover_finalizations(&state).await;

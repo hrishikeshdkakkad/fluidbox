@@ -41,8 +41,19 @@ struct GateDecision {
     /// (Phase E, #33). It exists so the post-approval-wait terminality deny
     /// answers with the SAME wire shape as the handler-top terminal guard —
     /// `{"decision":"deny","message":"session is not active"}` on `/permission`,
-    /// a `400 session is not active` on `/tools/call` — instead of the two guards
-    /// disagreeing about what a terminal session looks like to a runner.
+    /// a `400 {"error":"session is not active"}` on `/tools/call` — instead of the
+    /// guards disagreeing about what a terminal session looks like to a runner.
+    ///
+    /// There are THREE such guards on the brokered path, not two (review I2): the
+    /// handler top, this one, and the claim-time refusal
+    /// ([`fluidbox_db::ClaimOutcome::SessionTerminal`]) — a cancel that lands
+    /// between the gate and the claim. All three now answer `400 {"error":
+    /// "session is not active"}`. The third used to answer `200 {"ok":false,
+    /// "denied":true,"message":"session is terminal"}`, which
+    /// `images/runner-lib/broker-shim.mjs` renders as "fluidbox denied this call"
+    /// — a POLICY denial the model reasons around and retries differently —
+    /// rather than the transport-level "broker returned HTTP 400" the other two
+    /// produce. Same event, three wordings, two meanings.
     session_terminal: bool,
 }
 
@@ -75,7 +86,18 @@ impl GateDecision {
     }
 }
 
-/// The ONE wording both terminal guards use (handler-top and post-approval-wait).
+/// The ONE wording every terminal guard uses (handler-top, post-approval-wait,
+/// and — since review I2 — the claim-time refusal). On `/tools/call` all three
+/// surface as `400 {"error":"session is not active"}`; on `/permission` as
+/// `{"decision":"deny","message":"session is not active"}`.
+///
+/// FOR `scripts/hardening-e2e.sh` § (f), whose cancel-during-approval-wait
+/// assertion alternates over the shapes and explicitly asks to be told when they
+/// are unified: THEY ARE UNIFIED, and the final shape is this constant's text —
+/// `400 {"error":"session is not active"}` on `/tools/call`. Its string (3),
+/// `"session is terminal"` (`ClaimOutcome::SessionTerminal`), is now DEAD: no
+/// source path can produce it, so the alternation should drop to this one string,
+/// for exactly the reason its own comment gives for dropping the fourth.
 const TERMINAL_MESSAGE: &str = "session is not active";
 
 /// A reference into the run's FROZEN set for one `mcp__*` tool: the untrusted
@@ -964,12 +986,13 @@ pub async fn tool_call(
                     "brokered surface '{}' has no matching run resource binding",
                     surface.slot
                 );
-                record_binding_denial(
+                record_authority_denial(
                     &state,
                     scope,
                     session.id,
                     &req.tool_call_id,
                     &req.tool,
+                    "binding",
                     &reason,
                 )
                 .await;
@@ -982,12 +1005,13 @@ pub async fn tool_call(
             Ok(conn) => conn,
             Err(e) => {
                 let reason: String = e.chars().take(300).collect();
-                record_binding_denial(
+                record_authority_denial(
                     &state,
                     scope,
                     session.id,
                     &req.tool_call_id,
                     &req.tool,
+                    "binding",
                     &reason,
                 )
                 .await;
@@ -1019,15 +1043,41 @@ pub async fn tool_call(
 
     // ── Legacy path (pre-Phase-C / in-flight runs): the credential comes from the
     // connection_id embedded in the frozen bundle server; the only live check is
-    // broker.rs's status read (a legacy run froze no generation or owner to
+    // the connection's status (a legacy run froze no generation or owner to
     // compare — the residual invariant-21 gap the binding path closes). ──
     let srv = legacy_server.expect("gate allowed the call, so the tool is in the frozen set");
     let CapabilityServer::Brokered {
-        name: server_name, ..
+        name: server_name,
+        connection_id,
+        ..
     } = srv
     else {
         unreachable!("class-checked above")
     };
+    // Authority BEFORE the claim, exactly like the binding path above (Scope-1 #4).
+    // This read used to happen inside `broker::brokered_auth`, i.e. AFTER the claim
+    // was won — so a revoked connection produced `NeverSent` → `failed_before_send`,
+    // the one RE-CLAIMABLE state, and every retry re-took the claim; and the
+    // governance refusal was ledgered only as `tool.brokered ok=false`, never as a
+    // `tool.decision`. One event, two audit trails. Checking here makes a revoked
+    // legacy connection a ledgered denial that takes no claim at all.
+    if let Some(cid) = connection_id {
+        if let Err(reason) = legacy_connection_authority(&state, scope, *cid).await {
+            record_authority_denial(
+                &state,
+                scope,
+                session.id,
+                &req.tool_call_id,
+                &req.tool,
+                "connection",
+                &reason,
+            )
+            .await;
+            return Ok(Json(
+                json!({ "ok": false, "denied": true, "message": reason }),
+            ));
+        }
+    }
     let (_, tool_name) = capability::parse_mcp_tool(&req.tool).expect("found in the frozen set");
     let dispatch = BrokerDispatch::Legacy {
         server: srv,
@@ -1053,6 +1103,21 @@ pub async fn tool_call(
 /// never swept to `ambiguous` under it — while a genuinely crashed `claimed` row
 /// is reclaimed for classification promptly enough.
 const TOOL_EXECUTION_CLAIM_TTL_SECS: i64 = 600;
+
+/// How many dispatches ONE `(session, tool_call_id, input_digest)` may ever take
+/// (review I1): the initial claim plus two re-claims of a `failed_before_send`
+/// row. Small on purpose — `failed_before_send` is POSITIVE proof nothing was
+/// sent, so re-dispatching is safe, but the failures it covers (URL admission, a
+/// refused auth resolution, an open circuit breaker, a connect error) are the
+/// ones that repeat: three attempts is enough to ride out a blip and few enough
+/// that a sick upstream cannot be turned into a lock-contention engine.
+///
+/// A breaker refusal returns before ANY bucket charge and the faithful-retry
+/// short-circuit charges no tool-call budget, so re-claiming is free of every
+/// other meter in the system — this cap is the only thing bounding it. (Charging
+/// the tenant rate bucket instead would let one sick upstream throttle an org's
+/// unrelated connections; the cap is per claim row and cannot.)
+const MAX_EXECUTION_ATTEMPTS: i32 = 3;
 
 /// The resolved brokered dispatch target (post-gate, post-recheck). Both the
 /// Phase C binding path and the legacy embedded-connection path funnel through
@@ -1130,12 +1195,16 @@ impl BrokerDispatch<'_> {
 /// Wrap the ALLOWED brokered dispatch in the durable execution claim (Phase E,
 /// #33; Gap 11, plan E10). Take (or find) the claim keyed on the intent's exact
 /// input digest, then:
-///   - [`ClaimOutcome::SessionTerminal`] → the session stopped accepting work
-///     (cancel-during-approval brokered half) → deny;
-///   - [`ClaimOutcome::Won`] → dispatch once, complete the claim, respond;
-///   - [`ClaimOutcome::Existing`] → adopt a terminal outcome (the duplicate-
-///     return contract), re-claim a `failed_before_send` row for a fresh
-///     dispatch, or bounded-poll a `claimed`/`ambiguous` row.
+///   - [`fluidbox_db::ClaimOutcome::SessionTerminal`] → the session stopped
+///     accepting work (cancel-during-approval brokered half) → the SAME
+///     `400 session is not active` the other two terminal guards answer with
+///     (review I2), never a `denied:true` body the model reads as policy;
+///   - [`fluidbox_db::ClaimOutcome::Won`] → dispatch once, complete the claim,
+///     respond;
+///   - [`fluidbox_db::ClaimOutcome::Existing`] → adopt a terminal outcome (the
+///     duplicate-return contract), re-claim a `failed_before_send` row for a
+///     fresh dispatch WITHIN [`MAX_EXECUTION_ATTEMPTS`], or bounded-poll a
+///     `claimed`/`ambiguous` row.
 #[allow(clippy::too_many_arguments)]
 async fn execute_with_claim(
     state: &AppState,
@@ -1157,11 +1226,10 @@ async fn execute_with_claim(
     )
     .await?
     {
-        fluidbox_db::ClaimOutcome::SessionTerminal => Ok(Json(json!({
-            "ok": false,
-            "denied": true,
-            "message": "session is terminal",
-        }))),
+        // Review I2: the THIRD terminal guard, answering exactly like the other two.
+        fluidbox_db::ClaimOutcome::SessionTerminal => {
+            Err(ApiError::BadRequest(TERMINAL_MESSAGE.into()))
+        }
         fluidbox_db::ClaimOutcome::Won { claim_id } => {
             finish_won_claim(
                 state,
@@ -1172,6 +1240,7 @@ async fn execute_with_claim(
                 input,
                 dispatch,
                 claim_id,
+                1, // a freshly inserted claim is attempt 1
             )
             .await
         }
@@ -1188,29 +1257,55 @@ async fn execute_with_claim(
             // The ONLY re-claimable state: re-claim (same row) and dispatch fresh;
             // a lost re-claim means another handler is in flight → poll.
             "failed_before_send" => {
-                if fluidbox_db::reclaim_failed_before_send(
+                // Review I1: refuse a spent claim from the row we ALREADY read,
+                // without taking `reclaim`'s second `sessions … FOR UPDATE`. That
+                // second lock is the churn the finding names — a client looping on
+                // one tool_call_id took two exclusive locks per iteration on the
+                // very row `transition_session`, `begin_finalization` and
+                // `append_event` need, so cancelling the run contended every pass.
+                // Past the cap the steady-state loop costs ONE lock (the claim
+                // read above) and no writes at all.
+                if row.attempt >= MAX_EXECUTION_ATTEMPTS {
+                    tracing::debug!(
+                        "session {session_id}: tool call {tool_call_id} re-presented after \
+                         {} pre-send failures — refusing (attempts exhausted)",
+                        row.attempt
+                    );
+                    return Ok(Json(attempts_exhausted_response(row.attempt)));
+                }
+                match fluidbox_db::reclaim_failed_before_send(
                     &state.pool,
                     scope,
                     session_id,
                     tool_call_id,
                     input_digest,
                     TOOL_EXECUTION_CLAIM_TTL_SECS,
+                    MAX_EXECUTION_ATTEMPTS,
                 )
                 .await?
                 {
-                    finish_won_claim(
-                        state,
-                        scope,
-                        session_id,
-                        tool_call_id,
-                        tool,
-                        input,
-                        dispatch,
-                        row.id,
-                    )
-                    .await
-                } else {
-                    poll_in_flight(state, scope, session_id, tool_call_id, input_digest).await
+                    fluidbox_db::ReclaimOutcome::Reclaimed { attempt } => {
+                        finish_won_claim(
+                            state,
+                            scope,
+                            session_id,
+                            tool_call_id,
+                            tool,
+                            input,
+                            dispatch,
+                            row.id,
+                            attempt,
+                        )
+                        .await
+                    }
+                    // The cap was spent by a concurrent handler between our read
+                    // and the CAS — same answer as the short-circuit above.
+                    fluidbox_db::ReclaimOutcome::Exhausted { attempt } => {
+                        Ok(Json(attempts_exhausted_response(attempt)))
+                    }
+                    fluidbox_db::ReclaimOutcome::Lost => {
+                        poll_in_flight(state, scope, session_id, tool_call_id, input_digest).await
+                    }
                 }
             }
             // `claimed` (a concurrent dispatch in flight) → bounded poll.
@@ -1221,6 +1316,14 @@ async fn execute_with_claim(
 
 /// Dispatch a WON claim once, settle the claim from its classified outcome, ledger
 /// `tool.brokered` (with the settled `outcome`), and return the runner response.
+///
+/// `attempt` is which dispatch of this claim row we own (1 for a fresh claim, the
+/// re-claim's bumped value otherwise). It is read for ONE thing (review I1): when
+/// the LAST permitted attempt still fails before send, this is the exactly-once
+/// moment the churn budget is spent — only the winner of the settle CAS gets here
+/// — so the exhaustion is named in that call's own `tool.brokered` (never a second
+/// event) and the response turns terminal-shaped instead of inviting one more
+/// retry the claim layer would only refuse.
 #[allow(clippy::too_many_arguments)]
 async fn finish_won_claim(
     state: &AppState,
@@ -1231,6 +1334,7 @@ async fn finish_won_claim(
     input: &Value,
     dispatch: &BrokerDispatch<'_>,
     claim_id: uuid::Uuid,
+    attempt: i32,
 ) -> ApiResult<Json<Value>> {
     let started = std::time::Instant::now();
     let outcome = dispatch.run(state, scope, session_id, input).await;
@@ -1250,6 +1354,18 @@ async fn finish_won_claim(
         comp.error_message.as_deref(),
     )
     .await?;
+    // Review I1: did this dispatch spend the LAST permitted attempt? Then the
+    // claim is done re-dispatching, and this is the exactly-once place to say so —
+    // one dispatcher, one settle, one `tool.brokered`. Folded into that event's
+    // error text rather than emitted as a second event, and never re-emitted by
+    // the refusals that follow (they take no claim and write nothing).
+    let exhausted = comp.state == "failed_before_send" && attempt >= MAX_EXECUTION_ATTEMPTS;
+    if exhausted {
+        tracing::warn!(
+            "session {session_id}: brokered call {tool_call_id} ({tool}) failed before \
+             send on all {attempt} permitted attempts — not retrying"
+        );
+    }
     // Ledger ONLY when this dispatcher actually settled the claim. When the CAS
     // lost, the sweeper already flipped the row to `ambiguous` and ALREADY
     // ledgered that outcome — a second tool.brokered here would double-ledger one
@@ -1267,16 +1383,38 @@ async fn finish_won_claim(
             comp.ledger_ok,
             latency_ms,
             comp.result_digest.clone(),
-            comp.ledger_error.clone(),
+            match (&comp.ledger_error, exhausted) {
+                (Some(e), true) => Some(format!("{e} (attempt {attempt}; not retried)")),
+                (e, _) => e.clone(),
+            },
             Some(comp.state.to_string()),
         )
         .await;
+    }
+    if exhausted {
+        return Ok(Json(attempts_exhausted_response(attempt)));
     }
     Ok(Json(claim_response(
         comp.state,
         comp.result_content.as_ref(),
         comp.error_message.as_deref(),
     )))
+}
+
+/// The runner-facing answer for a claim whose re-dispatch budget is spent
+/// (review I1). TERMINAL-shaped on purpose: the wording mirrors `ambiguous`'s
+/// "not retried" rather than the retryable `failed_before_send`/`claimed` shape,
+/// so the model reads it as an upstream failure it should stop hammering. It is
+/// an `ok:false` + `error` body, NOT `denied:true` — nothing about this is a
+/// policy verdict, and `broker-shim.mjs` renders the two differently. PURE.
+fn attempts_exhausted_response(attempt: i32) -> Value {
+    json!({
+        "ok": false,
+        "error": format!(
+            "brokered dispatch failed before send on {attempt} attempts — not retried \
+             (execution attempts exhausted)"
+        ),
+    })
 }
 
 /// Bounded poll of an in-flight `claimed` row (every 500 ms, up to 30 s): a
@@ -1325,6 +1463,15 @@ async fn poll_in_flight(
 struct Completion {
     state: &'static str,
     result_content: Option<Value>,
+    /// The claim row's `is_error` column: **did this claim settle as a failure?**
+    /// `false` for `succeeded` alone; `true` for every failing terminal state —
+    /// `failed_upstream`, `failed_before_send` AND `ambiguous` (review, minor: the
+    /// first cut wrote `false` for `NeverSent` and `true` for `Ambiguous`, which
+    /// are both failures, so the column disagreed with `state` in one of the two).
+    /// It is a DURABLE AUDIT column, not a control input: nothing branches on it —
+    /// `claim_response` answers from `state`, and the runner-facing per-result
+    /// `is_error` lives inside `result_content`. Keeping it coherent costs nothing
+    /// and makes `select is_error from tool_execution_claims` mean what it says.
     is_error: Option<bool>,
     error_message: Option<String>,
     result_digest: Option<String>,
@@ -1373,7 +1520,7 @@ fn dispatch_to_completion(outcome: crate::broker::DispatchOutcome) -> Completion
             Completion {
                 state: "failed_before_send",
                 result_content: None,
-                is_error: Some(false),
+                is_error: Some(true),
                 error_message: Some(m.clone()),
                 result_digest: None,
                 ledger_ok: false,
@@ -1496,16 +1643,19 @@ async fn record_brokered_exec(
     .await;
 }
 
-/// Ledger a brokered-binding refusal as `tool.decision` (source="binding") —
-/// the same audit shape as a capability denial — before the endpoint returns
-/// it. The gate already allowed the call on the frozen set; the binding recheck
-/// is the live revocation layer above it (design :705-723).
-async fn record_binding_denial(
+/// Ledger a live-authority refusal as `tool.decision` — the same audit shape as
+/// a capability denial — before the endpoint returns it. The gate already
+/// allowed the call on the frozen set; this is the live revocation layer above it
+/// (design :705-723). `source` names WHICH authority refused: `"binding"` for a
+/// Phase C run resource binding, `"connection"` for a legacy run's embedded
+/// connection (Scope-1 #4 — the two paths now leave the SAME trail).
+async fn record_authority_denial(
     state: &AppState,
     scope: TenantScope,
     session_id: uuid::Uuid,
     tool_call_id: &str,
     tool: &str,
+    source: &str,
     reason: &str,
 ) {
     ledger::record(
@@ -1517,12 +1667,46 @@ async fn record_binding_denial(
             tool_call_id: tool_call_id.to_string(),
             tool: tool.to_string(),
             verdict: "deny".into(),
-            source: "binding".into(),
+            source: source.to_string(),
             original_verdict: None,
             reason: Some(reason.to_string()),
         },
     )
     .await;
+}
+
+/// The LEGACY embedded-connection authority check, run BEFORE the execution
+/// claim (Scope-1 #4). Read-only, and deliberately the same two conditions
+/// `broker::brokered_auth` would hit AFTER the claim — the connection must still
+/// exist under this tenant and still be `active` — so moving the check earlier
+/// changes WHEN a revoked connection is refused, never WHETHER.
+///
+/// A legacy bundle froze no binding, so there is no generation or owner to
+/// recheck (that is the residual invariant-21 gap the binding path closes);
+/// status is the whole of the live authority here. A lookup FAILURE denies too,
+/// matching `recheck_binding`: no proof of authority is not authority.
+async fn legacy_connection_authority(
+    state: &AppState,
+    scope: TenantScope,
+    cid: uuid::Uuid,
+) -> Result<(), String> {
+    let mut tx = fluidbox_db::scoped_tx(&state.pool, scope)
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?;
+    let conn = fluidbox_db::get_connection(&mut *tx, scope, cid)
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?;
+    tx.commit()
+        .await
+        .map_err(|e| format!("connection lookup failed: {e}"))?;
+    match conn {
+        None => Err(format!("connection {cid} is missing")),
+        Some(c) if c.status != "active" => Err(format!(
+            "connection {} is {} — reconnect it",
+            c.id, c.status
+        )),
+        Some(_) => Ok(()),
+    }
 }
 
 async fn maybe_resume(state: &AppState, scope: TenantScope, session_id: uuid::Uuid) {
@@ -1958,6 +2142,36 @@ mod approval_emission_guards {
              claim — a committed marker with no event is an unrecoverable audit hole"
         );
     }
+
+    /// Review I2: the CLAIM-time terminal refusal is the third guard, and it must
+    /// answer in the same shape as the other two. Its behavioral coverage is the
+    /// DB-gated cancel-during-approval e2e, so a regression here would otherwise
+    /// only surface as a model quietly treating a cancelled run's refusal as a
+    /// POLICY denial (`denied:true` → "fluidbox denied this call") and routing
+    /// around it. Sliced to the match arm; needles split so this guard is not
+    /// itself an occurrence.
+    #[test]
+    fn the_claim_time_terminal_refusal_uses_the_shared_terminal_shape() {
+        let src = include_str!("internal.rs");
+        let arm = concat!("ClaimOutcome::SessionTerminal", " => ");
+        let start = src.find(arm).expect("the claim-terminal arm exists");
+        let end = src[start..]
+            .find(concat!("ClaimOutcome::", "Won {"))
+            .map(|i| start + i)
+            .expect("the Won arm follows it");
+        let body = &src[start..end];
+        let unified = concat!("ApiError::BadRequest(TERMINAL_", "MESSAGE");
+        assert!(
+            body.contains(unified),
+            "the claim-time terminal refusal must answer `{unified}` — the SAME \
+             400 the handler-top and post-approval-wait guards use. A 200 \
+             `denied:true` body is read by broker-shim.mjs as a policy denial."
+        );
+        assert!(
+            !body.contains(concat!("\"denied\"", ": true")),
+            "a terminal session is not a policy verdict — never `denied:true`"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2206,6 +2420,59 @@ mod schema_gate_tests {
         let c = dispatch_to_completion(D::Ambiguous("timeout".into()));
         assert_eq!(c.state, "ambiguous");
         assert!(c.result_content.is_none());
+        // The stored `is_error` column agrees with `state` in EVERY arm (review,
+        // minor): true iff the claim settled as a failure — `failed_before_send`
+        // and `ambiguous` used to disagree with each other despite both failing.
+        for (outcome, state, want) in [
+            (
+                D::Definitive {
+                    content: json!([]),
+                    is_error: false,
+                    structured: None,
+                },
+                "succeeded",
+                false,
+            ),
+            (
+                D::Definitive {
+                    content: json!([]),
+                    is_error: true,
+                    structured: None,
+                },
+                "failed_upstream",
+                true,
+            ),
+            (D::NeverSent("x".into()), "failed_before_send", true),
+            (D::Ambiguous("x".into()), "ambiguous", true),
+        ] {
+            let c = dispatch_to_completion(outcome);
+            assert_eq!(c.state, state);
+            assert_eq!(
+                c.is_error,
+                Some(want),
+                "is_error must mean 'settled as a failure' for state {state}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_attempts_exhausted_answer_is_terminal_shaped() {
+        // Review I1: not a policy denial (`denied`), and not the RETRYABLE
+        // failed_before_send shape — the broker shim renders those two as "fluidbox
+        // denied this call" and as an ordinary retryable error respectively. This
+        // one has to read like `ambiguous`: an upstream failure that is over.
+        let r = attempts_exhausted_response(3);
+        assert_eq!(r["ok"], false);
+        assert!(
+            r.get("denied").is_none(),
+            "exhaustion is not a policy verdict"
+        );
+        let text = r["error"].as_str().expect("an error string");
+        assert!(
+            text.contains("not retried"),
+            "the answer must read terminal"
+        );
+        assert!(text.contains('3'), "and must name the attempts it burned");
     }
 
     #[test]
