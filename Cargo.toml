@@ -99,3 +99,11 @@ jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 # primitives (CoreJsonWebKey/CoreJwsSigningAlgorithm/AccessTokenHash) come from
 # the base crate (RustCrypto backends, no C toolchain). MIT/Apache-2.0.
 openidconnect = { version = "4", default-features = false }
+# Phase E (#33, Gap 12): frozen-schema argument enforcement at the gate.
+# default-features=false is LOAD-BEARING — it drops `resolve-http`/`resolve-file`/
+# `resolve-async`/`reqwest`/`tls-*`, so the validator has NO external-$ref
+# resolution path at the FEATURE level (a hostile photographed inputSchema can
+# never make the control plane dial out). A deny-everything retriever is layered
+# on top in code, and `schema_guard::guard_schema` rejects any non-local `$ref`
+# before compilation. MIT.
+jsonschema = { version = "0.48", default-features = false }

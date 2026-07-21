@@ -4,12 +4,21 @@
 //! Replaces the old whole-body `data:`-line scanner (survey A §1g): a real
 //! WHATWG-shaped parser that assembles multi-line `data:` fields (joined with
 //! `\n`), honors `event:`/`id:`/`retry:` framing and comment lines, dispatches
-//! on a blank line, tolerates CRLF/LF/CR terminators, and — crucially — feeds
-//! INCREMENTALLY so an event can span chunk boundaries. Each event is bounded to
-//! [`MAX_EVENT_BYTES`]; an oversize event is an ERROR (never silent truncation),
-//! surfaced up so the broker aborts the call as a protocol violation. The whole
-//! response body is still bounded to 8 MiB by the broker's streaming read; this
-//! adds the per-event bound the old scanner lacked.
+//! on a blank line, and tolerates CRLF/LF/CR terminators. Each event is bounded
+//! to [`MAX_EVENT_BYTES`]; an oversize event is an ERROR (never silent
+//! truncation), surfaced up so the broker aborts the call as a protocol violation.
+//!
+//! **How the broker actually dials it (survey A §1g):** the transport funnel
+//! (`broker::dial_rpc`) buffers the WHOLE decoded response body — bounded to 8
+//! MiB by the streaming read — and then feeds it to the assembler in ONE
+//! [`feed`](SseEventAssembler::feed) + [`finish`](SseEventAssembler::finish)
+//! call; the per-event 256 KiB cap is enforced DURING that single feed. The
+//! assembler itself is nonetheless a true INCREMENTAL parser — [`feed`] carries a
+//! partial line across chunk boundaries and returns only the events completed so
+//! far — and its tests exercise byte-split and CRLF-split chunks, so a future
+//! streaming dial path can feed it chunk-by-chunk without any change here. This
+//! module contributes the per-event bound the old scanner lacked; the whole-body
+//! 8 MiB bound stays the broker's.
 //!
 //! Named `mcp_sse` (not `sse`) to stay clearly distinct from the crate's
 //! OUTBOUND server-sent-events module (`sse.rs`, the run event stream).
