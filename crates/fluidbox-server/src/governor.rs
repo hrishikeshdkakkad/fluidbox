@@ -25,26 +25,50 @@
 //! [`HOST_GLOBAL_FACTOR`] × the per-tenant host ceiling: upstream protection
 //! against a stampede, loose enough that it is not a cross-tenant fairness lever.
 //!
-//! # No USER dimension (deferred, disclosed)
+//! # TWO TIERS since Phase F (Task 1)
 //!
-//! The design names four dimensions — tenant, user, connection, host — and this
-//! module implements every one except **user**: one user can still spread calls
-//! across an org's connections and consume the whole tenant bucket. The invoking
-//! principal is available at the gate, so adding it is mechanical; it is deferred
-//! with the rest of the durable multi-replica limiter (Phase F), because a
-//! per-replica per-user bucket is the weakest of the four and the tenant bucket
-//! already bounds the blast radius to one org. `docs/hosted/
-//! connector-admission-policy.md` states the same limitation — keep the two
-//! honest together.
+//! Everything above describes the LOCAL tier, and it is unchanged — same buckets,
+//! same breaker, same arithmetic, same tests. What Phase F adds is a SECOND,
+//! Postgres-backed tier ([`fluidbox_db::governance`], migration 0023) that a dial
+//! must ALSO pass. The local tier is consulted FIRST because it is free and it
+//! catches a runaway loop with zero DB load; the durable tier is what makes the
+//! numbers mean something across replicas.
 //!
-//! # Per-replica, by design (disclosed limitation)
+//! Three properties are worth stating up front:
 //!
-//! ALL state here is in-memory and REPLICA-LOCAL. With N replicas the effective
-//! ceiling is N × the configured rate and a breaker opened on one replica does
-//! not stop the others. This is a deliberate v1 scope call (plan E14, following
-//! the `llm_keys` per-replica mint-budget precedent): it is a fairness/abuse
-//! backstop and an upstream-protection reflex, NOT a hard quota. The durable,
-//! multi-replica limiter is Phase F.
+//! * **Degrade, never fail.** A durable-tier error (DB down, timeout) is logged,
+//!   counted ([`EgressGovernor::degraded_count`]) and ADMITTED on the local
+//!   verdict alone. This is an abuse/fairness control, not a quota system — the
+//!   same reason `0` means "disable that dimension" and never "block everything".
+//! * **The local tier can over-charge itself.** A dial the local tier admits and
+//!   the durable tier then refuses has already spent its local tokens, and may
+//!   have been promoted to the local half-open probe. Both self-heal (the bucket
+//!   refills; an unreported probe is taken over after one window — see
+//!   `a_lost_probe_cannot_wedge_the_breaker_shut_forever`), and both err toward
+//!   refusing, which is the safe direction.
+//! * **`host_global` stays LOCAL-ONLY.** It is the one dimension keyed across
+//!   tenants, so a durable version would need a per-dial RLS bypass. Trading the
+//!   short, audited bypass inventory for a tighter ceiling on ONE deliberately
+//!   loose upstream-protection tier is the wrong trade; its N× looseness stays
+//!   disclosed. See [`fluidbox_db::governance::rate_tiers`].
+//!
+//! # The USER dimension (Phase F, durable tier only)
+//!
+//! The design names four dimensions — tenant, user, connection, host — and Phase E
+//! shipped every one except **user**, so one member of an org could spread dials
+//! across the org's connections and consume the whole tenant bucket. Phase F adds
+//! it, keyed on `sessions.invoked_by_user_id` and resolved inside the durable
+//! admission statement. Two consequences to keep honest:
+//!
+//! * it lives in the DURABLE tier only, because the local tier is deliberately
+//!   byte-for-byte unchanged — so `FLUIDBOX_EGRESS_DURABLE=0` means no per-user
+//!   limiting at all;
+//! * a run with NO invoking user (trigger and schedule invocations — the column is
+//!   nullable) SKIPS the tier rather than bucketing every unattended run in the org
+//!   under the nil uuid, which would be one shared ceiling for all automation.
+//!
+//! `docs/hosted/connector-admission-policy.md` states the same limitations — keep
+//! the two honest together.
 //!
 //! # Bounded memory (this matters)
 //!
@@ -63,6 +87,10 @@
 //! no test in this module or in `broker.rs` ever sleeps.
 
 use crate::config::Config;
+use fluidbox_db::governance::{self, AdmitRequest, DurableAdmission, DurableLimits};
+use fluidbox_db::TenantScope;
+use sha2::{Digest, Sha256};
+use sqlx::PgPool;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -75,6 +103,17 @@ use uuid::Uuid;
 pub const SCOPE_TENANT: &str = "tenant";
 pub const SCOPE_CONNECTION: &str = "connection";
 pub const SCOPE_HOST: &str = "host";
+/// The PER-USER dimension (Phase F). Enforced in the DURABLE tier only — the
+/// local governor is deliberately unchanged — so it is inert when
+/// `FLUIDBOX_EGRESS_DURABLE=0`.
+///
+/// It appears in this module because a `Throttled` can carry it and
+/// `Throttled::message` renders it, but the VALUE is produced by
+/// `fluidbox_db::governance`; the only direct reader here is the test that pins
+/// the two spellings together (a drift would refuse dials with a scope name this
+/// module's own precedence order does not know).
+#[cfg_attr(not(test), allow(dead_code))]
+pub const SCOPE_USER: &str = "user";
 /// The cross-tenant upstream-protection tier (review I5): a much looser ceiling
 /// on ONE host summed over every tenant, so partitioning the per-tenant host
 /// bucket does not turn N tenants into N × the load one upstream sees.
@@ -88,6 +127,19 @@ pub const SCOPE_BREAKER: &str = "breaker";
 pub const DEFAULT_TENANT_PER_MIN: u32 = 120;
 pub const DEFAULT_CONNECTION_PER_MIN: u32 = 60;
 pub const DEFAULT_HOST_PER_MIN: u32 = 120;
+/// The per-USER ceiling (Phase F). Chosen as 60 — the same number as
+/// `DEFAULT_CONNECTION_PER_MIN`, deliberately, and NOT as the tenant's 120.
+///
+/// The reasoning against the three existing numbers: a typical run dials ONE
+/// connection, so today's effective per-user ceiling is already 60 (the connection
+/// bucket) — it just is not stated anywhere and evaporates the moment a user fans
+/// out across a second connection, which is precisely the hole this dimension
+/// exists to close. Setting it to 60 makes the common case's real ceiling explicit
+/// and unchanged, and starts binding exactly where the old arrangement leaked.
+/// Setting it to the tenant's 120 would have been a no-op default: at parity with
+/// the tier above it, the user bucket could never refuse before the tenant bucket
+/// did, and the dimension would ship dead.
+pub const DEFAULT_USER_PER_MIN: u32 = 60;
 /// The global host tier is this multiple of the PER-TENANT host ceiling. It is
 /// deliberately loose: it exists to stop a stampede on one upstream, not to
 /// arbitrate between tenants (that is what the per-tenant bucket does), so it
@@ -101,6 +153,16 @@ pub const DEFAULT_BREAKER_OPEN_SECS: u64 = 60;
 
 /// Per-map entry ceiling (see the module docs on bounded memory).
 pub const MAX_TRACKED: usize = 4096;
+
+/// How often ONE replica runs the durable tier's row collection, and how idle a
+/// row must be to be collected. The sweep is inline (it costs one dial every
+/// [`SWEEP_INTERVAL_SECS`] a bounded `DELETE`) rather than a spawned task, so
+/// there is no detached work to leak and the cost is visible where it is paid.
+const SWEEP_INTERVAL_SECS: u64 = 300;
+const SWEEP_IDLE_SECS: u64 = 3600;
+/// Rows deleted per pass. A backlog drains over several passes instead of one
+/// long statement holding locks — "bounded" is the point, not "instant".
+const SWEEP_BATCH: i64 = 5000;
 
 /// Token-bucket unit scale: one dial costs `UNIT` units and a bucket refills
 /// `per_min` units per elapsed millisecond, so a `per_min`-rate bucket regains a
@@ -116,8 +178,14 @@ pub struct GovernorLimits {
     pub tenant_per_min: u32,
     pub connection_per_min: u32,
     pub host_per_min: u32,
+    /// Durable tier only — see [`DEFAULT_USER_PER_MIN`] and [`SCOPE_USER`].
+    pub user_per_min: u32,
     pub breaker_threshold: u32,
     pub breaker_open_secs: u64,
+    /// Whether the cross-replica Postgres tier is consulted at all (Phase F,
+    /// `FLUIDBOX_EGRESS_DURABLE`, default ON). `false` restores exactly Phase E's
+    /// per-replica behaviour, INCLUDING the absence of the user dimension.
+    pub durable: bool,
 }
 
 impl Default for GovernorLimits {
@@ -126,8 +194,10 @@ impl Default for GovernorLimits {
             tenant_per_min: DEFAULT_TENANT_PER_MIN,
             connection_per_min: DEFAULT_CONNECTION_PER_MIN,
             host_per_min: DEFAULT_HOST_PER_MIN,
+            user_per_min: DEFAULT_USER_PER_MIN,
             breaker_threshold: DEFAULT_BREAKER_THRESHOLD,
             breaker_open_secs: DEFAULT_BREAKER_OPEN_SECS,
+            durable: true,
         }
     }
 }
@@ -148,13 +218,29 @@ impl GovernorLimits {
             tenant_per_min: cfg.egress_rate_tenant_per_min,
             connection_per_min: cfg.egress_rate_connection_per_min,
             host_per_min: cfg.egress_rate_host_per_min,
+            user_per_min: cfg.egress_rate_user_per_min,
             breaker_threshold: cfg.egress_breaker_threshold,
             breaker_open_secs: cfg.egress_breaker_open_secs,
+            durable: cfg.egress_durable,
         }
     }
 
     fn breaker_enabled(&self) -> bool {
         self.breaker_threshold > 0 && self.breaker_open_secs > 0
+    }
+
+    /// The same ceilings, as the durable tier's view of them. `host_global` has no
+    /// counterpart on purpose (see the module docs); everything else maps 1:1, so
+    /// the two tiers enforce the SAME numbers rather than two sets that can drift.
+    fn durable(&self) -> DurableLimits {
+        DurableLimits {
+            tenant_per_min: self.tenant_per_min,
+            user_per_min: self.user_per_min,
+            connection_per_min: self.connection_per_min,
+            host_per_min: self.host_per_min,
+            breaker_threshold: self.breaker_threshold,
+            breaker_open_secs: self.breaker_open_secs,
+        }
     }
 
     /// The cross-tenant ceiling on ONE upstream host (review I5). Derived, not a
@@ -428,8 +514,17 @@ pub struct Permit {
     tenant: Uuid,
     connection: Uuid,
     host: String,
+    /// The stored/reported form of `host` — see [`host_digest`]. Computed ONCE at
+    /// admission so the digest that keys the durable breaker is byte-identical to
+    /// the one the refusal message would have carried.
+    digest: String,
     /// `Some(epoch)` iff THIS admission was the breaker's half-open probe.
     probe: Option<u64>,
+    /// `Some(epoch)` iff THIS admission was elected the DURABLE breaker's
+    /// deployment-wide half-open probe (Phase F). Independent of `probe`: the two
+    /// breakers are separate state machines with separate epoch counters, and a
+    /// dial can be the probe for either, both, or neither.
+    durable_probe: Option<i64>,
 }
 
 impl std::ops::Deref for Permit {
@@ -439,11 +534,18 @@ impl std::ops::Deref for Permit {
     }
 }
 
-/// The in-memory, per-replica outbound governor held on `AppState`.
+/// The outbound governor held on `AppState`: an in-memory per-replica tier plus
+/// (Phase F) the cross-replica Postgres tier layered under it.
 pub struct EgressGovernor {
     limits: GovernorLimits,
     clock: Clock,
     state: Mutex<GovState>,
+    /// How many dials were admitted because the DURABLE tier errored. A rising
+    /// count means the cross-replica ceiling is not being enforced — the tier is
+    /// degrading exactly as designed, and the operator should know.
+    degraded: AtomicU64,
+    /// Monotonic ms of the last durable-row collection this replica ran. `0` = never.
+    last_sweep_ms: AtomicU64,
 }
 
 impl EgressGovernor {
@@ -458,6 +560,8 @@ impl EgressGovernor {
                 hosts_global: Bounded::new(),
                 breakers: Bounded::new(),
             }),
+            degraded: AtomicU64::new(0),
+            last_sweep_ms: AtomicU64::new(0),
         }
     }
 
@@ -535,8 +639,147 @@ impl EgressGovernor {
             tenant,
             connection,
             host: host.to_string(),
+            digest: host_digest(host),
             probe,
+            durable_probe: None,
         })
+    }
+
+    /// The SECOND, cross-replica tier (Phase F), applied to a permit the LOCAL tier
+    /// has already issued. Split that way on purpose: the broker keeps one gate
+    /// function for the local half (`broker::governor_gate`) and one refusal
+    /// renderer, and this module keeps `check` byte-for-byte what it was.
+    ///
+    /// Order is local-first and deliberate: the local tier costs a mutex and some
+    /// integer arithmetic, so a runaway loop is refused without ever touching the
+    /// database, and the DB only ever sees dials that already passed a real gate.
+    ///
+    /// **A local admission is not free even when this tier then refuses.** The
+    /// local tokens are already spent and the dial may already hold the local
+    /// half-open probe slot. Both self-heal (buckets refill; an unreported probe is
+    /// taken over after one window — see
+    /// `a_lost_probe_cannot_wedge_the_breaker_shut_forever`), and both err toward
+    /// refusing, which is the safe direction for an abuse control. Undoing them
+    /// would mean a rollback path through the local tier's `take`: strictly more
+    /// machinery for a strictly less safe outcome.
+    ///
+    /// `session` is the RUN's session, used only to resolve the invoking user for
+    /// the per-user dimension inside the durable statement.
+    pub async fn check_durable(
+        &self,
+        pool: &PgPool,
+        scope: TenantScope,
+        session: Uuid,
+        permit: &mut Permit,
+    ) -> Result<(), Throttled> {
+        if !self.limits.durable {
+            return Ok(());
+        }
+        let answer = governance::admit(
+            pool,
+            scope,
+            AdmitRequest {
+                session_id: session,
+                connection_id: permit.connection,
+                host_digest: &permit.digest,
+                replica: &crate::orchestrator::replica_id().to_string(),
+                limits: self.limits.durable(),
+            },
+        )
+        .await;
+        permit.durable_probe = self.fold_durable(answer)?;
+        self.maybe_sweep(pool, scope).await;
+        Ok(())
+    }
+
+    /// Fold the durable tier's answer into a verdict, DEGRADING on error.
+    ///
+    /// Split out from [`check_durable`](Self::check_durable) precisely so the
+    /// degrade path is reachable from a unit test without a database: everything
+    /// about "a DB failure must admit, not refuse" lives here, in eight lines, with
+    /// no I/O.
+    ///
+    /// The refusal `scope` is passed through verbatim — `fluidbox-db`'s scope
+    /// constants and this module's are the same strings by contract, pinned by
+    /// `the_two_tiers_agree_on_every_scope_name`.
+    fn fold_durable(
+        &self,
+        answer: sqlx::Result<DurableAdmission>,
+    ) -> Result<Option<i64>, Throttled> {
+        match answer {
+            Ok(DurableAdmission::Admitted { probe_epoch }) => Ok(probe_epoch),
+            Ok(DurableAdmission::Refused(r)) => Err(Throttled {
+                scope: r.scope,
+                retry_after_secs: r.retry_after_secs,
+            }),
+            // DEGRADE. A rate limiter that fails dials when its own bookkeeping
+            // store is unreachable has converted a fairness control into an
+            // outage amplifier: the database being down is already bad, and
+            // refusing every brokered tool call on top of it helps nobody. The
+            // local tier still bounds this replica; the count says the ceiling
+            // is not currently deployment-wide.
+            Err(e) => {
+                self.degraded.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    target: "governor",
+                    "durable egress governance unavailable — admitting on the per-replica \
+                     verdict alone (cross-replica ceiling NOT enforced): {e}"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Dials admitted (or health reports lost) because the durable tier was
+    /// unreachable. Surfaced to operators by [`maybe_sweep`](Self::maybe_sweep) —
+    /// a counter nobody reads is not observability.
+    pub fn degraded_count(&self) -> u64 {
+        self.degraded.load(Ordering::Relaxed)
+    }
+
+    /// Collect this tenant's information-free durable rows, at most once per
+    /// [`SWEEP_INTERVAL_SECS`] per replica. Tenant-scoped on purpose: it needs no
+    /// RLS bypass, and the tenants generating rows are the ones paying to clean
+    /// them. A failure is logged and retried at the next interval — it must never
+    /// affect the dial that happened to trigger it.
+    ///
+    /// What this bounds: the live set is "keys dialed within [`SWEEP_IDLE_SECS`]".
+    /// What it does NOT bound (disclosed): a tenant that stops dialing stops
+    /// sweeping, so its last working set is frozen — finite, no longer growing, but
+    /// not collected. A deployment-wide collector belongs beside the other
+    /// system-worker sweeps in `workers.rs`.
+    async fn maybe_sweep(&self, pool: &PgPool, scope: TenantScope) {
+        let now = self.clock.now_ms();
+        let last = self.last_sweep_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < SWEEP_INTERVAL_SECS.saturating_mul(1000) {
+            return;
+        }
+        // CAS so N concurrent dials on this replica run ONE sweep between them.
+        if self
+            .last_sweep_ms
+            .compare_exchange(last, now, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        // The sweep tick is also this replica's periodic health report. The degrade
+        // path logs each individual failure at warn, but a slow trickle scrolls
+        // past; the RUNNING TOTAL is what tells an operator the cross-replica
+        // ceiling has not actually been in force.
+        let degraded = self.degraded_count();
+        if degraded > 0 {
+            tracing::warn!(
+                target: "governor",
+                "durable egress governance has degraded {degraded} time(s) on this replica \
+                 since boot — those dials were admitted on the per-replica verdict alone"
+            );
+        }
+        if let Err(e) = governance::sweep(pool, scope, SWEEP_IDLE_SECS, SWEEP_BATCH).await {
+            tracing::warn!(
+                target: "governor",
+                "durable egress governance sweep failed (retrying next interval): {e}"
+            );
+        }
     }
 
     /// Feed one dispatch's health observation back into the connection's breaker.
@@ -577,6 +820,51 @@ impl EgressGovernor {
             // only a half-open PROBE can close a breaker.
             (open @ BreakerState::Open { .. }, _) => open,
         };
+    }
+
+    /// Feed one dispatch's health observation into BOTH breakers (Phase F). This
+    /// is what production calls; bare [`report`](Self::report) remains the local
+    /// tier and is what the timing tests drive.
+    ///
+    /// The permit carries both epochs, so the local breaker is decided by
+    /// `permit.probe` and the durable one by `permit.durable_probe` — a dial can be
+    /// the probe for either, both, or neither, and each breaker ignores a report
+    /// that does not carry ITS epoch.
+    ///
+    /// A durable failure here is logged and counted, never propagated: the dial has
+    /// already happened, and a bookkeeping write cannot be allowed to change what
+    /// the caller does with its result. The cost of losing one observation is a
+    /// breaker that opens one dial later.
+    pub async fn report_durable(
+        &self,
+        pool: &PgPool,
+        scope: TenantScope,
+        permit: &Permit,
+        outcome: Outcome,
+    ) {
+        self.report(permit, outcome);
+        if !self.limits.durable || !self.limits.breaker_enabled() {
+            return;
+        }
+        if let Err(e) = governance::report(
+            pool,
+            scope,
+            permit.connection,
+            &permit.digest,
+            outcome == Outcome::Ok,
+            permit.durable_probe,
+            &self.limits.durable(),
+        )
+        .await
+        {
+            self.degraded.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                target: "governor",
+                "durable breaker report lost (upstream {} health not recorded \
+                 deployment-wide): {e}",
+                permit.digest
+            );
+        }
     }
 
     /// Consult (and possibly transition) the breaker for one admitted dial.
@@ -637,6 +925,8 @@ impl EgressGovernor {
                 hosts_global: Bounded::new(),
                 breakers: Bounded::new(),
             }),
+            degraded: AtomicU64::new(0),
+            last_sweep_ms: AtomicU64::new(0),
         }
     }
 
@@ -675,6 +965,20 @@ impl EgressGovernor {
             st.breakers.len(),
         )
     }
+}
+
+/// The stored/reported form of an upstream host: a digest, never the host.
+///
+/// Byte-identical to `broker::msg_digest` (pinned by a test) so the value that
+/// keys a durable breaker row is the same value a refusal message shows and the
+/// same value the broker logs — one host, one identifier, everywhere. Defined here
+/// rather than imported so this module stays free of a back-dependency on the
+/// broker, which already depends on it.
+pub fn host_digest(host: &str) -> String {
+    format!(
+        "sha256:{}",
+        hex::encode(&Sha256::digest(host.as_bytes())[..8])
+    )
 }
 
 fn breaker_refusal(remaining_ms: u64) -> Throttled {
@@ -740,10 +1044,17 @@ mod tests {
             tenant_per_min: tenant,
             connection_per_min: conn,
             host_per_min: host,
+            // The user dimension lives in the DURABLE tier only, so it can never
+            // affect a local-tier test; zero says so out loud.
+            user_per_min: 0,
             // Breaker OFF unless a test is about the breaker, so a rate test can
             // never accidentally be measuring the breaker.
             breaker_threshold: 0,
             breaker_open_secs: 0,
+            // Every test in this module drives the LOCAL tier through `check` /
+            // `report`, which never consult the durable tier — but `false` keeps
+            // that independent of the entry point a future test picks.
+            durable: false,
         }
     }
 
@@ -753,8 +1064,10 @@ mod tests {
             tenant_per_min: 0,
             connection_per_min: 0,
             host_per_min: 0,
+            user_per_min: 0,
             breaker_threshold: threshold,
             breaker_open_secs: open_secs,
+            durable: false,
         }
     }
 
@@ -1205,8 +1518,10 @@ mod tests {
             tenant_per_min: 0,
             connection_per_min: 0,
             host_per_min: 10,
+            user_per_min: 0,
             breaker_threshold: 3,
             breaker_open_secs: 60,
+            durable: false,
         });
         let (t, c) = (Uuid::new_v4(), Uuid::new_v4());
         for i in 0..(MAX_TRACKED * 2) {
@@ -1264,8 +1579,10 @@ mod tests {
             tenant_per_min: 5,
             connection_per_min: 100,
             host_per_min: 100,
+            user_per_min: 0,
             breaker_threshold: 2,
             breaker_open_secs: 60,
+            durable: false,
         });
         let t = Uuid::new_v4();
         let (sick, healthy) = (Uuid::new_v4(), Uuid::new_v4());
@@ -1302,8 +1619,10 @@ mod tests {
             tenant_per_min: 100,
             connection_per_min: 5,
             host_per_min: 100,
+            user_per_min: 0,
             breaker_threshold: 2,
             breaker_open_secs: 60,
+            durable: false,
         });
         let (t, c) = (Uuid::new_v4(), Uuid::new_v4());
         for _ in 0..2 {
@@ -1353,5 +1672,161 @@ mod tests {
         assert_eq!(d.host_per_min, 120);
         assert_eq!(d.breaker_threshold, 5);
         assert_eq!(d.breaker_open_secs, 60);
+        // Phase F. The user ceiling is the CONNECTION number, not the tenant one:
+        // at parity with the tier above it the dimension could never refuse first
+        // and would ship dead (see DEFAULT_USER_PER_MIN).
+        assert_eq!(d.user_per_min, 60);
+        assert!(
+            d.user_per_min < d.tenant_per_min,
+            "a user ceiling at or above the tenant ceiling can never bind"
+        );
+        // The durable tier ships ON — a fix for an N× ceiling that must be
+        // switched on is a fix that ships dark.
+        assert!(d.durable);
+    }
+
+    // ── Phase F: the durable tier's SQL-free half ───────────────────────────
+
+    #[test]
+    fn the_two_tiers_agree_on_every_scope_name() {
+        // The scope strings are a wire format between this module and
+        // `fluidbox-db::governance` (which cannot depend on this crate — the
+        // dependency runs the other way), and they end up in the runner-facing
+        // refusal message. A drift here would be invisible: the durable tier would
+        // refuse with a scope this module's precedence and messages do not know.
+        assert_eq!(SCOPE_TENANT, governance::SCOPE_TENANT);
+        assert_eq!(SCOPE_USER, governance::SCOPE_USER);
+        assert_eq!(SCOPE_CONNECTION, governance::SCOPE_CONNECTION);
+        assert_eq!(SCOPE_HOST, governance::SCOPE_HOST);
+        assert_eq!(SCOPE_BREAKER, governance::SCOPE_BREAKER);
+    }
+
+    #[test]
+    fn the_durable_view_carries_every_ceiling_except_host_global() {
+        // The two tiers must enforce the SAME numbers; a hand-copied projection is
+        // exactly where they would drift.
+        let l = GovernorLimits {
+            tenant_per_min: 11,
+            connection_per_min: 22,
+            host_per_min: 33,
+            user_per_min: 44,
+            breaker_threshold: 5,
+            breaker_open_secs: 66,
+            durable: true,
+        };
+        let d = l.durable();
+        assert_eq!(d.tenant_per_min, 11);
+        assert_eq!(d.connection_per_min, 22);
+        assert_eq!(d.host_per_min, 33);
+        assert_eq!(d.user_per_min, 44);
+        assert_eq!(d.breaker_threshold, 5);
+        assert_eq!(d.breaker_open_secs, 66);
+        // `host_global` deliberately has no durable counterpart (a cross-tenant key
+        // would need a per-dial RLS bypass). The local tier still derives and
+        // enforces it, so this is a documented gap, not a forgotten field.
+        assert_eq!(l.host_global_per_min(), 33 * HOST_GLOBAL_FACTOR);
+    }
+
+    #[test]
+    fn a_durable_tier_error_admits_rather_than_refusing() {
+        // DEGRADE, never fail. The DB being unreachable is already an incident;
+        // refusing every brokered tool call on top of it turns a fairness control
+        // into an outage amplifier. The local tier still bounds this replica.
+        let g = EgressGovernor::manual(limits(0, 0, 0));
+        assert_eq!(g.degraded_count(), 0);
+        let admitted = g
+            .fold_durable(Err(sqlx::Error::PoolTimedOut))
+            .expect("a durable-tier failure must ADMIT, never refuse");
+        assert_eq!(
+            admitted, None,
+            "a degraded admission holds no probe — it was never elected one"
+        );
+        assert_eq!(
+            g.degraded_count(),
+            1,
+            "a degraded admission must be COUNTED: a rising count is the only \
+             signal that the cross-replica ceiling is not being enforced"
+        );
+        // …and it keeps counting, so the signal is a rate and not a boolean.
+        let _ = g.fold_durable(Err(sqlx::Error::WorkerCrashed));
+        assert_eq!(g.degraded_count(), 2);
+    }
+
+    #[test]
+    fn a_durable_refusal_becomes_a_throttled_with_its_scope_and_hint_intact() {
+        let g = EgressGovernor::manual(limits(0, 0, 0));
+        for scope in [
+            governance::SCOPE_TENANT,
+            governance::SCOPE_USER,
+            governance::SCOPE_CONNECTION,
+            governance::SCOPE_HOST,
+            governance::SCOPE_BREAKER,
+        ] {
+            let t = g
+                .fold_durable(Ok(DurableAdmission::Refused(
+                    fluidbox_db::governance::DurableRefusal {
+                        scope,
+                        retry_after_secs: 17,
+                    },
+                )))
+                .expect_err("a durable refusal must refuse");
+            assert_eq!(t.scope, scope);
+            assert_eq!(t.retry_after_secs, 17);
+            // …and it must render as a refusal message the runner can act on,
+            // carrying the digest and never the raw host.
+            let m = t.message("sha256:deadbeefcafe0001");
+            assert!(m.contains(scope) && m.contains("17"), "got: {m}");
+        }
+        assert_eq!(
+            g.degraded_count(),
+            0,
+            "a refusal is not a degradation — conflating them would hide real outages"
+        );
+    }
+
+    #[test]
+    fn a_durable_probe_election_rides_the_permit_and_a_plain_admission_carries_none() {
+        // The epoch is the ONLY thing that distinguishes the deployment-wide probe's
+        // completion from a straggler's, so it must survive the fold verbatim.
+        let g = EgressGovernor::manual(limits(0, 0, 0));
+        assert_eq!(
+            g.fold_durable(Ok(DurableAdmission::Admitted {
+                probe_epoch: Some(42)
+            }))
+            .unwrap(),
+            Some(42)
+        );
+        assert_eq!(
+            g.fold_durable(Ok(DurableAdmission::Admitted { probe_epoch: None }))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_permit_carries_the_host_digest_and_never_the_raw_host() {
+        // The digest is computed ONCE at admission, so the value that keys the
+        // durable breaker row is byte-identical to the one the refusal message and
+        // the broker's logs show.
+        let g = EgressGovernor::manual(limits(0, 0, 0));
+        let host = "secret-internal.corp.example";
+        let p = g.check(Uuid::new_v4(), Uuid::new_v4(), host).unwrap();
+        assert_eq!(p.digest, host_digest(host));
+        assert!(p.digest.starts_with("sha256:"));
+        assert!(
+            !p.digest.contains("corp.example"),
+            "the digest leaked the host: {}",
+            p.digest
+        );
+        assert_eq!(
+            p.digest,
+            crate::broker::msg_digest(host),
+            "the governor's digest and the broker's must be the SAME function — \
+             two spellings of one host would key two breaker rows"
+        );
+        assert_eq!(
+            p.durable_probe, None,
+            "the local tier elects no durable probe"
+        );
     }
 }

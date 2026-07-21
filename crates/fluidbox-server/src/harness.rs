@@ -221,8 +221,12 @@ mod tests {
             egress_rate_tenant_per_min: crate::governor::DEFAULT_TENANT_PER_MIN,
             egress_rate_connection_per_min: crate::governor::DEFAULT_CONNECTION_PER_MIN,
             egress_rate_host_per_min: crate::governor::DEFAULT_HOST_PER_MIN,
+            egress_rate_user_per_min: crate::governor::DEFAULT_USER_PER_MIN,
             egress_breaker_threshold: crate::governor::DEFAULT_BREAKER_THRESHOLD,
             egress_breaker_open_secs: crate::governor::DEFAULT_BREAKER_OPEN_SECS,
+            // This fixture builds a Config for harness-registry assertions only —
+            // no pool, no dials — so the durable tier is off rather than defaulted.
+            egress_durable: false,
             provider: "docker".into(),
             network_mode: fluidbox_core::traits::NetworkMode::HostDev,
             require_enforced_netpol: false,
