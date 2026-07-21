@@ -665,17 +665,58 @@ fn governor_gate(
     url: &str,
 ) -> Result<crate::governor::Permit, DispatchOutcome> {
     let host = host_key(url);
-    match gov.check(tenant, connection, &host) {
-        Ok(permit) => Ok(permit),
-        Err(t) => {
-            tracing::info!(
-                target: "broker",
-                "outbound dial refused by the egress governor (scope {}, upstream {}, retry {}s)",
-                t.scope, msg_digest(&host), t.retry_after_secs
-            );
-            Err(DispatchOutcome::NeverSent(t.message(&msg_digest(&host))))
-        }
-    }
+    gov.check(tenant, connection, &host)
+        .map_err(|t| refuse_dial(&host, t))
+}
+
+/// Render ONE governor refusal, from either tier. Shared so the two tiers can
+/// never diverge in what the runner is told or what the operator sees: the message
+/// carries the scope + the retry hint and a DIGEST of the upstream host — never the
+/// host verbatim (same discipline as [`msg_digest`] on untrusted upstream text).
+fn refuse_dial(host: &str, t: crate::governor::Throttled) -> DispatchOutcome {
+    let digest = msg_digest(host);
+    tracing::info!(
+        target: "broker",
+        "outbound dial refused by the egress governor (scope {}, upstream {}, retry {}s)",
+        t.scope, digest, t.retry_after_secs
+    );
+    DispatchOutcome::NeverSent(t.message(&digest))
+}
+
+/// The FULL two-tier gate (Phase F, Task 1) — this is what production dials
+/// through. [`governor_gate`] is the per-replica half, unchanged and called
+/// FIRST; this adds the cross-replica Postgres tier under it, so an N-replica
+/// deployment's real ceiling is the configured rate rather than N × it, and a
+/// breaker opened by one replica refuses on all of them.
+///
+/// Everything [`governor_gate`] documents still holds — the lock order, and above
+/// all that a refusal is a PRE-WRITE proof of non-dispatch (`NeverSent` ⇒
+/// `failed_before_send` ⇒ re-claimable), which is what makes the `retry after Ns`
+/// hint safe to act on. The durable tier is consulted strictly before any bytes
+/// leave, so that property is unchanged.
+///
+/// It is `async` and it does I/O, so it is NOT a leaf like the local tier — but it
+/// still runs before the per-peer session mutex is acquired, so the documented lock
+/// order is preserved and a durable round trip never blocks behind an in-flight
+/// call to the same peer.
+///
+/// `session` is the RUN's session id, used only to resolve the invoking user for
+/// the per-user dimension. A DB failure DEGRADES (admit on the local verdict) —
+/// see `governor::EgressGovernor::fold_durable`.
+async fn governor_gate_durable(
+    state: &AppState,
+    scope: fluidbox_db::TenantScope,
+    session: uuid::Uuid,
+    connection: uuid::Uuid,
+    url: &str,
+) -> Result<crate::governor::Permit, DispatchOutcome> {
+    let mut permit = governor_gate(&state.governor, scope.tenant_id(), connection, url)?;
+    state
+        .governor
+        .check_durable(&state.pool, scope, session, &mut permit)
+        .await
+        .map_err(|t| refuse_dial(&host_key(url), t))?;
+    Ok(permit)
 }
 
 /// The circuit breaker's ONLY input: was this dial an upstream-HEALTH failure?
@@ -1829,12 +1870,13 @@ pub async fn call_tool_auth(
         Ok(a) => a,
         Err(e) => return DispatchOutcome::NeverSent(e),
     };
-    // E14: the governor gate, BEFORE the per-peer session mutex (see
-    // `governor_gate` for the lock order) and before any bytes leave. A
-    // credential-free legacy bundle has no connection to key on — it takes the
-    // nil id, and the breaker's (connection, host) key still separates upstreams.
+    // E14 + Phase F: the TWO-TIER governor gate, BEFORE the per-peer session mutex
+    // (see `governor_gate_durable` for the lock order) and before any bytes leave.
+    // A credential-free legacy bundle has no connection to key on — it takes the
+    // nil id, and the breaker's (tenant, connection, host) key still separates
+    // upstreams in both tiers.
     let conn_key = brokered_connection_id(server).unwrap_or_else(uuid::Uuid::nil);
-    let host = match governor_gate(&state.governor, scope.tenant_id(), conn_key, url) {
+    let host = match governor_gate_durable(state, scope, run_session, conn_key, url).await {
         Ok(h) => h,
         Err(refused) => return refused,
     };
@@ -1857,7 +1899,10 @@ pub async fn call_tool_auth(
         None,
     )
     .await;
-    state.governor.report(&host, breaker_signal(&first));
+    state
+        .governor
+        .report_durable(&state.pool, scope, &host, breaker_signal(&first))
+        .await;
     match first {
         Err(CallErr::Unauthorized) => {
             // A 401 proves the tool never executed. Static credential ⇒ terminal
@@ -1884,7 +1929,10 @@ pub async fn call_tool_auth(
                         None,
                     )
                     .await;
-                    state.governor.report(&host, breaker_signal(&retry));
+                    state
+                        .governor
+                        .report_durable(&state.pool, scope, &host, breaker_signal(&retry))
+                        .await;
                     outcome_from_call(retry)
                 }
                 // Re-mint failure = auth resolution failure ⇒ never sent.
@@ -1930,9 +1978,9 @@ pub async fn call_tool_for_conn(
         Ok(a) => a,
         Err(e) => return DispatchOutcome::NeverSent(e),
     };
-    // E14: the governor gate, BEFORE the per-peer session mutex (lock order
-    // documented on `governor_gate`) and before any bytes leave.
-    let host = match governor_gate(&state.governor, scope.tenant_id(), conn.id, url) {
+    // E14 + Phase F: the TWO-TIER governor gate, BEFORE the per-peer session mutex
+    // (lock order documented on `governor_gate_durable`) and before any bytes leave.
+    let host = match governor_gate_durable(state, scope, binding.session_id, conn.id, url).await {
         Ok(h) => h,
         Err(refused) => return refused,
     };
@@ -1956,7 +2004,10 @@ pub async fn call_tool_for_conn(
         snapshot,
     )
     .await;
-    state.governor.report(&host, breaker_signal(&first));
+    state
+        .governor
+        .report_durable(&state.pool, scope, &host, breaker_signal(&first))
+        .await;
     match first {
         Err(CallErr::Unauthorized) => {
             // A 401 proves the tool never executed. Static credential ⇒ terminal
@@ -1989,7 +2040,10 @@ pub async fn call_tool_for_conn(
                         snapshot,
                     )
                     .await;
-                    state.governor.report(&host, breaker_signal(&retry));
+                    state
+                        .governor
+                        .report_durable(&state.pool, scope, &host, breaker_signal(&retry))
+                        .await;
                     outcome_from_call(retry)
                 }
                 Err(e) => DispatchOutcome::NeverSent(e),
@@ -2775,8 +2829,10 @@ mod tests {
             tenant_per_min: 0,
             connection_per_min: 1,
             host_per_min: 0,
+            user_per_min: 0,
             breaker_threshold: 0,
             breaker_open_secs: 0,
+            durable: false,
         });
         let (t, c) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
         let url = "https://secret-internal.corp.example/mcp";
@@ -2820,8 +2876,10 @@ mod tests {
             tenant_per_min: 0,
             connection_per_min: 0,
             host_per_min: 0,
+            user_per_min: 0,
             breaker_threshold: THRESHOLD,
             breaker_open_secs: 60,
+            durable: false,
         });
         let (t, c) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
 
@@ -2885,8 +2943,10 @@ mod tests {
             tenant_per_min: 0,
             connection_per_min: 0,
             host_per_min: 0,
+            user_per_min: 0,
             breaker_threshold: 2,
             breaker_open_secs: 60,
+            durable: false,
         });
         let (t, c) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
         let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
