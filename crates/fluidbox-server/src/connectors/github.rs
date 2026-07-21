@@ -832,13 +832,44 @@ pub(crate) fn subscription_marker(subscription_id: uuid::Uuid) -> String {
 ///
 /// Pure and total: a malformed/partial listing (not an array, missing `id`, a
 /// non-string `body`) yields `None`, which degrades to today's behavior (create a
-/// fresh comment) rather than to an error. Matching is a plain substring test on
-/// the marker — the marker is ours and contains no user text, so it cannot be
-/// spoofed into matching a different subscription's comment.
+/// fresh comment) rather than to an error.
+///
+/// WHAT ACTUALLY MAKES THIS SAFE (corrected — the first cut claimed the marker
+/// "contains no user text, so it cannot be spoofed", which is false). The marker
+/// carries no user text, but the BODY WE SEARCH DOES: [`comment_body`] embeds
+/// `summary` (raw agent output) and `subscription_name` (user text). An agent that
+/// writes another subscription's marker literal into its summary therefore plants
+/// that marker in a comment we ourselves post, and the victim subscription would
+/// adopt-and-PATCH it. Two things stop that:
+///   1. **The subscription id is an unguessable UUIDv7.** This is the real
+///      defense, and it is the only one that would survive on its own: the marker
+///      is `<!-- fluidbox:sub:{uuid} -->`, so spoofing requires knowing the target
+///      subscription's id — which no agent is ever told (it is not in the RunSpec's
+///      task, not in the workspace, and not in the comment we publish).
+///   2. **Position the agent cannot reach.** [`comment_body`] appends the marker
+///      LAST, after the footer, so a genuine marker is always the final
+///      non-whitespace token of the body; agent text is always ABOVE the footer.
+///      Requiring the trailing position (below) therefore rejects an injected
+///      marker structurally, without depending on (1) — the belt to that brace.
+///
+/// RESIDUAL, precisely. A trailing-position match still trusts that the comment
+/// was authored by us. Anyone able to comment on the PR could post a comment whose
+/// body ENDS with our marker and have the next reconcile adopt (and overwrite)
+/// theirs — but that again needs the unguessable subscription id, and the payoff
+/// is that we edit their comment into our own report. An author-identity check
+/// (`performed_via_github_app` / the bot login) was considered and NOT added: it
+/// does not close the vector this review found, because in that vector the
+/// polluted comment IS authored by our App, and it would trade a real duplicate-
+/// comment risk (adoption failing whenever GitHub omits the field) for coverage of
+/// the weaker case only. If it is ever added, it must be IN ADDITION to the
+/// positional check, never instead of it.
 fn find_marker_comment(listing: &Value, marker: &str) -> Option<(String, String)> {
     listing.as_array()?.iter().find_map(|c| {
         let body = c.get("body").and_then(|b| b.as_str())?;
-        if !body.contains(marker) {
+        // Trailing position only — `contains` would adopt a marker planted in the
+        // agent-controlled summary. `trim_end` tolerates the trailing newline we
+        // write and any whitespace GitHub normalizes onto the end.
+        if !body.trim_end().ends_with(marker) {
             return None;
         }
         let id = c.get("id").and_then(|i| i.as_i64())?.to_string();
@@ -1025,6 +1056,25 @@ async fn publish_pr_comment(
 /// far past any real review thread; the cap keeps a pathological PR from turning
 /// one delivery attempt into an unbounded crawl.
 const RECONCILE_MAX_PAGES: u32 = 10;
+
+/// Worst-case wall clock ONE GitHub publish attempt can occupy, in seconds — the
+/// number the delivery worker's claim TTL must clear (review I2). Every GitHub
+/// call this path makes is capped by [`GITHUB_TIMEOUT`], and the longest path is
+/// `publish_pr_comment`:
+///
+/// | leg                                              | calls |
+/// |--------------------------------------------------|-------|
+/// | `installation_token` mint (cache miss)            | 1     |
+/// | `reconcile_existing_comment` pages                | `RECONCILE_MAX_PAGES` |
+/// | PATCH an adopted comment that 404s, then POST     | 2     |
+///
+/// Lives here, next to the constants it derives from, so raising the page cap or
+/// the timeout moves this number — and fails `deliveries`' TTL assertion — without
+/// anyone having to remember the coupling. DB round trips are excluded; the TTL
+/// carries explicit headroom for them.
+pub(crate) const fn worst_case_publish_secs() -> i64 {
+    GITHUB_TIMEOUT.as_secs() as i64 * (1 + RECONCILE_MAX_PAGES as i64 + 2)
+}
 
 /// Look for a comment WE created on this PR by its deterministic marker — the
 /// reconcile half of reconcile-before-create. `Ok(None)` means "walked the whole
@@ -1470,6 +1520,51 @@ o+rncG5hSLaqG1A2w8vlQ3BS7Q==
             ..ctx
         };
         assert!(!comment_body(&anon).contains("<!-- fluidbox:sub:"));
+    }
+
+    /// The searched BODY carries agent output (`summary`) and user text
+    /// (`subscription_name`), so "the marker contains no user text" never made
+    /// adoption unspoofable. Adoption is restricted to a marker in the TRAILING
+    /// position — which `comment_body` puts below the footer, out of the agent's
+    /// reach — so a marker planted mid-body is not adopted (review Minor B).
+    #[test]
+    fn an_agent_planted_marker_is_not_adopted() {
+        let victim = Uuid::now_v7();
+        let attacker = Uuid::now_v7();
+        let victim_marker = subscription_marker(victim);
+
+        // The attacker's run emits the VICTIM's marker inside its summary; we
+        // publish that text ourselves, so the body genuinely contains it — above
+        // our own footer and our own trailing marker.
+        let planted = super::super::PublishContext {
+            scope: fluidbox_db::TenantScope::assume(Uuid::now_v7()),
+            session_id: Uuid::now_v7(),
+            subscription_id: Some(attacker),
+            subscription_name: "attacker".into(),
+            agent_name: "agent".into(),
+            status: "completed".into(),
+            summary: Some(format!("here is my report {victim_marker}")),
+            commit_sha: None,
+        };
+        let body = comment_body(&planted);
+        assert!(
+            body.contains(&victim_marker),
+            "the planted marker really is in the body — otherwise this test proves nothing"
+        );
+        let listing = json!([{"id": 42, "html_url": "https://github.test/c/42", "body": body}]);
+        assert_eq!(
+            find_marker_comment(&listing, &victim_marker),
+            None,
+            "a marker in agent-controlled text must NOT be adopted — the victim \
+             subscription would PATCH another subscription's comment"
+        );
+        // The attacker's OWN trailing marker still adopts: the check is positional,
+        // not a blanket refusal of bodies that mention a marker.
+        assert_eq!(
+            find_marker_comment(&listing, &subscription_marker(attacker)),
+            Some(("42".into(), "https://github.test/c/42".into())),
+            "our own trailing marker still reconciles"
+        );
     }
 
     #[test]

@@ -763,15 +763,18 @@ async fn await_pending_decision(
     // `GateDecision::terminal_deny`, byte-identical to the handler-top guard.
     // This closes the sandbox-tool half; the brokered half is additionally fenced
     // by the execution claim's in-tx nonterminal check (E10).
+    //
+    // The event rides INSIDE the claim's transaction (review Minor A), like the
+    // three decision sites: the marker is what stops every other waiter from
+    // emitting, so a marker that commits without its event loses the event for
+    // good. Both fail together instead — the caller retries and re-claims, and a
+    // ledger failure surfaces as an error rather than a silently unaudited deny.
     if allowed {
         if let Some(sess) = fluidbox_db::get_session(&state.pool, scope, session_id).await? {
             if !sess.status_enum().accepts_work() {
-                if fluidbox_db::claim_terminal_deny_emission(&state.pool, scope, approval.id)
-                    .await?
-                {
-                    ledger::record(
-                        state,
-                        scope,
+                let events = vec![state
+                    .redactor
+                    .scrub(fluidbox_core::event::EventEnvelope::new(
                         session_id,
                         Actor::System,
                         EventBody::ToolDecision {
@@ -784,9 +787,9 @@ async fn await_pending_decision(
                                 "session stopped accepting work during the approval wait".into(),
                             ),
                         },
-                    )
-                    .await;
-                }
+                    ))];
+                fluidbox_db::claim_terminal_deny_tx(&state.pool, scope, approval.id, events)
+                    .await?;
                 return Ok(GateDecision::terminal_deny());
             }
         }
@@ -1923,6 +1926,36 @@ mod approval_emission_guards {
             !body.contains(concat!("emit_", "decision(")),
             "the approval wait must not emit tool.decision — it belongs to the decision \
              transaction (approval_decision_events), or N waiters emit N copies"
+        );
+    }
+
+    /// The post-wait terminality deny is the FOURTH emission site, and it obeys the
+    /// same rule (review Minor A): its event rides the marker CAS's own transaction.
+    /// The first cut committed `terminal_deny_at` and THEN called the best-effort,
+    /// error-swallowing `ledger::record` — so a crash (or a failed append) between
+    /// them lost the event permanently, because the marker already blocks every
+    /// other waiter from emitting. Sliced to the wait's body, so the prose above it
+    /// cannot satisfy either half.
+    #[test]
+    fn the_terminal_deny_emits_inside_its_claim_transaction() {
+        let src = include_str!("internal.rs");
+        let start = src
+            .find("async fn await_pending_decision(")
+            .expect("the approval wait exists");
+        let end = src[start..]
+            .find("\npub struct PermissionReq")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        let in_tx = concat!("claim_terminal_deny_", "tx(");
+        assert!(
+            body.contains(in_tx),
+            "the terminal deny must claim AND emit in one transaction (`{in_tx}`)"
+        );
+        assert!(
+            !body.contains(concat!("ledger::", "record(")),
+            "no separate, error-swallowing ledger write may follow the terminal-deny \
+             claim — a committed marker with no event is an unrecoverable audit hole"
         );
     }
 }
