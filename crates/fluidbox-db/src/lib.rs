@@ -6860,6 +6860,134 @@ mod tests {
     use super::*;
     use fluidbox_core::event::{Actor, EventBody, EventEnvelope, Redactor};
 
+    // ─── Tenant-less global scans in a SHARED database (#33) ────────────────
+    //
+    // Every `system_worker` scan is a TENANT-LESS GLOBAL scan, and that is the
+    // production contract: one worker tick sweeps every tenant on every replica,
+    // and each returned row carries its own `tenant_id`/`session_id` so the
+    // caller ledgers it under the right scope. Nothing below argues with that.
+    //
+    // But `cargo test` runs this module's tests CONCURRENTLY against ONE
+    // database, so a scan issued by one test also sees — and converts, and
+    // CLAIMS — the rows of every test running beside it. That produces two
+    // distinct failures, both reproduced on a scratch Postgres:
+    //
+    //   * EXTRA rows. A sibling's expired row lands in my batch, so any assertion
+    //     about the batch's LENGTH is really an assertion about the whole
+    //     database. This is what broke CI: `sweep_converts_…` counted 2 and its
+    //     sibling counted 0 — one sweep statement had converted BOTH tests'
+    //     reservations (identical `usage_entries.created_at` to the microsecond,
+    //     i.e. one transaction, across two different tenants).
+    //     Cured by [`GLOBAL_SCAN`]-guarded helpers that FILTER every batch down to
+    //     the rows the calling test owns.
+    //
+    //   * STOLEN rows. A sibling's scan converts/claims MY row in the window
+    //     between my making it scannable and my own scan — measured at 3/6 runs
+    //     for the stale-claim pair and 6/6 for the delivery trio — so filtering
+    //     alone still leaves "my scan reported my row" flaky, and for the claim
+    //     scans it also hands my row's LEASE to another owner id.
+    //     Cured by [`GLOBAL_SCAN`].
+    //
+    // The tests are NOT serialized: they seed, reserve, assert and clean up
+    // concurrently as before. Only the window in which one test's rows are
+    // scannable-but-not-yet-scanned is mutually exclusive, and every scan runs
+    // inside one — which is exactly the condition under which a global scan can
+    // be reasoned about locally. `tenant_less_scans_go_through_the_scoped_helpers`
+    // below keeps it that way.
+    static GLOBAL_SCAN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// This session's slice of a global expired-reservation sweep. The sweep and
+    /// its `Utc::now()` cutoff are the real ones — only the ROWS are narrowed, so
+    /// every property the callers assert (what was converted, with which tokens,
+    /// under which tenant/session, and that a second sweep reports nothing more)
+    /// survives intact while a sibling tenant's booking in the same batch stops
+    /// being this test's business. Call under a [`GLOBAL_SCAN`] guard taken before
+    /// the reservation was expired.
+    async fn sweep_reservations(
+        pool: &PgPool,
+        session: Uuid,
+    ) -> Vec<system_worker::SweptReservation> {
+        system_worker::sweep_expired_llm_reservations(pool, Utc::now(), 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.session_id == session)
+            .collect()
+    }
+
+    /// This session's slice of a global stale-execution-claim sweep — same
+    /// narrowing, same reasons, same guard discipline as [`sweep_reservations`].
+    async fn sweep_stale_claims(
+        pool: &PgPool,
+        session: Uuid,
+    ) -> Vec<(Uuid, Uuid, String, Option<String>)> {
+        system_worker::sweep_stale_execution_claims(pool, Utc::now(), 200)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|(_, s, _, _)| *s == session)
+            .collect()
+    }
+
+    /// The rows THIS test enqueued that `owner` just claimed. The claim scan is
+    /// the real one — `owner`, `limit` and `ttl_secs` reach it untouched, so the
+    /// `limit`/`skip locked`/lease behaviour under test is unchanged — but a
+    /// sibling test's delivery that happened to be due is not this test's row and
+    /// is dropped from the answer. Call under a [`GLOBAL_SCAN`] guard taken before
+    /// the deliveries were enqueued: unlike the sweeps, a stolen delivery is not
+    /// merely unobserved, it is LEASED to another owner id, which no filter can
+    /// undo.
+    async fn claim_deliveries(
+        pool: &PgPool,
+        owner: Uuid,
+        limit: i64,
+        ttl_secs: i64,
+        mine: &[Uuid],
+    ) -> Vec<ResultDeliveryRow> {
+        system_worker::claim_due_deliveries(pool, owner, limit, ttl_secs)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| mine.contains(&r.id))
+            .collect()
+    }
+
+    /// Source guard for the #33 class, in the shape of the #32 one above: a scan
+    /// with no tenant predicate must never be called bare from a test, because a
+    /// bare call asserts about every OTHER test's rows and races them for their
+    /// own. This is a source assertion, not a DB test — it runs without
+    /// `DATABASE_URL`, so a re-added bare caller fails immediately instead of
+    /// flaking one CI run in eight. Each needle is assembled from two halves so
+    /// the guard is not itself an occurrence.
+    #[test]
+    fn tenant_less_scans_go_through_the_scoped_helpers() {
+        let src = include_str!("lib.rs");
+        for (needle, helper) in [
+            (
+                concat!("sweep_expired_llm", "_reservations("),
+                "sweep_reservations",
+            ),
+            (
+                concat!("sweep_stale_execution", "_claims("),
+                "sweep_stale_claims",
+            ),
+            (concat!("claim_due", "_deliveries("), "claim_deliveries"),
+            (
+                concat!("expired_pending", "_approvals("),
+                "the single containment-only caller",
+            ),
+        ] {
+            let n = src.matches(needle).count();
+            assert_eq!(
+                n, 1,
+                "`{needle}` must appear exactly ONCE in fluidbox-db — inside {helper} — \
+                 found {n}. Route the new call through that helper and hold GLOBAL_SCAN \
+                 from the moment your rows become scannable: a bare call counts every \
+                 other test's rows into your batch and converts/claims them out of theirs."
+            );
+        }
+    }
+
     /// The durable-finalizer DB contract (PR #47 fix batch 2 — H3/H5):
     /// single-winner intent under the session row lock, quiesce computed from
     /// the LOCKED snapshot, losers receive the winner's row, recovery sees
@@ -8392,6 +8520,11 @@ mod tests {
         .await
         .unwrap();
 
+        // A due delivery is visible to every replica's claim scan, which in a test
+        // process means every sibling test's scan too — so the enqueue and the
+        // claim that must win it sit inside one GLOBAL_SCAN window, and the batch
+        // is read back through the owning helper.
+        let scan = GLOBAL_SCAN.lock().await;
         let dest = serde_json::json!({"kind": "signed_webhook", "url": "http://127.0.0.1:1/cb"});
         let d = enqueue_result_delivery(&pool, scope, session.id, None, &dest)
             .await
@@ -8402,9 +8535,7 @@ mod tests {
         // Due immediately — and the poll now CLAIMS (Phase E): every attempt is
         // recorded by the replica that holds the row.
         let me = Uuid::now_v7();
-        let due = system_worker::claim_due_deliveries(&pool, me, 10, 300)
-            .await
-            .unwrap();
+        let due = claim_deliveries(&pool, me, 10, 300, &[d.id]).await;
         assert!(due.iter().any(|x| x.id == d.id));
 
         // Failure → still pending, attempts=1, pushed into the future (not due).
@@ -8423,11 +8554,11 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!((after.status.as_str(), after.attempts), ("pending", 1));
-        assert!(!system_worker::claim_due_deliveries(&pool, me, 50, 300)
+        assert!(!claim_deliveries(&pool, me, 50, 300, &[d.id])
             .await
-            .unwrap()
             .iter()
             .any(|x| x.id == d.id));
+        drop(scan);
 
         // Exhausting attempts → failed, terminal for the delivery only. Each
         // attempt re-claims first: recording one RELEASES the claim (so the next
@@ -14053,6 +14184,10 @@ mod tests {
             o => panic!("expected Won, got {o:?}"),
         };
         // Force it past expiry, then sweep: a crashed dispatcher's claim → ambiguous.
+        // The sweep is a tenant-less GLOBAL scan and the test beside this one
+        // expires a claim of its own, so both halves of the GLOBAL_SCAN discipline
+        // apply: guard from before the row is stale, read the batch session-scoped.
+        let scan = GLOBAL_SCAN.lock().await;
         {
             let mut tx = worker_tx(&pool).await.unwrap();
             sqlx::query(
@@ -14064,9 +14199,8 @@ mod tests {
             .unwrap();
             tx.commit().await.unwrap();
         }
-        let swept = system_worker::sweep_stale_execution_claims(&pool, Utc::now(), 200)
-            .await
-            .unwrap();
+        let swept = sweep_stale_claims(&pool, session_id).await;
+        drop(scan);
         assert!(
             swept
                 .iter()
@@ -14104,7 +14238,10 @@ mod tests {
             ClaimOutcome::Won { claim_id } => claim_id,
             o => panic!("expected Won, got {o:?}"),
         };
-        // The sweeper wins the row (expire → sweep → ambiguous).
+        // The sweeper wins the row (expire → sweep → ambiguous). Guarded even
+        // though this test ignores the batch: an unguarded sweep here is what
+        // STOLE the neighbouring test's stale claim (3 runs in 6 — GLOBAL_SCAN).
+        let scan = GLOBAL_SCAN.lock().await;
         {
             let mut tx = worker_tx(&pool).await.unwrap();
             sqlx::query(
@@ -14116,9 +14253,12 @@ mod tests {
             .unwrap();
             tx.commit().await.unwrap();
         }
-        system_worker::sweep_stale_execution_claims(&pool, Utc::now(), 200)
-            .await
-            .unwrap();
+        assert_eq!(
+            sweep_stale_claims(&pool, session_id).await.len(),
+            1,
+            "this test's own claim is the one the sweep flipped"
+        );
+        drop(scan);
         // The dispatcher's late completion CAS finds no 'claimed' row → false.
         assert!(
             !complete_tool_execution(&pool, scope, id, "succeeded", None, Some(false), None, None)
@@ -14347,6 +14487,11 @@ mod tests {
         // Already past its deadline.
         let approval = seed_pending_approval(&pool, scope, session_id, "tc-decide", -60).await;
 
+        // Tenant-less global scan too, but the ONE that needs no GLOBAL_SCAN guard
+        // (see the module note): since Phase E it only READS — the decision moved
+        // to the scoped, single-winner `expire_approval_tx` below — so a sibling's
+        // scan cannot take this row away, and asking whether MY approval is in the
+        // batch is already immune to whatever else is in it.
         let scanned = system_worker::expired_pending_approvals(&pool, 100)
             .await
             .unwrap();
@@ -14611,6 +14756,10 @@ mod tests {
         let pool = test_connect(&url).await.expect("connect");
         let (tenant, session_id) = seed_tenant_session(&pool).await;
         let scope = TenantScope::assume(tenant);
+        // Enqueue → claim inside one GLOBAL_SCAN window: until the renewal below
+        // lands, this row is due (then briefly leased for only 5 s) and any
+        // sibling test's claim scan would take it out from under this one.
+        let scan = GLOBAL_SCAN.lock().await;
         let dest = serde_json::json!({"kind": "signed_webhook", "url": "http://127.0.0.1:1/cb"});
         let row = enqueue_result_delivery(&pool, scope, session_id, None, &dest)
             .await
@@ -14619,15 +14768,14 @@ mod tests {
 
         // Claimed by us with a DELIBERATELY short TTL (5 s) — the batch stamp the
         // worker starts from; the re-stamp then renews it for the attempt itself.
-        let claimed = system_worker::claim_due_deliveries(&pool, mine, 10, 5)
-            .await
-            .unwrap();
+        let claimed = claim_deliveries(&pool, mine, 10, 5, &[row.id]).await;
         assert!(claimed.iter().any(|c| c.id == row.id), "we claimed the row");
         let before = delivery_claim_state(&pool, row.id).await;
         let renewed = extend_delivery_claim(&pool, scope, row.id, mine, 300)
             .await
             .unwrap();
         let after_renew = delivery_claim_state(&pool, row.id).await;
+        drop(scan);
 
         // Now the thief takes it (as an expired-claim steal would).
         stamp_delivery_claim(&pool, row.id, thief).await;
@@ -14770,6 +14918,13 @@ mod tests {
         let scope = TenantScope::assume(tenant);
         let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
 
+        // The backlog these two replicas race for must be exactly the four rows
+        // below — a sibling test's due delivery would otherwise eat replica A's
+        // `limit` (the scan is FIFO by `next_attempt_at`, so an older foreign row
+        // sorts FIRST) and leave A holding rows of a tenant this test cannot even
+        // address. Enqueue and both claims therefore share one GLOBAL_SCAN window,
+        // and each batch is read back through the owning helper.
+        let scan = GLOBAL_SCAN.lock().await;
         let mut ids = Vec::new();
         for i in 0..4 {
             let d = enqueue_result_delivery(
@@ -14786,12 +14941,9 @@ mod tests {
 
         // Replica A claims two, replica B claims the rest: SKIP LOCKED + the
         // claim stamp make the sets disjoint (B cannot see A's claimed rows).
-        let claimed_a = system_worker::claim_due_deliveries(&pool, a, 2, 300)
-            .await
-            .unwrap();
-        let claimed_b = system_worker::claim_due_deliveries(&pool, b, 10, 300)
-            .await
-            .unwrap();
+        let claimed_a = claim_deliveries(&pool, a, 2, 300, &ids).await;
+        let claimed_b = claim_deliveries(&pool, b, 10, 300, &ids).await;
+        drop(scan);
         let set_a: std::collections::HashSet<Uuid> = claimed_a.iter().map(|r| r.id).collect();
         let set_b: std::collections::HashSet<Uuid> = claimed_b.iter().map(|r| r.id).collect();
         let overlap = set_a.intersection(&set_b).count();
@@ -15401,21 +15553,24 @@ mod tests {
         )
         .await;
 
+        // The sweep is a tenant-less GLOBAL scan, so hold the scan guard from
+        // before this booking can be swept until this test has swept it, and read
+        // every batch through the session-scoped helper (see GLOBAL_SCAN).
+        let _scan = GLOBAL_SCAN.lock().await;
+
         // A live reservation is NOT swept.
-        assert!(
-            system_worker::sweep_expired_llm_reservations(&pool, Utc::now(), 100)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(sweep_reservations(&pool, session_id).await.is_empty());
 
         expire_reservation(&pool, req).await;
-        let swept = system_worker::sweep_expired_llm_reservations(&pool, Utc::now(), 100)
-            .await
-            .unwrap();
+        let swept = sweep_reservations(&pool, session_id).await;
         assert_eq!(swept.len(), 1);
         assert_eq!(swept[0].reserved_tokens, 4242);
         assert_eq!(swept[0].session_id, session_id);
+        assert_eq!(
+            swept[0].tenant_id, tenant,
+            "the swept row carries its OWN tenant — the worker ledgers the \
+             conservative charge under exactly this scope"
+        );
 
         // The conservative charge is now real, budget-visible usage…
         let totals = usage_totals(&pool, scope, session_id).await.unwrap();
@@ -15438,12 +15593,8 @@ mod tests {
             0
         );
         // Idempotent: a second sweep of the same instant finds nothing.
-        assert!(
-            system_worker::sweep_expired_llm_reservations(&pool, Utc::now(), 100)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(sweep_reservations(&pool, session_id).await.is_empty());
+        drop(_scan);
         cleanup_sw_tenant(&pool, tenant).await;
     }
 
@@ -15463,14 +15614,13 @@ mod tests {
         let (ta, sa, sca) = seed_reservation_session(&pool, 0).await;
         let ra = Uuid::now_v7();
         reserve(&pool, sca, sa, ra, 5000, Some(0.50), 32, None, None).await;
+        // Guarded + session-scoped like every other global-scan read (GLOBAL_SCAN):
+        // the guard is taken before the booking becomes sweepable and released
+        // once this test has swept it.
+        let scan_a = GLOBAL_SCAN.lock().await;
         expire_reservation(&pool, ra).await;
-        assert_eq!(
-            system_worker::sweep_expired_llm_reservations(&pool, Utc::now(), 100)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(sweep_reservations(&pool, sa).await.len(), 1);
+        drop(scan_a);
         assert!(
             !add_usage(
                 &pool,
@@ -15521,14 +15671,10 @@ mod tests {
         .await
         .unwrap());
         // …crash before the CAS: the row is still `reserved`, so the sweep runs.
+        let scan_b = GLOBAL_SCAN.lock().await;
         expire_reservation(&pool, rb).await;
-        assert_eq!(
-            system_worker::sweep_expired_llm_reservations(&pool, Utc::now(), 100)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(sweep_reservations(&pool, sb).await.len(), 1);
+        drop(scan_b);
         let b = usage_totals(&pool, scb, sb).await.unwrap();
         assert_eq!(
             (b.requests, b.input_tokens, b.output_tokens),
