@@ -131,6 +131,10 @@ pub async fn connect(database_url: &str, runtime_role: Option<&str>) -> anyhow::
             .execute(&mut owner)
             .await?;
     }
+    // `migrate!` BAKES the migrations directory into the binary at COMPILE time —
+    // adding a .sql file only takes effect once this crate recompiles, so any
+    // change under migrations/ must touch this file. Latest: 0020 (api_tokens
+    // audience column — Gap 10 audience-scoped sandbox credentials).
     sqlx::migrate!("../../migrations").run(&mut owner).await?;
     if let Some(role) = runtime_role {
         let exists: bool =
@@ -4931,23 +4935,30 @@ pub async fn tool_call_count(
 
 // ─── Tokens ───────────────────────────────────────────────────────────────
 
+/// Mint one audience-scoped session token (Gap 10, invariant 19). `audience` is
+/// one of `control|tool|llm|workspace` (or `all` for a legacy single token) and
+/// is enforced per-route by the auth extractors. A run mints FOUR of these, one
+/// per audience, all sharing the `fbx_sess_` prefix (the Redactor scrubs by
+/// prefix, so all four are covered).
 pub async fn create_session_token(
     pool: &PgPool,
     scope: TenantScope,
     session: Uuid,
     token_plain: &str,
     ttl_secs: i64,
+    audience: &str,
 ) -> sqlx::Result<()> {
     let mut tx = scoped_tx(pool, scope).await?;
     sqlx::query(
-        "insert into api_tokens (id, tenant_id, kind, session_id, token_sha256, expires_at)
-         values ($1, $2, 'session', $3, $4, now() + make_interval(secs => $5))",
+        "insert into api_tokens (id, tenant_id, kind, session_id, token_sha256, expires_at, audience)
+         values ($1, $2, 'session', $3, $4, now() + make_interval(secs => $5), $6)",
     )
     .bind(Uuid::now_v7())
     .bind(scope.tenant_id())
     .bind(session)
     .bind(sha256_hex(token_plain))
     .bind(ttl_secs as f64)
+    .bind(audience)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -4959,10 +4970,14 @@ pub async fn create_session_token(
 /// extractor / facade / `/result`) can build a `TenantScope` without a second
 /// query — the "bootstrap exception" pattern (token resolution keys purely on
 /// the sha256, then hands back a verified tenant).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SessionTokenAuth {
     pub session_id: Uuid,
     pub tenant_id: Uuid,
+    /// Which routes this token opens (Gap 10): `control|tool|llm|workspace`, or
+    /// the legacy `all` (pre-split tokens + e2e forgers via the column DEFAULT).
+    /// The caller enforces it per-route (auth.rs `audience_allows`).
+    pub audience: String,
 }
 
 /// Resolve a session token to its session IGNORING revoked_at/expiry — used
@@ -4981,7 +4996,7 @@ pub async fn session_for_token_incl_revoked(
     // IS the credential (documented TenantScope bootstrap exception).
     let mut tx = worker_tx(pool).await?;
     let row = sqlx::query(
-        "select session_id, tenant_id from api_tokens
+        "select session_id, tenant_id, audience from api_tokens
          where kind = 'session' and token_sha256 = $1",
     )
     .bind(sha256_hex(token_plain))
@@ -4993,12 +5008,13 @@ pub async fn session_for_token_incl_revoked(
             .map(|session_id| SessionTokenAuth {
                 session_id,
                 tenant_id: r.get::<Uuid, _>("tenant_id"),
+                audience: r.get::<String, _>("audience"),
             })
     }))
 }
 
-/// Returns the session (and its tenant) a valid (unexpired, unrevoked) token
-/// belongs to.
+/// Returns the session (and its tenant + audience) a valid (unexpired,
+/// unrevoked) token belongs to.
 pub async fn session_for_token(
     pool: &PgPool,
     token_plain: &str,
@@ -5007,7 +5023,7 @@ pub async fn session_for_token(
     // `session_for_token_incl_revoked`.
     let mut tx = worker_tx(pool).await?;
     let row = sqlx::query(
-        "select session_id, tenant_id from api_tokens
+        "select session_id, tenant_id, audience from api_tokens
          where kind = 'session' and token_sha256 = $1
            and revoked_at is null
            and (expires_at is null or expires_at > now())",
@@ -5021,10 +5037,18 @@ pub async fn session_for_token(
             .map(|session_id| SessionTokenAuth {
                 session_id,
                 tenant_id: r.get::<Uuid, _>("tenant_id"),
+                audience: r.get::<String, _>("audience"),
             })
     }))
 }
 
+/// Renew a session's tokens ahead of expiry. Gap 10 renewal contract: ONE renew
+/// call (the runner presents its `control` token) extends EVERY live token for
+/// that session — all four audiences move together in a single statement, so the
+/// four never drift apart and the runner keeps one renew loop. Resolves the
+/// session from the presented (unrevoked) token's digest, then bumps expiry on
+/// all of that session's unrevoked session-kind rows. A revoked/bogus token
+/// resolves no session ⇒ zero rows ⇒ `false` (never resurrects a revoked set).
 pub async fn extend_session_token(
     pool: &PgPool,
     token_plain: &str,
@@ -5035,7 +5059,11 @@ pub async fn extend_session_token(
     let mut tx = worker_tx(pool).await?;
     let res = sqlx::query(
         "update api_tokens set expires_at = now() + make_interval(secs => $2)
-         where kind = 'session' and token_sha256 = $1 and revoked_at is null",
+         where kind = 'session' and revoked_at is null
+           and session_id in (
+             select session_id from api_tokens
+              where kind = 'session' and token_sha256 = $1 and revoked_at is null
+           )",
     )
     .bind(sha256_hex(token_plain))
     .bind(ttl_secs as f64)
@@ -6510,36 +6538,91 @@ mod tests {
         .await
         .unwrap();
 
-        let token = format!("fbx_sess_{}", Uuid::now_v7().simple());
-        create_session_token(&pool, scope, session.id, &token, 3600)
+        // Gap 10: a run mints FOUR audience-scoped tokens. Mint two here + forge
+        // a legacy (no-audience) row to exercise the whole contract.
+        let control = format!("fbx_sess_{}", Uuid::now_v7().simple());
+        let tool = format!("fbx_sess_{}", Uuid::now_v7().simple());
+        create_session_token(&pool, scope, session.id, &control, 3600, "control")
             .await
             .unwrap();
+        create_session_token(&pool, scope, session.id, &tool, 3600, "tool")
+            .await
+            .unwrap();
+
+        // Audience is PERSISTED and RETURNED by the resolver.
+        let a = session_for_token(&pool, &control).await.unwrap().unwrap();
+        assert_eq!(a.session_id, session.id);
+        assert_eq!(a.audience, "control");
         assert_eq!(
-            session_for_token(&pool, &token)
+            session_for_token(&pool, &tool)
                 .await
                 .unwrap()
-                .map(|a| a.session_id),
-            Some(session.id)
+                .unwrap()
+                .audience,
+            "tool"
         );
-        // A live token extends.
-        assert!(extend_session_token(&pool, &token, 3600).await.unwrap());
 
-        // Terminal transition revokes it — the runner can no longer auth.
+        // A legacy row inserted WITHOUT an audience gets the column DEFAULT 'all'
+        // (in-flight compat + the e2e forgers rely on this forever).
+        let legacy = format!("fbx_sess_{}", Uuid::now_v7().simple());
+        {
+            let mut tx = worker_tx(&pool).await.unwrap();
+            sqlx::query(
+                "insert into api_tokens (id, tenant_id, kind, session_id, token_sha256, expires_at)
+                 values ($1, $2, 'session', $3, $4, now() + interval '1 hour')",
+            )
+            .bind(Uuid::now_v7())
+            .bind(tenant)
+            .bind(session.id)
+            .bind(sha256_hex(&legacy))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+        assert_eq!(
+            session_for_token(&pool, &legacy)
+                .await
+                .unwrap()
+                .unwrap()
+                .audience,
+            "all"
+        );
+
+        // Renew contract: presenting ONE token (control) extends EVERY token for
+        // the session — the tool token we did NOT present must move too.
+        let expiry = |sha: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+                    "select expires_at from api_tokens where token_sha256 = $1",
+                )
+                .bind(sha)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let tool_before = expiry(sha256_hex(&tool)).await;
+        assert!(extend_session_token(&pool, &control, 7200).await.unwrap());
+        let tool_after = expiry(sha256_hex(&tool)).await;
+        assert!(
+            tool_after > tool_before,
+            "renewing via control must extend the tool token too (renew-extends-all)"
+        );
+
+        // Terminal transition revokes ALL the session's tokens (control + tool +
+        // legacy = 3) — every audience loses access at once.
         assert_eq!(
             revoke_session_tokens(&pool, scope, session.id)
                 .await
                 .unwrap(),
-            1
+            3
         );
-        assert_eq!(
-            session_for_token(&pool, &token)
-                .await
-                .unwrap()
-                .map(|a| a.session_id),
-            None
-        );
-        // And a renew can never resurrect a revoked token.
-        assert!(!extend_session_token(&pool, &token, 3600).await.unwrap());
+        assert!(session_for_token(&pool, &control).await.unwrap().is_none());
+        assert!(session_for_token(&pool, &tool).await.unwrap().is_none());
+        // And a renew can never resurrect a revoked set.
+        assert!(!extend_session_token(&pool, &control, 3600).await.unwrap());
         // Revoking again is a no-op (idempotent).
         assert_eq!(
             revoke_session_tokens(&pool, scope, session.id)
@@ -13044,6 +13127,57 @@ mod tests {
             row.state, "ambiguous",
             "a swept stale claim lands in ambiguous"
         );
+        cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    #[tokio::test]
+    async fn late_complete_loses_to_a_sweep_flipped_row() {
+        // T4 rider: a dispatcher that CASes `complete` AFTER the sweeper already
+        // flipped its expired claim to `ambiguous` must LOSE — the CAS keys on
+        // state='claimed', which the sweep changed. finish_won_claim relies on
+        // this false to skip a second (double) tool.brokered ledger row.
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        let id = match claim_tool_execution(&pool, scope, session_id, "late", "sha256:l", 600)
+            .await
+            .unwrap()
+        {
+            ClaimOutcome::Won { claim_id } => claim_id,
+            o => panic!("expected Won, got {o:?}"),
+        };
+        // The sweeper wins the row (expire → sweep → ambiguous).
+        {
+            let mut tx = worker_tx(&pool).await.unwrap();
+            sqlx::query(
+                "update tool_execution_claims set claim_expires_at = now() - interval '1 minute' where id = $1",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+        system_worker::sweep_stale_execution_claims(&pool, Utc::now())
+            .await
+            .unwrap();
+        // The dispatcher's late completion CAS finds no 'claimed' row → false.
+        assert!(
+            !complete_tool_execution(&pool, scope, id, "succeeded", None, Some(false), None, None)
+                .await
+                .unwrap(),
+            "a late complete must lose to the sweep's ambiguous row"
+        );
+        // The durable truth stays `ambiguous` (the swept row was not overwritten).
+        let row = get_tool_execution(&pool, scope, session_id, "late", "sha256:l")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, "ambiguous");
         cleanup_sw_tenant(&pool, tenant).await;
     }
 

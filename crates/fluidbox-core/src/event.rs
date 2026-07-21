@@ -428,8 +428,18 @@ mod tests {
     fn redactor_scrubs_fluidbox_token_prefixes() {
         let r = Redactor::default();
         // Runner-session, trigger, browser-session, and PAT tokens all scrub.
+        // The FOUR audience-scoped session credentials (Gap 10: control, tool,
+        // llm, workspace) are covered here BY CONSTRUCTION: the rule keys on the
+        // shared `fbx_sess_` prefix, and every audience keeps that prefix (see
+        // orchestrator::run). The four sample tokens below assert exactly that,
+        // so a future audience that dropped the prefix would fail this test.
         for tok in [
             "fbx_sess_0123456789abcdef",
+            // one sample per minted audience — all share the prefix
+            "fbx_sess_control0123456789abcdef",
+            "fbx_sess_tool0123456789abcdef",
+            "fbx_sess_llm0123456789abcdef",
+            "fbx_sess_workspace0123456789abcdef",
             "fbx_trig_0123456789abcdef",
             "fbx_web_0123456789abcdef",
             "fbx_pat_0123456789abcdef",

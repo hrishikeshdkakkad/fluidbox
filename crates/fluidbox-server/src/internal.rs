@@ -709,6 +709,9 @@ pub async fn permission(
     State(state): State<AppState>,
     Json(req): Json<PermissionReq>,
 ) -> ApiResult<Json<Value>> {
+    // Gap 10: the gate is the TOOL-INTENT audience. A runner-control or LLM
+    // credential must never be able to ask for a tool decision.
+    auth.require_audience("tool")?;
     let session = fluidbox_db::get_session(&state.pool, auth.scope, auth.session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -762,6 +765,9 @@ pub async fn tool_call(
     State(state): State<AppState>,
     Json(req): Json<BrokeredCallReq>,
 ) -> ApiResult<Json<Value>> {
+    // Gap 10: brokered execution is the TOOL-INTENT audience (same class as
+    // /permission — the broker shim holds only this token).
+    auth.require_audience("tool")?;
     let session = fluidbox_db::get_session(&state.pool, auth.scope, auth.session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -1121,7 +1127,7 @@ async fn finish_won_claim(
     // Settle the claim (CAS from 'claimed'). A loser (already swept to ambiguous)
     // returns false — we still answer this request from the completion we computed;
     // the swept row is the durable truth a future duplicate adopts.
-    fluidbox_db::complete_tool_execution(
+    let settled = fluidbox_db::complete_tool_execution(
         &state.pool,
         scope,
         claim_id,
@@ -1132,21 +1138,28 @@ async fn finish_won_claim(
         comp.error_message.as_deref(),
     )
     .await?;
-    record_brokered_exec(
-        state,
-        scope,
-        session_id,
-        tool_call_id,
-        tool,
-        dispatch.server_label(),
-        dispatch.binding_id(),
-        comp.ledger_ok,
-        latency_ms,
-        comp.result_digest.clone(),
-        comp.ledger_error.clone(),
-        Some(comp.state.to_string()),
-    )
-    .await;
+    // Ledger ONLY when this dispatcher actually settled the claim. When the CAS
+    // lost, the sweeper already flipped the row to `ambiguous` and ALREADY
+    // ledgered that outcome — a second tool.brokered here would double-ledger one
+    // call and contradict the durable state. The sweep's ambiguous event is the
+    // truth; the runner still receives the real result we computed.
+    if settled {
+        record_brokered_exec(
+            state,
+            scope,
+            session_id,
+            tool_call_id,
+            tool,
+            dispatch.server_label(),
+            dispatch.binding_id(),
+            comp.ledger_ok,
+            latency_ms,
+            comp.result_digest.clone(),
+            comp.ledger_error.clone(),
+            Some(comp.state.to_string()),
+        )
+        .await;
+    }
     Ok(Json(claim_response(
         comp.state,
         comp.result_content.as_ref(),
@@ -1507,6 +1520,9 @@ pub async fn events(
     State(state): State<AppState>,
     Json(ev): Json<EventIn>,
 ) -> ApiResult<Json<Value>> {
+    // Gap 10: the timeline is RUNNER-CONTROL. A leaked tool/LLM credential must
+    // not be able to forge narrative events.
+    auth.require_audience("control")?;
     let actor = match ev.actor.as_str() {
         "agent" => Actor::Agent,
         "human" => Actor::Human,
@@ -1540,6 +1556,10 @@ pub async fn workspace_archive(
 ) -> ApiResult<axum::response::Response> {
     use axum::response::IntoResponse;
     use tokio::io::AsyncReadExt;
+    // Gap 10: the archive is its OWN audience. The init container is a separate
+    // process that receives ONLY this token, and no runner-held credential
+    // (control/tool/llm) opens this route.
+    auth.require_audience("workspace")?;
     // A terminal/winding-down session's archive is moot (the run is over) —
     // gate on accepts_work(), like every sibling internal endpoint.
     let session = fluidbox_db::get_session(&state.pool, auth.scope, auth.session_id)
@@ -1584,6 +1604,8 @@ pub async fn workspace_archive(
 }
 
 pub async fn heartbeat(auth: SessionAuth, State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    // Gap 10: liveness + the quiesce channel are RUNNER-CONTROL.
+    auth.require_audience("control")?;
     fluidbox_db::heartbeat(&state.pool, auth.scope, auth.session_id).await?;
     // Deliberately NO eager archive deletion here: Kubernetes documents that
     // init containers may re-execute (pod-infrastructure restart), and a
@@ -1628,6 +1650,15 @@ pub async fn result(
     let sess_auth = fluidbox_db::session_for_token_incl_revoked(&state.pool, &token)
         .await?
         .ok_or(ApiError::Unauthorized)?;
+    // Gap 10, ORDER IS LOAD-BEARING: the audience is checked on the RESOLVED row
+    // BEFORE any leniency below. The leniency exists only so a runner-control
+    // token that was revoked by the terminal transition can still ack
+    // idempotently — it is NOT a hole a wrong-audience credential fits through.
+    // So a revoked CONTROL token still ACKs; a (revoked or live) LLM/tool token
+    // gets 403 wrong_audience and can never terminalize a run.
+    if !crate::auth::audience_allows("control", &sess_auth.audience) {
+        return Err(ApiError::Forbidden("wrong_audience".into()));
+    }
     let session_id = sess_auth.session_id;
     let scope = TenantScope::assume(sess_auth.tenant_id);
     let session = fluidbox_db::get_session(&state.pool, scope, session_id)
@@ -1716,6 +1747,10 @@ pub async fn token_renew(
     State(state): State<AppState>,
     Json(req): Json<RenewReq>,
 ) -> ApiResult<Json<Value>> {
+    // Gap 10: renewal is RUNNER-CONTROL — and one renew extends ALL four of the
+    // session's audience tokens (see `extend_session_token`), so the runner
+    // keeps exactly one renew loop holding exactly one credential.
+    auth.require_audience("control")?;
     let session = fluidbox_db::get_session(&state.pool, auth.scope, auth.session_id)
         .await?
         .ok_or(ApiError::NotFound)?;

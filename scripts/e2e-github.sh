@@ -410,10 +410,12 @@ if [ -n "$SF" ]; then
   [ "$(pq "select trust_tier from sessions where id='$SF'")" = "read_only" ] && ok "sessions.trust_tier = read_only" || no "column not set"
   [ "$(sfield "$SF" "['run_spec']['workspace']['checkout_mode']")" = "read_only" ] && ok "checkout_mode = read_only" || no "checkout mode wrong"
   # Probe the real permission gate with the run's own session token.
+  # Gap 10: /permission is the TOOL-INTENT audience, so take FLUIDBOX_TOOL_TOKEN
+  # (the runner-control token in FLUIDBOX_SESSION_TOKEN would now 403 here).
   TOK=""
   for _ in $(seq 1 30); do
     CID=$(docker ps --filter "label=fluidbox.session=$SF" --format '{{.ID}}' | head -1)
-    [ -n "$CID" ] && { TOK=$(docker inspect "$CID" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^FLUIDBOX_SESSION_TOKEN=' | cut -d= -f2-); break; }
+    [ -n "$CID" ] && { TOK=$(docker inspect "$CID" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^FLUIDBOX_TOOL_TOKEN=' | cut -d= -f2-); break; }
     sleep 1
   done
   if [ -n "$TOK" ]; then
