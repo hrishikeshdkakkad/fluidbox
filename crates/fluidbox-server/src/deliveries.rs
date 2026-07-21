@@ -99,11 +99,53 @@ pub async fn enqueue_for_session(state: &AppState, session_id: Uuid) -> bool {
     all_present
 }
 
-/// How long a claimed delivery row stays off other replicas' scans. Comfortably
-/// over one attempt (`DELIVERY_TIMEOUT` 10 s plus the GitHub reconcile round
-/// trips) so a healthy attempt never has its row stolen mid-flight, and short
-/// enough that a crashed replica's rows return to the pool within a few ticks.
-const DELIVERY_CLAIM_TTL_SECS: i64 = 120;
+/// How long a claimed delivery row stays off other replicas' scans, measured from
+/// the moment ITS OWN attempt starts — `attempt` re-stamps the claim per row
+/// (`extend_delivery_claim`) rather than relying on the batch-wide stamp.
+///
+/// THE ARITHMETIC, EXPLICITLY (review I2). The first cut sized this at 120 s
+/// against "one attempt", which was wrong twice over: attempts run SEQUENTIALLY
+/// over a batch of `CLAIM_BATCH` = 10 (so the last row's batch-stamped claim had to
+/// survive nine other attempts first), and one GitHub publish alone can exceed
+/// 120 s — `GITHUB_TIMEOUT` 15 s × (1 installation-token mint + up to
+/// `RECONCILE_MAX_PAGES` = 10 reconcile pages + a PATCH that 404s then a POST) =
+/// **195 s**. That last number is the sharpest edge: the marker-reconcile
+/// pagination Task 6 added to STOP double-posting is itself what pushes a publish
+/// past a 120 s claim, re-creating duplicate comments by another route.
+///
+/// Both halves of the fix are needed. Re-stamping turns the bound from
+/// `batch × worst-case-per-row` into `worst-case-per-row`; this constant then has
+/// to clear that single-row worst case with margin for DB round trips and a Neon
+/// cold start — 195 s + 105 s = **300 s**. It is DERIVED, not typed in, so a
+/// raised timeout or page cap moves it automatically; the test additionally pins
+/// today's numbers, so such a change fails there and gets re-justified rather than
+/// silently parking rows for longer. The cost of the larger TTL is that a CRASHED
+/// replica's rows stay parked for up to 300 s before another replica may take
+/// them — a delay measured against a backoff schedule that already starts at 5 s
+/// and reaches 1 h, and far cheaper than a duplicate external side effect.
+const DELIVERY_CLAIM_TTL_SECS: i64 = worst_case_attempt_secs() + CLAIM_TTL_HEADROOM_SECS;
+
+/// Slack over the pure-HTTP worst case for the DB round trips inside one attempt
+/// (session + binding + subscription reads, the sealed-secret open, the recorded
+/// attempt) and for a Neon cold start ahead of any of them.
+const CLAIM_TTL_HEADROOM_SECS: i64 = 105;
+
+/// Rows claimed per tick. Kept at 10: with the per-row re-stamp the batch size no
+/// longer multiplies into the TTL, so this is purely a throughput/fairness knob.
+const CLAIM_BATCH: i64 = 10;
+
+/// Worst-case wall clock ONE delivery attempt can occupy, derived from the
+/// timeouts that actually bound it — the GitHub publish path (its own module owns
+/// that arithmetic) or a signed webhook (`DELIVERY_TIMEOUT`).
+const fn worst_case_attempt_secs() -> i64 {
+    let publish = crate::connectors::github::worst_case_publish_secs();
+    let webhook = DELIVERY_TIMEOUT.as_secs() as i64;
+    if publish > webhook {
+        publish
+    } else {
+        webhook
+    }
+}
 
 /// The delivery worker: one loop per replica, each taking a CLAIMED, DISJOINT
 /// slice of the due rows (Phase E, #33; Gap 13).
@@ -120,6 +162,11 @@ const DELIVERY_CLAIM_TTL_SECS: i64 = 120;
 /// webhook receivers dedup on `x-fluidbox-delivery`, and the GitHub comment
 /// create path closes its own crash window by reconcile-before-create against a
 /// deterministic per-subscription marker.
+///
+/// The batch is claimed at once but attempted SEQUENTIALLY, so each row re-stamps
+/// its own claim just before its attempt (review I2) — see
+/// [`DELIVERY_CLAIM_TTL_SECS`] for why a batch-wide stamp cannot be sized
+/// correctly.
 pub fn spawn_worker(state: AppState) {
     tokio::spawn(async move {
         let owner = crate::orchestrator::replica_id();
@@ -129,7 +176,7 @@ pub fn spawn_worker(state: AppState) {
             let due = match fluidbox_db::system_worker::claim_due_deliveries(
                 &state.pool,
                 owner,
-                10,
+                CLAIM_BATCH,
                 DELIVERY_CLAIM_TTL_SECS,
             )
             .await
@@ -151,18 +198,53 @@ async fn attempt(state: &AppState, d: &fluidbox_db::ResultDeliveryRow, owner: Uu
     // The delivery row carries only a session id; resolve the owning tenant
     // (cross-tenant worker load) so the scoped calls below key off the right
     // tenant. A vanished session (never happens — sessions are retained) leaves
-    // the row for the next tick rather than mutating cross-tenant state.
+    // the row alone rather than mutating cross-tenant state; it returns to the
+    // pool when the claim stamped by the poll lapses.
     let Ok(Some(session)) =
         fluidbox_db::system_worker::get_session(&state.pool, d.session_id).await
     else {
         tracing::warn!(
-            "delivery {}: session {} not found; skipping",
+            "delivery {}: session {} not found; skipping (the row stays claimed \
+             until its TTL lapses)",
             d.id,
             d.session_id
         );
         return;
     };
     let scope = TenantScope::assume(session.tenant_id);
+    // RE-STAMP THE CLAIM PER ROW, BEFORE the side effect (review I2). The batch
+    // stamp is already minutes old for a late row; this restarts the TTL clock at
+    // THIS attempt so `DELIVERY_CLAIM_TTL_SECS` only has to cover one of them. It
+    // is a strict owner CAS, so a row another replica has taken is SKIPPED HERE —
+    // before `try_deliver` — which is the only place a lost claim can be handled
+    // without either duplicating the external call or stomping the new owner.
+    match fluidbox_db::extend_delivery_claim(
+        &state.pool,
+        scope,
+        d.id,
+        owner,
+        DELIVERY_CLAIM_TTL_SECS,
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            // Not an error and not a spin: the row now belongs to another replica
+            // (or is no longer pending), and our own claim scan skips rows whose
+            // `claimed_until` is in the future and `claimed_by` is not us, so this
+            // replica will not re-pick it until that claim lapses.
+            tracing::warn!(
+                "delivery {}: claim lost before the attempt (owner {owner} no longer \
+                 holds it); skipping — its current owner will deliver it",
+                d.id
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("delivery {}: claim re-stamp failed: {e}; skipping", d.id);
+            return;
+        }
+    }
     let outcome = try_deliver(state, d, &session).await;
     let (ok, err, digest, external_url) = match &outcome {
         Ok((digest, external_url)) => (true, None, Some(digest.as_str()), external_url.clone()),
@@ -184,7 +266,31 @@ async fn attempt(state: &AppState, d: &fluidbox_db::ResultDeliveryRow, owner: Uu
         MAX_ATTEMPTS,
     )
     .await;
-    let Ok(Some(row)) = updated else { return };
+    let row = match updated {
+        Ok(Some(row)) => row,
+        // OBSERVABLE, because this branch drops the BACKOFF, not just the attempt
+        // record (review I2): nothing was written, so `attempts` and
+        // `next_attempt_at` are unchanged and the row is due again the moment its
+        // new owner's claim lapses. The external side effect above ALREADY
+        // happened, so whoever records the attempt records ours as if it were
+        // theirs — at-least-once, as documented. Silence here is what made the
+        // 120 s-TTL overrun invisible; it must never be silent again.
+        Ok(None) => {
+            tracing::warn!(
+                "delivery {}: claim lost DURING the attempt (it outran the {}s claim \
+                 TTL); the attempt and its backoff were NOT recorded — the current \
+                 owner's attempt will record instead. delivered={}",
+                d.id,
+                DELIVERY_CLAIM_TTL_SECS,
+                ok
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::error!("delivery {}: recording the attempt failed: {e}", d.id);
+            return;
+        }
+    };
     // Timeline visibility: record delivered / terminally-failed (not every
     // intermediate retry — that's the deliveries table's job). Provider
     // publishes surface the created comment/check URL.
@@ -577,5 +683,75 @@ mod tests {
         assert_eq!(backoff_secs(2), 30);
         assert_eq!(backoff_secs(6), 3600);
         assert_eq!(backoff_secs(99), 3600);
+    }
+
+    /// I2: the claim TTL must clear ONE worst-case attempt, derived from the
+    /// timeouts that actually bound it rather than asserted in prose. The first cut
+    /// (120 s) did not — a single GitHub publish can run 195 s — and an attempt
+    /// that outruns its claim loses `mark_delivery_attempt`'s owner guard, which
+    /// drops the BACKOFF as well as the attempt record: `attempts` and
+    /// `next_attempt_at` never move, so the row is immediately due again, never
+    /// reaches MAX_ATTEMPTS, never fails terminally, and repeats its external side
+    /// effect on every pass.
+    ///
+    /// Raising `GITHUB_TIMEOUT` or `RECONCILE_MAX_PAGES` without raising the TTL
+    /// fails HERE rather than in production.
+    #[test]
+    fn claim_ttl_covers_the_worst_case_attempt() {
+        let worst = worst_case_attempt_secs();
+        assert_eq!(
+            worst, 195,
+            "the derived worst case moved (15s × (1 token mint + 10 reconcile pages \
+             + PATCH-then-POST)); the TTL follows it automatically, but a longer \
+             claim parks a crashed replica's rows for longer — re-justify it here"
+        );
+        assert_eq!(
+            DELIVERY_CLAIM_TTL_SECS, 300,
+            "the documented TTL arithmetic is 195s worst case + 105s headroom"
+        );
+        assert!(
+            DELIVERY_CLAIM_TTL_SECS > worst,
+            "DELIVERY_CLAIM_TTL_SECS ({DELIVERY_CLAIM_TTL_SECS}s) must exceed one \
+             worst-case attempt ({worst}s), or a live attempt has its row stolen \
+             mid-flight — duplicating the external effect AND freezing the backoff"
+        );
+        // The margin is for DB round trips / a Neon cold start, not decoration.
+        assert!(
+            DELIVERY_CLAIM_TTL_SECS - worst >= 60,
+            "keep at least 60s of headroom over the pure-HTTP worst case"
+        );
+    }
+
+    /// The other half of I2 is ORDER: the per-row claim re-stamp must happen
+    /// BEFORE `try_deliver`, because that is the only point at which a lost claim
+    /// can be handled without either duplicating the external call or stomping the
+    /// new owner. A source guard, since the path itself is DB- and network-bound.
+    ///
+    /// Sliced to the STATEMENTS inside `attempt` (not the prose above it), so a
+    /// doc comment mentioning either call cannot satisfy it.
+    #[test]
+    fn the_claim_is_restamped_before_the_side_effect() {
+        let src = include_str!("deliveries.rs");
+        let start = src
+            .find("async fn attempt(")
+            .expect("the per-row attempt exists");
+        let end = src[start..]
+            .find("    let next_attempt = d.attempts + 1;")
+            .map(|i| start + i)
+            .expect("attempt() computes the next attempt number");
+        let body = &src[start..end];
+        let restamp = concat!("fluidbox_db::extend_delivery_", "claim(");
+        let deliver = concat!("try_de", "liver(state, d, &session)");
+        let (r, t) = (
+            body.find(restamp)
+                .expect("the claim is re-stamped in attempt()"),
+            body.find(deliver).expect("attempt() delivers"),
+        );
+        assert!(
+            r < t,
+            "`{restamp}` must precede `{deliver}`: re-stamping AFTER the side effect \
+             cannot prevent a duplicate, and not re-stamping at all measures the TTL \
+             from the batch claim instead of from this attempt"
+        );
     }
 }
