@@ -70,6 +70,21 @@ const COLLECT_TIMEOUT: Duration = Duration::from_secs(120);
 /// ticks, long enough to cover the gaps between a healthy driver's renews (which
 /// happen at every lifecycle step). Bounded overlap with the 420 s finalization
 /// claim window and the 300 s driver timeout, so two drivers still never overlap.
+///
+/// **This TTL is the multi-replica cancel latency (review, minor).** A replica
+/// that finishes `run()` leaves its lease standing — nothing releases it on the
+/// way out, and only a driver renews. So a cancel that arrives on a DIFFERENT
+/// replica finds an unexpired lease, hands the finalization claim straight back
+/// (`drive_finalization`'s `hold_lease` early return) and waits for the 20 s
+/// `finalize_worker` tick to try again. Worst case is the lease's remaining life
+/// plus a full worker period — up to ~50 s, typically ~30-40 s — before the
+/// wind-down actually starts. The user-visible status flips immediately (`cancel`
+/// is an UNFENCED intent write accepted on any replica); it is the sandbox
+/// teardown that waits. Single-replica deployments never see this: the holder and
+/// the receiver are the same process, so `hold_lease` renews and proceeds. Cutting
+/// the TTL shortens the stall but raises the risk of stealing a session from a
+/// slow-but-live driver; releasing the lease at the end of `run()` is the real
+/// fix and is not built.
 const SESSION_LEASE_TTL_SECS: i64 = 30;
 
 /// This replica's identity, minted ONCE per process (Phase E, #33; Gap 13).
@@ -1984,6 +1999,41 @@ mod tests {
         // A missing archives dir (Docker provider) is a quiet no-op.
         assert!(stale_archive_candidates(&tmp.join("nope"), std::time::Duration::ZERO).is_empty());
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// CONFIRMED FALSE-GREEN, closed. A reviewer deleted the lease re-proof that
+    /// guards `collect_artifacts` and all 323 tests still passed: the fence is a
+    /// two-replica race, so nothing in the suite (and nothing DB-gated) observes
+    /// its absence. This guard asserts the statement itself, so removing it fails
+    /// immediately, with or without a database.
+    ///
+    /// What the re-proof buys: `collect_artifacts` reads (and the teardown that
+    /// follows destroys) the workspace. A driver whose lease was stolen mid-drive
+    /// would otherwise read a worktree the NEW owner is already collecting or has
+    /// torn down, and store the loser's diff as the run's audit artifact.
+    ///
+    /// Sliced to the branch between the runner-exit check and the collect call —
+    /// the prose above it names both — and every needle is split so this test is
+    /// not itself an occurrence of what it searches for.
+    #[test]
+    fn the_collect_path_re_proves_the_lease_before_touching_the_workspace() {
+        let src = include_str!("orchestrator.rs");
+        let branch_anchor = concat!("if !runner_", "gone {");
+        let collect_anchor = concat!("state.provider.collect_", "artifacts(");
+        let start = src
+            .find(branch_anchor)
+            .expect("the runner-exit branch exists");
+        let end = src[start..]
+            .find(collect_anchor)
+            .map(|i| start + i)
+            .expect("the collect call follows it");
+        let needle = concat!("hold_lease(state, scope, id).await != ", "Some(epoch)");
+        assert!(
+            src[start..end].contains(needle),
+            "the collect path must re-prove the driver lease (`{needle}`) before \
+             reading the workspace; without it a stale driver whose session was \
+             stolen still collects, and stores a losing diff as the audit artifact"
+        );
     }
 
     #[test]
