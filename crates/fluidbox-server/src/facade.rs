@@ -174,18 +174,23 @@ fn reservation_refusal(dialect: Dialect, code: &str, message: &str) -> Response 
 
 // ─── Gap 14: conservative per-request budget reservations ──────────────────
 
-/// How many reservations one session may hold at once. The bound design :1118
-/// asks for — a finite ceiling on concurrent reservations — NOT a per-session
-/// mutex, which design :1113-1115 explicitly forbids because parallel subagent
-/// calls are legitimate. 32 is comfortably above any harness's real fan-out.
-const MAX_CONCURRENT_RESERVATIONS: i64 = 32;
+/// Default for how many reservations one session may hold at once. The bound
+/// design :1118 asks for — a finite ceiling on concurrent reservations — NOT a
+/// per-session mutex, which design :1113-1115 explicitly forbids because parallel
+/// subagent calls are legitimate. 32 is comfortably above any harness's real
+/// fan-out. Overridable per deployment via `FLUIDBOX_LLM_MAX_CONCURRENT_
+/// RESERVATIONS`, which `config.rs` parses at BOOT (a malformed or non-positive
+/// value fails boot naming the variable — see `parse_positive_i64_env`).
+pub const DEFAULT_MAX_CONCURRENT_RESERVATIONS: i64 = 32;
 
 /// Reservation lifetime. MUST comfortably exceed the facade's upstream request
-/// timeout (15 min, `main.rs`): the expiry sweep converts a still-`reserved` row
-/// into a CONSERVATIVE charge, and because both are keyed on the request id, that
-/// over-charge would then STICK against the real usage arriving later. 30 minutes
-/// means an expired reservation is proof the process died, not that a request is
-/// slow.
+/// timeout ([`crate::config::UPSTREAM_HTTP_TIMEOUT_SECS`]): the expiry sweep
+/// converts a still-`reserved` row into a CONSERVATIVE charge, and because both
+/// are keyed on the request id, that over-charge would then STICK against the real
+/// usage arriving later. 30 minutes means an expired reservation is proof the
+/// process died, not that a request is slow. The relationship is asserted against
+/// the real timeout constant, so raising the timeout fails that test rather than
+/// silently breaking the guarantee.
 const RESERVATION_TTL_SECS: i64 = 1800;
 
 /// Declared-output fallback when a request names no output cap. Anthropic REQUIRES
@@ -197,33 +202,6 @@ const FALLBACK_MAX_OUTPUT_TOKENS: i64 = 32_768;
 /// absurd `max_tokens` cannot book a nonsensical reservation (it would only ever
 /// starve its own run, but the arithmetic should stay sane).
 const MAX_RESERVABLE_OUTPUT_TOKENS: i64 = 1_000_000;
-
-/// The concurrent-reservation ceiling, `FLUIDBOX_LLM_MAX_CONCURRENT_RESERVATIONS`
-/// overriding the const. Read HERE rather than in `config.rs` because this task
-/// does not own that file; the trade-off is that a malformed value falls back to
-/// the built-in default with a NAMED error log instead of failing boot the way
-/// `config.rs`'s `parse_i64_env` knobs do. Moving it into `Config` is a follow-up.
-/// Values below 1 are refused the same way — a 0 ceiling would wedge every run.
-fn max_concurrent_reservations() -> i64 {
-    static CEILING: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
-    *CEILING.get_or_init(|| {
-        let raw = match std::env::var("FLUIDBOX_LLM_MAX_CONCURRENT_RESERVATIONS") {
-            Ok(v) if !v.trim().is_empty() => v,
-            _ => return MAX_CONCURRENT_RESERVATIONS,
-        };
-        match raw.trim().parse::<i64>() {
-            Ok(n) if n >= 1 => n,
-            _ => {
-                tracing::error!(
-                    "FLUIDBOX_LLM_MAX_CONCURRENT_RESERVATIONS='{raw}' is not a positive \
-                     integer — falling back to the built-in default \
-                     {MAX_CONCURRENT_RESERVATIONS}"
-                );
-                MAX_CONCURRENT_RESERVATIONS
-            }
-        }
-    })
-}
 
 /// The conservative maximum this request could cost, booked BEFORE it is
 /// forwarded (design :1117). Deliberately pessimistic — an over-reservation only
@@ -285,6 +263,21 @@ async fn release_reservation(state: &AppState, scope: TenantScope, request_id: U
     }
 }
 
+/// May a reservation retire to `charged`? ONLY once its authoritative usage row
+/// is DURABLE.
+///
+/// Extracted as a pure fn so the decision is testable with no database: the
+/// failure it guards (`add_usage` erroring) cannot be injected into
+/// [`reconcile_reservation`] without one. Charging on a FAILED usage write is the
+/// worst outcome in the whole reservation lifecycle and it is UNRECOVERABLE — the
+/// row reads `charged`, so the expiry sweeper skips it, and the spend is absent
+/// from `usage_entries` permanently. Leaving it `reserved` instead hands it to the
+/// sweeper's conservative conversion, which is design :1122's never-assume-zero
+/// fallback and errs in the safe direction (a disclosed over-charge).
+const fn should_charge_reservation(usage_written: bool) -> bool {
+    usage_written
+}
+
 /// Reconcile a reservation against AUTHORITATIVE usage (design :1120).
 ///
 /// ORDER IS LOAD-BEARING: the usage row lands FIRST, keyed `external_id =
@@ -294,6 +287,12 @@ async fn release_reservation(state: &AppState, scope: TenantScope, request_id: U
 /// so the two settle identically in EITHER order. Reversed, a crash after the CAS
 /// would retire the booking with no usage recorded: a silent under-charge, the
 /// exact failure Gap 14 exists to prevent.
+///
+/// SUCCESS IS EQUALLY LOAD-BEARING (review I1): ordering alone bought nothing
+/// while `record_usage` swallowed its error, because a transient insert failure
+/// still fell through to the CAS and produced exactly that unrecorded under-charge
+/// — durably, since a `charged` row is invisible to the sweeper. The gate is
+/// [`should_charge_reservation`].
 async fn reconcile_reservation(
     state: &AppState,
     scope: TenantScope,
@@ -302,7 +301,7 @@ async fn reconcile_reservation(
     usage: UsageDelta,
     request_id: Uuid,
 ) {
-    record_usage(
+    let usage_written = record_usage(
         state,
         scope,
         session_id,
@@ -311,6 +310,14 @@ async fn reconcile_reservation(
         Some(&request_id.to_string()),
     )
     .await;
+    if !should_charge_reservation(usage_written) {
+        tracing::warn!(
+            "facade: usage for LLM reservation {request_id} did not persist — leaving the \
+             reservation `reserved` so the expiry sweep converts it into a conservative \
+             charge (charging now would lose the spend permanently)"
+        );
+        return;
+    }
     if let Err(e) = fluidbox_db::charge_llm_reservation(&state.pool, scope, request_id).await {
         tracing::warn!("facade: charging LLM reservation {request_id} failed: {e}");
     }
@@ -710,7 +717,7 @@ pub async fn messages(
         &run_spec.model,
         reserved_tokens,
         reserved_cost,
-        max_concurrent_reservations(),
+        state.cfg.llm_max_concurrent_reservations,
         run_spec.budgets.max_tokens.map(|t| t as i64),
         run_spec.budgets.max_cost_usd,
         RESERVATION_TTL_SECS,
@@ -1075,6 +1082,12 @@ async fn trigger_budget_stop(
     }
 }
 
+/// Persist authoritative usage and ledger the model response.
+///
+/// RETURNS whether the `usage_entries` row is DURABLE — the caller's reservation
+/// gate depends on it, so this must never swallow the error (review I1). The
+/// ledger event is emitted either way: it is the operator-visible record that a
+/// call happened, and suppressing it would hide the failure entirely.
 async fn record_usage(
     state: &AppState,
     scope: TenantScope,
@@ -1082,9 +1095,9 @@ async fn record_usage(
     model: &str,
     usage: UsageDelta,
     external_id: Option<&str>,
-) {
+) -> bool {
     let cost = estimate_cost_usd(model, &usage);
-    fluidbox_db::add_usage(
+    let written = match fluidbox_db::add_usage(
         &state.pool,
         scope,
         session_id,
@@ -1098,7 +1111,13 @@ async fn record_usage(
         external_id,
     )
     .await
-    .ok();
+    {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("facade: recording usage for session {session_id} failed: {e}");
+            false
+        }
+    };
     ledger::record(
         state,
         scope,
@@ -1114,6 +1133,7 @@ async fn record_usage(
         },
     )
     .await;
+    written
 }
 
 // ─── Usage parsing ─────────────────────────────────────────────────────────
@@ -1460,6 +1480,14 @@ mod tests {
             1,
             "exactly one admission per request"
         );
+        // …and the ceiling it passes is the BOOT-PARSED knob, not the raw default:
+        // reverting to the const would silently ignore
+        // `FLUIDBOX_LLM_MAX_CONCURRENT_RESERVATIONS`, which only the e2e would catch.
+        assert!(
+            body.contains("state.cfg.llm_max_concurrent_reservations,"),
+            "admission must take the ceiling from Config (boot-validated), never from \
+             DEFAULT_MAX_CONCURRENT_RESERVATIONS directly"
+        );
     }
 
     /// The `usage unparsed` zero marker must RETAIN the reservation: the stream
@@ -1497,6 +1525,10 @@ mod tests {
     /// Reconcile writes the usage row BEFORE it retires the booking. Reversed, a
     /// crash between the two would settle the reservation with no usage recorded
     /// — a silent under-charge, the exact failure Gap 14 exists to prevent.
+    ///
+    /// The ordering half is a source guard; the CONDITION half (review I1) is
+    /// pinned both here — the CAS must sit behind the `should_charge_reservation`
+    /// gate — and by the pure-fn test below.
     #[test]
     fn reconcile_records_usage_before_it_charges_the_reservation() {
         let src = include_str!("facade.rs");
@@ -1509,12 +1541,68 @@ mod tests {
             .expect("the next item delimits the body");
         let body = &src[start..end];
         let usage = body.find("record_usage(").expect("records usage");
+        let gate = body
+            .find("if !should_charge_reservation(usage_written) {")
+            .expect(
+                "the CAS must be GATED on a durable usage write — an ungated charge after a \
+                 failed insert retires the booking with no usage row, and the sweeper skips \
+                 `charged` rows, so the spend is lost permanently",
+            );
         let charge = body
             .find("charge_llm_reservation(")
             .expect("charges the reservation");
         assert!(
-            usage < charge,
-            "record_usage must precede charge_llm_reservation"
+            usage < gate && gate < charge,
+            "order must be: record usage → gate on its durability → charge"
+        );
+        // The gate is only a gate if it can stop the charge.
+        assert!(
+            body[gate..charge].contains("return;"),
+            "the failed-write branch must RETURN, leaving the reservation `reserved` for the \
+             sweeper's conservative conversion (design :1122)"
+        );
+    }
+
+    /// The reconcile decision itself: charge ONLY on a durable usage write. The
+    /// `add_usage` failure cannot be injected without a database, so the decision
+    /// is a pure fn and this is the half that rides every local `cargo test`.
+    #[test]
+    fn a_reservation_is_charged_only_when_its_usage_row_is_durable() {
+        assert!(should_charge_reservation(true));
+        assert!(
+            !should_charge_reservation(false),
+            "a failed usage write must leave the reservation `reserved` — charging it is an \
+             UNRECOVERABLE under-charge (the sweeper skips `charged` rows)"
+        );
+    }
+
+    /// …and the input to that decision must be TRUTHFUL. `record_usage` swallowed
+    /// its insert error (`add_usage(…).await.ok()`), which is what made the
+    /// reconcile ORDERING worthless: the error vanished and the CAS ran anyway.
+    #[test]
+    fn record_usage_reports_a_failed_insert_rather_than_swallowing_it() {
+        let src = include_str!("facade.rs");
+        let start = src
+            .find("async fn record_usage(")
+            .expect("record_usage exists");
+        let end = src[start..]
+            .find("// ─── Usage parsing")
+            .map(|i| start + i)
+            .expect("the section header delimits the body");
+        let body = &src[start..end];
+        let arm = body.find("Err(e) => {").expect(
+            "the add_usage result must be MATCHED, never swallowed with `.ok()` — the \
+             reservation gate is only as good as the bool it is handed",
+        );
+        let arm_end = body[arm..]
+            .find("    };")
+            .map(|i| arm + i)
+            .expect("the match closes");
+        let arm = &body[arm..arm_end];
+        assert!(
+            arm.contains("false") && !arm.contains("true"),
+            "a failed usage insert must report FALSE, so the reservation stays `reserved` \
+             for the sweeper instead of retiring with no usage row"
         );
     }
 
@@ -1531,39 +1619,27 @@ mod tests {
         &src[start..end]
     }
 
-    #[test]
-    fn ceiling_env_override_rejects_junk_and_non_positive_values() {
-        // The parse itself (the OnceLock caches, so exercise the logic directly).
-        let parse = |raw: &str| -> i64 {
-            match raw.trim().parse::<i64>() {
-                Ok(n) if n >= 1 => n,
-                _ => MAX_CONCURRENT_RESERVATIONS,
-            }
-        };
-        assert_eq!(parse("8"), 8);
-        assert_eq!(parse(" 64 "), 64);
-        assert_eq!(parse("nope"), MAX_CONCURRENT_RESERVATIONS);
-        assert_eq!(
-            parse("0"),
-            MAX_CONCURRENT_RESERVATIONS,
-            "0 would wedge every run"
-        );
-        assert_eq!(parse("-1"), MAX_CONCURRENT_RESERVATIONS);
-        // The default is what an unset env yields.
-        assert_eq!(max_concurrent_reservations(), MAX_CONCURRENT_RESERVATIONS);
-    }
-
     /// The TTL must outlive the facade's upstream request timeout, or the sweeper
     /// would conservatively charge a request that is still legitimately in flight
     /// — and because both are keyed on the request id, that over-charge would
     /// then STICK against the real usage arriving afterwards.
+    ///
+    /// DERIVED from the real constant (review M1), not from a copy of its value:
+    /// raising the upstream timeout past the TTL now fails HERE instead of
+    /// silently voiding the guarantee.
     #[test]
     fn reservation_ttl_exceeds_the_upstream_request_timeout() {
-        let upstream_timeout_secs: i64 = 15 * 60;
+        let upstream_timeout_secs = crate::config::UPSTREAM_HTTP_TIMEOUT_SECS as i64;
         assert!(
             RESERVATION_TTL_SECS > upstream_timeout_secs,
             "RESERVATION_TTL_SECS ({RESERVATION_TTL_SECS}) must exceed the upstream \
-             timeout ({upstream_timeout_secs}s, main.rs)"
+             timeout (UPSTREAM_HTTP_TIMEOUT_SECS = {upstream_timeout_secs}s)"
+        );
+        // …with real margin, not by a second: the sweep tick and the DB round trips
+        // that settle a late drain both land after the timeout fires.
+        assert!(
+            RESERVATION_TTL_SECS - upstream_timeout_secs >= 600,
+            "the TTL must clear the upstream timeout by at least 10 minutes"
         );
     }
 
