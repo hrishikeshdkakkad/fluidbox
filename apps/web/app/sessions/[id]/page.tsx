@@ -438,13 +438,18 @@ function TimelineItem({ ev }: { ev: EventRow }) {
       break;
     case "tool.brokered": {
       const ok = d.ok === true;
-      cls = ok ? "good" : "danger";
+      const outcome = s("outcome");
+      // An ambiguous dispatch is neither a success nor a proven failure — the
+      // side effect may or may not have landed upstream, and it is never
+      // retried automatically. Amber keeps it visually distinct from a
+      // definite failure so an operator can act on it.
+      cls = outcome === "ambiguous" ? "human" : ok ? "good" : "danger";
       tag = "brokered";
       body = (
         <>
           <code>{s("tool")}</code> executed by the control plane{" "}
           <span className="mut">
-            ({ok ? "ok" : "failed"} · {s("latency_ms")}ms
+            ({outcome || (ok ? "ok" : "failed")} · {s("latency_ms")}ms
             {s("error") ? ` · ${s("error")}` : ""})
           </span>
         </>

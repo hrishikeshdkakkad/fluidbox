@@ -21,6 +21,11 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import crypto from "node:crypto";
+import {
+  audienceMismatchDiagnostic,
+  isWrongAudienceRefusal,
+  EXIT_AUDIENCE_MISMATCH,
+} from "./contract.mjs";
 
 function requireEnv(k) {
   const v = process.env[k];
@@ -33,7 +38,9 @@ function requireEnv(k) {
 
 const CONTROL = requireEnv("FLUIDBOX_CONTROL_URL");
 const SESSION = requireEnv("FLUIDBOX_SESSION_ID");
-const TOKEN = requireEnv("FLUIDBOX_SESSION_TOKEN");
+// Gap 10: this shim preflights /permission, so it holds the TOOL-INTENT
+// credential only — never the runner-control token.
+const TOKEN = requireEnv("FLUIDBOX_TOOL_TOKEN");
 const SERVER_NAME = requireEnv("FLUIDBOX_GATE_SERVER");
 const CHILD_COMMAND = requireEnv("FLUIDBOX_GATE_COMMAND");
 const CHILD_ARGS = JSON.parse(process.env.FLUIDBOX_GATE_ARGS || "[]");
@@ -60,7 +67,23 @@ async function gate(toolName, args) {
       }),
       signal: ctrl.signal,
     });
-    const body = await res.json().catch(() => null);
+    // TEXT first — a `wrong_audience` refusal must be told apart from a real
+    // refusal before it collapses into `allow:false`, which the model reads as
+    // a policy denial and works around.
+    const text = await res.text().catch(() => "");
+    if (isWrongAudienceRefusal(res.status, text)) {
+      // Gap 10 fatal (same treatment as the runner contract): abort loudly
+      // rather than gate-deny every sandbox tool for the rest of the run.
+      console.error(audienceMismatchDiagnostic(`${SERVER_NAME} permission preflight`));
+      process.exit(EXIT_AUDIENCE_MISMATCH);
+    }
+    const body = (() => {
+      try {
+        return JSON.parse(text);
+      } catch {
+        return null;
+      }
+    })();
     if (!res.ok || !body) return { allow: false, message: `gate HTTP ${res.status}` };
     return { allow: body.decision === "allow", message: body.message };
   } catch (e) {

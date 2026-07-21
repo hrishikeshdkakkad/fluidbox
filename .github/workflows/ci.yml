@@ -213,6 +213,79 @@ jobs:
           FLUIDBOX_SERVER_BIN: ${{ github.workspace }}/target/debug/fluidbox-server
         run: bash scripts/secrets-e2e.sh
 
+  # Phase E acceptance: broker and network hardening, driven end-to-end over HTTP
+  # against python-stdlib fakes (a recording MCP server + a redirect server). It
+  # proves the #33 matrix — the SSRF/egress boundary (private + metadata literals
+  # refused at admission and at dial, redirects refused not followed), the
+  # 2025-11-25 conformance contract (initialize-first, offered version, protocol
+  # header, version drift, 404-reinit, server-request -32601, SSE assembly,
+  # session DELETE, SEP-835 insufficient-scope marking the connection), frozen
+  # schema argument enforcement including the gate-ORDER proof the unit tests
+  # structurally cannot give, and the durable execution claims (one dispatch per
+  # duplicated intent, failed_upstream never ambiguous, failed_before_send
+  # re-claimable, ambiguous never re-dispatched, cancel-during-approval).
+  hardening:
+    runs-on: ubuntu-latest
+    # 45, not the 25 this job was created with. The budget has to cover a
+    # cache-MISS debug build of the workspace (10-18 min on its own) plus the
+    # script, which has grown from 1666 to ~3650 lines, 25 to 43 runs, ~5 s to
+    # ~36 s of fixed sleeps, and 1 to 3 boots of replica A plus a second replica.
+    # A timeout kill is indistinguishable from a hang in the log, so headroom
+    # here is what keeps a slow runner from reading as a broker deadlock.
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: fluidbox_hardening
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/fluidbox_hardening
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Share the debug build cache with the `rust` job — same profile.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: debug
+      - name: build server
+        run: cargo build -p fluidbox-server
+      # psql is REQUIRED by the acceptance script (it PROVES the claim-row states,
+      # the schema-denial ledger source, and the SEP-835 connection status write —
+      # the assertions that cannot be made from the HTTP surface alone).
+      - name: install postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: hardening acceptance (egress/SSRF + MCP conformance + schema gate + execution claims)
+        env:
+          # Reuse the just-built binary so the script `exec`s it directly (clean
+          # single-process lifecycle across the boots the matrix needs).
+          FLUIDBOX_SERVER_BIN: ${{ github.workspace }}/target/debug/fluidbox-server
+        run: bash scripts/hardening-e2e.sh
+      # FORENSICS. The script owns its stack in a mktemp dir and its EXIT trap
+      # `rm -rf`s it, so a CI-only failure used to leave nothing but the pass/fail
+      # lines — no control-plane log, no recorder JSONL, nothing to reconstruct
+      # which upstream request did or did not happen. The script now copies those
+      # files to a FIXED path (hardening-e2e-artifacts/) before deleting the work
+      # dir, but ONLY when the run failed and only under CI — which is why this
+      # step is `if: failure()` and why a green run uploads nothing. Copy-out was
+      # chosen over "keep the work dir": upload-artifact needs a path known when
+      # this YAML is written, and the work dir's name is random.
+      - name: upload hardening forensics (server logs + recorder JSONLs)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hardening-e2e-logs
+          path: hardening-e2e-artifacts/
+          if-no-files-found: warn
+          retention-days: 7
+
   web:
     runs-on: ubuntu-latest
     defaults:

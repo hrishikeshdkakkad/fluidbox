@@ -393,7 +393,14 @@ pub async fn create_run(
         &run_spec,
         &state.cfg.public_control_url,
         Uuid::nil(),
-        "fbx_sess_00000000000000000000000000000000",
+        // Placeholder identity, same shape/size as the real audience-scoped set
+        // (four `fbx_sess_` + 32 hex tokens) so the estimate stays faithful.
+        &fluidbox_core::traits::SandboxTokens {
+            control: "fbx_sess_00000000000000000000000000000000".into(),
+            tool: "fbx_sess_00000000000000000000000000000001".into(),
+            llm: "fbx_sess_00000000000000000000000000000002".into(),
+            workspace: "fbx_sess_00000000000000000000000000000003".into(),
+        },
     );
     let env_bytes = orchestrator::serialized_env_len(&est_env);
     if env_bytes > crate::config::MAX_RUNNER_ENV_BYTES {

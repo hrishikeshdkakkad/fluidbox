@@ -10,16 +10,19 @@ mod config;
 mod connections;
 mod connectors;
 mod deliveries;
+mod egress;
 mod error;
 mod events;
 mod facade;
 mod github_app;
+mod governor;
 mod harness;
 mod internal;
 mod kms;
 mod ledger;
 mod llm_keys;
 mod login;
+mod mcp_sse;
 mod oauth;
 mod orchestrator;
 mod rbac;
@@ -173,6 +176,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let events_tx = fluidbox_db::spawn_listener(cfg.database_url.clone());
+    // Phase E (#33; Gap 13): the second listener. Approval decisions announce
+    // themselves on their own channel so EVERY replica's blocked `/permission`
+    // waiters wake, not just the one that served the decision request.
+    let approvals_tx = fluidbox_db::spawn_approval_listener(cfg.database_url.clone());
 
     // Phase D (#32): the sealer is legacy-only (KMS off), KMS-envelope (static|aws),
     // or None (KMS off + no legacy key → sealing disabled, today's behavior). The
@@ -215,23 +222,47 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Phase E shared egress boundary: ONE policy (dev-loopback seam + operator
+    // allowlist + proxy) drives BOTH hardened clients and is stored on AppState
+    // for the broker/deliveries pre-dial admission and the git-clone derivation.
+    let egress_policy = egress::EgressPolicy::from_config(&cfg);
+    let identity_http = egress::build_identity_http(&egress_policy);
+    let egress_http = egress::build_egress_http(&egress_policy);
+    // Phase E (E14): the outbound rate limits + per-connection circuit breakers
+    // the broker consults before every dial. In-memory and PER-REPLICA by design
+    // — see the `governor` module docs (durable limiter = Phase F).
+    let governor = governor::EgressGovernor::from_config(&cfg);
+    {
+        let l = governor.limits();
+        tracing::info!(
+            "outbound egress governor: {}/min per tenant, {}/min per connection, {}/min per host; breaker {} consecutive transport failures ⇒ open {}s (0 = disabled; per-replica)",
+            l.tenant_per_min, l.connection_per_min, l.host_per_min, l.breaker_threshold, l.breaker_open_secs
+        );
+    }
+
     let state: state::AppState = Arc::new(AppStateInner {
         tenant_id: seed.tenant_id,
         redactor: fluidbox_core::event::Redactor::default(),
         provider,
         approvals: ApprovalRegistry::default(),
         events_tx,
+        approvals_tx,
+        // Plain client for operator-configured seams (GitHub, LLM) only.
         http: reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15 * 60))
+            .timeout(std::time::Duration::from_secs(
+                config::UPSTREAM_HTTP_TIMEOUT_SECS,
+            ))
             .build()?,
-        // Dedicated per-hop-SSRF client for OIDC identity fetches. The dev
-        // (loopback-http) allowance is baked in from the public URL at build
-        // time so a local Dex on 127.0.0.1 with a loopback FLUIDBOX_PUBLIC_URL
-        // still works while every non-dev deployment rejects private targets.
-        identity_http: login::build_identity_http(&cfg.public_url),
+        identity_http,
+        egress_http,
+        egress_policy,
+        governor,
         sealer,
         connector_tokens: Default::default(),
         oauth_locks: Default::default(),
+        mcp_sessions: Default::default(),
+        // Gap 12: compiled frozen-schema validators, cap 256 (Default).
+        schema_cache: Default::default(),
         tenant_llm_keys: Default::default(),
         // Docker needs no netpol gate; Kubernetes starts unverified and the
         // worker below flips it once the CNI is proven to enforce policy.

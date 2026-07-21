@@ -87,15 +87,54 @@ pub(crate) fn valid_repo_name(repo: &str) -> bool {
     }
 }
 
+/// Whether the caller may name a HOST FILESYSTEM PATH as a workspace
+/// (`WorkspaceInput::LocalCopy`). `LocalCopy` copies an arbitrary control-plane
+/// path into the run's `/workspace`, so it is host-filesystem read access with
+/// no root, no canonicalization and no tenant meaning — `/var/run/secrets/…`,
+/// another tenant's materialized workspace, the data dir, anything the server
+/// process can read.
+///
+/// It is therefore OPERATOR-ONLY. That matches the local/single-admin model it
+/// was built for (`FLUIDBOX_REQUIRE_SSO` off ⇒ the admin token IS the operator,
+/// so the CLI/e2e are unaffected), and closes it under multi-user, where
+/// `POST /v1/sessions` accepts ANY authenticated principal — a plain member or a
+/// PAT could otherwise exfiltrate host files into an agent. Stale comments
+/// elsewhere in this file called the workspace API "admin-token-gated"; it has
+/// not been since Phase B, and this enum is now the enforcement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalPathAuthority {
+    /// The principal is an Operator (admin token).
+    Operator,
+    /// Anyone else — a `LocalCopy` input is refused.
+    Denied,
+}
+
+impl LocalPathAuthority {
+    pub(crate) fn of(principal: &Principal) -> Self {
+        match principal {
+            Principal::Operator { .. } => LocalPathAuthority::Operator,
+            Principal::User(_) => LocalPathAuthority::Denied,
+        }
+    }
+}
+
 pub(crate) async fn resolve_workspace_input(
     state: &AppState,
     scope: TenantScope,
     viewer: ConnectionViewer,
+    local: LocalPathAuthority,
     input: WorkspaceInput,
 ) -> ApiResult<WorkspaceSpec> {
     Ok(match input {
         WorkspaceInput::Scratch => WorkspaceSpec::Scratch,
         WorkspaceInput::LocalCopy { path } => {
+            if local != LocalPathAuthority::Operator {
+                return Err(ApiError::Forbidden(
+                    "a local_copy workspace names a control-plane host path and is \
+                     restricted to the operator (admin token)"
+                        .into(),
+                ));
+            }
             if path.trim().is_empty() {
                 return Err(ApiError::BadRequest("workspace path is empty".into()));
             }
@@ -173,8 +212,11 @@ pub(crate) async fn resolve_workspace_input(
                     }
                 }
                 None => match clone_url {
-                    // Unauthenticated clone (public repo, or file:// in dev —
-                    // this API is admin-token-gated, same trust as LocalCopy).
+                    // Unauthenticated clone (public repo, or file:// in dev).
+                    // NOTE: this API is NOT admin-token-gated — any authenticated
+                    // principal reaches it (see `LocalPathAuthority`); an
+                    // unauthenticated clone URL is still admitted because it
+                    // carries no credential and goes through the egress policy.
                     Some(url) => url,
                     None => match &repository {
                         Some(repo) => format!("https://github.com/{repo}.git"),
@@ -207,12 +249,14 @@ pub(crate) async fn resolve_workspace_input(
 async fn default_workspace_value(
     state: &AppState,
     scope: TenantScope,
+    local: LocalPathAuthority,
     input: Option<WorkspaceInput>,
 ) -> ApiResult<Option<Value>> {
     match input {
         None => Ok(None),
         Some(input) => {
-            match resolve_workspace_input(state, scope, ConnectionViewer::All, input).await? {
+            match resolve_workspace_input(state, scope, ConnectionViewer::All, local, input).await?
+            {
                 WorkspaceSpec::Scratch => Ok(None),
                 spec => Ok(Some(serde_json::to_value(&spec)?)),
             }
@@ -448,7 +492,13 @@ pub async fn create_agent(
         .await?
         .ok_or_else(|| ApiError::BadRequest(format!("unknown policy '{policy_name}'")))?;
     let budgets = req.budgets.unwrap_or_default();
-    let default_workspace = default_workspace_value(&state, scope, req.default_workspace).await?;
+    let default_workspace = default_workspace_value(
+        &state,
+        scope,
+        LocalPathAuthority::of(&principal),
+        req.default_workspace,
+    )
+    .await?;
     let capability_pins = match &req.capability_bundles {
         Some(specs) => resolve_bundle_pins(&state, scope, specs).await?,
         None => json!([]),
@@ -566,7 +616,15 @@ pub async fn add_revision(
         .unwrap_or_else(|| serde_json::to_value(Budgets::default()).unwrap());
     // Omitted → inherit; explicit scratch → cleared (stored as NULL).
     let default_workspace = match req.default_workspace {
-        Some(input) => default_workspace_value(&state, scope, Some(input)).await?,
+        Some(input) => {
+            default_workspace_value(
+                &state,
+                scope,
+                LocalPathAuthority::of(&principal),
+                Some(input),
+            )
+            .await?
+        }
         None => latest.as_ref().and_then(|r| r.default_workspace.clone()),
     };
     // Omitted → inherit the previous pins verbatim; explicit list (incl.
@@ -933,7 +991,16 @@ pub async fn create_session(
         (w, r) => w.or(r),
     };
     let explicit = match explicit_input {
-        Some(input) => Some(resolve_workspace_input(&state, scope, viewer, input).await?),
+        Some(input) => Some(
+            resolve_workspace_input(
+                &state,
+                scope,
+                viewer,
+                LocalPathAuthority::of(&principal),
+                input,
+            )
+            .await?,
+        ),
         None => None,
     };
     let autonomy = if req.autonomous {
@@ -1219,10 +1286,26 @@ pub async fn decide_approval(
     // `decided_by` is DERIVED from the authenticated principal — never
     // request-supplied (parent design line 581).
     let decided_by = principal.decided_by();
-    let row = fluidbox_db::decide_approval(&state.pool, scope, id, status, &decided_by)
+    // Phase E (#33; Gap 13): the DECISION transaction is the ledger emitter. The
+    // canonical `approval.decided` + `tool.decision` pair commits atomically with
+    // this compare-and-set and `pg_notify`s every replica's waiters — so a decided
+    // approval produces exactly ONE pair no matter how many `/permission` handlers
+    // are re-attached to the row, and a waiter on ANOTHER replica wakes
+    // immediately instead of riding its ≤2 s poll floor.
+    let events = crate::internal::approval_decision_events(
+        &state,
+        session.id,
+        id,
+        &approval.tool_call_id,
+        &approval.tool,
+        status,
+        &decided_by,
+    );
+    let row = fluidbox_db::decide_approval_tx(&state.pool, scope, id, status, &decided_by, events)
         .await?
         .ok_or_else(|| ApiError::Conflict("approval is not pending".into()))?;
-    // Wake the blocked permission handler.
+    // Wake this replica's blocked permission handler without waiting for the
+    // NOTIFY round trip (other replicas ride the channel).
     state.approvals.wake(id).await;
     Ok(Json(json!({ "approval": row })))
 }
@@ -1346,6 +1429,41 @@ pub async fn get_cost(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `LocalCopy` is host-filesystem read access with no root and no tenant
+    /// meaning, and `POST /v1/sessions` admits ANY authenticated principal — so
+    /// the authority must be derived from the principal CLASS, not from a
+    /// comment about the admin token.
+    #[test]
+    fn local_copy_authority_is_operator_only() {
+        let scope = TenantScope::assume(Uuid::new_v4());
+        assert_eq!(
+            LocalPathAuthority::of(&Principal::Operator { scope }),
+            LocalPathAuthority::Operator
+        );
+        // Every non-operator principal — member, admin, owner, PAT alike; the
+        // roles live inside UserPrincipal and none of them opens this door.
+        for roles in [
+            vec![],
+            vec!["member".to_string()],
+            vec!["owner".to_string()],
+        ] {
+            let user = Principal::User(crate::auth::UserPrincipal {
+                tenant_id: scope.tenant_id(),
+                user_id: Uuid::new_v4(),
+                membership_id: Uuid::new_v4(),
+                roles,
+                auth: crate::auth::AuthContext::Pat {
+                    token_id: Uuid::new_v4(),
+                },
+            });
+            assert_eq!(
+                LocalPathAuthority::of(&user),
+                LocalPathAuthority::Denied,
+                "a non-operator principal must not reach a host path"
+            );
+        }
+    }
 
     #[test]
     fn same_origin_compares_parsed_origins_not_prefixes() {

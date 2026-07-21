@@ -315,6 +315,74 @@ pub fn parse_www_authenticate(header: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// An SEP-835 `insufficient_scope` challenge, carrying the (optional, already
+/// sanitized) `scope` the server says it needs. Its presence tells the broker to
+/// stop — a re-mint cannot fix a scope the grant never had — and mark the
+/// connection for reconnect-with-more-scopes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopeChallenge {
+    pub scope: Option<String>,
+}
+
+/// Read one `WWW-Authenticate` param value (`key="quoted"` or bare `key=token`).
+fn www_auth_param(header: &str, key: &str) -> Option<String> {
+    // RFC 7235: auth-param NAMES are case-insensitive (`error=` and `Error=` are
+    // the same param). Search a lowercased copy for the key, but read the VALUE
+    // from the ORIGINAL header — scope/token values are case-sensitive and land
+    // verbatim in a persisted note. ASCII-lowercasing preserves byte length, so
+    // offsets into `hay` index `header` identically.
+    let hay = header.to_ascii_lowercase();
+    let needle = key.to_ascii_lowercase();
+    // Match `key=` not preceded by another word char (so `error=` doesn't hit a
+    // hypothetical `xerror=`), tolerating whitespace.
+    let mut search = 0;
+    while let Some(rel) = hay[search..].find(needle.as_str()) {
+        let at = search + rel;
+        let before_ok = at == 0 || !hay.as_bytes()[at - 1].is_ascii_alphanumeric();
+        let after = header[at + needle.len()..].trim_start();
+        if before_ok {
+            if let Some(rest) = after.strip_prefix('=') {
+                let rest = rest.trim_start();
+                if let Some(q) = rest.strip_prefix('"') {
+                    let end = q.find('"')?;
+                    return Some(q[..end].to_string());
+                }
+                // bare token: up to the next comma / whitespace.
+                let end = rest.find([',', ' ', '\t']).unwrap_or(rest.len());
+                return Some(rest[..end].to_string());
+            }
+        }
+        search = at + needle.len();
+    }
+    None
+}
+
+/// SEP-835 detection: `Some` iff the `WWW-Authenticate` challenge carries
+/// `error="insufficient_scope"`. The optional `scope` is sanitized to the OAuth
+/// scope charset and length-bounded — a hostile upstream must not smuggle a
+/// control/secret-shaped string into the connection's durable error note.
+pub fn parse_insufficient_scope(header: &str) -> Option<ScopeChallenge> {
+    if www_auth_param(header, "error").as_deref() != Some("insufficient_scope") {
+        return None;
+    }
+    let scope = www_auth_param(header, "scope").map(|s| sanitize_scope(&s));
+    Some(ScopeChallenge { scope })
+}
+
+/// Keep only RFC 6749 scope-token characters (`%x21 / %x23-5B / %x5D-7E`,
+/// approximated by the printable ASCII a scope uses) and space separators, and
+/// bound the length — the value lands verbatim in a persisted note.
+fn sanitize_scope(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            *c == ' ' || (c.is_ascii_graphic() && !matches!(c, '"' | '\\' | ',' | '<' | '>'))
+        })
+        .take(200)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 #[derive(Debug, Clone)]
 pub struct AsMeta {
     pub issuer: String,
@@ -389,6 +457,23 @@ fn origin_and_path(url: &str) -> Result<(String, String), String> {
     ))
 }
 
+/// Pre-dial egress admission for a connector-OAuth identity fetch (Phase E, C1).
+///
+/// `state.identity_http` filters DNS *names* at resolve time and re-validates
+/// redirect hops, but reqwest dials an IP *literal* in the INITIAL request URL
+/// directly — the resolver is never consulted for a literal — so an
+/// `https://169.254.169.254/…` target would otherwise slip straight past the
+/// per-hop guard. `egress::admit_url` closes that on the first hop (scheme
+/// policy + host-literal block), and MUST be called immediately before every
+/// `identity_http` request whose URL is attacker-influenced (the mcp_url probe,
+/// PRM/AS-metadata discovery, DCR, code exchange, and the stored-bag refresh).
+///
+/// The denial reason is a static class from `admit_url` (never a resolved IP);
+/// we surface it as `egress blocked: <class>` so no internal address leaks.
+fn admit_oauth(url: &str, policy: &crate::egress::EgressPolicy) -> Result<(), String> {
+    crate::egress::admit_url(url, policy).map_err(|e| format!("egress blocked: {e}"))
+}
+
 // ─── Discovery (network) ──────────────────────────────────────────────────
 
 /// 401-probe the MCP endpoint, walk RFC 9728 → RFC 8414/OIDC, and return
@@ -396,8 +481,17 @@ fn origin_and_path(url: &str) -> Result<(String, String), String> {
 /// this runs interactively from the dashboard Connect flow.
 pub async fn discover(state: &AppState, mcp_url: &str) -> Result<AsMeta, String> {
     let mut prm_urls: Vec<String> = Vec::new();
+    // Phase E: connector-OAuth traffic rides the per-hop-SSRF `identity_http`
+    // (the same client OIDC uses). A PRM/AS-metadata document can point discovery
+    // anywhere, so every hop's scheme + resolved address is now validated — AND
+    // the initial-hop literal is admitted here (C1) since reqwest dials a literal
+    // IP without consulting the resolver. The mcp_url is the user's declared
+    // target: a private/plain-http one is a hard discovery failure, not a probe
+    // we silently skip (the same-origin PRM URLs derived below would all block
+    // anyway).
+    admit_oauth(mcp_url, &state.egress_policy)?;
     if let Ok(res) = state
-        .http
+        .identity_http
         .get(mcp_url)
         .timeout(HTTP_TIMEOUT)
         .header("accept", "application/json, text/event-stream")
@@ -424,13 +518,27 @@ pub async fn discover(state: &AppState, mcp_url: &str) -> Result<AsMeta, String>
 
     let mut as_base = None;
     for pu in &prm_urls {
-        let Ok(res) = state.http.get(pu).timeout(HTTP_TIMEOUT).send().await else {
+        // A PRM candidate can be attacker-supplied (the WWW-Authenticate one) —
+        // a blocked target is skipped like any non-answer; if ALL are blocked the
+        // loop falls through to the discovery-failure error below (C1).
+        if admit_oauth(pu, &state.egress_policy).is_err() {
+            continue;
+        }
+        let Ok(mut res) = state
+            .identity_http
+            .get(pu)
+            .timeout(HTTP_TIMEOUT)
+            .send()
+            .await
+        else {
             continue;
         };
         if !res.status().is_success() {
             continue;
         }
-        let Ok(v) = res.json::<Value>().await else {
+        // I3: bounded like every OIDC read — an attacker-influenced AS must not
+        // be able to stream hundreds of MB into memory per discovery leg.
+        let Ok(v) = crate::egress::read_json_bounded(&mut res).await else {
             continue;
         };
         if let Ok(a) = parse_resource_metadata(&v) {
@@ -453,22 +561,65 @@ pub async fn discover(state: &AppState, mcp_url: &str) -> Result<AsMeta, String>
     meta_urls.push(format!("{a_origin}/.well-known/oauth-authorization-server"));
     meta_urls.push(format!("{a_origin}/.well-known/openid-configuration"));
     for mu in &meta_urls {
-        let Ok(res) = state.http.get(mu).timeout(HTTP_TIMEOUT).send().await else {
+        // `as_base` came from the (attacker-influenced) PRM document, so admit
+        // each metadata candidate before dialing; a blocked one is skipped and
+        // the loop falls through to the discovery-failure error below (C1).
+        if admit_oauth(mu, &state.egress_policy).is_err() {
+            continue;
+        }
+        let Ok(mut res) = state
+            .identity_http
+            .get(mu)
+            .timeout(HTTP_TIMEOUT)
+            .send()
+            .await
+        else {
             continue;
         };
         if !res.status().is_success() {
             continue;
         }
-        let Ok(v) = res.json::<Value>().await else {
+        // I3: bounded read (256 KiB), same as the OIDC discovery documents.
+        let Ok(v) = crate::egress::read_json_bounded(&mut res).await else {
             continue;
         };
         // Found the document: S256-refusal must NOT fall through to the
         // next URL — this is a policy refusal, not a lookup miss.
-        return parse_as_metadata(&v);
+        let meta = parse_as_metadata(&v)?;
+        // RFC 8414 §3.3: the metadata's `issuer` MUST identify the server the
+        // metadata was retrieved from. Unvalidated, ANY member's malicious MCP
+        // server could claim a real provider's issuer, and since DCR rows are
+        // keyed GLOBALLY by `(issuer, redirect_uri)` it would occupy that
+        // provider's registration for the whole deployment — later, legitimate
+        // tenants would then adopt the attacker-registered client_id.
+        issuer_matches_discovery(&meta.issuer, &a_origin)?;
+        return Ok(meta);
     }
     Err(format!(
         "authorization server '{as_base}' publishes no discoverable metadata (RFC 8414/OIDC)"
     ))
+}
+
+/// RFC 8414 §3.3 issuer validation: the `issuer` an AS publishes must identify
+/// the server the metadata came FROM. Compared at ORIGIN granularity (scheme +
+/// host + port) — an issuer legitimately carries a path component for
+/// multi-tenant providers, but it can never name a DIFFERENT host than the one
+/// that served the document. A missing/blank issuer is refused: it is what makes
+/// the global registration key meaningless.
+fn issuer_matches_discovery(issuer: &str, discovered_origin: &str) -> Result<(), String> {
+    if issuer.trim().is_empty() {
+        return Err("authorization server metadata declares no issuer (RFC 8414 §3.3)".into());
+    }
+    let (i_origin, _) = origin_and_path(issuer)
+        .map_err(|_| "authorization server metadata declares a malformed issuer".to_string())?;
+    if !i_origin.eq_ignore_ascii_case(discovered_origin) {
+        return Err(
+            "authorization server metadata declares an issuer on a different origin than the \
+             server that published it — refusing (RFC 8414 §3.3)"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// The resolved OAuth client identity for a dance. `registration_id` points at
@@ -699,6 +850,9 @@ async fn dcr_register(
     state: &AppState,
     registration_endpoint: &str,
 ) -> Result<(String, Option<String>), String> {
+    // The registration_endpoint is read from (attacker-influenced) AS metadata —
+    // admit it before POSTing (C1); a denial surfaces as a registration failure.
+    admit_oauth(registration_endpoint, &state.egress_policy)?;
     let body = json!({
         "client_name": "fluidbox",
         "redirect_uris": [redirect_uri(state)],
@@ -706,8 +860,8 @@ async fn dcr_register(
         "response_types": ["code"],
         "token_endpoint_auth_method": "none",
     });
-    let res = state
-        .http
+    let mut res = state
+        .identity_http
         .post(registration_endpoint)
         .timeout(HTTP_TIMEOUT)
         .json(&body)
@@ -715,7 +869,11 @@ async fn dcr_register(
         .await
         .map_err(|e| format!("dynamic client registration failed: {e}"))?;
     let status = res.status();
-    let v: Value = res.json().await.unwrap_or(Value::Null);
+    // I3: bounded read — an over-cap or non-JSON body reads as `Null`, exactly
+    // as a malformed one already did.
+    let v: Value = crate::egress::read_json_bounded(&mut res)
+        .await
+        .unwrap_or(Value::Null);
     if !status.is_success() {
         return Err(format!(
             "dynamic client registration returned HTTP {status}"
@@ -1480,6 +1638,11 @@ async fn do_code_exchange(
     redirect: &str,
     resource: Option<&str>,
 ) -> ExchangeOutcome {
+    // Admit the token endpoint before dialing (C1). It was frozen from AS
+    // metadata at flow start; a denial maps to the exchange-failure shape.
+    if let Err(e) = admit_oauth(token_endpoint, &state.egress_policy) {
+        return ExchangeOutcome::Other(e);
+    }
     let mut form: Vec<(&str, &str)> = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -1490,8 +1653,17 @@ async fn do_code_exchange(
     if let Some(r) = resource {
         form.push(("resource", r));
     }
+    // NO-REDIRECT client (`egress_http`, `redirect::Policy::none()`) — NOT the
+    // redirect-following `identity_http`. On a 307/308 reqwest REPLAYS the body,
+    // so a token-leg redirect would forward the authorization code + PKCE
+    // verifier to whatever other host the AS names; stripping a cross-origin
+    // `Authorization` header does nothing for a BODY. Refused outright rather
+    // than same-origin-restricted: this flow FROZE `token_endpoint` at start
+    // (RFC 8414 metadata names it exactly), so a redirect here means the
+    // endpoint moved under us mid-flow — never something to follow. A 3xx is
+    // then simply a non-success status and falls through to the error branch.
     let mut req = state
-        .http
+        .egress_http
         .post(token_endpoint)
         .timeout(HTTP_TIMEOUT)
         .header("content-type", "application/x-www-form-urlencoded")
@@ -1499,12 +1671,15 @@ async fn do_code_exchange(
     if let Some(s) = secret {
         req = req.basic_auth(client_id, Some(s));
     }
-    let res = match req.send().await {
+    let mut res = match req.send().await {
         Ok(r) => r,
         Err(e) => return ExchangeOutcome::Other(format!("token exchange failed: {e}")),
     };
     let status = res.status();
-    let v: Value = res.json().await.unwrap_or(Value::Null);
+    // I3: bounded read (256 KiB) — the token endpoint is attacker-influenced.
+    let v: Value = crate::egress::read_json_bounded(&mut res)
+        .await
+        .unwrap_or(Value::Null);
     if status.is_success() {
         return ExchangeOutcome::Ok(v);
     }
@@ -2362,6 +2537,10 @@ async fn refresh_access_token(
         .get("token_endpoint")
         .and_then(Value::as_str)
         .ok_or("connection has no token endpoint — reconnect it")?;
+    // Admit the token endpoint read from the STORED oauth bag before dialing
+    // (C1). Defense in depth for pre-Phase-E rows sealed before admission
+    // existed — a stored private/plain-http endpoint is refused here too.
+    admit_oauth(token_endpoint, &state.egress_policy)?;
     let resource = oauth.get("resource").and_then(Value::as_str);
     // Resolve the client identity (shared registration preferred, per-connection
     // legacy fallback) THROUGH `db` — the refresh stays on its single lock-holding
@@ -2389,8 +2568,11 @@ async fn refresh_access_token(
     if let Some(r) = resource {
         form.push(("resource", r));
     }
+    // NO-REDIRECT client, same reason as the code-exchange leg: a 307/308 replays
+    // the body, which here carries the REFRESH TOKEN itself — the longest-lived
+    // credential in the connection. `egress_http` refuses the 3xx instead.
     let mut req = state
-        .http
+        .egress_http
         .post(token_endpoint)
         .timeout(HTTP_TIMEOUT)
         .header("content-type", "application/x-www-form-urlencoded")
@@ -2398,12 +2580,15 @@ async fn refresh_access_token(
     if let Some(secret) = &client.secret {
         req = req.basic_auth(&client.client_id, Some(secret));
     }
-    let res = req
+    let mut res = req
         .send()
         .await
         .map_err(|e| format!("token refresh failed: {e}"))?;
     let status = res.status();
-    let v: Value = res.json().await.unwrap_or(Value::Null);
+    // I3: bounded read (256 KiB) — same ceiling the OIDC legs use.
+    let v: Value = crate::egress::read_json_bounded(&mut res)
+        .await
+        .unwrap_or(Value::Null);
     if !status.is_success() {
         let err = v["error"].as_str().unwrap_or("");
         if err == "invalid_grant" || err == "invalid_client" {
@@ -2508,6 +2693,159 @@ mod tests {
 
     fn test_sealer() -> Sealer {
         Sealer::from_key_string(&"ab".repeat(32)).unwrap()
+    }
+
+    /// Issuer poisoning: DCR rows are keyed GLOBALLY by `(issuer,
+    /// redirect_uri)`, so an unvalidated `issuer` lets any member's malicious
+    /// server claim a real provider's identity and occupy that provider's
+    /// registration deployment-wide. RFC 8414 §3.3 already forbids it.
+    #[test]
+    fn issuer_must_match_the_origin_that_published_the_metadata() {
+        // Exact origin, and an issuer with a tenant PATH on that origin.
+        issuer_matches_discovery("https://as.example.test", "https://as.example.test").unwrap();
+        issuer_matches_discovery(
+            "https://as.example.test/tenant-1",
+            "https://as.example.test",
+        )
+        .unwrap();
+        // Scheme is part of the origin.
+        issuer_matches_discovery("HTTPS://AS.example.test", "https://as.example.test").unwrap();
+        // The attack: a member's server claiming a real provider's issuer.
+        let e =
+            issuer_matches_discovery("https://accounts.google.com", "https://evil.example.test")
+                .unwrap_err();
+        assert!(e.contains("different origin"), "got: {e}");
+        // A port change is a different origin too.
+        assert!(issuer_matches_discovery(
+            "https://as.example.test:8443",
+            "https://as.example.test"
+        )
+        .is_err());
+        // Absent/blank/malformed issuers are refused, not defaulted.
+        assert!(issuer_matches_discovery("", "https://as.example.test").is_err());
+        assert!(issuer_matches_discovery("   ", "https://as.example.test").is_err());
+        assert!(issuer_matches_discovery("not-a-url", "https://as.example.test").is_err());
+        // …and the discovery path must actually CALL it: the check is worthless
+        // if `parse_as_metadata`'s result is returned unvalidated. Needle built
+        // at runtime so this scan does not count its own source text.
+        let src = include_str!("oauth.rs");
+        let call = format!(
+            "        {}(&meta.issuer, &a_origin)?;",
+            "issuer_matches_discovery"
+        );
+        assert_eq!(
+            src.matches(&call).count(),
+            1,
+            "AS-metadata discovery must validate the issuer against the origin it came from"
+        );
+    }
+
+    /// Both token legs must ride the NO-REDIRECT client. `identity_http` follows
+    /// any admitted https hop, and a 307/308 REPLAYS the request body — so the
+    /// code + PKCE verifier (exchange) or the refresh token (refresh) would be
+    /// forwarded to a different host of the AS's choosing. Header-level
+    /// protections do not cover a body, so the client itself must refuse.
+    ///
+    /// Asserted against the source because these two builders are the whole
+    /// property and neither is reachable without a live `AppState`.
+    #[test]
+    fn token_legs_use_the_no_redirect_client() {
+        let src = include_str!("oauth.rs");
+        // Assembled at runtime so the scan does not count its own source text.
+        let needle = format!(".post({})", "token_endpoint");
+        let legs: Vec<usize> = src.match_indices(&needle).map(|(i, _)| i).collect();
+        assert_eq!(
+            legs.len(),
+            2,
+            "expected exactly the code-exchange and refresh legs; found {}",
+            legs.len()
+        );
+        for at in legs {
+            let window = &src[at.saturating_sub(200)..at];
+            assert!(
+                window.contains("egress_http"),
+                "a token leg does not use the no-redirect egress_http client"
+            );
+            assert!(
+                !window.contains("identity_http"),
+                "a token leg still uses the redirect-following identity_http client"
+            );
+        }
+    }
+
+    fn egress_policy(dev: bool) -> crate::egress::EgressPolicy {
+        crate::egress::EgressPolicy {
+            dev_loopback: dev,
+            allow_cidrs: vec![],
+            github_clone_base: None,
+            proxy: None,
+        }
+    }
+
+    // C1: every connector-OAuth surface (discover probe / PRM / AS-metadata /
+    // DCR / code exchange / stored-bag refresh) funnels its pre-dial admission
+    // through `admit_oauth`, so proving it here proves the whole class. reqwest
+    // dials an IP LITERAL without the resolver, so admit_url is the ONLY thing
+    // standing between a `https://<private-ip>` target and an open socket.
+    #[test]
+    fn admit_oauth_refuses_private_literals_and_plain_http_outside_dev() {
+        let prod = egress_policy(false);
+        // Private + metadata IP literals over https are refused in prod, with a
+        // static-classed reason (no IP echoed) under the `egress blocked:` prefix.
+        let blocked = admit_oauth("https://169.254.169.254/token", &prod).unwrap_err();
+        assert!(blocked.starts_with("egress blocked:"), "{blocked}");
+        assert!(
+            !blocked.contains("169.254"),
+            "reason leaked the target: {blocked}"
+        );
+        assert!(admit_oauth("https://10.0.0.1/register", &prod).is_err());
+        assert!(admit_oauth("https://[::1]/token", &prod).is_err());
+        // Plain http is refused in prod (E3); a public https AS is fine.
+        assert!(admit_oauth("http://as.example.com/token", &prod).is_err());
+        assert!(admit_oauth("https://as.example.com/token", &prod).is_ok());
+        // Hostname-FREE form of the same two assertions. `admit_oauth` is a
+        // synchronous parse + range check that resolves nothing (see the
+        // hermeticity note in `egress::tests`), so neither form touches DNS.
+        assert!(admit_oauth("http://93.184.216.34/token", &prod).is_err());
+        assert!(admit_oauth("https://93.184.216.34/token", &prod).is_ok());
+    }
+
+    // I3: every connector-OAuth response body — PRM, AS metadata, DCR, code
+    // exchange, stored-bag refresh — must be read under the SAME 256 KiB ceiling
+    // the OIDC legs use. An unbounded `Response::json` read buffers whatever the
+    // (attacker-influenced) authorization server streams, and with a 15 s timeout
+    // that is hundreds of MB per leg, several legs per discovery.
+    //
+    // The ceiling itself is tested in `egress::tests`; what needs pinning HERE is
+    // that no leg in this file bypasses it — a statement-level property, so it is
+    // asserted against the statements. Needles are composed at runtime so these
+    // literals cannot match themselves.
+    #[test]
+    fn every_oauth_body_read_is_bounded() {
+        let src = include_str!("oauth.rs");
+        let unbounded = format!("res.{}(", "json");
+        assert_eq!(
+            src.matches(&unbounded).count(),
+            0,
+            "an unbounded body read crept back into a connector-OAuth leg"
+        );
+        let bounded = format!("egress::read_json_{}(&mut res)", "bounded");
+        assert_eq!(
+            src.matches(&bounded).count(),
+            5,
+            "expected exactly the five bounded legs (PRM, AS metadata, DCR, exchange, refresh)"
+        );
+    }
+
+    #[test]
+    fn admit_oauth_allows_loopback_only_under_dev_seam() {
+        let dev = egress_policy(true);
+        // The e2e fake AS on loopback http is admitted under the dev seam…
+        assert!(admit_oauth("http://127.0.0.1:8899/token", &dev).is_ok());
+        // …but metadata/link-local stays blocked even in dev (loopback ≠ link-local)…
+        assert!(admit_oauth("http://169.254.169.254/latest", &dev).is_err());
+        // …and a non-loopback private http host is still refused in dev.
+        assert!(admit_oauth("http://10.0.0.1/token", &dev).is_err());
     }
 
     // A malicious authorization server can echo the sealed state / a bearer into
@@ -3270,6 +3608,40 @@ mod tests {
             Some("https://x/prm")
         );
         assert!(parse_www_authenticate("Bearer realm=\"x\"").is_none());
+    }
+
+    #[test]
+    fn insufficient_scope_challenge_parses_and_sanitizes() {
+        // The SEP-835 challenge: error + the scope the server wants.
+        let c = parse_insufficient_scope(
+            r#"Bearer error="insufficient_scope", scope="read:issues write:issues""#,
+        )
+        .expect("insufficient_scope detected");
+        assert_eq!(c.scope.as_deref(), Some("read:issues write:issues"));
+        // A bare (unquoted) token value parses too.
+        let c = parse_insufficient_scope("Bearer error=insufficient_scope, scope=admin")
+            .expect("bare token");
+        assert_eq!(c.scope.as_deref(), Some("admin"));
+        // No scope param → challenge still detected, scope None.
+        let c = parse_insufficient_scope(r#"Bearer error="insufficient_scope""#).unwrap();
+        assert!(c.scope.is_none());
+        // RFC 7235: the auth-param NAME is case-insensitive — a mixed-case
+        // `Error=` is still an insufficient_scope challenge, and a mixed-case
+        // `Scope=` value is read verbatim (values stay case-sensitive).
+        let c =
+            parse_insufficient_scope(r#"Bearer Error="insufficient_scope", Scope="Read:Issues""#)
+                .expect("mixed-case Error= must still parse");
+        assert_eq!(c.scope.as_deref(), Some("Read:Issues"));
+        // A DIFFERENT error is NOT an insufficient_scope challenge.
+        assert!(parse_insufficient_scope(r#"Bearer error="invalid_token""#).is_none());
+        assert!(parse_insufficient_scope("Bearer realm=\"x\"").is_none());
+        // Sanitize: a poison/secret-shaped scope is stripped of control/quote
+        // characters before it can reach the persisted note.
+        let c = parse_insufficient_scope(
+            "Bearer error=\"insufficient_scope\", scope=\"ok\u{202e}evil\"",
+        )
+        .unwrap();
+        assert_eq!(c.scope.as_deref(), Some("okevil"));
     }
 
     #[test]
