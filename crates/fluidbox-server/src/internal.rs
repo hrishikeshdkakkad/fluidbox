@@ -687,10 +687,11 @@ pub async fn tool_call(
     // Resolution failure is an execution failure, not a policy denial —
     // visibly ledgered either way.
     let started = std::time::Instant::now();
-    let outcome = crate::broker::call_tool_auth(&state, scope, srv, tool_name, &req.input).await;
+    let outcome =
+        crate::broker::call_tool_auth(&state, scope, srv, tool_name, &req.input, session.id).await;
     let latency_ms = started.elapsed().as_millis() as u64;
     match outcome {
-        Ok((content, is_error)) => {
+        Ok((content, is_error, structured)) => {
             record_brokered_exec(
                 &state,
                 scope,
@@ -701,14 +702,11 @@ pub async fn tool_call(
                 None,
                 !is_error,
                 latency_ms,
-                Some(digest_json(&content)),
+                Some(brokered_result_digest(&content, structured.as_ref())),
                 None,
             )
             .await;
-            Ok(Json(json!({
-                "ok": true,
-                "result": { "content": content, "is_error": is_error },
-            })))
+            Ok(Json(brokered_ok_json(content, is_error, structured)))
         }
         Err(e) => {
             let msg: String = e.chars().take(300).collect();
@@ -810,7 +808,7 @@ async fn broker_call_via_binding(
     .await;
     let latency_ms = started.elapsed().as_millis() as u64;
     match outcome {
-        Ok((content, is_error)) => {
+        Ok((content, is_error, structured)) => {
             record_brokered_exec(
                 state,
                 scope,
@@ -821,14 +819,11 @@ async fn broker_call_via_binding(
                 Some(surface.binding_id),
                 !is_error,
                 latency_ms,
-                Some(digest_json(&content)),
+                Some(brokered_result_digest(&content, structured.as_ref())),
                 None,
             )
             .await;
-            Ok(Json(json!({
-                "ok": true,
-                "result": { "content": content, "is_error": is_error },
-            })))
+            Ok(Json(brokered_ok_json(content, is_error, structured)))
         }
         Err(e) => {
             let msg: String = e.chars().take(300).collect();
@@ -848,6 +843,28 @@ async fn broker_call_via_binding(
             .await;
             Ok(Json(json!({ "ok": false, "error": msg })))
         }
+    }
+}
+
+/// The runner-facing result shape for a successful brokered call. `structured_content`
+/// (E7) is additive — included ONLY when the MCP result carried `structuredContent`,
+/// so the existing `{content, is_error}` shape is unchanged for tools that declare none.
+fn brokered_ok_json(content: Value, is_error: bool, structured: Option<Value>) -> Value {
+    let mut result = json!({ "content": content, "is_error": is_error });
+    if let Some(s) = structured {
+        result["structured_content"] = s;
+    }
+    json!({ "ok": true, "result": result })
+}
+
+/// The ledger result digest for a brokered call (E7). Back-compatible: with no
+/// `structuredContent` it is `digest_json(&content)` exactly as before; when the
+/// result carried structured output, the digest covers both (still digest-only —
+/// no payload reaches the ledger).
+fn brokered_result_digest(content: &Value, structured: Option<&Value>) -> String {
+    match structured {
+        Some(s) => digest_json(&json!({ "content": content, "structuredContent": s })),
+        None => digest_json(content),
     }
 }
 

@@ -21,6 +21,7 @@ mod kms;
 mod ledger;
 mod llm_keys;
 mod login;
+mod mcp_sse;
 mod oauth;
 mod orchestrator;
 mod rbac;
@@ -239,6 +240,7 @@ async fn main() -> anyhow::Result<()> {
         sealer,
         connector_tokens: Default::default(),
         oauth_locks: Default::default(),
+        mcp_sessions: Default::default(),
         tenant_llm_keys: Default::default(),
         // Docker needs no netpol gate; Kubernetes starts unverified and the
         // worker below flips it once the CNI is proven to enforce policy.

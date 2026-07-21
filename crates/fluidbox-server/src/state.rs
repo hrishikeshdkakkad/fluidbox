@@ -42,6 +42,70 @@ type CachedToken = (String, DateTime<Utc>);
 /// `(connection_id, authorization_generation)` (design :783-789).
 type ConnectorTokenCache = Mutex<HashMap<(Uuid, i32), CachedToken>>;
 
+/// Which brokered peer an upstream MCP session belongs to, WITHIN one run
+/// (Phase E, E5). The Phase C binding path keys on the run resource binding;
+/// the legacy embedded-connection path on the connection. Distinct variants so
+/// a run using both never collides two peers into one session.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum McpPeer {
+    Binding(Uuid),
+    Conn(Uuid),
+}
+
+/// A live upstream MCP session for one `(run, peer)` (Phase E, E5). Created on
+/// the first post-gate brokered call to that peer, reused across later calls in
+/// the same run, and torn down (best-effort DELETE) at the run's terminal
+/// transition. Replica-local by design — Phase F owns cross-replica affinity, so
+/// a run whose calls land on a different replica simply re-initializes there.
+pub struct McpUpstreamSession {
+    /// The `Mcp-Session-Id` the server issued at initialize (absent = the
+    /// server runs sessionless; we still send `MCP-Protocol-Version`).
+    pub session_id: Option<String>,
+    /// The protocol version the server negotiated at initialize. Empty until a
+    /// successful handshake — the sentinel the session manager uses to decide
+    /// whether an `initialize` is still owed for this entry.
+    pub negotiated: String,
+    /// Monotonic JSON-RPC request-id counter — EVERY request (initialize
+    /// included) draws the next value, so ids are unique within the session.
+    pub next_id: u64,
+    /// The endpoint the session speaks to. Held so terminal cleanup can DELETE
+    /// the session without re-resolving the run's frozen surface.
+    pub url: String,
+}
+
+impl McpUpstreamSession {
+    /// A fresh, un-initialized session for `url` (registry entry or throwaway).
+    pub fn fresh(url: &str) -> Self {
+        McpUpstreamSession {
+            session_id: None,
+            negotiated: String::new(),
+            next_id: 0,
+            url: url.to_string(),
+        }
+    }
+
+    /// The next JSON-RPC request id (post-increment), used for every request.
+    pub fn next(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    /// Reset to un-initialized (404-with-session reinit): drop the dead session
+    /// id + negotiated version so the next attempt re-`initialize`s. The id
+    /// counter keeps advancing (never reused).
+    pub fn reset(&mut self) {
+        self.session_id = None;
+        self.negotiated.clear();
+    }
+}
+
+/// Per-run upstream MCP session registry (Phase E, E5). Keyed `(run session id,
+/// peer)`; the value is per-entry serialized (one in-flight request per upstream
+/// session — ids stay ordered and demuxing is unnecessary).
+pub(crate) type McpSessionRegistry =
+    Mutex<HashMap<(Uuid, McpPeer), Arc<Mutex<McpUpstreamSession>>>>;
+
 pub struct AppStateInner {
     pub cfg: Config,
     pub pool: PgPool,
@@ -101,6 +165,12 @@ pub struct AppStateInner {
     /// concurrent brokered calls must mint ONE new refresh token, not race
     /// each other into invalid_grant (Notion keeps ≤2 valid).
     pub oauth_locks: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
+    /// Per-run upstream MCP session manager (Phase E, E5): reuses one
+    /// `initialize`d session per `(run, peer)` across a run's brokered calls,
+    /// sends `MCP-Protocol-Version` on every post-init request, re-initializes
+    /// once on a 404-with-session, and DELETEs the session at the run's terminal
+    /// transition. Replica-local (invariant 11); a restart/failover re-inits.
+    pub mcp_sessions: McpSessionRegistry,
     /// Per-tenant LiteLLM virtual keys, cached UNSEALED in memory (Phase D, #32),
     /// keyed by tenant_id. The durable key stays sealed in `tenant_llm_keys`; this
     /// is a read-through of that sealed column (re-seeded on a cold cache /
