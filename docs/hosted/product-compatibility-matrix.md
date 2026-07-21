@@ -1,7 +1,7 @@
 # Hosted product compatibility matrix
 
-**Date:** 2026-07-17
-**Status:** Phase A deliverable of the multi-user MCP control plane epic (#28)
+**Date:** 2026-07-21
+**Status:** Phase A deliverable of the multi-user MCP control plane epic (#28); MCP protocol rows re-verified against shipped code at the end of Phase E
 **Authority:** [`../plans/2026-07-14-multi-user-mcp-control-plane-design.md`](../plans/2026-07-14-multi-user-mcp-control-plane-design.md) (v4) and [`../plans/2026-07-17-idp-agnostic-identity-design.md`](../plans/2026-07-17-idp-agnostic-identity-design.md) (v5). This document **states** the supported hosted product boundary; it decides nothing. If it ever disagrees with the design documents, the design documents win and this file has a bug.
 
 This matrix defines what the hosted, multi-user fluidbox deployment (~300 seats) supports, what it explicitly does not, and what happens at each boundary. "Unsupported" always has a defined, fail-closed behavior — nothing degrades silently.
@@ -14,7 +14,7 @@ This matrix defines what the hosted, multi-user fluidbox deployment (~300 seats)
 | **Deferred** | Deliberately out of v1; requires its own security/UX design before any support (parent design, Non-goals) |
 | **Never** | Permanently outside the product boundary; a design change here is a rewrite of the security model |
 
-Phase labels (B–F) refer to the parent design's implementation sequence; a **shipped** qualifier marks a phase already delivered on `main` (Phase B — identity + tenant enforcement — and Phase C — connection ownership + run resource bindings — are shipped; D–F remain target-state).
+Phase labels (B–F) refer to the parent design's implementation sequence; a **shipped** qualifier marks a phase already delivered (B identity + tenant enforcement, C connection ownership + run resource bindings, D sealing/OAuth/RLS, and E broker + network hardening are shipped; F remains target-state).
 
 ## MCP protocol surface
 
@@ -22,12 +22,12 @@ Phase labels (B–F) refer to the parent design's implementation sequence; a **s
 
 | Capability | Boundary behavior |
 |---|---|
-| **Tools** (`tools/call`) over **Streamable HTTP** | The only supported upstream MCP primitive and transport. Every call passes the single decision gate (budget → frozen set → schema → trust tier → policy → approval → execution claim) before the upstream is contacted. |
-| Registration-time `tools/list` photograph | Discovery uses its own short-lived client session; names, descriptions, schemas, and annotations are validated (ANSI/zero-width screening, size bounds) and frozen into an append-only snapshot. If `nextCursor` remains after the discovery page cap, discovery **fails** rather than freezing a partial list (Gap 8). |
-| Protocol version `2025-11-25` | Offered at initialization; an explicit supported-version set is maintained; unsupported negotiation is rejected. Runtime negotiation must match the snapshot's protocol version unless an explicit compatibility adapter exists. `MCP-Protocol-Version` is sent on subsequent requests. (Gap 8; Phase E — the current broker offers `2025-06-18` and initializes lazily.) |
-| Frozen-schema argument validation | Tool arguments are validated server-side against the frozen input schema (depth/size bounds, no external `$ref` resolution) before trust-tier and policy evaluation. The JSON Schema dialect follows the snapshot's protocol version (`2025-11-25` ⇒ JSON Schema 2020-12, SEP-1613). Rejections surface to the model as tool-execution errors (SEP-1303), never protocol errors. (Gap 12; Phase E.) |
-| Optional `MCP-Session-Id` | Persisted per run binding; treated as routing state, never authentication. The OAuth/static authorization header is sent on every upstream HTTP request. |
-| `outputSchema` / `structuredContent` | Preserved end to end, or the tool is explicitly rejected at registration — never silently dropped (Gap 8; the current snapshot/result path drops both, which Phase E closes). |
+| **Tools** (`tools/call`) over **Streamable HTTP** | The only supported upstream MCP primitive and transport. Every call passes the single decision gate — budget → frozen-set availability → **schema** → trust tier → policy → approval → execution claim — before the upstream is contacted. The order is load-bearing; Phase E inserted only the schema stage. |
+| Registration-time `tools/list` photograph | Discovery uses its own short-lived client session; names, descriptions, schemas, and annotations are validated (ANSI/zero-width screening, size bounds) and frozen into an append-only snapshot that records the negotiated protocol version. If `nextCursor` remains after the discovery page cap, discovery **fails** rather than freezing a partial list (Gap 8). |
+| Protocol version `2025-11-25` | **Shipped (Phase E).** `2025-11-25` is offered at initialization and the supported set is exactly `{2025-11-25, 2025-06-18}`; a negotiation outside it is rejected. `initialize` (followed by `notifications/initialized`) precedes every call — the stateless-first path is gone — and `MCP-Protocol-Version` rides every post-initialize request. **At run time the negotiated version must equal the frozen snapshot's `protocol_version`**, and a mismatch denies the call as protocol drift naming the remedy: `POST /v1/connections/{id}/tools/refresh` to re-photograph. There is no compatibility adapter. A surface frozen before the field carries no version and falls back to supported-set membership. |
+| Frozen-schema argument validation | **Shipped (Phase E).** Arguments are validated server-side against the run's frozen input schema, after frozen-set availability and before trust tier/policy. The schema itself is treated as untrusted input and pre-guarded (≤256 KiB serialized, depth ≤32, every `$ref` local — a violation makes the tool un-callable); arguments are bounded (≤1 MiB, depth ≤64); external `$ref` resolution is denied by a deny-everything retriever. Dialect follows the snapshot's protocol version: `2025-11-25` ⇒ JSON Schema 2020-12 (SEP-1613), any other recorded version ⇒ draft-07, a pre-field surface ⇒ 2020-12. Rejections surface to the model as tool-execution errors (SEP-1303), never protocol errors, and are ledgered as a gate denial with `source=schema`. |
+| Optional `MCP-Session-Id` | Held per run in a replica-local `(run, peer)` registry — never shared across runs or users — and treated as routing state, never authentication. The OAuth/static authorization header is sent on every upstream HTTP request **including the terminal `DELETE`**, whose credential is re-resolved through the live binding recheck rather than cached. A `404` on a session reinitializes once, in the same slot, and never refreshes tools. |
+| `outputSchema` / `structuredContent` | **Preserved end to end (Phase E)**: `outputSchema` is photographed into the snapshot and folded into the tool digest when present (a tool without one digests exactly as before), and `structuredContent` is read from the result, relayed to the runner, and covered by the result digest. **Results are not validated against `outputSchema`** — that is a disclosed residual, not a silent gap; results remain untrusted input either way. |
 
 ### Explicitly unsupported MCP primitives (v1)
 
@@ -44,16 +44,16 @@ Client-side capabilities fluidbox never advertises (Gap 9: "advertise no unsuppo
 
 | Capability | v1 status | Boundary behavior |
 |---|---|---|
-| Sampling (server asks the client to run a model call) | Deferred | Not advertised. A server that sends the request anyway receives a JSON-RPC error response — never silence that could block the server (Gap 8). |
-| Elicitation (server asks the client to prompt the user) | Deferred | Not advertised; JSON-RPC error on receipt. |
-| Roots | Deferred | Not advertised; JSON-RPC error on receipt. |
+| Sampling (server asks the client to run a model call) | Deferred | Not advertised. A server that sends the request anyway receives a JSON-RPC `-32601` posted back on the same session — never silence that could block the server (shipped, Phase E). |
+| Elicitation (server asks the client to prompt the user) | Deferred | Not advertised; `-32601` on receipt (shipped, Phase E). |
+| Roots | Deferred | Not advertised; `-32601` on receipt (shipped, Phase E). |
 
 Notifications:
 
 | Notification | Behavior |
 |---|---|
-| `notifications/tools/list_changed` | A signal for an out-of-band **future** snapshot only. It never mutates an in-flight run's frozen tool set (invariant 14). |
-| Other server-to-client notifications | Ignored. Server-to-client **requests** for unadvertised capabilities get JSON-RPC errors; notifications (no response expected) are dropped. |
+| `notifications/tools/list_changed` | Logged only — a signal for an out-of-band **future** snapshot. It never mutates an in-flight run's frozen tool set (invariant 14), and it never triggers an automatic re-photograph. |
+| Other server-to-client notifications | Ignored (no response expected). Server-to-client **requests** for unadvertised capabilities get `-32601`. |
 
 ### Transports
 
@@ -183,7 +183,7 @@ Fork PRs freeze `TrustTier::ReadOnly` (all MCP tools stripped from the frozen se
 | Normal concurrent runs | 30–60 |
 | Normal active upstream MCP sessions | 90–180 |
 | Full-seat stress case | 300 sandboxes / 900 logical MCP sessions |
-| Deployment shape, v1 | Single replica + `Recreate` (shipped chart v0.2.0); the `ReadWriteOnce` archive PVC is the first multi-replica blocker. Two-to-three-replica topology is an explicit **Phase F** target behind the statelessness inventory. |
+| Deployment shape, v1 | Single replica + `Recreate` (shipped chart v0.2.0). Phase E shipped the coordination primitives — approval single-emission with cross-replica `pg_notify` wakeups, per-session orchestrator lease + epoch fencing, per-row delivery claims — but the remaining multi-replica blockers are unchanged: the `ReadWriteOnce` archive PVC, per-replica (not durable) egress rate limits, and the replica-local MCP session registry. Two-to-three-replica topology stays an explicit **Phase F** target. |
 
 ## Related documents
 
