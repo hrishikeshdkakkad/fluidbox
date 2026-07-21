@@ -1036,10 +1036,13 @@ async fn finish_terminal_cleanup(
         );
         return;
     }
-    // Phase E (E5): terminate any live upstream MCP sessions this run opened
-    // (best-effort DELETE) and evict the replica-local registry entries. Drains
-    // the registry, so a re-drive of this idempotent reconciler finds nothing;
-    // fire-and-forget so a wedged upstream never blocks terminalization.
+    // Phase E (E5) + Phase F (Task 3): terminate any live upstream MCP sessions
+    // this run opened ON ANY REPLICA (best-effort DELETE) and evict the local
+    // registry entries. The registry drain is still one-shot, but the durable
+    // `mcp_upstream_sessions` rows are not: a pass that could not finish leaves
+    // them live and a re-drive of this idempotent reconciler retries them (and the
+    // deployment-wide sweeper retires whatever can never be sent). Fire-and-forget
+    // so a wedged upstream never blocks terminalization.
     tokio::spawn({
         let state = state.clone();
         async move { crate::broker::run_terminal_mcp_cleanup(&state, id).await }

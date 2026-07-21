@@ -103,6 +103,12 @@
 //!   on its `tenant_id: None` branch, which is a DEPLOYMENT-level operator row that
 //!   belongs to no tenant (a rejected login, an admin refusal, a re-seal run); the
 //!   `Some(tenant)` branch is scoped like any other write.
+//! * **`crate::mcp_sessions`** (Phase F, Task 3) —
+//!   `sweep_orphaned_upstream_sessions` ONLY: the deployment-wide GC that retires
+//!   `mcp_upstream_sessions` rows whose run reached a terminal status a grace period
+//!   ago. A category (a) global scan by construction (it must find rows a CRASHED
+//!   replica left behind, across every tenant), returning each row's own `tenant_id`
+//!   to the caller. Every other function in that module is `scoped_tx`.
 //! * **everything in this module**, including the two `pub` tx hand-outs.
 //!
 //! Anything NOT on that list is scoped, and adding to it is a review event. The
