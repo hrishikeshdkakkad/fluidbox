@@ -500,8 +500,12 @@ pub enum DispatchOutcome {
 ///   connection). Carries the (sanitized) scope the server asked for.
 /// - `SessionExpired` — HTTP 404 on a request that carried a session id: the
 ///   session manager re-initializes ONCE and replays (never escapes as-is).
-/// - `Other` — a DEFINITIVE upstream protocol error (HTTP error status, JSON-RPC
-///   error object): the tool call resolved to an error → `failed_upstream`.
+/// - `Other` — a DEFINITIVE upstream protocol error (HTTP 4xx, JSON-RPC error
+///   object): the tool call resolved to an error → `failed_upstream`.
+/// - `UpstreamUnavailable` — a DEFINITIVE 5xx. Classified exactly like `Other`
+///   for the dispatch outcome (`failed_upstream`, never ambiguous), but split out
+///   because it is the one definitive response that ALSO counts as an
+///   upstream-HEALTH failure for the circuit breaker (plan E14).
 /// - `NeverSent` — provable no-send (admit_url refusal, reqwest `is_connect()`).
 /// - `Ambiguous` — sent/maybe-sent, outcome unknown (timeout, redirect after
 ///   connect, mid-stream body-read/decode failure).
@@ -511,6 +515,7 @@ enum CallErr {
     InsufficientScope(Option<String>),
     SessionExpired,
     Other(String),
+    UpstreamUnavailable(String),
     NeverSent(String),
     Ambiguous(String),
 }
@@ -523,8 +528,24 @@ impl CallErr {
                 "insufficient scope — reconnect the connection with more scopes".into()
             }
             CallErr::SessionExpired => "mcp session expired and could not be re-initialized".into(),
-            CallErr::Other(m) | CallErr::NeverSent(m) | CallErr::Ambiguous(m) => m,
+            CallErr::Other(m)
+            | CallErr::UpstreamUnavailable(m)
+            | CallErr::NeverSent(m)
+            | CallErr::Ambiguous(m) => m,
         }
+    }
+}
+
+/// Classify one dialed HTTP status the session machinery could not use: a 5xx is
+/// an upstream-health failure ([`CallErr::UpstreamUnavailable`]), any other error
+/// status is a plain definitive error ([`CallErr::Other`]). Both render as
+/// `failed_upstream`; only the former feeds the circuit breaker.
+fn status_err(method: &str, status: reqwest::StatusCode) -> CallErr {
+    let msg = format!("mcp {method} returned HTTP {status}");
+    if status.is_server_error() {
+        CallErr::UpstreamUnavailable(msg)
+    } else {
+        CallErr::Other(msg)
     }
 }
 
@@ -567,6 +588,82 @@ fn outcome_from_call(r: Result<(Value, bool, Option<Value>), CallErr>) -> Dispat
             is_error: true,
             structured: None,
         },
+    }
+}
+
+// ─── Outbound governor wiring (Phase E, E14) ──────────────────────────────
+
+/// The upstream-host bucket key: the lowercased host, port-insensitive. Port
+/// deliberately excluded — including it would let one connection evade its host
+/// ceiling by cycling ports on the same machine. A URL with no parsable host
+/// keys the empty bucket (its dial is refused a moment later by `admit_url`
+/// anyway); the tenant/connection dimensions still bind either way.
+fn host_key(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+        .unwrap_or_default()
+}
+
+/// The pre-dial governor gate for ONE brokered dispatch. Runs AFTER the execution
+/// claim is won (the caller's `finish_won_claim`) and BEFORE anything touches the
+/// wire — including before the per-peer MCP session mutex is acquired.
+///
+/// **Lock order (Task 2 rider):** governor → per-peer session mutex, never the
+/// reverse. The governor's own lock is a leaf: `check` takes it, does pure
+/// in-memory arithmetic, and releases it before returning — it never awaits, and
+/// it never acquires the session registry map lock or a per-peer entry lock. So
+/// this order cannot deadlock, and it also means a throttled or circuit-broken
+/// call never blocks behind an in-flight call to the same peer just to be told no.
+///
+/// A refusal is a **pre-write proof of non-dispatch**, so it maps to
+/// [`DispatchOutcome::NeverSent`] ⇒ claim `failed_before_send` ⇒ RE-CLAIMABLE,
+/// which is exactly what makes the `retry after Ns` hint safe to act on. The
+/// message carries the scope + the hint and a DIGEST of the upstream host — never
+/// the host verbatim (same discipline as [`msg_digest`] on untrusted upstream
+/// text). Returns the host key on admission, for the matching `report`.
+fn governor_gate(
+    gov: &crate::governor::EgressGovernor,
+    tenant: uuid::Uuid,
+    connection: uuid::Uuid,
+    url: &str,
+) -> Result<String, DispatchOutcome> {
+    let host = host_key(url);
+    match gov.check(tenant, connection, &host) {
+        Ok(()) => Ok(host),
+        Err(t) => {
+            tracing::info!(
+                target: "broker",
+                "outbound dial refused by the egress governor (scope {}, upstream {}, retry {}s)",
+                t.scope, msg_digest(&host), t.retry_after_secs
+            );
+            Err(DispatchOutcome::NeverSent(t.message(&msg_digest(&host))))
+        }
+    }
+}
+
+/// The circuit breaker's ONLY input: was this dial an upstream-HEALTH failure?
+///
+/// | dial result                                   | signal            |
+/// |-----------------------------------------------|-------------------|
+/// | `Ok(_)` — a real MCP result, `isError` or not | `Ok`              |
+/// | JSON-RPC `error` object / HTTP 4xx (`Other`)  | `Ok`              |
+/// | 401 / SEP-835 / 404-session-expired           | `Ok`              |
+/// | HTTP 5xx (`UpstreamUnavailable`)              | `TransportFailure`|
+/// | connect refused / SSRF-resolver / inadmissible URL (`NeverSent`) | `TransportFailure` |
+/// | timeout / mid-stream read / refused redirect (`Ambiguous`)       | `TransportFailure` |
+///
+/// The load-bearing rule (plan E14): a DEFINITIVE upstream tool error means the
+/// upstream is healthy and answering — an `isError` result, a JSON-RPC error, or
+/// a 4xx MUST NOT trip the breaker. Only "we could not get a usable answer out of
+/// this endpoint" does.
+fn breaker_signal(r: &Result<(Value, bool, Option<Value>), CallErr>) -> crate::governor::Outcome {
+    use crate::governor::Outcome;
+    match r {
+        Err(CallErr::UpstreamUnavailable(_))
+        | Err(CallErr::NeverSent(_))
+        | Err(CallErr::Ambiguous(_)) => Outcome::TransportFailure,
+        _ => Outcome::Ok,
     }
 }
 
@@ -981,10 +1078,7 @@ async fn ensure_initialized(
         return Err(e);
     }
     if !resp.status.is_success() {
-        return Err(CallErr::Other(format!(
-            "mcp initialize returned HTTP {}",
-            resp.status
-        )));
+        return Err(status_err("initialize", resp.status));
     }
     let result = unwrap_result(resp.value, "initialize")?;
     let negotiated = result
@@ -1048,10 +1142,7 @@ async fn call_in_session(
         return Err(CallErr::SessionExpired);
     }
     if !resp.status.is_success() {
-        return Err(CallErr::Other(format!(
-            "mcp {method} returned HTTP {}",
-            resp.status
-        )));
+        return Err(status_err(method, resp.status));
     }
     unwrap_result(resp.value, method).map_err(Into::into)
 }
@@ -1449,6 +1540,15 @@ pub async fn call_tool_auth(
         Ok(a) => a,
         Err(e) => return DispatchOutcome::NeverSent(e),
     };
+    // E14: the governor gate, BEFORE the per-peer session mutex (see
+    // `governor_gate` for the lock order) and before any bytes leave. A
+    // credential-free legacy bundle has no connection to key on — it takes the
+    // nil id, and the breaker's (connection, host) key still separates upstreams.
+    let conn_key = brokered_connection_id(server).unwrap_or_else(uuid::Uuid::nil);
+    let host = match governor_gate(&state.governor, scope.tenant_id(), conn_key, url) {
+        Ok(h) => h,
+        Err(refused) => return refused,
+    };
     let entry = match brokered_connection_id(server) {
         Some(cid) => session_entry(state, run_session, McpPeer::Conn(cid), url).await,
         // Credential-free legacy bundle: no connection to key on — throwaway.
@@ -1457,7 +1557,7 @@ pub async fn call_tool_auth(
     let client = &state.egress_http;
     let policy = &state.egress_policy;
     // Legacy path froze no snapshot ⇒ SUPPORTED-set negotiation (None).
-    match call_tool(
+    let first = call_tool(
         client,
         policy,
         url,
@@ -1467,8 +1567,11 @@ pub async fn call_tool_auth(
         arguments,
         None,
     )
-    .await
-    {
+    .await;
+    state
+        .governor
+        .report(conn_key, &host, breaker_signal(&first));
+    match first {
         Err(CallErr::Unauthorized) => {
             // A 401 proves the tool never executed. Static credential ⇒ terminal
             // definitive failure; OAuth ⇒ re-mint once and the RETRY's outcome
@@ -1481,8 +1584,9 @@ pub async fn call_tool_auth(
                 };
             }
             match reauth_after_401(state, scope, server, auth).await {
-                Ok(auth) => outcome_from_call(
-                    call_tool(
+                Ok(auth) => {
+                    // The retry is a SECOND dial — its health is reported too.
+                    let retry = call_tool(
                         client,
                         policy,
                         url,
@@ -1492,8 +1596,12 @@ pub async fn call_tool_auth(
                         arguments,
                         None,
                     )
-                    .await,
-                ),
+                    .await;
+                    state
+                        .governor
+                        .report(conn_key, &host, breaker_signal(&retry));
+                    outcome_from_call(retry)
+                }
                 // Re-mint failure = auth resolution failure ⇒ never sent.
                 Err(e) => DispatchOutcome::NeverSent(e),
             }
@@ -1546,6 +1654,12 @@ pub async fn call_tool_for_conn(
         Ok(a) => a,
         Err(e) => return DispatchOutcome::NeverSent(e),
     };
+    // E14: the governor gate, BEFORE the per-peer session mutex (lock order
+    // documented on `governor_gate`) and before any bytes leave.
+    let host = match governor_gate(&state.governor, scope.tenant_id(), conn.id, url) {
+        Ok(h) => h,
+        Err(refused) => return refused,
+    };
     let entry = session_entry(state, binding.session_id, McpPeer::Binding(binding.id), url).await;
     let client = &state.egress_http;
     let policy = &state.egress_policy;
@@ -1555,7 +1669,7 @@ pub async fn call_tool_for_conn(
     // remedy /tools/refresh); when `None` (a surface frozen before the field
     // existed), negotiation falls back to SUPPORTED-set membership.
     let snapshot: Option<&str> = protocol_version;
-    match call_tool(
+    let first = call_tool(
         client,
         policy,
         url,
@@ -1565,8 +1679,11 @@ pub async fn call_tool_for_conn(
         arguments,
         snapshot,
     )
-    .await
-    {
+    .await;
+    state
+        .governor
+        .report(conn.id, &host, breaker_signal(&first));
+    match first {
         Err(CallErr::Unauthorized) => {
             // A 401 proves the tool never executed. Static credential ⇒ terminal
             // definitive failure; OAuth ⇒ recheck + re-mint once, retry governs.
@@ -1585,8 +1702,9 @@ pub async fn call_tool_for_conn(
                 Err(e) => return DispatchOutcome::NeverSent(e),
             };
             match reauth_after_401_conn(state, scope, &fresh, url, auth).await {
-                Ok(auth) => outcome_from_call(
-                    call_tool(
+                Ok(auth) => {
+                    // The retry is a SECOND dial — its health is reported too.
+                    let retry = call_tool(
                         client,
                         policy,
                         url,
@@ -1596,8 +1714,12 @@ pub async fn call_tool_for_conn(
                         arguments,
                         snapshot,
                     )
-                    .await,
-                ),
+                    .await;
+                    state
+                        .governor
+                        .report(conn.id, &host, breaker_signal(&retry));
+                    outcome_from_call(retry)
+                }
                 Err(e) => DispatchOutcome::NeverSent(e),
             }
         }
@@ -1980,6 +2102,236 @@ mod tests {
             matches!(outcome, DispatchOutcome::Definitive { is_error: true, .. }),
             "HTTP 500 must be Definitive/failed_upstream, got {outcome:?}"
         );
+    }
+
+    // ── Egress governor wiring (Phase E, E14) ───────────────────────────────
+
+    #[test]
+    fn breaker_signal_classification_boundary() {
+        use crate::governor::Outcome;
+        // HEALTHY upstream — every one of these is a definitive answer from a
+        // server that is demonstrably alive, so NONE may trip the breaker.
+        assert_eq!(breaker_signal(&Ok((json!([]), false, None))), Outcome::Ok);
+        assert_eq!(
+            breaker_signal(&Ok((
+                json!([{"type":"text","text":"tool blew up"}]),
+                true,
+                None
+            ))),
+            Outcome::Ok,
+            "an isError tool result must NEVER trip the breaker"
+        );
+        assert_eq!(
+            breaker_signal(&Err(CallErr::Other(
+                "mcp tools/call failed (code -32000, msg sha256:…)".into()
+            ))),
+            Outcome::Ok,
+            "a JSON-RPC error object must NEVER trip the breaker"
+        );
+        assert_eq!(
+            breaker_signal(&Err(status_err(
+                "tools/call",
+                reqwest::StatusCode::BAD_REQUEST
+            ))),
+            Outcome::Ok,
+            "a 4xx is a definitive answer, not an upstream-health failure"
+        );
+        assert_eq!(breaker_signal(&Err(CallErr::Unauthorized)), Outcome::Ok);
+        assert_eq!(
+            breaker_signal(&Err(CallErr::InsufficientScope(None))),
+            Outcome::Ok
+        );
+        assert_eq!(breaker_signal(&Err(CallErr::SessionExpired)), Outcome::Ok);
+        // UNHEALTHY upstream — 5xx, provable no-send, and unknown-outcome dials.
+        for status in [
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert_eq!(
+                breaker_signal(&Err(status_err("tools/call", status))),
+                Outcome::TransportFailure,
+                "{status} must count as an upstream-health failure"
+            );
+        }
+        assert_eq!(
+            breaker_signal(&Err(CallErr::NeverSent("mcp server unreachable".into()))),
+            Outcome::TransportFailure
+        );
+        assert_eq!(
+            breaker_signal(&Err(CallErr::Ambiguous("mcp request timed out".into()))),
+            Outcome::TransportFailure
+        );
+    }
+
+    #[test]
+    fn a_5xx_still_classifies_definitive_failed_upstream() {
+        // Splitting 5xx out for the BREAKER must not change the claim outcome:
+        // a definitive 500 is still `failed_upstream`, never `ambiguous`
+        // (Task 4's acceptance bullet).
+        assert!(matches!(
+            outcome_from_call(Err(status_err(
+                "tools/call",
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            ))),
+            DispatchOutcome::Definitive { is_error: true, .. }
+        ));
+        // … and the message still names the status for an operator.
+        let m = status_err("tools/call", reqwest::StatusCode::BAD_GATEWAY).into_msg();
+        assert!(m.contains("502") && m.contains("tools/call"), "got: {m}");
+    }
+
+    #[test]
+    fn host_key_is_lowercased_and_port_insensitive() {
+        assert_eq!(host_key("https://MCP.Example.Test/mcp"), "mcp.example.test");
+        assert_eq!(
+            host_key("https://mcp.example.test:8443/mcp"),
+            host_key("https://mcp.example.test/mcp"),
+            "a port must not open a fresh host bucket"
+        );
+        // Unparsable → the shared empty bucket (admit_url refuses the dial).
+        assert_eq!(host_key("not a url"), "");
+    }
+
+    #[test]
+    fn a_governor_refusal_is_never_sent_and_leaks_no_host() {
+        // The gate's refusal must be re-claimable (NeverSent), name the scope +
+        // retry hint, and carry only a DIGEST of the upstream host.
+        let gov = crate::governor::EgressGovernor::manual(crate::governor::GovernorLimits {
+            tenant_per_min: 0,
+            connection_per_min: 1,
+            host_per_min: 0,
+            breaker_threshold: 0,
+            breaker_open_secs: 0,
+        });
+        let (t, c) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let url = "https://secret-internal.corp.example/mcp";
+        assert!(
+            governor_gate(&gov, t, c, url).is_ok(),
+            "first dial admitted"
+        );
+        let refused = governor_gate(&gov, t, c, url).expect_err("second is throttled");
+        let DispatchOutcome::NeverSent(msg) = refused else {
+            panic!("a governor refusal MUST be NeverSent (re-claimable): {refused:?}");
+        };
+        assert!(
+            msg.contains("connection") && msg.contains("retry after"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("secret-internal.corp.example"),
+            "the refusal leaked the raw upstream host: {msg}"
+        );
+        assert!(
+            msg.contains("sha256:"),
+            "the refusal dropped the digest: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn breaker_opens_on_repeated_5xx_and_then_stops_dialing_the_upstream() {
+        // The production sequence, verbatim: governor_gate → call_tool →
+        // report(breaker_signal(...)) — the same three calls `call_tool_auth`
+        // and `call_tool_for_conn` make. A fake that 500s EVERYTHING must open
+        // the breaker after `threshold` dials, and the next call must be refused
+        // as NeverSent WITHOUT the fake seeing another request.
+        const THRESHOLD: u32 = 3;
+        let handler: Handler = Arc::new(|_i, _rec: &Recorded| {
+            FakeReply::json(500, json!({ "error": "down" }).to_string())
+        });
+        let (url, records, jh) = spawn_fake(handler).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let gov = crate::governor::EgressGovernor::manual(crate::governor::GovernorLimits {
+            tenant_per_min: 0,
+            connection_per_min: 0,
+            host_per_min: 0,
+            breaker_threshold: THRESHOLD,
+            breaker_open_secs: 60,
+        });
+        let (t, c) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+
+        for i in 0..THRESHOLD {
+            let host = governor_gate(&gov, t, c, &url)
+                .unwrap_or_else(|e| panic!("dial {i} must be admitted, got {e:?}"));
+            let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
+            let r = call_tool(&client, &policy, &url, None, &entry, "x", &json!({}), None).await;
+            assert!(
+                matches!(r, Err(CallErr::UpstreamUnavailable(_))),
+                "dial {i} must classify as an upstream-health failure, got {r:?}"
+            );
+            gov.report(c, &host, breaker_signal(&r));
+        }
+        // Precondition: the fake WAS recording (a dead fake must not false-green
+        // the "stopped dialing" assertion below).
+        let before = records.lock().unwrap().len();
+        assert!(
+            before >= THRESHOLD as usize,
+            "the fake recorded {before} requests — it never saw the dials"
+        );
+
+        // The (N+1)th never reaches the wire.
+        let refused = governor_gate(&gov, t, c, &url).expect_err("the breaker must be open");
+        assert!(
+            matches!(refused, DispatchOutcome::NeverSent(_)),
+            "a breaker refusal is a pre-write proof of non-dispatch: {refused:?}"
+        );
+        assert_eq!(
+            records.lock().unwrap().len(),
+            before,
+            "the breaker refusal still contacted the upstream"
+        );
+        jh.abort();
+    }
+
+    #[tokio::test]
+    async fn an_iserror_result_never_opens_the_breaker() {
+        // A fake that initializes fine and answers EVERY tools/call with a
+        // well-formed `isError: true` result. The upstream is healthy, so no
+        // number of these may open the breaker (plan E14's binding rule).
+        let handler: Handler = Arc::new(|_i, rec: &Recorded| match rec.rpc_method.as_str() {
+            "initialize" => FakeReply::json(200, init_result(rec, "2025-11-25")),
+            "notifications/initialized" => FakeReply::empty(202),
+            "tools/call" => FakeReply::json(
+                200,
+                rpc_result(
+                    rec,
+                    json!({
+                        "content": [{ "type": "text", "text": "the tool refused" }],
+                        "isError": true,
+                    }),
+                ),
+            ),
+            _ => FakeReply::empty(202),
+        });
+        let (url, records, jh) = spawn_fake(handler).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let gov = crate::governor::EgressGovernor::manual(crate::governor::GovernorLimits {
+            tenant_per_min: 0,
+            connection_per_min: 0,
+            host_per_min: 0,
+            breaker_threshold: 2,
+            breaker_open_secs: 60,
+        });
+        let (t, c) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
+        for i in 0..6 {
+            let host = governor_gate(&gov, t, c, &url).unwrap_or_else(|e| {
+                panic!("an isError result must never open the breaker (dial {i}): {e:?}")
+            });
+            let r = call_tool(&client, &policy, &url, None, &entry, "x", &json!({}), None).await;
+            assert!(
+                matches!(&r, Ok((_, true, _))),
+                "dial {i} must be a real isError RESULT, got {r:?}"
+            );
+            gov.report(c, &host, breaker_signal(&r));
+        }
+        assert!(
+            count_rpc(&records, "tools/call") >= 6,
+            "the fake never saw the calls — the assertion above is vacuous"
+        );
+        jh.abort();
     }
 
     #[test]
