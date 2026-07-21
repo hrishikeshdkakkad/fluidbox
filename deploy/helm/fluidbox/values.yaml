@@ -116,6 +116,22 @@ server:
   # by concurrency: budget `maxRequestBodyBytes × concurrent runs` against
   # server.resources.limits.memory above before you move it.
   maxRequestBodyBytes: ""
+  # Workload identity on the sandbox-facing internal gateway (Gap 6, Phase F).
+  # "" (default) = off, exactly today's behaviour. "observe" evaluates and logs
+  # without ever refusing — RUN THIS FIRST and watch for `workload_identity`
+  # mismatch lines before switching. "enforce" refuses a request whose socket
+  # peer contradicts the pod address the control plane recorded at provision.
+  #
+  # A run with no recorded address is ALWAYS admitted (counted and logged, never
+  # refused): the Docker provider reports none, and neither do sessions
+  # provisioned before migration 0025. Those runs are exactly as exposed as they
+  # were — the gain is that you can see how much of the fleet is actually covered
+  # instead of assuming all of it.
+  #
+  # This is a NETWORK-layer binding, not a cryptographic one: it does not
+  # distinguish another process in the same pod, a node-level attacker, or a
+  # fabric that permits source-address spoofing. mTLS is the stronger follow-up.
+  workloadIdentity: ""
   # Archive PVC (survives Recreate upgrades so init can still pull).
   archivePvc:
     size: 10Gi

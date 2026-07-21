@@ -95,9 +95,11 @@ create table egress_rate_windows (
     primary key (tenant_id, scope, subject)
 );
 
--- The sweep deletes rows whose window is long past; a plain btree on window_start
--- keeps it an index scan instead of a seq scan over the live working set.
-create index egress_rate_windows_sweep on egress_rate_windows (window_start);
+-- The sweep deletes rows whose window is long past. Every sweep predicate LEADS
+-- with `tenant_id` (the sweep is tenant-scoped so that it needs no RLS bypass), so
+-- the index does too: on `(window_start)` alone a tenant's pass scanned every
+-- tenant's expired rows and then filtered.
+create index egress_rate_windows_sweep on egress_rate_windows (tenant_id, window_start);
 
 -- ─── Circuit breakers ───────────────────────────────────────────────────────
 
@@ -118,9 +120,21 @@ create table egress_breakers (
     failures int not null default 0,
     -- When the current open window started (NULL unless state = 'open').
     opened_at timestamptz,
-    -- Monotonic, NEVER reused, and never reset — not even when a probe closes the
-    -- breaker. A completion may transition this breaker only if it carries this
-    -- exact value, so reuse would let a stale completion decide a later window.
+    -- Monotonic and never reset WITHIN A ROW'S LIFETIME — not even when a probe
+    -- closes the breaker. A completion may transition this breaker only if it
+    -- carries this exact value, so reuse would let a stale completion decide a
+    -- later window.
+    --
+    -- NOT globally unique, and the difference is worth stating: the sweeper deletes
+    -- idle breakers, and the INSERT arm of the report statement re-seeds a fresh row
+    -- at 0. (An earlier comment here claimed "NEVER reused, and never reset", which
+    -- the sweep+re-insert path makes false.) What keeps that safe is the sweep
+    -- predicate, not the counter: only a `closed` breaker with zero consecutive
+    -- failures and no activity for the idle period is collectable, so a row with an
+    -- outstanding probe (`half_open`) or an open window is never deleted. For a
+    -- superseded completion to decide anything after a re-seed, its epoch would have
+    -- to be re-reached by that many FRESH elections and the row would have to be
+    -- half_open at that moment — a disclosed residual, not an eliminated one.
     probe_epoch bigint not null default 0,
     -- Which replica was elected to probe. INFORMATIONAL ONLY (logs, debugging):
     -- correctness rides entirely on `probe_epoch`, because a replica id can be
@@ -137,8 +151,10 @@ create table egress_breakers (
 
 -- The sweep collects only IDLE, INFORMATION-FREE breakers (closed with no
 -- consecutive failures); a partial index keeps an open or degrading breaker out of
--- the scan entirely, so the sweep can never be the thing that forgets one.
-create index egress_breakers_sweep on egress_breakers (updated_at)
+-- the scan entirely, so the sweep can never be the thing that forgets one. Leading
+-- column `tenant_id` for the same reason as the rate index above: the sweep is
+-- tenant-scoped and its predicate leads with it.
+create index egress_breakers_sweep on egress_breakers (tenant_id, updated_at)
     where state = 'closed' and failures = 0;
 
 -- ─── Bounded growth: what actually bounds these tables ──────────────────────
@@ -152,12 +168,27 @@ create index egress_breakers_sweep on egress_breakers (updated_at)
 -- period). Tenant-scoped is deliberate: it needs no RLS bypass, and the tenants
 -- generating rows are exactly the tenants paying to clean them.
 --
--- WHAT THAT BOUNDS: the live set is "keys dialed within the idle period", which is
--- the working set, not history. WHAT IT DOES NOT BOUND (disclosed): a tenant that
--- stops dialing entirely stops sweeping too, so its last working set is frozen in
--- place — finite and no longer growing, but not collected. A deployment-wide
--- collector belongs in `workers.rs` with the other system-worker sweeps; it is not
--- in this task's file ownership.
+-- WHAT ACTUALLY BOUNDS THE TABLE. The sweeper visits tenants on a deterministic
+-- ROTATION over the tenants a replica is serving (`governor::sweep_batch`),
+-- `SWEEP_TENANTS_PER_TICK` of them per tick. So for a replica serving T tenants a
+-- given tenant is collected once per
+--
+--     SWEEP_INTERVAL_SECS × ceil(T / SWEEP_TENANTS_PER_TICK)
+--
+-- seconds, and its residue is bounded by "keys dialed within SWEEP_IDLE_SECS + that
+-- period". That is what makes the bound a function of the CONFIGURED constants
+-- rather than of luck. The first cut swept whichever tenant's dial happened to win
+-- the once-per-interval CAS, which is O(replicas) of capacity against O(tenants) of
+-- demand: with T tenants and R replicas a tenant was collected roughly once per
+-- 300·T/R seconds, so past T > 12R the idle threshold never bound and the lottery
+-- did — for a deployment at the design's 300-user / 1,500-connection scale, that is
+-- the normal case, not a corner.
+--
+-- WHAT IT STILL DOES NOT BOUND (disclosed): a tenant that stops dialing ENTIRELY
+-- leaves this replica's rotation set (the set is the local governor's tenant map),
+-- so its last working set is frozen in place — finite and no longer growing, but not
+-- collected until it dials again. A deployment-wide collector belongs in
+-- `workers.rs` with the other system-worker sweeps.
 
 -- ─── RLS triple (0018 rule for a new tenant-owned table) ────────────────────
 alter table egress_rate_windows enable row level security;
@@ -185,6 +216,22 @@ create policy tenant_isolation on egress_breakers as permissive for all to publi
 -- GUC `fluidbox.runtime_role`, default `fluidbox_runtime` — NEVER hardcoded; a
 -- shared-cluster deployment picks its own name). Copied verbatim from 0018 (e),
 -- via 0019/0022.
+--
+-- THE `if exists` IS LOAD-BEARING AND IT IS ALSO A TRAP. It is here because 0018
+-- section (a) WARNS rather than fails when the role is absent — a managed host may
+-- not let the migration role create roles, and refusing the migration would be the
+-- worse outcome. The trap: if the role is created AFTERWARDS, this grant was
+-- silently skipped, every `admit`/`report` answers `permission denied`, and the
+-- server's (correct) degrade path converts that into admit-and-count. The
+-- deployment then believes it has a cross-replica ceiling and has none.
+--
+-- Two things close it: the RAISE WARNING below makes the skip visible in the
+-- migration output, and — because migration output scrolls past — the server runs a
+-- BOOT USABILITY PROBE (`governance::preflight`, called once by
+-- `EgressGovernor::check_durable`) that exercises select/insert/update/delete on
+-- both tables as the role it actually runs as and logs at ERROR, once, with the
+-- remediation, distinguishably from the per-dial degrade warning. Remediation is
+-- exactly the two grants below, or re-running this migration's grant block.
 do $$
 declare
     v_role text := coalesce(nullif(current_setting('fluidbox.runtime_role', true), ''),
@@ -193,5 +240,7 @@ begin
     if exists (select 1 from pg_roles where rolname = v_role) then
         execute format('grant select, insert, update, delete on table egress_rate_windows to %I', v_role);
         execute format('grant select, insert, update, delete on table egress_breakers to %I', v_role);
+    else
+        raise warning 'egress governance: runtime role % does not exist, so the DML grants on egress_rate_windows / egress_breakers were SKIPPED. Create the role and re-run these two grants, or the durable (cross-replica) egress tier will degrade to per-replica limiting on every dial. The server logs this at boot too (governance::preflight).', v_role;
     end if;
 end $$;

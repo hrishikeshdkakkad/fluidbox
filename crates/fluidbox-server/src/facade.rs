@@ -537,12 +537,27 @@ pub async fn messages(
     Path(rest): Path<String>,
     State(state): State<AppState>,
     headers: HeaderMap,
+    crate::auth::PeerAddr(peer): crate::auth::PeerAddr,
     body: axum::body::Bytes,
 ) -> ApiResult<Response> {
     let token = session_token(&headers).ok_or(ApiError::Unauthorized)?;
     let sess_auth = fluidbox_db::session_for_token(&state.pool, &token)
         .await?
         .ok_or(ApiError::Unauthorized)?;
+    // Gap 6 (Phase F): the facade resolves the session token by hand rather than
+    // through the `SessionAuth` extractor, so the workload binding has to be
+    // asserted here too — and this is the route where it matters most, because the
+    // sandbox's fake `ANTHROPIC_API_KEY` IS this token and it is the only sandbox
+    // credential that spends money. Refused BEFORE the audience check, the session
+    // load, the budget check and any dispatch, for the same reason the extractor
+    // does: a caller at the wrong address learns nothing.
+    crate::auth::enforce_workload_identity(
+        state.cfg.workload_identity,
+        sess_auth.session_id,
+        &sess_auth.workload_addrs,
+        peer,
+        "/internal/llm",
+    )?;
     // Gap 10: model egress is the LLM audience. The sandbox's fake provider key
     // is now the LLM-scoped token ONLY — a runner-control or tool-intent
     // credential can no longer spend the run's model budget. Refused at the auth

@@ -1695,6 +1695,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluidbox-loadgen"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "futures",
+ "hex",
+ "reqwest",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "fluidbox-provider"
 version = "0.1.0"
 dependencies = [
@@ -1781,12 +1798,20 @@ dependencies = [
 name = "fluidbox-workspace"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
  "flate2",
  "fluidbox-core",
+ "futures",
  "hex",
+ "hmac 0.13.0",
+ "reqwest",
  "sha2 0.11.0",
  "tar",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

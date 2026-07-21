@@ -5823,6 +5823,14 @@ pub struct SessionTokenAuth {
     /// the legacy `all` (pre-split tokens + e2e forgers via the column DEFAULT).
     /// The caller enforces it per-route (auth.rs `audience_allows`).
     pub audience: String,
+    /// The workload identity this run's credentials were issued to (Gap 6, Phase F;
+    /// `sessions.workload_addrs`, migration 0025) — the provider-reported source
+    /// addresses of the sandbox. Carried on the CREDENTIAL so the internal gateway
+    /// can check the socket peer without a second query: `/events` is the one
+    /// internal route that never loads the session row, and a per-request query
+    /// added only there would be a per-event round trip on the hottest path we
+    /// have. Empty = unbindable (no provider-asserted identity, or a pre-0025 row).
+    pub workload_addrs: Vec<String>,
 }
 
 /// Resolve a session token to its session IGNORING revoked_at/expiry — used
@@ -5841,21 +5849,35 @@ pub async fn session_for_token_incl_revoked(
     // IS the credential (documented TenantScope bootstrap exception).
     let mut tx = worker_tx(pool).await?;
     let row = sqlx::query(
-        "select session_id, tenant_id, audience from api_tokens
-         where kind = 'session' and token_sha256 = $1",
+        "select t.session_id, t.tenant_id, t.audience, s.workload_addrs
+           from api_tokens t
+           left join sessions s on s.id = t.session_id
+          where t.kind = 'session' and t.token_sha256 = $1",
     )
     .bind(sha256_hex(token_plain))
     .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(row.and_then(|r| {
-        r.get::<Option<Uuid>, _>("session_id")
-            .map(|session_id| SessionTokenAuth {
-                session_id,
-                tenant_id: r.get::<Uuid, _>("tenant_id"),
-                audience: r.get::<String, _>("audience"),
-            })
-    }))
+    Ok(row.and_then(session_token_auth))
+}
+
+/// Shape one resolved `api_tokens` row (joined to its session) into
+/// [`SessionTokenAuth`]. Shared by the strict and lenient resolvers so the two
+/// can never drift on which columns they carry — the Gap-6 `workload_addrs` in
+/// particular must ride BOTH, since `/result` uses the lenient one and is a
+/// terminalizing route.
+fn session_token_auth(r: sqlx::postgres::PgRow) -> Option<SessionTokenAuth> {
+    r.get::<Option<Uuid>, _>("session_id")
+        .map(|session_id| SessionTokenAuth {
+            session_id,
+            tenant_id: r.get::<Uuid, _>("tenant_id"),
+            audience: r.get::<String, _>("audience"),
+            // NULL (no provider-asserted identity, or a pre-0025 row) flattens to
+            // the empty vec — the caller's "unbindable" case.
+            workload_addrs: r
+                .get::<Option<Vec<String>>, _>("workload_addrs")
+                .unwrap_or_default(),
+        })
 }
 
 /// Returns the session (and its tenant + audience) a valid (unexpired,
@@ -5867,24 +5889,61 @@ pub async fn session_for_token(
     // Credential-digest bootstrap resolution (audited bypass) — see
     // `session_for_token_incl_revoked`.
     let mut tx = worker_tx(pool).await?;
+    // Gap 6 (Phase F): the LEFT JOIN carries `sessions.workload_addrs` on the SAME
+    // statement that was already resolving the credential. Cost is one extra
+    // primary-key index probe inside an existing round trip — no new query, and no
+    // per-request query added to `/events` (the one internal route that never
+    // loads the session row). LEFT, not INNER: a session-less `api_tokens` row must
+    // still resolve exactly as it did before, and be discarded by the same
+    // `session_id`-is-null test.
     let row = sqlx::query(
-        "select session_id, tenant_id, audience from api_tokens
-         where kind = 'session' and token_sha256 = $1
-           and revoked_at is null
-           and (expires_at is null or expires_at > now())",
+        "select t.session_id, t.tenant_id, t.audience, s.workload_addrs
+           from api_tokens t
+           left join sessions s on s.id = t.session_id
+          where t.kind = 'session' and t.token_sha256 = $1
+            and t.revoked_at is null
+            and (t.expires_at is null or t.expires_at > now())",
     )
     .bind(sha256_hex(token_plain))
     .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(row.and_then(|r| {
-        r.get::<Option<Uuid>, _>("session_id")
-            .map(|session_id| SessionTokenAuth {
-                session_id,
-                tenant_id: r.get::<Uuid, _>("tenant_id"),
-                audience: r.get::<String, _>("audience"),
-            })
-    }))
+    Ok(row.and_then(session_token_auth))
+}
+
+/// Record the Gap-6 workload identity for a run (Phase F; migration 0025): the
+/// provider-reported source addresses of the sandbox that this session's four
+/// credentials were issued to. Written once, on the provisioning path, from data
+/// the provider already held.
+///
+/// Deliberately NOT folded into `set_sandbox_handle`: the address is a SECURITY
+/// fact with its own column and its own guard, and keeping the write explicit is
+/// what lets the orchestrator order it BEFORE the handle attach (closing as much
+/// of the "workload is running but its identity is not yet recorded" window as a
+/// post-hoc capture can — see the call site).
+///
+/// Unconditional within the tenant: no status predicate, and a later write wins.
+/// A workload that reports a NEW address (a reprovision) must be able to replace
+/// the stale one, and refusing the write on a winding-down session would leave a
+/// row whose recorded identity is a lie. Returns whether a row was touched.
+pub async fn set_workload_addrs(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    addrs: &[String],
+) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let res = sqlx::query(
+        "update sessions set workload_addrs = $2, updated_at = now()
+          where id = $1 and tenant_id = $3",
+    )
+    .bind(id)
+    .bind(addrs)
+    .bind(scope.tenant_id())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(res.rows_affected() == 1)
 }
 
 /// Renew a session's tokens ahead of expiry. Gap 10 renewal contract: ONE renew

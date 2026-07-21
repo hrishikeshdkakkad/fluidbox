@@ -193,6 +193,15 @@ spec:
             # memory — raise server.resources.limits.memory with it.
             - { name: FLUIDBOX_MAX_REQUEST_BODY_BYTES, value: {{ . | quote }} }
             {{- end }}
+            {{- with .Values.server.workloadIdentity }}
+            # Gap 6 workload identity on the sandbox-facing internal gateway.
+            # Only meaningful under FLUIDBOX_PROVIDER=kubernetes, and only while
+            # NOTHING NATs or proxies between sandbox pods and the internal
+            # Service — introducing a mesh sidecar or egress gateway on that path
+            # turns every run into a mismatch, and the control would have to be
+            # redesigned rather than reconfigured.
+            - { name: FLUIDBOX_WORKLOAD_IDENTITY, value: {{ . | quote }} }
+            {{- end }}
             {{- if .Values.server.allowRlsBypass }}
             # Review M2 escape hatch: accept a pool role that bypasses RLS even in
             # multi-user mode. Local/single-user only — a hosted install must instead

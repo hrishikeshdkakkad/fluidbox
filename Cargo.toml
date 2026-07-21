@@ -10,6 +10,9 @@ members = [
     "crates/fluidbox-server",
     "crates/fluidbox-cli",
     "crates/fluidbox-catalog-import",
+    # Phase F (#34) load-test harness. Drives a RUNNING deployment; never built
+    # into the server, never on a request path.
+    "crates/fluidbox-loadgen",
 ]
 
 [workspace.package]

@@ -27,8 +27,13 @@
 //!
 //! # TWO TIERS since Phase F (Task 1)
 //!
-//! Everything above describes the LOCAL tier, and it is unchanged — same buckets,
-//! same breaker, same arithmetic, same tests. What Phase F adds is a SECOND,
+//! Everything above describes the LOCAL tier, and its VERDICT is unchanged — same
+//! buckets, same breaker, same arithmetic, same tests. (Not its cost:
+//! [`EgressGovernor::check`] now
+//! also computes the permit's host digest, an unconditional SHA-256 per admission,
+//! so that the value keying a durable breaker row is byte-identical to the one the
+//! refusal message and the broker's logs carry. "Unchanged" below always means the
+//! decision, never the instruction count.) What Phase F adds is a SECOND,
 //! Postgres-backed tier ([`fluidbox_db::governance`], migration 0023) that a dial
 //! must ALSO pass. The local tier is consulted FIRST because it is free and it
 //! catches a runaway loop with zero DB load; the durable tier is what makes the
@@ -40,6 +45,9 @@
 //!   counted ([`EgressGovernor::degraded_count`]) and ADMITTED on the local
 //!   verdict alone. This is an abuse/fairness control, not a quota system — the
 //!   same reason `0` means "disable that dimension" and never "block everything".
+//!   Degrading is right for a BLIP and wrong as the only signal for a permanent
+//!   misconfiguration, which is why there is also a one-shot usability probe —
+//!   see [`EgressGovernor::preflight_durable`].
 //! * **The local tier can over-charge itself.** A dial the local tier admits and
 //!   the durable tier then refuses has already spent its local tokens, and may
 //!   have been promoted to the local half-open probe. Both self-heal (the bucket
@@ -60,15 +68,35 @@
 //! it, keyed on `sessions.invoked_by_user_id` and resolved inside the durable
 //! admission statement. Two consequences to keep honest:
 //!
-//! * it lives in the DURABLE tier only, because the local tier is deliberately
-//!   byte-for-byte unchanged — so `FLUIDBOX_EGRESS_DURABLE=0` means no per-user
+//! * it lives in the DURABLE tier only, because the local tier's verdict is
+//!   deliberately unchanged — so `FLUIDBOX_EGRESS_DURABLE=0` means no per-user
 //!   limiting at all;
 //! * a run with NO invoking user (trigger and schedule invocations — the column is
 //!   nullable) SKIPS the tier rather than bucketing every unattended run in the org
-//!   under the nil uuid, which would be one shared ceiling for all automation.
+//!   under the nil uuid, which would be one shared ceiling for all automation;
+//! * it AGGREGATES. 60/min is one user's whole outbound budget across every run and
+//!   every connection they own simultaneously — not 60 per run. The design's own
+//!   working-set assumption is 3 attached MCP servers per run, whose effective
+//!   ceiling was 3 × the per-connection 60 = 180/min; under this dimension that
+//!   user is bounded at 60/min in total. That is a deliberate BEHAVIOUR CHANGE for
+//!   fan-out shapes, not a no-op default, and `FLUIDBOX_EGRESS_RATE_USER_PER_MIN`
+//!   is the knob (`0` disables the dimension outright).
 //!
-//! `docs/hosted/connector-admission-policy.md` states the same limitations — keep
-//! the two honest together.
+//! `docs/hosted/connector-admission-policy.md` and `.env.example` state the same
+//! limitations — keep all three honest together. (They were not, for one commit:
+//! the doc still said "per-user limiting is not implemented", "a refusal costs
+//! nothing" and "durable limiting is Phase F" after all three had shipped.)
+//!
+//! # What a dial costs (disclosed)
+//!
+//! The durable tier is not free and the price lands on the broker's hottest path:
+//! roughly 9 extra database round trips per brokered dial (`admit` costs BEGIN,
+//! `set_config`, two statements and COMMIT/ROLLBACK; `report` costs 4 more, and the
+//! 401 re-mint path dispatches twice), plus 4 per swept tenant on a sweep tick, plus
+//! a one-time 6-round-trip preflight. Every dial in one tenant also SERIALISES on
+//! that tenant's single `egress_rate_windows` row, which the admission transaction
+//! holds across the breaker round trip. `fluidbox_db::governance`'s module docs
+//! carry the full accounting; `FLUIDBOX_EGRESS_DURABLE=0` is the escape hatch.
 //!
 //! # Bounded memory (this matters)
 //!
@@ -93,7 +121,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 use uuid::Uuid;
@@ -163,6 +191,26 @@ const SWEEP_IDLE_SECS: u64 = 3600;
 /// Rows deleted per pass. A backlog drains over several passes instead of one
 /// long statement holding locks — "bounded" is the point, not "instant".
 const SWEEP_BATCH: i64 = 5000;
+/// How many TENANTS one sweep tick collects, in rotation.
+///
+/// This number is what turns the sweeper's capacity from O(replicas) into
+/// O(tenants). The first cut swept the tenant of whichever dial happened to win the
+/// once-per-interval CAS: with T tenants and R replicas that visits a given tenant
+/// about once per `SWEEP_INTERVAL_SECS · T / R` seconds, so past `T > 12R` the
+/// [`SWEEP_IDLE_SECS`] threshold never binds and the lottery does — and at the
+/// design's 300-user / 1,500-connection scale that is the ordinary case, not a
+/// corner. With a rotation, a replica serving T tenants visits each one every
+///
+/// ```text
+/// SWEEP_INTERVAL_SECS × ceil(T / SWEEP_TENANTS_PER_TICK)
+/// ```
+///
+/// seconds — a function of the constants rather than of luck.
+///
+/// 16 is the trade: one tick costs 16 × ~4 round trips inline on ONE dial every
+/// [`SWEEP_INTERVAL_SECS`], and covers 4 800 tenant-visits per replica per hour,
+/// which is more than [`MAX_TRACKED`] can hold.
+const SWEEP_TENANTS_PER_TICK: usize = 16;
 
 /// Token-bucket unit scale: one dial costs `UNIT` units and a bucket refills
 /// `per_min` units per elapsed millisecond, so a `per_min`-rate bucket regains a
@@ -476,6 +524,12 @@ impl<K: Eq + Hash + Clone, V> Bounded<K, V> {
     fn len(&self) -> usize {
         self.map.len()
     }
+
+    /// Every tracked key. Used by ONE caller — the sweeper's tenant rotation, for
+    /// which the tenant map is exactly "the tenants this replica is serving".
+    fn keys(&self) -> impl Iterator<Item = &K> {
+        self.map.keys()
+    }
 }
 
 struct GovState {
@@ -498,6 +552,11 @@ struct GovState {
     /// upstream, so the host component is a refinement that matters for the same
     /// legacy path.
     breakers: Bounded<(Uuid, Uuid, String), Breaker>,
+    /// The last tenant the durable sweeper collected, i.e. the rotation cursor.
+    /// Lives here rather than in an atomic because choosing the next batch reads
+    /// `tenants` and writes the cursor, and those two must be one critical section
+    /// or two concurrent ticks could hand out the same batch.
+    sweep_cursor: Uuid,
 }
 
 /// Proof that ONE dial was admitted, and by whom (review I5/I6). It is what
@@ -546,6 +605,14 @@ pub struct EgressGovernor {
     degraded: AtomicU64,
     /// Monotonic ms of the last durable-row collection this replica ran. `0` = never.
     last_sweep_ms: AtomicU64,
+    /// One-shot latch for the durable-tier usability probe: the task that flips it
+    /// runs the probe, everyone else skips (it is advisory — nobody waits on it).
+    /// See [`EgressGovernor::preflight_durable`].
+    preflight_claimed: AtomicBool,
+    /// Set iff the probe RAN and FAILED. Read only to restate the diagnosis on the
+    /// periodic health line — the tier keeps trying regardless, so a grant fixed
+    /// underneath a running server heals without a restart.
+    preflight_failed: AtomicBool,
 }
 
 impl EgressGovernor {
@@ -559,9 +626,12 @@ impl EgressGovernor {
                 hosts: Bounded::new(),
                 hosts_global: Bounded::new(),
                 breakers: Bounded::new(),
+                sweep_cursor: Uuid::nil(),
             }),
             degraded: AtomicU64::new(0),
             last_sweep_ms: AtomicU64::new(0),
+            preflight_claimed: AtomicBool::new(false),
+            preflight_failed: AtomicBool::new(false),
         }
     }
 
@@ -675,6 +745,7 @@ impl EgressGovernor {
         if !self.limits.durable {
             return Ok(());
         }
+        self.preflight_durable(pool, scope).await;
         let answer = governance::admit(
             pool,
             scope,
@@ -737,16 +808,136 @@ impl EgressGovernor {
         self.degraded.load(Ordering::Relaxed)
     }
 
-    /// Collect this tenant's information-free durable rows, at most once per
-    /// [`SWEEP_INTERVAL_SECS`] per replica. Tenant-scoped on purpose: it needs no
-    /// RLS bypass, and the tenants generating rows are the ones paying to clean
-    /// them. A failure is logged and retried at the next interval — it must never
-    /// affect the dial that happened to trigger it.
+    /// ONE-SHOT usability probe for the durable tier: can this process actually
+    /// read and write the governance tables as the role it runs as?
     ///
-    /// What this bounds: the live set is "keys dialed within [`SWEEP_IDLE_SECS`]".
-    /// What it does NOT bound (disclosed): a tenant that stops dialing stops
-    /// sweeping, so its last working set is frozen — finite, no longer growing, but
-    /// not collected. A deployment-wide collector belongs beside the other
+    /// **Why this exists.** Migration 0023 wraps its DML grants in
+    /// `if exists (select 1 from pg_roles …)`, because 0018 §(a) warns rather than
+    /// fails when the runtime role is absent (a managed host may not let the
+    /// migrating role create roles, and refusing the migration would be worse). If
+    /// the role appears afterwards, the grant was silently skipped; every `admit`
+    /// and `report` then answers `permission denied`, and the *correct* degrade path
+    /// converts that into admit-and-count. The deployment believes it has a
+    /// cross-replica ceiling and has none — and, worse, a PERMANENT
+    /// misconfiguration is indistinguishable from a transient blip, because both
+    /// produce the same trickle of per-dial warnings.
+    ///
+    /// **WARN, not refuse — and the justification is not "warnings are easier".**
+    /// Three reasons, in order of weight:
+    ///
+    /// 1. It would be inconsistent with the tier's own rule. The identical
+    ///    statement failing at runtime ADMITS (degrade, never fail) precisely
+    ///    because this is a fairness/abuse control and not a quota system. Refusing
+    ///    boot for the same failure at t=0 would make "the database said no" fatal
+    ///    at one instant and harmless at every other.
+    /// 2. `FLUIDBOX_EGRESS_DURABLE` defaults ON, so a refusal is not a refusal of
+    ///    something an operator asked for — it is a refusal of a default. Phase F
+    ///    has to be deployable as a no-op on an existing install; turning a missed
+    ///    grant into an un-bootable control plane converts a fairness-control gap
+    ///    into a total outage, which is exactly the outage amplification
+    ///    [`fold_durable`](Self::fold_durable) refuses to do one dial at a time.
+    /// 3. Refusing here would be stricter than the migration that CREATES the
+    ///    condition: 0023's grant block warns and continues.
+    ///
+    /// What it buys instead is the thing that was actually missing: ONE
+    /// `tracing::error!` naming the remediation, distinguishable by level and text
+    /// from the per-dial degrade `warn!`, restated on every periodic health line so
+    /// it cannot scroll away. The tier keeps trying afterwards, so a grant fixed
+    /// underneath a running server heals without a restart.
+    ///
+    /// **Placement.** It runs on the first durable dial rather than in `main.rs`
+    /// (another owner's file in this wave), latched so exactly one task pays for it;
+    /// it is `pub` precisely so a boot call can be added later with no behaviour
+    /// change — the latch makes a second call free. It needs a real `TenantScope`,
+    /// which is another reason first-dial is a natural home: it probes under the
+    /// same RLS binding a real dial uses.
+    pub async fn preflight_durable(&self, pool: &PgPool, scope: TenantScope) {
+        if self
+            .preflight_claimed
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        match governance::preflight(pool, scope).await {
+            Ok(()) => tracing::info!(
+                target: "governor",
+                "durable egress governance preflight OK — the cross-replica tier is \
+                 readable and writable by this process"
+            ),
+            Err(e) => {
+                self.preflight_failed.store(true, Ordering::Relaxed);
+                tracing::error!(
+                    target: "governor",
+                    "DURABLE EGRESS GOVERNANCE IS NOT USABLE — the cross-replica \
+                     ceiling is NOT in force and every dial will fall back to \
+                     per-replica limiting (N replicas ⇒ N× the configured rate). \
+                     This is a PERMANENT misconfiguration, not a transient outage. \
+                     Most likely cause: migration 0023's DML grants were skipped \
+                     because the runtime role did not exist yet — grant \
+                     select/insert/update/delete on egress_rate_windows and \
+                     egress_breakers to it, or set FLUIDBOX_EGRESS_DURABLE=0 to stop \
+                     paying for a tier you are not getting. Probe error: {e}"
+                );
+            }
+        }
+    }
+
+    /// The next tenants to collect, as a deterministic ROTATION over the tenants
+    /// this replica is serving.
+    ///
+    /// The local governor's own tenant bucket map IS that set — every tenant that
+    /// dialed recently enough to still be tracked — so the rotation needs no new
+    /// bookkeeping and no cross-tenant query. The cursor is the last tenant handed
+    /// out; each tick takes up to [`SWEEP_TENANTS_PER_TICK`] ids strictly after it
+    /// in sort order and wraps. Sorting is what makes it a rotation rather than a
+    /// second lottery: `HashMap` iteration order is not stable across mutations, so
+    /// an index cursor into it would skip.
+    ///
+    /// `current` (the tenant whose dial triggered the tick) is always included. That
+    /// is not belt-and-braces: `peek` never creates a bucket for a dimension whose
+    /// limit is `0`, so with `FLUIDBOX_EGRESS_RATE_TENANT_PER_MIN=0` the tenant map
+    /// is EMPTY while the connection/host/user dimensions are still writing rows.
+    fn sweep_batch(&self, current: Uuid) -> Vec<Uuid> {
+        let st = &mut *self.lock();
+        let mut ids: Vec<Uuid> = st.tenants.keys().copied().collect();
+        if !ids.contains(&current) {
+            ids.push(current);
+        }
+        ids.sort_unstable();
+        let start = ids.partition_point(|id| *id <= st.sweep_cursor);
+        let mut batch: Vec<Uuid> = ids[start..]
+            .iter()
+            .copied()
+            .take(SWEEP_TENANTS_PER_TICK)
+            .collect();
+        // Wrap, without re-taking anything this pass already took.
+        let need = SWEEP_TENANTS_PER_TICK.saturating_sub(batch.len());
+        batch.extend(ids[..start.min(need)].iter().copied());
+        if let Some(last) = batch.last() {
+            st.sweep_cursor = *last;
+        }
+        batch
+    }
+
+    /// Collect information-free durable rows for a ROTATING BATCH of this replica's
+    /// tenants, at most once per [`SWEEP_INTERVAL_SECS`] per replica. Tenant-scoped
+    /// on purpose: it needs no RLS bypass, and the tenants generating rows are the
+    /// ones paying to clean them. A failure is logged and the tenant comes round
+    /// again next cycle — it must never affect the dial that triggered the tick.
+    ///
+    /// **What this bounds.** With a replica serving T tenants, each is visited every
+    /// `SWEEP_INTERVAL_SECS × ceil(T / SWEEP_TENANTS_PER_TICK)` seconds, so a
+    /// tenant's residue is bounded by "keys dialed within [`SWEEP_IDLE_SECS`] + that
+    /// period" — constants, not luck. The first cut swept only the tenant of
+    /// whichever dial won the CAS, which is O(replicas) of capacity against
+    /// O(tenants) of demand; see [`SWEEP_TENANTS_PER_TICK`] for the arithmetic and
+    /// why `T > 12R` made the idle threshold stop binding altogether.
+    ///
+    /// **What it does NOT bound (disclosed).** A tenant that stops dialing entirely
+    /// falls out of the local tenant map and therefore out of the rotation, so its
+    /// last working set is frozen — finite, no longer growing, but not collected
+    /// until it dials again. A deployment-wide collector belongs beside the other
     /// system-worker sweeps in `workers.rs`.
     async fn maybe_sweep(&self, pool: &PgPool, scope: TenantScope) {
         let now = self.clock.now_ms();
@@ -774,11 +965,28 @@ impl EgressGovernor {
                  since boot — those dials were admitted on the per-replica verdict alone"
             );
         }
-        if let Err(e) = governance::sweep(pool, scope, SWEEP_IDLE_SECS, SWEEP_BATCH).await {
-            tracing::warn!(
+        if self.preflight_failed.load(Ordering::Relaxed) {
+            tracing::error!(
                 target: "governor",
-                "durable egress governance sweep failed (retrying next interval): {e}"
+                "durable egress governance is still UNUSABLE by this process (the boot \
+                 probe failed) — the cross-replica ceiling has not been in force at any \
+                 point since boot; see the preflight error for the remediation"
             );
+        }
+        for tenant in self.sweep_batch(scope.tenant_id()) {
+            if let Err(e) = governance::sweep(
+                pool,
+                TenantScope::assume(tenant),
+                SWEEP_IDLE_SECS,
+                SWEEP_BATCH,
+            )
+            .await
+            {
+                tracing::warn!(
+                    target: "governor",
+                    "durable egress governance sweep failed (retrying next cycle): {e}"
+                );
+            }
         }
     }
 
@@ -924,9 +1132,12 @@ impl EgressGovernor {
                 hosts: Bounded::new(),
                 hosts_global: Bounded::new(),
                 breakers: Bounded::new(),
+                sweep_cursor: Uuid::nil(),
             }),
             degraded: AtomicU64::new(0),
             last_sweep_ms: AtomicU64::new(0),
+            preflight_claimed: AtomicBool::new(false),
+            preflight_failed: AtomicBool::new(false),
         }
     }
 
@@ -1685,6 +1896,150 @@ mod tests {
         assert!(d.durable);
     }
 
+    /// A `Config` with the seven governor knobs set to DISTINCT, recognisable
+    /// values and everything else inert.
+    ///
+    /// The full literal is deliberate. `Config` has no `Default`, `from_env` reads
+    /// the process environment (unusable from a parallel test), and the mapping
+    /// under test is exactly "does each field land in the right place" — which a
+    /// helper that took seven arguments and built the same struct would not test.
+    /// `harness.rs` carries the same fixture for the same reason. If a new `Config`
+    /// field breaks this, adding it here is one line — and the break is a prompt to
+    /// ask whether the governor should be reading it.
+    #[cfg(test)]
+    fn cfg_with_egress(
+        tenant: u32,
+        connection: u32,
+        host: u32,
+        user: u32,
+        threshold: u32,
+        open_secs: u64,
+        durable: bool,
+    ) -> Config {
+        Config {
+            bind: String::new(),
+            internal_bind: String::new(),
+            database_url: String::new(),
+            runtime_role: None,
+            allow_rls_bypass: false,
+            db_pool: fluidbox_db::PoolSettings::default(),
+            admin_token: String::new(),
+            public_control_url: String::new(),
+            data_dir: std::path::PathBuf::new(),
+            sandbox_image: String::new(),
+            default_model: String::new(),
+            codex_sandbox_image: String::new(),
+            default_codex_model: String::new(),
+            llm_upstream_url: String::new(),
+            llm_upstream_key: String::new(),
+            llm_upstream_is_anthropic: false,
+            llm_key_mode: crate::config::LlmKeyMode::Shared,
+            llm_admin_url: String::new(),
+            llm_tenant_models: Vec::new(),
+            llm_tenant_max_budget: None,
+            llm_tenant_budget_duration: None,
+            llm_tenant_tpm: None,
+            llm_tenant_rpm: None,
+            llm_max_concurrent_reservations: crate::facade::DEFAULT_MAX_CONCURRENT_RESERVATIONS,
+            credential_key: None,
+            kms_mode: crate::config::KmsMode::Off,
+            kms_static_kek: None,
+            kms_aws_key_id: None,
+            kms_aws_endpoint: None,
+            github_api_url: String::new(),
+            github_web_url: String::new(),
+            github_clone_base: String::new(),
+            keep_workspaces: false,
+            public_url: String::new(),
+            egress_allow_cidrs: Vec::new(),
+            egress_proxy: None,
+            // The seven fields this fixture exists for.
+            egress_rate_tenant_per_min: tenant,
+            egress_rate_connection_per_min: connection,
+            egress_rate_host_per_min: host,
+            egress_rate_user_per_min: user,
+            egress_durable: durable,
+            egress_breaker_threshold: threshold,
+            egress_breaker_open_secs: open_secs,
+            provider: "docker".into(),
+            network_mode: fluidbox_core::traits::NetworkMode::HostDev,
+            require_enforced_netpol: false,
+            netpol_probe_image: String::new(),
+            internal_service: None,
+            internal_service_namespace: None,
+            max_archive_bytes: 0,
+            archive_ttl_secs: 0,
+            require_sso: false,
+            trust_forwarded_for: false,
+            session_idle_secs: 0,
+            session_absolute_secs: 0,
+            oidc_discovery_max_age_secs: 0,
+            oidc_clock_skew_secs: 0,
+            session_reauth_secs: 0,
+            max_request_body_bytes: crate::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
+            workload_identity: crate::config::WorkloadIdentityMode::default(),
+            // Task 4 (archive store): inert here — the governor reads none of it.
+            archive_store: fluidbox_workspace::ArchiveStoreConfig::Fs,
+        }
+    }
+
+    #[test]
+    fn from_config_maps_every_knob_to_the_field_that_enforces_it() {
+        // THE PATH PRODUCTION TAKES. `EgressGovernor::from_config` →
+        // `GovernorLimits::from_config` is the only way a real server ever builds
+        // its limits; `GovernorLimits::default()` is never called by the binary. A
+        // test that asserts on `default()` therefore proves nothing about the
+        // mapping: `durable: cfg.egress_durable` could be replaced by
+        // `durable: false` — disabling the entire cross-replica tier and silently
+        // reopening the N× ceiling this whole task exists to close — with every
+        // fluidbox-server test still green. That mutation is what this test exists
+        // to catch.
+        //
+        // Seven DISTINCT values, none of them a default and none equal to another,
+        // so a transposition (host ↔ user, threshold ↔ open_secs) fails as loudly
+        // as a dropped field.
+        let cfg = cfg_with_egress(11, 22, 33, 44, 55, 66, true);
+        let l = GovernorLimits::from_config(&cfg);
+        assert_eq!(l.tenant_per_min, 11, "tenant knob");
+        assert_eq!(l.connection_per_min, 22, "connection knob");
+        assert_eq!(l.host_per_min, 33, "host knob");
+        assert_eq!(l.user_per_min, 44, "user knob");
+        assert_eq!(l.breaker_threshold, 55, "breaker threshold knob");
+        assert_eq!(l.breaker_open_secs, 66, "breaker open-window knob");
+        assert!(
+            l.durable,
+            "the durable tier must follow FLUIDBOX_EGRESS_DURABLE"
+        );
+
+        // …and the flag is a MAPPING, not a constant: the other value must survive
+        // the trip too, or `durable: true` would pass the assertion above.
+        let off = GovernorLimits::from_config(&cfg_with_egress(11, 22, 33, 44, 55, 66, false));
+        assert!(
+            !off.durable,
+            "FLUIDBOX_EGRESS_DURABLE=0 must reach GovernorLimits — a hardcoded \
+             `true` here would make the disable knob dead"
+        );
+
+        // The SHIPPED defaults, through the same path: `config.rs` resolves an
+        // absent env var to these constants, so this pins that the deployed
+        // behaviour is the documented one and not merely that `default()` is.
+        let shipped = GovernorLimits::from_config(&cfg_with_egress(
+            DEFAULT_TENANT_PER_MIN,
+            DEFAULT_CONNECTION_PER_MIN,
+            DEFAULT_HOST_PER_MIN,
+            DEFAULT_USER_PER_MIN,
+            DEFAULT_BREAKER_THRESHOLD,
+            DEFAULT_BREAKER_OPEN_SECS,
+            true,
+        ));
+        assert_eq!(
+            shipped,
+            GovernorLimits::default(),
+            "the constants config.rs falls back to must produce exactly the \
+             documented defaults"
+        );
+    }
+
     // ── Phase F: the durable tier's SQL-free half ───────────────────────────
 
     #[test]
@@ -1724,7 +2079,23 @@ mod tests {
         // `host_global` deliberately has no durable counterpart (a cross-tenant key
         // would need a per-dial RLS bypass). The local tier still derives and
         // enforces it, so this is a documented gap, not a forgotten field.
-        assert_eq!(l.host_global_per_min(), 33 * HOST_GLOBAL_FACTOR);
+        //
+        // The expected value is WRITTEN OUT, not recomputed. `33 * HOST_GLOBAL_FACTOR`
+        // put the same constant on both sides of the assertion, so changing the
+        // factor could not fail it — a "test" of `x == x`. 264 = 33 × 8; if the
+        // factor moves, this number has to move with it, deliberately and visibly.
+        assert_eq!(HOST_GLOBAL_FACTOR, 8, "the shipped cross-tenant multiplier");
+        assert_eq!(l.host_global_per_min(), 264);
+        // …and it is DERIVED from the host ceiling, not a fourth constant: zeroing
+        // the host dimension must disable this tier too, never "block everything".
+        assert_eq!(
+            GovernorLimits {
+                host_per_min: 0,
+                ..l
+            }
+            .host_global_per_min(),
+            0
+        );
     }
 
     #[test]
@@ -1828,5 +2199,210 @@ mod tests {
             p.durable_probe, None,
             "the local tier elects no durable probe"
         );
+    }
+
+    // ── Phase F: the durable tier's I/O half, without a database ─────────────
+    //
+    // These use a LAZY pool pointed at a port nothing listens on. Nothing connects
+    // unless the code under test actually reaches the database, and a refused
+    // connection is instant and local — no DATABASE_URL, no server, no Neon. The
+    // observation is `degraded_count()`: 0 means the early return held, 1 means the
+    // call reached the pool and the degrade path caught the failure. That is what
+    // makes deleting an early return VISIBLE rather than merely slower.
+
+    fn unreachable_pool() -> PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(250))
+            .connect_lazy("postgres://nobody:nobody@127.0.0.1:1/nowhere")
+            .expect("a lazy pool never dials at construction")
+    }
+
+    fn durable_limits(durable: bool) -> GovernorLimits {
+        GovernorLimits {
+            tenant_per_min: 10,
+            connection_per_min: 10,
+            host_per_min: 10,
+            user_per_min: 10,
+            breaker_threshold: 3,
+            breaker_open_secs: 60,
+            durable,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_durable_tier_switch_really_switches_it_off() {
+        // `config.rs` promises `FLUIDBOX_EGRESS_DURABLE=0` "restores exactly Phase
+        // E's per-replica behaviour". Until now that rested on inspection: neither
+        // `check_durable` nor `report_durable` had a test at all. Both early returns
+        // are asserted here from the observable side.
+        let scope = TenantScope::assume(Uuid::new_v4());
+        let (t, c, h) = (Uuid::new_v4(), Uuid::new_v4(), "up.example.test");
+
+        let off = EgressGovernor::manual(durable_limits(false));
+        let mut permit = off.check(t, c, h).expect("the local tier admits");
+        off.check_durable(&unreachable_pool(), scope, Uuid::new_v4(), &mut permit)
+            .await
+            .expect("a disabled durable tier admits without consulting anything");
+        assert_eq!(
+            off.degraded_count(),
+            0,
+            "a disabled tier must not touch the pool at all — a degrade here means \
+             the early return is gone and every dial is paying for a round trip"
+        );
+        assert_eq!(permit.durable_probe, None);
+
+        off.report_durable(
+            &unreachable_pool(),
+            scope,
+            &permit,
+            Outcome::TransportFailure,
+        )
+        .await;
+        assert_eq!(
+            off.degraded_count(),
+            0,
+            "the report path's disable check must hold too"
+        );
+        assert!(
+            !off.preflight_claimed.load(Ordering::SeqCst),
+            "a disabled tier must not even run the usability probe — there is \
+             nothing to be usable"
+        );
+
+        // FALSE-GREEN GUARD: with the tier ON, the same calls DO reach the pool and
+        // DO degrade — so the zeroes above are the early return and not "this test
+        // can never observe anything".
+        let on = EgressGovernor::manual(durable_limits(true));
+        let mut permit = on.check(t, c, h).expect("the local tier admits");
+        on.check_durable(&unreachable_pool(), scope, Uuid::new_v4(), &mut permit)
+            .await
+            .expect("an unreachable durable tier DEGRADES, never refuses");
+        assert!(
+            on.degraded_count() >= 1,
+            "with the tier enabled the unreachable pool must be observed"
+        );
+        // The usability probe is WIRED, not merely written: an enabled tier runs it
+        // once and records the diagnosis. Without this, deleting the call site would
+        // be invisible — the whole point of the probe is that the degrade path is
+        // silent about permanent failure.
+        assert!(
+            on.preflight_claimed.load(Ordering::SeqCst),
+            "an enabled durable tier must run the usability probe"
+        );
+        assert!(
+            on.preflight_failed.load(Ordering::SeqCst),
+            "…and must RECORD that it failed, so the periodic health line can \
+             restate it after the one-shot ERROR has scrolled away"
+        );
+        let before = on.degraded_count();
+        on.report_durable(
+            &unreachable_pool(),
+            scope,
+            &permit,
+            Outcome::TransportFailure,
+        )
+        .await;
+        assert!(
+            on.degraded_count() > before,
+            "a lost durable health report must be counted too"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sweep_interval_gates_the_tick() {
+        // `maybe_sweep` had no test either. The interval gate is what keeps the
+        // collection off the hot path; without it every dial would sweep.
+        let g = EgressGovernor::manual(durable_limits(true));
+        let scope = TenantScope::assume(Uuid::new_v4());
+        let pool = unreachable_pool();
+
+        // The clock must be ADVANCED (a little) before the first assertion: at t=0
+        // the CAS is 0 → 0, so a governor with no gate at all would leave
+        // `last_sweep_ms` at 0 and look identical to a gated one. One second in, a
+        // missing gate stamps 1_000 and the difference is visible. (This test passed
+        // against a gate-less mutant until that was fixed.)
+        g.advance_ms(1_000);
+        g.maybe_sweep(&pool, scope).await;
+        assert_eq!(
+            g.last_sweep_ms.load(Ordering::SeqCst),
+            0,
+            "1s is not an interval — no tick may run, and none may be claimed"
+        );
+
+        g.advance_ms(SWEEP_INTERVAL_SECS * 1000);
+        g.maybe_sweep(&pool, scope).await;
+        let claimed = SWEEP_INTERVAL_SECS * 1000 + 1_000;
+        assert_eq!(
+            g.last_sweep_ms.load(Ordering::SeqCst),
+            claimed,
+            "one full interval must claim a tick"
+        );
+        // …and the claim holds: a call one second later is gated again.
+        g.advance_ms(1_000);
+        g.maybe_sweep(&pool, scope).await;
+        assert_eq!(g.last_sweep_ms.load(Ordering::SeqCst), claimed);
+    }
+
+    #[test]
+    fn the_sweeper_rotates_over_every_tenant_this_replica_serves() {
+        // The defect this pins: the first cut swept the tenant of whichever dial
+        // won the CAS, so with T tenants and R replicas a given tenant was collected
+        // about once per 300·T/R seconds and past T > 12R the idle threshold never
+        // bound — the lottery did. A rotation makes coverage a function of the
+        // constants. Deliberately more tenants than one tick can hold.
+        let g = EgressGovernor::manual(durable_limits(true));
+        let n = SWEEP_TENANTS_PER_TICK * 3 + 5;
+        let tenants: Vec<Uuid> = (0..n).map(|_| Uuid::new_v4()).collect();
+        for (i, t) in tenants.iter().enumerate() {
+            // A DISTINCT host per tenant: the cross-tenant `host_global` bucket is
+            // keyed by host alone, so a shared host would make this test's setup
+            // silently depend on HOST_GLOBAL_FACTOR × host_per_min ≥ n — coupling a
+            // rotation test to an unrelated constant.
+            g.check(*t, Uuid::new_v4(), &format!("h{i}"))
+                .expect("admitted");
+        }
+
+        // ONE tick is bounded …
+        let first = g.sweep_batch(tenants[0]);
+        assert_eq!(
+            first.len(),
+            SWEEP_TENANTS_PER_TICK,
+            "a tick must not sweep every tenant at once — the cost is inline on one dial"
+        );
+
+        // … and ceil(T / K) ticks cover ALL of them, each exactly once.
+        let mut seen = first;
+        let ticks = n.div_ceil(SWEEP_TENANTS_PER_TICK);
+        for _ in 1..ticks {
+            seen.extend(g.sweep_batch(tenants[0]));
+        }
+        let mut unique = seen.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            n,
+            "every tenant this replica serves must be visited within ceil(T/K) \
+             ticks — {} of {n} were, over {ticks} ticks",
+            unique.len()
+        );
+        assert_eq!(
+            seen.len(),
+            unique.len() + (ticks * SWEEP_TENANTS_PER_TICK - n),
+            "a full cycle must not revisit a tenant before covering the rest \
+             (only the wrap at the end may repeat)"
+        );
+
+        // A tenant the tenant MAP does not know is still swept: `peek` creates no
+        // bucket when the tenant dimension is disabled, so with
+        // FLUIDBOX_EGRESS_RATE_TENANT_PER_MIN=0 the map is empty while the other
+        // dimensions keep writing rows.
+        let g = EgressGovernor::manual(GovernorLimits {
+            tenant_per_min: 0,
+            ..durable_limits(true)
+        });
+        let lonely = Uuid::new_v4();
+        g.check(lonely, Uuid::new_v4(), "h").expect("admitted");
+        assert_eq!(g.sweep_batch(lonely), vec![lonely]);
     }
 }
