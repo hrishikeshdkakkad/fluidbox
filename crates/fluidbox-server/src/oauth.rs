@@ -524,7 +524,7 @@ pub async fn discover(state: &AppState, mcp_url: &str) -> Result<AsMeta, String>
         if admit_oauth(pu, &state.egress_policy).is_err() {
             continue;
         }
-        let Ok(res) = state
+        let Ok(mut res) = state
             .identity_http
             .get(pu)
             .timeout(HTTP_TIMEOUT)
@@ -536,7 +536,9 @@ pub async fn discover(state: &AppState, mcp_url: &str) -> Result<AsMeta, String>
         if !res.status().is_success() {
             continue;
         }
-        let Ok(v) = res.json::<Value>().await else {
+        // I3: bounded like every OIDC read — an attacker-influenced AS must not
+        // be able to stream hundreds of MB into memory per discovery leg.
+        let Ok(v) = crate::egress::read_json_bounded(&mut res).await else {
             continue;
         };
         if let Ok(a) = parse_resource_metadata(&v) {
@@ -565,7 +567,7 @@ pub async fn discover(state: &AppState, mcp_url: &str) -> Result<AsMeta, String>
         if admit_oauth(mu, &state.egress_policy).is_err() {
             continue;
         }
-        let Ok(res) = state
+        let Ok(mut res) = state
             .identity_http
             .get(mu)
             .timeout(HTTP_TIMEOUT)
@@ -577,7 +579,8 @@ pub async fn discover(state: &AppState, mcp_url: &str) -> Result<AsMeta, String>
         if !res.status().is_success() {
             continue;
         }
-        let Ok(v) = res.json::<Value>().await else {
+        // I3: bounded read (256 KiB), same as the OIDC discovery documents.
+        let Ok(v) = crate::egress::read_json_bounded(&mut res).await else {
             continue;
         };
         // Found the document: S256-refusal must NOT fall through to the
@@ -827,7 +830,7 @@ async fn dcr_register(
         "response_types": ["code"],
         "token_endpoint_auth_method": "none",
     });
-    let res = state
+    let mut res = state
         .identity_http
         .post(registration_endpoint)
         .timeout(HTTP_TIMEOUT)
@@ -836,7 +839,11 @@ async fn dcr_register(
         .await
         .map_err(|e| format!("dynamic client registration failed: {e}"))?;
     let status = res.status();
-    let v: Value = res.json().await.unwrap_or(Value::Null);
+    // I3: bounded read — an over-cap or non-JSON body reads as `Null`, exactly
+    // as a malformed one already did.
+    let v: Value = crate::egress::read_json_bounded(&mut res)
+        .await
+        .unwrap_or(Value::Null);
     if !status.is_success() {
         return Err(format!(
             "dynamic client registration returned HTTP {status}"
@@ -1625,12 +1632,15 @@ async fn do_code_exchange(
     if let Some(s) = secret {
         req = req.basic_auth(client_id, Some(s));
     }
-    let res = match req.send().await {
+    let mut res = match req.send().await {
         Ok(r) => r,
         Err(e) => return ExchangeOutcome::Other(format!("token exchange failed: {e}")),
     };
     let status = res.status();
-    let v: Value = res.json().await.unwrap_or(Value::Null);
+    // I3: bounded read (256 KiB) — the token endpoint is attacker-influenced.
+    let v: Value = crate::egress::read_json_bounded(&mut res)
+        .await
+        .unwrap_or(Value::Null);
     if status.is_success() {
         return ExchangeOutcome::Ok(v);
     }
@@ -2528,12 +2538,15 @@ async fn refresh_access_token(
     if let Some(secret) = &client.secret {
         req = req.basic_auth(&client.client_id, Some(secret));
     }
-    let res = req
+    let mut res = req
         .send()
         .await
         .map_err(|e| format!("token refresh failed: {e}"))?;
     let status = res.status();
-    let v: Value = res.json().await.unwrap_or(Value::Null);
+    // I3: bounded read (256 KiB) — same ceiling the OIDC legs use.
+    let v: Value = crate::egress::read_json_bounded(&mut res)
+        .await
+        .unwrap_or(Value::Null);
     if !status.is_success() {
         let err = v["error"].as_str().unwrap_or("");
         if err == "invalid_grant" || err == "invalid_client" {
@@ -2670,6 +2683,38 @@ mod tests {
         // Plain http is refused in prod (E3); a public https AS is fine.
         assert!(admit_oauth("http://as.example.com/token", &prod).is_err());
         assert!(admit_oauth("https://as.example.com/token", &prod).is_ok());
+        // Hostname-FREE form of the same two assertions. `admit_oauth` is a
+        // synchronous parse + range check that resolves nothing (see the
+        // hermeticity note in `egress::tests`), so neither form touches DNS.
+        assert!(admit_oauth("http://93.184.216.34/token", &prod).is_err());
+        assert!(admit_oauth("https://93.184.216.34/token", &prod).is_ok());
+    }
+
+    // I3: every connector-OAuth response body — PRM, AS metadata, DCR, code
+    // exchange, stored-bag refresh — must be read under the SAME 256 KiB ceiling
+    // the OIDC legs use. An unbounded `Response::json` read buffers whatever the
+    // (attacker-influenced) authorization server streams, and with a 15 s timeout
+    // that is hundreds of MB per leg, several legs per discovery.
+    //
+    // The ceiling itself is tested in `egress::tests`; what needs pinning HERE is
+    // that no leg in this file bypasses it — a statement-level property, so it is
+    // asserted against the statements. Needles are composed at runtime so these
+    // literals cannot match themselves.
+    #[test]
+    fn every_oauth_body_read_is_bounded() {
+        let src = include_str!("oauth.rs");
+        let unbounded = format!("res.{}(", "json");
+        assert_eq!(
+            src.matches(&unbounded).count(),
+            0,
+            "an unbounded body read crept back into a connector-OAuth leg"
+        );
+        let bounded = format!("egress::read_json_{}(&mut res)", "bounded");
+        assert_eq!(
+            src.matches(&bounded).count(),
+            5,
+            "expected exactly the five bounded legs (PRM, AS metadata, DCR, exchange, refresh)"
+        );
     }
 
     #[test]

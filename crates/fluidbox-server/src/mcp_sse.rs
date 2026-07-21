@@ -5,14 +5,16 @@
 //! WHATWG-shaped parser that assembles multi-line `data:` fields (joined with
 //! `\n`), honors `event:`/`id:`/`retry:` framing and comment lines, dispatches
 //! on a blank line, and tolerates CRLF/LF/CR terminators. Each event is bounded
-//! to [`MAX_EVENT_BYTES`]; an oversize event is an ERROR (never silent
-//! truncation), surfaced up so the broker aborts the call as a protocol violation.
+//! to [`MAX_EVENT_BYTES`] and each RESPONSE to [`MAX_EVENTS`] events; either
+//! overflow is an ERROR (never silent truncation), surfaced up so the broker
+//! aborts the call as a protocol violation.
 //!
 //! **How the broker actually dials it (survey A §1g):** the transport funnel
 //! (`broker::dial_rpc`) buffers the WHOLE decoded response body — bounded to 8
 //! MiB by the streaming read — and then feeds it to the assembler in ONE
 //! [`feed`](SseEventAssembler::feed) + [`finish`](SseEventAssembler::finish)
-//! call; the per-event 256 KiB cap is enforced DURING that single feed. The
+//! call; the per-event 256 KiB cap and the per-response event-count cap are
+//! enforced DURING that single feed, and the scan is LINEAR in the body (C1). The
 //! assembler itself is nonetheless a true INCREMENTAL parser — [`feed`] carries a
 //! partial line across chunk boundaries and returns only the events completed so
 //! far — and its tests exercise byte-split and CRLF-split chunks, so a future
@@ -27,6 +29,17 @@
 /// is refused as a protocol error — a single event can never balloon memory or
 /// the runner context past this, independent of the whole-body 8 MiB cap.
 pub const MAX_EVENT_BYTES: usize = 256 * 1024;
+
+/// How many events ONE response may dispatch (C1). The per-event cap bounds each
+/// event and the 8 MiB body cap bounds the whole response, but neither bounds the
+/// COUNT: an 8 MiB body of `data: a\n\n` frames is ~900 000 one-byte events, each
+/// of which becomes a parsed `Value` and then a message the broker walks. 4096 is
+/// far above any real exchange — an MCP Streamable-HTTP POST carries one response
+/// plus at most a trickle of progress notifications (one per second for the full
+/// 15-minute request timeout is 900) — and it holds the average event over the
+/// cap at ~2 KiB, so only a pathological or hostile framing can reach it.
+/// Exceeding it is a protocol error, exactly like the per-event cap.
+pub const MAX_EVENTS: usize = 4096;
 
 /// One dispatched SSE event. `data` is the `data:` lines joined by `\n`
 /// (the WHATWG rule); `event`/`id`/`retry` are the optional framing fields.
@@ -55,6 +68,9 @@ pub struct SseEventAssembler {
     cur_retry: Option<u64>,
     /// Accumulated `data:` bytes for the current event (the cap unit).
     cur_data_bytes: usize,
+    /// Events dispatched so far by THIS assembler — one assembler is one
+    /// response, so this is the per-response count [`MAX_EVENTS`] bounds.
+    events: usize,
 }
 
 impl SseEventAssembler {
@@ -63,20 +79,35 @@ impl SseEventAssembler {
     }
 
     /// Feed a decoded chunk; returns every event that completed. `Err` on a
-    /// single event exceeding [`MAX_EVENT_BYTES`] (the caller aborts the call).
+    /// single event exceeding [`MAX_EVENT_BYTES`], or on a response exceeding
+    /// [`MAX_EVENTS`] events (the caller aborts the call).
+    ///
+    /// **Linear by construction (C1).** The scan advances an INDEX over the
+    /// buffer and compacts exactly once per `feed`. The previous shape drained
+    /// the consumed prefix off the FRONT per line, and `Vec::drain(..n)` memmoves
+    /// the whole remainder — quadratic in the body size, and the broker hands the
+    /// whole (up to 8 MiB) body to one synchronous `feed`. Measured on the old
+    /// shape: 256 KiB → 175 ms, 1 MiB → 5.0 s, 4 MiB → 37.3 s, 8 MiB → 143.9 s of
+    /// pure CPU on a request any org member can aim at an arbitrary URL.
     pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, String> {
         self.line_buf.extend_from_slice(chunk);
         let mut out = Vec::new();
+        // Take the buffer OUT so line slices borrow a local, not `self` (which
+        // `process_line` needs mutably); it is put back — compacted once — below.
+        let buf = std::mem::take(&mut self.line_buf);
+        let mut pos = 0usize;
+        let mut err: Option<String> = None;
         // Extract every COMPLETE line; hold an incomplete tail (and a lone
         // trailing `\r`, which might still be the first half of a `\r\n`).
-        while let Some(term) = self.line_buf.iter().position(|&b| b == b'\n' || b == b'\r') {
-            let consume_to = if self.line_buf[term] == b'\r' {
-                if term + 1 == self.line_buf.len() {
+        while let Some(rel) = buf[pos..].iter().position(|&b| b == b'\n' || b == b'\r') {
+            let term = pos + rel;
+            let consume_to = if buf[term] == b'\r' {
+                if term + 1 == buf.len() {
                     // A `\r` at the very end: wait for the next byte to know
                     // whether it is a bare CR or the CR of a CRLF.
                     break;
                 }
-                if self.line_buf[term + 1] == b'\n' {
+                if buf[term + 1] == b'\n' {
                     term + 2
                 } else {
                     term + 1
@@ -84,18 +115,34 @@ impl SseEventAssembler {
             } else {
                 term + 1
             };
-            let line: Vec<u8> = self.line_buf.drain(..consume_to).collect();
-            let line = &line[..term]; // strip the terminator byte(s)
-            if let Some(ev) = self.process_line(line)? {
-                out.push(ev);
+            match self.process_line(&buf[pos..term]) {
+                Ok(Some(ev)) => out.push(ev),
+                Ok(None) => {}
+                Err(e) => {
+                    err = Some(e);
+                    pos = consume_to;
+                    break;
+                }
             }
+            pos = consume_to;
         }
-        Ok(out)
+        // ONE memmove per feed (of the unconsumed tail only), not one per line.
+        self.line_buf = buf;
+        self.line_buf.drain(..pos);
+        match err {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
     }
 
     /// Flush a trailing event that never got its blank-line terminator (and any
     /// final unterminated line still buffered). Idempotent once drained.
-    pub fn finish(&mut self) -> Vec<SseEvent> {
+    ///
+    /// M8: this errors on the SAME conditions `feed` does. A server that omits
+    /// the final blank line must not convert "protocol violation, abort" into a
+    /// silently-dropped oversize event — the mid-stream path errors, so the
+    /// trailing path errors identically.
+    pub fn finish(&mut self) -> Result<Vec<SseEvent>, String> {
         let mut out = Vec::new();
         // A final line with no terminator (incl. a held lone `\r`).
         if !self.line_buf.is_empty() {
@@ -106,25 +153,39 @@ impl SseEventAssembler {
             } else {
                 &line[..]
             };
-            // process_line only errors on data overflow; at finish we prefer a
-            // best-effort flush, so swallow that (the body cap already bounds it).
             // A blank final line dispatches HERE — capture it, don't drop it.
-            if let Ok(Some(ev)) = self.process_line(line) {
+            if let Some(ev) = self.process_line(line)? {
                 out.push(ev);
             }
         }
         // A non-blank final line leaves an unterminated event to flush.
         if let Some(ev) = self.dispatch() {
+            self.count_event()?;
             out.push(ev);
         }
-        out
+        Ok(out)
+    }
+
+    /// Charge one dispatched event against the per-response [`MAX_EVENTS`] cap.
+    fn count_event(&mut self) -> Result<(), String> {
+        self.events += 1;
+        if self.events > MAX_EVENTS {
+            return Err(format!(
+                "mcp SSE response exceeds the {MAX_EVENTS}-event per-response cap"
+            ));
+        }
+        Ok(())
     }
 
     /// Process one terminator-stripped line. Returns a dispatched event when the
     /// line was blank (end of an event with data).
     fn process_line(&mut self, line: &[u8]) -> Result<Option<SseEvent>, String> {
         if line.is_empty() {
-            return Ok(self.dispatch());
+            let ev = self.dispatch();
+            if ev.is_some() {
+                self.count_event()?;
+            }
+            return Ok(ev);
         }
         // A leading ':' is a comment line — ignored (keep-alive/heartbeat).
         if line[0] == b':' {
@@ -195,7 +256,7 @@ mod tests {
     fn feed_all(input: &str) -> Vec<SseEvent> {
         let mut a = SseEventAssembler::new();
         let mut out = a.feed(input.as_bytes()).expect("no overflow");
-        out.extend(a.finish());
+        out.extend(a.finish().expect("no overflow at finish"));
         out
     }
 
@@ -307,8 +368,95 @@ mod tests {
             .feed(b"data: {\"id\":1,\"result\":{}}")
             .unwrap()
             .is_empty());
-        let evs = a.finish();
+        let evs = a.finish().unwrap();
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].data, "{\"id\":1,\"result\":{}}");
+    }
+
+    #[test]
+    fn oversize_trailing_event_errors_like_a_mid_stream_one() {
+        // M8: the same oversize payload, differing ONLY in whether the server
+        // sent the final blank line, must produce the SAME verdict. Before the
+        // fix the terminated form errored (abort) while the unterminated form
+        // was swallowed into a silently truncated event, so a server could
+        // downgrade a protocol violation to a normal-looking answer by omitting
+        // one newline.
+        let huge = format!("data: {}", "x".repeat(MAX_EVENT_BYTES + 10));
+        // Terminated: the error surfaces from feed…
+        let mut a = SseEventAssembler::new();
+        let mid = a
+            .feed(format!("{huge}\n\n").as_bytes())
+            .expect_err("terminated oversize event must error");
+        assert!(mid.contains("per-event cap"), "got: {mid}");
+        // …unterminated: it must surface from finish, not vanish.
+        let mut b = SseEventAssembler::new();
+        // The line has no terminator, so feed buffers it without deciding.
+        assert!(b.feed(huge.as_bytes()).unwrap().is_empty());
+        let tail = b.finish().expect_err("trailing oversize event must error");
+        assert_eq!(tail, mid, "the trailing path must error identically");
+    }
+
+    #[test]
+    fn event_count_cap_refuses_a_frame_flood() {
+        // C1: neither the per-event cap nor the broker's 8 MiB body cap bounds the
+        // NUMBER of events — `data: a\n\n` is a legal 1-byte event, so an 8 MiB
+        // body carries ~900k of them. The per-response cap is the bound.
+        let flood: String = "data: a\n\n".repeat(MAX_EVENTS + 50);
+        let mut a = SseEventAssembler::new();
+        let err = a
+            .feed(flood.as_bytes())
+            .expect_err("a frame flood must be refused");
+        assert!(err.contains("per-response cap"), "got: {err}");
+        // FALSE-GREEN guard: EXACTLY the cap passes, so the assertion above is
+        // about the cap and not about "many events always fail".
+        let mut b = SseEventAssembler::new();
+        let ok = "data: a\n\n".repeat(MAX_EVENTS);
+        let evs = b.feed(ok.as_bytes()).expect("exactly the cap must pass");
+        assert_eq!(evs.len(), MAX_EVENTS);
+        // And the cap is per RESPONSE (per assembler), not per feed: the same
+        // assembler fed the cap in two halves still refuses the overflow.
+        let mut c = SseEventAssembler::new();
+        let half = "data: a\n\n".repeat(MAX_EVENTS / 2);
+        assert!(c.feed(half.as_bytes()).is_ok());
+        assert!(c.feed(half.as_bytes()).is_ok());
+        assert!(
+            c.feed(b"data: a\n\n").is_err(),
+            "the cap must span feeds, not reset per chunk"
+        );
+    }
+
+    #[test]
+    fn a_line_flood_parses_in_linear_time() {
+        // C1 REGRESSION GUARD. The body is ~1 MiB of two-byte SSE comment lines
+        // (`:\n` keep-alives — a real construct, and the line class NEITHER the
+        // per-event byte cap nor the per-response event cap bounds), followed by
+        // one real event.
+        //
+        // Why this discriminates: the assertion is on LINES, not events, so the
+        // event cap cannot short-circuit it. Under the old front-`drain(..n)`
+        // shape each of the ~1 048 576 lines memmoved the whole remaining buffer.
+        // A/B on the two loop shapes (rustc -O, same inputs, same machine) for
+        // exactly this body: 256 KiB → 266 ms old / 0.25 ms new; 1 MiB → 4.57 s
+        // old / 0.99 ms new; so 2 MiB is ~18 s old and ~2 ms new. The bound below
+        // is therefore ~9× UNDER the quadratic shape and (measured at ~60 ms for
+        // this whole test in a debug build, body construction included) ~30× OVER
+        // the linear one — it fails the bug and cannot flake on the fix.
+        const BODY: usize = 2 * 1024 * 1024;
+        let mut body = String::with_capacity(BODY + 32);
+        while body.len() < BODY {
+            body.push_str(":\n");
+        }
+        body.push_str("data: {\"id\":1}\n\n");
+        let started = std::time::Instant::now();
+        let mut a = SseEventAssembler::new();
+        let evs = a.feed(body.as_bytes()).expect("keep-alives are not events");
+        let elapsed = started.elapsed();
+        // Not vacuous: the keep-alives are skipped and the one real event lands.
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].data, "{\"id\":1}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "SSE parsing is not linear in the body size: {BODY} bytes took {elapsed:?}"
+        );
     }
 }
