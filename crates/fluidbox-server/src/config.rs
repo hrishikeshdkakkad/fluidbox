@@ -175,6 +175,26 @@ pub struct Config {
     pub egress_rate_tenant_per_min: u32,
     pub egress_rate_connection_per_min: u32,
     pub egress_rate_host_per_min: u32,
+    /// The PER-USER outbound ceiling (`FLUIDBOX_EGRESS_RATE_USER_PER_MIN`, Phase F).
+    /// The fourth dimension the design names and Phase E deferred: without it one
+    /// member of an org can spread dials across the org's connections and consume
+    /// the whole tenant budget. Default 60 — the same number as the per-CONNECTION
+    /// ceiling, which is what a single-connection run is already bounded by today,
+    /// so the common shape sees no change and the multi-connection fan-out this
+    /// dimension exists to catch is the case that starts binding. Enforced ONLY in
+    /// the durable tier (the in-memory governor is deliberately unchanged), so it
+    /// is inactive when `FLUIDBOX_EGRESS_DURABLE=0`. **0 DISABLES it**; a malformed
+    /// value fails boot.
+    pub egress_rate_user_per_min: u32,
+    /// Cross-replica egress governance (`FLUIDBOX_EGRESS_DURABLE`, Phase F;
+    /// migration 0023). Default ON. The in-memory governor is per-replica, so an
+    /// N-replica deployment's real ceiling is N × the configured rate and a breaker
+    /// opened on one replica does not stop the others; this turns on the Postgres
+    /// tier that closes both. It is a SECOND gate, never a replacement — a dial
+    /// must pass the local tier AND this one — and it DEGRADES: a DB error admits
+    /// on the local verdict alone rather than failing the dial. A malformed value
+    /// fails boot.
+    pub egress_durable: bool,
     /// Per-connection circuit breaker (`FLUIDBOX_EGRESS_BREAKER_THRESHOLD`,
     /// `FLUIDBOX_EGRESS_BREAKER_OPEN_SECS`, Phase E): consecutive transport/5xx
     /// failures that open it (default 5) and how long it stays open before
@@ -413,6 +433,22 @@ impl Config {
                 get("FLUIDBOX_EGRESS_RATE_HOST_PER_MIN").ok(),
                 crate::governor::DEFAULT_HOST_PER_MIN,
             )?,
+            egress_rate_user_per_min: parse_u32_env(
+                "FLUIDBOX_EGRESS_RATE_USER_PER_MIN",
+                get("FLUIDBOX_EGRESS_RATE_USER_PER_MIN").ok(),
+                crate::governor::DEFAULT_USER_PER_MIN,
+            )?,
+            // Default ON: `DATABASE_URL` is REQUIRED above, so "a database is
+            // configured" is always true here and the durable tier ships enabled.
+            // That is deliberate — a fix for an N× ceiling that has to be switched
+            // on is a fix that ships dark — and it is safe to default because the
+            // tier DEGRADES on any DB error (admit on the local verdict, log,
+            // count) rather than failing dials closed.
+            egress_durable: parse_bool_env(
+                "FLUIDBOX_EGRESS_DURABLE",
+                get("FLUIDBOX_EGRESS_DURABLE").ok(),
+                true,
+            )?,
             egress_breaker_threshold: parse_u32_env(
                 "FLUIDBOX_EGRESS_BREAKER_THRESHOLD",
                 get("FLUIDBOX_EGRESS_BREAKER_THRESHOLD").ok(),
@@ -507,6 +543,31 @@ fn parse_u32_env(name: &str, raw: Option<String>, default: u32) -> anyhow::Resul
         Some(v) => v
             .parse()
             .map_err(|e| anyhow::anyhow!("{name}='{v}' is not a valid u32: {e}")),
+    }
+}
+
+/// Same fail-boot-on-malformed discipline for a BOOLEAN governor knob (Phase F).
+///
+/// Deliberately stricter than the older `.map(|v| v == "1" || …).unwrap_or(false)`
+/// shape used by the non-safety flags above: that one reads `FLUIDBOX_EGRESS_DURABLE=ture`
+/// as "off" and silently restores the per-replica ceiling the operator was trying to
+/// close. A typo in a control that governs outbound abuse must fail boot naming the
+/// variable, exactly like the `FLUIDBOX_EGRESS_RATE_*` numbers beside it.
+///
+/// Whitespace-only is treated as UNSET (the `parse_egress_cidrs` precedent), not as
+/// malformed: a stray space after `FLUIDBOX_EGRESS_DURABLE=` in a `.env` means the
+/// operator wrote nothing, and answering that with a boot failure would be a worse
+/// trade than answering it with the default — which here is the SAFE value anyway.
+fn parse_bool_env(name: &str, raw: Option<String>, default: bool) -> anyhow::Result<bool> {
+    match raw.filter(|v| !v.trim().is_empty()) {
+        None => Ok(default),
+        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(anyhow::anyhow!(
+                "{name}='{v}' is not a valid boolean (use 1/0, true/false, yes/no, on/off)"
+            )),
+        },
     }
 }
 
@@ -725,6 +786,39 @@ mod tests {
         );
         assert!(parse_u32_env("G", Some("-1".into()), 120).is_err());
         assert!(parse_u32_env("G", Some("4294967296".into()), 120).is_err());
+    }
+
+    /// `FLUIDBOX_EGRESS_DURABLE` (Phase F). The knob that decides whether the
+    /// cross-replica tier runs at all, so a typo must be a boot error rather than a
+    /// silent return to the per-replica N× ceiling.
+    #[test]
+    fn the_durable_egress_flag_defaults_on_and_fails_boot_on_a_typo() {
+        // Absent/empty ⇒ the shipped default (ON — DATABASE_URL is required, so a
+        // database is always configured).
+        assert!(parse_bool_env("FLUIDBOX_EGRESS_DURABLE", None, true).unwrap());
+        assert!(parse_bool_env("FLUIDBOX_EGRESS_DURABLE", Some("  ".into()), true).unwrap());
+        // Every spelling an operator plausibly writes, both ways.
+        for on in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(
+                parse_bool_env("D", Some(on.into()), false).unwrap(),
+                "{on} must read as ON"
+            );
+        }
+        for off in ["0", "false", "False", "no", "off"] {
+            assert!(
+                !parse_bool_env("D", Some(off.into()), true).unwrap(),
+                "{off} must read as OFF"
+            );
+        }
+        // A typo is a NAMED boot error. The old `v == "1" || v == "true"` shape
+        // would have read this as "off" and quietly reopened the N× ceiling.
+        let e = parse_bool_env("FLUIDBOX_EGRESS_DURABLE", Some("ture".into()), true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("FLUIDBOX_EGRESS_DURABLE") && e.contains("ture"),
+            "got: {e}"
+        );
     }
 
     /// The LLM concurrency ceiling (Gap 14). Drives the REAL parse — the earlier

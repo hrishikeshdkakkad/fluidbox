@@ -11,6 +11,7 @@ use sqlx::postgres::{PgListener, PgPoolOptions};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+pub mod governance;
 pub mod identity;
 pub mod seed;
 pub mod system_worker;
