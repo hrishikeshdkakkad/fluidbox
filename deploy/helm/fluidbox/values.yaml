@@ -43,10 +43,39 @@ secretKeys:
   adminToken: FLUIDBOX_ADMIN_TOKEN
   credentialKey: FLUIDBOX_CREDENTIAL_KEY
   litellmMasterKey: LITELLM_MASTER_KEY
+  # Only read when server.archiveStore is "s3".
+  archiveS3AccessKeyId: FLUIDBOX_ARCHIVE_S3_ACCESS_KEY_ID
+  archiveS3SecretAccessKey: FLUIDBOX_ARCHIVE_S3_SECRET_ACCESS_KEY
 
 server:
-  # v1 is single-replica + Recreate (settled: multi-replica is a non-goal).
+  # Default stays 1. Phase F made >1 POSSIBLE, not automatic: raising this
+  # requires archiveStore "s3" (boot REFUSES "fs" with replicas > 1, because the
+  # alternative is an init container's archive GET landing on a replica that does
+  # not hold the file — which looks like a flaky run, not a misconfiguration) AND
+  # strategy RollingUpdate below.
+  #
+  # The value is passed to the server as FLUIDBOX_REPLICAS. It is a DECLARATION —
+  # a process cannot observe its own replica count — so it is only as good as
+  # this chart setting it. A hand-rolled Deployment scaled to 2 without it still
+  # breaks silently.
   replicas: 1
+  # Workspace-archive storage (Phase F). "" or "fs" = node-local disk on the
+  # archive PVC, byte-for-byte today's behaviour, SINGLE REPLICA ONLY. "s3" = any
+  # S3-compatible bucket (AWS, MinIO, R2, GCS-XML) — this is what actually
+  # unblocks replicas > 1, because the k8s init container fetches the archive
+  # over HTTP from whichever replica the Service picks.
+  #
+  # Credentials are STATIC key/secret from the secret above. IRSA, instance roles
+  # and STS auto-refresh are NOT supported: the AWS credential chain only helps
+  # against real AWS, and the point of this backend is that MinIO/R2 work
+  # identically. Pasted temporary credentials work until they expire.
+  archiveStore: ""
+  archiveS3:
+    bucket: ""
+    region: ""            # required — it is the SigV4 credential scope
+    endpoint: ""          # "" = real AWS; set for MinIO/R2/GCS-XML
+    prefix: "archives/"
+    forcePathStyle: ""    # "" = true when endpoint is set, false for AWS
   # Browser/AS-facing base URL (Ingress origin) — feeds OAuth redirect_uri +
   # CIMD + GitHub App webhooks. Set to your https origin in production.
   publicUrl: ""

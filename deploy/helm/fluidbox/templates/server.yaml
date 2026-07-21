@@ -193,6 +193,27 @@ spec:
             # memory — raise server.resources.limits.memory with it.
             - { name: FLUIDBOX_MAX_REQUEST_BODY_BYTES, value: {{ . | quote }} }
             {{- end }}
+            # Phase F: a DECLARATION of the replica count, not an observation.
+            # Boot refuses archiveStore "fs" when this is > 1.
+            - { name: FLUIDBOX_REPLICAS, value: {{ .Values.server.replicas | quote }} }
+            {{- with .Values.server.archiveStore }}
+            - { name: FLUIDBOX_ARCHIVE_STORE, value: {{ . | quote }} }
+            {{- end }}
+            {{- if eq .Values.server.archiveStore "s3" }}
+            - { name: FLUIDBOX_ARCHIVE_S3_BUCKET, value: {{ .Values.server.archiveS3.bucket | quote }} }
+            - { name: FLUIDBOX_ARCHIVE_S3_REGION, value: {{ .Values.server.archiveS3.region | quote }} }
+            {{- with .Values.server.archiveS3.endpoint }}
+            - { name: FLUIDBOX_ARCHIVE_S3_ENDPOINT, value: {{ . | quote }} }
+            {{- end }}
+            - { name: FLUIDBOX_ARCHIVE_S3_PREFIX, value: {{ .Values.server.archiveS3.prefix | quote }} }
+            {{- with .Values.server.archiveS3.forcePathStyle }}
+            - { name: FLUIDBOX_ARCHIVE_S3_FORCE_PATH_STYLE, value: {{ . | quote }} }
+            {{- end }}
+            - name: FLUIDBOX_ARCHIVE_S3_ACCESS_KEY_ID
+              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.archiveS3AccessKeyId | quote }} } }
+            - name: FLUIDBOX_ARCHIVE_S3_SECRET_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.archiveS3SecretAccessKey | quote }} } }
+            {{- end }}
             {{- with .Values.server.workloadIdentity }}
             # Gap 6 workload identity on the sandbox-facing internal gateway.
             # Only meaningful under FLUIDBOX_PROVIDER=kubernetes, and only while
