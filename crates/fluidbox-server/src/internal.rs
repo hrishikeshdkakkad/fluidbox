@@ -31,6 +31,12 @@ use std::time::Duration;
 struct GateDecision {
     allowed: bool,
     message: Option<String>,
+    /// The canonical `digest_json(input)` the gate bound to the intent (Phase E,
+    /// #33). The brokered dispatch keys its durable execution claim on THIS exact
+    /// digest — never a re-serialization — so a claim can never diverge from the
+    /// approval's digest. Empty until stamped by [`decide_tool_call`]; only the
+    /// brokered `tool_call` path reads it.
+    input_digest: String,
 }
 
 impl GateDecision {
@@ -38,12 +44,14 @@ impl GateDecision {
         Self {
             allowed: true,
             message: None,
+            input_digest: String::new(),
         }
     }
     fn deny(message: impl Into<String>) -> Self {
         Self {
             allowed: false,
             message: Some(message.into()),
+            input_digest: String::new(),
         }
     }
 }
@@ -112,19 +120,17 @@ fn schema_gate_decision(
 ) -> Option<String> {
     use fluidbox_core::schema_guard as sg;
     let frozen = locate_frozen_schema(run_spec, tool)?;
-    // 1. Screen the untrusted frozen schema (size/depth/local-$ref).
-    if sg::guard_schema(frozen.schema).is_err() {
-        return Some("frozen schema invalid — refresh the snapshot".to_string());
-    }
-    // 2. Compile (cached) under the snapshot's dialect. A compile failure is a
-    //    SCHEMA problem (malformed but past the guard), not an args problem — it
-    //    shares the schema-invalid deny.
+    // 1. Compile (cached) under the snapshot's dialect. The cache screens the
+    //    UNTRUSTED frozen schema (size/depth/local-$ref) on a MISS only — a hit
+    //    was already guarded, and a frozen schema is stable, so its verdict is
+    //    too. A guard failure OR a compile failure is the same schema-invalid
+    //    deny (malformed schema, not an args problem).
     let dialect = sg::dialect_for(frozen.protocol_version);
     let validator = match cache.get_or_compile(frozen.digest, tool, frozen.schema, dialect) {
         Ok(v) => v,
         Err(_) => return Some("frozen schema invalid — refresh the snapshot".to_string()),
     };
-    // 3. Validate the args (size/depth pre-guarded inside). Report bounded
+    // 2. Validate the args (size/depth pre-guarded inside). Report bounded
     //    JSON-pointer PATHS — never values (secrets-adjacent).
     match sg::validate_instance(&validator, input) {
         Ok(()) => None,
@@ -135,11 +141,30 @@ fn schema_gate_decision(
     }
 }
 
+/// The shared gate entry point (`permission` and brokered `tool_call` both call
+/// it). Runs the full ordered gate ([`gate_tool_call`]) and stamps the canonical
+/// input digest onto the decision so the brokered dispatch keys its execution
+/// claim on the SAME digest the intent bound (`digest_json` is a pure fn of the
+/// in-memory `Value`, identical to `register_tool_intent`'s — computed here at the
+/// gate boundary, never re-derived inside the broker path).
+async fn decide_tool_call(
+    state: &AppState,
+    session: &fluidbox_db::SessionRow,
+    run_spec: &RunSpec,
+    tool_call_id: &str,
+    tool: &str,
+    input: &Value,
+) -> ApiResult<GateDecision> {
+    let mut decision = gate_tool_call(state, session, run_spec, tool_call_id, tool, input).await?;
+    decision.input_digest = digest_json(input);
+    Ok(decision)
+}
+
 /// The heart of the system: one decision per tool call, made server-side
 /// against the FROZEN RunSpec (never live config). Idempotent by
 /// tool_call_id through the approvals table, so retries re-attach instead
 /// of re-asking.
-async fn decide_tool_call(
+async fn gate_tool_call(
     state: &AppState,
     session: &fluidbox_db::SessionRow,
     run_spec: &RunSpec,
@@ -638,6 +663,20 @@ async fn await_pending_decision(
     .await;
 
     let allowed = final_status == "approved_once" || final_status == "approved_session";
+    // E12 slice (Task 4, plan): the session may have terminalized DURING a
+    // minutes-long wait (cancel / budget sweep). A post-wait ALLOW must not
+    // execute against a tearing-down run — re-read status and deny if it no longer
+    // accepts work, mirroring the handler-top terminal guard (a deny with no fresh
+    // tool.decision; the human's approval, already ledgered above, was real). This
+    // closes the sandbox-tool half; the brokered half is additionally fenced by
+    // the execution claim's in-tx nonterminal check (E10).
+    if allowed {
+        if let Some(sess) = fluidbox_db::get_session(&state.pool, scope, session_id).await? {
+            if !sess.status_enum().accepts_work() {
+                return Ok(GateDecision::deny("session terminal during approval wait"));
+            }
+        }
+    }
     emit_decision(
         state,
         scope,
@@ -784,16 +823,86 @@ pub async fn tool_call(
         })));
     }
 
-    // ── Phase C binding path (takes precedence over legacy bundles) ──
+    // ── The gate allowed the call; wrap the ALLOWED dispatch in a durable
+    // execution claim (Phase E, #33; Gap 11). The claim keys on the intent's
+    // input digest so exactly ONE upstream send happens per (session, call,
+    // digest), taken under the same sessions-row lock order as cancellation and
+    // refused once the session stops accepting work. ──
+    let input_digest = decision.input_digest;
+
+    // Phase C binding path (takes precedence over legacy bundles). Binding
+    // resolution (integrity 500) + the live revocation recheck (a governance
+    // denial) both happen BEFORE the claim — a recheck refusal is a denial, never
+    // a re-claimable dispatch failure; the credential-turn is the only thing the
+    // claim wraps.
     if let Some(surface) = surface {
-        return broker_call_via_binding(&state, scope, &session, &req, &surface).await;
+        let binding =
+            fluidbox_db::find_session_binding(&state.pool, scope, session.id, "mcp", &surface.slot)
+                .await?;
+        let binding = match binding {
+            Some(b) if b.id == surface.binding_id => b,
+            _ => {
+                let reason = format!(
+                    "brokered surface '{}' has no matching run resource binding",
+                    surface.slot
+                );
+                record_binding_denial(
+                    &state,
+                    scope,
+                    session.id,
+                    &req.tool_call_id,
+                    &req.tool,
+                    &reason,
+                )
+                .await;
+                return Err(ApiError::Internal(reason));
+            }
+        };
+        // Revocation recheck immediately before secret access (design :705-723):
+        // a revoked/reauthorized connection or a deactivated owner fails closed.
+        let conn = match crate::broker::recheck_binding(&state, scope, &binding).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                let reason: String = e.chars().take(300).collect();
+                record_binding_denial(
+                    &state,
+                    scope,
+                    session.id,
+                    &req.tool_call_id,
+                    &req.tool,
+                    &reason,
+                )
+                .await;
+                return Ok(Json(
+                    json!({ "ok": false, "denied": true, "message": reason }),
+                ));
+            }
+        };
+        let (_, tool_name) = capability::parse_mcp_tool(&req.tool)
+            .expect("gate allowed an mcp surface tool, so it parses");
+        let dispatch = BrokerDispatch::Binding {
+            conn: Box::new(conn),
+            surface: &surface,
+            binding: Box::new(binding),
+            tool_name,
+        };
+        return execute_with_claim(
+            &state,
+            scope,
+            session.id,
+            &req.tool_call_id,
+            &req.tool,
+            &req.input,
+            &input_digest,
+            &dispatch,
+        )
+        .await;
     }
 
-    // ── Legacy path (byte-for-byte today's behavior): the credential comes
-    // from the connection_id embedded in the frozen bundle server, and the only
-    // live check is broker.rs's status read (a legacy run froze no generation
-    // or owner to compare — the residual invariant-21 gap the binding path
-    // closes for new runs). ──
+    // ── Legacy path (pre-Phase-C / in-flight runs): the credential comes from the
+    // connection_id embedded in the frozen bundle server; the only live check is
+    // broker.rs's status read (a legacy run froze no generation or owner to
+    // compare — the residual invariant-21 gap the binding path closes). ──
     let srv = legacy_server.expect("gate allowed the call, so the tool is in the frozen set");
     let CapabilityServer::Brokered {
         name: server_name, ..
@@ -802,183 +911,414 @@ pub async fn tool_call(
         unreachable!("class-checked above")
     };
     let (_, tool_name) = capability::parse_mcp_tool(&req.tool).expect("found in the frozen set");
+    let dispatch = BrokerDispatch::Legacy {
+        server: srv,
+        server_name,
+        tool_name,
+    };
+    execute_with_claim(
+        &state,
+        scope,
+        session.id,
+        &req.tool_call_id,
+        &req.tool,
+        &req.input,
+        &input_digest,
+        &dispatch,
+    )
+    .await
+}
 
-    // Credential turn happens inside the broker: resolved (static compose
-    // or OAuth mint/refresh), sent to the (audience-bound) server, dropped.
-    // Resolution failure is an execution failure, not a policy denial —
-    // visibly ledgered either way.
-    let started = std::time::Instant::now();
-    let outcome =
-        crate::broker::call_tool_auth(&state, scope, srv, tool_name, &req.input, session.id).await;
-    let latency_ms = started.elapsed().as_millis() as u64;
-    match outcome {
-        Ok((content, is_error, structured)) => {
-            record_brokered_exec(
-                &state,
-                scope,
-                session.id,
-                &req.tool_call_id,
-                &req.tool,
-                server_name,
-                None,
-                !is_error,
-                latency_ms,
-                Some(brokered_result_digest(&content, structured.as_ref())),
-                None,
-            )
-            .await;
-            Ok(Json(brokered_ok_json(content, is_error, structured)))
+/// The execution-claim TTL (Phase E, #33; Gap 11): 10 minutes. This comfortably
+/// covers a whole dispatch (the 30 s `MCP_TIMEOUT`, the single 401-reauth retry,
+/// and a loser's up-to-30 s in-flight poll) with margin, so a live dispatch is
+/// never swept to `ambiguous` under it — while a genuinely crashed `claimed` row
+/// is reclaimed for classification promptly enough.
+const TOOL_EXECUTION_CLAIM_TTL_SECS: i64 = 600;
+
+/// The resolved brokered dispatch target (post-gate, post-recheck). Both the
+/// Phase C binding path and the legacy embedded-connection path funnel through
+/// the SAME execution-claim machinery; this is the only per-path difference — the
+/// actual send + its ledger identity.
+enum BrokerDispatch<'a> {
+    Binding {
+        // Boxed (large rows; this transient descriptor lives one request).
+        conn: Box<fluidbox_db::IntegrationConnectionRow>,
+        surface: &'a fluidbox_core::spec::BrokeredSurface,
+        binding: Box<fluidbox_db::RunResourceBindingRow>,
+        tool_name: &'a str,
+    },
+    Legacy {
+        server: &'a CapabilityServer,
+        server_name: &'a str,
+        tool_name: &'a str,
+    },
+}
+
+impl BrokerDispatch<'_> {
+    /// One logical dispatch (incl. the broker's single sanctioned 401-reauth
+    /// retry) → a classified [`crate::broker::DispatchOutcome`].
+    async fn run(
+        &self,
+        state: &AppState,
+        scope: TenantScope,
+        session_id: uuid::Uuid,
+        input: &Value,
+    ) -> crate::broker::DispatchOutcome {
+        match self {
+            BrokerDispatch::Binding {
+                conn,
+                surface,
+                binding,
+                tool_name,
+            } => {
+                crate::broker::call_tool_for_conn(
+                    state,
+                    scope,
+                    conn,
+                    &surface.url,
+                    tool_name,
+                    input,
+                    binding,
+                    // Gap 12: pin the runtime MCP negotiation to the frozen version.
+                    surface.protocol_version.as_deref(),
+                )
+                .await
+            }
+            BrokerDispatch::Legacy {
+                server, tool_name, ..
+            } => {
+                crate::broker::call_tool_auth(state, scope, server, tool_name, input, session_id)
+                    .await
+            }
         }
-        Err(e) => {
-            let msg: String = e.chars().take(300).collect();
-            record_brokered_exec(
-                &state,
-                scope,
-                session.id,
-                &req.tool_call_id,
-                &req.tool,
-                server_name,
-                None,
-                false,
-                latency_ms,
-                None,
-                Some(msg.clone()),
-            )
-            .await;
-            Ok(Json(json!({ "ok": false, "error": msg })))
+    }
+    /// The `tool.brokered` ledger server label (binding slot vs legacy server).
+    fn server_label(&self) -> &str {
+        match self {
+            BrokerDispatch::Binding { surface, .. } => &surface.slot,
+            BrokerDispatch::Legacy { server_name, .. } => server_name,
+        }
+    }
+    /// The binding id for the ledger (Some on the Phase C path, None on legacy).
+    fn binding_id(&self) -> Option<uuid::Uuid> {
+        match self {
+            BrokerDispatch::Binding { surface, .. } => Some(surface.binding_id),
+            BrokerDispatch::Legacy { .. } => None,
         }
     }
 }
 
-/// The Phase C brokered-execution path: the requested tool resolved to a
-/// binding-backed surface. Recheck the run resource binding (status +
-/// generation + owner membership) IMMEDIATELY before the credential turns
-/// server-side, then execute against the frozen surface url. A binding refusal
-/// ledgers `tool.decision` (source="binding") — the same audit shape as a
-/// capability denial — before the denial returns; a corrupt surface⇄binding
-/// link is a 500-class integrity error (both written in one transaction).
-async fn broker_call_via_binding(
+/// Wrap the ALLOWED brokered dispatch in the durable execution claim (Phase E,
+/// #33; Gap 11, plan E10). Take (or find) the claim keyed on the intent's exact
+/// input digest, then:
+///   - [`ClaimOutcome::SessionTerminal`] → the session stopped accepting work
+///     (cancel-during-approval brokered half) → deny;
+///   - [`ClaimOutcome::Won`] → dispatch once, complete the claim, respond;
+///   - [`ClaimOutcome::Existing`] → adopt a terminal outcome (the duplicate-
+///     return contract), re-claim a `failed_before_send` row for a fresh
+///     dispatch, or bounded-poll a `claimed`/`ambiguous` row.
+#[allow(clippy::too_many_arguments)]
+async fn execute_with_claim(
     state: &AppState,
     scope: TenantScope,
-    session: &fluidbox_db::SessionRow,
-    req: &BrokeredCallReq,
-    surface: &fluidbox_core::spec::BrokeredSurface,
+    session_id: uuid::Uuid,
+    tool_call_id: &str,
+    tool: &str,
+    input: &Value,
+    input_digest: &str,
+    dispatch: &BrokerDispatch<'_>,
 ) -> ApiResult<Json<Value>> {
-    let binding =
-        fluidbox_db::find_session_binding(&state.pool, scope, session.id, "mcp", &surface.slot)
-            .await?;
-    let binding = match binding {
-        Some(b) if b.id == surface.binding_id => b,
-        _ => {
-            let reason = format!(
-                "brokered surface '{}' has no matching run resource binding",
-                surface.slot
-            );
-            record_binding_denial(
+    match fluidbox_db::claim_tool_execution(
+        &state.pool,
+        scope,
+        session_id,
+        tool_call_id,
+        input_digest,
+        TOOL_EXECUTION_CLAIM_TTL_SECS,
+    )
+    .await?
+    {
+        fluidbox_db::ClaimOutcome::SessionTerminal => Ok(Json(json!({
+            "ok": false,
+            "denied": true,
+            "message": "session is terminal",
+        }))),
+        fluidbox_db::ClaimOutcome::Won { claim_id } => {
+            finish_won_claim(
                 state,
                 scope,
-                session.id,
-                &req.tool_call_id,
-                &req.tool,
-                &reason,
+                session_id,
+                tool_call_id,
+                tool,
+                input,
+                dispatch,
+                claim_id,
             )
-            .await;
-            return Err(ApiError::Internal(reason));
+            .await
         }
-    };
+        fluidbox_db::ClaimOutcome::Existing(row) => match row.state.as_str() {
+            // Terminal → adopt the stored outcome verbatim (the duplicate-return
+            // contract): a faithful retry returns byte-for-byte what the original did.
+            "succeeded" | "failed_upstream" => Ok(Json(claim_response(
+                &row.state,
+                row.result_content.as_ref(),
+                row.error_message.as_deref(),
+            ))),
+            // Ambiguous is NEVER auto-redispatched (invariant 15).
+            "ambiguous" => Ok(Json(claim_response("ambiguous", None, None))),
+            // The ONLY re-claimable state: re-claim (same row) and dispatch fresh;
+            // a lost re-claim means another handler is in flight → poll.
+            "failed_before_send" => {
+                if fluidbox_db::reclaim_failed_before_send(
+                    &state.pool,
+                    scope,
+                    session_id,
+                    tool_call_id,
+                    input_digest,
+                    TOOL_EXECUTION_CLAIM_TTL_SECS,
+                )
+                .await?
+                {
+                    finish_won_claim(
+                        state,
+                        scope,
+                        session_id,
+                        tool_call_id,
+                        tool,
+                        input,
+                        dispatch,
+                        row.id,
+                    )
+                    .await
+                } else {
+                    poll_in_flight(state, scope, session_id, tool_call_id, input_digest).await
+                }
+            }
+            // `claimed` (a concurrent dispatch in flight) → bounded poll.
+            _ => poll_in_flight(state, scope, session_id, tool_call_id, input_digest).await,
+        },
+    }
+}
 
-    // Revocation recheck immediately before secret access (design :705-723): a
-    // revoked/reauthorized connection or a deactivated owner fails closed here.
-    let conn = match crate::broker::recheck_binding(state, scope, &binding).await {
-        Ok(conn) => conn,
-        Err(e) => {
-            let reason: String = e.chars().take(300).collect();
-            record_binding_denial(
-                state,
-                scope,
-                session.id,
-                &req.tool_call_id,
-                &req.tool,
-                &reason,
-            )
-            .await;
-            return Ok(Json(json!({
-                "ok": false,
-                "denied": true,
-                "message": reason,
-            })));
-        }
-    };
-
-    let (_, tool_name) = capability::parse_mcp_tool(&req.tool)
-        .expect("gate allowed an mcp surface tool, so it parses");
-
-    // Credential turns server-side inside the broker against the just-rechecked
-    // connection + the frozen surface url; sent to the (audience-bound) server,
-    // dropped. Resolution/transport failure is an execution failure, ledgered.
+/// Dispatch a WON claim once, settle the claim from its classified outcome, ledger
+/// `tool.brokered` (with the settled `outcome`), and return the runner response.
+#[allow(clippy::too_many_arguments)]
+async fn finish_won_claim(
+    state: &AppState,
+    scope: TenantScope,
+    session_id: uuid::Uuid,
+    tool_call_id: &str,
+    tool: &str,
+    input: &Value,
+    dispatch: &BrokerDispatch<'_>,
+    claim_id: uuid::Uuid,
+) -> ApiResult<Json<Value>> {
     let started = std::time::Instant::now();
-    let outcome = crate::broker::call_tool_for_conn(
+    let outcome = dispatch.run(state, scope, session_id, input).await;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    let comp = dispatch_to_completion(outcome);
+    // Settle the claim (CAS from 'claimed'). A loser (already swept to ambiguous)
+    // returns false — we still answer this request from the completion we computed;
+    // the swept row is the durable truth a future duplicate adopts.
+    fluidbox_db::complete_tool_execution(
+        &state.pool,
+        scope,
+        claim_id,
+        comp.state,
+        comp.result_digest.as_deref(),
+        comp.is_error,
+        comp.result_content.as_ref(),
+        comp.error_message.as_deref(),
+    )
+    .await?;
+    record_brokered_exec(
         state,
         scope,
-        &conn,
-        &surface.url,
-        tool_name,
-        &req.input,
-        &binding,
-        // Gap 12: pin the runtime MCP negotiation to the version the surface
-        // froze; the legacy `call_tool_auth` path has no frozen version (None).
-        surface.protocol_version.as_deref(),
+        session_id,
+        tool_call_id,
+        tool,
+        dispatch.server_label(),
+        dispatch.binding_id(),
+        comp.ledger_ok,
+        latency_ms,
+        comp.result_digest.clone(),
+        comp.ledger_error.clone(),
+        Some(comp.state.to_string()),
     )
     .await;
-    let latency_ms = started.elapsed().as_millis() as u64;
-    match outcome {
-        Ok((content, is_error, structured)) => {
-            record_brokered_exec(
-                state,
-                scope,
-                session.id,
-                &req.tool_call_id,
-                &req.tool,
-                &surface.slot,
-                Some(surface.binding_id),
-                !is_error,
-                latency_ms,
-                Some(brokered_result_digest(&content, structured.as_ref())),
-                None,
-            )
-            .await;
-            Ok(Json(brokered_ok_json(content, is_error, structured)))
+    Ok(Json(claim_response(
+        comp.state,
+        comp.result_content.as_ref(),
+        comp.error_message.as_deref(),
+    )))
+}
+
+/// Bounded poll of an in-flight `claimed` row (every 500 ms, up to 30 s): a
+/// terminal state adopts; still-`claimed` (or reset to `failed_before_send` by the
+/// in-flight dispatcher's pre-send failure) returns a retryable in-flight tool
+/// error the runner may re-request against.
+async fn poll_in_flight(
+    state: &AppState,
+    scope: TenantScope,
+    session_id: uuid::Uuid,
+    tool_call_id: &str,
+    input_digest: &str,
+) -> ApiResult<Json<Value>> {
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Some(row) = fluidbox_db::get_tool_execution(
+            &state.pool,
+            scope,
+            session_id,
+            tool_call_id,
+            input_digest,
+        )
+        .await?
+        {
+            match row.state.as_str() {
+                "succeeded" | "failed_upstream" => {
+                    return Ok(Json(claim_response(
+                        &row.state,
+                        row.result_content.as_ref(),
+                        row.error_message.as_deref(),
+                    )))
+                }
+                "ambiguous" => return Ok(Json(claim_response("ambiguous", None, None))),
+                _ => {} // still claimed / failed_before_send → keep waiting.
+            }
         }
-        Err(e) => {
-            let msg: String = e.chars().take(300).collect();
-            record_brokered_exec(
-                state,
-                scope,
-                session.id,
-                &req.tool_call_id,
-                &req.tool,
-                &surface.slot,
-                Some(surface.binding_id),
-                false,
-                latency_ms,
-                None,
-                Some(msg.clone()),
-            )
-            .await;
-            Ok(Json(json!({ "ok": false, "error": msg })))
+    }
+    Ok(Json(
+        json!({ "ok": false, "error": "execution in flight; retry later" }),
+    ))
+}
+
+/// The claim-completion columns + ledger meta a [`crate::broker::DispatchOutcome`]
+/// settles to (plan E10). Kept as a plain struct so [`dispatch_to_completion`]
+/// stays a PURE, unit-tested mapping.
+struct Completion {
+    state: &'static str,
+    result_content: Option<Value>,
+    is_error: Option<bool>,
+    error_message: Option<String>,
+    result_digest: Option<String>,
+    ledger_ok: bool,
+    ledger_error: Option<String>,
+}
+
+/// Map a broker outcome to the claim's terminal columns (plan E10): PURE.
+/// `Definitive && !is_error → succeeded`; `Definitive && is_error →
+/// failed_upstream` (an MCP isError result OR a synthesized upstream/transport
+/// error, carrying the result so a duplicate adopts it); `NeverSent →
+/// failed_before_send`; `Ambiguous → ambiguous`.
+fn dispatch_to_completion(outcome: crate::broker::DispatchOutcome) -> Completion {
+    use crate::broker::DispatchOutcome as D;
+    match outcome {
+        D::Definitive {
+            content,
+            is_error,
+            structured,
+        } => {
+            let result_obj = brokered_result_obj(&content, is_error, structured.as_ref());
+            let digest = brokered_result_digest(&content, structured.as_ref());
+            // An error result (isError, or a synthesized upstream/transport error)
+            // logs its text for the audit trail; a success logs only the digest.
+            let err_text = if is_error {
+                Some(first_text_block(&content))
+            } else {
+                None
+            };
+            Completion {
+                state: if is_error {
+                    "failed_upstream"
+                } else {
+                    "succeeded"
+                },
+                result_content: Some(result_obj),
+                is_error: Some(is_error),
+                error_message: err_text.clone(),
+                result_digest: Some(digest),
+                ledger_ok: !is_error,
+                ledger_error: err_text,
+            }
+        }
+        D::NeverSent(msg) => {
+            let m: String = msg.chars().take(300).collect();
+            Completion {
+                state: "failed_before_send",
+                result_content: None,
+                is_error: Some(false),
+                error_message: Some(m.clone()),
+                result_digest: None,
+                ledger_ok: false,
+                ledger_error: Some(m),
+            }
+        }
+        D::Ambiguous(msg) => {
+            let m: String = msg.chars().take(300).collect();
+            Completion {
+                state: "ambiguous",
+                result_content: None,
+                is_error: Some(true),
+                error_message: Some(m.clone()),
+                result_digest: None,
+                ledger_ok: false,
+                ledger_error: Some(m),
+            }
         }
     }
 }
 
-/// The runner-facing result shape for a successful brokered call. `structured_content`
-/// (E7) is additive — included ONLY when the MCP result carried `structuredContent`,
-/// so the existing `{content, is_error}` shape is unchanged for tools that declare none.
-fn brokered_ok_json(content: Value, is_error: bool, structured: Option<Value>) -> Value {
-    let mut result = json!({ "content": content, "is_error": is_error });
+/// The runner-facing `{content, is_error, structured_content?}` result object
+/// (E7-additive: `structured_content` only when present).
+fn brokered_result_obj(content: &Value, is_error: bool, structured: Option<&Value>) -> Value {
+    let mut r = json!({ "content": content, "is_error": is_error });
     if let Some(s) = structured {
-        result["structured_content"] = s;
+        r["structured_content"] = s.clone();
     }
-    json!({ "ok": true, "result": result })
+    r
+}
+
+/// The first text block of an MCP content array (capped) — the ledger error text.
+fn first_text_block(content: &Value) -> String {
+    content
+        .as_array()
+        .and_then(|a| {
+            a.iter()
+                .find_map(|b| b.get("text").and_then(|t| t.as_str()))
+        })
+        .unwrap_or("brokered call failed")
+        .chars()
+        .take(300)
+        .collect()
+}
+
+/// The runner-facing JSON for a settled claim state + its stored columns. Used
+/// IDENTICALLY for a fresh completion AND a duplicate's adoption, so a duplicate
+/// returns byte-for-byte what the original did. PURE — unit-tested.
+fn claim_response(
+    state: &str,
+    result_content: Option<&Value>,
+    error_message: Option<&str>,
+) -> Value {
+    match state {
+        "succeeded" | "failed_upstream" => match result_content {
+            Some(rc) => json!({ "ok": true, "result": rc }),
+            None => {
+                json!({ "ok": false, "error": error_message.unwrap_or("brokered call failed") })
+            }
+        },
+        // Never retried — the outcome is genuinely unknown (invariant 15).
+        "ambiguous" => {
+            json!({ "ok": false, "error": "brokered call outcome ambiguous — not retried" })
+        }
+        // failed_before_send / claimed (in-flight) → retryable.
+        _ => json!({
+            "ok": false,
+            "error": error_message.unwrap_or("brokered dispatch did not complete; retry"),
+        }),
+    }
 }
 
 /// The ledger result digest for a brokered call (E7). Back-compatible: with no
@@ -994,7 +1334,8 @@ fn brokered_result_digest(content: &Value, structured: Option<&Value>) -> String
 
 /// Ledger one `tool.brokered` event (identity + digests + latency; never
 /// inputs, outputs, or secrets). `binding_id` is Some on the Phase C binding
-/// path, None on the legacy embedded-connection path.
+/// path, None on the legacy embedded-connection path. `outcome` is the durable
+/// execution-claim state this call settled at (Phase E, #33; Gap 11).
 #[allow(clippy::too_many_arguments)]
 async fn record_brokered_exec(
     state: &AppState,
@@ -1008,6 +1349,7 @@ async fn record_brokered_exec(
     latency_ms: u64,
     result_digest: Option<String>,
     error: Option<String>,
+    outcome: Option<String>,
 ) {
     ledger::record(
         state,
@@ -1023,6 +1365,7 @@ async fn record_brokered_exec(
             latency_ms,
             result_digest,
             error,
+            outcome,
         },
     )
     .await;
@@ -1531,9 +1874,12 @@ mod schema_gate_tests {
 
     #[test]
     fn order_readonly_records_the_schema_denial_not_trust_tier() {
-        // A ReadOnly-tier run with bad mcp args: the schema decision is produced
-        // regardless of tier, and in `decide_tool_call` it is consulted BEFORE the
-        // trust-tier floor — so the SCHEMA deny wins (proving placement-before-tier).
+        // This pins ONLY the PURE decision: `schema_gate_decision` produces a
+        // schema deny for bad mcp args regardless of trust tier (it never consults
+        // the tier). The actual GATE-ORDER placement — that `gate_tool_call`
+        // consults schema BEFORE the trust-tier floor — is a DB-coupled property
+        // proven by the governance/hardening e2e (a ReadOnly run with bad args
+        // records source="schema", not source="trust_tier"), not by this unit test.
         let cache = SchemaCache::new(8);
         let mut spec = base_spec(TrustTier::ReadOnly);
         spec.brokered = vec![surface(int_field_schema(), Some("2025-11-25"))];
@@ -1594,5 +1940,94 @@ mod schema_gate_tests {
             schema_gate_decision(&cache, &spec, "mcp__kb__search", &json!(["ok"])),
             None
         );
+    }
+
+    // ── Execution-claim response mapping (Phase E, #33; Gap 11) — PURE ────────
+
+    #[test]
+    fn dispatch_to_completion_maps_every_state() {
+        use crate::broker::DispatchOutcome as D;
+        // Definitive success → succeeded, carries the result object + digest.
+        let c = dispatch_to_completion(D::Definitive {
+            content: json!([{"type":"text","text":"ok"}]),
+            is_error: false,
+            structured: None,
+        });
+        assert_eq!(c.state, "succeeded");
+        assert!(c.ledger_ok);
+        assert!(c.result_content.is_some() && c.result_digest.is_some());
+        assert!(c.ledger_error.is_none());
+        // Definitive error → failed_upstream, STILL carries the result (adoption),
+        // and logs the error text.
+        let c = dispatch_to_completion(D::Definitive {
+            content: json!([{"type":"text","text":"boom"}]),
+            is_error: true,
+            structured: None,
+        });
+        assert_eq!(c.state, "failed_upstream");
+        assert!(!c.ledger_ok);
+        assert!(c.result_content.is_some());
+        assert_eq!(c.ledger_error.as_deref(), Some("boom"));
+        // NeverSent → failed_before_send (re-claimable), no stored result.
+        let c = dispatch_to_completion(D::NeverSent("connect refused".into()));
+        assert_eq!(c.state, "failed_before_send");
+        assert!(c.result_content.is_none() && !c.ledger_ok);
+        // Ambiguous → ambiguous, no stored result.
+        let c = dispatch_to_completion(D::Ambiguous("timeout".into()));
+        assert_eq!(c.state, "ambiguous");
+        assert!(c.result_content.is_none());
+    }
+
+    #[test]
+    fn claim_response_shapes_per_state() {
+        let result = json!({ "content": [{"type":"text","text":"ok"}], "is_error": false });
+        // succeeded/failed_upstream with a stored result → {ok:true, result}.
+        let r = claim_response("succeeded", Some(&result), None);
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["result"], result);
+        assert_eq!(
+            claim_response("failed_upstream", Some(&result), None)["ok"],
+            true
+        );
+        // ambiguous → a not-retried error (invariant 15), never {ok:true}.
+        let r = claim_response("ambiguous", None, None);
+        assert_eq!(r["ok"], false);
+        assert!(r["error"].as_str().unwrap().contains("ambiguous"));
+        // failed_before_send / claimed → retryable error.
+        assert_eq!(
+            claim_response("failed_before_send", None, Some("x"))["ok"],
+            false
+        );
+        assert_eq!(claim_response("claimed", None, None)["ok"], false);
+    }
+
+    #[test]
+    fn fresh_completion_and_adoption_use_the_same_pure_mapping() {
+        // The duplicate-adopt contract rests on ONE pure fn: the fresh Won path and
+        // the adoption path BOTH call `claim_response` with the columns
+        // `dispatch_to_completion` produced / `complete_tool_execution` stored. So a
+        // duplicate returns byte-for-byte what the original did — proven here for
+        // the pure layer; the DB round-trip + single-dispatch is the DB test's job.
+        use crate::broker::DispatchOutcome as D;
+        let comp = dispatch_to_completion(D::Definitive {
+            content: json!([{"type":"text","text":"payload"}]),
+            is_error: false,
+            structured: Some(json!({ "k": "v" })),
+        });
+        let fresh = claim_response(
+            comp.state,
+            comp.result_content.as_ref(),
+            comp.error_message.as_deref(),
+        );
+        // A duplicate reads back the SAME stored columns and maps them identically.
+        let adopted = claim_response(
+            comp.state,
+            comp.result_content.as_ref(),
+            comp.error_message.as_deref(),
+        );
+        assert_eq!(fresh, adopted);
+        assert_eq!(fresh["ok"], true);
+        // structuredContent survives into the stored/returned result object (E7).
+        assert_eq!(fresh["result"]["structured_content"], json!({ "k": "v" }));
     }
 }

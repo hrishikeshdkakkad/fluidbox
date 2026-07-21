@@ -464,6 +464,34 @@ pub fn url_within_base(url: &str, base: &str) -> bool {
 
 // ─── Per-run MCP session manager ──────────────────────────────────────────
 
+/// The classification of ONE logical brokered dispatch (Phase E, #33; Gap 11,
+/// plan E10) — INCLUDING its sanctioned single 401-reauth retry. The execution
+/// claim is completed from this: `Definitive&&!is_error → succeeded`,
+/// `Definitive&&is_error → failed_upstream`, `NeverSent → failed_before_send`
+/// (the ONLY re-claimable state), `Ambiguous → ambiguous` (never auto-retried,
+/// invariant 15). Err-free by design: every early return (auth resolution, URL
+/// admission, breaker-open) is one of the three variants, so no caller can forget
+/// to classify a failure.
+#[derive(Debug)]
+pub enum DispatchOutcome {
+    /// The upstream answered definitively. `is_error=false` = a real MCP result;
+    /// `is_error=true` = an MCP `isError` result OR a definitive upstream error
+    /// (HTTP error status / JSON-RPC error object), rendered as an error result.
+    Definitive {
+        content: Value,
+        is_error: bool,
+        structured: Option<Value>,
+    },
+    /// POSITIVE proof no request bytes were written (URL admission refusal, auth
+    /// resolution failure, binding recheck refusal, breaker-open, or a reqwest
+    /// `is_connect()` transport error). Re-claimable.
+    NeverSent(String),
+    /// The request was (or may have been) sent but the outcome is unknown: a
+    /// timeout, a mid-stream body-read/decode failure, or a post-connect redirect
+    /// refusal. Terminal — never auto-retried.
+    Ambiguous(String),
+}
+
 /// Broker call outcomes that stay distinguishable above the transport:
 /// - `Unauthorized` — HTTP 401 with no scope challenge: an OAuth connection may
 ///   re-mint and retry exactly once (the 401 proves the tool never executed).
@@ -472,13 +500,19 @@ pub fn url_within_base(url: &str, base: &str) -> bool {
 ///   connection). Carries the (sanitized) scope the server asked for.
 /// - `SessionExpired` — HTTP 404 on a request that carried a session id: the
 ///   session manager re-initializes ONCE and replays (never escapes as-is).
-/// - `Other` — any other transport/protocol/JSON-RPC error (already sanitized).
+/// - `Other` — a DEFINITIVE upstream protocol error (HTTP error status, JSON-RPC
+///   error object): the tool call resolved to an error → `failed_upstream`.
+/// - `NeverSent` — provable no-send (admit_url refusal, reqwest `is_connect()`).
+/// - `Ambiguous` — sent/maybe-sent, outcome unknown (timeout, redirect after
+///   connect, mid-stream body-read/decode failure).
 #[derive(Debug)]
 enum CallErr {
     Unauthorized,
     InsufficientScope(Option<String>),
     SessionExpired,
     Other(String),
+    NeverSent(String),
+    Ambiguous(String),
 }
 
 impl CallErr {
@@ -489,7 +523,7 @@ impl CallErr {
                 "insufficient scope — reconnect the connection with more scopes".into()
             }
             CallErr::SessionExpired => "mcp session expired and could not be re-initialized".into(),
-            CallErr::Other(m) => m,
+            CallErr::Other(m) | CallErr::NeverSent(m) | CallErr::Ambiguous(m) => m,
         }
     }
 }
@@ -503,6 +537,36 @@ impl From<String> for CallErr {
 impl From<&str> for CallErr {
     fn from(m: &str) -> Self {
         CallErr::Other(m.into())
+    }
+}
+
+/// A one-text-block error content array (an upstream/transport definitive error
+/// carries no MCP `content`, so the runner-facing result synthesizes one). The
+/// message is already sanitized (digests, not secrets).
+fn err_content(msg: &str) -> Value {
+    json!([{ "type": "text", "text": msg }])
+}
+
+/// Map the inner `call_tool` result (a real MCP result, or a classified
+/// `CallErr`) to the dispatch's [`DispatchOutcome`] (plan E10). The retry logic
+/// in the two public fns intercepts `Unauthorized`/`InsufficientScope` first;
+/// the arms for them here are defensive.
+fn outcome_from_call(r: Result<(Value, bool, Option<Value>), CallErr>) -> DispatchOutcome {
+    match r {
+        Ok((content, is_error, structured)) => DispatchOutcome::Definitive {
+            content,
+            is_error,
+            structured,
+        },
+        Err(CallErr::NeverSent(m)) => DispatchOutcome::NeverSent(m),
+        Err(CallErr::Ambiguous(m)) => DispatchOutcome::Ambiguous(m),
+        // Definitive upstream protocol errors (HTTP status, JSON-RPC error) and
+        // the terminal auth/session variants → an error RESULT (failed_upstream).
+        Err(e) => DispatchOutcome::Definitive {
+            content: err_content(&e.into_msg()),
+            is_error: true,
+            structured: None,
+        },
     }
 }
 
@@ -554,9 +618,12 @@ async fn dial_rpc(
     auth: Option<&BrokeredAuth>,
     headers: SessionHeaders<'_>,
     body: &Value,
-) -> Result<DialResponse, String> {
-    crate::egress::admit_url(url, policy).map_err(|e| e.to_string())?;
+    timeout: Duration,
+) -> Result<DialResponse, CallErr> {
+    // URL admission is BEFORE any bytes leave — a refusal is provably no-send.
+    crate::egress::admit_url(url, policy).map_err(|e| CallErr::NeverSent(e.to_string()))?;
     let res = match build_req(client, url, auth, headers)
+        .timeout(timeout)
         .json(body)
         .send()
         .await
@@ -564,20 +631,35 @@ async fn dial_rpc(
         Ok(r) => r,
         // `Policy::none` can surface a refused redirect as an error; never echo
         // the Location target — log a digest of the request URL at debug only.
+        // A redirect happens AFTER connect ⇒ the request was sent ⇒ Ambiguous.
         Err(e) if e.is_redirect() => {
             tracing::debug!(target: "broker", "mcp upstream redirect refused (req {})", msg_digest(url));
-            return Err("upstream attempted redirect (refused)".into());
+            return Err(CallErr::Ambiguous(
+                "upstream attempted redirect (refused)".into(),
+            ));
         }
-        Err(e) => return Err(format!("mcp server unreachable: {e}")),
+        // A connect-phase error (DNS/SSRF-resolver rejection, refused TCP, TLS
+        // handshake) is provable no-send; a timeout or any other transport error
+        // after connect is Ambiguous (bytes may have gone out).
+        Err(e) if e.is_connect() => {
+            return Err(CallErr::NeverSent(format!("mcp server unreachable: {e}")));
+        }
+        Err(e) if e.is_timeout() => {
+            return Err(CallErr::Ambiguous(format!("mcp request timed out: {e}")));
+        }
+        Err(e) => return Err(CallErr::Ambiguous(format!("mcp transport error: {e}"))),
     };
     let status = res.status();
     // A redirect the client did NOT follow comes back as a 3xx response under
     // `Policy::none`; refuse it identically and never echo the Location header.
+    // The request WAS sent (we got a response) ⇒ Ambiguous.
     if status.is_redirection() {
         if let Some(loc) = res.headers().get("location").and_then(|v| v.to_str().ok()) {
             tracing::debug!(target: "broker", "mcp upstream redirect refused (loc {})", msg_digest(loc));
         }
-        return Err("upstream attempted redirect (refused)".into());
+        return Err(CallErr::Ambiguous(
+            "upstream attempted redirect (refused)".into(),
+        ));
     }
     let session_id = header_str(&res, "mcp-session-id");
     let www_authenticate = header_str(&res, "www-authenticate");
@@ -585,24 +667,27 @@ async fn dial_rpc(
     let is_sse = content_type.contains("event-stream");
     let is_json = content_type.contains("application/json");
     // R3.3: refuse an over-large advertised body BEFORE buffering it in memory.
+    // Sent + a response received but unusable ⇒ Ambiguous.
     if let Some(len) = res.content_length() {
         if len > MAX_RESPONSE_BYTES {
-            return Err(format!(
+            return Err(CallErr::Ambiguous(format!(
                 "mcp response advertises {len} bytes, over the {MAX_RESPONSE_BYTES}-byte cap"
-            ));
+            )));
         }
     }
     // The Content-Length pre-check only bounds a body that ADVERTISES its length;
     // a chunked/compressed response slips it and `text()` would buffer unboundedly
     // (D). Stream the DECODED body, aborting the moment it would exceed the cap.
+    // A mid-stream read failure or over-cap ⇒ Ambiguous (the send happened).
     let mut stream = res.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("mcp response unreadable: {e}"))?;
+        let chunk =
+            chunk.map_err(|e| CallErr::Ambiguous(format!("mcp response unreadable: {e}")))?;
         if buf.len() + chunk.len() > MAX_RESPONSE_BYTES as usize {
-            return Err(format!(
+            return Err(CallErr::Ambiguous(format!(
                 "mcp response exceeds the {MAX_RESPONSE_BYTES}-byte cap while streaming"
-            ));
+            )));
         }
         buf.extend_from_slice(&chunk);
     }
@@ -618,12 +703,14 @@ async fn dial_rpc(
         });
     }
     if !is_sse && !is_json {
-        return Err(format!(
+        return Err(CallErr::Ambiguous(format!(
             "mcp response has an unexpected content-type '{content_type}' (want application/json or text/event-stream)"
-        ));
+        )));
     }
-    let messages = parse_messages(&buf, is_sse)?;
-    let value = select_response(client, url, auth, headers, messages, body.get("id")).await?;
+    let messages = parse_messages(&buf, is_sse).map_err(CallErr::Ambiguous)?;
+    let value = select_response(client, url, auth, headers, messages, body.get("id"))
+        .await
+        .map_err(CallErr::Ambiguous)?;
     Ok(DialResponse {
         status,
         session_id,
@@ -639,9 +726,11 @@ fn build_req(
     auth: Option<&BrokeredAuth>,
     headers: SessionHeaders<'_>,
 ) -> reqwest::RequestBuilder {
+    // The per-request timeout is applied by the caller (`dial_rpc` uses
+    // `MCP_TIMEOUT`; `reply_method_not_found` uses `MCP_DELETE_TIMEOUT`) so a test
+    // can dial with a short timeout to exercise the Ambiguous timeout arm.
     let mut req = client
         .post(url)
-        .timeout(MCP_TIMEOUT)
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream");
     if let Some(a) = auth {
@@ -848,8 +937,17 @@ async fn send_raw(
     auth: Option<&BrokeredAuth>,
     sess: &McpUpstreamSession,
     body: &Value,
-) -> Result<DialResponse, String> {
-    dial_rpc(client, policy, url, auth, session_headers(sess), body).await
+) -> Result<DialResponse, CallErr> {
+    dial_rpc(
+        client,
+        policy,
+        url,
+        auth,
+        session_headers(sess),
+        body,
+        MCP_TIMEOUT,
+    )
+    .await
 }
 
 /// Ensure this session is `initialize`d (E5): if it has not negotiated yet, run
@@ -1341,9 +1439,16 @@ pub async fn call_tool_auth(
     tool: &str,
     arguments: &Value,
     run_session: uuid::Uuid,
-) -> Result<(Value, bool, Option<Value>), String> {
-    let url = server_url(server)?;
-    let auth = brokered_auth(state, scope, server).await?;
+) -> DispatchOutcome {
+    let url = match server_url(server) {
+        Ok(u) => u,
+        Err(e) => return DispatchOutcome::NeverSent(e),
+    };
+    // Auth resolution BEFORE any request write ⇒ a failure is provable no-send.
+    let auth = match brokered_auth(state, scope, server).await {
+        Ok(a) => a,
+        Err(e) => return DispatchOutcome::NeverSent(e),
+    };
     let entry = match brokered_connection_id(server) {
         Some(cid) => session_entry(state, run_session, McpPeer::Conn(cid), url).await,
         // Credential-free legacy bundle: no connection to key on — throwaway.
@@ -1365,28 +1470,48 @@ pub async fn call_tool_auth(
     .await
     {
         Err(CallErr::Unauthorized) => {
-            let auth = reauth_after_401(state, scope, server, auth).await?;
-            call_tool(
-                client,
-                policy,
-                url,
-                auth.as_ref(),
-                &entry,
-                tool,
-                arguments,
-                None,
-            )
-            .await
-            .map_err(CallErr::into_msg)
+            // A 401 proves the tool never executed. Static credential ⇒ terminal
+            // definitive failure; OAuth ⇒ re-mint once and the RETRY's outcome
+            // governs the whole dispatch (one claim, one logical dispatch).
+            if auth.as_ref().and_then(|a| a.oauth_connection).is_none() {
+                return DispatchOutcome::Definitive {
+                    content: err_content("mcp server rejected the credential (HTTP 401)"),
+                    is_error: true,
+                    structured: None,
+                };
+            }
+            match reauth_after_401(state, scope, server, auth).await {
+                Ok(auth) => outcome_from_call(
+                    call_tool(
+                        client,
+                        policy,
+                        url,
+                        auth.as_ref(),
+                        &entry,
+                        tool,
+                        arguments,
+                        None,
+                    )
+                    .await,
+                ),
+                // Re-mint failure = auth resolution failure ⇒ never sent.
+                Err(e) => DispatchOutcome::NeverSent(e),
+            }
         }
         Err(CallErr::InsufficientScope(challenge_scope)) => {
             if let Some(cid) = auth.as_ref().and_then(|a| a.oauth_connection) {
                 let rejected = auth.as_ref().and_then(|a| a.oauth_access()).unwrap_or("");
                 mark_insufficient_scope(state, scope, cid, rejected, challenge_scope).await;
             }
-            Err(CallErr::InsufficientScope(None).into_msg())
+            DispatchOutcome::Definitive {
+                content: err_content(
+                    "insufficient scope — reconnect the connection with more scopes",
+                ),
+                is_error: true,
+                structured: None,
+            }
         }
-        r => r.map_err(CallErr::into_msg),
+        r => outcome_from_call(r),
     }
 }
 
@@ -1415,8 +1540,12 @@ pub async fn call_tool_for_conn(
     arguments: &Value,
     binding: &fluidbox_db::RunResourceBindingRow,
     protocol_version: Option<&str>,
-) -> Result<(Value, bool, Option<Value>), String> {
-    let auth = brokered_auth_for_conn(state, scope, conn, url).await?;
+) -> DispatchOutcome {
+    // Auth resolution BEFORE any request write ⇒ a failure is provable no-send.
+    let auth = match brokered_auth_for_conn(state, scope, conn, url).await {
+        Ok(a) => a,
+        Err(e) => return DispatchOutcome::NeverSent(e),
+    };
     let entry = session_entry(state, binding.session_id, McpPeer::Binding(binding.id), url).await;
     let client = &state.egress_http;
     let policy = &state.egress_policy;
@@ -1439,27 +1568,51 @@ pub async fn call_tool_for_conn(
     .await
     {
         Err(CallErr::Unauthorized) => {
-            let fresh = recheck_binding(state, scope, binding).await?;
-            let auth = reauth_after_401_conn(state, scope, &fresh, url, auth).await?;
-            call_tool(
-                client,
-                policy,
-                url,
-                auth.as_ref(),
-                &entry,
-                tool,
-                arguments,
-                snapshot,
-            )
-            .await
-            .map_err(CallErr::into_msg)
+            // A 401 proves the tool never executed. Static credential ⇒ terminal
+            // definitive failure; OAuth ⇒ recheck + re-mint once, retry governs.
+            if auth.as_ref().and_then(|a| a.oauth_connection).is_none() {
+                return DispatchOutcome::Definitive {
+                    content: err_content("mcp server rejected the credential (HTTP 401)"),
+                    is_error: true,
+                    structured: None,
+                };
+            }
+            // R2.5 / invariant 9: the retry re-runs recheck_binding first — a
+            // refusal (revoke/reauthorize/deactivate) BEFORE the retry's write, or
+            // a re-mint failure, is provable no-send.
+            let fresh = match recheck_binding(state, scope, binding).await {
+                Ok(c) => c,
+                Err(e) => return DispatchOutcome::NeverSent(e),
+            };
+            match reauth_after_401_conn(state, scope, &fresh, url, auth).await {
+                Ok(auth) => outcome_from_call(
+                    call_tool(
+                        client,
+                        policy,
+                        url,
+                        auth.as_ref(),
+                        &entry,
+                        tool,
+                        arguments,
+                        snapshot,
+                    )
+                    .await,
+                ),
+                Err(e) => DispatchOutcome::NeverSent(e),
+            }
         }
         Err(CallErr::InsufficientScope(challenge_scope)) => {
             let rejected = auth.as_ref().and_then(|a| a.oauth_access()).unwrap_or("");
             mark_insufficient_scope(state, scope, conn.id, rejected, challenge_scope).await;
-            Err(CallErr::InsufficientScope(None).into_msg())
+            DispatchOutcome::Definitive {
+                content: err_content(
+                    "insufficient scope — reconnect the connection with more scopes",
+                ),
+                is_error: true,
+                structured: None,
+            }
         }
-        r => r.map_err(CallErr::into_msg),
+        r => outcome_from_call(r),
     }
 }
 
@@ -1648,12 +1801,19 @@ mod tests {
             None,
             SessionHeaders::default(),
             &body,
+            MCP_TIMEOUT,
         )
         .await
         .expect_err("a 302 must be refused, not followed");
+        // A redirect happens AFTER connect (the request was sent) ⇒ Ambiguous.
         assert!(
-            err.contains("redirect") && err.contains("refused"),
-            "expected a redirect-refused error, got: {err}"
+            matches!(err, CallErr::Ambiguous(_)),
+            "a post-connect redirect refusal must classify Ambiguous"
+        );
+        let msg = err.into_msg();
+        assert!(
+            msg.contains("redirect") && msg.contains("refused"),
+            "expected a redirect-refused error, got: {msg}"
         );
         // The decisive assertion: Policy::none did NOT dial the Location target.
         assert_eq!(
@@ -1662,6 +1822,141 @@ mod tests {
             "the client followed the redirect (saw a second request)"
         );
         srv.abort();
+    }
+
+    // ── DispatchOutcome classification (Phase E, Gap 11, plan E10) ──────────
+
+    #[test]
+    fn outcome_from_call_maps_every_arm() {
+        // A real MCP success result.
+        assert!(matches!(
+            outcome_from_call(Ok((json!([]), false, None))),
+            DispatchOutcome::Definitive {
+                is_error: false,
+                ..
+            }
+        ));
+        // A real MCP isError result → failed_upstream (Definitive, is_error).
+        assert!(matches!(
+            outcome_from_call(Ok((json!([{"type":"text","text":"boom"}]), true, None))),
+            DispatchOutcome::Definitive { is_error: true, .. }
+        ));
+        // A definitive upstream protocol error (HTTP status / JSON-RPC error) is
+        // rendered as an error RESULT ⇒ failed_upstream, NEVER ambiguous.
+        assert!(matches!(
+            outcome_from_call(Err(CallErr::Other(
+                "mcp tools/call returned HTTP 500".into()
+            ))),
+            DispatchOutcome::Definitive { is_error: true, .. }
+        ));
+        // Provable no-send is re-claimable.
+        assert!(matches!(
+            outcome_from_call(Err(CallErr::NeverSent("connect refused".into()))),
+            DispatchOutcome::NeverSent(_)
+        ));
+        // Sent, unknown outcome — never auto-retried.
+        assert!(matches!(
+            outcome_from_call(Err(CallErr::Ambiguous("timeout".into()))),
+            DispatchOutcome::Ambiguous(_)
+        ));
+        // A terminal session-expiry renders as an error result (failed_upstream).
+        assert!(matches!(
+            outcome_from_call(Err(CallErr::SessionExpired)),
+            DispatchOutcome::Definitive { is_error: true, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn dial_rpc_connect_refused_is_never_sent() {
+        // Reserve a port, capture the addr, then DROP the listener so the dial
+        // gets connection-refused (reqwest `is_connect()` ⇒ NeverSent — provable
+        // no-send, re-claimable).
+        let addr = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let url = format!("http://{addr}/mcp");
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+        let err = dial_rpc(
+            &client,
+            &policy,
+            &url,
+            None,
+            SessionHeaders::default(),
+            &body,
+            MCP_TIMEOUT,
+        )
+        .await
+        .expect_err("a refused connection must error");
+        assert!(
+            matches!(err, CallErr::NeverSent(_)),
+            "connect-refused must classify NeverSent, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dial_rpc_timeout_is_ambiguous() {
+        // A fake that accepts the connection and NEVER responds; a short per-dial
+        // timeout forces the `is_timeout()` ⇒ Ambiguous classification (the send
+        // may have landed, so the outcome is unknown — never auto-retried).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                match listener.accept().await {
+                    Ok((sock, _)) => held.push(sock), // keep open, never reply
+                    Err(_) => return,
+                }
+            }
+        });
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let url = format!("http://{addr}/mcp");
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+        let err = dial_rpc(
+            &client,
+            &policy,
+            &url,
+            None,
+            SessionHeaders::default(),
+            &body,
+            Duration::from_millis(300),
+        )
+        .await
+        .expect_err("a non-responding server must time out");
+        assert!(
+            matches!(err, CallErr::Ambiguous(_)),
+            "a timeout must classify Ambiguous, got {err:?}"
+        );
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn call_tool_http_500_is_definitive_failed_upstream() {
+        // A fake that initializes fine but returns HTTP 500 on tools/call → the
+        // dispatch is a DEFINITIVE upstream error (is_error=true → failed_upstream),
+        // NEVER ambiguous (the acceptance bullet: a definitive 500 is not unknown).
+        let handler: Handler = Arc::new(|_i, rec: &Recorded| match rec.rpc_method.as_str() {
+            "initialize" => FakeReply::json(200, init_result(rec, "2025-11-25")),
+            "notifications/initialized" => FakeReply::empty(202),
+            "tools/call" => FakeReply::json(500, json!({ "error": "boom" }).to_string()),
+            _ => FakeReply::empty(202),
+        });
+        let (url, _records, jh) = spawn_fake(handler).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
+        let outcome = outcome_from_call(
+            call_tool(&client, &policy, &url, None, &entry, "x", &json!({}), None).await,
+        );
+        jh.abort();
+        assert!(
+            matches!(outcome, DispatchOutcome::Definitive { is_error: true, .. }),
+            "HTTP 500 must be Definitive/failed_upstream, got {outcome:?}"
+        );
     }
 
     #[test]
@@ -1902,6 +2197,7 @@ mod tests {
             401 => "Unauthorized",
             403 => "Forbidden",
             404 => "Not Found",
+            500 => "Internal Server Error",
             _ => "OK",
         };
         let mut s = format!("HTTP/1.1 {} {reason}\r\n", r.status);

@@ -271,8 +271,11 @@ impl SchemaCache {
     }
 
     /// Return the compiled validator for `(tools_digest, tool)`, compiling +
-    /// caching on a miss. `Err` = the frozen schema did not compile (the gate
-    /// maps this to the schema-invalid deny). STUB: recompiles every call.
+    /// caching on a miss. `Err` = the frozen schema failed the untrusted-schema
+    /// guard OR did not compile (the gate maps either to the schema-invalid deny).
+    /// The [`guard_schema`] screen runs on the MISS path only: a cache hit was
+    /// already guarded when first compiled, and a frozen schema is stable, so its
+    /// verdict is too (T3 rider).
     pub fn get_or_compile(
         &self,
         tools_digest: &str,
@@ -295,8 +298,11 @@ impl SchemaCache {
                 }
             }
         }
-        // Compile OUTSIDE the lock (compilation is the slow part; it must not
+        // MISS: screen the UNTRUSTED frozen schema (size/depth/local-$ref) BEFORE
+        // compiling — done here, once per (digest,tool,dialect), so a cache hit
+        // never re-guards. Then compile OUTSIDE the lock (the slow part must not
         // block other keys).
+        guard_schema(schema)?;
         let validator = Arc::new(compile(schema, dialect)?);
         let mut inner = self.inner.lock().unwrap();
         inner.insert(
@@ -655,5 +661,46 @@ mod tests {
         assert!(cache
             .get_or_compile("dbad", "t", &bad, SchemaDialect::Draft2020_12)
             .is_err());
+    }
+
+    #[test]
+    fn cache_rejects_unguarded_schema_on_miss() {
+        // T3 rider: the untrusted-schema guard is now folded into the cache MISS
+        // path, so a non-local `$ref` (or a size/depth bomb) is rejected by
+        // get_or_compile itself — not only by a separate guard_schema call.
+        let cache = SchemaCache::new(4);
+        let remote_ref = json!({ "$ref": "https://evil.test/s.json" });
+        assert!(cache
+            .get_or_compile("dref", "t", &remote_ref, SchemaDialect::Draft2020_12)
+            .is_err());
+    }
+
+    #[test]
+    fn cache_dialect_mismatch_recompiles_not_serves_wrong_validator() {
+        // The dialect is NOT part of tools_digest, so a HIT whose stored dialect
+        // differs from the requested one must RECOMPILE under the requested draft
+        // rather than serve the wrong-dialect validator (the recompile branch).
+        let cache = SchemaCache::new(8);
+        // `prefixItems` is a 2020-12 tuple assertion; draft-07 ignores the keyword.
+        let schema = json!({ "type": "array", "prefixItems": [{"type": "string"}] });
+        let v2020 = cache
+            .get_or_compile("digX", "mcp__s__t", &schema, SchemaDialect::Draft2020_12)
+            .unwrap();
+        let v7 = cache
+            .get_or_compile("digX", "mcp__s__t", &schema, SchemaDialect::Draft7)
+            .unwrap();
+        // Same key, different dialect ⇒ a fresh compilation (not the cached Arc).
+        assert!(
+            !Arc::ptr_eq(&v2020, &v7),
+            "a dialect mismatch must recompile, not serve the cached validator"
+        );
+        // …and the two validators BEHAVE per their draft: a numeric item-0 fails
+        // 2020-12 (prefixItems enforced) but passes draft-07 (keyword ignored).
+        let args = json!([42]);
+        assert!(
+            validate_instance(&v2020, &args).is_err(),
+            "the 2020-12 validator must enforce prefixItems"
+        );
+        validate_instance(&v7, &args).expect("the draft-07 validator ignores prefixItems");
     }
 }

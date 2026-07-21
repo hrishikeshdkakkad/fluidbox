@@ -416,6 +416,48 @@ async fn budget_sweeper(state: AppState) {
     let mut tick = tokio::time::interval(Duration::from_secs(10));
     loop {
         tick.tick().await;
+
+        // Phase E (#33; Gap 11): sweep stale execution claims on the same 10s
+        // cadence. A `claimed` row whose control-plane dispatcher crashed
+        // mid-flight is CAS'd to `ambiguous` past its TTL (never auto-retried —
+        // invariant 15) and ledgered so the timeline records the unknown outcome.
+        match fluidbox_db::system_worker::sweep_stale_execution_claims(
+            &state.pool,
+            chrono::Utc::now(),
+        )
+        .await
+        {
+            Ok(swept) => {
+                for (tenant_id, session_id, tool_call_id, tool) in swept {
+                    // Scope from the returned row's tenant, like every worker.
+                    let scope = TenantScope::assume(tenant_id);
+                    let tool = tool.unwrap_or_else(|| "(unknown)".to_string());
+                    let server = fluidbox_core::capability::parse_mcp_tool(&tool)
+                        .map(|(s, _)| s.to_string())
+                        .unwrap_or_else(|| "broker".to_string());
+                    crate::ledger::record(
+                        &state,
+                        scope,
+                        session_id,
+                        fluidbox_core::event::Actor::System,
+                        fluidbox_core::event::EventBody::BrokeredToolCall {
+                            tool_call_id,
+                            tool,
+                            server,
+                            binding_id: None,
+                            ok: false,
+                            latency_ms: 0,
+                            result_digest: None,
+                            error: Some("execution claim expired — outcome unknown".into()),
+                            outcome: Some("ambiguous".into()),
+                        },
+                    )
+                    .await;
+                }
+            }
+            Err(e) => tracing::warn!("stale execution-claim sweep failed: {e}"),
+        }
+
         let active = match fluidbox_db::system_worker::sessions_in_status(
             &state.pool,
             &["running", "awaiting_approval"],

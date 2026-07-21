@@ -151,6 +151,14 @@ pub enum EventBody {
         result_digest: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// The durable execution-claim state this call settled at (Phase E, #33;
+        /// Gap 11): `succeeded` | `failed_upstream` | `failed_before_send` |
+        /// `ambiguous`. `#[serde(default)]` keeps legacy tool.brokered events —
+        /// and the stale-claim sweep's ledger path — round-tripping; None on the
+        /// events written before claims existed. Additive: no payloads, so the
+        /// Redactor (which round-trips the whole body) needs no change.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<String>,
     },
     /// Forward-compat: events written by newer components still round-trip.
     #[serde(untagged)]
@@ -342,12 +350,15 @@ mod tests {
             latency_ms: 42,
             result_digest: Some("sha256:abcd".into()),
             error: None,
+            outcome: Some("succeeded".into()),
         };
         let v = serde_json::to_value(&brokered).unwrap();
         assert_eq!(v["type"], "tool.brokered");
         assert_eq!(v["data"]["latency_ms"], 42);
         assert_eq!(v["data"]["binding_id"], binding_id.to_string());
         assert!(v["data"].get("error").is_none());
+        // Phase E: the claim outcome rides the event (additive, serde-default).
+        assert_eq!(v["data"]["outcome"], "succeeded");
         let back: EventBody = serde_json::from_value(v.clone()).unwrap();
         assert_eq!(back.type_name(), "tool.brokered");
         // Phase C round-trip: binding_id survives.
@@ -373,6 +384,7 @@ mod tests {
             back,
             EventBody::BrokeredToolCall {
                 binding_id: None,
+                outcome: None,
                 ..
             }
         ));
