@@ -998,6 +998,87 @@ mod tests {
         );
     }
 
+    // ── Breaker × rate-bucket interaction ───────────────────────────────────
+
+    #[test]
+    fn a_breaker_refusal_charges_no_rate_bucket() {
+        // The one combination NEITHER helper above can express: `limits()` zeroes
+        // the breaker and `breaker_limits()` zeroes the rates, so until now every
+        // test in this module ran with one of the two controls switched OFF and a
+        // mutation making a breaker refusal charge the tenant bucket passed all of
+        // them. That behavior would let ONE sick upstream drain its org's shared
+        // budget and throttle every OTHER connection — so pin the current, correct
+        // behavior: `check` peeks all three dimensions, consults the breaker, and
+        // consumes tokens ONLY when everyone said yes.
+        let h = "up.example.test";
+
+        // A — the TENANT dimension (the shared budget). Connection/host roomy so
+        // the only bucket that can speak is the tenant's.
+        let g = EgressGovernor::manual(GovernorLimits {
+            tenant_per_min: 5,
+            connection_per_min: 100,
+            host_per_min: 100,
+            breaker_threshold: 2,
+            breaker_open_secs: 60,
+        });
+        let t = Uuid::new_v4();
+        let (sick, healthy) = (Uuid::new_v4(), Uuid::new_v4());
+        // Two admitted dials: 2 tenant tokens spent, and the breaker opens.
+        for _ in 0..2 {
+            assert!(g.check(t, sick, h).is_ok());
+            g.report(sick, h, Outcome::TransportFailure);
+        }
+        // 20 refusals — 4× the whole tenant capacity — all from the BREAKER.
+        for i in 0..20 {
+            let e = g.check(t, sick, h).expect_err("the breaker is open");
+            assert_eq!(
+                e.scope, SCOPE_BREAKER,
+                "refusal {i} came from the wrong gate"
+            );
+        }
+        // A sibling connection (its own clean breaker, same tenant) still gets
+        // EXACTLY the 3 tokens the two admitted dials left — the 20 refusals cost
+        // the tenant nothing.
+        for i in 0..3 {
+            assert!(
+                g.check(t, healthy, h).is_ok(),
+                "sibling dial {i} must survive the sick connection's refusals"
+            );
+        }
+        // FALSE-GREEN guard: the bucket IS charged by ADMITTED dials, so the three
+        // passes above are the remaining budget and not "nothing is ever charged".
+        let e = g.check(t, healthy, h).expect_err("tenant capacity is 5");
+        assert_eq!(e.scope, SCOPE_TENANT);
+
+        // B — the CONNECTION dimension. The breaker is keyed (connection, host),
+        // so a SECOND host gives the same connection a clean breaker while sharing
+        // its one connection bucket.
+        let g = EgressGovernor::manual(GovernorLimits {
+            tenant_per_min: 100,
+            connection_per_min: 5,
+            host_per_min: 100,
+            breaker_threshold: 2,
+            breaker_open_secs: 60,
+        });
+        let (t, c) = (Uuid::new_v4(), Uuid::new_v4());
+        for _ in 0..2 {
+            assert!(g.check(t, c, h).is_ok());
+            g.report(c, h, Outcome::TransportFailure);
+        }
+        for _ in 0..20 {
+            assert_eq!(g.check(t, c, h).unwrap_err().scope, SCOPE_BREAKER);
+        }
+        let other = "other.example.test";
+        for i in 0..3 {
+            assert!(
+                g.check(t, c, other).is_ok(),
+                "dial {i} to a healthy host must survive the other host's refusals"
+            );
+        }
+        let e = g.check(t, c, other).expect_err("connection capacity is 5");
+        assert_eq!(e.scope, SCOPE_CONNECTION);
+    }
+
     // ── Refusal message ─────────────────────────────────────────────────────
 
     #[test]

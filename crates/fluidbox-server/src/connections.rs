@@ -839,6 +839,13 @@ mod tests {
         // A public https server is admitted and the parsed URL flows back.
         let ok = admit_connector_base_url("https://mcp.example.com/mcp", &prod).unwrap();
         assert_eq!(ok.host_str(), Some("mcp.example.com"));
+        // Hostname-FREE form of the same admit/refuse pair. `admit_connector_base_url`
+        // is a synchronous parse + literal range check and deliberately resolves
+        // NOTHING (see its doc comment and the hermeticity note in `egress::tests`),
+        // so no assertion in this test can perform a live lookup.
+        let ok = admit_connector_base_url("https://93.184.216.34/mcp", &prod).unwrap();
+        assert_eq!(ok.host_str(), Some("93.184.216.34"));
+        assert!(admit_connector_base_url("http://93.184.216.34/mcp", &prod).is_err());
     }
 
     #[test]

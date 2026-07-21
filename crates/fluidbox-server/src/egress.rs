@@ -359,12 +359,27 @@ mod tests {
     }
 
     // ─── admit_url (pre-dial, E3) ─────────────────────────────────────────
+    //
+    // HERMETIC BY CONSTRUCTION: every predicate asserted in this module —
+    // `admit_url`, `redirect_hop_allowed`, `filter_public_addrs`, and their
+    // callers `oauth::admit_oauth` / `connections::admit_connector_base_url` —
+    // is a SYNCHRONOUS `fn` that parses a URL and range-checks a literal. None
+    // of them resolves a name; the only resolution in this crate lives in
+    // `SsrfDnsResolver` and `validate_fetch_target`, which are on neither path.
+    // So no test here performs a live lookup, and none can be made flaky or slow
+    // by the network. The hostnames below are RFC 2606 reserved names used only
+    // to exercise the "host is NOT an IP literal" branch; each is paired with an
+    // IP-literal assertion pinning the same property with no name involved.
     #[test]
     fn admit_url_requires_https_outside_dev() {
         let prod = prod_policy(vec![]);
         assert!(admit_url("https://mcp.example.com/x", &prod).is_ok());
         // plain http is refused when not dev…
         assert!(admit_url("http://mcp.example.com/x", &prod).is_err());
+        // …and the identical scheme rule holds on a hostname-FREE input, so the
+        // property is asserted without any name at all.
+        assert!(admit_url("https://93.184.216.34/x", &prod).is_ok());
+        assert!(admit_url("http://93.184.216.34/x", &prod).is_err());
         // …but allowed for loopback under the dev seam (the e2e fakes).
         let dev = dev_policy(vec![]);
         assert!(admit_url("http://127.0.0.1:9/mcp", &dev).is_ok());
@@ -397,6 +412,9 @@ mod tests {
         let u = |s: &str| reqwest::Url::parse(s).unwrap();
         assert!(redirect_hop_allowed(&u("https://issuer.example/x"), false, &[]).is_ok());
         assert!(redirect_hop_allowed(&u("http://issuer.example/x"), false, &[]).is_err());
+        // The same scheme rule on a hostname-FREE public literal (no name).
+        assert!(redirect_hop_allowed(&u("https://93.184.216.34/x"), false, &[]).is_ok());
+        assert!(redirect_hop_allowed(&u("http://93.184.216.34/x"), false, &[]).is_err());
         assert!(redirect_hop_allowed(&u("https://169.254.169.254/latest"), false, &[]).is_err());
         assert!(redirect_hop_allowed(&u("https://10.0.0.1/x"), false, &[]).is_err());
         assert!(redirect_hop_allowed(&u("https://[::1]/x"), false, &[]).is_err());
@@ -405,6 +423,45 @@ mod tests {
         // allow-CIDR opens an otherwise-blocked private redirect target.
         let allow: Vec<IpCidr> = vec!["10.0.0.0/8".parse().unwrap()];
         assert!(redirect_hop_allowed(&u("https://10.0.0.1/x"), false, &allow).is_ok());
+    }
+
+    // ─── bounded reads (I3: the ceiling connector-OAuth now shares) ────────
+    #[tokio::test]
+    async fn read_json_bounded_refuses_an_over_cap_body_both_ways() {
+        // Hermetic: a synthetic `reqwest::Response`, no socket and no resolver.
+        let body = |n: usize| format!("{{\"pad\":\"{}\"}}", "x".repeat(n));
+        // 1. NO declared length (a chunked/streamed body, which is how a hostile
+        //    server evades a length pre-check) ⇒ the running total is the only
+        //    enforcement, so this case must exercise THAT branch.
+        let chunks = (0..40).map(|_| Ok::<_, std::io::Error>(vec![b'x'; 8 * 1024]));
+        let streamed =
+            axum::http::Response::new(reqwest::Body::wrap_stream(futures::stream::iter(chunks)));
+        let mut res = reqwest::Response::from(streamed);
+        assert_eq!(
+            res.content_length(),
+            None,
+            "this case must have no declared length, or it tests the wrong branch"
+        );
+        let err = read_json_bounded(&mut res)
+            .await
+            .expect_err("an over-cap streamed body must be refused");
+        assert!(err.contains("size bound"), "got: {err}");
+        // 2. A DECLARED length over the cap is refused before buffering.
+        let declared = axum::http::Response::builder()
+            .header(
+                "content-length",
+                (MAX_HTTP_BODY_BYTES as u64 + 1).to_string(),
+            )
+            .body(body(MAX_HTTP_BODY_BYTES + 1024))
+            .unwrap();
+        let mut res = reqwest::Response::from(declared);
+        assert!(read_json_bounded(&mut res).await.is_err());
+        // FALSE-GREEN guard: an UNDER-cap document still parses, so the two
+        // assertions above are about the ceiling and not about reads failing.
+        let small = axum::http::Response::new(body(16));
+        let mut res = reqwest::Response::from(small);
+        let v = read_json_bounded(&mut res).await.expect("under cap parses");
+        assert_eq!(v["pad"].as_str().map(str::len), Some(16));
     }
 
     #[test]

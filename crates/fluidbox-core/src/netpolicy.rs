@@ -84,6 +84,40 @@ fn cidr_match_v6(net: Ipv6Addr, ip: Ipv6Addr, prefix: u8) -> bool {
     (u128::from(net) & mask) == (u128::from(ip) & mask)
 }
 
+/// The IPv4 address embedded in a v6 form that really addresses an IPv4 host:
+/// v4-MAPPED (`::ffff:a.b.c.d`), v4-COMPATIBLE (`::a.b.c.d`, RFC 4291 §2.5.5.1)
+/// and the well-known NAT64 prefix (`64:ff9b::/96`, RFC 6052). All three reach
+/// an IPv4 destination, so all three MUST be judged on their v4 form — without
+/// this, `::10.0.0.1` and `64:ff9b::169.254.169.254` fall through every v6 arm
+/// of [`ip_blocked`] and read as PUBLIC.
+///
+/// `::` and `::1` are deliberately NOT treated as v4-compatible: they are v6
+/// addresses in their own right, the v6 arm already blocks them, and the `dev`
+/// seam un-blocks `::1` as loopback (which `0.0.0.1` is not).
+///
+/// Residual (deliberate): the RFC 8215 local-use NAT64 prefix `64:ff9b:1::/48`
+/// is not normalized — its embedded-v4 offset depends on the operator's chosen
+/// translation prefix length, so there is no single position to read.
+fn embedded_ipv4(a: Ipv6Addr) -> Option<Ipv4Addr> {
+    if a.is_loopback() || a.is_unspecified() {
+        return None;
+    }
+    if let Some(m) = a.to_ipv4_mapped() {
+        return Some(m);
+    }
+    let s = a.segments();
+    let low32 = || Ipv4Addr::from((u32::from(s[6]) << 16) | u32::from(s[7]));
+    // `::a.b.c.d` — 96 leading zero bits.
+    if s[..6].iter().all(|&x| x == 0) {
+        return Some(low32());
+    }
+    // `64:ff9b::a.b.c.d` — the well-known NAT64 /96.
+    if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6].iter().all(|&x| x == 0) {
+        return Some(low32());
+    }
+    None
+}
+
 /// Reject private/loopback/link-local/metadata/CGNAT/reserved/multicast ranges.
 ///
 /// `dev` (the loopback-dev seam, keyed off a loopback-http `FLUIDBOX_PUBLIC_URL`)
@@ -93,10 +127,11 @@ fn cidr_match_v6(net: Ipv6Addr, ip: Ipv6Addr, prefix: u8) -> bool {
 /// blocked (a private LiteLLM / GHES / metadata endpoint the deployment opts
 /// into); it overrides every range below.
 pub fn ip_blocked(ip: IpAddr, dev: bool, allow: &[IpCidr]) -> bool {
-    // Normalize a v4-mapped v6 address to its v4 form up front so both the
-    // allowlist and the range checks see one canonical address.
+    // Normalize EVERY v6 form that addresses an IPv4 host (mapped, compatible,
+    // NAT64) to its v4 form up front so both the allowlist and the range checks
+    // see one canonical address.
     if let IpAddr::V6(a) = ip {
-        if let Some(v4) = a.to_ipv4_mapped() {
+        if let Some(v4) = embedded_ipv4(a) {
             return ip_blocked(IpAddr::V4(v4), dev, allow);
         }
     }
@@ -196,6 +231,36 @@ mod tests {
         // ::ffff:10.0.0.1 must be blocked like 10.0.0.1; ::ffff:93.184.216.34 allowed.
         assert!(ip_blocked(ip("::ffff:10.0.0.1"), false, &[]));
         assert!(!ip_blocked(ip("::ffff:93.184.216.34"), false, &[]));
+    }
+
+    #[test]
+    fn v4_compatible_and_nat64_forms_are_judged_on_their_v4() {
+        // M7: `::a.b.c.d` and `64:ff9b::a.b.c.d` reach an IPv4 host, so they must
+        // decide on the v4 address — before this they matched no v6 arm and read
+        // as PUBLIC, opening SSRF to private space and the metadata endpoint
+        // through both the reqwest resolver and the git-clone path.
+        assert!(ip_blocked(ip("::10.0.0.1"), false, &[]));
+        assert!(ip_blocked(ip("::192.168.1.1"), false, &[]));
+        assert!(ip_blocked(ip("::169.254.169.254"), false, &[]));
+        assert!(ip_blocked(ip("64:ff9b::10.0.0.1"), false, &[]));
+        assert!(ip_blocked(ip("64:ff9b::127.0.0.1"), false, &[]));
+        // Metadata stays blocked in dev through both forms (dev frees loopback only).
+        assert!(ip_blocked(ip("::169.254.169.254"), true, &[]));
+        assert!(ip_blocked(ip("64:ff9b::169.254.169.254"), true, &[]));
+        // FALSE-GREEN guard: the SAME two forms carrying a PUBLIC v4 stay admitted,
+        // so the test cannot pass by blocking these prefixes wholesale.
+        assert!(!ip_blocked(ip("::93.184.216.34"), false, &[]));
+        assert!(!ip_blocked(ip("64:ff9b::93.184.216.34"), false, &[]));
+        // `::` and `::1` are NOT v4-compatible addresses: the v6 arm keeps them,
+        // so the dev loopback seam still flips `::1` (0.0.0.1 would not).
+        assert!(!ip_blocked(ip("::1"), true, &[]));
+        assert!(ip_blocked(ip("::1"), false, &[]));
+        assert!(ip_blocked(ip("::"), false, &[]));
+        // The allowlist sees the normalized v4 too (one canonical address).
+        let allow: Vec<IpCidr> = vec!["10.0.0.0/8".parse().unwrap()];
+        assert!(!ip_blocked(ip("::10.1.2.3"), false, &allow));
+        assert!(!ip_blocked(ip("64:ff9b::10.1.2.3"), false, &allow));
+        assert!(ip_blocked(ip("::192.168.0.1"), false, &allow));
     }
 
     #[test]
