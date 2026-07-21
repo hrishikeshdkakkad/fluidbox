@@ -30,8 +30,22 @@
 #   * every "exactly N" assertion first proves its recorder file is non-empty;
 #   * a section that asserts ZERO upstream traffic carries a POSITIVE CONTROL in
 #     the same section proving the recorder DOES record when a call is allowed;
+#   * NO ASSERTION MAY PASS ON AN ABSENT ANSWER. Concretely, three rules the
+#     whole-branch review added after finding assertions that passed without
+#     exercising anything:
+#       - a `db()` read that FAILED is not an empty result: psql runs with
+#         ON_ERROR_STOP, returns `<psql-error>`, and the run fails at RESULT;
+#       - an emptiness/length assertion (`-z`, `= ""`, `${#x} -le N`) carries a
+#         FLOOR proving the query returned a row at all (a companion count);
+#       - `CODE=000` (curl never connected) is a hard failure, and an "accepted"
+#         HTTP arm names the set of codes it accepts instead of saying "not 403";
 #   * where an assertion could not be made fail-capable in this harness, there
 #     is a comment naming what would be required instead — never a fake pass.
+#     Grep `NOT ASSERTED` for the full set; the two added by the whole-branch
+#     review are DNS REBINDING (section (a)) and cross-USER session isolation
+#     (section (c)), the two acceptance clauses this suite structurally cannot
+#     reach — an IP-literal harness has no rebinding, and a single-tenant
+#     REQUIRE_SSO=0 boot has no user boundary.
 #
 # HERMETIC + no model spend: runs never launch a sandbox (no runner image in CI,
 # so provisioning fails FAST via the dead-registry image ref — exactly what the
@@ -188,11 +202,60 @@ j() { python3 -c "import sys,json;d=json.load(sys.stdin);print(d$1)" 2>/dev/null
 # every tenant table (binding the table OWNER too), so a GUC-less fixture read
 # returns zero rows and a fixture INSERT is refused. A session-level SET on a
 # custom (dotted) option needs no privilege.
-db() { psql "$DATABASE_URL" -X -q -A -t -c "set fluidbox.bypass = 'system_worker'; $1"; }
+#
+# `-v ON_ERROR_STOP=1` is LOAD-BEARING, not hygiene. Without it psql exits 0 on a
+# failed statement, so a broken query printed to stderr and returned "" — and an
+# EMPTY string silently satisfies every `-z`, `= ""` and `${#x} -le N` assertion
+# in this file. A psql failure is now three things at once:
+#   1. a loud stderr line (visible in the CI log next to the section it broke),
+#   2. the value `<psql-error>` on stdout — which no assertion here expects, so
+#      every downstream comparison FAILS instead of passing on emptiness,
+#   3. a line in $DB_ERR_LOG, asserted to be empty in the RESULT section — so a
+#      failure inside a `db … >/dev/null` fixture write (whose value nothing
+#      reads) is still COUNTED. The counter itself cannot live here: db() is
+#      almost always called inside `$( )`, and a subshell's `fail=$((fail+1))`
+#      never reaches the parent.
+# db() is never called from a background subshell (the only `&` blocks in this
+# file run sess_call/perm_at/curl), so one shared stderr file is safe and keeps
+# stdout free of NOTICE/WARNING text.
+DB_ERR='<psql-error>'
+DB_ERR_LOG="$WORK/psql-errors.log";  : > "$DB_ERR_LOG"
+DB_ERR_FILE="$WORK/.psql-stderr";    : > "$DB_ERR_FILE"
+db() {
+  local out rc
+  out=$(psql "$DATABASE_URL" -X -q -A -t -v ON_ERROR_STOP=1 \
+        -c "set fluidbox.bypass = 'system_worker'; $1" 2>"$DB_ERR_FILE")
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf '%s :: exit %s :: %s\n' "$1" "$rc" "$(tr '\n' ' ' < "$DB_ERR_FILE")" >> "$DB_ERR_LOG"
+    printf "  \033[1;31m✗\033[0m psql FAILED (exit %s): %s\n      %s\n" \
+      "$rc" "$1" "$(tr '\n' ' ' < "$DB_ERR_FILE")" >&2
+    printf '%s\n' "$DB_ERR"
+    return "$rc"
+  fi
+  printf '%s\n' "$out"
+}
 
 # ── Cleanup ──────────────────────────────────────────────────────────────────
+# Where a FAILED CI run's forensics are copied to (see below). Fixed, inside the
+# checkout, because actions/upload-artifact needs a path known when the workflow
+# YAML is written and $WORK is a random mktemp dir.
+CI_ARTIFACTS="$ROOT/hardening-e2e-artifacts"
 # shellcheck disable=SC2329  # invoked via the EXIT/INT/TERM trap
 cleanup() {
+  local rc=$?
+  # CI FORENSICS. $WORK holds the ONLY copy of the control-plane logs and every
+  # recorder JSONL, and the `rm -rf` below destroys them — which left a CI-only
+  # failure with nothing to debug but the pass/fail lines. So: when the run
+  # FAILED (nonzero exit, or any counted failure) and we are in CI, copy those
+  # files out first. Copy-out rather than "skip the rm" so the artifact path is
+  # static, and only on failure so a green run leaves nothing behind.
+  if [ -n "${CI:-}" ] && { [ "$rc" -ne 0 ] || [ "${fail:-0}" -gt 0 ]; }; then
+    mkdir -p "$CI_ARTIFACTS"
+    cp -p "$SERVER_LOG" "$SERVER_B_LOG" "$MCP_LOG" "$MCP2_LOG" "$REDIR_LOG" \
+          "$LLM_LOG" "$SINK_LOG" "$DB_ERR_LOG" "$CI_ARTIFACTS/" 2>/dev/null
+    echo "hardening-e2e: run failed (exit $rc, $fail failed assertions) — preserved server logs + recorder JSONLs in $CI_ARTIFACTS" >&2
+  fi
   [ -n "$SERVER_PID" ]   && kill "$SERVER_PID"   2>/dev/null
   [ -n "$SERVER_B_PID" ] && kill "$SERVER_B_PID" 2>/dev/null
   [ -n "$MCP_PID" ]    && kill "$MCP_PID"    2>/dev/null
@@ -1038,8 +1101,38 @@ restart_server() { # label → 0 if the new process is healthy
 # ── HTTP helpers ─────────────────────────────────────────────────────────────
 AH="authorization: Bearer $ADMIN_TOKEN"
 BODY=""; CODE=""
-admin_post() { CODE=$(curl -s -o "$UB" -w '%{http_code}' -X POST -H "$AH" -H 'content-type: application/json' -d "$2" "$API$1"); BODY=$(cat "$UB"); }
-admin_get()  { CODE=$(curl -s -o "$UB" -w '%{http_code}' -H "$AH" "$API$1"); BODY=$(cat "$UB"); }
+# TWO rules every CODE/BODY helper below obeys, both learned from a false green:
+#
+#  1. TRUNCATE $UB FIRST. It is ONE shared file and curl does not truncate `-o`
+#     when the connection never opens — so a dead control plane answers
+#     `CODE=000` while $UB still holds the PREVIOUS request's body. Any assertion
+#     shaped "not a 403" / "not the wrong-audience body" then passes against a
+#     corpse, reading a stale success as this request's answer.
+#  2. `CODE=000` IS A FAILURE, everywhere. curl reports 000 when it never got a
+#     status line at all (connection refused, DNS failure, timeout). That is not
+#     "the route accepted us", it is "there was no route" — and this suite reboots
+#     the server four times, so a boot that silently died must never read as a
+#     pass. Counted here rather than at the call sites: these helpers run in the
+#     MAIN shell (they set globals), so `no` reaches the real counter.
+http_dead() { # code label → 0 (having recorded ONE failure) when nothing answered
+  [ "$1" = 000 ] || return 1
+  no "$2: the request never completed (curl code 000 — connection refused / no status line). A dead control plane is never a passing outcome."
+  return 0
+}
+admin_post() {
+  : > "$UB"
+  CODE=$(curl -s -o "$UB" -w '%{http_code}' -X POST -H "$AH" -H 'content-type: application/json' -d "$2" "$API$1")
+  BODY=$(cat "$UB")
+  http_dead "$CODE" "POST $1" && return 1
+  return 0
+}
+admin_get()  {
+  : > "$UB"
+  CODE=$(curl -s -o "$UB" -w '%{http_code}' -H "$AH" "$API$1")
+  BODY=$(cat "$UB")
+  http_dead "$CODE" "GET $1" && return 1
+  return 0
+}
 # The in-sandbox internal gate: authenticated by the per-session bearer token.
 sess_call() { # sid token-plaintext json → prints the tools/call response body
   curl -s -X POST -H "authorization: Bearer $2" -H 'content-type: application/json' -d "$3" "$API/internal/sessions/$1/tools/call"
@@ -1127,6 +1220,7 @@ forge_audience_set() { # sid prefix
 aud_curl() { # method path token [json-body]
   local m=$1 p=$2 t=$3 b=${4:-}
   [ -n "$b" ] || b='{}'
+  : > "$UB"
   if [ "$m" = GET ]; then
     CODE=$(curl -s -o "$UB" -w '%{http_code}' -H "authorization: Bearer $t" "$API$p")
   else
@@ -1134,8 +1228,21 @@ aud_curl() { # method path token [json-body]
       -H 'content-type: application/json' -d "$b" "$API$p")
   fi
   BODY=$(cat "$UB")
+  http_dead "$CODE" "$m $p" && return 1
+  return 0
 }
 wrong_aud_body() { case "$1" in *wrong_audience*) return 0;; esac; return 1; }
+# The ACCEPTED set for an audience matrix arm, stated POSITIVELY. The old shape
+# was `[ "$CODE" != 403 ]`, which passes on 000 (no connection) and on 401 (the
+# token never resolved — a broken forge), i.e. exactly the two ways this matrix
+# can go blind. Acceptance means "THIS handler answered": a status it produces
+# itself. The exact 2xx cannot be pinned per route without coupling the mapping
+# proof to unrelated downstream state — the workspace archive is absent (404),
+# nothing listens on the LLM port in this boot (5xx), and /tools/call may deny
+# (200) or reject a body (400/422) — which is why the set is a list rather than
+# `= 200`. 000, 401 and 403 are the three codes it deliberately excludes.
+AUD_ACCEPT_SET="200 201 202 204 400 404 409 422 429 500 502 503 504"
+aud_accepted() { case " $AUD_ACCEPT_SET " in *" $1 "*) return 0;; esac; return 1; }
 
 # Running tally of the init container's blast radius, accumulated BY the matrix
 # (never by a second pass — the bodies differ per route, and an invalid body is
@@ -1143,28 +1250,36 @@ wrong_aud_body() { case "$1" in *wrong_audience*) return 0;; esac; return 1; }
 # read as a false "refused"). WS_TRIED is the >0 precondition.
 WS_TRIED=0; WS_LEAK=0; WS_OWN_OK=0
 
-# ONE route × EVERY audience. The route's own audience must be ACCEPTED (any
-# non-403 that is not a wrong_audience body — the route's own downstream 200/400/
-# 404/502 is irrelevant to the mapping), every OTHER scoped audience must be
-# refused 403 with the body code VERBATIM, and the legacy 'all' must pass.
-# "non-403 = accepted" is precise, not loose: `wrong_audience` is the ONLY
-# ApiError::Forbidden anywhere on the internal plane (internal.rs + facade.rs
-# carry no other), so a 403 on these routes can mean nothing else.
-# Self-checking: a broken forge shows up as 401s on the three negatives, so the
-# "accepted" arms can never pass vacuously.
+# ONE route × EVERY audience. The route's own audience must be ACCEPTED — the
+# handler's OWN answer, positively (`aud_accepted`, above), with no
+# wrong_audience body — every OTHER scoped audience must be refused 403 with the
+# body code VERBATIM, and the legacy 'all' must pass. Acceptance is a positive
+# membership test rather than "not 403" because `wrong_audience` being the ONLY
+# ApiError::Forbidden on the internal plane (internal.rs + facade.rs carry no
+# other) makes 403 sufficient for the NEGATIVE arms but not necessary for the
+# positive ones: a 000 (dead server) and a 401 (a forge that produced no usable
+# token) are both "not 403" and neither is acceptance.
+# Self-checking twice over: a broken forge shows up as 401s on the three
+# negatives AND fails the accepted arms, so no arm can pass vacuously.
 aud_matrix() { # label required-audience token-prefix method path [json-body]
   local label=$1 want=$2 pfx=$3 m=$4 p=$5 b=${6:-} a
   for a in $AUDIENCES all; do
     aud_curl "$m" "$p" "$pfx-$a" "$b"
     if [ "$a" = "$want" ]; then
-      { [ "$CODE" != 403 ] && ! wrong_aud_body "$BODY"; } \
-        && ok "$label ← '$a' (the route's OWN audience): accepted ($CODE)" \
-        || no "$label ← '$a' (the route's OWN audience) was REFUSED → $CODE: $BODY"
-      [ "$a" = workspace ] && WS_OWN_OK=1
+      # WS_OWN_OK is set INSIDE the passing branch: outside it (its original
+      # position) it recorded only that the workspace arm was TRIED, which made
+      # the `WS_OWN_OK = 1` conjunct in the containment verdict below unfalsifiable
+      # — the "the archive route accepted it" half was never actually asserted.
+      if aud_accepted "$CODE" && ! wrong_aud_body "$BODY"; then
+        ok "$label ← '$a' (the route's OWN audience): accepted ($CODE)"
+        [ "$a" = workspace ] && WS_OWN_OK=1
+      else
+        no "$label ← '$a' (the route's OWN audience) was NOT accepted → $CODE: $BODY (want one of: $AUD_ACCEPT_SET)"
+      fi
     elif [ "$a" = all ]; then
-      { [ "$CODE" != 403 ] && ! wrong_aud_body "$BODY"; } \
+      { aud_accepted "$CODE" && ! wrong_aud_body "$BODY"; } \
         && ok "$label ← legacy 'all': accepted ($CODE) — in-flight sessions keep working" \
-        || no "$label ← legacy 'all' was REFUSED → $CODE: $BODY (breaks every run spanning the deploy)"
+        || no "$label ← legacy 'all' was NOT accepted → $CODE: $BODY (want one of: $AUD_ACCEPT_SET; breaks every run spanning the deploy)"
     else
       { [ "$CODE" = 403 ] && [ "$BODY" = "$WRONG_AUD" ]; } \
         && ok "$label ← '$a': 403 $WRONG_AUD" \
@@ -1428,6 +1543,16 @@ if gt0 "$REDIR_HITS" "the redirector's recorder in this window"; then
     && ok "the redirector recorded EXACTLY ONE request (the client did not retry it)" \
     || no "redirector recorded $REDIR_HITS requests in the window (want exactly 1)"
 fi
+# POSITIVE CONTROL for the ZERO below — the in-section control this file's
+# assertion discipline mandates. The redirect TARGET lives on the PRIMARY fake
+# ($FOLLOW_URL is $MCP_PORT/followed), so the zero is only meaningful if that
+# fake's recorder was alive and appending in THIS window. One probe of the same
+# fake must land at path=/mcp; the zero filters on path=/followed, so the control
+# can never inflate it.
+admin_post "/v1/mcp/probe" "{\"url\":\"$MCP_URL\"}"
+F_CTL=$(rec "$F_MARK" count path=/mcp)
+gt0 "$F_CTL" "requests recorded on the redirect-target fake in this window" \
+  && ok "POSITIVE CONTROL: the redirect-target fake recorded $F_CTL request(s) at /mcp in this same window — its recorder is live"
 FOLLOWED=$(rec "$F_MARK" count path=/followed)
 [ "$FOLLOWED" = 0 ] \
   && ok "the redirect TARGET was never contacted (0 requests at $FOLLOW_URL)" \
@@ -1490,6 +1615,29 @@ fi
 # every loopback fake in this file unreachable, so it belongs in its own boot
 # (a follow-up section), not here. The unit tests in
 # crates/fluidbox-workspace/src/lib.rs cover the closed-seam matrix directly.
+#
+# NOT ASSERTED — DNS REBINDING, the remaining half of acceptance bullet (a).
+# Every SSRF target in this section is an IP LITERAL ($PRIV_MCP, $META_URL,
+# $PRIV_CLONE), which exercises `admit_url`'s host-literal short-circuit
+# (egress.rs) and nothing else. A rebinding attack does not use a literal: it
+# uses a NAME that resolves to a public address when the URL is admitted and to a
+# private one when the socket is opened. The product's answer to that is a
+# different mechanism than anything asserted here — `admit_url` deliberately does
+# NOT resolve (resolving would only add a TOCTOU window), and the enforcement is
+# `SsrfDnsResolver`, a reqwest `dns::Resolve` that re-filters EVERY resolved
+# address at CONNECT time and errors when the filtered set is empty, so a
+# rebound name never opens a connection.
+# Making this fail-capable in an e2e needs a CONTROLLABLE DNS SERVER: a resolver
+# that answers A=<public> for the first lookup of one name and A=<private> for
+# the second, plus the control plane's process resolver pointed at it (a
+# /etc/resolv.conf or a resolver-override the server does not expose). This
+# harness is python-stdlib fakes on loopback with no root and no resolver seam,
+# so there is no honest assertion to write — a name that resolves to 127.0.0.1
+# would be refused by the SAME literal/CIDR filter already asserted above, and
+# would prove nothing about rebinding while LOOKING like it did. What IS covered:
+# `filter_public_addrs` (the exact function SsrfDnsResolver applies to resolved
+# addresses) is driven over public/private/loopback/metadata addresses by
+# `dns_filter_range_logic` in crates/fluidbox-server/src/egress.rs's own tests.
 
 # ═════════════════════════════════════════════════════════════════════════════
 # (b) A DENIED brokered call never contacts the upstream.
@@ -1616,6 +1764,25 @@ PYEOF
     && ok "every POST presented exactly the connection's sealed credential" \
     || no "unexpected credential(s) on the wire: [$BEARERS]"
 fi
+# NOT ASSERTED — "session IDs never cross USER boundaries", the second half of
+# acceptance bullet (c). What is proven above is per-RUN isolation: two runs of
+# ONE agent against ONE connection get two distinct upstream mcp-session-ids,
+# because the registry key is (run session id, McpPeer::Binding(binding id)).
+# That is the whole of the isolation this boot CAN show. This suite runs
+# FLUIDBOX_REQUIRE_SSO=0 with a single tenant and drives everything with the
+# admin token, so every run here belongs to the SAME principal — there is no user
+# boundary in this process for a session id to cross, and an assertion phrased as
+# one would be comparing two runs of one user and calling it a cross-user proof.
+# Making it fail-capable needs a SECOND tenant and a second USER: two orgs, an
+# activated IdP config per org, a member in each, and a run per member whose
+# upstream sessions are then compared. That is the SSO fixture — REQUIRE_SSO=1
+# plus an OIDC provider and cookie/PAT principals — which simultaneously confines
+# the admin token to /v1/admin/* and would break every forge, catalog Connect and
+# aud_matrix call in this file (the same reason (h)'s `tenant_llm_keys_required`
+# is disclosed rather than asserted). scripts/identity-e2e.sh is the suite that
+# already owns that fixture; the tenant-scoping floor underneath it — every
+# tenant-owned loader carrying a TenantScope, and RLS FORCEd on the session
+# tables — is asserted there and in the fluidbox-db tests, not here.
 
 # ═════════════════════════════════════════════════════════════════════════════
 # (d) 2025-11-25 conformance.
@@ -1683,10 +1850,18 @@ mcp_mode "2024-11-05" ok
 if live_run hq-agent "sess-d2-$$" "d/unsupported"; then
   D_UNS="$RUN"
   db "update sessions set run_spec = run_spec #- '{brokered,0,protocol_version}' where id='$D_UNS'" >/dev/null
+  # The floor this fixture needs: `run_spec->'brokered'->0 ? 'protocol_version'`
+  # is NULL — hence not-true, hence count 0 — when there is no brokered surface at
+  # ALL. So the zero alone cannot tell "the key was removed" from "this run froze
+  # no brokered surface, and the unsupported-version arm below is testing nothing".
+  # Prove the surface EXISTS first, then that the key is gone from it.
+  SURF=$(db "select coalesce(jsonb_array_length(run_spec->'brokered'),0) from sessions where id='$D_UNS'")
   LEFT=$(db "select count(*) from sessions where id='$D_UNS' and run_spec->'brokered'->0 ? 'protocol_version'")
-  [ "$LEFT" = 0 ] \
-    && ok "fixture: the frozen surface's protocol_version was removed (a pre-Phase-E RunSpec)" \
-    || no "fixture failed — protocol_version is still on the frozen surface"
+  if gt0 "$SURF" "frozen brokered surfaces on the unsupported-version run"; then
+    [ "$LEFT" = 0 ] \
+      && ok "fixture: the frozen surface exists ($SURF) and its protocol_version was removed (a pre-Phase-E RunSpec)" \
+      || no "fixture failed — protocol_version is still on the frozen surface"
+  fi
   D_MARK=$(mark)
   R=$(sess_call "$D_UNS" "sess-d2-$$" '{"tool_call_id":"d2","tool":"mcp__hq__hq_search","input":{"query":"x"}}')
   { echo "$R" | grep -q "negotiated unsupported protocol version" \
@@ -1949,10 +2124,19 @@ if live_run hq-agent "sess-d8-$$" "d/scope"; then
     && ok "the reconnect note records the challenge scope verbatim-but-sanitized ('$CNOTE')" \
     || no "connection note = '$CNOTE' (want the insufficient_scope reconnect note naming the scope)"
   # A NEW run against the errored connection must be refused at creation.
+  # Stated as a POSITIVE refusal set, not `!= 200`: the binding refusal is an
+  # ApiError::BadRequest raised by bindings.rs (either "connection '…' is error —
+  # reconnect it" on an explicit slot, or the no-satisfying-connection arm), so
+  # the answer must be a 4xx the HANDLER produced. `!= 200` also accepted 000 —
+  # a control plane that had died would have "proven" fail-closed behaviour.
   admin_post "/v1/sessions" "{\"agent\":\"hq-agent\",\"task\":\"t\",\"repo\":{\"kind\":\"none\"}}"
-  [ "$CODE" != 200 ] \
-    && ok "a new run bound to the errored connection → $CODE (fail closed off status)" \
-    || no "a new run against the errored connection was created: $BODY"
+  case "$CODE" in
+    400|409|422)
+      { [ -n "$BODY" ] && ok "a new run bound to the errored connection → $CODE (fail closed off status): $BODY"; } \
+        || no "the run was refused with $CODE but an EMPTY body — no refusal reason was rendered";;
+    *)
+      no "a new run against the errored connection → $CODE: $BODY (want a 400/409/422 refusal; 2xx = it was created, 000 = nothing answered)";;
+  esac
   # Restore the connection so the remaining sections can bind it. This is a
   # documented fixture, not a product path (reconnect is the product path).
   db "update integration_connections set status='active', oauth = coalesce(oauth,'{}'::jsonb) - 'error', updated_at=now() where id='$CONN'" >/dev/null
@@ -1987,11 +2171,20 @@ if live_run hq-agent "sess-e-$$" "e/schema"; then
   [ "$E1_CALLS" = 0 ] \
     && ok "the schema-rejected call produced ZERO tools/call upstream" \
     || no "$E1_CALLS tools/call escaped a schema rejection"
-  # The bounded message names JSON-pointer PATHS, never argument VALUES.
+  # The bounded message names JSON-pointer PATHS, never argument VALUES. The
+  # bound needs a FLOOR at both ends or it is not an assertion: zero bytes
+  # satisfies `-le 600`, so an absent event row — or a psql that failed — used to
+  # "prove" boundedness. The floor is the companion row count (the ledger row must
+  # EXIST) plus a non-empty reason, and the reason must still name the schema
+  # rejection rather than being any old short string.
+  E1_ROWS=$(db "select count(*) from events where session_id='$E_RUN' and type='tool.decision' and payload->>'tool_call_id'='e1'")
   E1_REASON=$(db "select coalesce(payload->>'reason','') from events where session_id='$E_RUN' and type='tool.decision' and payload->>'tool_call_id'='e1'")
-  [ "${#E1_REASON}" -le 600 ] \
-    && ok "the ledgered schema reason is bounded (${#E1_REASON} bytes)" \
-    || no "schema reason is unbounded (${#E1_REASON} bytes)"
+  if gt0 "$E1_ROWS" "tool.decision ledger rows for the schema-rejected intent"; then
+    { [ "${#E1_REASON}" -ge 1 ] && [ "${#E1_REASON}" -le 600 ] \
+        && echo "$E1_REASON" | grep -q "frozen schema"; } \
+      && ok "the ledgered schema reason is present, names the frozen schema, and is bounded (${#E1_REASON} bytes, 1..600)" \
+      || no "schema reason is out of bounds or not a schema reason (${#E1_REASON} bytes): '$E1_REASON'"
+  fi
 
   # (e.2) A wrong-typed property.
   E_MARK=$(mark)
@@ -2051,6 +2244,21 @@ if live_run hq-agent "sess-e-ro-$$" "e/order"; then
   E5_CALLS=$(rec "$E_MARK" count rpc=tools/call)
   [ "$E5_CALLS" = 0 ] && ok "the order-proof call reached the upstream ZERO times" \
     || no "$E5_CALLS tools/call escaped the order-proof denial"
+  # POSITIVE CONTROL for that ZERO, in the SAME recorder window. It cannot be run
+  # on $E_RO itself (every call from a ReadOnly run is denied — with good args by
+  # the tier, with bad args by the schema), so it is a fresh full-trust run whose
+  # valid call MUST appear in the window the zero was read from. Read after the
+  # zero, exactly like (h.3a)/(h.3b)'s deferred control: the zero covered
+  # [E_MARK, now) and this re-read proves the recorder was appending in it.
+  if live_run hq-agent "sess-e-ro-ctl-$$" "e/order-control"; then
+    R=$(sess_call "$RUN" "sess-e-ro-ctl-$$" '{"tool_call_id":"e5c","tool":"mcp__hq__hq_count","input":{"n":3}}')
+    echo "$R" | grep -q '"ok": *true' \
+      && ok "POSITIVE CONTROL: a full-trust run's valid call executed in the same window" \
+      || no "the order-proof's positive control call failed: $R"
+    E5_CTL=$(rec "$E_MARK" count rpc=tools/call)
+    gt0 "$E5_CTL" "tools/call recorded in the order-proof window once a real dispatch happened" \
+      && ok "POSITIVE CONTROL: that same window now holds $E5_CTL tools/call — the ZERO above was a real absence, not a dead fake"
+  fi
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2101,8 +2309,13 @@ if live_run hq-agent "sess-f2-$$" "f/500"; then
   if gt0 "$F2_CALLS" "tools/call in the 500 window"; then
     ok "the 500-returning upstream was actually contacted ($F2_CALLS tools/call)"
   fi
+  # `[ "$ST" != ambiguous ]` used to ride along as a second conjunct here. It was
+  # tautological — the preceding `= failed_upstream` already excludes every other
+  # state, `ambiguous` included — so it asserted nothing and only made the check
+  # look stronger than it was. The single equality IS the assertion; the failure
+  # message keeps naming 'ambiguous' as the regression this guards.
   ST=$(claim_state "$F_500" f2)
-  { [ "$ST" = failed_upstream ] && [ "$ST" != ambiguous ]; } \
+  [ "$ST" = failed_upstream ] \
     && ok "an HTTP 500 settled the claim at 'failed_upstream' (a definitive answer, not ambiguity)" \
     || no "claim state after a 500 = '$ST' (want failed_upstream; 'ambiguous' is the bug this asserts against)"
   echo "$R" | grep -qi "500" \
@@ -2187,15 +2400,43 @@ if live_run hq-agent "sess-f4-$$" "f/ambiguous"; then
   [ "$(claim_state "$F_AMB" f4)" = ambiguous ] \
     && ok "the claim row is still 'ambiguous' (the refusal did not mutate it)" \
     || no "claim state changed to '$(claim_state "$F_AMB" f4)' after the refusal"
+  # POSITIVE CONTROL for that ZERO, on the SAME run and in the SAME window: a
+  # DIFFERENT intent (f4c) on this very session dispatches normally. That makes
+  # the zero attributable to the AMBIGUOUS CLAIM specifically — not to a dead
+  # fake, a dead recorder, or a run that had stopped dispatching anything.
+  R=$(sess_call "$F_AMB" "sess-f4-$$" '{"tool_call_id":"f4c","tool":"mcp__hq__hq_search","input":{"query":"ctl"}}')
+  echo "$R" | grep -q '"ok": *true' \
+    && ok "POSITIVE CONTROL: a fresh intent on the SAME run still dispatches (only the ambiguous one is frozen)" \
+    || no "the ambiguous section's positive control call failed: $R"
+  F4_CTL=$(rec "$F_MARK" count rpc=tools/call)
+  gt0 "$F4_CTL" "tools/call recorded in the ambiguous window once a fresh intent ran" \
+    && ok "POSITIVE CONTROL: that same window now holds $F4_CTL tools/call — the ZERO above was a real absence"
 fi
 
 say "(f) Cancel DURING an approval wait — approving afterwards dispatches NOTHING"
 # The other half of Gap 11: the approval said "allow" minutes ago, but the run is
-# gone. Two fences exist and either is a pass — the post-wait terminality recheck
-# in decide_tool_call (internal.rs:676 "session terminal during approval wait")
-# and the claim's in-transaction non-terminal condition (internal.rs:1045
-# "session is terminal"). The ZERO-dispatch assertion is the load-bearing one and
-# is asserted separately so a message-shape change cannot mask it.
+# gone. Two fences exist and either is a pass, and there are exactly THREE strings
+# in the shipped source between them (verified against internal.rs, #33):
+#   1. "session stopped accepting work during the approval wait" — the post-wait
+#      terminality recheck's LEDGER reason (EventBody::ToolDecision,
+#      source="session_terminal"). It is NOT the response body: that arm returns
+#      GateDecision::terminal_deny(), which /tools/call renders as (3).
+#   2. "session is not active" — TERMINAL_MESSAGE, the RESPONSE for both the
+#      handler-top terminal guard and fence 1 (deliberately indistinguishable to
+#      a runner).
+#   3. "session is terminal" — ClaimOutcome::SessionTerminal, the claim's
+#      in-transaction non-terminal condition.
+# The alternation below carries only the two RESPONSE shapes, (2) and (3). A
+# fourth string, "session terminal during approval wait", used to lead it and
+# exists NOWHERE in the source — a branch that can never match hides which shape
+# actually shipped, so it is gone.
+# TO WHOEVER UNIFIES THESE GUARDS: this is the assertion that tracks them. If
+# ClaimOutcome::SessionTerminal is folded onto TERMINAL_MESSAGE, string (3) goes
+# dead and must be DROPPED from the alternation for exactly the reason the fourth
+# one was — every alternative here has to be a real, greppable string, or the
+# check quietly stops naming which fence fired.
+# The ZERO-dispatch assertion is the load-bearing one and is asserted separately
+# so a message-shape change cannot mask it.
 if live_run hq-appr-agent "sess-f5-$$" "f/cancel"; then
   F_CAN="$RUN"
   F_MARK=$(mark)
@@ -2225,13 +2466,36 @@ if live_run hq-appr-agent "sess-f5-$$" "f/cancel"; then
   [ "$F5_CALLS" = 0 ] \
     && ok "ZERO tools/call reached the upstream for the approved-but-cancelled intent" \
     || no "$F5_CALLS tools/call dispatched for a cancelled run (the Gap-11 bug)"
-  echo "$R" | grep -qE "session terminal during approval wait|session is terminal|session is not active" \
+  echo "$R" | grep -qE "session is terminal|session is not active" \
     && ok "the response names the terminal session as the reason" \
     || no "cancel-during-approval response: $R"
+  # The "no claim row" assertion needs a FLOOR, or a psql that answered nothing
+  # would satisfy `-z` and read as "nothing was claimed". Two companions, both in
+  # this window: the run's own claim count must be a real 0, and the SAME table
+  # read through the SAME helper must be returning rows for the runs that DID
+  # claim (section (f) has been filling it since the duplicate-intent test).
+  F5_CLAIMS=$(db "select count(*) from tool_execution_claims where session_id='$F_CAN'")
+  F5_CLAIM_CTL=$(db "select count(*) from tool_execution_claims where state='succeeded'")
   CST=$(claim_state "$F_CAN" f5)
-  [ -z "$CST" ] \
-    && ok "no execution claim was ever taken for the cancelled intent" \
-    || no "a claim row exists in state '$CST' for a cancelled run's intent"
+  if gt0 "$F5_CLAIM_CTL" "claim rows readable in this window (the table, the bypass GUC and psql all work)"; then
+    { [ "$F5_CLAIMS" = 0 ] && [ -z "$CST" ]; } \
+      && ok "no execution claim was ever taken for the cancelled intent (0 rows for the run, and $F5_CLAIM_CTL succeeded rows prove the read works)" \
+      || no "claim rows for the cancelled run = '$F5_CLAIMS', f5 state = '$CST' (want 0 and empty)"
+  fi
+  # POSITIVE CONTROL for the ZERO above, in the SAME recorder window — F_MARK was
+  # re-marked at the top of this block, so nothing else proved the fake or its
+  # recorder survived the cancel + approval poll (~40 s of sleeps). A fresh run's
+  # allowed call must now appear in that window. Read AFTER the zero, so it can
+  # never inflate it.
+  if live_run hq-agent "sess-f5c-$$" "f/cancel-control"; then
+    R=$(sess_call "$RUN" "sess-f5c-$$" '{"tool_call_id":"f5c","tool":"mcp__hq__hq_count","input":{"n":5}}')
+    echo "$R" | grep -q '"ok": *true' \
+      && ok "POSITIVE CONTROL: a live run's call executed after the cancel test" \
+      || no "the cancel section's positive control call failed: $R"
+    F5_CTL=$(rec "$F_MARK" count rpc=tools/call)
+    gt0 "$F5_CTL" "tools/call recorded in the cancel window once a live run dispatched" \
+      && ok "POSITIVE CONTROL: that same window now holds $F5_CTL tools/call — the ZERO above was a real absence, not a fake that died during the cancel poll"
+  fi
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2459,12 +2723,18 @@ fi
 say "(h) LLM budget reservations — fake LiteLLM up"
 start_llm
 
-# One facade request, foreground; sets CODE + BODY like the admin_* helpers.
+# One facade request, foreground; sets CODE + BODY like the admin_* helpers —
+# including the shared-body-file truncation and the 000 hard failure (this
+# section reboots the control plane, so "the facade answered 000" must never read
+# as "the facade did not 403 us").
 llm_post() { # token json
+  : > "$UB"
   CODE=$(curl -s -o "$UB" -w '%{http_code}' -X POST \
     -H "authorization: Bearer $1" -H 'content-type: application/json' \
     -d "$2" "$API/internal/llm/v1/messages")
   BODY=$(cat "$UB")
+  http_dead "$CODE" "POST /internal/llm/v1/messages" && return 1
+  return 0
 }
 # The request body. `metadata` is a first-class Anthropic field and this dialect's
 # body is forwarded re-serialized but otherwise untouched (facade.rs:643), so the
@@ -2479,6 +2749,13 @@ llm_body() { # model max_tokens hold_ms usage [reply]
 # would never exit.
 llm_fire() { # pidfile tag token json
   (
+    # Per-tag body file, truncated first for the same reason $UB is: curl leaves
+    # `-o` untouched when the connection never opens, and these files are read
+    # back by tag after the wait. A 000 here needs no `no` of its own — it is a
+    # background subshell (the counter would be lost), and the caller's outcome
+    # classifier already routes an unrecognised code to its "other" bucket, which
+    # fails its assertion.
+    : > "$2.body"
     c=$(curl -s -o "$2.body" -w '%{http_code}' -X POST \
       -H "authorization: Bearer $3" -H 'content-type: application/json' \
       -d "$4" "$API/internal/llm/v1/messages")
@@ -2696,9 +2973,18 @@ if [ "$H_OK" = 1 ] \
     H3B="$RUN"
     forge_audience_token "$H3B" llm "sess-h3b-$$-llm" >/dev/null
     db "update sessions set run_spec = jsonb_set(jsonb_set(run_spec,'{budgets,max_tokens}','null'),'{budgets,max_cost_usd}','null') where id='$H3B'" >/dev/null
-    [ "$(db "select run_spec->'budgets'->>'max_tokens' from sessions where id='$H3B'")" = "" ] \
-      && ok "fixture: this run has NO token budget — only the concurrency ceiling can refuse" \
-      || no "fixture failed — the ceiling run still carries a token budget"
+    # `->>'max_tokens'` returns the empty string for JSON null, for a missing key,
+    # for a missing `budgets` object AND for a missing ROW — so `= ""` alone would
+    # pass even if this session did not exist. Floor: the row must exist and the
+    # key must be PRESENT, and only then is its value asserted to be JSON null
+    # (via `<null>`, which coalesce can produce from nothing else here).
+    H3B_KEYS=$(db "select count(*) from sessions where id='$H3B' and run_spec->'budgets' ? 'max_tokens'")
+    H3B_BUDGET=$(db "select coalesce(run_spec->'budgets'->>'max_tokens','<null>') from sessions where id='$H3B'")
+    if gt0 "$H3B_KEYS" "the ceiling run's row + its frozen budgets.max_tokens key"; then
+      [ "$H3B_BUDGET" = "<null>" ] \
+        && ok "fixture: this run has NO token budget (budgets.max_tokens is present and JSON null) — only the concurrency ceiling can refuse" \
+        || no "fixture failed — the ceiling run still carries a token budget ('$H3B_BUDGET')"
+    fi
     : > "$WORK/h3b.pids"
     for H_N in 1 2 3; do
       llm_fire "$WORK/h3b.pids" "$WORK/h3b-$H_N" "sess-h3b-$$-llm" \
@@ -3386,6 +3672,17 @@ if restart_server "control plane rebooted with tenant=0 host=0 connection=12/min
 fi
 
 # ── Result ───────────────────────────────────────────────────────────────────
+# EVERY psql statement this run issued had to succeed. db() cannot count its own
+# failures (it runs inside `$( )`, and a subshell's counter increment is lost),
+# so it appends to $DB_ERR_LOG and the tally is asserted HERE — once, for the
+# whole file. This is what stops a broken fixture write, or a psql that lost the
+# server, from turning into an assertion that "passed" on an empty string.
+DB_ERRS=$(wc -l < "$DB_ERR_LOG" | tr -d ' ')
+[ "$DB_ERRS" = 0 ] \
+  && ok "every psql statement in this run succeeded — no assertion above read a swallowed error" \
+  || no "$DB_ERRS psql statement(s) FAILED; every assertion reading one is VOID:
+$(cat "$DB_ERR_LOG")"
+
 say "RESULT"
 printf "  \033[1;32m%d passed\033[0m, \033[1;31m%d failed\033[0m\n" "$pass" "$fail"
 exit $(( fail > 0 ? 1 : 0 ))
