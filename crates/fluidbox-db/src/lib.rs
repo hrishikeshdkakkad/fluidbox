@@ -4667,6 +4667,16 @@ pub async fn expire_approval_tx(
 /// order, so `approval.decided` precedes `tool.decision` exactly as the old waiter
 /// emission did) and announce the decision on [`APPROVALS_CHANNEL`]. Runs AFTER
 /// the approvals CAS, inside its transaction — the binding lock order.
+///
+/// DELIBERATE BEHAVIOR CHANGE (Phase E, #33; review Minor E): the `?` below is
+/// inside the decision's transaction, so a failed ledger append now ROLLS BACK THE
+/// DECISION ITSELF — the approve/deny CAS and its audit rows commit together or
+/// not at all, making the ledger a hard dependency of deciding an approval. That
+/// is chosen fail-closed: a decision the timeline cannot prove is worse than a
+/// decision that must be retried (the runner re-attaches to the still-pending row
+/// and the human's verdict is re-appliable), and the previous split — CAS commits,
+/// then a best-effort `ledger::record` swallows its error — could silently diverge
+/// the audit trail from the durable verdict.
 async fn emit_and_notify(
     tx: &mut sqlx::PgConnection,
     scope: TenantScope,
@@ -4684,18 +4694,33 @@ async fn emit_and_notify(
     Ok(())
 }
 
-/// Claim the RIGHT to ledger the post-approval-wait terminality deny, exactly once
-/// (Phase E, #33; plan E12 "M4"). The session can terminalize DURING a
-/// minutes-long approval wait, in which case an approved call must still be
-/// refused — but EVERY re-attached waiter computes that same refusal, so the
-/// ledger write needs a single-winner CAS just like the deterministic gate paths.
-/// `terminal_deny_at` (migration 0021) is that marker: it is NOT a verdict (the
-/// human decision stays immutable in `status`), only a record that the deny was
-/// already ledgered. Returns true iff THIS caller won and must emit.
-pub async fn claim_terminal_deny_emission(
+/// Claim the RIGHT to ledger the post-approval-wait terminality deny AND emit it,
+/// in ONE transaction, exactly once (Phase E, #33; plan E12 "M4"). The session can
+/// terminalize DURING a minutes-long approval wait, in which case an approved call
+/// must still be refused — but EVERY re-attached waiter computes that same
+/// refusal, so the ledger write needs a single-winner CAS just like the
+/// deterministic gate paths. `terminal_deny_at` (migration 0021) is that marker: it
+/// is NOT a verdict (the human decision stays immutable in `status`), only a record
+/// that the deny was ledgered. Returns true iff THIS caller won and emitted.
+///
+/// IN-TX BY THE SAME RULE AS ITS THREE SIBLINGS (review Minor A): the first cut
+/// committed the marker and then called `ledger::record` in a separate,
+/// error-swallowing transaction, so a crash (or a transient append failure) between
+/// them lost the event PERMANENTLY — the marker blocks every other waiter from
+/// emitting, and nothing ever re-emits. Appending inside the claim's own
+/// transaction makes marker-and-event atomic: a failed append rolls the marker back
+/// and the next waiter (or the runner's retry) re-claims and re-emits. Same
+/// fail-closed trade as [`emit_and_notify`], and the same binding lock order
+/// (approvals FIRST, then `append_event`'s `sessions` row lock).
+///
+/// No `pg_notify` here, unlike [`emit_and_notify`]: this is not a decision, so no
+/// waiter is blocked on it — every waiter reaching this point has already left the
+/// wait loop.
+pub async fn claim_terminal_deny_tx(
     pool: &PgPool,
     scope: TenantScope,
     id: Uuid,
+    events: Vec<Redacted<EventEnvelope>>,
 ) -> sqlx::Result<bool> {
     let mut tx = scoped_tx(pool, scope).await?;
     let res = sqlx::query(
@@ -4708,8 +4733,17 @@ pub async fn claim_terminal_deny_emission(
     .bind(scope.tenant_id())
     .execute(&mut *tx)
     .await?;
+    if res.rows_affected() == 0 {
+        // Lost the claim — another waiter already ledgered this deny. The events
+        // are DISCARDED untouched, exactly as a lost decision CAS discards its own.
+        tx.commit().await?;
+        return Ok(false);
+    }
+    for ev in events {
+        append_event_in_tx(&mut tx, scope, ev).await?;
+    }
     tx.commit().await?;
-    Ok(res.rows_affected() > 0)
+    Ok(true)
 }
 
 pub async fn get_approval(
@@ -6004,6 +6038,57 @@ pub async fn enqueue_result_delivery(
     Ok(__rls_out)
 }
 
+/// RE-STAMP this replica's claim on ONE delivery row, immediately before its
+/// attempt (Phase E, #33; review I2). Returns true iff we still own it.
+///
+/// WHY THIS EXISTS. [`system_worker::claim_due_deliveries`] stamps a whole BATCH
+/// at once, but the worker then attempts the rows SEQUENTIALLY: the last row of a
+/// batch of 10 can sit unattempted for nine attempts' worth of wall clock, so a
+/// TTL measured from the batch is long expired by the time its turn comes. Two
+/// failures follow from that, and both are user-visible:
+///   * another replica steals the row and delivers it AGAIN (a second GitHub
+///     comment, a second webhook POST) — the exact duplicate the claim exists to
+///     prevent; and
+///   * whichever replica finishes second loses [`mark_delivery_attempt`]'s owner
+///     guard, so `attempts` and `next_attempt_at` DO NOT MOVE. The row is
+///     immediately due again, and with every replica overrunning its claim the
+///     cycle repeats forever: the backoff never advances, `max_attempts` is never
+///     reached, and the external side effect repeats on every pass.
+///
+/// Re-stamping per row makes the TTL measure ONE attempt instead of a whole batch,
+/// which is what lets the caller size it against a single worst-case attempt.
+///
+/// STRICTLY OWNER-GUARDED, never a steal: if another replica already took the row
+/// (`claimed_by` moved), this matches zero rows and the caller SKIPS it without
+/// performing the external side effect — the new owner does it exactly once. The
+/// CAS is atomic against a concurrent claim scan: whoever takes the row lock first
+/// wins, and the loser's predicate no longer holds.
+pub async fn extend_delivery_claim(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    owner: Uuid,
+    ttl_secs: i64,
+) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let res = sqlx::query(
+        "update result_deliveries
+            set claimed_until = now() + make_interval(secs => $3),
+                updated_at = now()
+          where id = $1 and claimed_by = $2 and status = 'pending'
+            and exists (select 1 from sessions s
+                        where s.id = result_deliveries.session_id and s.tenant_id = $4)",
+    )
+    .bind(id)
+    .bind(owner)
+    .bind(ttl_secs.max(1) as f64)
+    .bind(scope.tenant_id())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(res.rows_affected() > 0)
+}
+
 /// Record one attempt. ok → delivered; failure → attempts+1 and either
 /// rescheduled (`retry_in_secs`) or terminally 'failed' at `max_attempts`.
 ///
@@ -6013,6 +6098,12 @@ pub async fn enqueue_result_delivery(
 /// and was stolen mid-attempt matches zero rows and gets `None`, so it can never
 /// stomp the new owner's attempt counter or backoff. The claim is RELEASED here
 /// (both columns nulled) so the next backoff window is open to any replica.
+///
+/// `None` IS A REAL FAILURE MODE, NOT A NO-OP (review I2): nothing was recorded,
+/// so neither `attempts` nor `next_attempt_at` moved — the caller MUST log it
+/// (see `deliveries::attempt`) and rely on the new owner to record the attempt it
+/// is running. [`extend_delivery_claim`] makes this rare by re-stamping the claim
+/// per attempt; it stays possible when an attempt outruns even that fresh TTL.
 #[allow(clippy::too_many_arguments)]
 pub async fn mark_delivery_attempt(
     pool: &PgPool,
@@ -13569,6 +13660,38 @@ mod tests {
         tx.commit().await.unwrap();
     }
 
+    /// Read the claim + backoff columns a delivery row does not expose on
+    /// [`ResultDeliveryRow`] (they are coordination state, deliberately not part of
+    /// the serialized API shape). Under `worker_tx`, like the sweeps.
+    async fn delivery_claim_state(
+        pool: &PgPool,
+        delivery_id: Uuid,
+    ) -> (
+        Option<Uuid>,
+        Option<DateTime<Utc>>,
+        i32,
+        DateTime<Utc>,
+        String,
+    ) {
+        let mut tx = worker_tx(pool).await.unwrap();
+        let row = sqlx::query(
+            "select claimed_by, claimed_until, attempts, next_attempt_at, status
+               from result_deliveries where id = $1",
+        )
+        .bind(delivery_id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        (
+            row.get("claimed_by"),
+            row.get("claimed_until"),
+            row.get("attempts"),
+            row.get("next_attempt_at"),
+            row.get("status"),
+        )
+    }
+
     /// Force a session's status (state-machine-bypassing) so a test can drive
     /// terminality directly. Under `worker_tx` (RLS bypass), like the sweeps.
     async fn force_session_status(pool: &PgPool, session_id: Uuid, status: &str) {
@@ -14107,13 +14230,30 @@ mod tests {
             .count();
         let decided = count_events(&pool, scope, session_id, "approval.decided").await;
         let tool_dec = count_events(&pool, scope, session_id, "tool.decision").await;
-        // The single-emission marker for the post-wait terminal deny: one winner.
-        let m1 = claim_terminal_deny_emission(&pool, scope, approval.id)
+        // The post-wait terminal deny: one winner, and (review Minor A) the event
+        // now rides the claim's OWN transaction, so "won the marker" and "the event
+        // exists" can no longer diverge. Two waiters, two event vectors, one event.
+        let deny_event = || {
+            vec![Redactor::default().scrub(EventEnvelope::new(
+                session_id,
+                Actor::System,
+                EventBody::ToolDecision {
+                    tool_call_id: "tc-decide".into(),
+                    tool: "Bash".into(),
+                    verdict: "deny".into(),
+                    source: "session_terminal".into(),
+                    original_verdict: Some("allow".into()),
+                    reason: Some("session stopped accepting work during the approval wait".into()),
+                },
+            ))]
+        };
+        let m1 = claim_terminal_deny_tx(&pool, scope, approval.id, deny_event())
             .await
             .unwrap();
-        let m2 = claim_terminal_deny_emission(&pool, scope, approval.id)
+        let m2 = claim_terminal_deny_tx(&pool, scope, approval.id, deny_event())
             .await
             .unwrap();
+        let after_deny = count_events(&pool, scope, session_id, "tool.decision").await;
         cleanup_sw_tenant(&pool, tenant).await;
 
         assert!(
@@ -14125,6 +14265,12 @@ mod tests {
         assert_eq!(tool_dec, 1, "expiry ledgers ONE tool.decision");
         assert!(m1, "the first terminal-deny claim wins");
         assert!(!m2, "a second waiter's terminal-deny claim emits nothing");
+        assert_eq!(
+            after_deny,
+            tool_dec + 1,
+            "the winning claim appended EXACTLY ONE tool.decision, in its own \
+             transaction; the loser appended none"
+        );
     }
 
     /// Lease steal matrix + the epoch's defining asymmetry: it moves ONLY on an
@@ -14237,6 +14383,133 @@ mod tests {
             sw[stmt_start..stmt_end].contains(skip_locked),
             "claim_due_deliveries's CTE must use `{skip_locked}` so replicas take \
              disjoint slices rather than queueing on each other"
+        );
+
+        // (4) The claim scan must EXCLUDE rows another replica currently holds.
+        // Without the `claimed_until` half, a replica re-picks a row it just lost
+        // and re-runs the external side effect every 3 s tick (review I2); without
+        // the `claimed_by = $1` half, our own re-stamped row becomes unreachable to
+        // us on the very next pass.
+        let scan_pred = "(claimed_until is null or claimed_until < now() or claimed_by = $1)";
+        assert!(
+            sw[stmt_start..stmt_end].contains(scan_pred),
+            "claim_due_deliveries must skip rows another replica holds (`{scan_pred}`)"
+        );
+
+        // (5) The per-row re-stamp (review I2) is a strict OWNER CAS, never a
+        // steal: a row taken over by another replica must match ZERO rows so the
+        // caller skips it BEFORE performing the external side effect. Sliced to the
+        // statement — the prose above it discusses `claimed_by` at length.
+        let ext_start = src
+            .find("pub async fn extend_delivery_claim(")
+            .expect("the per-row claim re-stamp exists");
+        let ext_end = src[ext_start..]
+            .find(".bind(id)")
+            .map(|i| ext_start + i)
+            .expect("the re-stamp binds its row id");
+        let restamp_stmt = &src[ext_start..ext_end];
+        let owner_cas = concat!(
+            "where id = $1 and claimed_by = $2 and ",
+            "status = 'pending'"
+        );
+        assert!(
+            restamp_stmt.contains(owner_cas),
+            "extend_delivery_claim must be a strict owner CAS (`{owner_cas}`); a \
+             predicate that also matches an EXPIRED claim held by someone else would \
+             steal a row mid-flight and duplicate its external side effect"
+        );
+        let ttl_stamp = "claimed_until = now() + make_interval(secs => $3)";
+        assert!(
+            restamp_stmt.contains(ttl_stamp),
+            "extend_delivery_claim must actually MOVE the deadline (`{ttl_stamp}`), \
+             or the TTL still measures from the batch claim rather than this attempt"
+        );
+    }
+
+    /// I2, behaviorally: a LOST delivery claim must be caught by the per-row
+    /// re-stamp (before the external side effect), because the alternative — the
+    /// old owner discovering it at `mark_delivery_attempt` — silently drops the
+    /// BACKOFF as well as the attempt record, leaving the row immediately due
+    /// again in a ~3 s-tick loop that never reaches `max_attempts` and repeats the
+    /// external effect every pass.
+    #[tokio::test]
+    async fn a_lost_delivery_claim_is_caught_before_the_attempt_and_freezes_no_backoff() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        let dest = serde_json::json!({"kind": "signed_webhook", "url": "http://127.0.0.1:1/cb"});
+        let row = enqueue_result_delivery(&pool, scope, session_id, None, &dest)
+            .await
+            .unwrap();
+        let (mine, thief) = (Uuid::now_v7(), Uuid::now_v7());
+
+        // Claimed by us with a DELIBERATELY short TTL (5 s) — the batch stamp the
+        // worker starts from; the re-stamp then renews it for the attempt itself.
+        let claimed = system_worker::claim_due_deliveries(&pool, mine, 10, 5)
+            .await
+            .unwrap();
+        assert!(claimed.iter().any(|c| c.id == row.id), "we claimed the row");
+        let before = delivery_claim_state(&pool, row.id).await;
+        let renewed = extend_delivery_claim(&pool, scope, row.id, mine, 300)
+            .await
+            .unwrap();
+        let after_renew = delivery_claim_state(&pool, row.id).await;
+
+        // Now the thief takes it (as an expired-claim steal would).
+        stamp_delivery_claim(&pool, row.id, thief).await;
+        let restamp_after_theft = extend_delivery_claim(&pool, scope, row.id, mine, 300)
+            .await
+            .unwrap();
+        // …and the old owner's attempt record is refused, changing NOTHING.
+        let marked = mark_delivery_attempt(
+            &pool,
+            scope,
+            row.id,
+            mine,
+            false,
+            Some("stale replica"),
+            None,
+            30,
+            6,
+        )
+        .await
+        .unwrap();
+        let after_theft = delivery_claim_state(&pool, row.id).await;
+        cleanup_sw_tenant(&pool, tenant).await;
+
+        assert!(renewed, "the holder re-stamps its own claim");
+        assert_eq!(before.0, Some(mine), "the batch claim named us");
+        assert!(
+            after_renew.1 > before.1,
+            "the re-stamp must MOVE the deadline (the TTL measures THIS attempt, \
+             not the batch claim): {:?} → {:?}",
+            before.1,
+            after_renew.1
+        );
+        assert!(
+            !restamp_after_theft,
+            "a row taken over by another replica must fail the re-stamp — that is \
+             the skip that stops the duplicate external call"
+        );
+        assert!(
+            marked.is_none(),
+            "the owner guard refuses the stale replica's attempt record"
+        );
+        assert_eq!(
+            (after_theft.2, after_theft.3),
+            (after_renew.2, after_renew.3),
+            "a refused record leaves attempts AND next_attempt_at untouched — the \
+             row stays immediately due, which is precisely why the re-stamp above \
+             must catch this first"
+        );
+        assert_eq!(
+            after_theft.0,
+            Some(thief),
+            "the thief still owns the row (nothing was stomped)"
         );
     }
 
