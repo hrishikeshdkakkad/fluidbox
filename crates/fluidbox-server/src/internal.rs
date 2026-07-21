@@ -711,7 +711,7 @@ pub async fn permission(
 ) -> ApiResult<Json<Value>> {
     // Gap 10: the gate is the TOOL-INTENT audience. A runner-control or LLM
     // credential must never be able to ask for a tool decision.
-    auth.require_audience("tool")?;
+    auth.require_audience(crate::auth::AUD_TOOL)?;
     let session = fluidbox_db::get_session(&state.pool, auth.scope, auth.session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -767,7 +767,7 @@ pub async fn tool_call(
 ) -> ApiResult<Json<Value>> {
     // Gap 10: brokered execution is the TOOL-INTENT audience (same class as
     // /permission — the broker shim holds only this token).
-    auth.require_audience("tool")?;
+    auth.require_audience(crate::auth::AUD_TOOL)?;
     let session = fluidbox_db::get_session(&state.pool, auth.scope, auth.session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -1522,7 +1522,7 @@ pub async fn events(
 ) -> ApiResult<Json<Value>> {
     // Gap 10: the timeline is RUNNER-CONTROL. A leaked tool/LLM credential must
     // not be able to forge narrative events.
-    auth.require_audience("control")?;
+    auth.require_audience(crate::auth::AUD_CONTROL)?;
     let actor = match ev.actor.as_str() {
         "agent" => Actor::Agent,
         "human" => Actor::Human,
@@ -1559,7 +1559,7 @@ pub async fn workspace_archive(
     // Gap 10: the archive is its OWN audience. The init container is a separate
     // process that receives ONLY this token, and no runner-held credential
     // (control/tool/llm) opens this route.
-    auth.require_audience("workspace")?;
+    auth.require_audience(crate::auth::AUD_WORKSPACE)?;
     // A terminal/winding-down session's archive is moot (the run is over) —
     // gate on accepts_work(), like every sibling internal endpoint.
     let session = fluidbox_db::get_session(&state.pool, auth.scope, auth.session_id)
@@ -1605,7 +1605,7 @@ pub async fn workspace_archive(
 
 pub async fn heartbeat(auth: SessionAuth, State(state): State<AppState>) -> ApiResult<Json<Value>> {
     // Gap 10: liveness + the quiesce channel are RUNNER-CONTROL.
-    auth.require_audience("control")?;
+    auth.require_audience(crate::auth::AUD_CONTROL)?;
     fluidbox_db::heartbeat(&state.pool, auth.scope, auth.session_id).await?;
     // Deliberately NO eager archive deletion here: Kubernetes documents that
     // init containers may re-execute (pod-infrastructure restart), and a
@@ -1656,7 +1656,7 @@ pub async fn result(
     // idempotently — it is NOT a hole a wrong-audience credential fits through.
     // So a revoked CONTROL token still ACKs; a (revoked or live) LLM/tool token
     // gets 403 wrong_audience and can never terminalize a run.
-    if !crate::auth::audience_allows("control", &sess_auth.audience) {
+    if !crate::auth::audience_allows(crate::auth::AUD_CONTROL, &sess_auth.audience) {
         return Err(ApiError::Forbidden("wrong_audience".into()));
     }
     let session_id = sess_auth.session_id;
@@ -1750,7 +1750,7 @@ pub async fn token_renew(
     // Gap 10: renewal is RUNNER-CONTROL — and one renew extends ALL four of the
     // session's audience tokens (see `extend_session_token`), so the runner
     // keeps exactly one renew loop holding exactly one credential.
-    auth.require_audience("control")?;
+    auth.require_audience(crate::auth::AUD_CONTROL)?;
     let session = fluidbox_db::get_session(&state.pool, auth.scope, auth.session_id)
         .await?
         .ok_or(ApiError::NotFound)?;

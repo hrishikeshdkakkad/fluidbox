@@ -6603,16 +6603,60 @@ mod tests {
                 .unwrap()
             }
         };
+        // A SECOND session with its own control token. "Renew extends all" is
+        // scoped to ONE session: without this, a renew that dropped the
+        // `session_id in (…)` predicate and extended every live session token in
+        // the table would pass every assertion above. Same tenant on purpose —
+        // tenant scoping cannot be what saves us here.
+        let other_session = create_session(
+            &pool,
+            scope,
+            agent.id,
+            rev.id,
+            "autonomous",
+            "trusted",
+            "t2",
+            &serde_json::json!({"kind":"none"}),
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+        let other_control = format!("fbx_sess_{}", Uuid::now_v7().simple());
+        create_session_token(
+            &pool,
+            scope,
+            other_session.id,
+            &other_control,
+            3600,
+            "control",
+        )
+        .await
+        .unwrap();
+
         let tool_before = expiry(sha256_hex(&tool)).await;
+        let other_before = expiry(sha256_hex(&other_control)).await;
         assert!(extend_session_token(&pool, &control, 7200).await.unwrap());
         let tool_after = expiry(sha256_hex(&tool)).await;
         assert!(
             tool_after > tool_before,
             "renewing via control must extend the tool token too (renew-extends-all)"
         );
+        assert_eq!(
+            expiry(sha256_hex(&other_control)).await,
+            other_before,
+            "a renew must NOT touch another session's tokens (extends-all is per-SESSION)"
+        );
 
         // Terminal transition revokes ALL the session's tokens (control + tool +
-        // legacy = 3) — every audience loses access at once.
+        // legacy = 3) — every audience loses access at once, and only this
+        // session's: the count excludes the other session's live token.
         assert_eq!(
             revoke_session_tokens(&pool, scope, session.id)
                 .await
@@ -6621,6 +6665,13 @@ mod tests {
         );
         assert!(session_for_token(&pool, &control).await.unwrap().is_none());
         assert!(session_for_token(&pool, &tool).await.unwrap().is_none());
+        assert!(
+            session_for_token(&pool, &other_control)
+                .await
+                .unwrap()
+                .is_some(),
+            "another session's token must survive this session's terminal revoke"
+        );
         // And a renew can never resurrect a revoked set.
         assert!(!extend_session_token(&pool, &control, 3600).await.unwrap());
         // Revoking again is a no-op (idempotent).

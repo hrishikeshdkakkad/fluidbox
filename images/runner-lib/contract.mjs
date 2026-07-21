@@ -30,6 +30,52 @@ export function requireEnv(k) {
   return v;
 }
 
+// ─── Audience mismatch: a FATAL misconfiguration, never a verdict ──────────
+//
+// Gap 10 gave every internal route a required audience, and the control plane
+// refuses a wrong-audience credential with `403 {"error":"wrong_audience"}`.
+// That refusal must NOT be collapsed into the ordinary 401/403 "the session is
+// over" handling, which answers `deny` and lets the agent keep going: a runner
+// image whose token wiring disagrees with the control plane's route guards
+// would then have EVERY tool call denied while model spend proceeds normally,
+// and the run would finish with a plausible summary that is simply wrong.
+// Wrong-and-expensive-and-looks-right is the worst failure shape we have, so
+// this class aborts the process instead.
+export const EXIT_AUDIENCE_MISMATCH = 3;
+
+/// True iff an HTTP refusal is the control plane's audience guard. Keyed off
+/// the BODY code (`{"error":"wrong_audience"}`) rather than the status, because
+/// 403 alone is also how a terminal session refuses. Robust to a non-JSON body
+/// (a proxy error page, an empty body): JSON is tried first, then a plain
+/// substring — that code word appears in no other refusal we emit.
+export function isWrongAudienceRefusal(status, bodyText) {
+  if (status !== 401 && status !== 403) return false;
+  if (typeof bodyText !== "string" || bodyText.length === 0) return false;
+  try {
+    const parsed = JSON.parse(bodyText);
+    if (parsed && typeof parsed === "object" && parsed.error === "wrong_audience") return true;
+  } catch {
+    // Not JSON — fall through to the substring check.
+  }
+  return bodyText.includes("wrong_audience");
+}
+
+/// The one-line operator diagnostic. Names the likely cause, because in
+/// practice there is only one: the runner image and the control plane were not
+/// deployed together (images ship IN this repo and are versioned with the
+/// server — a PINNED pre-split image on a post-split server is the reachable
+/// shape, since `runner_image` is a per-revision API field that carries forward
+/// across revisions).
+export function audienceMismatchDiagnostic(where) {
+  return (
+    `fluidbox-runner: FATAL — the control plane refused this credential at ${where} with ` +
+    `'wrong_audience'; this runner image predates (or disagrees with) the audience-scoped ` +
+    `credential split, and the runner image and control plane MUST be deployed together. ` +
+    `Aborting the run: continuing would deny every tool call while model spend proceeds, ` +
+    `producing a wrong result that looks right.`
+  );
+}
+
 // Shim paths, derived from THIS module's own location — so they resolve
 // correctly no matter where each image installs the lib (the claude image at
 // /opt/fluidbox-runner/lib, the codex image at /opt/fluidbox-codex/lib).
@@ -134,6 +180,58 @@ export class RunnerClient {
     // the outcome). Registered via onQuiesce(); harness-specific, one place.
     this.quiesceCb = null;
     this.quiesced = false;
+    // Latch for the fatal audience-mismatch abort below: the FIRST detection
+    // owns the exit, every later caller just parks.
+    this.audienceAborting = false;
+  }
+
+  /// Abort the run on a `wrong_audience` refusal (Gap 10). Never returns: it
+  /// logs the diagnostic, best-effort records it on the run's timeline, and
+  /// exits non-zero so nothing downstream mistakes a misconfiguration for a
+  /// governance verdict. Deliberately does NOT post /result — a runner whose
+  /// credential wiring the control plane just rejected has not earned the right
+  /// to write a terminal outcome; the heartbeat watchdog terminalizes the
+  /// exited run, exactly as it does for any runner crash.
+  async #abortAudienceMismatch(where) {
+    if (this.audienceAborting) {
+      // Never resolves: concurrent callers must not continue, and the first
+      // detection's process.exit is moments away.
+      return new Promise(() => {});
+    }
+    this.audienceAborting = true;
+    const diag = audienceMismatchDiagnostic(where);
+    console.error(diag);
+    // RAW fetch, never #post — #post is what detected this, and re-entering it
+    // would recurse. Hard 5s cap; a failure here changes nothing. In the
+    // pinned-old-image shape the single legacy token IS the runner-control
+    // credential, so /events accepts it and the diagnostic reaches the run
+    // timeline rather than only the container log.
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 5000);
+      try {
+        await fetch(`${this.sessionBase()}/events`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${this.env.TOKEN}`,
+          },
+          body: JSON.stringify({
+            actor: "harness",
+            body: { type: "agent.message", data: { role: "system", text: diag } },
+          }),
+          signal: ctrl.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch (e) {
+      console.error(
+        "fluidbox-runner: could not record the audience-mismatch diagnostic:",
+        e?.message || e,
+      );
+    }
+    process.exit(EXIT_AUDIENCE_MISMATCH);
   }
 
   /// Register the harness abort callback fired when the control plane asks the
@@ -196,6 +294,13 @@ export class RunnerClient {
           const text = await res.text().catch(() => "");
           const err = new Error(`${url} → HTTP ${res.status}: ${text}`);
           err.status = res.status;
+          err.body = text;
+          // Checked HERE, once, so EVERY route (permission, events, heartbeat,
+          // result, renew) gets the fatal treatment rather than each caller's
+          // local 4xx policy. Never returns.
+          if (isWrongAudienceRefusal(res.status, text)) {
+            await this.#abortAudienceMismatch(url);
+          }
           throw err;
         }
         return res.status === 204 ? null : await res.json().catch(() => null);
@@ -240,7 +345,9 @@ export class RunnerClient {
       } catch (e) {
         // A terminal 401/403 means the session is gone (token revoked on the
         // terminal transition) — retrying forever would hang the runner. Treat
-        // it as a hard DENY and stop.
+        // it as a hard DENY and stop. A `wrong_audience` 403 NEVER reaches here:
+        // #post aborts the process on that body code, precisely so a credential
+        // misconfiguration is not laundered into a governance verdict.
         if (e.status === 401 || e.status === 403) {
           console.error("fluidbox-runner: permission rejected (session terminal) — deny");
           return { decision: "deny", message: "session is not active" };
