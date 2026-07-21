@@ -17,6 +17,7 @@
 // token as a fake provider key; the real key lives only in the gateway.
 
 import crypto from "node:crypto";
+import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -76,6 +77,107 @@ export function audienceMismatchDiagnostic(where) {
   );
 }
 
+// ─── Off-environment credential hand-off (Phase F) ─────────────────────────
+//
+// The runner-control credential no longer reaches the runner in its
+// environment. `lib/entrypoint.sh` writes it to a 0600 file, opens it as a file
+// descriptor, unlinks the file, unsets the variable and `exec`s the runner —
+// so execve() gives the runner an environ region that never held the token and
+// /proc/<pid>/environ has nothing for a same-uid agent child to read. This end
+// of the contract reads that descriptor (named by the env var below, which is
+// NOT a secret: it names a channel rather than being one) and CLOSES it before
+// the harness spawns anything.
+//
+// Read the "what this does NOT close" note in entrypoint.sh: ptrace(2) of the
+// runner by a same-uid child still reaches the token in live memory, and no
+// container hardening we ship blocks it.
+export const TOKEN_FD_ENV = "FLUIDBOX_SESSION_TOKEN_FD";
+
+// A hand-off that was ATTEMPTED and FAILED is fatal, exactly like an audience
+// mismatch and for the same reason: the alternatives are running credential-less
+// (every /events, /heartbeat and /result silently rejected while model spend
+// proceeds) or falling back to an environment variable the entrypoint already
+// unset. Both are the wrong-and-expensive-and-looks-right shape. Abort instead.
+export const EXIT_TOKEN_HANDOFF = 4;
+
+// A session token is ~50 bytes. The cap exists so a mis-pointed descriptor
+// (someone else's fd, a socket) can never be read into unbounded memory.
+const HANDOFF_MAX_BYTES = 4096;
+
+/// The one-line operator diagnostic for a failed hand-off. Unlike the audience
+/// mismatch this is NOT mirrored to the run timeline — /events needs the very
+/// credential that just failed to arrive, so the container log is the only
+/// place it can go.
+export function tokenHandoffDiagnostic(reason) {
+  return (
+    `fluidbox-runner: FATAL — the runner-control credential hand-off failed (${reason}). ` +
+    `${TOKEN_FD_ENV} was set, so the entrypoint already removed the token from this ` +
+    `process's environment and there is nothing to fall back to. Aborting the run: ` +
+    `continuing would fail every /events, /heartbeat and /result call while model spend ` +
+    `proceeds, producing a wrong result that looks right.`
+  );
+}
+
+/// Read the runner-control credential from the hand-off descriptor and close it.
+/// Returns `{ok:true, token}` or `{ok:false, reason}` — the caller decides the
+/// exit, so this stays unit-testable. Closing is unconditional and immediate:
+/// the descriptor must not survive to be inherited by anything the harness
+/// spawns, and the file behind it is already unlinked so nothing can re-open it.
+export function readControlTokenFromFd(fdSpec, { fsMod = fs } = {}) {
+  const fd = Number(fdSpec);
+  if (!Number.isInteger(fd) || fd < 3) {
+    return { ok: false, reason: `${TOKEN_FD_ENV}='${fdSpec}' is not a usable descriptor number` };
+  }
+  const buf = Buffer.alloc(HANDOFF_MAX_BYTES);
+  let len = 0;
+  try {
+    for (;;) {
+      const n = fsMod.readSync(fd, buf, len, buf.length - len, null);
+      if (n === 0) break; // EOF
+      len += n;
+      if (len >= buf.length) {
+        return { ok: false, reason: `fd ${fd} carried more than ${HANDOFF_MAX_BYTES} bytes` };
+      }
+    }
+  } catch (e) {
+    return { ok: false, reason: `reading fd ${fd} failed: ${e?.code || e?.message || e}` };
+  } finally {
+    try {
+      fsMod.closeSync(fd);
+    } catch {
+      // Already closed / never valid — the read result above is what matters.
+    }
+  }
+  const token = buf.toString("utf8", 0, len).trim();
+  if (!token) return { ok: false, reason: `fd ${fd} carried no credential (0 usable bytes)` };
+  return { ok: true, token };
+}
+
+/// Resolve the runner-control credential. Prefers the off-environment hand-off
+/// and NEVER falls back to the environment once it has been attempted.
+///
+/// COMPATIBILITY PATH: with `FLUIDBOX_SESSION_TOKEN_FD` absent — someone ran
+/// `node index.mjs` directly, or an old manifest/provider bypassed the image
+/// ENTRYPOINT — the token is read from the environment exactly as it always
+/// was. That path RE-OPENS the /proc/<pid>/environ residual in full: the token
+/// sits in this process's execve-fixed environ region for its whole life, where
+/// any same-uid agent child can read it. It exists so a bypassed entrypoint
+/// degrades to Phase E behaviour instead of failing the run; it is NOT the
+/// supported configuration, and both shipped images route through the
+/// entrypoint.
+export function resolveControlToken() {
+  const fdSpec = process.env[TOKEN_FD_ENV];
+  if (fdSpec === undefined || fdSpec === "") {
+    return requireEnv("FLUIDBOX_SESSION_TOKEN");
+  }
+  const res = readControlTokenFromFd(fdSpec);
+  if (!res.ok) {
+    console.error(tokenHandoffDiagnostic(res.reason));
+    process.exit(EXIT_TOKEN_HANDOFF);
+  }
+  return res.token;
+}
+
 // Shim paths, derived from THIS module's own location — so they resolve
 // correctly no matter where each image installs the lib (the claude image at
 // /opt/fluidbox-runner/lib, the codex image at /opt/fluidbox-codex/lib).
@@ -89,9 +191,11 @@ export const SANDBOX_GATE_SHIM = fileURLToPath(new URL("./sandbox-gate-shim.mjs"
 ///
 /// AUDIENCE-SCOPED CREDENTIALS (Gap 10). The control plane now mints one token
 /// per audience and the routes enforce which is accepted:
-///   TOKEN      (FLUIDBOX_SESSION_TOKEN) — runner-control: events, heartbeat,
-///              result, token renew. The harness DELETES this var from
-///              process.env before spawning the agent, so it lives only here.
+///   TOKEN      (the hand-off fd, else FLUIDBOX_SESSION_TOKEN) — runner-control:
+///              events, heartbeat, result, token renew. Phase F moved this one
+///              OFF the environment entirely (see resolveControlToken above);
+///              the harness still DELETES the legacy var, which is what the
+///              compatibility path and the spawned environment need.
 ///   TOOL_TOKEN (FLUIDBOX_TOOL_TOKEN)    — tool intent: /permission, /tools/call.
 ///   LLM_TOKEN  (FLUIDBOX_LLM_TOKEN)     — model egress at the facade (codex;
 ///              claude's SDK reads ANTHROPIC_API_KEY directly).
@@ -102,7 +206,7 @@ export const SANDBOX_GATE_SHIM = fileURLToPath(new URL("./sandbox-gate-shim.mjs"
 export function loadRunnerEnv() {
   const CONTROL = requireEnv("FLUIDBOX_CONTROL_URL");
   const SESSION = requireEnv("FLUIDBOX_SESSION_ID");
-  const TOKEN = requireEnv("FLUIDBOX_SESSION_TOKEN");
+  const TOKEN = resolveControlToken();
   const TOOL_TOKEN = process.env.FLUIDBOX_TOOL_TOKEN || TOKEN;
   const LLM_TOKEN = process.env.FLUIDBOX_LLM_TOKEN || TOKEN;
   const TASK = requireEnv("FLUIDBOX_TASK");
