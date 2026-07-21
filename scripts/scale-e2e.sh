@@ -492,7 +492,16 @@ if forge_fast "$RUN" "$FORGE_N" "(a)"; then
     [ -n "$SID" ] || continue
     IDX=$((IDX + 1))
     (
-      curl -s -o "$RESP/$IDX.body" -w '%{http_code}' \
+      # --max-time is load-bearing, not hygiene. `wait` below blocks on EVERY
+      # backgrounded curl, so ONE request the gate never answers hangs the whole
+      # job until the CI job timeout — which reads in the checks list as
+      # "cancelled", indistinguishable from a human cancel, and in the log from a
+      # deadlock. A load harness must bound every remote-driven request: a gate
+      # decision is sub-second, so 30 s is pure headroom, and a request that
+      # blows it writes curl's `000` — which the DEAD assertion below already
+      # treats as a hard failure. The bound converts an uninformative timeout
+      # into a precise "N requests never completed" verdict.
+      curl -s --max-time 30 --connect-timeout 10 -o "$RESP/$IDX.body" -w '%{http_code}' \
         -X POST -H "authorization: Bearer fbx_sess_sc_${TAG}_${IDX}_tool" \
         -H 'content-type: application/json' \
         -d "{\"tool_call_id\":\"$TAG-a-$IDX\",\"tool\":\"Read\",\"input\":{\"file_path\":\"/workspace/README.md\"}}" \
