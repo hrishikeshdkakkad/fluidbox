@@ -2704,22 +2704,52 @@ fi
 #     budget was simply too small to make any request at all".
 #
 #     SIZING (written down so a future edit can re-derive it):
-#       reserved = declared max output + ceil(body_len / 4)   [facade.rs:250-272]
+#       reserved = declared max output + ceil(body_len / BYTES_PER_INPUT_TOKEN)
+#       [facade.rs `conservative_reservation`], and BYTES_PER_INPUT_TOKEN is 1 —
+#       #33 review 1 moved it off the 4-byte AVERAGE, which was not an upper bound
+#       at all (dense or adversarial text tokenizes far denser, so two requests
+#       could each reserve a quarter of what they spent and both be admitted).
+#       Byte-level BPE has all 256 bytes in its vocabulary and only ever merges,
+#       so N bytes can never bill more than N input tokens: 1:1 is a bound no
+#       input can beat.
 #       The burst declares `max_tokens: 1000` in a 189-byte body (measured — the
 #       facade re-serializes it to the same 189 bytes), so ONE request books
-#       1000 + ceil(189/4) = 1048 tokens. The run's frozen `max_tokens` budget is
+#       1000 + 189 = 1189 tokens. The run's frozen `max_tokens` budget is
 #       forced to 1500, which sits between one reservation and two:
 #         * one request alone  → admitted (sole claimant; the arms are skipped);
-#         * a second WHILE the first is live → 0 used + 1048 active + 1048 this
-#           = 2096 > 1500 ⇒ BudgetExceeded.
-#       Both margins are wide (1048 vs 1500, 2096 vs 1500) so neither verdict can
-#       flip on a model-name length change or a few bytes of body drift. `fbx_hold_ms` holds the winner
+#         * a second WHILE the first is live → 0 used + 1189 active + 1189 this
+#           = 2378 > 1500 ⇒ BudgetExceeded.
+#       Both margins are wide (1189 vs 1500, 2378 vs 1500) so neither verdict can
+#       flip on a model-name length change or a few bytes of body drift. Note the
+#       first margin is the tighter of the two now: a body that grew past 311
+#       bytes would make the SOLE claimant's reservation exceed 1500, which the
+#       carve-out still admits — (h.1c) asserts exactly that, so the section stays
+#       readable either way.
+#
+#       WHAT THE ESTIMATE IS COMPARED AGAINST (#33 review 1): the assertions in
+#       (h.1) only prove admission SERIALIZES around the estimate — they never ask
+#       whether the estimate actually bounds the spend. (h.2a) closes that: it
+#       compares the settled reservation to the AUTHORITATIVE `usage_entries` row
+#       the facade wrote for the same request id, and requires reserved ≥ actual.
+#       That is the property "conservative" means, and it is the one that fails if
+#       the ratio ever drifts back toward an average. `fbx_hold_ms` holds the winner
 #       upstream for 3 s — far longer than the burst takes to arrive — so the
 #       losers provably contend with a LIVE reservation rather than a settled one.
 #       Nothing here can be swept out from under the assertions: the reservation
 #       TTL is 1800 s (facade.rs:189) and the expiry sweep only touches expired
 #       rows, so a RETAINED reservation stays `reserved` for the whole suite.
 # ═════════════════════════════════════════════════════════════════════════════
+#     SCOPE — SINGLE REPLICA (#33 review 7, stated so nobody reads more into it).
+#     Every request in (h) is fired at $API, i.e. replica A; replica B is not
+#     booted until (i). What (h) therefore proves is that CONCURRENT ADMISSION is
+#     serialized in the DATABASE — `reserve_llm_budget`'s `sessions FOR UPDATE`
+#     plus its guard CTE — which is where the property lives and the only place it
+#     could live, since the reservation table is the shared state. It does NOT
+#     exercise two facade PROCESSES contending, and it is not evidence about
+#     process-local caching in the facade (there is none on this path: the
+#     admission decision is one round trip and holds no in-process state between
+#     requests). A cross-replica version would assert the same SQL through a
+#     second client; it is omitted, not silently covered.
 say "(h) LLM budget reservations — fake LiteLLM up"
 start_llm
 
@@ -2797,7 +2827,7 @@ if [ "$H_OK" = 1 ]; then
   db "update sessions set run_spec = jsonb_set(jsonb_set(run_spec,'{budgets,max_tokens}','1500'),'{budgets,max_cost_usd}','null') where id='$H1'" >/dev/null
   H_BUDGET=$(db "select run_spec->'budgets'->>'max_tokens' from sessions where id='$H1'")
   [ "$H_BUDGET" = 1500 ] \
-    && ok "fixture: the frozen token budget is 1500 — between ONE conservative reservation (1048) and TWO (2096)" \
+    && ok "fixture: the frozen token budget is 1500 — between ONE conservative reservation (1189) and TWO (2378)" \
     || no "fixture failed — frozen max_tokens is '$H_BUDGET' (want 1500); the sizing above no longer holds"
 
   H_MARK=$(markl)
@@ -2836,8 +2866,8 @@ if [ "$H_OK" = 1 ]; then
   # numbers change fails HERE (loudly, with the arithmetic in the message) rather
   # than quietly weakening the concurrency claim.
   [ "$H_PASS" = 1 ] \
-    && ok "exactly ONE of 5 concurrent requests was admitted — the other 4 contended with a LIVE reservation (1048 booked vs a 1500 budget)" \
-    || no "$H_PASS of 5 concurrent requests were admitted (want exactly 1; re-derive the sizing comment above — reserved=1048, budget=1500)"
+    && ok "exactly ONE of 5 concurrent requests was admitted — the other 4 contended with a LIVE reservation (1189 booked vs a 1500 budget)" \
+    || no "$H_PASS of 5 concurrent requests were admitted (want exactly 1; re-derive the sizing comment above — reserved=1189, budget=1500)"
 
   # THE GAP-14 LEDGER ASSERTION: recorded usage can never exceed what was
   # admitted. `usage_entries` rows are written ONLY by a reconcile (authoritative)
@@ -2904,6 +2934,27 @@ if [ "$H_OK" = 1 ] && live_run hq-agent "sess-h2-$$" "h/retention"; then
   [ "$H2_CHARGED" = 1 ] \
     && ok "POSITIVE CONTROL: its reservation reconciled to 'charged' — the SSE drain CAN settle a booking" \
     || no "the usage-carrying SSE reservation never reached 'charged' (states: $(db "select coalesce(string_agg(state,','),'none') from llm_reservations where session_id='$H2'"))"
+  # (h.2a) IS THE ESTIMATE ACTUALLY CONSERVATIVE? (#33 review 1.) Everything in
+  # (h.1) proves admission serializes AROUND the reservation; nothing there
+  # compares it to what the request went on to spend, so a ratio that
+  # under-counts would keep every assertion green while the hard budget
+  # overspends. This is that comparison, against the authoritative source: the
+  # facade keys the `usage_entries` row on the SAME id as the reservation
+  # (migration 0022 — the id is minted before the insert precisely so the two
+  # join), so `reserved_tokens` vs the summed usage columns is a direct
+  # bound check on the estimate. Fails the moment the ratio drifts back toward an
+  # average, which is what shipped and what review 1 caught.
+  H2_CMP=$(db "select r.reserved_tokens::text || ' ' ||
+                      (u.input_tokens+u.output_tokens+u.cache_read_tokens+u.cache_write_tokens)::text
+               from llm_reservations r
+               join usage_entries u on u.external_id = r.id::text
+               where r.session_id='$H2' and r.state='charged' limit 1")
+  H2_RES=${H2_CMP%% *}; H2_ACT=${H2_CMP##* }
+  if need "$H2_CMP" "no charged reservation joined to an authoritative usage row (the bound check below cannot run)"; then
+    { [ -n "$H2_RES" ] && [ -n "$H2_ACT" ] && [ "$H2_RES" -ge "$H2_ACT" ]; } \
+      && ok "the reservation BOUNDED the spend: $H2_RES tokens booked vs $H2_ACT actually billed for the same request id — conservative, as design :1117 requires" \
+      || no "the reservation booked $H2_RES tokens but authoritative usage for that request id was $H2_ACT — the estimate is an average, not a maximum, and the hard budget is overspendable"
+  fi
   # B) The retention case — same run, same route, only the usage events removed.
   llm_post "sess-h2-$$-llm" "$(llm_body "$H_MODEL" 64 0 sse_none)"
   [ "$CODE" = 200 ] \
@@ -3224,11 +3275,14 @@ if [ "$I_OK" = 1 ] && live_run hq-appr-agent "sess-i2-$$" "i/notify"; then
       printf '%s\n%s\n' "$(now_ms)" "$R" > "$WORK/i2-$I2_K" ) & I2P=$!
     I2_AID=$(pending_approval_id "$I2")
     if need "$I2_AID" "sample $I2_K: no approval became pending on replica B"; then
-      # Put the waiter provably INSIDE its wait (and shift its poll anchor
-      # earlier) before the decision lands.
+      # Give replica B's handler time to enter its wait loop before the decision
+      # lands. `kill -0` proves ONLY that the curl process has not exited, i.e.
+      # that B has not answered yet — it is NOT evidence that B is inside the
+      # wait loop (#33 review 6; the earlier wording claimed it was). See the
+      # NOT-ASSERTED note under this block for exactly what that leaves open.
       sleep 0.5
       kill -0 "$I2P" 2>/dev/null \
-        && ok "sample $I2_K: replica B's waiter is blocked and its poll anchor is ≥0.5s old" \
+        && ok "sample $I2_K: replica B has not answered yet (the request is still outstanding), so the measurement below has something to measure" \
         || no "sample $I2_K: replica B's waiter returned before the decision — the latency below would measure nothing"
       I2_T0=$(now_ms)
       admin_post "/v1/approvals/$I2_AID/decision" '{"decision":"approved_once"}'
@@ -3245,11 +3299,28 @@ if [ "$I_OK" = 1 ] && live_run hq-appr-agent "sess-i2-$$" "i/notify"; then
         && ok "sample $I2_K: replica B's waiter returned allow" \
         || no "sample $I2_K: replica B's waiter returned '$I2_RESP' (want allow)"
       { [ "$I2_MS" -ge 0 ] && [ "$I2_MS" -le "$I2_THRESHOLD_MS" ]; } \
-        && ok "sample $I2_K: replica B released ${I2_MS}ms after the decision on replica A — far under the ~1000ms its poll floor could have managed, so the notification crossed" \
+        && ok "sample $I2_K: replica B released ${I2_MS}ms after the decision on replica A — far under the ~1000ms a poll-driven wake could have managed" \
         || no "sample $I2_K: replica B released ${I2_MS}ms after the decision (want ≤${I2_THRESHOLD_MS}ms; ~1000ms+ means the pg_notify relay did not cross and it fell back to the ≤2s poll)"
     fi
   done
 fi
+# NOT ASSERTED — "the wake was caused BY the notification" (#33 review 6, and the
+# honest reading of what (i.2) delivers). The measurement is sound about LATENCY:
+# a poll-driven wake is anchored at the waiter's first read of the pending row and
+# ticks at ≤2 s, so ≤400 ms is inconsistent with the poll path. What is NOT proven
+# is that the waiter had ALREADY performed that first read when the decision
+# landed. The pending row becomes visible to the fixture at INSERT time, which
+# precedes the handler entering its wait loop; if replica B were descheduled
+# across that gap for longer than the 0.5 s sleep, its first read would find the
+# row already decided and return fast with no LISTEN/NOTIFY involved — green, for
+# the wrong reason. Nothing observable from outside distinguishes the two: the
+# handler exposes no "I am waiting" signal, and adding one is a server change
+# (`internal.rs`), not a script change. Two independent samples must BOTH be fast,
+# so a false green needs the stall to recur, but that is a probability argument,
+# not a proof. Treat (i.2) as "cross-replica release is fast enough to rule out
+# the poll floor", not as "the NOTIFY fired". The relay itself — that the decision
+# transaction emits on `fluidbox_approvals` — is asserted in `fluidbox-db`'s own
+# tests, where it is a property of the statement rather than of a race.
 
 say "(i.3) Delivery claims — both workers live, ONE POST per delivery"
 I3_N=14
@@ -3456,20 +3527,49 @@ if [ "$I_OK" = 1 ] && live_run plain-agent "sess-i4-$$" "i/lease"; then
     # would make this flaky without making it stronger. What must hold — and what
     # a renew would violate — is that the owner change moved it at all.
     { [ -n "$I4_EPOCH1" ] && [ "$I4_EPOCH1" -gt "$I4_EPOCH0" ]; } \
-      && ok "the fencing epoch advanced on the owner change ($I4_EPOCH0 → $I4_EPOCH1) — every mutation the dead driver could still attempt is now stale" \
+      && ok "the fencing epoch advanced on the owner change ($I4_EPOCH0 → $I4_EPOCH1) — the token the dead driver still carries no longer matches the session (what a mutation carrying it does is NOT asserted here; see the disclosure below)" \
       || no "orchestrator_epoch is '$I4_EPOCH1' after a takeover from epoch $I4_EPOCH0 (a steal MUST bump it; only a renew keeps it)"
   fi
 fi
 
-# NOT ASSERTED — "a stale-epoch UPDATE from the previous holder matched ZERO
-# rows", observed from outside. The fenced statement lives inside
-# `transition_session_fenced` and the only external evidence of a refusal is the
-# session NOT moving — which (i.4) asserts — because a driver that loses the fence
-# also stops. Watching the losing UPDATE itself would need the driver to keep
-# running with a known-stale token past a takeover, i.e. an injected pause in the
-# server; that property is driven directly against the database in
-# `fluidbox-db`'s own lease/fence tests (the epoch-fence and steal-matrix cases),
-# which is where a pure-CAS property belongs.
+# NOT ASSERTED — STALE-EPOCH FENCING ITSELF. Read this before quoting (i.4) as
+# coverage of the fence (#33 review 5, which found the section's old success text
+# claiming more than its assertions deliver).
+#
+# What (i.4) actually drives: a lease held by a THIRD replica makes BOTH live
+# drivers fail `hold_lease` and stop — before either ever acquires an epoch. So no
+# driver in this section ever HOLDS an epoch across a takeover, and no fenced
+# mutation carrying a stale token is ever attempted, let alone observed to be
+# refused. Deleting the `expected_epoch` predicate from the process-level wiring
+# would leave every assertion above GREEN. What (i.4) does prove, and it is worth
+# having, is the lease's operational behavior end to end: a foreign holder stops
+# both drivers, a fenced-out driver RELEASES its finalization claim instead of
+# squatting it (the attempts counter keeps rising), the session does not advance
+# while the foreign lease is live, and expiring it produces a real takeover whose
+# owner change bumps the epoch.
+#
+# Why the missing half is not driven here: it needs a driver to keep running with
+# a known-stale token PAST a takeover, i.e. an injected pause between the lease
+# read and the fenced mutation. That is a server-side seam, not something the
+# script can arrange. The pure-CAS property — "an UPDATE carrying epoch N matches
+# zero rows once the session is at N+1" — is driven directly against the database
+# in `fluidbox-db`'s own lease/fence tests (the epoch-fence and steal-matrix
+# cases), and the process-level wiring (that the driver PASSES the epoch it proved
+# into every lifecycle mutation, and re-proves it adjacent to the slow ones) is
+# held by source-level guards in `orchestrator.rs`'s own test module, each of
+# which was confirmed to fail when its statement is removed.
+#
+# NOT ASSERTED, and NOT TRUE AS SOMETIMES STATED — "every provider side effect
+# carries an epoch" (#33 review 8). It does not, deliberately.
+# `finish_terminal_cleanup` runs OUTSIDE the fence: a driver that loses the
+# terminal transition still performs cleanup once it observes the session
+# terminal, because cleanup is the retry ticket and stranding it whenever the
+# winner died mid-way would leak sandboxes. The epoch gates the TRANSITION. What
+# bounds the unfenced part instead is the finalization claim (one cleanup runs at
+# a time), idempotence throughout (token revocation is an UPDATE, delivery enqueue
+# is deduped), and UID-preconditioned provider deletes. `orchestrator.rs` says the
+# same thing at the call site; anywhere the property is written down it must be
+# scoped to the transition, not to side effects.
 #
 # NOT ASSERTED — MCP session affinity across replicas. The broker's session
 # registry is per-replica in-memory, so a run whose calls land on two replicas
