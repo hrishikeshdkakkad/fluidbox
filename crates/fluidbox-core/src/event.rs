@@ -335,6 +335,28 @@ mod tests {
         };
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["type"], "tool.decision");
+        // The NESTING LEVEL is part of the ledger contract, not an encoding
+        // detail. `events.payload` stores this value verbatim (fluidbox-db
+        // `append_event_in_tx` binds `serde_json::to_value(&env.body)`), so every
+        // out-of-process reader — the acceptance suites' SQL, the events API's
+        // consumers, the dashboard — addresses body fields as `payload->'data'->…`.
+        // Switching to an internally-tagged enum would flatten them to the top
+        // level and every such reader would start silently reading NULL/zero
+        // rather than failing: `payload->>'source'` becomes SQL NULL and
+        // `payload->>'tool_call_id' = 'x'` matches nothing. Both directions are
+        // asserted so the level cannot move without this test failing.
+        assert_eq!(json["data"]["source"], "autonomy_rewrite");
+        assert_eq!(json["data"]["tool_call_id"], "t1");
+        assert_eq!(json["data"]["original_verdict"], "require_approval");
+        assert!(
+            json.get("source").is_none() && json.get("tool_call_id").is_none(),
+            "body fields must live UNDER 'data', never at the payload top level: {json}"
+        );
+        assert_eq!(
+            json.as_object().map(|o| o.len()),
+            Some(2),
+            "the payload envelope is exactly {{type, data}}: {json}"
+        );
         let back: EventBody = serde_json::from_value(json).unwrap();
         assert_eq!(back.type_name(), "tool.decision");
     }
