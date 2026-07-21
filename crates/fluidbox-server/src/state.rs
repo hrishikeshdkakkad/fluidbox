@@ -145,6 +145,15 @@ pub struct AppStateInner {
     /// broker/deliveries consult it via `egress::admit_url`; the orchestrator
     /// derives the workspace `GitEgressPolicy` from it.
     pub egress_policy: crate::egress::EgressPolicy,
+    /// Outbound rate limits + per-connection circuit breakers (Phase E, E14).
+    /// The broker consults it AFTER the execution claim is won and BEFORE the
+    /// dial, so a refusal is a pre-write proof of non-dispatch (`NeverSent` ⇒
+    /// `failed_before_send` ⇒ re-claimable). In-memory and PER-REPLICA by design:
+    /// with N replicas the effective ceiling is N × the configured rate and a
+    /// breaker opened here does not stop the others — it is a fairness/abuse
+    /// backstop and an upstream-protection reflex, not a hard quota. The durable
+    /// multi-replica limiter is Phase F (disclosed, plan E14).
+    pub governor: crate::governor::EgressGovernor,
     /// Seals/unseals connection credentials (Phase D versioned envelope). Built
     /// by `seal::build_sealer`: a legacy key (KMS off), a KMS-envelope backend
     /// (static|aws), or None — sealing disabled — ONLY when KMS is off AND

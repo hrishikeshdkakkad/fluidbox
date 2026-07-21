@@ -160,6 +160,21 @@ pub struct Config {
     /// literal+scheme checks still do) — the proxy becomes the egress control
     /// point, so point it at an allowlisting forward proxy.
     pub egress_proxy: Option<String>,
+    /// Outbound brokered-dial ceilings, per minute, for the in-memory
+    /// `EgressGovernor` (`FLUIDBOX_EGRESS_RATE_{TENANT,CONNECTION,HOST}_PER_MIN`,
+    /// Phase E). Defaults 120 / 60 / 120. **A value of 0 DISABLES that
+    /// dimension** (see `governor::GovernorLimits::from_config` for why zero is
+    /// not "block everything"); a malformed value fails boot.
+    pub egress_rate_tenant_per_min: u32,
+    pub egress_rate_connection_per_min: u32,
+    pub egress_rate_host_per_min: u32,
+    /// Per-connection circuit breaker (`FLUIDBOX_EGRESS_BREAKER_THRESHOLD`,
+    /// `FLUIDBOX_EGRESS_BREAKER_OPEN_SECS`, Phase E): consecutive transport/5xx
+    /// failures that open it (default 5) and how long it stays open before
+    /// admitting one half-open probe (default 60s). Zero on EITHER disables the
+    /// breaker; a malformed value fails boot.
+    pub egress_breaker_threshold: u32,
+    pub egress_breaker_open_secs: u64,
     /// Execution backend: `docker` (default) or `kubernetes`. Selects which
     /// `ExecutionProvider` `AppState.provider` holds. Dual-provider permanence
     /// (settled Q17): Docker is never replaced.
@@ -358,6 +373,31 @@ impl Config {
                 "FLUIDBOX_EGRESS_PROXY",
                 get("FLUIDBOX_EGRESS_PROXY").ok(),
             )?,
+            egress_rate_tenant_per_min: parse_u32_env(
+                "FLUIDBOX_EGRESS_RATE_TENANT_PER_MIN",
+                get("FLUIDBOX_EGRESS_RATE_TENANT_PER_MIN").ok(),
+                crate::governor::DEFAULT_TENANT_PER_MIN,
+            )?,
+            egress_rate_connection_per_min: parse_u32_env(
+                "FLUIDBOX_EGRESS_RATE_CONNECTION_PER_MIN",
+                get("FLUIDBOX_EGRESS_RATE_CONNECTION_PER_MIN").ok(),
+                crate::governor::DEFAULT_CONNECTION_PER_MIN,
+            )?,
+            egress_rate_host_per_min: parse_u32_env(
+                "FLUIDBOX_EGRESS_RATE_HOST_PER_MIN",
+                get("FLUIDBOX_EGRESS_RATE_HOST_PER_MIN").ok(),
+                crate::governor::DEFAULT_HOST_PER_MIN,
+            )?,
+            egress_breaker_threshold: parse_u32_env(
+                "FLUIDBOX_EGRESS_BREAKER_THRESHOLD",
+                get("FLUIDBOX_EGRESS_BREAKER_THRESHOLD").ok(),
+                crate::governor::DEFAULT_BREAKER_THRESHOLD,
+            )?,
+            egress_breaker_open_secs: parse_u64_env(
+                "FLUIDBOX_EGRESS_BREAKER_OPEN_SECS",
+                get("FLUIDBOX_EGRESS_BREAKER_OPEN_SECS").ok(),
+                crate::governor::DEFAULT_BREAKER_OPEN_SECS,
+            )?,
             provider,
             network_mode: get("FLUIDBOX_NETWORK_MODE")
                 .ok()
@@ -430,6 +470,18 @@ fn parse_u64_env(name: &str, raw: Option<String>, default: u64) -> anyhow::Resul
         Some(v) => v
             .parse()
             .map_err(|e| anyhow::anyhow!("{name}='{v}' is not a valid u64: {e}")),
+    }
+}
+
+/// Same fail-boot-on-malformed discipline for the u32 governor knobs (Phase E):
+/// a typo in an intended egress rate limit must fail boot naming the variable,
+/// never silently restore the default ceiling.
+fn parse_u32_env(name: &str, raw: Option<String>, default: u32) -> anyhow::Result<u32> {
+    match raw.filter(|v| !v.is_empty()) {
+        None => Ok(default),
+        Some(v) => v
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{name}='{v}' is not a valid u32: {e}")),
     }
 }
 
@@ -609,6 +661,32 @@ mod tests {
         // A malformed entry is a boot error, never a silently dropped rule.
         assert!(parse_egress_cidrs("X", Some("10.0.0.0/8,nonsense".into())).is_err());
         assert!(parse_egress_cidrs("X", Some("10.0.0.0/40".into())).is_err());
+    }
+
+    #[test]
+    fn governor_knobs_default_and_fail_closed() {
+        // Absent/empty ⇒ the documented default …
+        assert_eq!(parse_u32_env("G", None, 120).unwrap(), 120);
+        assert_eq!(parse_u32_env("G", Some(String::new()), 60).unwrap(), 60);
+        // … an explicit value wins, INCLUDING the "disabled" zero …
+        assert_eq!(parse_u32_env("G", Some("7".into()), 120).unwrap(), 7);
+        assert_eq!(parse_u32_env("G", Some("0".into()), 120).unwrap(), 0);
+        // … and a malformed value is a NAMED boot error, never the default (the
+        // `FLUIDBOX_EGRESS_ALLOW_CIDRS` precedent: an egress knob typo must not
+        // silently widen the ceiling).
+        let e = parse_u32_env(
+            "FLUIDBOX_EGRESS_RATE_HOST_PER_MIN",
+            Some("lots".into()),
+            120,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("FLUIDBOX_EGRESS_RATE_HOST_PER_MIN") && e.contains("lots"),
+            "got: {e}"
+        );
+        assert!(parse_u32_env("G", Some("-1".into()), 120).is_err());
+        assert!(parse_u32_env("G", Some("4294967296".into()), 120).is_err());
     }
 
     #[test]
