@@ -1340,10 +1340,14 @@ async fn finish_won_claim(
     let outcome = dispatch.run(state, scope, session_id, input).await;
     let latency_ms = started.elapsed().as_millis() as u64;
     let comp = dispatch_to_completion(outcome);
-    // Settle the claim (CAS from 'claimed'). A loser (already swept to ambiguous)
-    // returns false — we still answer this request from the completion we computed;
-    // the swept row is the durable truth a future duplicate adopts.
-    let settled = fluidbox_db::complete_tool_execution(
+    // Settle the claim (CAS from 'claimed'). A loser — the stale-claim sweep
+    // already moved this row to `ambiguous` — gets the DURABLE row back and must
+    // answer from it (review I3). Answering from the local completion made the
+    // original caller read `succeeded` while the ledger, every duplicate, and the
+    // claim row all said `ambiguous`: claim fencing that the fenced caller never
+    // learns about, and an ambiguity hidden from exactly the one party that acts
+    // on it.
+    let settle = fluidbox_db::complete_tool_execution(
         &state.pool,
         scope,
         claim_id,
@@ -1359,7 +1363,8 @@ async fn finish_won_claim(
     // one dispatcher, one settle, one `tool.brokered`. Folded into that event's
     // error text rather than emitted as a second event, and never re-emitted by
     // the refusals that follow (they take no claim and write nothing).
-    let exhausted = comp.state == "failed_before_send" && attempt >= MAX_EXECUTION_ATTEMPTS;
+    let exhausted =
+        settle.settled() && comp.state == "failed_before_send" && attempt >= MAX_EXECUTION_ATTEMPTS;
     if exhausted {
         tracing::warn!(
             "session {session_id}: brokered call {tool_call_id} ({tool}) failed before \
@@ -1370,8 +1375,8 @@ async fn finish_won_claim(
     // lost, the sweeper already flipped the row to `ambiguous` and ALREADY
     // ledgered that outcome — a second tool.brokered here would double-ledger one
     // call and contradict the durable state. The sweep's ambiguous event is the
-    // truth; the runner still receives the real result we computed.
-    if settled {
+    // truth, and (review I3) it is now ALSO what the caller is told.
+    if settle.settled() {
         record_brokered_exec(
             state,
             scope,
@@ -1394,11 +1399,33 @@ async fn finish_won_claim(
     if exhausted {
         return Ok(Json(attempts_exhausted_response(attempt)));
     }
-    Ok(Json(claim_response(
-        comp.state,
-        comp.result_content.as_ref(),
-        comp.error_message.as_deref(),
-    )))
+    Ok(Json(settlement_answer(&settle, &comp)))
+}
+
+/// The runner-facing answer for a dispatch we OWNED: the locally computed
+/// completion iff this dispatcher landed the settle CAS, else the DURABLE row the
+/// CAS lost to (review I3). PURE.
+///
+/// Why the durable row wins: a lost CAS means the stale-claim sweep already
+/// declared this call `ambiguous` and ledgered it. Two parties then disagree
+/// unless we adopt — the audit trail and every duplicate (which read the row) say
+/// "outcome unknown, not retried", while the original caller would have been told
+/// "succeeded". The dispatch really may have landed upstream; that is precisely
+/// what `ambiguous` is for, and hiding it from the one caller who can act on it
+/// is the failure mode invariant 15 exists to prevent.
+fn settlement_answer(settle: &fluidbox_db::SettleOutcome, comp: &Completion) -> Value {
+    match settle {
+        fluidbox_db::SettleOutcome::Settled => claim_response(
+            comp.state,
+            comp.result_content.as_ref(),
+            comp.error_message.as_deref(),
+        ),
+        fluidbox_db::SettleOutcome::Superseded {
+            state,
+            result_content,
+            error_message,
+        } => claim_response(state, result_content.as_ref(), error_message.as_deref()),
+    }
 }
 
 /// The runner-facing answer for a claim whose re-dispatch budget is spent
@@ -2496,6 +2523,65 @@ mod schema_gate_tests {
             false
         );
         assert_eq!(claim_response("claimed", None, None)["ok"], false);
+    }
+
+    #[test]
+    fn a_superseded_settle_answers_from_the_durable_row_not_the_local_result() {
+        // Review I3. The dispatch SUCCEEDED locally, but the settle CAS lost —
+        // the stale-claim sweep had already moved the row to `ambiguous` and
+        // ledgered it. The caller must be told what the row says.
+        let result = json!({ "content": [{"type":"text","text":"ok"}], "is_error": false });
+        let comp = dispatch_to_completion(crate::broker::DispatchOutcome::Definitive {
+            content: json!([{"type":"text","text":"ok"}]),
+            is_error: false,
+            structured: None,
+        });
+        assert_eq!(
+            comp.state, "succeeded",
+            "precondition: the LOCAL result won"
+        );
+
+        // Won the CAS → the local completion is the answer.
+        let won = settlement_answer(&fluidbox_db::SettleOutcome::Settled, &comp);
+        assert_eq!(won["ok"], true, "a settled dispatch answers from itself");
+
+        // Lost the CAS → the durable `ambiguous` is the answer, and it must be
+        // the SAME shape a duplicate reading the row gets.
+        let lost = settlement_answer(
+            &fluidbox_db::SettleOutcome::Superseded {
+                state: "ambiguous".to_string(),
+                result_content: None,
+                error_message: None,
+            },
+            &comp,
+        );
+        assert_eq!(
+            lost["ok"], false,
+            "a superseded dispatcher must NOT report success the ledger contradicts"
+        );
+        assert!(
+            lost["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ambiguous"),
+            "the caller must be told the outcome is ambiguous, got {lost}"
+        );
+        assert_eq!(
+            lost,
+            claim_response("ambiguous", None, None),
+            "the original caller and every duplicate must read the same answer"
+        );
+
+        // A superseded row carrying a stored terminal result is adopted verbatim.
+        let adopted = settlement_answer(
+            &fluidbox_db::SettleOutcome::Superseded {
+                state: "failed_upstream".to_string(),
+                result_content: Some(result.clone()),
+                error_message: None,
+            },
+            &comp,
+        );
+        assert_eq!(adopted["result"], result, "the DURABLE result is returned");
     }
 
     #[test]

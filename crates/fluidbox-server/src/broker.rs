@@ -655,10 +655,10 @@ fn governor_gate(
     tenant: uuid::Uuid,
     connection: uuid::Uuid,
     url: &str,
-) -> Result<String, DispatchOutcome> {
+) -> Result<crate::governor::Permit, DispatchOutcome> {
     let host = host_key(url);
     match gov.check(tenant, connection, &host) {
-        Ok(()) => Ok(host),
+        Ok(permit) => Ok(permit),
         Err(t) => {
             tracing::info!(
                 target: "broker",
@@ -1770,7 +1770,7 @@ pub async fn call_tool_auth(
     .await;
     state
         .governor
-        .report(conn_key, &host, breaker_signal(&first));
+        .report(&host, breaker_signal(&first));
     match first {
         Err(CallErr::Unauthorized) => {
             // A 401 proves the tool never executed. Static credential ⇒ terminal
@@ -1799,7 +1799,7 @@ pub async fn call_tool_auth(
                     .await;
                     state
                         .governor
-                        .report(conn_key, &host, breaker_signal(&retry));
+                        .report(&host, breaker_signal(&retry));
                     outcome_from_call(retry)
                 }
                 // Re-mint failure = auth resolution failure ⇒ never sent.
@@ -1873,7 +1873,7 @@ pub async fn call_tool_for_conn(
     .await;
     state
         .governor
-        .report(conn.id, &host, breaker_signal(&first));
+        .report(&host, breaker_signal(&first));
     match first {
         Err(CallErr::Unauthorized) => {
             // A 401 proves the tool never executed. Static credential ⇒ terminal
@@ -1908,7 +1908,7 @@ pub async fn call_tool_for_conn(
                     .await;
                     state
                         .governor
-                        .report(conn.id, &host, breaker_signal(&retry));
+                        .report(&host, breaker_signal(&retry));
                     outcome_from_call(retry)
                 }
                 Err(e) => DispatchOutcome::NeverSent(e),
@@ -2705,7 +2705,7 @@ mod tests {
                 matches!(r, Err(CallErr::UpstreamUnavailable(_))),
                 "dial {i} must classify as an upstream-health failure, got {r:?}"
             );
-            gov.report(c, &host, breaker_signal(&r));
+            gov.report(&host, breaker_signal(&r));
         }
         // Precondition: the fake WAS recording (a dead fake must not false-green
         // the "stopped dialing" assertion below).
@@ -2770,7 +2770,7 @@ mod tests {
                 matches!(&r, Ok((_, true, _))),
                 "dial {i} must be a real isError RESULT, got {r:?}"
             );
-            gov.report(c, &host, breaker_signal(&r));
+            gov.report(&host, breaker_signal(&r));
         }
         assert!(
             count_rpc(&records, "tools/call") >= 6,
