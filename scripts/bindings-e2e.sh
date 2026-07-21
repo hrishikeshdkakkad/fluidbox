@@ -83,7 +83,10 @@ SLUG_CAT="kb-fake"       # the custom catalog entry's slug (valid [a-z0-9-])
 # The distinctive negotiated protocol version the fake MCP returns at initialize —
 # the snapshot MUST record THIS exact string (proves the photograph negotiated a
 # real version, not a client-offered default).
-MCP_PROTO="2025-06-18-fakekb-1"
+# Must be a revision the broker SUPPORTS: discovery now refuses to RECORD
+# an out-of-set protocol version (a recorded one is later honored by exact
+# match, which made an arbitrary string permanently acceptable).
+MCP_PROTO="2025-06-18"
 
 # A one-file HTTP sink for the signed-webhook publish consumer (R3.8): logs each
 # request's method + the two fluidbox delivery headers + a body digest as jsonl.

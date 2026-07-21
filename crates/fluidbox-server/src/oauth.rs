@@ -585,11 +585,41 @@ pub async fn discover(state: &AppState, mcp_url: &str) -> Result<AsMeta, String>
         };
         // Found the document: S256-refusal must NOT fall through to the
         // next URL — this is a policy refusal, not a lookup miss.
-        return parse_as_metadata(&v);
+        let meta = parse_as_metadata(&v)?;
+        // RFC 8414 §3.3: the metadata's `issuer` MUST identify the server the
+        // metadata was retrieved from. Unvalidated, ANY member's malicious MCP
+        // server could claim a real provider's issuer, and since DCR rows are
+        // keyed GLOBALLY by `(issuer, redirect_uri)` it would occupy that
+        // provider's registration for the whole deployment — later, legitimate
+        // tenants would then adopt the attacker-registered client_id.
+        issuer_matches_discovery(&meta.issuer, &a_origin)?;
+        return Ok(meta);
     }
     Err(format!(
         "authorization server '{as_base}' publishes no discoverable metadata (RFC 8414/OIDC)"
     ))
+}
+
+/// RFC 8414 §3.3 issuer validation: the `issuer` an AS publishes must identify
+/// the server the metadata came FROM. Compared at ORIGIN granularity (scheme +
+/// host + port) — an issuer legitimately carries a path component for
+/// multi-tenant providers, but it can never name a DIFFERENT host than the one
+/// that served the document. A missing/blank issuer is refused: it is what makes
+/// the global registration key meaningless.
+fn issuer_matches_discovery(issuer: &str, discovered_origin: &str) -> Result<(), String> {
+    if issuer.trim().is_empty() {
+        return Err("authorization server metadata declares no issuer (RFC 8414 §3.3)".into());
+    }
+    let (i_origin, _) = origin_and_path(issuer)
+        .map_err(|_| "authorization server metadata declares a malformed issuer".to_string())?;
+    if !i_origin.eq_ignore_ascii_case(discovered_origin) {
+        return Err(
+            "authorization server metadata declares an issuer on a different origin than the \
+             server that published it — refusing (RFC 8414 §3.3)"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// The resolved OAuth client identity for a dance. `registration_id` points at
@@ -1623,8 +1653,17 @@ async fn do_code_exchange(
     if let Some(r) = resource {
         form.push(("resource", r));
     }
+    // NO-REDIRECT client (`egress_http`, `redirect::Policy::none()`) — NOT the
+    // redirect-following `identity_http`. On a 307/308 reqwest REPLAYS the body,
+    // so a token-leg redirect would forward the authorization code + PKCE
+    // verifier to whatever other host the AS names; stripping a cross-origin
+    // `Authorization` header does nothing for a BODY. Refused outright rather
+    // than same-origin-restricted: this flow FROZE `token_endpoint` at start
+    // (RFC 8414 metadata names it exactly), so a redirect here means the
+    // endpoint moved under us mid-flow — never something to follow. A 3xx is
+    // then simply a non-success status and falls through to the error branch.
     let mut req = state
-        .identity_http
+        .egress_http
         .post(token_endpoint)
         .timeout(HTTP_TIMEOUT)
         .header("content-type", "application/x-www-form-urlencoded")
@@ -2529,8 +2568,11 @@ async fn refresh_access_token(
     if let Some(r) = resource {
         form.push(("resource", r));
     }
+    // NO-REDIRECT client, same reason as the code-exchange leg: a 307/308 replays
+    // the body, which here carries the REFRESH TOKEN itself — the longest-lived
+    // credential in the connection. `egress_http` refuses the 3xx instead.
     let mut req = state
-        .identity_http
+        .egress_http
         .post(token_endpoint)
         .timeout(HTTP_TIMEOUT)
         .header("content-type", "application/x-www-form-urlencoded")
@@ -2651,6 +2693,84 @@ mod tests {
 
     fn test_sealer() -> Sealer {
         Sealer::from_key_string(&"ab".repeat(32)).unwrap()
+    }
+
+    /// Issuer poisoning: DCR rows are keyed GLOBALLY by `(issuer,
+    /// redirect_uri)`, so an unvalidated `issuer` lets any member's malicious
+    /// server claim a real provider's identity and occupy that provider's
+    /// registration deployment-wide. RFC 8414 §3.3 already forbids it.
+    #[test]
+    fn issuer_must_match_the_origin_that_published_the_metadata() {
+        // Exact origin, and an issuer with a tenant PATH on that origin.
+        issuer_matches_discovery("https://as.example.test", "https://as.example.test").unwrap();
+        issuer_matches_discovery(
+            "https://as.example.test/tenant-1",
+            "https://as.example.test",
+        )
+        .unwrap();
+        // Scheme is part of the origin.
+        issuer_matches_discovery("HTTPS://AS.example.test", "https://as.example.test").unwrap();
+        // The attack: a member's server claiming a real provider's issuer.
+        let e =
+            issuer_matches_discovery("https://accounts.google.com", "https://evil.example.test")
+                .unwrap_err();
+        assert!(e.contains("different origin"), "got: {e}");
+        // A port change is a different origin too.
+        assert!(issuer_matches_discovery(
+            "https://as.example.test:8443",
+            "https://as.example.test"
+        )
+        .is_err());
+        // Absent/blank/malformed issuers are refused, not defaulted.
+        assert!(issuer_matches_discovery("", "https://as.example.test").is_err());
+        assert!(issuer_matches_discovery("   ", "https://as.example.test").is_err());
+        assert!(issuer_matches_discovery("not-a-url", "https://as.example.test").is_err());
+        // …and the discovery path must actually CALL it: the check is worthless
+        // if `parse_as_metadata`'s result is returned unvalidated. Needle built
+        // at runtime so this scan does not count its own source text.
+        let src = include_str!("oauth.rs");
+        let call = format!(
+            "        {}(&meta.issuer, &a_origin)?;",
+            "issuer_matches_discovery"
+        );
+        assert_eq!(
+            src.matches(&call).count(),
+            1,
+            "AS-metadata discovery must validate the issuer against the origin it came from"
+        );
+    }
+
+    /// Both token legs must ride the NO-REDIRECT client. `identity_http` follows
+    /// any admitted https hop, and a 307/308 REPLAYS the request body — so the
+    /// code + PKCE verifier (exchange) or the refresh token (refresh) would be
+    /// forwarded to a different host of the AS's choosing. Header-level
+    /// protections do not cover a body, so the client itself must refuse.
+    ///
+    /// Asserted against the source because these two builders are the whole
+    /// property and neither is reachable without a live `AppState`.
+    #[test]
+    fn token_legs_use_the_no_redirect_client() {
+        let src = include_str!("oauth.rs");
+        // Assembled at runtime so the scan does not count its own source text.
+        let needle = format!(".post({})", "token_endpoint");
+        let legs: Vec<usize> = src.match_indices(&needle).map(|(i, _)| i).collect();
+        assert_eq!(
+            legs.len(),
+            2,
+            "expected exactly the code-exchange and refresh legs; found {}",
+            legs.len()
+        );
+        for at in legs {
+            let window = &src[at.saturating_sub(200)..at];
+            assert!(
+                window.contains("egress_http"),
+                "a token leg does not use the no-redirect egress_http client"
+            );
+            assert!(
+                !window.contains("identity_http"),
+                "a token leg still uses the redirect-following identity_http client"
+            );
+        }
     }
 
     fn egress_policy(dev: bool) -> crate::egress::EgressPolicy {
