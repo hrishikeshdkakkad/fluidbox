@@ -55,6 +55,17 @@ A load test written before these were fixed would have measured the connection p
 
 **PR #85** into `release/multi-user-mcp-control-plane`. Final local bar: `cargo test --workspace` **810 passed / 0 failed**, `clippy --workspace --all-targets -D warnings` clean, `cargo deny` clean, `bash -n` + `shellcheck` clean, `helm lint` clean — all with `DATABASE_URL` proven `UNSET`.
 
+## CI state: 10 of 11 jobs green; `scale` hangs — start here
+
+`rust · hardening · identity · bindings · secrets · kind-calico · unit · web · deny · chart` all **pass**. The new `scale` job does not, and its first real execution is worth more than the green ones:
+
+- **`web` failed first, and the test was wrong, not the code.** The "a closed descriptor" case passed fd 9 on the premise that anything above 2 is closed in a spawned child. A parent can leak descriptors: on the GitHub Linux runner that case died by *signal* (`spawnSync` status `null`) while exiting 4 on macOS. Now uses a descriptor above the process limit — EBADF by definition on every POSIX platform — and asserts `signal` before `status`, because "null !== 4" says nothing about why. **These are Linux-only procfs assertions that self-skip on a developer's Mac, so CI was always going to be their first real run.**
+- **`scale` times out.** Raised 25 → 45 minutes after the first run was eaten by a cache-miss build; it then hit 45 minutes too, with the cache warm — so this is **not a budget problem, the script hangs**.
+
+**Where it hangs, from the job log:** section (a) forges 24 sessions from the template, mints 96 audience-scoped tokens, and asserts all four audiences are present. It then fires 24 concurrent `POST /internal/sessions/{id}/permission` calls and never returns. The gate blocks waiting for an approval decision, so the most likely cause is that the template run's frozen policy sends that tool call to `RequireApproval` rather than the `allow` the section asserts — i.e. the fixture's premise about its own RunSpec is wrong. **Confirm that against the frozen policy snapshot before changing the script**; a timeout is indistinguishable in the log from a deadlock, which is exactly what the `hardening` job's timeout comment warns about.
+
+This is the load harness's own author's disclosed risk landing: it never executed the script (correctly — running it was forbidden), and said so.
+
 ## What is NOT done — read this first
 
 1. **The review gate has not been run on this branch.** No whole-branch review in parallel scopes, and no Codex gate. Phase E's lesson was that an outside model found 2 Critical + 17 Important on a branch that had already survived four internal passes. **Budget for it; it is not redundant.** Only Task 1 got a per-task review (which found the phase's headline false green).
