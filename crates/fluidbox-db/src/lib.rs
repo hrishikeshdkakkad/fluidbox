@@ -3768,6 +3768,143 @@ pub async fn transition_session(
     Ok(Some((current, updated)))
 }
 
+/// The epoch-fenced sibling of [`transition_session`] (Phase E, #33; Gap 13).
+/// Identical semantics plus ONE extra condition: the session's
+/// `orchestrator_epoch` must still equal the epoch the caller acquired with its
+/// lease. A driver that was paused, partitioned, or simply slow — and whose lease
+/// another replica then stole — carries a STALE epoch, so its lifecycle mutation
+/// matches zero rows and returns `Ok(None)` instead of overwriting the new
+/// owner's work. The epoch is checked UNDER the same `for update` row lock the
+/// status guard uses, so the fence and the state-machine check see one snapshot.
+///
+/// Deliberately a separate entry point rather than an `Option<i64>` parameter on
+/// `transition_session`: request-side intent writes (cancel, `finalize_forced`,
+/// `maybe_resume`) are NOT driver mutations and must stay unfenced — they are
+/// idempotent CAS inserts whose whole job is to be accepted from any replica.
+pub async fn transition_session_fenced(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    next: SessionStatus,
+    reason: Option<&str>,
+    expected_epoch: i64,
+) -> sqlx::Result<Option<(SessionStatus, SessionRow)>> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let row: Option<(String, i64)> = sqlx::query_as(
+        "select status, orchestrator_epoch from sessions
+         where id = $1 and tenant_id = $2 for update",
+    )
+    .bind(id)
+    .bind(scope.tenant_id())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((current, epoch)) = row else {
+        return Ok(None);
+    };
+    if epoch != expected_epoch {
+        tx.rollback().await.ok();
+        return Ok(None);
+    }
+    let current = SessionStatus::parse(&current).unwrap_or(SessionStatus::Failed);
+    if !current.can_transition_to(next) {
+        tx.rollback().await.ok();
+        return Ok(None);
+    }
+    let updated: SessionRow = sqlx::query_as(
+        "update sessions set
+            status = $2,
+            status_reason = $3,
+            updated_at = now(),
+            started_at = case when $2 = 'running'
+                              then coalesce(started_at, now()) else started_at end,
+            finished_at = case when $2 in ('completed','failed','cancelled','budget_exceeded')
+                               then now() else finished_at end
+         where id = $1 and tenant_id = $4 and orchestrator_epoch = $5 returning *",
+    )
+    .bind(id)
+    .bind(next.as_str())
+    .bind(reason)
+    .bind(scope.tenant_id())
+    .bind(expected_epoch)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some((current, updated)))
+}
+
+/// Acquire, STEAL, or renew this replica's driver lease on one session, and
+/// return the fencing epoch to carry (Phase E, #33; Gap 13; design :1067-1078).
+///
+/// Predicate — take it iff the lease is free, expired, or already mine:
+/// `owner is null OR lease_until < now() OR owner = $me`. `None` means another
+/// replica holds an UNEXPIRED lease: this driver must not mutate the session.
+///
+/// **The epoch increments ONLY on an owner CHANGE.** A renew by the same owner
+/// keeps it, so a healthy driver's fence never moves under its own feet; a
+/// takeover (including re-taking a lease of ours that lapsed) bumps it, which
+/// instantly invalidates every mutation the previous holder had in flight. That
+/// asymmetry is what makes the epoch a fencing TOKEN rather than a counter.
+///
+/// Time-based takeover, exactly like `claim_finalization` — NEVER a Postgres
+/// advisory lock. The design rejects advisory locks here (`:1067-1072`): they are
+/// tied to one connection, fragile under pool reconnects and Neon scale-to-zero,
+/// and poorly observable. A lease column survives all three and is queryable.
+/// Beneath this replica-scope fence the Kubernetes provider's UID-preconditioned
+/// delete stays as the PROVIDER-scope fence.
+pub async fn acquire_session_lease(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    owner: Uuid,
+    ttl_secs: i64,
+) -> sqlx::Result<Option<i64>> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let row: Option<(i64,)> = sqlx::query_as(
+        "update sessions set
+            orchestrator_owner_id = $3,
+            orchestrator_lease_until = now() + make_interval(secs => $4),
+            orchestrator_epoch = case
+                when orchestrator_owner_id is distinct from $3
+                then orchestrator_epoch + 1 else orchestrator_epoch end,
+            updated_at = now()
+         where id = $1 and tenant_id = $2
+           and (orchestrator_owner_id is null
+                or orchestrator_lease_until is null
+                or orchestrator_lease_until < now()
+                or orchestrator_owner_id = $3)
+         returning orchestrator_epoch",
+    )
+    .bind(id)
+    .bind(scope.tenant_id())
+    .bind(owner)
+    .bind(ttl_secs.max(1) as f64)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row.map(|(e,)| e))
+}
+
+/// The session's current lease holder + fencing epoch — the read half of
+/// [`acquire_session_lease`], used by tests and by side-effect guards that want to
+/// confirm ownership without extending the lease.
+pub async fn session_lease(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+) -> sqlx::Result<Option<(Option<Uuid>, Option<DateTime<Utc>>, i64)>> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let row: Option<(Option<Uuid>, Option<DateTime<Utc>>, i64)> = sqlx::query_as(
+        "select orchestrator_owner_id, orchestrator_lease_until, orchestrator_epoch
+         from sessions where id = $1 and tenant_id = $2",
+    )
+    .bind(id)
+    .bind(scope.tenant_id())
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
 /// Attach the sandbox handle — REFUSED (returns false) unless the session is
 /// still in an ACTIVE (pre-wind-down) state AND no finalization intent
 /// exists: the intent is the single source of truth for ownership, and it
@@ -4213,16 +4350,43 @@ pub async fn append_event(
     scope: TenantScope,
     event: Redacted<EventEnvelope>,
 ) -> sqlx::Result<i64> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let seq = append_event_in_tx(&mut tx, scope, event).await?;
+    tx.commit().await?;
+    Ok(seq)
+}
+
+/// The LISTEN/NOTIFY channel a committed approval DECISION announces itself on
+/// (Phase E, #33; Gap 13). Payload = the approval id, so every replica can wake
+/// its own local waiters for that row. Deliberately separate from
+/// `fluidbox_events` (payload `session:seq`): approvals key on the approval id,
+/// and a listener that had to parse two payload shapes off one channel would be a
+/// silent-misroute hazard. Like SSE, the NOTIFY is ONLY a wakeup — the wait loop's
+/// ≤2 s poll re-read of Postgres stays the delivery truth (missed notifies, Neon
+/// scale-to-zero).
+pub const APPROVALS_CHANNEL: &str = "fluidbox_approvals";
+
+/// `append_event` on an EXISTING transaction — the in-tx emission primitive the
+/// approval decision transactions ride (Phase E, #33; Gap 13, plan E12), so the
+/// canonical ledger event commits atomically with the decision CAS that produced
+/// it and a loser of that CAS emits nothing.
+///
+/// The caller MUST already have set the tenant GUC on this connection
+/// (`scoped_tx`) or the audited bypass (`worker_tx`): the plpgsql
+/// `append_event(...)` is SECURITY INVOKER, so its `update sessions` +
+/// `insert events` run under the caller's policies.
+///
+/// Gate: the `where exists(...)` guards the target list, so the side-effecting
+/// function is NOT invoked on a scope miss (no seq bump, no NOTIFY) — zero rows →
+/// `RowNotFound`.
+async fn append_event_in_tx(
+    tx: &mut sqlx::PgConnection,
+    scope: TenantScope,
+    event: Redacted<EventEnvelope>,
+) -> sqlx::Result<i64> {
     let env = event.into_inner();
     let payload = serde_json::to_value(&env.body).unwrap_or(Value::Null);
     let type_name = env.body.type_name();
-    // Gate the append on the session belonging to the caller's tenant. The
-    // `where exists(...)` guards the target list, so the side-effecting
-    // `append_event(...)` function is NOT invoked on a scope miss (no seq bump,
-    // no NOTIFY) — zero rows → RowNotFound, which the ledger helper logs. The scoped
-    // tx also sets the tenant GUC so the plpgsql function's `update sessions` +
-    // `insert events` (SECURITY INVOKER, subject to RLS) pass under the policies.
-    let mut tx = scoped_tx(pool, scope).await?;
     let row = sqlx::query(
         "select append_event($1, $2, $3, $4, $5, $6) as seq
          where exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $7)",
@@ -4236,7 +4400,6 @@ pub async fn append_event(
     .bind(scope.tenant_id())
     .fetch_optional(&mut *tx)
     .await?;
-    tx.commit().await?;
     match row {
         Some(r) => Ok(r.get::<i64, _>("seq")),
         None => Err(sqlx::Error::RowNotFound),
@@ -4287,9 +4450,6 @@ macro_rules! approval_cols {
          scope, scope_key, status, requested_at, expires_at, decided_at, decided_by"
     };
 }
-// Re-exported by path so the `system_worker` module's approval scans share the
-// same compile-time column literal.
-pub(crate) use approval_cols;
 
 /// Register a tool-call intent, idempotent by (session_id, tool_call_id).
 /// Returns (row, inserted). When `inserted` is false the caller MUST compare
@@ -4409,16 +4569,43 @@ pub async fn record_intent_verdict(
     Ok(res.rows_affected() > 0)
 }
 
-pub async fn decide_approval(
+/// Decide a pending approval AND emit its canonical ledger events in ONE
+/// transaction (Phase E, #33; Gap 13, plan E12). This is the single-emission fix:
+/// before it, every awakened waiter emitted its own `approval.decided` +
+/// `tool.decision`, so two handlers re-attached to one pending row double-ledgered
+/// **inside a single process** (design :1058-1066) — a current bug, not merely a
+/// multi-replica one. Now the DECISION CAS is the emitter: a loser of the CAS
+/// affects zero rows and appends nothing, and waiters emit neither event.
+///
+/// `events` are pre-scrubbed by the caller (the `Redacted` newtype is
+/// constructible only through `Redactor::scrub`, so the ledger invariant holds)
+/// and are DISCARDED untouched when the CAS loses.
+///
+/// LOCK ORDER — BINDING (Phase E, #33): **approvals CAS FIRST, then
+/// `append_event`** (which locks the `sessions` row to assign the gapless seq).
+/// Every decision site in this codebase uses that order: this function, its
+/// [`expire_approval_tx`] sibling, and the waiter timeout path (which calls this
+/// one). See [`claim_tool_execution`]'s LOCK-ORDER ANALYSIS for why this cannot
+/// cycle with the claim/cancellation order: that transaction takes `sessions`
+/// FIRST and then `tool_execution_claims`, and NEVER touches `approvals`, so the
+/// two orderings operate on DISJOINT resource pairs — `{approvals, sessions}` here
+/// versus `{sessions, tool_execution_claims}` there — and a cycle needs both
+/// transactions to want each other's held resource.
+///
+/// The commit also `pg_notify`s [`APPROVALS_CHANNEL`] so waiters on OTHER replicas
+/// wake immediately instead of riding the ≤2 s poll floor (which stays as the
+/// missed-notify backstop).
+pub async fn decide_approval_tx(
     pool: &PgPool,
     scope: TenantScope,
     id: Uuid,
     status: &str,
     decided_by: &str,
+    events: Vec<Redacted<EventEnvelope>>,
 ) -> sqlx::Result<Option<ApprovalRow>> {
     let mut tx = scoped_tx(pool, scope).await?;
 
-    let __rls_out = sqlx::query_as(concat!(
+    let decided: Option<ApprovalRow> = sqlx::query_as(concat!(
         "update approvals set status = $2, decided_at = now(), decided_by = $3
          where id = $1 and status = 'pending'
            and exists (select 1 from sessions s
@@ -4432,8 +4619,97 @@ pub async fn decide_approval(
     .bind(scope.tenant_id())
     .fetch_optional(&mut *tx)
     .await?;
+    let Some(row) = decided else {
+        // Lost the CAS (already decided/expired, or another tenant). Nothing is
+        // written and NOTHING is ledgered — that is the whole point.
+        tx.commit().await?;
+        return Ok(None);
+    };
+    emit_and_notify(&mut tx, scope, id, events).await?;
     tx.commit().await?;
-    Ok(__rls_out)
+    Ok(Some(row))
+}
+
+/// Expire ONE pending approval past its deadline and emit its ledger events in
+/// the same transaction — the cross-replica-safe expiry decision site (Phase E,
+/// #33). Single-winner by the `status = 'pending' and expires_at < now()` CAS, so
+/// N replicas sweeping the same row produce exactly one decision and one pair of
+/// events. Same binding lock order as [`decide_approval_tx`].
+pub async fn expire_approval_tx(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    events: Vec<Redacted<EventEnvelope>>,
+) -> sqlx::Result<Option<ApprovalRow>> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let expired: Option<ApprovalRow> = sqlx::query_as(concat!(
+        "update approvals set status = 'expired', decided_at = now(), decided_by = 'timeout'
+         where id = $1 and status = 'pending' and expires_at < now()
+           and exists (select 1 from sessions s
+                       where s.id = approvals.session_id and s.tenant_id = $2)
+         returning ",
+        approval_cols!()
+    ))
+    .bind(id)
+    .bind(scope.tenant_id())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(row) = expired else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    emit_and_notify(&mut tx, scope, id, events).await?;
+    tx.commit().await?;
+    Ok(Some(row))
+}
+
+/// Shared tail of every decision transaction: append the pre-scrubbed events (in
+/// order, so `approval.decided` precedes `tool.decision` exactly as the old waiter
+/// emission did) and announce the decision on [`APPROVALS_CHANNEL`]. Runs AFTER
+/// the approvals CAS, inside its transaction — the binding lock order.
+async fn emit_and_notify(
+    tx: &mut sqlx::PgConnection,
+    scope: TenantScope,
+    approval_id: Uuid,
+    events: Vec<Redacted<EventEnvelope>>,
+) -> sqlx::Result<()> {
+    for ev in events {
+        append_event_in_tx(&mut *tx, scope, ev).await?;
+    }
+    sqlx::query("select pg_notify($1, $2)")
+        .bind(APPROVALS_CHANNEL)
+        .bind(approval_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    Ok(())
+}
+
+/// Claim the RIGHT to ledger the post-approval-wait terminality deny, exactly once
+/// (Phase E, #33; plan E12 "M4"). The session can terminalize DURING a
+/// minutes-long approval wait, in which case an approved call must still be
+/// refused — but EVERY re-attached waiter computes that same refusal, so the
+/// ledger write needs a single-winner CAS just like the deterministic gate paths.
+/// `terminal_deny_at` (migration 0021) is that marker: it is NOT a verdict (the
+/// human decision stays immutable in `status`), only a record that the deny was
+/// already ledgered. Returns true iff THIS caller won and must emit.
+pub async fn claim_terminal_deny_emission(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let res = sqlx::query(
+        "update approvals set terminal_deny_at = now()
+         where id = $1 and terminal_deny_at is null
+           and exists (select 1 from sessions s
+                       where s.id = approvals.session_id and s.tenant_id = $2)",
+    )
+    .bind(id)
+    .bind(scope.tenant_id())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(res.rows_affected() > 0)
 }
 
 pub async fn get_approval(
@@ -4721,7 +4997,7 @@ pub async fn session_approvals(
 }
 
 /// The tenant-scoped approvals inbox (the org approval queue). The
-/// cross-tenant expiry sweep runs off [`system_worker::expire_stale_approvals`];
+/// cross-tenant expiry scan runs off [`system_worker::expired_pending_approvals`];
 /// this one is what a request handler shows an approver, and it never crosses a
 /// tenant boundary.
 pub async fn pending_approvals(
@@ -5444,11 +5720,19 @@ pub async fn enqueue_result_delivery(
 
 /// Record one attempt. ok → delivered; failure → attempts+1 and either
 /// rescheduled (`retry_in_secs`) or terminally 'failed' at `max_attempts`.
+///
+/// GUARDED on the caller still holding the row's claim (Phase E, #33; Gap 13).
+/// `owner` is the replica id that
+/// [`system_worker::claim_due_deliveries`] stamped; a replica whose claim expired
+/// and was stolen mid-attempt matches zero rows and gets `None`, so it can never
+/// stomp the new owner's attempt counter or backoff. The claim is RELEASED here
+/// (both columns nulled) so the next backoff window is open to any replica.
 #[allow(clippy::too_many_arguments)]
 pub async fn mark_delivery_attempt(
     pool: &PgPool,
     scope: TenantScope,
     id: Uuid,
+    owner: Uuid,
     ok: bool,
     error: Option<&str>,
     payload_digest: Option<&str>,
@@ -5467,8 +5751,10 @@ pub async fn mark_delivery_attempt(
             last_error = $3,
             payload_digest = coalesce($4, payload_digest),
             next_attempt_at = now() + make_interval(secs => $5),
+            claimed_by = null,
+            claimed_until = null,
             updated_at = now()
-         where id = $1
+         where id = $1 and claimed_by = $8
            and exists (select 1 from sessions s
                        where s.id = result_deliveries.session_id and s.tenant_id = $7)
          returning *",
@@ -5480,6 +5766,7 @@ pub async fn mark_delivery_attempt(
     .bind(retry_in_secs as f64)
     .bind(max_attempts)
     .bind(scope.tenant_id())
+    .bind(owner)
     .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -6053,37 +6340,72 @@ pub async fn upsert_external_result(
 /// this connection deliberately stays role-plain (it does not even need the runtime
 /// role; it only LISTENs).
 pub fn spawn_listener(database_url: String) -> tokio::sync::broadcast::Sender<(Uuid, i64)> {
-    let (tx, _) = tokio::sync::broadcast::channel::<(Uuid, i64)>(1024);
+    spawn_channel_listener(database_url, "fluidbox_events", |payload| {
+        let (sid, seq) = payload.split_once(':')?;
+        Some((Uuid::parse_str(sid).ok()?, seq.parse::<i64>().ok()?))
+    })
+}
+
+/// The cross-replica approval-decision wakeup (Phase E, #33; Gap 13, plan E12).
+/// Every committed decision transaction `pg_notify`s [`APPROVALS_CHANNEL`] with
+/// the approval id; this listener relays it so EVERY replica can wake its own
+/// local `/permission` waiters, not just the one that happened to serve the
+/// decision request. Same discipline as `spawn_listener` above: a dedicated
+/// connection outside the app pool, role-plain, LISTEN-only, auto-reconnecting.
+///
+/// It is a LATENCY optimization, never the correctness mechanism — the wait loop's
+/// ≤2 s Postgres re-read stays the source of truth and the missed-notify /
+/// scale-to-zero backstop, exactly as `events_after` does for SSE.
+pub fn spawn_approval_listener(database_url: String) -> tokio::sync::broadcast::Sender<Uuid> {
+    spawn_channel_listener(database_url, APPROVALS_CHANNEL, |payload| {
+        Uuid::parse_str(payload).ok()
+    })
+}
+
+/// The shared LISTEN relay both channels ride. Runs on its OWN connection (outside
+/// the app pool) and needs NO tenant GUC: `LISTEN` and the `pg_notify` payloads it
+/// receives are not table reads, so RLS never applies here (the RLS-scoped
+/// catch-up queries that actually deliver run on the app pool). Undeliverable
+/// payloads are dropped, and a dropped connection reconnects with a 3 s backoff —
+/// a missed notify only costs the consumer's polling interval.
+fn spawn_channel_listener<T, F>(
+    database_url: String,
+    channel: &'static str,
+    parse: F,
+) -> tokio::sync::broadcast::Sender<T>
+where
+    T: Clone + Send + 'static,
+    F: Fn(&str) -> Option<T> + Send + 'static,
+{
+    let (tx, _) = tokio::sync::broadcast::channel::<T>(1024);
     let tx2 = tx.clone();
     tokio::spawn(async move {
         loop {
             match PgListener::connect(&database_url).await {
                 Ok(mut listener) => {
-                    if listener.listen("fluidbox_events").await.is_err() {
+                    if listener.listen(channel).await.is_err() {
                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                         continue;
                     }
-                    tracing::info!("pg listener connected");
+                    tracing::info!("pg listener connected ({channel})");
                     loop {
                         match listener.recv().await {
                             Ok(n) => {
-                                if let Some((sid, seq)) = n.payload().split_once(':') {
-                                    if let (Ok(sid), Ok(seq)) =
-                                        (Uuid::parse_str(sid), seq.parse::<i64>())
-                                    {
-                                        let _ = tx2.send((sid, seq));
-                                    }
+                                if let Some(v) = parse(n.payload()) {
+                                    let _ = tx2.send(v);
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!("pg listener dropped: {e}; reconnecting");
+                                tracing::warn!(
+                                    "pg listener ({channel}) dropped: {e}; reconnecting"
+                                );
                                 break;
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("pg listener connect failed: {e}; retrying");
+                    tracing::warn!("pg listener ({channel}) connect failed: {e}; retrying");
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -6804,7 +7126,7 @@ mod tests {
                 .is_none(),
             "second promotion is a no-op"
         );
-        let decided = decide_approval(&pool, scope, row2.id, "approved_once", "tester")
+        let decided = decide_approval_tx(&pool, scope, row2.id, "approved_once", "tester", vec![])
             .await
             .unwrap()
             .expect("pending row decides");
@@ -7638,8 +7960,10 @@ mod tests {
         assert_eq!(d.status, "pending");
         assert_eq!(d.attempts, 0);
 
-        // Due immediately.
-        let due = system_worker::due_result_deliveries(&pool, 10)
+        // Due immediately — and the poll now CLAIMS (Phase E): every attempt is
+        // recorded by the replica that holds the row.
+        let me = Uuid::now_v7();
+        let due = system_worker::claim_due_deliveries(&pool, me, 10, 300)
             .await
             .unwrap();
         assert!(due.iter().any(|x| x.id == d.id));
@@ -7649,6 +7973,7 @@ mod tests {
             &pool,
             scope,
             d.id,
+            me,
             false,
             Some("connection refused"),
             None,
@@ -7659,30 +7984,38 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!((after.status.as_str(), after.attempts), ("pending", 1));
-        assert!(!system_worker::due_result_deliveries(&pool, 50)
+        assert!(!system_worker::claim_due_deliveries(&pool, me, 50, 300)
             .await
             .unwrap()
             .iter()
             .any(|x| x.id == d.id));
 
-        // Exhausting attempts → failed, terminal for the delivery only.
-        mark_delivery_attempt(&pool, scope, d.id, false, Some("refused"), None, 30, 3)
+        // Exhausting attempts → failed, terminal for the delivery only. Each
+        // attempt re-claims first: recording one RELEASES the claim (so the next
+        // backoff window is open to any replica), and the row is no longer due, so
+        // the claim is re-stamped directly rather than via the due scan.
+        stamp_delivery_claim(&pool, d.id, me).await;
+        mark_delivery_attempt(&pool, scope, d.id, me, false, Some("refused"), None, 30, 3)
             .await
             .unwrap();
-        let last = mark_delivery_attempt(&pool, scope, d.id, false, Some("refused"), None, 30, 3)
-            .await
-            .unwrap()
-            .unwrap();
+        stamp_delivery_claim(&pool, d.id, me).await;
+        let last =
+            mark_delivery_attempt(&pool, scope, d.id, me, false, Some("refused"), None, 30, 3)
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!((last.status.as_str(), last.attempts), ("failed", 3));
 
         // Success path on a second delivery.
         let d2 = enqueue_result_delivery(&pool, scope, session.id, None, &dest)
             .await
             .unwrap();
-        let okd = mark_delivery_attempt(&pool, scope, d2.id, true, None, Some("sha256:x"), 0, 3)
-            .await
-            .unwrap()
-            .unwrap();
+        stamp_delivery_claim(&pool, d2.id, me).await;
+        let okd =
+            mark_delivery_attempt(&pool, scope, d2.id, me, true, None, Some("sha256:x"), 0, 3)
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(okd.status, "delivered");
         assert!(okd.delivered_at.is_some());
         assert_eq!(okd.payload_digest.as_deref(), Some("sha256:x"));
@@ -12932,6 +13265,24 @@ mod tests {
     // ─── Durable execution claims (Phase E, #33; Gap 11) ────────────────────
     // DB-backed; self-skip when DATABASE_URL is unset (CI proves them).
 
+    /// Stamp a delivery row's claim directly (bypassing the due scan) so a test
+    /// can record consecutive attempts without waiting out the backoff. Under
+    /// `worker_tx` (RLS bypass), like the sweeps.
+    async fn stamp_delivery_claim(pool: &PgPool, delivery_id: Uuid, owner: Uuid) {
+        let mut tx = worker_tx(pool).await.unwrap();
+        sqlx::query(
+            "update result_deliveries
+                set claimed_by = $2, claimed_until = now() + interval '5 minutes'
+              where id = $1",
+        )
+        .bind(delivery_id)
+        .bind(owner)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
     /// Force a session's status (state-machine-bypassing) so a test can drive
     /// terminality directly. Under `worker_tx` (RLS bypass), like the sweeps.
     async fn force_session_status(pool: &PgPool, session_id: Uuid, status: &str) {
@@ -13264,5 +13615,502 @@ mod tests {
         );
         assert_eq!(existings, 1, "the loser adopts the existing row");
         cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    // ─── Multi-replica coordination (Phase E, #33; Gap 13) ──────────────────
+    // DB-backed; self-skip when DATABASE_URL is unset (CI proves them).
+
+    /// Put an approvals row into `pending` the way the gate does (register the
+    /// intent, then promote it), returning the row.
+    async fn seed_pending_approval(
+        pool: &PgPool,
+        scope: TenantScope,
+        session_id: Uuid,
+        tool_call_id: &str,
+        ttl_secs: i64,
+    ) -> ApprovalRow {
+        let (intent, inserted) = register_tool_intent(
+            pool,
+            scope,
+            session_id,
+            tool_call_id,
+            "Bash",
+            "git push",
+            "sha256:args",
+        )
+        .await
+        .unwrap();
+        assert!(inserted, "fresh intent");
+        promote_intent_to_pending(
+            pool,
+            scope,
+            intent.id,
+            Some("high"),
+            "once",
+            "Bash",
+            ttl_secs,
+        )
+        .await
+        .unwrap()
+        .expect("promoted to pending")
+    }
+
+    /// Count this session's ledger rows by event type.
+    async fn count_events(pool: &PgPool, scope: TenantScope, session_id: Uuid, ty: &str) -> usize {
+        events_after(pool, scope, session_id, 0, 500)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.r#type == ty)
+            .count()
+    }
+
+    fn decision_events(
+        session_id: Uuid,
+        approval_id: Uuid,
+        decision: &str,
+        decided_by: &str,
+    ) -> Vec<Redacted<EventEnvelope>> {
+        let r = Redactor::default();
+        vec![
+            r.scrub(EventEnvelope::new(
+                session_id,
+                Actor::Human,
+                EventBody::ApprovalDecided {
+                    approval_id,
+                    tool_call_id: "tc-decide".into(),
+                    decision: decision.into(),
+                    decided_by: decided_by.into(),
+                },
+            )),
+            r.scrub(EventEnvelope::new(
+                session_id,
+                Actor::System,
+                EventBody::ToolDecision {
+                    tool_call_id: "tc-decide".into(),
+                    tool: "Bash".into(),
+                    verdict: "allow".into(),
+                    source: "human".into(),
+                    original_verdict: None,
+                    reason: Some(format!("human:{decided_by}")),
+                },
+            )),
+        ]
+    }
+
+    /// **THE load-bearing Gap-13 test.** A decided approval ledgers EXACTLY ONE
+    /// `approval.decided` and ONE `tool.decision`, no matter how many handlers are
+    /// attached to the row.
+    ///
+    /// Why this would have FAILED before the change: emission used to live in
+    /// `await_pending_decision`, which ran it UNCONDITIONALLY for every awakened
+    /// waiter — and two waiters on one pending row is an ordinary occurrence (a
+    /// `/permission` retry across a runner restart re-attaches while the first
+    /// call still blocks; both the has-session-grant branch and the
+    /// lost-the-promotion branch fall through to the same wait). Both would wake
+    /// on one decision and both would append, giving 2 + 2 (design :1058-1066 —
+    /// a single-process bug, not merely a multi-replica one). The events are now
+    /// carried BY the decision CAS, so the sequence below — three deciders
+    /// racing/retrying one row, exactly as N waiters would — writes one pair.
+    #[tokio::test]
+    async fn decided_approval_ledgers_exactly_one_pair_however_many_deciders() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        let approval = seed_pending_approval(&pool, scope, session_id, "tc-decide", 600).await;
+
+        // Two GENUINELY concurrent deciders (separate pool handles), each carrying
+        // its own copy of the events — the shape two re-attached waiters had.
+        let pool2 = pool.clone();
+        let (a, b) = tokio::join!(
+            decide_approval_tx(
+                &pool,
+                scope,
+                approval.id,
+                "approved_once",
+                "human:alice",
+                decision_events(session_id, approval.id, "approved_once", "alice"),
+            ),
+            decide_approval_tx(
+                &pool2,
+                scope,
+                approval.id,
+                "approved_once",
+                "human:alice",
+                decision_events(session_id, approval.id, "approved_once", "alice"),
+            ),
+        );
+        let winners = [a.unwrap(), b.unwrap()]
+            .iter()
+            .filter(|o| o.is_some())
+            .count();
+
+        // A third, LATER decider (the waiter's own timeout CAS racing a human who
+        // already won) must also emit nothing.
+        let late = decide_approval_tx(
+            &pool,
+            scope,
+            approval.id,
+            "denied",
+            "timeout",
+            decision_events(session_id, approval.id, "denied", "timeout"),
+        )
+        .await
+        .unwrap();
+
+        let decided = count_events(&pool, scope, session_id, "approval.decided").await;
+        let tool_dec = count_events(&pool, scope, session_id, "tool.decision").await;
+        cleanup_sw_tenant(&pool, tenant).await;
+
+        assert_eq!(winners, 1, "exactly one concurrent decider wins the CAS");
+        assert!(
+            late.is_none(),
+            "a decider that lost the CAS decides nothing"
+        );
+        assert_eq!(
+            decided, 1,
+            "exactly ONE approval.decided per decided approval (was 1-per-waiter)"
+        );
+        assert_eq!(
+            tool_dec, 1,
+            "exactly ONE tool.decision per decided approval (was 1-per-waiter)"
+        );
+    }
+
+    /// The expiry decision site obeys the same rule: single-winner CAS, one pair
+    /// of events, and a loser (a human who decided first) writes nothing.
+    #[tokio::test]
+    async fn expiry_decision_is_single_winner_and_emits_once() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        // Already past its deadline.
+        let approval = seed_pending_approval(&pool, scope, session_id, "tc-decide", -60).await;
+
+        let scanned = system_worker::expired_pending_approvals(&pool, 100)
+            .await
+            .unwrap();
+        let seen = scanned.iter().any(|r| r.id == approval.id);
+
+        let pool2 = pool.clone();
+        let (a, b) = tokio::join!(
+            expire_approval_tx(
+                &pool,
+                scope,
+                approval.id,
+                decision_events(session_id, approval.id, "expired", "timeout"),
+            ),
+            expire_approval_tx(
+                &pool2,
+                scope,
+                approval.id,
+                decision_events(session_id, approval.id, "expired", "timeout"),
+            ),
+        );
+        let winners = [a.unwrap(), b.unwrap()]
+            .iter()
+            .filter(|o| o.is_some())
+            .count();
+        let decided = count_events(&pool, scope, session_id, "approval.decided").await;
+        let tool_dec = count_events(&pool, scope, session_id, "tool.decision").await;
+        // The single-emission marker for the post-wait terminal deny: one winner.
+        let m1 = claim_terminal_deny_emission(&pool, scope, approval.id)
+            .await
+            .unwrap();
+        let m2 = claim_terminal_deny_emission(&pool, scope, approval.id)
+            .await
+            .unwrap();
+        cleanup_sw_tenant(&pool, tenant).await;
+
+        assert!(
+            seen,
+            "the cross-tenant scan finds an over-deadline approval"
+        );
+        assert_eq!(winners, 1, "exactly one replica expires the row");
+        assert_eq!(decided, 1, "expiry ledgers ONE approval.decided");
+        assert_eq!(tool_dec, 1, "expiry ledgers ONE tool.decision");
+        assert!(m1, "the first terminal-deny claim wins");
+        assert!(!m2, "a second waiter's terminal-deny claim emits nothing");
+    }
+
+    /// Lease steal matrix + the epoch's defining asymmetry: it moves ONLY on an
+    /// owner change. Fresh / self-renew / held-by-another-unexpired / expired.
+    #[tokio::test]
+    async fn session_lease_steals_on_expiry_and_epoch_moves_only_on_owner_change() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+
+        // (1) FRESH: no owner → acquired, epoch 0 → 1 (owner changed null → A).
+        let e1 = acquire_session_lease(&pool, scope, session_id, a, 300)
+            .await
+            .unwrap();
+        // (2) SELF-RENEW: same owner keeps the epoch (the fence must not move
+        //     under a healthy driver's own feet).
+        let e2 = acquire_session_lease(&pool, scope, session_id, a, 300)
+            .await
+            .unwrap();
+        // (3) HELD BY ANOTHER, UNEXPIRED: refused outright.
+        let held = acquire_session_lease(&pool, scope, session_id, b, 300)
+            .await
+            .unwrap();
+        // (4) EXPIRED: force the deadline into the past, then B steals — epoch+1.
+        {
+            let mut tx = worker_tx(&pool).await.unwrap();
+            sqlx::query(
+                "update sessions set orchestrator_lease_until = now() - interval '1 minute'
+                 where id = $1",
+            )
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let e3 = acquire_session_lease(&pool, scope, session_id, b, 300)
+            .await
+            .unwrap();
+        let after = session_lease(&pool, scope, session_id).await.unwrap();
+        cleanup_sw_tenant(&pool, tenant).await;
+
+        assert_eq!(
+            e1,
+            Some(1),
+            "a fresh acquire is an owner change: epoch 0 → 1"
+        );
+        assert_eq!(e2, Some(1), "a self-renew must NOT move the epoch");
+        assert_eq!(
+            held, None,
+            "an unexpired lease held by another replica is refused"
+        );
+        assert_eq!(
+            e3,
+            Some(2),
+            "a steal after expiry is an owner change: epoch+1"
+        );
+        let (owner, _, epoch) = after.expect("session row");
+        assert_eq!(owner, Some(b), "the steal recorded the new owner");
+        assert_eq!(epoch, 2);
+    }
+
+    /// Source guards for the two Gap-13 SQL predicates whose behavioral tests are
+    /// DB-gated (they self-skip without `DATABASE_URL`, so CI is where they run).
+    /// These assert the predicates themselves, so deleting either one fails
+    /// IMMEDIATELY — with or without a database — instead of silently passing a
+    /// skipped suite. Needles are split so this guard is not itself an occurrence.
+    #[test]
+    fn coordination_sql_predicates_are_present() {
+        let src = include_str!("lib.rs");
+
+        // (1) The epoch is a FENCING TOKEN, not a counter: it moves only when the
+        // owner changes. Drop the conditional and a healthy driver's own renew
+        // invalidates its in-flight fence — every renew would look like a takeover.
+        let epoch_guard = concat!("orchestrator_owner_id is distinct ", "from $3");
+        assert!(
+            src.contains(epoch_guard),
+            "acquire_session_lease must bump orchestrator_epoch ONLY on an owner \
+             change (`{epoch_guard}`); an unconditional bump makes a self-renew \
+             fence the renewing driver out of its own session"
+        );
+
+        // (2) A delivery attempt is recorded only by the replica that HOLDS the
+        // row's claim. Drop the guard and a replica whose claim expired mid-attempt
+        // stomps the new owner's attempt counter and backoff.
+        let claim_guard = concat!("where id = $1 and claimed_", "by = $8");
+        assert!(
+            src.contains(claim_guard),
+            "mark_delivery_attempt must be owner-guarded (`{claim_guard}`) or two \
+             replicas can both record attempts on one delivery row"
+        );
+
+        // (3) SKIP LOCKED is what makes two replicas' claimed sets DISJOINT; a
+        // plain FOR UPDATE would serialize them onto the same rows instead.
+        // Scoped to the STATEMENT (the prose above it mentions the clause too, so a
+        // whole-file `contains` would be satisfied by the doc comment alone).
+        let sw = include_str!("system_worker.rs");
+        let stmt_start = sw.find("with due as (").expect("the claim CTE exists");
+        let stmt_end = sw[stmt_start..]
+            .find("returning d.*")
+            .map(|i| stmt_start + i)
+            .expect("the claim CTE returns its rows");
+        let skip_locked = concat!("for update skip ", "locked");
+        assert!(
+            sw[stmt_start..stmt_end].contains(skip_locked),
+            "claim_due_deliveries's CTE must use `{skip_locked}` so replicas take \
+             disjoint slices rather than queueing on each other"
+        );
+    }
+
+    /// The fencing token does its job: a driver carrying a STALE epoch mutates
+    /// nothing, while the current holder's identical call succeeds.
+    #[tokio::test]
+    async fn epoch_fence_rejects_a_stale_driver_and_admits_the_holder() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+
+        let stale = acquire_session_lease(&pool, scope, session_id, a, 300)
+            .await
+            .unwrap()
+            .unwrap();
+        // A steals, stalls; B takes over (epoch moves) — A's token is now stale.
+        {
+            let mut tx = worker_tx(&pool).await.unwrap();
+            sqlx::query(
+                "update sessions set orchestrator_lease_until = now() - interval '1 minute'
+                 where id = $1",
+            )
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let fresh = acquire_session_lease(&pool, scope, session_id, b, 300)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let by_stale = transition_session_fenced(
+            &pool,
+            scope,
+            session_id,
+            SessionStatus::Provisioning,
+            Some("stale driver"),
+            stale,
+        )
+        .await
+        .unwrap();
+        let by_holder = transition_session_fenced(
+            &pool,
+            scope,
+            session_id,
+            SessionStatus::Provisioning,
+            Some("current holder"),
+            fresh,
+        )
+        .await
+        .unwrap();
+        let status = get_session(&pool, scope, session_id)
+            .await
+            .unwrap()
+            .map(|s| (s.status, s.status_reason));
+        cleanup_sw_tenant(&pool, tenant).await;
+
+        assert_ne!(stale, fresh, "a takeover must move the epoch");
+        assert!(
+            by_stale.is_none(),
+            "a stale-epoch driver's lifecycle mutation must affect ZERO rows"
+        );
+        assert!(by_holder.is_some(), "the current lease holder proceeds");
+        assert_eq!(
+            status,
+            Some(("provisioning".into(), Some("current holder".into()))),
+            "only the holder's write landed"
+        );
+    }
+
+    /// Two replicas polling one due-delivery backlog take DISJOINT sets, and a
+    /// replica that no longer holds a row's claim cannot record its attempt.
+    #[tokio::test]
+    async fn delivery_claims_are_disjoint_and_attempts_are_owner_guarded() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let d = enqueue_result_delivery(
+                &pool,
+                scope,
+                session_id,
+                None,
+                &serde_json::json!({"kind":"signed_webhook","url":format!("https://x.test/{i}")}),
+            )
+            .await
+            .unwrap();
+            ids.push(d.id);
+        }
+
+        // Replica A claims two, replica B claims the rest: SKIP LOCKED + the
+        // claim stamp make the sets disjoint (B cannot see A's claimed rows).
+        let claimed_a = system_worker::claim_due_deliveries(&pool, a, 2, 300)
+            .await
+            .unwrap();
+        let claimed_b = system_worker::claim_due_deliveries(&pool, b, 10, 300)
+            .await
+            .unwrap();
+        let set_a: std::collections::HashSet<Uuid> = claimed_a.iter().map(|r| r.id).collect();
+        let set_b: std::collections::HashSet<Uuid> = claimed_b.iter().map(|r| r.id).collect();
+        let overlap = set_a.intersection(&set_b).count();
+
+        // B cannot record an attempt on a row A holds.
+        let stolen = mark_delivery_attempt(
+            &pool,
+            scope,
+            *set_a.iter().next().unwrap(),
+            b,
+            false,
+            Some("not mine"),
+            None,
+            30,
+            3,
+        )
+        .await
+        .unwrap();
+        // A can, and doing so RELEASES the claim.
+        let own_id = *set_a.iter().next().unwrap();
+        let mine =
+            mark_delivery_attempt(&pool, scope, own_id, a, false, Some("refused"), None, 30, 3)
+                .await
+                .unwrap();
+        let released: Option<(Option<Uuid>,)> = {
+            let mut tx = worker_tx(&pool).await.unwrap();
+            let r = sqlx::query_as("select claimed_by from result_deliveries where id = $1")
+                .bind(own_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            r
+        };
+        cleanup_sw_tenant(&pool, tenant).await;
+
+        assert_eq!(set_a.len(), 2, "the limit bounds a replica's claimed slice");
+        assert_eq!(set_b.len(), 2, "the other replica takes what is left");
+        assert_eq!(overlap, 0, "two replicas never claim the same delivery row");
+        assert!(
+            stolen.is_none(),
+            "a replica that does not hold the claim cannot record an attempt"
+        );
+        assert!(mine.is_some(), "the claim holder records its attempt");
+        assert_eq!(
+            released,
+            Some((None,)),
+            "recording an attempt releases the claim for the next backoff window"
+        );
     }
 }
