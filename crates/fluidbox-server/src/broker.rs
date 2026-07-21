@@ -4,24 +4,36 @@
 //! dropped. Fourth instance of the credential inversion (LLM facade, git
 //! fetch, webhook verify, tool broker).
 //!
-//! Deliberately minimal client: JSON-RPC POSTs to the single MCP endpoint,
-//! accepting both `application/json` and SSE-framed responses (the spec
-//! requires clients to handle both). Stateless-first: `tools/*` is attempted
-//! directly; if the server demands a session (pre-2026 revisions), one
-//! `initialize` handshake runs and the call retries once — safe because a
-//! session-required rejection means the tool never executed.
+//! Per-run MCP session manager (Phase E, E5–E8): the client `initialize`s FIRST
+//! for every new `(run, peer)`, persists the negotiated protocol version +
+//! optional session id in a replica-local registry, reuses that session across
+//! the run's brokered calls (sending `MCP-Protocol-Version` on every
+//! post-initialize request), re-initializes ONCE on a 404-with-session, DELETEs
+//! the session at the run's terminal transition, and speaks a real incremental
+//! SSE parser ([`crate::mcp_sse`]) with content-type + jsonrpc + id validation.
+//! It accepts both `application/json` and SSE-framed responses, replies
+//! `-32601` to unsupported server→client requests, and treats an SEP-835
+//! `insufficient_scope` challenge as terminal (never a re-mint).
 
-use crate::state::AppState;
+use crate::state::{AppState, McpPeer, McpUpstreamSession};
 use fluidbox_core::capability::{CapabilityServer, ToolSnapshot};
 use futures::StreamExt;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 const MCP_TIMEOUT: Duration = Duration::from_secs(30);
-/// Protocol revision we offer at initialize; we echo whatever the server
-/// negotiates on subsequent requests.
-const OFFERED_PROTOCOL: &str = "2025-06-18";
+/// Best-effort cap on the terminal session-DELETE (never blocks terminalization).
+const MCP_DELETE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Protocol revision we OFFER at initialize (2025-11-25). We accept any version
+/// in [`SUPPORTED_PROTOCOLS`], and — once a surface is frozen (Task 3) — the one
+/// the snapshot recorded.
+const OFFERED_PROTOCOL: &str = "2025-11-25";
+/// The protocol revisions this client can speak. A server negotiating anything
+/// outside this set (with no frozen snapshot to defer to) fails the call.
+const SUPPORTED_PROTOCOLS: [&str; 2] = ["2025-11-25", "2025-06-18"];
 /// Discovery pagination bound (tools beyond this are a config smell; the
 /// per-server tool cap in fluidbox-core rejects them at validation anyway).
 const MAX_LIST_PAGES: usize = 4;
@@ -36,6 +48,20 @@ const MAX_RESULT_BYTES: usize = 256 * 1024;
 /// and discovery re-validates the whole surface against fluidbox-core's 2 MiB
 /// serialized ceiling.
 const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+/// How many server→client REQUESTS one response may make us answer with a
+/// `-32601` (C2). The 2025-11-25 spec defines exactly three server→client
+/// requests (`sampling/createMessage`, `roots/list`, `elicitation/create`) and we
+/// implement none of them, so a conformant server sends at most a handful per
+/// response and every one is refused. 8 leaves generous headroom for that while
+/// bounding the outbound amplification the governor never sees: 8 replies ×
+/// [`MCP_DELETE_TIMEOUT`] = 40 s worst case against a 600 s execution-claim TTL,
+/// versus the ~180 000 sequential POSTs an 8 MiB body of request frames buys.
+const MAX_SERVER_REQUEST_REPLIES: usize = 8;
+/// Wall-clock budget for ONE response's whole reply loop (C2), independent of the
+/// count: a stalling server that answers each reply just under
+/// [`MCP_DELETE_TIMEOUT`] must still not push the exchange toward the claim TTL.
+/// 30 s + one in-flight 5 s reply is the hard ceiling on this loop.
+const SERVER_REQUEST_REPLY_BUDGET: Duration = Duration::from_secs(30);
 
 /// A resolved outbound credential: which header to set, its full value, and
 /// — for OAuth connections — the connection whose access token can be
@@ -44,6 +70,12 @@ pub struct BrokeredAuth {
     pub header: String,
     pub value: String,
     pub oauth_connection: Option<uuid::Uuid>,
+    /// The connection's `authorization_generation` AS OF resolution. Carried so
+    /// a status write derived from this credential's outcome can be conditioned
+    /// on it: a hostile server can hold a request open while the owner
+    /// reconnects, then answer `insufficient_scope`, and an unconditional write
+    /// would mark the NEW, freshly-authorized generation `error`.
+    pub generation: i32,
 }
 
 impl BrokeredAuth {
@@ -113,28 +145,42 @@ pub async fn brokered_auth(
     let Some(cid) = connection_id else {
         return Ok(None);
     };
-    // Unfiltered read by design: the LEGACY broker path's authority comes from
-    // the frozen RunSpec's embedded `connection_id`, never a request viewer — so
-    // no owner-visibility filter applies. This path (a pre-Phase-C bundle) froze
-    // no binding, so there is no generation/owner to recheck; the status read
-    // below is the only live check. Phase C runs route through the binding path
-    // ([`recheck_binding`] + [`call_tool_for_conn`]), never here.
+    auth_for_connection_id(state, scope, *cid, url)
+        .await
+        .map_err(|e| format!("capability server '{name}': {e}"))
+}
+
+/// The LEGACY embedded-connection resolution core: fetch the connection fresh by
+/// id under `scope`, then defer to [`brokered_auth_for_conn`]. Shared by
+/// [`brokered_auth`] (the frozen-RunSpec call path) and the terminal session
+/// DELETE, so both send exactly the credential a live call would.
+///
+/// Unfiltered read by design: the LEGACY broker path's authority comes from the
+/// frozen RunSpec's embedded `connection_id`, never a request viewer — so no
+/// owner-visibility filter applies. This path (a pre-Phase-C bundle) froze no
+/// binding, so there is no generation/owner to recheck; the status read inside
+/// [`brokered_auth_for_conn`] is the only live check. Phase C runs route through
+/// the binding path ([`recheck_binding`] + [`call_tool_for_conn`]), never here.
+async fn auth_for_connection_id(
+    state: &AppState,
+    scope: fluidbox_db::TenantScope,
+    cid: uuid::Uuid,
+    url: &str,
+) -> Result<Option<BrokeredAuth>, String> {
     // Tenant known (the frozen RunSpec's scope) → scoped_tx so the RLS GUC rides
     // the executor-generic read.
     let mut conn_tx = fluidbox_db::scoped_tx(&state.pool, scope)
         .await
         .map_err(|e| format!("connection lookup failed: {e}"))?;
-    let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, *cid)
+    let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, cid)
         .await
         .map_err(|e| format!("connection lookup failed: {e}"))?
-        .ok_or_else(|| format!("capability server '{name}': connection {cid} is missing"))?;
+        .ok_or_else(|| format!("connection {cid} is missing"))?;
     conn_tx
         .commit()
         .await
         .map_err(|e| format!("connection lookup failed: {e}"))?;
-    brokered_auth_for_conn(state, scope, &conn, url)
-        .await
-        .map_err(|e| format!("capability server '{name}': {e}"))
+    brokered_auth_for_conn(state, scope, &conn, url).await
 }
 
 /// Credential-resolution CORE, callable with an ALREADY-FETCHED connection row
@@ -184,6 +230,7 @@ pub async fn brokered_auth_for_conn(
             header: "authorization".into(),
             value: format!("Bearer {access}"),
             oauth_connection: Some(conn.id),
+            generation: conn.authorization_generation,
         }));
     }
     let sealer = state
@@ -229,6 +276,7 @@ pub async fn brokered_auth_for_conn(
         header,
         value: compose_header_value(scheme, &token),
         oauth_connection: None,
+        generation: conn.authorization_generation,
     }))
 }
 
@@ -450,23 +498,90 @@ pub fn url_within_base(url: &str, base: &str) -> bool {
     up == bp || up.starts_with(&format!("{bp}/"))
 }
 
-// ─── Minimal MCP Streamable HTTP client ───────────────────────────────────
+// ─── Per-run MCP session manager ──────────────────────────────────────────
 
-/// Errors where HTTP 401 stays distinguishable: an OAuth connection may
-/// re-mint its access token and retry exactly once (the 401 happened at the
-/// auth layer, so the tool provably never executed — the same reasoning
-/// that makes the session-handshake retry safe).
+/// The classification of ONE logical brokered dispatch (Phase E, #33; Gap 11,
+/// plan E10) — INCLUDING its sanctioned single 401-reauth retry. The execution
+/// claim is completed from this: `Definitive&&!is_error → succeeded`,
+/// `Definitive&&is_error → failed_upstream`, `NeverSent → failed_before_send`
+/// (the ONLY re-claimable state), `Ambiguous → ambiguous` (never auto-retried,
+/// invariant 15). Err-free by design: every early return (auth resolution, URL
+/// admission, breaker-open) is one of the three variants, so no caller can forget
+/// to classify a failure.
+#[derive(Debug)]
+pub enum DispatchOutcome {
+    /// The upstream answered definitively. `is_error=false` = a real MCP result;
+    /// `is_error=true` = an MCP `isError` result OR a definitive upstream error
+    /// (HTTP error status / JSON-RPC error object), rendered as an error result.
+    Definitive {
+        content: Value,
+        is_error: bool,
+        structured: Option<Value>,
+    },
+    /// POSITIVE proof no request bytes were written (URL admission refusal, auth
+    /// resolution failure, binding recheck refusal, breaker-open, or a reqwest
+    /// `is_connect()` transport error). Re-claimable.
+    NeverSent(String),
+    /// The request was (or may have been) sent but the outcome is unknown: a
+    /// timeout, a mid-stream body-read/decode failure, or a post-connect redirect
+    /// refusal. Terminal — never auto-retried.
+    Ambiguous(String),
+}
+
+/// Broker call outcomes that stay distinguishable above the transport:
+/// - `Unauthorized` — HTTP 401 with no scope challenge: an OAuth connection may
+///   re-mint and retry exactly once (the 401 proves the tool never executed).
+/// - `InsufficientScope` — an SEP-835 challenge: the grant lacks a scope, so a
+///   re-mint cannot help; terminal for the call (the caller marks the
+///   connection). Carries the (sanitized) scope the server asked for.
+/// - `SessionExpired` — HTTP 404 on a request that carried a session id: the
+///   session manager re-initializes ONCE and replays (never escapes as-is).
+/// - `Other` — a DEFINITIVE upstream protocol error (HTTP 4xx, JSON-RPC error
+///   object): the tool call resolved to an error → `failed_upstream`.
+/// - `UpstreamUnavailable` — a DEFINITIVE 5xx. Classified exactly like `Other`
+///   for the dispatch outcome (`failed_upstream`, never ambiguous), but split out
+///   because it is the one definitive response that ALSO counts as an
+///   upstream-HEALTH failure for the circuit breaker (plan E14).
+/// - `NeverSent` — provable no-send (admit_url refusal, reqwest `is_connect()`).
+/// - `Ambiguous` — sent/maybe-sent, outcome unknown (timeout, redirect after
+///   connect, mid-stream body-read/decode failure).
+#[derive(Debug)]
 enum CallErr {
     Unauthorized,
+    InsufficientScope(Option<String>),
+    SessionExpired,
     Other(String),
+    UpstreamUnavailable(String),
+    NeverSent(String),
+    Ambiguous(String),
 }
 
 impl CallErr {
     fn into_msg(self) -> String {
         match self {
             CallErr::Unauthorized => "mcp server rejected the credential (HTTP 401)".into(),
-            CallErr::Other(m) => m,
+            CallErr::InsufficientScope(_) => {
+                "insufficient scope — reconnect the connection with more scopes".into()
+            }
+            CallErr::SessionExpired => "mcp session expired and could not be re-initialized".into(),
+            CallErr::Other(m)
+            | CallErr::UpstreamUnavailable(m)
+            | CallErr::NeverSent(m)
+            | CallErr::Ambiguous(m) => m,
         }
+    }
+}
+
+/// Classify one dialed HTTP status the session machinery could not use: a 5xx is
+/// an upstream-health failure ([`CallErr::UpstreamUnavailable`]), any other error
+/// status is a plain definitive error ([`CallErr::Other`]). Both render as
+/// `failed_upstream`; only the former feeds the circuit breaker.
+fn status_err(method: &str, status: reqwest::StatusCode) -> CallErr {
+    let msg = format!("mcp {method} returned HTTP {status}");
+    if status.is_server_error() {
+        CallErr::UpstreamUnavailable(msg)
+    } else {
+        CallErr::Other(msg)
     }
 }
 
@@ -482,194 +597,454 @@ impl From<&str> for CallErr {
     }
 }
 
-struct McpSession {
-    session_id: Option<String>,
-    protocol_version: Option<String>,
+/// A one-text-block error content array (an upstream/transport definitive error
+/// carries no MCP `content`, so the runner-facing result synthesizes one). The
+/// message is already sanitized (digests, not secrets).
+fn err_content(msg: &str) -> Value {
+    json!([{ "type": "text", "text": msg }])
 }
 
-async fn post_rpc(
-    state: &AppState,
+/// Map the inner `call_tool` result (a real MCP result, or a classified
+/// `CallErr`) to the dispatch's [`DispatchOutcome`] (plan E10). The retry logic
+/// in the two public fns intercepts `Unauthorized`/`InsufficientScope` first;
+/// the arms for them here are defensive.
+fn outcome_from_call(r: Result<(Value, bool, Option<Value>), CallErr>) -> DispatchOutcome {
+    match r {
+        Ok((content, is_error, structured)) => DispatchOutcome::Definitive {
+            content,
+            is_error,
+            structured,
+        },
+        Err(CallErr::NeverSent(m)) => DispatchOutcome::NeverSent(m),
+        Err(CallErr::Ambiguous(m)) => DispatchOutcome::Ambiguous(m),
+        // Definitive upstream protocol errors (HTTP status, JSON-RPC error) and
+        // the terminal auth/session variants → an error RESULT (failed_upstream).
+        Err(e) => DispatchOutcome::Definitive {
+            content: err_content(&e.into_msg()),
+            is_error: true,
+            structured: None,
+        },
+    }
+}
+
+// ─── Outbound governor wiring (Phase E, E14) ──────────────────────────────
+
+/// The upstream-host bucket key: the lowercased host, port-insensitive. Port
+/// deliberately excluded — including it would let one connection evade its host
+/// ceiling by cycling ports on the same machine. A URL with no parsable host
+/// keys the empty bucket (its dial is refused a moment later by `admit_url`
+/// anyway); the tenant/connection dimensions still bind either way.
+fn host_key(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+        .unwrap_or_default()
+}
+
+/// The pre-dial governor gate for ONE brokered dispatch. Runs AFTER the execution
+/// claim is won (the caller's `finish_won_claim`) and BEFORE anything touches the
+/// wire — including before the per-peer MCP session mutex is acquired.
+///
+/// **Lock order (Task 2 rider):** governor → per-peer session mutex, never the
+/// reverse. The governor's own lock is a leaf: `check` takes it, does pure
+/// in-memory arithmetic, and releases it before returning — it never awaits, and
+/// it never acquires the session registry map lock or a per-peer entry lock. So
+/// this order cannot deadlock, and it also means a throttled or circuit-broken
+/// call never blocks behind an in-flight call to the same peer just to be told no.
+///
+/// A refusal is a **pre-write proof of non-dispatch**, so it maps to
+/// [`DispatchOutcome::NeverSent`] ⇒ claim `failed_before_send` ⇒ RE-CLAIMABLE,
+/// which is exactly what makes the `retry after Ns` hint safe to act on. The
+/// message carries the scope + the hint and a DIGEST of the upstream host — never
+/// the host verbatim (same discipline as [`msg_digest`] on untrusted upstream
+/// text). Returns the host key on admission, for the matching `report`.
+fn governor_gate(
+    gov: &crate::governor::EgressGovernor,
+    tenant: uuid::Uuid,
+    connection: uuid::Uuid,
+    url: &str,
+) -> Result<crate::governor::Permit, DispatchOutcome> {
+    let host = host_key(url);
+    match gov.check(tenant, connection, &host) {
+        Ok(permit) => Ok(permit),
+        Err(t) => {
+            tracing::info!(
+                target: "broker",
+                "outbound dial refused by the egress governor (scope {}, upstream {}, retry {}s)",
+                t.scope, msg_digest(&host), t.retry_after_secs
+            );
+            Err(DispatchOutcome::NeverSent(t.message(&msg_digest(&host))))
+        }
+    }
+}
+
+/// The circuit breaker's ONLY input: was this dial an upstream-HEALTH failure?
+///
+/// | dial result                                   | signal            |
+/// |-----------------------------------------------|-------------------|
+/// | `Ok(_)` — a real MCP result, `isError` or not | `Ok`              |
+/// | JSON-RPC `error` object / HTTP 4xx (`Other`)  | `Ok`              |
+/// | 401 / SEP-835 / 404-session-expired           | `Ok`              |
+/// | HTTP 5xx (`UpstreamUnavailable`)              | `TransportFailure`|
+/// | connect refused / SSRF-resolver / inadmissible URL (`NeverSent`) | `TransportFailure` |
+/// | timeout / mid-stream read / refused redirect (`Ambiguous`)       | `TransportFailure` |
+///
+/// The load-bearing rule (plan E14): a DEFINITIVE upstream tool error means the
+/// upstream is healthy and answering — an `isError` result, a JSON-RPC error, or
+/// a 4xx MUST NOT trip the breaker. Only "we could not get a usable answer out of
+/// this endpoint" does.
+fn breaker_signal(r: &Result<(Value, bool, Option<Value>), CallErr>) -> crate::governor::Outcome {
+    use crate::governor::Outcome;
+    match r {
+        Err(CallErr::UpstreamUnavailable(_))
+        | Err(CallErr::NeverSent(_))
+        | Err(CallErr::Ambiguous(_)) => Outcome::TransportFailure,
+        _ => Outcome::Ok,
+    }
+}
+
+/// The session-scoped headers set on every dialed request: the server-issued
+/// `Mcp-Session-Id` (when present) and the negotiated `MCP-Protocol-Version`
+/// (on every POST-initialize request — absent only DURING initialize, when
+/// nothing is negotiated yet).
+#[derive(Clone, Copy, Default)]
+struct SessionHeaders<'a> {
+    session_id: Option<&'a str>,
+    protocol_version: Option<&'a str>,
+}
+
+/// One dialed JSON-RPC exchange's outcome at the transport layer.
+#[derive(Debug)]
+struct DialResponse {
+    status: reqwest::StatusCode,
+    /// The `Mcp-Session-Id` the server issued/echoed on THIS response, if any.
+    session_id: Option<String>,
+    /// The `WWW-Authenticate` challenge on a 401/403 (for SEP-835 parsing).
+    www_authenticate: Option<String>,
+    /// The selected JSON-RPC response value (Null on a non-2xx / empty body).
+    value: Value,
+}
+
+/// Set the session headers a request carries, given the session's current state.
+fn session_headers(sess: &McpUpstreamSession) -> SessionHeaders<'_> {
+    SessionHeaders {
+        session_id: sess.session_id.as_deref(),
+        // `MCP-Protocol-Version` on every POST-initialize request; empty
+        // negotiated (still handshaking) ⇒ no header.
+        protocol_version: (!sess.negotiated.is_empty()).then_some(sess.negotiated.as_str()),
+    }
+}
+
+/// Dial ONE request over the hardened `egress_http` and return the selected
+/// JSON-RPC response. Admits the destination (scheme + host-literal IP block),
+/// REFUSES any redirect (`Policy::none` — an MCP endpoint pivoting us onto a
+/// fresh host is an SSRF vector), bounded-reads the DECODED body (8 MiB), runs
+/// the incremental SSE parser (per-event cap) or JSON parse, validates the
+/// content-type + `jsonrpc: "2.0"` + id match on success, replies `-32601` to
+/// any server→client REQUEST and ignores notifications. Taking the client +
+/// policy directly (not `&AppState`) keeps the redirect/parse contract testable
+/// against a fake server.
+async fn dial_rpc(
+    client: &reqwest::Client,
+    policy: &crate::egress::EgressPolicy,
     url: &str,
     auth: Option<&BrokeredAuth>,
-    session: Option<&McpSession>,
+    headers: SessionHeaders<'_>,
     body: &Value,
-) -> Result<(reqwest::StatusCode, Option<String>, Value), String> {
-    let mut req = state
-        .http
+    timeout: Duration,
+) -> Result<DialResponse, CallErr> {
+    // URL admission is BEFORE any bytes leave — a refusal is provably no-send.
+    crate::egress::admit_url(url, policy).map_err(|e| CallErr::NeverSent(e.to_string()))?;
+    let res = match build_req(client, url, auth, headers)
+        .timeout(timeout)
+        .json(body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        // `Policy::none` can surface a refused redirect as an error; never echo
+        // the Location target — log a digest of the request URL at debug only.
+        // A redirect happens AFTER connect ⇒ the request was sent ⇒ Ambiguous.
+        Err(e) if e.is_redirect() => {
+            tracing::debug!(target: "broker", "mcp upstream redirect refused (req {})", msg_digest(url));
+            return Err(CallErr::Ambiguous(
+                "upstream attempted redirect (refused)".into(),
+            ));
+        }
+        // A connect-phase error (DNS/SSRF-resolver rejection, refused TCP, TLS
+        // handshake) is provable no-send; a timeout or any other transport error
+        // after connect is Ambiguous (bytes may have gone out).
+        Err(e) if e.is_connect() => {
+            return Err(CallErr::NeverSent(format!("mcp server unreachable: {e}")));
+        }
+        Err(e) if e.is_timeout() => {
+            return Err(CallErr::Ambiguous(format!("mcp request timed out: {e}")));
+        }
+        Err(e) => return Err(CallErr::Ambiguous(format!("mcp transport error: {e}"))),
+    };
+    let status = res.status();
+    // A redirect the client did NOT follow comes back as a 3xx response under
+    // `Policy::none`; refuse it identically and never echo the Location header.
+    // The request WAS sent (we got a response) ⇒ Ambiguous.
+    if status.is_redirection() {
+        if let Some(loc) = res.headers().get("location").and_then(|v| v.to_str().ok()) {
+            tracing::debug!(target: "broker", "mcp upstream redirect refused (loc {})", msg_digest(loc));
+        }
+        return Err(CallErr::Ambiguous(
+            "upstream attempted redirect (refused)".into(),
+        ));
+    }
+    let session_id = header_str(&res, "mcp-session-id");
+    let www_authenticate = header_str(&res, "www-authenticate");
+    let content_type = header_str(&res, "content-type").unwrap_or_default();
+    let media_type = media_type_of(&content_type);
+    let is_sse = media_type == "text/event-stream";
+    let is_json = media_type == "application/json";
+    // R3.3: refuse an over-large advertised body BEFORE buffering it in memory.
+    // Sent + a response received but unusable ⇒ Ambiguous.
+    if let Some(len) = res.content_length() {
+        if len > MAX_RESPONSE_BYTES {
+            return Err(CallErr::Ambiguous(format!(
+                "mcp response advertises {len} bytes, over the {MAX_RESPONSE_BYTES}-byte cap"
+            )));
+        }
+    }
+    // The Content-Length pre-check only bounds a body that ADVERTISES its length;
+    // a chunked/compressed response slips it and `text()` would buffer unboundedly
+    // (D). Stream the DECODED body, aborting the moment it would exceed the cap.
+    // A mid-stream read failure or over-cap ⇒ Ambiguous (the send happened).
+    let mut stream = res.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| CallErr::Ambiguous(format!("mcp response unreadable: {e}")))?;
+        if buf.len() + chunk.len() > MAX_RESPONSE_BYTES as usize {
+            return Err(CallErr::Ambiguous(format!(
+                "mcp response exceeds the {MAX_RESPONSE_BYTES}-byte cap while streaming"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    // The body is only interpreted as JSON-RPC on SUCCESS: an error status
+    // (401/403/404/5xx) is classified by the caller off `status`; its body
+    // (often text/html) is not our protocol payload.
+    if !status.is_success() || buf.is_empty() {
+        return Ok(DialResponse {
+            status,
+            session_id,
+            www_authenticate,
+            value: Value::Null,
+        });
+    }
+    if !is_sse && !is_json {
+        return Err(CallErr::Ambiguous(format!(
+            "mcp response has an unexpected content-type '{content_type}' (want application/json or text/event-stream)"
+        )));
+    }
+    let messages = parse_messages(&buf, is_sse).map_err(CallErr::Ambiguous)?;
+    let value = select_response(client, url, auth, headers, messages, body.get("id"))
+        .await
+        .map_err(CallErr::Ambiguous)?;
+    Ok(DialResponse {
+        status,
+        session_id,
+        www_authenticate,
+        value,
+    })
+}
+
+/// The bare media type of a `Content-Type` header: parameters (`; charset=…`)
+/// dropped, surrounding whitespace trimmed, ASCII-lowercased (RFC 9110 §8.3 —
+/// the type is case-insensitive, its parameters are not our business).
+///
+/// This must be an EXACT comparison, never a substring one: `contains
+/// ("application/json")` also accepts `application/jsonp`,
+/// `application/json-seq`, `x-application/json` and `application/json+evil`,
+/// none of which is the JSON-RPC framing we parse.
+fn media_type_of(header: &str) -> String {
+    header
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// Build the POST with content-type/accept + auth + session headers.
+fn build_req(
+    client: &reqwest::Client,
+    url: &str,
+    auth: Option<&BrokeredAuth>,
+    headers: SessionHeaders<'_>,
+) -> reqwest::RequestBuilder {
+    // The per-request timeout is applied by the caller (`dial_rpc` uses
+    // `MCP_TIMEOUT`; `reply_method_not_found` uses `MCP_DELETE_TIMEOUT`) so a test
+    // can dial with a short timeout to exercise the Ambiguous timeout arm.
+    let mut req = client
         .post(url)
-        .timeout(MCP_TIMEOUT)
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream");
     if let Some(a) = auth {
         req = req.header(a.header.as_str(), a.value.as_str());
     }
-    if let Some(s) = session {
-        if let Some(sid) = &s.session_id {
-            req = req.header("mcp-session-id", sid);
-        }
-        if let Some(v) = &s.protocol_version {
-            req = req.header("mcp-protocol-version", v);
-        }
+    if let Some(sid) = headers.session_id {
+        req = req.header("mcp-session-id", sid);
     }
-    let res = req
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| format!("mcp server unreachable: {e}"))?;
-    let status = res.status();
-    let session_id = res
-        .headers()
-        .get("mcp-session-id")
+    if let Some(v) = headers.protocol_version {
+        req = req.header("mcp-protocol-version", v);
+    }
+    req
+}
+
+fn header_str(res: &reqwest::Response, name: &str) -> Option<String> {
+    res.headers()
+        .get(name)
         .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let is_sse = res
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.contains("event-stream"))
-        .unwrap_or(false);
-    // R3.3: refuse an over-large advertised body BEFORE buffering it in memory.
-    if let Some(len) = res.content_length() {
-        if len > MAX_RESPONSE_BYTES {
-            return Err(format!(
-                "mcp response advertises {len} bytes, over the {MAX_RESPONSE_BYTES}-byte cap"
-            ));
-        }
-    }
-    // The Content-Length pre-check only bounds a body that ADVERTISES its length;
-    // a chunked or compressed response slips it and `text()` would then buffer
-    // unboundedly (D). Read the DECODED body through the byte stream and abort the
-    // moment the accumulated size would exceed the same hard cap. The per-call
-    // tools/call result path still truncates via `cap_content` after this.
-    let mut stream = res.bytes_stream();
-    let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("mcp response unreadable: {e}"))?;
-        if buf.len() + chunk.len() > MAX_RESPONSE_BYTES as usize {
-            return Err(format!(
-                "mcp response exceeds the {MAX_RESPONSE_BYTES}-byte cap while streaming"
-            ));
-        }
-        buf.extend_from_slice(&chunk);
-    }
-    let text = String::from_utf8_lossy(&buf).into_owned();
-    let value = if text.trim().is_empty() {
-        Value::Null
-    } else if is_sse {
-        parse_sse_json(&text, body.get("id")).unwrap_or(Value::Null)
+        .map(str::to_string)
+}
+
+/// Turn a decoded body into the list of JSON-RPC messages it carries: the SSE
+/// path assembles events (per-event cap) and parses each `data:` payload; the
+/// JSON path parses one object (or a batch array).
+fn parse_messages(buf: &[u8], is_sse: bool) -> Result<Vec<Value>, String> {
+    if is_sse {
+        let mut asm = crate::mcp_sse::SseEventAssembler::new();
+        let mut events = asm.feed(buf)?;
+        // M8: `finish` fails on the same conditions `feed` does, so a server that
+        // omits the final blank line cannot downgrade a protocol violation.
+        events.extend(asm.finish()?);
+        Ok(events
+            .into_iter()
+            .filter_map(|e| serde_json::from_str::<Value>(&e.data).ok())
+            .collect())
     } else {
-        serde_json::from_str(&text).unwrap_or(Value::Null)
-    };
-    Ok((status, session_id, value))
-}
-
-/// Extract the JSON-RPC response object from an SSE-framed body: scan
-/// `data:` lines for the message whose id matches (or the last parseable
-/// message when the request carried no id).
-pub fn parse_sse_json(body: &str, want_id: Option<&Value>) -> Option<Value> {
-    let mut last = None;
-    for line in body.lines() {
-        let Some(data) = line.trim().strip_prefix("data:") else {
-            continue;
-        };
-        let data = data.trim();
-        if data.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(data) else {
-            continue;
-        };
-        match want_id {
-            Some(id) if v.get("id") == Some(id) => return Some(v),
-            _ => last = Some(v),
+        match serde_json::from_slice::<Value>(buf) {
+            Ok(Value::Array(a)) => Ok(a),
+            Ok(v) => Ok(vec![v]),
+            Err(e) => Err(format!("mcp response was not JSON: {e}")),
         }
     }
-    last
 }
 
-/// One JSON-RPC call with the stateless-first strategy. `handshake_retry`
-/// is only safe for calls that a session-required rejection provably did
-/// not execute (the server refused them before dispatch).
-async fn rpc(
-    state: &AppState,
+/// From the parsed messages: reply `-32601` to any server→client REQUEST, log
+/// (and ignore) notifications, and return the RESPONSE whose id matches ours.
+/// Validates `jsonrpc == "2.0"` on the selected response.
+///
+/// **The reply loop is CAPPED (C2).** Each server→client request costs us one
+/// outbound POST, and the governor admitted exactly ONE dial — the replies are
+/// neither counted nor gated. A ~46-byte `{"jsonrpc":"2.0","id":N,"method":"x"}`
+/// frame in an 8 MiB body is ~180 000 of them, each with a 5 s timeout, fired
+/// sequentially while holding the per-peer session mutex and an already-won
+/// execution claim: unbounded outbound amplification, and — once the loop
+/// outlives the claim TTL — a call that reached the wire with NO `tool.brokered`
+/// ledger row, because the sweeper flipped the claim to `ambiguous` and the
+/// finishing CAS then loses. Both bounds below exist to keep one response's
+/// reply work far inside that TTL. The `-32601` behavior itself is unchanged
+/// (the conformance contract requires replying rather than silently ignoring);
+/// past the cap we stop replying and fail the exchange as a protocol violation.
+async fn select_response(
+    client: &reqwest::Client,
     url: &str,
     auth: Option<&BrokeredAuth>,
-    method: &str,
-    params: Value,
-) -> Result<Value, CallErr> {
-    let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
-    let (status, _, value) = post_rpc(state, url, auth, None, &body).await?;
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(CallErr::Unauthorized);
+    headers: SessionHeaders<'_>,
+    messages: Vec<Value>,
+    want_id: Option<&Value>,
+) -> Result<Value, String> {
+    let mut selected: Option<Value> = None;
+    let mut replies = 0usize;
+    let started = std::time::Instant::now();
+    for m in messages {
+        let has_method = m.get("method").is_some();
+        let msg_id = m.get("id").cloned();
+        if has_method && msg_id.is_some() {
+            // A server→client REQUEST: we implement none of them — respond with
+            // a JSON-RPC "method not found" rather than silently ignoring it
+            // (2025-11-25 conformance), best-effort on the same session.
+            replies += 1;
+            if let Some(reason) = reply_budget_exhausted(replies, started.elapsed()) {
+                return Err(reason);
+            }
+            reply_method_not_found(client, url, auth, headers, msg_id.as_ref()).await;
+            continue;
+        }
+        if has_method {
+            // A NOTIFICATION (no id): log and continue; a list-change is noted
+            // specially but never acted on (the frozen snapshot is the surface).
+            let method = m.get("method").and_then(Value::as_str).unwrap_or("");
+            if method.contains("list_changed") {
+                tracing::debug!(target: "broker", "mcp server sent {method} (ignored — snapshot is frozen)");
+            } else {
+                tracing::debug!(target: "broker", "mcp server notification {method} (ignored)");
+            }
+            continue;
+        }
+        // A RESPONSE. Match our id (or take the last when we sent none).
+        let is_ours = match (want_id, &msg_id) {
+            (Some(w), Some(i)) => w == i,
+            (None, _) => true,
+            _ => false,
+        };
+        if is_ours {
+            if m.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+                return Err("mcp response is not JSON-RPC 2.0".into());
+            }
+            selected = Some(m);
+        }
     }
-    if status.is_success() && value.get("error").is_none() && !value.is_null() {
-        return unwrap_result(value, method).map_err(Into::into);
+    Ok(selected.unwrap_or(Value::Null))
+}
+
+/// Both C2 bounds on ONE response's `-32601` reply loop, as a pure predicate so
+/// each is testable without a slow upstream: `Some(reason)` = stop replying and
+/// fail the exchange as a protocol violation. `replies` is 1-based (the reply
+/// about to be sent), `elapsed` is the loop's age.
+fn reply_budget_exhausted(replies: usize, elapsed: Duration) -> Option<String> {
+    if replies > MAX_SERVER_REQUEST_REPLIES {
+        return Some(format!(
+            "mcp response carries more than {MAX_SERVER_REQUEST_REPLIES} server→client requests"
+        ));
     }
-    // Pre-2026 servers may demand an initialize handshake / session. Those
-    // rejections happen before the method dispatches, so one retry is safe.
-    let session_needed = status == reqwest::StatusCode::BAD_REQUEST
-        || status == reqwest::StatusCode::NOT_FOUND
-        || value
-            .get("error")
-            .and_then(|e| e.get("message"))
-            .and_then(|m| m.as_str())
-            .map(|m| {
-                let m = m.to_ascii_lowercase();
-                m.contains("initial") || m.contains("session")
-            })
-            .unwrap_or(false);
-    if !session_needed {
-        return unwrap_result(rpc_error_to_err(status, value, method)?, method).map_err(Into::into);
+    if elapsed >= SERVER_REQUEST_REPLY_BUDGET {
+        return Some("mcp server→client request replies exceeded their time budget".into());
     }
-    let session = handshake(state, url, auth).await?;
-    let (status, _, value) = post_rpc(state, url, auth, Some(&session), &body).await?;
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(CallErr::Unauthorized);
-    }
-    if !status.is_success() {
-        return Err(CallErr::Other(format!(
-            "mcp {method} returned HTTP {status}"
-        )));
-    }
-    unwrap_result(rpc_error_to_err(status, value, method)?, method).map_err(Into::into)
+    None
+}
+
+/// Best-effort `-32601` reply to a server→client request on the same session.
+/// Fire-and-forget: we never read its response (and never recurse on it). The
+/// url is already `admit_url`-vetted for this exchange.
+async fn reply_method_not_found(
+    client: &reqwest::Client,
+    url: &str,
+    auth: Option<&BrokeredAuth>,
+    headers: SessionHeaders<'_>,
+    req_id: Option<&Value>,
+) {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": req_id.cloned().unwrap_or(Value::Null),
+        "error": { "code": -32601, "message": "method not found" },
+    });
+    let _ = build_req(client, url, auth, headers)
+        .timeout(MCP_DELETE_TIMEOUT)
+        .json(&body)
+        .send()
+        .await;
 }
 
 /// A short, non-reversible fingerprint of an UNTRUSTED upstream error message
 /// (C). A malicious MCP server can echo the bearer we just sent inside its
 /// JSON-RPC error message; that string must never leave the broker verbatim (it
 /// would flow into logs, the connection's persisted `oauth.error`, and the
-/// dashboard). We surface method + HTTP status + JSON-RPC code + this digest so
-/// an operator can still correlate repeated failures without the bytes. Shared
-/// with `oauth.rs`, whose AS-error log boundary needs the identical treatment
-/// (an authorization server can echo the sealed state/code/verifier/secret).
+/// dashboard). We surface method + JSON-RPC code + this digest so an operator can
+/// still correlate repeated failures without the bytes. Shared with `oauth.rs`,
+/// whose AS-error log boundary needs the identical treatment (an authorization
+/// server can echo the sealed state/code/verifier/secret).
 pub(crate) fn msg_digest(msg: &str) -> String {
     format!(
         "sha256:{}",
         hex::encode(&Sha256::digest(msg.as_bytes())[..8])
     )
-}
-
-fn rpc_error_to_err(
-    status: reqwest::StatusCode,
-    value: Value,
-    method: &str,
-) -> Result<Value, String> {
-    if let Some(err) = value.get("error") {
-        let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
-        // The upstream message is untrusted — surface only its digest (C).
-        let digest = err
-            .get("message")
-            .and_then(|m| m.as_str())
-            .map(msg_digest)
-            .unwrap_or_else(|| "none".into());
-        return Err(format!(
-            "mcp {method} failed (HTTP {status}, code {code}, msg {digest})"
-        ));
-    }
-    if !status.is_success() {
-        return Err(format!("mcp {method} returned HTTP {status}"));
-    }
-    Ok(value)
 }
 
 fn unwrap_result(value: Value, method: &str) -> Result<Value, String> {
@@ -689,52 +1064,527 @@ fn unwrap_result(value: Value, method: &str) -> Result<Value, String> {
         .ok_or_else(|| format!("mcp {method} returned no result"))
 }
 
-async fn handshake(
-    state: &AppState,
+/// How the negotiated protocol version is validated after `initialize`.
+enum VersionPolicy<'a> {
+    /// Discovery/photograph: the version is what the snapshot RECORDS, so it
+    /// must be one we actually speak ([`SUPPORTED_PROTOCOLS`]). Recording an
+    /// arbitrary string would let a hostile server PERSIST a version outside the
+    /// supported set and then be honored forever by the runtime snapshot-equality
+    /// check — and `schema_guard::dialect_for` would silently interpret its
+    /// schemas as draft-07. Gap 8's supported-set requirement is enforced on BOTH
+    /// paths, not just at runtime.
+    Record,
+    /// A runtime call: the negotiated version must be one we speak
+    /// ([`SUPPORTED_PROTOCOLS`]), OR — once Task 3 threads it — exactly the
+    /// version the frozen snapshot recorded (drift ⇒ deny, remedy /tools/refresh).
+    Enforce { snapshot: Option<&'a str> },
+}
+
+/// Validate a runtime-call negotiated version (E5). Membership in
+/// [`SUPPORTED_PROTOCOLS`] is required UNCONDITIONALLY — a snapshot match is an
+/// ADDITIONAL requirement, never a substitute for one. (It used to be a
+/// substitute: a snapshot frozen before the discovery path enforced the
+/// supported set, or written by an older binary, could pin `"attacker-version"`,
+/// and exact equality alone then kept honoring it — while
+/// `schema_guard::dialect_for` read anything non-`2025-11-25` as draft-07.)
+/// `snapshot` is the frozen surface's `protocol_version` when present: `Some` ⇒
+/// supported AND equal (a server that photographed as X must still speak X,
+/// otherwise it drifted); `None` (legacy surfaces / the embedded-connection
+/// path) ⇒ supported.
+fn check_negotiated(negotiated: &str, snapshot: Option<&str>) -> Result<(), String> {
+    if negotiated.is_empty() {
+        return Err("mcp server negotiated no protocol version".into());
+    }
+    if !SUPPORTED_PROTOCOLS.contains(&negotiated) {
+        return Err(format!(
+            "mcp server negotiated unsupported protocol version '{negotiated}' (supported: {})",
+            SUPPORTED_PROTOCOLS.join(", ")
+        ));
+    }
+    match snapshot.filter(|s| !s.is_empty()) {
+        None => Ok(()),
+        Some(snap) if negotiated == snap => Ok(()),
+        Some(snap) => Err(format!(
+            "mcp protocol drift: server now negotiates '{negotiated}' but this run's frozen \
+             snapshot recorded '{snap}' — run POST /v1/connections/{{id}}/tools/refresh to re-photograph"
+        )),
+    }
+}
+
+/// Classify a 401/403 for the reactive-auth path. An SEP-835
+/// `insufficient_scope` challenge (E8) is TERMINAL — a re-mint cannot add a
+/// scope the grant never had — and carries the scope the server asked for; a
+/// plain 401 is a stale-credential signal (retry once after re-mint); a plain
+/// 403 is neither (falls through to a hard error).
+fn auth_error(status: reqwest::StatusCode, www_authenticate: Option<&str>) -> Option<CallErr> {
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        if let Some(chal) = www_authenticate.and_then(crate::oauth::parse_insufficient_scope) {
+            return Some(CallErr::InsufficientScope(chal.scope));
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Some(CallErr::Unauthorized);
+        }
+    }
+    None
+}
+
+/// Send one request over the hardened client with the session's current headers.
+async fn send_raw(
+    client: &reqwest::Client,
+    policy: &crate::egress::EgressPolicy,
     url: &str,
     auth: Option<&BrokeredAuth>,
-) -> Result<McpSession, CallErr> {
+    sess: &McpUpstreamSession,
+    body: &Value,
+) -> Result<DialResponse, CallErr> {
+    dial_rpc(
+        client,
+        policy,
+        url,
+        auth,
+        session_headers(sess),
+        body,
+        MCP_TIMEOUT,
+    )
+    .await
+}
+
+/// Ensure this session is `initialize`d (E5): if it has not negotiated yet, run
+/// `initialize` FIRST (never a tools/* probe — stateless-first is gone), record
+/// the negotiated version + optional session id, VALIDATE the version per
+/// `policy`, then send `notifications/initialized` UNCONDITIONALLY (the old
+/// session-id gate is dropped). Idempotent — a cache-hit (already negotiated)
+/// returns immediately.
+async fn ensure_initialized(
+    client: &reqwest::Client,
+    policy: &crate::egress::EgressPolicy,
+    url: &str,
+    auth: Option<&BrokeredAuth>,
+    sess: &mut McpUpstreamSession,
+    version: VersionPolicy<'_>,
+) -> Result<(), CallErr> {
+    if !sess.negotiated.is_empty() {
+        return Ok(());
+    }
+    let id = sess.next();
     let body = json!({
-        "jsonrpc": "2.0", "id": 0, "method": "initialize",
+        "jsonrpc": "2.0", "id": id, "method": "initialize",
         "params": {
             "protocolVersion": OFFERED_PROTOCOL,
             "capabilities": {},
             "clientInfo": { "name": "fluidbox-broker", "version": env!("CARGO_PKG_VERSION") },
         }
     });
-    let (status, session_id, value) = post_rpc(state, url, auth, None, &body).await?;
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(CallErr::Unauthorized);
+    let resp = send_raw(client, policy, url, auth, sess, &body).await?;
+    if let Some(e) = auth_error(resp.status, resp.www_authenticate.as_deref()) {
+        return Err(e);
     }
-    if !status.is_success() {
-        return Err(CallErr::Other(format!(
-            "mcp initialize returned HTTP {status}"
-        )));
+    if !resp.status.is_success() {
+        return Err(status_err("initialize", resp.status));
     }
-    let result = unwrap_result(value, "initialize")?;
-    let session = McpSession {
-        session_id,
-        protocol_version: result
-            .get("protocolVersion")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
+    let result = unwrap_result(resp.value, "initialize")?;
+    let negotiated = result
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    match version {
+        VersionPolicy::Record => {
+            if negotiated.is_empty() {
+                return Err(CallErr::Other(
+                    "mcp server negotiated no protocolVersion at initialize — cannot record a trustworthy snapshot".into(),
+                ));
+            }
+            // The recorded version must be one we SPEAK: a snapshot is
+            // long-lived and is later honored by exact match, so an
+            // out-of-set string persisted here would be an unsupported
+            // version accepted forever (and read as draft-07 by
+            // `schema_guard::dialect_for`).
+            if !SUPPORTED_PROTOCOLS.contains(&negotiated.as_str()) {
+                return Err(CallErr::Other(format!(
+                    "mcp server negotiated unsupported protocol version '{negotiated}' (supported: {}) — refusing to record it",
+                    SUPPORTED_PROTOCOLS.join(", ")
+                )));
+            }
+            // A tool surface is only photographable from a server that
+            // DECLARES the `tools` capability (MCP `initialize` result). Not
+            // enforced on the runtime path: the frozen snapshot is already
+            // proof the server declared it when photographed, and re-checking
+            // there would break in-flight runs over a server's cosmetic reply
+            // change rather than over anything security-relevant.
+            if result.pointer("/capabilities/tools").is_none() {
+                return Err(CallErr::Other(
+                    "mcp server did not declare the 'tools' capability at initialize — refusing to photograph a tool surface".into(),
+                ));
+            }
+        }
+        // Runtime call: `snapshot` is the frozen surface's `protocol_version`
+        // (threaded from `call_tool_for_conn` since Task 3, Gap 12). `Some(v)` ⇒
+        // the negotiated version must equal `v` exactly (drift ⇒ deny); `None` ⇒
+        // SUPPORTED-set membership (legacy surfaces / the embedded-connection path).
+        VersionPolicy::Enforce { snapshot } => {
+            check_negotiated(&negotiated, snapshot).map_err(CallErr::Other)?;
+        }
+    }
+    sess.negotiated = negotiated;
+    sess.session_id = resp.session_id;
+    // `notifications/initialized` UNCONDITIONALLY after a successful initialize
+    // (drop the old session-id gate); fire-and-forget (servers answer 202).
+    let note = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+    let _ = send_raw(client, policy, url, auth, sess, &note).await;
+    Ok(())
+}
+
+/// Send ONE JSON-RPC request within an already-initialized session, drawing a
+/// fresh id from the session counter. Classifies auth (401/403 → Unauthorized /
+/// InsufficientScope) and a 404-with-session (→ SessionExpired, for the caller's
+/// single reinit) before unwrapping the result.
+async fn call_in_session(
+    client: &reqwest::Client,
+    policy: &crate::egress::EgressPolicy,
+    url: &str,
+    auth: Option<&BrokeredAuth>,
+    sess: &mut McpUpstreamSession,
+    method: &str,
+    params: Value,
+) -> Result<Value, CallErr> {
+    let had_session = sess.session_id.is_some();
+    let id = sess.next();
+    let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    let resp = send_raw(client, policy, url, auth, sess, &body).await?;
+    // A server may (re)issue a session id on any response — adopt it.
+    if resp.session_id.is_some() {
+        sess.session_id = resp.session_id.clone();
+    }
+    if let Some(e) = auth_error(resp.status, resp.www_authenticate.as_deref()) {
+        return Err(e);
+    }
+    // 404 on a request that carried a session id ⇒ the session was dropped
+    // upstream; the caller re-initializes ONCE and replays.
+    if resp.status == reqwest::StatusCode::NOT_FOUND && had_session {
+        return Err(CallErr::SessionExpired);
+    }
+    if !resp.status.is_success() {
+        return Err(status_err(method, resp.status));
+    }
+    unwrap_result(resp.value, method).map_err(Into::into)
+}
+
+/// A full managed request against a `(run, peer)` session: initialize if
+/// needed, send, and on a 404-with-session re-initialize ONCE (reset in place —
+/// same registry slot, so the entry count never grows) and replay ONCE. A
+/// second 404 is terminal (never refreshes/expands the tool set).
+#[allow(clippy::too_many_arguments)]
+async fn managed_call(
+    client: &reqwest::Client,
+    policy: &crate::egress::EgressPolicy,
+    url: &str,
+    auth: Option<&BrokeredAuth>,
+    entry: &Arc<Mutex<McpUpstreamSession>>,
+    method: &str,
+    params: Value,
+    snapshot: Option<&str>,
+) -> Result<Value, CallErr> {
+    let mut sess = entry.lock().await;
+    ensure_initialized(
+        client,
+        policy,
+        url,
+        auth,
+        &mut sess,
+        VersionPolicy::Enforce { snapshot },
+    )
+    .await?;
+    match call_in_session(client, policy, url, auth, &mut sess, method, params.clone()).await {
+        Err(CallErr::SessionExpired) => {
+            // Reinit ONCE and replay ONCE. reset() keeps the same map slot (no
+            // leak) but forces a fresh initialize.
+            sess.reset();
+            ensure_initialized(
+                client,
+                policy,
+                url,
+                auth,
+                &mut sess,
+                VersionPolicy::Enforce { snapshot },
+            )
+            .await?;
+            match call_in_session(client, policy, url, auth, &mut sess, method, params).await {
+                // A second 404 is terminal — surface a clear protocol error.
+                Err(CallErr::SessionExpired) => Err(CallErr::Other(
+                    "mcp session expired again after re-initialization".into(),
+                )),
+                other => other,
+            }
+        }
+        other => other,
+    }
+}
+
+/// Get (or create) the replica-local registry entry for one `(run, peer)`.
+async fn session_entry(
+    state: &AppState,
+    run_session: uuid::Uuid,
+    peer: McpPeer,
+    url: &str,
+) -> Arc<Mutex<McpUpstreamSession>> {
+    state
+        .mcp_sessions
+        .lock()
+        .await
+        .entry((run_session, peer))
+        .or_insert_with(|| Arc::new(Mutex::new(McpUpstreamSession::fresh(url))))
+        .clone()
+}
+
+/// Terminal MCP cleanup for a finished run (E5): DELETE each live upstream
+/// session best-effort and EVICT every registry entry for the run regardless of
+/// the DELETE outcome. Hooked into the orchestrator's terminal driver. Runs are
+/// replica-local — entries only exist on the replica that made the calls.
+///
+/// The DELETE carries the SAME authorization header a live call would (design
+/// `:914` — "always send the OAuth/static authorization header on every upstream
+/// HTTP request; an MCP session ID is routing state, not authentication"), so a
+/// conforming upstream actually terminates the session instead of 401ing it.
+/// The credential is RE-RESOLVED here through the live path (invariant 9: every
+/// upstream call rechecks live revoke/status state) rather than cached on the
+/// registry entry at call time: by teardown a cached header could name a
+/// connection that has since been revoked, reauthorized to a new generation, or
+/// whose owner left the org — and an access token minted minutes ago may have
+/// expired. A revoked connection is precisely the case where we must NOT send a
+/// credential, so a resolution/recheck failure SKIPS the DELETE entirely.
+/// (Caching it would also park ambient credential state on a long-lived
+/// in-memory map, which invariant 22 rules out. Do not "optimize" this into a
+/// stored header.)
+pub async fn run_terminal_mcp_cleanup(state: &AppState, session_id: uuid::Uuid) {
+    // Evict FIRST and unconditionally — before any DB or network work, so a
+    // wedged upstream (or an unresolvable tenant) never strands an entry.
+    let drained = drain_run_sessions(&state.mcp_sessions, session_id).await;
+    if drained.is_empty() {
+        return;
+    }
+    // ONE cross-tenant session lookup for the whole run (a worker/system entry
+    // holds only a bare id); the per-peer resolution below is tenant-scoped.
+    let scope = match fluidbox_db::system_worker::get_session(&state.pool, session_id).await {
+        Ok(Some(s)) => Some(fluidbox_db::TenantScope::assume(s.tenant_id)),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::debug!(target: "broker", "mcp cleanup tenant resolve failed (best-effort): {e}");
+            None
+        }
     };
-    // `notifications/initialized` only matters once a session was established;
-    // fire-and-forget per spec (servers answer 202).
-    if session.session_id.is_some() {
-        let note = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
-        let _ = post_rpc(state, url, auth, Some(&session), &note).await;
+    delete_upstream_sessions(
+        &state.egress_http,
+        &state.egress_policy,
+        drained,
+        |peer, url| async move {
+            let scope = scope.ok_or_else(|| "run's tenant could not be resolved".to_string())?;
+            terminal_peer_auth(state, scope, peer, &url).await
+        },
+    )
+    .await;
+}
+
+/// Drain (evict) every registry entry for one run under the map lock, returning
+/// them with their peer identity so each can be resolved + DELETEd outside the
+/// lock. Eviction is unconditional and happens before any I/O.
+async fn drain_run_sessions(
+    registry: &crate::state::McpSessionRegistry,
+    session_id: uuid::Uuid,
+) -> Vec<(McpPeer, Arc<Mutex<McpUpstreamSession>>)> {
+    let mut map = registry.lock().await;
+    let keys: Vec<(uuid::Uuid, McpPeer)> = map
+        .keys()
+        .filter(|(sid, _)| *sid == session_id)
+        .cloned()
+        .collect();
+    keys.iter()
+        .filter_map(|k| map.remove(k).map(|e| (k.1, e)))
+        .collect()
+}
+
+/// Re-resolve one drained peer's credential the way a live call does — the
+/// binding path reverifies the binding (status + generation + owner + invoker)
+/// via [`recheck_binding`] before [`brokered_auth_for_conn`]; the legacy
+/// embedded-connection path takes the same fetch-then-resolve core the frozen
+/// RunSpec path uses. Any refusal propagates, and the caller skips the DELETE.
+async fn terminal_peer_auth(
+    state: &AppState,
+    scope: fluidbox_db::TenantScope,
+    peer: McpPeer,
+    url: &str,
+) -> Result<Option<BrokeredAuth>, String> {
+    match peer {
+        McpPeer::Binding(binding_id) => {
+            let binding = fluidbox_db::get_run_resource_binding(&state.pool, scope, binding_id)
+                .await
+                .map_err(|e| format!("run resource binding lookup failed: {e}"))?
+                .ok_or("run resource binding is missing")?;
+            let conn = recheck_binding(state, scope, &binding).await?;
+            brokered_auth_for_conn(state, scope, &conn, url).await
+        }
+        McpPeer::Conn(cid) => auth_for_connection_id(state, scope, cid, url).await,
     }
-    Ok(session)
+}
+
+/// The registry-free DELETE loop (client + policy + the resolver explicit, so a
+/// fake server can assert the DELETE — and the skip — without a full
+/// `AppState`). Best-effort and bounded by `MCP_DELETE_TIMEOUT`; nothing here
+/// can block terminalization.
+async fn delete_upstream_sessions<F, Fut>(
+    client: &reqwest::Client,
+    policy: &crate::egress::EgressPolicy,
+    drained: Vec<(McpPeer, Arc<Mutex<McpUpstreamSession>>)>,
+    resolve_auth: F,
+) where
+    F: Fn(McpPeer, String) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<BrokeredAuth>, String>>,
+{
+    for (peer, entry) in drained {
+        let sess = entry.lock().await;
+        let (Some(sid), url) = (sess.session_id.as_deref(), sess.url.as_str()) else {
+            continue;
+        };
+        // Egress admission stays in front of the dial — and ahead of the
+        // resolution, so a url we would refuse never mints a token.
+        if crate::egress::admit_url(url, policy).is_err() {
+            continue;
+        }
+        // Invariant 9: a refusal here (revoked connection, moved generation,
+        // deactivated owner, unavailable credential) means we must not send a
+        // credential — and an unauthorized DELETE would just 401 — so skip it.
+        // Termination is best-effort; the upstream expires the session itself.
+        let auth = match resolve_auth(peer, url.to_string()).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::debug!(target: "broker", "mcp session DELETE skipped (credential unavailable): {e}");
+                continue;
+            }
+        };
+        let mut req = client
+            .delete(url)
+            .timeout(MCP_DELETE_TIMEOUT)
+            .header("mcp-session-id", sid);
+        if let Some(a) = auth.as_ref() {
+            req = req.header(a.header.as_str(), a.value.as_str());
+        }
+        if !sess.negotiated.is_empty() {
+            req = req.header("mcp-protocol-version", sess.negotiated.as_str());
+        }
+        if let Err(e) = req.send().await {
+            tracing::debug!(target: "broker", "mcp session DELETE failed (best-effort): {e}");
+        }
+    }
+}
+
+/// Which connection an SEP-835 `insufficient_scope` challenge may mark `error`
+/// (I6). The answer is: ONLY an OAuth connection — the one whose authority came
+/// from a grant that can be re-consented with more scopes.
+///
+/// A hostile MCP server chooses its own `WWW-Authenticate` header, so this
+/// predicate is the whole blast radius of that choice. For a STATIC credential
+/// (API key / custom header / Basic) there is no scope grant to widen, the
+/// "reconnect with more scopes" remedy is not actionable, and
+/// `invalidate_rejected_access(_, "")` is a no-op — marking it would hand any
+/// upstream a one-header kill switch on an org's connection.
+///
+/// The design (:983) requires that the challenge be TERMINAL for the call and
+/// that the connection be marked for its owner. The first half is unconditional
+/// here — [`insufficient_scope_outcome`] returns a `Definitive` error on every
+/// path, whatever this predicate says — so narrowing the second half to the
+/// credential kind it was written for keeps the design property and drops the
+/// remote-DoS. Both call sites (legacy bundle + Phase C binding) go through the
+/// one helper, so they cannot drift again.
+fn insufficient_scope_target(auth: Option<&BrokeredAuth>) -> Option<uuid::Uuid> {
+    auth.and_then(|a| a.oauth_connection)
+}
+
+/// The shared SEP-835 (E8) dispatch outcome: mark the connection when — and only
+/// when — [`insufficient_scope_target`] names one, then fail the call terminally.
+async fn insufficient_scope_outcome(
+    state: &AppState,
+    scope: fluidbox_db::TenantScope,
+    auth: Option<&BrokeredAuth>,
+    challenge_scope: Option<String>,
+) -> DispatchOutcome {
+    if let Some(cid) = insufficient_scope_target(auth) {
+        let rejected = auth.and_then(|a| a.oauth_access()).unwrap_or("");
+        let generation = auth.map(|a| a.generation).unwrap_or(0);
+        mark_insufficient_scope(state, scope, cid, generation, rejected, challenge_scope).await;
+    }
+    DispatchOutcome::Definitive {
+        content: err_content("insufficient scope — reconnect the connection with more scopes"),
+        is_error: true,
+        structured: None,
+    }
+}
+
+/// The generation CAS predicate for a credential-outcome status write: the
+/// connection's CURRENT generation must be exactly the one the credential was
+/// resolved at. `None` (row unreadable/gone) is FAIL-CLOSED — no write.
+fn generation_unchanged(current: Option<i32>, expected: i32) -> bool {
+    current == Some(expected)
+}
+
+/// SEP-835 (E8): mark a connection `status='error'` with a reconnect-with-more-
+/// scopes note and evict its rejected access token. The note records the
+/// (sanitized) challenge scope only; routed through the SAME `mark_connection_error`
+/// entry the `invalid_grant` writer uses, under the run's tenant scope.
+async fn mark_insufficient_scope(
+    state: &AppState,
+    scope: fluidbox_db::TenantScope,
+    connection_id: uuid::Uuid,
+    expected_generation: i32,
+    rejected_token: &str,
+    challenge_scope: Option<String>,
+) {
+    let note = match challenge_scope.filter(|s| !s.is_empty()) {
+        Some(s) => {
+            format!("insufficient_scope: reconnect with more scopes (server asked for: {s})")
+        }
+        None => "insufficient_scope: reconnect with more scopes".to_string(),
+    };
+    if let Ok(mut tx) = fluidbox_db::scoped_tx(&state.pool, scope).await {
+        // GENERATION GATE: this challenge answers the credential resolved at
+        // `expected_generation`. A malicious server can stall the request while
+        // the owner reconnects (which BUMPS the generation and re-activates the
+        // connection); writing unconditionally would then disable an authority
+        // this response says nothing about. Read the current generation in the
+        // SAME transaction as the write and skip when it has moved.
+        //
+        // RESIDUAL, stated honestly: under READ COMMITTED the read and the
+        // update are separate statements, so a bump committing between them can
+        // still slip through. Closing it fully needs the predicate IN the write:
+        // `fluidbox_db::mark_connection_error` should take an
+        // `expected_generation` and add `and authorization_generation = $n` to
+        // its UPDATE (that crate is owned elsewhere). This gate turns an
+        // unbounded stall-then-write into a microsecond window.
+        let current = fluidbox_db::get_connection(&mut *tx, scope, connection_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|c| c.authorization_generation);
+        if generation_unchanged(current, expected_generation)
+            && fluidbox_db::mark_connection_error(&mut *tx, scope, connection_id, &note)
+                .await
+                .is_ok()
+        {
+            tx.commit().await.ok();
+        }
+    }
+    // Compare-and-drop: only evict the exact token the upstream rejected (keeps
+    // the singleflight intact if a concurrent caller already re-minted).
+    crate::oauth::invalidate_rejected_access(state, connection_id, rejected_token).await;
 }
 
 // ─── The two operations fluidbox performs ─────────────────────────────────
 
 /// Map one `tools/list` result page into snapshot shape (camelCase
-/// `inputSchema` → snake `input_schema`; annotations kept verbatim), appending
-/// to `out`, and return the page's `nextCursor` (absent = last page). Shared by
-/// the stateless registration/probe path and the forced-negotiation snapshot
-/// discovery so both map identically.
+/// `inputSchema` → snake `input_schema`; `outputSchema` → `output_schema` (E7);
+/// annotations kept verbatim), appending to `out`, and return the page's
+/// `nextCursor` (absent = last page). Shared by the probe path and the
+/// forced-negotiation snapshot discovery so both map identically.
 fn map_tools_page(result: &Value, out: &mut Vec<ToolSnapshot>) -> Result<Option<String>, CallErr> {
     for t in result
         .get("tools")
@@ -756,6 +1606,9 @@ fn map_tools_page(result: &Value, out: &mut Vec<ToolSnapshot>) -> Result<Option<
                 .get("inputSchema")
                 .cloned()
                 .unwrap_or_else(|| json!({ "type": "object" })),
+            // E7: capture the declared output schema so the frozen surface can
+            // carry it (and the digest covers it). Absent ⇒ None.
+            output_schema: t.get("outputSchema").cloned(),
             annotations: t.get("annotations").cloned(),
         });
     }
@@ -766,72 +1619,78 @@ fn map_tools_page(result: &Value, out: &mut Vec<ToolSnapshot>) -> Result<Option<
         .map(str::to_string))
 }
 
-/// Registration-time discovery — THE (stateless-first) photograph for the
-/// legacy bundle probe path. Paginates tools/list; on hitting the page cap with
-/// a cursor still pending it freezes what it has (acceptable for the probe/BYO
-/// preview — the snapshot path below is stricter). Validation happens in
-/// fluidbox-core after this returns.
-async fn discover_tools(
-    state: &AppState,
+/// Paginate `tools/list` in an ALREADY-initialized session, up to
+/// [`MAX_LIST_PAGES`] pages. Returns the mapped tools and whether the listing
+/// COMPLETED — `false` means a `nextCursor` was still outstanding at the page
+/// cap, i.e. the list is a PREFIX of the server's surface.
+///
+/// M10: the probe and the photograph share this one loop so their pagination can
+/// no longer drift. What they may legitimately differ on is what truncation
+/// MEANS, and that is the caller's decision — the photograph refuses to freeze a
+/// partial surface, the probe discloses the truncation to the user — so this
+/// returns the flag rather than deciding for them.
+async fn list_tools_paged(
+    client: &reqwest::Client,
+    policy: &crate::egress::EgressPolicy,
     url: &str,
     auth: Option<&BrokeredAuth>,
-) -> Result<Vec<ToolSnapshot>, CallErr> {
+    sess: &mut McpUpstreamSession,
+) -> Result<(Vec<ToolSnapshot>, bool), CallErr> {
     let mut tools = Vec::new();
     let mut cursor: Option<String> = None;
+    let mut complete = false;
     for _ in 0..MAX_LIST_PAGES {
         let params = match &cursor {
             Some(c) => json!({ "cursor": c }),
             None => json!({}),
         };
-        let result = rpc(state, url, auth, "tools/list", params).await?;
+        let result = call_in_session(client, policy, url, auth, sess, "tools/list", params).await?;
         cursor = map_tools_page(&result, &mut tools)?;
         if cursor.is_none() {
+            complete = true;
             break;
         }
     }
-    if tools.is_empty() {
-        return Err(CallErr::Other("mcp server advertises no tools".into()));
-    }
-    Ok(tools)
+    Ok((tools, complete))
 }
 
-/// One `tools/list` page carrying an ESTABLISHED session (the negotiated
-/// protocol-version + any session-id headers ride along) — the discovery
-/// counterpart to the stateless-first `rpc`. No handshake retry: discovery
-/// already initialized.
-async fn list_tools_page_session(
+/// Credential-free pre-connect discovery (the probe). `initialize`s first (via
+/// the SHARED session machinery — stateless-first is gone), accepts any
+/// negotiated version ([`VersionPolicy::Record`]), and paginates tools/list
+/// through the SHARED [`list_tools_paged`].
+///
+/// M10: the probe additionally runs the SAME `validate_tools` screen the
+/// photograph runs (the list is untrusted remote input either way, and this one
+/// is rendered straight into the Connect wizard), and reports truncation to the
+/// caller instead of silently returning a prefix as if it were the whole surface.
+async fn discover_tools(
     state: &AppState,
     url: &str,
     auth: Option<&BrokeredAuth>,
-    session: &McpSession,
-    cursor: Option<&str>,
-) -> Result<Value, CallErr> {
-    let params = match cursor {
-        Some(c) => json!({ "cursor": c }),
-        None => json!({}),
-    };
-    let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": params });
-    let (status, _, value) = post_rpc(state, url, auth, Some(session), &body).await?;
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(CallErr::Unauthorized);
+) -> Result<(Vec<ToolSnapshot>, bool), CallErr> {
+    let client = &state.egress_http;
+    let policy = &state.egress_policy;
+    let mut sess = McpUpstreamSession::fresh(url);
+    ensure_initialized(client, policy, url, auth, &mut sess, VersionPolicy::Record).await?;
+    let (tools, complete) = list_tools_paged(client, policy, url, auth, &mut sess).await?;
+    if tools.is_empty() {
+        return Err(CallErr::Other("mcp server advertises no tools".into()));
     }
-    if !status.is_success() {
-        return Err(CallErr::Other(format!(
-            "mcp tools/list returned HTTP {status}"
-        )));
-    }
-    unwrap_result(rpc_error_to_err(status, value, "tools/list")?, "tools/list").map_err(Into::into)
+    fluidbox_core::capability::validate_tools("mcp connection", &tools)
+        .map_err(|e| CallErr::Other(format!("discovered tool list failed validation: {e}")))?;
+    Ok((tools, !complete))
 }
 
-/// The forced-negotiation photograph (design :298-343; Phase C). UNLIKE the
-/// stateless-first paths above, discovery ALWAYS `initialize`s first so it can
-/// record a REAL negotiated protocol version — the whole point of a snapshot
-/// (survey A §2e: the legacy photograph negotiates none and cannot be trusted).
-/// Fails closed when the server negotiates no/empty `protocolVersion`, and —
-/// per design :1282-1283 — when a `nextCursor` still remains after the page cap
-/// (freeze the whole surface or none, never a partial list). The remote list is
+/// The forced-negotiation photograph (design :298-343; Phase C). Rides the SAME
+/// initialize-first machinery as the runtime call path ([`ensure_initialized`]);
+/// records a REAL negotiated protocol version — one from [`SUPPORTED_PROTOCOLS`]
+/// (a snapshot is later honored by exact match, so recording an out-of-set
+/// string would make an unsupported version permanently acceptable), and — per
+/// design :1282-1283 — fails when a `nextCursor` still remains
+/// after the page cap (freeze the whole surface or none). The remote list is
 /// untrusted input: it passes core's IDENTICAL `validate_tools` screen (charset,
-/// poison-screen, caps) before it can become a snapshot.
+/// poison-screen, caps) before it can become a snapshot. Uses a throwaway
+/// session (discovery is one-shot, not a per-run reused session).
 pub async fn discover_snapshot(
     state: &AppState,
     scope: fluidbox_db::TenantScope,
@@ -841,39 +1700,27 @@ pub async fn discover_snapshot(
     let auth = brokered_auth_for_conn(state, scope, conn, endpoint_url)
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
-    // Always initialize first, and require a negotiated protocol version.
-    let session = handshake(state, endpoint_url, auth.as_ref())
-        .await
-        .map_err(|e| anyhow::anyhow!(e.into_msg()))?;
-    let protocol_version = session
-        .protocol_version
-        .clone()
-        .filter(|v| !v.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "mcp server negotiated no protocolVersion at initialize — cannot record a trustworthy snapshot"
-            )
-        })?;
-    // Paginate tools/list WITH the session; fail (not freeze) on a leftover cursor.
-    let mut tools = Vec::new();
-    let mut cursor: Option<String> = None;
-    let mut complete = false;
-    for _ in 0..MAX_LIST_PAGES {
-        let result = list_tools_page_session(
-            state,
-            endpoint_url,
-            auth.as_ref(),
-            &session,
-            cursor.as_deref(),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!(e.into_msg()))?;
-        cursor = map_tools_page(&result, &mut tools).map_err(|e| anyhow::anyhow!(e.into_msg()))?;
-        if cursor.is_none() {
-            complete = true;
-            break;
-        }
-    }
+    let client = &state.egress_http;
+    let policy = &state.egress_policy;
+    let mut sess = McpUpstreamSession::fresh(endpoint_url);
+    ensure_initialized(
+        client,
+        policy,
+        endpoint_url,
+        auth.as_ref(),
+        &mut sess,
+        VersionPolicy::Record,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(e.into_msg()))?;
+    // `Record` guaranteed a non-empty negotiated version.
+    let protocol_version = sess.negotiated.clone();
+    // Paginate tools/list WITH the session (the SHARED loop — M10); fail (not
+    // freeze) on a leftover cursor.
+    let (tools, complete) =
+        list_tools_paged(client, policy, endpoint_url, auth.as_ref(), &mut sess)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.into_msg()))?;
     if !complete {
         anyhow::bail!(
             "mcp server advertises more tools than the discovery page cap — refusing to freeze a partial snapshot"
@@ -884,22 +1731,31 @@ pub async fn discover_snapshot(
     Ok((protocol_version, tools))
 }
 
-/// One brokered tool execution. Returns (content, is_error) from the MCP
-/// result. At-least-once under network failure by design — the caller
-/// ledgers every attempt; we never blind-retry after a request was sent.
+/// One brokered tool execution against a `(run, peer)` session. Returns
+/// (content, is_error, structured_content) from the MCP result — `structuredContent`
+/// (E7) is passed through when present. At-least-once under network failure by
+/// design — the caller ledgers every attempt; we never blind-retry after a
+/// request was sent.
+#[allow(clippy::too_many_arguments)]
 async fn call_tool(
-    state: &AppState,
+    client: &reqwest::Client,
+    policy: &crate::egress::EgressPolicy,
     url: &str,
     auth: Option<&BrokeredAuth>,
+    entry: &Arc<Mutex<McpUpstreamSession>>,
     tool: &str,
     arguments: &Value,
-) -> Result<(Value, bool), CallErr> {
-    let result = rpc(
-        state,
+    snapshot: Option<&str>,
+) -> Result<(Value, bool, Option<Value>), CallErr> {
+    let result = managed_call(
+        client,
+        policy,
         url,
         auth,
+        entry,
         "tools/call",
         json!({ "name": tool, "arguments": arguments }),
+        snapshot,
     )
     .await?;
     let is_error = result
@@ -907,7 +1763,8 @@ async fn call_tool(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let content = result.get("content").cloned().unwrap_or(json!([]));
-    Ok((cap_content(content), is_error))
+    let structured = result.get("structuredContent").cloned();
+    Ok((cap_content(content), is_error, cap_structured(structured)))
 }
 
 /// Reactive-401 recovery, OAuth connections only: drop the REJECTED access
@@ -939,26 +1796,105 @@ fn server_url(server: &CapabilityServer) -> Result<&str, String> {
     }
 }
 
+/// The embedded connection id of a legacy brokered server (`None` = a
+/// credential-free legacy bundle — it keys no per-run registry entry and simply
+/// re-initializes a throwaway session each call).
+fn brokered_connection_id(server: &CapabilityServer) -> Option<uuid::Uuid> {
+    match server {
+        CapabilityServer::Brokered { connection_id, .. } => *connection_id,
+        _ => None,
+    }
+}
+
 /// Execute one brokered tool with credential resolution + the single
 /// reactive-401 retry (safe: a 401 at the auth layer proves the tool never
-/// executed). This is the broker's public execution surface.
+/// executed). The legacy embedded-connection path — keys the per-run session
+/// registry on the connection (`McpPeer::Conn`) so calls in the same run reuse
+/// one `initialize`d session. `run_session` is the run's session id (registry
+/// key). Returns (content, is_error, structured_content).
 pub async fn call_tool_auth(
     state: &AppState,
     scope: fluidbox_db::TenantScope,
     server: &CapabilityServer,
     tool: &str,
     arguments: &Value,
-) -> Result<(Value, bool), String> {
-    let url = server_url(server)?;
-    let auth = brokered_auth(state, scope, server).await?;
-    match call_tool(state, url, auth.as_ref(), tool, arguments).await {
+    run_session: uuid::Uuid,
+) -> DispatchOutcome {
+    let url = match server_url(server) {
+        Ok(u) => u,
+        Err(e) => return DispatchOutcome::NeverSent(e),
+    };
+    // Auth resolution BEFORE any request write ⇒ a failure is provable no-send.
+    let auth = match brokered_auth(state, scope, server).await {
+        Ok(a) => a,
+        Err(e) => return DispatchOutcome::NeverSent(e),
+    };
+    // E14: the governor gate, BEFORE the per-peer session mutex (see
+    // `governor_gate` for the lock order) and before any bytes leave. A
+    // credential-free legacy bundle has no connection to key on — it takes the
+    // nil id, and the breaker's (connection, host) key still separates upstreams.
+    let conn_key = brokered_connection_id(server).unwrap_or_else(uuid::Uuid::nil);
+    let host = match governor_gate(&state.governor, scope.tenant_id(), conn_key, url) {
+        Ok(h) => h,
+        Err(refused) => return refused,
+    };
+    let entry = match brokered_connection_id(server) {
+        Some(cid) => session_entry(state, run_session, McpPeer::Conn(cid), url).await,
+        // Credential-free legacy bundle: no connection to key on — throwaway.
+        None => Arc::new(Mutex::new(McpUpstreamSession::fresh(url))),
+    };
+    let client = &state.egress_http;
+    let policy = &state.egress_policy;
+    // Legacy path froze no snapshot ⇒ SUPPORTED-set negotiation (None).
+    let first = call_tool(
+        client,
+        policy,
+        url,
+        auth.as_ref(),
+        &entry,
+        tool,
+        arguments,
+        None,
+    )
+    .await;
+    state.governor.report(&host, breaker_signal(&first));
+    match first {
         Err(CallErr::Unauthorized) => {
-            let auth = reauth_after_401(state, scope, server, auth).await?;
-            call_tool(state, url, auth.as_ref(), tool, arguments)
-                .await
-                .map_err(CallErr::into_msg)
+            // A 401 proves the tool never executed. Static credential ⇒ terminal
+            // definitive failure; OAuth ⇒ re-mint once and the RETRY's outcome
+            // governs the whole dispatch (one claim, one logical dispatch).
+            if auth.as_ref().and_then(|a| a.oauth_connection).is_none() {
+                return DispatchOutcome::Definitive {
+                    content: err_content("mcp server rejected the credential (HTTP 401)"),
+                    is_error: true,
+                    structured: None,
+                };
+            }
+            match reauth_after_401(state, scope, server, auth).await {
+                Ok(auth) => {
+                    // The retry is a SECOND dial — its health is reported too.
+                    let retry = call_tool(
+                        client,
+                        policy,
+                        url,
+                        auth.as_ref(),
+                        &entry,
+                        tool,
+                        arguments,
+                        None,
+                    )
+                    .await;
+                    state.governor.report(&host, breaker_signal(&retry));
+                    outcome_from_call(retry)
+                }
+                // Re-mint failure = auth resolution failure ⇒ never sent.
+                Err(e) => DispatchOutcome::NeverSent(e),
+            }
         }
-        r => r.map_err(CallErr::into_msg),
+        Err(CallErr::InsufficientScope(challenge_scope)) => {
+            insufficient_scope_outcome(state, scope, auth.as_ref(), challenge_scope).await
+        }
+        r => outcome_from_call(r),
     }
 }
 
@@ -967,14 +1903,18 @@ pub async fn call_tool_auth(
 /// connection immediately before — so the credential resolved here rides an
 /// authority just verified live (status + generation + owner + invoker). The
 /// counterpart to [`call_tool_auth`], but the credential comes from a connection
-/// row + an explicit endpoint (the binding's frozen surface url) rather than a
-/// `CapabilityServer::Brokered`. Same single reactive-401 retry: OAuth re-mints
-/// once (a 401 proves the tool never executed); a static credential is terminal.
+/// row + an explicit endpoint (the binding's frozen surface url). Keys the per-run
+/// session registry on the binding (`McpPeer::Binding`, run = `binding.session_id`).
+/// Same single reactive-401 retry: OAuth re-mints once (a 401 proves the tool
+/// never executed); a static credential is terminal. An SEP-835 `insufficient_scope`
+/// challenge fails the call terminally without a retry (E8) and — only for an
+/// OAuth connection — marks it `error` (I6, see [`insufficient_scope_target`]).
 ///
 /// R2.5 / invariant 9: the retry is a SECOND upstream call, so it RE-runs
 /// [`recheck_binding`] before re-minting — a revoke/reauthorize/deactivate that
 /// lands between the first call and the 401 fails the retry closed. It re-mints
 /// against the FRESH connection row the recheck returns.
+#[allow(clippy::too_many_arguments)]
 pub async fn call_tool_for_conn(
     state: &AppState,
     scope: fluidbox_db::TenantScope,
@@ -983,17 +1923,84 @@ pub async fn call_tool_for_conn(
     tool: &str,
     arguments: &Value,
     binding: &fluidbox_db::RunResourceBindingRow,
-) -> Result<(Value, bool), String> {
-    let auth = brokered_auth_for_conn(state, scope, conn, url).await?;
-    match call_tool(state, url, auth.as_ref(), tool, arguments).await {
+    protocol_version: Option<&str>,
+) -> DispatchOutcome {
+    // Auth resolution BEFORE any request write ⇒ a failure is provable no-send.
+    let auth = match brokered_auth_for_conn(state, scope, conn, url).await {
+        Ok(a) => a,
+        Err(e) => return DispatchOutcome::NeverSent(e),
+    };
+    // E14: the governor gate, BEFORE the per-peer session mutex (lock order
+    // documented on `governor_gate`) and before any bytes leave.
+    let host = match governor_gate(&state.governor, scope.tenant_id(), conn.id, url) {
+        Ok(h) => h,
+        Err(refused) => return refused,
+    };
+    let entry = session_entry(state, binding.session_id, McpPeer::Binding(binding.id), url).await;
+    let client = &state.egress_http;
+    let policy = &state.egress_policy;
+    // Task 3 (Gap 12): the frozen `BrokeredSurface.protocol_version` the gate
+    // resolved is threaded in as the negotiation snapshot. When `Some`, the
+    // runtime `initialize` MUST negotiate exactly that version (drift ⇒ deny,
+    // remedy /tools/refresh); when `None` (a surface frozen before the field
+    // existed), negotiation falls back to SUPPORTED-set membership.
+    let snapshot: Option<&str> = protocol_version;
+    let first = call_tool(
+        client,
+        policy,
+        url,
+        auth.as_ref(),
+        &entry,
+        tool,
+        arguments,
+        snapshot,
+    )
+    .await;
+    state.governor.report(&host, breaker_signal(&first));
+    match first {
         Err(CallErr::Unauthorized) => {
-            let fresh = recheck_binding(state, scope, binding).await?;
-            let auth = reauth_after_401_conn(state, scope, &fresh, url, auth).await?;
-            call_tool(state, url, auth.as_ref(), tool, arguments)
-                .await
-                .map_err(CallErr::into_msg)
+            // A 401 proves the tool never executed. Static credential ⇒ terminal
+            // definitive failure; OAuth ⇒ recheck + re-mint once, retry governs.
+            if auth.as_ref().and_then(|a| a.oauth_connection).is_none() {
+                return DispatchOutcome::Definitive {
+                    content: err_content("mcp server rejected the credential (HTTP 401)"),
+                    is_error: true,
+                    structured: None,
+                };
+            }
+            // R2.5 / invariant 9: the retry re-runs recheck_binding first — a
+            // refusal (revoke/reauthorize/deactivate) BEFORE the retry's write, or
+            // a re-mint failure, is provable no-send.
+            let fresh = match recheck_binding(state, scope, binding).await {
+                Ok(c) => c,
+                Err(e) => return DispatchOutcome::NeverSent(e),
+            };
+            match reauth_after_401_conn(state, scope, &fresh, url, auth).await {
+                Ok(auth) => {
+                    // The retry is a SECOND dial — its health is reported too.
+                    let retry = call_tool(
+                        client,
+                        policy,
+                        url,
+                        auth.as_ref(),
+                        &entry,
+                        tool,
+                        arguments,
+                        snapshot,
+                    )
+                    .await;
+                    state.governor.report(&host, breaker_signal(&retry));
+                    outcome_from_call(retry)
+                }
+                Err(e) => DispatchOutcome::NeverSent(e),
+            }
         }
-        r => r.map_err(CallErr::into_msg),
+        Err(CallErr::InsufficientScope(challenge_scope)) => {
+            // I6: the SAME helper the legacy path uses — a static-credential
+            // connection is never flipped to `error` by an upstream's header.
+            insufficient_scope_outcome(state, scope, auth.as_ref(), challenge_scope).await
+        }
+        r => outcome_from_call(r),
     }
 }
 
@@ -1021,6 +2028,29 @@ async fn reauth_after_401_conn(
 /// Oversized results are replaced by a truncated text block so a hostile or
 /// chatty server can't balloon the runner/context; the ledger stores only a
 /// digest either way.
+/// Cap `structuredContent` under the SAME 256 KiB ceiling as `content` (T4
+/// rider). Without this an untrusted MCP server could hand back an unbounded
+/// structured payload that we then persist verbatim into the execution claim's
+/// `result_content` (the duplicate-adoption copy) and stream to the runner.
+///
+/// Unlike a `content` array — a list of typed blocks we can truncate down to one
+/// text block — `structuredContent` is a single opaque JSON value paired with the
+/// tool's `outputSchema`; truncating its interior would yield a value that no
+/// longer satisfies that schema and could not be told apart from real data. So an
+/// oversize payload is REPLACED WHOLESALE with an explicit truncation marker: the
+/// paired (already capped) `content` still carries the human-readable result, and
+/// the result digest covers whatever we actually stored.
+fn cap_structured(structured: Option<Value>) -> Option<Value> {
+    let s = structured?;
+    if s.to_string().len() <= MAX_RESULT_BYTES {
+        return Some(s);
+    }
+    Some(json!({
+        "fluidbox_truncated": true,
+        "reason": "structuredContent exceeded the 256 KiB result ceiling and was dropped by the fluidbox broker",
+    }))
+}
+
 fn cap_content(content: Value) -> Value {
     let serialized = content.to_string();
     if serialized.len() <= MAX_RESULT_BYTES {
@@ -1049,7 +2079,15 @@ fn cap_content(content: Value) -> Value {
 pub enum ProbeOutcome {
     /// Authless server — these tools are for DISPLAY only, never persisted;
     /// the authoritative photograph still happens at connect.
-    Tools(Vec<ToolSnapshot>),
+    ///
+    /// `truncated` is true when the server still had a `nextCursor` at the
+    /// discovery page cap: the list is a PREFIX, not the whole surface (M10).
+    /// The probe used to drop that fact on the floor and hand a partial list to
+    /// the Connect wizard as if it were complete.
+    Tools {
+        tools: Vec<ToolSnapshot>,
+        truncated: bool,
+    },
     /// The server answered 401 — it wants a credential (api_key or oauth).
     Unauthorized,
     /// Not reachable / not a well-behaved MCP endpoint (message for `notes`).
@@ -1057,13 +2095,13 @@ pub enum ProbeOutcome {
 }
 
 /// Credential-free discovery for the pre-connect probe. Persists nothing and
-/// sends no secret. Reuses all of `discover_tools`' paging/SSE/handshake-retry
+/// sends no secret. Reuses all of `discover_tools`' initialize-first paging/SSE
 /// logic; bounded by `MCP_TIMEOUT` per request.
 pub async fn probe_tools(state: &AppState, url: &str) -> ProbeOutcome {
     match discover_tools(state, url, None).await {
-        Ok(tools) => ProbeOutcome::Tools(tools),
+        Ok((tools, truncated)) => ProbeOutcome::Tools { tools, truncated },
         Err(CallErr::Unauthorized) => ProbeOutcome::Unauthorized,
-        Err(CallErr::Other(m)) => ProbeOutcome::Unreachable(m),
+        Err(e) => ProbeOutcome::Unreachable(e.into_msg()),
     }
 }
 
@@ -1076,50 +2114,798 @@ mod tests {
     #[test]
     fn upstream_error_message_never_leaks_verbatim() {
         // A malicious server echoes the bearer it just received into its error
-        // message. rpc_error_to_err / unwrap_result must surface method + code +
-        // a digest — NEVER the token-shaped substring (C).
+        // message. unwrap_result must surface method + code + a digest — NEVER
+        // the token-shaped substring (C).
         let secret = "sk-live-abc123SECRETtoken";
         let value = json!({
             "jsonrpc": "2.0", "id": 1,
             "error": { "code": -32000, "message": format!("bad bearer {secret} rejected") }
         });
-        let e = rpc_error_to_err(
-            reqwest::StatusCode::BAD_REQUEST,
-            value.clone(),
-            "tools/list",
-        )
-        .unwrap_err();
-        assert!(
-            !e.contains(secret),
-            "sanitized rpc error leaked the token: {e}"
-        );
-        assert!(
-            e.contains("code -32000") && e.contains("tools/list") && e.contains("sha256:"),
-            "sanitized rpc error dropped method/code/digest: {e}"
-        );
         let e2 = unwrap_result(value, "tools/call").unwrap_err();
         assert!(
             !e2.contains(secret),
             "sanitized unwrap error leaked the token: {e2}"
         );
         assert!(
-            e2.contains("code -32000") && e2.contains("sha256:"),
-            "sanitized unwrap error dropped code/digest: {e2}"
+            e2.contains("code -32000") && e2.contains("sha256:") && e2.contains("tools/call"),
+            "sanitized unwrap error dropped method/code/digest: {e2}"
+        );
+    }
+
+    /// A `select_response` client whose every reply attempt fails INSTANTLY with
+    /// no I/O: the URL is unparseable, so `RequestBuilder::send` returns the
+    /// stored builder error without opening a socket or resolving anything. That
+    /// makes the reply-cap test hermetic AND fast while still exercising the real
+    /// counting path (`reply_method_not_found` is fire-and-forget — it ignores
+    /// the send result, so a failing send counts exactly like a successful one).
+    const NO_IO_URL: &str = "http://[";
+
+    fn server_request(id: u64) -> Value {
+        json!({ "jsonrpc": "2.0", "id": id, "method": "sampling/createMessage", "params": {} })
+    }
+
+    #[tokio::test]
+    async fn server_request_replies_are_capped_per_response() {
+        // C2: ONE governor-admitted dial must not turn into an unbounded outbound
+        // reply storm. A ~46-byte server→client request frame fits ~180 000 times
+        // in an 8 MiB body, and each one cost a sequential POST with a 5 s timeout
+        // held under the per-peer session mutex and a won execution claim.
+        let client = reqwest::Client::new();
+        let flood: Vec<Value> = (0..MAX_SERVER_REQUEST_REPLIES as u64 + 5)
+            .map(server_request)
+            .collect();
+        let err = select_response(
+            &client,
+            NO_IO_URL,
+            None,
+            SessionHeaders::default(),
+            flood,
+            Some(&json!(1)),
+        )
+        .await
+        .expect_err("a server→client request flood must abort the exchange");
+        assert!(
+            err.contains(&MAX_SERVER_REQUEST_REPLIES.to_string()),
+            "the refusal must name the cap: {err}"
+        );
+
+        // FALSE-GREEN guard: EXACTLY the cap still replies AND still returns our
+        // response — the `-32601` conformance behavior is unchanged below the cap,
+        // so the assertion above is about the ceiling, not about requests failing.
+        let mut ok: Vec<Value> = (0..MAX_SERVER_REQUEST_REPLIES as u64)
+            .map(server_request)
+            .collect();
+        ok.push(json!({ "jsonrpc": "2.0", "id": 99, "result": { "ours": true } }));
+        let v = select_response(
+            &client,
+            NO_IO_URL,
+            None,
+            SessionHeaders::default(),
+            ok,
+            Some(&json!(99)),
+        )
+        .await
+        .expect("exactly the cap must pass");
+        assert_eq!(v["result"]["ours"], json!(true));
+    }
+
+    #[test]
+    fn reply_budget_bounds_both_count_and_time() {
+        // C2 has TWO bounds and the flood test can only reach the count one (its
+        // replies fail instantly), so the time budget gets its own assertions
+        // here — otherwise a mutation disabling it would survive.
+        // Count: exactly the cap is admitted; one past it is refused BY NAME.
+        assert!(reply_budget_exhausted(MAX_SERVER_REQUEST_REPLIES, Duration::ZERO).is_none());
+        let e = reply_budget_exhausted(MAX_SERVER_REQUEST_REPLIES + 1, Duration::ZERO)
+            .expect("one past the cap must stop the loop");
+        assert!(e.contains(&MAX_SERVER_REQUEST_REPLIES.to_string()), "{e}");
+        // Time: a still-in-budget loop keeps going, and reaching the budget stops
+        // it even though the COUNT is fine — the stalling-server case.
+        assert!(
+            reply_budget_exhausted(1, SERVER_REQUEST_REPLY_BUDGET - Duration::from_millis(1))
+                .is_none()
+        );
+        let e = reply_budget_exhausted(1, SERVER_REQUEST_REPLY_BUDGET)
+            .expect("the time budget must stop the loop");
+        assert!(e.contains("time budget"), "{e}");
+        // The point of both bounds: one response's reply loop cannot approach the
+        // 600 s execution-claim TTL, whose expiry is what loses the ledger row.
+        assert!(SERVER_REQUEST_REPLY_BUDGET + MCP_DELETE_TIMEOUT < Duration::from_secs(600));
+    }
+
+    /// A stale SEP-835 response must not disable a FRESHLY REAUTHORIZED
+    /// connection. A malicious server can hold a request open while the owner
+    /// reconnects — which bumps `authorization_generation` and re-activates the
+    /// connection — and then answer `insufficient_scope`. The write is therefore
+    /// conditioned on the generation the CREDENTIAL was resolved at, and the
+    /// credential carries it (`BrokeredAuth::generation`).
+    #[test]
+    fn insufficient_scope_write_is_generation_conditioned() {
+        // Same generation ⇒ the response is about the authority we used.
+        assert!(generation_unchanged(Some(3), 3));
+        // Moved (owner reconnected mid-call) ⇒ never write.
+        assert!(!generation_unchanged(Some(4), 3));
+        assert!(!generation_unchanged(Some(2), 3));
+        // Unreadable/gone ⇒ FAIL CLOSED, not "assume it matches".
+        assert!(!generation_unchanged(None, 3));
+
+        // The credential must actually carry a generation to condition on…
+        let auth = BrokeredAuth {
+            generation: 7,
+            header: "authorization".into(),
+            value: "Bearer x".into(),
+            oauth_connection: Some(uuid::Uuid::now_v7()),
+        };
+        assert_eq!(auth.generation, 7);
+        // …and the ONE status write on this path must be gated by the predicate,
+        // never called bare.
+        // The needle is assembled at runtime so this assertion does not count
+        // its own source text (the same trick the neighbouring source test uses).
+        let src = include_str!("broker.rs");
+        let needle = format!(
+            "fluidbox_db::{}(&mut *tx, scope, connection_id",
+            "mark_connection_error"
+        );
+        assert_eq!(
+            src.matches(&needle).count(),
+            1,
+            "broker's insufficient-scope write must stay a single, gated call site"
+        );
+        let at = src.find(&needle).expect("the write exists");
+        assert!(
+            src[at.saturating_sub(200)..at].contains("generation_unchanged"),
+            "the status write is not guarded by the generation CAS"
         );
     }
 
     #[test]
-    fn sse_framed_responses_parse_by_id() {
-        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{\"x\":1}}\n\n\
-                    data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n";
-        let v = parse_sse_json(body, Some(&serde_json::json!(1))).unwrap();
-        assert_eq!(v["result"]["tools"], serde_json::json!([]));
-        // No id preference → last parseable message.
-        let v = parse_sse_json(body, None).unwrap();
-        assert_eq!(v["id"], 1);
-        // Junk and empty data lines are skipped.
-        assert!(parse_sse_json("data: not-json\n\n", None).is_none());
-        assert!(parse_sse_json(": comment\n\n", None).is_none());
+    fn insufficient_scope_marks_only_an_oauth_connection() {
+        // I6: a hostile MCP server picks its own WWW-Authenticate header, so this
+        // predicate is the entire blast radius of that choice. A STATIC-credential
+        // connection has no scope grant to widen — marking it `error` would be a
+        // remote kill switch on an org's connection — while an OAuth one is
+        // exactly the case the SEP-835 remedy was written for.
+        let cid = uuid::Uuid::now_v7();
+        let oauth = BrokeredAuth {
+            generation: 1,
+            header: "authorization".into(),
+            value: "Bearer tok".into(),
+            oauth_connection: Some(cid),
+        };
+        let static_key = BrokeredAuth {
+            generation: 1,
+            header: "x-api-key".into(),
+            value: "sk-static".into(),
+            oauth_connection: None,
+        };
+        assert_eq!(insufficient_scope_target(Some(&oauth)), Some(cid));
+        assert_eq!(insufficient_scope_target(Some(&static_key)), None);
+        // A credential-free (authless) call has nothing to mark either.
+        assert_eq!(insufficient_scope_target(None), None);
+        // Both dispatch arms route through ONE helper, so the two paths cannot
+        // diverge again: this asserts the shared helper exists and is the only
+        // marker, by being the single thing either arm calls.
+        // Needles are COMPOSED at runtime so these string literals cannot match
+        // themselves and inflate the counts.
+        let src = include_str!("broker.rs");
+        let call = format!(
+            "insufficient_scope_outcome(state, {}, auth.as_ref()",
+            "scope"
+        );
+        assert_eq!(
+            src.matches(&call).count(),
+            2,
+            "both InsufficientScope arms must call the shared helper"
+        );
+        let marker = format!("mark_insufficient_scope(state, {}, cid,", "scope");
+        assert_eq!(
+            src.matches(&marker).count(),
+            1,
+            "mark_insufficient_scope must have exactly one caller (the helper)"
+        );
+    }
+
+    #[test]
+    fn version_negotiation_accepts_supported_and_rejects_others() {
+        // The SUPPORTED set is accepted; an unknown version is rejected by name.
+        assert!(check_negotiated("2025-11-25", None).is_ok());
+        assert!(check_negotiated("2025-06-18", None).is_ok());
+        let e = check_negotiated("2024-11-05", None).unwrap_err();
+        assert!(
+            e.contains("2024-11-05") && e.contains("unsupported"),
+            "got: {e}"
+        );
+        // Empty negotiated is always a failure.
+        assert!(check_negotiated("", None).is_err());
+        // With a frozen snapshot, an EXACT match passes — but ONLY for a
+        // SUPPORTED version: equality is an ADDITIONAL requirement, never a
+        // substitute for membership.
+        assert!(check_negotiated("2025-06-18", Some("2025-06-18")).is_ok());
+        // … and any divergence is protocol drift (remedy names /tools/refresh).
+        let e = check_negotiated("2025-11-25", Some("2025-06-18")).unwrap_err();
+        assert!(
+            e.contains("drift") && e.contains("tools/refresh"),
+            "got: {e}"
+        );
+        // A NON-standard version is refused on BOTH paths now. It used to be
+        // accepted whenever the frozen snapshot recorded the same string, which
+        // is what let a hostile server persist its own "version" at discovery
+        // and then be honored forever (and read as draft-07 by
+        // `schema_guard::dialect_for`). The bindings-e2e fake was the only user
+        // of that latitude and now negotiates a supported revision.
+        let nonstandard = "2025-06-18-fakekb-1";
+        assert!(
+            check_negotiated(nonstandard, Some(nonstandard)).is_err(),
+            "snapshot equality must NOT substitute for supported-set membership"
+        );
+        assert!(
+            check_negotiated(nonstandard, None).is_err(),
+            "without the threaded snapshot, plain SUPPORTED membership rejects fakekb"
+        );
+    }
+
+    // I1a: a hardened `egress_http` (Policy::none) must REFUSE an upstream 3xx
+    // and NEVER follow the Location — a redirect is the classic SSRF pivot onto
+    // an internal host. A raw-TCP fake returns 302 + Location and counts every
+    // connection; the real `dial_rpc` transport funnel must error and leave the
+    // fake having seen exactly ONE request.
+    #[tokio::test]
+    async fn dial_rpc_refuses_upstream_redirect_and_never_follows() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits_srv = hits.clone();
+        let srv = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                hits_srv.fetch_add(1, Ordering::SeqCst);
+                // Best-effort drain of the request line/headers before replying.
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                // Location points BACK at this same fake so that a following
+                // policy would re-hit it (hits >= 2) — making the count assertion
+                // load-bearing (Policy::none keeps it at exactly 1).
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{addr}/next\r\ncontent-length: 0\r\n\r\n"
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        // Dev seam so the loopback fake is admissible; the client itself is
+        // Policy::none, which is what refuses the redirect.
+        let policy = crate::egress::EgressPolicy {
+            dev_loopback: true,
+            allow_cidrs: vec![],
+            github_clone_base: None,
+            proxy: None,
+        };
+        let client = crate::egress::build_egress_http(&policy);
+        let url = format!("http://{addr}/mcp");
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+        let err = dial_rpc(
+            &client,
+            &policy,
+            &url,
+            None,
+            SessionHeaders::default(),
+            &body,
+            MCP_TIMEOUT,
+        )
+        .await
+        .expect_err("a 302 must be refused, not followed");
+        // A redirect happens AFTER connect (the request was sent) ⇒ Ambiguous.
+        assert!(
+            matches!(err, CallErr::Ambiguous(_)),
+            "a post-connect redirect refusal must classify Ambiguous"
+        );
+        let msg = err.into_msg();
+        assert!(
+            msg.contains("redirect") && msg.contains("refused"),
+            "expected a redirect-refused error, got: {msg}"
+        );
+        // The decisive assertion: Policy::none did NOT dial the Location target.
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the client followed the redirect (saw a second request)"
+        );
+        srv.abort();
+    }
+
+    /// A loopback fake `tools/list` endpoint for the pagination tests. It echoes
+    /// the request's JSON-RPC id (the transport only accepts its own id back) and
+    /// returns ONE tool per page, appending a `nextCursor` iff the request path
+    /// says `/truncating` — so one fake drives both the never-ending server and
+    /// the well-behaved one. Binds 127.0.0.1:0 and closes each connection, so no
+    /// name is resolved and no port is assumed.
+    async fn spawn_paging_fake() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                // Read until the JSON-RPC body has landed (headers and body can
+                // arrive in separate segments).
+                let mut req = String::new();
+                for _ in 0..5 {
+                    let mut buf = [0u8; 4096];
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.push_str(&String::from_utf8_lossy(&buf[..n])),
+                    }
+                    if req.contains("\"method\"") {
+                        break;
+                    }
+                }
+                let id: i64 = req
+                    .rsplit("\"id\":")
+                    .next()
+                    .and_then(|t| t.split(|c: char| !c.is_ascii_digit()).next())
+                    .and_then(|d| d.parse().ok())
+                    .unwrap_or(1);
+                let cursor = if req.contains("/truncating") {
+                    ",\"nextCursor\":\"more\""
+                } else {
+                    ""
+                };
+                let body = format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"tools\":[{{\"name\":\"t{id}\",\
+                     \"description\":\"d\",\"inputSchema\":{{\"type\":\"object\"}}}}]{cursor}}}}}"
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (addr, srv)
+    }
+
+    #[tokio::test]
+    async fn pagination_reports_truncation_instead_of_silently_prefixing() {
+        // M10: the probe and the photograph carried SEPARATE copies of this loop
+        // with divergent semantics — the photograph refused a leftover cursor
+        // while the probe silently returned the first pages, so a PARTIAL tool
+        // list reached the Connect wizard looking like the server's whole surface.
+        // One loop now decides completeness and REPORTS it; what truncation means
+        // stays the caller's (refuse vs disclose).
+        let (addr, srv) = spawn_paging_fake().await;
+        let policy = crate::egress::EgressPolicy {
+            dev_loopback: true,
+            allow_cidrs: vec![],
+            github_clone_base: None,
+            proxy: None,
+        };
+        let client = crate::egress::build_egress_http(&policy);
+
+        // A server that never stops paging: the cap stops us, and `complete` says so.
+        let url = format!("http://{addr}/truncating");
+        let mut sess = McpUpstreamSession::fresh(&url);
+        let (tools, complete) = list_tools_paged(&client, &policy, &url, None, &mut sess)
+            .await
+            .expect("the fake answers every page");
+        assert_eq!(
+            tools.len(),
+            MAX_LIST_PAGES,
+            "exactly the page cap should have been fetched"
+        );
+        assert!(
+            !complete,
+            "an outstanding nextCursor is a PREFIX, never a complete listing"
+        );
+
+        // FALSE-GREEN guard: the SAME loop over a server that finishes reports
+        // complete — so the assertion above is about the leftover cursor, not
+        // about this loop always claiming truncation.
+        let url = format!("http://{addr}/complete");
+        let mut sess = McpUpstreamSession::fresh(&url);
+        let (tools, complete) = list_tools_paged(&client, &policy, &url, None, &mut sess)
+            .await
+            .expect("the fake answers the single page");
+        assert_eq!(tools.len(), 1);
+        assert!(complete, "no nextCursor means the listing finished");
+        srv.abort();
+    }
+
+    #[test]
+    fn both_discovery_paths_share_one_pagination_loop() {
+        // The structural half of M10: unification is the fix, so pin it. Needles
+        // are composed at runtime so these literals cannot match themselves.
+        let src = include_str!("broker.rs");
+        let call = format!("list_tools_{}(client, policy,", "paged");
+        assert_eq!(
+            src.matches(&call).count(),
+            2,
+            "the probe and the photograph must both go through the shared loop"
+        );
+        let loop_head = format!("for _ in 0..MAX_LIST_{}", "PAGES");
+        assert_eq!(
+            src.matches(&loop_head).count(),
+            1,
+            "exactly one tools/list pagination loop may exist"
+        );
+        // And the probe screens the untrusted remote list exactly like the
+        // photograph does — it used to skip `validate_tools` entirely.
+        let screen = format!("capability::validate_{}(", "tools");
+        assert_eq!(
+            src.matches(&screen).count(),
+            2,
+            "both discovery paths must run the core tool-list validation"
+        );
+    }
+
+    // ── DispatchOutcome classification (Phase E, Gap 11, plan E10) ──────────
+
+    #[test]
+    fn outcome_from_call_maps_every_arm() {
+        // A real MCP success result.
+        assert!(matches!(
+            outcome_from_call(Ok((json!([]), false, None))),
+            DispatchOutcome::Definitive {
+                is_error: false,
+                ..
+            }
+        ));
+        // A real MCP isError result → failed_upstream (Definitive, is_error).
+        assert!(matches!(
+            outcome_from_call(Ok((json!([{"type":"text","text":"boom"}]), true, None))),
+            DispatchOutcome::Definitive { is_error: true, .. }
+        ));
+        // A definitive upstream protocol error (HTTP status / JSON-RPC error) is
+        // rendered as an error RESULT ⇒ failed_upstream, NEVER ambiguous.
+        assert!(matches!(
+            outcome_from_call(Err(CallErr::Other(
+                "mcp tools/call returned HTTP 500".into()
+            ))),
+            DispatchOutcome::Definitive { is_error: true, .. }
+        ));
+        // Provable no-send is re-claimable.
+        assert!(matches!(
+            outcome_from_call(Err(CallErr::NeverSent("connect refused".into()))),
+            DispatchOutcome::NeverSent(_)
+        ));
+        // Sent, unknown outcome — never auto-retried.
+        assert!(matches!(
+            outcome_from_call(Err(CallErr::Ambiguous("timeout".into()))),
+            DispatchOutcome::Ambiguous(_)
+        ));
+        // A terminal session-expiry renders as an error result (failed_upstream).
+        assert!(matches!(
+            outcome_from_call(Err(CallErr::SessionExpired)),
+            DispatchOutcome::Definitive { is_error: true, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn dial_rpc_connect_refused_is_never_sent() {
+        // Reserve a port, capture the addr, then DROP the listener so the dial
+        // gets connection-refused (reqwest `is_connect()` ⇒ NeverSent — provable
+        // no-send, re-claimable).
+        let addr = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let url = format!("http://{addr}/mcp");
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+        let err = dial_rpc(
+            &client,
+            &policy,
+            &url,
+            None,
+            SessionHeaders::default(),
+            &body,
+            MCP_TIMEOUT,
+        )
+        .await
+        .expect_err("a refused connection must error");
+        assert!(
+            matches!(err, CallErr::NeverSent(_)),
+            "connect-refused must classify NeverSent, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dial_rpc_timeout_is_ambiguous() {
+        // A fake that accepts the connection and NEVER responds; a short per-dial
+        // timeout forces the `is_timeout()` ⇒ Ambiguous classification (the send
+        // may have landed, so the outcome is unknown — never auto-retried).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                match listener.accept().await {
+                    Ok((sock, _)) => held.push(sock), // keep open, never reply
+                    Err(_) => return,
+                }
+            }
+        });
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let url = format!("http://{addr}/mcp");
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+        let err = dial_rpc(
+            &client,
+            &policy,
+            &url,
+            None,
+            SessionHeaders::default(),
+            &body,
+            Duration::from_millis(300),
+        )
+        .await
+        .expect_err("a non-responding server must time out");
+        assert!(
+            matches!(err, CallErr::Ambiguous(_)),
+            "a timeout must classify Ambiguous, got {err:?}"
+        );
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn call_tool_http_500_is_definitive_failed_upstream() {
+        // A fake that initializes fine but returns HTTP 500 on tools/call → the
+        // dispatch is a DEFINITIVE upstream error (is_error=true → failed_upstream),
+        // NEVER ambiguous (the acceptance bullet: a definitive 500 is not unknown).
+        let handler: Handler = Arc::new(|_i, rec: &Recorded| match rec.rpc_method.as_str() {
+            "initialize" => FakeReply::json(200, init_result(rec, "2025-11-25")),
+            "notifications/initialized" => FakeReply::empty(202),
+            "tools/call" => FakeReply::json(500, json!({ "error": "boom" }).to_string()),
+            _ => FakeReply::empty(202),
+        });
+        let (url, _records, jh) = spawn_fake(handler).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
+        let outcome = outcome_from_call(
+            call_tool(&client, &policy, &url, None, &entry, "x", &json!({}), None).await,
+        );
+        jh.abort();
+        assert!(
+            matches!(outcome, DispatchOutcome::Definitive { is_error: true, .. }),
+            "HTTP 500 must be Definitive/failed_upstream, got {outcome:?}"
+        );
+    }
+
+    // ── Egress governor wiring (Phase E, E14) ───────────────────────────────
+
+    #[test]
+    fn breaker_signal_classification_boundary() {
+        use crate::governor::Outcome;
+        // HEALTHY upstream — every one of these is a definitive answer from a
+        // server that is demonstrably alive, so NONE may trip the breaker.
+        assert_eq!(breaker_signal(&Ok((json!([]), false, None))), Outcome::Ok);
+        assert_eq!(
+            breaker_signal(&Ok((
+                json!([{"type":"text","text":"tool blew up"}]),
+                true,
+                None
+            ))),
+            Outcome::Ok,
+            "an isError tool result must NEVER trip the breaker"
+        );
+        assert_eq!(
+            breaker_signal(&Err(CallErr::Other(
+                "mcp tools/call failed (code -32000, msg sha256:…)".into()
+            ))),
+            Outcome::Ok,
+            "a JSON-RPC error object must NEVER trip the breaker"
+        );
+        assert_eq!(
+            breaker_signal(&Err(status_err(
+                "tools/call",
+                reqwest::StatusCode::BAD_REQUEST
+            ))),
+            Outcome::Ok,
+            "a 4xx is a definitive answer, not an upstream-health failure"
+        );
+        assert_eq!(breaker_signal(&Err(CallErr::Unauthorized)), Outcome::Ok);
+        assert_eq!(
+            breaker_signal(&Err(CallErr::InsufficientScope(None))),
+            Outcome::Ok
+        );
+        assert_eq!(breaker_signal(&Err(CallErr::SessionExpired)), Outcome::Ok);
+        // UNHEALTHY upstream — 5xx, provable no-send, and unknown-outcome dials.
+        for status in [
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert_eq!(
+                breaker_signal(&Err(status_err("tools/call", status))),
+                Outcome::TransportFailure,
+                "{status} must count as an upstream-health failure"
+            );
+        }
+        assert_eq!(
+            breaker_signal(&Err(CallErr::NeverSent("mcp server unreachable".into()))),
+            Outcome::TransportFailure
+        );
+        assert_eq!(
+            breaker_signal(&Err(CallErr::Ambiguous("mcp request timed out".into()))),
+            Outcome::TransportFailure
+        );
+    }
+
+    #[test]
+    fn a_5xx_still_classifies_definitive_failed_upstream() {
+        // Splitting 5xx out for the BREAKER must not change the claim outcome:
+        // a definitive 500 is still `failed_upstream`, never `ambiguous`
+        // (Task 4's acceptance bullet).
+        assert!(matches!(
+            outcome_from_call(Err(status_err(
+                "tools/call",
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            ))),
+            DispatchOutcome::Definitive { is_error: true, .. }
+        ));
+        // … and the message still names the status for an operator.
+        let m = status_err("tools/call", reqwest::StatusCode::BAD_GATEWAY).into_msg();
+        assert!(m.contains("502") && m.contains("tools/call"), "got: {m}");
+    }
+
+    #[test]
+    fn host_key_is_lowercased_and_port_insensitive() {
+        assert_eq!(host_key("https://MCP.Example.Test/mcp"), "mcp.example.test");
+        assert_eq!(
+            host_key("https://mcp.example.test:8443/mcp"),
+            host_key("https://mcp.example.test/mcp"),
+            "a port must not open a fresh host bucket"
+        );
+        // Unparsable → the shared empty bucket (admit_url refuses the dial).
+        assert_eq!(host_key("not a url"), "");
+    }
+
+    #[test]
+    fn a_governor_refusal_is_never_sent_and_leaks_no_host() {
+        // The gate's refusal must be re-claimable (NeverSent), name the scope +
+        // retry hint, and carry only a DIGEST of the upstream host.
+        let gov = crate::governor::EgressGovernor::manual(crate::governor::GovernorLimits {
+            tenant_per_min: 0,
+            connection_per_min: 1,
+            host_per_min: 0,
+            breaker_threshold: 0,
+            breaker_open_secs: 0,
+        });
+        let (t, c) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let url = "https://secret-internal.corp.example/mcp";
+        assert!(
+            governor_gate(&gov, t, c, url).is_ok(),
+            "first dial admitted"
+        );
+        let refused = governor_gate(&gov, t, c, url).expect_err("second is throttled");
+        let DispatchOutcome::NeverSent(msg) = refused else {
+            panic!("a governor refusal MUST be NeverSent (re-claimable): {refused:?}");
+        };
+        assert!(
+            msg.contains("connection") && msg.contains("retry after"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("secret-internal.corp.example"),
+            "the refusal leaked the raw upstream host: {msg}"
+        );
+        assert!(
+            msg.contains("sha256:"),
+            "the refusal dropped the digest: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn breaker_opens_on_repeated_5xx_and_then_stops_dialing_the_upstream() {
+        // The production sequence, verbatim: governor_gate → call_tool →
+        // report(breaker_signal(...)) — the same three calls `call_tool_auth`
+        // and `call_tool_for_conn` make. A fake that 500s EVERYTHING must open
+        // the breaker after `threshold` dials, and the next call must be refused
+        // as NeverSent WITHOUT the fake seeing another request.
+        const THRESHOLD: u32 = 3;
+        let handler: Handler = Arc::new(|_i, _rec: &Recorded| {
+            FakeReply::json(500, json!({ "error": "down" }).to_string())
+        });
+        let (url, records, jh) = spawn_fake(handler).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let gov = crate::governor::EgressGovernor::manual(crate::governor::GovernorLimits {
+            tenant_per_min: 0,
+            connection_per_min: 0,
+            host_per_min: 0,
+            breaker_threshold: THRESHOLD,
+            breaker_open_secs: 60,
+        });
+        let (t, c) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+
+        for i in 0..THRESHOLD {
+            let host = governor_gate(&gov, t, c, &url)
+                .unwrap_or_else(|e| panic!("dial {i} must be admitted, got {e:?}"));
+            let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
+            let r = call_tool(&client, &policy, &url, None, &entry, "x", &json!({}), None).await;
+            assert!(
+                matches!(r, Err(CallErr::UpstreamUnavailable(_))),
+                "dial {i} must classify as an upstream-health failure, got {r:?}"
+            );
+            gov.report(&host, breaker_signal(&r));
+        }
+        // Precondition: the fake WAS recording (a dead fake must not false-green
+        // the "stopped dialing" assertion below).
+        let before = records.lock().unwrap().len();
+        assert!(
+            before >= THRESHOLD as usize,
+            "the fake recorded {before} requests — it never saw the dials"
+        );
+
+        // The (N+1)th never reaches the wire.
+        let refused = governor_gate(&gov, t, c, &url).expect_err("the breaker must be open");
+        assert!(
+            matches!(refused, DispatchOutcome::NeverSent(_)),
+            "a breaker refusal is a pre-write proof of non-dispatch: {refused:?}"
+        );
+        assert_eq!(
+            records.lock().unwrap().len(),
+            before,
+            "the breaker refusal still contacted the upstream"
+        );
+        jh.abort();
+    }
+
+    #[tokio::test]
+    async fn an_iserror_result_never_opens_the_breaker() {
+        // A fake that initializes fine and answers EVERY tools/call with a
+        // well-formed `isError: true` result. The upstream is healthy, so no
+        // number of these may open the breaker (plan E14's binding rule).
+        let handler: Handler = Arc::new(|_i, rec: &Recorded| match rec.rpc_method.as_str() {
+            "initialize" => FakeReply::json(200, init_result(rec, "2025-11-25")),
+            "notifications/initialized" => FakeReply::empty(202),
+            "tools/call" => FakeReply::json(
+                200,
+                rpc_result(
+                    rec,
+                    json!({
+                        "content": [{ "type": "text", "text": "the tool refused" }],
+                        "isError": true,
+                    }),
+                ),
+            ),
+            _ => FakeReply::empty(202),
+        });
+        let (url, records, jh) = spawn_fake(handler).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let gov = crate::governor::EgressGovernor::manual(crate::governor::GovernorLimits {
+            tenant_per_min: 0,
+            connection_per_min: 0,
+            host_per_min: 0,
+            breaker_threshold: 2,
+            breaker_open_secs: 60,
+        });
+        let (t, c) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
+        for i in 0..6 {
+            let host = governor_gate(&gov, t, c, &url).unwrap_or_else(|e| {
+                panic!("an isError result must never open the breaker (dial {i}): {e:?}")
+            });
+            let r = call_tool(&client, &policy, &url, None, &entry, "x", &json!({}), None).await;
+            assert!(
+                matches!(&r, Ok((_, true, _))),
+                "dial {i} must be a real isError RESULT, got {r:?}"
+            );
+            gov.report(&host, breaker_signal(&r));
+        }
+        assert!(
+            count_rpc(&records, "tools/call") >= 6,
+            "the fake never saw the calls — the assertion above is vacuous"
+        );
+        jh.abort();
     }
 
     #[test]
@@ -1192,6 +2978,1042 @@ mod tests {
         let s = capped.to_string();
         assert!(s.len() < MAX_RESULT_BYTES);
         assert!(s.contains("truncated by fluidbox broker"));
+    }
+
+    #[test]
+    fn oversized_structured_content_is_capped_to_a_marker() {
+        // Absent stays absent; a small payload passes through byte-identical.
+        assert_eq!(cap_structured(None), None);
+        let small = serde_json::json!({ "answer": 42 });
+        assert_eq!(cap_structured(Some(small.clone())), Some(small));
+        // Oversize is REPLACED wholesale (never truncated in place — that would
+        // silently violate the tool's outputSchema).
+        let big = serde_json::json!({ "blob": "x".repeat(MAX_RESULT_BYTES + 1) });
+        let capped = cap_structured(Some(big)).unwrap();
+        let s = capped.to_string();
+        assert!(
+            s.len() < MAX_RESULT_BYTES,
+            "capped structured content must fit the ceiling"
+        );
+        assert_eq!(capped["fluidbox_truncated"], serde_json::json!(true));
+        assert!(!s.contains("xxxxxxxx"), "no oversize payload survives");
+    }
+
+    // ── Session-manager conformance (raw-TCP fake MCP server, no DB) ──────────
+    //
+    // A loopback fake records every request (HTTP method, jsonrpc method, headers,
+    // body) and replies per a handler closure. Every count assertion carries a
+    // `>0` precondition so a dead fake cannot false-green (Phase D discipline).
+
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Clone)]
+    struct Recorded {
+        http_method: String,
+        rpc_method: String,
+        headers: HashMap<String, String>,
+        body: Value,
+    }
+    impl Recorded {
+        fn id(&self) -> Value {
+            self.body.get("id").cloned().unwrap_or(Value::Null)
+        }
+    }
+
+    struct FakeReply {
+        status: u16,
+        content_type: &'static str,
+        session_id: Option<String>,
+        www_auth: Option<String>,
+        body: String,
+    }
+    impl FakeReply {
+        fn json(status: u16, body: String) -> Self {
+            FakeReply {
+                status,
+                content_type: "application/json",
+                session_id: None,
+                www_auth: None,
+                body,
+            }
+        }
+        fn empty(status: u16) -> Self {
+            FakeReply {
+                status,
+                content_type: "",
+                session_id: None,
+                www_auth: None,
+                body: String::new(),
+            }
+        }
+        fn with_session(mut self, sid: &str) -> Self {
+            self.session_id = Some(sid.to_string());
+            self
+        }
+    }
+
+    /// A JSON-RPC result envelope echoing the request id.
+    fn rpc_result(rec: &Recorded, result: Value) -> String {
+        json!({ "jsonrpc": "2.0", "id": rec.id(), "result": result }).to_string()
+    }
+    /// The standard initialize result at a given negotiated version.
+    fn init_result(rec: &Recorded, version: &str) -> String {
+        rpc_result(
+            rec,
+            json!({
+                "protocolVersion": version,
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": "fake", "version": "1" },
+            }),
+        )
+    }
+
+    type Handler = Arc<dyn Fn(usize, &Recorded) -> FakeReply + Send + Sync>;
+
+    /// Spawn a loopback fake; returns (url, records, abort-handle).
+    async fn spawn_fake(
+        handler: Handler,
+    ) -> (
+        String,
+        Arc<StdMutex<Vec<Recorded>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let records = Arc::new(StdMutex::new(Vec::<Recorded>::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let recs = records.clone();
+        let jh = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let Some(rec) = read_request(&mut sock).await else {
+                    continue;
+                };
+                let idx = {
+                    let mut r = recs.lock().unwrap();
+                    r.push(rec.clone());
+                    r.len() - 1
+                };
+                let reply = handler(idx, &rec);
+                let _ = sock.write_all(&render_reply(&reply)).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}/mcp"), records, jh)
+    }
+
+    async fn read_request(sock: &mut tokio::net::TcpStream) -> Option<Recorded> {
+        let mut buf = Vec::new();
+        let head_end = loop {
+            let mut tmp = [0u8; 2048];
+            let n = sock.read(&mut tmp).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break p + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+        let mut lines = head.split("\r\n");
+        let request_line = lines.next().unwrap_or("");
+        let mut rl = request_line.split_whitespace();
+        let http_method = rl.next().unwrap_or("").to_string();
+        let mut headers = HashMap::new();
+        for line in lines {
+            if let Some((k, v)) = line.split_once(':') {
+                headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            }
+        }
+        let clen: usize = headers
+            .get("content-length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let mut body_bytes = buf[head_end..].to_vec();
+        while body_bytes.len() < clen {
+            let mut tmp = [0u8; 2048];
+            let n = sock.read(&mut tmp).await.ok()?;
+            if n == 0 {
+                break;
+            }
+            body_bytes.extend_from_slice(&tmp[..n]);
+        }
+        body_bytes.truncate(clen);
+        let body = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
+        let rpc_method = body
+            .get("method")
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .to_string();
+        Some(Recorded {
+            http_method,
+            rpc_method,
+            headers,
+            body,
+        })
+    }
+
+    fn render_reply(r: &FakeReply) -> Vec<u8> {
+        let reason = match r.status {
+            200 => "OK",
+            202 => "Accepted",
+            401 => "Unauthorized",
+            403 => "Forbidden",
+            404 => "Not Found",
+            500 => "Internal Server Error",
+            _ => "OK",
+        };
+        let mut s = format!("HTTP/1.1 {} {reason}\r\n", r.status);
+        s.push_str("connection: close\r\n");
+        s.push_str(&format!("content-length: {}\r\n", r.body.len()));
+        if !r.content_type.is_empty() {
+            s.push_str(&format!("content-type: {}\r\n", r.content_type));
+        }
+        if let Some(sid) = &r.session_id {
+            s.push_str(&format!("mcp-session-id: {sid}\r\n"));
+        }
+        if let Some(w) = &r.www_auth {
+            s.push_str(&format!("www-authenticate: {w}\r\n"));
+        }
+        s.push_str("\r\n");
+        let mut out = s.into_bytes();
+        out.extend_from_slice(r.body.as_bytes());
+        out
+    }
+
+    fn dev_policy() -> crate::egress::EgressPolicy {
+        crate::egress::EgressPolicy {
+            dev_loopback: true,
+            allow_cidrs: vec![],
+            github_clone_base: None,
+            proxy: None,
+        }
+    }
+
+    fn count_rpc(records: &Arc<StdMutex<Vec<Recorded>>>, method: &str) -> usize {
+        records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.rpc_method == method)
+            .count()
+    }
+    fn count_http(records: &Arc<StdMutex<Vec<Recorded>>>, method: &str) -> usize {
+        records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.http_method == method)
+            .count()
+    }
+
+    /// A default sessionless handler: initialize (echo `version`), notifications,
+    /// and a trivial tools/call echo. `version` = the negotiated protocol.
+    fn basic_handler(version: &'static str) -> Handler {
+        Arc::new(move |_idx, rec: &Recorded| match rec.rpc_method.as_str() {
+            "initialize" => FakeReply::json(200, init_result(rec, version)),
+            "notifications/initialized" => FakeReply::empty(202),
+            "tools/call" => FakeReply::json(
+                200,
+                rpc_result(
+                    rec,
+                    json!({ "content": [{"type":"text","text":"ok"}], "isError": false }),
+                ),
+            ),
+            _ => FakeReply::empty(202),
+        })
+    }
+
+    #[tokio::test]
+    async fn initialize_is_first_offers_2025_11_25_and_notifies_unconditionally() {
+        let (url, records, jh) = spawn_fake(basic_handler("2025-11-25")).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
+        let out = managed_call(
+            &client,
+            &policy,
+            &url,
+            None,
+            &entry,
+            "tools/call",
+            json!({ "name": "x", "arguments": {} }),
+            None,
+        )
+        .await;
+        jh.abort();
+        assert!(
+            out.is_ok(),
+            "call failed: {:?}",
+            out.err().map(|e| e.into_msg())
+        );
+        let recs = records.lock().unwrap();
+        assert!(!recs.is_empty(), "the fake saw NO requests (dead fake)");
+        // The FIRST request is initialize (stateless-first is gone) …
+        assert_eq!(
+            recs[0].rpc_method, "initialize",
+            "first request must be initialize"
+        );
+        // … and it OFFERS 2025-11-25.
+        assert_eq!(
+            recs[0].body["params"]["protocolVersion"], "2025-11-25",
+            "offer must be 2025-11-25"
+        );
+        // notifications/initialized is sent UNCONDITIONALLY (server issued no
+        // session id) and carries none.
+        let note = recs
+            .iter()
+            .find(|r| r.rpc_method == "notifications/initialized");
+        let note = note.expect("notifications/initialized must be sent");
+        assert!(
+            !note.headers.contains_key("mcp-session-id"),
+            "no session id was issued, so none must be sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_negotiation_rejects_unsupported_over_the_wire() {
+        // A server negotiating 2024-11-05 (unsupported, no frozen snapshot) fails
+        // the call by name; 2025-06-18 succeeds.
+        let (bad_url, bad_recs, jh1) = spawn_fake(basic_handler("2024-11-05")).await;
+        let (ok_url, ok_recs, jh2) = spawn_fake(basic_handler("2025-06-18")).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let call = |url: String| {
+            let client = client.clone();
+            let policy = policy.clone();
+            async move {
+                let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
+                managed_call(
+                    &client,
+                    &policy,
+                    &url,
+                    None,
+                    &entry,
+                    "tools/call",
+                    json!({ "name": "x", "arguments": {} }),
+                    None,
+                )
+                .await
+                .map_err(|e| e.into_msg())
+            }
+        };
+        let bad = call(bad_url).await;
+        let good = call(ok_url).await;
+        jh1.abort();
+        jh2.abort();
+        assert!(count_rpc(&bad_recs, "initialize") > 0, "dead bad fake");
+        assert!(count_rpc(&ok_recs, "initialize") > 0, "dead ok fake");
+        let e = bad.expect_err("2024-11-05 must be rejected");
+        assert!(
+            e.contains("2024-11-05") && e.contains("unsupported"),
+            "got: {e}"
+        );
+        assert!(good.is_ok(), "2025-06-18 must be accepted: {good:?}");
+    }
+
+    /// Gap 8's supported-set requirement must bind on BOTH paths. A hostile
+    /// server used to be able to negotiate `"attacker-version"` at DISCOVERY
+    /// (`VersionPolicy::Record` accepted any non-empty string), persist it into
+    /// the snapshot, and then keep executing forever because the runtime check
+    /// was satisfied by exact snapshot EQUALITY before any membership test —
+    /// while `schema_guard::dialect_for` read that same string as draft-07.
+    #[tokio::test]
+    async fn unsupported_version_is_refused_at_record_and_at_runtime_despite_snapshot_match() {
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let record = |url: String| {
+            let (client, policy) = (client.clone(), policy.clone());
+            async move {
+                let mut sess = McpUpstreamSession::fresh(&url);
+                ensure_initialized(
+                    &client,
+                    &policy,
+                    &url,
+                    None,
+                    &mut sess,
+                    VersionPolicy::Record,
+                )
+                .await
+                .map_err(|e| e.into_msg())
+            }
+        };
+        let runtime = |url: String, snapshot: &'static str| {
+            let (client, policy) = (client.clone(), policy.clone());
+            async move {
+                let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
+                managed_call(
+                    &client,
+                    &policy,
+                    &url,
+                    None,
+                    &entry,
+                    "tools/call",
+                    json!({ "name": "x", "arguments": {} }),
+                    Some(snapshot),
+                )
+                .await
+                .map_err(|e| e.into_msg())
+            }
+        };
+
+        // 1. DISCOVERY refuses to RECORD an out-of-set version.
+        let (bad_url, bad_recs, jh1) = spawn_fake(basic_handler("attacker-version")).await;
+        let rec_err = record(bad_url.clone())
+            .await
+            .expect_err("recording an unsupported version must be refused");
+        assert!(
+            rec_err.contains("attacker-version") && rec_err.contains("unsupported"),
+            "got: {rec_err}"
+        );
+        // 2. RUNTIME refuses it too, even though the snapshot matches EXACTLY —
+        //    the pre-existing rows a stricter discovery path cannot retract.
+        let run_err = runtime(bad_url, "attacker-version")
+            .await
+            .expect_err("an unsupported version must not be honored via snapshot equality");
+        assert!(
+            run_err.contains("attacker-version") && run_err.contains("unsupported"),
+            "got: {run_err}"
+        );
+        jh1.abort();
+        assert!(count_rpc(&bad_recs, "initialize") > 0, "dead bad fake");
+
+        // FALSE-GREEN guard: a SUPPORTED version records and runs, so the two
+        // refusals above are about the supported set and not about the fixture.
+        let (ok_url, ok_recs, jh2) = spawn_fake(basic_handler("2025-06-18")).await;
+        record(ok_url.clone())
+            .await
+            .expect("a supported version records");
+        assert!(
+            runtime(ok_url, "2025-06-18").await.is_ok(),
+            "a supported, snapshot-matching version must still run"
+        );
+        jh2.abort();
+        assert!(count_rpc(&ok_recs, "initialize") > 0, "dead ok fake");
+    }
+
+    /// MCP conformance: a server must DECLARE `tools` in its `initialize`
+    /// capabilities before we photograph a tool surface from it. Enforced on the
+    /// discovery path only — a frozen snapshot is already proof the server
+    /// declared it when photographed, and re-checking at runtime would break
+    /// in-flight runs over a cosmetic reply change.
+    #[tokio::test]
+    async fn photographing_requires_a_declared_tools_capability() {
+        let no_tools: Handler =
+            Arc::new(move |_idx, rec: &Recorded| match rec.rpc_method.as_str() {
+                "initialize" => FakeReply::json(
+                    200,
+                    rpc_result(
+                        rec,
+                        json!({
+                            "protocolVersion": "2025-11-25",
+                            "capabilities": { "prompts": {} },
+                            "serverInfo": { "name": "no-tools", "version": "1" },
+                        }),
+                    ),
+                ),
+                "notifications/initialized" => FakeReply::empty(202),
+                "tools/call" => FakeReply::json(
+                    200,
+                    rpc_result(
+                        rec,
+                        json!({ "content": [{"type":"text","text":"ok"}], "isError": false }),
+                    ),
+                ),
+                _ => FakeReply::empty(202),
+            });
+        let (url, recs, jh) = spawn_fake(no_tools).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+
+        let mut sess = McpUpstreamSession::fresh(&url);
+        let err = ensure_initialized(
+            &client,
+            &policy,
+            &url,
+            None,
+            &mut sess,
+            VersionPolicy::Record,
+        )
+        .await
+        .expect_err("a server that declares no tools capability is not photographable")
+        .into_msg();
+        assert!(err.contains("tools"), "got: {err}");
+
+        // The runtime path is deliberately unchanged (an already-frozen surface
+        // keeps working).
+        let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
+        let out = managed_call(
+            &client,
+            &policy,
+            &url,
+            None,
+            &entry,
+            "tools/call",
+            json!({ "name": "x", "arguments": {} }),
+            Some("2025-11-25"),
+        )
+        .await;
+        jh.abort();
+        assert!(
+            out.is_ok(),
+            "the runtime path must NOT have grown a capability requirement: {:?}",
+            out.err().map(|e| e.into_msg())
+        );
+        assert!(count_rpc(&recs, "initialize") > 0, "dead fake");
+    }
+
+    #[test]
+    fn media_type_is_exact_not_substring() {
+        assert_eq!(media_type_of("application/json"), "application/json");
+        assert_eq!(
+            media_type_of(" Application/JSON ; charset=utf-8"),
+            "application/json"
+        );
+        assert_eq!(media_type_of("text/event-stream;x=1"), "text/event-stream");
+        // The look-alikes a `contains()` check used to accept.
+        for bogus in [
+            "application/jsonp",
+            "application/json-seq",
+            "x-application/json",
+            "application/json+evil",
+            "text/event-streaming",
+        ] {
+            let m = media_type_of(bogus);
+            assert!(
+                m != "application/json" && m != "text/event-stream",
+                "'{bogus}' must not pass as a JSON-RPC framing"
+            );
+        }
+    }
+
+    /// Over the wire: a reply labelled `application/jsonp` is NOT parsed as
+    /// JSON-RPC, even though its body is valid JSON-RPC — the substring match
+    /// used to accept it.
+    #[tokio::test]
+    async fn jsonp_content_type_is_refused_over_the_wire() {
+        let jsonp: Handler = Arc::new(move |_idx, rec: &Recorded| {
+            let mut reply = FakeReply::json(200, init_result(rec, "2025-11-25"));
+            reply.content_type = "application/jsonp";
+            reply
+        });
+        let (url, recs, jh) = spawn_fake(jsonp).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
+        let out = managed_call(
+            &client,
+            &policy,
+            &url,
+            None,
+            &entry,
+            "tools/call",
+            json!({ "name": "x", "arguments": {} }),
+            None,
+        )
+        .await;
+        jh.abort();
+        let err = out
+            .expect_err("application/jsonp must not be accepted as JSON-RPC")
+            .into_msg();
+        assert!(err.contains("content-type"), "got: {err}");
+        assert!(count_rpc(&recs, "initialize") > 0, "dead fake");
+    }
+
+    #[tokio::test]
+    async fn request_ids_are_distinct_and_protocol_header_present() {
+        let (url, records, jh) = spawn_fake(basic_handler("2025-11-25")).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
+        for _ in 0..2 {
+            managed_call(
+                &client,
+                &policy,
+                &url,
+                None,
+                &entry,
+                "tools/call",
+                json!({ "name": "x", "arguments": {} }),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        jh.abort();
+        let recs = records.lock().unwrap();
+        let call_ids: Vec<i64> = recs
+            .iter()
+            .filter(|r| r.rpc_method == "tools/call")
+            .map(|r| r.id().as_i64().unwrap_or(-1))
+            .collect();
+        assert_eq!(call_ids.len(), 2, "the fake must have seen 2 tools/call");
+        assert_ne!(call_ids[0], call_ids[1], "ids must be distinct");
+        assert!(call_ids[1] > call_ids[0], "ids must increment");
+        // Every post-initialize request carries MCP-Protocol-Version = negotiated.
+        for r in recs.iter().filter(|r| r.rpc_method == "tools/call") {
+            assert_eq!(
+                r.headers.get("mcp-protocol-version").map(String::as_str),
+                Some("2025-11-25"),
+                "MCP-Protocol-Version header must be present post-init"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reinit_once_on_404_with_session_then_replays() {
+        // Issue a session id at initialize; 404 the FIRST tools/call; succeed after.
+        let call_seen = Arc::new(AtomicUsize::new(0));
+        let cs = call_seen.clone();
+        let handler: Handler =
+            Arc::new(move |_idx, rec: &Recorded| match rec.rpc_method.as_str() {
+                "initialize" => {
+                    FakeReply::json(200, init_result(rec, "2025-11-25")).with_session("sess-1")
+                }
+                "notifications/initialized" => FakeReply::empty(202),
+                "tools/call" => {
+                    if cs.fetch_add(1, Ordering::SeqCst) == 0 {
+                        FakeReply::empty(404) // first call: session gone upstream
+                    } else {
+                        FakeReply::json(
+                            200,
+                            rpc_result(rec, json!({ "content": [], "isError": false })),
+                        )
+                    }
+                }
+                _ => FakeReply::empty(202),
+            });
+        let (url, records, jh) = spawn_fake(handler).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
+        let out = managed_call(
+            &client,
+            &policy,
+            &url,
+            None,
+            &entry,
+            "tools/call",
+            json!({ "name": "x", "arguments": {} }),
+            None,
+        )
+        .await;
+        jh.abort();
+        assert!(
+            out.is_ok(),
+            "reinit+replay must succeed: {:?}",
+            out.err().map(|e| e.into_msg())
+        );
+        assert_eq!(
+            count_rpc(&records, "initialize"),
+            2,
+            "exactly ONE reinit (2 initializes total)"
+        );
+        assert_eq!(
+            count_rpc(&records, "tools/call"),
+            2,
+            "one 404'd call + one replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn double_404_errors() {
+        // Always 404 tools/call (even after reinit): the SECOND 404 is terminal.
+        let handler: Handler = Arc::new(|_idx, rec: &Recorded| match rec.rpc_method.as_str() {
+            "initialize" => {
+                FakeReply::json(200, init_result(rec, "2025-11-25")).with_session("sess-1")
+            }
+            "tools/call" => FakeReply::empty(404),
+            _ => FakeReply::empty(202),
+        });
+        let (url, records, jh) = spawn_fake(handler).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
+        let out = managed_call(
+            &client,
+            &policy,
+            &url,
+            None,
+            &entry,
+            "tools/call",
+            json!({ "name": "x", "arguments": {} }),
+            None,
+        )
+        .await;
+        jh.abort();
+        assert!(
+            count_rpc(&records, "tools/call") >= 2,
+            "must have tried twice"
+        );
+        let e = out.expect_err("a double-404 must error").into_msg();
+        assert!(e.contains("session expired"), "got: {e}");
+    }
+
+    #[tokio::test]
+    async fn server_request_gets_method_not_found_and_notification_ignored() {
+        // The tools/call reply is an SSE stream with a server→client REQUEST, a
+        // NOTIFICATION, and our RESPONSE. We must reply -32601 to the request,
+        // ignore the notification, and still return the result.
+        let handler: Handler = Arc::new(|_idx, rec: &Recorded| match rec.rpc_method.as_str() {
+            "initialize" => FakeReply::json(200, init_result(rec, "2025-11-25")).with_session("s1"),
+            "notifications/initialized" => FakeReply::empty(202),
+            "tools/call" => {
+                let sse = format!(
+                    "event: message\ndata: {}\n\n\
+                     data: {}\n\n\
+                     data: {}\n\n",
+                    json!({"jsonrpc":"2.0","id":"srv-1","method":"sampling/createMessage","params":{}}),
+                    json!({"jsonrpc":"2.0","method":"notifications/progress","params":{}}),
+                    json!({"jsonrpc":"2.0","id": rec.id(), "result": {"content":[{"type":"text","text":"done"}],"isError":false}}),
+                );
+                FakeReply {
+                    status: 200,
+                    content_type: "text/event-stream",
+                    session_id: None,
+                    www_auth: None,
+                    body: sse,
+                }
+            }
+            _ => FakeReply::empty(202),
+        });
+        let (url, records, jh) = spawn_fake(handler).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
+        let out = managed_call(
+            &client,
+            &policy,
+            &url,
+            None,
+            &entry,
+            "tools/call",
+            json!({ "name": "x", "arguments": {} }),
+            None,
+        )
+        .await;
+        jh.abort();
+        // The result still comes back despite the interleaved server traffic.
+        let v = out.expect("call returns the result");
+        assert_eq!(v["content"][0]["text"], "done");
+        // A -32601 reply was POSTed back (an extra request carrying that error).
+        let recs = records.lock().unwrap();
+        assert!(
+            recs.len() >= 3,
+            "expected the -32601 reply POST (dead fake?)"
+        );
+        let saw_mnf = recs.iter().any(|r| {
+            r.body
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(Value::as_i64)
+                == Some(-32601)
+        });
+        assert!(
+            saw_mnf,
+            "the broker must reply -32601 to the server request"
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_content_passes_through_and_is_capped() {
+        let handler: Handler = Arc::new(|_idx, rec: &Recorded| match rec.rpc_method.as_str() {
+            "initialize" => FakeReply::json(200, init_result(rec, "2025-11-25")),
+            "tools/call" => FakeReply::json(
+                200,
+                rpc_result(
+                    rec,
+                    json!({
+                        "content": [{"type":"text","text":"ok"}],
+                        "isError": false,
+                        "structuredContent": {"answer": 42},
+                    }),
+                ),
+            ),
+            _ => FakeReply::empty(202),
+        });
+        let (url, records, jh) = spawn_fake(handler).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
+        let (content, is_error, structured) =
+            call_tool(&client, &policy, &url, None, &entry, "x", &json!({}), None)
+                .await
+                .expect("call ok");
+        jh.abort();
+        assert!(count_rpc(&records, "tools/call") > 0, "dead fake");
+        assert!(!is_error);
+        assert_eq!(content[0]["text"], "ok");
+        assert_eq!(
+            structured,
+            Some(json!({"answer": 42})),
+            "structuredContent must pass through"
+        );
+    }
+
+    #[tokio::test]
+    async fn insufficient_scope_is_terminal_and_names_reconnect() {
+        // A 401 with an SEP-835 challenge: no re-mint retry at the managed layer;
+        // the error names reconnect. (The connection status write is exercised by
+        // the CI hardening suite — it is DB-gated behind mark_insufficient_scope.)
+        let handler: Handler = Arc::new(|_idx, rec: &Recorded| match rec.rpc_method.as_str() {
+            "initialize" => FakeReply::json(200, init_result(rec, "2025-11-25")),
+            "notifications/initialized" => FakeReply::empty(202),
+            "tools/call" => FakeReply {
+                status: 401,
+                content_type: "",
+                session_id: None,
+                www_auth: Some("Bearer error=\"insufficient_scope\", scope=\"read:issues\"".into()),
+                body: String::new(),
+            },
+            _ => FakeReply::empty(202),
+        });
+        let (url, records, jh) = spawn_fake(handler).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
+        let out = managed_call(
+            &client,
+            &policy,
+            &url,
+            None,
+            &entry,
+            "tools/call",
+            json!({ "name": "x", "arguments": {} }),
+            None,
+        )
+        .await;
+        jh.abort();
+        // Exactly ONE tools/call — no retry (a re-mint cannot add a scope).
+        assert_eq!(
+            count_rpc(&records, "tools/call"),
+            1,
+            "must NOT retry an insufficient_scope 401"
+        );
+        match out {
+            Err(CallErr::InsufficientScope(scope)) => {
+                assert_eq!(scope.as_deref(), Some("read:issues"));
+            }
+            other => panic!(
+                "expected InsufficientScope, got {:?}",
+                other.map(|_| ()).map_err(|e| e.into_msg())
+            ),
+        }
+        assert!(CallErr::InsufficientScope(None)
+            .into_msg()
+            .contains("reconnect"));
+    }
+
+    /// Drain + DELETE with a FIXED credential-resolution outcome, standing in for
+    /// the production resolver (which needs an `AppState` + DB). `Ok(None)` = a
+    /// credentialless remote, `Ok(Some((header, value)))` = a resolved credential,
+    /// `Err` = resolution/recheck refused (revoked connection, moved generation,
+    /// deactivated owner).
+    async fn cleanup_with_auth(
+        registry: &crate::state::McpSessionRegistry,
+        client: &reqwest::Client,
+        policy: &crate::egress::EgressPolicy,
+        session_id: uuid::Uuid,
+        resolved: Result<Option<(&'static str, &'static str)>, &'static str>,
+    ) {
+        let drained = drain_run_sessions(registry, session_id).await;
+        delete_upstream_sessions(client, policy, drained, move |_peer, _url| async move {
+            match resolved {
+                Ok(Some((header, value))) => Ok(Some(BrokeredAuth {
+                    generation: 1,
+                    header: header.into(),
+                    value: value.into(),
+                    oauth_connection: None,
+                })),
+                Ok(None) => Ok(None),
+                Err(e) => Err(e.to_string()),
+            }
+        })
+        .await;
+    }
+
+    /// One registry entry for `run` with a live server-issued session id at `url`.
+    fn live_registry(
+        run: uuid::Uuid,
+        peer: McpPeer,
+        url: &str,
+    ) -> HashMap<(uuid::Uuid, McpPeer), Arc<Mutex<McpUpstreamSession>>> {
+        let mut map = HashMap::new();
+        map.insert(
+            (run, peer),
+            Arc::new(Mutex::new(McpUpstreamSession {
+                session_id: Some("live-session".into()),
+                negotiated: "2025-11-25".into(),
+                next_id: 3,
+                url: url.to_string(),
+            })),
+        );
+        map
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_deletes_the_session_and_evicts() {
+        let handler: Handler = Arc::new(|_idx, _rec: &Recorded| FakeReply::empty(200));
+        let (url, records, jh) = spawn_fake(handler).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let run = uuid::Uuid::now_v7();
+        let peer = McpPeer::Conn(uuid::Uuid::now_v7());
+        // A registry with one live session (has a server-issued session id).
+        let registry: crate::state::McpSessionRegistry = Mutex::new(live_registry(run, peer, &url));
+        cleanup_with_auth(&registry, &client, &policy, run, Ok(None)).await;
+        jh.abort();
+        // The fake saw a DELETE carrying the session id …
+        assert!(
+            count_http(&records, "DELETE") > 0,
+            "no DELETE fired (dead fake?)"
+        );
+        {
+            let recs = records.lock().unwrap();
+            let del = recs.iter().find(|r| r.http_method == "DELETE").unwrap();
+            assert_eq!(
+                del.headers.get("mcp-session-id").map(String::as_str),
+                Some("live-session")
+            );
+        }
+        // … and the entry is evicted regardless.
+        assert!(
+            registry.lock().await.is_empty(),
+            "the registry entry must be evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_evicts_even_when_delete_fails() {
+        // Point the session at a dead port: the DELETE errors, but eviction still
+        // happens (best-effort teardown never strands an entry).
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let run = uuid::Uuid::now_v7();
+        let registry: crate::state::McpSessionRegistry = Mutex::new(HashMap::new());
+        registry.lock().await.insert(
+            (run, McpPeer::Binding(uuid::Uuid::now_v7())),
+            Arc::new(Mutex::new(McpUpstreamSession {
+                session_id: Some("live".into()),
+                negotiated: "2025-11-25".into(),
+                next_id: 1,
+                // 127.0.0.1:9 is the discard port — connect refuses immediately.
+                url: "http://127.0.0.1:9/mcp".into(),
+            })),
+        );
+        cleanup_with_auth(&registry, &client, &policy, run, Ok(None)).await;
+        assert!(
+            registry.lock().await.is_empty(),
+            "eviction must happen even on DELETE failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_delete_carries_the_authorization_header() {
+        // Design :914 — "always send the OAuth/static authorization header on
+        // every upstream HTTP request; an MCP session ID is routing state, not
+        // authentication". A conforming upstream 401s an unauthorized DELETE, so
+        // the session would never actually terminate.
+        let handler: Handler = Arc::new(|_idx, _rec: &Recorded| FakeReply::empty(200));
+        let (url, records, jh) = spawn_fake(handler).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let run = uuid::Uuid::now_v7();
+        let registry: crate::state::McpSessionRegistry = Mutex::new(live_registry(
+            run,
+            McpPeer::Binding(uuid::Uuid::now_v7()),
+            &url,
+        ));
+        cleanup_with_auth(
+            &registry,
+            &client,
+            &policy,
+            run,
+            Ok(Some(("authorization", "Bearer terminal-tok"))),
+        )
+        .await;
+        jh.abort();
+        // Precondition: the fake recorded something at all.
+        assert!(
+            count_http(&records, "DELETE") > 0,
+            "no DELETE fired (dead fake?)"
+        );
+        let recs = records.lock().unwrap();
+        let del = recs.iter().find(|r| r.http_method == "DELETE").unwrap();
+        assert_eq!(
+            del.headers.get("authorization").map(String::as_str),
+            Some("Bearer terminal-tok"),
+            "the terminal DELETE must carry the re-resolved credential"
+        );
+        // …still alongside the routing headers it always sent.
+        assert_eq!(
+            del.headers.get("mcp-session-id").map(String::as_str),
+            Some("live-session")
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_skips_the_delete_when_the_credential_is_unavailable() {
+        // Invariant 9: the credential is re-resolved at teardown, and a revoked
+        // connection / moved generation / deactivated owner is precisely the case
+        // where we must NOT send one. Termination is best-effort ⇒ skip the DELETE
+        // (never send it unauthorized), while eviction still happens.
+        let handler: Handler = Arc::new(|_idx, _rec: &Recorded| FakeReply::empty(200));
+        let (url, records, jh) = spawn_fake(handler).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+
+        // Positive control on the SAME fake: a resolvable credential DOES fire one.
+        let ok_run = uuid::Uuid::now_v7();
+        let ok_registry: crate::state::McpSessionRegistry = Mutex::new(live_registry(
+            ok_run,
+            McpPeer::Binding(uuid::Uuid::now_v7()),
+            &url,
+        ));
+        cleanup_with_auth(
+            &ok_registry,
+            &client,
+            &policy,
+            ok_run,
+            Ok(Some(("authorization", "Bearer live"))),
+        )
+        .await;
+        assert_eq!(
+            count_http(&records, "DELETE"),
+            1,
+            "the fake must record a DELETE when resolution succeeds (dead fake?)"
+        );
+
+        // Same fake, same shape — but resolution refuses.
+        let bad_run = uuid::Uuid::now_v7();
+        let bad_registry: crate::state::McpSessionRegistry = Mutex::new(live_registry(
+            bad_run,
+            McpPeer::Binding(uuid::Uuid::now_v7()),
+            &url,
+        ));
+        cleanup_with_auth(
+            &bad_registry,
+            &client,
+            &policy,
+            bad_run,
+            Err("connection is revoked — reconnect it"),
+        )
+        .await;
+        jh.abort();
+        assert_eq!(
+            count_http(&records, "DELETE"),
+            1,
+            "a DELETE must NOT be sent when the credential cannot be re-resolved"
+        );
+        assert!(
+            bad_registry.lock().await.is_empty(),
+            "eviction must happen even when the DELETE is skipped"
+        );
     }
 
     // ── recheck_binding matrix (real Neon; self-skips when DATABASE_URL unset) ──

@@ -118,16 +118,47 @@ pub fn model_belongs(harness: &str, model: &str) -> bool {
 
 /// Per-harness env extras beyond the generic `FLUIDBOX_*` block.
 ///
-/// claude-agent-sdk: the Anthropic trio — base URL pointed at the LLM facade,
-/// the fake API key that IS the session token (the facade swaps identity),
-/// and the model. codex: nothing — the codex supervisor materializes its
-/// model-provider wiring from the generic block inside the runner image.
-/// Unknown harnesses get nothing: no identity material for an id the
-/// registry doesn't know (create_run refuses those before launch anyway).
+/// `llm_token` is the LLM-AUDIENCE credential (Gap 10): it authenticates model
+/// egress at the facade and NOTHING else — it cannot post /result, forge
+/// /events, or ask the tool gate for a decision. Each harness receives it under
+/// the var its agent binary actually reads:
+/// - claude-agent-sdk: the Anthropic trio — base URL pointed at the LLM facade,
+///   the fake API key (= the llm token; the facade swaps in the real upstream
+///   identity), and the model.
+/// - codex: `FLUIDBOX_LLM_TOKEN`, which the supervisor wires as the codex
+///   model-provider `env_key`. (It used to read `FLUIDBOX_SESSION_TOKEN`; that
+///   var is now runner-control ONLY and is deleted from the env before codex
+///   spawns.)
+///
+/// Unknown harnesses get nothing: no identity material for an id the registry
+/// doesn't know (create_run refuses those before launch anyway).
+///
+/// **Runner-image compatibility (Gap 10 decision, plan E11).** The audience
+/// split is a COUPLED server+image change: a NEW server pairs new sessions with
+/// the CURRENT in-repo runner image (`default_runner_image` resolves from this
+/// deployment's config), and an in-flight session that predates the deploy holds
+/// a legacy `'all'` token that every route still accepts. The unsupported cell is
+/// an OLD image PINNED onto a NEW server — reachable without a bad deploy, since
+/// `runner_image` is a per-revision API field that `inherit_unless_switched`
+/// carries forward: that image's runner-lib reads only `FLUIDBOX_SESSION_TOKEN`
+/// and presents the runner-CONTROL token at the tool gate, earning a 403
+/// `wrong_audience`. We deliberately do NOT widen the guards to accept it — that
+/// would gut the split and the invariant-19 acceptance bullet.
+///
+/// What that cell does, precisely: the runner-lib treats a `wrong_audience` body
+/// code as a FATAL misconfiguration — it logs a named diagnostic, records it on
+/// the run's timeline, and exits non-zero (`EXIT_AUDIENCE_MISMATCH`), so the run
+/// aborts at the first tool call and the heartbeat watchdog terminalizes it. The
+/// broker and sandbox-gate shims exit the same way. **Honest residual:** that
+/// behavior lives in the IMAGE, so it protects images built at or after it. An
+/// image built BEFORE it maps any 401/403 to `{decision:"deny"}` and would run
+/// to completion with every tool denied while model spend proceeded — the exact
+/// wrong-result-that-looks-right this closes going forward, and the reason the
+/// runner-lib change and this note ship together.
 pub fn runner_env(
     harness: &str,
     control_url: &str,
-    session_token: &str,
+    llm_token: &str,
     model: &str,
 ) -> Vec<(String, String)> {
     match harness {
@@ -136,11 +167,12 @@ pub fn runner_env(
                 "ANTHROPIC_BASE_URL".into(),
                 format!("{}/internal/llm", control_url.trim_end_matches('/')),
             ),
-            // The fake key IS the session token; the facade swaps in the
+            // The fake key IS the llm-audience token; the facade swaps in the
             // real one upstream.
-            ("ANTHROPIC_API_KEY".into(), session_token.to_string()),
+            ("ANTHROPIC_API_KEY".into(), llm_token.to_string()),
             ("ANTHROPIC_MODEL".into(), model.to_string()),
         ],
+        CODEX => vec![("FLUIDBOX_LLM_TOKEN".into(), llm_token.to_string())],
         _ => Vec::new(),
     }
 }
@@ -173,6 +205,7 @@ mod tests {
             llm_tenant_budget_duration: None,
             llm_tenant_tpm: None,
             llm_tenant_rpm: None,
+            llm_max_concurrent_reservations: crate::facade::DEFAULT_MAX_CONCURRENT_RESERVATIONS,
             credential_key: None,
             kms_mode: crate::config::KmsMode::Off,
             kms_static_kek: None,
@@ -183,6 +216,13 @@ mod tests {
             github_clone_base: String::new(),
             keep_workspaces: false,
             public_url: String::new(),
+            egress_allow_cidrs: Vec::new(),
+            egress_proxy: None,
+            egress_rate_tenant_per_min: crate::governor::DEFAULT_TENANT_PER_MIN,
+            egress_rate_connection_per_min: crate::governor::DEFAULT_CONNECTION_PER_MIN,
+            egress_rate_host_per_min: crate::governor::DEFAULT_HOST_PER_MIN,
+            egress_breaker_threshold: crate::governor::DEFAULT_BREAKER_THRESHOLD,
+            egress_breaker_open_secs: crate::governor::DEFAULT_BREAKER_OPEN_SECS,
             provider: "docker".into(),
             network_mode: fluidbox_core::traits::NetworkMode::HostDev,
             require_enforced_netpol: false,
@@ -235,7 +275,7 @@ mod tests {
         let env = runner_env(
             "claude-agent-sdk",
             "http://host.docker.internal:8787/",
-            "fbx_sess_abc",
+            "fbx_sess_llm",
             "claude-haiku-4-5",
         );
         assert_eq!(
@@ -245,7 +285,8 @@ mod tests {
                     "ANTHROPIC_BASE_URL".to_string(),
                     "http://host.docker.internal:8787/internal/llm".to_string()
                 ),
-                ("ANTHROPIC_API_KEY".to_string(), "fbx_sess_abc".to_string()),
+                // The fake provider key is the LLM-audience token (Gap 10).
+                ("ANTHROPIC_API_KEY".to_string(), "fbx_sess_llm".to_string()),
                 (
                     "ANTHROPIC_MODEL".to_string(),
                     "claude-haiku-4-5".to_string()
@@ -255,9 +296,38 @@ mod tests {
     }
 
     #[test]
-    fn codex_and_unknown_get_no_extras() {
-        assert!(runner_env("codex", "http://c", "t", "m").is_empty());
-        assert!(runner_env("mystery", "http://c", "t", "m").is_empty());
+    fn codex_gets_the_llm_token_and_unknown_gets_nothing() {
+        // Gap 10: codex's model-provider env_key moved OFF FLUIDBOX_SESSION_TOKEN
+        // (now runner-control only) onto its own LLM-audience var.
+        assert_eq!(
+            runner_env("codex", "http://c", "fbx_sess_llm", "m"),
+            vec![("FLUIDBOX_LLM_TOKEN".to_string(), "fbx_sess_llm".to_string())]
+        );
+        // Neither harness may leak the control token into the agent's env: the
+        // only credential either arm emits is the one it was handed.
+        assert!(runner_env("mystery", "http://c", "fbx_sess_llm", "m").is_empty());
+    }
+
+    #[test]
+    fn default_runner_images_are_this_deployment_s_configured_images() {
+        // What this pins, exactly: the DEFAULT image for each harness resolves
+        // from THIS deployment's config — nothing more. That is the half of the
+        // Gap 10 compat story this file owns (an unpinned revision therefore
+        // launches the runner image shipped with the running server). It says
+        // NOTHING about a PINNED image, whose skew behavior lives in the runner
+        // image and is asserted route-by-route by the CI `hardening` job; see
+        // `runner_env`'s doc for that cell.
+        let mut cfg = test_cfg();
+        cfg.sandbox_image = "ghcr.io/fluidbox/sandbox-runner:v9".into();
+        cfg.codex_sandbox_image = "ghcr.io/fluidbox/codex-runner:v9".into();
+        assert_eq!(
+            default_runner_image(CLAUDE_AGENT_SDK, &cfg),
+            Some("ghcr.io/fluidbox/sandbox-runner:v9")
+        );
+        assert_eq!(
+            default_runner_image(CODEX, &cfg),
+            Some("ghcr.io/fluidbox/codex-runner:v9")
+        );
     }
 
     #[test]

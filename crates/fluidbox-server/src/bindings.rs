@@ -63,6 +63,12 @@ pub struct ResolvedMcpSurface {
     pub snapshot_version: i32,
     pub tools: Vec<ToolSnapshot>,
     pub tools_digest: String,
+    /// The MCP protocol version the photographed snapshot negotiated (Gap 12),
+    /// carried through to `BrokeredSurface.protocol_version` so the gate can pick
+    /// the JSON Schema dialect for arg validation and the broker can pin the
+    /// runtime negotiation to it. `None` when the snapshot recorded no (or an
+    /// empty) version — the gate then defaults to 2020-12.
+    pub protocol_version: Option<String>,
 }
 
 /// One resolved requirement, ready to (a) stamp into the RunSpec and (b) write
@@ -340,6 +346,9 @@ async fn resolve_snapshot_surface(
         snapshot_version: snap.snapshot_version,
         tools_digest: tools_digest(&effective),
         tools: effective,
+        // Freeze the snapshot's negotiated protocol version (Gap 12); an empty
+        // string (a snapshot that recorded none) becomes None → 2020-12 default.
+        protocol_version: Some(snap.protocol_version.clone()).filter(|s| !s.is_empty()),
     })
 }
 
@@ -647,6 +656,7 @@ pub fn brokered_surfaces(resolved: &[ResolvedBinding]) -> Vec<BrokeredSurface> {
                 snapshot_version: m.snapshot_version,
                 tools: m.tools.clone(),
                 tools_digest: m.tools_digest.clone(),
+                protocol_version: m.protocol_version.clone(),
             })
         })
         .collect()
@@ -832,6 +842,7 @@ mod tests {
             snapshot_version: 1,
             tools: vec![tool("t")],
             tools_digest: "sha256:x".into(),
+            protocol_version: None,
         };
         // A brokered surface sharing a sandbox alias collides.
         assert_eq!(
@@ -862,6 +873,7 @@ mod tests {
                 snapshot_version: 3,
                 tools_digest: tools_digest(&tools),
                 tools,
+                protocol_version: Some("2025-06-18".into()),
             }),
         }
     }
@@ -871,6 +883,7 @@ mod tests {
             name: name.into(),
             description: format!("does {name}"),
             input_schema: json!({"type": "object"}),
+            output_schema: None,
             annotations: None,
         }
     }
@@ -893,6 +906,9 @@ mod tests {
         assert_eq!(surfaces[0].binding_id, mcp.id);
         assert_eq!(surfaces[0].snapshot_version, 3);
         assert_eq!(surfaces[0].tools.len(), 1);
+        // Gap 12: the snapshot's negotiated protocol version freezes onto the
+        // BrokeredSurface (drives the gate's dialect + the broker's version pin).
+        assert_eq!(surfaces[0].protocol_version.as_deref(), Some("2025-06-18"));
     }
 
     #[test]
@@ -1350,6 +1366,9 @@ mod tests {
             "effective = exactly the required subset, in requirement order"
         );
         assert_eq!(surface.url, "https://mcp.example.test/mcp");
+        // Gap 12: the seeded snapshot's protocol version ("2025-06-18") resolves
+        // onto the surface, ready to freeze into RunSpec.brokered.
+        assert_eq!(surface.protocol_version.as_deref(), Some("2025-06-18"));
         match &b.authority {
             ResolvedAuthority::Connection {
                 id,
@@ -1370,6 +1389,8 @@ mod tests {
         assert_eq!(surfaces[0].slot, "github");
         assert_eq!(surfaces[0].binding_id, b.id);
         assert_eq!(surfaces[0].tools.len(), 2);
+        // …and it lands in the frozen RunSpec.brokered surface (Gap 12 freeze).
+        assert_eq!(surfaces[0].protocol_version.as_deref(), Some("2025-06-18"));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].authority_kind, "connection");
         assert_eq!(rows[0].slot_kind, "mcp");
