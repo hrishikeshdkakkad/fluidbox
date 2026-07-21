@@ -213,6 +213,56 @@ jobs:
           FLUIDBOX_SERVER_BIN: ${{ github.workspace }}/target/debug/fluidbox-server
         run: bash scripts/secrets-e2e.sh
 
+  # Phase E acceptance: broker and network hardening, driven end-to-end over HTTP
+  # against python-stdlib fakes (a recording MCP server + a redirect server). It
+  # proves the #33 matrix — the SSRF/egress boundary (private + metadata literals
+  # refused at admission and at dial, redirects refused not followed), the
+  # 2025-11-25 conformance contract (initialize-first, offered version, protocol
+  # header, version drift, 404-reinit, server-request -32601, SSE assembly,
+  # session DELETE, SEP-835 insufficient-scope marking the connection), frozen
+  # schema argument enforcement including the gate-ORDER proof the unit tests
+  # structurally cannot give, and the durable execution claims (one dispatch per
+  # duplicated intent, failed_upstream never ambiguous, failed_before_send
+  # re-claimable, ambiguous never re-dispatched, cancel-during-approval).
+  hardening:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: fluidbox_hardening
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/fluidbox_hardening
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Share the debug build cache with the `rust` job — same profile.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: debug
+      - name: build server
+        run: cargo build -p fluidbox-server
+      # psql is REQUIRED by the acceptance script (it PROVES the claim-row states,
+      # the schema-denial ledger source, and the SEP-835 connection status write —
+      # the assertions that cannot be made from the HTTP surface alone).
+      - name: install postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: hardening acceptance (egress/SSRF + MCP conformance + schema gate + execution claims)
+        env:
+          # Reuse the just-built binary so the script `exec`s it directly (clean
+          # single-process lifecycle across the boots the matrix needs).
+          FLUIDBOX_SERVER_BIN: ${{ github.workspace }}/target/debug/fluidbox-server
+        run: bash scripts/hardening-e2e.sh
+
   web:
     runs-on: ubuntu-latest
     defaults:
