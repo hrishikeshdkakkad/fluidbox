@@ -27,7 +27,10 @@ function requireEnv(k) {
 
 const CONTROL = requireEnv("FLUIDBOX_CONTROL_URL");
 const SESSION = requireEnv("FLUIDBOX_SESSION_ID");
-const TOKEN = requireEnv("FLUIDBOX_SESSION_TOKEN");
+// Gap 10: this shim forwards intents to /tools/call, so it holds the TOOL-INTENT
+// credential and nothing else — never the runner-control token (which the
+// harness deletes from the environment before spawning anything).
+const TOKEN = requireEnv("FLUIDBOX_TOOL_TOKEN");
 const SERVER_NAME = requireEnv("FLUIDBOX_BROKER_SERVER");
 const TOOLS = JSON.parse(requireEnv("FLUIDBOX_BROKER_TOOLS"));
 

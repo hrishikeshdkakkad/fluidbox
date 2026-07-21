@@ -448,14 +448,17 @@ FROZEN_EV=$(pq "select count(*) from events where session_id='$SA' and type='cap
 
 # ── The gate: availability (frozen set) then policy — probed for real ─────
 say "GATE — the ONE permission gate: frozen availability, then policy"
-token_for() { # session → token (kills the runner so probes own the contract)
+token_for() { # session → TOOL-audience token (kills the runner so probes own the contract)
   # The token must be read from the container env BEFORE the keyless runner
   # fails fast and gets reaped (container removed) — poll tightly, and kill
   # the runner the moment it's seen. 120s ceiling for slow CI runners.
+  # Gap 10: every route this phase drives (/permission and /tools/call) is the
+  # TOOL-INTENT audience, so we take FLUIDBOX_TOOL_TOKEN — the runner-control
+  # token in FLUIDBOX_SESSION_TOKEN would now 403 at both.
   local sid=$1 cid tok=""
   for _ in $(seq 1 240); do
     cid=$(docker ps -a --filter "label=fluidbox.session=$sid" --format '{{.ID}}' | head -1)
-    [ -n "$cid" ] && { tok=$(docker inspect "$cid" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^FLUIDBOX_SESSION_TOKEN=' | cut -d= -f2-); break; }
+    [ -n "$cid" ] && { tok=$(docker inspect "$cid" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^FLUIDBOX_TOOL_TOKEN=' | cut -d= -f2-); break; }
     sleep 0.5
   done
   [ -n "$cid" ] && docker kill "$cid" >/dev/null 2>&1

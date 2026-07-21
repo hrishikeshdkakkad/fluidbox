@@ -18,7 +18,9 @@ use crate::state::AppState;
 use fluidbox_core::event::{Actor, EventBody};
 use fluidbox_core::spec::{RunSpec, WorkspaceSpec};
 use fluidbox_core::state::SessionStatus;
-use fluidbox_core::traits::{CollectContext, CollectedArtifacts, SandboxHandle, SandboxSpec};
+use fluidbox_core::traits::{
+    CollectContext, CollectedArtifacts, SandboxHandle, SandboxSpec, SandboxTokens,
+};
 use fluidbox_db::{SessionRow, TenantScope};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -959,16 +961,33 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
         anyhow::bail!("could not enter provisioning");
     }
 
-    // Mint the session token the sandbox authenticates with.
-    let session_token = format!("fbx_sess_{}", uuid_token());
-    fluidbox_db::create_session_token(
-        &state.pool,
-        scope,
-        session_id,
-        &session_token,
-        SESSION_TOKEN_TTL_SECS,
-    )
-    .await?;
+    // Mint the FOUR audience-scoped credentials the sandbox authenticates with
+    // (Gap 10, invariant 19). One `api_tokens` row per audience, each valid ONLY
+    // on its routes; all keep the `fbx_sess_` prefix so the event.rs Redactor
+    // (which scrubs by prefix) covers every one. `revoke_session_tokens` revokes
+    // by session_id, so the terminal transition kills all four together.
+    let tokens = SandboxTokens {
+        control: format!("fbx_sess_{}", uuid_token()),
+        tool: format!("fbx_sess_{}", uuid_token()),
+        llm: format!("fbx_sess_{}", uuid_token()),
+        workspace: format!("fbx_sess_{}", uuid_token()),
+    };
+    for (token, audience) in [
+        (&tokens.control, "control"),
+        (&tokens.tool, "tool"),
+        (&tokens.llm, "llm"),
+        (&tokens.workspace, "workspace"),
+    ] {
+        fluidbox_db::create_session_token(
+            &state.pool,
+            scope,
+            session_id,
+            token,
+            SESSION_TOKEN_TTL_SECS,
+            audience,
+        )
+        .await?;
+    }
 
     // provisioning → initializing (workspace materialization, control-plane
     // side, BEFORE the agent starts — a bad repo fails here at zero model
@@ -990,7 +1009,7 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
     }
 
     let control_url = state.cfg.public_control_url.clone();
-    let env = build_runner_env(&run_spec, &control_url, session_id, &session_token);
+    let env = build_runner_env(&run_spec, &control_url, session_id, &tokens);
 
     // 512 KiB serialized runner-env ceiling (env injection is the v1 config
     // channel; a Kubernetes Secret caps ~1 MiB). Fail closed at zero spend.
@@ -1021,6 +1040,10 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
         session_id,
         image: run_spec.runner_image.clone(),
         env,
+        // The provider routes these per-audience (k8s: one Secret key each) and
+        // is the ONLY path the `workspace` token takes — it is deliberately
+        // absent from `env`, so the runner container never receives it.
+        tokens: tokens.clone(),
         workspace_host_dir: workspace_dir.as_ref().map(|p| p.display().to_string()),
         workspace_archive,
         active_deadline_secs: run_spec.budgets.max_wall_clock_secs,
@@ -1083,18 +1106,27 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Assemble the runner env. The generic FLUIDBOX_* block is the harness-neutral
-/// runner contract; per-harness extras ride `harness::runner_env`.
+/// Assemble the RUNNER CONTAINER's env. The generic FLUIDBOX_* block is the
+/// harness-neutral runner contract; per-harness extras ride `harness::runner_env`.
+///
+/// Gap 10 env contract: `FLUIDBOX_SESSION_TOKEN` keeps its NAME but now carries
+/// ONLY the runner-control audience (runner-lib compatibility — the shared
+/// contract client still reads that var), `FLUIDBOX_TOOL_TOKEN` carries the
+/// tool-intent audience, and the LLM token reaches the agent through the
+/// per-harness var (`ANTHROPIC_API_KEY` / `FLUIDBOX_LLM_TOKEN`). The `workspace`
+/// token is DELIBERATELY ABSENT: it goes to the init container only, via the
+/// provider (`SandboxSpec::tokens`).
 pub fn build_runner_env(
     run_spec: &RunSpec,
     control_url: &str,
     session_id: Uuid,
-    session_token: &str,
+    tokens: &SandboxTokens,
 ) -> Vec<(String, String)> {
     let mut env = vec![
         ("FLUIDBOX_CONTROL_URL".into(), control_url.to_string()),
         ("FLUIDBOX_SESSION_ID".into(), session_id.to_string()),
-        ("FLUIDBOX_SESSION_TOKEN".into(), session_token.to_string()),
+        ("FLUIDBOX_SESSION_TOKEN".into(), tokens.control.clone()),
+        ("FLUIDBOX_TOOL_TOKEN".into(), tokens.tool.clone()),
         ("FLUIDBOX_TASK".into(), run_spec.task.clone()),
         (
             "FLUIDBOX_AUTONOMY".into(),
@@ -1106,7 +1138,7 @@ pub fn build_runner_env(
     env.extend(crate::harness::runner_env(
         &run_spec.harness,
         control_url,
-        session_token,
+        &tokens.llm,
         &run_spec.model,
     ));
     if let Some(sp) = &run_spec.system_prompt {
