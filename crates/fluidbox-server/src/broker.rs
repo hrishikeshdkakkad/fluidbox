@@ -125,28 +125,42 @@ pub async fn brokered_auth(
     let Some(cid) = connection_id else {
         return Ok(None);
     };
-    // Unfiltered read by design: the LEGACY broker path's authority comes from
-    // the frozen RunSpec's embedded `connection_id`, never a request viewer — so
-    // no owner-visibility filter applies. This path (a pre-Phase-C bundle) froze
-    // no binding, so there is no generation/owner to recheck; the status read
-    // below is the only live check. Phase C runs route through the binding path
-    // ([`recheck_binding`] + [`call_tool_for_conn`]), never here.
+    auth_for_connection_id(state, scope, *cid, url)
+        .await
+        .map_err(|e| format!("capability server '{name}': {e}"))
+}
+
+/// The LEGACY embedded-connection resolution core: fetch the connection fresh by
+/// id under `scope`, then defer to [`brokered_auth_for_conn`]. Shared by
+/// [`brokered_auth`] (the frozen-RunSpec call path) and the terminal session
+/// DELETE, so both send exactly the credential a live call would.
+///
+/// Unfiltered read by design: the LEGACY broker path's authority comes from the
+/// frozen RunSpec's embedded `connection_id`, never a request viewer — so no
+/// owner-visibility filter applies. This path (a pre-Phase-C bundle) froze no
+/// binding, so there is no generation/owner to recheck; the status read inside
+/// [`brokered_auth_for_conn`] is the only live check. Phase C runs route through
+/// the binding path ([`recheck_binding`] + [`call_tool_for_conn`]), never here.
+async fn auth_for_connection_id(
+    state: &AppState,
+    scope: fluidbox_db::TenantScope,
+    cid: uuid::Uuid,
+    url: &str,
+) -> Result<Option<BrokeredAuth>, String> {
     // Tenant known (the frozen RunSpec's scope) → scoped_tx so the RLS GUC rides
     // the executor-generic read.
     let mut conn_tx = fluidbox_db::scoped_tx(&state.pool, scope)
         .await
         .map_err(|e| format!("connection lookup failed: {e}"))?;
-    let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, *cid)
+    let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, cid)
         .await
         .map_err(|e| format!("connection lookup failed: {e}"))?
-        .ok_or_else(|| format!("capability server '{name}': connection {cid} is missing"))?;
+        .ok_or_else(|| format!("connection {cid} is missing"))?;
     conn_tx
         .commit()
         .await
         .map_err(|e| format!("connection lookup failed: {e}"))?;
-    brokered_auth_for_conn(state, scope, &conn, url)
-        .await
-        .map_err(|e| format!("capability server '{name}': {e}"))
+    brokered_auth_for_conn(state, scope, &conn, url).await
 }
 
 /// Credential-resolution CORE, callable with an ALREADY-FETCHED connection row
@@ -1218,48 +1232,133 @@ async fn session_entry(
 /// session best-effort and EVICT every registry entry for the run regardless of
 /// the DELETE outcome. Hooked into the orchestrator's terminal driver. Runs are
 /// replica-local — entries only exist on the replica that made the calls.
+///
+/// The DELETE carries the SAME authorization header a live call would (design
+/// `:914` — "always send the OAuth/static authorization header on every upstream
+/// HTTP request; an MCP session ID is routing state, not authentication"), so a
+/// conforming upstream actually terminates the session instead of 401ing it.
+/// The credential is RE-RESOLVED here through the live path (invariant 9: every
+/// upstream call rechecks live revoke/status state) rather than cached on the
+/// registry entry at call time: by teardown a cached header could name a
+/// connection that has since been revoked, reauthorized to a new generation, or
+/// whose owner left the org — and an access token minted minutes ago may have
+/// expired. A revoked connection is precisely the case where we must NOT send a
+/// credential, so a resolution/recheck failure SKIPS the DELETE entirely.
+/// (Caching it would also park ambient credential state on a long-lived
+/// in-memory map, which invariant 22 rules out. Do not "optimize" this into a
+/// stored header.)
 pub async fn run_terminal_mcp_cleanup(state: &AppState, session_id: uuid::Uuid) {
-    cleanup_run_sessions(
-        &state.mcp_sessions,
+    // Evict FIRST and unconditionally — before any DB or network work, so a
+    // wedged upstream (or an unresolvable tenant) never strands an entry.
+    let drained = drain_run_sessions(&state.mcp_sessions, session_id).await;
+    if drained.is_empty() {
+        return;
+    }
+    // ONE cross-tenant session lookup for the whole run (a worker/system entry
+    // holds only a bare id); the per-peer resolution below is tenant-scoped.
+    let scope = match fluidbox_db::system_worker::get_session(&state.pool, session_id).await {
+        Ok(Some(s)) => Some(fluidbox_db::TenantScope::assume(s.tenant_id)),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::debug!(target: "broker", "mcp cleanup tenant resolve failed (best-effort): {e}");
+            None
+        }
+    };
+    delete_upstream_sessions(
         &state.egress_http,
         &state.egress_policy,
-        session_id,
+        drained,
+        |peer, url| async move {
+            let scope = scope.ok_or_else(|| "run's tenant could not be resolved".to_string())?;
+            terminal_peer_auth(state, scope, peer, &url).await
+        },
     )
     .await;
 }
 
-/// The registry-level core of [`run_terminal_mcp_cleanup`] (client + policy
-/// explicit, so a fake server can assert the DELETE without a full `AppState`).
-async fn cleanup_run_sessions(
+/// Drain (evict) every registry entry for one run under the map lock, returning
+/// them with their peer identity so each can be resolved + DELETEd outside the
+/// lock. Eviction is unconditional and happens before any I/O.
+async fn drain_run_sessions(
     registry: &crate::state::McpSessionRegistry,
+    session_id: uuid::Uuid,
+) -> Vec<(McpPeer, Arc<Mutex<McpUpstreamSession>>)> {
+    let mut map = registry.lock().await;
+    let keys: Vec<(uuid::Uuid, McpPeer)> = map
+        .keys()
+        .filter(|(sid, _)| *sid == session_id)
+        .cloned()
+        .collect();
+    keys.iter()
+        .filter_map(|k| map.remove(k).map(|e| (k.1, e)))
+        .collect()
+}
+
+/// Re-resolve one drained peer's credential the way a live call does — the
+/// binding path reverifies the binding (status + generation + owner + invoker)
+/// via [`recheck_binding`] before [`brokered_auth_for_conn`]; the legacy
+/// embedded-connection path takes the same fetch-then-resolve core the frozen
+/// RunSpec path uses. Any refusal propagates, and the caller skips the DELETE.
+async fn terminal_peer_auth(
+    state: &AppState,
+    scope: fluidbox_db::TenantScope,
+    peer: McpPeer,
+    url: &str,
+) -> Result<Option<BrokeredAuth>, String> {
+    match peer {
+        McpPeer::Binding(binding_id) => {
+            let binding = fluidbox_db::get_run_resource_binding(&state.pool, scope, binding_id)
+                .await
+                .map_err(|e| format!("run resource binding lookup failed: {e}"))?
+                .ok_or("run resource binding is missing")?;
+            let conn = recheck_binding(state, scope, &binding).await?;
+            brokered_auth_for_conn(state, scope, &conn, url).await
+        }
+        McpPeer::Conn(cid) => auth_for_connection_id(state, scope, cid, url).await,
+    }
+}
+
+/// The registry-free DELETE loop (client + policy + the resolver explicit, so a
+/// fake server can assert the DELETE — and the skip — without a full
+/// `AppState`). Best-effort and bounded by `MCP_DELETE_TIMEOUT`; nothing here
+/// can block terminalization.
+async fn delete_upstream_sessions<F, Fut>(
     client: &reqwest::Client,
     policy: &crate::egress::EgressPolicy,
-    session_id: uuid::Uuid,
-) {
-    // Drain (evict) every entry for this run under the map lock, then DELETE
-    // each outside the lock — eviction is unconditional, so a wedged upstream
-    // never strands an entry.
-    let entries: Vec<Arc<Mutex<McpUpstreamSession>>> = {
-        let mut map = registry.lock().await;
-        let keys: Vec<(uuid::Uuid, McpPeer)> = map
-            .keys()
-            .filter(|(sid, _)| *sid == session_id)
-            .cloned()
-            .collect();
-        keys.iter().filter_map(|k| map.remove(k)).collect()
-    };
-    for entry in entries {
+    drained: Vec<(McpPeer, Arc<Mutex<McpUpstreamSession>>)>,
+    resolve_auth: F,
+) where
+    F: Fn(McpPeer, String) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<BrokeredAuth>, String>>,
+{
+    for (peer, entry) in drained {
         let sess = entry.lock().await;
         let (Some(sid), url) = (sess.session_id.as_deref(), sess.url.as_str()) else {
             continue;
         };
+        // Egress admission stays in front of the dial — and ahead of the
+        // resolution, so a url we would refuse never mints a token.
         if crate::egress::admit_url(url, policy).is_err() {
             continue;
         }
+        // Invariant 9: a refusal here (revoked connection, moved generation,
+        // deactivated owner, unavailable credential) means we must not send a
+        // credential — and an unauthorized DELETE would just 401 — so skip it.
+        // Termination is best-effort; the upstream expires the session itself.
+        let auth = match resolve_auth(peer, url.to_string()).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::debug!(target: "broker", "mcp session DELETE skipped (credential unavailable): {e}");
+                continue;
+            }
+        };
         let mut req = client
             .delete(url)
             .timeout(MCP_DELETE_TIMEOUT)
             .header("mcp-session-id", sid);
+        if let Some(a) = auth.as_ref() {
+            req = req.header(a.header.as_str(), a.value.as_str());
+        }
         if !sess.negotiated.is_empty() {
             req = req.header("mcp-protocol-version", sess.negotiated.as_str());
         }
@@ -3027,6 +3126,52 @@ mod tests {
             .contains("reconnect"));
     }
 
+    /// Drain + DELETE with a FIXED credential-resolution outcome, standing in for
+    /// the production resolver (which needs an `AppState` + DB). `Ok(None)` = a
+    /// credentialless remote, `Ok(Some((header, value)))` = a resolved credential,
+    /// `Err` = resolution/recheck refused (revoked connection, moved generation,
+    /// deactivated owner).
+    async fn cleanup_with_auth(
+        registry: &crate::state::McpSessionRegistry,
+        client: &reqwest::Client,
+        policy: &crate::egress::EgressPolicy,
+        session_id: uuid::Uuid,
+        resolved: Result<Option<(&'static str, &'static str)>, &'static str>,
+    ) {
+        let drained = drain_run_sessions(registry, session_id).await;
+        delete_upstream_sessions(client, policy, drained, move |_peer, _url| async move {
+            match resolved {
+                Ok(Some((header, value))) => Ok(Some(BrokeredAuth {
+                    header: header.into(),
+                    value: value.into(),
+                    oauth_connection: None,
+                })),
+                Ok(None) => Ok(None),
+                Err(e) => Err(e.to_string()),
+            }
+        })
+        .await;
+    }
+
+    /// One registry entry for `run` with a live server-issued session id at `url`.
+    fn live_registry(
+        run: uuid::Uuid,
+        peer: McpPeer,
+        url: &str,
+    ) -> HashMap<(uuid::Uuid, McpPeer), Arc<Mutex<McpUpstreamSession>>> {
+        let mut map = HashMap::new();
+        map.insert(
+            (run, peer),
+            Arc::new(Mutex::new(McpUpstreamSession {
+                session_id: Some("live-session".into()),
+                negotiated: "2025-11-25".into(),
+                next_id: 3,
+                url: url.to_string(),
+            })),
+        );
+        map
+    }
+
     #[tokio::test]
     async fn terminal_cleanup_deletes_the_session_and_evicts() {
         let handler: Handler = Arc::new(|_idx, _rec: &Recorded| FakeReply::empty(200));
@@ -3036,17 +3181,8 @@ mod tests {
         let run = uuid::Uuid::now_v7();
         let peer = McpPeer::Conn(uuid::Uuid::now_v7());
         // A registry with one live session (has a server-issued session id).
-        let registry: crate::state::McpSessionRegistry = Mutex::new(HashMap::new());
-        registry.lock().await.insert(
-            (run, peer),
-            Arc::new(Mutex::new(McpUpstreamSession {
-                session_id: Some("live-session".into()),
-                negotiated: "2025-11-25".into(),
-                next_id: 3,
-                url: url.clone(),
-            })),
-        );
-        cleanup_run_sessions(&registry, &client, &policy, run).await;
+        let registry: crate::state::McpSessionRegistry = Mutex::new(live_registry(run, peer, &url));
+        cleanup_with_auth(&registry, &client, &policy, run, Ok(None)).await;
         jh.abort();
         // The fake saw a DELETE carrying the session id …
         assert!(
@@ -3086,10 +3222,113 @@ mod tests {
                 url: "http://127.0.0.1:9/mcp".into(),
             })),
         );
-        cleanup_run_sessions(&registry, &client, &policy, run).await;
+        cleanup_with_auth(&registry, &client, &policy, run, Ok(None)).await;
         assert!(
             registry.lock().await.is_empty(),
             "eviction must happen even on DELETE failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_delete_carries_the_authorization_header() {
+        // Design :914 — "always send the OAuth/static authorization header on
+        // every upstream HTTP request; an MCP session ID is routing state, not
+        // authentication". A conforming upstream 401s an unauthorized DELETE, so
+        // the session would never actually terminate.
+        let handler: Handler = Arc::new(|_idx, _rec: &Recorded| FakeReply::empty(200));
+        let (url, records, jh) = spawn_fake(handler).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let run = uuid::Uuid::now_v7();
+        let registry: crate::state::McpSessionRegistry = Mutex::new(live_registry(
+            run,
+            McpPeer::Binding(uuid::Uuid::now_v7()),
+            &url,
+        ));
+        cleanup_with_auth(
+            &registry,
+            &client,
+            &policy,
+            run,
+            Ok(Some(("authorization", "Bearer terminal-tok"))),
+        )
+        .await;
+        jh.abort();
+        // Precondition: the fake recorded something at all.
+        assert!(
+            count_http(&records, "DELETE") > 0,
+            "no DELETE fired (dead fake?)"
+        );
+        let recs = records.lock().unwrap();
+        let del = recs.iter().find(|r| r.http_method == "DELETE").unwrap();
+        assert_eq!(
+            del.headers.get("authorization").map(String::as_str),
+            Some("Bearer terminal-tok"),
+            "the terminal DELETE must carry the re-resolved credential"
+        );
+        // …still alongside the routing headers it always sent.
+        assert_eq!(
+            del.headers.get("mcp-session-id").map(String::as_str),
+            Some("live-session")
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_skips_the_delete_when_the_credential_is_unavailable() {
+        // Invariant 9: the credential is re-resolved at teardown, and a revoked
+        // connection / moved generation / deactivated owner is precisely the case
+        // where we must NOT send one. Termination is best-effort ⇒ skip the DELETE
+        // (never send it unauthorized), while eviction still happens.
+        let handler: Handler = Arc::new(|_idx, _rec: &Recorded| FakeReply::empty(200));
+        let (url, records, jh) = spawn_fake(handler).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+
+        // Positive control on the SAME fake: a resolvable credential DOES fire one.
+        let ok_run = uuid::Uuid::now_v7();
+        let ok_registry: crate::state::McpSessionRegistry = Mutex::new(live_registry(
+            ok_run,
+            McpPeer::Binding(uuid::Uuid::now_v7()),
+            &url,
+        ));
+        cleanup_with_auth(
+            &ok_registry,
+            &client,
+            &policy,
+            ok_run,
+            Ok(Some(("authorization", "Bearer live"))),
+        )
+        .await;
+        assert_eq!(
+            count_http(&records, "DELETE"),
+            1,
+            "the fake must record a DELETE when resolution succeeds (dead fake?)"
+        );
+
+        // Same fake, same shape — but resolution refuses.
+        let bad_run = uuid::Uuid::now_v7();
+        let bad_registry: crate::state::McpSessionRegistry = Mutex::new(live_registry(
+            bad_run,
+            McpPeer::Binding(uuid::Uuid::now_v7()),
+            &url,
+        ));
+        cleanup_with_auth(
+            &bad_registry,
+            &client,
+            &policy,
+            bad_run,
+            Err("connection is revoked — reconnect it"),
+        )
+        .await;
+        jh.abort();
+        assert_eq!(
+            count_http(&records, "DELETE"),
+            1,
+            "a DELETE must NOT be sent when the credential cannot be re-resolved"
+        );
+        assert!(
+            bad_registry.lock().await.is_empty(),
+            "eviction must happen even when the DELETE is skipped"
         );
     }
 
