@@ -242,6 +242,10 @@ mod tests {
             oidc_discovery_max_age_secs: 3600,
             oidc_clock_skew_secs: 60,
             session_reauth_secs: 60,
+            // Phase F capacity knobs — this fixture never opens a pool or serves a
+            // request, so the shipped defaults are simply carried.
+            db_pool: fluidbox_db::PoolSettings::default(),
+            max_request_body_bytes: crate::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
         }
     }
 
