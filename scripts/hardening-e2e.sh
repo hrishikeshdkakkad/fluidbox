@@ -3539,11 +3539,33 @@ fi
 
 say "(i.4) Lease + epoch fencing — a foreign lease stops the fenced driver, and expiring it hands over"
 # The fence's operational meaning, driven end to end. A session whose lease is held
-# by a THIRD (dead) replica may not be mutated by either live driver: both call
-# `hold_lease` first (orchestrator.rs:593) and, getting None, RELEASE the
-# finalization claim and return. The request-side wind-down is deliberately
-# unfenced (orchestrator.rs:458-464 — a lease held elsewhere must never swallow a
-# user's cancel), so the run still enters `cancelling` and then stops there.
+# by a THIRD (dead) replica may not be mutated by either live DRIVER: both call
+# `hold_lease` first (`drive_finalization`, orchestrator.rs) and, getting None
+# (`acquire_session_lease`'s predicate matches zero rows while another owner's
+# `orchestrator_lease_until` is in the future), RELEASE the finalization claim and
+# return — before ever reaching a lifecycle mutation.
+#
+# The REQUEST-side wind-down is deliberately unfenced (`enter_winddown`'s `epoch`
+# is `None` on the cancel / `finalize_forced` / `fail` paths — a lease held
+# elsewhere must never swallow a user's cancel), so the cancel is accepted AND
+# materializes the wind-down state its intent implies, foreign lease or not.
+#
+# WHICH state that is comes from the LOCKED snapshot, never from the caller:
+# `begin_finalization` computes `quiesce = want_quiesce && status in
+# ('running','awaiting_approval') && handle.is_some()`. `forge_running` stamps
+# status='running' but NEVER a sandbox_handle (the run never launched), so there
+# is no runner to quiesce, the intent lands `needs_quiesce=false`, and the implied
+# state is `finalizing` — applied synchronously inside the cancel handler, tens of
+# ms after the 202. That is the sanctioned unfenced path, NOT a fence leak; an
+# earlier revision of this section asserted `cancelling` here and was wrong about
+# its own fixture (#33, review 12).
+#
+# What the fence actually owes, and what is asserted below: the run stops at that
+# wind-down state and NEVER TERMINALIZES, because terminalization
+# (`collect_and_terminalize` → `transition_fenced`) is a DRIVER mutation and every
+# driver is turned away at `hold_lease`. Delete that gate and this run reaches
+# `cancelled` while the foreign lease is live — so the assertion is fail-capable
+# on the property it names.
 #
 # Forcing the epoch directly (the plan's psql fixture) would prove less than this:
 # a manual bump is picked up by the SAME owner on its next renew (the epoch moves
@@ -3572,9 +3594,20 @@ if [ "$I_OK" = 1 ] && live_run plain-agent "sess-i4-$$" "i/lease"; then
       case "$I4_WIND" in cancelling|finalizing|completed|failed|cancelled|budget_exceeded) break;; esac
       sleep 0.5
     done
-    [ "$I4_WIND" = cancelling ] \
-      && ok "the run entered 'cancelling' (the intent materialized) but got no further" \
-      || no "the run's status after the cancel is '$I4_WIND' (want cancelling; a terminal status means the fence did not hold)"
+    # Pin the MECHANISM, not just the outcome: `needs_quiesce` is what decides
+    # which wind-down state the unfenced request path applies, and this fixture
+    # (status='running', sandbox_handle NULL) must produce `false`. Asserting it
+    # explicitly means that if `forge_running` ever starts stamping a handle, THIS
+    # line fails loudly rather than the status line drifting to a state nobody
+    # re-derived.
+    I4_NQ=$(db "select needs_quiesce from session_finalizations where session_id='$I4'")
+    [ "$I4_NQ" = f ] \
+      && ok "the cancel's intent landed needs_quiesce=false — computed from the LOCKED snapshot (the fixture run has no sandbox_handle, so there is no runner to quiesce), which makes 'finalizing' the state the request path owes" \
+      || no "the cancel's intent reads needs_quiesce='$I4_NQ' (want f: status='running' + sandbox_handle NULL cannot owe a quiesce) — the wind-down expectation below is derived from this"
+    I4_WANT=finalizing; [ "$I4_NQ" = t ] && I4_WANT=cancelling
+    [ "$I4_WIND" = "$I4_WANT" ] \
+      && ok "the run entered '$I4_WIND' — the UNFENCED request path materialized exactly the wind-down state its intent implies, foreign lease and all (that is the design: a cancel may never depend on who holds the lease)" \
+      || no "the run's status after the cancel is '$I4_WIND' (want '$I4_WANT', the state this intent implies)"
 
     # THE ea11853 ASSERTION, and it is fail-capable in exactly the right way:
     # a fenced driver RELEASES the finalization claim on its way out, so the next
@@ -3593,9 +3626,35 @@ if [ "$I_OK" = 1 ] && live_run plain-agent "sess-i4-$$" "i/lease"; then
         && ok "drivers KEPT trying and kept being turned away ($I4_ATT0 → $I4_ATT1 attempts across 25s > the 20s worker tick) — the fenced driver releases its claim instead of squatting it" \
         || no "finalization attempts froze at $I4_ATT1 across 25s — either no driver retried, or a fenced driver left the claim stamped (the 420s squat ea11853 fixes)"
     fi
-    [ "$I4_STATUS" = cancelling ] \
-      && ok "…and the run is STILL 'cancelling' — no replica mutated a session whose lease it does not hold" \
-      || no "the run reached '$I4_STATUS' while a foreign replica held the lease (the epoch fence let a mutation through)"
+    # THE DRIVER-SIDE PROMISE, and the only half of it this script can drive from
+    # outside: terminalization is a DRIVER mutation (`collect_and_terminalize` →
+    # `transition_fenced`), reached only PAST `hold_lease`. Every driver above was
+    # turned away there — one claim per attempt, zero mutations — so the run must
+    # still be sitting where the request path left it. TERMINAL is the tell:
+    # remove the `hold_lease` gate and this run is `cancelled` within one worker
+    # tick (`plan_step(needs_quiesce=false, .., Finalizing)` = Collect). The
+    # stale-EPOCH half is a different property and is NOT driven here — see the
+    # disclosure below.
+    case "$I4_STATUS" in
+      completed|failed|cancelled|budget_exceeded)
+        no "the run reached TERMINAL '$I4_STATUS' while a foreign replica held an unexpired lease — terminalization is a fenced DRIVER mutation and no replica holding no lease may perform it";;
+      "$I4_WANT")
+        ok "…and 25s later the run is STILL non-terminal ('$I4_STATUS') — the drivers claimed, failed hold_lease and left: no replica that does not hold the lease advanced the session past the request path's own wind-down";;
+      *)
+        no "the run drifted to '$I4_STATUS' while a foreign replica held the lease (want the request path's '$I4_WANT' — nothing but the lease holder may move it)";;
+    esac
+
+    # DIRECT evidence for the step behind that one. The assertion above shows no
+    # non-holder MUTATED the session; this shows none ever ACQUIRED the lease at
+    # all. `acquire_session_lease` bumps the epoch on any owner CHANGE, so a single
+    # successful acquire by either live replica during the window would have moved
+    # it off $I4_EPOCH0 — read here, BEFORE the takeover leg below moves it on
+    # purpose. Fail-capable: loosen the lease predicate's foreign-holder arm and
+    # this reads a HIGHER epoch than the fixture installed.
+    I4_EPOCH_MID=$(db "select orchestrator_epoch from sessions where id='$I4'")
+    [ "$I4_EPOCH_MID" = "$I4_EPOCH0" ] \
+      && ok "…and the fencing epoch never moved off $I4_EPOCH0 across those $I4_ATT1 turned-away attempts — no live replica ACQUIRED the lease, not merely none that mutated behind it" \
+      || no "orchestrator_epoch moved $I4_EPOCH0 → $I4_EPOCH_MID while the foreign lease was still unexpired — a live replica took a lease it had no right to"
 
     # Expire the lease: the next worker tick may now steal it, and a steal — unlike
     # a renew — MUST bump the epoch.
@@ -3633,11 +3692,21 @@ fi
 # mutation carrying a stale token is ever attempted, let alone observed to be
 # refused. Deleting the `expected_epoch` predicate from the process-level wiring
 # would leave every assertion above GREEN. What (i.4) does prove, and it is worth
-# having, is the lease's operational behavior end to end: a foreign holder stops
+# having, is the LEASE's operational behavior end to end: a foreign holder stops
 # both drivers, a fenced-out driver RELEASES its finalization claim instead of
-# squatting it (the attempts counter keeps rising), the session does not advance
+# squatting it (the attempts counter keeps rising), the session never TERMINALIZES
 # while the foreign lease is live, and expiring it produces a real takeover whose
 # owner change bumps the epoch.
+#
+# Read "never terminalizes" literally — it is NOT "never advances" (an earlier
+# revision of this comment, and of the assertions under it, claimed the stronger
+# thing and was wrong about the fixture; #33 review 12). The session DOES advance
+# while the foreign lease is live, by design: the cancel's own request-side
+# wind-down is unfenced and lands the state its intent implies. What no non-holder
+# may do is drive it PAST that, and that is what is asserted. The gate being
+# demonstrated is therefore the LEASE (`hold_lease` returning None), not the
+# `expected_epoch` CAS — which is the same reason the paragraph above says
+# deleting `expected_epoch` would leave the section green.
 #
 # Why the missing half is not driven here: it needs a driver to keep running with
 # a known-stale token PAST a takeover, i.e. an injected pause between the lease
