@@ -217,7 +217,14 @@ test("compatibility path: with no hand-off, the environment still works", (t) =>
 test("a broken hand-off aborts with EXIT_TOKEN_HANDOFF, never a silent fallback", (t) => {
   const { c, probe } = probeCase(t, LOAD_PROBE);
   for (const [label, fd] of [
-    ["a closed descriptor", "9"],
+    // An OUT-OF-RANGE descriptor, not merely an unopened one. "fd 9 is closed"
+    // reads like a fact but is a platform assumption: a parent can leak
+    // descriptors above 2 into a child, and CI proved it — on the GitHub Linux
+    // runner this case died by SIGNAL (spawnSync status `null`) instead of
+    // exiting 4, while it exited 4 on macOS. A descriptor above the process
+    // limit is EBADF by definition everywhere, so the case tests the guard
+    // rather than the environment.
+    ["an out-of-range descriptor", "1000000"],
     ["a descriptor number that cannot be ours", "0"],
     ["a non-numeric value", "three"],
   ]) {
@@ -232,6 +239,10 @@ test("a broken hand-off aborts with EXIT_TOKEN_HANDOFF, never a silent fallback"
         FLUIDBOX_SESSION_TOKEN: TOKEN,
       },
     });
+    // `signal` first: a `status` of null means the child was KILLED, which the
+    // bare status assertion reports only as "null !== 4" — a message that sent
+    // the first CI failure here on a long detour.
+    assert.equal(r.signal, null, `${label}: killed by ${r.signal}, stderr: ${r.stderr}`);
     assert.equal(r.status, 4, `${label}: expected EXIT_TOKEN_HANDOFF (4), got ${r.status} ${r.stdout}`);
     assert.match(r.stderr, /FATAL — the runner-control credential hand-off failed/, label);
     assert.ok(!r.stdout.includes(TOKEN), `${label}: fell back to the environment`);
