@@ -14,8 +14,8 @@
 #   (e) frozen-schema argument enforcement + its GATE ORDER           [Task 3]
 #   (f) durable four-state execution claims                           [Task 4]
 #   (g) per-route audience negatives (the route→audience mapping)     [Task 5]
-#   (h) LLM reservations     — Task 7  (placeholder at the end)
-#   (i) two-replica          — Task 6  (placeholder at the end)
+#   (h) durable per-run LLM budget reservations (Gap 14)              [Task 7]
+#   (i) two-replica coordination (Gap 13)                             [Task 6]
 #   (j) outbound rate limits + per-connection circuit breakers        [Task 8]
 #
 # House style mirrors scripts/secrets-e2e.sh + scripts/bindings-e2e.sh:
@@ -76,9 +76,19 @@ command -v psql    >/dev/null 2>&1 || { echo "hardening-e2e: psql is required (a
 # ── Config ───────────────────────────────────────────────────────────────────
 API_PORT=8787
 API="http://127.0.0.1:$API_PORT"
-# Reserved for section (i) (Task 6): the second replica binds here, same DB.
-# shellcheck disable=SC2034  # consumed by the section (i) placeholder's boot
-API_PORT_B=8788
+# Section (i) (Task 6): the SECOND replica, same DB, its own two ports.
+#
+# TWO ports per replica, not one: main.rs binds a public listener (`FLUIDBOX_BIND`)
+# AND a sandbox-facing internal listener (`FLUIDBOX_INTERNAL_BIND`, main.rs:527-528),
+# whose Docker-provider default is 127.0.0.1:8788 (config.rs:267-273). The first
+# replica therefore ALREADY holds 8788, so a second replica bound there would die
+# at `bind()` before serving a byte — which is why the ports below are 8790/8791
+# and not the 8788 this file's placeholder originally reserved. The public bind
+# serves /internal too (the comment at main.rs:519), so every request in section
+# (i) still goes to the public port; the internal bind only has to be FREE.
+API_PORT_B=8790
+API_PORT_B_INT=8791
+API_B="http://127.0.0.1:$API_PORT_B"
 
 ADMIN_TOKEN=$(openssl rand -hex 32)
 CRED_KEY=$(openssl rand -hex 32)        # FLUIDBOX_CREDENTIAL_KEY (seals connections)
@@ -90,7 +100,8 @@ MASTER_KEY="sk-litellm-master-$$"       # LITELLM_MASTER_KEY placeholder (shared
 MCP_PORT=8971       # the primary brokered MCP upstream (all conformance work)
 MCP2_PORT=8972      # a SECOND MCP upstream, killed on purpose in section (f)
 REDIR_PORT=8973     # a server that answers 302 (redirect-refusal proof)
-LLM_PORT=8974       # reserved: fake LiteLLM for section (h) (Task 7)
+LLM_PORT=8974       # the fake LiteLLM (data plane + /key/* admin plane) — section (h)
+SINK_PORT=8975      # the signed-callback receiver both replicas POST to — section (i)
 MCP_URL="http://127.0.0.1:$MCP_PORT/mcp"
 MCP2_URL="http://127.0.0.1:$MCP2_PORT/mcp"
 REDIR_URL="http://127.0.0.1:$REDIR_PORT/mcp"
@@ -117,15 +128,27 @@ DATA_DIR="$WORK/data"; mkdir -p "$DATA_DIR"
 FAKES="$WORK/fakes";   mkdir -p "$FAKES"
 CLONE_ROOT="$WORK/repos"; mkdir -p "$CLONE_ROOT"
 CLONE_BASE="file://$CLONE_ROOT"     # FLUIDBOX_GITHUB_CLONE_BASE for this run
-SERVER_PID=""
-MCP_PID=""; MCP2_PID=""; REDIR_PID=""
+SERVER_PID=""; SERVER_B_PID=""
+MCP_PID=""; MCP2_PID=""; REDIR_PID=""; LLM_PID=""; SINK_PID=""
 SERVER_LOG="$WORK/server.log"
+SERVER_B_LOG="$WORK/server-b.log"   # replica B's own log (section (i))
 UB="$WORK/ub"                       # scratch body file for the curl helpers
 MCP_LOG="$WORK/mcp-requests.jsonl";     : > "$MCP_LOG"
 MCP2_LOG="$WORK/mcp2-requests.jsonl";   : > "$MCP2_LOG"
 REDIR_LOG="$WORK/redirect-requests.jsonl"; : > "$REDIR_LOG"
+LLM_LOG="$WORK/llm-requests.jsonl";     : > "$LLM_LOG"
+SINK_LOG="$WORK/sink-deliveries.jsonl"; : > "$SINK_LOG"
 MCP_CTL="$WORK/mcp-control.json"
 MCP2_CTL="$WORK/mcp2-control.json"
+LLM_CTL="$WORK/llm-control.json"
+# The EXACT 401 body the fake LiteLLM answers with in section (h)'s release test,
+# defined ONCE here and passed to the fake as argv — so "forwarded verbatim" is a
+# byte comparison against a single source of truth, not two hand-copied literals.
+# The shape is deliberate: facade.rs:834-835 names `{"error":{"message":"OpenAI API
+# key not found","type":"auth_error"}}` as PROVIDER-originated and therefore NOT a
+# virtual-key rejection, so `virtual_key_rejected` is false and the facade takes the
+# R5 exit — forward verbatim, release the reservation, never re-provision.
+LLM_401_BODY='{"error":{"message":"OpenAI API key not found","type":"auth_error"}}'
 # The bearers the fakes accept. Anything else is a real 401 (a credentialed
 # server), so a broker that turned the WRONG credential fails loudly.
 TOK_HQ="hq-secret-$$"
@@ -170,10 +193,13 @@ db() { psql "$DATABASE_URL" -X -q -A -t -c "set fluidbox.bypass = 'system_worker
 # ── Cleanup ──────────────────────────────────────────────────────────────────
 # shellcheck disable=SC2329  # invoked via the EXIT/INT/TERM trap
 cleanup() {
-  [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
+  [ -n "$SERVER_PID" ]   && kill "$SERVER_PID"   2>/dev/null
+  [ -n "$SERVER_B_PID" ] && kill "$SERVER_B_PID" 2>/dev/null
   [ -n "$MCP_PID" ]    && kill "$MCP_PID"    2>/dev/null
   [ -n "$MCP2_PID" ]   && kill "$MCP2_PID"   2>/dev/null
   [ -n "$REDIR_PID" ]  && kill "$REDIR_PID"  2>/dev/null
+  [ -n "$LLM_PID" ]    && kill "$LLM_PID"    2>/dev/null
+  [ -n "$SINK_PID" ]   && kill "$SINK_PID"   2>/dev/null
   rm -rf "$WORK"
 }
 trap cleanup EXIT INT TERM
@@ -472,6 +498,212 @@ class Redir(http.server.BaseHTTPRequestHandler):
 http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Redir).serve_forever()
 PYEOF
 
+# ── The fake LiteLLM (section (h)) ───────────────────────────────────────────
+# ONE process serving BOTH planes the facade talks to:
+#   * the DATA plane `/v1/messages` (the Anthropic dialect this suite's runs use —
+#     facade.rs `resolve_suffix`), and
+#   * the ADMIN plane `/key/generate` + `/key/delete`, which `FLUIDBOX_LLM_KEY_MODE=
+#     tenant` mints against (llm_keys.rs:419-420, :488-489).
+# Every request is recorded as one jsonl line carrying the AUTHORIZATION it was
+# presented — which is how section (h) proves the master key is confined to the
+# admin plane in tenant mode (the D7 invariant) without ever printing a key.
+#
+# Behavior is BODY-DRIVEN, so one server serves every case with no restart and no
+# control-file race: `metadata.fbx_hold_ms` holds the response open (the ceiling and
+# concurrency tests need overlapping in-flight requests), `metadata.fbx_usage`
+# selects the response shape, and `metadata.fbx_reply` selects the status. `metadata`
+# is a first-class Anthropic request field and the facade forwards the re-serialized
+# body verbatim for this dialect (facade.rs:643 — only the OpenAI dialect is
+# rewritten), so the knobs arrive intact.
+#   fbx_usage: normal   → 200 JSON WITH a usage object      (reconcile ⇒ charged)
+#              none     → 200 JSON with NO usage object     (R11 retain)
+#              sse      → 200 SSE carrying message_start/message_delta usage
+#              sse_none → 200 SSE with NO usage event at all (R13 retain + marker)
+#   fbx_reply: unauthorized → the argv-supplied 401 body, verbatim
+# The ONE control-file knob is `keygen`, because a mint failure cannot be driven
+# from a request body the server writes itself.
+cat > "$FAKES/fake_llm.py" <<'PYEOF'
+import http.server, json, os, sys, threading, time
+
+PORT, LOG, CTL, UNAUTH = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+
+LOCK = threading.Lock()
+STATE = {"minted": 0}
+
+
+def ctl():
+    try:
+        with open(CTL) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def record(row):
+    with LOCK:
+        with open(LOG, "a") as f:
+            f.write(json.dumps(row) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+
+SSE_WITH_USAGE = (
+    "event: message\n"
+    'data: {"type":"message_start","message":{"usage":'
+    '{"input_tokens":11,"output_tokens":0}}}\n\n'
+    "event: message\n"
+    'data: {"type":"message_delta","usage":{"output_tokens":7}}\n\n'
+)
+# No message_start and no message_delta ⇒ AnthropicAccumulator.seen stays false ⇒
+# Meter::any() is false ⇒ facade.rs R13 (retain + the "usage unparsed" marker).
+SSE_NO_USAGE = (
+    "event: message\n"
+    'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}\n\n'
+    "event: message\n"
+    'data: {"type":"message_stop"}\n\n'
+)
+
+
+class Llm(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _raw(self, code, body, ctype):
+        data = body.encode() if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("content-type", ctype)
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, code, obj):
+        self._raw(code, json.dumps(obj), "application/json")
+
+    def do_POST(self):
+        n = int(self.headers.get("content-length") or 0)
+        raw = self.rfile.read(n).decode() if n else ""
+        try:
+            req = json.loads(raw)
+        except Exception:
+            req = {}
+        meta = req.get("metadata") if isinstance(req.get("metadata"), dict) else {}
+        try:
+            hold = int(meta.get("fbx_hold_ms", 0) or 0)
+        except Exception:
+            hold = 0
+        usage = str(meta.get("fbx_usage", "normal"))
+        reply = str(meta.get("fbx_reply", "ok"))
+        record({
+            "path": self.path.split("?")[0],
+            "auth": self.headers.get("authorization", ""),
+            "xapikey": self.headers.get("x-api-key", ""),
+            "hold": str(hold),
+            "usage": usage,
+            "reply": reply,
+            "model": str(req.get("model", "")),
+        })
+        if self.path.startswith("/key/generate"):
+            if ctl().get("keygen", "ok") != "ok":
+                # 5xx (not 4xx): llm_keys.rs treats a client error as "nothing was
+                # created" and a 5xx as AMBIGUOUS, keeping the mint guard armed —
+                # which is the path that also exercises /key/delete below.
+                return self._json(503, {"error": "harness disabled /key/generate"})
+            with LOCK:
+                STATE["minted"] += 1
+                minted = "sk-fbx-tenant-%d" % STATE["minted"]
+            return self._json(200, {"key": minted})
+        if self.path.startswith("/key/delete"):
+            return self._json(200, {"deleted": True})
+        if not self.path.startswith("/v1/messages"):
+            return self._json(404, {"error": "unknown path"})
+        if hold > 0:
+            time.sleep(hold / 1000.0)
+        if reply == "unauthorized":
+            return self._raw(401, UNAUTH, "application/json")
+        if usage in ("sse", "sse_none"):
+            body = SSE_WITH_USAGE if usage == "sse" else SSE_NO_USAGE
+            return self._raw(200, body, "text/event-stream")
+        out = {
+            "id": "msg_fake", "type": "message", "role": "assistant",
+            "model": req.get("model", ""), "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "ok"}],
+        }
+        if usage != "none":
+            out["usage"] = {"input_tokens": 11, "output_tokens": 7}
+        return self._json(200, out)
+
+    def log_message(self, *a):
+        pass
+
+
+http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Llm).serve_forever()
+PYEOF
+
+# ── The signed-callback receiver (section (i)) ───────────────────────────────
+# The "external service" both replicas' delivery workers POST to. Records ONE line
+# per POST carrying `x-fluidbox-delivery` (deliveries.rs:485) — the id receivers
+# dedup on — so "exactly one POST per delivery with two live workers" is a count
+# over distinct ids, not a guess.
+#
+# HOLD_MS is load-bearing, not padding: `attempt` processes a claimed batch
+# SEQUENTIALLY, so holding each POST open keeps the claim visible in
+# `result_deliveries.claimed_by` long enough for the psql sampler to observe it
+# (the claim is CLEARED by mark_delivery_attempt on completion — db_lib.rs
+# `claimed_by = null` — so a fast sink erases the only evidence of who claimed).
+# It also guarantees the second claim round: the per-tick limit is 10
+# (deliveries.rs:132), so a 14-row burst leaves 4 rows for whichever worker ticks
+# next, and the first claimant is busy 10*HOLD_MS — longer than the other's 3 s
+# tick. Kept far under DELIVERY_TIMEOUT (10 s) so every attempt still succeeds.
+cat > "$FAKES/fake_sink.py" <<'PYEOF'
+import http.server, json, os, sys, threading, time
+
+PORT, LOG, HOLD_MS = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+LOCK = threading.Lock()
+
+
+def record(row):
+    with LOCK:
+        with open(LOG, "a") as f:
+            f.write(json.dumps(row) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+
+class Sink(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self):
+        n = int(self.headers.get("content-length") or 0)
+        if n:
+            self.rfile.read(n)
+        record({
+            "delivery": self.headers.get("x-fluidbox-delivery", ""),
+            "event": self.headers.get("x-fluidbox-event", ""),
+            "signed": "yes" if self.headers.get("x-fluidbox-signature") else "no",
+        })
+        if HOLD_MS > 0:
+            time.sleep(HOLD_MS / 1000.0)
+        body = b'{"ok":true}'
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        body = b'{"ready":true}'
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Sink).serve_forever()
+PYEOF
+
 # ── The recorder query helper ────────────────────────────────────────────────
 # One python file so every assertion reads the SAME jsonl the same way. All ops
 # take a START index so a section can scope itself to its own window (the
@@ -539,11 +771,15 @@ PYEOF
 rec()   { python3 "$FAKES/rec.py" "$MCP_LOG"   "$@"; }
 rec2()  { python3 "$FAKES/rec.py" "$MCP2_LOG"  "$@"; }
 recr()  { python3 "$FAKES/rec.py" "$REDIR_LOG" "$@"; }
+recl()  { python3 "$FAKES/rec.py" "$LLM_LOG"   "$@"; }
+recs()  { python3 "$FAKES/rec.py" "$SINK_LOG"  "$@"; }
 # The current end of a recorder — every section snapshots this first so its
 # assertions are scoped to its OWN window and can never inherit earlier traffic.
 mark()  { rec 0 len; }
 mark2() { rec2 0 len; }
 markr() { recr 0 len; }
+markl() { recl 0 len; }
+marks() { recs 0 len; }
 
 # ── Fake lifecycle ───────────────────────────────────────────────────────────
 # The control file must exist BEFORE the first request; both fakes tolerate a
@@ -605,6 +841,43 @@ start_redirect() {
   echo "hardening-e2e: fake redirector did not become ready" >&2; exit 1
 }
 
+# The fake LiteLLM's ONE control-file knob (mint failures cannot ride a request
+# body — see the fake's header).
+llm_keygen() { # ok|fail
+  printf '{"keygen":"%s"}\n' "$1" > "$LLM_CTL"
+}
+start_llm() {
+  llm_keygen ok
+  python3 "$FAKES/fake_llm.py" "$LLM_PORT" "$LLM_LOG" "$LLM_CTL" "$LLM_401_BODY" &
+  LLM_PID=$!
+  for _ in $(seq 1 40); do
+    # A POST to an unknown path answers 404 — enough to prove the listener is up,
+    # and it records a line the sections below never read (their windows start
+    # after their own mark).
+    curl -s -o /dev/null -X POST "http://127.0.0.1:$LLM_PORT/_ready" 2>/dev/null && {
+      ok "fake LiteLLM up on :$LLM_PORT (data plane + /key/* admin plane, auth recorded)"
+      return 0; }
+    sleep 0.25
+  done
+  echo "hardening-e2e: fake LiteLLM did not become ready" >&2; exit 1
+}
+
+# How long the callback sink holds each POST open (see the fake's header — this is
+# what keeps `result_deliveries.claimed_by` observable and what forces the second
+# claim round).
+SINK_HOLD_MS=500
+start_sink() {
+  python3 "$FAKES/fake_sink.py" "$SINK_PORT" "$SINK_LOG" "$SINK_HOLD_MS" &
+  SINK_PID=$!
+  for _ in $(seq 1 40); do
+    curl -s -o /dev/null "http://127.0.0.1:$SINK_PORT/ready" 2>/dev/null && {
+      ok "callback sink up on :$SINK_PORT (holds each POST ${SINK_HOLD_MS}ms, records x-fluidbox-delivery)"
+      return 0; }
+    sleep 0.25
+  done
+  echo "hardening-e2e: callback sink did not become ready" >&2; exit 1
+}
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Server boot. CI passes FLUIDBOX_SERVER_BIN (a prebuilt binary) so the script
 # `exec`s it (clean single-process lifecycle); otherwise `cargo run`.
@@ -617,19 +890,33 @@ start_redirect() {
 # section (j) sets these and RESTARTS rather than mutating a live process.
 GOV_TENANT=""; GOV_CONN=""; GOV_HOST=""; GOV_THRESHOLD=""; GOV_OPEN_SECS=""
 
-_spawn() {
-  printf '\n===== control plane (re)start =====\n' >> "$SERVER_LOG"
+# Per-boot LLM knobs, consumed by `_spawn` (section (h) sets and RESTARTS — both
+# are boot-resolved: `Config::from_env` parses the key mode, and the reservation
+# ceiling is a process-lifetime `OnceLock` (facade.rs:207-226)).
+LLM_KEY_MODE=shared     # shared | tenant
+LLM_MAX_RES=""          # empty ⇒ the shipped default (32)
+
+# `_spawn` sets this; callers assign it to whichever replica handle they own.
+SPAWN_PID=""
+
+_spawn() { # [public-port] [internal-port] [logfile] → sets SPAWN_PID
+  # Parameterized for section (i): a SECOND replica needs its own public AND
+  # internal binds (main.rs:527-528) and its own log. Every pre-existing call site
+  # passes nothing and gets exactly the previous behavior.
+  local port=${1:-$API_PORT} iport=${2:-} log=${3:-$SERVER_LOG}
+  printf '\n===== control plane (re)start =====\n' >> "$log"
   (
     cd "$ROOT" || exit 1
     export DATABASE_URL="$DATABASE_URL"
-    export FLUIDBOX_BIND="127.0.0.1:$API_PORT"
+    export FLUIDBOX_BIND="127.0.0.1:$port"
+    [ -n "$iport" ] && export FLUIDBOX_INTERNAL_BIND="127.0.0.1:$iport"
     # LOAD-BEARING: a loopback-http public URL is the ONLY switch that opens the
     # dev-loopback egress seam (egress.rs `dev_loopback`). Without it every fake
     # in this file becomes an unreachable plain-http non-https target and the
     # whole suite fails at the first dial — while the metadata/private-IP
     # negatives below stay blocked regardless, which is exactly the split the
     # SSRF section asserts.
-    export FLUIDBOX_PUBLIC_URL="http://127.0.0.1:$API_PORT"
+    export FLUIDBOX_PUBLIC_URL="http://127.0.0.1:$port"
     export FLUIDBOX_ADMIN_TOKEN="$ADMIN_TOKEN"
     export FLUIDBOX_PROVIDER=docker
     export FLUIDBOX_DATA_DIR="$DATA_DIR"
@@ -648,11 +935,17 @@ _spawn() {
     export FLUIDBOX_CREDENTIAL_KEY="$CRED_KEY"
     export FLUIDBOX_REQUIRE_SSO=0
     # LITELLM_MASTER_KEY placeholder — `shared` mode refuses to boot on an EMPTY
-    # key. No facade traffic happens in sections (a)-(f); section (h) (Task 7)
-    # points LLM_UPSTREAM_URL at a fake on :$LLM_PORT.
-    export FLUIDBOX_LLM_KEY_MODE=shared
+    # key. No facade traffic happens in sections (a)-(f); section (h) points
+    # LLM_UPSTREAM_URL at the fake on :$LLM_PORT and flips the key mode.
+    export FLUIDBOX_LLM_KEY_MODE="$LLM_KEY_MODE"
     export LITELLM_MASTER_KEY="$MASTER_KEY"
     export LLM_UPSTREAM_URL="http://127.0.0.1:$LLM_PORT"
+    # Section (h.3)'s concurrency ceiling. Unset on every other boot, so the rest
+    # of the suite runs against the shipped default (32) and cannot be refused by
+    # it. `FLUIDBOX_LLM_ADMIN_URL` is deliberately left unset: it defaults to
+    # LLM_UPSTREAM_URL (config.rs:257), so the fake serves both planes on one port
+    # and "which plane got which credential" is answerable from one recorder.
+    [ -n "$LLM_MAX_RES" ] && export FLUIDBOX_LLM_MAX_CONCURRENT_RESERVATIONS="$LLM_MAX_RES"
     export RUST_LOG="${RUST_LOG:-warn,fluidbox_server=info}"
     # Section (j)'s governor knobs. Unset here on the FIRST boot, so sections
     # (a)-(g) run against the shipped defaults (tenant 120 / connection 60 /
@@ -666,16 +959,50 @@ _spawn() {
       exec "$FLUIDBOX_SERVER_BIN"
     fi
     exec cargo run -q -p fluidbox-server
-  ) >>"$SERVER_LOG" 2>&1 &
-  SERVER_PID=$!
+  ) >>"$log" 2>&1 &
+  SPAWN_PID=$!
 }
 
 boot() {
   _spawn
+  SERVER_PID=$SPAWN_PID
   for _ in $(seq 1 180); do
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then SERVER_PID=""; return 1; fi
     curl -sf "$API/v1/health" >/dev/null 2>&1 && return 0
     sleep 1
+  done
+  return 1
+}
+
+# ── The SECOND replica (section (i)) ─────────────────────────────────────────
+# Same binary, same DATABASE_URL, same runtime role, distinct ports and log.
+# Booted only in section (i) and stopped at its end, so section (j) — whose
+# governor is in-memory and PER-REPLICA — still runs against exactly one process.
+#
+# Boot ORDER is load-bearing: replica A is healthy (and has therefore already run
+# every migration) long before this is called, so B's own migrate pass is a no-op
+# and the two can never race the migration lock. The shared FLUIDBOX_DATA_DIR is
+# deliberate (it models the shared volume a real two-replica deployment has), and
+# B's boot is safe for the forged fixtures already in the DB for exactly the reason
+# `restart_server` documents: they carry NULL started_at/last_heartbeat_at and
+# never provisioned a sandbox, so no watchdog, wall-clock sweeper or orphan reap
+# on B has anything of theirs to act on.
+boot_replica_b() {
+  _spawn "$API_PORT_B" "$API_PORT_B_INT" "$SERVER_B_LOG"
+  SERVER_B_PID=$SPAWN_PID
+  for _ in $(seq 1 180); do
+    if ! kill -0 "$SERVER_B_PID" 2>/dev/null; then SERVER_B_PID=""; return 1; fi
+    curl -sf "$API_B/v1/health" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+stop_replica_b() {
+  [ -n "$SERVER_B_PID" ] && kill "$SERVER_B_PID" 2>/dev/null
+  SERVER_B_PID=""
+  for _ in $(seq 1 60); do
+    curl -sf "$API_B/v1/health" >/dev/null 2>&1 || return 0
+    sleep 0.5
   done
   return 1
 }
@@ -1908,12 +2235,17 @@ if live_run hq-appr-agent "sess-f5-$$" "f/cancel"; then
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SECTIONS (g) AND (j) FOLLOW; (h) AND (i) ARE STILL PLACEHOLDERS — their
-# behavior (durable LLM reservations, multi-replica coordination) has not landed,
-# and an empty section is honest where a guessed one is not. Each placeholder
-# owns its acceptance bullet; the harness above (fakes, recorders, boot, forgers,
-# psql helpers) is shared — extend it rather than duplicating. Section (j) runs
-# LAST because it REBOOTS the control plane with low egress ceilings.
+# ORDER OF THE REMAINING SECTIONS, and why it is not arbitrary:
+#   (g) audiences   — no boot change; runs on the original process.
+#   (h) reservations— its last sub-test REBOOTS with FLUIDBOX_LLM_KEY_MODE=tenant
+#                     and a reservation ceiling of 2 (both boot-resolved), then
+#                     hands the knobs back.
+#   (i) two-replica — boots a SECOND process and stops it again at the end, so
+#                     everything after it is single-replica once more.
+#   (j) governor    — REBOOTS with low egress ceilings; runs LAST because those
+#                     ceilings would throttle every section above it.
+# The harness (fakes, recorders, boot/forge helpers, psql shims) is shared — a new
+# section extends it rather than duplicating it.
 # ═════════════════════════════════════════════════════════════════════════════
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2085,18 +2417,785 @@ if live_run hq-agent "sess-gr-$$-all" "g/result-matrix" && forge_audience_set "$
     POST "/internal/sessions/$RUN/result" '{"outcome":"completed","summary":"g"}'
 fi
 
-# SECTION (h) reservations — Task 7 (durable request-keyed LLM budget
-# reservations, migration 0022). Append here: start a fake LiteLLM on
-# :$LLM_PORT (LLM_UPSTREAM_URL already points there), give a run a budget for
-# fewer than N requests, fire N in parallel through the facade, and assert that
-# exactly the budget's worth pass and that recorded usage + conservative
-# sweeper conversions never exceed budget + one reservation.
+# ═════════════════════════════════════════════════════════════════════════════
+# (h) Durable request-keyed LLM budget reservations (Task 7, E13; Gap 14;
+#     migration 0022).
+#     Acceptance bullet: "concurrent model requests can no longer all pass one
+#     budget check; a per-request reservation binds them against the run's
+#     frozen budget."
+#
+#     THE RACE, precisely (0022's header): the facade CHECKED accumulated usage
+#     before forwarding and RECORDED usage only after completion, so N concurrent
+#     requests all read the same remaining budget and all passed it. The fix books
+#     a CONSERVATIVE maximum BEFORE forwarding — atomically, behind a short
+#     `sessions FOR UPDATE` plus one guard CTE (db_lib.rs `reserve_llm_budget`) —
+#     and reconciles it against authoritative usage afterwards.
+#
+#     DEVIATION 1, THE SOLE-CLAIMANT RULE (db_lib.rs:5291-5302): the budget arms
+#     are SKIPPED when ZERO other reservations are live (`a.n = 0` in the guard).
+#     Gap 14 is a CONCURRENCY race; the terminal "this run is out of budget"
+#     verdict deliberately stays with the pre-existing accumulated check. Every
+#     assertion below is therefore about the CONCURRENT case — and (h.1c) asserts
+#     the carve-out itself, so a refusal here can never be confused with "the
+#     budget was simply too small to make any request at all".
+#
+#     SIZING (written down so a future edit can re-derive it):
+#       reserved = declared max output + ceil(body_len / 4)   [facade.rs:250-272]
+#       The burst declares `max_tokens: 1000` in a 189-byte body (measured — the
+#       facade re-serializes it to the same 189 bytes), so ONE request books
+#       1000 + ceil(189/4) = 1048 tokens. The run's frozen `max_tokens` budget is
+#       forced to 1500, which sits between one reservation and two:
+#         * one request alone  → admitted (sole claimant; the arms are skipped);
+#         * a second WHILE the first is live → 0 used + 1048 active + 1048 this
+#           = 2096 > 1500 ⇒ BudgetExceeded.
+#       Both margins are wide (1048 vs 1500, 2096 vs 1500) so neither verdict can
+#       flip on a model-name length change or a few bytes of body drift. `fbx_hold_ms` holds the winner
+#       upstream for 3 s — far longer than the burst takes to arrive — so the
+#       losers provably contend with a LIVE reservation rather than a settled one.
+#       Nothing here can be swept out from under the assertions: the reservation
+#       TTL is 1800 s (facade.rs:189) and the expiry sweep only touches expired
+#       rows, so a RETAINED reservation stays `reserved` for the whole suite.
+# ═════════════════════════════════════════════════════════════════════════════
+say "(h) LLM budget reservations — fake LiteLLM up"
+start_llm
 
-# SECTION (i) two-replica — Task 6 (approval single-emission, lease/epoch
-# fencing, delivery claims). Append here: boot a SECOND server against the SAME
-# DB on :$API_PORT_B (the `_spawn` helper needs a port parameter for that), then
-# assert exactly ONE `approval.decided` event per decision, one POST per
-# delivery at a signed-webhook sink, and that a stale-epoch mutation is refused.
+# One facade request, foreground; sets CODE + BODY like the admin_* helpers.
+llm_post() { # token json
+  CODE=$(curl -s -o "$UB" -w '%{http_code}' -X POST \
+    -H "authorization: Bearer $1" -H 'content-type: application/json' \
+    -d "$2" "$API/internal/llm/v1/messages")
+  BODY=$(cat "$UB")
+}
+# The request body. `metadata` is a first-class Anthropic field and this dialect's
+# body is forwarded re-serialized but otherwise untouched (facade.rs:643), so the
+# fake reads these knobs straight off the wire.
+llm_body() { # model max_tokens hold_ms usage [reply]
+  printf '{"model":"%s","max_tokens":%s,"messages":[{"role":"user","content":"hardening-e2e reservation probe"}],"metadata":{"fbx_hold_ms":%s,"fbx_usage":"%s","fbx_reply":"%s"}}' \
+    "$1" "$2" "$3" "$4" "${5:-ok}"
+}
+# Fire one facade request in the BACKGROUND: status code → "<tag>.code", body →
+# "<tag>.body", pid appended to the pidfile. Pids ride a file (never `wait` with
+# no argument) because the fakes are also background children of this shell and
+# would never exit.
+llm_fire() { # pidfile tag token json
+  (
+    c=$(curl -s -o "$2.body" -w '%{http_code}' -X POST \
+      -H "authorization: Bearer $3" -H 'content-type: application/json' \
+      -d "$4" "$API/internal/llm/v1/messages")
+    printf '%s' "$c" > "$2.code"
+  ) &
+  echo $! >> "$1"
+}
+llm_wait() { # pidfile
+  local p
+  while read -r p; do wait "$p"; done < "$1"
+}
+res_count() { db "select count(*) from llm_reservations where session_id='$1' and state='$2'"; }
+usage_rows() { db "select count(*) from usage_entries where session_id='$1'"; }
+
+say "(h.1) Concurrency — one budget, N parallel requests, exactly one booking fits"
+# Pre-initialized because `set -u` is on and (h.2)/(h.3) read H_MODEL: a failed
+# fixture must skip its dependants loudly, never abort the whole suite on an
+# unbound expansion.
+H_OK=0; H1=""; H_MODEL=""; H_HARNESS=""
+if live_run hq-agent "sess-h1-$$" "h/reservations"; then H_OK=1; H1="$RUN"; fi
+if [ "$H_OK" = 1 ]; then
+  # The facade is the LLM audience (Task 5), so this section drives it with a
+  # PURPOSE-BUILT llm token rather than the run's legacy 'all' one — the same
+  # credential a real sandbox's fake ANTHROPIC_API_KEY now carries.
+  forge_audience_token "$H1" llm "sess-h1-$$-llm" \
+    && ok "forged an 'llm'-audience session token for the facade" \
+    || { no "could not forge the llm-audience token — section (h) cannot run"; H_OK=0; }
+  H_MODEL=$(db "select run_spec->>'model' from sessions where id='$H1'")
+  H_HARNESS=$(db "select run_spec->>'harness' from sessions where id='$H1'")
+  need "$H_MODEL" "the frozen RunSpec carries no model — the facade's model pin would reject every body" || H_OK=0
+  # The body shapes below (max_tokens, usage envelope, SSE event types) are the
+  # ANTHROPIC dialect's, which facade.rs `dialect_for` selects from the frozen
+  # harness. Assert it rather than assume it.
+  [ "$H_HARNESS" = claude-agent-sdk ] \
+    && ok "the run's frozen harness is 'claude-agent-sdk' ⇒ the Anthropic dialect (the bodies below)" \
+    || { no "frozen harness is '$H_HARNESS' (want claude-agent-sdk; the dialect-shaped bodies would not apply)"; H_OK=0; }
+fi
+if [ "$H_OK" = 1 ]; then
+  db "update sessions set run_spec = jsonb_set(jsonb_set(run_spec,'{budgets,max_tokens}','1500'),'{budgets,max_cost_usd}','null') where id='$H1'" >/dev/null
+  H_BUDGET=$(db "select run_spec->'budgets'->>'max_tokens' from sessions where id='$H1'")
+  [ "$H_BUDGET" = 1500 ] \
+    && ok "fixture: the frozen token budget is 1500 — between ONE conservative reservation (1048) and TWO (2096)" \
+    || no "fixture failed — frozen max_tokens is '$H_BUDGET' (want 1500); the sizing above no longer holds"
+
+  H_MARK=$(markl)
+  : > "$WORK/h1.pids"
+  for H_N in 1 2 3 4 5; do
+    llm_fire "$WORK/h1.pids" "$WORK/h1-$H_N" "sess-h1-$$-llm" \
+      "$(llm_body "$H_MODEL" 1000 3000 normal)"
+  done
+  llm_wait "$WORK/h1.pids"
+
+  H_PASS=0; H_429=0; H_OTHER=0; H_SHAPED=0
+  for H_N in 1 2 3 4 5; do
+    H_C=$(cat "$WORK/h1-$H_N.code" 2>/dev/null)
+    H_B=$(cat "$WORK/h1-$H_N.body" 2>/dev/null)
+    case "$H_C" in
+      2*)  H_PASS=$((H_PASS+1));;
+      429) H_429=$((H_429+1))
+           # The DIALECT-shaped machine slot, not a substring match: Anthropic
+           # puts the code in `error.type` with the envelope `type:"error"`
+           # (facade.rs `reservation_refusal`), which is what the runner SDK
+           # parses. A 429 whose body lost that shape is a regression.
+           { [ "$(echo "$H_B" | j "['error']['type']")" = llm_budget_reservation_exceeded ] \
+               && [ "$(echo "$H_B" | j "['type']")" = error ]; } && H_SHAPED=$((H_SHAPED+1));;
+      *)   H_OTHER=$((H_OTHER+1));;
+    esac
+  done
+  if gt0 "$H_429" "429 reservation refusals in the burst"; then
+    [ "$H_429" = "$H_SHAPED" ] \
+      && ok "every one of the $H_429 refusals is a 429 whose Anthropic-shaped body carries error.type='llm_budget_reservation_exceeded'" \
+      || no "$H_SHAPED of $H_429 refusals carried the dialect-shaped machine code (the runner SDK keys on error.type)"
+  fi
+  [ "$H_OTHER" = 0 ] \
+    && ok "no burst request failed for an unrelated reason (0 responses outside 2xx/429)" \
+    || no "$H_OTHER burst request(s) answered neither 2xx nor 429 — the counts below would be meaningless"
+  # The sizing check, stated separately from the acceptance above so a future
+  # numbers change fails HERE (loudly, with the arithmetic in the message) rather
+  # than quietly weakening the concurrency claim.
+  [ "$H_PASS" = 1 ] \
+    && ok "exactly ONE of 5 concurrent requests was admitted — the other 4 contended with a LIVE reservation (1048 booked vs a 1500 budget)" \
+    || no "$H_PASS of 5 concurrent requests were admitted (want exactly 1; re-derive the sizing comment above — reserved=1048, budget=1500)"
+
+  # THE GAP-14 LEDGER ASSERTION: recorded usage can never exceed what was
+  # admitted. `usage_entries` rows are written ONLY by a reconcile (authoritative)
+  # or the expiry sweep (conservative), both keyed on the request id, so this
+  # counts spend events against admissions.
+  H_USAGE=$(usage_rows "$H1")
+  if gt0 "$H_PASS" "requests ADMITTED by the reservation gate"; then
+    [ "$H_USAGE" -le "$H_PASS" ] \
+      && ok "recorded usage rows ($H_USAGE) never exceed the admitted requests ($H_PASS)" \
+      || no "$H_USAGE usage rows for $H_PASS admitted requests — a refused request spent budget"
+  fi
+  # …and the positive control for that ≤: usage recording WORKS in this window,
+  # so "≤" is not passing because nothing was ever recorded.
+  gt0 "$H_USAGE" "usage rows recorded for the admitted request(s)" \
+    && ok "POSITIVE CONTROL: the admitted request(s) DID record usage ($H_USAGE row(s)) — the ≤ above is not vacuous"
+  # A refusal books NOTHING: the insert is inside the same guarded CTE, so a
+  # refused request leaves no row at all (not even a 'released' one).
+  H_ROWS=$(db "select count(*) from llm_reservations where session_id='$H1'")
+  [ "$H_ROWS" = "$H_PASS" ] \
+    && ok "exactly $H_ROWS reservation row(s) exist for $H_PASS admitted request(s) — a refused request books nothing (the guard and the insert are one statement)" \
+    || no "llm_reservations rows = $H_ROWS for $H_PASS admitted request(s) (want equal)"
+  [ "$(res_count "$H1" reserved)" = 0 ] \
+    && ok "no reservation is left 'reserved' once the burst settled (each admitted request reconciled)" \
+    || no "$(res_count "$H1" reserved) reservation(s) still 'reserved' after the burst settled"
+
+  # Shared mode presents the DEPLOYMENT key on every model request (the explicit
+  # D7 behavior). Asserted here so section (h.3)'s tenant-mode assertion has a
+  # baseline it visibly differs from.
+  H_AUTH=$(recl "$H_MARK" distinct auth path=/v1/messages)
+  [ "$H_AUTH" = "Bearer $MASTER_KEY" ] \
+    && ok "shared mode: every model request presented the deployment key, and only that" \
+    || no "shared-mode upstream authorization was [$H_AUTH] (want exactly the deployment key)"
+
+  say "(h.1c) The sole-claimant carve-out — one request ALONE, same tiny budget, is ADMITTED"
+  # Deviation 1, asserted directly. Without it, the refusals above would be
+  # indistinguishable from "this budget is too small to ever make a request", and
+  # a run whose per-request estimate exceeds its remaining budget would livelock.
+  llm_post "sess-h1-$$-llm" "$(llm_body "$H_MODEL" 1000 0 normal)"
+  { [ "$CODE" = 200 ] && ! echo "$BODY" | grep -q llm_budget_reservation_exceeded; } \
+    && ok "a lone request against the SAME 1500-token budget is admitted (200) — the refusals above were about CONCURRENCY, not about the budget being unreachable" \
+    || no "the sole claimant was refused → $CODE: $BODY (the carve-out at db_lib.rs:5291-5302 is gone; runs whose estimate exceeds their remaining budget would livelock)"
+fi
+
+say "(h.2) Retention — a stream that reports NO usage keeps its reservation (never assume zero)"
+# design :1122 / facade.rs R13: "we could not parse usage" is NOT proof of zero
+# spend, so the booking is RETAINED for the expiry sweep to convert into a
+# conservative charge — and a `usage unparsed` marker lands on the timeline. The
+# WITH-usage control runs FIRST, on the same run and the same recorders, so the
+# "stays reserved" verdict cannot be "the SSE path never charges anything".
+if [ "$H_OK" = 1 ] && live_run hq-agent "sess-h2-$$" "h/retention"; then
+  H2="$RUN"
+  forge_audience_token "$H2" llm "sess-h2-$$-llm" >/dev/null
+  db "update sessions set run_spec = jsonb_set(jsonb_set(run_spec,'{budgets,max_tokens}','null'),'{budgets,max_cost_usd}','null') where id='$H2'" >/dev/null
+  # A) POSITIVE CONTROL — an SSE response that DOES carry usage events charges.
+  llm_post "sess-h2-$$-llm" "$(llm_body "$H_MODEL" 64 0 sse)"
+  [ "$CODE" = 200 ] \
+    && ok "POSITIVE CONTROL: the usage-carrying SSE response was forwarded (200)" \
+    || no "usage-carrying SSE request → $CODE: $BODY"
+  H2_CHARGED=0
+  for _ in $(seq 1 40); do
+    [ "$(res_count "$H2" charged)" -ge 1 ] && { H2_CHARGED=1; break; }
+    sleep 0.5
+  done
+  [ "$H2_CHARGED" = 1 ] \
+    && ok "POSITIVE CONTROL: its reservation reconciled to 'charged' — the SSE drain CAN settle a booking" \
+    || no "the usage-carrying SSE reservation never reached 'charged' (states: $(db "select coalesce(string_agg(state,','),'none') from llm_reservations where session_id='$H2'"))"
+  # B) The retention case — same run, same route, only the usage events removed.
+  llm_post "sess-h2-$$-llm" "$(llm_body "$H_MODEL" 64 0 sse_none)"
+  [ "$CODE" = 200 ] \
+    && ok "the usage-free SSE response was forwarded to the caller unchanged (200)" \
+    || no "usage-free SSE request → $CODE: $BODY"
+  H2_MARKER=0
+  for _ in $(seq 1 40); do
+    [ "$(db "select count(*) from events where session_id='$H2' and type='agent.message' and payload->>'text'='model stream completed (usage unparsed)'")" -ge 1 ] \
+      && { H2_MARKER=1; break; }
+    sleep 0.5
+  done
+  [ "$H2_MARKER" = 1 ] \
+    && ok "the timeline carries the 'model stream completed (usage unparsed)' marker — a call happened and was recorded as unmetered" \
+    || no "no 'usage unparsed' marker on the timeline (the drain's zero-usage branch did not run)"
+  H2_RESERVED=$(res_count "$H2" reserved)
+  H2_RELEASED=$(res_count "$H2" released)
+  { [ "$H2_RESERVED" = 1 ] && [ "$H2_RELEASED" = 0 ]; } \
+    && ok "the unmetered request's booking is STILL 'reserved' (0 released) — never assume zero; the expiry sweep will charge it conservatively" \
+    || no "unmetered booking states: reserved=$H2_RESERVED released=$H2_RELEASED (want 1 and 0 — a release here silently under-charges)"
+fi
+
+say "(h.3) Ceiling + release — tenant key mode, FLUIDBOX_LLM_MAX_CONCURRENT_RESERVATIONS=2"
+# Both knobs are BOOT-resolved (the key mode in `Config::from_env`; the ceiling in
+# a process-lifetime OnceLock at facade.rs:207-226), so this restarts rather than
+# mutating a live process — the same discipline section (j) uses for the governor.
+# Tenant mode is exercised here because the RELEASE path this section asserts (R1
+# and R5) is reached through it, and because it is the only posture where "the
+# master key never rides a model request" is observable.
+LLM_KEY_MODE=tenant; LLM_MAX_RES=2
+if [ "$H_OK" = 1 ] \
+   && restart_server "control plane rebooted with FLUIDBOX_LLM_KEY_MODE=tenant, reservation ceiling 2"; then
+
+  # (h.3a) A tenant key that cannot be provisioned ⇒ the pre-existing 503 code,
+  # and the booking is RELEASED (R1 — nothing was sent). Run FIRST, before any
+  # successful mint: `ensure_tenant_key` caches in memory AND seals the key in the
+  # DB, so once a mint succeeds this path is unreachable for the rest of the run.
+  llm_keygen fail
+  H3_MARK=$(markl)
+  if live_run hq-agent "sess-h3a-$$" "h/key-unavailable"; then
+    H3A="$RUN"
+    forge_audience_token "$H3A" llm "sess-h3a-$$-llm" >/dev/null
+    llm_post "sess-h3a-$$-llm" "$(llm_body "$H_MODEL" 64 0 normal)"
+    { [ "$CODE" = 503 ] \
+        && [ "$(echo "$BODY" | j "['error']['type']")" = tenant_llm_key_unavailable ]; } \
+      && ok "an unmintable tenant key still answers 503 'tenant_llm_key_unavailable' (the secrets-e2e code, unchanged by the reservation work)" \
+      || no "unmintable tenant key → $CODE: $BODY (want 503 tenant_llm_key_unavailable)"
+    H3A_REL=$(res_count "$H3A" released)
+    H3A_RES=$(res_count "$H3A" reserved)
+    { [ "$H3A_REL" = 1 ] && [ "$H3A_RES" = 0 ]; } \
+      && ok "…and its booking was RELEASED (R1: the refusal is upstream of the dial, so non-dispatch is PROVEN)" \
+      || no "key-unavailable booking states: released=$H3A_REL reserved=$H3A_RES (want 1 and 0)"
+    # ZERO model-plane traffic for that request. Read from H3_MARK now, and read
+    # the SAME window again after (h.3b) succeeds — the second read is this zero's
+    # positive control (the recorder demonstrably records /v1/messages in it).
+    H3A_MSGS=$(recl "$H3_MARK" count path=/v1/messages)
+    [ "$H3A_MSGS" = 0 ] \
+      && ok "the 503 reached the upstream ZERO times (the model plane was never dialed)" \
+      || no "$H3A_MSGS model request(s) went upstream despite the key refusal"
+  fi
+
+  # (h.3b) THE CEILING. Budgets are NULLed so ONLY the concurrency ceiling can
+  # bind (the outcome mapping checks `under_ceiling` first, but with no budget the
+  # verdict is unambiguous). Three parallel requests against a ceiling of 2: the
+  # first two book, the third finds `a.n = 2` and `2 < 2` false.
+  llm_keygen ok
+  if live_run hq-agent "sess-h3b-$$" "h/ceiling"; then
+    H3B="$RUN"
+    forge_audience_token "$H3B" llm "sess-h3b-$$-llm" >/dev/null
+    db "update sessions set run_spec = jsonb_set(jsonb_set(run_spec,'{budgets,max_tokens}','null'),'{budgets,max_cost_usd}','null') where id='$H3B'" >/dev/null
+    [ "$(db "select run_spec->'budgets'->>'max_tokens' from sessions where id='$H3B'")" = "" ] \
+      && ok "fixture: this run has NO token budget — only the concurrency ceiling can refuse" \
+      || no "fixture failed — the ceiling run still carries a token budget"
+    : > "$WORK/h3b.pids"
+    for H_N in 1 2 3; do
+      llm_fire "$WORK/h3b.pids" "$WORK/h3b-$H_N" "sess-h3b-$$-llm" \
+        "$(llm_body "$H_MODEL" 64 4000 normal)"
+    done
+    llm_wait "$WORK/h3b.pids"
+    H3B_PASS=0; H3B_CEIL=0; H3B_OTHER=0
+    for H_N in 1 2 3; do
+      H_C=$(cat "$WORK/h3b-$H_N.code" 2>/dev/null)
+      H_B=$(cat "$WORK/h3b-$H_N.body" 2>/dev/null)
+      case "$H_C" in
+        2*)  H3B_PASS=$((H3B_PASS+1));;
+        429) [ "$(echo "$H_B" | j "['error']['type']")" = llm_reservation_ceiling_exceeded ] \
+               && H3B_CEIL=$((H3B_CEIL+1)) || H3B_OTHER=$((H3B_OTHER+1));;
+        *)   H3B_OTHER=$((H3B_OTHER+1));;
+      esac
+    done
+    if gt0 "$H3B_PASS" "requests admitted under the ceiling of 2"; then
+      { [ "$H3B_CEIL" = 1 ] && [ "$H3B_PASS" = 2 ] && [ "$H3B_OTHER" = 0 ]; } \
+        && ok "3 overlapping requests against a ceiling of 2 → exactly ONE 'llm_reservation_ceiling_exceeded' (2 admitted, 0 other outcomes)" \
+        || no "ceiling outcome: admitted=$H3B_PASS ceiling-refused=$H3B_CEIL other=$H3B_OTHER (want 2 / 1 / 0)"
+    fi
+    # Tenant mode's custody claim, from the recorder: the MODEL plane presented
+    # the minted virtual key, and the master key appeared ONLY on the admin plane.
+    H3_AUTH=$(recl "$H3_MARK" distinct auth path=/v1/messages)
+    H3_MINT=$(recl "$H3_MARK" first auth path=/key/generate)
+    { [ -n "$H3_AUTH" ] && [ "$H3_AUTH" != "Bearer $MASTER_KEY" ]; } \
+      && ok "tenant mode: the model plane presented a per-tenant virtual key, never the deployment master key" \
+      || no "tenant-mode model-plane authorization was [$H3_AUTH] — the master key must not ride a model request"
+    [ "$H3_MINT" = "Bearer $MASTER_KEY" ] \
+      && ok "…and the master key appears ONLY on the /key/generate admin plane (the D7 confinement)" \
+      || no "/key/generate presented [$H3_MINT] (want the deployment master key)"
+    # The deferred positive control for (h.3a)'s ZERO: the SAME window now holds
+    # model-plane requests, so that zero was a real absence, not a dead recorder.
+    H3_MSGS_NOW=$(recl "$H3_MARK" count path=/v1/messages)
+    gt0 "$H3_MSGS_NOW" "model-plane requests recorded in the window (h.3a) read as zero" \
+      && ok "POSITIVE CONTROL: that same recorder window now holds $H3_MSGS_NOW model request(s) — (h.3a)'s ZERO was a real absence"
+  fi
+
+  # (h.3c) RELEASE on a proven non-execution. A 401 is the facade's own proof that
+  # the request never executed upstream (the basis of its exactly-once replay), so
+  # the booking is released — and the rejection is forwarded VERBATIM, never
+  # re-shaped and never re-provisioned into (this body is the provider-originated
+  # shape facade.rs:834-835 excludes from `virtual_key_rejected`). Its OWN run, so
+  # "the reservation" is unambiguous: exactly one row exists.
+  if live_run hq-agent "sess-h3c-$$" "h/401-release"; then
+    H3C="$RUN"
+    forge_audience_token "$H3C" llm "sess-h3c-$$-llm" >/dev/null
+    llm_post "sess-h3c-$$-llm" "$(llm_body "$H_MODEL" 64 0 normal unauthorized)"
+    { [ "$CODE" = 401 ] && [ "$BODY" = "$LLM_401_BODY" ]; } \
+      && ok "the upstream 401 was forwarded VERBATIM (status and bytes identical to what the upstream sent)" \
+      || no "401 forwarding → $CODE: $BODY (want 401 and exactly '$LLM_401_BODY')"
+    H3C_ROWS=$(db "select count(*) from llm_reservations where session_id='$H3C'")
+    if gt0 "$H3C_ROWS" "reservation rows booked by the 401 request"; then
+      H3C_STATE=$(db "select state from llm_reservations where session_id='$H3C'")
+      [ "$H3C_STATE" = released ] \
+        && ok "its reservation is 'released', NOT 'charged' — a 401 is proof of non-execution, so the budget is given back" \
+        || no "the 401 request's reservation is '$H3C_STATE' (want released; 'charged' would bill a request that never ran)"
+    fi
+    [ "$(usage_rows "$H3C")" = 0 ] \
+      && ok "…and nothing was recorded as usage for it" \
+      || no "the 401 request recorded usage ($(usage_rows "$H3C") row(s))"
+  fi
+
+  # NOT ASSERTED — the OTHER pre-existing 503, `tenant_llm_keys_required`. It
+  # fires only under FLUIDBOX_REQUIRE_SSO=1 + shared mode (llm_keys.rs
+  # `KeySource::RefuseSsoShared`), and REQUIRE_SSO=1 confines the admin token to
+  # /v1/admin/* — which would break every fixture, forge and assertion in this
+  # file. Proving it needs a boot whose whole identity posture differs, which is
+  # exactly what scripts/secrets-e2e.sh already owns; asserting a weaker proxy
+  # here would add no signal. The half this suite CAN reach —
+  # `tenant_llm_key_unavailable` — is asserted in (h.3a), including that the
+  # reservation work did not change its status or its code.
+fi
+# Hand the knobs back UNCONDITIONALLY — including on the path where (h) was
+# skipped entirely — so section (i) boots its replica, and section (j) reboots
+# this one, on the shipped defaults. Replica A itself stays on whatever boot it
+# last got until (j) restarts it; section (i) drives no facade traffic at all.
+LLM_KEY_MODE=shared; LLM_MAX_RES=""
+
+# ═════════════════════════════════════════════════════════════════════════════
+# (i) Two-replica coordination (Task 6, E12; Gap 13; migration 0021).
+#     Acceptance bullet: "two replicas on one database: a decided approval emits
+#     exactly ONE pair of ledger rows and releases every waiter; each delivery is
+#     POSTed once; a driver without the lease cannot mutate a session."
+#
+#     THE FIXTURE: two processes, distinct public+internal ports, ONE database,
+#     ONE runtime role, one shared callback sink. Nothing is mocked — the second
+#     replica is the same binary with the same env, so every worker it runs (the
+#     delivery claim loop, the finalize driver, approval expiry, the
+#     `fluidbox_approvals` LISTEN relay) is genuinely live and genuinely racing
+#     the first. Replica B is stopped at the END of this section so section (j),
+#     whose governor is in-memory and per-replica, still measures one process.
+#
+#     WHY IT IS A REAL TEST AND NOT A RESTATEMENT: before Task 6 every awakened
+#     waiter ledgered its own `approval.decided` + `tool.decision`, so N
+#     re-attached waiters produced N pairs; and the delivery poll took no claim, so
+#     both replicas POSTed the same row. Both are now single-winner in the DB —
+#     the decision CAS carries the events inside its transaction, and the delivery
+#     poll claims `for update skip locked`. The assertions below are exactly those
+#     two counts, plus the notify hop that makes the first one fast, plus the lease
+#     that makes the driver single-writer.
+# ═════════════════════════════════════════════════════════════════════════════
+say "(i) Two-replica coordination — callback sink + replica B"
+start_sink
+
+# One /permission call against a NAMED replica — the base URL is the only thing
+# that differs from `sess_perm`, and naming the replica is what makes a failure
+# message say WHICH process misbehaved.
+perm_at() { # base sid token json
+  curl -s -X POST -H "authorization: Bearer $3" -H 'content-type: application/json' \
+    -d "$4" "$1/internal/sessions/$2/permission"
+}
+perm_body() { # tool_call_id
+  printf '{"tool_call_id":"%s","tool":"mcp__hq__hq_search","input":{"query":"i"}}' "$1"
+}
+# Count rows on the OPERATOR-VISIBLE timeline (GET /v1/sessions/{id}/events),
+# optionally narrowed by one payload field. Deliberately the API and not psql: the
+# single-emission property is a claim about what an operator (and the SSE stream
+# built on the same `events_after` query) sees.
+ev_count() { # sid type [payload-key] [payload-value]
+  admin_get "/v1/sessions/$1/events?limit=1000"
+  echo "$BODY" | python3 -c "
+import sys, json
+t, k, v = sys.argv[1], sys.argv[2], sys.argv[3]
+n = 0
+for r in json.load(sys.stdin).get('events', []):
+    if r.get('type') != t:
+        continue
+    if k and str((r.get('payload') or {}).get(k, '')) != v:
+        continue
+    n += 1
+print(n)
+" "$2" "${3:-}" "${4:-}" 2>/dev/null
+}
+now_ms() { python3 -c 'import time;print(int(time.time()*1000))'; }
+
+I_OK=0
+if boot_replica_b; then
+  I_OK=1
+  ok "replica B healthy on :$API_PORT_B (public) / :$API_PORT_B_INT (internal), same DB + runtime role"
+else
+  no "replica B did not become healthy — every assertion in section (i) is skipped: $(tail -30 "$SERVER_B_LOG")"
+fi
+
+if [ "$I_OK" = 1 ]; then
+  # Prove the second process is a REAL peer before asserting anything about it:
+  # it serves the same tenant's data from the same database.
+  # `j` interpolates its argument as a SUFFIX of `d`, so the length is spelled as
+  # a method call rather than `len(...)` (which would evaluate to `dlen(...)`).
+  admin_get "/v1/agents"
+  I_AGENTS_A=$(echo "$BODY" | j "['agents'].__len__()")
+  I_AGENTS_B=$(curl -s -H "$AH" "$API_B/v1/agents" | j "['agents'].__len__()")
+  { [ -n "$I_AGENTS_B" ] && [ "$I_AGENTS_A" = "$I_AGENTS_B" ]; } \
+    && ok "both replicas serve the SAME database (identical agent count: $I_AGENTS_A)" \
+    || no "replica A lists $I_AGENTS_A agents, replica B lists '$I_AGENTS_B' — they are not on one DB, so nothing below tests coordination"
+fi
+
+say "(i.1) Single emission — one decided approval, TWO blocked waiters, ONE pair of ledger rows"
+mcp_mode "$PROTO_SNAP" ok
+if [ "$I_OK" = 1 ] && live_run hq-appr-agent "sess-i1-$$" "i/single-emission"; then
+  I1="$RUN"
+  ( perm_at "$API"   "$I1" "sess-i1-$$" "$(perm_body i1)" > "$WORK/i1-a" 2>/dev/null ) & I1PA=$!
+  ( perm_at "$API_B" "$I1" "sess-i1-$$" "$(perm_body i1)" > "$WORK/i1-b" 2>/dev/null ) & I1PB=$!
+  I1_AID=$(pending_approval_id "$I1")
+  if need "$I1_AID" "no approval became pending — neither replica paused, so there is nothing to decide"; then
+    # PRECONDITION, not decoration: both callers must still be BLOCKED when the
+    # decision lands. A waiter that had already returned would make "exactly one
+    # pair" trivially true (one waiter, one pair) and prove nothing.
+    { kill -0 "$I1PA" 2>/dev/null && kill -0 "$I1PB" 2>/dev/null; } \
+      && ok "both replicas' /permission calls are still blocked on the one approval row" \
+      || no "a waiter returned before the decision (replica A: $(kill -0 "$I1PA" 2>/dev/null && echo blocked || echo returned); replica B: $(kill -0 "$I1PB" 2>/dev/null && echo blocked || echo returned)) — the two-waiter race is not being exercised"
+    admin_post "/v1/approvals/$I1_AID/decision" '{"decision":"approved_once"}'
+    [ "$CODE" = 200 ] \
+      && ok "the approval was decided ONCE, on replica A" \
+      || no "decision on replica A → $CODE: $BODY"
+  fi
+  wait "$I1PA"; wait "$I1PB"
+  I1_A=$(cat "$WORK/i1-a" 2>/dev/null); I1_B=$(cat "$WORK/i1-b" 2>/dev/null)
+  echo "$I1_A" | grep -q '"decision": *"allow"' \
+    && ok "replica A's waiter returned allow" \
+    || no "replica A's waiter did not allow: $I1_A"
+  echo "$I1_B" | grep -q '"decision": *"allow"' \
+    && ok "replica B's waiter returned allow (the decision crossed processes)" \
+    || no "replica B's waiter did not allow: $I1_B"
+  # THE LOAD-BEARING COUNTS. Both rows are written INSIDE the decision CAS
+  # (`decide_approval_tx` + `approval_decision_events`), so the number of waiters
+  # cannot multiply them.
+  I1_DECIDED=$(ev_count "$I1" approval.decided approval_id "$I1_AID")
+  I1_TOOLDEC=$(ev_count "$I1" tool.decision tool_call_id i1)
+  [ "$I1_DECIDED" = 1 ] \
+    && ok "exactly ONE 'approval.decided' on the timeline for that approval (two waiters, one row)" \
+    || no "approval.decided rows for approval $I1_AID = $I1_DECIDED (want exactly 1; >1 is the pre-Task-6 per-waiter emission)"
+  [ "$I1_TOOLDEC" = 1 ] \
+    && ok "exactly ONE 'tool.decision' for that intent (two waiters, one row)" \
+    || no "tool.decision rows for tool_call_id 'i1' = $I1_TOOLDEC (want exactly 1; >1 means waiters are emitting again)"
+
+  # POSITIVE CONTROL, same run + same reader + same window: a SECOND decision on
+  # this session DOES add a second pair. Without it, "exactly 1" would also be the
+  # reading of a timeline that stopped recording.
+  ( perm_at "$API" "$I1" "sess-i1-$$" "$(perm_body i1b)" > "$WORK/i1-c" 2>/dev/null ) & I1PC=$!
+  I1_AID2=$(pending_approval_id "$I1")
+  if need "$I1_AID2" "the control approval never became pending"; then
+    admin_post "/v1/approvals/$I1_AID2/decision" '{"decision":"approved_once"}'
+  fi
+  wait "$I1PC"
+  I1_TOTAL=$(ev_count "$I1" approval.decided)
+  I1_TOOLTOTAL=$(ev_count "$I1" tool.decision tool_call_id i1b)
+  if gt0 "$I1_TOOLTOTAL" "tool.decision rows for the control intent"; then
+    { [ "$I1_TOTAL" = 2 ] && [ "$I1_TOOLTOTAL" = 1 ]; } \
+      && ok "POSITIVE CONTROL: a second decision on the same run added exactly one more pair (2 approval.decided total) — the recorder is live, so the ONEs above are real" \
+      || no "control decision: approval.decided total=$I1_TOTAL, tool.decision for 'i1b'=$I1_TOOLTOTAL (want 2 and 1)"
+  fi
+fi
+
+say "(i.2) The NOTIFY relay — a decision on replica A releases a waiter on replica B in well under its poll floor"
+# The waiter's fallback is a ≤2 s poll anchored at the moment it read the row as
+# pending (internal.rs:742, `tick = until_expiry.min(Duration::from_secs(2))`).
+# The measurement below is deliberately arranged so a MISSED notify cannot look
+# fast: `pending_approval_id` polls at 0.5 s granularity and we then sleep another
+# 0.5 s, so the decision lands 0.5-1.0 s after the waiter's anchor — meaning a
+# poll-driven wake could not arrive sooner than ~1.0 s after the decision. A
+# NOTIFY-driven wake is one LISTEN hop plus one indexed approval read.
+#
+# THRESHOLD: 400 ms. That is comfortably above the notify path (a broadcast wake,
+# one primary-key read and the HTTP response, tens of ms even on a loaded runner)
+# and comfortably below the ~1.0 s floor computed above, so the two outcomes are
+# not confusable and no statistics are needed. The elapsed time is measured from
+# BEFORE the decision request is sent, so it over-counts by that request's own
+# latency — the conservative direction for a "must be small" assertion. Two
+# samples, both required to pass.
+I2_THRESHOLD_MS=400
+if [ "$I_OK" = 1 ] && live_run hq-appr-agent "sess-i2-$$" "i/notify"; then
+  I2="$RUN"
+  for I2_K in 1 2; do
+    ( R=$(perm_at "$API_B" "$I2" "sess-i2-$$" "$(perm_body "i2-$I2_K")" 2>/dev/null)
+      printf '%s\n%s\n' "$(now_ms)" "$R" > "$WORK/i2-$I2_K" ) & I2P=$!
+    I2_AID=$(pending_approval_id "$I2")
+    if need "$I2_AID" "sample $I2_K: no approval became pending on replica B"; then
+      # Put the waiter provably INSIDE its wait (and shift its poll anchor
+      # earlier) before the decision lands.
+      sleep 0.5
+      kill -0 "$I2P" 2>/dev/null \
+        && ok "sample $I2_K: replica B's waiter is blocked and its poll anchor is ≥0.5s old" \
+        || no "sample $I2_K: replica B's waiter returned before the decision — the latency below would measure nothing"
+      I2_T0=$(now_ms)
+      admin_post "/v1/approvals/$I2_AID/decision" '{"decision":"approved_once"}'
+      [ "$CODE" = 200 ] || no "sample $I2_K: decision on replica A → $CODE: $BODY"
+    else
+      I2_T0=$(now_ms)
+    fi
+    wait "$I2P"
+    I2_T1=$(head -1 "$WORK/i2-$I2_K" 2>/dev/null)
+    I2_RESP=$(tail -n +2 "$WORK/i2-$I2_K" 2>/dev/null)
+    if need "$I2_T1" "sample $I2_K: replica B's waiter recorded no completion timestamp"; then
+      I2_MS=$(( I2_T1 - I2_T0 ))
+      echo "$I2_RESP" | grep -q '"decision": *"allow"' \
+        && ok "sample $I2_K: replica B's waiter returned allow" \
+        || no "sample $I2_K: replica B's waiter returned '$I2_RESP' (want allow)"
+      { [ "$I2_MS" -ge 0 ] && [ "$I2_MS" -le "$I2_THRESHOLD_MS" ]; } \
+        && ok "sample $I2_K: replica B released ${I2_MS}ms after the decision on replica A — far under the ~1000ms its poll floor could have managed, so the notification crossed" \
+        || no "sample $I2_K: replica B released ${I2_MS}ms after the decision (want ≤${I2_THRESHOLD_MS}ms; ~1000ms+ means the pg_notify relay did not cross and it fell back to the ≤2s poll)"
+    fi
+  done
+fi
+
+say "(i.3) Delivery claims — both workers live, ONE POST per delivery"
+I3_N=14
+I3_SUB=""; I3_TOK=""
+if [ "$I_OK" = 1 ]; then
+  admin_post "/v1/triggers" \
+    "{\"agent\":\"plain-agent\",\"name\":\"i3-sub-$$\",\"task_template\":\"hardening-e2e delivery\",\"autonomous\":true,\"callback_url\":\"http://127.0.0.1:$SINK_PORT/cb\"}"
+  I3_SUB=$(echo "$BODY" | j "['subscription']['id']")
+  I3_TOK=$(echo "$BODY" | j "['token']")
+  { [ "$CODE" = 200 ] && [ -n "$I3_SUB" ] && [ -n "$I3_TOK" ]; } \
+    && ok "subscription created with a loopback signed-callback destination" \
+    || no "subscription create → $CODE: $BODY"
+fi
+if [ -n "$I3_SUB" ] && [ -n "$I3_TOK" ]; then
+  I3_MARK=$(marks)
+  # Invocations ALTERNATE between the replicas, so both processes are proven to
+  # serve the trigger API too — and the deliveries they enqueue are indistinguish-
+  # able afterwards, which is the point (any worker may claim any row).
+  I3_INVOKED=0
+  for I3_K in $(seq 1 $I3_N); do
+    if [ $(( I3_K % 2 )) -eq 0 ]; then I3_BASE="$API_B"; else I3_BASE="$API"; fi
+    I3_SID=$(curl -s -X POST -H "authorization: Bearer $I3_TOK" -H 'content-type: application/json' \
+      -d '{}' "$I3_BASE/v1/triggers/$I3_SUB/invoke" | j "['session_id']")
+    [ -n "$I3_SID" ] && I3_INVOKED=$((I3_INVOKED+1))
+  done
+  if gt0 "$I3_INVOKED" "trigger invocations that created a run"; then
+    [ "$I3_INVOKED" = "$I3_N" ] \
+      && ok "$I3_INVOKED runs invoked (alternating replicas — both serve the trigger API)" \
+      || no "only $I3_INVOKED of $I3_N invocations created a run"
+  fi
+  # Wait for every run to terminalize AND for its delivery row to be POSTed.
+  I3_DELIVERED=0
+  I3_DEADLINE=$(( $(date +%s) + 420 ))
+  while [ "$(date +%s)" -lt "$I3_DEADLINE" ]; do
+    I3_DELIVERED=$(db "select count(*) from result_deliveries where subscription_id='$I3_SUB' and status='delivered'")
+    [ "$I3_DELIVERED" = "$I3_INVOKED" ] && break
+    sleep 2
+  done
+  I3_ROWS=$(db "select count(*) from result_deliveries where subscription_id='$I3_SUB'")
+  if gt0 "$I3_ROWS" "delivery rows enqueued for the subscription"; then
+    { [ "$I3_ROWS" = "$I3_INVOKED" ] && [ "$I3_DELIVERED" = "$I3_INVOKED" ]; } \
+      && ok "all $I3_ROWS deliveries reached status='delivered' (one row per run, exactly-once by the terminal-entry funnel)" \
+      || no "delivery rows=$I3_ROWS delivered=$I3_DELIVERED for $I3_INVOKED runs — the counts below would be misleading"
+  fi
+  # THE LOAD-BEARING COUNT: with two claim loops racing, the sink saw each
+  # delivery exactly once. Before the claim this was two POSTs per row.
+  I3_POSTS=$(recs "$I3_MARK" count)
+  # Snapshotted BEFORE the replay below, because this recorder window is
+  # open-ended: read afterwards it would also contain the replay's rows and the
+  # subset check at the end of this section would be vacuously true.
+  I3_IDS1_SET=$(recs "$I3_MARK" distinct delivery)
+  I3_IDS=$(echo "$I3_IDS1_SET" | wc -w | tr -d ' ')
+  if gt0 "$I3_POSTS" "POSTs recorded by the callback sink"; then
+    { [ "$I3_POSTS" = "$I3_DELIVERED" ] && [ "$I3_IDS" = "$I3_DELIVERED" ]; } \
+      && ok "the sink recorded $I3_POSTS POSTs carrying $I3_IDS DISTINCT x-fluidbox-delivery ids for $I3_DELIVERED deliveries — exactly one POST each, with both workers live" \
+      || no "sink POSTs=$I3_POSTS distinct ids=$I3_IDS for $I3_DELIVERED deliveries (want all three equal; POSTs>ids means two replicas attempted one row)"
+  fi
+  I3_SIGNED=$(recs "$I3_MARK" all_have signed)
+  case "$I3_SIGNED" in
+    OK\ *) ok "every POST carried an x-fluidbox-signature ($I3_SIGNED)";;
+    NONE)  no "no POSTs recorded — the signature assertion would be vacuous";;
+    *)     no "a callback went out UNSIGNED ($I3_SIGNED)";;
+  esac
+
+  # ── Did BOTH workers actually claim, or was one idle? ────────────────────
+  # `mark_delivery_attempt` CLEARS `claimed_by` on completion (db_lib.rs
+  # `claimed_by = null`), so the only way to see who claimed is to sample WHILE
+  # rows are in flight. The burst below makes that deterministic rather than
+  # lucky: all $I3_N rows are reset to due at once, the per-tick claim limit is 10
+  # (deliveries.rs:132), and the first claimant then spends 10 × ${SINK_HOLD_MS}ms
+  # working through its batch sequentially — longer than the other worker's 3 s
+  # tick, so the remaining rows are necessarily claimed by the OTHER replica.
+  # The replay is deliberate: the same delivery id arrives at the sink twice,
+  # which is precisely the at-least-once contract receivers dedup on, so this
+  # window asserts nothing about POST counts.
+  I3_MARK2=$(marks)
+  db "update result_deliveries set status='pending', attempts=0, next_attempt_at=now(),
+      claimed_by=null, claimed_until=null, delivered_at=null
+      where subscription_id='$I3_SUB'" >/dev/null
+  I3_PENDING=$(db "select count(*) from result_deliveries where subscription_id='$I3_SUB' and status='pending'")
+  [ "$I3_PENDING" = "$I3_ROWS" ] \
+    && ok "fixture: all $I3_PENDING deliveries were reset to due AT ONCE (a burst larger than one tick's claim limit of 10)" \
+    || no "fixture failed — only $I3_PENDING of $I3_ROWS rows are pending; the two-round claim argument does not hold"
+  I3_SEEN=""
+  I3_OBS_DEADLINE=$(( $(date +%s) + 120 ))
+  while [ "$(date +%s)" -lt "$I3_OBS_DEADLINE" ]; do
+    I3_NOW=$(db "select coalesce(string_agg(distinct claimed_by::text, ' '), '') from result_deliveries where subscription_id='$I3_SUB' and claimed_by is not null")
+    for I3_ONE in $I3_NOW; do
+      case " $I3_SEEN " in
+        *" $I3_ONE "*) ;;
+        *) I3_SEEN="$I3_SEEN $I3_ONE";;
+      esac
+    done
+    I3_DISTINCT=$(echo "$I3_SEEN" | wc -w | tr -d ' ')
+    [ "$I3_DISTINCT" -ge 2 ] && break
+    [ "$(db "select count(*) from result_deliveries where subscription_id='$I3_SUB' and status='pending'")" = 0 ] && break
+    sleep 0.3
+  done
+  I3_DISTINCT=$(echo "$I3_SEEN" | wc -w | tr -d ' ')
+  if gt0 "$I3_DISTINCT" "distinct claim owners observed while deliveries were in flight"; then
+    [ "$I3_DISTINCT" = 2 ] \
+      && ok "TWO distinct replica ids were observed holding delivery claims — the second worker is genuinely doing work, not idle while the first drains everything" \
+      || no "only $I3_DISTINCT distinct claim owner(s) observed across a $I3_ROWS-row burst (want 2 — with a per-tick limit of 10 the second round MUST fall to the other replica unless its worker is dead)"
+  fi
+  # The replay window's own shape: the SAME ids arriving again. Asserted as a real
+  # SUBSET test against the pre-replay snapshot, not as a count comparison — a
+  # re-attempt must reuse the delivery row's id, which is exactly what makes
+  # at-least-once safe for a receiver that dedups on `x-fluidbox-delivery`.
+  I3_POSTS2=$(recs "$I3_MARK2" count)
+  I3_IDS2_SET=$(recs "$I3_MARK2" distinct delivery)
+  I3_IDS2=$(echo "$I3_IDS2_SET" | wc -w | tr -d ' ')
+  I3_NEWIDS=0
+  for I3_ONE in $I3_IDS2_SET; do
+    case " $I3_IDS1_SET " in
+      *" $I3_ONE "*) ;;
+      *) I3_NEWIDS=$((I3_NEWIDS+1));;
+    esac
+  done
+  if gt0 "$I3_IDS2" "distinct delivery ids seen during the forced replay"; then
+    [ "$I3_NEWIDS" = 0 ] \
+      && ok "every one of the $I3_IDS2 replayed ids (across $I3_POSTS2 POSTs) is one the sink had ALREADY seen — a re-attempt reuses the delivery id, which is what receivers dedup on" \
+      || no "$I3_NEWIDS of $I3_IDS2 replayed deliveries carried an id the sink had never seen (a re-attempt must never mint a new x-fluidbox-delivery)"
+  fi
+fi
+
+say "(i.4) Lease + epoch fencing — a foreign lease stops the fenced driver, and expiring it hands over"
+# The fence's operational meaning, driven end to end. A session whose lease is held
+# by a THIRD (dead) replica may not be mutated by either live driver: both call
+# `hold_lease` first (orchestrator.rs:593) and, getting None, RELEASE the
+# finalization claim and return. The request-side wind-down is deliberately
+# unfenced (orchestrator.rs:458-464 — a lease held elsewhere must never swallow a
+# user's cancel), so the run still enters `cancelling` and then stops there.
+#
+# Forcing the epoch directly (the plan's psql fixture) would prove less than this:
+# a manual bump is picked up by the SAME owner on its next renew (the epoch moves
+# only on an owner CHANGE), so it self-heals and no assertion could fail. A
+# FOREIGN owner with a live lease is the state the fence actually exists for, and
+# it is observable in both directions.
+if [ "$I_OK" = 1 ] && live_run plain-agent "sess-i4-$$" "i/lease"; then
+  I4="$RUN"
+  I4_FOREIGN=$(db "select gen_random_uuid()")
+  need "$I4_FOREIGN" "could not mint a foreign replica id" || I4_FOREIGN=""
+  if [ -n "$I4_FOREIGN" ]; then
+    db "update sessions set orchestrator_owner_id='$I4_FOREIGN',
+        orchestrator_lease_until = now() + interval '150 seconds' where id='$I4'" >/dev/null
+    I4_EPOCH0=$(db "select orchestrator_epoch from sessions where id='$I4'")
+    [ "$(db "select orchestrator_owner_id from sessions where id='$I4'")" = "$I4_FOREIGN" ] \
+      && ok "fixture: a THIRD replica id holds an unexpired driver lease (epoch $I4_EPOCH0)" \
+      || no "fixture failed — the foreign lease was not installed, so nothing below is fenced"
+
+    admin_post "/v1/sessions/$I4/cancel" '{}'
+    { [ "$CODE" = 200 ] || [ "$CODE" = 202 ]; } \
+      && ok "the cancel was ACCEPTED by replica A despite the foreign lease (the request path is unfenced by design)" \
+      || no "cancel → $CODE: $BODY"
+    I4_WIND=""
+    for _ in $(seq 1 30); do
+      I4_WIND=$(db "select status from sessions where id='$I4'")
+      case "$I4_WIND" in cancelling|finalizing|completed|failed|cancelled|budget_exceeded) break;; esac
+      sleep 0.5
+    done
+    [ "$I4_WIND" = cancelling ] \
+      && ok "the run entered 'cancelling' (the intent materialized) but got no further" \
+      || no "the run's status after the cancel is '$I4_WIND' (want cancelling; a terminal status means the fence did not hold)"
+
+    # THE ea11853 ASSERTION, and it is fail-capable in exactly the right way:
+    # a fenced driver RELEASES the finalization claim on its way out, so the next
+    # replica's 20 s finalize worker can claim again and `attempts` keeps rising.
+    # If the claim were left stamped, `claim_finalization`'s predicate would refuse
+    # for the full 420 s stale window and this counter would be FROZEN.
+    # `coalesce((select …), 0)` rather than `coalesce(attempts, 0)`: the latter
+    # returns ZERO ROWS (an empty string here) if the intent is gone, which would
+    # break the arithmetic comparison instead of failing the assertion cleanly.
+    I4_ATT0=$(db "select coalesce((select attempts from session_finalizations where session_id='$I4'), 0)")
+    sleep 25
+    I4_ATT1=$(db "select coalesce((select attempts from session_finalizations where session_id='$I4'), 0)")
+    I4_STATUS=$(db "select status from sessions where id='$I4'")
+    if gt0 "$I4_ATT1" "finalization drive attempts recorded while the lease was foreign"; then
+      [ "$I4_ATT1" -gt "$I4_ATT0" ] \
+        && ok "drivers KEPT trying and kept being turned away ($I4_ATT0 → $I4_ATT1 attempts across 25s > the 20s worker tick) — the fenced driver releases its claim instead of squatting it" \
+        || no "finalization attempts froze at $I4_ATT1 across 25s — either no driver retried, or a fenced driver left the claim stamped (the 420s squat ea11853 fixes)"
+    fi
+    [ "$I4_STATUS" = cancelling ] \
+      && ok "…and the run is STILL 'cancelling' — no replica mutated a session whose lease it does not hold" \
+      || no "the run reached '$I4_STATUS' while a foreign replica held the lease (the epoch fence let a mutation through)"
+
+    # Expire the lease: the next worker tick may now steal it, and a steal — unlike
+    # a renew — MUST bump the epoch.
+    db "update sessions set orchestrator_lease_until = now() - interval '60 seconds' where id='$I4'" >/dev/null
+    I4_FINAL=$(wait_terminal "$I4" 180)
+    case "$I4_FINAL" in
+      completed|failed|cancelled|budget_exceeded)
+        ok "with the lease expired, a live replica took over and drove the run to '$I4_FINAL'";;
+      *)
+        no "the run never terminalized after the lease expired (status=$I4_FINAL) — takeover is broken";;
+    esac
+    I4_OWNER=$(db "select orchestrator_owner_id from sessions where id='$I4'")
+    I4_EPOCH1=$(db "select orchestrator_epoch from sessions where id='$I4'")
+    { [ -n "$I4_OWNER" ] && [ "$I4_OWNER" != "$I4_FOREIGN" ]; } \
+      && ok "the lease now belongs to a LIVE replica, not the dead one that held it" \
+      || no "orchestrator_owner_id is '$I4_OWNER' after takeover (want a live replica's id, never the foreign one)"
+    # `>` rather than `= epoch0 + 1`: a takeover bumps by exactly one, but a second
+    # lapse-and-steal (the other replica picking the session up after a 30 s lease
+    # TTL on a slow runner) is EQUALLY correct behavior, so pinning the exact value
+    # would make this flaky without making it stronger. What must hold — and what
+    # a renew would violate — is that the owner change moved it at all.
+    { [ -n "$I4_EPOCH1" ] && [ "$I4_EPOCH1" -gt "$I4_EPOCH0" ]; } \
+      && ok "the fencing epoch advanced on the owner change ($I4_EPOCH0 → $I4_EPOCH1) — every mutation the dead driver could still attempt is now stale" \
+      || no "orchestrator_epoch is '$I4_EPOCH1' after a takeover from epoch $I4_EPOCH0 (a steal MUST bump it; only a renew keeps it)"
+  fi
+fi
+
+# NOT ASSERTED — "a stale-epoch UPDATE from the previous holder matched ZERO
+# rows", observed from outside. The fenced statement lives inside
+# `transition_session_fenced` and the only external evidence of a refusal is the
+# session NOT moving — which (i.4) asserts — because a driver that loses the fence
+# also stops. Watching the losing UPDATE itself would need the driver to keep
+# running with a known-stale token past a takeover, i.e. an injected pause in the
+# server; that property is driven directly against the database in
+# `fluidbox-db`'s own lease/fence tests (the epoch-fence and steal-matrix cases),
+# which is where a pure-CAS property belongs.
+#
+# NOT ASSERTED — MCP session affinity across replicas. The broker's session
+# registry is per-replica in-memory, so a run whose calls land on two replicas
+# opens two upstream MCP sessions. That is a KNOWN, disclosed residual (Phase F),
+# not a regression this suite can catch: asserting it today would encode the
+# limitation as if it were the contract.
+
+if [ "$I_OK" = 1 ]; then
+  stop_replica_b \
+    && ok "replica B stopped — section (j) measures a single process, as its per-replica governor requires" \
+    || no "replica B is still holding :$API_PORT_B; section (j)'s per-replica governor assertions may be diluted"
+fi
 
 # ═════════════════════════════════════════════════════════════════════════════
 # (j) Outbound rate limits + per-connection circuit breakers (Task 8, E14).
