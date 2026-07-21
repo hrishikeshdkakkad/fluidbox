@@ -668,7 +668,7 @@ pub async fn probe(
     }
     let mut notes: Vec<String> = Vec::new();
     match crate::broker::probe_tools(&state, url).await {
-        crate::broker::ProbeOutcome::Tools(tools) => {
+        crate::broker::ProbeOutcome::Tools { tools, truncated } => {
             // Display-only preview (capped at the core per-server tool cap of
             // 64); the authoritative photograph still runs at connect.
             let preview: Vec<Value> = tools
@@ -676,6 +676,15 @@ pub async fn probe(
                 .take(64)
                 .map(|t| json!({ "name": t.name, "description": t.description }))
                 .collect();
+            // M10: the probe used to silently truncate at the discovery page cap
+            // and show a PREFIX as if it were the whole surface. Say so — and say
+            // that connect will refuse, because `discover_snapshot` will not
+            // freeze a partial surface.
+            if truncated {
+                notes.push(
+                    "This server lists more tools than the discovery page cap, so the preview above is only the first pages — connecting will be refused until the server pages within the cap.".into(),
+                );
+            }
             Ok(Json(json!({
                 "url": url,
                 "transport": "streamable_http",
@@ -684,6 +693,7 @@ pub async fn probe(
                 "oauth_available": false,
                 "static_possible": false,
                 "tools_preview": preview,
+                "tools_truncated": truncated,
                 "oauth": Value::Null,
                 "auth_hints": {},
                 "notes": notes,

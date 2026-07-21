@@ -48,6 +48,20 @@ const MAX_RESULT_BYTES: usize = 256 * 1024;
 /// and discovery re-validates the whole surface against fluidbox-core's 2 MiB
 /// serialized ceiling.
 const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+/// How many server→client REQUESTS one response may make us answer with a
+/// `-32601` (C2). The 2025-11-25 spec defines exactly three server→client
+/// requests (`sampling/createMessage`, `roots/list`, `elicitation/create`) and we
+/// implement none of them, so a conformant server sends at most a handful per
+/// response and every one is refused. 8 leaves generous headroom for that while
+/// bounding the outbound amplification the governor never sees: 8 replies ×
+/// [`MCP_DELETE_TIMEOUT`] = 40 s worst case against a 600 s execution-claim TTL,
+/// versus the ~180 000 sequential POSTs an 8 MiB body of request frames buys.
+const MAX_SERVER_REQUEST_REPLIES: usize = 8;
+/// Wall-clock budget for ONE response's whole reply loop (C2), independent of the
+/// count: a stalling server that answers each reply just under
+/// [`MCP_DELETE_TIMEOUT`] must still not push the exchange toward the claim TTL.
+/// 30 s + one in-flight 5 s reply is the hard ceiling on this loop.
+const SERVER_REQUEST_REPLY_BUDGET: Duration = Duration::from_secs(30);
 
 /// A resolved outbound credential: which header to set, its full value, and
 /// — for OAuth connections — the connection whose access token can be
@@ -870,7 +884,9 @@ fn parse_messages(buf: &[u8], is_sse: bool) -> Result<Vec<Value>, String> {
     if is_sse {
         let mut asm = crate::mcp_sse::SseEventAssembler::new();
         let mut events = asm.feed(buf)?;
-        events.extend(asm.finish());
+        // M8: `finish` fails on the same conditions `feed` does, so a server that
+        // omits the final blank line cannot downgrade a protocol violation.
+        events.extend(asm.finish()?);
         Ok(events
             .into_iter()
             .filter_map(|e| serde_json::from_str::<Value>(&e.data).ok())
@@ -887,6 +903,19 @@ fn parse_messages(buf: &[u8], is_sse: bool) -> Result<Vec<Value>, String> {
 /// From the parsed messages: reply `-32601` to any server→client REQUEST, log
 /// (and ignore) notifications, and return the RESPONSE whose id matches ours.
 /// Validates `jsonrpc == "2.0"` on the selected response.
+///
+/// **The reply loop is CAPPED (C2).** Each server→client request costs us one
+/// outbound POST, and the governor admitted exactly ONE dial — the replies are
+/// neither counted nor gated. A ~46-byte `{"jsonrpc":"2.0","id":N,"method":"x"}`
+/// frame in an 8 MiB body is ~180 000 of them, each with a 5 s timeout, fired
+/// sequentially while holding the per-peer session mutex and an already-won
+/// execution claim: unbounded outbound amplification, and — once the loop
+/// outlives the claim TTL — a call that reached the wire with NO `tool.brokered`
+/// ledger row, because the sweeper flipped the claim to `ambiguous` and the
+/// finishing CAS then loses. Both bounds below exist to keep one response's
+/// reply work far inside that TTL. The `-32601` behavior itself is unchanged
+/// (the conformance contract requires replying rather than silently ignoring);
+/// past the cap we stop replying and fail the exchange as a protocol violation.
 async fn select_response(
     client: &reqwest::Client,
     url: &str,
@@ -896,6 +925,8 @@ async fn select_response(
     want_id: Option<&Value>,
 ) -> Result<Value, String> {
     let mut selected: Option<Value> = None;
+    let mut replies = 0usize;
+    let started = std::time::Instant::now();
     for m in messages {
         let has_method = m.get("method").is_some();
         let msg_id = m.get("id").cloned();
@@ -903,6 +934,10 @@ async fn select_response(
             // A server→client REQUEST: we implement none of them — respond with
             // a JSON-RPC "method not found" rather than silently ignoring it
             // (2025-11-25 conformance), best-effort on the same session.
+            replies += 1;
+            if let Some(reason) = reply_budget_exhausted(replies, started.elapsed()) {
+                return Err(reason);
+            }
             reply_method_not_found(client, url, auth, headers, msg_id.as_ref()).await;
             continue;
         }
@@ -931,6 +966,22 @@ async fn select_response(
         }
     }
     Ok(selected.unwrap_or(Value::Null))
+}
+
+/// Both C2 bounds on ONE response's `-32601` reply loop, as a pure predicate so
+/// each is testable without a slow upstream: `Some(reason)` = stop replying and
+/// fail the exchange as a protocol violation. `replies` is 1-based (the reply
+/// about to be sent), `elapsed` is the loop's age.
+fn reply_budget_exhausted(replies: usize, elapsed: Duration) -> Option<String> {
+    if replies > MAX_SERVER_REQUEST_REPLIES {
+        return Some(format!(
+            "mcp response carries more than {MAX_SERVER_REQUEST_REPLIES} server→client requests"
+        ));
+    }
+    if elapsed >= SERVER_REQUEST_REPLY_BUDGET {
+        return Some("mcp server→client request replies exceeded their time budget".into());
+    }
+    None
 }
 
 /// Best-effort `-32601` reply to a server→client request on the same session.
@@ -1368,6 +1419,47 @@ async fn delete_upstream_sessions<F, Fut>(
     }
 }
 
+/// Which connection an SEP-835 `insufficient_scope` challenge may mark `error`
+/// (I6). The answer is: ONLY an OAuth connection — the one whose authority came
+/// from a grant that can be re-consented with more scopes.
+///
+/// A hostile MCP server chooses its own `WWW-Authenticate` header, so this
+/// predicate is the whole blast radius of that choice. For a STATIC credential
+/// (API key / custom header / Basic) there is no scope grant to widen, the
+/// "reconnect with more scopes" remedy is not actionable, and
+/// `invalidate_rejected_access(_, "")` is a no-op — marking it would hand any
+/// upstream a one-header kill switch on an org's connection.
+///
+/// The design (:983) requires that the challenge be TERMINAL for the call and
+/// that the connection be marked for its owner. The first half is unconditional
+/// here — [`insufficient_scope_outcome`] returns a `Definitive` error on every
+/// path, whatever this predicate says — so narrowing the second half to the
+/// credential kind it was written for keeps the design property and drops the
+/// remote-DoS. Both call sites (legacy bundle + Phase C binding) go through the
+/// one helper, so they cannot drift again.
+fn insufficient_scope_target(auth: Option<&BrokeredAuth>) -> Option<uuid::Uuid> {
+    auth.and_then(|a| a.oauth_connection)
+}
+
+/// The shared SEP-835 (E8) dispatch outcome: mark the connection when — and only
+/// when — [`insufficient_scope_target`] names one, then fail the call terminally.
+async fn insufficient_scope_outcome(
+    state: &AppState,
+    scope: fluidbox_db::TenantScope,
+    auth: Option<&BrokeredAuth>,
+    challenge_scope: Option<String>,
+) -> DispatchOutcome {
+    if let Some(cid) = insufficient_scope_target(auth) {
+        let rejected = auth.and_then(|a| a.oauth_access()).unwrap_or("");
+        mark_insufficient_scope(state, scope, cid, rejected, challenge_scope).await;
+    }
+    DispatchOutcome::Definitive {
+        content: err_content("insufficient scope — reconnect the connection with more scopes"),
+        is_error: true,
+        structured: None,
+    }
+}
+
 /// SEP-835 (E8): mark a connection `status='error'` with a reconnect-with-more-
 /// scopes note and evict its rejected access token. The note records the
 /// (sanitized) challenge scope only; routed through the SAME `mark_connection_error`
@@ -1439,37 +1531,66 @@ fn map_tools_page(result: &Value, out: &mut Vec<ToolSnapshot>) -> Result<Option<
         .map(str::to_string))
 }
 
-/// Credential-free pre-connect discovery (the probe). `initialize`s first (via
-/// the SHARED session machinery — stateless-first is gone), accepts any
-/// negotiated version ([`VersionPolicy::Record`]), and paginates tools/list.
-/// A throwaway session (no registry): the probe persists nothing.
-async fn discover_tools(
-    state: &AppState,
+/// Paginate `tools/list` in an ALREADY-initialized session, up to
+/// [`MAX_LIST_PAGES`] pages. Returns the mapped tools and whether the listing
+/// COMPLETED — `false` means a `nextCursor` was still outstanding at the page
+/// cap, i.e. the list is a PREFIX of the server's surface.
+///
+/// M10: the probe and the photograph share this one loop so their pagination can
+/// no longer drift. What they may legitimately differ on is what truncation
+/// MEANS, and that is the caller's decision — the photograph refuses to freeze a
+/// partial surface, the probe discloses the truncation to the user — so this
+/// returns the flag rather than deciding for them.
+async fn list_tools_paged(
+    client: &reqwest::Client,
+    policy: &crate::egress::EgressPolicy,
     url: &str,
     auth: Option<&BrokeredAuth>,
-) -> Result<Vec<ToolSnapshot>, CallErr> {
-    let client = &state.egress_http;
-    let policy = &state.egress_policy;
-    let mut sess = McpUpstreamSession::fresh(url);
-    ensure_initialized(client, policy, url, auth, &mut sess, VersionPolicy::Record).await?;
+    sess: &mut McpUpstreamSession,
+) -> Result<(Vec<ToolSnapshot>, bool), CallErr> {
     let mut tools = Vec::new();
     let mut cursor: Option<String> = None;
+    let mut complete = false;
     for _ in 0..MAX_LIST_PAGES {
         let params = match &cursor {
             Some(c) => json!({ "cursor": c }),
             None => json!({}),
         };
-        let result =
-            call_in_session(client, policy, url, auth, &mut sess, "tools/list", params).await?;
+        let result = call_in_session(client, policy, url, auth, sess, "tools/list", params).await?;
         cursor = map_tools_page(&result, &mut tools)?;
         if cursor.is_none() {
+            complete = true;
             break;
         }
     }
+    Ok((tools, complete))
+}
+
+/// Credential-free pre-connect discovery (the probe). `initialize`s first (via
+/// the SHARED session machinery — stateless-first is gone), accepts any
+/// negotiated version ([`VersionPolicy::Record`]), and paginates tools/list
+/// through the SHARED [`list_tools_paged`].
+///
+/// M10: the probe additionally runs the SAME `validate_tools` screen the
+/// photograph runs (the list is untrusted remote input either way, and this one
+/// is rendered straight into the Connect wizard), and reports truncation to the
+/// caller instead of silently returning a prefix as if it were the whole surface.
+async fn discover_tools(
+    state: &AppState,
+    url: &str,
+    auth: Option<&BrokeredAuth>,
+) -> Result<(Vec<ToolSnapshot>, bool), CallErr> {
+    let client = &state.egress_http;
+    let policy = &state.egress_policy;
+    let mut sess = McpUpstreamSession::fresh(url);
+    ensure_initialized(client, policy, url, auth, &mut sess, VersionPolicy::Record).await?;
+    let (tools, complete) = list_tools_paged(client, policy, url, auth, &mut sess).await?;
     if tools.is_empty() {
         return Err(CallErr::Other("mcp server advertises no tools".into()));
     }
-    Ok(tools)
+    fluidbox_core::capability::validate_tools("mcp connection", &tools)
+        .map_err(|e| CallErr::Other(format!("discovered tool list failed validation: {e}")))?;
+    Ok((tools, !complete))
 }
 
 /// The forced-negotiation photograph (design :298-343; Phase C). Rides the SAME
@@ -1505,32 +1626,12 @@ pub async fn discover_snapshot(
     .map_err(|e| anyhow::anyhow!(e.into_msg()))?;
     // `Record` guaranteed a non-empty negotiated version.
     let protocol_version = sess.negotiated.clone();
-    // Paginate tools/list WITH the session; fail (not freeze) on a leftover cursor.
-    let mut tools = Vec::new();
-    let mut cursor: Option<String> = None;
-    let mut complete = false;
-    for _ in 0..MAX_LIST_PAGES {
-        let params = match &cursor {
-            Some(c) => json!({ "cursor": c }),
-            None => json!({}),
-        };
-        let result = call_in_session(
-            client,
-            policy,
-            endpoint_url,
-            auth.as_ref(),
-            &mut sess,
-            "tools/list",
-            params,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!(e.into_msg()))?;
-        cursor = map_tools_page(&result, &mut tools).map_err(|e| anyhow::anyhow!(e.into_msg()))?;
-        if cursor.is_none() {
-            complete = true;
-            break;
-        }
-    }
+    // Paginate tools/list WITH the session (the SHARED loop — M10); fail (not
+    // freeze) on a leftover cursor.
+    let (tools, complete) =
+        list_tools_paged(client, policy, endpoint_url, auth.as_ref(), &mut sess)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.into_msg()))?;
     if !complete {
         anyhow::bail!(
             "mcp server advertises more tools than the discovery page cap — refusing to freeze a partial snapshot"
@@ -1706,17 +1807,7 @@ pub async fn call_tool_auth(
             }
         }
         Err(CallErr::InsufficientScope(challenge_scope)) => {
-            if let Some(cid) = auth.as_ref().and_then(|a| a.oauth_connection) {
-                let rejected = auth.as_ref().and_then(|a| a.oauth_access()).unwrap_or("");
-                mark_insufficient_scope(state, scope, cid, rejected, challenge_scope).await;
-            }
-            DispatchOutcome::Definitive {
-                content: err_content(
-                    "insufficient scope — reconnect the connection with more scopes",
-                ),
-                is_error: true,
-                structured: None,
-            }
+            insufficient_scope_outcome(state, scope, auth.as_ref(), challenge_scope).await
         }
         r => outcome_from_call(r),
     }
@@ -1731,7 +1822,8 @@ pub async fn call_tool_auth(
 /// session registry on the binding (`McpPeer::Binding`, run = `binding.session_id`).
 /// Same single reactive-401 retry: OAuth re-mints once (a 401 proves the tool
 /// never executed); a static credential is terminal. An SEP-835 `insufficient_scope`
-/// challenge marks the connection `error` and does NOT retry (E8).
+/// challenge fails the call terminally without a retry (E8) and — only for an
+/// OAuth connection — marks it `error` (I6, see [`insufficient_scope_target`]).
 ///
 /// R2.5 / invariant 9: the retry is a SECOND upstream call, so it RE-runs
 /// [`recheck_binding`] before re-minting — a revoke/reauthorize/deactivate that
@@ -1823,15 +1915,9 @@ pub async fn call_tool_for_conn(
             }
         }
         Err(CallErr::InsufficientScope(challenge_scope)) => {
-            let rejected = auth.as_ref().and_then(|a| a.oauth_access()).unwrap_or("");
-            mark_insufficient_scope(state, scope, conn.id, rejected, challenge_scope).await;
-            DispatchOutcome::Definitive {
-                content: err_content(
-                    "insufficient scope — reconnect the connection with more scopes",
-                ),
-                is_error: true,
-                structured: None,
-            }
+            // I6: the SAME helper the legacy path uses — a static-credential
+            // connection is never flipped to `error` by an upstream's header.
+            insufficient_scope_outcome(state, scope, auth.as_ref(), challenge_scope).await
         }
         r => outcome_from_call(r),
     }
@@ -1912,7 +1998,15 @@ fn cap_content(content: Value) -> Value {
 pub enum ProbeOutcome {
     /// Authless server — these tools are for DISPLAY only, never persisted;
     /// the authoritative photograph still happens at connect.
-    Tools(Vec<ToolSnapshot>),
+    ///
+    /// `truncated` is true when the server still had a `nextCursor` at the
+    /// discovery page cap: the list is a PREFIX, not the whole surface (M10).
+    /// The probe used to drop that fact on the floor and hand a partial list to
+    /// the Connect wizard as if it were complete.
+    Tools {
+        tools: Vec<ToolSnapshot>,
+        truncated: bool,
+    },
     /// The server answered 401 — it wants a credential (api_key or oauth).
     Unauthorized,
     /// Not reachable / not a well-behaved MCP endpoint (message for `notes`).
@@ -1924,7 +2018,7 @@ pub enum ProbeOutcome {
 /// logic; bounded by `MCP_TIMEOUT` per request.
 pub async fn probe_tools(state: &AppState, url: &str) -> ProbeOutcome {
     match discover_tools(state, url, None).await {
-        Ok(tools) => ProbeOutcome::Tools(tools),
+        Ok((tools, truncated)) => ProbeOutcome::Tools { tools, truncated },
         Err(CallErr::Unauthorized) => ProbeOutcome::Unauthorized,
         Err(e) => ProbeOutcome::Unreachable(e.into_msg()),
     }
@@ -1954,6 +2048,132 @@ mod tests {
         assert!(
             e2.contains("code -32000") && e2.contains("sha256:") && e2.contains("tools/call"),
             "sanitized unwrap error dropped method/code/digest: {e2}"
+        );
+    }
+
+    /// A `select_response` client whose every reply attempt fails INSTANTLY with
+    /// no I/O: the URL is unparseable, so `RequestBuilder::send` returns the
+    /// stored builder error without opening a socket or resolving anything. That
+    /// makes the reply-cap test hermetic AND fast while still exercising the real
+    /// counting path (`reply_method_not_found` is fire-and-forget — it ignores
+    /// the send result, so a failing send counts exactly like a successful one).
+    const NO_IO_URL: &str = "http://[";
+
+    fn server_request(id: u64) -> Value {
+        json!({ "jsonrpc": "2.0", "id": id, "method": "sampling/createMessage", "params": {} })
+    }
+
+    #[tokio::test]
+    async fn server_request_replies_are_capped_per_response() {
+        // C2: ONE governor-admitted dial must not turn into an unbounded outbound
+        // reply storm. A ~46-byte server→client request frame fits ~180 000 times
+        // in an 8 MiB body, and each one cost a sequential POST with a 5 s timeout
+        // held under the per-peer session mutex and a won execution claim.
+        let client = reqwest::Client::new();
+        let flood: Vec<Value> = (0..MAX_SERVER_REQUEST_REPLIES as u64 + 5)
+            .map(server_request)
+            .collect();
+        let err = select_response(
+            &client,
+            NO_IO_URL,
+            None,
+            SessionHeaders::default(),
+            flood,
+            Some(&json!(1)),
+        )
+        .await
+        .expect_err("a server→client request flood must abort the exchange");
+        assert!(
+            err.contains(&MAX_SERVER_REQUEST_REPLIES.to_string()),
+            "the refusal must name the cap: {err}"
+        );
+
+        // FALSE-GREEN guard: EXACTLY the cap still replies AND still returns our
+        // response — the `-32601` conformance behavior is unchanged below the cap,
+        // so the assertion above is about the ceiling, not about requests failing.
+        let mut ok: Vec<Value> = (0..MAX_SERVER_REQUEST_REPLIES as u64)
+            .map(server_request)
+            .collect();
+        ok.push(json!({ "jsonrpc": "2.0", "id": 99, "result": { "ours": true } }));
+        let v = select_response(
+            &client,
+            NO_IO_URL,
+            None,
+            SessionHeaders::default(),
+            ok,
+            Some(&json!(99)),
+        )
+        .await
+        .expect("exactly the cap must pass");
+        assert_eq!(v["result"]["ours"], json!(true));
+    }
+
+    #[test]
+    fn reply_budget_bounds_both_count_and_time() {
+        // C2 has TWO bounds and the flood test can only reach the count one (its
+        // replies fail instantly), so the time budget gets its own assertions
+        // here — otherwise a mutation disabling it would survive.
+        // Count: exactly the cap is admitted; one past it is refused BY NAME.
+        assert!(reply_budget_exhausted(MAX_SERVER_REQUEST_REPLIES, Duration::ZERO).is_none());
+        let e = reply_budget_exhausted(MAX_SERVER_REQUEST_REPLIES + 1, Duration::ZERO)
+            .expect("one past the cap must stop the loop");
+        assert!(e.contains(&MAX_SERVER_REQUEST_REPLIES.to_string()), "{e}");
+        // Time: a still-in-budget loop keeps going, and reaching the budget stops
+        // it even though the COUNT is fine — the stalling-server case.
+        assert!(
+            reply_budget_exhausted(1, SERVER_REQUEST_REPLY_BUDGET - Duration::from_millis(1))
+                .is_none()
+        );
+        let e = reply_budget_exhausted(1, SERVER_REQUEST_REPLY_BUDGET)
+            .expect("the time budget must stop the loop");
+        assert!(e.contains("time budget"), "{e}");
+        // The point of both bounds: one response's reply loop cannot approach the
+        // 600 s execution-claim TTL, whose expiry is what loses the ledger row.
+        assert!(SERVER_REQUEST_REPLY_BUDGET + MCP_DELETE_TIMEOUT < Duration::from_secs(600));
+    }
+
+    #[test]
+    fn insufficient_scope_marks_only_an_oauth_connection() {
+        // I6: a hostile MCP server picks its own WWW-Authenticate header, so this
+        // predicate is the entire blast radius of that choice. A STATIC-credential
+        // connection has no scope grant to widen — marking it `error` would be a
+        // remote kill switch on an org's connection — while an OAuth one is
+        // exactly the case the SEP-835 remedy was written for.
+        let cid = uuid::Uuid::now_v7();
+        let oauth = BrokeredAuth {
+            header: "authorization".into(),
+            value: "Bearer tok".into(),
+            oauth_connection: Some(cid),
+        };
+        let static_key = BrokeredAuth {
+            header: "x-api-key".into(),
+            value: "sk-static".into(),
+            oauth_connection: None,
+        };
+        assert_eq!(insufficient_scope_target(Some(&oauth)), Some(cid));
+        assert_eq!(insufficient_scope_target(Some(&static_key)), None);
+        // A credential-free (authless) call has nothing to mark either.
+        assert_eq!(insufficient_scope_target(None), None);
+        // Both dispatch arms route through ONE helper, so the two paths cannot
+        // diverge again: this asserts the shared helper exists and is the only
+        // marker, by being the single thing either arm calls.
+        // Needles are COMPOSED at runtime so these string literals cannot match
+        // themselves and inflate the counts.
+        let src = include_str!("broker.rs");
+        let call = format!(
+            "insufficient_scope_outcome(state, {}, auth.as_ref()",
+            "scope"
+        );
+        assert_eq!(
+            src.matches(&call).count(),
+            2,
+            "both InsufficientScope arms must call the shared helper"
+        );
+        let marker = format!("mark_insufficient_scope(state, {}, cid,", "scope");
+        assert_eq!(
+            src.matches(&marker).count(),
+            1,
+            "mark_insufficient_scope must have exactly one caller (the helper)"
         );
     }
 
@@ -2066,6 +2286,132 @@ mod tests {
             "the client followed the redirect (saw a second request)"
         );
         srv.abort();
+    }
+
+    /// A loopback fake `tools/list` endpoint for the pagination tests. It echoes
+    /// the request's JSON-RPC id (the transport only accepts its own id back) and
+    /// returns ONE tool per page, appending a `nextCursor` iff the request path
+    /// says `/truncating` — so one fake drives both the never-ending server and
+    /// the well-behaved one. Binds 127.0.0.1:0 and closes each connection, so no
+    /// name is resolved and no port is assumed.
+    async fn spawn_paging_fake() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                // Read until the JSON-RPC body has landed (headers and body can
+                // arrive in separate segments).
+                let mut req = String::new();
+                for _ in 0..5 {
+                    let mut buf = [0u8; 4096];
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.push_str(&String::from_utf8_lossy(&buf[..n])),
+                    }
+                    if req.contains("\"method\"") {
+                        break;
+                    }
+                }
+                let id: i64 = req
+                    .rsplit("\"id\":")
+                    .next()
+                    .and_then(|t| t.split(|c: char| !c.is_ascii_digit()).next())
+                    .and_then(|d| d.parse().ok())
+                    .unwrap_or(1);
+                let cursor = if req.contains("/truncating") {
+                    ",\"nextCursor\":\"more\""
+                } else {
+                    ""
+                };
+                let body = format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"tools\":[{{\"name\":\"t{id}\",\
+                     \"description\":\"d\",\"inputSchema\":{{\"type\":\"object\"}}}}]{cursor}}}}}"
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (addr, srv)
+    }
+
+    #[tokio::test]
+    async fn pagination_reports_truncation_instead_of_silently_prefixing() {
+        // M10: the probe and the photograph carried SEPARATE copies of this loop
+        // with divergent semantics — the photograph refused a leftover cursor
+        // while the probe silently returned the first pages, so a PARTIAL tool
+        // list reached the Connect wizard looking like the server's whole surface.
+        // One loop now decides completeness and REPORTS it; what truncation means
+        // stays the caller's (refuse vs disclose).
+        let (addr, srv) = spawn_paging_fake().await;
+        let policy = crate::egress::EgressPolicy {
+            dev_loopback: true,
+            allow_cidrs: vec![],
+            github_clone_base: None,
+            proxy: None,
+        };
+        let client = crate::egress::build_egress_http(&policy);
+
+        // A server that never stops paging: the cap stops us, and `complete` says so.
+        let url = format!("http://{addr}/truncating");
+        let mut sess = McpUpstreamSession::fresh(&url);
+        let (tools, complete) = list_tools_paged(&client, &policy, &url, None, &mut sess)
+            .await
+            .expect("the fake answers every page");
+        assert_eq!(
+            tools.len(),
+            MAX_LIST_PAGES,
+            "exactly the page cap should have been fetched"
+        );
+        assert!(
+            !complete,
+            "an outstanding nextCursor is a PREFIX, never a complete listing"
+        );
+
+        // FALSE-GREEN guard: the SAME loop over a server that finishes reports
+        // complete — so the assertion above is about the leftover cursor, not
+        // about this loop always claiming truncation.
+        let url = format!("http://{addr}/complete");
+        let mut sess = McpUpstreamSession::fresh(&url);
+        let (tools, complete) = list_tools_paged(&client, &policy, &url, None, &mut sess)
+            .await
+            .expect("the fake answers the single page");
+        assert_eq!(tools.len(), 1);
+        assert!(complete, "no nextCursor means the listing finished");
+        srv.abort();
+    }
+
+    #[test]
+    fn both_discovery_paths_share_one_pagination_loop() {
+        // The structural half of M10: unification is the fix, so pin it. Needles
+        // are composed at runtime so these literals cannot match themselves.
+        let src = include_str!("broker.rs");
+        let call = format!("list_tools_{}(client, policy,", "paged");
+        assert_eq!(
+            src.matches(&call).count(),
+            2,
+            "the probe and the photograph must both go through the shared loop"
+        );
+        let loop_head = format!("for _ in 0..MAX_LIST_{}", "PAGES");
+        assert_eq!(
+            src.matches(&loop_head).count(),
+            1,
+            "exactly one tools/list pagination loop may exist"
+        );
+        // And the probe screens the untrusted remote list exactly like the
+        // photograph does — it used to skip `validate_tools` entirely.
+        let screen = format!("capability::validate_{}(", "tools");
+        assert_eq!(
+            src.matches(&screen).count(),
+            2,
+            "both discovery paths must run the core tool-list validation"
+        );
     }
 
     // ── DispatchOutcome classification (Phase E, Gap 11, plan E10) ──────────
