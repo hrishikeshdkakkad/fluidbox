@@ -14678,11 +14678,8 @@ mod tests {
     // no-DB SOURCE GUARD below keeps the admission predicate mutation-provable
     // locally.
 
-    /// The admission statement is the whole fix, so its load-bearing predicates
-    /// are asserted from source — a mutation that drops the ceiling guard or
-    /// stops counting live reservations fails HERE, with no database.
-    #[test]
-    fn reserve_llm_budget_sql_keeps_its_load_bearing_predicates() {
+    /// The body of `reserve_llm_budget`, for the source guards below.
+    fn reserve_llm_budget_body() -> &'static str {
         let src = include_str!("lib.rs");
         let start = src
             .find("pub async fn reserve_llm_budget(")
@@ -14691,7 +14688,15 @@ mod tests {
             .find("pub async fn charge_llm_reservation(")
             .map(|i| start + i)
             .expect("the next fn delimits the body");
-        let body = &src[start..end];
+        &src[start..end]
+    }
+
+    /// The admission statement is the whole fix, so its load-bearing predicates
+    /// are asserted from source — a mutation that drops the ceiling guard or
+    /// stops counting live reservations fails HERE, with no database.
+    #[test]
+    fn reserve_llm_budget_sql_keeps_its_load_bearing_predicates() {
+        let body = reserve_llm_budget_body();
         for (needle, why) in [
             (
                 "for update",
@@ -14711,17 +14716,78 @@ mod tests {
                 "u.cost + a.cost + coalesce($7::float8, 0) <= $10::float8",
                 "the cost projection must include LIVE RESERVATIONS, not just recorded usage",
             ),
-            (
-                "where session_id = $2 and state = 'reserved'",
-                "ACTIVE is state-only: an expired-but-unswept row must keep counting, or \
-                 there is an unbudgeted window between expiry and the sweep",
-            ),
         ] {
             assert!(
                 body.contains(needle),
                 "reserve_llm_budget's SQL lost `{needle}` — {why}"
             );
         }
+    }
+
+    /// `active` counts by STATE ALONE. Narrowing it with an expiry predicate
+    /// (`… and expires_at > now()`) reopens an UNBUDGETED window between a
+    /// reservation expiring and the sweeper converting it: the row would stop
+    /// counting against the projection while its spend is still unsettled.
+    ///
+    /// Review I2: the first cut asserted the bare prefix
+    /// `where session_id = $2 and state = 'reserved'`, which that exact mutation
+    /// still CONTAINS — the guard passed on the drift it existed to catch. It now
+    /// slices the whole `active` sub-select and pins the clause through its
+    /// newline terminator, plus a direct refusal of any `expires_at` narrowing.
+    #[test]
+    fn reserve_llm_budget_counts_active_reservations_by_state_alone() {
+        let body = reserve_llm_budget_body();
+        let start = body.find("active as (").expect("the `active` CTE exists");
+        let end = body[start..]
+            .find("guard as (")
+            .map(|i| start + i)
+            .expect("the `guard` CTE delimits `active`");
+        let active = &body[start..end];
+        assert!(
+            active.contains("where session_id = $2 and state = 'reserved'\n"),
+            "the `active` sub-select's WHERE must END at `state = 'reserved'` — anything \
+             appended to it (an expiry predicate above all) stops expired-but-unswept rows \
+             counting, which is precisely the unbudgeted window this closes"
+        );
+        assert!(
+            !active.contains("expires_at"),
+            "`active` must not read expires_at AT ALL: expiry is the SWEEPER's business, \
+             and every form of narrowing here reopens the same window"
+        );
+    }
+
+    /// The SOLE-CLAIMANT carve-out (`a.n = 0`) — the most consequential deviation
+    /// from the plan's literal predicate, and the reason a run whose per-request
+    /// conservative estimate alone exceeds its remaining budget stops cleanly
+    /// instead of livelocking: with nothing else in flight there is nothing to
+    /// drain, so refusing forever would never become admitting. Its DB test
+    /// discriminates but self-skips without `DATABASE_URL`; this rides every run.
+    #[test]
+    fn reserve_llm_budget_keeps_the_sole_claimant_carve_out() {
+        let body = reserve_llm_budget_body();
+        let start = body.find("guard as (").expect("the `guard` CTE exists");
+        let end = body[start..]
+            .find("ins as (")
+            .map(|i| start + i)
+            .expect("the `ins` CTE delimits `guard`");
+        let guard = &body[start..end];
+        for (needle, arm) in [
+            ("($9::bigint is null or a.n = 0", "token"),
+            ("($10::float8 is null or a.n = 0", "cost"),
+        ] {
+            assert!(
+                guard.contains(needle),
+                "the {arm} budget arm lost its `a.n = 0` sole-claimant disjunct — a lone \
+                 request would then be refused by its own conservative estimate with no \
+                 sibling to drain, livelocking the run instead of stopping it"
+            );
+        }
+        // The carve-out is a DISJUNCT of the budget arms only — it must never
+        // reach the ceiling guard, which has to bind even the first request.
+        assert!(
+            guard.contains("a.n < $8::bigint as under_ceiling"),
+            "the ceiling arm must stay unconditional"
+        );
     }
 
     /// Seed a session plus a scope, and give it a settled usage row so the

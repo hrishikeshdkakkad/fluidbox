@@ -249,7 +249,9 @@ async fn main() -> anyhow::Result<()> {
         approvals_tx,
         // Plain client for operator-configured seams (GitHub, LLM) only.
         http: reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15 * 60))
+            .timeout(std::time::Duration::from_secs(
+                config::UPSTREAM_HTTP_TIMEOUT_SECS,
+            ))
             .build()?,
         identity_http,
         egress_http,

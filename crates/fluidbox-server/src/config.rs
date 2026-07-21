@@ -115,6 +115,13 @@ pub struct Config {
     pub llm_tenant_budget_duration: Option<String>,
     pub llm_tenant_tpm: Option<i64>,
     pub llm_tenant_rpm: Option<i64>,
+    /// How many LLM budget reservations one session may hold at once (Phase E,
+    /// #33; Gap 14) — the finite ceiling design :1118 asks for, NOT a per-session
+    /// mutex. Lives here rather than behind a lazy `OnceLock` in `facade.rs` so a
+    /// malformed value FAILS BOOT naming the variable (and is therefore visible to
+    /// `just doctor`) instead of logging once at the first model request and
+    /// tolerating the typo for the life of the process. Must be ≥ 1.
+    pub llm_max_concurrent_reservations: i64,
     /// 32-byte key (hex/base64) sealing connection credentials at rest.
     /// Optional: without it (and with KMS off), integration connections are
     /// disabled. Once KMS is on and every row is re-sealed, this may be retired
@@ -229,6 +236,19 @@ pub struct Config {
 /// run closed at zero model spend rather than at an opaque kubelet error.
 pub const MAX_RUNNER_ENV_BYTES: usize = 512 * 1024;
 
+/// Request timeout on the plain outbound client (`AppStateInner::http`) used for
+/// operator-configured seams — GitHub and, load-bearingly, the LLM upstream that
+/// the facade forwards to. A long-running model turn must not be cut off.
+///
+/// NAMED rather than typed inline at the one use site (`main.rs`) because
+/// `facade::RESERVATION_TTL_SECS` must comfortably EXCEED it: the expiry sweep
+/// converts a still-`reserved` row into a conservative charge, so a TTL shorter
+/// than this timeout would over-charge a request that is merely slow — and,
+/// because both settle under the same request id, that over-charge would stick.
+/// `facade`'s test derives its assertion from this constant, so raising the
+/// timeout past the TTL fails there instead of silently breaking the guarantee.
+pub const UPSTREAM_HTTP_TIMEOUT_SECS: u64 = 15 * 60;
+
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         let get = |k: &str| std::env::var(k);
@@ -329,6 +349,11 @@ impl Config {
             llm_tenant_rpm: parse_opt_i64(
                 "FLUIDBOX_LLM_TENANT_RPM",
                 get("FLUIDBOX_LLM_TENANT_RPM").ok(),
+            )?,
+            llm_max_concurrent_reservations: parse_positive_i64_env(
+                "FLUIDBOX_LLM_MAX_CONCURRENT_RESERVATIONS",
+                get("FLUIDBOX_LLM_MAX_CONCURRENT_RESERVATIONS").ok(),
+                crate::facade::DEFAULT_MAX_CONCURRENT_RESERVATIONS,
             )?,
             credential_key: get("FLUIDBOX_CREDENTIAL_KEY")
                 .ok()
@@ -493,6 +518,19 @@ fn parse_i64_env(name: &str, raw: Option<String>, default: i64) -> anyhow::Resul
             .parse()
             .map_err(|e| anyhow::anyhow!("{name}='{v}' is not a valid i64: {e}")),
     }
+}
+
+/// An i64 knob that must be at least 1. `parse_i64_env` accepts any integer, but
+/// a 0 (or negative) concurrency ceiling admits NOTHING and would wedge every run
+/// — so it fails boot naming the variable rather than silently restoring the
+/// default, which is the whole reason this knob moved out of `facade.rs`'s
+/// `OnceLock` (a log line at the first model request is not a boot signal).
+fn parse_positive_i64_env(name: &str, raw: Option<String>, default: i64) -> anyhow::Result<i64> {
+    let v = parse_i64_env(name, raw, default)?;
+    if v < 1 {
+        anyhow::bail!("{name}='{v}' must be at least 1 (0 or negative admits no work at all)");
+    }
+    Ok(v)
 }
 
 /// Optional f64 knob (tenant virtual-key budget): absent/empty → `None`; a
@@ -687,6 +725,62 @@ mod tests {
         );
         assert!(parse_u32_env("G", Some("-1".into()), 120).is_err());
         assert!(parse_u32_env("G", Some("4294967296".into()), 120).is_err());
+    }
+
+    /// The LLM concurrency ceiling (Gap 14). Drives the REAL parse — the earlier
+    /// facade-side test re-implemented the match in its own body, so relaxing the
+    /// production check to accept 0 (a ceiling that wedges every run, the exact
+    /// case the test named) still passed it.
+    #[test]
+    fn llm_reservation_ceiling_defaults_and_fails_boot_on_bad_values() {
+        // Absent/empty ⇒ the shipped default (32), which is what the const says.
+        assert_eq!(
+            parse_positive_i64_env(
+                "C",
+                None,
+                crate::facade::DEFAULT_MAX_CONCURRENT_RESERVATIONS
+            )
+            .unwrap(),
+            32
+        );
+        assert_eq!(
+            parse_positive_i64_env("C", Some(String::new()), 32).unwrap(),
+            32
+        );
+        // An explicit positive value wins.
+        assert_eq!(
+            parse_positive_i64_env("C", Some("8".into()), 32).unwrap(),
+            8
+        );
+        assert_eq!(
+            parse_positive_i64_env("C", Some("1".into()), 32).unwrap(),
+            1
+        );
+        // Junk is a NAMED boot error, never the default.
+        let e = parse_positive_i64_env(
+            "FLUIDBOX_LLM_MAX_CONCURRENT_RESERVATIONS",
+            Some("nope".into()),
+            32,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("FLUIDBOX_LLM_MAX_CONCURRENT_RESERVATIONS") && e.contains("nope"),
+            "got: {e}"
+        );
+        // …and so is a non-positive ceiling: 0 would admit no model request at all.
+        let e = parse_positive_i64_env(
+            "FLUIDBOX_LLM_MAX_CONCURRENT_RESERVATIONS",
+            Some("0".into()),
+            32,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("FLUIDBOX_LLM_MAX_CONCURRENT_RESERVATIONS") && e.contains("at least 1"),
+            "got: {e}"
+        );
+        assert!(parse_positive_i64_env("C", Some("-1".into()), 32).is_err());
     }
 
     #[test]
