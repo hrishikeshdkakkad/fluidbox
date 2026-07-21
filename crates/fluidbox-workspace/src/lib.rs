@@ -123,27 +123,159 @@ fn run_fetch(
     run_git_env(dir, &refs, envs)
 }
 
+/// Wall-clock ceiling for ONE git invocation. `Command::output()` waits
+/// FOREVER, and dropping the `spawn_blocking` future that hosts materialization
+/// does not signal — let alone kill — the child, so a server that trickles bytes
+/// pins a blocking thread and a run's `initializing` state indefinitely. 30 min
+/// is far past any legitimate clone we provision and is the only bound that
+/// actually holds: git offers no native transfer-size cap for fetch (`--depth`
+/// would change base-commit/diff semantics, and `http.maxRequestBuffer` bounds
+/// what we SEND, not what we receive), so BYTES ON DISK REMAIN UNBOUNDED except
+/// through this deadline.
+const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// The leading `-c` overrides applied to EVERY git invocation on the
+/// materialize path. They neutralize inherited *configuration* the same way
+/// `env_clear` neutralizes inherited *environment*:
+/// - `credential.helper=` — the empty value RESETS the helper list, so no
+///   ambient/system helper (osxkeychain, libsecret, a `!sh -c` helper) can be
+///   consulted for a fetch we intend to run unauthenticated;
+/// - `core.askPass=` — with `GIT_TERMINAL_PROMPT=0`, no path to a prompt.
+///
+/// Single-sourced so a test asserting this fn breaks the moment the real path
+/// stops applying it.
+pub(crate) fn git_hardening_args() -> [&'static str; 4] {
+    ["-c", "credential.helper=", "-c", "core.askPass="]
+}
+
+/// The scrubbed environment for a materialize-path git invocation: an explicit
+/// ALLOWLIST, applied after `env_clear`.
+///
+/// The child used to inherit the control plane's whole environment, so an
+/// `authority: none` clone could pick up an operator's (or another tenant's
+/// leftover) `GIT_CONFIG_*` `http.extraHeader`, a credential helper, `HOME`'s
+/// dotfiles, or `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` — the same ambient-proxy
+/// bypass closed in `egress.rs`, but out-of-process.
+///
+/// `PATH` survives so `git` and its own helper binaries resolve; `home` is a
+/// dedicated empty directory; `GIT_CONFIG_NOSYSTEM=1` drops `/etc/gitconfig` and
+/// `GIT_CONFIG_GLOBAL=/dev/null` drops both `$HOME/.gitconfig` AND
+/// `$XDG_CONFIG_HOME/git/config`. Our OWN credentials are unaffected: they are
+/// appended afterwards from `envs` (the existing `GIT_CONFIG_*` mechanism).
+pub(crate) fn scrubbed_git_env(home: &Path) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = vec![
+        (
+            "PATH".into(),
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+        ),
+        ("HOME".into(), home.display().to_string()),
+        ("XDG_CONFIG_HOME".into(), home.display().to_string()),
+        ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+        ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
+        // Never fall back to interactive credential prompts.
+        ("GIT_TERMINAL_PROMPT".into(), "0".into()),
+        ("LC_ALL".into(), "C".into()),
+    ];
+    // Phase E hardening on EVERY git invocation (LFS smudge off + transport
+    // allowlist), shared with the collection path.
+    for (k, v) in transport_hardening_env() {
+        env.push((k.to_string(), v.to_string()));
+    }
+    env
+}
+
+/// A dedicated, empty `HOME` for git children — created 0700 so nothing on the
+/// host can plant dotfiles in it. `GIT_CONFIG_GLOBAL=/dev/null` already stops
+/// git reading a global config from here; this bounds anything else that
+/// consults `$HOME` (`.netrc`, helper state).
+fn scrub_home() -> Result<PathBuf, WorkspaceError> {
+    let home = std::env::temp_dir().join(format!("fluidbox-git-home-{}", std::process::id()));
+    std::fs::create_dir_all(&home)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(home)
+}
+
+/// Spawn `cmd`, enforce `timeout`, and KILL the child when it expires (then reap
+/// it, so no zombie survives). Returns the captured output.
+fn run_bounded(
+    mut cmd: Command,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, WorkspaceError> {
+    use std::io::Read;
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let mut out_pipe = child.stdout.take().expect("stdout piped");
+    let mut err_pipe = child.stderr.take().expect("stderr piped");
+    // Reader threads keep the pipes drained — a full pipe would deadlock the
+    // child and the deadline below would then be the only thing that ends it.
+    let out_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = out_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = err_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                return Ok(std::process::Output {
+                    status,
+                    stdout: out_reader.join().unwrap_or_default(),
+                    stderr: err_reader.join().unwrap_or_default(),
+                })
+            }
+            None => {
+                if started.elapsed() > timeout {
+                    child.kill().ok();
+                    child.wait().ok();
+                    return Err(WorkspaceError::Git(format!(
+                        "timed out after {}s and was killed",
+                        timeout.as_secs()
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+}
+
 /// `envs` is how credentials reach git: via GIT_CONFIG_* variables, never on
 /// the command line (visible in `ps`) and never in on-disk config (the .git
 /// dir is mounted into the sandbox). Error text includes args, never envs.
+///
+/// The child runs with a SCRUBBED environment ([`scrubbed_git_env`]) plus
+/// config-neutralizing `-c` overrides ([`git_hardening_args`]) and under a
+/// wall-clock deadline that kills it ([`GIT_TIMEOUT`]) — nothing about the
+/// control plane's own environment or the host's git configuration leaks into a
+/// clone, and no invocation can hang forever.
 fn run_git_env(
     dir: &Path,
     args: &[&str],
     envs: &[(String, String)],
 ) -> Result<String, WorkspaceError> {
     let mut cmd = Command::new("git");
-    cmd.current_dir(dir).args(args);
-    // Never fall back to interactive credential prompts.
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
-    // Phase E hardening on EVERY git invocation (LFS smudge off + transport
-    // allowlist), single-sourced so tests assert exactly what the real path sets.
-    for (k, v) in transport_hardening_env() {
+    cmd.current_dir(dir).args(git_hardening_args()).args(args);
+    // env_clear FIRST: everything git sees is enumerated below.
+    cmd.env_clear();
+    let home = scrub_home()?;
+    for (k, v) in scrubbed_git_env(&home) {
         cmd.env(k, v);
     }
+    // OUR credentials, last — the existing GIT_CONFIG_* mechanism is unchanged.
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    let out = cmd.output()?;
+    let out = run_bounded(cmd, GIT_TIMEOUT)?;
     if !out.status.success() {
         return Err(WorkspaceError::Git(format!(
             "git {}: {}",
@@ -574,6 +706,104 @@ mod tests {
             env.contains(&("GIT_ALLOW_PROTOCOL", "http:https:file")),
             "{env:?}"
         );
+    }
+
+    #[test]
+    fn scrubbed_env_and_hardening_args_are_what_the_real_path_applies() {
+        let args = git_hardening_args();
+        // The empty value is load-bearing: it RESETS the helper list.
+        assert_eq!(args, ["-c", "credential.helper=", "-c", "core.askPass="]);
+        let home = std::path::Path::new("/tmp/fbx-home");
+        let env = scrubbed_git_env(home);
+        let get = |k: &str| {
+            env.iter()
+                .find(|(a, _)| a == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(get("GIT_CONFIG_NOSYSTEM"), "1");
+        assert_eq!(get("GIT_CONFIG_GLOBAL"), "/dev/null");
+        assert_eq!(get("GIT_TERMINAL_PROMPT"), "0");
+        assert_eq!(get("HOME"), "/tmp/fbx-home");
+        assert_eq!(get("XDG_CONFIG_HOME"), "/tmp/fbx-home");
+        assert!(!get("PATH").is_empty(), "git must still resolve");
+        // The transport hardening rides along on this path too.
+        assert_eq!(get("GIT_LFS_SKIP_SMUDGE"), "1");
+        // The allowlist is CLOSED: no proxy or credential variable is carried.
+        for leaky in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "GIT_CONFIG_COUNT",
+            "GIT_ASKPASS",
+        ] {
+            assert!(
+                !env.iter().any(|(k, _)| k == leaky),
+                "{leaky} must never be in the allowlist"
+            );
+        }
+    }
+
+    /// The two halves of the git-environment boundary, over a REAL `git`:
+    /// 1. an AMBIENT `GIT_CONFIG_*` `http.extraHeader` (exactly the shape our own
+    ///    credential injection uses, and exactly what a hostile or careless
+    ///    parent environment would carry) must NOT reach the child;
+    /// 2. the SAME variable passed through `envs` must still reach it — the
+    ///    credential path is unchanged.
+    #[test]
+    fn ambient_git_config_is_scrubbed_but_ours_still_flows() {
+        let dir = std::env::temp_dir().join(format!("fbx-gitenv-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        run_git(&dir, &["init", "-q"]).expect("git init");
+
+        std::env::set_var("GIT_CONFIG_COUNT", "1");
+        std::env::set_var("GIT_CONFIG_KEY_0", "http.extraheader");
+        std::env::set_var("GIT_CONFIG_VALUE_0", "Authorization: ambient-leak");
+        let ambient = run_git(&dir, &["config", "--get", "http.extraheader"]);
+        std::env::remove_var("GIT_CONFIG_COUNT");
+        std::env::remove_var("GIT_CONFIG_KEY_0");
+        std::env::remove_var("GIT_CONFIG_VALUE_0");
+        assert!(
+            ambient.is_err(),
+            "an AMBIENT http.extraHeader reached the git child: {ambient:?}"
+        );
+
+        let ours = run_git_env(
+            &dir,
+            &["config", "--get", "http.extraheader"],
+            &[
+                ("GIT_CONFIG_COUNT".into(), "1".into()),
+                ("GIT_CONFIG_KEY_0".into(), "http.extraheader".into()),
+                ("GIT_CONFIG_VALUE_0".into(), "Authorization: ours".into()),
+            ],
+        )
+        .expect("our own GIT_CONFIG_* credential injection must still work");
+        assert_eq!(ours, "Authorization: ours");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A child that never exits is KILLED at the deadline instead of hanging the
+    /// caller forever (`Command::output()` has no deadline at all, and dropping
+    /// the hosting `spawn_blocking` future does not signal the process).
+    #[test]
+    fn run_bounded_kills_a_child_that_outlives_its_deadline() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let started = std::time::Instant::now();
+        let err = run_bounded(cmd, std::time::Duration::from_millis(200))
+            .expect_err("an over-deadline child must be an error, not a wait");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the deadline did not fire: {elapsed:?}"
+        );
+        assert!(format!("{err}").contains("timed out"), "got: {err}");
+        // FALSE-GREEN guard: a child that finishes inside the deadline is NOT
+        // an error, so the assertion above is about the deadline.
+        let mut ok = Command::new("sleep");
+        ok.arg("0");
+        let out = run_bounded(ok, std::time::Duration::from_secs(30)).expect("fast child is fine");
+        assert!(out.status.success());
     }
 
     /// The loopback-dev clone policy the e2e runs under: file:// and loopback
