@@ -4455,6 +4455,242 @@ pub async fn get_approval(
     Ok(__rls_out)
 }
 
+// ─── Durable tool execution claims (Phase E, #33; Gap 11) ───────────────────
+// The four-state (+ambiguous) claim that fences every brokered dispatch: exactly
+// one send per (session, tool_call_id, input_digest), taken under the SAME
+// sessions-row lock order as cancellation, refused once the session stops
+// accepting work, carrying the settled outcome so a duplicate ADOPTS it.
+// Migration 0019. Every fn is tenant-scoped (`scoped_tx` + `tenant_id` predicate);
+// the cross-tenant stale-claim sweep lives in `system_worker`.
+
+/// One `tool_execution_claims` row (migration 0019).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ToolExecutionClaimRow {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub session_id: Uuid,
+    pub tool_call_id: String,
+    pub input_digest: String,
+    pub state: String,
+    pub attempt: i32,
+    pub claimed_at: DateTime<Utc>,
+    pub claim_expires_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub result_digest: Option<String>,
+    pub is_error: Option<bool>,
+    pub result_content: Option<Value>,
+    pub error_message: Option<String>,
+}
+
+/// The outcome of [`claim_tool_execution`]: whether THIS caller won the single
+/// dispatch, found an existing claim to reconcile against, or hit a session that
+/// no longer accepts work.
+#[derive(Debug, Clone)]
+pub enum ClaimOutcome {
+    /// This caller inserted the claim and owns the one dispatch.
+    Won { claim_id: Uuid },
+    /// A claim already exists — the caller adopts a terminal outcome, re-claims a
+    /// `failed_before_send` row, or polls a `claimed` one. Boxed (the row is large
+    /// and this variant is the cold path).
+    Existing(Box<ToolExecutionClaimRow>),
+    /// The session stopped accepting work (cancelled/finalizing/terminal) before
+    /// the claim could be taken — the brokered dispatch is refused.
+    SessionTerminal,
+}
+
+/// Take (or find) the durable execution claim for one brokered dispatch. ONE
+/// short transaction, NEVER held across the upstream HTTP call:
+///   1. lock the sessions row `FOR UPDATE` (the cancellation lock order), then
+///   2. re-read status in a SECOND statement (the [`set_sandbox_handle`]
+///      lock-then-read discipline — a single-statement predicate keeps a stale
+///      command snapshot past a blocked lock, so a just-committed wind-down could
+///      be missed) — refuse with [`ClaimOutcome::SessionTerminal`] if it no
+///      longer `accepts_work()`, then
+///   3. `insert … on conflict do nothing returning id` → [`ClaimOutcome::Won`],
+///      else read the existing row → [`ClaimOutcome::Existing`].
+///
+/// LOCK-ORDER ANALYSIS (why this cannot deadlock with cancellation, the ledger,
+/// or approvals — Phase E, #33):
+///   - This tx acquires `sessions` (FOR UPDATE) → then `tool_execution_claims`
+///     (INSERT/read). It NEVER touches `approvals` and NEVER calls `append_event`.
+///     `reclaim_failed_before_send` uses the identical order.
+///   - Cancellation (`transition_session`, `begin_finalization`) also takes the
+///     SAME `sessions` row FOR UPDATE first. Two writers on one session therefore
+///     SERIALIZE on that row: a cancel that commits first is SEEN here as
+///     terminal (refuse); a claim that commits first means the dispatch was taken
+///     under a proven-nonterminal snapshot. Same row, same order ⇒ no cycle.
+///   - `append_event` (the ledger) locks `sessions` → `events` in a SEPARATE
+///     transaction (record_brokered_exec runs AFTER this claim tx commits and
+///     after `complete_tool_execution`, never nested). No tx ever holds a claim
+///     row while waiting on `sessions`, so it can never block a cancel that holds
+///     `sessions` while wanting a claim row — the classic cycle never forms.
+///   - The stale-claim sweep (`system_worker`) updates claim rows + reads
+///     `approvals`; it does NOT lock `sessions`, so it never waits on the lock
+///     this tx holds. (Task 6's E12 nests `append_event` inside the approvals CAS
+///     — approvals → sessions — which is a DIFFERENT resource pair; the claim tx's
+///     never touching approvals keeps the two orderings disjoint.)
+pub async fn claim_tool_execution(
+    pool: &PgPool,
+    scope: TenantScope,
+    session_id: Uuid,
+    tool_call_id: &str,
+    input_digest: &str,
+    ttl_secs: i64,
+) -> sqlx::Result<ClaimOutcome> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let locked: Option<(String,)> =
+        sqlx::query_as("select status from sessions where id = $1 and tenant_id = $2 for update")
+            .bind(session_id)
+            .bind(scope.tenant_id())
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((status,)) = locked else {
+        return Ok(ClaimOutcome::SessionTerminal);
+    };
+    if !SessionStatus::parse(&status).is_some_and(|s| s.accepts_work()) {
+        return Ok(ClaimOutcome::SessionTerminal);
+    }
+    let expires = Utc::now() + chrono::Duration::seconds(ttl_secs.max(1));
+    let won: Option<(Uuid,)> = sqlx::query_as(
+        "insert into tool_execution_claims
+             (tenant_id, session_id, tool_call_id, input_digest, state, claim_expires_at)
+         values ($1, $2, $3, $4, 'claimed', $5)
+         on conflict (session_id, tool_call_id, input_digest) do nothing
+         returning id",
+    )
+    .bind(scope.tenant_id())
+    .bind(session_id)
+    .bind(tool_call_id)
+    .bind(input_digest)
+    .bind(expires)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let outcome = match won {
+        Some((claim_id,)) => ClaimOutcome::Won { claim_id },
+        None => {
+            let row: ToolExecutionClaimRow = sqlx::query_as(
+                "select * from tool_execution_claims
+                 where session_id = $1 and tool_call_id = $2 and input_digest = $3
+                   and tenant_id = $4",
+            )
+            .bind(session_id)
+            .bind(tool_call_id)
+            .bind(input_digest)
+            .bind(scope.tenant_id())
+            .fetch_one(&mut *tx)
+            .await?;
+            ClaimOutcome::Existing(Box::new(row))
+        }
+    };
+    tx.commit().await?;
+    Ok(outcome)
+}
+
+/// Settle a WON claim from `claimed` to a terminal state (CAS on
+/// `state = 'claimed'`). `result_content` MUST be pre-capped by the caller
+/// (reuse the broker's 256 KiB cap). Returns true iff this call landed the
+/// transition — a loser (already swept to `ambiguous`, or a duplicate) gets false.
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_tool_execution(
+    pool: &PgPool,
+    scope: TenantScope,
+    claim_id: Uuid,
+    state: &str,
+    result_digest: Option<&str>,
+    is_error: Option<bool>,
+    result_content: Option<&Value>,
+    error_message: Option<&str>,
+) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let res = sqlx::query(
+        "update tool_execution_claims
+            set state = $2, result_digest = $3, is_error = $4, result_content = $5,
+                error_message = $6, completed_at = now()
+          where id = $1 and tenant_id = $7 and state = 'claimed'",
+    )
+    .bind(claim_id)
+    .bind(state)
+    .bind(result_digest)
+    .bind(is_error)
+    .bind(result_content)
+    .bind(error_message)
+    .bind(scope.tenant_id())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// Re-claim a `failed_before_send` row for a fresh dispatch — the ONLY
+/// re-claimable state (positive proof nothing was sent). CAS
+/// `failed_before_send → claimed`, `attempt + 1`, fresh expiry, and the result
+/// columns reset, INSIDE the same sessions-`FOR UPDATE` nonterminal tx shape as
+/// [`claim_tool_execution`]. Returns true iff this call won the re-claim.
+pub async fn reclaim_failed_before_send(
+    pool: &PgPool,
+    scope: TenantScope,
+    session_id: Uuid,
+    tool_call_id: &str,
+    input_digest: &str,
+    ttl_secs: i64,
+) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let locked: Option<(String,)> =
+        sqlx::query_as("select status from sessions where id = $1 and tenant_id = $2 for update")
+            .bind(session_id)
+            .bind(scope.tenant_id())
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((status,)) = locked else {
+        return Ok(false);
+    };
+    if !SessionStatus::parse(&status).is_some_and(|s| s.accepts_work()) {
+        return Ok(false);
+    }
+    let expires = Utc::now() + chrono::Duration::seconds(ttl_secs.max(1));
+    let res = sqlx::query(
+        "update tool_execution_claims
+            set state = 'claimed', attempt = attempt + 1, claim_expires_at = $5,
+                claimed_at = now(), completed_at = null, result_digest = null,
+                is_error = null, result_content = null, error_message = null
+          where session_id = $1 and tool_call_id = $2 and input_digest = $3
+            and tenant_id = $4 and state = 'failed_before_send'",
+    )
+    .bind(session_id)
+    .bind(tool_call_id)
+    .bind(input_digest)
+    .bind(scope.tenant_id())
+    .bind(expires)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// Read a claim by its natural key (the loser's bounded poll of an in-flight
+/// `claimed` row, and the duplicate's adoption read).
+pub async fn get_tool_execution(
+    pool: &PgPool,
+    scope: TenantScope,
+    session_id: Uuid,
+    tool_call_id: &str,
+    input_digest: &str,
+) -> sqlx::Result<Option<ToolExecutionClaimRow>> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let row = sqlx::query_as(
+        "select * from tool_execution_claims
+         where session_id = $1 and tool_call_id = $2 and input_digest = $3 and tenant_id = $4",
+    )
+    .bind(session_id)
+    .bind(tool_call_id)
+    .bind(input_digest)
+    .bind(scope.tenant_id())
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
 /// Human-lifecycle rows only: intent bookkeeping ('intent'/'auto_*') is the
 /// gate's, not the approvals API's.
 pub async fn session_approvals(
@@ -12557,5 +12793,291 @@ mod tests {
             "a pool that SET ROLEs to fluidbox_runtime must be RLS-BOUND"
         );
         rt_pool.close().await;
+    }
+
+    // ─── Durable execution claims (Phase E, #33; Gap 11) ────────────────────
+    // DB-backed; self-skip when DATABASE_URL is unset (CI proves them).
+
+    /// Force a session's status (state-machine-bypassing) so a test can drive
+    /// terminality directly. Under `worker_tx` (RLS bypass), like the sweeps.
+    async fn force_session_status(pool: &PgPool, session_id: Uuid, status: &str) {
+        let mut tx = worker_tx(pool).await.unwrap();
+        sqlx::query("update sessions set status = $2 where id = $1")
+            .bind(session_id)
+            .bind(status)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn claim_won_completed_then_duplicate_adopts_without_redispatch() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+
+        // Won.
+        let claim_id =
+            match claim_tool_execution(&pool, scope, session_id, "tc1", "sha256:aaa", 600)
+                .await
+                .unwrap()
+            {
+                ClaimOutcome::Won { claim_id } => claim_id,
+                o => panic!("expected Won, got {o:?}"),
+            };
+        let result = serde_json::json!({
+            "content": [{"type":"text","text":"the answer"}], "is_error": false
+        });
+        assert!(complete_tool_execution(
+            &pool,
+            scope,
+            claim_id,
+            "succeeded",
+            Some("sha256:res"),
+            Some(false),
+            Some(&result),
+            None,
+        )
+        .await
+        .unwrap());
+
+        // A duplicate for the SAME (session, tool_call_id, digest) adopts the
+        // stored outcome — and, the false-green guard: the claim was NOT
+        // re-dispatched (attempt stays 1; the stored result is byte-identical).
+        // The LIVE single-upstream-request proof rides the hardening e2e (T9 §f).
+        match claim_tool_execution(&pool, scope, session_id, "tc1", "sha256:aaa", 600)
+            .await
+            .unwrap()
+        {
+            ClaimOutcome::Existing(row) => {
+                assert_eq!(row.state, "succeeded");
+                assert_eq!(
+                    row.attempt, 1,
+                    "a duplicate must not re-dispatch (attempt stays 1)"
+                );
+                assert_eq!(
+                    row.result_content.as_ref(),
+                    Some(&result),
+                    "the duplicate adopts the exact stored result"
+                );
+            }
+            o => panic!("expected Existing(succeeded), got {o:?}"),
+        }
+        cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    #[tokio::test]
+    async fn claim_refuses_a_terminal_session() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        // Cancel-during-approval, brokered half: a terminal (or winding-down)
+        // session refuses the claim in the same lock-holding tx as cancellation.
+        force_session_status(&pool, session_id, "cancelled").await;
+        assert!(
+            matches!(
+                claim_tool_execution(&pool, scope, session_id, "tc1", "sha256:aaa", 600)
+                    .await
+                    .unwrap(),
+                ClaimOutcome::SessionTerminal
+            ),
+            "a cancelled session must refuse the claim"
+        );
+        // Winding-down also refuses.
+        force_session_status(&pool, session_id, "finalizing").await;
+        assert!(matches!(
+            claim_tool_execution(&pool, scope, session_id, "tc2", "sha256:bbb", 600)
+                .await
+                .unwrap(),
+            ClaimOutcome::SessionTerminal
+        ));
+        cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    #[tokio::test]
+    async fn reclaim_is_only_for_failed_before_send() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+
+        // failed_before_send IS re-claimable (same row, attempt+1).
+        let id = match claim_tool_execution(&pool, scope, session_id, "fbs", "sha256:1", 600)
+            .await
+            .unwrap()
+        {
+            ClaimOutcome::Won { claim_id } => claim_id,
+            o => panic!("expected Won, got {o:?}"),
+        };
+        assert!(complete_tool_execution(
+            &pool,
+            scope,
+            id,
+            "failed_before_send",
+            None,
+            Some(false),
+            None,
+            Some("connect refused"),
+        )
+        .await
+        .unwrap());
+        assert!(
+            reclaim_failed_before_send(&pool, scope, session_id, "fbs", "sha256:1", 600)
+                .await
+                .unwrap(),
+            "a failed_before_send row must be re-claimable"
+        );
+        let row = get_tool_execution(&pool, scope, session_id, "fbs", "sha256:1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, "claimed");
+        assert_eq!(row.attempt, 2, "a re-claim bumps attempt");
+
+        // Every OTHER state refuses the re-claim.
+        // 'claimed' (the row we just re-claimed).
+        assert!(
+            !reclaim_failed_before_send(&pool, scope, session_id, "fbs", "sha256:1", 600)
+                .await
+                .unwrap()
+        );
+        // 'succeeded'.
+        assert!(complete_tool_execution(
+            &pool,
+            scope,
+            row.id,
+            "succeeded",
+            None,
+            Some(false),
+            None,
+            None
+        )
+        .await
+        .unwrap());
+        assert!(
+            !reclaim_failed_before_send(&pool, scope, session_id, "fbs", "sha256:1", 600)
+                .await
+                .unwrap()
+        );
+        // 'ambiguous' (a separate claim).
+        let id2 = match claim_tool_execution(&pool, scope, session_id, "amb", "sha256:2", 600)
+            .await
+            .unwrap()
+        {
+            ClaimOutcome::Won { claim_id } => claim_id,
+            o => panic!("expected Won, got {o:?}"),
+        };
+        assert!(complete_tool_execution(
+            &pool,
+            scope,
+            id2,
+            "ambiguous",
+            None,
+            Some(true),
+            None,
+            None
+        )
+        .await
+        .unwrap());
+        assert!(
+            !reclaim_failed_before_send(&pool, scope, session_id, "amb", "sha256:2", 600)
+                .await
+                .unwrap()
+        );
+        cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    #[tokio::test]
+    async fn stale_claim_sweep_marks_ambiguous() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        let id = match claim_tool_execution(&pool, scope, session_id, "stale", "sha256:s", 600)
+            .await
+            .unwrap()
+        {
+            ClaimOutcome::Won { claim_id } => claim_id,
+            o => panic!("expected Won, got {o:?}"),
+        };
+        // Force it past expiry, then sweep: a crashed dispatcher's claim → ambiguous.
+        {
+            let mut tx = worker_tx(&pool).await.unwrap();
+            sqlx::query(
+                "update tool_execution_claims set claim_expires_at = now() - interval '1 minute' where id = $1",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let swept = system_worker::sweep_stale_execution_claims(&pool, Utc::now())
+            .await
+            .unwrap();
+        assert!(
+            swept
+                .iter()
+                .any(|(t, s, tc, _)| *t == tenant && *s == session_id && tc == "stale"),
+            "the stale claim must be swept and returned with its tenant/session"
+        );
+        let row = get_tool_execution(&pool, scope, session_id, "stale", "sha256:s")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.state, "ambiguous",
+            "a swept stale claim lands in ambiguous"
+        );
+        cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    #[tokio::test]
+    async fn claim_two_tx_race_yields_exactly_one_winner() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        let pool2 = pool.clone();
+        // Two concurrent transactions on the SAME natural key: the unique index +
+        // `on conflict do nothing` make exactly one Win and one adopt (Existing).
+        let (a, b) = tokio::join!(
+            claim_tool_execution(&pool, scope, session_id, "race", "sha256:r", 600),
+            claim_tool_execution(&pool2, scope, session_id, "race", "sha256:r", 600),
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        let mut wins = 0;
+        let mut existings = 0;
+        for o in [&a, &b] {
+            match o {
+                ClaimOutcome::Won { .. } => wins += 1,
+                ClaimOutcome::Existing(_) => existings += 1,
+                ClaimOutcome::SessionTerminal => {}
+            }
+        }
+        assert_eq!(
+            wins, 1,
+            "exactly one concurrent claim wins the single dispatch"
+        );
+        assert_eq!(existings, 1, "the loser adopts the existing row");
+        cleanup_sw_tenant(&pool, tenant).await;
     }
 }

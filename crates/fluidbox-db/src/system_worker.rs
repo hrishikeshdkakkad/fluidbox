@@ -14,8 +14,10 @@
 //!
 //! (a) **Background workers that derive scope from the returned row.** The
 //!     heartbeat watchdog, wall-clock budget sweeper, approval-expiry sweep,
-//!     the restart-recoverable finalize driver, the managed-sandbox reconciler,
-//!     and the delivery worker each act on ids/status across ALL tenants by
+//!     the stale-execution-claim sweep ([`sweep_stale_execution_claims`], Gap 11
+//!     — CAS a crashed `claimed` row to `ambiguous` past its expiry), the
+//!     restart-recoverable finalize driver, the managed-sandbox reconciler, and
+//!     the delivery worker each act on ids/status across ALL tenants by
 //!     construction (a global scan), then scope every mutation to the
 //!     `tenant_id` of the row they just fetched.
 //!
@@ -115,6 +117,7 @@ use crate::{
     ScheduleRow, SessionRow, TriggerSubscriptionRow,
 };
 use crate::{CONNECTION_COLS, GH_REG_COLS, SUBSCRIPTION_COLS};
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -320,6 +323,36 @@ pub async fn expire_stale_approvals(pool: &PgPool) -> sqlx::Result<Vec<ApprovalR
     .await?;
     tx.commit().await?;
     Ok(out)
+}
+
+/// Sweep stale execution claims (Phase E, #33; Gap 11): a `claimed` row whose
+/// dispatcher crashed mid-flight never completes, so past its `claim_expires_at`
+/// it is CAS'd to `ambiguous` (never retried — invariant 15). A cross-tenant
+/// global scan like the other sweeps; each returned tuple carries its own
+/// `tenant_id` so the caller ledgers the ambiguous outcome under the right scope.
+/// The correlated subquery adopts the tool name from the owning intent row so the
+/// `tool.brokered` audit event names the tool (NULL only if the intent is gone).
+pub async fn sweep_stale_execution_claims(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+) -> sqlx::Result<Vec<(Uuid, Uuid, String, Option<String>)>> {
+    let mut tx = crate::worker_tx(pool).await?;
+    let rows: Vec<(Uuid, Uuid, String, Option<String>)> = sqlx::query_as(
+        "update tool_execution_claims c
+            set state = 'ambiguous', completed_at = now(),
+                error_message = coalesce(c.error_message,
+                    'execution claim expired — outcome unknown')
+          where c.state = 'claimed' and c.claim_expires_at < $1
+        returning c.tenant_id, c.session_id, c.tool_call_id,
+                  (select a.tool from approvals a
+                    where a.session_id = c.session_id
+                      and a.tool_call_id = c.tool_call_id) as tool",
+    )
+    .bind(now)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows)
 }
 
 /// Due work for the (single, sequential) scheduler worker — a cross-tenant
