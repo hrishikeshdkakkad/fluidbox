@@ -15,6 +15,7 @@ mod error;
 mod events;
 mod facade;
 mod github_app;
+mod governor;
 mod harness;
 mod internal;
 mod kms;
@@ -223,6 +224,17 @@ async fn main() -> anyhow::Result<()> {
     let egress_policy = egress::EgressPolicy::from_config(&cfg);
     let identity_http = egress::build_identity_http(&egress_policy);
     let egress_http = egress::build_egress_http(&egress_policy);
+    // Phase E (E14): the outbound rate limits + per-connection circuit breakers
+    // the broker consults before every dial. In-memory and PER-REPLICA by design
+    // — see the `governor` module docs (durable limiter = Phase F).
+    let governor = governor::EgressGovernor::from_config(&cfg);
+    {
+        let l = governor.limits();
+        tracing::info!(
+            "outbound egress governor: {}/min per tenant, {}/min per connection, {}/min per host; breaker {} consecutive transport failures ⇒ open {}s (0 = disabled; per-replica)",
+            l.tenant_per_min, l.connection_per_min, l.host_per_min, l.breaker_threshold, l.breaker_open_secs
+        );
+    }
 
     let state: state::AppState = Arc::new(AppStateInner {
         tenant_id: seed.tenant_id,
@@ -237,6 +249,7 @@ async fn main() -> anyhow::Result<()> {
         identity_http,
         egress_http,
         egress_policy,
+        governor,
         sealer,
         connector_tokens: Default::default(),
         oauth_locks: Default::default(),
