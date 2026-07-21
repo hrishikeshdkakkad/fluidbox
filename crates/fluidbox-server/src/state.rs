@@ -118,6 +118,13 @@ pub struct AppStateInner {
     pub approvals: ApprovalRegistry,
     /// LISTEN/NOTIFY wakeups (session_id, seq) for SSE fanout.
     pub events_tx: broadcast::Sender<(Uuid, i64)>,
+    /// LISTEN/NOTIFY wakeups (approval_id) for the approval wait loop — the
+    /// cross-replica half of `approvals` above (Phase E, #33; Gap 13). Every
+    /// committed approval decision transaction notifies `fluidbox_approvals`;
+    /// `workers::spawn_approval_wakeups` relays it into THIS replica's registry,
+    /// so a handler blocked here learns about a decision served elsewhere without
+    /// waiting out its ≤2 s poll. The poll stays as the missed-notify backstop.
+    pub approvals_tx: broadcast::Sender<Uuid>,
     /// The plain client for OPERATOR-configured seams only (GitHub REST/App, LLM
     /// facade + admin). Those hosts are operator-set (GHES, a private LiteLLM),
     /// never attacker input, so they are deliberately NOT run through the SSRF

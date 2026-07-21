@@ -176,6 +176,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let events_tx = fluidbox_db::spawn_listener(cfg.database_url.clone());
+    // Phase E (#33; Gap 13): the second listener. Approval decisions announce
+    // themselves on their own channel so EVERY replica's blocked `/permission`
+    // waiters wake, not just the one that served the decision request.
+    let approvals_tx = fluidbox_db::spawn_approval_listener(cfg.database_url.clone());
 
     // Phase D (#32): the sealer is legacy-only (KMS off), KMS-envelope (static|aws),
     // or None (KMS off + no legacy key → sealing disabled, today's behavior). The
@@ -242,6 +246,7 @@ async fn main() -> anyhow::Result<()> {
         provider,
         approvals: ApprovalRegistry::default(),
         events_tx,
+        approvals_tx,
         // Plain client for operator-configured seams (GitHub, LLM) only.
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15 * 60))
