@@ -962,24 +962,28 @@ async fn publish_pr_comment(
     // RECONCILE BEFORE CREATE (Phase E, #33; Gap 13; design :1082-1084). No
     // recorded id does NOT prove no comment exists: the POST necessarily precedes
     // the row that records it, so a crash (or a lost delivery claim) in that
-    // window leaves a real comment with no local record — and the retry used to
+    // window leaves a real comment with no local record — and the retry would
     // post a DUPLICATE. Before creating, list the PR's comments and adopt a
-    // marker match. A listing failure is NOT fatal: reconciliation is a
-    // best-effort improvement on at-least-once, so we fall through to the create
-    // path (today's behavior) rather than failing an otherwise-healthy delivery.
+    // marker match.
+    //
+    // A LISTING ERROR FAILS THE ATTEMPT (#33 review 2). It used to warn and fall
+    // through to the create, which quietly reinstated the duplicate this exists to
+    // prevent: a transient list timeout on a RETRY is indistinguishable from "no
+    // comment exists", and treating it as proof-of-absence posts a second comment.
+    // Only `Ok(None)` — a completed walk that found nothing — is proof. Delivery
+    // is at-least-once with backoff, so failing here costs a delayed comment and
+    // buys never posting two; a duplicate is the worse outcome and it is not
+    // repairable afterwards.
     let existing = match recorded {
         Some(r) => Some(r),
-        None => match reconcile_existing_comment(state, &auth, repository, pr_number, sub_id).await
-        {
-            Ok(found) => found,
-            Err(e) => {
-                tracing::warn!(
+        None => reconcile_existing_comment(state, &auth, repository, pr_number, sub_id)
+            .await
+            .map_err(|e| {
+                format!(
                     "pr comment reconcile for {repository}#{pr_number} failed ({e}); \
-                     falling back to create (a duplicate is possible)"
-                );
-                None
-            }
-        },
+                     refusing to create — a retry will re-reconcile"
+                )
+            })?,
     };
 
     if let Some((external_id, external_url)) = existing {
@@ -1068,6 +1072,10 @@ const RECONCILE_MAX_PAGES: u32 = 10;
 /// | `reconcile_existing_comment` pages                | `RECONCILE_MAX_PAGES` |
 /// | PATCH an adopted comment that 404s, then POST     | 2     |
 ///
+/// The CHECK path has the same shape but a smaller cap
+/// (`RECONCILE_CHECK_MAX_PAGES`, and its listing is name-filtered), so it stays
+/// strictly under this bound and does not move the number.
+///
 /// Lives here, next to the constants it derives from, so raising the page cap or
 /// the timeout moves this number — and fails `deliveries`' TTL assertion — without
 /// anyone having to remember the coupling. DB round trips are excluded; the TTL
@@ -1111,6 +1119,83 @@ async fn reconcile_existing_comment(
     Ok(None)
 }
 
+/// The app-controlled identity stamped on every check run we create, and the key
+/// [`reconcile_existing_check`] adopts on. GitHub's check-run API gives apps an
+/// `external_id` field verbatim, which is a far better handle than the display
+/// name: the name is `fluidbox/<subscription_name>` (USER text — two orgs could
+/// collide, and any other app may publish a check with the same name), while this
+/// carries the subscription's unguessable UUIDv7. Same defense as the comment
+/// marker, on a field no agent output can reach.
+pub(crate) fn check_external_id(subscription_id: uuid::Uuid) -> String {
+    format!("fluidbox:sub:{subscription_id}")
+}
+
+/// Check runs walked while reconciling one head SHA. GitHub returns at most 100
+/// per page and the listing is already filtered to OUR check name, so one page is
+/// generous; the cap exists for the same reason the comment one does.
+const RECONCILE_CHECK_MAX_PAGES: u32 = 3;
+
+/// Find the check run WE already created for this head SHA, by `external_id`.
+/// `Ok(None)` means the (name-filtered) listing was walked to the end and ours is
+/// genuinely absent — the only state in which creating is correct. `Err` means we
+/// could not tell, and the caller must NOT create.
+async fn reconcile_existing_check(
+    state: &AppState,
+    auth: &str,
+    repository: &str,
+    head_sha: &str,
+    name: &str,
+    subscription_id: uuid::Uuid,
+) -> Result<Option<String>, String> {
+    let want = check_external_id(subscription_id);
+    for page in 1..=RECONCILE_CHECK_MAX_PAGES {
+        // `name` is `fluidbox/<subscription_name>` — USER text, so it is
+        // percent-encoded rather than interpolated. `Url::parse_with_params`
+        // against a throwaway base is the encoder already in the tree (no new
+        // dependency); only its query string is used.
+        let query = reqwest::Url::parse_with_params(
+            "https://github.invalid/",
+            &[
+                ("check_name", name),
+                ("per_page", "100"),
+                ("page", &page.to_string()),
+            ],
+        )
+        .map_err(|e| format!("check list url build failed: {e}"))?;
+        let (status, body, _) = api(
+            state,
+            reqwest::Method::GET,
+            auth,
+            &format!(
+                "/repos/{repository}/commits/{head_sha}/check-runs?{}",
+                query.query().unwrap_or_default()
+            ),
+            None,
+        )
+        .await?;
+        if !status.is_success() {
+            return Err(format!("github check list returned {status}"));
+        }
+        let runs = body["check_runs"].as_array().cloned().unwrap_or_default();
+        if let Some(id) = find_marker_check(&runs, &want) {
+            return Ok(Some(id));
+        }
+        if runs.len() < 100 {
+            break;
+        }
+    }
+    Ok(None)
+}
+
+/// Pure adoption rule for a `check_runs` page: our `external_id`, and an id we can
+/// actually address. Extracted so the matching is unit-testable without GitHub.
+fn find_marker_check(runs: &[Value], want: &str) -> Option<String> {
+    runs.iter()
+        .find(|r| r["external_id"].as_str() == Some(want))
+        .and_then(|r| r["id"].as_i64())
+        .map(|id| id.to_string())
+}
+
 async fn publish_check(
     state: &AppState,
     connection_id: uuid::Uuid,
@@ -1118,6 +1203,13 @@ async fn publish_check(
     head_sha: &str,
     ctx: &super::PublishContext,
 ) -> Result<super::PublishOutcome, String> {
+    // Same requirement as the comment path, and for the same reason: §17 #3's
+    // contract is ONE check per (subscription, head SHA), so without a
+    // subscription there is no identity to reconcile against and every retry
+    // would create another check run.
+    let sub_id = ctx
+        .subscription_id
+        .ok_or("check publishing requires a subscription (stable identity is per subscription)")?;
     let conn = app_connection(state, ctx.scope, connection_id).await?;
     let token = installation_token(state, &conn).await?;
     // Stable name per subscription; one run per head SHA (that's how
@@ -1134,6 +1226,7 @@ async fn publish_check(
     let payload = json!({
         "name": name,
         "head_sha": head_sha,
+        "external_id": check_external_id(sub_id),
         "status": "completed",
         "conclusion": check_conclusion(&ctx.status),
         "completed_at": Utc::now().to_rfc3339(),
@@ -1143,19 +1236,99 @@ async fn publish_check(
         },
     });
     let digest = format!("sha256:{}", fluidbox_db::sha256_hex(&payload.to_string()));
-    let (status, body, _) = api(
-        state,
-        reqwest::Method::POST,
-        &format!("Bearer {token}"),
-        &format!("/repos/{repository}/check-runs"),
-        Some(&payload),
+    let auth = format!("Bearer {token}");
+    let resource_key = format!("{repository}@{head_sha}");
+
+    // RECONCILE BEFORE CREATE — the same treatment the comment path gets (#33
+    // review 2). Checks used to POST unconditionally with no idempotency key and
+    // no adoption, so a crash after GitHub accepted the create (or any retry of a
+    // delivery whose recording leg failed) added ANOTHER check run to the same
+    // commit. They reconcile exactly as well as comments do: `external_id` is an
+    // app-controlled field GitHub returns verbatim, and check runs are listable
+    // per commit filtered by name, so `(head_sha, name, external_id)` is a
+    // complete, deterministic identity. An UPDATE is a PATCH to the run's id, and
+    // a completed run may be re-completed, so re-publishing is an in-place edit.
+    //
+    // A listing error FAILS the attempt, never falls through to create.
+    let recorded = fluidbox_db::get_external_result(
+        &state.pool,
+        ctx.scope,
+        sub_id,
+        "github_check_run",
+        &resource_key,
     )
-    .await?;
-    if !status.is_success() {
-        return Err(format!("github check create returned {status}"));
+    .await
+    .map_err(|e| format!("external result lookup failed: {e}"))?
+    .map(|r| r.external_id);
+    let existing = match recorded {
+        Some(id) => Some(id),
+        None => reconcile_existing_check(state, &auth, repository, head_sha, &name, sub_id)
+            .await
+            .map_err(|e| {
+                format!(
+                    "check reconcile for {repository}@{head_sha} failed ({e}); \
+                     refusing to create — a retry will re-reconcile"
+                )
+            })?,
+    };
+
+    let mut url: Option<String> = None;
+    let mut external_id: Option<String> = None;
+    if let Some(id) = existing {
+        let (status, body, _) = api(
+            state,
+            reqwest::Method::PATCH,
+            &auth,
+            &format!("/repos/{repository}/check-runs/{id}"),
+            Some(&payload),
+        )
+        .await?;
+        if status.is_success() {
+            url = Some(body["html_url"].as_str().unwrap_or("").to_string());
+            external_id = Some(id);
+        } else if status != reqwest::StatusCode::NOT_FOUND && status != reqwest::StatusCode::GONE {
+            return Err(format!("github check update returned {status}"));
+        }
+        // 404/410 ⇒ deleted out from under us; fall through and create a fresh one.
+    }
+
+    if external_id.is_none() {
+        let (status, body, _) = api(
+            state,
+            reqwest::Method::POST,
+            &auth,
+            &format!("/repos/{repository}/check-runs"),
+            Some(&payload),
+        )
+        .await?;
+        if !status.is_success() {
+            return Err(format!("github check create returned {status}"));
+        }
+        url = Some(body["html_url"].as_str().unwrap_or("").to_string());
+        // A create whose id we cannot read is still a real check run, so it MUST
+        // NOT be recorded as absent — but it is reconcilable on the next attempt
+        // via `external_id`, which is why that is the load-bearing handle here.
+        external_id = body["id"].as_i64().map(|i| i.to_string());
+    }
+
+    // Record LAST: this row is only the fast path. The POST necessarily precedes
+    // it, so a crash in between is exactly the window `reconcile_existing_check`
+    // closes — the row is an optimization, not the source of truth.
+    if let Some(id) = &external_id {
+        fluidbox_db::upsert_external_result(
+            &state.pool,
+            ctx.scope,
+            sub_id,
+            "github_check_run",
+            &resource_key,
+            id,
+            url.as_deref(),
+        )
+        .await
+        .map_err(|e| format!("external result record failed: {e}"))?;
     }
     Ok(super::PublishOutcome {
-        external_url: body["html_url"].as_str().unwrap_or("").to_string(),
+        external_url: url.unwrap_or_default(),
         digest,
     })
 }
@@ -1173,6 +1346,99 @@ mod tests {
         h.insert("x-github-delivery", delivery.parse().unwrap());
         h.insert("x-github-event", event.parse().unwrap());
         h
+    }
+
+    /// #33 review 2, the checks half. Checks used to POST unconditionally with no
+    /// idempotency key at all, so a crash after GitHub accepted the create added a
+    /// SECOND check run to the same commit on every retry. Adoption keys on the
+    /// app-controlled `external_id`, never on the display name (user text, and any
+    /// app may publish a check with the same one).
+    #[test]
+    fn a_check_run_is_adopted_by_its_external_id_and_nothing_else() {
+        let sub = Uuid::now_v7();
+        let other = Uuid::now_v7();
+        let want = check_external_id(sub);
+        assert!(
+            want.contains(&sub.to_string()),
+            "the identity carries the unguessable subscription id"
+        );
+
+        let ours = json!({"id": 77, "name": "fluidbox/x", "external_id": want.clone()});
+        assert_eq!(
+            find_marker_check(std::slice::from_ref(&ours), &want),
+            Some("77".into())
+        );
+
+        // Another subscription's check on the same commit is NOT ours.
+        let theirs = json!({"id": 78, "name": "fluidbox/x",
+                            "external_id": check_external_id(other)});
+        assert_eq!(
+            find_marker_check(std::slice::from_ref(&theirs), &want),
+            None
+        );
+        assert_eq!(
+            find_marker_check(&[theirs, ours], &want),
+            Some("77".into()),
+            "ours is picked out of a mixed page"
+        );
+
+        // A same-NAMED check from another app carries no external_id of ours —
+        // adopting it would PATCH someone else's check run.
+        assert_eq!(
+            find_marker_check(&[json!({"id": 79, "name": "fluidbox/x"})], &want),
+            None
+        );
+        // No usable id ⇒ not adoptable (we could not address it anyway).
+        assert_eq!(
+            find_marker_check(&[json!({"external_id": want.clone()})], &want),
+            None
+        );
+        assert_eq!(find_marker_check(&[], &want), None);
+    }
+
+    /// A reconciliation ERROR must never be read as proof-of-absence (#33 review
+    /// 2). Both publish paths route the `Err` arm into `?` — no `unwrap_or`, no
+    /// `None` fallback, no warn-and-continue — because a transient list timeout on
+    /// a RETRY is indistinguishable from "nothing is there", and guessing wrong
+    /// posts a duplicate that cannot be repaired afterwards. Asserted against the
+    /// source because the failure needs a flaky GitHub to reproduce; needles are
+    /// split so this test is not its own evidence.
+    #[test]
+    fn a_reconcile_error_never_falls_through_to_create() {
+        let src = include_str!("github.rs");
+        for (open, close, what) in [
+            (
+                concat!("async fn publish_pr_", "comment("),
+                concat!("issues/{pr_number}/", "comments\""),
+                "comment",
+            ),
+            (
+                concat!("async fn publish_", "check("),
+                concat!("reqwest::Method::", "POST,"),
+                "check",
+            ),
+        ] {
+            let start = src.find(open).expect("the publish fn exists");
+            let end = src[start..]
+                .find(close)
+                .map(|i| start + i)
+                .expect("its create call follows");
+            let slice = &src[start..end];
+            assert!(
+                slice.contains(concat!("refusing to ", "create")),
+                "the {what} path must FAIL the attempt when reconciliation errors"
+            );
+            for banned in [
+                concat!("Ok(found) =", "> found"),
+                concat!("tracing::", "warn!"),
+            ] {
+                assert!(
+                    !slice.contains(banned),
+                    "the {what} path swallows a reconcile error (`{banned}`) and \
+                     falls through to create — that is the duplicate this closes"
+                );
+            }
+        }
     }
 
     #[test]

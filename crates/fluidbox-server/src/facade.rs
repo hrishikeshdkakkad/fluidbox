@@ -203,19 +203,52 @@ const FALLBACK_MAX_OUTPUT_TOKENS: i64 = 32_768;
 /// starve its own run, but the arithmetic should stay sane).
 const MAX_RESERVABLE_OUTPUT_TOKENS: i64 = 1_000_000;
 
+/// Bytes of serialized request charged as ONE input token.
+///
+/// **1, and it has to be 1** (#33 review 1). The previous value was 4 — the
+/// well-known AVERAGE for English prose — which is not an upper bound at all:
+/// dense CJK, minified JSON, base64, or deliberately adversarial text tokenizes
+/// far denser, so two requests could each reserve ~a quarter of what they went on
+/// to spend and both be admitted against a budget neither could afford. Design
+/// :1117 asks for a CONSERVATIVE MAXIMUM, so the ratio must be one no input can
+/// beat.
+///
+/// 1 byte per token is that bound, and it is a property of the tokenizer family
+/// rather than a guess: every production LLM tokenizer here is byte-level BPE,
+/// whose vocabulary contains all 256 single bytes as atomic tokens. BPE only ever
+/// MERGES adjacent tokens, so an N-byte payload can never encode to more than N
+/// tokens — the worst case (nothing merges) is exactly one token per byte. There
+/// is no input, adversarial or otherwise, that exceeds it.
+///
+/// COST OF OVER-RESERVING, stated plainly: for ordinary English a reservation is
+/// now ~4× the request's real input, so a session's CONCURRENT fan-out against a
+/// tight token budget shrinks by roughly that factor. What that costs is bounded
+/// on three sides. (1) The sole-claimant carve-out means a request with NO live
+/// sibling skips the reservation arms entirely — an over-estimate can never
+/// refuse a serial run, only a parallel one. (2) The booking is transient: it
+/// reconciles against authoritative usage the moment the response completes, so
+/// the over-count exists for one request's latency, not for the run. (3) The
+/// refusal it can cause is a retryable `429 budget_reservation`, explicitly NOT
+/// the terminal `BudgetExceeded` verdict. Under-reserving has no comparable
+/// bound: it silently overspends the hard budget, which is the whole point of
+/// Gap 14.
+const BYTES_PER_INPUT_TOKEN: usize = 1;
+
 /// The conservative maximum this request could cost, booked BEFORE it is
 /// forwarded (design :1117). Deliberately pessimistic — an over-reservation only
 /// delays a concurrent sibling and is reconciled away the moment authoritative
 /// usage lands, whereas an under-reservation reopens the very race this closes.
 ///
-/// `reserved = declared_max_output + ceil(body_len / 4)`, priced with
-/// `estimate_cost_usd` when the model is in the price table.
+/// `reserved = declared_max_output + ceil(body_len / BYTES_PER_INPUT_TOKEN)`,
+/// priced with `estimate_cost_usd` when the model is in the price table.
 ///
 /// ASSUMPTIONS, all erring high on purpose:
-///   * **Every byte of the serialized request is billable input**, at 4 bytes per
-///     token. JSON punctuation, tool schemas and base64 image payloads are all
-///     counted as text tokens; images actually bill by pixel and base64 inflates
-///     the byte count ~4/3, so this over-counts them.
+///   * **Every byte of the serialized request is billable input**, at
+///     [`BYTES_PER_INPUT_TOKEN`] = 1 byte per token — a genuine upper bound for
+///     byte-level BPE, not an average (see that constant for why, and for what
+///     over-reserving costs). JSON punctuation, tool schemas and base64 image
+///     payloads are all counted as text tokens; images actually bill by pixel and
+///     base64 inflates the byte count ~4/3, so this over-counts them further.
 ///   * **Nothing is cache-hit.** Prompt-cached input reads at a fraction of the
 ///     input price; pricing the whole estimate as fresh input over-counts a
 ///     cache-heavy turn (which is the common shape for an agent loop).
@@ -239,7 +272,7 @@ fn conservative_reservation(
     .filter(|n| *n > 0)
     .map(|n| (n as i64).min(MAX_RESERVABLE_OUTPUT_TOKENS))
     .unwrap_or(FALLBACK_MAX_OUTPUT_TOKENS);
-    let input = body_len.div_ceil(4) as i64;
+    let input = body_len.div_ceil(BYTES_PER_INPUT_TOKEN) as i64;
     let usage = UsageDelta {
         input_tokens: input as u64,
         output_tokens: declared as u64,
@@ -1409,12 +1442,12 @@ mod tests {
     #[test]
     fn conservative_reservation_uses_declared_output_plus_input_estimate() {
         // Anthropic: `max_tokens` is required by that API and is the declared
-        // output allowance; input is body_len/4, rounded UP.
+        // output allowance; input is body_len / BYTES_PER_INPUT_TOKEN, rounded UP.
         let body = json!({"model": "claude-haiku-4-5", "max_tokens": 1000, "messages": []});
         let len = 401usize;
         let (tokens, cost) =
             conservative_reservation(Dialect::Anthropic, &body, len, "claude-haiku-4-5");
-        assert_eq!(tokens, 1000 + 101, "declared output + ceil(401/4)");
+        assert_eq!(tokens, 1000 + 401, "declared output + ceil(401/1)");
         assert!(cost.unwrap() > 0.0, "a priced model reserves cost too");
 
         // Codex declares `max_output_tokens`; `max_tokens` must NOT be read for it
@@ -1422,7 +1455,7 @@ mod tests {
         // different things across the dialects, and Responses ignores max_tokens).
         let body = json!({"model": "m", "max_output_tokens": 64, "max_tokens": 999_999});
         let (tokens, _) = conservative_reservation(Dialect::OpenAi, &body, 40, "m");
-        assert_eq!(tokens, 64 + 10);
+        assert_eq!(tokens, 64 + 40);
         let body = json!({"model": "m", "max_tokens": 999_999});
         let (tokens, _) = conservative_reservation(Dialect::OpenAi, &body, 0, "m");
         assert_eq!(
@@ -1460,6 +1493,36 @@ mod tests {
         );
         assert_eq!(tokens, 10);
         assert!(cost.is_none());
+    }
+
+    /// The input estimate must be an UPPER BOUND, not an average (#33 review 1).
+    ///
+    /// The property asserted is the tokenizer fact [`BYTES_PER_INPUT_TOKEN`]
+    /// documents: byte-level BPE has all 256 single bytes in its vocabulary and
+    /// only ever MERGES, so an N-byte request can never bill more than N input
+    /// tokens. Therefore `reserved − declared_output ≥ body_len` for EVERY body
+    /// length. Any ratio above 1 — including the 4 this shipped with — fails here
+    /// at every non-trivial length, which is exactly the regression to catch:
+    /// with 4, two 2400-byte requests declaring 64 output tokens each reserve 664
+    /// apiece and both fit a 1500-token budget while spending well past it.
+    #[test]
+    fn the_input_estimate_is_an_upper_bound_not_an_average() {
+        const DECLARED: i64 = 64;
+        let body = json!({"max_tokens": DECLARED});
+        for len in [0usize, 1, 3, 4, 5, 189, 401, 2400, 1_048_576] {
+            let (tokens, _) = conservative_reservation(Dialect::Anthropic, &body, len, "m");
+            let input = tokens - DECLARED;
+            assert!(
+                input >= len as i64,
+                "a {len}-byte request reserved only {input} input tokens — an \
+                 adversarially dense payload can bill one token per byte, so this \
+                 is an average, not a conservative maximum"
+            );
+        }
+        // …and it is not gratuitously above the bound either: exactly 1:1 keeps
+        // the over-reservation cost documented in BYTES_PER_INPUT_TOKEN honest.
+        let (tokens, _) = conservative_reservation(Dialect::Anthropic, &body, 2400, "m");
+        assert_eq!(tokens, DECLARED + 2400);
     }
 
     /// The reservation is minted and booked EXACTLY ONCE per request, which is

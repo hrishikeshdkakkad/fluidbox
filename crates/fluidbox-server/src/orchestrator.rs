@@ -1225,7 +1225,7 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
         anyhow::bail!("session left active state before workspace init");
     }
     let (workspace_dir, base_commit) =
-        materialize_workspace(&state, scope, session_id, &run_spec).await?;
+        materialize_workspace(&state, scope, session_id, &run_spec, epoch).await?;
 
     // Ownership gate AFTER materialization, BEFORE anything else is created
     // (the K8s archive write included): a finalizer that took the session
@@ -1317,8 +1317,18 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
         );
     }
 
-    // initializing → running (traffic is now expected)
-    transition_fenced(
+    // initializing → running (traffic is now expected).
+    //
+    // The result is HONORED (#33 review 4). Discarding it used to mean a
+    // transient DB error — or a transition refused because another replica took
+    // the session between the attach fence and here — left a LIVE sandbox parked
+    // in `initializing` behind a timeline that said "sandbox launched", while
+    // `run()` returned Ok so nothing initiated recovery; the stale-launch
+    // watchdog only notices ~30 minutes later. Failing instead routes through
+    // `spawn_run`'s `fail()`, which finalizes the session and reaps the sandbox
+    // now. The sandbox is already attached, so the finalizer terminates it from
+    // the handle — this is a fail-fast, not a leak.
+    if !transition_fenced(
         &state,
         scope,
         session_id,
@@ -1326,7 +1336,13 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
         None,
         epoch,
     )
-    .await;
+    .await
+    {
+        anyhow::bail!(
+            "could not enter running after the sandbox attached; failing the launch so the \
+             finalizer reaps it instead of leaving a live sandbox in 'initializing'"
+        );
+    }
     fluidbox_db::heartbeat(&state.pool, scope, session_id)
         .await
         .ok();
@@ -1577,6 +1593,7 @@ async fn materialize_workspace(
     scope: TenantScope,
     session_id: Uuid,
     run_spec: &RunSpec,
+    epoch: i64,
 ) -> anyhow::Result<(Option<PathBuf>, Option<String>)> {
     let data_dir = state.cfg.data_dir.clone();
     let (ws, repo, r#ref) = match &run_spec.workspace {
@@ -1664,6 +1681,28 @@ async fn materialize_workspace(
             (ws, None, None)
         }
     };
+
+    // RE-PROVE THE LEASE ADJACENT TO THE EFFECT (#33 review 3). The clone/copy
+    // above can take minutes; the epoch we carry was proven BEFORE it. In that
+    // window a cancel on another replica can steal the lease and terminalize the
+    // session — and neither write below is fenced on its own (`set_base_commit`
+    // has no epoch or status predicate, and `append_event` accepts any seq), so a
+    // stale driver would go on to stamp a base commit and post
+    // `WorkspaceInitialized` onto a run that is already over. Proving ownership
+    // here rather than only at the next provider step is the cleaner fence: it
+    // sits immediately before the mutations it authorizes.
+    //
+    // Failure is ABANDON, not just skip-the-writes: the materialized workspace on
+    // disk belongs to a launch that is no longer ours. `abandon_launch` removes it
+    // only when no finalizer owns the session (it checks the intent first), so the
+    // finalizer's collection can never be destroyed out from under it.
+    if hold_lease(state, scope, session_id).await != Some(epoch) {
+        abandon_launch(state, scope, session_id).await;
+        anyhow::bail!(
+            "orchestrator lease moved during workspace materialization; abandoning before the \
+             base-commit and WorkspaceInitialized writes"
+        );
+    }
 
     if let Some(bc) = &ws.base_commit {
         fluidbox_db::set_base_commit(&state.pool, scope, session_id, bc)
@@ -2033,6 +2072,62 @@ mod tests {
             "the collect path must re-prove the driver lease (`{needle}`) before \
              reading the workspace; without it a stale driver whose session was \
              stolen still collects, and stores a losing diff as the audit artifact"
+        );
+    }
+
+    /// #33 review 3, same class as the guard above and closed the same way. The
+    /// lease is proven once before workspace materialization and not re-proven
+    /// until the pre-`provision` gate; a clone can take minutes. `set_base_commit`
+    /// carries NO epoch or status predicate and `append_event` accepts any seq, so
+    /// a driver whose session was cancelled and terminalized on another replica
+    /// mid-clone would still stamp a base commit and post `WorkspaceInitialized`
+    /// onto a finished run. Only a two-replica race observes that, so this asserts
+    /// the statement — needles split so the test is not its own evidence.
+    #[test]
+    fn the_workspace_writes_re_prove_the_lease_before_mutating_the_session() {
+        let src = include_str!("orchestrator.rs");
+        let fn_anchor = concat!("async fn materialize_", "workspace(");
+        let write_anchor = concat!("fluidbox_db::set_base_", "commit(");
+        let start = src.find(fn_anchor).expect("materialize_workspace exists");
+        let end = src[start..]
+            .find(write_anchor)
+            .map(|i| start + i)
+            .expect("the base-commit write lives inside it");
+        let needle = concat!(
+            "hold_lease(state, scope, session_id).await != ",
+            "Some(epoch)"
+        );
+        assert!(
+            src[start..end].contains(needle),
+            "materialize_workspace must re-prove the driver lease (`{needle}`) after \
+             the clone and before the base-commit / WorkspaceInitialized writes; \
+             without it a stale driver mutates a session another replica already \
+             terminalized"
+        );
+    }
+
+    /// #33 review 4. The `initializing → running` CAS used to be called for effect
+    /// and its boolean dropped, so a refused or errored transition left a LIVE,
+    /// already-attached sandbox parked in `initializing` behind a timeline that
+    /// said it had launched — and `run()` returned `Ok`, so nothing initiated
+    /// recovery until the ~30-minute stale-launch watchdog. Honoring it is a
+    /// one-token change and reverts just as easily, so it is asserted here.
+    #[test]
+    fn the_launch_honors_the_final_running_transition() {
+        let src = include_str!("orchestrator.rs");
+        let start = src
+            .find(concat!("// initializing → ", "running"))
+            .expect("the final launch transition is commented");
+        let end = src[start..]
+            .find(concat!("sandbox launched", " ("))
+            .map(|i| start + i)
+            .expect("the launched ledger line follows it");
+        let needle = concat!("if !transition_", "fenced(");
+        assert!(
+            src[start..end].contains(needle),
+            "the launch must FAIL when the initializing→running transition does not \
+             apply (`{needle}`); discarding it reports success over a live sandbox \
+             stuck in 'initializing'"
         );
     }
 
