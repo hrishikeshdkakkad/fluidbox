@@ -15,6 +15,19 @@ use tokio::time::MissedTickBehavior;
 /// backlog — is what a tick's duration is sized against.
 const SWEEP_BATCH: i64 = 200;
 
+/// How long after a run goes TERMINAL the deployment-wide GC may retire its
+/// leftover `mcp_upstream_sessions` rows (Phase F, Task 3).
+///
+/// This is a deliberate handicap, not a timeout. The run-terminal teardown path
+/// (`broker::run_terminal_mcp_cleanup`) is the ONLY thing that ever sends the
+/// upstream `DELETE`, it now sees every replica's rows, and — because the rows are
+/// durable — a reconciler pass that could not finish is re-driven. The grace period
+/// exists so the sweeper never retires a row out from under a teardown that is
+/// still owed a retry. 15 minutes is comfortably past both the finalize driver's
+/// re-drive cadence and the longest single teardown (a peer count × the 5 s
+/// `MCP_DELETE_TIMEOUT`).
+const MCP_SESSION_GRACE_SECS: i64 = 900;
+
 /// Every periodic worker uses this. `tokio::time::interval` defaults to `Burst`:
 /// after a tick that overran its period, the missed ticks fire BACK-TO-BACK to
 /// "catch up", so one slow sweep is immediately followed by several with no gap —
@@ -526,6 +539,39 @@ async fn budget_sweeper(state: AppState) {
                 }
             }
             Err(e) => tracing::warn!("expired LLM-reservation sweep failed: {e}"),
+        }
+
+        // Phase F (Task 3): retire `mcp_upstream_sessions` rows whose run has been
+        // terminal for at least the grace period.
+        //
+        // This is a GARBAGE COLLECTOR, not a delivery mechanism: it does NOT send
+        // the upstream DELETE (the reasoning lives on
+        // `mcp_sessions::sweep_orphaned_upstream_sessions`). What reaches it is the
+        // residue the run-terminal path could not send — dominated by rows whose
+        // credential is unresolvable, which is exactly where invariant 9 forbids
+        // sending one. The disclosed cost is that such an upstream session stays
+        // allocated until the upstream expires it itself; the alternative is a
+        // second retry/backoff system dialing a wedged server on a timer.
+        //
+        // Bounded like the sweeps above, and no ledger row per swept session — the
+        // row is a teardown receipt, not a run event, and a run that ended 15
+        // minutes ago should not gain timeline entries.
+        let terminal_before =
+            chrono::Utc::now() - chrono::Duration::seconds(MCP_SESSION_GRACE_SECS);
+        match fluidbox_db::mcp_sessions::sweep_orphaned_upstream_sessions(
+            &state.pool,
+            terminal_before,
+            SWEEP_BATCH,
+        )
+        .await
+        {
+            Ok(swept) if !swept.is_empty() => tracing::info!(
+                "retired {} orphaned upstream MCP session row(s) without an upstream DELETE \
+                 (their sessions expire on the upstream's own schedule)",
+                swept.len()
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("orphaned upstream MCP session sweep failed: {e}"),
         }
 
         let active = match fluidbox_db::system_worker::sessions_in_status(

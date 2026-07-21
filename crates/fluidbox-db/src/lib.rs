@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 pub mod governance;
 pub mod identity;
+pub mod mcp_sessions;
 pub mod seed;
 pub mod system_worker;
 

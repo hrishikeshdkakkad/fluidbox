@@ -52,11 +52,43 @@ pub enum McpPeer {
     Conn(Uuid),
 }
 
+impl McpPeer {
+    /// The `(peer_kind, peer_id)` pair stored in `mcp_upstream_sessions`
+    /// (Phase F, Task 3; migration 0024). The strings are a WIRE FORMAT with the
+    /// migration's CHECK constraint — they live in `fluidbox-db` so exactly one
+    /// definition exists.
+    pub fn parts(&self) -> (&'static str, Uuid) {
+        match self {
+            McpPeer::Binding(id) => (fluidbox_db::mcp_sessions::PEER_BINDING, *id),
+            McpPeer::Conn(id) => (fluidbox_db::mcp_sessions::PEER_CONNECTION, *id),
+        }
+    }
+
+    /// Reconstruct a peer from a durable row. `None` for an unrecognized kind:
+    /// teardown must re-resolve a credential THROUGH the peer, so a row whose kind
+    /// we cannot map is unusable and is skipped rather than guessed at.
+    pub fn from_parts(kind: &str, id: Uuid) -> Option<Self> {
+        match kind {
+            fluidbox_db::mcp_sessions::PEER_BINDING => Some(McpPeer::Binding(id)),
+            fluidbox_db::mcp_sessions::PEER_CONNECTION => Some(McpPeer::Conn(id)),
+            _ => None,
+        }
+    }
+}
+
 /// A live upstream MCP session for one `(run, peer)` (Phase E, E5). Created on
 /// the first post-gate brokered call to that peer, reused across later calls in
 /// the same run, and torn down (best-effort DELETE) at the run's terminal
-/// transition. Replica-local by design — Phase F owns cross-replica affinity, so
-/// a run whose calls land on a different replica simply re-initializes there.
+/// transition. Still replica-local, and deliberately so: a run whose calls land
+/// on a different replica simply re-initializes there, because ADOPTING another
+/// replica's session would put two replicas on one upstream session with no
+/// serialization and force a change to the per-entry `next_id` id space.
+///
+/// Phase F (Task 3) keeps that unchanged and adds the missing half: TEARDOWN is
+/// no longer replica-local. Every session id learned here is mirrored into
+/// `mcp_upstream_sessions` (migration 0024) keyed by `(run, peer, this replica)`,
+/// so the replica that finalizes the run DELETEs every replica's sessions, not
+/// just the ones in this map. See `broker::run_terminal_mcp_cleanup`.
 pub struct McpUpstreamSession {
     /// The `Mcp-Session-Id` the server issued at initialize (absent = the
     /// server runs sessionless; we still send `MCP-Protocol-Version`).
@@ -186,6 +218,10 @@ pub struct AppStateInner {
     /// sends `MCP-Protocol-Version` on every post-init request, re-initializes
     /// once on a 404-with-session, and DELETEs the session at the run's terminal
     /// transition. Replica-local (invariant 11); a restart/failover re-inits.
+    /// Phase F (Task 3): the map is still the only place a LIVE session is reused,
+    /// but every learned session id is also durable (`mcp_upstream_sessions`), so
+    /// teardown covers other replicas' sessions and a crash no longer leaks them
+    /// until process exit.
     pub mcp_sessions: McpSessionRegistry,
     /// Per-tenant LiteLLM virtual keys, cached UNSEALED in memory (Phase D, #32),
     /// keyed by tenant_id. The durable key stays sealed in `tenant_llm_keys`; this

@@ -14,6 +14,15 @@
 //! It accepts both `application/json` and SSE-framed responses, replies
 //! `-32601` to unsupported server→client requests, and treats an SEP-835
 //! `insufficient_scope` challenge as terminal (never a re-mint).
+//!
+//! Cross-replica teardown (Phase F, Task 3; migration 0024): the registry above
+//! stays replica-local — a replica NEVER adopts another's upstream session — but
+//! every session id it learns is mirrored into `mcp_upstream_sessions`, keyed by
+//! `(run, peer, this replica)`. Terminal cleanup therefore tears down the UNION of
+//! this replica's map and every replica's durable rows, which closes the Phase E
+//! leak (calls on replica A, finalization on replica B ⇒ no DELETE at all). No
+//! credential is ever stored on a row: the teardown DELETE re-resolves it live, and
+//! a resolution failure still skips the DELETE (invariants 9 and 22).
 
 use crate::state::{AppState, McpPeer, McpUpstreamSession};
 use fluidbox_core::capability::{CapabilityServer, ToolSnapshot};
@@ -1277,6 +1286,87 @@ async fn ensure_initialized(
     Ok(())
 }
 
+/// Where a learned upstream session id is durably recorded so ANY replica can tear
+/// it down (Phase F, Task 3). Holds identity only — the tenant scope, the run, and
+/// the peer — never a credential: the teardown DELETE re-resolves that live
+/// (invariants 9 and 22), and parking ambient credential state on a long-lived
+/// handle is precisely what invariant 22 rules out.
+///
+/// `None` at a call site is a deliberate statement that the session is not
+/// teardown-tracked: discovery/photograph sessions (one-shot throwaways with no
+/// run) and credential-free legacy bundles (no peer key at all) both pass `None`.
+pub(crate) struct SessionRecorder {
+    state: AppState,
+    scope: fluidbox_db::TenantScope,
+    run_session: uuid::Uuid,
+    peer: McpPeer,
+}
+
+impl SessionRecorder {
+    fn new(
+        state: &AppState,
+        scope: fluidbox_db::TenantScope,
+        run_session: uuid::Uuid,
+        peer: McpPeer,
+    ) -> Self {
+        SessionRecorder {
+            state: state.clone(),
+            scope,
+            run_session,
+            peer,
+        }
+    }
+
+    /// Mirror a freshly negotiated session into `mcp_upstream_sessions`.
+    ///
+    /// Best-effort by construction. A failure here must not fail a tool call that
+    /// the gate, the claim and the budget have all already admitted; the cost of a
+    /// lost row is exactly the Phase E behaviour (teardown falls back to whatever
+    /// the local registry holds), so degrading is strictly no worse than not
+    /// having the table.
+    async fn record(&self, sess: &McpUpstreamSession) {
+        let Some((upstream, version)) = recordable(sess) else {
+            return;
+        };
+        let (peer_kind, peer_id) = self.peer.parts();
+        if let Err(e) = fluidbox_db::mcp_sessions::record_upstream_session(
+            &self.state.pool,
+            self.scope,
+            fluidbox_db::mcp_sessions::NewUpstreamSession {
+                session_id: self.run_session,
+                peer_kind,
+                peer_id,
+                replica: crate::orchestrator::replica_id(),
+                upstream_session_id: upstream,
+                endpoint_url: &sess.url,
+                protocol_version: version,
+            },
+        )
+        .await
+        {
+            tracing::warn!(
+                target: "broker",
+                "durable mcp session record failed (teardown degrades to replica-local): {e}"
+            );
+        }
+    }
+}
+
+/// What (if anything) a negotiated session owes the durable table: its
+/// `Mcp-Session-Id` and the negotiated protocol version.
+///
+/// `None` is THE "no session id ⇒ no row" rule, and it is the only branch that
+/// decides it. A sessionless upstream server has nothing to `DELETE`, so a row for
+/// it would be a permanent sweep candidate that could never be satisfied — and
+/// `deleted_at is null` would stop meaning "still allocated upstream".
+fn recordable(sess: &McpUpstreamSession) -> Option<(&str, Option<&str>)> {
+    let upstream = sess.session_id.as_deref().filter(|s| !s.is_empty())?;
+    Some((
+        upstream,
+        Some(sess.negotiated.as_str()).filter(|v| !v.is_empty()),
+    ))
+}
+
 /// Send ONE JSON-RPC request within an already-initialized session, drawing a
 /// fresh id from the session counter. Classifies auth (401/403 → Unauthorized /
 /// InsufficientScope) and a 404-with-session (→ SessionExpired, for the caller's
@@ -1312,10 +1402,55 @@ async fn call_in_session(
     unwrap_result(resp.value, method).map_err(Into::into)
 }
 
+/// Is the durable mirror owed a write on THIS `ensure_initialized` pass?
+///
+/// It is owed exactly once per negotiation, and `negotiated` is the same sentinel
+/// [`ensure_initialized`] itself keys on — so this is "did we just learn a session
+/// id", not "did we make a call". `reset()` (the 404-with-session path) clears it,
+/// which is precisely why a re-initialize DOES record again.
+///
+/// Not a mere optimization: `record_upstream_session`'s upsert REVIVES a row it
+/// finds deleted (correct for a re-initialize). Writing on every call would let a
+/// tool call that overlaps terminal teardown resurrect a row that was just stamped,
+/// leaving an upstream session marked live that no teardown will ever revisit.
+fn owes_record(sess: &McpUpstreamSession) -> bool {
+    sess.negotiated.is_empty()
+}
+
+/// Initialize `sess` if it is not already, and — when this call is the one that
+/// actually negotiated ([`owes_record`]) — mirror the learned session id into the
+/// durable teardown table (Phase F, Task 3).
+async fn ensure_initialized_recorded(
+    client: &reqwest::Client,
+    policy: &crate::egress::EgressPolicy,
+    url: &str,
+    auth: Option<&BrokeredAuth>,
+    sess: &mut McpUpstreamSession,
+    version: VersionPolicy<'_>,
+    recorder: Option<&SessionRecorder>,
+) -> Result<(), CallErr> {
+    let owed = owes_record(sess);
+    ensure_initialized(client, policy, url, auth, sess, version).await?;
+    if owed {
+        if let Some(r) = recorder {
+            r.record(sess).await;
+        }
+    }
+    Ok(())
+}
+
 /// A full managed request against a `(run, peer)` session: initialize if
 /// needed, send, and on a 404-with-session re-initialize ONCE (reset in place —
 /// same registry slot, so the entry count never grows) and replay ONCE. A
 /// second 404 is terminal (never refreshes/expands the tool set).
+///
+/// `recorder` is the durable teardown mirror (Phase F, Task 3). It fires ONLY on a
+/// call that actually negotiated — including the reinit after a 404, which is why
+/// the durable row is updated in place there. It runs while the per-peer session
+/// mutex is held, which is a lock order this file already establishes (the mutex is
+/// held across the whole upstream request, and every DB transaction reachable from
+/// under it — this one, and the teardown's credential re-resolution — never waits
+/// on a session mutex, so no cycle exists).
 #[allow(clippy::too_many_arguments)]
 async fn managed_call(
     client: &reqwest::Client,
@@ -1326,15 +1461,17 @@ async fn managed_call(
     method: &str,
     params: Value,
     snapshot: Option<&str>,
+    recorder: Option<&SessionRecorder>,
 ) -> Result<Value, CallErr> {
     let mut sess = entry.lock().await;
-    ensure_initialized(
+    ensure_initialized_recorded(
         client,
         policy,
         url,
         auth,
         &mut sess,
         VersionPolicy::Enforce { snapshot },
+        recorder,
     )
     .await?;
     match call_in_session(client, policy, url, auth, &mut sess, method, params.clone()).await {
@@ -1342,13 +1479,14 @@ async fn managed_call(
             // Reinit ONCE and replay ONCE. reset() keeps the same map slot (no
             // leak) but forces a fresh initialize.
             sess.reset();
-            ensure_initialized(
+            ensure_initialized_recorded(
                 client,
                 policy,
                 url,
                 auth,
                 &mut sess,
                 VersionPolicy::Enforce { snapshot },
+                recorder,
             )
             .await?;
             match call_in_session(client, policy, url, auth, &mut sess, method, params).await {
@@ -1379,10 +1517,50 @@ async fn session_entry(
         .clone()
 }
 
-/// Terminal MCP cleanup for a finished run (E5): DELETE each live upstream
-/// session best-effort and EVICT every registry entry for the run regardless of
-/// the DELETE outcome. Hooked into the orchestrator's terminal driver. Runs are
-/// replica-local — entries only exist on the replica that made the calls.
+/// One upstream MCP session owed a terminal `DELETE`, from EITHER source: this
+/// replica's registry, or a durable `mcp_upstream_sessions` row written by any
+/// replica (Phase F, Task 3).
+///
+/// It deliberately carries no credential and no `Arc` — everything the DELETE
+/// needs is here by value, so the union below is a pure function and the DELETE
+/// loop needs neither the registry nor an `AppState`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TeardownTarget {
+    pub peer: McpPeer,
+    pub url: String,
+    /// The `Mcp-Session-Id` to terminate.
+    pub upstream_session_id: String,
+    /// The negotiated version, echoed as `MCP-Protocol-Version` when known.
+    pub negotiated: Option<String>,
+    /// The durable row to stamp once the DELETE has been ATTEMPTED. `None` for a
+    /// registry entry with no matching row (the record write failed, or the row
+    /// predates this session id) — the DELETE still fires, there is just nothing
+    /// to stamp.
+    pub row_id: Option<uuid::Uuid>,
+}
+
+/// A registry entry snapshotted out from under its mutex at drain time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalSession {
+    pub peer: McpPeer,
+    pub session_id: Option<String>,
+    pub negotiated: String,
+    pub url: String,
+}
+
+/// Terminal MCP cleanup for a finished run (E5, extended in Phase F Task 3):
+/// DELETE every live upstream session this run opened ON ANY REPLICA, best-effort,
+/// and EVICT every local registry entry regardless of the DELETE outcome. Hooked
+/// into the orchestrator's terminal driver.
+///
+/// The Phase E version tore down only the LOCAL map, and disclosed the hole: a run
+/// whose brokered calls ran on replica A but which is finalized on replica B found
+/// zero entries and sent no DELETE at all. The teardown set is now the UNION of the
+/// drained map and `mcp_upstream_sessions` for this run, so whichever replica
+/// finalizes tears down all of them. Because the durable row survives, this
+/// reconciler is also now RETRYABLE: an earlier pass that could not finish leaves
+/// its rows live and a re-drive picks them up (the drained map, by contrast, was
+/// one-shot).
 ///
 /// The DELETE carries the SAME authorization header a live call would (design
 /// `:914` — "always send the OAuth/static authorization header on every upstream
@@ -1390,11 +1568,12 @@ async fn session_entry(
 /// conforming upstream actually terminates the session instead of 401ing it.
 /// The credential is RE-RESOLVED here through the live path (invariant 9: every
 /// upstream call rechecks live revoke/status state) rather than cached on the
-/// registry entry at call time: by teardown a cached header could name a
+/// registry entry or the durable row: by teardown a cached header could name a
 /// connection that has since been revoked, reauthorized to a new generation, or
 /// whose owner left the org — and an access token minted minutes ago may have
 /// expired. A revoked connection is precisely the case where we must NOT send a
-/// credential, so a resolution/recheck failure SKIPS the DELETE entirely.
+/// credential, so a resolution/recheck failure SKIPS the DELETE entirely — and
+/// leaves the row LIVE, for the deployment-wide sweeper to retire.
 /// (Caching it would also park ambient credential state on a long-lived
 /// in-memory map, which invariant 22 rules out. Do not "optimize" this into a
 /// stored header.)
@@ -1402,11 +1581,10 @@ pub async fn run_terminal_mcp_cleanup(state: &AppState, session_id: uuid::Uuid) 
     // Evict FIRST and unconditionally — before any DB or network work, so a
     // wedged upstream (or an unresolvable tenant) never strands an entry.
     let drained = drain_run_sessions(&state.mcp_sessions, session_id).await;
-    if drained.is_empty() {
-        return;
-    }
     // ONE cross-tenant session lookup for the whole run (a worker/system entry
-    // holds only a bare id); the per-peer resolution below is tenant-scoped.
+    // holds only a bare id); the durable read and per-peer resolution below are
+    // tenant-scoped. No scope ⇒ no durable rows AND no credential, so the loop
+    // below can only skip — exactly the Phase E behaviour.
     let scope = match fluidbox_db::system_worker::get_session(&state.pool, session_id).await {
         Ok(Some(s)) => Some(fluidbox_db::TenantScope::assume(s.tenant_id)),
         Ok(None) => None,
@@ -1415,34 +1593,159 @@ pub async fn run_terminal_mcp_cleanup(state: &AppState, session_id: uuid::Uuid) 
             None
         }
     };
-    delete_upstream_sessions(
+    let rows = match scope {
+        Some(scope) => {
+            match fluidbox_db::mcp_sessions::live_upstream_sessions(&state.pool, scope, session_id)
+                .await
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    // Degrade to the local map rather than skipping teardown: the
+                    // rows stay live and either a re-drive or the sweeper gets them.
+                    tracing::warn!(target: "broker", "durable mcp session read failed (teardown degrades to replica-local): {e}");
+                    Vec::new()
+                }
+            }
+        }
+        None => Vec::new(),
+    };
+    let targets = union_teardown(drained, rows);
+    if targets.is_empty() {
+        return;
+    }
+    let attempted = delete_upstream_sessions(
         &state.egress_http,
         &state.egress_policy,
-        drained,
+        targets,
         |peer, url| async move {
             let scope = scope.ok_or_else(|| "run's tenant could not be resolved".to_string())?;
             terminal_peer_auth(state, scope, peer, &url).await
         },
     )
     .await;
+    // Stamp only what was actually ATTEMPTED. A skipped DELETE (credential
+    // unresolvable) deliberately leaves its row live: `deleted_at is null` is the
+    // honest "still allocated upstream" predicate an acceptance script reads, and
+    // marking it here would turn that into a hopeful one.
+    if let Some(scope) = scope {
+        for row_id in attempted {
+            if let Err(e) = fluidbox_db::mcp_sessions::mark_upstream_session_deleted(
+                &state.pool,
+                scope,
+                row_id,
+                fluidbox_db::mcp_sessions::OUTCOME_DELETED,
+            )
+            .await
+            {
+                tracing::warn!(target: "broker", "durable mcp session mark failed (the sweeper will retire it): {e}");
+            }
+        }
+    }
 }
 
-/// Drain (evict) every registry entry for one run under the map lock, returning
-/// them with their peer identity so each can be resolved + DELETEd outside the
-/// lock. Eviction is unconditional and happens before any I/O.
+/// Fold this replica's drained registry entries and every replica's durable rows
+/// into ONE teardown set. Pure — the whole cross-replica behaviour is decided here
+/// and is unit-testable without a database or a socket.
+///
+/// Rules:
+///   * a target with NO session id is dropped, from EITHER source — a sessionless
+///     upstream server has nothing to DELETE. This is the same rule (and the same
+///     empty-string handling: `Mcp-Session-Id:` with an empty value parses as
+///     `Some("")`) that stops a row being written in the first place, so the two
+///     cannot disagree about what "has a session" means;
+///   * a local entry and a durable row naming the SAME `(peer, upstream session
+///     id)` are ONE target — that is this replica's own row, and it must be
+///     DELETEd once and stamped once;
+///   * every other durable row becomes its own target: another replica's session
+///     (or one of ours from before a restart), which is the leak this task closes;
+///   * a row whose `peer_kind` does not map back to a peer is SKIPPED — teardown
+///     re-resolves the credential THROUGH the peer, so an unmappable row cannot be
+///     torn down and must not be silently stamped as if it had been.
+fn union_teardown(
+    local: Vec<LocalSession>,
+    rows: Vec<fluidbox_db::mcp_sessions::UpstreamSessionRow>,
+) -> Vec<TeardownTarget> {
+    let mut targets: Vec<TeardownTarget> = local
+        .into_iter()
+        .filter_map(|l| {
+            l.session_id
+                .filter(|s| !s.is_empty())
+                .map(|sid| TeardownTarget {
+                    peer: l.peer,
+                    url: l.url,
+                    upstream_session_id: sid,
+                    negotiated: Some(l.negotiated).filter(|v| !v.is_empty()),
+                    row_id: None,
+                })
+        })
+        .collect();
+    for row in rows {
+        if row.upstream_session_id.is_empty() {
+            continue;
+        }
+        let Some(peer) = McpPeer::from_parts(&row.peer_kind, row.peer_id) else {
+            tracing::warn!(
+                target: "broker",
+                "durable mcp session row {} has unknown peer_kind '{}' — cannot tear it down",
+                row.id,
+                row.peer_kind
+            );
+            continue;
+        };
+        match targets
+            .iter_mut()
+            .find(|t| t.peer == peer && t.upstream_session_id == row.upstream_session_id)
+        {
+            // Our own row: attach it to the local target so ONE DELETE fires and
+            // that one stamping is the row's.
+            Some(existing) => existing.row_id = Some(row.id),
+            None => targets.push(TeardownTarget {
+                peer,
+                url: row.endpoint_url,
+                upstream_session_id: row.upstream_session_id,
+                negotiated: row.protocol_version.filter(|v| !v.is_empty()),
+                row_id: Some(row.id),
+            }),
+        }
+    }
+    targets
+}
+
+/// Drain (evict) every registry entry for one run under the map lock, snapshotting
+/// each entry's routing state so the DELETE can happen outside both locks.
+/// Eviction is unconditional and happens before any I/O.
+///
+/// Snapshotting takes each entry's own mutex, which a concurrent in-flight call
+/// holds across its upstream request — so a drain can wait for it, exactly as the
+/// Phase E DELETE loop did. That is the correct behaviour: the whole cleanup is
+/// spawned fire-and-forget, and reading a session id mid-mutation is worse than
+/// waiting.
 async fn drain_run_sessions(
     registry: &crate::state::McpSessionRegistry,
     session_id: uuid::Uuid,
-) -> Vec<(McpPeer, Arc<Mutex<McpUpstreamSession>>)> {
-    let mut map = registry.lock().await;
-    let keys: Vec<(uuid::Uuid, McpPeer)> = map
-        .keys()
-        .filter(|(sid, _)| *sid == session_id)
-        .cloned()
-        .collect();
-    keys.iter()
-        .filter_map(|k| map.remove(k).map(|e| (k.1, e)))
-        .collect()
+) -> Vec<LocalSession> {
+    let evicted: Vec<(McpPeer, Arc<Mutex<McpUpstreamSession>>)> = {
+        let mut map = registry.lock().await;
+        let keys: Vec<(uuid::Uuid, McpPeer)> = map
+            .keys()
+            .filter(|(sid, _)| *sid == session_id)
+            .cloned()
+            .collect();
+        keys.iter()
+            .filter_map(|k| map.remove(k).map(|e| (k.1, e)))
+            .collect()
+    };
+    let mut out = Vec::with_capacity(evicted.len());
+    for (peer, entry) in evicted {
+        let sess = entry.lock().await;
+        out.push(LocalSession {
+            peer,
+            session_id: sess.session_id.clone(),
+            negotiated: sess.negotiated.clone(),
+            url: sess.url.clone(),
+        });
+    }
+    out
 }
 
 /// Re-resolve one drained peer's credential the way a live call does — the
@@ -1469,24 +1772,29 @@ async fn terminal_peer_auth(
     }
 }
 
-/// The registry-free DELETE loop (client + policy + the resolver explicit, so a
-/// fake server can assert the DELETE — and the skip — without a full
+/// The registry-free, database-free DELETE loop (client + policy + the resolver
+/// explicit, so a fake server can assert the DELETE — and the skip — without a full
 /// `AppState`). Best-effort and bounded by `MCP_DELETE_TIMEOUT`; nothing here
 /// can block terminalization.
+///
+/// Returns the durable row ids whose DELETE was ACTUALLY ATTEMPTED, for the caller
+/// to stamp. A skipped target contributes nothing: an admission refusal or an
+/// unresolvable credential leaves the row live on purpose, because the upstream
+/// session really is still allocated and the sweeper — not an optimistic stamp — is
+/// what retires it.
 async fn delete_upstream_sessions<F, Fut>(
     client: &reqwest::Client,
     policy: &crate::egress::EgressPolicy,
-    drained: Vec<(McpPeer, Arc<Mutex<McpUpstreamSession>>)>,
+    targets: Vec<TeardownTarget>,
     resolve_auth: F,
-) where
+) -> Vec<uuid::Uuid>
+where
     F: Fn(McpPeer, String) -> Fut,
     Fut: std::future::Future<Output = Result<Option<BrokeredAuth>, String>>,
 {
-    for (peer, entry) in drained {
-        let sess = entry.lock().await;
-        let (Some(sid), url) = (sess.session_id.as_deref(), sess.url.as_str()) else {
-            continue;
-        };
+    let mut attempted = Vec::new();
+    for t in targets {
+        let url = t.url.as_str();
         // Egress admission stays in front of the dial — and ahead of the
         // resolution, so a url we would refuse never mints a token.
         if crate::egress::admit_url(url, policy).is_err() {
@@ -1496,7 +1804,7 @@ async fn delete_upstream_sessions<F, Fut>(
         // deactivated owner, unavailable credential) means we must not send a
         // credential — and an unauthorized DELETE would just 401 — so skip it.
         // Termination is best-effort; the upstream expires the session itself.
-        let auth = match resolve_auth(peer, url.to_string()).await {
+        let auth = match resolve_auth(t.peer, url.to_string()).await {
             Ok(a) => a,
             Err(e) => {
                 tracing::debug!(target: "broker", "mcp session DELETE skipped (credential unavailable): {e}");
@@ -1506,17 +1814,24 @@ async fn delete_upstream_sessions<F, Fut>(
         let mut req = client
             .delete(url)
             .timeout(MCP_DELETE_TIMEOUT)
-            .header("mcp-session-id", sid);
+            .header("mcp-session-id", t.upstream_session_id.as_str());
         if let Some(a) = auth.as_ref() {
             req = req.header(a.header.as_str(), a.value.as_str());
         }
-        if !sess.negotiated.is_empty() {
-            req = req.header("mcp-protocol-version", sess.negotiated.as_str());
+        if let Some(v) = t.negotiated.as_deref().filter(|v| !v.is_empty()) {
+            req = req.header("mcp-protocol-version", v);
         }
+        // The row is stamped on ATTEMPT, not on success: a transport error means
+        // we cannot know whether the upstream saw it, and re-sending it forever
+        // from a background sweep is exactly the retry loop this design refuses.
         if let Err(e) = req.send().await {
             tracing::debug!(target: "broker", "mcp session DELETE failed (best-effort): {e}");
         }
+        if let Some(row_id) = t.row_id {
+            attempted.push(row_id);
+        }
     }
+    attempted
 }
 
 /// Which connection an SEP-835 `insufficient_scope` challenge may mark `error`
@@ -1787,6 +2102,7 @@ async fn call_tool(
     tool: &str,
     arguments: &Value,
     snapshot: Option<&str>,
+    recorder: Option<&SessionRecorder>,
 ) -> Result<(Value, bool, Option<Value>), CallErr> {
     let result = managed_call(
         client,
@@ -1797,6 +2113,7 @@ async fn call_tool(
         "tools/call",
         json!({ "name": tool, "arguments": arguments }),
         snapshot,
+        recorder,
     )
     .await?;
     let is_error = result
@@ -1880,10 +2197,21 @@ pub async fn call_tool_auth(
         Ok(h) => h,
         Err(refused) => return refused,
     };
-    let entry = match brokered_connection_id(server) {
-        Some(cid) => session_entry(state, run_session, McpPeer::Conn(cid), url).await,
+    // Phase F (Task 3): a keyed peer is teardown-tracked durably; a credential-free
+    // legacy bundle is not — it has no peer key, keys no registry entry, and is
+    // therefore never drained or DELETEd. `None` here states that explicitly.
+    let (entry, recorder) = match brokered_connection_id(server) {
+        Some(cid) => (
+            session_entry(state, run_session, McpPeer::Conn(cid), url).await,
+            Some(SessionRecorder::new(
+                state,
+                scope,
+                run_session,
+                McpPeer::Conn(cid),
+            )),
+        ),
         // Credential-free legacy bundle: no connection to key on — throwaway.
-        None => Arc::new(Mutex::new(McpUpstreamSession::fresh(url))),
+        None => (Arc::new(Mutex::new(McpUpstreamSession::fresh(url))), None),
     };
     let client = &state.egress_http;
     let policy = &state.egress_policy;
@@ -1897,6 +2225,7 @@ pub async fn call_tool_auth(
         tool,
         arguments,
         None,
+        recorder.as_ref(),
     )
     .await;
     state
@@ -1927,6 +2256,7 @@ pub async fn call_tool_auth(
                         tool,
                         arguments,
                         None,
+                        recorder.as_ref(),
                     )
                     .await;
                     state
@@ -1984,7 +2314,11 @@ pub async fn call_tool_for_conn(
         Ok(h) => h,
         Err(refused) => return refused,
     };
-    let entry = session_entry(state, binding.session_id, McpPeer::Binding(binding.id), url).await;
+    let peer = McpPeer::Binding(binding.id);
+    let entry = session_entry(state, binding.session_id, peer, url).await;
+    // Phase F (Task 3): mirror the negotiated session id so ANY replica can DELETE
+    // it at teardown. Identity only — never a credential (invariants 9, 22).
+    let recorder = SessionRecorder::new(state, scope, binding.session_id, peer);
     let client = &state.egress_http;
     let policy = &state.egress_policy;
     // Task 3 (Gap 12): the frozen `BrokeredSurface.protocol_version` the gate
@@ -2002,6 +2336,7 @@ pub async fn call_tool_for_conn(
         tool,
         arguments,
         snapshot,
+        Some(&recorder),
     )
     .await;
     state
@@ -2038,6 +2373,7 @@ pub async fn call_tool_for_conn(
                         tool,
                         arguments,
                         snapshot,
+                        Some(&recorder),
                     )
                     .await;
                     state
@@ -2723,7 +3059,18 @@ mod tests {
         let client = crate::egress::build_egress_http(&policy);
         let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
         let outcome = outcome_from_call(
-            call_tool(&client, &policy, &url, None, &entry, "x", &json!({}), None).await,
+            call_tool(
+                &client,
+                &policy,
+                &url,
+                None,
+                &entry,
+                "x",
+                &json!({}),
+                None,
+                None,
+            )
+            .await,
         );
         jh.abort();
         assert!(
@@ -2887,7 +3234,18 @@ mod tests {
             let host = governor_gate(&gov, t, c, &url)
                 .unwrap_or_else(|e| panic!("dial {i} must be admitted, got {e:?}"));
             let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
-            let r = call_tool(&client, &policy, &url, None, &entry, "x", &json!({}), None).await;
+            let r = call_tool(
+                &client,
+                &policy,
+                &url,
+                None,
+                &entry,
+                "x",
+                &json!({}),
+                None,
+                None,
+            )
+            .await;
             assert!(
                 matches!(r, Err(CallErr::UpstreamUnavailable(_))),
                 "dial {i} must classify as an upstream-health failure, got {r:?}"
@@ -2954,7 +3312,18 @@ mod tests {
             let host = governor_gate(&gov, t, c, &url).unwrap_or_else(|e| {
                 panic!("an isError result must never open the breaker (dial {i}): {e:?}")
             });
-            let r = call_tool(&client, &policy, &url, None, &entry, "x", &json!({}), None).await;
+            let r = call_tool(
+                &client,
+                &policy,
+                &url,
+                None,
+                &entry,
+                "x",
+                &json!({}),
+                None,
+                None,
+            )
+            .await;
             assert!(
                 matches!(&r, Ok((_, true, _))),
                 "dial {i} must be a real isError RESULT, got {r:?}"
@@ -3304,6 +3673,7 @@ mod tests {
             "tools/call",
             json!({ "name": "x", "arguments": {} }),
             None,
+            None,
         )
         .await;
         jh.abort();
@@ -3357,6 +3727,7 @@ mod tests {
                     &entry,
                     "tools/call",
                     json!({ "name": "x", "arguments": {} }),
+                    None,
                     None,
                 )
                 .await
@@ -3416,6 +3787,7 @@ mod tests {
                     "tools/call",
                     json!({ "name": "x", "arguments": {} }),
                     Some(snapshot),
+                    None,
                 )
                 .await
                 .map_err(|e| e.into_msg())
@@ -3517,6 +3889,7 @@ mod tests {
             "tools/call",
             json!({ "name": "x", "arguments": {} }),
             Some("2025-11-25"),
+            None,
         )
         .await;
         jh.abort();
@@ -3575,6 +3948,7 @@ mod tests {
             "tools/call",
             json!({ "name": "x", "arguments": {} }),
             None,
+            None,
         )
         .await;
         jh.abort();
@@ -3600,6 +3974,7 @@ mod tests {
                 &entry,
                 "tools/call",
                 json!({ "name": "x", "arguments": {} }),
+                None,
                 None,
             )
             .await
@@ -3661,6 +4036,7 @@ mod tests {
             "tools/call",
             json!({ "name": "x", "arguments": {} }),
             None,
+            None,
         )
         .await;
         jh.abort();
@@ -3703,6 +4079,7 @@ mod tests {
             &entry,
             "tools/call",
             json!({ "name": "x", "arguments": {} }),
+            None,
             None,
         )
         .await;
@@ -3755,6 +4132,7 @@ mod tests {
             "tools/call",
             json!({ "name": "x", "arguments": {} }),
             None,
+            None,
         )
         .await;
         jh.abort();
@@ -3801,10 +4179,19 @@ mod tests {
         let policy = dev_policy();
         let client = crate::egress::build_egress_http(&policy);
         let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
-        let (content, is_error, structured) =
-            call_tool(&client, &policy, &url, None, &entry, "x", &json!({}), None)
-                .await
-                .expect("call ok");
+        let (content, is_error, structured) = call_tool(
+            &client,
+            &policy,
+            &url,
+            None,
+            &entry,
+            "x",
+            &json!({}),
+            None,
+            None,
+        )
+        .await
+        .expect("call ok");
         jh.abort();
         assert!(count_rpc(&records, "tools/call") > 0, "dead fake");
         assert!(!is_error);
@@ -3846,6 +4233,7 @@ mod tests {
             "tools/call",
             json!({ "name": "x", "arguments": {} }),
             None,
+            None,
         )
         .await;
         jh.abort();
@@ -3880,9 +4268,24 @@ mod tests {
         policy: &crate::egress::EgressPolicy,
         session_id: uuid::Uuid,
         resolved: Result<Option<(&'static str, &'static str)>, &'static str>,
-    ) {
+    ) -> Vec<uuid::Uuid> {
+        cleanup_with_rows(registry, client, policy, session_id, resolved, Vec::new()).await
+    }
+
+    /// As above, plus the DURABLE rows the production path reads (Phase F, Task 3).
+    /// Returns the row ids whose DELETE was actually ATTEMPTED — production stamps
+    /// exactly these.
+    async fn cleanup_with_rows(
+        registry: &crate::state::McpSessionRegistry,
+        client: &reqwest::Client,
+        policy: &crate::egress::EgressPolicy,
+        session_id: uuid::Uuid,
+        resolved: Result<Option<(&'static str, &'static str)>, &'static str>,
+        rows: Vec<fluidbox_db::mcp_sessions::UpstreamSessionRow>,
+    ) -> Vec<uuid::Uuid> {
         let drained = drain_run_sessions(registry, session_id).await;
-        delete_upstream_sessions(client, policy, drained, move |_peer, _url| async move {
+        let targets = union_teardown(drained, rows);
+        delete_upstream_sessions(client, policy, targets, move |_peer, _url| async move {
             match resolved {
                 Ok(Some((header, value))) => Ok(Some(BrokeredAuth {
                     generation: 1,
@@ -3894,7 +4297,31 @@ mod tests {
                 Err(e) => Err(e.to_string()),
             }
         })
-        .await;
+        .await
+    }
+
+    /// A durable `mcp_upstream_sessions` row as the teardown query returns it.
+    fn durable_row(
+        run: uuid::Uuid,
+        peer: McpPeer,
+        upstream: &str,
+        url: &str,
+    ) -> fluidbox_db::mcp_sessions::UpstreamSessionRow {
+        let (peer_kind, peer_id) = peer.parts();
+        fluidbox_db::mcp_sessions::UpstreamSessionRow {
+            id: uuid::Uuid::now_v7(),
+            tenant_id: uuid::Uuid::now_v7(),
+            session_id: run,
+            peer_kind: peer_kind.to_string(),
+            peer_id,
+            replica: uuid::Uuid::now_v7(),
+            upstream_session_id: upstream.to_string(),
+            endpoint_url: url.to_string(),
+            protocol_version: Some("2025-11-25".into()),
+            opened_at: chrono::Utc::now(),
+            deleted_at: None,
+            delete_outcome: None,
+        }
     }
 
     /// One registry entry for `run` with a live server-issued session id at `url`.
@@ -4073,6 +4500,285 @@ mod tests {
         assert!(
             bad_registry.lock().await.is_empty(),
             "eviction must happen even when the DELETE is skipped"
+        );
+    }
+
+    // ── Cross-replica teardown (Phase F, Task 3) ────────────────────────────
+
+    #[test]
+    fn a_sessionless_upstream_owes_no_durable_row() {
+        // THE "no session id ⇒ no row" rule, and the only place it is decided. A
+        // server that issues no `Mcp-Session-Id` has nothing to DELETE, so a row
+        // for it could never be satisfied and `deleted_at is null` would stop
+        // meaning "still allocated upstream".
+        let mut sess = McpUpstreamSession::fresh("https://up/mcp");
+        sess.negotiated = "2025-11-25".into();
+        assert_eq!(
+            recordable(&sess),
+            None,
+            "a negotiated-but-sessionless upstream must not be recorded"
+        );
+        // An empty header value is the same thing wearing a string.
+        sess.session_id = Some(String::new());
+        assert_eq!(
+            recordable(&sess),
+            None,
+            "an empty session id is no session id"
+        );
+
+        sess.session_id = Some("up-1".into());
+        assert_eq!(recordable(&sess), Some(("up-1", Some("2025-11-25"))));
+        // Not-yet-negotiated is stored as NULL, never as the empty-string sentinel.
+        sess.negotiated.clear();
+        assert_eq!(recordable(&sess), Some(("up-1", None)));
+    }
+
+    #[test]
+    fn the_durable_mirror_is_owed_once_per_negotiation() {
+        let mut s = McpUpstreamSession::fresh("https://u/mcp");
+        assert!(owes_record(&s), "a fresh session owes the mirror a write");
+        s.negotiated = "2025-11-25".into();
+        s.session_id = Some("up-1".into());
+        assert!(
+            !owes_record(&s),
+            "a later call on an already-negotiated session must NOT re-write: the upsert \
+             REVIVES a deleted row, so a write overlapping terminal teardown would resurrect \
+             a session no teardown will revisit"
+        );
+        s.reset();
+        assert!(
+            owes_record(&s),
+            "the 404-with-session reinit clears `negotiated`, so the NEW session id is recorded"
+        );
+    }
+
+    #[test]
+    fn teardown_unions_another_replicas_rows_with_the_local_map() {
+        // THE point of the task. Replica B finalizes a run whose brokered calls all
+        // happened on replica A: B's map is empty, and before Phase F that meant no
+        // DELETE was ever sent.
+        let run = uuid::Uuid::now_v7();
+        let peer_a = McpPeer::Binding(uuid::Uuid::now_v7());
+        let peer_b = McpPeer::Conn(uuid::Uuid::now_v7());
+        let targets = union_teardown(
+            Vec::new(),
+            vec![
+                durable_row(run, peer_a, "up-a", "https://a/mcp"),
+                durable_row(run, peer_b, "up-b", "https://b/mcp"),
+            ],
+        );
+        assert_eq!(
+            targets.len(),
+            2,
+            "both replicas' sessions are owed a DELETE"
+        );
+        assert_eq!(
+            targets
+                .iter()
+                .map(|t| t.upstream_session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["up-a", "up-b"]
+        );
+        assert!(
+            targets.iter().all(|t| t.row_id.is_some()),
+            "a row-sourced target must carry its row id, or the row can never be stamped"
+        );
+        assert_eq!(
+            targets[0].peer, peer_a,
+            "the peer must round-trip — teardown re-resolves the credential THROUGH it"
+        );
+        assert_eq!(targets[1].peer, peer_b);
+    }
+
+    #[test]
+    fn our_own_row_and_our_own_registry_entry_are_one_target() {
+        // The replica that made the calls holds BOTH the map entry and the row it
+        // wrote. Two targets would mean two DELETEs for one upstream session and a
+        // stamp racing itself.
+        let run = uuid::Uuid::now_v7();
+        let peer = McpPeer::Binding(uuid::Uuid::now_v7());
+        let row = durable_row(run, peer, "up-1", "https://a/mcp");
+        let row_id = row.id;
+        let targets = union_teardown(
+            vec![LocalSession {
+                peer,
+                session_id: Some("up-1".into()),
+                negotiated: "2025-11-25".into(),
+                url: "https://a/mcp".into(),
+            }],
+            vec![row],
+        );
+        assert_eq!(targets.len(), 1, "one upstream session, one DELETE");
+        assert_eq!(
+            targets[0].row_id,
+            Some(row_id),
+            "the local entry must adopt its own row's id so the DELETE is stamped"
+        );
+
+        // …but a row for the SAME peer with a DIFFERENT upstream session id is a
+        // different session (ours from before a restart, or another replica's) and
+        // is owed its own DELETE.
+        let targets = union_teardown(
+            vec![LocalSession {
+                peer,
+                session_id: Some("up-1".into()),
+                negotiated: "2025-11-25".into(),
+                url: "https://a/mcp".into(),
+            }],
+            vec![durable_row(run, peer, "up-OLD", "https://a/mcp")],
+        );
+        assert_eq!(
+            targets.len(),
+            2,
+            "distinct upstream session ids are distinct sessions"
+        );
+    }
+
+    #[test]
+    fn union_drops_sessionless_locals_and_unmappable_rows() {
+        let run = uuid::Uuid::now_v7();
+        let peer = McpPeer::Conn(uuid::Uuid::now_v7());
+        // A local entry that never got a session id has nothing to DELETE.
+        assert!(union_teardown(
+            vec![LocalSession {
+                peer,
+                session_id: None,
+                negotiated: "2025-11-25".into(),
+                url: "https://a/mcp".into(),
+            }],
+            Vec::new(),
+        )
+        .is_empty());
+        // A row whose peer_kind we cannot map back is UNUSABLE — teardown resolves
+        // the credential through the peer — so it must be skipped, NOT emitted with
+        // a guessed peer and NOT stamped as if it had been torn down.
+        let mut bad = durable_row(run, peer, "up-x", "https://a/mcp");
+        bad.peer_kind = "sandbox".into();
+        assert!(union_teardown(Vec::new(), vec![bad]).is_empty());
+
+        // `Mcp-Session-Id:` with an EMPTY value parses as `Some("")` (header_str
+        // does not filter), and `recordable` already refuses to write a row for it.
+        // The union must agree, from BOTH sources — otherwise teardown sends a
+        // DELETE carrying an empty session id, which addresses nothing.
+        assert!(
+            union_teardown(
+                vec![LocalSession {
+                    peer,
+                    session_id: Some(String::new()),
+                    negotiated: "2025-11-25".into(),
+                    url: "https://a/mcp".into(),
+                }],
+                vec![durable_row(run, peer, "", "https://a/mcp")],
+            )
+            .is_empty(),
+            "an empty session id is no session id, in the map and in the table alike"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_row_from_another_replica_gets_a_real_delete_and_is_reported_attempted() {
+        // End-to-end over the DELETE loop: the replica finalizing the run holds an
+        // EMPTY registry and still terminates the upstream session, and reports the
+        // row id back so production can stamp exactly that row.
+        let handler: Handler = Arc::new(|_idx, _rec: &Recorded| FakeReply::empty(200));
+        let (url, records, jh) = spawn_fake(handler).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let run = uuid::Uuid::now_v7();
+        let row = durable_row(
+            run,
+            McpPeer::Binding(uuid::Uuid::now_v7()),
+            "remote-sid",
+            &url,
+        );
+        let row_id = row.id;
+        let empty: crate::state::McpSessionRegistry = Mutex::new(HashMap::new());
+
+        let attempted = cleanup_with_rows(
+            &empty,
+            &client,
+            &policy,
+            run,
+            Ok(Some(("authorization", "Bearer terminal-tok"))),
+            vec![row],
+        )
+        .await;
+        jh.abort();
+
+        assert_eq!(
+            attempted,
+            vec![row_id],
+            "the attempted row must be reported so production stamps it"
+        );
+        assert_eq!(
+            count_http(&records, "DELETE"),
+            1,
+            "no DELETE fired (dead fake?)"
+        );
+        let recs = records.lock().unwrap();
+        let del = recs.iter().find(|r| r.http_method == "DELETE").unwrap();
+        assert_eq!(
+            del.headers.get("mcp-session-id").map(String::as_str),
+            Some("remote-sid"),
+            "the DELETE must name the OTHER replica's upstream session"
+        );
+        assert_eq!(
+            del.headers.get("authorization").map(String::as_str),
+            Some("Bearer terminal-tok"),
+            "the credential is re-resolved live — a row never stores one"
+        );
+        assert_eq!(
+            del.headers.get("mcp-protocol-version").map(String::as_str),
+            Some("2025-11-25"),
+            "the negotiated version rides the row and is echoed on the DELETE"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_skipped_delete_leaves_its_row_live() {
+        // Invariant 9: an unresolvable credential must NOT be sent, so no DELETE
+        // fires — and therefore the row must NOT be reported attempted. Stamping it
+        // would turn `deleted_at is null` from "still allocated upstream" into a
+        // hopeful guess, and the sweeper (the only thing that retires such a row)
+        // would never see it.
+        let handler: Handler = Arc::new(|_idx, _rec: &Recorded| FakeReply::empty(200));
+        let (url, records, jh) = spawn_fake(handler).await;
+        let policy = dev_policy();
+        let client = crate::egress::build_egress_http(&policy);
+        let run = uuid::Uuid::now_v7();
+        let peer = McpPeer::Binding(uuid::Uuid::now_v7());
+
+        // Positive control on the SAME fake: resolution succeeds ⇒ attempted.
+        let ok = cleanup_with_rows(
+            &Mutex::new(HashMap::new()),
+            &client,
+            &policy,
+            run,
+            Ok(Some(("authorization", "Bearer live"))),
+            vec![durable_row(run, peer, "up-ok", &url)],
+        )
+        .await;
+        assert_eq!(ok.len(), 1, "the control must fire (dead fake?)");
+        assert_eq!(count_http(&records, "DELETE"), 1);
+
+        let skipped = cleanup_with_rows(
+            &Mutex::new(HashMap::new()),
+            &client,
+            &policy,
+            run,
+            Err("connection is revoked — reconnect it"),
+            vec![durable_row(run, peer, "up-revoked", &url)],
+        )
+        .await;
+        jh.abort();
+        assert!(
+            skipped.is_empty(),
+            "a skipped DELETE must not be reported attempted — the row stays live for the sweeper"
+        );
+        assert_eq!(
+            count_http(&records, "DELETE"),
+            1,
+            "…and no DELETE was sent for it"
         );
     }
 
