@@ -438,23 +438,42 @@ pub async fn sweep_expired_llm_reservations(
 /// `tenant_id` so the caller ledgers the ambiguous outcome under the right scope.
 /// The correlated subquery adopts the tool name from the owning intent row so the
 /// `tool.brokered` audit event names the tool (NULL only if the intent is gone).
+///
+/// BOUNDED like the reservation sweep beside it (review, minor): `limit` +
+/// `for update skip locked`. Unbounded it was still CORRECT under concurrency (the
+/// `state = 'claimed'` CAS makes a double-sweep impossible), but a large backlog
+/// turned one 10 s tick into a single unbounded UPDATE plus N SERIAL ledger writes
+/// — the caller appends one `tool.brokered` per swept row, each its own
+/// transaction — so the tick could outrun its own period. A slice per tick drains
+/// at a steady rate instead; `order by claim_expires_at` keeps it FIFO so nothing
+/// starves, and `skip locked` keeps two replicas' slices disjoint.
 pub async fn sweep_stale_execution_claims(
     pool: &PgPool,
     now: DateTime<Utc>,
+    limit: i64,
 ) -> sqlx::Result<Vec<(Uuid, Uuid, String, Option<String>)>> {
     let mut tx = crate::worker_tx(pool).await?;
     let rows: Vec<(Uuid, Uuid, String, Option<String>)> = sqlx::query_as(
-        "update tool_execution_claims c
+        "with stale as (
+             select id from tool_execution_claims
+              where state = 'claimed' and claim_expires_at < $1
+              order by claim_expires_at
+              limit $2
+              for update skip locked
+         )
+         update tool_execution_claims c
             set state = 'ambiguous', completed_at = now(),
                 error_message = coalesce(c.error_message,
                     'execution claim expired — outcome unknown')
-          where c.state = 'claimed' and c.claim_expires_at < $1
+           from stale s
+          where c.id = s.id and c.state = 'claimed'
         returning c.tenant_id, c.session_id, c.tool_call_id,
                   (select a.tool from approvals a
                     where a.session_id = c.session_id
                       and a.tool_call_id = c.tool_call_id) as tool",
     )
     .bind(now)
+    .bind(limit)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;

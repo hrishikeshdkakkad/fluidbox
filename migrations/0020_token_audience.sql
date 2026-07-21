@@ -25,9 +25,34 @@
 -- psql token forgers (secrets-e2e.sh, bindings-e2e.sh) INSERT without an audience
 -- and must resolve to a universally-accepted token. auth.rs treats 'all' as
 -- satisfying every route (audience_allows), so both keep working unchanged.
+--
+-- LOCK DISCIPLINE (review, minor). `api_tokens` is the table EVERY internal
+-- request, PAT and session cookie resolves against, and both statements below take
+-- ACCESS EXCLUSIVE on it. Two rules keep that from becoming an auth outage:
+--
+--   (1) `lock_timeout` — matching 0018/0019/0021/0022. Without it, a long-running
+--       reader makes the ALTER queue, and an ACCESS EXCLUSIVE request in the lock
+--       queue blocks every LATER reader behind it: one slow query would stall all
+--       authentication for as long as it ran. With it the migration FAILS FAST
+--       (and is simply re-run) instead.
+--
+--   (2) `NOT VALID` on the CHECK. A validating ADD CONSTRAINT scans the whole
+--       table WHILE HOLDING that ACCESS EXCLUSIVE lock, so the outage window grows
+--       with the table. `NOT VALID` is a catalog-only change — O(1) under the lock
+--       — and Postgres still enforces the constraint on every subsequent INSERT
+--       and UPDATE; only pre-existing rows go unverified. Here there is nothing to
+--       verify: the ADD COLUMN wrote 'all' into every existing row earlier in this
+--       same transaction (its ACCESS EXCLUSIVE lock means nothing else could have
+--       written another value in between), and 'all' satisfies the check by
+--       construction. A later `ALTER TABLE api_tokens VALIDATE CONSTRAINT
+--       api_tokens_audience_check` can flip `convalidated` out-of-band whenever
+--       cosmetics demand — it takes only SHARE UPDATE EXCLUSIVE and blocks nobody.
+set local lock_timeout = '5s';
+
 alter table api_tokens
   add column audience text not null default 'all';
 
 alter table api_tokens
   add constraint api_tokens_audience_check
-  check (audience in ('all', 'llm', 'tool', 'control', 'workspace'));
+  check (audience in ('all', 'llm', 'tool', 'control', 'workspace'))
+  not valid;

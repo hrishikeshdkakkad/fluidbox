@@ -3840,10 +3840,12 @@ pub async fn transition_session_fenced(
 /// replica holds an UNEXPIRED lease: this driver must not mutate the session.
 ///
 /// **The epoch increments ONLY on an owner CHANGE.** A renew by the same owner
-/// keeps it, so a healthy driver's fence never moves under its own feet; a
-/// takeover (including re-taking a lease of ours that lapsed) bumps it, which
-/// instantly invalidates every mutation the previous holder had in flight. That
-/// asymmetry is what makes the epoch a fencing TOKEN rather than a counter.
+/// keeps it, so a healthy driver's fence never moves under its own feet.
+/// Re-taking a lease of OURS that merely lapsed (nobody stole it) also keeps the
+/// epoch — the bump is gated on the owner actually changing. A takeover by a
+/// DIFFERENT replica bumps it, which instantly invalidates every mutation the
+/// previous holder had in flight. That asymmetry is what makes the epoch a
+/// fencing TOKEN rather than a counter.
 ///
 /// Time-based takeover, exactly like `claim_finalization` — NEVER a Postgres
 /// advisory lock. The design rejects advisory locks here (`:1067-1072`): they are
@@ -4935,11 +4937,46 @@ pub async fn complete_tool_execution(
     Ok(res.rows_affected() == 1)
 }
 
+/// The outcome of [`reclaim_failed_before_send`] (Phase E, #33; review I1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReclaimOutcome {
+    /// This call won the re-claim: the row is `claimed` again and `attempt`
+    /// carries the (bumped) number of the dispatch the caller now owns.
+    Reclaimed { attempt: i32 },
+    /// The row is still `failed_before_send` and has SPENT its attempt budget —
+    /// no further dispatch may be taken for this `(session, tool_call_id,
+    /// input_digest)`. The caller answers with a terminal-shaped tool error.
+    Exhausted { attempt: i32 },
+    /// Somebody else moved the row (a concurrent re-claim won it, a dispatcher
+    /// re-settled it) or the session stopped accepting work — the caller polls.
+    Lost,
+}
+
 /// Re-claim a `failed_before_send` row for a fresh dispatch — the ONLY
 /// re-claimable state (positive proof nothing was sent). CAS
 /// `failed_before_send → claimed`, `attempt + 1`, fresh expiry, and the result
 /// columns reset, INSIDE the same sessions-`FOR UPDATE` nonterminal tx shape as
-/// [`claim_tool_execution`]. Returns true iff this call won the re-claim.
+/// [`claim_tool_execution`].
+///
+/// **BOUNDED (review I1).** `max_attempts` caps the dispatches ONE claim row may
+/// ever take: the CAS carries `attempt < $6`, so re-claiming is impossible past
+/// the cap no matter how many handlers race. Without it a sandbox looping
+/// `/tools/call` on one `tool_call_id` against a sick upstream re-claimed for
+/// free forever — a breaker refusal charges no budget and emits no ledger event,
+/// so each iteration cost only two exclusive `sessions`-row locks (this one plus
+/// [`claim_tool_execution`]'s), taken on the very row `transition_session`,
+/// `begin_finalization` and `append_event` need. The cap turns that unbounded
+/// churn into a small constant, and `attempt` — previously written and read by
+/// nothing — becomes the thing that bounds it.
+///
+/// HONEST SCOPE (review, minor): this function has NO reachable production caller
+/// today. `images/runner-lib/broker-shim.mjs` mints a fresh `bkr_<uuid>`
+/// `tool_call_id` for every MCP request, so a shipped runner never re-presents the
+/// same `(tool_call_id, input_digest)` and never lands on an existing claim row.
+/// The re-claimable property is therefore correct but VACUOUS in production; it
+/// exists for a harness that does re-present an id (the runner contract permits
+/// it, and `/permission`'s idempotency assumes it) and for the DB-gated tests.
+/// Keep it — and keep it bounded.
 pub async fn reclaim_failed_before_send(
     pool: &PgPool,
     scope: TenantScope,
@@ -4947,7 +4984,8 @@ pub async fn reclaim_failed_before_send(
     tool_call_id: &str,
     input_digest: &str,
     ttl_secs: i64,
-) -> sqlx::Result<bool> {
+    max_attempts: i32,
+) -> sqlx::Result<ReclaimOutcome> {
     let mut tx = scoped_tx(pool, scope).await?;
     let locked: Option<(String,)> =
         sqlx::query_as("select status from sessions where id = $1 and tenant_id = $2 for update")
@@ -4956,29 +4994,53 @@ pub async fn reclaim_failed_before_send(
             .fetch_optional(&mut *tx)
             .await?;
     let Some((status,)) = locked else {
-        return Ok(false);
+        return Ok(ReclaimOutcome::Lost);
     };
     if !SessionStatus::parse(&status).is_some_and(|s| s.accepts_work()) {
-        return Ok(false);
+        return Ok(ReclaimOutcome::Lost);
     }
     let expires = Utc::now() + chrono::Duration::seconds(ttl_secs.max(1));
-    let res = sqlx::query(
+    let reclaimed: Option<i32> = sqlx::query_scalar(
         "update tool_execution_claims
             set state = 'claimed', attempt = attempt + 1, claim_expires_at = $5,
                 claimed_at = now(), completed_at = null, result_digest = null,
                 is_error = null, result_content = null, error_message = null
           where session_id = $1 and tool_call_id = $2 and input_digest = $3
-            and tenant_id = $4 and state = 'failed_before_send'",
+            and tenant_id = $4 and state = 'failed_before_send' and attempt < $6
+        returning attempt",
     )
     .bind(session_id)
     .bind(tool_call_id)
     .bind(input_digest)
     .bind(scope.tenant_id())
     .bind(expires)
-    .execute(&mut *tx)
+    .bind(max_attempts)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(attempt) = reclaimed {
+        tx.commit().await?;
+        return Ok(ReclaimOutcome::Reclaimed { attempt });
+    }
+    // Zero rows: either the cap is spent or somebody else moved the row. Tell the
+    // two apart from the row itself so the caller can refuse TERMINALLY instead of
+    // polling for 30 s on a claim that will never move again.
+    let row: Option<(String, i32)> = sqlx::query_as(
+        "select state, attempt from tool_execution_claims
+          where session_id = $1 and tool_call_id = $2 and input_digest = $3 and tenant_id = $4",
+    )
+    .bind(session_id)
+    .bind(tool_call_id)
+    .bind(input_digest)
+    .bind(scope.tenant_id())
+    .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(res.rows_affected() == 1)
+    Ok(match row {
+        Some((state, attempt)) if state == "failed_before_send" && attempt >= max_attempts => {
+            ReclaimOutcome::Exhausted { attempt }
+        }
+        _ => ReclaimOutcome::Lost,
+    })
 }
 
 /// Read a claim by its natural key (the loser's bounded poll of an in-flight
@@ -13827,10 +13889,11 @@ mod tests {
         )
         .await
         .unwrap());
-        assert!(
-            reclaim_failed_before_send(&pool, scope, session_id, "fbs", "sha256:1", 600)
+        assert_eq!(
+            reclaim_failed_before_send(&pool, scope, session_id, "fbs", "sha256:1", 600, 3)
                 .await
                 .unwrap(),
+            ReclaimOutcome::Reclaimed { attempt: 2 },
             "a failed_before_send row must be re-claimable"
         );
         let row = get_tool_execution(&pool, scope, session_id, "fbs", "sha256:1")
@@ -13842,10 +13905,11 @@ mod tests {
 
         // Every OTHER state refuses the re-claim.
         // 'claimed' (the row we just re-claimed).
-        assert!(
-            !reclaim_failed_before_send(&pool, scope, session_id, "fbs", "sha256:1", 600)
+        assert_eq!(
+            reclaim_failed_before_send(&pool, scope, session_id, "fbs", "sha256:1", 600, 3)
                 .await
-                .unwrap()
+                .unwrap(),
+            ReclaimOutcome::Lost
         );
         // 'succeeded'.
         assert!(complete_tool_execution(
@@ -13860,10 +13924,11 @@ mod tests {
         )
         .await
         .unwrap());
-        assert!(
-            !reclaim_failed_before_send(&pool, scope, session_id, "fbs", "sha256:1", 600)
+        assert_eq!(
+            reclaim_failed_before_send(&pool, scope, session_id, "fbs", "sha256:1", 600, 3)
                 .await
-                .unwrap()
+                .unwrap(),
+            ReclaimOutcome::Lost
         );
         // 'ambiguous' (a separate claim).
         let id2 = match claim_tool_execution(&pool, scope, session_id, "amb", "sha256:2", 600)
@@ -13885,10 +13950,88 @@ mod tests {
         )
         .await
         .unwrap());
-        assert!(
-            !reclaim_failed_before_send(&pool, scope, session_id, "amb", "sha256:2", 600)
+        assert_eq!(
+            reclaim_failed_before_send(&pool, scope, session_id, "amb", "sha256:2", 600, 3)
                 .await
-                .unwrap()
+                .unwrap(),
+            ReclaimOutcome::Lost
+        );
+        cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    /// Review I1: the re-claim budget is BOUNDED. A client that keeps
+    /// re-presenting one `(session, tool_call_id, input_digest)` against a sick
+    /// upstream must stop winning re-claims at the cap — that is what stops the
+    /// unmetered `sessions`-row lock churn — and the refusal must be
+    /// DISTINGUISHABLE from losing a race, so the caller can answer terminally
+    /// instead of polling a row that will never move again.
+    #[tokio::test]
+    async fn reclaim_is_capped_at_max_attempts() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        const CAP: i32 = 2;
+
+        let id = match claim_tool_execution(&pool, scope, session_id, "cap", "sha256:c", 600)
+            .await
+            .unwrap()
+        {
+            ClaimOutcome::Won { claim_id } => claim_id,
+            o => panic!("expected Won, got {o:?}"),
+        };
+        // Attempt 1 (the insert) failed before send → one re-claim is left.
+        assert!(complete_tool_execution(
+            &pool,
+            scope,
+            id,
+            "failed_before_send",
+            None,
+            Some(true),
+            None,
+            Some("connect refused"),
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            reclaim_failed_before_send(&pool, scope, session_id, "cap", "sha256:c", 600, CAP)
+                .await
+                .unwrap(),
+            ReclaimOutcome::Reclaimed { attempt: 2 },
+            "re-claims within the cap must still be granted"
+        );
+        // Attempt 2 also failed before send → the budget is spent.
+        assert!(complete_tool_execution(
+            &pool,
+            scope,
+            id,
+            "failed_before_send",
+            None,
+            Some(true),
+            None,
+            Some("connect refused"),
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            reclaim_failed_before_send(&pool, scope, session_id, "cap", "sha256:c", 600, CAP)
+                .await
+                .unwrap(),
+            ReclaimOutcome::Exhausted { attempt: CAP },
+            "past the cap the re-claim must be refused, not granted"
+        );
+        // …and refused WITHOUT churning the row: it stays exactly where the last
+        // dispatch left it, so nothing accumulates per rejected retry.
+        let row = get_tool_execution(&pool, scope, session_id, "cap", "sha256:c")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (row.state.as_str(), row.attempt),
+            ("failed_before_send", CAP)
         );
         cleanup_sw_tenant(&pool, tenant).await;
     }
@@ -13921,7 +14064,7 @@ mod tests {
             .unwrap();
             tx.commit().await.unwrap();
         }
-        let swept = system_worker::sweep_stale_execution_claims(&pool, Utc::now())
+        let swept = system_worker::sweep_stale_execution_claims(&pool, Utc::now(), 200)
             .await
             .unwrap();
         assert!(
@@ -13973,7 +14116,7 @@ mod tests {
             .unwrap();
             tx.commit().await.unwrap();
         }
-        system_worker::sweep_stale_execution_claims(&pool, Utc::now())
+        system_worker::sweep_stale_execution_claims(&pool, Utc::now(), 200)
             .await
             .unwrap();
         // The dispatcher's late completion CAS finds no 'claimed' row → false.
@@ -14423,6 +14566,33 @@ mod tests {
             restamp_stmt.contains(ttl_stamp),
             "extend_delivery_claim must actually MOVE the deadline (`{ttl_stamp}`), \
              or the TTL still measures from the batch claim rather than this attempt"
+        );
+    }
+
+    /// Source guard for the review-I1 re-claim CAP. The behavioral test
+    /// (`reclaim_is_capped_at_max_attempts`) is DB-gated and self-skips without
+    /// `DATABASE_URL`, so deleting the predicate would pass a skipped suite
+    /// silently. Sliced to the STATEMENT — the doc comment above it explains the
+    /// cap at length and would satisfy a whole-file `contains` on its own.
+    #[test]
+    fn the_reclaim_attempt_cap_predicate_is_present() {
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("pub async fn reclaim_failed_before_send(")
+            .expect("the re-claim exists");
+        let end = src[start..]
+            .find(".bind(max_attempts)")
+            .map(|i| start + i)
+            .expect("the re-claim binds its cap");
+        let stmt = &src[start..end];
+        let cap = concat!("state = 'failed_before_send' and ", "attempt < $6");
+        assert!(
+            stmt.contains(cap),
+            "reclaim_failed_before_send's CAS must carry the attempt cap (`{cap}`). \
+             Without it a client looping /tools/call on ONE (tool_call_id, \
+             input_digest) against a sick upstream re-claims forever — free of \
+             budget, free of ledger, two exclusive sessions-row locks per \
+             iteration on the row cancellation itself needs."
         );
     }
 
