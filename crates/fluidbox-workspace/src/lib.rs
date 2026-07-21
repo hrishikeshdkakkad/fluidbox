@@ -22,6 +22,13 @@ use uuid::Uuid;
 
 pub mod archive;
 pub mod collect;
+/// Where the packed archive LIVES (Phase F, Task 4) — node-local files or an
+/// S3-compatible bucket. Behind the `store` feature so the in-pod `workspaced`
+/// binary never links an HTTP client or an async runtime.
+#[cfg(feature = "store")]
+pub mod sigv4;
+#[cfg(feature = "store")]
+pub mod store;
 
 /// The clone-URL egress policy (Phase E, E4), built server-side from the shared
 /// `EgressPolicy` and passed into materialization. The git fetch runs
@@ -50,6 +57,11 @@ pub use archive::{
     unpack_archive_reader, verify_archive, PackedArchive, StoredArchive,
 };
 pub use collect::{collect_diff, collect_diff_at, CollectedDiff, CollectionOutcome, DiffCaps};
+#[cfg(feature = "store")]
+pub use store::{
+    build_store, parse_store_config, validate_replicas, ArchiveKey, ArchiveRead, ArchiveStore,
+    ArchiveStoreConfig, S3Config, StoreError,
+};
 
 /// Directory (under the per-session workspace root) holding the pristine
 /// copy of the materialized `.git` — saved before the agent ever runs,

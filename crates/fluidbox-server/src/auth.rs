@@ -389,6 +389,354 @@ pub fn audience_allows(required: &str, actual: &str) -> bool {
     actual == AUD_ALL || actual == required
 }
 
+// ─── Workload identity (Phase F, Gap 6) ────────────────────────────────────
+//
+// WHAT THIS BINDS. Phase E narrowed the sandbox's ONE bearer into four
+// audience-scoped tokens, which bounds what a stolen credential can DO. It says
+// nothing about WHO holds it: any process anywhere that can reach `:8788` and
+// present the bytes is, to the control plane, the sandbox. The design has always
+// required "workload identity or mTLS in addition to run bearer tokens" (design
+// :1233-1240) and the threat model's T7 row says it outright. This binds a run's
+// credentials to the network identity the control plane itself recorded for the
+// workload it issued them to, so the same token presented from somewhere else is
+// refusable.
+//
+// WHAT IT IS NOT. A source address is a NETWORK fact, not a cryptographic one. It
+// is unforgeable only to the extent the network makes it so, and it identifies a
+// LOCATION, not a process. mTLS is the strictly stronger control and is the
+// disclosed follow-up; this is what can be built without a per-run PKI, a rustls
+// listener, and a client-certificate path through two Node runner images.
+//
+// THE PEER IS THE SOCKET PEER. NEVER A HEADER. Not `X-Forwarded-For`, not
+// `X-Real-IP`, not `Forwarded`, and NOT gated on `FLUIDBOX_TRUST_FORWARDED_FOR`
+// (which exists for the PUBLIC plane, where the peer really can be a trusted
+// reverse proxy). The reason is specific to this plane: the entity we are trying
+// to identify is the entity sending the request. A sandbox can set any header it
+// likes, so honouring one here would let the caller assert its own identity —
+// a control that authenticates the attacker's claim about themselves is worse
+// than no control, because it reads as protection in the threat model while
+// providing none. If a proxy is ever interposed on `:8788`, this control must be
+// redesigned (the proxy's own identity becomes the peer for every run), not
+// patched by trusting a header.
+
+/// The `SandboxHandle::attrs` key a provider reports workload addresses under.
+/// This is a CONTRACT with the provider crates; a test below `include_str!`s the
+/// Kubernetes provider and fails if the two sides ever disagree, so renaming one
+/// alone cannot silently disable the binding.
+pub const WORKLOAD_ADDR_ATTR: &str = "workload_addrs";
+
+/// The refusal body code for a workload-identity mismatch.
+///
+/// DELIBERATELY NOT `wrong_audience`. `images/runner-lib/contract.mjs:51-61`
+/// keys a FATAL process abort on that exact code (by body substring, not status),
+/// with a diagnostic that says "this runner image predates the audience-scoped
+/// credential split". Reusing it would make a workload mismatch abort the run
+/// with a confidently wrong explanation. The substring `wrong_workload` does not
+/// contain `wrong_audience`, so the runner's check cannot false-positive on it —
+/// pinned by a test below.
+///
+/// WHAT THE RUNNER DOES WITH IT TODAY: nothing specific. It has no branch for this
+/// code, so a 403 carrying it falls into the ordinary "the session is gone"
+/// handling — `/permission` answers a hard `deny` logged as "session terminal",
+/// token renew stops, heartbeats are swallowed until the watchdog terminalizes the
+/// run, and the facade's 403 fails the model call (so spend does NOT continue past
+/// the refusal). For a genuine replay from elsewhere that is the right outcome. For
+/// a FALSE POSITIVE it is a correct-but-misdiagnosed death: the run ends and the
+/// runner-side log blames session termination. Accepted for this phase because the
+/// server-side warning names the real cause on every request and `observe` mode
+/// exists to find false positives before anything is refused. Teaching runner-lib
+/// this code (a named diagnostic, like `EXIT_AUDIENCE_MISMATCH`) is the follow-up;
+/// a test below asserts the runner does not know it yet, so that stays a decision.
+pub const WRONG_WORKLOAD_CODE: &str = "wrong_workload";
+
+/// Pull the provider-reported workload addresses out of a persisted
+/// [`SandboxHandle`]. Tolerant by design — a provider that reports nothing (the
+/// Docker provider) and a provider that reports a list are both ordinary — but it
+/// never invents: a non-array, or an array of non-strings, yields what it can and
+/// nothing more.
+pub fn workload_addrs_from_handle(handle: &fluidbox_core::traits::SandboxHandle) -> Vec<String> {
+    handle
+        .attrs
+        .get(WORKLOAD_ADDR_ATTR)
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The socket peer of a request, or `None` if the connect-info extension is
+/// absent. Reads `parts.extensions` ONLY — see the header discussion above.
+///
+/// `main.rs` serves both planes with `into_make_service_with_connect_info::<SocketAddr>()`,
+/// so `None` here is a WIRING DEFECT, not a deployment state. It is handled as
+/// [`WorkloadVerdict::Unverifiable`] (fail-closed under `enforce`) rather than as
+/// "no opinion", because a control that silently switches itself off when someone
+/// refactors the service builder is the failure this whole module exists to avoid.
+pub fn peer_addr(parts: &Parts) -> Option<std::net::SocketAddr> {
+    parts
+        .extensions
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0)
+}
+
+/// The socket peer, as a handler parameter. Infallible: a missing connect-info
+/// extension yields `None` rather than a rejection, so the decision about what
+/// absence MEANS is made in one place ([`workload_verdict`]) instead of by an
+/// extractor rejection nobody would notice.
+#[derive(Debug, Clone, Copy)]
+pub struct PeerAddr(pub Option<std::net::SocketAddr>);
+
+impl<S: Send + Sync> FromRequestParts<S> for PeerAddr {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(PeerAddr(peer_addr(parts)))
+    }
+}
+
+/// The outcome of checking one request's socket peer against the workload
+/// identity recorded for its run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkloadVerdict {
+    /// `FLUIDBOX_WORKLOAD_IDENTITY=off` — not evaluated at all.
+    Disabled,
+    /// No provider-asserted identity for this run: the Docker provider, a session
+    /// provisioned before migration 0025, an adopted orphan, or a provider whose
+    /// API did not report an address. ADMITTED, and counted. See the ruling below.
+    Unbindable,
+    /// The peer is one of the recorded addresses.
+    Match,
+    /// The peer is a valid address and is NOT one of the recorded addresses.
+    Mismatch,
+    /// An identity WAS recorded but this request cannot be judged against it:
+    /// the connect-info extension is missing (a wiring defect), or every recorded
+    /// address is unparseable (a provider defect). Treated as a mismatch under
+    /// `enforce` — we know what this run's identity should be and cannot confirm
+    /// it, which is the definition of failing closed.
+    Unverifiable,
+}
+
+impl WorkloadVerdict {
+    /// Stable label for logs and counters.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkloadVerdict::Disabled => "disabled",
+            WorkloadVerdict::Unbindable => "unbindable",
+            WorkloadVerdict::Match => "match",
+            WorkloadVerdict::Mismatch => "mismatch",
+            WorkloadVerdict::Unverifiable => "unverifiable",
+        }
+    }
+}
+
+/// Normalize an address for comparison. An IPv4-mapped IPv6 peer
+/// (`::ffff:10.4.2.9`, which is what a dual-stack listener reports for an IPv4
+/// connection) and the IPv4 literal a provider records (`10.4.2.9`) are the SAME
+/// host; comparing them as strings, or as un-normalized `IpAddr`s, would call that
+/// a mismatch and take down every run on a dual-stack cluster.
+fn canonical_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => std::net::IpAddr::V4(v4),
+            None => std::net::IpAddr::V6(v6),
+        },
+        v4 => v4,
+    }
+}
+
+/// Decide one request. PURE — no I/O, no clock, no counters — so the whole matrix
+/// is unit-testable and the impure wrapper below has nothing to get wrong.
+///
+/// The SOURCE PORT is deliberately ignored: it is chosen per-connection by the
+/// client's kernel and carries no identity.
+pub fn workload_verdict(
+    mode: crate::config::WorkloadIdentityMode,
+    recorded: &[String],
+    peer: Option<std::net::SocketAddr>,
+) -> WorkloadVerdict {
+    if !mode.evaluates() {
+        return WorkloadVerdict::Disabled;
+    }
+    if recorded.is_empty() {
+        return WorkloadVerdict::Unbindable;
+    }
+    let parsed: Vec<std::net::IpAddr> = recorded
+        .iter()
+        .filter_map(|s| s.trim().parse::<std::net::IpAddr>().ok())
+        .map(canonical_ip)
+        .collect();
+    // Something was recorded and NONE of it is an address. Checked before the peer
+    // so a provider defect is reported as a provider defect, not as a mismatch.
+    if parsed.is_empty() {
+        return WorkloadVerdict::Unverifiable;
+    }
+    let Some(peer) = peer else {
+        return WorkloadVerdict::Unverifiable;
+    };
+    if parsed.contains(&canonical_ip(peer.ip())) {
+        WorkloadVerdict::Match
+    } else {
+        WorkloadVerdict::Mismatch
+    }
+}
+
+/// Whether a verdict REFUSES the request in this mode. PURE, and separate from
+/// [`workload_verdict`] on purpose: `observe` must compute the identical verdict
+/// that `enforce` would, so what an operator watches is exactly what they later
+/// turn on — not a second code path that merely resembles it.
+///
+/// [`WorkloadVerdict::Unbindable`] never refuses, in ANY mode. That is the ruling
+/// on "what if no address was recorded", and it is deliberate:
+///
+///   * We do NOT do trust-on-first-use. TOFU would pin whatever address makes the
+///     first authenticated call, which means the identity is asserted by the
+///     CLAIMANT rather than recorded by the PROVISIONER — the same defect as
+///     trusting a forwarded-for header, one layer up. Its race is real and its
+///     losing side is worse than the status quo: an attacker who exfiltrates the
+///     token before the sandbox's first call pins THEIR address, gains an
+///     EXCLUSIVE credential, and locks the legitimate workload out for the rest of
+///     the run. Today that same attacker gets a credential they SHARE with a
+///     running sandbox. TOFU would therefore convert a confidentiality failure
+///     into a confidentiality failure plus a denial of service, in exchange for
+///     stopping an attacker who steals the token strictly LATER than the first
+///     call — a narrower window than it appears, since the first call happens
+///     within seconds of the pod starting.
+///   * Refusing unbindable runs outright would mean `enforce` breaks every Docker
+///     deployment, every in-flight session, and every adopted orphan — none of
+///     which are attacks. A control that cannot be switched on does not protect
+///     anything.
+///
+/// What "admit unbindable" therefore does NOT stop: token theft against any run
+/// whose provider reports no address. That is exactly today's exposure, unchanged
+/// — the gain is that it is now COUNTED and logged, so an operator can see how
+/// much of their fleet the control actually covers instead of assuming all of it.
+pub fn workload_refused(
+    mode: crate::config::WorkloadIdentityMode,
+    verdict: WorkloadVerdict,
+) -> bool {
+    matches!(mode, crate::config::WorkloadIdentityMode::Enforce)
+        && matches!(
+            verdict,
+            WorkloadVerdict::Mismatch | WorkloadVerdict::Unverifiable
+        )
+}
+
+/// Per-process verdict tallies. Not a `state.rs` field on purpose (that file is
+/// not this task's to change), and per-replica like the egress governor's — the
+/// numbers answer "is this control covering my fleet, and is it about to refuse
+/// anything", which is a per-replica question an operator asks of logs.
+#[derive(Default)]
+pub struct WorkloadCounts {
+    pub unbindable: std::sync::atomic::AtomicU64,
+    pub matched: std::sync::atomic::AtomicU64,
+    pub mismatch: std::sync::atomic::AtomicU64,
+    pub unverifiable: std::sync::atomic::AtomicU64,
+    pub refused: std::sync::atomic::AtomicU64,
+}
+
+static WORKLOAD_COUNTS: std::sync::LazyLock<WorkloadCounts> =
+    std::sync::LazyLock::new(WorkloadCounts::default);
+
+/// Read the tallies (operators via the boot/periodic logs; tests directly).
+pub fn workload_counts() -> &'static WorkloadCounts {
+    &WORKLOAD_COUNTS
+}
+
+/// Log the unbindable running total at 1, 10, 100, … rather than on every
+/// request. An unbindable run is the NORMAL state on the Docker provider, so
+/// logging each one would be pure noise and logging none would make the coverage
+/// gap invisible; powers of ten give an operator a visible, order-of-magnitude
+/// signal at bounded cost. Pure, so the schedule is testable.
+pub fn should_log_unbindable(count: u64) -> bool {
+    let mut n = count;
+    if n == 0 {
+        return false;
+    }
+    while n.is_multiple_of(10) {
+        n /= 10;
+    }
+    n == 1
+}
+
+/// Evaluate the binding for one internal-gateway request, record it, and refuse
+/// if the mode says to. The ONE place a workload refusal is produced.
+///
+/// Called from the three places a sandbox credential is resolved: the
+/// [`SessionAuth`] extractor (which covers six of the seven internal routes),
+/// `facade::messages`, and `internal::result` — the two handlers that resolve a
+/// session token by hand and so are not covered by the extractor.
+pub fn enforce_workload_identity(
+    mode: crate::config::WorkloadIdentityMode,
+    session_id: Uuid,
+    recorded: &[String],
+    peer: Option<std::net::SocketAddr>,
+    route: &str,
+) -> Result<(), ApiError> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let verdict = workload_verdict(mode, recorded, peer);
+    let refused = workload_refused(mode, verdict);
+    let counts = workload_counts();
+    match verdict {
+        WorkloadVerdict::Disabled => return Ok(()),
+        WorkloadVerdict::Match => {
+            counts.matched.fetch_add(1, Relaxed);
+        }
+        WorkloadVerdict::Unbindable => {
+            let n = counts.unbindable.fetch_add(1, Relaxed) + 1;
+            if should_log_unbindable(n) {
+                tracing::info!(
+                    target: "workload_identity",
+                    verdict = verdict.as_str(),
+                    "{n} internal-gateway request(s) so far had NO recorded workload identity \
+                     and were admitted on the bearer token alone (mode={}); these runs are not \
+                     covered by workload-identity enforcement",
+                    mode.as_str()
+                );
+            }
+        }
+        WorkloadVerdict::Mismatch => {
+            counts.mismatch.fetch_add(1, Relaxed);
+            // Always logged, never throttled: by construction this is either an
+            // attack or a deployment shape we got wrong, and both are rare enough
+            // that every instance is worth a line. `observe` mode exists to
+            // produce exactly these without refusing anything.
+            tracing::warn!(
+                target: "workload_identity",
+                verdict = verdict.as_str(),
+                "workload identity MISMATCH on {route} for session {session_id}: peer {} is not \
+                 among the recorded workload address(es) {recorded:?} (mode={}, {})",
+                peer.map(|p| p.ip().to_string()).unwrap_or_else(|| "<none>".into()),
+                mode.as_str(),
+                if refused { "REFUSED" } else { "admitted" },
+            );
+        }
+        WorkloadVerdict::Unverifiable => {
+            counts.unverifiable.fetch_add(1, Relaxed);
+            tracing::error!(
+                target: "workload_identity",
+                verdict = verdict.as_str(),
+                "workload identity UNVERIFIABLE on {route} for session {session_id}: recorded \
+                 address(es) {recorded:?}, socket peer {} — either the connect-info extension \
+                 is not wired on this listener or the provider recorded a non-address \
+                 (mode={}, {})",
+                peer.map(|p| p.ip().to_string()).unwrap_or_else(|| "<none>".into()),
+                mode.as_str(),
+                if refused { "REFUSED" } else { "admitted" },
+            );
+        }
+    }
+    if refused {
+        counts.refused.fetch_add(1, Relaxed);
+        return Err(ApiError::Forbidden(WRONG_WORKLOAD_CODE.into()));
+    }
+    Ok(())
+}
+
 /// Per-session authentication for the internal gateway. Resolves the bearer
 /// token to the session it belongs to (unexpired, unrevoked) AND its owning
 /// tenant — `scope` is derived from the token's row, never `state.tenant_id`,
@@ -434,6 +782,20 @@ impl FromRequestParts<AppState> for SessionAuth {
         let auth = fluidbox_db::session_for_token(&state.pool, &token)
             .await?
             .ok_or(ApiError::Unauthorized)?;
+        // Gap 6 (Phase F): bind the credential to the workload it was issued to.
+        // Here rather than per-handler because this extractor is the FIRST thing
+        // six of the seven internal routes run — including `/events`, the one route
+        // that never loads the session row, whose recorded addresses ride the token
+        // lookup above at the cost of one primary-key join. Refuses BEFORE the
+        // audience check on purpose: a caller at the wrong address should learn
+        // nothing about which audiences exist.
+        enforce_workload_identity(
+            state.cfg.workload_identity,
+            auth.session_id,
+            &auth.workload_addrs,
+            peer_addr(parts),
+            parts.uri.path(),
+        )?;
         Ok(SessionAuth {
             session_id: auth.session_id,
             token,
@@ -615,5 +977,501 @@ mod tests {
             PUB,
         )
         .is_err());
+    }
+
+    // ─── Workload identity (Phase F, Gap 6) ────────────────────────────────
+
+    use crate::config::WorkloadIdentityMode as Mode;
+    use std::net::SocketAddr;
+
+    fn sock(s: &str) -> Option<SocketAddr> {
+        Some(s.parse().expect("test address"))
+    }
+    fn rec(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// This file's PRODUCTION half. The source guards below count occurrences, and
+    /// a test module that quotes the strings it counts would count itself.
+    fn production_src() -> &'static str {
+        let src = include_str!("auth.rs");
+        let end = src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("this file has a test module");
+        &src[..end]
+    }
+
+    #[test]
+    fn mode_parsing_defaults_off_and_refuses_junk() {
+        assert_eq!(Mode::parse(""), Some(Mode::Off));
+        assert_eq!(Mode::parse("off"), Some(Mode::Off));
+        assert_eq!(Mode::parse("  OFF "), Some(Mode::Off));
+        assert_eq!(Mode::parse("observe"), Some(Mode::Observe));
+        assert_eq!(Mode::parse("Enforce"), Some(Mode::Enforce));
+        // The near-miss that must NEVER silently mean "off".
+        assert_eq!(Mode::parse("enforc"), None);
+        assert_eq!(Mode::parse("true"), None);
+        assert_eq!(Mode::parse("1"), None);
+        // Unset MUST be today's behaviour.
+        assert_eq!(Mode::default(), Mode::Off);
+        assert!(!Mode::Off.evaluates());
+        assert!(Mode::Observe.evaluates());
+        assert!(Mode::Enforce.evaluates());
+    }
+
+    /// The whole decision matrix, in one place. Rows are
+    /// (mode, recorded, peer) → verdict, refused.
+    #[test]
+    fn the_decision_matrix() {
+        let a = "10.4.2.9";
+        let b = "10.4.2.10";
+        type Row = (Mode, Vec<String>, Option<SocketAddr>, WorkloadVerdict, bool);
+        let rows: Vec<Row> = vec![
+            // off: never evaluated, whatever the inputs.
+            (
+                Mode::Off,
+                rec(&[a]),
+                sock("10.9.9.9:5"),
+                WorkloadVerdict::Disabled,
+                false,
+            ),
+            (Mode::Off, vec![], None, WorkloadVerdict::Disabled, false),
+            // no recorded identity ⇒ unbindable, ADMITTED in both live modes.
+            (
+                Mode::Observe,
+                vec![],
+                sock("10.4.2.9:1"),
+                WorkloadVerdict::Unbindable,
+                false,
+            ),
+            (
+                Mode::Enforce,
+                vec![],
+                sock("10.4.2.9:1"),
+                WorkloadVerdict::Unbindable,
+                false,
+            ),
+            // match.
+            (
+                Mode::Observe,
+                rec(&[a]),
+                sock("10.4.2.9:33000"),
+                WorkloadVerdict::Match,
+                false,
+            ),
+            (
+                Mode::Enforce,
+                rec(&[a]),
+                sock("10.4.2.9:33000"),
+                WorkloadVerdict::Match,
+                false,
+            ),
+            // mismatch: observed but admitted / refused.
+            (
+                Mode::Observe,
+                rec(&[a]),
+                sock("10.4.2.10:1"),
+                WorkloadVerdict::Mismatch,
+                false,
+            ),
+            (
+                Mode::Enforce,
+                rec(&[a]),
+                sock("10.4.2.10:1"),
+                WorkloadVerdict::Mismatch,
+                true,
+            ),
+            // dual-stack: EITHER recorded family matches.
+            (
+                Mode::Enforce,
+                rec(&[a, "fd00::5"]),
+                sock("[fd00::5]:1"),
+                WorkloadVerdict::Match,
+                false,
+            ),
+            (
+                Mode::Enforce,
+                rec(&[a, "fd00::5"]),
+                sock("[fd00::6]:1"),
+                WorkloadVerdict::Mismatch,
+                true,
+            ),
+            // recorded, but no socket peer ⇒ unverifiable, fail closed under enforce.
+            (
+                Mode::Observe,
+                rec(&[a]),
+                None,
+                WorkloadVerdict::Unverifiable,
+                false,
+            ),
+            (
+                Mode::Enforce,
+                rec(&[a]),
+                None,
+                WorkloadVerdict::Unverifiable,
+                true,
+            ),
+            // recorded garbage ⇒ unverifiable, NOT "mismatch" (a provider defect
+            // must not read as an attack), and fail closed under enforce.
+            (
+                Mode::Enforce,
+                rec(&["not-an-address"]),
+                sock("10.4.2.9:1"),
+                WorkloadVerdict::Unverifiable,
+                true,
+            ),
+            // a partly-garbage list still binds on its usable entries.
+            (
+                Mode::Enforce,
+                rec(&["not-an-address", b]),
+                sock("10.4.2.10:1"),
+                WorkloadVerdict::Match,
+                false,
+            ),
+        ];
+        for (mode, recorded, peer, want, want_refused) in rows {
+            let got = workload_verdict(mode, &recorded, peer);
+            assert_eq!(
+                got, want,
+                "verdict for mode={mode:?} recorded={recorded:?} peer={peer:?}"
+            );
+            assert_eq!(
+                workload_refused(mode, got),
+                want_refused,
+                "refusal for mode={mode:?} recorded={recorded:?} peer={peer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ipv4_mapped_peer_matches_the_ipv4_the_provider_recorded() {
+        // A dual-stack listener reports an IPv4 client as ::ffff:a.b.c.d while the
+        // Kubernetes API reports the pod's address as a.b.c.d. Comparing those as
+        // strings — or as un-normalized IpAddrs — refuses every legitimate request.
+        assert_eq!(
+            workload_verdict(
+                Mode::Enforce,
+                &rec(&["10.4.2.9"]),
+                sock("[::ffff:10.4.2.9]:44000"),
+            ),
+            WorkloadVerdict::Match
+        );
+        // ...and the reverse direction (provider records the mapped form).
+        assert_eq!(
+            workload_verdict(
+                Mode::Enforce,
+                &rec(&["::ffff:10.4.2.9"]),
+                sock("10.4.2.9:1")
+            ),
+            WorkloadVerdict::Match
+        );
+        // The mapping must not make DIFFERENT hosts equal.
+        assert_eq!(
+            workload_verdict(
+                Mode::Enforce,
+                &rec(&["10.4.2.9"]),
+                sock("[::ffff:10.4.2.10]:1"),
+            ),
+            WorkloadVerdict::Mismatch
+        );
+    }
+
+    #[test]
+    fn the_source_port_is_not_part_of_the_identity() {
+        for port in ["1", "33000", "65535"] {
+            assert_eq!(
+                workload_verdict(
+                    Mode::Enforce,
+                    &rec(&["10.4.2.9"]),
+                    sock(&format!("10.4.2.9:{port}")),
+                ),
+                WorkloadVerdict::Match
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusal_code_cannot_be_mistaken_for_the_audience_refusal() {
+        // `images/runner-lib/contract.mjs` aborts the whole run on a body
+        // CONTAINING "wrong_audience" (substring, not exact match), with a
+        // diagnostic that would be plainly wrong here.
+        assert!(!WRONG_WORKLOAD_CODE.contains("wrong_audience"));
+        assert_ne!(WRONG_WORKLOAD_CODE, "wrong_audience");
+        // And the runner's real predicate, transcribed: the substring test it runs.
+        let body = format!("{{\"error\":\"{WRONG_WORKLOAD_CODE}\"}}");
+        assert!(!body.contains("wrong_audience"));
+        // Belt: the runner-lib source really does key on that substring, so the
+        // assertion above is testing the rule that exists rather than one we
+        // remember. If contract.mjs stops doing this, revisit the choice of code.
+        let contract = include_str!("../../../images/runner-lib/contract.mjs");
+        assert!(
+            contract.contains("bodyText.includes(\"wrong_audience\")"),
+            "runner-lib no longer substring-matches wrong_audience; re-check WRONG_WORKLOAD_CODE"
+        );
+        // The runner has no branch for our code today (disclosed): it falls into
+        // the ordinary 401/403 handling. Assert that absence so it is a decision,
+        // not an oversight — flip this when a runner learns the code.
+        assert!(!contract.contains(WRONG_WORKLOAD_CODE));
+    }
+
+    #[test]
+    fn the_refusal_is_a_403_carrying_exactly_that_code() {
+        use axum::response::IntoResponse;
+        let err = enforce_workload_identity(
+            Mode::Enforce,
+            Uuid::nil(),
+            &rec(&["10.4.2.9"]),
+            sock("10.9.9.9:1"),
+            "/internal/sessions/{id}/events",
+        )
+        .expect_err("a mismatch under enforce must refuse");
+        let resp = err.into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+        // Every other verdict admits.
+        for (mode, recorded, peer) in [
+            (Mode::Off, rec(&["10.4.2.9"]), sock("10.9.9.9:1")),
+            (Mode::Observe, rec(&["10.4.2.9"]), sock("10.9.9.9:1")),
+            (Mode::Enforce, vec![], sock("10.9.9.9:1")),
+            (Mode::Enforce, rec(&["10.4.2.9"]), sock("10.4.2.9:1")),
+        ] {
+            assert!(
+                enforce_workload_identity(mode, Uuid::nil(), &recorded, peer, "/x").is_ok(),
+                "mode={mode:?} recorded={recorded:?} peer={peer:?} must be admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn the_unbindable_log_schedule_is_powers_of_ten() {
+        assert!(!should_log_unbindable(0));
+        for n in [1u64, 10, 100, 1_000, 10_000, 1_000_000] {
+            assert!(should_log_unbindable(n), "{n} should log");
+        }
+        for n in [2u64, 9, 11, 99, 101, 999, 1_001, 20, 300] {
+            assert!(!should_log_unbindable(n), "{n} should NOT log");
+        }
+    }
+
+    #[test]
+    fn handle_attrs_are_read_leniently_and_never_invented() {
+        use fluidbox_core::traits::SandboxHandle;
+        let h = |attrs: serde_json::Value| SandboxHandle {
+            runtime: "kubernetes".into(),
+            external_id: "fbx-x".into(),
+            attrs,
+        };
+        assert_eq!(
+            workload_addrs_from_handle(&h(serde_json::json!({
+                "namespace": "s", "uid": "u", "workload_addrs": ["10.4.2.9", "fd00::5"]
+            }))),
+            rec(&["10.4.2.9", "fd00::5"])
+        );
+        // The Docker handle: no such key ⇒ empty ⇒ unbindable.
+        assert!(
+            workload_addrs_from_handle(&h(serde_json::json!({"network": "n", "name": "c"})))
+                .is_empty()
+        );
+        // Junk shapes yield nothing rather than panicking or fabricating.
+        assert!(
+            workload_addrs_from_handle(&h(serde_json::json!({"workload_addrs": "10.4.2.9"})))
+                .is_empty()
+        );
+        assert!(
+            workload_addrs_from_handle(&h(serde_json::json!({"workload_addrs": [1, null]})))
+                .is_empty()
+        );
+        assert!(
+            workload_addrs_from_handle(&h(serde_json::json!({"workload_addrs": ["  "]})))
+                .is_empty()
+        );
+        assert_eq!(
+            workload_addrs_from_handle(&h(serde_json::json!({"workload_addrs": [" 10.4.2.9 "]}))),
+            rec(&["10.4.2.9"])
+        );
+    }
+
+    /// The provider writes the attribute; the control plane reads it. Nothing in
+    /// the type system connects the two, so this reads the OTHER CRATE'S SOURCE and
+    /// fails if either side renames the key.
+    #[test]
+    fn the_provider_and_the_control_plane_agree_on_the_handle_attribute() {
+        let k8s = include_str!("../../fluidbox-provider-k8s/src/lib.rs");
+        assert!(
+            k8s.contains(&format!("\"{WORKLOAD_ADDR_ATTR}\"")),
+            "the Kubernetes provider no longer writes the '{WORKLOAD_ADDR_ATTR}' handle \
+             attribute that auth.rs reads — the workload binding is silently disabled"
+        );
+        // And it must actually be captured from the Pod, not hardcoded empty.
+        assert!(k8s.contains("pod_workload_addrs(&pod)"));
+    }
+
+    /// DESIGN CONSTRAINT: the internal plane's peer is the SOCKET peer, never a
+    /// header. A sandbox can set headers, so honouring one would let the caller
+    /// assert its own identity. Proven two ways: the production source names no
+    /// forwarding header in this region, and the live-socket test below shows a
+    /// forged one changes nothing.
+    #[test]
+    fn no_forwarding_header_is_consulted_on_the_internal_plane() {
+        let src = production_src();
+        let start = src
+            .find("pub fn peer_addr(")
+            .expect("peer_addr is defined in this file");
+        let end = src
+            .find("/// Per-session authentication for the internal gateway")
+            .expect("the workload region ends at SessionAuth");
+        let region = &src[start..end].to_lowercase();
+        for banned in [
+            "x-forwarded-for",
+            "x-real-ip",
+            "trust_forwarded_for",
+            "headers",
+        ] {
+            assert!(
+                !region.contains(banned),
+                "the workload-identity decision path must not reach for '{banned}'"
+            );
+        }
+        // It reads the connect-info extension and nothing else.
+        assert!(src.contains("parts\n        .extensions\n        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()"));
+    }
+
+    /// Live socket. Proves (a) `PeerAddr` reports the REAL peer, and (b) forged
+    /// forwarding headers do not move it — including under a header set crafted to
+    /// look exactly like a trusted-proxy deployment.
+    #[tokio::test]
+    async fn the_peer_is_the_socket_peer_even_under_forged_forwarding_headers() {
+        use axum::routing::get;
+        let app = axum::Router::new().route(
+            "/peer",
+            get(|PeerAddr(p): PeerAddr| async move {
+                p.map(|s| s.ip().to_string())
+                    .unwrap_or_else(|| "none".into())
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        });
+        let client = reqwest::Client::new();
+        let body = client
+            .get(format!("http://{addr}/peer"))
+            .header("x-forwarded-for", "10.4.2.9")
+            .header("x-real-ip", "10.4.2.9")
+            .header("forwarded", "for=10.4.2.9")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        // The loopback client's real address — never the forged 10.4.2.9.
+        assert_eq!(body, "127.0.0.1", "a forged header moved the peer");
+    }
+
+    /// Without `into_make_service_with_connect_info`, the extension is absent.
+    /// That is a WIRING DEFECT, and the matrix above turns it into `Unverifiable`
+    /// (fail-closed under enforce) rather than into a silent no-op.
+    #[tokio::test]
+    async fn a_listener_without_connect_info_reports_no_peer() {
+        use axum::routing::get;
+        let app = axum::Router::new().route(
+            "/peer",
+            get(|PeerAddr(p): PeerAddr| async move {
+                p.map(|s| s.ip().to_string())
+                    .unwrap_or_else(|| "none".into())
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let body = reqwest::get(format!("http://{addr}/peer"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, "none");
+        assert_eq!(
+            workload_verdict(Mode::Enforce, &rec(&["10.4.2.9"]), None),
+            WorkloadVerdict::Unverifiable
+        );
+        assert!(workload_refused(
+            Mode::Enforce,
+            WorkloadVerdict::Unverifiable
+        ));
+    }
+
+    /// CALL-SITE GUARD. The matrix above is pure, so every one of its assertions
+    /// passes with the guard deleted from production. These assertions are what
+    /// make deleting a call site fail: the three places a sandbox credential is
+    /// resolved must each run it, and both listeners must supply connect info.
+    #[test]
+    fn every_sandbox_credential_resolution_runs_the_workload_guard() {
+        // (1) the extractor, covering six of seven internal routes.
+        assert!(
+            production_src()
+                .contains("enforce_workload_identity(\n            state.cfg.workload_identity,"),
+            "SessionAuth::from_request_parts no longer enforces the workload binding"
+        );
+        // (2) + (3) the two handlers that resolve a session token by hand.
+        for (file, src) in [
+            ("facade.rs", include_str!("facade.rs")),
+            ("internal.rs", include_str!("internal.rs")),
+        ] {
+            assert!(
+                src.contains("crate::auth::enforce_workload_identity("),
+                "{file} resolves a session token without the workload binding"
+            );
+            assert!(
+                src.contains("crate::auth::PeerAddr(peer): crate::auth::PeerAddr"),
+                "{file} must take the socket peer as a handler parameter"
+            );
+        }
+        // The extension only exists because both listeners are built with it.
+        let main_src = include_str!("main.rs");
+        assert_eq!(
+            main_src
+                .matches("into_make_service_with_connect_info::<SocketAddr>()")
+                .count(),
+            2,
+            "both planes must supply ConnectInfo or the guard degrades to unverifiable"
+        );
+        // The orchestrator must actually RECORD an identity, or every run is
+        // unbindable and the guard never has anything to compare against.
+        let orch = include_str!("orchestrator.rs");
+        assert!(orch.contains("crate::auth::workload_addrs_from_handle(&handle)"));
+        assert!(orch.contains("fluidbox_db::set_workload_addrs("));
+    }
+
+    /// THE SILENT-DEATH GUARD. Every credential resolution reads the recorded
+    /// addresses off the token lookup's join. Drop that one column from either
+    /// resolver and `workload_addrs` is always empty, every request becomes
+    /// `Unbindable`, and the feature is disabled with every test above still green
+    /// (they are pure, and the call-site guard only proves the call happens). This
+    /// is what makes deleting the join fail — no database required.
+    #[test]
+    fn both_session_token_resolvers_carry_the_recorded_addresses() {
+        let db = include_str!("../../fluidbox-db/src/lib.rs");
+        assert_eq!(
+            db.matches("select t.session_id, t.tenant_id, t.audience, s.workload_addrs")
+                .count(),
+            2,
+            "session_for_token and session_for_token_incl_revoked must BOTH carry \
+             sessions.workload_addrs, or the workload binding silently sees nothing"
+        );
+        assert_eq!(
+            db.matches("left join sessions s on s.id = t.session_id")
+                .count(),
+            2
+        );
+        // ...and the row shaper must not drop it on the floor.
+        assert!(db.contains("workload_addrs: r"));
+        // The writer must exist and target the column the readers read.
+        assert!(db.contains("update sessions set workload_addrs = $2"));
     }
 }

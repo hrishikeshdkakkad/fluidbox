@@ -18,24 +18,57 @@
 //! returned as [`sqlx::Error`], and DEGRADING on it (admit on the local verdict
 //! alone, log, count) is the server's decision, made in one place.
 //!
-//! # Take-then-check
+//! # Take-then-check, then ROLL BACK on a refusal
 //!
 //! [`admit`] increments every enabled dimension in ONE multi-row upsert and reads
 //! each dimension's POST-increment count back; the comparison then happens in Rust.
-//! The consequence is deliberate and worth stating plainly: **a dial refused by one
-//! dimension has already consumed a unit on every dimension that passed.** Under
-//! contention that makes the durable tier marginally STRICTER than its nominal
-//! ceiling — the safe direction for an abuse control — and it buys a single round
-//! trip on the hot path instead of a check-then-take pair that would need a second
-//! statement and could still race between them.
+//! That buys a single round trip on the hot path instead of a check-then-take pair
+//! that would need a second statement and could still race between them.
 //!
-//! There is exactly ONE exception, and it is not cosmetic: a **breaker** refusal
-//! ROLLS THE WHOLE ADMISSION BACK, so it charges nothing. The local governor has a
-//! dedicated test for this property (`a_breaker_refusal_charges_no_rate_bucket`)
-//! and the reason is the same here: without it, one sick upstream refusing dials in
-//! a loop would burn its ORG's shared per-minute budget and throttle every other
-//! connection the org owns — a self-inflicted denial of service triggered by a
-//! third party's outage.
+//! **A refusal — from ANY dimension, rate or breaker — then rolls the WHOLE
+//! admission back, so it charges nothing.** The transaction is the unit: nothing a
+//! refused dial touched survives it.
+//!
+//! That is not tidiness. An earlier revision committed the take on a RATE refusal
+//! and called the result "marginally STRICTER … the safe direction"; it is neither
+//! marginal nor confined to the offender, and it contradicted the rationale twenty
+//! lines below it that justifies the breaker's rollback. `PRECEDENCE` reports
+//! `tenant` FIRST, so the moment the tenant row goes over its ceiling every OTHER
+//! connection and user in the organisation is refused for the rest of the minute —
+//! and the surplus on that row is contributed by dials the narrower
+//! `connection`/`user`/`host` tiers had already refused. Concretely: 3 replicas,
+//! `connection_per_min = 60`, `tenant_per_min = 120`, one runaway connection. Each
+//! replica's LOCAL bucket admits 60/min, so 180 attempts/min reach this tier; the
+//! durable `connection` tier refuses after 60, but COMMITTING the take charges
+//! `tenant` all 180 and throttles the whole org from attempt ~121. Rolling back
+//! charges only the 60 that were actually admitted.
+//!
+//! Rolling back does NOT stop the limiter working: the refusing dimension's stored
+//! count returns to exactly its ceiling, so the next dial increments across it
+//! again and is refused again, for the whole window
+//! (`a_rate_refusal_rolls_its_charge_back_and_keeps_refusing_all_window` pins this
+//! — "rollback" and "the limiter silently stopped counting" are one mistake apart).
+//!
+//! # What a dial now costs (disclosed)
+//!
+//! Governance is not free, and the price is paid on the broker's hottest path:
+//!
+//! * [`admit`] is BEGIN + `set_config` + the rate upsert + the breaker statement +
+//!   COMMIT/ROLLBACK — **5 round trips** (4 with the breaker disabled, 0 with every
+//!   dimension disabled), before the dial itself has sent a byte.
+//! * [`report`] is BEGIN + `set_config` + one upsert + COMMIT — **4 more**. The
+//!   broker reports once per dispatch and the 401 re-mint path dispatches twice, so
+//!   a re-minted dial pays 13.
+//! * Each swept tenant costs another 4, amortised over `SWEEP_INTERVAL_SECS`.
+//!
+//! The serialisation matters more than the count. `RATE_UPSERT` takes a row lock on
+//! the `tenant` dimension's SINGLE row and the transaction holds it across the
+//! breaker round trip, so every dial in one tenant serialises on that one row for
+//! the duration of two statements. That is the deliberate price of an exact
+//! cross-replica count; it also means per-tenant durable throughput is bounded by
+//! round-trip latency, not by the configured ceiling. `FLUIDBOX_EGRESS_DURABLE=0`
+//! is the escape hatch, and [`preflight`] is what tells an operator the tier is
+//! being paid for and not delivering.
 //!
 //! # Time
 //!
@@ -48,9 +81,16 @@
 //!
 //! Both tables are tenant-owned and carry `tenant_id` directly; every statement
 //! rides [`crate::scoped_tx`], so the RLS policy from 0023 is the enforcing floor
-//! and the explicit `tenant_id = $n` predicate is the defence in depth. No function
-//! here takes a bypass — deliberately. The cross-tenant `host_global` dimension of
-//! the local governor is therefore NOT mirrored here (see [`rate_tiers`]).
+//! and the explicit `tenant_id = $n` predicate is the defence in depth — including
+//! `SWEEP`'s two outer `DELETE`s, which now repeat it BESIDE the `ctid in (…)`
+//! subquery instead of leaving it to the subquery alone. That was the one place in
+//! this module where the stated discipline was not followed, on its two most
+//! destructive statements: an unqualified `delete … where ctid in (…)` is correct
+//! only for as long as the subquery is, so a policy or predicate regression there
+//! had the whole table as its blast radius rather than one tenant's rows. No
+//! function here takes a bypass — deliberately. The cross-tenant `host_global`
+//! dimension of the local governor is therefore NOT mirrored here (see
+//! [`rate_tiers`]).
 
 use crate::{scoped_tx, TenantScope};
 use sqlx::PgPool;
@@ -202,14 +242,28 @@ returning w.scope,
 ///
 /// The UPDATE arm is the PROBE ELECTION: it fires only for a breaker whose open
 /// window has fully elapsed, bumps `probe_epoch`, and stamps this replica. Because
-/// it is a single conditional UPDATE, exactly ONE replica deployment-wide can win
-/// it — every other replica's UPDATE matches zero rows and falls through to the
-/// refusal branch. The second disjunct is the LOST-PROBE takeover: a replica that
-/// dies between election and completion would otherwise wedge the breaker half-open
+/// it is a single conditional UPDATE, only one caller wins any GIVEN election —
+/// every other replica's UPDATE matches zero rows and falls through to the refusal
+/// branch. The second disjunct is the LOST-PROBE takeover: a replica that dies
+/// between election and completion would otherwise wedge the breaker half-open
 /// forever, so after one further window the next caller is elected with a FRESH
-/// epoch, which is exactly what makes the abandoned probe's late completion inert.
-/// (The local breaker has the same rule and the same reason — `governor.rs`'s
-/// `a_lost_probe_cannot_wedge_the_breaker_shut_forever`.)
+/// epoch. (The local breaker has the same rule and the same reason —
+/// `governor.rs`'s `a_lost_probe_cannot_wedge_the_breaker_shut_forever`.)
+///
+/// **The guarantee is NOT "exactly one probe is in flight deployment-wide" — it is
+/// that at most one probe can DECIDE.** The takeover disjunct cannot tell a dead
+/// replica from a slow one, and it does not try: a full brokered dial is
+/// `initialize` + `notifications/initialized` + `tools/call`, each bounded by the
+/// broker's 30s `MCP_TIMEOUT`, i.e. up to ~90s against a 60s default open window,
+/// so OVERLAPPING PROBES ARE ROUTINE rather than an edge case. What holds
+/// regardless is the epoch: `BREAKER_REPORT` transitions the row only for a
+/// completion whose epoch equals the row's CURRENT `probe_epoch`, and every
+/// takeover bumps it, so a superseded probe is inert in BOTH directions — its late
+/// success cannot close a window it knows nothing about and its late failure cannot
+/// swallow the live probe's answer. Overlap therefore costs extra dials at a sick
+/// upstream, bounded by one per open window, and never a wrong transition. Widening
+/// the takeover window would trade those dials for a longer wedge after a genuinely
+/// dead replica; both breakers make the same trade for the same reason.
 ///
 /// The outer SELECT reads the PRE-update snapshot — CTEs and the main query share
 /// one snapshot — so `state` and the retry hint are the values as of BEFORE any
@@ -302,10 +356,15 @@ on conflict (tenant_id, connection_id, host_digest) do update set
 /// predicate (and by the partial index), so the sweep can never be the thing that
 /// forgets one. `limit` caps a single pass so a large backlog is drained over
 /// several passes instead of one long statement holding locks.
+/// Both outer `DELETE`s repeat `tenant_id = $1` beside the `ctid` subquery. It is
+/// redundant with the subquery and with RLS — which is the point: this module's
+/// stated discipline is that every statement carries the predicate explicitly, and
+/// these two are the statements where skipping it would cost the most.
 const SWEEP: &str = "\
 with dead_windows as (
     delete from egress_rate_windows
-     where ctid in (
+     where tenant_id = $1::uuid
+       and ctid in (
            select ctid from egress_rate_windows
             where tenant_id = $1::uuid
               and window_start < now() - make_interval(secs => $2::double precision)
@@ -313,7 +372,8 @@ with dead_windows as (
     returning 1
 ), dead_breakers as (
     delete from egress_breakers
-     where ctid in (
+     where tenant_id = $1::uuid
+       and ctid in (
            select ctid from egress_breakers
             where tenant_id = $1::uuid
               and state = 'closed' and failures = 0
@@ -322,6 +382,41 @@ with dead_windows as (
     returning 1
 )
 select (select count(*) from dead_windows) + (select count(*) from dead_breakers)";
+
+/// The BOOT USABILITY PROBE (Phase F fix wave). Four statements that exercise every
+/// privilege the durable tier needs — `insert`, `update` (the `on conflict` arm),
+/// `select` (the `where` clauses) and `delete` — on BOTH tables, as whatever role
+/// the server actually runs as and under the RLS policy the tenant GUC binds. The
+/// whole probe is ROLLED BACK, so it proves the privileges without leaving a row.
+///
+/// Why a probe at all: migration 0023's grant block is wrapped in `if exists (…
+/// pg_roles …)` because 0018 §(a) warns rather than fails when the runtime role
+/// does not exist on a managed host. If the role is created afterwards, the grant
+/// was silently skipped and EVERY `admit`/`report` then answers `permission denied`
+/// — which the (correct) degrade path converts into admit-and-count. The deployment
+/// believes it has a cross-replica ceiling and has none, and the per-dial warning
+/// makes a permanent misconfiguration look exactly like a transient blip.
+///
+/// The subjects are deliberately un-collidable with real data: `scope='preflight'`
+/// is not a dimension name, and a real `host_digest` is always `sha256:<hex>`.
+///
+/// DELETE FIRST, INSERT SECOND — the order is load-bearing and it is not the
+/// obvious one. Insert-then-delete probes the same four privileges but nets to zero
+/// inside the transaction, which makes the closing `rollback` observationally
+/// identical to a `commit`: the safety property would be untestable and the next
+/// person to "simplify" it would find every test still green. Deleting first (a
+/// no-op match, but the ACL and the policy are checked all the same) leaves the two
+/// inserted rows depending on the rollback for their removal.
+const PREFLIGHT: [&str; 4] = [
+    "delete from egress_rate_windows where tenant_id = $1::uuid and scope = 'preflight'",
+    "delete from egress_breakers where tenant_id = $1::uuid and host_digest = 'preflight'",
+    "insert into egress_rate_windows (tenant_id, scope, subject, window_start, hits)
+     values ($1::uuid, 'preflight', '', date_trunc('minute', now()), 0)
+     on conflict (tenant_id, scope, subject) do update set hits = 0",
+    "insert into egress_breakers (tenant_id, connection_id, host_digest, state)
+     values ($1::uuid, '00000000-0000-0000-0000-000000000000'::uuid, 'preflight', 'closed')
+     on conflict (tenant_id, connection_id, host_digest) do update set updated_at = now()",
+];
 
 // ─── Pure policy ────────────────────────────────────────────────────────────
 
@@ -437,10 +532,14 @@ pub async fn admit(
             })
             .collect();
         if let Some(refusal) = rate_verdict(&l, &hits) {
-            // COMMIT the take. See the module docs: the units spent on the
-            // dimensions that passed are not returned, which makes the tier
-            // marginally stricter under contention — the safe direction.
-            tx.commit().await?;
+            // ROLL THE TAKE BACK — see the module docs. Committing it charged the
+            // TENANT row for refusals raised by the narrower connection/user/host
+            // tiers, and because `PRECEDENCE` reports `tenant` first, once that row
+            // went over every other connection and user in the org was refused for
+            // the rest of the minute. The limiter still binds after the rollback:
+            // the refusing dimension's count returns to exactly its ceiling, so the
+            // next dial re-crosses it.
+            tx.rollback().await?;
             return Ok(DurableAdmission::Refused(refusal));
         }
     }
@@ -473,15 +572,38 @@ pub async fn admit(
         }),
     };
     match verdict {
-        // A BREAKER refusal charges nothing (module docs): rolling the whole
-        // admission back is what stops one sick upstream from burning its org's
-        // shared per-minute budget and throttling every other connection it owns.
-        // Nothing else in this transaction needs to survive — the election UPDATE
-        // matched zero rows, which is precisely why we are refusing.
+        // A BREAKER refusal charges nothing (module docs), exactly like the rate
+        // refusal above: rolling the whole admission back is what stops one sick
+        // upstream from burning its org's shared per-minute budget and throttling
+        // every other connection it owns. Nothing else in this transaction needs to
+        // survive — the election UPDATE matched zero rows, which is precisely why
+        // we are refusing.
         DurableAdmission::Refused(_) => tx.rollback().await?,
         DurableAdmission::Admitted { .. } => tx.commit().await?,
     }
     Ok(verdict)
+}
+
+/// Prove the durable tier is USABLE by the role this process actually runs as.
+///
+/// One rolled-back transaction exercising insert / update / select / delete on both
+/// tables (see the `PREFLIGHT` statements for why this exists at all — a silently
+/// skipped 0023 grant degrades the whole feature to nothing, permanently, and the
+/// degrade path makes that indistinguishable from a transient outage).
+///
+/// It answers `Err` and never interprets it: this module's only consumer,
+/// `fluidbox-server`'s `EgressGovernor`, owns the decision of what to do about a
+/// failure, in one place, as with every other failure here.
+pub async fn preflight(pool: &PgPool, scope: TenantScope) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    for stmt in PREFLIGHT {
+        sqlx::query(stmt)
+            .bind(scope.tenant_id())
+            .execute(&mut *tx)
+            .await?;
+    }
+    // Nothing a probe writes may survive it.
+    tx.rollback().await
 }
 
 /// Feed one dispatch's health observation back into the durable breaker.
@@ -835,8 +957,146 @@ mod tests {
             "the retry hint must be the remainder of the minute, got {}",
             r.retry_after_secs
         );
-        // Take-then-check: the refusal ITSELF charged a unit (4 dials ⇒ 4 hits).
+        // Take-then-check, then ROLL BACK: the refusal's own increment does not
+        // survive, so the stored count is the 3 ADMITTED dials and never 4. (This
+        // assertion read `4` while the refusal was committed — see the module docs
+        // for why charging a refusal was neither marginal nor safe.)
+        assert_eq!(window_hits(&pool, scope, SCOPE_TENANT).await, 3);
+    }
+
+    #[tokio::test]
+    async fn a_rate_refusal_rolls_its_charge_back_and_keeps_refusing_all_window() {
+        // TWO properties, and they are one mistake apart.
+        //
+        // (a) A refusal raised by a NARROW dimension must not charge the BROAD one.
+        //     `PRECEDENCE` reports `tenant` first, so a tenant row pushed over by
+        //     refusals a connection ceiling already rejected throttles every other
+        //     connection and user in the org for the rest of the minute — the exact
+        //     self-inflicted denial of service the breaker rollback exists to stop.
+        // (b) The limiter must still REFUSE after rolling back. A rollback restores
+        //     the refusing dimension to exactly its ceiling, so the next dial
+        //     re-crosses it; a rollback that also un-did the limit would look like a
+        //     fix and be a hole.
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let scope = throwaway_tenant(&pool).await;
+        let session = seed_session(&pool, scope, None).await;
+        // Tenant roomy (50), connection tight (2): only the connection tier speaks,
+        // and the tenant row is the shared budget the over-charge would drain.
+        let l = limits(50, 0, 2, 0);
+        let (noisy, sibling, h) = (Uuid::now_v7(), Uuid::now_v7(), "sha256:host");
+
+        for i in 0..2 {
+            assert!(
+                matches!(
+                    admit(&pool, scope, req(session, noisy, h, l))
+                        .await
+                        .unwrap(),
+                    DurableAdmission::Admitted { .. }
+                ),
+                "dial {i} is inside the connection ceiling"
+            );
+        }
+        // 40 refusals — 20× the connection ceiling, and 4/5 of the tenant's whole
+        // budget if any of them were charged.
+        for i in 0..40 {
+            let refused = admit(&pool, scope, req(session, noisy, h, l))
+                .await
+                .unwrap();
+            let DurableAdmission::Refused(r) = refused else {
+                panic!("refusal {i} must persist for the WHOLE window: {refused:?}");
+            };
+            assert_eq!(
+                r.scope, SCOPE_CONNECTION,
+                "refusal {i} came from the wrong dimension"
+            );
+        }
+        assert_eq!(
+            window_hits(&pool, scope, SCOPE_CONNECTION).await,
+            2,
+            "the refusing dimension must sit at its ceiling, not climb with refusals"
+        );
+        assert_eq!(
+            window_hits(&pool, scope, SCOPE_TENANT).await,
+            2,
+            "40 refusals raised by the CONNECTION tier must not have charged the \
+             org's shared tenant budget"
+        );
+        // …and the tenant budget really is intact: a SIBLING connection still has
+        // its own ceiling and the org still has 48 of its 50.
+        for i in 0..2 {
+            assert!(
+                matches!(
+                    admit(&pool, scope, req(session, sibling, h, l))
+                        .await
+                        .unwrap(),
+                    DurableAdmission::Admitted { .. }
+                ),
+                "sibling dial {i} must survive the noisy connection's refusals"
+            );
+        }
         assert_eq!(window_hits(&pool, scope, SCOPE_TENANT).await, 4);
+    }
+
+    #[tokio::test]
+    async fn the_preflight_probe_proves_read_and_write_and_leaves_nothing_behind() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let scope = throwaway_tenant(&pool).await;
+        preflight(&pool, scope).await.expect("the probe must pass");
+        // Twice, because a probe that leaves a row behind would collide with itself
+        // and because the second run must not see the first one's residue.
+        preflight(&pool, scope).await.expect("idempotent");
+
+        let mut tx = scoped_tx(&pool, scope).await.unwrap();
+        let (windows,): (i64,) =
+            sqlx::query_as("select count(*) from egress_rate_windows where tenant_id = $1")
+                .bind(scope.tenant_id())
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        let (breakers,): (i64,) =
+            sqlx::query_as("select count(*) from egress_breakers where tenant_id = $1")
+                .bind(scope.tenant_id())
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            (windows, breakers),
+            (0, 0),
+            "the probe writes inside a transaction it ROLLS BACK — a probe that \
+             leaves rows behind is a probe that pollutes the thing it measures"
+        );
+
+        // …and it passes AS THE ROLE PRODUCTION RUNS AS. `test_connect`'s pool sets
+        // the system_worker bypass on every connection, so the run above proved the
+        // statements are well-formed and nothing about privileges. This one runs
+        // under `fluidbox_runtime` with RLS actually binding — i.e. it is the
+        // assertion that 0023's enumerated DML grants reached that role, which is
+        // the exact failure the probe exists to report.
+        use sqlx::Executor;
+        let as_runtime = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    conn.execute("set role fluidbox_runtime").await?;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .expect("runtime-role pool");
+        preflight(&as_runtime, scope).await.expect(
+            "the probe must pass for the deployment's runtime role — a \
+                     failure here means 0023's DML grants did not reach it",
+        );
     }
 
     #[tokio::test]
@@ -882,7 +1142,19 @@ mod tests {
             panic!("the attended run's 2nd dial must hit the user ceiling: {refused:?}");
         };
         assert_eq!(r.scope, SCOPE_USER);
-        assert_eq!(window_hits(&pool, scope, SCOPE_USER).await, 2);
+        // 1, not 2: the refused dial's own increment is rolled back with the rest of
+        // its transaction, so the stored count sits AT the ceiling rather than
+        // climbing past it with every refusal (module docs, "take-then-check, then
+        // ROLL BACK"). It is still the value that keeps refusing — the next dial
+        // increments 1 → 2 and re-crosses the ceiling of 1.
+        assert_eq!(window_hits(&pool, scope, SCOPE_USER).await, 1);
+        assert!(
+            matches!(
+                admit(&pool, scope, req(attended, c, h, l)).await.unwrap(),
+                DurableAdmission::Refused(_)
+            ),
+            "and it keeps refusing after the rollback"
+        );
     }
 
     #[tokio::test]
@@ -1295,8 +1567,33 @@ mod tests {
             .unwrap();
             tx.commit().await.unwrap();
         }
-        let n = sweep(&pool, scope, 1800, 1000).await.unwrap();
-        assert!(n >= 3, "3 rate windows must be collected, swept {n}");
+        // THE BOUND MUST BIND. There are exactly 5 collectable rate windows here
+        // (tenant ×1, connection ×2, host ×2) and exactly 1 collectable breaker
+        // (`quiet`; `sick` is open), so a `limit` of 2 drains them over three passes
+        // — 2+1, then 2+0, then 1+0. An earlier version passed `1000` against 6
+        // rows, which made the whole `limit` clause deletable with the test still
+        // green: "bounded" is the property, and an unbounded DELETE holding locks
+        // over a large backlog is precisely what it exists to prevent.
+        assert_eq!(
+            sweep(&pool, scope, 1800, 2).await.unwrap(),
+            3,
+            "pass 1 must cap at 2 windows + 2 breakers (only 1 is collectable)"
+        );
+        assert_eq!(
+            sweep(&pool, scope, 1800, 2).await.unwrap(),
+            2,
+            "pass 2 must cap at 2 windows"
+        );
+        assert_eq!(
+            sweep(&pool, scope, 1800, 2).await.unwrap(),
+            1,
+            "pass 3 drains the remainder"
+        );
+        assert_eq!(
+            sweep(&pool, scope, 1800, 2).await.unwrap(),
+            0,
+            "a drained tenant sweeps nothing"
+        );
         assert_eq!(window_hits(&pool, scope, SCOPE_TENANT).await, 0);
         // The OPEN breaker survives — it is the only row here carrying information,
         // and forgetting it would silently re-admit traffic to a dead upstream.

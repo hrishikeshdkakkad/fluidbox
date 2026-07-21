@@ -56,6 +56,84 @@ impl LlmKeyMode {
     }
 }
 
+// ─── Workload identity on the internal gateway (Phase F, Gap 6) ────────────
+
+/// How the internal (sandbox-facing) gateway treats the binding between a run's
+/// session tokens and the network identity of the workload those tokens were
+/// issued to (Gap 6; design :1233-1240, threat-model T7).
+///
+/// Three modes, and the DEFAULT IS A NO-OP on purpose. This control can refuse
+/// requests from a live run, and the population it would refuse is not knowable
+/// in advance from a config file — it depends on the provider, the CNI, and
+/// whether anything NATs between the sandbox and `:8788`. So an operator gets to
+/// watch it first: `observe` counts and logs exactly what `enforce` would have
+/// refused, changing no behaviour, and only then is turning it on a decision
+/// rather than a gamble.
+///
+/// A malformed value FAILS BOOT (the house style for every other knob here) —
+/// `FLUIDBOX_WORKLOAD_IDENTITY=enforc` must never silently mean "off".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkloadIdentityMode {
+    /// Today's behaviour, byte for byte: the bearer token alone authenticates and
+    /// the socket peer is never consulted. The default, so Phase F deploys as a
+    /// no-op on an existing install.
+    #[default]
+    Off,
+    /// Evaluate the binding and record the verdict (counters + logs), but ADMIT
+    /// every request regardless. The rollout step: it tells an operator how many
+    /// of their sessions are bindable at all, and whether any legitimate traffic
+    /// would be refused, before anything is refused.
+    Observe,
+    /// Evaluate and REFUSE a request whose socket peer contradicts the address the
+    /// control plane recorded for that run's workload. A run with no recorded
+    /// address is still admitted (and counted) — see `auth.rs::workload_verdict`
+    /// for why "unknown" is not treated as hostile.
+    Enforce,
+}
+
+impl WorkloadIdentityMode {
+    /// Absent/empty ⇒ [`Off`](Self::Off) (unset must mean today's behaviour);
+    /// anything unrecognised ⇒ `None`, which the caller turns into a boot error.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "off" | "" => Some(WorkloadIdentityMode::Off),
+            "observe" => Some(WorkloadIdentityMode::Observe),
+            "enforce" => Some(WorkloadIdentityMode::Enforce),
+            _ => None,
+        }
+    }
+
+    /// The wire/log spelling — used in the boot banner and in every counter log,
+    /// so an operator reading a mismatch warning can see which mode produced it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkloadIdentityMode::Off => "off",
+            WorkloadIdentityMode::Observe => "observe",
+            WorkloadIdentityMode::Enforce => "enforce",
+        }
+    }
+
+    /// True iff the gateway should evaluate the binding at all. `Off` short-circuits
+    /// BEFORE the verdict is computed, so the disabled path costs one enum compare.
+    pub fn evaluates(self) -> bool {
+        !matches!(self, WorkloadIdentityMode::Off)
+    }
+}
+
+/// Read `FLUIDBOX_WORKLOAD_IDENTITY`. Split out (rather than inlined in
+/// [`Config::from_env`]) so the failure message is testable without an env var,
+/// and so the source guard below can prove `from_env` passes the SAME name it
+/// reads — a typo there would leave a knob that parses, validates, and is never
+/// set by anybody.
+fn parse_workload_identity(
+    name: &str,
+    raw: Option<String>,
+) -> anyhow::Result<WorkloadIdentityMode> {
+    let raw = raw.unwrap_or_default();
+    WorkloadIdentityMode::parse(&raw)
+        .ok_or_else(|| anyhow::anyhow!("{name}='{raw}' is invalid (known: off, observe, enforce)"))
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind: String,
@@ -277,6 +355,26 @@ pub struct Config {
     /// every real request on this API, which is the "never block everything" shape
     /// the governor knobs already refuse.
     pub max_request_body_bytes: usize,
+    /// Workload identity on the sandbox-facing internal gateway
+    /// (`FLUIDBOX_WORKLOAD_IDENTITY`, Phase F, Gap 6; migration 0025). Default
+    /// [`WorkloadIdentityMode::Off`] — today's behaviour byte for byte. See
+    /// [`WorkloadIdentityMode`] for why the default is a no-op and what `observe`
+    /// is for; a malformed value fails boot.
+    pub workload_identity: WorkloadIdentityMode,
+
+    // ---- Workspace-archive storage (Phase F, Task 4) -----------------------
+    /// Where packed workspace archives live (`FLUIDBOX_ARCHIVE_STORE`, plus the
+    /// `FLUIDBOX_ARCHIVE_S3_*` family). `fs` — the default — is today's node-local
+    /// `<data_dir>/archives`, byte for byte; `s3` puts them in an S3-compatible
+    /// bucket so ANY replica can serve ANY run's archive GET, which is what takes
+    /// the `ReadWriteOnce` PVC off the critical path. Parsed and validated by
+    /// [`fluidbox_workspace::parse_store_config`], which fails boot naming the
+    /// variable on every malformed or incomplete value (the `FLUIDBOX_KMS_*` shape:
+    /// the mode selects which other variables become required).
+    /// (`FLUIDBOX_REPLICAS` is read alongside it — see [`parse_archive_store`] —
+    /// but is deliberately NOT carried here: its only job is a boot refusal, and
+    /// a process cannot act on its own replica count afterwards.)
+    pub archive_store: fluidbox_workspace::ArchiveStoreConfig,
 }
 
 /// The default buffered-body ceiling — deliberately EQUAL to axum's own implicit
@@ -340,6 +438,10 @@ impl Config {
             .unwrap_or_else(|_| "docker".into())
             .to_lowercase();
         let is_k8s_provider = matches!(provider.as_str(), "kubernetes" | "k8s");
+        // Phase F, Task 4: the archive store + the declared replica count. Both
+        // refusals (an incomplete `s3` config, and `fs` on a declared
+        // multi-replica deployment) fire here, before anything else is built.
+        let (archive_store, _replicas) = parse_archive_store(&get)?;
         Ok(Config {
             bind: get("FLUIDBOX_BIND").unwrap_or_else(|_| "127.0.0.1:8787".into()),
             // Only the Kubernetes plane needs a pod-reachable internal bind;
@@ -565,8 +667,33 @@ impl Config {
                 "FLUIDBOX_MAX_REQUEST_BODY_BYTES",
                 get("FLUIDBOX_MAX_REQUEST_BODY_BYTES").ok(),
             )?,
+            workload_identity: parse_workload_identity(
+                "FLUIDBOX_WORKLOAD_IDENTITY",
+                get("FLUIDBOX_WORKLOAD_IDENTITY").ok(),
+            )?,
+            // Phase F, Task 4. `FLUIDBOX_REPLICAS` was consumed above: its only
+            // job is to refuse `fs` on a deployment that has already told us one
+            // replica cannot serve every archive GET.
+            archive_store,
         })
     }
+}
+
+/// Read + validate the workspace-archive store knobs (Phase F, Task 4). The
+/// parsing itself lives in `fluidbox-workspace` beside the backends, so the
+/// variable NAMES have exactly one home; this wraps it in the boot-error shape
+/// the rest of `from_env` uses and then runs the cross-field refusal.
+fn parse_archive_store(
+    get: &impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> anyhow::Result<(fluidbox_workspace::ArchiveStoreConfig, u32)> {
+    let cfg = fluidbox_workspace::parse_store_config(|k| get(k).ok())
+        .map_err(|m| anyhow::anyhow!("{m}"))?;
+    // `parse_positive_u32_env`, not `parse_u32_env`: a declared 0 replicas is a
+    // typo, and reading it as "fewer than two, so fs is fine" would disarm the
+    // very guard this value exists for.
+    let replicas = parse_positive_u32_env("FLUIDBOX_REPLICAS", get("FLUIDBOX_REPLICAS").ok(), 1)?;
+    fluidbox_workspace::validate_replicas(&cfg, replicas).map_err(|m| anyhow::anyhow!("{m}"))?;
+    Ok((cfg, replicas))
 }
 
 /// Read the five `FLUIDBOX_DB_*` pool knobs (Phase F). Each one is absent-means-
@@ -1255,6 +1382,62 @@ mod tests {
         &src[..end]
     }
 
+    /// Same guard, for the Gap-6 workload-identity knob (Phase F). The name is
+    /// passed INTO the parser, so no amount of parser testing proves `from_env`
+    /// reads the variable an operator (or the Helm chart) actually sets.
+    #[test]
+    fn workload_identity_is_read_from_the_documented_variable() {
+        let src = production_src();
+        assert_eq!(
+            src.matches("\"FLUIDBOX_WORKLOAD_IDENTITY\"").count(),
+            2,
+            "from_env passes the same name to the parser that it reads from the env"
+        );
+        assert!(src.contains("workload_identity: parse_workload_identity("));
+    }
+
+    /// The knob itself: absent ⇒ off (Phase F must deploy as a no-op), the three
+    /// modes parse, and a malformed value FAILS BOOT with a message that names both
+    /// the variable and the legal values — never silently degrading to `off`.
+    #[test]
+    fn workload_identity_defaults_off_and_fails_boot_on_junk() {
+        let name = "FLUIDBOX_WORKLOAD_IDENTITY";
+        assert_eq!(
+            parse_workload_identity(name, None).unwrap(),
+            WorkloadIdentityMode::Off
+        );
+        assert_eq!(
+            parse_workload_identity(name, Some(String::new())).unwrap(),
+            WorkloadIdentityMode::Off
+        );
+        assert_eq!(
+            parse_workload_identity(name, Some("observe".into())).unwrap(),
+            WorkloadIdentityMode::Observe
+        );
+        assert_eq!(
+            parse_workload_identity(name, Some(" ENFORCE ".into())).unwrap(),
+            WorkloadIdentityMode::Enforce
+        );
+        // The typo that must never mean "off".
+        let e = parse_workload_identity(name, Some("enforc".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(name), "got: {e}");
+        assert!(e.contains("off, observe, enforce"), "got: {e}");
+        // And a boolean-shaped value is refused too: this is not an on/off flag.
+        assert!(parse_workload_identity(name, Some("true".into())).is_err());
+        assert!(parse_workload_identity(name, Some("1".into())).is_err());
+        // Round-trip through the log/banner spelling.
+        for m in [
+            WorkloadIdentityMode::Off,
+            WorkloadIdentityMode::Observe,
+            WorkloadIdentityMode::Enforce,
+        ] {
+            assert_eq!(WorkloadIdentityMode::parse(m.as_str()), Some(m));
+        }
+        assert_eq!(WorkloadIdentityMode::default(), WorkloadIdentityMode::Off);
+    }
+
     /// `from_env` must read the body-limit knob under the name the docs, the boot
     /// error, and the Helm chart all use. There is no way to prove this by calling
     /// the parser — the name is passed IN — and a typo would leave a knob that
@@ -1327,5 +1510,86 @@ mod tests {
         assert_eq!(parse_opt_i64("R", None).unwrap(), None);
         assert_eq!(parse_opt_i64("R", Some("100".into())).unwrap(), Some(100));
         assert!(parse_opt_i64("R", Some("fast".into())).is_err());
+    }
+
+    // ---- Workspace-archive storage (Phase F, Task 4) ----------------------
+
+    /// Drive the REAL `parse_archive_store` — the function `from_env` calls —
+    /// through a fake environment. Testing `fluidbox_workspace::parse_store_config`
+    /// alone would prove the parser and nothing about whether boot consults it.
+    fn archive_env(
+        pairs: &[(&str, &str)],
+    ) -> impl Fn(&str) -> Result<String, std::env::VarError> + use<> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k: &str| map.get(k).cloned().ok_or(std::env::VarError::NotPresent)
+    }
+
+    #[test]
+    fn archive_store_defaults_to_fs_and_one_replica() {
+        let (store, replicas) = parse_archive_store(&archive_env(&[])).unwrap();
+        assert_eq!(store, fluidbox_workspace::ArchiveStoreConfig::Fs);
+        assert_eq!(replicas, 1);
+    }
+
+    #[test]
+    fn archive_store_boot_refusals() {
+        // An unknown backend.
+        let e = parse_archive_store(&archive_env(&[("FLUIDBOX_ARCHIVE_STORE", "gcs")]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("FLUIDBOX_ARCHIVE_STORE") && e.contains("known: fs, s3"),
+            "{e}"
+        );
+
+        // `s3` with nothing else names the first thing it needs.
+        let e = parse_archive_store(&archive_env(&[("FLUIDBOX_ARCHIVE_STORE", "s3")]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("FLUIDBOX_ARCHIVE_S3_BUCKET"), "{e}");
+
+        // A malformed replica count fails boot rather than disarming the guard.
+        let e = parse_archive_store(&archive_env(&[("FLUIDBOX_REPLICAS", "two")]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("FLUIDBOX_REPLICAS"), "{e}");
+        let e = parse_archive_store(&archive_env(&[("FLUIDBOX_REPLICAS", "0")]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("FLUIDBOX_REPLICAS"), "{e}");
+
+        // The cross-field refusal: >1 replica on the node-local fs store.
+        let e = parse_archive_store(&archive_env(&[("FLUIDBOX_REPLICAS", "3")]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("FLUIDBOX_REPLICAS=3"), "{e}");
+        assert!(e.contains("FLUIDBOX_ARCHIVE_STORE"), "{e}");
+    }
+
+    #[test]
+    fn archive_store_s3_boots_and_lifts_the_replica_refusal() {
+        let s3 = [
+            ("FLUIDBOX_ARCHIVE_STORE", "s3"),
+            ("FLUIDBOX_ARCHIVE_S3_BUCKET", "fbx-archives"),
+            ("FLUIDBOX_ARCHIVE_S3_REGION", "us-east-1"),
+            ("FLUIDBOX_ARCHIVE_S3_ACCESS_KEY_ID", "AKIA"),
+            ("FLUIDBOX_ARCHIVE_S3_SECRET_ACCESS_KEY", "SECRET"),
+        ];
+        let (store, replicas) = parse_archive_store(&archive_env(&s3)).unwrap();
+        assert!(matches!(
+            store,
+            fluidbox_workspace::ArchiveStoreConfig::S3(_)
+        ));
+        assert_eq!(replicas, 1);
+        // FALSE-GREEN guard: the SAME replica count that is refused on `fs` is
+        // accepted on `s3` — so the refusal above is about the store, not about
+        // `FLUIDBOX_REPLICAS` being rejected outright.
+        let mut many: Vec<(&str, &str)> = s3.to_vec();
+        many.push(("FLUIDBOX_REPLICAS", "3"));
+        let (_, replicas) = parse_archive_store(&archive_env(&many)).unwrap();
+        assert_eq!(replicas, 3);
     }
 }

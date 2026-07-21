@@ -593,6 +593,14 @@ async fn main() -> anyhow::Result<()> {
         "fluidbox internal listening on http://{} (/internal only)",
         state.cfg.internal_bind
     );
+    // Gap 6 (Phase F): say which mode is live at boot. A security control whose
+    // state can only be learned by reading the deployment's env is a control
+    // nobody knows the state of; `off` is the default and is announced as loudly
+    // as the other two, so "we turned that on months ago" is checkable.
+    tracing::info!(
+        "workload identity on the internal gateway: {} (FLUIDBOX_WORKLOAD_IDENTITY)",
+        state.cfg.workload_identity.as_str()
+    );
     tracing::info!("default agent: {}", seed.default_agent);
 
     // Serve both planes; if either listener falls over, the process exits.
