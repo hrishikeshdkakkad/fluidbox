@@ -255,8 +255,12 @@ pub async fn connect_with(
     }
     // `migrate!` BAKES the migrations directory into the binary at COMPILE time —
     // adding a .sql file only takes effect once this crate recompiles, so any
-    // change under migrations/ must touch this file. Latest: 0020 (api_tokens
-    // audience column — Gap 10 audience-scoped sandbox credentials).
+    // change under migrations/ must touch this file. Latest: 0024
+    // (mcp_upstream_sessions — cross-replica teardown of upstream MCP sessions).
+    // This line was stale at 0020 through all four Phase E migrations: the
+    // mechanism still worked, because every one of them also edited this file for
+    // its own reasons, but the note itself was a lie for four migrations running.
+    // Nothing asserts it — treat it as a reminder, not a guarantee.
     sqlx::migrate!("../../migrations").run(&mut owner).await?;
     if let Some(role) = runtime_role {
         let exists: bool =
