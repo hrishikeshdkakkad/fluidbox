@@ -5,12 +5,37 @@
 //!
 //! # Shape
 //!
-//! Three INDEPENDENT token buckets are consulted per dial — per tenant, per
-//! connection, per upstream host — and a per-connection circuit breaker rides on
-//! top. A refusal happens strictly BEFORE any request bytes are written, so the
-//! broker maps it to `DispatchOutcome::NeverSent` ⇒ execution-claim state
+//! Four INDEPENDENT token buckets are consulted per dial — per tenant, per
+//! connection, per (tenant, upstream host), and a loose cross-tenant tier on the
+//! host — and a per-`(tenant, connection, host)` circuit breaker rides on top. A
+//! refusal happens strictly BEFORE any request bytes are written, so the broker
+//! maps it to `DispatchOutcome::NeverSent` ⇒ execution-claim state
 //! `failed_before_send` ⇒ re-claimable, which is what makes the retry-after hint
 //! we hand the caller safe to act on.
+//!
+//! # Everything here is PER TENANT (review I5)
+//!
+//! No dimension may let one tenant refuse another's healthy calls. The host
+//! bucket was originally keyed by host string alone, so a tenant exhausting its
+//! dials against a shared SaaS host throttled every other tenant pointed at it;
+//! the breaker was keyed `(connection, host)`, which collapsed to host-only for
+//! the legacy credential-free path (`connection == Uuid::nil()`) and let five
+//! failures from one tenant open another's breaker. Both now carry the tenant.
+//! The only deliberately shared control is [`SCOPE_HOST_GLOBAL`], set at
+//! [`HOST_GLOBAL_FACTOR`] × the per-tenant host ceiling: upstream protection
+//! against a stampede, loose enough that it is not a cross-tenant fairness lever.
+//!
+//! # No USER dimension (deferred, disclosed)
+//!
+//! The design names four dimensions — tenant, user, connection, host — and this
+//! module implements every one except **user**: one user can still spread calls
+//! across an org's connections and consume the whole tenant bucket. The invoking
+//! principal is available at the gate, so adding it is mechanical; it is deferred
+//! with the rest of the durable multi-replica limiter (Phase F), because a
+//! per-replica per-user bucket is the weakest of the four and the tenant bucket
+//! already bounds the blast radius to one org. `docs/hosted/
+//! connector-admission-policy.md` states the same limitation — keep the two
+//! honest together.
 //!
 //! # Per-replica, by design (disclosed limitation)
 //!
@@ -50,6 +75,10 @@ use uuid::Uuid;
 pub const SCOPE_TENANT: &str = "tenant";
 pub const SCOPE_CONNECTION: &str = "connection";
 pub const SCOPE_HOST: &str = "host";
+/// The cross-tenant upstream-protection tier (review I5): a much looser ceiling
+/// on ONE host summed over every tenant, so partitioning the per-tenant host
+/// bucket does not turn N tenants into N × the load one upstream sees.
+pub const SCOPE_HOST_GLOBAL: &str = "host_global";
 pub const SCOPE_BREAKER: &str = "breaker";
 
 /// Per-minute dial ceilings. A tenant's whole org shares `TENANT`; one connection
@@ -59,6 +88,12 @@ pub const SCOPE_BREAKER: &str = "breaker";
 pub const DEFAULT_TENANT_PER_MIN: u32 = 120;
 pub const DEFAULT_CONNECTION_PER_MIN: u32 = 60;
 pub const DEFAULT_HOST_PER_MIN: u32 = 120;
+/// The global host tier is this multiple of the PER-TENANT host ceiling. It is
+/// deliberately loose: it exists to stop a stampede on one upstream, not to
+/// arbitrate between tenants (that is what the per-tenant bucket does), so it
+/// must not bind before roughly this many tenants are simultaneously saturating
+/// their own host budgets against the same upstream.
+pub const HOST_GLOBAL_FACTOR: u32 = 8;
 /// Consecutive transport/5xx failures that open a connection's breaker.
 pub const DEFAULT_BREAKER_THRESHOLD: u32 = 5;
 /// How long an open breaker refuses before admitting one half-open probe.
@@ -120,6 +155,14 @@ impl GovernorLimits {
 
     fn breaker_enabled(&self) -> bool {
         self.breaker_threshold > 0 && self.breaker_open_secs > 0
+    }
+
+    /// The cross-tenant ceiling on ONE upstream host (review I5). Derived, not a
+    /// separate knob: it tracks whatever the per-tenant host limit is set to, and
+    /// `0` (host limiting disabled) disables this tier too — never "block
+    /// everything", same rule as every other dimension.
+    fn host_global_per_min(&self) -> u32 {
+        self.host_per_min.saturating_mul(HOST_GLOBAL_FACTOR)
     }
 }
 
@@ -247,16 +290,32 @@ enum BreakerState {
     /// is refused. `probe_ms` also bounds a LOST probe: if no outcome is reported
     /// within one open window the next caller becomes the new probe, so a caller
     /// that dies between the gate and its report cannot wedge the breaker shut.
-    HalfOpen { probe_ms: u64 },
+    /// `epoch` identifies THIS probe: the admission that was promoted carries
+    /// it in its [`Permit`], and only that permit's report may transition the
+    /// state (review I6).
+    HalfOpen { probe_ms: u64, epoch: u64 },
 }
 
 struct Breaker {
     state: BreakerState,
+    /// Monotonic per-breaker probe counter — never reused, so a stale permit can
+    /// never match a later window.
+    epochs: u64,
 }
 
 impl Breaker {
     fn clean(&self) -> bool {
         matches!(self.state, BreakerState::Closed { failures: 0 })
+    }
+
+    /// Promote the calling dial to the half-open probe and return its epoch.
+    fn promote(&mut self, now: u64) -> u64 {
+        self.epochs = self.epochs.saturating_add(1);
+        self.state = BreakerState::HalfOpen {
+            probe_ms: now,
+            epoch: self.epochs,
+        };
+        self.epochs
     }
 }
 
@@ -303,21 +362,24 @@ impl<K: Eq + Hash + Clone, V> Bounded<K, V> {
         &mut slot.value
     }
 
+    /// ONE pass (review I6): the older shape scanned the map twice at capacity
+    /// (once filtered to forgettable entries, once unfiltered as the fallback).
+    /// Both candidates are tracked in a single iteration instead — same
+    /// preference order, half the work under the governor's one mutex.
     fn evict_one(&mut self, forgettable: &impl Fn(&V) -> bool) {
-        let victim = self
-            .map
-            .iter()
-            .filter(|(_, s)| forgettable(&s.value))
-            .min_by_key(|(_, s)| s.used)
-            .map(|(k, _)| k.clone())
-            // Nothing forgettable: bounded memory still wins — drop the
-            // least-recently-used entry outright.
-            .or_else(|| {
-                self.map
-                    .iter()
-                    .min_by_key(|(_, s)| s.used)
-                    .map(|(k, _)| k.clone())
-            });
+        let mut oldest_forgettable: Option<(&K, u64)> = None;
+        let mut oldest: Option<(&K, u64)> = None;
+        for (k, slot) in self.map.iter() {
+            if oldest.is_none_or(|(_, u)| slot.used < u) {
+                oldest = Some((k, slot.used));
+            }
+            if forgettable(&slot.value) && oldest_forgettable.is_none_or(|(_, u)| slot.used < u) {
+                oldest_forgettable = Some((k, slot.used));
+            }
+        }
+        // Nothing forgettable: bounded memory still wins — drop the
+        // least-recently-used entry outright.
+        let victim = oldest_forgettable.or(oldest).map(|(k, _)| k.clone());
         if let Some(k) = victim {
             self.map.remove(&k);
         }
@@ -333,13 +395,48 @@ impl<K: Eq + Hash + Clone, V> Bounded<K, V> {
 struct GovState {
     tenants: Bounded<Uuid, Bucket>,
     connections: Bounded<Uuid, Bucket>,
-    hosts: Bounded<String, Bucket>,
-    /// Keyed `(connection, host)` — strictly FINER than per-connection (which is
-    /// why `report` takes the host too). A connection normally has exactly one
-    /// upstream, so this is per-connection in practice; the refinement matters
-    /// for the legacy credential-free bundle path, where there is no connection
-    /// id at all (`Uuid::nil()`) and only the host distinguishes upstreams.
-    breakers: Bounded<(Uuid, String), Breaker>,
+    /// Keyed `(tenant, host)` — the host ceiling is PER TENANT (review I5).
+    /// Keying it by host alone made it a cross-tenant DoS: one tenant burning
+    /// 120 dials/min at a shared SaaS host refused every other tenant's healthy
+    /// calls to that host, and nothing about that refusal was the other tenants'
+    /// doing.
+    hosts: Bounded<(Uuid, String), Bucket>,
+    /// The cross-tenant tier on the same host, at [`HOST_GLOBAL_FACTOR`] × the
+    /// per-tenant ceiling — upstream protection only.
+    hosts_global: Bounded<String, Bucket>,
+    /// Keyed `(tenant, connection, host)`. The tenant component is load-bearing
+    /// (review I5): the legacy credential-free bundle path has no connection id
+    /// at all (`Uuid::nil()`), so `(connection, host)` collapsed every tenant's
+    /// legacy traffic to one host-keyed breaker and five failures from one
+    /// tenant refused another's dials. A connection normally has exactly one
+    /// upstream, so the host component is a refinement that matters for the same
+    /// legacy path.
+    breakers: Bounded<(Uuid, Uuid, String), Breaker>,
+}
+
+/// Proof that ONE dial was admitted, and by whom (review I5/I6). It is what
+/// [`EgressGovernor::report`] must be handed back: the breaker is keyed by
+/// `(tenant, connection, host)` — none of which `report` could reconstruct on
+/// its own for the legacy nil-connection path — and a half-open PROBE is
+/// identified by the epoch stamped here at admission, so only the dial that was
+/// actually promoted can transition that breaker.
+///
+/// Derefs to the host key so callers that already carry it around (the broker's
+/// refusal digests, its logs) keep reading it straight off the permit.
+#[derive(Debug, Clone)]
+pub struct Permit {
+    tenant: Uuid,
+    connection: Uuid,
+    host: String,
+    /// `Some(epoch)` iff THIS admission was the breaker's half-open probe.
+    probe: Option<u64>,
+}
+
+impl std::ops::Deref for Permit {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.host
+    }
 }
 
 /// The in-memory, per-replica outbound governor held on `AppState`.
@@ -358,6 +455,7 @@ impl EgressGovernor {
                 tenants: Bounded::new(),
                 connections: Bounded::new(),
                 hosts: Bounded::new(),
+                hosts_global: Bounded::new(),
                 breakers: Bounded::new(),
             }),
         }
@@ -386,53 +484,71 @@ impl EgressGovernor {
     /// A poisoned lock is recovered rather than propagated: the governor is an
     /// availability control, and failing every brokered dial because one caller
     /// panicked mid-update would be a worse outcome than a slightly stale bucket.
-    pub fn check(&self, tenant: Uuid, connection: Uuid, host: &str) -> Result<(), Throttled> {
+    pub fn check(&self, tenant: Uuid, connection: Uuid, host: &str) -> Result<Permit, Throttled> {
         let now = self.clock.now_ms();
         let st = &mut *self.lock();
         let l = self.limits;
-        // 1. Peek every dimension (refilling as it goes) WITHOUT consuming.
-        for (scope, retry) in [
-            (
-                SCOPE_TENANT,
-                peek(&mut st.tenants, &tenant, l.tenant_per_min, now),
-            ),
-            (
-                SCOPE_CONNECTION,
-                peek(&mut st.connections, &connection, l.connection_per_min, now),
-            ),
-            (
-                SCOPE_HOST,
-                peek(&mut st.hosts, &host.to_string(), l.host_per_min, now),
-            ),
-        ] {
-            if let Some(retry_after_secs) = retry {
-                return Err(Throttled {
-                    scope,
-                    retry_after_secs,
-                });
-            }
+        // 1. Peek every dimension (refilling as it goes) WITHOUT consuming, and
+        //    SHORT-CIRCUIT on the first refusal (review I6). Short-circuiting is
+        //    not just cheaper: a caller its own tenant bucket already refused
+        //    must not reach the host maps at all, or it could keep naming fresh
+        //    hosts and force an eviction scan per dial — cross-tenant lock
+        //    contention bought with dials that were never going to happen.
+        if let Some(retry_after_secs) = peek(&mut st.tenants, &tenant, l.tenant_per_min, now) {
+            return Err(Throttled {
+                scope: SCOPE_TENANT,
+                retry_after_secs,
+            });
+        }
+        if let Some(retry_after_secs) =
+            peek(&mut st.connections, &connection, l.connection_per_min, now)
+        {
+            return Err(Throttled {
+                scope: SCOPE_CONNECTION,
+                retry_after_secs,
+            });
+        }
+        let host_key = (tenant, host.to_string());
+        if let Some(retry_after_secs) = peek(&mut st.hosts, &host_key, l.host_per_min, now) {
+            return Err(Throttled {
+                scope: SCOPE_HOST,
+                retry_after_secs,
+            });
+        }
+        let global_per_min = l.host_global_per_min();
+        if let Some(retry_after_secs) =
+            peek(&mut st.hosts_global, &host.to_string(), global_per_min, now)
+        {
+            return Err(Throttled {
+                scope: SCOPE_HOST_GLOBAL,
+                retry_after_secs,
+            });
         }
         // 2. Breaker (may promote this caller to the half-open probe).
-        if let Some(t) = self.check_breaker(st, connection, host, now) {
-            return Err(t);
-        }
+        let probe = self.check_breaker(st, tenant, connection, host, now)?;
         // 3. Everyone said yes — consume one token from each enabled dimension.
         take(&mut st.tenants, &tenant, l.tenant_per_min, now);
         take(&mut st.connections, &connection, l.connection_per_min, now);
-        take(&mut st.hosts, &host.to_string(), l.host_per_min, now);
-        Ok(())
+        take(&mut st.hosts, &host_key, l.host_per_min, now);
+        take(&mut st.hosts_global, &host.to_string(), global_per_min, now);
+        Ok(Permit {
+            tenant,
+            connection,
+            host: host.to_string(),
+            probe,
+        })
     }
 
     /// Feed one dispatch's health observation back into the connection's breaker.
     /// Consecutive means consecutive: any [`Outcome::Ok`] resets the count.
-    pub fn report(&self, connection: Uuid, host: &str, outcome: Outcome) {
+    pub fn report(&self, permit: &Permit, outcome: Outcome) {
         if !self.limits.breaker_enabled() {
             return;
         }
         let now = self.clock.now_ms();
         let threshold = self.limits.breaker_threshold;
         let st = &mut *self.lock();
-        let br = breaker_entry(st, connection, host);
+        let br = breaker_entry(st, permit.tenant, permit.connection, &permit.host);
         br.state = match (br.state, outcome) {
             (BreakerState::Closed { failures }, Outcome::TransportFailure) => {
                 let n = failures.saturating_add(1);
@@ -443,51 +559,62 @@ impl EgressGovernor {
                 }
             }
             (BreakerState::Closed { .. }, Outcome::Ok) => BreakerState::Closed { failures: 0 },
-            // The probe answered: success closes and fully resets; failure opens
-            // a FRESH window (never a shorter one).
-            (BreakerState::HalfOpen { .. }, Outcome::Ok) => BreakerState::Closed { failures: 0 },
-            (BreakerState::HalfOpen { .. }, Outcome::TransportFailure) => {
-                BreakerState::Open { opened_ms: now }
-            }
-            // A straggler from a dial admitted before the breaker opened. It says
-            // nothing about the open window's premise, so the window stands —
+            // The PROBE answered — and it is the probe only if this permit
+            // carries the epoch stamped when it was promoted (review I6).
+            // Success closes and fully resets; failure opens a FRESH window
+            // (never a shorter one).
+            (BreakerState::HalfOpen { epoch, .. }, out) if permit.probe == Some(epoch) => match out
+            {
+                Outcome::Ok => BreakerState::Closed { failures: 0 },
+                Outcome::TransportFailure => BreakerState::Open { opened_ms: now },
+            },
+            // A straggler: a dial admitted BEFORE this probe window (typically
+            // before the breaker opened at all) reporting late. It says nothing
+            // about the probe's premise, so it must not close the breaker early
+            // nor reopen it and swallow the real probe's answer.
+            (half @ BreakerState::HalfOpen { .. }, _) => half,
+            // Same reasoning for a straggler arriving while the window is open —
             // only a half-open PROBE can close a breaker.
             (open @ BreakerState::Open { .. }, _) => open,
         };
     }
 
+    /// Consult (and possibly transition) the breaker for one admitted dial.
+    /// `Ok(Some(epoch))` = admitted AS the half-open probe; `Ok(None)` =
+    /// admitted normally; `Err` = refused.
     fn check_breaker(
         &self,
         st: &mut GovState,
+        tenant: Uuid,
         connection: Uuid,
         host: &str,
         now: u64,
-    ) -> Option<Throttled> {
+    ) -> Result<Option<u64>, Throttled> {
         if !self.limits.breaker_enabled() {
-            return None;
+            return Ok(None);
         }
         let open_ms = self.limits.breaker_open_secs.saturating_mul(1000);
-        let br = breaker_entry(st, connection, host);
+        let br = breaker_entry(st, tenant, connection, host);
         match br.state {
-            BreakerState::Closed { .. } => None,
+            BreakerState::Closed { .. } => Ok(None),
             BreakerState::Open { opened_ms } => {
                 let elapsed = now.saturating_sub(opened_ms);
                 if elapsed >= open_ms {
-                    br.state = BreakerState::HalfOpen { probe_ms: now };
-                    None
+                    Ok(Some(br.promote(now)))
                 } else {
-                    Some(breaker_refusal(open_ms - elapsed))
+                    Err(breaker_refusal(open_ms - elapsed))
                 }
             }
-            BreakerState::HalfOpen { probe_ms } => {
+            BreakerState::HalfOpen { probe_ms, .. } => {
                 let elapsed = now.saturating_sub(probe_ms);
                 if elapsed >= open_ms {
                     // The in-flight probe never reported (a caller died between
-                    // the gate and its report) — take over as the new probe.
-                    br.state = BreakerState::HalfOpen { probe_ms: now };
-                    None
+                    // the gate and its report) — take over as the new probe. The
+                    // epoch bumps, so the abandoned probe's late report is a
+                    // straggler and cannot decide this window.
+                    Ok(Some(br.promote(now)))
                 } else {
-                    Some(breaker_refusal(open_ms - elapsed))
+                    Err(breaker_refusal(open_ms - elapsed))
                 }
             }
         }
@@ -507,9 +634,25 @@ impl EgressGovernor {
                 tenants: Bounded::new(),
                 connections: Bounded::new(),
                 hosts: Bounded::new(),
+                hosts_global: Bounded::new(),
                 breakers: Bounded::new(),
             }),
         }
+    }
+
+    /// Test-only: admit one dial and feed its outcome back through the permit
+    /// that admission produced — the exact shape every production caller has.
+    #[cfg(test)]
+    fn dial(
+        &self,
+        tenant: Uuid,
+        connection: Uuid,
+        host: &str,
+        o: Outcome,
+    ) -> Result<(), Throttled> {
+        let permit = self.check(tenant, connection, host)?;
+        self.report(&permit, o);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -541,11 +684,17 @@ fn breaker_refusal(remaining_ms: u64) -> Throttled {
     }
 }
 
-fn breaker_entry<'a>(st: &'a mut GovState, connection: Uuid, host: &str) -> &'a mut Breaker {
+fn breaker_entry<'a>(
+    st: &'a mut GovState,
+    tenant: Uuid,
+    connection: Uuid,
+    host: &str,
+) -> &'a mut Breaker {
     st.breakers.entry(
-        &(connection, host.to_string()),
+        &(tenant, connection, host.to_string()),
         || Breaker {
             state: BreakerState::Closed { failures: 0 },
+            epochs: 0,
         },
         Breaker::clean,
     )
@@ -693,22 +842,125 @@ mod tests {
     }
 
     #[test]
-    fn host_dimension_binds_across_connections_and_tenants() {
+    fn host_dimension_binds_across_connections_but_never_across_tenants() {
+        // Review I5. This test previously asserted the OPPOSITE — that the host
+        // ceiling was "shared by every caller" — which is exactly the
+        // cross-tenant denial-of-service being fixed: with the shipped default
+        // of 120, one tenant's 120 dials at a shared SaaS host refused every
+        // other tenant's healthy calls to it. The assertion is not weakened:
+        // the host dimension still binds (a tenant cannot escape it by cycling
+        // connections, asserted here), and the cross-tenant ceiling still
+        // exists — it just lives in the loose HOST_GLOBAL tier below.
         let g = EgressGovernor::manual(limits(100, 100, 2));
-        assert!(g
-            .check(Uuid::new_v4(), Uuid::new_v4(), "shared.test")
-            .is_ok());
-        assert!(g
-            .check(Uuid::new_v4(), Uuid::new_v4(), "shared.test")
-            .is_ok());
+        let noisy = Uuid::new_v4();
+        assert!(g.check(noisy, Uuid::new_v4(), "shared.test").is_ok());
+        assert!(g.check(noisy, Uuid::new_v4(), "shared.test").is_ok());
+        let e = g
+            .check(noisy, Uuid::new_v4(), "shared.test")
+            .expect_err("the host ceiling binds across ONE tenant's connections");
+        assert_eq!(e.scope, SCOPE_HOST);
+        // The victim tenant, same host, is untouched.
+        assert!(
+            g.check(Uuid::new_v4(), Uuid::new_v4(), "shared.test")
+                .is_ok(),
+            "one tenant exhausting a shared host must not refuse another's calls"
+        );
+        // A different host is untouched for the noisy tenant too.
+        assert!(g.check(noisy, Uuid::new_v4(), "other.test").is_ok());
+    }
+
+    #[test]
+    fn the_global_host_tier_still_protects_one_upstream_from_a_stampede() {
+        // Per-tenant host ceiling 1 ⇒ global tier HOST_GLOBAL_FACTOR × 1. Each
+        // tenant is allowed exactly one dial, so the tier can only be reached by
+        // MANY tenants — which is the only thing it is meant to catch.
+        let g = EgressGovernor::manual(limits(1000, 1000, 1));
+        for i in 0..HOST_GLOBAL_FACTOR {
+            assert!(
+                g.check(Uuid::new_v4(), Uuid::new_v4(), "shared.test")
+                    .is_ok(),
+                "tenant {i} must get its own host token"
+            );
+        }
         let e = g
             .check(Uuid::new_v4(), Uuid::new_v4(), "shared.test")
-            .expect_err("the host ceiling is shared by every caller");
-        assert_eq!(e.scope, SCOPE_HOST);
-        // A different host is untouched.
+            .expect_err("the cross-tenant tier must cap total load on one host");
+        assert_eq!(e.scope, SCOPE_HOST_GLOBAL);
+        // …and it is per HOST, not global-global.
         assert!(g
             .check(Uuid::new_v4(), Uuid::new_v4(), "other.test")
             .is_ok());
+    }
+
+    #[test]
+    fn the_legacy_nil_connection_breaker_is_still_per_tenant() {
+        // Review I5. The credential-free legacy path has no connection id, so
+        // the breaker key collapsed to (nil, host) — five failures from ONE
+        // tenant opened every other tenant's breaker for that host.
+        let g = EgressGovernor::manual(breaker_limits(2, 60));
+        let (noisy, victim, h) = (Uuid::new_v4(), Uuid::new_v4(), "legacy.test");
+        for _ in 0..2 {
+            let _ = g.dial(noisy, Uuid::nil(), h, Outcome::TransportFailure);
+        }
+        assert_eq!(
+            g.check(noisy, Uuid::nil(), h)
+                .expect_err("the noisy tenant's breaker is open")
+                .scope,
+            SCOPE_BREAKER
+        );
+        assert!(
+            g.check(victim, Uuid::nil(), h).is_ok(),
+            "another tenant's legacy dials to the same host must still be admitted"
+        );
+    }
+
+    #[test]
+    fn only_the_admitted_probe_may_transition_a_half_open_breaker() {
+        // Review I6. A slow dial admitted BEFORE the breaker opened must not be
+        // mistaken for the half-open probe: its success would close the breaker
+        // on evidence about a different window, and its failure would re-open a
+        // window the real probe was about to close.
+        let g = EgressGovernor::manual(breaker_limits(2, 60));
+        let (t, c, h) = (Uuid::new_v4(), Uuid::new_v4(), "h");
+        let straggler = g.check(t, c, h).expect("admitted while closed");
+        for _ in 0..2 {
+            let _ = g.dial(t, c, h, Outcome::TransportFailure);
+        }
+        g.advance_ms(60_000);
+        let probe = g.check(t, c, h).expect("promoted to the half-open probe");
+        assert!(
+            g.check(t, c, h).is_err(),
+            "precondition: the breaker really is half-open with ONE probe out"
+        );
+
+        // The straggler answers first — it is NOT the probe, so nothing moves.
+        g.report(&straggler, Outcome::Ok);
+        assert!(
+            g.check(t, c, h).is_err(),
+            "a straggler's success must not close a half-open breaker"
+        );
+
+        // The real probe answers — and its success is what closes the breaker.
+        g.report(&probe, Outcome::Ok);
+        assert!(
+            g.check(t, c, h).is_ok(),
+            "the admitted probe's success must close the breaker"
+        );
+
+        // The mirror case: a straggler FAILURE must not reopen against a probe.
+        let g = EgressGovernor::manual(breaker_limits(2, 60));
+        let stale = g.check(t, c, h).expect("admitted while closed");
+        for _ in 0..2 {
+            let _ = g.dial(t, c, h, Outcome::TransportFailure);
+        }
+        g.advance_ms(60_000);
+        let probe = g.check(t, c, h).expect("promoted");
+        g.report(&stale, Outcome::TransportFailure);
+        g.report(&probe, Outcome::Ok);
+        assert!(
+            g.check(t, c, h).is_ok(),
+            "the real probe's success must decide the window, not a straggler's failure"
+        );
     }
 
     #[test]
@@ -769,23 +1021,22 @@ mod tests {
         let g = EgressGovernor::manual(breaker_limits(5, 60));
         let (t, c, h) = (Uuid::new_v4(), Uuid::new_v4(), "h");
         for _ in 0..4 {
-            assert!(g.check(t, c, h).is_ok());
-            g.report(c, h, Outcome::TransportFailure);
-        }
-        assert!(g.check(t, c, h).is_ok(), "4 < threshold — still closed");
-        g.report(c, h, Outcome::Ok);
-        for _ in 0..4 {
-            assert!(
-                g.check(t, c, h).is_ok(),
-                "the success reset the consecutive count"
-            );
-            g.report(c, h, Outcome::TransportFailure);
+            assert!(g.dial(t, c, h, Outcome::TransportFailure).is_ok());
         }
         assert!(
-            g.check(t, c, h).is_ok(),
+            g.dial(t, c, h, Outcome::Ok).is_ok(),
+            "4 < threshold — still closed"
+        );
+        for _ in 0..4 {
+            assert!(
+                g.dial(t, c, h, Outcome::TransportFailure).is_ok(),
+                "the success reset the consecutive count"
+            );
+        }
+        assert!(
+            g.dial(t, c, h, Outcome::TransportFailure).is_ok(),
             "still 4 consecutive, still closed"
         );
-        g.report(c, h, Outcome::TransportFailure);
         assert_eq!(
             g.check(t, c, h).unwrap_err().scope,
             SCOPE_BREAKER,
@@ -798,8 +1049,7 @@ mod tests {
         let g = EgressGovernor::manual(breaker_limits(3, 60));
         let (t, c, h) = (Uuid::new_v4(), Uuid::new_v4(), "h");
         for _ in 0..3 {
-            assert!(g.check(t, c, h).is_ok());
-            g.report(c, h, Outcome::TransportFailure);
+            assert!(g.dial(t, c, h, Outcome::TransportFailure).is_ok());
         }
         // Open: refused, with a retry hint that shrinks with the window.
         let e = g.check(t, c, h).expect_err("breaker is open");
@@ -832,18 +1082,14 @@ mod tests {
         let g = EgressGovernor::manual(breaker_limits(3, 60));
         let (t, c, h) = (Uuid::new_v4(), Uuid::new_v4(), "h");
         for _ in 0..3 {
-            let _ = g.check(t, c, h);
-            g.report(c, h, Outcome::TransportFailure);
+            let _ = g.dial(t, c, h, Outcome::TransportFailure);
         }
         g.advance_ms(60_000);
-        assert!(g.check(t, c, h).is_ok(), "probe admitted");
-        g.report(c, h, Outcome::Ok);
+        assert!(g.dial(t, c, h, Outcome::Ok).is_ok(), "probe admitted");
         // Closed AND reset: two fresh failures must not re-open it (that would
         // prove the pre-open count survived).
-        assert!(g.check(t, c, h).is_ok());
-        g.report(c, h, Outcome::TransportFailure);
-        assert!(g.check(t, c, h).is_ok());
-        g.report(c, h, Outcome::TransportFailure);
+        assert!(g.dial(t, c, h, Outcome::TransportFailure).is_ok());
+        assert!(g.dial(t, c, h, Outcome::TransportFailure).is_ok());
         assert!(
             g.check(t, c, h).is_ok(),
             "a closing probe must reset the consecutive count to zero"
@@ -855,12 +1101,13 @@ mod tests {
         let g = EgressGovernor::manual(breaker_limits(3, 60));
         let (t, c, h) = (Uuid::new_v4(), Uuid::new_v4(), "h");
         for _ in 0..3 {
-            let _ = g.check(t, c, h);
-            g.report(c, h, Outcome::TransportFailure);
+            let _ = g.dial(t, c, h, Outcome::TransportFailure);
         }
         g.advance_ms(60_000);
-        assert!(g.check(t, c, h).is_ok(), "probe admitted");
-        g.report(c, h, Outcome::TransportFailure);
+        assert!(
+            g.dial(t, c, h, Outcome::TransportFailure).is_ok(),
+            "probe admitted"
+        );
         // A FULL window, measured from the probe's failure — not the leftover of
         // the previous one.
         assert_eq!(g.check(t, c, h).unwrap_err().retry_after_secs, 60);
@@ -884,8 +1131,7 @@ mod tests {
         let g = EgressGovernor::manual(breaker_limits(2, 30));
         let (t, c, h) = (Uuid::new_v4(), Uuid::new_v4(), "h");
         for _ in 0..2 {
-            let _ = g.check(t, c, h);
-            g.report(c, h, Outcome::TransportFailure);
+            let _ = g.dial(t, c, h, Outcome::TransportFailure);
         }
         g.advance_ms(30_000);
         assert!(g.check(t, c, h).is_ok(), "probe admitted (and then lost)");
@@ -904,8 +1150,7 @@ mod tests {
         let t = Uuid::new_v4();
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
         for _ in 0..2 {
-            let _ = g.check(t, a, "h1");
-            g.report(a, "h1", Outcome::TransportFailure);
+            let _ = g.dial(t, a, "h1", Outcome::TransportFailure);
         }
         assert!(g.check(t, a, "h1").is_err(), "a/h1 is open");
         assert!(
@@ -924,12 +1169,14 @@ mod tests {
         // that was admitted before the breaker opened must not cancel the window.
         let g = EgressGovernor::manual(breaker_limits(2, 60));
         let (t, c, h) = (Uuid::new_v4(), Uuid::new_v4(), "h");
+        // The straggler's permit is taken FIRST — admitted while the breaker was
+        // still closed, reported long after it opened.
+        let straggler = g.check(t, c, h).expect("admitted while closed");
         for _ in 0..2 {
-            let _ = g.check(t, c, h);
-            g.report(c, h, Outcome::TransportFailure);
+            let _ = g.dial(t, c, h, Outcome::TransportFailure);
         }
         assert!(g.check(t, c, h).is_err());
-        g.report(c, h, Outcome::Ok);
+        g.report(&straggler, Outcome::Ok);
         assert!(
             g.check(t, c, h).is_err(),
             "an out-of-band success must not re-open the gate"
@@ -942,8 +1189,10 @@ mod tests {
             let g = EgressGovernor::manual(l);
             let (t, c, h) = (Uuid::new_v4(), Uuid::new_v4(), "h");
             for _ in 0..50 {
-                assert!(g.check(t, c, h).is_ok(), "a disabled breaker never trips");
-                g.report(c, h, Outcome::TransportFailure);
+                assert!(
+                    g.dial(t, c, h, Outcome::TransportFailure).is_ok(),
+                    "a disabled breaker never trips"
+                );
             }
         }
     }
@@ -962,8 +1211,7 @@ mod tests {
         let (t, c) = (Uuid::new_v4(), Uuid::new_v4());
         for i in 0..(MAX_TRACKED * 2) {
             let host = format!("h{i}.example.test");
-            assert!(g.check(t, c, &host).is_ok());
-            g.report(c, &host, Outcome::Ok);
+            assert!(g.dial(t, c, &host, Outcome::Ok).is_ok());
         }
         let (_, _, hosts, breakers) = g.tracked();
         assert!(
@@ -983,14 +1231,12 @@ mod tests {
         let g = EgressGovernor::manual(breaker_limits(2, 60));
         let (t, c) = (Uuid::new_v4(), Uuid::new_v4());
         for _ in 0..2 {
-            let _ = g.check(t, c, "victim.test");
-            g.report(c, "victim.test", Outcome::TransportFailure);
+            let _ = g.dial(t, c, "victim.test", Outcome::TransportFailure);
         }
         assert!(g.check(t, c, "victim.test").is_err(), "precondition: open");
         for i in 0..(MAX_TRACKED * 2) {
             let host = format!("flood{i}.test");
-            let _ = g.check(t, c, &host);
-            g.report(c, &host, Outcome::Ok);
+            let _ = g.dial(t, c, &host, Outcome::Ok);
         }
         assert!(
             g.check(t, c, "victim.test").is_err(),
@@ -1025,8 +1271,7 @@ mod tests {
         let (sick, healthy) = (Uuid::new_v4(), Uuid::new_v4());
         // Two admitted dials: 2 tenant tokens spent, and the breaker opens.
         for _ in 0..2 {
-            assert!(g.check(t, sick, h).is_ok());
-            g.report(sick, h, Outcome::TransportFailure);
+            assert!(g.dial(t, sick, h, Outcome::TransportFailure).is_ok());
         }
         // 20 refusals — 4× the whole tenant capacity — all from the BREAKER.
         for i in 0..20 {
@@ -1062,8 +1307,7 @@ mod tests {
         });
         let (t, c) = (Uuid::new_v4(), Uuid::new_v4());
         for _ in 0..2 {
-            assert!(g.check(t, c, h).is_ok());
-            g.report(c, h, Outcome::TransportFailure);
+            assert!(g.dial(t, c, h, Outcome::TransportFailure).is_ok());
         }
         for _ in 0..20 {
             assert_eq!(g.check(t, c, h).unwrap_err().scope, SCOPE_BREAKER);
