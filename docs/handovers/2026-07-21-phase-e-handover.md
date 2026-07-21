@@ -1,10 +1,10 @@
 # Phase E (#33) — session handover
 
-**Date:** 2026-07-21 · **State:** implementation, acceptance, whole-branch review, Codex gate and fix waves COMPLETE. **PR #84 open**; CI running on the final head.
+**Date:** 2026-07-21 · **State:** implementation, acceptance, whole-branch review, Codex gate and fix waves COMPLETE. **PR #84 open, CI FULLY GREEN** on head `0f0da8e` (rust · hardening · identity · bindings · secrets · kind-calico · unit · web · deny · chart), mergeable and awaiting review.
 
 Epic #28 (multi-user MCP control plane). Phases A/B/C/D merged into `release/multi-user-mcp-control-plane`; **Phase E is branch `feat/mu-phase-E`** off `825ce56`, 29 commits, migrations 0019–0022, head `343c80d`. Never PR to `main` — the epic lands on the release branch (PR #27).
 
-Final local bar at `343c80d`, `DATABASE_URL` proven unset: fmt ✓ · clippy `--workspace --all-targets -D warnings` ✓ · `cargo test --workspace` **655 passed / 0 failed** · `pnpm build` ✓ · vitest 34/34 · `bash -n` all scripts ✓ · shellcheck clean.
+Final local bar at `0f0da8e`, `DATABASE_URL` proven unset: fmt ✓ · clippy `--workspace --all-targets -D warnings` ✓ · `cargo test --workspace` **655 passed / 0 failed** · `pnpm build` ✓ · vitest 34/34 · `bash -n` all scripts ✓ · shellcheck clean.
 
 **Review record.** Eight implementation tasks, each spec+quality reviewed with fix rounds; three parallel whole-branch reviews (found 2 Critical: a quadratic SSE parse measured at 144 s on an 8 MiB stream, and uncapped `-32601` amplification at ~180k POSTs per admitted dial); then the Codex gate (gpt-5.6-sol, xhigh, read-only, 3 scoped rounds) which found **2 Critical + 17 Important**, every one adjudicated and fixed across three further waves. The Codex Critical that mattered most: `LocalCopy` accepted an arbitrary path and **any authenticated member could have an agent copy arbitrary control-plane files** — the in-file comment claiming that API was admin-gated had been stale since Phase B. Now operator-only via `LocalPathAuthority`.
 
