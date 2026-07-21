@@ -326,14 +326,20 @@ pub struct ScopeChallenge {
 
 /// Read one `WWW-Authenticate` param value (`key="quoted"` or bare `key=token`).
 fn www_auth_param(header: &str, key: &str) -> Option<String> {
+    // RFC 7235: auth-param NAMES are case-insensitive (`error=` and `Error=` are
+    // the same param). Search a lowercased copy for the key, but read the VALUE
+    // from the ORIGINAL header — scope/token values are case-sensitive and land
+    // verbatim in a persisted note. ASCII-lowercasing preserves byte length, so
+    // offsets into `hay` index `header` identically.
+    let hay = header.to_ascii_lowercase();
+    let needle = key.to_ascii_lowercase();
     // Match `key=` not preceded by another word char (so `error=` doesn't hit a
     // hypothetical `xerror=`), tolerating whitespace.
     let mut search = 0;
-    while let Some(rel) = header[search..].find(key) {
+    while let Some(rel) = hay[search..].find(needle.as_str()) {
         let at = search + rel;
-        let before_ok = at == 0 || !header.as_bytes()[at - 1].is_ascii_alphanumeric();
-        let after = &header[at + key.len()..];
-        let after = after.trim_start();
+        let before_ok = at == 0 || !hay.as_bytes()[at - 1].is_ascii_alphanumeric();
+        let after = header[at + needle.len()..].trim_start();
         if before_ok {
             if let Some(rest) = after.strip_prefix('=') {
                 let rest = rest.trim_start();
@@ -346,7 +352,7 @@ fn www_auth_param(header: &str, key: &str) -> Option<String> {
                 return Some(rest[..end].to_string());
             }
         }
-        search = at + key.len();
+        search = at + needle.len();
     }
     None
 }
@@ -3454,6 +3460,13 @@ mod tests {
         // No scope param → challenge still detected, scope None.
         let c = parse_insufficient_scope(r#"Bearer error="insufficient_scope""#).unwrap();
         assert!(c.scope.is_none());
+        // RFC 7235: the auth-param NAME is case-insensitive — a mixed-case
+        // `Error=` is still an insufficient_scope challenge, and a mixed-case
+        // `Scope=` value is read verbatim (values stay case-sensitive).
+        let c =
+            parse_insufficient_scope(r#"Bearer Error="insufficient_scope", Scope="Read:Issues""#)
+                .expect("mixed-case Error= must still parse");
+        assert_eq!(c.scope.as_deref(), Some("Read:Issues"));
         // A DIFFERENT error is NOT an insufficient_scope challenge.
         assert!(parse_insufficient_scope(r#"Bearer error="invalid_token""#).is_none());
         assert!(parse_insufficient_scope("Bearer realm=\"x\"").is_none());

@@ -1067,6 +1067,7 @@ mod tests {
             snapshot_version: 3,
             tools: vec![tool("get_pr")],
             tools_digest: "sha256:abc".into(),
+            protocol_version: None,
         }];
 
         // Built-ins pass through (None), both attachment paths resolve.

@@ -275,6 +275,15 @@ pub struct BrokeredSurface {
     pub snapshot_version: i32,
     pub tools: Vec<crate::capability::ToolSnapshot>,
     pub tools_digest: String,
+    /// The MCP protocol version the snapshot negotiated (Phase E, Gap 12), frozen
+    /// from `connection_tool_snapshots.protocol_version` at `create_run`. Selects
+    /// the JSON Schema dialect the gate validates this surface's tool arguments
+    /// under ([`crate::schema_guard::dialect_for`]). `None` = a surface frozen
+    /// before this field existed (and legacy bundles) — [`dialect_for`] defaults
+    /// those to 2020-12. `#[serde(default)]` keeps every pre-Phase-E frozen
+    /// RunSpec deserializable; omitted on the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<String>,
 }
 
 /// Whether any brokered surface advertises `tool` under `server` (its slot
@@ -773,6 +782,7 @@ mod tests {
                 annotations: None,
             }],
             tools_digest: "sha256:cafe".into(),
+            protocol_version: Some("2025-11-25".into()),
         };
         let mut spec = sample_run_spec();
         spec.brokered = vec![surface.clone()];
@@ -793,6 +803,58 @@ mod tests {
         assert!(back.find_brokered_surface("nope").is_none());
         // Value round-trip is stable.
         assert_eq!(serde_json::to_value(&back).unwrap(), v);
+        // protocol_version round-trips.
+        assert_eq!(
+            v["brokered"][0]["protocol_version"], "2025-11-25",
+            "a set protocol_version must serialize"
+        );
+        assert_eq!(
+            back.brokered[0].protocol_version.as_deref(),
+            Some("2025-11-25")
+        );
+    }
+
+    #[test]
+    fn brokered_surface_protocol_version_back_compat() {
+        use crate::capability::ToolSnapshot;
+        // A frozen pre-Phase-E BrokeredSurface jsonb: NO `protocol_version` key.
+        // It must deserialize forever, defaulting to None (→ dialect_for 2020-12).
+        let old = serde_json::json!({
+            "slot": "gh",
+            "url": "https://mcp.github.test/mcp",
+            "binding_id": Uuid::now_v7(),
+            "snapshot_version": 3,
+            "tools": [{"name": "get_pr", "description": "d", "input_schema": {"type": "object"}}],
+            "tools_digest": "sha256:abc"
+        });
+        let surface: BrokeredSurface = serde_json::from_value(old).unwrap();
+        assert!(
+            surface.protocol_version.is_none(),
+            "an absent protocol_version must default to None"
+        );
+
+        // A surface WITH a version round-trips, and None is omitted on the wire.
+        let with_version = BrokeredSurface {
+            protocol_version: Some("2025-06-18".into()),
+            ..surface.clone()
+        };
+        let v = serde_json::to_value(&with_version).unwrap();
+        assert_eq!(v["protocol_version"], "2025-06-18");
+        let back: BrokeredSurface = serde_json::from_value(v).unwrap();
+        assert_eq!(back.protocol_version.as_deref(), Some("2025-06-18"));
+
+        // None ⇒ skip_serializing_if omits the key entirely (wire byte-identical
+        // to a pre-Phase-E surface).
+        let none_wire = serde_json::to_value(&surface).unwrap();
+        assert!(none_wire.get("protocol_version").is_none());
+        // Silence unused-import lint when tools aren't otherwise referenced here.
+        let _ = ToolSnapshot {
+            name: "x".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+            output_schema: None,
+            annotations: None,
+        };
     }
 
     #[test]
