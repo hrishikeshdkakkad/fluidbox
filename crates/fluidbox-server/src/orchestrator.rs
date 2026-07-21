@@ -93,9 +93,14 @@ pub fn replica_id() -> Uuid {
 /// dies).
 ///
 /// Calling this repeatedly is the renew: the same owner keeps the same epoch, so
-/// a healthy driver's fence never moves under its own feet. A lease of ours that
-/// LAPSED and is re-taken here bumps the epoch — deliberately self-fencing, since
-/// anything we had in flight across the lapse can no longer be assumed ours.
+/// a healthy driver's fence never moves under its own feet. Re-taking a lease of
+/// OURS that merely lapsed (nobody stole it) also keeps the epoch — the bump is
+/// gated on the owner actually changing. That is deliberate: self-fencing on a
+/// lapse would kill any launch slower than the lease TTL, and the
+/// `hold_lease(..) != Some(epoch)` re-proofs before `provision` and
+/// `collect_artifacts` depend on the epoch surviving a slow turn. The fence
+/// protects against a DIFFERENT owner having moved the session on, which is
+/// exactly when the epoch does move.
 async fn hold_lease(state: &AppState, scope: TenantScope, id: Uuid) -> Option<i64> {
     match fluidbox_db::acquire_session_lease(
         &state.pool,
@@ -575,10 +580,20 @@ pub async fn drive_finalization(state: &AppState, id: Uuid) {
     for _ in 0..6 {
         // Acquire on the first turn, renew on every later one (the same owner
         // keeps the same epoch). A lease held by ANOTHER replica stops this driver
-        // rather than letting it mutate behind the owner: the intent stays put, so
-        // that owner's driver — or a later worker tick — re-drives it. Nothing is
-        // lost by returning here.
+        // rather than letting it mutate behind the owner.
+        //
+        // RELEASE THE CLAIM ON THE WAY OUT. `claim_finalization` above already
+        // stamped `claimed_at`, so simply returning would park the intent for the
+        // full 420 s stale window while this replica does no work — and every
+        // replica's 20 s finalize worker would be turned away by that stamp. That
+        // is a user-visible cancel stall in exactly the multi-replica mode this
+        // lease exists to support (a cancel arriving on a non-holder while the
+        // holder's lease is fresh). Same idiom as the provisioning-settle deferral
+        // below: a deliberate hand-back releases, it does not squat.
         let Some(epoch) = hold_lease(state, scope, id).await else {
+            fluidbox_db::release_finalization_claim(&state.pool, scope, id)
+                .await
+                .ok();
             return;
         };
         let session = match fluidbox_db::get_session(&state.pool, scope, id).await {
