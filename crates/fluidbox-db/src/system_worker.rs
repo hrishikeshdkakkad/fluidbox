@@ -18,7 +18,10 @@
 //!     itself is the scoped, single-winner `expire_approval_tx` so it can emit
 //!     its ledger events in the same transaction), the stale-execution-claim
 //!     sweep ([`sweep_stale_execution_claims`], Gap 11 — CAS a crashed `claimed`
-//!     row to `ambiguous` past its expiry), the restart-recoverable finalize
+//!     row to `ambiguous` past its expiry), the expired-LLM-reservation sweep
+//!     ([`sweep_expired_llm_reservations`], Gap 14 — convert a crashed booking into
+//!     a conservative `usage_entries` row and CAS it to `charged`), the
+//!     restart-recoverable finalize
 //!     driver, the managed-sandbox reconciler, and the delivery worker
 //!     ([`claim_due_deliveries`] — Phase E: the scan now STAMPS a per-row claim
 //!     under `for update skip locked` so replicas take disjoint sets) each act on
@@ -349,6 +352,78 @@ pub async fn expired_pending_approvals(
           where a.status = 'pending' and a.expires_at < now()
           order by a.expires_at limit $1",
     )
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(out)
+}
+
+/// One reservation the expiry sweep converted into a conservative charge.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SweptReservation {
+    pub tenant_id: Uuid,
+    pub session_id: Uuid,
+    pub request_id: Uuid,
+    pub reserved_tokens: i64,
+    pub reserved_cost_usd: Option<f64>,
+}
+
+/// Sweep expired LLM budget reservations (Phase E, #33; Gap 14): a `reserved` row
+/// whose facade request died without reconciling never settles, so past its
+/// `expires_at` it is CONVERTED — a conservative `usage_entries` row written under
+/// `external_id = <request id>` with `source = 'reservation_timeout'`, then a CAS
+/// to `charged`. Design :1122-1123: on crash/timeout with unknown provider usage
+/// RETAIN the conservative charge, never assume zero.
+///
+/// IDEMPOTENT IN EITHER ORDER, which is the whole point of keying on the request
+/// id. If the drain task recorded authoritative usage first, this insert hits the
+/// partial-unique `usage_external` index and is a no-op (the real number wins) — the
+/// CAS then finds no `reserved` row and returns nothing. If the sweep lands first,
+/// a late drain's `add_usage` is the no-op and its `charge_llm_reservation` CAS
+/// returns false. Neither path can double-charge.
+///
+/// `for update skip locked` makes two replicas' sweeps DISJOINT (the delivery-claim
+/// discipline), and the whole conversion is ONE statement so a crash between the
+/// usage row and the CAS is impossible. Cross-tenant by construction; every
+/// returned row carries its own `tenant_id` so the caller ledgers under the right
+/// scope. The reservation TTL is set well beyond the facade's upstream request
+/// timeout, so an expired row means the process died — not that a request is slow.
+pub async fn sweep_expired_llm_reservations(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    limit: i64,
+) -> sqlx::Result<Vec<SweptReservation>> {
+    let mut tx = crate::worker_tx(pool).await?;
+    let out = sqlx::query_as(
+        "with expired as (
+             select id, tenant_id, session_id, model, reserved_tokens, reserved_cost_usd
+               from llm_reservations
+              where state = 'reserved' and expires_at < $1
+              order by expires_at
+              limit $2
+              for update skip locked
+         ),
+         ins as (
+             insert into usage_entries
+                 (id, session_id, model, input_tokens, output_tokens,
+                  cache_read_tokens, cache_write_tokens, cost_usd, source, external_id)
+             select gen_random_uuid(), e.session_id, e.model, 0, e.reserved_tokens, 0, 0,
+                    e.reserved_cost_usd, 'reservation_timeout', e.id::text
+               from expired e
+             on conflict (external_id) where external_id is not null do nothing
+         ),
+         settled as (
+             update llm_reservations r set state = 'charged'
+               from expired e
+              where r.id = e.id and r.state = 'reserved'
+             returning r.tenant_id, r.session_id, r.id as request_id,
+                       r.reserved_tokens, r.reserved_cost_usd
+         )
+         select tenant_id, session_id, request_id, reserved_tokens, reserved_cost_usd
+           from settled",
+    )
+    .bind(now)
     .bind(limit)
     .fetch_all(&mut *tx)
     .await?;
