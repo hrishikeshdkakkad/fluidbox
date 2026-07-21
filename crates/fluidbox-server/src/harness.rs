@@ -246,6 +246,16 @@ mod tests {
             // request, so the shipped defaults are simply carried.
             db_pool: fluidbox_db::PoolSettings::default(),
             max_request_body_bytes: crate::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
+            // Gap 6: this fixture serves no requests, so the shipped default (off)
+            // is carried. NOTE for anyone adding a workload-identity assertion —
+            // asserting on THIS value proves nothing about production, which builds
+            // its Config in `config.rs::from_env`; test that path instead.
+            workload_identity: crate::config::WorkloadIdentityMode::default(),
+            // Task 4: this fixture packs no archive, so the shipped default
+            // (node-local `fs`, one replica) is carried. Same NOTE as above —
+            // asserting on THESE values proves nothing about production, which
+            // parses them in `config.rs::parse_archive_store`; test that path.
+            archive_store: fluidbox_workspace::ArchiveStoreConfig::Fs,
         }
     }
 

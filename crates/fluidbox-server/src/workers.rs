@@ -304,22 +304,18 @@ async fn archive_ttl_sweep(state: AppState) {
     let mut tick = periodic(Duration::from_secs(3600));
     loop {
         tick.tick().await;
-        let data_dir = state.cfg.data_dir.clone();
-        let candidates = tokio::task::spawn_blocking(move || {
-            orchestrator::stale_archive_candidates(&data_dir, ttl)
-        })
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!("archive TTL sweep task failed: {e}");
-            Vec::new()
-        });
+        // Listing is the STORE's job now (Phase F, Task 4): a directory scan on
+        // `fs`, a ListObjectsV2 over the prefix on `s3` — plus, on `s3`, this
+        // node's leftover staging files, which no object listing would ever show.
+        let store = orchestrator::archive_store(&state);
+        let candidates = orchestrator::stale_archive_candidates(&state, ttl).await;
         let mut removed = 0usize;
-        for path in candidates {
+        for key in candidates {
             // Age alone is not proof of leak: a run with a wall-clock budget
             // longer than the TTL still needs its archive for a possible
             // init re-execution. Only a terminal/unknown session's archive
             // is reclaimable; a DB blip keeps the file for the next pass.
-            let deletable = match orchestrator::archive_session_id(&path) {
+            let deletable = match orchestrator::archive_session_id(&key) {
                 None => true, // not a name this server writes — reclaim
                 Some(sid) => {
                     match fluidbox_db::system_worker::get_session(&state.pool, sid).await {
@@ -339,21 +335,23 @@ async fn archive_ttl_sweep(state: AppState) {
             };
             if !deletable {
                 tracing::warn!(
-                    "archive TTL sweep: {} outlived the TTL but its session is still live; keeping",
-                    path.display()
+                    "archive TTL sweep: {key} outlived the TTL but its session is still live; keeping"
                 );
                 continue;
             }
-            match std::fs::remove_file(&path) {
+            match store.delete_key(&key).await {
                 Ok(()) => {
-                    tracing::info!("archive TTL sweep removed {}", path.display());
+                    tracing::info!("archive TTL sweep removed {key}");
                     removed += 1;
                 }
-                Err(e) => tracing::warn!("archive TTL sweep failed on {}: {e}", path.display()),
+                Err(e) => tracing::warn!("archive TTL sweep failed on {key}: {e}"),
             }
         }
         if removed > 0 {
-            tracing::info!("archive TTL sweep reclaimed {removed} stale archive(s)");
+            tracing::info!(
+                "archive TTL sweep reclaimed {removed} stale archive(s) from the {} store",
+                store.backend()
+            );
         }
     }
 }

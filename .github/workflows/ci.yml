@@ -286,6 +286,69 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  # Phase F acceptance (#34): the scale/reliability suite. Today it proves the
+  # FAST session forge and that the gate answers every one of N concurrent
+  # sessions exactly once, recorded exactly once in the ledger — the precondition
+  # every later scale section depends on. Sections (b)-(j) are listed in the
+  # script as comments, deliberately NOT as stub assertions: an assertion that
+  # cannot fail is the most damaging thing this suite could contain.
+  #
+  # Hermetic and cheap: no runner image, no upstream, no model spend. The runs it
+  # creates use an absent local_copy workspace, which fails during `initializing`
+  # before the provider is ever asked for a sandbox.
+  scale:
+    runs-on: ubuntu-latest
+    # 25, not the 45 `hardening` needs: this suite boots the control plane ONCE
+    # and its one section is a single burst of concurrent requests. The budget is
+    # dominated by a cache-MISS debug build. Raise it as sections (b)-(j) land —
+    # a timeout kill is indistinguishable from a hang in the log.
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: fluidbox_scale
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/fluidbox_scale
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Share the debug build cache with the `rust` job — same profile.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: debug
+      - name: build server
+        run: cargo build -p fluidbox-server
+      # psql is REQUIRED: the fixture forge and every ledger assertion go through
+      # it, and none of them may silently skip.
+      - name: install postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: scale acceptance (fast session forge + concurrent gate decisions)
+        env:
+          # Reuse the just-built binary so the script `exec`s it directly (clean
+          # single-process lifecycle across the boots later sections will need).
+          FLUIDBOX_SERVER_BIN: ${{ github.workspace }}/target/debug/fluidbox-server
+        run: bash scripts/scale-e2e.sh
+      # FORENSICS — same rationale as the hardening job: the script owns its stack
+      # in a mktemp dir its EXIT trap deletes, so it copies logs and per-request
+      # recorders to a fixed path first, but only on failure and only under CI.
+      - name: upload scale forensics (server logs + per-request recorders)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: scale-e2e-logs
+          path: scale-e2e-artifacts/
+          if-no-files-found: warn
+          retention-days: 7
+
   web:
     runs-on: ubuntu-latest
     defaults:
