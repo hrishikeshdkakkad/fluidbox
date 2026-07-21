@@ -843,6 +843,14 @@ async fn finish_terminal_cleanup(
         );
         return;
     }
+    // Phase E (E5): terminate any live upstream MCP sessions this run opened
+    // (best-effort DELETE) and evict the replica-local registry entries. Drains
+    // the registry, so a re-drive of this idempotent reconciler finds nothing;
+    // fire-and-forget so a wedged upstream never blocks terminalization.
+    tokio::spawn({
+        let state = state.clone();
+        async move { crate::broker::run_terminal_mcp_cleanup(&state, id).await }
+    });
     // Reap MUST succeed (or the sandbox be verifiably gone) before the
     // workspace, archive, and intent go away — especially on Docker, where
     // nothing else ever kills the container.

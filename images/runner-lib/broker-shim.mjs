@@ -63,7 +63,14 @@ async function forward(toolName, args) {
     }
     if (body.ok) {
       const content = Array.isArray(body.result?.content) ? body.result.content : [];
-      return { content, isError: Boolean(body.result?.is_error) };
+      const out = { content, isError: Boolean(body.result?.is_error) };
+      // E7: relay structured output when the broker passed it through (MCP
+      // CallToolResult.structuredContent, paired with an outputSchema tool).
+      const structured = body.result?.structured_content;
+      if (structured !== undefined && structured !== null) {
+        out.structuredContent = structured;
+      }
+      return out;
     }
     if (body.denied) {
       return errText(`fluidbox denied this call: ${body.message || "denied by policy"}`);

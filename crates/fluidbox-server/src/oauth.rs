@@ -315,6 +315,68 @@ pub fn parse_www_authenticate(header: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// An SEP-835 `insufficient_scope` challenge, carrying the (optional, already
+/// sanitized) `scope` the server says it needs. Its presence tells the broker to
+/// stop — a re-mint cannot fix a scope the grant never had — and mark the
+/// connection for reconnect-with-more-scopes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopeChallenge {
+    pub scope: Option<String>,
+}
+
+/// Read one `WWW-Authenticate` param value (`key="quoted"` or bare `key=token`).
+fn www_auth_param(header: &str, key: &str) -> Option<String> {
+    // Match `key=` not preceded by another word char (so `error=` doesn't hit a
+    // hypothetical `xerror=`), tolerating whitespace.
+    let mut search = 0;
+    while let Some(rel) = header[search..].find(key) {
+        let at = search + rel;
+        let before_ok = at == 0 || !header.as_bytes()[at - 1].is_ascii_alphanumeric();
+        let after = &header[at + key.len()..];
+        let after = after.trim_start();
+        if before_ok {
+            if let Some(rest) = after.strip_prefix('=') {
+                let rest = rest.trim_start();
+                if let Some(q) = rest.strip_prefix('"') {
+                    let end = q.find('"')?;
+                    return Some(q[..end].to_string());
+                }
+                // bare token: up to the next comma / whitespace.
+                let end = rest.find([',', ' ', '\t']).unwrap_or(rest.len());
+                return Some(rest[..end].to_string());
+            }
+        }
+        search = at + key.len();
+    }
+    None
+}
+
+/// SEP-835 detection: `Some` iff the `WWW-Authenticate` challenge carries
+/// `error="insufficient_scope"`. The optional `scope` is sanitized to the OAuth
+/// scope charset and length-bounded — a hostile upstream must not smuggle a
+/// control/secret-shaped string into the connection's durable error note.
+pub fn parse_insufficient_scope(header: &str) -> Option<ScopeChallenge> {
+    if www_auth_param(header, "error").as_deref() != Some("insufficient_scope") {
+        return None;
+    }
+    let scope = www_auth_param(header, "scope").map(|s| sanitize_scope(&s));
+    Some(ScopeChallenge { scope })
+}
+
+/// Keep only RFC 6749 scope-token characters (`%x21 / %x23-5B / %x5D-7E`,
+/// approximated by the printable ASCII a scope uses) and space separators, and
+/// bound the length — the value lands verbatim in a persisted note.
+fn sanitize_scope(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            *c == ' ' || (c.is_ascii_graphic() && !matches!(c, '"' | '\\' | ',' | '<' | '>'))
+        })
+        .take(200)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 #[derive(Debug, Clone)]
 pub struct AsMeta {
     pub issuer: String,
@@ -3375,6 +3437,33 @@ mod tests {
             Some("https://x/prm")
         );
         assert!(parse_www_authenticate("Bearer realm=\"x\"").is_none());
+    }
+
+    #[test]
+    fn insufficient_scope_challenge_parses_and_sanitizes() {
+        // The SEP-835 challenge: error + the scope the server wants.
+        let c = parse_insufficient_scope(
+            r#"Bearer error="insufficient_scope", scope="read:issues write:issues""#,
+        )
+        .expect("insufficient_scope detected");
+        assert_eq!(c.scope.as_deref(), Some("read:issues write:issues"));
+        // A bare (unquoted) token value parses too.
+        let c = parse_insufficient_scope("Bearer error=insufficient_scope, scope=admin")
+            .expect("bare token");
+        assert_eq!(c.scope.as_deref(), Some("admin"));
+        // No scope param → challenge still detected, scope None.
+        let c = parse_insufficient_scope(r#"Bearer error="insufficient_scope""#).unwrap();
+        assert!(c.scope.is_none());
+        // A DIFFERENT error is NOT an insufficient_scope challenge.
+        assert!(parse_insufficient_scope(r#"Bearer error="invalid_token""#).is_none());
+        assert!(parse_insufficient_scope("Bearer realm=\"x\"").is_none());
+        // Sanitize: a poison/secret-shaped scope is stripped of control/quote
+        // characters before it can reach the persisted note.
+        let c = parse_insufficient_scope(
+            "Bearer error=\"insufficient_scope\", scope=\"ok\u{202e}evil\"",
+        )
+        .unwrap();
+        assert_eq!(c.scope.as_deref(), Some("okevil"));
     }
 
     #[test]
