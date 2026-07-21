@@ -461,6 +461,46 @@ async fn budget_sweeper(state: AppState) {
             Err(e) => tracing::warn!("stale execution-claim sweep failed: {e}"),
         }
 
+        // Phase E (#33; Gap 14): reconcile expired LLM budget reservations on the
+        // same tick, BEFORE the budget loop reads usage totals — so a booking whose
+        // facade request died is already counted as (conservative) usage by the
+        // time this session's budget is judged, rather than a tick late. The
+        // conversion is one statement in the DB (usage row keyed on the request id,
+        // then the CAS), so it is idempotent against a late drain in either order.
+        match fluidbox_db::system_worker::sweep_expired_llm_reservations(
+            &state.pool,
+            chrono::Utc::now(),
+            200,
+        )
+        .await
+        {
+            Ok(swept) => {
+                for r in swept {
+                    let scope = TenantScope::assume(r.tenant_id);
+                    let cost = r
+                        .reserved_cost_usd
+                        .map(|c| format!(", ~${c:.4}"))
+                        .unwrap_or_default();
+                    crate::ledger::record(
+                        &state,
+                        scope,
+                        r.session_id,
+                        fluidbox_core::event::Actor::System,
+                        fluidbox_core::event::EventBody::AgentMessage {
+                            role: "system".into(),
+                            text: format!(
+                                "model request {} never reported usage — charging the \
+                                 conservative reservation ({} tokens{cost})",
+                                r.request_id, r.reserved_tokens
+                            ),
+                        },
+                    )
+                    .await;
+                }
+            }
+            Err(e) => tracing::warn!("expired LLM-reservation sweep failed: {e}"),
+        }
+
         let active = match fluidbox_db::system_worker::sessions_in_status(
             &state.pool,
             &["running", "awaiting_approval"],
@@ -514,11 +554,25 @@ async fn budget_sweeper(state: AppState) {
             // sweep is the crash-durable driver, and the only one for an
             // idle runner that makes no further requests. Thresholds mirror
             // the inline checks exactly (>=).
+            //
+            // Phase E (#33; Gap 14): the projection now includes LIVE reservations
+            // (`state='reserved'`), not just recorded usage — a budget check that
+            // ignores booked-but-unreported spend is the very bug Gap 14 names.
+            // Disclosed consequence: within one conservative reservation of the
+            // ceiling this stops a run whose in-flight request would have fit,
+            // which is the "over-charge in the safe direction" the design asks for
+            // (:1122-1123) and the counterpart to the facade's sole-claimant
+            // admission — that carve-out keeps a lone request from livelocking on
+            // 429s, and this is where such a run is stopped properly instead:
+            // once, with a ledgered BudgetExceeded.
             let mut over: Option<&'static str> = None;
             if run_spec.budgets.max_tokens.is_some() || run_spec.budgets.max_cost_usd.is_some() {
                 if let Ok(totals) = fluidbox_db::usage_totals(&state.pool, scope, s.id).await {
+                    let booked = fluidbox_db::active_reservation_totals(&state.pool, scope, s.id)
+                        .await
+                        .unwrap_or_default();
                     if let Some(max) = run_spec.budgets.max_cost_usd {
-                        if totals.cost_usd >= max {
+                        if totals.cost_usd + booked.cost_usd >= max {
                             over = Some("max_cost_usd");
                         }
                     }
@@ -527,8 +581,8 @@ async fn budget_sweeper(state: AppState) {
                             let used = (totals.input_tokens
                                 + totals.output_tokens
                                 + totals.cache_read_tokens
-                                + totals.cache_write_tokens)
-                                as u64;
+                                + totals.cache_write_tokens
+                                + booked.tokens) as u64;
                             if used >= max {
                                 over = Some("max_tokens");
                             }
@@ -782,6 +836,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Gap 14's half of the budget sweeper, asserted from source so it stays
+    /// mutation-provable without a database. TWO properties:
+    ///   * expired reservations are RECONCILED on this tick, and BEFORE the
+    ///     budget loop reads usage totals — otherwise a crashed request's
+    ///     conservative charge is counted a tick late;
+    ///   * the token AND cost projections include LIVE reservations. A budget
+    ///     check that sees only recorded usage is precisely the Gap-14 defect,
+    ///     and this worker is the crash-durable driver for an idle runner.
+    #[test]
+    fn budget_sweeper_reconciles_and_projects_live_reservations() {
+        let src = include_str!("workers.rs");
+        let start = src
+            .find("async fn budget_sweeper(")
+            .expect("budget_sweeper exists");
+        let end = src[start..]
+            .find("/// Expire pending approvals")
+            .map(|i| start + i)
+            .expect("budget_sweeper's body is delimited");
+        let body = &src[start..end];
+
+        let sweep = body
+            .find("sweep_expired_llm_reservations(")
+            .expect("the sweeper converts expired LLM reservations into usage");
+        let totals = body
+            .find("fluidbox_db::usage_totals(")
+            .expect("the budget loop reads usage totals");
+        assert!(
+            sweep < totals,
+            "expired reservations must be converted BEFORE usage totals are read, \
+             so a crashed request's conservative charge is judged on this tick"
+        );
+        assert!(
+            body.contains("active_reservation_totals("),
+            "the budget projection must count LIVE reservations, not just recorded usage"
+        );
+        assert!(
+            body.contains("totals.cost_usd + booked.cost_usd >= max"),
+            "the COST arm must include live reservations"
+        );
+        assert!(
+            body.contains("+ booked.tokens) as u64"),
+            "the TOKEN arm must include live reservations"
+        );
     }
 
     #[test]

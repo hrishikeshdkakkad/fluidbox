@@ -5209,6 +5209,292 @@ pub async fn tool_call_count(
     Ok(row.get::<i64, _>("n"))
 }
 
+// ─── LLM budget reservations (Phase E, #33; Gap 14) ───────────────────────
+// Migration 0022. The facade's check-then-record budget was raceable: N
+// concurrent requests all read the same remaining budget and all passed. These
+// functions replace the check with a durable, request-ID-keyed ATOMIC admission
+// so concurrent requests see each other's bookings. Every fn is tenant-scoped
+// (`scoped_tx` + `tenant_id` predicate); the cross-tenant expiry sweep lives in
+// `system_worker`.
+
+/// One `llm_reservations` row (migration 0022).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct LlmReservationRow {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub session_id: Uuid,
+    pub model: String,
+    pub reserved_tokens: i64,
+    pub reserved_cost_usd: Option<f64>,
+    pub state: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Live (`state = 'reserved'`) reservation totals for one session — the spend that
+/// is booked but not yet in `usage_entries`. The budget sweeper adds these to
+/// `usage_totals` so its projection sees in-flight requests, not just settled ones.
+#[derive(Debug, Clone, Copy, Default, sqlx::FromRow)]
+pub struct ReservationTotals {
+    pub tokens: i64,
+    pub cost_usd: f64,
+    pub active: i64,
+}
+
+/// The verdict of [`reserve_llm_budget`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReserveOutcome {
+    /// Booked. The caller owns the reservation and MUST settle it (charge on
+    /// authoritative usage, release only on positively-proven non-dispatch).
+    Reserved,
+    /// The projection `recorded usage + live reservations + this request` exceeds
+    /// the named budget. `active` is how many live reservations were counted —
+    /// always ≥ 1, because a request with no competitors is admitted by the
+    /// sole-claimant rule (see the fn docs).
+    BudgetExceeded { budget: &'static str, active: i64 },
+    /// Too many reservations already outstanding for this session.
+    CeilingExceeded { active: i64, ceiling: i64 },
+    /// The session stopped accepting work (or is not this tenant's) before the
+    /// reservation could be booked.
+    SessionTerminal,
+}
+
+/// Book a conservative maximum against a run's LLM budget, atomically.
+///
+/// TWO STATEMENTS, and both halves are load-bearing:
+///
+///   1. `select status from sessions … for update` — the SERIALIZER. A CTE alone
+///      does NOT close the race: under READ COMMITTED two concurrent transactions
+///      each take their own snapshot and neither sees the other's uncommitted
+///      insert, so both would pass an identical guard. Locking the session row
+///      first makes concurrent admissions for one session queue on that row, and
+///      the SECOND statement then runs on a fresh command snapshot that includes
+///      everything the previous holder committed. (A single statement would keep
+///      the stale pre-lock snapshot for the rows it reads — the same hazard
+///      `claim_tool_execution` and `set_sandbox_handle` document.) The lock is
+///      held for one short statement and NEVER across the upstream model call, so
+///      this is not "serialize requests per session", which design :1113-1115
+///      forbids: parallel subagent calls still run in parallel, they just take
+///      their bookings in a defined order.
+///   2. ONE atomic CTE that computes recorded usage + live reservations + the
+///      ceiling and inserts the row only if every guard passes — decision and
+///      booking can never be separated by another writer.
+///
+/// LOCK ORDER: `sessions` (FOR UPDATE) → `llm_reservations`. Identical to
+/// `claim_tool_execution` (`sessions` → `tool_execution_claims`) and to
+/// cancellation (`transition_session` / `begin_finalization`, which also take the
+/// session row first), so all four serialize on the same row in the same order and
+/// no cycle can form. This tx never touches `approvals` and never calls
+/// `append_event`, so it is disjoint from the approvals→sessions ordering the
+/// decision sites use.
+///
+/// THE SOLE-CLAIMANT RULE (a deliberate refinement of the plan's literal
+/// predicate). The budget arms are skipped when there are ZERO other live
+/// reservations. Gap 14 is a CONCURRENCY race, and the pre-existing accumulated
+/// check (`recorded usage >= budget`, unchanged, evaluated moments earlier in the
+/// facade) has already ruled on whether the run may proceed at all. Without this
+/// carve-out a run whose per-request conservative estimate alone exceeds its
+/// remaining budget could never make a single request — it would be refused
+/// forever with nothing in flight to drain, livelocking instead of stopping. The
+/// terminal "this run is out of budget" verdict therefore stays where it already
+/// lives (the accumulated check plus the budget sweeper, which now counts live
+/// reservations and so still stops an over-projecting sole claimant — once,
+/// cleanly, with a ledgered `BudgetExceeded`).
+///
+/// `budget_tokens` / `budget_cost` are the RunSpec's frozen caps (`None` = no
+/// cap). `reserved_cost` is `None` for an unpriced model; NULL contributes 0 to
+/// the cost projection, which is why the token arm carries the weight there.
+#[allow(clippy::too_many_arguments)]
+pub async fn reserve_llm_budget(
+    pool: &PgPool,
+    scope: TenantScope,
+    session_id: Uuid,
+    request_id: Uuid,
+    model: &str,
+    reserved_tokens: i64,
+    reserved_cost: Option<f64>,
+    ceiling: i64,
+    budget_tokens: Option<i64>,
+    budget_cost: Option<f64>,
+    ttl_secs: i64,
+) -> sqlx::Result<ReserveOutcome> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let locked: Option<(String,)> =
+        sqlx::query_as("select status from sessions where id = $1 and tenant_id = $2 for update")
+            .bind(session_id)
+            .bind(scope.tenant_id())
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((status,)) = locked else {
+        return Ok(ReserveOutcome::SessionTerminal);
+    };
+    if !SessionStatus::parse(&status).is_some_and(|s| s.accepts_work()) {
+        return Ok(ReserveOutcome::SessionTerminal);
+    }
+    let expires = Utc::now() + chrono::Duration::seconds(ttl_secs.max(1));
+    let row = sqlx::query(
+        "with used as (
+             select coalesce(sum(input_tokens + output_tokens
+                                 + cache_read_tokens + cache_write_tokens), 0)::bigint as tokens,
+                    coalesce(sum(cost_usd), 0)::float8 as cost
+               from usage_entries
+              where session_id = $2
+                and exists (select 1 from sessions s where s.id = $2 and s.tenant_id = $3)
+         ),
+         active as (
+             select coalesce(sum(reserved_tokens), 0)::bigint as tokens,
+                    coalesce(sum(reserved_cost_usd), 0)::float8 as cost,
+                    count(*)::bigint as n
+               from llm_reservations
+              where session_id = $2 and state = 'reserved'
+                and exists (select 1 from sessions s where s.id = $2 and s.tenant_id = $3)
+         ),
+         guard as (
+             select a.n as active_n,
+                    a.n < $8::bigint as under_ceiling,
+                    ($9::bigint is null or a.n = 0
+                       or u.tokens + a.tokens + $6::bigint <= $9::bigint) as under_tokens,
+                    ($10::float8 is null or a.n = 0
+                       or u.cost + a.cost + coalesce($7::float8, 0) <= $10::float8) as under_cost
+               from used u, active a
+         ),
+         ins as (
+             insert into llm_reservations
+                 (id, tenant_id, session_id, model, reserved_tokens, reserved_cost_usd,
+                  state, expires_at)
+             select $1::uuid, $3::uuid, $2::uuid, $5::text, $6::bigint, $7::float8,
+                    'reserved', $4::timestamptz
+               from guard g
+              where g.under_ceiling and g.under_tokens and g.under_cost
+                and exists (select 1 from sessions s where s.id = $2 and s.tenant_id = $3)
+             returning id
+         )
+         select (select count(*) from ins)::bigint as inserted,
+                g.active_n, g.under_ceiling, g.under_tokens, g.under_cost
+           from guard g",
+    )
+    .bind(request_id)
+    .bind(session_id)
+    .bind(scope.tenant_id())
+    .bind(expires)
+    .bind(model)
+    .bind(reserved_tokens)
+    .bind(reserved_cost)
+    .bind(ceiling)
+    .bind(budget_tokens)
+    .bind(budget_cost)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    let inserted: i64 = row.get("inserted");
+    let active: i64 = row.get("active_n");
+    let outcome = if inserted == 1 {
+        ReserveOutcome::Reserved
+    } else if !row.get::<bool, _>("under_ceiling") {
+        ReserveOutcome::CeilingExceeded { active, ceiling }
+    } else if !row.get::<bool, _>("under_tokens") {
+        ReserveOutcome::BudgetExceeded {
+            budget: "max_tokens",
+            active,
+        }
+    } else if !row.get::<bool, _>("under_cost") {
+        ReserveOutcome::BudgetExceeded {
+            budget: "max_cost_usd",
+            active,
+        }
+    } else {
+        // Every guard passed but the insert's tenant/session predicate did not —
+        // the session vanished or is not this tenant's. Fail closed.
+        ReserveOutcome::SessionTerminal
+    };
+    Ok(outcome)
+}
+
+/// Settle a reservation as SPENT (CAS `reserved → charged`). The caller MUST have
+/// already written the matching `usage_entries` row keyed `external_id = id`; this
+/// only retires the booking so it stops being counted twice. Returns true iff this
+/// call landed the transition (false = the sweeper already converted it).
+pub async fn charge_llm_reservation(
+    pool: &PgPool,
+    scope: TenantScope,
+    request_id: Uuid,
+) -> sqlx::Result<bool> {
+    cas_reservation_state(pool, scope, request_id, "charged").await
+}
+
+/// Settle a reservation as NEVER SPENT (CAS `reserved → released`). Legal ONLY on
+/// positively-proven non-dispatch (design :1121) — a pre-send refusal or an
+/// upstream 401, which the facade already treats as proof the request never
+/// executed. "We could not parse usage" is NOT proof and must retain instead.
+pub async fn release_llm_reservation(
+    pool: &PgPool,
+    scope: TenantScope,
+    request_id: Uuid,
+) -> sqlx::Result<bool> {
+    cas_reservation_state(pool, scope, request_id, "released").await
+}
+
+async fn cas_reservation_state(
+    pool: &PgPool,
+    scope: TenantScope,
+    request_id: Uuid,
+    state: &str,
+) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let res = sqlx::query(
+        "update llm_reservations set state = $3
+          where id = $1 and tenant_id = $2 and state = 'reserved'",
+    )
+    .bind(request_id)
+    .bind(scope.tenant_id())
+    .bind(state)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// Live reservation totals for one session (the budget sweeper's projection input,
+/// and the tests' observation window).
+pub async fn active_reservation_totals(
+    pool: &PgPool,
+    scope: TenantScope,
+    session: Uuid,
+) -> sqlx::Result<ReservationTotals> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let out = sqlx::query_as(
+        "select coalesce(sum(reserved_tokens), 0)::bigint as tokens,
+                coalesce(sum(reserved_cost_usd), 0)::float8 as cost_usd,
+                count(*)::bigint as active
+           from llm_reservations
+          where session_id = $1 and state = 'reserved'
+            and exists (select 1 from sessions s where s.id = $1 and s.tenant_id = $2)",
+    )
+    .bind(session)
+    .bind(scope.tenant_id())
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(out)
+}
+
+/// Read one reservation by its request id (tests + operator introspection).
+pub async fn get_llm_reservation(
+    pool: &PgPool,
+    scope: TenantScope,
+    request_id: Uuid,
+) -> sqlx::Result<Option<LlmReservationRow>> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let out = sqlx::query_as("select * from llm_reservations where id = $1 and tenant_id = $2")
+        .bind(request_id)
+        .bind(scope.tenant_id())
+        .fetch_optional(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(out)
+}
+
 // ─── Tokens ───────────────────────────────────────────────────────────────
 
 /// Mint one audience-scoped session token (Gap 10, invariant 19). `audience` is
@@ -14112,5 +14398,643 @@ mod tests {
             Some((None,)),
             "recording an attempt releases the claim for the next backoff window"
         );
+    }
+
+    // ─── LLM budget reservations (Phase E, #33; Gap 14) ─────────────────────
+    // DB-backed; self-skip when DATABASE_URL is unset (CI proves them). The
+    // no-DB SOURCE GUARD below keeps the admission predicate mutation-provable
+    // locally.
+
+    /// The admission statement is the whole fix, so its load-bearing predicates
+    /// are asserted from source — a mutation that drops the ceiling guard or
+    /// stops counting live reservations fails HERE, with no database.
+    #[test]
+    fn reserve_llm_budget_sql_keeps_its_load_bearing_predicates() {
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("pub async fn reserve_llm_budget(")
+            .expect("reserve_llm_budget exists");
+        let end = src[start..]
+            .find("pub async fn charge_llm_reservation(")
+            .map(|i| start + i)
+            .expect("the next fn delimits the body");
+        let body = &src[start..end];
+        for (needle, why) in [
+            (
+                "for update",
+                "the sessions row lock is the SERIALIZER — a CTE alone cannot see a \
+                 concurrent transaction's uncommitted reservation, so without this both \
+                 racers pass the same guard (Gap 14 returns)",
+            ),
+            (
+                "a.n < $8::bigint as under_ceiling",
+                "the finite ceiling on concurrent reservations (design :1118)",
+            ),
+            (
+                "u.tokens + a.tokens + $6::bigint <= $9::bigint",
+                "the token projection must include LIVE RESERVATIONS, not just recorded usage",
+            ),
+            (
+                "u.cost + a.cost + coalesce($7::float8, 0) <= $10::float8",
+                "the cost projection must include LIVE RESERVATIONS, not just recorded usage",
+            ),
+            (
+                "where session_id = $2 and state = 'reserved'",
+                "ACTIVE is state-only: an expired-but-unswept row must keep counting, or \
+                 there is an unbudgeted window between expiry and the sweep",
+            ),
+        ] {
+            assert!(
+                body.contains(needle),
+                "reserve_llm_budget's SQL lost `{needle}` — {why}"
+            );
+        }
+    }
+
+    /// Seed a session plus a scope, and give it a settled usage row so the
+    /// projection has a non-zero `used` component.
+    async fn seed_reservation_session(
+        pool: &PgPool,
+        used_tokens: i64,
+    ) -> (Uuid, Uuid, TenantScope) {
+        let (tenant, session_id) = seed_tenant_session(pool).await;
+        let scope = TenantScope::assume(tenant);
+        if used_tokens > 0 {
+            add_usage(
+                pool,
+                scope,
+                session_id,
+                "claude-haiku-4-5",
+                used_tokens,
+                0,
+                0,
+                0,
+                Some(0.01),
+                "facade",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        (tenant, session_id, scope)
+    }
+
+    /// Reserve with the fixture's fixed model and TTL — the tests vary only the
+    /// numbers they assert on.
+    #[allow(clippy::too_many_arguments)]
+    async fn reserve(
+        pool: &PgPool,
+        scope: TenantScope,
+        session: Uuid,
+        id: Uuid,
+        tokens: i64,
+        cost: Option<f64>,
+        ceiling: i64,
+        budget_tokens: Option<i64>,
+        budget_cost: Option<f64>,
+    ) -> ReserveOutcome {
+        reserve_llm_budget(
+            pool,
+            scope,
+            session,
+            id,
+            "claude-haiku-4-5",
+            tokens,
+            cost,
+            ceiling,
+            budget_tokens,
+            budget_cost,
+            600,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Push a reservation's expiry into the past (what a crashed facade request
+    /// looks like to the sweeper).
+    async fn expire_reservation(pool: &PgPool, id: Uuid) {
+        let mut tx = worker_tx(pool).await.unwrap();
+        sqlx::query(
+            "update llm_reservations set expires_at = now() - interval '1 minute' where id = $1",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reserve_llm_budget_books_and_settles() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id, scope) = seed_reservation_session(&pool, 100).await;
+
+        let req = Uuid::now_v7();
+        assert_eq!(
+            reserve(
+                &pool,
+                scope,
+                session_id,
+                req,
+                500,
+                Some(0.02),
+                32,
+                Some(10_000),
+                Some(1.0)
+            )
+            .await,
+            ReserveOutcome::Reserved
+        );
+        let totals = active_reservation_totals(&pool, scope, session_id)
+            .await
+            .unwrap();
+        assert_eq!((totals.tokens, totals.active), (500, 1));
+
+        // Charge is a one-way CAS: the second call finds no `reserved` row.
+        assert!(charge_llm_reservation(&pool, scope, req).await.unwrap());
+        assert!(!charge_llm_reservation(&pool, scope, req).await.unwrap());
+        assert!(
+            !release_llm_reservation(&pool, scope, req).await.unwrap(),
+            "a charged reservation can never be released back"
+        );
+        let row = get_llm_reservation(&pool, scope, req)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, "charged");
+        let after = active_reservation_totals(&pool, scope, session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            (after.tokens, after.active),
+            (0, 0),
+            "a charged row stops being active"
+        );
+
+        // Release is the mirror image, on a fresh booking.
+        let req2 = Uuid::now_v7();
+        assert_eq!(
+            reserve(
+                &pool,
+                scope,
+                session_id,
+                req2,
+                500,
+                Some(0.02),
+                32,
+                Some(10_000),
+                Some(1.0)
+            )
+            .await,
+            ReserveOutcome::Reserved
+        );
+        assert!(release_llm_reservation(&pool, scope, req2).await.unwrap());
+        assert_eq!(
+            get_llm_reservation(&pool, scope, req2)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "released"
+        );
+        assert_eq!(
+            active_reservation_totals(&pool, scope, session_id)
+                .await
+                .unwrap()
+                .active,
+            0
+        );
+        cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    #[tokio::test]
+    async fn reserve_llm_budget_counts_recorded_usage_and_live_reservations() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        // 600 tokens already recorded against a 1000-token budget.
+        let (tenant, session_id, scope) = seed_reservation_session(&pool, 600).await;
+
+        // First booking fits: 600 recorded + 0 live + 300 = 900 <= 1000.
+        assert_eq!(
+            reserve(
+                &pool,
+                scope,
+                session_id,
+                Uuid::now_v7(),
+                300,
+                None,
+                32,
+                Some(1000),
+                None
+            )
+            .await,
+            ReserveOutcome::Reserved
+        );
+        // Second is individually small but 600 + 300 + 300 = 1200 > 1000. It is
+        // refused ONLY because the LIVE reservation is counted — recorded usage
+        // alone (600 + 300) would have passed.
+        assert_eq!(
+            reserve(
+                &pool,
+                scope,
+                session_id,
+                Uuid::now_v7(),
+                300,
+                None,
+                32,
+                Some(1000),
+                None
+            )
+            .await,
+            ReserveOutcome::BudgetExceeded {
+                budget: "max_tokens",
+                active: 1
+            }
+        );
+        // The cost arm binds the same way, on its own.
+        let (t2, s2, sc2) = seed_reservation_session(&pool, 0).await;
+        assert_eq!(
+            reserve(
+                &pool,
+                sc2,
+                s2,
+                Uuid::now_v7(),
+                1,
+                Some(0.90),
+                32,
+                None,
+                Some(1.0)
+            )
+            .await,
+            ReserveOutcome::Reserved
+        );
+        assert_eq!(
+            reserve(
+                &pool,
+                sc2,
+                s2,
+                Uuid::now_v7(),
+                1,
+                Some(0.90),
+                32,
+                None,
+                Some(1.0)
+            )
+            .await,
+            ReserveOutcome::BudgetExceeded {
+                budget: "max_cost_usd",
+                active: 1
+            }
+        );
+        // A run with NO caps is never refused by the budget arms.
+        assert_eq!(
+            reserve(
+                &pool,
+                sc2,
+                s2,
+                Uuid::now_v7(),
+                1_000_000,
+                Some(999.0),
+                32,
+                None,
+                None
+            )
+            .await,
+            ReserveOutcome::Reserved
+        );
+        cleanup_sw_tenant(&pool, tenant).await;
+        cleanup_sw_tenant(&pool, t2).await;
+    }
+
+    /// The SOLE-CLAIMANT rule: with nothing else in flight the budget arms are
+    /// skipped, so a lone request whose conservative estimate alone exceeds the
+    /// remaining budget still gets to run (it would otherwise 429-livelock with
+    /// nothing to drain). The moment a sibling exists, the projection binds.
+    #[tokio::test]
+    async fn reserve_llm_budget_admits_the_sole_claimant_then_binds() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id, scope) = seed_reservation_session(&pool, 900).await;
+        // 900 recorded, budget 1000, this request alone wants 5000.
+        assert_eq!(
+            reserve(
+                &pool,
+                scope,
+                session_id,
+                Uuid::now_v7(),
+                5000,
+                None,
+                32,
+                Some(1000),
+                None
+            )
+            .await,
+            ReserveOutcome::Reserved,
+            "a lone request is admitted — the accumulated check already ruled"
+        );
+        assert!(matches!(
+            reserve(
+                &pool,
+                scope,
+                session_id,
+                Uuid::now_v7(),
+                1,
+                None,
+                32,
+                Some(1000),
+                None
+            )
+            .await,
+            ReserveOutcome::BudgetExceeded { .. }
+        ));
+        cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    #[tokio::test]
+    async fn reserve_llm_budget_enforces_the_concurrency_ceiling() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id, scope) = seed_reservation_session(&pool, 0).await;
+        // Ceiling 2, no budget caps at all — only the ceiling can refuse.
+        for _ in 0..2 {
+            assert_eq!(
+                reserve(
+                    &pool,
+                    scope,
+                    session_id,
+                    Uuid::now_v7(),
+                    1,
+                    None,
+                    2,
+                    None,
+                    None
+                )
+                .await,
+                ReserveOutcome::Reserved
+            );
+        }
+        assert_eq!(
+            reserve(
+                &pool,
+                scope,
+                session_id,
+                Uuid::now_v7(),
+                1,
+                None,
+                2,
+                None,
+                None
+            )
+            .await,
+            ReserveOutcome::CeilingExceeded {
+                active: 2,
+                ceiling: 2
+            }
+        );
+        cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    /// THE GAP-14 ACCEPTANCE. Two genuinely concurrent transactions on separate
+    /// connections, each individually inside the budget, jointly over it: exactly
+    /// ONE may book. This is the race the facade's check-then-record budget lost
+    /// every time.
+    #[tokio::test]
+    async fn reserve_llm_budget_two_tx_race_yields_exactly_one_winner() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id, scope) = seed_reservation_session(&pool, 0).await;
+        let pool2 = pool.clone();
+        // Budget 1000; each request books 600 — either alone fits, both do not.
+        let (a, b) = tokio::join!(
+            reserve(
+                &pool,
+                scope,
+                session_id,
+                Uuid::now_v7(),
+                600,
+                None,
+                32,
+                Some(1000),
+                None
+            ),
+            reserve(
+                &pool2,
+                scope,
+                session_id,
+                Uuid::now_v7(),
+                600,
+                None,
+                32,
+                Some(1000),
+                None
+            ),
+        );
+        let wins = [&a, &b]
+            .iter()
+            .filter(|o| ***o == ReserveOutcome::Reserved)
+            .count();
+        assert_eq!(
+            wins, 1,
+            "exactly one concurrent reservation may take the shared budget (got {a:?} / {b:?})"
+        );
+        assert!(
+            [&a, &b]
+                .iter()
+                .any(|o| matches!(o, ReserveOutcome::BudgetExceeded { .. })),
+            "the loser is refused on the BUDGET, not on some other arm (got {a:?} / {b:?})"
+        );
+        let totals = active_reservation_totals(&pool, scope, session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            (totals.active, totals.tokens),
+            (1, 600),
+            "only the winner's booking exists"
+        );
+        cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    #[tokio::test]
+    async fn sweep_converts_expired_reservations_conservatively() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id, scope) = seed_reservation_session(&pool, 0).await;
+        let req = Uuid::now_v7();
+        reserve(
+            &pool,
+            scope,
+            session_id,
+            req,
+            4242,
+            Some(0.25),
+            32,
+            None,
+            None,
+        )
+        .await;
+
+        // A live reservation is NOT swept.
+        assert!(
+            system_worker::sweep_expired_llm_reservations(&pool, Utc::now(), 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        expire_reservation(&pool, req).await;
+        let swept = system_worker::sweep_expired_llm_reservations(&pool, Utc::now(), 100)
+            .await
+            .unwrap();
+        assert_eq!(swept.len(), 1);
+        assert_eq!(swept[0].reserved_tokens, 4242);
+        assert_eq!(swept[0].session_id, session_id);
+
+        // The conservative charge is now real, budget-visible usage…
+        let totals = usage_totals(&pool, scope, session_id).await.unwrap();
+        assert_eq!(totals.output_tokens, 4242);
+        assert!((totals.cost_usd - 0.25).abs() < 1e-9);
+        // …and the reservation is settled, so it is no longer double-counted.
+        assert_eq!(
+            get_llm_reservation(&pool, scope, req)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "charged"
+        );
+        assert_eq!(
+            active_reservation_totals(&pool, scope, session_id)
+                .await
+                .unwrap()
+                .active,
+            0
+        );
+        // Idempotent: a second sweep of the same instant finds nothing.
+        assert!(
+            system_worker::sweep_expired_llm_reservations(&pool, Utc::now(), 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        cleanup_sw_tenant(&pool, tenant).await;
+    }
+
+    /// The sweeper and a late drain settle the SAME request id, so `add_usage`'s
+    /// `on conflict (external_id) do nothing` makes them idempotent in EITHER
+    /// order — never a double charge, never a lost charge.
+    #[tokio::test]
+    async fn sweep_and_late_drain_are_idempotent_in_either_order() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+
+        // Order A — sweeper first, drain late. The conservative charge stands;
+        // the drain's real usage is the no-op and its CAS loses.
+        let (ta, sa, sca) = seed_reservation_session(&pool, 0).await;
+        let ra = Uuid::now_v7();
+        reserve(&pool, sca, sa, ra, 5000, Some(0.50), 32, None, None).await;
+        expire_reservation(&pool, ra).await;
+        assert_eq!(
+            system_worker::sweep_expired_llm_reservations(&pool, Utc::now(), 100)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            !add_usage(
+                &pool,
+                sca,
+                sa,
+                "claude-haiku-4-5",
+                7,
+                11,
+                0,
+                0,
+                Some(0.001),
+                "facade",
+                Some(&ra.to_string()),
+            )
+            .await
+            .unwrap(),
+            "the late drain's usage row is refused by the external_id conflict"
+        );
+        assert!(
+            !charge_llm_reservation(&pool, sca, ra).await.unwrap(),
+            "the late drain's CAS finds an already-charged reservation"
+        );
+        let a = usage_totals(&pool, sca, sa).await.unwrap();
+        assert_eq!(
+            (a.requests, a.output_tokens, a.input_tokens),
+            (1, 5000, 0),
+            "exactly one usage row, and it is the conservative one"
+        );
+
+        // Order B — drain first, sweeper late. The REAL usage stands and the
+        // sweeper's conservative row is the no-op.
+        let (tb, sb, scb) = seed_reservation_session(&pool, 0).await;
+        let rb = Uuid::now_v7();
+        reserve(&pool, scb, sb, rb, 5000, Some(0.50), 32, None, None).await;
+        assert!(add_usage(
+            &pool,
+            scb,
+            sb,
+            "claude-haiku-4-5",
+            7,
+            11,
+            0,
+            0,
+            Some(0.001),
+            "facade",
+            Some(&rb.to_string()),
+        )
+        .await
+        .unwrap());
+        // …crash before the CAS: the row is still `reserved`, so the sweep runs.
+        expire_reservation(&pool, rb).await;
+        assert_eq!(
+            system_worker::sweep_expired_llm_reservations(&pool, Utc::now(), 100)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let b = usage_totals(&pool, scb, sb).await.unwrap();
+        assert_eq!(
+            (b.requests, b.input_tokens, b.output_tokens),
+            (1, 7, 11),
+            "exactly one usage row, and the authoritative numbers won"
+        );
+        assert_eq!(
+            get_llm_reservation(&pool, scb, rb)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "charged"
+        );
+        cleanup_sw_tenant(&pool, ta).await;
+        cleanup_sw_tenant(&pool, tb).await;
     }
 }
