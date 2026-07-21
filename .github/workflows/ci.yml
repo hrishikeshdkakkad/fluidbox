@@ -298,11 +298,13 @@ jobs:
   # before the provider is ever asked for a sandbox.
   scale:
     runs-on: ubuntu-latest
-    # 25, not the 45 `hardening` needs: this suite boots the control plane ONCE
-    # and its one section is a single burst of concurrent requests. The budget is
-    # dominated by a cache-MISS debug build. Raise it as sections (b)-(j) land —
-    # a timeout kill is indistinguishable from a hang in the log.
-    timeout-minutes: 25
+    # 45, not the 25 this job was created with. The first real run PROVED the
+    # point `hardening` makes: 25 was eaten almost entirely by a cache-MISS debug
+    # build of the workspace (10-18 min on its own), leaving the script too
+    # little, and GitHub reports a timeout kill as "cancelled" — indistinguishable
+    # in the checks list from a job someone cancelled, and in the log from a hang.
+    # Headroom here is what keeps a slow runner from reading as a deadlock.
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:16
