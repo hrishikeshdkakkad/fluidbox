@@ -23,6 +23,7 @@ mod ledger;
 mod llm_keys;
 mod login;
 mod mcp_sse;
+mod metrics;
 mod oauth;
 mod orchestrator;
 mod rbac;
@@ -282,15 +283,17 @@ async fn main() -> anyhow::Result<()> {
     let egress_policy = egress::EgressPolicy::from_config(&cfg);
     let identity_http = egress::build_identity_http(&egress_policy);
     let egress_http = egress::build_egress_http(&egress_policy);
-    // Phase E (E14): the outbound rate limits + per-connection circuit breakers
-    // the broker consults before every dial. In-memory and PER-REPLICA by design
-    // — see the `governor` module docs (durable limiter = Phase F).
+    // Phase E (E14) + Phase F (0023): the outbound rate limits + per-connection
+    // circuit breakers the broker consults before every dial. Two tiers — a
+    // per-replica in-memory tier checked first, then (default on) a durable
+    // Postgres tier giving the deployment-wide ceiling. See the `governor` docs.
     let governor = governor::EgressGovernor::from_config(&cfg);
     {
         let l = governor.limits();
         tracing::info!(
-            "outbound egress governor: {}/min per tenant, {}/min per connection, {}/min per host; breaker {} consecutive transport failures ⇒ open {}s (0 = disabled; per-replica)",
-            l.tenant_per_min, l.connection_per_min, l.host_per_min, l.breaker_threshold, l.breaker_open_secs
+            "outbound egress governor: {}/min per tenant, {}/min per connection, {}/min per host; breaker {} consecutive transport failures ⇒ open {}s (0 = disabled). Durable cross-replica tier: {} (host_global stays per-replica)",
+            l.tenant_per_min, l.connection_per_min, l.host_per_min, l.breaker_threshold, l.breaker_open_secs,
+            if cfg.egress_durable { "ON" } else { "OFF (per-replica only)" }
         );
     }
 
@@ -326,6 +329,7 @@ async fn main() -> anyhow::Result<()> {
         // progress, both in-memory (the job is restart-safe by construction).
         reseal_running: std::sync::atomic::AtomicBool::new(false),
         reseal_status: tokio::sync::Mutex::new(reseal::ResealStatus::default()),
+        metrics: metrics::Metrics::default(),
         pool,
         cfg,
     });
@@ -441,6 +445,10 @@ async fn main() -> anyhow::Result<()> {
         // count parity + job progress. The D4 retirement boot gate
         // (seal::check_retirement_gates) reads the same counts.
         .route("/admin/reseal", get(reseal::status).post(reseal::start))
+        // Operational metrics (Phase F, #34): admin-gated Prometheus exposition.
+        // The optional unauth `FLUIDBOX_METRICS_BIND` listener (below) serves the
+        // identical body on its own private port.
+        .route("/admin/metrics", get(metrics::admin_metrics))
         .route(
             "/capabilities",
             get(capabilities::list).post(capabilities::create),
@@ -588,6 +596,27 @@ async fn main() -> anyhow::Result<()> {
 
     let public_listener = tokio::net::TcpListener::bind(&state.cfg.bind).await?;
     let internal_listener = tokio::net::TcpListener::bind(&state.cfg.internal_bind).await?;
+
+    // Optional UNAUTHENTICATED metrics listener (Phase F, #34). Bound at boot so a
+    // bad address fails boot (the established convention), then served on a
+    // background task: a metrics-endpoint fault must not take the control plane
+    // down, unlike the two planes above whose failure is fatal by design.
+    if let Some(metrics_addr) = state.cfg.metrics_bind.clone() {
+        let metrics_listener = tokio::net::TcpListener::bind(&metrics_addr).await?;
+        let metrics_app = Router::new()
+            .route("/metrics", get(metrics::metrics_endpoint))
+            .with_state(state.clone());
+        tracing::warn!(
+            "fluidbox metrics listening on http://{metrics_addr}/metrics (UNAUTHENTICATED — \
+             FLUIDBOX_METRICS_BIND must reach a private interface only)"
+        );
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(metrics_listener, metrics_app).await {
+                tracing::error!("metrics listener exited: {e}");
+            }
+        });
+    }
+
     tracing::info!("fluidbox public  listening on http://{}", state.cfg.bind);
     tracing::info!(
         "fluidbox internal listening on http://{} (/internal only)",
@@ -711,6 +740,27 @@ mod tests {
             src.matches("state.cfg.max_request_body_bytes,").count(),
             2,
             "each listener passes the configured limit through"
+        );
+    }
+
+    /// The metrics surface must stay wired: the admin-gated route on the public
+    /// plane, and the optional unauth listener guarded by the config knob. A
+    /// dropped route or a listener that ignored `metrics_bind` would look identical
+    /// in review, and no handler unit test sees the wiring.
+    #[test]
+    fn the_metrics_endpoint_and_optional_listener_are_wired() {
+        let src = production_src();
+        assert!(
+            src.contains("get(metrics::admin_metrics)"),
+            "the admin-gated metrics route must be wired on the public plane"
+        );
+        assert!(
+            src.contains("if let Some(metrics_addr) = state.cfg.metrics_bind.clone()"),
+            "the optional metrics listener must be gated on the configured bind"
+        );
+        assert!(
+            src.contains("get(metrics::metrics_endpoint)"),
+            "the optional listener must serve the unauth metrics handler"
         );
     }
 

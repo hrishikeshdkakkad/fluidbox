@@ -26,7 +26,21 @@ mod seed;
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
-use guard::{host_of, production_signals, scheme_of, TargetFacts};
+use guard::{production_signals, scheme_of, TargetFacts};
+
+/// The `database_host` guard fact. `None` only when NO database URL was given
+/// (nothing to seed — not a signal). A URL that is present but does not parse as
+/// a Postgres URL is reported as a non-loopback sentinel so the guard REFUSES
+/// rather than silently proceeding: an unparseable seeding URL is not a safe one,
+/// and treating "can't tell" as "safe" is the fail-open the guard exists to avoid.
+fn db_host_fact(database_url: &str) -> Option<String> {
+    if database_url.trim().is_empty() {
+        return None;
+    }
+    Some(
+        guard::effective_db_host(database_url).unwrap_or_else(|| "unparseable-database-url".into()),
+    )
+}
 use scenarios::{Ctx, TemplateWorkspace};
 use std::time::Duration;
 use uuid::Uuid;
@@ -49,7 +63,9 @@ IT NEVER SPENDS MODEL MONEY
   the brokered scenarios) a fake MCP upstream it hosts itself on loopback. It
   never contacts a model provider. `--facade-calls-per-session` drives the
   deployment's LLM FACADE, which forwards to whatever that deployment's
-  LLM_UPSTREAM_URL names — so point it at a fake gateway first. It defaults to 0.
+  LLM_UPSTREAM_URL names — so point it at a fake gateway first. It defaults to 0,
+  and a nonzero value requires --allow-model-spend (this harness cannot verify
+  the deployment's upstream is a fake, so the opt-in is the enforceable gate).
 
 IT DOES NOT LAUNCH SANDBOXES
   N concurrent runs are simulated by creating ONE genuine run through the public
@@ -146,6 +162,14 @@ struct Cli {
     /// Permit a template workspace that can reach the sandbox provider.
     #[arg(long, global = true)]
     allow_provisioning: bool,
+
+    /// Acknowledge that this run may spend REAL model money. Required whenever
+    /// --facade-calls-per-session > 0: those calls drive the deployment's LLM
+    /// facade, which forwards to the deployment's own LLM_UPSTREAM_URL — and a
+    /// standard local LiteLLM holds a real provider key, so a loopback target is
+    /// not proof of a fake upstream. This harness cannot see LLM_UPSTREAM_URL.
+    #[arg(long, global = true)]
+    allow_model_spend: bool,
 
     /// Leave the seeded sessions/connections in the database.
     #[arg(long, global = true)]
@@ -271,6 +295,20 @@ impl Cmd {
         }
     }
 
+    /// LLM-facade calls this scenario will make per session. Only
+    /// `concurrent-sandboxes` can drive the facade (the sole model-spend path);
+    /// every other verb reports 0, so the model-spend gate can never spuriously
+    /// fire on a scenario that never touches the facade.
+    fn facade_calls_per_session(&self) -> usize {
+        match self {
+            Cmd::ConcurrentSandboxes {
+                facade_calls_per_session,
+                ..
+            } => *facade_calls_per_session,
+            _ => 0,
+        }
+    }
+
     /// A one-paragraph statement of what running this will DO to the target.
     /// Printed before every run; there is no quiet mode.
     fn impact(&self) -> String {
@@ -319,6 +357,34 @@ impl Cmd {
     }
 }
 
+/// The model-spend gate: the ENFORCEABLE counterpart to the "model spend NONE"
+/// banner. A run that drives the deployment's LLM facade
+/// (`facade_calls_per_session` > 0) forwards REAL model requests to whatever the
+/// deployment's `LLM_UPSTREAM_URL` names — and a standard LOCAL LiteLLM holds a
+/// real provider key, so a loopback control plane is NOT proof of a fake
+/// upstream. This harness cannot see `LLM_UPSTREAM_URL` (it belongs to the
+/// deployment), so the only enforceable acknowledgement is an explicit operator
+/// opt-in, exactly as `--force-unsafe-target` gates the production-target
+/// signals. Returns `Err(reason)` when the run would spend model money without
+/// the flag; the default (zero facade calls) is always safe.
+fn model_spend_gate(
+    facade_calls_per_session: usize,
+    allow_model_spend: bool,
+) -> Result<(), String> {
+    if facade_calls_per_session > 0 && !allow_model_spend {
+        return Err(format!(
+            "--facade-calls-per-session {facade_calls_per_session} drives the deployment's LLM \
+             FACADE, which forwards REAL model requests to whatever that deployment's \
+             LLM_UPSTREAM_URL names. A standard local LiteLLM holds a REAL provider key, so a \
+             loopback target is NOT proof of a fake upstream, and this harness cannot see \
+             LLM_UPSTREAM_URL. Pass --allow-model-spend to acknowledge that this run may spend \
+             real model money, or leave --facade-calls-per-session at 0 (the default), which \
+             makes no facade calls."
+        ));
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(e) = real_main().await {
@@ -354,6 +420,14 @@ async fn real_main() -> Result<()> {
             _ => "",
         }
     );
+
+    // ── model-spend gate ───────────────────────────────────────────────────
+    // The enforceable counterpart to the banner above: a nonzero
+    // --facade-calls-per-session forwards REAL model requests through the
+    // deployment's facade to its own LLM_UPSTREAM_URL, which this harness cannot
+    // verify is a fake. Refuse without an explicit --allow-model-spend opt-in.
+    model_spend_gate(cli.cmd.facade_calls_per_session(), cli.allow_model_spend)
+        .map_err(anyhow::Error::msg)?;
 
     // ── provisioning gate ──────────────────────────────────────────────────
     if let Some(ws) = cli.cmd.template_workspace() {
@@ -405,8 +479,12 @@ async fn real_main() -> Result<()> {
     }
     let facts = TargetFacts {
         control_scheme: scheme_of(&cli.base_url),
-        control_host: host_of(&cli.base_url).unwrap_or_default(),
-        database_host: host_of(&cli.database_url),
+        // Connector-faithful host extraction (guard-bypass fix): reason about the
+        // host the tools ACTUALLY reach, not a textual authority a `host=` override
+        // or a userinfo/path trick can make read loopback. An empty control host
+        // (unparseable base URL) defaults to "" — non-loopback — so it refuses.
+        control_host: guard::effective_target_host(&cli.base_url).unwrap_or_default(),
+        database_host: db_host_fact(&cli.database_url),
         admin_token_opens_v1: Some(probe.is_2xx()),
     };
     let signals = production_signals(&facts);
@@ -664,5 +742,80 @@ mod tests {
     fn the_provisioning_gate_has_a_reachable_arm() {
         assert!(TemplateWorkspace::Scratch.provisions());
         assert!(!TemplateWorkspace::AbsentLocalPath.provisions());
+    }
+
+    /// The model-spend gate is the ENFORCEABLE half of the "model spend NONE"
+    /// banner: a nonzero --facade-calls-per-session forwards real model requests
+    /// through the deployment's facade, whose upstream this harness cannot
+    /// verify is a fake — so it must refuse without an explicit opt-in, and the
+    /// refusal (not the printed warning) is the actual control.
+    #[test]
+    fn the_model_spend_gate_refuses_facade_calls_without_the_optin() {
+        // The default (no facade calls) is always allowed, flag or not.
+        assert!(model_spend_gate(0, false).is_ok());
+        assert!(model_spend_gate(0, true).is_ok());
+        // Facade calls without the opt-in are refused, and the message names both
+        // the flag and the risk so the operator can act on it.
+        let err =
+            model_spend_gate(1, false).expect_err("a facade call without the flag must refuse");
+        assert!(
+            err.contains("--allow-model-spend"),
+            "names the opt-in: {err}"
+        );
+        assert!(
+            err.contains("--facade-calls-per-session"),
+            "names the parameter: {err}"
+        );
+        assert!(err.contains("LLM_UPSTREAM_URL"), "names the risk: {err}");
+        // The explicit opt-in permits it.
+        assert!(model_spend_gate(3, true).is_ok());
+    }
+
+    /// Only concurrent-sandboxes can drive the facade; every other verb reports
+    /// zero, so the gate above can never spuriously fire on a scenario that
+    /// makes no facade calls. If a future scenario grows a facade path, this
+    /// accessor MUST learn about it or the gate will silently miss it.
+    #[test]
+    fn only_concurrent_sandboxes_reports_facade_calls() {
+        assert_eq!(
+            Cmd::ConcurrentSandboxes {
+                sessions: 1,
+                gate_calls_per_session: 1,
+                facade_calls_per_session: 7,
+                template_session: None,
+                template_workspace: TemplateWorkspace::AbsentLocalPath,
+                model: "m".into(),
+            }
+            .facade_calls_per_session(),
+            7
+        );
+        assert_eq!(
+            Cmd::Connections {
+                count: 1,
+                list_reads: 1
+            }
+            .facade_calls_per_session(),
+            0
+        );
+        assert_eq!(
+            Cmd::UpstreamFailures {
+                sessions: 1,
+                calls_per_arm: 1,
+                template_workspace: TemplateWorkspace::AbsentLocalPath,
+            }
+            .facade_calls_per_session(),
+            0
+        );
+        assert_eq!(
+            Cmd::SlowApprovals {
+                sessions: 1,
+                decide_after_secs: 1,
+                ttl_secs: 1,
+                template_workspace: TemplateWorkspace::AbsentLocalPath,
+            }
+            .facade_calls_per_session(),
+            0
+        );
+        assert_eq!(Cmd::DbFailover.facade_calls_per_session(), 0);
     }
 }

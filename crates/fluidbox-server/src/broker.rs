@@ -313,7 +313,7 @@ pub async fn recheck_binding(
     scope: fluidbox_db::TenantScope,
     binding: &fluidbox_db::RunResourceBindingRow,
 ) -> Result<fluidbox_db::IntegrationConnectionRow, String> {
-    recheck_binding_pool(&state.pool, scope, binding).await
+    recheck_binding_pool_metered(&state.pool, scope, binding, Some(&state.metrics)).await
 }
 
 /// Revalidate the RUN's invoking authority (design `:716-717`), which is
@@ -403,10 +403,26 @@ pub(crate) async fn recheck_invoking_authority(
 /// Pool-based core of [`recheck_binding`] — the public fn (fixed to take
 /// `&AppState` by the Phase C plan) only unwraps `state.pool`. Split out so the
 /// matrix DB tests drive it without an `AppState` (matching `bindings.rs`).
+/// 3-arg shim so the pool-based unit tests drive the recheck without an
+/// `AppState`; production reaches the metrics-aware body through
+/// [`recheck_binding`], which threads the registry. A `None` registry here means
+/// "count nothing" — hence test-only.
+#[cfg(test)]
 async fn recheck_binding_pool(
     pool: &sqlx::PgPool,
     scope: fluidbox_db::TenantScope,
     binding: &fluidbox_db::RunResourceBindingRow,
+) -> Result<fluidbox_db::IntegrationConnectionRow, String> {
+    recheck_binding_pool_metered(pool, scope, binding, None).await
+}
+
+async fn recheck_binding_pool_metered(
+    pool: &sqlx::PgPool,
+    scope: fluidbox_db::TenantScope,
+    binding: &fluidbox_db::RunResourceBindingRow,
+    // Operational metrics (Phase F, #34) — `None` from the pool-based unit tests;
+    // every production caller reaches it through `recheck_binding`.
+    metrics: Option<&crate::metrics::Metrics>,
 ) -> Result<fluidbox_db::IntegrationConnectionRow, String> {
     // Tenant equality (belt-and-braces): the scoped reads below already pin the
     // tenant, but a binding row handed in from elsewhere must match it.
@@ -448,6 +464,9 @@ async fn recheck_binding_pool(
         ));
     }
     if conn.authorization_generation != expected_generation {
+        if let Some(m) = metrics {
+            m.generation_mismatches.inc();
+        }
         return Err(format!(
             "connection {} was reauthorized after this run started — its binding is stale",
             conn.id
@@ -672,10 +691,29 @@ fn governor_gate(
     tenant: uuid::Uuid,
     connection: uuid::Uuid,
     url: &str,
+    // Operational metrics (Phase F, #34): `None` from the unit tests that drive the
+    // gate without an `AppState`; production passes the registry from the durable
+    // wrapper so a per-replica (local-tier) refusal is counted at its own site.
+    metrics: Option<&crate::metrics::Metrics>,
 ) -> Result<crate::governor::Permit, DispatchOutcome> {
     let host = host_key(url);
-    gov.check(tenant, connection, &host)
-        .map_err(|t| refuse_dial(&host, t))
+    gov.check(tenant, connection, &host).map_err(|t| {
+        count_egress_reject(metrics, &t);
+        refuse_dial(&host, t)
+    })
+}
+
+/// Map a governor refusal to its operational-metrics `reason` and count it. The
+/// breaker names itself (`SCOPE_BREAKER`); every other scope is a rate dimension.
+fn count_egress_reject(metrics: Option<&crate::metrics::Metrics>, t: &crate::governor::Throttled) {
+    if let Some(m) = metrics {
+        let reason = if t.scope == crate::governor::SCOPE_BREAKER {
+            "breaker_open"
+        } else {
+            "rate_limited"
+        };
+        m.egress_rejections.inc(reason);
+    }
 }
 
 /// Render ONE governor refusal, from either tier. Shared so the two tiers can
@@ -719,12 +757,21 @@ async fn governor_gate_durable(
     connection: uuid::Uuid,
     url: &str,
 ) -> Result<crate::governor::Permit, DispatchOutcome> {
-    let mut permit = governor_gate(&state.governor, scope.tenant_id(), connection, url)?;
+    let mut permit = governor_gate(
+        &state.governor,
+        scope.tenant_id(),
+        connection,
+        url,
+        Some(&state.metrics),
+    )?;
     state
         .governor
         .check_durable(&state.pool, scope, session, &mut permit)
         .await
-        .map_err(|t| refuse_dial(&host_key(url), t))?;
+        .map_err(|t| {
+            count_egress_reject(Some(&state.metrics), &t);
+            refuse_dial(&host_key(url), t)
+        })?;
     Ok(permit)
 }
 
@@ -750,6 +797,22 @@ fn breaker_signal(r: &Result<(Value, bool, Option<Value>), CallErr>) -> crate::g
         | Err(CallErr::NeverSent(_))
         | Err(CallErr::Ambiguous(_)) => Outcome::TransportFailure,
         _ => Outcome::Ok,
+    }
+}
+
+/// The operational-metrics upstream-failure class for a dial result, or `None`
+/// for a success or a class not worth a series (Ambiguous/NeverSent are counted
+/// as brokered outcomes, not as an upstream failure). Mirrors the `CallErr`
+/// variants the broker distinguishes — never re-parses a status string, so it
+/// cannot drift from what the broker actually decided (Phase F, #34).
+fn upstream_failure_class(
+    r: &Result<(Value, bool, Option<Value>), CallErr>,
+) -> Option<&'static str> {
+    match r {
+        Err(CallErr::Unauthorized) => Some("unauthorized"),
+        Err(CallErr::InsufficientScope(_)) => Some("insufficient_scope"),
+        Err(CallErr::UpstreamUnavailable(_)) => Some("unavailable"),
+        _ => None,
     }
 }
 
@@ -2192,7 +2255,14 @@ pub async fn call_tool_auth(
     // A credential-free legacy bundle has no connection to key on — it takes the
     // nil id, and the breaker's (tenant, connection, host) key still separates
     // upstreams in both tiers.
-    let conn_key = brokered_connection_id(server).unwrap_or_else(uuid::Uuid::nil);
+    // A credential-free legacy bundle has NO connection identity. The old
+    // `Uuid::nil()` sentinel put EVERY tenant's legacy-bundle traffic into ONE
+    // per-replica connection bucket — a cross-tenant rate collision (the durable
+    // tier is tenant-keyed, but the local tier keys the connection dimension by id
+    // alone, so tenant A's burst could refuse tenant B's legacy call on the same
+    // replica). Key it by the TENANT instead: for a connectionless bundle the
+    // per-connection dimension IS per-tenant, so each tenant gets its own bucket.
+    let conn_key = brokered_connection_id(server).unwrap_or_else(|| scope.tenant_id());
     let host = match governor_gate_durable(state, scope, run_session, conn_key, url).await {
         Ok(h) => h,
         Err(refused) => return refused,
@@ -2232,6 +2302,9 @@ pub async fn call_tool_auth(
         .governor
         .report_durable(&state.pool, scope, &host, breaker_signal(&first))
         .await;
+    if let Some(class) = upstream_failure_class(&first) {
+        state.metrics.upstream_classes.inc(class);
+    }
     match first {
         Err(CallErr::Unauthorized) => {
             // A 401 proves the tool never executed. Static credential ⇒ terminal
@@ -2246,7 +2319,18 @@ pub async fn call_tool_auth(
             }
             match reauth_after_401(state, scope, server, auth).await {
                 Ok(auth) => {
-                    // The retry is a SECOND dial — its health is reported too.
+                    // The retry is a SECOND upstream dial, so it must pass admission
+                    // AGAIN — otherwise a hostile server that 401s every first attempt
+                    // and accepts the re-mint would DOUBLE the governed rate uncounted
+                    // (the breaker never sees a 401, by design). A refusal here is a
+                    // pre-write proof of non-dispatch (NeverSent ⇒ re-claimable), and a
+                    // normal token-refresh 401 simply books the second dial it makes.
+                    let host = match governor_gate_durable(state, scope, run_session, conn_key, url)
+                        .await
+                    {
+                        Ok(h) => h,
+                        Err(refused) => return refused,
+                    };
                     let retry = call_tool(
                         client,
                         policy,
@@ -2343,6 +2427,9 @@ pub async fn call_tool_for_conn(
         .governor
         .report_durable(&state.pool, scope, &host, breaker_signal(&first))
         .await;
+    if let Some(class) = upstream_failure_class(&first) {
+        state.metrics.upstream_classes.inc(class);
+    }
     match first {
         Err(CallErr::Unauthorized) => {
             // A 401 proves the tool never executed. Static credential ⇒ terminal
@@ -2363,7 +2450,18 @@ pub async fn call_tool_for_conn(
             };
             match reauth_after_401_conn(state, scope, &fresh, url, auth).await {
                 Ok(auth) => {
-                    // The retry is a SECOND dial — its health is reported too.
+                    // The retry is a SECOND upstream dial, so re-admit it through the
+                    // governor — a hostile server 401ing every first attempt and
+                    // accepting the re-mint would otherwise DOUBLE the governed rate
+                    // uncounted (a 401 never trips the breaker). A refusal here is a
+                    // pre-write proof of non-dispatch (NeverSent ⇒ re-claimable).
+                    let host =
+                        match governor_gate_durable(state, scope, binding.session_id, conn.id, url)
+                            .await
+                        {
+                            Ok(h) => h,
+                            Err(refused) => return refused,
+                        };
                     let retry = call_tool(
                         client,
                         policy,
@@ -3184,10 +3282,10 @@ mod tests {
         let (t, c) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
         let url = "https://secret-internal.corp.example/mcp";
         assert!(
-            governor_gate(&gov, t, c, url).is_ok(),
+            governor_gate(&gov, t, c, url, None).is_ok(),
             "first dial admitted"
         );
-        let refused = governor_gate(&gov, t, c, url).expect_err("second is throttled");
+        let refused = governor_gate(&gov, t, c, url, None).expect_err("second is throttled");
         let DispatchOutcome::NeverSent(msg) = refused else {
             panic!("a governor refusal MUST be NeverSent (re-claimable): {refused:?}");
         };
@@ -3231,7 +3329,7 @@ mod tests {
         let (t, c) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
 
         for i in 0..THRESHOLD {
-            let host = governor_gate(&gov, t, c, &url)
+            let host = governor_gate(&gov, t, c, &url, None)
                 .unwrap_or_else(|e| panic!("dial {i} must be admitted, got {e:?}"));
             let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
             let r = call_tool(
@@ -3261,7 +3359,7 @@ mod tests {
         );
 
         // The (N+1)th never reaches the wire.
-        let refused = governor_gate(&gov, t, c, &url).expect_err("the breaker must be open");
+        let refused = governor_gate(&gov, t, c, &url, None).expect_err("the breaker must be open");
         assert!(
             matches!(refused, DispatchOutcome::NeverSent(_)),
             "a breaker refusal is a pre-write proof of non-dispatch: {refused:?}"
@@ -3309,7 +3407,7 @@ mod tests {
         let (t, c) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
         let entry = Arc::new(Mutex::new(McpUpstreamSession::fresh(&url)));
         for i in 0..6 {
-            let host = governor_gate(&gov, t, c, &url).unwrap_or_else(|e| {
+            let host = governor_gate(&gov, t, c, &url, None).unwrap_or_else(|e| {
                 panic!("an isError result must never open the breaker (dial {i}): {e:?}")
             });
             let r = call_tool(
@@ -4952,10 +5050,15 @@ mod tests {
             &binding_row(org.id, &alice_conn, gen, "user", Some(alice)),
         )
         .await;
-        let gen_mismatch = recheck_binding_pool(
+        // Drive the METERED path here so the generation-mismatch metric insertion
+        // is proven: a local registry must observe exactly one mismatch (delete the
+        // `generation_mismatches.inc()` and this assertion fails).
+        let gen_metrics = crate::metrics::Metrics::default();
+        let gen_mismatch = recheck_binding_pool_metered(
             &pool,
             scope,
             &binding_row(org.id, &org_conn, gen + 1, "organization", None),
+            Some(&gen_metrics),
         )
         .await;
         let tenant_mismatch = recheck_binding_pool(
@@ -5004,6 +5107,11 @@ mod tests {
         assert!(gen_mismatch
             .expect_err("gen mismatch")
             .contains("reauthorized"));
+        assert_eq!(
+            gen_metrics.generation_mismatches.get(),
+            1,
+            "a stale-generation refusal must increment the metric exactly once"
+        );
         assert!(tenant_mismatch
             .expect_err("tenant mismatch")
             .contains("different tenant"));
