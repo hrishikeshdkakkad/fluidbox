@@ -375,6 +375,17 @@ pub struct Config {
     /// but is deliberately NOT carried here: its only job is a boot refusal, and
     /// a process cannot act on its own replica count afterwards.)
     pub archive_store: fluidbox_workspace::ArchiveStoreConfig,
+
+    /// Optional dedicated listener for the Prometheus metrics exposition
+    /// (`FLUIDBOX_METRICS_BIND`, Phase F, issue #34). `None` (the default) means
+    /// metrics are reachable ONLY at the admin-gated `GET /v1/admin/metrics`. When
+    /// set (e.g. `127.0.0.1:9090`), a THIRD listener serves the same exposition
+    /// UNAUTHENTICATED — the Prometheus/OTel scrape convention — so it MUST bind a
+    /// private interface a scraper reaches and the public internet does not.
+    /// Nothing sensitive is exposed (no ids, hosts, credentials or payloads — see
+    /// the `metrics` module), but the bind is a network-reachability decision the
+    /// operator makes explicitly, which is why it is off by default.
+    pub metrics_bind: Option<String>,
 }
 
 /// The default buffered-body ceiling — deliberately EQUAL to axum's own implicit
@@ -675,6 +686,14 @@ impl Config {
             // job is to refuse `fs` on a deployment that has already told us one
             // replica cannot serve every archive GET.
             archive_store,
+            // Phase F, issue #34. A blank/whitespace value is treated as unset so
+            // an empty env entry from a chart default cannot bind an unauth
+            // listener by accident; the address itself is validated by the bind
+            // call at boot (a bad host:port fails there, naming the port).
+            metrics_bind: get("FLUIDBOX_METRICS_BIND")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
         })
     }
 }

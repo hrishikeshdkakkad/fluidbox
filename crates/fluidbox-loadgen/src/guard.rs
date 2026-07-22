@@ -120,11 +120,12 @@ pub fn production_signals(f: &TargetFacts) -> Vec<ProductionSignal> {
     out
 }
 
-/// Host component of a URL-ish string, lowercased, without port or brackets.
-/// Hand-rolled rather than pulling in a URL parser: this must work for both
-/// `http://h:8787` and `postgres://u:p@h:5432/db`, and a wrong answer here
-/// FAILS OPEN in the direction of refusing, because an unparseable host is not
-/// loopback.
+/// Host component of a URL-ish string by TEXT — the naive parser the guard used
+/// to trust. RETAINED ONLY IN TESTS, as the foil that [`effective_db_host`] /
+/// [`effective_target_host`] are measured against: it cannot see a libpq `host=`
+/// override or a userinfo/path trick, which is exactly the bypass those two close.
+/// Production must never reason about the host from this function.
+#[cfg(test)]
 pub fn host_of(url: &str) -> Option<String> {
     let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     // Strip userinfo (postgres URLs carry `user:password@`), then path/query.
@@ -156,6 +157,31 @@ pub fn scheme_of(url: &str) -> String {
     url.split_once("://")
         .map(|(s, _)| s.to_ascii_lowercase())
         .unwrap_or_else(|| "http".into())
+}
+
+/// The host the DATABASE connection will ACTUALLY reach, resolved the way sqlx
+/// resolves it — which HONORS the libpq `host=`/`hostaddr=` query parameter that
+/// OVERRIDES the URL authority. A textual parser ([`host_of`]) cannot see that
+/// override: `postgres://prod_user:prod_pw@127.0.0.1/db?host=ep-prod.neon.tech`
+/// reads loopback to the eye while sqlx dials prod, which is exactly how the guard
+/// is bypassed. The guard must ask the SAME parser that opens the connection.
+/// `None` only when the string does not parse as a Postgres URL at all.
+pub fn effective_db_host(url: &str) -> Option<String> {
+    use std::str::FromStr;
+    sqlx::postgres::PgConnectOptions::from_str(url)
+        .ok()
+        .map(|o| o.get_host().to_ascii_lowercase())
+}
+
+/// The host the TARGET requests will ACTUALLY reach, resolved the way reqwest's
+/// URL parser resolves it — so a userinfo/path trick like
+/// `http://prod.example/x@127.0.0.1/..` (which a textual `rsplit('@')` misreads as
+/// loopback but `url` normalizes to `prod.example`) is seen for what it is.
+/// `None` when the string does not parse as an absolute URL with a host.
+pub fn effective_target_host(url: &str) -> Option<String> {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
 }
 
 #[cfg(test)]
@@ -299,6 +325,47 @@ mod tests {
     fn a_password_with_an_at_sign_does_not_confuse_the_host() {
         assert_eq!(
             host_of("postgres://u:p@ss@127.0.0.1:5432/db").as_deref(),
+            Some("127.0.0.1")
+        );
+    }
+
+    /// THE BYPASS `host_of` COULD NOT SEE: libpq's `host=` query parameter
+    /// OVERRIDES the URL authority, so sqlx dials prod while the authority reads
+    /// loopback. `effective_db_host` must report the endpoint sqlx will actually
+    /// connect to, so the `RemoteDatabase` signal fires.
+    #[test]
+    fn a_libpq_host_override_is_seen_as_the_real_database_host() {
+        let sneaky =
+            "postgres://prod_user:prod_pw@127.0.0.1/fluidbox?host=ep-production.us-east-2.aws.neon.tech&sslmode=require";
+        // The textual parser is fooled (this is the bug being closed)…
+        assert_eq!(host_of(sneaky).as_deref(), Some("127.0.0.1"));
+        // …but the connector-faithful parser is not.
+        assert_eq!(
+            effective_db_host(sneaky).as_deref(),
+            Some("ep-production.us-east-2.aws.neon.tech")
+        );
+        assert!(!is_loopback_host(&effective_db_host(sneaky).unwrap()));
+        // A plain local URL still reads loopback.
+        assert_eq!(
+            effective_db_host("postgres://postgres:postgres@127.0.0.1:5432/fluidbox_scale")
+                .as_deref(),
+            Some("127.0.0.1")
+        );
+    }
+
+    /// THE BYPASS `host_of` COULD NOT SEE on the TARGET side: a userinfo/path
+    /// trick where the real authority is prod but `rsplit('@')` reads loopback.
+    /// `effective_target_host` parses it the way reqwest will and sees prod.
+    #[test]
+    fn a_userinfo_path_trick_is_seen_as_the_real_target_host() {
+        let sneaky = "http://production.example/x@127.0.0.1/..";
+        assert_eq!(host_of(sneaky).as_deref(), Some("127.0.0.1")); // fooled
+        assert_eq!(
+            effective_target_host(sneaky).as_deref(),
+            Some("production.example")
+        ); // not fooled
+        assert_eq!(
+            effective_target_host("http://127.0.0.1:8787").as_deref(),
             Some("127.0.0.1")
         );
     }

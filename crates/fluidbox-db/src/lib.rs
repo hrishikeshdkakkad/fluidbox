@@ -191,8 +191,52 @@ pub fn pool_options(settings: PoolSettings) -> PgPoolOptions {
         .acquire_timeout(std::time::Duration::from_secs(
             settings.acquire_timeout_secs,
         ))
-        .idle_timeout(std::time::Duration::from_secs(settings.idle_timeout_secs))
-        .max_lifetime(std::time::Duration::from_secs(settings.max_lifetime_secs))
+        // `idle_timeout`/`max_lifetime` take `impl Into<Option<Duration>>`, and
+        // sqlx DISABLES the cap only on `None` — a `Some(Duration::ZERO)` means
+        // "expire immediately", so every returned connection is closed and the pool
+        // never pools (a per-acquire reconnect storm against Neon). `0` is the
+        // documented "no cap" value (validate_pool_settings and its test), so it
+        // MUST map to `None`, not to `Duration::from_secs(0)`.
+        .idle_timeout(disabled_when_zero(settings.idle_timeout_secs))
+        .max_lifetime(disabled_when_zero(settings.max_lifetime_secs))
+}
+
+/// Map a "seconds, 0 = disabled" knob onto sqlx's `Option<Duration>` cap: `0`
+/// becomes `None` (no cap), anything else the duration. Without this, `0` would
+/// become `Some(Duration::ZERO)` — "expire on return", the opposite of "no cap".
+fn disabled_when_zero(secs: u64) -> Option<std::time::Duration> {
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+#[cfg(test)]
+mod pool_option_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The `0 = no cap` semantics that `validate_pool_settings` documents must
+    /// actually reach sqlx as `None`, not as `Some(Duration::ZERO)` (which sqlx
+    /// reads as "expire immediately" → a reconnect storm). This asserts on the
+    /// CONSTRUCTED `PgPoolOptions` getters — the layer the prior test never
+    /// inspected — so deleting `disabled_when_zero` fails here.
+    #[test]
+    fn zero_lifetime_and_idle_map_to_no_cap_not_instant_expiry() {
+        let zero = pool_options(PoolSettings {
+            max_lifetime_secs: 0,
+            idle_timeout_secs: 0,
+            ..PoolSettings::default()
+        });
+        assert_eq!(zero.get_max_lifetime(), None, "0 lifetime must be NO cap");
+        assert_eq!(zero.get_idle_timeout(), None, "0 idle must be NO cap");
+
+        // A non-zero value still lands as that exact duration.
+        let set = pool_options(PoolSettings {
+            max_lifetime_secs: 1800,
+            idle_timeout_secs: 240,
+            ..PoolSettings::default()
+        });
+        assert_eq!(set.get_max_lifetime(), Some(Duration::from_secs(1800)));
+        assert_eq!(set.get_idle_timeout(), Some(Duration::from_secs(240)));
+    }
 }
 
 /// Connect the application pool with the DEFAULT sizing ([`PoolSettings::default`]).

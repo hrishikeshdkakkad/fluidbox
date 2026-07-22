@@ -288,6 +288,11 @@ fn conservative_reservation(
 /// expiry sweep converts it into a conservative charge, which is the safe
 /// direction.
 async fn release_reservation(state: &AppState, scope: TenantScope, request_id: Uuid) {
+    // Count the INTENT to release (proven non-dispatch), not the DB result: a
+    // failed release is swept as a conservative charge, and counting only the
+    // success would undercount proven non-dispatches (the metric mirrors the
+    // release-set decision, the sweeper metric mirrors the fallback).
+    state.metrics.reservations.inc("released");
     if let Err(e) = fluidbox_db::release_llm_reservation(&state.pool, scope, request_id).await {
         tracing::warn!(
             "facade: releasing LLM reservation {request_id} failed: {e} — it will be swept \
@@ -353,6 +358,8 @@ async fn reconcile_reservation(
     }
     if let Err(e) = fluidbox_db::charge_llm_reservation(&state.pool, scope, request_id).await {
         tracing::warn!("facade: charging LLM reservation {request_id} failed: {e}");
+    } else {
+        state.metrics.reservations.inc("charged");
     }
 }
 
@@ -772,7 +779,9 @@ pub async fn messages(
     )
     .await?
     {
-        fluidbox_db::ReserveOutcome::Reserved => {}
+        fluidbox_db::ReserveOutcome::Reserved => {
+            state.metrics.reservations.inc("booked");
+        }
         // The run wound down between the status check above and the booking —
         // same refusal the pre-existing check emits, byte for byte.
         fluidbox_db::ReserveOutcome::SessionTerminal => {
@@ -783,6 +792,7 @@ pub async fn messages(
             ));
         }
         fluidbox_db::ReserveOutcome::CeilingExceeded { active, ceiling } => {
+            state.metrics.reservations.inc("refused");
             return Ok(reservation_refusal(
                 dialect,
                 "llm_reservation_ceiling_exceeded",
@@ -796,6 +806,7 @@ pub async fn messages(
         // remaining budget. They reconcile (or expire) and the retry proceeds —
         // or the accumulated check / budget sweeper stops the run for real.
         fluidbox_db::ReserveOutcome::BudgetExceeded { budget, active } => {
+            state.metrics.reservations.inc("refused");
             return Ok(reservation_refusal(
                 dialect,
                 "llm_budget_reservation_exceeded",

@@ -51,8 +51,13 @@ server:
   # Default stays 1. Phase F made >1 POSSIBLE, not automatic: raising this
   # requires archiveStore "s3" (boot REFUSES "fs" with replicas > 1, because the
   # alternative is an init container's archive GET landing on a replica that does
-  # not hold the file — which looks like a flaky run, not a misconfiguration) AND
-  # strategy RollingUpdate below.
+  # not hold the file — which looks like a flaky run, not a misconfiguration).
+  # Setting archiveStore "s3" is the ONE switch: the chart then drops the
+  # node-local ReadWriteOnce archive PVC (nothing is shared on disk) and renders
+  # the Deployment with strategy RollingUpdate instead of Recreate — both derived
+  # from archiveStore in templates/server.yaml, so there is no separate strategy
+  # field to set. The node-local "" | "fs" path keeps its single RWO PVC and the
+  # Recreate strategy that one volume forces.
   #
   # The value is passed to the server as FLUIDBOX_REPLICAS. It is a DECLARATION —
   # a process cannot observe its own replica count — so it is only as good as
@@ -60,10 +65,12 @@ server:
   # breaks silently.
   replicas: 1
   # Workspace-archive storage (Phase F). "" or "fs" = node-local disk on the
-  # archive PVC, byte-for-byte today's behaviour, SINGLE REPLICA ONLY. "s3" = any
-  # S3-compatible bucket (AWS, MinIO, R2, GCS-XML) — this is what actually
-  # unblocks replicas > 1, because the k8s init container fetches the archive
-  # over HTTP from whichever replica the Service picks.
+  # archive PVC, byte-for-byte today's behaviour, SINGLE REPLICA ONLY (chart
+  # renders the ReadWriteOnce PVC + Recreate strategy). "s3" = any S3-compatible
+  # bucket (AWS, MinIO, R2, GCS-XML) — this is what actually unblocks replicas > 1,
+  # because the k8s init container fetches the archive over HTTP from whichever
+  # replica the Service picks. In "s3" mode the chart mounts NO node-local PVC
+  # (replicas share nothing on disk) and switches to a RollingUpdate strategy.
   #
   # Credentials are STATIC key/secret from the secret above. IRSA, instance roles
   # and STS auto-refresh are NOT supported: the AWS credential chain only helps
@@ -161,7 +168,9 @@ server:
   # distinguish another process in the same pod, a node-level attacker, or a
   # fabric that permits source-address spoofing. mTLS is the stronger follow-up.
   workloadIdentity: ""
-  # Archive PVC (survives Recreate upgrades so init can still pull).
+  # Archive PVC (survives Recreate upgrades so init can still pull). Rendered ONLY
+  # for the node-local "" | "fs" archive store; archiveStore "s3" mounts nothing
+  # local, so these fields are unused there.
   archivePvc:
     size: 10Gi
     storageClass: ""     # "" = cluster default; per-cloud presets set gp3/managed-csi/…

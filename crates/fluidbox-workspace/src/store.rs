@@ -82,6 +82,21 @@ const MAX_LIST_PAGES: usize = 100;
 /// unbounded page, so the read stops here regardless.
 const MAX_LIST_BODY_BYTES: usize = 8 * 1024 * 1024;
 
+/// Hard ceiling on stale keys ONE sweep pass will accumulate in memory, across
+/// ALL pages. `MAX_LIST_BODY_BYTES` bounds one page and `MAX_LIST_PAGES` bounds
+/// the page COUNT, but neither bounds the parsed keys we retain: a hostile store
+/// can pack ~90k minimal `<Contents>` into one 8 MiB page and stamp every one
+/// stale (`LastModified` is its own XML — it controls it), so 100 such pages
+/// would otherwise pile ~9M separately-allocated keys into one `Vec` — hundreds
+/// of MiB to >1 GiB during the hourly sweep. This is the third, load-bearing
+/// bound. 1e6 is generous on purpose: an archive store for ONE deployment holds
+/// packed-per-run, swept-hourly archives — a few thousand live at a time, never
+/// a legitimate million — while 1e6 keys is only tens of MiB, not a GiB. The
+/// sweep is best-effort and hourly, so on hitting the ceiling it hands back the
+/// keys gathered so far (the caller DELETES them, shrinking the bucket) and the
+/// next pass re-lists the rest — forward progress, not a stall.
+const MAX_LISTED_KEYS: usize = 1_000_000;
+
 /// Read a response body chunk by chunk, abandoning it the instant it exceeds
 /// `cap`. Unlike `resp.text()`/`resp.bytes()`, which buffer the WHOLE body before
 /// anyone can truncate it, this never holds more than one chunk beyond `cap` —
@@ -127,7 +142,7 @@ impl ArchiveStoreConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct S3Config {
     /// Scheme + authority only, no trailing slash (`https://s3.us-east-1.amazonaws.com`,
     /// `http://minio:9000`).
@@ -144,6 +159,31 @@ pub struct S3Config {
     pub session_token: Option<String>,
     /// `true` ⇒ `{endpoint}/{bucket}/{key}`; `false` ⇒ `{scheme}://{bucket}.{host}/{key}`.
     pub force_path_style: bool,
+}
+
+impl std::fmt::Debug for S3Config {
+    /// Hand-written — NOT derived — because `secret_access_key` and
+    /// `session_token` are live credentials, and this type sits inside a `Debug`
+    /// `ArchiveStoreConfig` and a `Debug` `S3ArchiveStore`, either of which lands
+    /// in a log line the instant anyone `{:?}`s the configured store. The secrets
+    /// render `<redacted>` (the exact style `sigv4::Credentials` uses); every
+    /// non-secret field — `access_key_id` included, like an S3 access-key id it
+    /// is public — stays visible so the output is still a diagnostic.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("prefix", &self.prefix)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("force_path_style", &self.force_path_style)
+            .finish()
+    }
 }
 
 /// Environment variable names, single-sourced here so the parser, its error
@@ -878,7 +918,9 @@ impl S3ArchiveStore {
     }
 
     /// ListObjectsV2 over our prefix, keeping objects last modified before
-    /// `now - ttl`. Paginated, and bounded by [`MAX_LIST_PAGES`].
+    /// `now - ttl`. Paginated, and bounded THREE ways: [`MAX_LIST_BODY_BYTES`]
+    /// per page, [`MAX_LIST_PAGES`] pages, and [`MAX_LISTED_KEYS`] accumulated
+    /// keys (the last is the DoS bound — the first two do not cap retained keys).
     async fn stale_objects(&self, ttl: Duration) -> Result<Vec<ArchiveKey>, StoreError> {
         let cutoff = chrono::Utc::now()
             - chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::zero());
@@ -925,16 +967,19 @@ impl S3ArchiveStore {
             // cap; a truncated one simply yields fewer keys for this sweep pass,
             // which the next hourly sweep re-lists.
             let body = bounded_body(resp, MAX_LIST_BODY_BYTES).await;
-            for (key, last_modified) in list_contents(&body) {
-                let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&last_modified) else {
-                    // Unparseable timestamp reads as FRESH — the same
-                    // conservative direction the fs sweep takes on clock skew.
-                    tracing::warn!("archive TTL sweep: unparseable LastModified on {key}");
-                    continue;
-                };
-                if ts.with_timezone(&chrono::Utc) <= cutoff {
-                    out.push(ArchiveKey::Object(key));
-                }
+            if collect_stale_keys(&body, cutoff, MAX_LISTED_KEYS, &mut out) {
+                // The prefix holds more stale archives than one pass keeps in
+                // memory (a hostile store, or a bucket shared with something
+                // enormous). Best-effort + hourly: hand back what we have — the
+                // caller deletes these, so the bucket shrinks and the next sweep
+                // re-lists the remainder. Never a SILENT drop — name it.
+                tracing::warn!(
+                    "archive TTL sweep hit the {MAX_LISTED_KEYS}-key ceiling on prefix '{}'; \
+                     reclaiming {} stale archive(s) this pass and re-listing the rest next sweep",
+                    self.cfg.prefix,
+                    out.len()
+                );
+                break;
             }
             match first_tag(&body, "IsTruncated").as_deref() {
                 Some("true") => match first_tag(&body, "NextContinuationToken") {
@@ -973,6 +1018,39 @@ fn list_contents(xml: &str) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// Fold one ListObjectsV2 page's STALE keys (`LastModified <= cutoff`) into
+/// `out`, stopping the instant `out` reaches `max_keys`. Returns `true` when
+/// that ceiling was hit — the signal for [`S3ArchiveStore::stale_objects`] to
+/// stop paging rather than pile an unbounded number of keys into one `Vec`.
+///
+/// PURE and `max_keys`-parameterised so the ceiling is a unit test rather than a
+/// comment (a small `max_keys` trips it without materialising a million keys).
+/// The bound is on RETAINED keys because that is what spends memory and what the
+/// sweep then processes; a fresh key is neither retained nor swept, so it does
+/// not count against the ceiling.
+fn collect_stale_keys(
+    body: &str,
+    cutoff: chrono::DateTime<chrono::Utc>,
+    max_keys: usize,
+    out: &mut Vec<ArchiveKey>,
+) -> bool {
+    for (key, last_modified) in list_contents(body) {
+        if out.len() >= max_keys {
+            return true;
+        }
+        let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&last_modified) else {
+            // Unparseable timestamp reads as FRESH — the same conservative
+            // direction the fs sweep takes on clock skew.
+            tracing::warn!("archive TTL sweep: unparseable LastModified on {key}");
+            continue;
+        };
+        if ts.with_timezone(&chrono::Utc) <= cutoff {
+            out.push(ArchiveKey::Object(key));
+        }
+    }
+    out.len() >= max_keys
 }
 
 /// The five predefined XML entities. Our own keys (`{uuid}.tar.gz`) contain
@@ -1159,6 +1237,69 @@ mod tests {
         assert_eq!(normalize_prefix("/"), "");
     }
 
+    /// FINDING 2 (latent secret leak): `S3Config` is `Debug`, and it is reached
+    /// transitively by `{:?}` on `ArchiveStoreConfig` and on the built
+    /// `S3ArchiveStore`. Neither the secret access key nor the session token may
+    /// appear. Mutation-proof: revert the hand-written `Debug` to `derive(Debug)`
+    /// and the "secret leaked" assertions fire.
+    #[test]
+    fn s3config_debug_redacts_secrets() {
+        const SECRET: &str = "SUPER-SECRET-KEY-planted";
+        const TOKEN: &str = "SESSION-TOKEN-planted";
+        let cfg = S3Config {
+            endpoint: "https://minio:9000".into(),
+            bucket: "fbx-archives".into(),
+            region: "us-east-1".into(),
+            prefix: "archives/".into(),
+            access_key_id: "AKIAEXAMPLE".into(),
+            secret_access_key: SECRET.into(),
+            session_token: Some(TOKEN.into()),
+            force_path_style: true,
+        };
+
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains(SECRET), "secret leaked: {dbg}");
+        assert!(!dbg.contains(TOKEN), "session token leaked: {dbg}");
+        assert!(dbg.contains("<redacted>"), "{dbg}");
+        // Redaction is targeted, not a blanket opaque struct: non-secret fields
+        // — access-key id included, it is public — stay visible.
+        assert!(
+            dbg.contains("fbx-archives"),
+            "bucket must stay visible: {dbg}"
+        );
+        assert!(
+            dbg.contains("AKIAEXAMPLE"),
+            "access-key id is not a secret: {dbg}"
+        );
+
+        // The container types are what actually get `{:?}`d (the parsed config,
+        // the built store); the redaction must survive both.
+        let via_enum = format!("{:?}", ArchiveStoreConfig::S3(cfg.clone()));
+        assert!(
+            !via_enum.contains(SECRET),
+            "secret leaked via enum: {via_enum}"
+        );
+        assert!(
+            !via_enum.contains(TOKEN),
+            "token leaked via enum: {via_enum}"
+        );
+
+        let store = S3ArchiveStore {
+            staging: std::env::temp_dir(),
+            cfg,
+            http: reqwest::Client::new(),
+        };
+        let via_store = format!("{store:?}");
+        assert!(
+            !via_store.contains(SECRET),
+            "secret leaked via store: {via_store}"
+        );
+        assert!(
+            !via_store.contains(TOKEN),
+            "token leaked via store: {via_store}"
+        );
+    }
+
     /// The multi-replica refusal, in both directions.
     #[test]
     fn fs_refuses_a_declared_multi_replica_deployment() {
@@ -1343,6 +1484,53 @@ mod tests {
         // `&amp;lt;` is a literal "&lt;", not a "<".
         assert_eq!(xml_decode("&amp;lt;"), "&lt;");
         assert_eq!(xml_decode("plain"), "plain");
+    }
+
+    /// FINDING 1 (heap-amplification DoS): a hostile store can mark every key on
+    /// every page stale, so accumulation MUST be ceiling-bounded across pages.
+    /// Mutation-proof: delete the `out.len() >= max_keys` guard in
+    /// `collect_stale_keys` and the `assert_eq!(out.len(), 10)` below fails
+    /// because `out` then grows to all 50 entries.
+    #[test]
+    fn collect_stale_keys_is_bounded_by_max_keys() {
+        let cutoff = chrono::Utc::now();
+        // 50 STALE entries (LastModified in 2001, before `cutoff`) — the hostile
+        // shape: stamp every key old so all of them try to accumulate.
+        let mut xml = String::new();
+        for i in 0..50 {
+            xml.push_str(&format!(
+                "<Contents><Key>archives/{i}.tar.gz</Key>\
+                 <LastModified>2001-01-01T00:00:00.000Z</LastModified></Contents>"
+            ));
+        }
+
+        // Over the ceiling: accumulation stops dead at `max_keys` and reports it.
+        let mut out = Vec::new();
+        assert!(
+            collect_stale_keys(&xml, cutoff, 10, &mut out),
+            "50 stale entries over a ceiling of 10 must report the ceiling hit"
+        );
+        assert_eq!(out.len(), 10, "accumulation must stop at max_keys");
+
+        // Under the ceiling: everything accumulates, no ceiling hit.
+        let mut out = Vec::new();
+        assert!(!collect_stale_keys(&xml, cutoff, 1000, &mut out));
+        assert_eq!(out.len(), 50);
+
+        // A FRESH key (LastModified after cutoff) is neither retained nor swept,
+        // so it does not count toward the ceiling.
+        let fresh = "<Contents><Key>archives/z.tar.gz</Key>\
+                     <LastModified>2999-01-01T00:00:00.000Z</LastModified></Contents>";
+        let mut out = Vec::new();
+        assert!(!collect_stale_keys(fresh, cutoff, 10, &mut out));
+        assert!(out.is_empty());
+
+        // The SHIPPED ceiling is a bounded magnitude — not `usize::MAX`. Catches a
+        // future edit that neuters the constant (tens of MiB worst case, not GiB).
+        assert!(
+            (1_000..=2_000_000).contains(&MAX_LISTED_KEYS),
+            "MAX_LISTED_KEYS={MAX_LISTED_KEYS} is outside the intended bounded range"
+        );
     }
 
     // -----------------------------------------------------------------------

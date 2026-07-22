@@ -185,9 +185,14 @@ pub const LIMITS: &str = "
       local ephemeral-port range and the loopback path are shared with the
       deployment under test, so absolute latencies are optimistic and the tail
       includes the harness's own scheduling.
-    * Rate limits and circuit breakers in the control plane are PER-REPLICA and
-      in-memory; a single-replica run cannot show the N x ceiling a multi-replica
-      deployment has.
+    * Rate limits and circuit breakers have TWO tiers. The in-memory (local)
+      tier — token buckets and breakers per tenant/connection/host — is
+      PER-REPLICA and is checked FIRST, so a single-replica run cannot show the
+      N x local ceiling a multi-replica deployment has. Phase F added a durable,
+      Postgres-backed tier (default-on; FLUIDBOX_EGRESS_DURABLE) that enforces a
+      deployment-WIDE, cross-replica ceiling for the tenant, user, connection and
+      (tenant, host) dimensions — that ceiling IS visible from a single replica.
+      The host_global cross-tenant tier stays local and per-replica.
     * Percentiles are over the requests this run made. p99 of 1,000 requests is
       one datum; it is not a service-level objective.";
 

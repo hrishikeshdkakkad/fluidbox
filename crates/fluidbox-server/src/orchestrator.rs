@@ -217,7 +217,7 @@ async fn transition_inner(
     outcome: sqlx::Result<Option<(SessionStatus, fluidbox_db::SessionRow)>>,
 ) -> bool {
     match outcome {
-        Ok(Some((from, _))) => {
+        Ok(Some((from, row))) => {
             ledger::record(
                 state,
                 scope,
@@ -230,7 +230,28 @@ async fn transition_inner(
                 },
             )
             .await;
+            // Operational metrics (Phase F, #34): this is the single status-writer
+            // funnel, so the active-runs gauge and lifecycle counters are exact —
+            // one CAS winner, one count. The gauge moves only on the band edges
+            // (see `metrics::active_delta`); a `dec` saturates at zero.
+            match crate::metrics::active_delta(from, next) {
+                1 => state.metrics.active_runs.inc(),
+                -1 => state.metrics.active_runs.dec(),
+                _ => {}
+            }
+            // Provisioning latency: measured ONLY on the initializing→running edge
+            // (the sandbox is ready), never on a re-entry to running from an
+            // approval pause, so the histogram is not polluted by mid-run pauses.
+            if from == SessionStatus::Initializing && next == SessionStatus::Running {
+                let ms = (chrono::Utc::now() - row.created_at).num_milliseconds();
+                if ms >= 0 {
+                    state.metrics.run_provisioning_ms.observe(ms as f64);
+                }
+            }
             if next.is_terminal() {
+                // The terminal outcome label is the status' own name
+                // (completed | failed | cancelled | budget_exceeded).
+                state.metrics.runs_terminal.inc(next.as_str());
                 // Defense-in-depth: kill the session's tokens the moment it
                 // goes terminal so a still-running or leaked token can't reach
                 // the facade/gateway. The PRIMARY guard is each endpoint's own
@@ -1038,11 +1059,15 @@ async fn finish_terminal_cleanup(
     }
     // Phase E (E5) + Phase F (Task 3): terminate any live upstream MCP sessions
     // this run opened ON ANY REPLICA (best-effort DELETE) and evict the local
-    // registry entries. The registry drain is still one-shot, but the durable
-    // `mcp_upstream_sessions` rows are not: a pass that could not finish leaves
-    // them live and a re-drive of this idempotent reconciler retries them (and the
-    // deployment-wide sweeper retires whatever can never be sent). Fire-and-forget
-    // so a wedged upstream never blocks terminalization.
+    // registry entries. Fired FIRE-AND-FORGET so a wedged upstream never blocks
+    // terminalization — which ALSO means the teardown is NOT gated by the
+    // finalization receipt: if this reconciler completes (reaps + deletes the
+    // intent below) while the spawned cleanup fails or the process dies first,
+    // there is NO re-drive from the intent scan. The deployment-wide sweeper is the
+    // only backstop, and it retires a durable row it cannot DELETE by marking it
+    // `swept` WITHOUT contacting upstream — a disclosed upstream-session-SLOT leak
+    // (never custody; invariant 9 forbids sending an unresolvable credential). A
+    // durable, awaited teardown receipt is the follow-up.
     tokio::spawn({
         let state = state.clone();
         async move { crate::broker::run_terminal_mcp_cleanup(&state, id).await }
@@ -1315,6 +1340,35 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
     if let Err(e) =
         fluidbox_db::set_workload_addrs(&state.pool, scope, session_id, &workload_addrs).await
     {
+        // In ENFORCE mode, a run whose provider REPORTED a bindable address but whose
+        // identity we could NOT record would be admitted on the bearer token alone for
+        // its ENTIRE life — indistinguishable at the gate from the legitimately
+        // unbindable classes (Docker, pre-0025, adopted orphans). A transient write
+        // failure here would therefore silently defeat the enforcement the operator
+        // chose (a stolen token from another pod would be admitted). So refuse to run
+        // it unbound: terminate the just-provisioned sandbox (the same cleanup as a
+        // lost attach below) and fail the launch. observe/off keep the best-effort
+        // warning — there the binding is coverage, not a correctness boundary, and an
+        // empty `workload_addrs` (Docker reports none) has nothing to bind regardless.
+        if matches!(
+            state.cfg.workload_identity,
+            crate::config::WorkloadIdentityMode::Enforce
+        ) && !workload_addrs.is_empty()
+        {
+            tracing::error!(
+                "enforce: could not record workload identity for {session_id} ({e}); refusing to \
+                 run it unbound (terminating the sandbox)"
+            );
+            if let Err(te) = state.provider.terminate(&handle).await {
+                tracing::warn!(
+                    "workload-fail terminate for {session_id} failed ({te}); finalizer discovery will reap"
+                );
+            }
+            abandon_launch(&state, scope, session_id).await;
+            anyhow::bail!(
+                "enforce mode: workload identity for {session_id} could not be recorded; launch refused"
+            );
+        }
         tracing::warn!(
             "failed to record workload identity for {session_id} ({e}); this run will be \
              UNBINDABLE at the internal gateway (admitted on the bearer token alone)"

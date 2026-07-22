@@ -1,5 +1,15 @@
 {{- $fullname := include "fluidbox.fullname" . -}}
 {{- $sandboxNs := .Values.sandbox.namespace -}}
+{{- /*
+  Archive backend split. "" and "fs" are the node-local backend: a single
+  ReadWriteOnce PVC holds the workspace archives, which forces one replica and a
+  Recreate upgrade (the old pod must release the volume before the new one binds
+  it). "s3" shares nothing on disk — every replica serves any archive over S3 —
+  so no node-local PVC is mounted and a RollingUpdate is safe. The server boot
+  gate enforces the same rule (it REFUSES "fs" with replicas > 1), so
+  archiveStore != "s3" is exactly the node-local / single-replica case.
+*/}}
+{{- $nodeLocalArchive := ne .Values.server.archiveStore "s3" -}}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -68,6 +78,9 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "fluidbox.serverName" . }}
     namespace: {{ .Release.Namespace }}
+{{- if $nodeLocalArchive }}
+{{- /* Node-local archive PVC — only for the "" | "fs" backend (single replica).
+       Not rendered for archiveStore "s3": replicas share nothing on disk. */}}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -82,6 +95,7 @@ spec:
   resources:
     requests:
       storage: {{ .Values.server.archivePvc.size }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -91,7 +105,16 @@ metadata:
 spec:
   replicas: {{ .Values.server.replicas }}
   strategy:
+    {{- if $nodeLocalArchive }}
+    {{- /* Single RWO archive PVC forces Recreate: the old pod must release the
+           volume before the replacement can attach it. */}}
     type: Recreate
+    {{- else }}
+    {{- /* archiveStore "s3": no shared RWO volume, so a rolling upgrade is safe
+           and avoids the full downtime Recreate would impose. maxSurge /
+           maxUnavailable are left at the Kubernetes defaults (25% each). */}}
+    type: RollingUpdate
+    {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "fluidbox.name" . }}
@@ -240,17 +263,21 @@ spec:
             {{- with .Values.server.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          {{- if $nodeLocalArchive }}
           volumeMounts:
             - { name: archives, mountPath: /var/lib/fluidbox }
+          {{- end }}
           readinessProbe:
             httpGet: { path: /v1/health, port: public }
             initialDelaySeconds: 5
             periodSeconds: 10
           resources: {{- toYaml .Values.server.resources | nindent 12 }}
+      {{- if $nodeLocalArchive }}
       volumes:
         - name: archives
           persistentVolumeClaim:
             claimName: {{ include "fluidbox.serverName" . }}-archives
+      {{- end }}
 ---
 # Public Service (:8787): dashboard + CLI + OAuth + webhooks. Ingress origin.
 apiVersion: v1

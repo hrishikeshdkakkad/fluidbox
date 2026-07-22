@@ -350,16 +350,27 @@ on conflict (tenant_id, connection_id, host_digest) do update set
         else null end,
     updated_at = now()";
 
-/// Bounded, tenant-scoped collection of rows that carry no information: rate
-/// windows whose minute is long gone, and breakers that are closed with a zero
-/// consecutive-failure count. An OPEN or degrading breaker is excluded by the
-/// predicate (and by the partial index), so the sweep can never be the thing that
-/// forgets one. `limit` caps a single pass so a large backlog is drained over
-/// several passes instead of one long statement holding locks.
-/// Both outer `DELETE`s repeat `tenant_id = $1` beside the `ctid` subquery. It is
-/// redundant with the subquery and with RLS — which is the point: this module's
-/// stated discipline is that every statement carries the predicate explicitly, and
-/// these two are the statements where skipping it would cost the most.
+/// Bounded, tenant-scoped collection of rows that carry no LIVE information: rate
+/// windows whose minute is long gone, and breakers untouched for `idle_secs`.
+///
+/// **Why an OPEN breaker is now eligible once AGED.** The earlier predicate kept
+/// every non-closed breaker forever, on the theory that forgetting an open one
+/// re-admits traffic to a dead upstream. But a breaker row has no connection FK,
+/// so an OPEN row whose connection was revoked/abandoned never sees another dial,
+/// never transitions, and grew without bound — a tenant could mint permanent rows
+/// by tripping a breaker then dropping the connection. The resolution keys on TIME,
+/// not state: `idle_secs` (3600) is FAR longer than any `breaker_open_secs`
+/// (default 60), so a row untouched for `idle_secs` cannot be protecting anything
+/// live — an endpoint still being dialed refreshes `updated_at` within its open
+/// window (a half-open probe, or a report). Collecting an aged open row costs at
+/// most ONE re-probe of an endpoint nobody has dialed in an hour, which is exactly
+/// what half-open already does on a 60 s cycle. A RECENT open breaker (live
+/// protection) still survives, because its `updated_at` is recent.
+///
+/// `limit` caps a single pass so a large backlog is drained over several passes
+/// instead of one long statement holding locks. Both outer `DELETE`s repeat
+/// `tenant_id = $1` beside the `ctid` subquery — redundant with the subquery and
+/// RLS, which is the point: every statement in this module carries the predicate.
 const SWEEP: &str = "\
 with dead_windows as (
     delete from egress_rate_windows
@@ -376,7 +387,6 @@ with dead_windows as (
        and ctid in (
            select ctid from egress_breakers
             where tenant_id = $1::uuid
-              and state = 'closed' and failures = 0
               and updated_at < now() - make_interval(secs => $2::double precision)
             limit $3::bigint)
     returning 1
@@ -634,7 +644,13 @@ pub async fn report(
         .bind(host_digest)
         .bind(ok)
         .bind(probe_epoch)
-        .bind(limits.breaker_threshold as i32)
+        // SATURATE, never wrap: `breaker_threshold` is a `u32`, but the durable
+        // predicate binds `i32`. A value above `i32::MAX` under `as i32` would
+        // wrap to a NEGATIVE threshold, and the SQL `failures >= $6` would then
+        // trip the breaker on the very first failure — the exact opposite of the
+        // "effectively never" the local `u32` tier gives the same value. `try_from`
+        // + `i32::MAX` keeps the two tiers consistent at the extreme.
+        .bind(i32::try_from(limits.breaker_threshold).unwrap_or(i32::MAX))
         .execute(&mut *tx)
         .await?;
     tx.commit().await
@@ -1511,7 +1527,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_sweep_is_bounded_and_keeps_every_informative_row() {
+    async fn the_sweep_is_bounded_and_collects_aged_rows_including_open_breakers() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
@@ -1568,21 +1584,23 @@ mod tests {
             tx.commit().await.unwrap();
         }
         // THE BOUND MUST BIND. There are exactly 5 collectable rate windows here
-        // (tenant ×1, connection ×2, host ×2) and exactly 1 collectable breaker
-        // (`quiet`; `sick` is open), so a `limit` of 2 drains them over three passes
-        // — 2+1, then 2+0, then 1+0. An earlier version passed `1000` against 6
-        // rows, which made the whole `limit` clause deletable with the test still
-        // green: "bounded" is the property, and an unbounded DELETE holding locks
-        // over a large backlog is precisely what it exists to prevent.
+        // (tenant ×1, connection ×2, host ×2) and — now that an AGED open breaker is
+        // eligible (see `SWEEP`) — 2 collectable breakers (`quiet` closed, `sick`
+        // open), all aged an hour past the 30-min `idle`. `limit` of 2 drains them
+        // over three passes: 2 windows + 2 breakers, then 2 windows, then 1 window.
+        // An earlier version passed `1000` against 6 rows, which made the whole
+        // `limit` clause deletable with the test still green: "bounded" is the
+        // property, and an unbounded DELETE holding locks over a large backlog is
+        // precisely what it exists to prevent.
         assert_eq!(
             sweep(&pool, scope, 1800, 2).await.unwrap(),
-            3,
-            "pass 1 must cap at 2 windows + 2 breakers (only 1 is collectable)"
+            4,
+            "pass 1 must cap at 2 windows + 2 breakers"
         );
         assert_eq!(
             sweep(&pool, scope, 1800, 2).await.unwrap(),
             2,
-            "pass 2 must cap at 2 windows"
+            "pass 2 must cap at 2 windows (both breakers already gone)"
         );
         assert_eq!(
             sweep(&pool, scope, 1800, 2).await.unwrap(),
@@ -1595,14 +1613,9 @@ mod tests {
             "a drained tenant sweeps nothing"
         );
         assert_eq!(window_hits(&pool, scope, SCOPE_TENANT).await, 0);
-        // The OPEN breaker survives — it is the only row here carrying information,
-        // and forgetting it would silently re-admit traffic to a dead upstream.
-        let (state, _, _) = breaker_state(&pool, scope).await;
-        assert_eq!(
-            state, "open",
-            "the sweep must never collect an open breaker"
-        );
-        // The idle, clean one is gone.
+        // BOTH aged breakers are gone — the abandoned-open-row leak is closed. The
+        // separate `a_recent_open_breaker_is_never_swept` proves the flip side: a
+        // breaker whose `updated_at` is recent (live protection) survives.
         let mut tx = scoped_tx(&pool, scope).await.unwrap();
         let (rows,): (i64,) =
             sqlx::query_as("select count(*) from egress_breakers where tenant_id = $1")
@@ -1611,7 +1624,46 @@ mod tests {
                 .await
                 .unwrap();
         tx.commit().await.unwrap();
-        assert_eq!(rows, 1, "the clean, idle breaker must be collected");
+        assert_eq!(rows, 0, "every aged breaker row must be collected");
+    }
+
+    /// The flip side of the abandoned-open-row fix: a breaker whose `updated_at` is
+    /// RECENT — a live protection on an endpoint still being dialed — must survive
+    /// the sweep. Only TIME distinguishes "abandoned" from "live", so this proves
+    /// the sweep never forgets a protection that could still be doing work.
+    #[tokio::test]
+    async fn a_recent_open_breaker_is_never_swept() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let scope = throwaway_tenant(&pool).await;
+        let session = seed_session(&pool, scope, None).await;
+        let l = DurableLimits {
+            tenant_per_min: 100,
+            user_per_min: 0,
+            connection_per_min: 100,
+            host_per_min: 100,
+            breaker_threshold: 2,
+            breaker_open_secs: 60,
+        };
+        let live = Uuid::now_v7();
+        for _ in 0..2 {
+            admit(&pool, scope, req(session, live, "sha256:live", l))
+                .await
+                .unwrap();
+            report(&pool, scope, live, "sha256:live", false, None, &l)
+                .await
+                .unwrap();
+        }
+        // NOT aged: its `updated_at` is now(). A generous idle grace still spares it.
+        let collected = sweep(&pool, scope, 1800, 100).await.unwrap();
+        let (state, _, _) = breaker_state(&pool, scope).await;
+        assert_eq!(
+            state, "open",
+            "a recent open breaker is a live protection and must survive; swept {collected}"
+        );
     }
 
     #[tokio::test]

@@ -256,6 +256,7 @@ mod tests {
             // asserting on THESE values proves nothing about production, which
             // parses them in `config.rs::parse_archive_store`; test that path.
             archive_store: fluidbox_workspace::ArchiveStoreConfig::Fs,
+            metrics_bind: None,
         }
     }
 

@@ -98,3 +98,72 @@ Findings acted on (`9019a48`): two stale comments, the class this project keeps 
 - **A claim about a default is not a claim about production.** Three separate defects this phase came from the same shape: testing a constructor, a `Default`, or a helper's argument rather than the path production takes.
 - **Parallel agents in one tree work if — and only if — ownership is by REGION and the tool is exact-string Edit.** Six agents ran concurrently with zero data loss this phase, against two incidents in Phase E. The rules that made the difference: never `git checkout`/`stash`/`restore`, never whole-file `Write` on an existing file, never `cargo fmt --all`. One agent still `rm -rf`'d a shared scratchpad subdirectory — scratchpad paths need per-agent namespacing too.
 - **The most valuable finding was not in the plan.** Nothing in the design or the issue said "the pool is 10 and nobody chose it." It came from asking a survey to enumerate every knob that binds under load, before writing the tests that would have measured it.
+
+---
+
+# Session 2 closeout — Codex gate, operational metrics, load plan (2026-07-21, later)
+
+This section is authoritative for what the second session did. It supersedes the "What is NOT done" list above on the two items it names as done.
+
+## Operational metrics (issue #34 deliverable 2) — BUILT, proven, CI-covered
+
+`crates/fluidbox-server/src/metrics.rs`: a hand-rolled, dependency-free registry — atomic `Counter`/`Gauge`, fixed-bucket `Histogram`, and a `Family` (a labelled counter over a COMPILE-TIME-fixed value set with an `_other` catch-all). **Cardinality is a security property here:** tenants are untrusted, so no metric is labelled by `tenant_id`/`connection_id`/upstream host — an unbounded label set would be a memory-exhaustion DoS. Per-tenant attribution stays in the ledger/`usage_entries` (already redacted, already tenant-scoped).
+
+Exposition: `GET /v1/admin/metrics` (admin-token-gated, the same `/v1/admin/*` surface the operator keeps under SSO) plus an OPTIONAL unauth `FLUIDBOX_METRICS_BIND` third listener (off by default; documented private-interface-only). Both render identical Prometheus text; the render does NO database query (pool stats + a registry lock only), so a scrape cannot be turned into DB load.
+
+Insertion points are the funnels where the data already sits, so a decision can't be counted twice or missed:
+- `ledger::record` (ONE funnel for every event): gate verdicts + deny sources (`ToolDecision`), brokered latency + outcome (`BrokeredToolCall`), delivery outcomes (`CallbackDelivered`/`Failed`), ledger-write count. Refactored to take `&Metrics` so the event→metric mapping is unit-tested with no DB (mutation-proof: `ledger::tests`).
+- `orchestrator::transition_inner` (the single status writer): active-runs gauge (band-edge deltas, `metrics::active_delta` unit-tested), provisioning latency (initializing→running only), terminal-outcome counters.
+- `broker.rs`: upstream failure class (from the `CallErr` variants the broker genuinely distinguishes — NOT a fabricated numeric-status split), generation mismatches (metered `recheck_binding` path, DB-test-proven at `broker.rs`), egress rejections (rate/breaker, from the governor's `Throttled.scope`).
+- `facade.rs`: reservation lifecycle (booked/released/charged/refused). `connections.rs`: revocations. Governor `degraded_count` + pool + MCP-session count read LIVE at render.
+
+Coverage: `cargo test -p fluidbox-server` metrics/ledger/main tests all green (registry math, `_other` routing, cumulative histogram, deterministic render, exposition-name uniqueness, the route+listener wiring source-guard). The `scale` CI job's new `tool.decision` assertion (below) exercises the ledger funnel end to end.
+
+## The Codex gate — RUN (gpt-5.6-sol), adjudicated by mechanism, fixed
+
+Three scoped rounds over `git diff 46ffe7f..fc3d231`, matching the three whole-branch scopes. **Max reasoning silently exceeded the 30-min MCP idle timeout on the two broad scopes**, so B and C were re-run at `high` and B was split (B1 teardown+workload, B2 token-off-env+audience). Aggregate: **2 Critical + 16 Important + 6 Minor.** Phase E's gate was 2 Critical + 17 Important — the prediction held. Scope B2 (the token-off-env exec chain + the audience mapping — the most security-sensitive surface) came back **completely clean**, all twelve mechanisms verified by an outside model. The SigV4 signer and the SplitMix64 RNG were **independently recomputed in Python and matched exactly** — the hand-rolled crypto is correct.
+
+Every finding was adjudicated against code, not deference (this phase's own review had reported a FALSE "from_config untested" Minor; Codex's own "Verified correct" confirmed that test exists). **FIXED (17):**
+
+| # | Finding | Fix | Test |
+|---|---|---|---|
+| C1 **Crit** | loadgen production guard bypassable: `host_of` (textual) misses libpq `host=` override + a userinfo/path `@` trick, so it reads loopback while sqlx/reqwest dial prod | `guard.rs`: `effective_db_host` (via `PgConnectOptions::get_host`) + `effective_target_host` (via `reqwest::Url`) reason about the host the connectors ACTUALLY use; present-but-unparseable DB → refuse. (An agent also moved the loadgen DB URL to `FLUIDBOX_LOADGEN_DATABASE_URL` so a `.env` source can't arm it.) | 2 bypass tests, mutation-proof |
+| C2 **Crit** | `scale-e2e.sh` had NO production-DB refusal — a `source .env; bash scale-e2e.sh` would seed + forge auth-capable tokens into real Neon | added a python3 host guard (honors `host=` override); refuses non-loopback unless `FLUIDBOX_SCALE_ALLOW_REMOTE_DB=1` | `bash -n` + shellcheck |
+| A7 | `FLUIDBOX_DB_MAX_LIFETIME_SECS=0` documented as "no cap" but `pool_options` passed `Some(Duration::ZERO)` → sqlx expires every connection immediately (reconnect storm on Neon) | `disabled_when_zero` maps 0→`None` for lifetime AND idle | `pool_option_tests` asserts the constructed getters |
+| A1 | breaker threshold `u32→i32` wrap: a value > `i32::MAX` opened the durable breaker on the first failure | saturating `i32::try_from(...).unwrap_or(i32::MAX)` | — |
+| A5 | abandoned open/half-open breaker rows never swept (only `closed AND failures=0`) → unbounded growth; a test PINNED the leak | sweep now collects any row aged past `idle_secs` (≫ `breaker_open_secs`, so a live protection's recent `updated_at` still survives); test flipped + a new `a_recent_open_breaker_is_never_swept` | DB tests |
+| A2 | the OAuth 401 retry dial was not re-admitted → a hostile 401-then-200 doubles the governed rate uncounted | re-run `governor_gate_durable` before each retry dial (both broker paths) | — |
+| A4 | credential-free legacy bundle keyed the local connection dimension by shared `Uuid::nil()` → cross-tenant collision | key it by the tenant (for a connectionless bundle the per-connection dimension IS per-tenant) | — |
+| B1-1 | in `enforce`, a failed `set_workload_addrs` left a k8s run bearer-only for its whole life (indistinguishable from the legit unbindable classes) | in enforce, when the provider reported an address but recording failed, terminate the sandbox + refuse the launch | — |
+| C3 | `scale` job counted only `tool.requested` + `max(seq)≤2` → dropping the `tool.decision` append stayed green | added an explicit `tool.decision == FORGE_N` assertion | the job |
+| C4 | S3 `ListObjects` parser accumulated every `<Contents>` key across 100 pages unbounded → ~9M keys/>1 GiB | `MAX_LISTED_KEYS` ceiling + warn + break; caller re-lists next sweep | mutation-proof |
+| C5 | health/HTTP/auth curls in `scale-e2e.sh` lacked `--max-time` → a hung listener blocks to the 45-min timeout | `--max-time` on all six | `bash -n` |
+| C6 | `--facade-calls-per-session>0` could spend real model money with only a warning | new `--allow-model-spend` opt-in (pure `model_spend_gate`), refuses otherwise | unit test |
+| C7 | report footer said all limits are "per-replica in-memory" (stale after 0023) | corrected to name both tiers | — |
+| C8 | `S3Config` derived `Debug` exposing `secret_access_key`/`session_token` | hand-written redacting `Debug` | mutation-proof |
+| A8 | Helm `replicas:3 + archiveStore:s3` still mounted one RWO PVC into every pod + hardcoded `Recreate` | PVC + `Recreate` gated to the node-local `fs` path; `s3` drops the PVC + uses `RollingUpdate`; single-replica render byte-identical | `helm lint` + rendered diff |
+| A-min2 / B1-min | stale comments: governor "durable = Phase F" (state.rs, main.rs, CLAUDE.md), orchestrator "a live row causes a re-drive" (false at the last hop), report footer | corrected to the truth | — |
+| — | `.env.example` missing every `FLUIDBOX_DB_*`, `MAX_REQUEST_BODY_BYTES`, `WORKLOAD_IDENTITY`, archive-store + `METRICS_BIND` knob | full Phase F section added | — |
+
+**DOCUMENTED, deliberately not fixed this phase (each real, each bounded, each on a best-effort subsystem where a rushed hot-path change is the very false-green class this phase hunts):**
+
+- **A3 — probe/refresh MCP discovery egress is ungoverned.** `probe_tools`/`discover_tools`/`discover_snapshot` send `initialize` + up to 4 `tools/list` pages with no governor admission. Bounded per request, not in aggregate. Mitigating: these are ADMIN/member-authenticated actions, not the unauthenticated abuse the governor primarily guards. FIX: thread `governor_gate_durable` into the three discovery entry points (a new integration into separate paths). Follow-up.
+- **A6 — neither listener carries a request-timeout or concurrency layer** (a slowloris on drip-fed sub-2-MiB bodies holds a socket without reaching the DB acquire timeout). The absence is disclosed with rationale (a GLOBAL timeout would cut SSE/LLM/permission-wait routes mid-flight); the reviewer's point is that no ROUTE-SCOPED substitute was added for the short-lived routes. In production this is normally handled at the ingress/LB; app-level route-scoped timeouts on the short routes are the follow-up.
+- **B1-2 — cross-replica MCP-session teardown can mark a REPLACEMENT session deleted without deleting it** (replica B snapshots row R/S1, replica A reinits R→S2, B deletes S1 and marks R deleted by UUID → S2's slot leaks). A session SLOT leak, not custody. Broadens the disclosed sweeper residual.
+- **B1-3 / B1-4 — the terminal MCP cleanup is fire-and-forget and MCP persistence is best-effort**, so "every registered session is persisted / retryable" overstates: a process death between `delete_finalization` and the spawned cleanup, or a caught `SessionRecorder` DB error, leaves an upstream session slot that the sweeper later retires WITHOUT a DELETE (invariant 9 forbids sending an unresolvable credential). The false comment is corrected; the behavior is a disclosed slot-leak. FIX: a durable, awaited teardown receipt. Follow-up.
+- **A-min (governance observability):** the durable-tier preflight runs at first dial, not boot, and `preflight_failed` never clears after a transient recovery. Cosmetic/observability; the degrade path itself is correct and counted.
+
+## Load plan (Gate 3, and the 60/150/300 runs) — PRESENTED, awaiting owner approval + cost sign-off
+
+The harness is built and CI-proven at small N; the real runs spend money and provision infrastructure. Proposed sequence, each gated on the previous holding and on the pool/quota values being RECORDED (Gate 5 extrapolates from them):
+
+1. **Shape the deployment like production first:** multi-replica (≥2), real Postgres sized so `replicas × (FLUIDBOX_DB_MAX_CONNECTIONS + 2)` fits the compute's ceiling (Neon ~112 ⇒ e.g. 3 replicas × 25 + spare), `FLUIDBOX_ARCHIVE_STORE=s3` (fs is single-replica), `FLUIDBOX_EGRESS_DURABLE=1`, `FLUIDBOX_WORKLOAD_IDENTITY=enforce`, runner images rebuilt from this branch, `FLUIDBOX_METRICS_BIND` wired to a scraper (Gate 3 reads these metrics).
+2. **60 concurrent (the design's first capacity checkpoint).** Hold every `rollout-gates.md` Gate-3 row: provisioning-latency p95 with no upward trend, pool never sustains 100% checked-out + zero acquire timeouts, gate-decision-latency p95 within a stated factor of idle, ambiguous brokered outcomes a small fraction, no run exceeds budget beyond the sole-claimant bound, durable egress ceiling observed to BIND (not N×), zero orphaned sandboxes after teardown (the k8s epic's audit, repeated under load). **Record the pool/quota/limit values used.** Est. cost: a short (~20–30 min) 60-sandbox run at the haiku default is small; the estimate goes in the approval request.
+3. **150, then 300** only if 60 holds and the numbers are recorded. 300 is the full-seat stress case; the harness sustains it or the deployment documents a lower supported ceiling (Gate 5).
+4. **Fault injection (Gate 5):** kill a replica mid-run (leases transfer, deliveries re-claim, MCP sessions still torn down), DB failover mid-run (no duplicate side effects), a sustained soak for unbounded memory/connection growth.
+
+6 of 10 load SCENARIOS remain named gaps (each refuses with its blocker, never renders green) — the OAuth-refresh-storm, revocation-during-active-run, upstream-failure-matrix, slow-approval, broker-restart, and reservation-race sections are still to be built; they are not required to run the concurrency gate above but ARE required for Gates 4–5.
+
+## Verification at closeout
+
+`cargo clippy --workspace --all-targets -D warnings` clean (and `-p fluidbox-workspace --features store`); `cargo test` green on every non-DB suite run locally (server 414, loadgen 52, workspace/store 64, plus the new metrics/ledger/guard/pool tests) with `DATABASE_URL` proven `UNSET`. The DB-backed governance/broker tests (the flipped breaker-sweep, the metered generation-mismatch) are CI's to prove. **CI on PR #85 is the proof for everything DB-backed** — that is the final gate.
