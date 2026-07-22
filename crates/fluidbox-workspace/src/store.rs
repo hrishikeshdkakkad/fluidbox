@@ -77,6 +77,31 @@ const LIST_PAGE_SIZE: u32 = 1000;
 /// cannot turn the hourly sweep into an unbounded scan.
 const MAX_LIST_PAGES: usize = 100;
 
+/// The largest response body per ListObjectsV2 page we will read. A conforming
+/// page is ~1000 keys of modest XML; a hostile or broken store could stream an
+/// unbounded page, so the read stops here regardless.
+const MAX_LIST_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Read a response body chunk by chunk, abandoning it the instant it exceeds
+/// `cap`. Unlike `resp.text()`/`resp.bytes()`, which buffer the WHOLE body before
+/// anyone can truncate it, this never holds more than one chunk beyond `cap` —
+/// so an object store answering with a huge body cannot spike our memory. A
+/// transport error mid-read yields whatever was read so far (this is only ever
+/// used for diagnostics and best-effort parsing, never for archive bytes, which
+/// are digest-verified elsewhere). Truncation at a byte boundary can split a
+/// UTF-8 sequence; `from_utf8_lossy` renders the tail rather than erroring.
+async fn bounded_body(mut resp: reqwest::Response, cap: usize) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() <= cap {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    buf.truncate(cap);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -703,12 +728,15 @@ impl S3ArchiveStore {
     }
 
     /// Render a non-success response as a `StoreError`, pulling S3's `<Code>`
-    /// out of the XML body when there is one. Bounded — an endpoint answering
-    /// with something enormous must not be read into memory.
+    /// out of the XML body when there is one. Genuinely bounded — the body is
+    /// read chunk by chunk and abandoned the moment it exceeds
+    /// [`MAX_ERROR_BODY_BYTES`], so a compromised or misconfigured store cannot
+    /// spike control-plane memory by answering an error with a huge body.
+    /// (`resp.text()` here would buffer the WHOLE body first and only then
+    /// truncate — the bound would be a comment, not a fact.)
     async fn error_from(&self, resp: reqwest::Response, verb: &str, key: &str) -> StoreError {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        let body: String = body.chars().take(MAX_ERROR_BODY_BYTES).collect();
+        let body = bounded_body(resp, MAX_ERROR_BODY_BYTES).await;
         let code = first_tag(&body, "Code").unwrap_or_else(|| "(no code)".into());
         StoreError::Backend(format!(
             "{verb} {key}: {} from the object store ({code})",
@@ -892,10 +920,11 @@ impl S3ArchiveStore {
             if !resp.status().is_success() {
                 return Err(self.error_from(resp, "LIST", &self.cfg.prefix).await);
             }
-            let body = resp
-                .text()
-                .await
-                .map_err(|e| StoreError::Backend(format!("LIST: reading body: {e}")))?;
+            // Bounded chunk-wise (see `bounded_body`): a hostile store cannot
+            // make one page spike our memory. A conforming page is far under the
+            // cap; a truncated one simply yields fewer keys for this sweep pass,
+            // which the next hourly sweep re-lists.
+            let body = bounded_body(resp, MAX_LIST_BODY_BYTES).await;
             for (key, last_modified) in list_contents(&body) {
                 let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&last_modified) else {
                     // Unparseable timestamp reads as FRESH — the same
