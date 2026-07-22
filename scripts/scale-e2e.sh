@@ -564,9 +564,12 @@ if forge_fast "$RUN" "$FORGE_N" "(a)"; then
       && ok "(a) …spread across all $REQ_SESSIONS sessions — every forged session was genuinely reachable, not one session $FORGE_N times" \
       || no "(a) only $REQ_SESSIONS of $FORGE_N sessions recorded a request"
   fi
-  # `append_event` assigns a gapless per-session seq under a row lock. With one
-  # request per session the max seq per session must be 1; anything higher means
-  # a request was counted against the wrong session.
+  # `append_event` assigns a gapless per-session seq under a row lock. ONE gate
+  # call appends TWO events — `tool.requested` then `tool.decision` — so with one
+  # request per session the max seq must be <=2. A HIGHER value means a second
+  # request was counted against this session, i.e. traffic crossed sessions.
+  # (Do NOT "correct" this bound to =1: that is the stale-comment trap this line
+  # used to set — the code has always been right, the old comment was not.)
   MAXSEQ=$(db "select coalesce(max(seq), 0) from events where session_id = any('{$ARR}'::uuid[])")
   gt0 "$MAXSEQ" "(a) max per-session event seq" && {
     [ "$MAXSEQ" -le 2 ] \
