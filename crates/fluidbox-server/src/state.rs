@@ -184,14 +184,17 @@ pub struct AppStateInner {
     /// broker/deliveries consult it via `egress::admit_url`; the orchestrator
     /// derives the workspace `GitEgressPolicy` from it.
     pub egress_policy: crate::egress::EgressPolicy,
-    /// Outbound rate limits + per-connection circuit breakers (Phase E, E14).
-    /// The broker consults it AFTER the execution claim is won and BEFORE the
-    /// dial, so a refusal is a pre-write proof of non-dispatch (`NeverSent` ⇒
-    /// `failed_before_send` ⇒ re-claimable). In-memory and PER-REPLICA by design:
-    /// with N replicas the effective ceiling is N × the configured rate and a
-    /// breaker opened here does not stop the others — it is a fairness/abuse
-    /// backstop and an upstream-protection reflex, not a hard quota. The durable
-    /// multi-replica limiter is Phase F (disclosed, plan E14).
+    /// Outbound rate limits + per-connection circuit breakers (Phase E, E14;
+    /// durable cross-replica tier added in Phase F, migration 0023). The broker
+    /// consults it AFTER the execution claim is won and BEFORE the dial, so a
+    /// refusal is a pre-write proof of non-dispatch (`NeverSent` ⇒
+    /// `failed_before_send` ⇒ re-claimable). TWO tiers: a per-replica in-memory
+    /// tier checked FIRST (fast, and the sole gate on `FLUIDBOX_EGRESS_DURABLE=0`),
+    /// then a durable Postgres tier (default on) that gives the DEPLOYMENT-WIDE
+    /// ceiling for the tenant/user/connection/(tenant,host) dimensions and a
+    /// cross-replica breaker. `host_global` deliberately stays per-replica (a
+    /// durable cross-tenant key would need a per-dial RLS bypass). A store error
+    /// DEGRADES to the local verdict (never fails a dial closed on governance).
     pub governor: crate::governor::EgressGovernor,
     /// Seals/unseals connection credentials (Phase D versioned envelope). Built
     /// by `seal::build_sealer`: a legacy key (KMS off), a KMS-envelope backend
@@ -254,6 +257,12 @@ pub struct AppStateInner {
     /// resealed/skipped/failed + last_error), surfaced by `GET /v1/admin/reseal`
     /// alongside the authoritative live parity counts.
     pub reseal_status: Mutex<crate::reseal::ResealStatus>,
+    /// Hand-rolled operational metrics (Phase F, issue #34): counters, gauges and
+    /// fixed-bucket histograms fed from the event/lifecycle funnels, rendered as
+    /// Prometheus text by `GET /v1/admin/metrics` (and the optional unauth
+    /// `FLUIDBOX_METRICS_BIND` listener). Replica-local and reset on restart — an
+    /// operational signal, not an audit record (the ledger is that).
+    pub metrics: crate::metrics::Metrics,
 }
 
 pub type AppState = Arc<AppStateInner>;

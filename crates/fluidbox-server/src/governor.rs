@@ -1980,6 +1980,7 @@ mod tests {
             workload_identity: crate::config::WorkloadIdentityMode::default(),
             // Task 4 (archive store): inert here — the governor reads none of it.
             archive_store: fluidbox_workspace::ArchiveStoreConfig::Fs,
+            metrics_bind: None,
         }
     }
 

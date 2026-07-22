@@ -70,6 +70,38 @@ command -v openssl >/dev/null 2>&1 || { echo "scale-e2e: openssl is required (to
 # through it. None of those may silently skip, so a missing psql aborts the run.
 command -v psql    >/dev/null 2>&1 || { echo "scale-e2e: psql is required (acceptance must be PROVEN, not skipped)." >&2; exit 2; }
 
+# ── Production-database guard ────────────────────────────────────────────────
+# This script boots a server against DATABASE_URL, runs migrations, sets the
+# cross-tenant `system_worker` bypass, and INSERTs policies/agents/sessions and
+# audience-scoped tokens DIRECTLY — and the forged bearers, once their hashes land
+# in `api_tokens`, AUTHENTICATE against anything sharing that database. A
+# `set -a; source .env` puts the project's hosted Neon straight into DATABASE_URL,
+# so "NEVER executed locally" cannot be a comment — it must be enforced. Refuse a
+# non-loopback database the way crates/fluidbox-loadgen/src/guard.rs does, honoring
+# the libpq `host=`/`hostaddr=` override that a textual check cannot see (sqlx
+# does). `FLUIDBOX_SCALE_ALLOW_REMOTE_DB=1` is the explicit, deliberate escape
+# hatch — the `--force-unsafe-target` analogue.
+DB_HOST=$(python3 - "$DATABASE_URL" <<'PY'
+import sys, urllib.parse as u
+p = u.urlsplit(sys.argv[1])
+q = dict(u.parse_qsl(p.query))
+# host=/hostaddr= OVERRIDE the URL authority for libpq/sqlx; honor them.
+print((q.get("hostaddr") or q.get("host") or (p.hostname or "")).lower())
+PY
+)
+case "$DB_HOST" in
+  127.*|localhost|::1) LOCAL_DB=1 ;;
+  *)                   LOCAL_DB=0 ;;  # non-loopback OR empty/unparseable ⇒ refuse
+esac
+if [ "$LOCAL_DB" = 0 ] && [ "${FLUIDBOX_SCALE_ALLOW_REMOTE_DB:-0}" != 1 ]; then
+  echo "scale-e2e: REFUSING — DATABASE_URL resolves to a NON-loopback host ('${DB_HOST:-<unparseable>}')." >&2
+  echo "  This script writes sessions, api_tokens and policies DIRECTLY and forges" >&2
+  echo "  bearer tokens that authenticate against whatever shares this database." >&2
+  echo "  It runs ONLY against a throwaway local Postgres (CI's service container)." >&2
+  echo "  If you truly intend a remote target, set FLUIDBOX_SCALE_ALLOW_REMOTE_DB=1." >&2
+  exit 2
+fi
+
 # ── Config ───────────────────────────────────────────────────────────────────
 # PORTS. scripts/hardening-e2e.sh owns 8787/8788 (replica A) and 8790/8791
 # (replica B). This suite deliberately picks a DIFFERENT block so both can run on
@@ -250,7 +282,7 @@ boot() {
   SERVER_PID=$SPAWN_PID
   for _ in $(seq 1 180); do
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then SERVER_PID=""; return 1; fi
-    curl -sf "$API/v1/health" >/dev/null 2>&1 && return 0
+    curl -sf --max-time 5 "$API/v1/health" >/dev/null 2>&1 && return 0
     sleep 1
   done
   return 1
@@ -275,7 +307,7 @@ boot_replica_b() {
   SERVER_B_PID=$SPAWN_PID
   for _ in $(seq 1 180); do
     if ! kill -0 "$SERVER_B_PID" 2>/dev/null; then SERVER_B_PID=""; return 1; fi
-    curl -sf "$API_B/v1/health" >/dev/null 2>&1 && return 0
+    curl -sf --max-time 5 "$API_B/v1/health" >/dev/null 2>&1 && return 0
     sleep 1
   done
   return 1
@@ -285,7 +317,7 @@ stop_replica_b() {
   [ -n "$SERVER_B_PID" ] && kill "$SERVER_B_PID" 2>/dev/null
   SERVER_B_PID=""
   for _ in $(seq 1 60); do
-    curl -sf "$API_B/v1/health" >/dev/null 2>&1 || return 0
+    curl -sf --max-time 5 "$API_B/v1/health" >/dev/null 2>&1 || return 0
     sleep 0.5
   done
   return 1
@@ -305,7 +337,7 @@ http_dead() { # code label → 0 (having recorded ONE failure) when nothing answ
 }
 admin_post() {
   : > "$UB"
-  CODE=$(curl -s -o "$UB" -w '%{http_code}' -X POST -H "$AH" -H 'content-type: application/json' -d "$2" "$API$1")
+  CODE=$(curl -s --max-time 30 -o "$UB" -w '%{http_code}' -X POST -H "$AH" -H 'content-type: application/json' -d "$2" "$API$1")
   BODY=$(cat "$UB")
   http_dead "$CODE" "POST $1" && return 1
   return 0
@@ -313,7 +345,7 @@ admin_post() {
 # shellcheck disable=SC2317,SC2329  # called by sections still to be written
 admin_get() {
   : > "$UB"
-  CODE=$(curl -s -o "$UB" -w '%{http_code}' -H "$AH" "$API$1")
+  CODE=$(curl -s --max-time 30 -o "$UB" -w '%{http_code}' -H "$AH" "$API$1")
   BODY=$(cat "$UB")
   http_dead "$CODE" "GET $1" && return 1
   return 0
@@ -564,6 +596,18 @@ if forge_fast "$RUN" "$FORGE_N" "(a)"; then
       && ok "(a) …spread across all $REQ_SESSIONS sessions — every forged session was genuinely reachable, not one session $FORGE_N times" \
       || no "(a) only $REQ_SESSIONS of $FORGE_N sessions recorded a request"
   fi
+  # The DECISION row is the actual gate OUTPUT — count it explicitly. Without this,
+  # dropping the `tool.decision` append (while the handler still answers 200/allow)
+  # leaves every other assertion in this section green: one `tool.requested` per
+  # session, max seq 1. CI's "every gate decision recorded exactly once" claim is
+  # only true if THIS binds — and the `<=2` seq bound below is only meaningful
+  # because TWO events per call is what we assert here.
+  DEC_EVENTS=$(db "select count(*) from events where session_id = any('{$ARR}'::uuid[]) and type='tool.decision'")
+  if gt0 "$DEC_EVENTS" "(a) tool.decision ledger rows"; then
+    [ "$DEC_EVENTS" = "$FORGE_N" ] \
+      && ok "(a) the ledger holds exactly $DEC_EVENTS tool.decision rows — every gate call recorded its verdict, none duplicated" \
+      || no "(a) $DEC_EVENTS tool.decision rows for $FORGE_N requests — a decision append was dropped or duplicated"
+  fi
   # `append_event` assigns a gapless per-session seq under a row lock. ONE gate
   # call appends TWO events — `tool.requested` then `tool.decision` — so with one
   # request per session the max seq must be <=2. A HIGHER value means a second
@@ -584,7 +628,7 @@ if forge_fast "$RUN" "$FORGE_N" "(a)"; then
   CTRL_SID=$(printf '%s\n' "$FORGED_IDS" | head -1)
   if need "$CTRL_SID" "(a) no forged session for the auth positive control"; then
     : > "$UB"
-    CTRL_CODE=$(curl -s -o "$UB" -w '%{http_code}' -X POST \
+    CTRL_CODE=$(curl -s --max-time 30 -o "$UB" -w '%{http_code}' -X POST \
       -H "authorization: Bearer fbx_sess_sc_${TAG}_never_minted_tool" \
       -H 'content-type: application/json' \
       -d "{\"tool_call_id\":\"$TAG-ctrl\",\"tool\":\"Read\",\"input\":{\"file_path\":\"/workspace/README.md\"}}" \
