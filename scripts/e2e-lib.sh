@@ -20,6 +20,13 @@ j() { python3 -c "import sys,json;d=json.load(sys.stdin);print(d$1)" 2>/dev/null
 load_env() {
   [ -f "$ROOT/.env" ] || { echo "missing $ROOT/.env — copy .env.example and fill it in"; exit 1; }
   set -a; source "$ROOT/.env"; set +a
+  # The acceptance fixtures are loopback-http BY CONSTRUCTION (fake AS, fake
+  # GitHub API, plain-http callbacks, file:// clones), and the Phase-E egress
+  # seams key on a loopback FLUIDBOX_PUBLIC_URL — a hosted/ngrok URL in .env
+  # (real webhook work) turns the dev seam OFF and 400s every http fixture.
+  # Pin the suite's posture regardless of what .env carries; CI runs loopback
+  # and this makes local runs match it.
+  export FLUIDBOX_PUBLIC_URL="http://127.0.0.1:8787"
 }
 
 require_cmd() {
