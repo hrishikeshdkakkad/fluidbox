@@ -1878,7 +1878,6 @@ pub async fn workspace_archive(
     State(state): State<AppState>,
 ) -> ApiResult<axum::response::Response> {
     use axum::response::IntoResponse;
-    use tokio::io::AsyncReadExt;
     // Gap 10: the archive is its OWN audience. The init container is a separate
     // process that receives ONLY this token, and no runner-held credential
     // (control/tool/llm) opens this route.
@@ -1891,26 +1890,27 @@ pub async fn workspace_archive(
     if !session.status_enum().accepts_work() {
         return Err(ApiError::BadRequest("session is not active".into()));
     }
-    let path = crate::orchestrator::archive_path(&state.cfg.data_dir, auth.session_id);
-    // Streamed straight off disk — a large archive must never transit
-    // control-plane RAM (M4). The explicit Content-Length lets the client
-    // detect truncation cheaply; the init container's digest check remains
-    // the integrity authority.
-    let mut file = tokio::fs::File::open(&path)
+    // Streamed out of the configured store — off local disk on `fs`, straight
+    // off the object store on `s3`. Either way a large archive must never
+    // transit control-plane RAM (M4). The proxy stays: a `zeroEgress` run pod
+    // can reach ONLY this listener, so a presigned URL would be unreachable
+    // from inside the sandbox by design.
+    //
+    // The length comes from the STORE (it used to come from `File::metadata`).
+    // The explicit Content-Length lets the client detect truncation cheaply;
+    // the init container's digest check remains the integrity authority.
+    let read = match crate::orchestrator::archive_store(&state)
+        .get(auth.session_id)
         .await
-        .map_err(|_| ApiError::NotFound)?;
-    let len = file.metadata().await.map_err(|_| ApiError::NotFound)?.len();
-    let stream = async_stream::stream! {
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            match file.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n])),
-                Err(e) => {
-                    yield Err(e);
-                    break;
-                }
-            }
+    {
+        Ok(read) => read,
+        // ABSENT is 404 (the init container gives up and the pod fails, at zero
+        // model spend); BROKEN is 502, so a transient store failure is retried
+        // rather than mistaken for "this run has no archive".
+        Err(fluidbox_workspace::StoreError::NotFound) => return Err(ApiError::NotFound),
+        Err(e) => {
+            tracing::warn!("workspace archive for {} unavailable: {e}", auth.session_id);
+            return Err(ApiError::Upstream("workspace archive unavailable".into()));
         }
     };
     Ok((
@@ -1919,9 +1919,9 @@ pub async fn workspace_archive(
                 axum::http::header::CONTENT_TYPE,
                 "application/gzip".to_string(),
             ),
-            (axum::http::header::CONTENT_LENGTH, len.to_string()),
+            (axum::http::header::CONTENT_LENGTH, read.len.to_string()),
         ],
-        axum::body::Body::from_stream(stream),
+        axum::body::Body::from_stream(read.stream),
     )
         .into_response())
 }
@@ -1967,12 +1967,25 @@ pub struct ResultIn {
 pub async fn result(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
+    crate::auth::PeerAddr(peer): crate::auth::PeerAddr,
     Json(res): Json<ResultIn>,
 ) -> ApiResult<Json<Value>> {
     let token = crate::auth::bearer_from_headers(&headers).ok_or(ApiError::Unauthorized)?;
     let sess_auth = fluidbox_db::session_for_token_incl_revoked(&state.pool, &token)
         .await?
         .ok_or(ApiError::Unauthorized)?;
+    // Gap 6 (Phase F), and the SAME ordering argument as the audience check below:
+    // this route's revoked-token leniency exists so a lost-response retry can ack
+    // idempotently, NOT as a hole for a credential presented from the wrong place.
+    // Checked on the resolved row before any leniency, so a token replayed from
+    // elsewhere can never terminalize a run.
+    crate::auth::enforce_workload_identity(
+        state.cfg.workload_identity,
+        sess_auth.session_id,
+        &sess_auth.workload_addrs,
+        peer,
+        "/internal/sessions/{id}/result",
+    )?;
     // Gap 10, ORDER IS LOAD-BEARING: the audience is checked on the RESOLVED row
     // BEFORE any leniency below. The leniency exists only so a runner-control
     // token that was revoked by the terminal transition can still ack

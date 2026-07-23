@@ -286,6 +286,71 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  # Phase F acceptance (#34): the scale/reliability suite. Today it proves the
+  # FAST session forge and that the gate answers every one of N concurrent
+  # sessions exactly once, recorded exactly once in the ledger — the precondition
+  # every later scale section depends on. Sections (b)-(j) are listed in the
+  # script as comments, deliberately NOT as stub assertions: an assertion that
+  # cannot fail is the most damaging thing this suite could contain.
+  #
+  # Hermetic and cheap: no runner image, no upstream, no model spend. The runs it
+  # creates use an absent local_copy workspace, which fails during `initializing`
+  # before the provider is ever asked for a sandbox.
+  scale:
+    runs-on: ubuntu-latest
+    # 45, not the 25 this job was created with. The first real run PROVED the
+    # point `hardening` makes: 25 was eaten almost entirely by a cache-MISS debug
+    # build of the workspace (10-18 min on its own), leaving the script too
+    # little, and GitHub reports a timeout kill as "cancelled" — indistinguishable
+    # in the checks list from a job someone cancelled, and in the log from a hang.
+    # Headroom here is what keeps a slow runner from reading as a deadlock.
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: fluidbox_scale
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/fluidbox_scale
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Share the debug build cache with the `rust` job — same profile.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: debug
+      - name: build server
+        run: cargo build -p fluidbox-server
+      # psql is REQUIRED: the fixture forge and every ledger assertion go through
+      # it, and none of them may silently skip.
+      - name: install postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: scale acceptance (fast session forge + concurrent gate decisions)
+        env:
+          # Reuse the just-built binary so the script `exec`s it directly (clean
+          # single-process lifecycle across the boots later sections will need).
+          FLUIDBOX_SERVER_BIN: ${{ github.workspace }}/target/debug/fluidbox-server
+        run: bash scripts/scale-e2e.sh
+      # FORENSICS — same rationale as the hardening job: the script owns its stack
+      # in a mktemp dir its EXIT trap deletes, so it copies logs and per-request
+      # recorders to a fixed path first, but only on failure and only under CI.
+      - name: upload scale forensics (server logs + per-request recorders)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: scale-e2e-logs
+          path: scale-e2e-artifacts/
+          if-no-files-found: warn
+          retention-days: 7
+
   web:
     runs-on: ubuntu-latest
     defaults:
@@ -307,6 +372,15 @@ jobs:
       # (webMode strictness, cookie allowlist, no-bearer forward, Set-Cookie
       # propagation) is unit-tested; run it in CI alongside the build.
       - run: pnpm test
+      # The runner-lib credential hand-off (Phase F). node:test, zero deps, so it
+      # rides the Node this job already set up rather than earning its own job.
+      # THREE of its assertions are Linux-only (procfs: that the exec'd process's
+      # /proc/self/environ is clean, and that the hand-off file is unlinked and
+      # 0600 while the descriptor is open) and self-skip elsewhere — this runner
+      # is Linux, so CI is where they actually execute. They are the assertions
+      # that prove the residual is closed, so a green `web` job is their proof.
+      - run: node --test images/runner-lib/*.test.mjs
+        working-directory: .
 
   # Supply-chain gate: advisories, licenses, bans, sources (deny.toml).
   deny:

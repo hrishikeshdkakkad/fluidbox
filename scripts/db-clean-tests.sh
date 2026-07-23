@@ -91,6 +91,23 @@ delete from agents where name in ($FIXTURE_AGENTS);
 -- crates/fluidbox-db/src/lib.rs:4414 mints these as pmt-bundle-{uuid}.
 delete from capability_bundles where name like 'pmt-bundle-%';
 
+-- e2e-capabilities' kb-upstream connection (scripts/e2e-capabilities.sh) leaks
+-- when a run aborts before its own end-of-phase cleanup, and TWO active copies
+-- make the requirement resolver refuse as ambiguous on the next run. REVOKE
+-- rather than delete: old runs' bindings may still reference the row, and a
+-- revoked connection can never resolve. Triple predicate so a real connection
+-- is untouchable (name AND provider AND loopback base_url).
+update integration_connections set status = 'revoked'
+ where provider = 'mcp_http' and display_name = 'kb-upstream'
+   and metadata->>'base_url' like 'http://127.0.0.1:%'
+   and status <> 'revoked';
+
+-- Pending deliveries to LOOPBACK fixture receivers (e2e callback servers that
+-- died with their run). Real destinations are never loopback; leaving these
+-- costs retry attempts every server boot until the 6-attempt cap.
+delete from result_deliveries
+ where status = 'pending' and destination->>'url' like 'http://127.0.0.1%';
+
 \echo ''
 \echo '── AFTER (in-transaction) ─────────────'
 select 'fixture agents' t, count(*) n from agents where name in ($FIXTURE_AGENTS)

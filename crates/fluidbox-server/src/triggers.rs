@@ -1023,6 +1023,10 @@ pub async fn invoke(
             },
             task,
             explicit_workspace,
+            // A local_copy can only arrive via the stored revision default,
+            // which passed the operator-only save gate; invoke overrides can
+            // never name a local path. Config-sanctioned ⇒ operator authority.
+            local_path_authority: crate::api::LocalPathAuthority::Operator,
             autonomy,
             trust_tier: fluidbox_core::spec::TrustTier::Trusted,
             budget_override,
@@ -1083,7 +1087,11 @@ pub async fn invoke(
     }
 }
 
-/// Scoped polling: a trigger token can read exactly the runs it created.
+/// Scoped polling: a trigger token reads exactly its SUBSCRIPTION's runs.
+/// Deliberately subscription-scoped rather than token-scoped (PR #27 review,
+/// settled): every token of a subscription already shares its invoke
+/// authority, and keying polls to the minting token would strand pre-rotation
+/// runs after a routine credential rotation.
 pub async fn poll_run(
     auth: TriggerAuth,
     State(state): State<AppState>,

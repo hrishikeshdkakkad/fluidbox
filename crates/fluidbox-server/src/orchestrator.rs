@@ -217,7 +217,7 @@ async fn transition_inner(
     outcome: sqlx::Result<Option<(SessionStatus, fluidbox_db::SessionRow)>>,
 ) -> bool {
     match outcome {
-        Ok(Some((from, _))) => {
+        Ok(Some((from, row))) => {
             ledger::record(
                 state,
                 scope,
@@ -230,7 +230,28 @@ async fn transition_inner(
                 },
             )
             .await;
+            // Operational metrics (Phase F, #34): this is the single status-writer
+            // funnel, so the active-runs gauge and lifecycle counters are exact —
+            // one CAS winner, one count. The gauge moves only on the band edges
+            // (see `metrics::active_delta`); a `dec` saturates at zero.
+            match crate::metrics::active_delta(from, next) {
+                1 => state.metrics.active_runs.inc(),
+                -1 => state.metrics.active_runs.dec(),
+                _ => {}
+            }
+            // Provisioning latency: measured ONLY on the initializing→running edge
+            // (the sandbox is ready), never on a re-entry to running from an
+            // approval pause, so the histogram is not polluted by mid-run pauses.
+            if from == SessionStatus::Initializing && next == SessionStatus::Running {
+                let ms = (chrono::Utc::now() - row.created_at).num_milliseconds();
+                if ms >= 0 {
+                    state.metrics.run_provisioning_ms.observe(ms as f64);
+                }
+            }
             if next.is_terminal() {
+                // The terminal outcome label is the status' own name
+                // (completed | failed | cancelled | budget_exceeded).
+                state.metrics.runs_terminal.inc(next.as_str());
                 // Defense-in-depth: kill the session's tokens the moment it
                 // goes terminal so a still-running or leaked token can't reach
                 // the facade/gateway. The PRIMARY guard is each endpoint's own
@@ -1036,10 +1057,17 @@ async fn finish_terminal_cleanup(
         );
         return;
     }
-    // Phase E (E5): terminate any live upstream MCP sessions this run opened
-    // (best-effort DELETE) and evict the replica-local registry entries. Drains
-    // the registry, so a re-drive of this idempotent reconciler finds nothing;
-    // fire-and-forget so a wedged upstream never blocks terminalization.
+    // Phase E (E5) + Phase F (Task 3): terminate any live upstream MCP sessions
+    // this run opened ON ANY REPLICA (best-effort DELETE) and evict the local
+    // registry entries. Fired FIRE-AND-FORGET so a wedged upstream never blocks
+    // terminalization — which ALSO means the teardown is NOT gated by the
+    // finalization receipt: if this reconciler completes (reaps + deletes the
+    // intent below) while the spawned cleanup fails or the process dies first,
+    // there is NO re-drive from the intent scan. The deployment-wide sweeper is the
+    // only backstop, and it retires a durable row it cannot DELETE by marking it
+    // `swept` WITHOUT contacting upstream — a disclosed upstream-session-SLOT leak
+    // (never custody; invariant 9 forbids sending an unresolvable credential). A
+    // durable, awaited teardown receipt is the follow-up.
     tokio::spawn({
         let state = state.clone();
         async move { crate::broker::run_terminal_mcp_cleanup(&state, id).await }
@@ -1055,7 +1083,7 @@ async fn finish_terminal_cleanup(
             tracing::warn!("workspace cleanup failed for {id}: {e} — retrying next drive");
             return;
         }
-        if let Err(e) = delete_archive(&state.cfg.data_dir, id) {
+        if let Err(e) = delete_archive(state, id).await {
             tracing::warn!("archive removal failed for {id}: {e} — retrying next drive");
             return;
         }
@@ -1293,6 +1321,59 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
         anyhow::bail!("session ownership lost before provisioning; launch abandoned");
     }
     let handle = state.provider.provision(&sandbox_spec).await?;
+    // Gap 6 (Phase F): record the workload identity the provider reported, BEFORE
+    // the handle attach. The ordering is the point — `provision` returns only once
+    // the runner container is Running, so the sandbox may already be posting to
+    // `:8788`; every instant between "workload is live" and "its identity is
+    // recorded" is an instant where its own requests count as unbindable. Writing
+    // the identity first makes that window as small as a post-hoc capture can be.
+    // (It cannot be eliminated: the address does not exist until the pod is
+    // scheduled, so there is nothing to reserve in advance.) The residual window is
+    // FAIL-OPEN, not fail-closed, and deliberately so — an unbindable request is
+    // admitted, so a slow write costs coverage, never a broken run.
+    //
+    // A provider that reports nothing (Docker) writes an empty array, which is the
+    // same "unbindable" state as NULL. A failure here is logged and NOT fatal: this
+    // is defence in depth on a plane that still has its bearer tokens, and killing a
+    // provisioned run over it would trade a real outage for a marginal control.
+    let workload_addrs = crate::auth::workload_addrs_from_handle(&handle);
+    if let Err(e) =
+        fluidbox_db::set_workload_addrs(&state.pool, scope, session_id, &workload_addrs).await
+    {
+        // In ENFORCE mode, a run whose provider REPORTED a bindable address but whose
+        // identity we could NOT record would be admitted on the bearer token alone for
+        // its ENTIRE life — indistinguishable at the gate from the legitimately
+        // unbindable classes (Docker, pre-0025, adopted orphans). A transient write
+        // failure here would therefore silently defeat the enforcement the operator
+        // chose (a stolen token from another pod would be admitted). So refuse to run
+        // it unbound: terminate the just-provisioned sandbox (the same cleanup as a
+        // lost attach below) and fail the launch. observe/off keep the best-effort
+        // warning — there the binding is coverage, not a correctness boundary, and an
+        // empty `workload_addrs` (Docker reports none) has nothing to bind regardless.
+        if matches!(
+            state.cfg.workload_identity,
+            crate::config::WorkloadIdentityMode::Enforce
+        ) && !workload_addrs.is_empty()
+        {
+            tracing::error!(
+                "enforce: could not record workload identity for {session_id} ({e}); refusing to \
+                 run it unbound (terminating the sandbox)"
+            );
+            if let Err(te) = state.provider.terminate(&handle).await {
+                tracing::warn!(
+                    "workload-fail terminate for {session_id} failed ({te}); finalizer discovery will reap"
+                );
+            }
+            abandon_launch(&state, scope, session_id).await;
+            anyhow::bail!(
+                "enforce mode: workload identity for {session_id} could not be recorded; launch refused"
+            );
+        }
+        tracing::warn!(
+            "failed to record workload identity for {session_id} ({e}); this run will be \
+             UNBINDABLE at the internal gateway (admitted on the bearer token alone)"
+        );
+    }
     let attached = fluidbox_db::set_sandbox_handle(
         &state.pool,
         scope,
@@ -1417,18 +1498,36 @@ pub fn serialized_env_len(env: &[(String, String)]) -> usize {
     env.iter().map(|(k, v)| k.len() + v.len() + 2).sum()
 }
 
-/// The on-disk archive path for a session (PVC-backed in Kubernetes; survives
-/// a `Recreate` upgrade so init can still pull after a control-plane restart).
-pub fn archive_path(data_dir: &std::path::Path, session_id: Uuid) -> PathBuf {
-    data_dir
-        .join("archives")
-        .join(format!("{session_id}.tar.gz"))
+/// The configured archive store (Phase F, Task 4): node-local files (`fs`, the
+/// default and today's behaviour byte for byte) or an S3-compatible bucket
+/// (`s3`), which is what lets ANY replica serve ANY run's archive GET.
+///
+/// Built per call rather than held on `AppState`: it is a few `String` clones
+/// plus an `Arc` bump on the shared HTTP client, and the archive path touches it
+/// a handful of times per run (pack, serve, delete, hourly sweep). `state.http`
+/// is the plain outbound client — an S3 endpoint is an operator-configured seam
+/// exactly like GitHub or the LLM upstream (routinely a private-network MinIO),
+/// never attacker input.
+pub fn archive_store(state: &AppState) -> std::sync::Arc<dyn fluidbox_workspace::ArchiveStore> {
+    fluidbox_workspace::build_store(
+        &state.cfg.archive_store,
+        &state.cfg.data_dir,
+        state.http.clone(),
+    )
+}
+
+/// The session a stored archive belongs to, from its `{uuid}.tar.gz` (or
+/// `.partial`) name. None = not an archive this server named.
+pub fn archive_session_id(key: &fluidbox_workspace::ArchiveKey) -> Option<Uuid> {
+    key.session_id()
 }
 
 /// Pack the materialized workspace into an immutable archive, store it, and
 /// return the descriptor the init container verifies. The archive URL is on
 /// the INTERNAL listener (the pod reaches it with the session token it already
-/// holds — nothing new becomes reachable).
+/// holds — nothing new becomes reachable), whichever backend actually holds the
+/// bytes: the sandbox has `zeroEgress` and could not dial an object store even
+/// if we handed it a presigned URL.
 async fn pack_and_store_archive(
     state: &AppState,
     session_id: Uuid,
@@ -1436,7 +1535,12 @@ async fn pack_and_store_archive(
 ) -> anyhow::Result<fluidbox_core::traits::WorkspaceArchive> {
     let data_dir = state.cfg.data_dir.clone();
     let max_bytes = state.cfg.max_archive_bytes;
-    let dest = archive_path(&data_dir, session_id);
+    let store = archive_store(state);
+    // For `fs` this IS the final path (so the pack below is unchanged); for `s3`
+    // it is node-local staging the `put` uploads and then unlinks. Packing always
+    // goes to local disk first: the digest and length must be known before a
+    // single-chunk PUT can be signed, and the archive must never transit RAM.
+    let dest = store.staging_path(session_id);
     // Streamed to disk (GzEncoder<File>) — the archive never lives in RAM,
     // and the size cap fails the run HERE, before any sandbox or model spend.
     let packed = tokio::task::spawn_blocking(move || {
@@ -1448,6 +1552,9 @@ async fn pack_and_store_archive(
         Ok::<_, anyhow::Error>(packed)
     })
     .await??;
+    // Publish. A failure here fails the run during `initializing`, at zero model
+    // spend — the same place an over-cap pack already failed it.
+    store.put(session_id, &packed).await?;
 
     // The pod pulls from the internal control URL (the same base the runner
     // uses for every other internal call).
@@ -1470,75 +1577,35 @@ async fn pack_and_store_archive(
 /// sweep (`workers::archive_ttl_sweep`) is the backstop for the crash window
 /// between the terminal transition and this call. NOT called on heartbeats:
 /// init containers may legitimately re-execute and re-fetch.
-pub fn delete_archive(data_dir: &std::path::Path, session_id: Uuid) -> std::io::Result<()> {
-    match std::fs::remove_file(archive_path(data_dir, session_id)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
+pub async fn delete_archive(
+    state: &AppState,
+    session_id: Uuid,
+) -> Result<(), fluidbox_workspace::StoreError> {
+    archive_store(state).delete(session_id).await
 }
 
-/// List stored archives (incl. orphaned `.partial`s) whose mtime is older
-/// than `ttl` — sweep CANDIDATES only. Deletion is decided by the caller
-/// against SESSION STATE: age alone must never kill an archive a long-budget
-/// run could still re-fetch on an init re-execution. Failures are LOGGED,
-/// never silent — a persistent PVC error would otherwise retain a leak with
-/// no operational evidence.
-pub fn stale_archive_candidates(
-    data_dir: &std::path::Path,
+/// List stored archives (incl. orphaned `.partial`s) untouched for longer than
+/// `ttl` — sweep CANDIDATES only. Deletion is decided by the caller against
+/// SESSION STATE: age alone must never kill an archive a long-budget run could
+/// still re-fetch on an init re-execution. Failures are LOGGED, never silent —
+/// a persistent storage error would otherwise retain a leak with no operational
+/// evidence.
+///
+/// On the `s3` backend this covers BOTH halves: the objects, and any node-local
+/// staging file a crash left behind before it could be uploaded. Without the
+/// second half, moving the archive to object storage would merely have swapped
+/// one leak for another.
+pub async fn stale_archive_candidates(
+    state: &AppState,
     ttl: std::time::Duration,
-) -> Vec<PathBuf> {
-    let dir = data_dir.join("archives");
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        // No archives ever stored (e.g. the Docker provider): quiet no-op.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+) -> Vec<fluidbox_workspace::ArchiveKey> {
+    match archive_store(state).stale_candidates(ttl).await {
+        Ok(c) => c,
         Err(e) => {
-            tracing::warn!("archive TTL sweep cannot read {}: {e}", dir.display());
-            return Vec::new();
-        }
-    };
-    let now = std::time::SystemTime::now();
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("archive TTL sweep cannot stat {}: {e}", path.display());
-                continue;
-            }
-        };
-        if !meta.is_file() {
-            continue;
-        }
-        let mtime = match meta.modified() {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!("archive TTL sweep: no mtime for {}: {e}", path.display());
-                continue;
-            }
-        };
-        // A future-dated mtime (clock skew) reads as fresh — conservative.
-        let stale = now
-            .duration_since(mtime)
-            .map(|age| age >= ttl)
-            .unwrap_or(false);
-        if stale {
-            out.push(path);
+            tracing::warn!("archive TTL sweep listing failed: {e}");
+            Vec::new()
         }
     }
-    out
-}
-
-/// The session a stored archive belongs to, from its `{uuid}.tar.gz`
-/// (or `.partial`) filename. None = not an archive this server named.
-pub fn archive_session_id(path: &std::path::Path) -> Option<Uuid> {
-    let name = path.file_name()?.to_str()?;
-    let stem = name
-        .strip_suffix(".tar.gz.partial")
-        .or_else(|| name.strip_suffix(".tar.gz"))?;
-    Uuid::parse_str(stem).ok()
 }
 
 pub fn env_size_breakdown(env: &[(String, String)]) -> String {
@@ -1781,7 +1848,7 @@ async fn abandon_launch(state: &AppState, scope: TenantScope, id: Uuid) {
     if let Err(e) = fluidbox_workspace::cleanup_workspace(&state.cfg.data_dir, id) {
         tracing::warn!("abandoned-launch workspace cleanup for {id}: {e}");
     }
-    let _ = delete_archive(&state.cfg.data_dir, id);
+    let _ = delete_archive(state, id).await;
 }
 
 /// Phase C workspace fetch: resolve the git auth header from the run's frozen
@@ -2015,29 +2082,88 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ttl_sweep_removes_only_stale_archives() {
+    /// The TTL sweep's listing, through the store the DEFAULT configuration
+    /// builds (`ArchiveStoreConfig::Fs` + `data_dir`) — the same expression
+    /// `archive_store()` evaluates to, so this is the fs behaviour the archive
+    /// path had before it became backend-agnostic.
+    #[tokio::test]
+    async fn ttl_sweep_removes_only_stale_archives() {
         let tmp = std::env::temp_dir().join(format!("fbx-ttl-{}", uuid::Uuid::now_v7()));
         let archives = tmp.join("archives");
         std::fs::create_dir_all(&archives).unwrap();
         let sid = uuid::Uuid::now_v7();
         std::fs::write(archives.join(format!("{sid}.tar.gz")), b"x").unwrap();
         std::fs::write(archives.join("b.tar.gz"), b"y").unwrap();
+        let store = |dir: &std::path::Path| {
+            fluidbox_workspace::build_store(
+                &fluidbox_workspace::ArchiveStoreConfig::Fs,
+                dir,
+                reqwest::Client::new(),
+            )
+        };
 
         // A generous TTL keeps fresh archives.
-        assert!(stale_archive_candidates(&tmp, std::time::Duration::from_secs(3600)).is_empty());
+        assert!(store(&tmp)
+            .stale_candidates(std::time::Duration::from_secs(3600))
+            .await
+            .unwrap()
+            .is_empty());
         assert!(archives.join("b.tar.gz").exists());
 
         // TTL zero: everything with mtime <= now is a candidate — nothing is
         // DELETED here; the worker decides against session state.
-        let mut candidates = stale_archive_candidates(&tmp, std::time::Duration::ZERO);
-        candidates.sort();
+        let mut candidates = store(&tmp)
+            .stale_candidates(std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        candidates.sort_by_key(|k| k.to_string());
         assert_eq!(candidates.len(), 2);
+        // One is a session's archive, one is not a name this server writes —
+        // both are candidates, and `archive_session_id` tells the worker which.
+        assert!(candidates
+            .iter()
+            .any(|k| archive_session_id(k) == Some(sid)));
+        assert!(candidates.iter().any(|k| archive_session_id(k).is_none()));
         assert!(archives.join("b.tar.gz").exists());
 
         // A missing archives dir (Docker provider) is a quiet no-op.
-        assert!(stale_archive_candidates(&tmp.join("nope"), std::time::Duration::ZERO).is_empty());
+        assert!(store(&tmp.join("nope"))
+            .stale_candidates(std::time::Duration::ZERO)
+            .await
+            .unwrap()
+            .is_empty());
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// CONFIRMED FALSE-GREEN CLASS, closed by construction. `archive_store()` is
+    /// the ONE place the backend is chosen, and every archive call site
+    /// (pack/serve/delete/sweep) goes through it — but nothing in a unit test can
+    /// build an `AppState`, so a controller that hardcoded `Fs` or a literal
+    /// directory would disable the whole `s3` backend with every server test
+    /// still green (exactly the defect this phase already shipped once). Assert
+    /// the construction itself reads the CONFIGURED store and the CONFIGURED
+    /// data dir. Needles are split so this test is not an occurrence of what it
+    /// searches for.
+    #[test]
+    fn the_archive_store_is_built_from_configuration_not_hardcoded() {
+        let src = include_str!("orchestrator.rs");
+        let anchor = concat!("pub fn archive_", "store(state: &AppState)");
+        let start = src.find(anchor).expect("archive_store must exist");
+        let body = &src[start..start + 400];
+        for needle in [
+            concat!("state.cfg.archive_", "store"),
+            concat!("state.cfg.data_", "dir"),
+        ] {
+            assert!(
+                body.contains(needle),
+                "archive_store must build from `{needle}` — hardcoding it disables the \
+                 configured backend with every test still passing"
+            );
+        }
+        assert!(
+            !body.contains(concat!("ArchiveStoreConfig::", "Fs")),
+            "archive_store must not pin a backend"
+        );
     }
 
     /// CONFIRMED FALSE-GREEN, closed. A reviewer deleted the lease re-proof that
@@ -2133,17 +2259,29 @@ mod tests {
 
     #[test]
     fn archive_filenames_map_back_to_their_session() {
+        use fluidbox_workspace::ArchiveKey;
         let sid = uuid::Uuid::now_v7();
-        let p = std::path::PathBuf::from(format!("/data/archives/{sid}.tar.gz"));
-        assert_eq!(archive_session_id(&p), Some(sid));
-        let partial = std::path::PathBuf::from(format!("/data/archives/{sid}.tar.gz.partial"));
-        assert_eq!(archive_session_id(&partial), Some(sid));
+        let local = |s: String| ArchiveKey::Local(std::path::PathBuf::from(s));
         assert_eq!(
-            archive_session_id(std::path::Path::new("/data/archives/junk.tar.gz")),
+            archive_session_id(&local(format!("/data/archives/{sid}.tar.gz"))),
+            Some(sid)
+        );
+        assert_eq!(
+            archive_session_id(&local(format!("/data/archives/{sid}.tar.gz.partial"))),
+            Some(sid)
+        );
+        // The same mapping over an object key — the sweep's liveness check must
+        // work identically whichever backend produced the candidate.
+        assert_eq!(
+            archive_session_id(&ArchiveKey::Object(format!("archives/{sid}.tar.gz"))),
+            Some(sid)
+        );
+        assert_eq!(
+            archive_session_id(&local("/data/archives/junk.tar.gz".into())),
             None
         );
         assert_eq!(
-            archive_session_id(std::path::Path::new("/data/archives/notatar")),
+            archive_session_id(&local("/data/archives/notatar".into())),
             None
         );
     }

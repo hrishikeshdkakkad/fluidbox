@@ -221,8 +221,12 @@ mod tests {
             egress_rate_tenant_per_min: crate::governor::DEFAULT_TENANT_PER_MIN,
             egress_rate_connection_per_min: crate::governor::DEFAULT_CONNECTION_PER_MIN,
             egress_rate_host_per_min: crate::governor::DEFAULT_HOST_PER_MIN,
+            egress_rate_user_per_min: crate::governor::DEFAULT_USER_PER_MIN,
             egress_breaker_threshold: crate::governor::DEFAULT_BREAKER_THRESHOLD,
             egress_breaker_open_secs: crate::governor::DEFAULT_BREAKER_OPEN_SECS,
+            // This fixture builds a Config for harness-registry assertions only —
+            // no pool, no dials — so the durable tier is off rather than defaulted.
+            egress_durable: false,
             provider: "docker".into(),
             network_mode: fluidbox_core::traits::NetworkMode::HostDev,
             require_enforced_netpol: false,
@@ -236,8 +240,24 @@ mod tests {
             session_idle_secs: 8 * 3600,
             session_absolute_secs: 7 * 24 * 3600,
             oidc_discovery_max_age_secs: 3600,
+            oidc_discovery_stale_grace_secs: 86400,
             oidc_clock_skew_secs: 60,
             session_reauth_secs: 60,
+            // Phase F capacity knobs — this fixture never opens a pool or serves a
+            // request, so the shipped defaults are simply carried.
+            db_pool: fluidbox_db::PoolSettings::default(),
+            max_request_body_bytes: crate::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
+            // Gap 6: this fixture serves no requests, so the shipped default (off)
+            // is carried. NOTE for anyone adding a workload-identity assertion —
+            // asserting on THIS value proves nothing about production, which builds
+            // its Config in `config.rs::from_env`; test that path instead.
+            workload_identity: crate::config::WorkloadIdentityMode::default(),
+            // Task 4: this fixture packs no archive, so the shipped default
+            // (node-local `fs`, one replica) is carried. Same NOTE as above —
+            // asserting on THESE values proves nothing about production, which
+            // parses them in `config.rs::parse_archive_store`; test that path.
+            archive_store: fluidbox_workspace::ArchiveStoreConfig::Fs,
+            metrics_bind: None,
         }
     }
 

@@ -598,6 +598,7 @@ pub async fn revoke(
     let row = fluidbox_db::revoke_connection(&state.pool, scope, conn.id)
         .await?
         .ok_or_else(|| ApiError::Conflict("connection is already revoked".into()))?;
+    state.metrics.connection_revocations.inc();
     // A cached installation/access token must not outlive the revocation.
     crate::oauth::invalidate_access(&state, row.id).await;
     Ok(Json(json!({ "connection": row })))

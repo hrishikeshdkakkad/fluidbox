@@ -11,7 +11,9 @@ use sqlx::postgres::{PgListener, PgPoolOptions};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+pub mod governance;
 pub mod identity;
+pub mod mcp_sessions;
 pub mod seed;
 pub mod system_worker;
 
@@ -86,6 +88,166 @@ impl ConnectionViewer {
     }
 }
 
+/// Neon suspends an idle compute after five minutes of inactivity and drops every
+/// connection with it. `PoolSettings::idle_timeout_secs` is deliberately kept BELOW
+/// this so the POOL retires an idle connection before the SERVER does: sqlx's
+/// `test_before_acquire` would otherwise discover the corpse one round trip into
+/// the next acquire, on the request that was unlucky enough to arrive first after a
+/// quiet period. A test derives its assertion from this constant rather than
+/// hardcoding four minutes, so raising the idle timeout past the autosuspend window
+/// fails there instead of silently reintroducing the stall.
+pub const NEON_AUTOSUSPEND_SECS: u64 = 5 * 60;
+
+/// Application connection-pool sizing (Phase F). Every field here used to be either
+/// a hardcoded literal at the one construction site or an sqlx default nobody had
+/// chosen; they are a struct so the server can drive them from `FLUIDBOX_DB_*` and
+/// so each one carries the reason it is what it is.
+///
+/// The pool is LAZY — `max_connections` is a ceiling, not an allocation, and with
+/// `min_connections = 0` a quiet deployment holds no pooled connections at all — so
+/// the cost of the ceiling is paid only by load that actually arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolSettings {
+    /// Hard ceiling on pooled connections for THIS replica. The deployment-wide
+    /// figure is `replicas × (max_connections + 2)`; the `+ 2` is the pair of
+    /// `PgListener` connections (`spawn_listener`, `spawn_approval_listener`),
+    /// which live OUTSIDE the pool and are permanently open.
+    pub max_connections: u32,
+    /// Idle connections the pool keeps warm. 0 = "open on demand".
+    pub min_connections: u32,
+    /// How long a caller waits for a free connection before the request fails.
+    /// This is the deployment's real back-pressure valve: with no concurrency
+    /// layer in front of the listeners (see `main.rs`), a saturated pool sheds by
+    /// timing out here rather than by queueing without bound.
+    pub acquire_timeout_secs: u64,
+    /// Retire a connection that has been idle this long. Kept under
+    /// [`NEON_AUTOSUSPEND_SECS`].
+    pub idle_timeout_secs: u64,
+    /// Retire a connection this long after it was opened, however busy. Recycling
+    /// bounds the server-side state a single long-lived session accumulates and
+    /// gives a failed-over Neon endpoint a bounded window to take over the pool.
+    pub max_lifetime_secs: u64,
+}
+
+impl Default for PoolSettings {
+    /// The shipped production sizing.
+    ///
+    /// `max_connections = 25`: the old hardcoded 10 (which was simply sqlx's own
+    /// default, never a decision) is the ceiling Phase F exists to remove — at the
+    /// design's 300-concurrent-run target the per-run pollers alone issue hundreds
+    /// of queries a second, and pool throughput is `max_connections / mean query
+    /// time`, so 10 connections against a ~25 ms round trip to a remote Neon caps
+    /// the whole replica at ~400 queries/second. 25 is chosen against the DATABASE,
+    /// not against the run count: Neon's smallest compute (0.25 CU) allows 112
+    /// connections, and the design's recommended shape is two to three API replicas,
+    /// so `3 × (25 + 2) = 81` leaves real headroom for migrations, `psql`, and
+    /// monitoring. A deployment on a larger compute should raise
+    /// `FLUIDBOX_DB_MAX_CONNECTIONS` — the chart documents the tiers.
+    ///
+    /// `min_connections = 0` (sqlx's default, made explicit): a warm floor would
+    /// hold connections open against a Neon compute that is trying to scale to
+    /// zero. It is only half a saving — the two `PgListener` connections are always
+    /// open anyway — but the pool should not be the thing that adds to it.
+    ///
+    /// `acquire_timeout_secs = 15` is UNCHANGED from the pre-Phase-F hardcode
+    /// (sqlx's own default is 30). Shortening it would convert transient contention
+    /// into 500s; lengthening it would let a slow database accumulate in-flight
+    /// requests, which is precisely the memory-exhaustion path.
+    ///
+    /// `idle_timeout_secs = 240` REPLACES sqlx's 600: ten minutes is longer than
+    /// [`NEON_AUTOSUSPEND_SECS`], so the old value guaranteed the pool would hand
+    /// out connections the server had already closed. `max_lifetime_secs = 1800`
+    /// keeps sqlx's default, chosen rather than inherited.
+    fn default() -> Self {
+        Self {
+            max_connections: 25,
+            min_connections: 0,
+            acquire_timeout_secs: 15,
+            idle_timeout_secs: 4 * 60,
+            max_lifetime_secs: 30 * 60,
+        }
+    }
+}
+
+/// Build the sqlx pool options from [`PoolSettings`].
+///
+/// Split out of [`connect_with`] deliberately: `connect_with` runs migrations on a
+/// real connection before it ever builds a pool, so NOTHING about the settings→sqlx
+/// mapping can be exercised without a database — and a knob that is parsed,
+/// validated, logged and then never handed to sqlx looks identical, at every other
+/// layer, to one that works. This function is pure, so a test can assert each knob
+/// actually lands (`PoolOptions` exposes getters for all five).
+///
+/// Every knob is set EXPLICITLY (Phase F): the four that used to ride sqlx's
+/// defaults were never chosen, and two of them (`idle_timeout`, `max_connections`)
+/// were actively wrong for a remote Neon at the design's concurrency target.
+/// `test_before_acquire` is deliberately LEFT at sqlx's `true`: it costs a round
+/// trip per acquire, but Neon's scale-to-zero closes connections underneath us and
+/// handing out a dead one would surface as a spurious request failure.
+pub fn pool_options(settings: PoolSettings) -> PgPoolOptions {
+    PgPoolOptions::new()
+        .max_connections(settings.max_connections)
+        .min_connections(settings.min_connections)
+        .acquire_timeout(std::time::Duration::from_secs(
+            settings.acquire_timeout_secs,
+        ))
+        // `idle_timeout`/`max_lifetime` take `impl Into<Option<Duration>>`, and
+        // sqlx DISABLES the cap only on `None` — a `Some(Duration::ZERO)` means
+        // "expire immediately", so every returned connection is closed and the pool
+        // never pools (a per-acquire reconnect storm against Neon). `0` is the
+        // documented "no cap" value (validate_pool_settings and its test), so it
+        // MUST map to `None`, not to `Duration::from_secs(0)`.
+        .idle_timeout(disabled_when_zero(settings.idle_timeout_secs))
+        .max_lifetime(disabled_when_zero(settings.max_lifetime_secs))
+}
+
+/// Map a "seconds, 0 = disabled" knob onto sqlx's `Option<Duration>` cap: `0`
+/// becomes `None` (no cap), anything else the duration. Without this, `0` would
+/// become `Some(Duration::ZERO)` — "expire on return", the opposite of "no cap".
+fn disabled_when_zero(secs: u64) -> Option<std::time::Duration> {
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+#[cfg(test)]
+mod pool_option_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The `0 = no cap` semantics that `validate_pool_settings` documents must
+    /// actually reach sqlx as `None`, not as `Some(Duration::ZERO)` (which sqlx
+    /// reads as "expire immediately" → a reconnect storm). This asserts on the
+    /// CONSTRUCTED `PgPoolOptions` getters — the layer the prior test never
+    /// inspected — so deleting `disabled_when_zero` fails here.
+    #[test]
+    fn zero_lifetime_and_idle_map_to_no_cap_not_instant_expiry() {
+        let zero = pool_options(PoolSettings {
+            max_lifetime_secs: 0,
+            idle_timeout_secs: 0,
+            ..PoolSettings::default()
+        });
+        assert_eq!(zero.get_max_lifetime(), None, "0 lifetime must be NO cap");
+        assert_eq!(zero.get_idle_timeout(), None, "0 idle must be NO cap");
+
+        // A non-zero value still lands as that exact duration.
+        let set = pool_options(PoolSettings {
+            max_lifetime_secs: 1800,
+            idle_timeout_secs: 240,
+            ..PoolSettings::default()
+        });
+        assert_eq!(set.get_max_lifetime(), Some(Duration::from_secs(1800)));
+        assert_eq!(set.get_idle_timeout(), Some(Duration::from_secs(240)));
+    }
+}
+
+/// Connect the application pool with the DEFAULT sizing ([`PoolSettings::default`]).
+///
+/// Kept as a distinct entry point so the tests that only want "a migrated pool"
+/// (and the crate's own `test_connect`) do not have to thread sizing they do not
+/// care about. The server calls [`connect_with`].
+pub async fn connect(database_url: &str, runtime_role: Option<&str>) -> anyhow::Result<PgPool> {
+    connect_with(database_url, runtime_role, PoolSettings::default()).await
+}
+
 /// Connect the application pool, running migrations first.
 ///
 /// Phase D (#32) splits the two identities the process used to conflate: DDL runs
@@ -114,7 +276,11 @@ impl ConnectionViewer {
 /// a configured-but-absent role with the exact `CREATE ROLE` fix, and re-runs the
 /// migration's POSTURE validation ([`check_runtime_role_posture`]) — a role can be
 /// altered, or re-granted to another principal, long after 0018 ran.
-pub async fn connect(database_url: &str, runtime_role: Option<&str>) -> anyhow::Result<PgPool> {
+pub async fn connect_with(
+    database_url: &str,
+    runtime_role: Option<&str>,
+    pool_settings: PoolSettings,
+) -> anyhow::Result<PgPool> {
     use sqlx::Connection;
     // (1) Migrations + role verification on a one-shot OWNER connection, closed
     // before the app pool exists. DDL is never attempted under the runtime role.
@@ -133,8 +299,12 @@ pub async fn connect(database_url: &str, runtime_role: Option<&str>) -> anyhow::
     }
     // `migrate!` BAKES the migrations directory into the binary at COMPILE time —
     // adding a .sql file only takes effect once this crate recompiles, so any
-    // change under migrations/ must touch this file. Latest: 0020 (api_tokens
-    // audience column — Gap 10 audience-scoped sandbox credentials).
+    // change under migrations/ must touch this file. Latest: 0024
+    // (mcp_upstream_sessions — cross-replica teardown of upstream MCP sessions).
+    // This line was stale at 0020 through all four Phase E migrations: the
+    // mechanism still worked, because every one of them also edited this file for
+    // its own reasons, but the note itself was a lie for four migrations running.
+    // Nothing asserts it — treat it as a reminder, not a guarantee.
     sqlx::migrate!("../../migrations").run(&mut owner).await?;
     if let Some(role) = runtime_role {
         let exists: bool =
@@ -162,9 +332,9 @@ pub async fn connect(database_url: &str, runtime_role: Option<&str>) -> anyhow::
 
     // (2) The application pool. In runtime-role mode every connection SET ROLEs on
     // acquisition; the tenant/bypass GUC (scoped_tx/worker_tx) then rides each tx.
-    let opts = PgPoolOptions::new()
-        .max_connections(10)
-        .acquire_timeout(std::time::Duration::from_secs(15));
+    // Sizing comes from [`pool_options`], which is pure so the mapping can be
+    // asserted without a database.
+    let opts = pool_options(pool_settings);
     let pool = match runtime_role {
         Some(role) => {
             // Validated above to ^[a-z_][a-z0-9_]*$, so plain double-quoting is safe.
@@ -5697,6 +5867,14 @@ pub struct SessionTokenAuth {
     /// the legacy `all` (pre-split tokens + e2e forgers via the column DEFAULT).
     /// The caller enforces it per-route (auth.rs `audience_allows`).
     pub audience: String,
+    /// The workload identity this run's credentials were issued to (Gap 6, Phase F;
+    /// `sessions.workload_addrs`, migration 0025) — the provider-reported source
+    /// addresses of the sandbox. Carried on the CREDENTIAL so the internal gateway
+    /// can check the socket peer without a second query: `/events` is the one
+    /// internal route that never loads the session row, and a per-request query
+    /// added only there would be a per-event round trip on the hottest path we
+    /// have. Empty = unbindable (no provider-asserted identity, or a pre-0025 row).
+    pub workload_addrs: Vec<String>,
 }
 
 /// Resolve a session token to its session IGNORING revoked_at/expiry — used
@@ -5715,21 +5893,35 @@ pub async fn session_for_token_incl_revoked(
     // IS the credential (documented TenantScope bootstrap exception).
     let mut tx = worker_tx(pool).await?;
     let row = sqlx::query(
-        "select session_id, tenant_id, audience from api_tokens
-         where kind = 'session' and token_sha256 = $1",
+        "select t.session_id, t.tenant_id, t.audience, s.workload_addrs
+           from api_tokens t
+           left join sessions s on s.id = t.session_id
+          where t.kind = 'session' and t.token_sha256 = $1",
     )
     .bind(sha256_hex(token_plain))
     .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(row.and_then(|r| {
-        r.get::<Option<Uuid>, _>("session_id")
-            .map(|session_id| SessionTokenAuth {
-                session_id,
-                tenant_id: r.get::<Uuid, _>("tenant_id"),
-                audience: r.get::<String, _>("audience"),
-            })
-    }))
+    Ok(row.and_then(session_token_auth))
+}
+
+/// Shape one resolved `api_tokens` row (joined to its session) into
+/// [`SessionTokenAuth`]. Shared by the strict and lenient resolvers so the two
+/// can never drift on which columns they carry — the Gap-6 `workload_addrs` in
+/// particular must ride BOTH, since `/result` uses the lenient one and is a
+/// terminalizing route.
+fn session_token_auth(r: sqlx::postgres::PgRow) -> Option<SessionTokenAuth> {
+    r.get::<Option<Uuid>, _>("session_id")
+        .map(|session_id| SessionTokenAuth {
+            session_id,
+            tenant_id: r.get::<Uuid, _>("tenant_id"),
+            audience: r.get::<String, _>("audience"),
+            // NULL (no provider-asserted identity, or a pre-0025 row) flattens to
+            // the empty vec — the caller's "unbindable" case.
+            workload_addrs: r
+                .get::<Option<Vec<String>>, _>("workload_addrs")
+                .unwrap_or_default(),
+        })
 }
 
 /// Returns the session (and its tenant + audience) a valid (unexpired,
@@ -5741,24 +5933,61 @@ pub async fn session_for_token(
     // Credential-digest bootstrap resolution (audited bypass) — see
     // `session_for_token_incl_revoked`.
     let mut tx = worker_tx(pool).await?;
+    // Gap 6 (Phase F): the LEFT JOIN carries `sessions.workload_addrs` on the SAME
+    // statement that was already resolving the credential. Cost is one extra
+    // primary-key index probe inside an existing round trip — no new query, and no
+    // per-request query added to `/events` (the one internal route that never
+    // loads the session row). LEFT, not INNER: a session-less `api_tokens` row must
+    // still resolve exactly as it did before, and be discarded by the same
+    // `session_id`-is-null test.
     let row = sqlx::query(
-        "select session_id, tenant_id, audience from api_tokens
-         where kind = 'session' and token_sha256 = $1
-           and revoked_at is null
-           and (expires_at is null or expires_at > now())",
+        "select t.session_id, t.tenant_id, t.audience, s.workload_addrs
+           from api_tokens t
+           left join sessions s on s.id = t.session_id
+          where t.kind = 'session' and t.token_sha256 = $1
+            and t.revoked_at is null
+            and (t.expires_at is null or t.expires_at > now())",
     )
     .bind(sha256_hex(token_plain))
     .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(row.and_then(|r| {
-        r.get::<Option<Uuid>, _>("session_id")
-            .map(|session_id| SessionTokenAuth {
-                session_id,
-                tenant_id: r.get::<Uuid, _>("tenant_id"),
-                audience: r.get::<String, _>("audience"),
-            })
-    }))
+    Ok(row.and_then(session_token_auth))
+}
+
+/// Record the Gap-6 workload identity for a run (Phase F; migration 0025): the
+/// provider-reported source addresses of the sandbox that this session's four
+/// credentials were issued to. Written once, on the provisioning path, from data
+/// the provider already held.
+///
+/// Deliberately NOT folded into `set_sandbox_handle`: the address is a SECURITY
+/// fact with its own column and its own guard, and keeping the write explicit is
+/// what lets the orchestrator order it BEFORE the handle attach (closing as much
+/// of the "workload is running but its identity is not yet recorded" window as a
+/// post-hoc capture can — see the call site).
+///
+/// Unconditional within the tenant: no status predicate, and a later write wins.
+/// A workload that reports a NEW address (a reprovision) must be able to replace
+/// the stale one, and refusing the write on a winding-down session would leave a
+/// row whose recorded identity is a lie. Returns whether a row was touched.
+pub async fn set_workload_addrs(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    addrs: &[String],
+) -> sqlx::Result<bool> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let res = sqlx::query(
+        "update sessions set workload_addrs = $2, updated_at = now()
+          where id = $1 and tenant_id = $3",
+    )
+    .bind(id)
+    .bind(addrs)
+    .bind(scope.tenant_id())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(res.rows_affected() == 1)
 }
 
 /// Renew a session's tokens ahead of expiry. Gap 10 renewal contract: ONE renew

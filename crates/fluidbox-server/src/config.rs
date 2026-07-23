@@ -56,6 +56,84 @@ impl LlmKeyMode {
     }
 }
 
+// ─── Workload identity on the internal gateway (Phase F, Gap 6) ────────────
+
+/// How the internal (sandbox-facing) gateway treats the binding between a run's
+/// session tokens and the network identity of the workload those tokens were
+/// issued to (Gap 6; design :1233-1240, threat-model T7).
+///
+/// Three modes, and the DEFAULT IS A NO-OP on purpose. This control can refuse
+/// requests from a live run, and the population it would refuse is not knowable
+/// in advance from a config file — it depends on the provider, the CNI, and
+/// whether anything NATs between the sandbox and `:8788`. So an operator gets to
+/// watch it first: `observe` counts and logs exactly what `enforce` would have
+/// refused, changing no behaviour, and only then is turning it on a decision
+/// rather than a gamble.
+///
+/// A malformed value FAILS BOOT (the house style for every other knob here) —
+/// `FLUIDBOX_WORKLOAD_IDENTITY=enforc` must never silently mean "off".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkloadIdentityMode {
+    /// Today's behaviour, byte for byte: the bearer token alone authenticates and
+    /// the socket peer is never consulted. The default, so Phase F deploys as a
+    /// no-op on an existing install.
+    #[default]
+    Off,
+    /// Evaluate the binding and record the verdict (counters + logs), but ADMIT
+    /// every request regardless. The rollout step: it tells an operator how many
+    /// of their sessions are bindable at all, and whether any legitimate traffic
+    /// would be refused, before anything is refused.
+    Observe,
+    /// Evaluate and REFUSE a request whose socket peer contradicts the address the
+    /// control plane recorded for that run's workload. A run with no recorded
+    /// address is still admitted (and counted) — see `auth.rs::workload_verdict`
+    /// for why "unknown" is not treated as hostile.
+    Enforce,
+}
+
+impl WorkloadIdentityMode {
+    /// Absent/empty ⇒ [`Off`](Self::Off) (unset must mean today's behaviour);
+    /// anything unrecognised ⇒ `None`, which the caller turns into a boot error.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "off" | "" => Some(WorkloadIdentityMode::Off),
+            "observe" => Some(WorkloadIdentityMode::Observe),
+            "enforce" => Some(WorkloadIdentityMode::Enforce),
+            _ => None,
+        }
+    }
+
+    /// The wire/log spelling — used in the boot banner and in every counter log,
+    /// so an operator reading a mismatch warning can see which mode produced it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkloadIdentityMode::Off => "off",
+            WorkloadIdentityMode::Observe => "observe",
+            WorkloadIdentityMode::Enforce => "enforce",
+        }
+    }
+
+    /// True iff the gateway should evaluate the binding at all. `Off` short-circuits
+    /// BEFORE the verdict is computed, so the disabled path costs one enum compare.
+    pub fn evaluates(self) -> bool {
+        !matches!(self, WorkloadIdentityMode::Off)
+    }
+}
+
+/// Read `FLUIDBOX_WORKLOAD_IDENTITY`. Split out (rather than inlined in
+/// [`Config::from_env`]) so the failure message is testable without an env var,
+/// and so the source guard below can prove `from_env` passes the SAME name it
+/// reads — a typo there would leave a knob that parses, validates, and is never
+/// set by anybody.
+fn parse_workload_identity(
+    name: &str,
+    raw: Option<String>,
+) -> anyhow::Result<WorkloadIdentityMode> {
+    let raw = raw.unwrap_or_default();
+    WorkloadIdentityMode::parse(&raw)
+        .ok_or_else(|| anyhow::anyhow!("{name}='{raw}' is invalid (known: off, observe, enforce)"))
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind: String,
@@ -79,6 +157,17 @@ pub struct Config {
     /// convention. Set this to `1` only for local single-user operation on a
     /// superuser database; a hosted deployment must fix the role instead.
     pub allow_rls_bypass: bool,
+    /// Application connection-pool sizing (`FLUIDBOX_DB_*`, Phase F). The old
+    /// hardcoded `max_connections(10)` was the ceiling that made the design's
+    /// 300-concurrent-run target arithmetically impossible: pool throughput is
+    /// `max_connections / mean query time`, and at 300 runs the per-run pollers
+    /// (approval wait ≤2 s, in-flight claim poll 500 ms, one SSE catch-up per
+    /// connected browser ≤2 s) alone are hundreds of queries a second. See
+    /// [`fluidbox_db::PoolSettings`] for what each field is and why its default is
+    /// what it is; every one of them fails boot on a malformed value, and the two
+    /// that can wedge the process (a zero ceiling, a floor above the ceiling) fail
+    /// boot on a merely NONSENSICAL one.
+    pub db_pool: fluidbox_db::PoolSettings,
     pub admin_token: String,
     /// URL sandboxes use to reach this control plane (e.g. host.docker.internal).
     pub public_control_url: String,
@@ -175,6 +264,26 @@ pub struct Config {
     pub egress_rate_tenant_per_min: u32,
     pub egress_rate_connection_per_min: u32,
     pub egress_rate_host_per_min: u32,
+    /// The PER-USER outbound ceiling (`FLUIDBOX_EGRESS_RATE_USER_PER_MIN`, Phase F).
+    /// The fourth dimension the design names and Phase E deferred: without it one
+    /// member of an org can spread dials across the org's connections and consume
+    /// the whole tenant budget. Default 60 — the same number as the per-CONNECTION
+    /// ceiling, which is what a single-connection run is already bounded by today,
+    /// so the common shape sees no change and the multi-connection fan-out this
+    /// dimension exists to catch is the case that starts binding. Enforced ONLY in
+    /// the durable tier (the in-memory governor is deliberately unchanged), so it
+    /// is inactive when `FLUIDBOX_EGRESS_DURABLE=0`. **0 DISABLES it**; a malformed
+    /// value fails boot.
+    pub egress_rate_user_per_min: u32,
+    /// Cross-replica egress governance (`FLUIDBOX_EGRESS_DURABLE`, Phase F;
+    /// migration 0023). Default ON. The in-memory governor is per-replica, so an
+    /// N-replica deployment's real ceiling is N × the configured rate and a breaker
+    /// opened on one replica does not stop the others; this turns on the Postgres
+    /// tier that closes both. It is a SECOND gate, never a replacement — a dial
+    /// must pass the local tier AND this one — and it DEGRADES: a DB error admits
+    /// on the local verdict alone rather than failing the dial. A malformed value
+    /// fails boot.
+    pub egress_durable: bool,
     /// Per-connection circuit breaker (`FLUIDBOX_EGRESS_BREAKER_THRESHOLD`,
     /// `FLUIDBOX_EGRESS_BREAKER_OPEN_SECS`, Phase E): consecutive transport/5xx
     /// failures that open it (default 5) and how long it stays open before
@@ -223,12 +332,78 @@ pub struct Config {
     pub session_absolute_secs: i64,
     /// Max age of a cached OIDC discovery document / JWKS before re-fetch.
     pub oidc_discovery_max_age_secs: i64,
+    /// Bounded grace PAST max-age within which a FAILED refresh may still fall
+    /// back to the cached (last-known-good) discovery/JWKS. Past it, logins
+    /// fail closed: an unbounded fallback would keep revoked signing keys and
+    /// moved endpoints trusted for as long as the issuer stays unreachable.
+    pub oidc_discovery_stale_grace_secs: i64,
     /// Permitted clock skew when validating ID-token time claims.
     pub oidc_clock_skew_secs: i64,
     /// Minimum interval between a browser session's re-authorization checks on
     /// a long-lived stream; clamped to at most 60s (the re-auth bound).
     pub session_reauth_secs: i64,
+    /// Ceiling on a buffered request body, in bytes (`FLUIDBOX_MAX_REQUEST_BODY_BYTES`,
+    /// Phase F). Default [`DEFAULT_MAX_REQUEST_BODY_BYTES`] = axum's own implicit
+    /// 2 MiB, so shipping this changes NOTHING — the point is that the limit stops
+    /// being invisible. It was already being enforced (every body-consuming handler
+    /// in this crate extracts `Bytes`/`Json`, which axum bounds by default), it was
+    /// simply not a number anyone had chosen, could see, or could move.
+    ///
+    /// It is a CONCURRENCY knob, not just a validation one: the bound is per
+    /// in-flight request, so the deployment's exposure is `limit × concurrent
+    /// requests` — at the design's 300-run target the default already reserves
+    /// 600 MiB against a chart default of a 1 GiB memory limit. Raise it (the LLM
+    /// facade buffers the whole model request, so a long conversation is what
+    /// actually hits 2 MiB) only together with `server.resources.limits.memory`.
+    ///
+    /// Refused below [`MIN_MAX_REQUEST_BODY_BYTES`]: a sub-kilobyte ceiling rejects
+    /// every real request on this API, which is the "never block everything" shape
+    /// the governor knobs already refuse.
+    pub max_request_body_bytes: usize,
+    /// Workload identity on the sandbox-facing internal gateway
+    /// (`FLUIDBOX_WORKLOAD_IDENTITY`, Phase F, Gap 6; migration 0025). Default
+    /// [`WorkloadIdentityMode::Off`] — today's behaviour byte for byte. See
+    /// [`WorkloadIdentityMode`] for why the default is a no-op and what `observe`
+    /// is for; a malformed value fails boot.
+    pub workload_identity: WorkloadIdentityMode,
+
+    // ---- Workspace-archive storage (Phase F, Task 4) -----------------------
+    /// Where packed workspace archives live (`FLUIDBOX_ARCHIVE_STORE`, plus the
+    /// `FLUIDBOX_ARCHIVE_S3_*` family). `fs` — the default — is today's node-local
+    /// `<data_dir>/archives`, byte for byte; `s3` puts them in an S3-compatible
+    /// bucket so ANY replica can serve ANY run's archive GET, which is what takes
+    /// the `ReadWriteOnce` PVC off the critical path. Parsed and validated by
+    /// [`fluidbox_workspace::parse_store_config`], which fails boot naming the
+    /// variable on every malformed or incomplete value (the `FLUIDBOX_KMS_*` shape:
+    /// the mode selects which other variables become required).
+    /// (`FLUIDBOX_REPLICAS` is read alongside it — see [`parse_archive_store`] —
+    /// but is deliberately NOT carried here: its only job is a boot refusal, and
+    /// a process cannot act on its own replica count afterwards.)
+    pub archive_store: fluidbox_workspace::ArchiveStoreConfig,
+
+    /// Optional dedicated listener for the Prometheus metrics exposition
+    /// (`FLUIDBOX_METRICS_BIND`, Phase F, issue #34). `None` (the default) means
+    /// metrics are reachable ONLY at the admin-gated `GET /v1/admin/metrics`. When
+    /// set (e.g. `127.0.0.1:9090`), a THIRD listener serves the same exposition
+    /// UNAUTHENTICATED — the Prometheus/OTel scrape convention — so it MUST bind a
+    /// private interface a scraper reaches and the public internet does not.
+    /// Nothing sensitive is exposed (no ids, hosts, credentials or payloads — see
+    /// the `metrics` module), but the bind is a network-reachability decision the
+    /// operator makes explicitly, which is why it is off by default.
+    pub metrics_bind: Option<String>,
 }
+
+/// The default buffered-body ceiling — deliberately EQUAL to axum's own implicit
+/// default (`axum_core`'s `DEFAULT_LIMIT`, 2 MiB), so making the limit explicit is
+/// a byte-for-byte no-op on an existing install. A test asserts the equality by
+/// driving a real router, in both directions, so a future axum bump that moves its
+/// default is visible here rather than in a 413 nobody expected.
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// Floor under `FLUIDBOX_MAX_REQUEST_BODY_BYTES`. Nothing this API accepts fits in
+/// under a kilobyte — a smaller value is a typo (or a unit mix-up), and honouring it
+/// would take the whole write surface down while looking like a deliberate setting.
+pub const MIN_MAX_REQUEST_BODY_BYTES: usize = 1024;
 
 /// Serialized runner-env ceiling: env injection is the v1 config channel
 /// (authenticated fetch is the designated v1.1 follow-up), and Kubernetes
@@ -279,6 +454,10 @@ impl Config {
             .unwrap_or_else(|_| "docker".into())
             .to_lowercase();
         let is_k8s_provider = matches!(provider.as_str(), "kubernetes" | "k8s");
+        // Phase F, Task 4: the archive store + the declared replica count. Both
+        // refusals (an incomplete `s3` config, and `fs` on a declared
+        // multi-replica deployment) fire here, before anything else is built.
+        let (archive_store, _replicas) = parse_archive_store(&get)?;
         Ok(Config {
             bind: get("FLUIDBOX_BIND").unwrap_or_else(|_| "127.0.0.1:8787".into()),
             // Only the Kubernetes plane needs a pod-reachable internal bind;
@@ -308,6 +487,7 @@ impl Config {
             allow_rls_bypass: get("FLUIDBOX_ALLOW_RLS_BYPASS")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            db_pool: parse_pool_settings(&get)?,
             admin_token: get("FLUIDBOX_ADMIN_TOKEN")
                 .map_err(|_| anyhow::anyhow!("FLUIDBOX_ADMIN_TOKEN is required"))?,
             public_control_url: get("FLUIDBOX_PUBLIC_CONTROL_URL")
@@ -413,6 +593,22 @@ impl Config {
                 get("FLUIDBOX_EGRESS_RATE_HOST_PER_MIN").ok(),
                 crate::governor::DEFAULT_HOST_PER_MIN,
             )?,
+            egress_rate_user_per_min: parse_u32_env(
+                "FLUIDBOX_EGRESS_RATE_USER_PER_MIN",
+                get("FLUIDBOX_EGRESS_RATE_USER_PER_MIN").ok(),
+                crate::governor::DEFAULT_USER_PER_MIN,
+            )?,
+            // Default ON: `DATABASE_URL` is REQUIRED above, so "a database is
+            // configured" is always true here and the durable tier ships enabled.
+            // That is deliberate — a fix for an N× ceiling that has to be switched
+            // on is a fix that ships dark — and it is safe to default because the
+            // tier DEGRADES on any DB error (admit on the local verdict, log,
+            // count) rather than failing dials closed.
+            egress_durable: parse_bool_env(
+                "FLUIDBOX_EGRESS_DURABLE",
+                get("FLUIDBOX_EGRESS_DURABLE").ok(),
+                true,
+            )?,
             egress_breaker_threshold: parse_u32_env(
                 "FLUIDBOX_EGRESS_BREAKER_THRESHOLD",
                 get("FLUIDBOX_EGRESS_BREAKER_THRESHOLD").ok(),
@@ -470,6 +666,14 @@ impl Config {
                 get("FLUIDBOX_OIDC_DISCOVERY_MAX_AGE_SECS").ok(),
                 3600,
             )?,
+            // 24h default: generous for an issuer outage, bounded for key
+            // revocation (a revoked signing key stops verifying within
+            // max_age + grace even if the issuer never comes back).
+            oidc_discovery_stale_grace_secs: parse_i64_env(
+                "FLUIDBOX_OIDC_DISCOVERY_STALE_GRACE_SECS",
+                get("FLUIDBOX_OIDC_DISCOVERY_STALE_GRACE_SECS").ok(),
+                86400,
+            )?,
             oidc_clock_skew_secs: parse_i64_env(
                 "FLUIDBOX_OIDC_CLOCK_SKEW_SECS",
                 get("FLUIDBOX_OIDC_CLOCK_SKEW_SECS").ok(),
@@ -483,8 +687,132 @@ impl Config {
                 60,
             )?
             .min(60),
+            max_request_body_bytes: parse_body_limit(
+                "FLUIDBOX_MAX_REQUEST_BODY_BYTES",
+                get("FLUIDBOX_MAX_REQUEST_BODY_BYTES").ok(),
+            )?,
+            workload_identity: parse_workload_identity(
+                "FLUIDBOX_WORKLOAD_IDENTITY",
+                get("FLUIDBOX_WORKLOAD_IDENTITY").ok(),
+            )?,
+            // Phase F, Task 4. `FLUIDBOX_REPLICAS` was consumed above: its only
+            // job is to refuse `fs` on a deployment that has already told us one
+            // replica cannot serve every archive GET.
+            archive_store,
+            // Phase F, issue #34. A blank/whitespace value is treated as unset so
+            // an empty env entry from a chart default cannot bind an unauth
+            // listener by accident; the address itself is validated by the bind
+            // call at boot (a bad host:port fails there, naming the port).
+            metrics_bind: get("FLUIDBOX_METRICS_BIND")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
         })
     }
+}
+
+/// Read + validate the workspace-archive store knobs (Phase F, Task 4). The
+/// parsing itself lives in `fluidbox-workspace` beside the backends, so the
+/// variable NAMES have exactly one home; this wraps it in the boot-error shape
+/// the rest of `from_env` uses and then runs the cross-field refusal.
+fn parse_archive_store(
+    get: &impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> anyhow::Result<(fluidbox_workspace::ArchiveStoreConfig, u32)> {
+    let cfg = fluidbox_workspace::parse_store_config(|k| get(k).ok())
+        .map_err(|m| anyhow::anyhow!("{m}"))?;
+    // `parse_positive_u32_env`, not `parse_u32_env`: a declared 0 replicas is a
+    // typo, and reading it as "fewer than two, so fs is fine" would disarm the
+    // very guard this value exists for.
+    let replicas = parse_positive_u32_env("FLUIDBOX_REPLICAS", get("FLUIDBOX_REPLICAS").ok(), 1)?;
+    fluidbox_workspace::validate_replicas(&cfg, replicas).map_err(|m| anyhow::anyhow!("{m}"))?;
+    Ok((cfg, replicas))
+}
+
+/// Read the five `FLUIDBOX_DB_*` pool knobs (Phase F). Each one is absent-means-
+/// default and malformed-means-boot-error, exactly like the egress knobs beside
+/// them; the CROSS-field coherence check then runs in [`validate_pool_settings`],
+/// which is pure and unit-tested.
+fn parse_pool_settings(
+    get: &impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> anyhow::Result<fluidbox_db::PoolSettings> {
+    let d = fluidbox_db::PoolSettings::default();
+    let settings = fluidbox_db::PoolSettings {
+        max_connections: parse_positive_u32_env(
+            "FLUIDBOX_DB_MAX_CONNECTIONS",
+            get("FLUIDBOX_DB_MAX_CONNECTIONS").ok(),
+            d.max_connections,
+        )?,
+        // 0 is MEANINGFUL here (open on demand) and is the default, so this one
+        // rides the plain u32 parse rather than the positive one.
+        min_connections: parse_u32_env(
+            "FLUIDBOX_DB_MIN_CONNECTIONS",
+            get("FLUIDBOX_DB_MIN_CONNECTIONS").ok(),
+            d.min_connections,
+        )?,
+        acquire_timeout_secs: parse_u64_env(
+            "FLUIDBOX_DB_ACQUIRE_TIMEOUT_SECS",
+            get("FLUIDBOX_DB_ACQUIRE_TIMEOUT_SECS").ok(),
+            d.acquire_timeout_secs,
+        )?,
+        idle_timeout_secs: parse_u64_env(
+            "FLUIDBOX_DB_IDLE_TIMEOUT_SECS",
+            get("FLUIDBOX_DB_IDLE_TIMEOUT_SECS").ok(),
+            d.idle_timeout_secs,
+        )?,
+        max_lifetime_secs: parse_u64_env(
+            "FLUIDBOX_DB_MAX_LIFETIME_SECS",
+            get("FLUIDBOX_DB_MAX_LIFETIME_SECS").ok(),
+            d.max_lifetime_secs,
+        )?,
+    };
+    validate_pool_settings(&settings).map_err(|m| anyhow::anyhow!("{m}"))?;
+    Ok(settings)
+}
+
+/// Cross-field coherence for the pool knobs (pure, unit-tested). Each individual
+/// value already parsed; these are the combinations that are individually legal and
+/// jointly nonsense, and every one of them would surface as a hang or a stall rather
+/// than as an error at the point of use — which is exactly the class that belongs in
+/// a boot refusal.
+fn validate_pool_settings(s: &fluidbox_db::PoolSettings) -> Result<(), String> {
+    if s.min_connections > s.max_connections {
+        return Err(format!(
+            "FLUIDBOX_DB_MIN_CONNECTIONS={} exceeds FLUIDBOX_DB_MAX_CONNECTIONS={} — the pool \
+             would try to keep more connections warm than it is allowed to open",
+            s.min_connections, s.max_connections
+        ));
+    }
+    if s.acquire_timeout_secs == 0 {
+        return Err(
+            "FLUIDBOX_DB_ACQUIRE_TIMEOUT_SECS=0 would fail every acquire that does not find a \
+             free connection already waiting — set a positive number of seconds"
+                .into(),
+        );
+    }
+    // The pool must not hold an idle connection past the point where the SERVER
+    // closes it. Neon suspends an idle compute after NEON_AUTOSUSPEND_SECS and takes
+    // its connections down with it; anything at or beyond that guarantees the pool
+    // hands out connections that are already gone (sqlx then discovers this one
+    // round trip into `test_before_acquire`, on whichever request arrives first
+    // after a quiet period).
+    if s.idle_timeout_secs >= fluidbox_db::NEON_AUTOSUSPEND_SECS {
+        return Err(format!(
+            "FLUIDBOX_DB_IDLE_TIMEOUT_SECS={} is at or above Neon's {}s idle-compute autosuspend \
+             — the pool must retire an idle connection BEFORE the server does, or the first \
+             request after a quiet period pays for discovering a dead one",
+            s.idle_timeout_secs,
+            fluidbox_db::NEON_AUTOSUSPEND_SECS
+        ));
+    }
+    if s.max_lifetime_secs > 0 && s.max_lifetime_secs <= s.idle_timeout_secs {
+        return Err(format!(
+            "FLUIDBOX_DB_MAX_LIFETIME_SECS={} is not above FLUIDBOX_DB_IDLE_TIMEOUT_SECS={} — \
+             recycling would retire connections faster than idling does, so the pool would churn \
+             a fresh TLS handshake on a busy connection while a quiet one lives on",
+            s.max_lifetime_secs, s.idle_timeout_secs
+        ));
+    }
+    Ok(())
 }
 
 /// Safety-relevant numeric knobs FAIL BOOT on a malformed value: a typo in an
@@ -507,6 +835,62 @@ fn parse_u32_env(name: &str, raw: Option<String>, default: u32) -> anyhow::Resul
         Some(v) => v
             .parse()
             .map_err(|e| anyhow::anyhow!("{name}='{v}' is not a valid u32: {e}")),
+    }
+}
+
+/// A u32 knob that must be at least 1 (Phase F) — the `parse_positive_i64_env`
+/// shape, for the pool ceiling. `parse_u32_env` accepts 0, and for
+/// `FLUIDBOX_DB_MAX_CONNECTIONS` a 0 is not "disabled" like it is for the egress
+/// rates: it is a pool that can never open a connection, i.e. a process that boots
+/// healthy and then times out every single request 15 seconds at a time.
+fn parse_positive_u32_env(name: &str, raw: Option<String>, default: u32) -> anyhow::Result<u32> {
+    let v = parse_u32_env(name, raw, default)?;
+    if v < 1 {
+        anyhow::bail!("{name}='{v}' must be at least 1 (a pool of 0 connections serves nothing)");
+    }
+    Ok(v)
+}
+
+/// Parse `FLUIDBOX_MAX_REQUEST_BODY_BYTES` (Phase F): absent/empty ⇒ the axum-
+/// equal default, malformed ⇒ a named boot error, and anything under
+/// [`MIN_MAX_REQUEST_BODY_BYTES`] ⇒ a boot refusal rather than an API that 413s
+/// every write. Parsed as u64 first so a value above `usize::MAX` on a 32-bit
+/// target is a clean error instead of a wrap.
+fn parse_body_limit(name: &str, raw: Option<String>) -> anyhow::Result<usize> {
+    let v = parse_u64_env(name, raw, DEFAULT_MAX_REQUEST_BODY_BYTES as u64)?;
+    let v =
+        usize::try_from(v).map_err(|_| anyhow::anyhow!("{name}='{v}' does not fit in usize"))?;
+    if v < MIN_MAX_REQUEST_BODY_BYTES {
+        anyhow::bail!(
+            "{name}='{v}' is below the {MIN_MAX_REQUEST_BODY_BYTES}-byte floor — every request \
+             this API accepts is larger than that, so the whole write surface would 413"
+        );
+    }
+    Ok(v)
+}
+
+/// Same fail-boot-on-malformed discipline for a BOOLEAN governor knob (Phase F).
+///
+/// Deliberately stricter than the older `.map(|v| v == "1" || …).unwrap_or(false)`
+/// shape used by the non-safety flags above: that one reads `FLUIDBOX_EGRESS_DURABLE=ture`
+/// as "off" and silently restores the per-replica ceiling the operator was trying to
+/// close. A typo in a control that governs outbound abuse must fail boot naming the
+/// variable, exactly like the `FLUIDBOX_EGRESS_RATE_*` numbers beside it.
+///
+/// Whitespace-only is treated as UNSET (the `parse_egress_cidrs` precedent), not as
+/// malformed: a stray space after `FLUIDBOX_EGRESS_DURABLE=` in a `.env` means the
+/// operator wrote nothing, and answering that with a boot failure would be a worse
+/// trade than answering it with the default — which here is the SAFE value anyway.
+fn parse_bool_env(name: &str, raw: Option<String>, default: bool) -> anyhow::Result<bool> {
+    match raw.filter(|v| !v.trim().is_empty()) {
+        None => Ok(default),
+        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(anyhow::anyhow!(
+                "{name}='{v}' is not a valid boolean (use 1/0, true/false, yes/no, on/off)"
+            )),
+        },
     }
 }
 
@@ -727,6 +1111,39 @@ mod tests {
         assert!(parse_u32_env("G", Some("4294967296".into()), 120).is_err());
     }
 
+    /// `FLUIDBOX_EGRESS_DURABLE` (Phase F). The knob that decides whether the
+    /// cross-replica tier runs at all, so a typo must be a boot error rather than a
+    /// silent return to the per-replica N× ceiling.
+    #[test]
+    fn the_durable_egress_flag_defaults_on_and_fails_boot_on_a_typo() {
+        // Absent/empty ⇒ the shipped default (ON — DATABASE_URL is required, so a
+        // database is always configured).
+        assert!(parse_bool_env("FLUIDBOX_EGRESS_DURABLE", None, true).unwrap());
+        assert!(parse_bool_env("FLUIDBOX_EGRESS_DURABLE", Some("  ".into()), true).unwrap());
+        // Every spelling an operator plausibly writes, both ways.
+        for on in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(
+                parse_bool_env("D", Some(on.into()), false).unwrap(),
+                "{on} must read as ON"
+            );
+        }
+        for off in ["0", "false", "False", "no", "off"] {
+            assert!(
+                !parse_bool_env("D", Some(off.into()), true).unwrap(),
+                "{off} must read as OFF"
+            );
+        }
+        // A typo is a NAMED boot error. The old `v == "1" || v == "true"` shape
+        // would have read this as "off" and quietly reopened the N× ceiling.
+        let e = parse_bool_env("FLUIDBOX_EGRESS_DURABLE", Some("ture".into()), true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("FLUIDBOX_EGRESS_DURABLE") && e.contains("ture"),
+            "got: {e}"
+        );
+    }
+
     /// The LLM concurrency ceiling (Gap 14). Drives the REAL parse — the earlier
     /// facade-side test re-implemented the match in its own body, so relaxing the
     /// production check to accept 0 (a ceiling that wedges every run, the exact
@@ -783,6 +1200,339 @@ mod tests {
         assert!(parse_positive_i64_env("C", Some("-1".into()), 32).is_err());
     }
 
+    /// The pool ceiling (Phase F). `parse_u32_env` treats 0 as a legitimate
+    /// "disabled" for the egress rates; for a connection pool 0 means the process
+    /// boots healthy and then times out every request, so it needs the
+    /// positive-only shape.
+    #[test]
+    fn the_pool_ceiling_defaults_and_refuses_a_pool_of_zero() {
+        assert_eq!(parse_positive_u32_env("C", None, 25).unwrap(), 25);
+        assert_eq!(
+            parse_positive_u32_env("C", Some(String::new()), 25).unwrap(),
+            25
+        );
+        assert_eq!(
+            parse_positive_u32_env("C", Some("200".into()), 25).unwrap(),
+            200
+        );
+        assert_eq!(
+            parse_positive_u32_env("C", Some("1".into()), 25).unwrap(),
+            1
+        );
+        // Zero is the one an operator reaches for meaning "unlimited" and gets the
+        // exact opposite of.
+        let e = parse_positive_u32_env("FLUIDBOX_DB_MAX_CONNECTIONS", Some("0".into()), 25)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("FLUIDBOX_DB_MAX_CONNECTIONS") && e.contains("at least 1"),
+            "got: {e}"
+        );
+        // …and a typo is a named boot error, never the default.
+        let e = parse_positive_u32_env("FLUIDBOX_DB_MAX_CONNECTIONS", Some("lots".into()), 25)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("FLUIDBOX_DB_MAX_CONNECTIONS") && e.contains("lots"),
+            "got: {e}"
+        );
+    }
+
+    /// The SHIPPED pool sizing. These are load-bearing numbers rather than sqlx
+    /// defaults, so they are asserted here: a silent revert to `PoolOptions::new()`
+    /// restores the exact ceiling Phase F exists to remove.
+    #[test]
+    fn the_shipped_pool_sizing_is_the_documented_one() {
+        let d = fluidbox_db::PoolSettings::default();
+        // Above sqlx's (and the old hardcode's) 10 — the whole point of the task.
+        assert!(
+            d.max_connections > 10,
+            "the pool ceiling must exceed the sqlx default that was the old hardcode"
+        );
+        assert_eq!(d.max_connections, 25);
+        assert_eq!(d.min_connections, 0);
+        // UNCHANGED from the pre-Phase-F hardcode: this is the shed valve, and
+        // moving it silently would change how a saturated deployment behaves.
+        assert_eq!(d.acquire_timeout_secs, 15);
+        // DERIVED, not hardcoded: an idle timeout at or past Neon's autosuspend
+        // guarantees the pool serves connections the server has already closed.
+        assert!(
+            d.idle_timeout_secs < fluidbox_db::NEON_AUTOSUSPEND_SECS,
+            "idle timeout {} must stay under Neon's {}s autosuspend",
+            d.idle_timeout_secs,
+            fluidbox_db::NEON_AUTOSUSPEND_SECS
+        );
+        assert!(d.max_lifetime_secs > d.idle_timeout_secs);
+        // The shipped sizing must itself satisfy the boot gate.
+        assert!(validate_pool_settings(&d).is_ok());
+    }
+
+    /// Every knob must actually REACH sqlx. `connect_with` migrates before it
+    /// builds a pool, so this is the only layer where the mapping is observable
+    /// offline — and a knob parsed, validated, logged and then dropped on the floor
+    /// is indistinguishable from a working one everywhere else.
+    #[test]
+    fn every_pool_knob_reaches_sqlx() {
+        // Five distinct values, so a copy-paste between fields is visible too.
+        let o = fluidbox_db::pool_options(fluidbox_db::PoolSettings {
+            max_connections: 41,
+            min_connections: 7,
+            acquire_timeout_secs: 11,
+            idle_timeout_secs: 91,
+            max_lifetime_secs: 601,
+        });
+        assert_eq!(o.get_max_connections(), 41);
+        assert_eq!(o.get_min_connections(), 7);
+        assert_eq!(o.get_acquire_timeout(), std::time::Duration::from_secs(11));
+        assert_eq!(
+            o.get_idle_timeout(),
+            Some(std::time::Duration::from_secs(91))
+        );
+        assert_eq!(
+            o.get_max_lifetime(),
+            Some(std::time::Duration::from_secs(601))
+        );
+        // Deliberately UNCHANGED from sqlx's default: Neon's scale-to-zero closes
+        // connections underneath the pool, so the pre-acquire ping stays on.
+        assert!(o.get_test_before_acquire());
+    }
+
+    /// Cross-field pool coherence. Every case here is individually legal and
+    /// jointly nonsense, and every one of them would surface as a hang, a stall or
+    /// a churn rather than as an error at the point of use.
+    #[test]
+    fn nonsensical_pool_combinations_fail_boot() {
+        let d = fluidbox_db::PoolSettings::default();
+        // A warm floor above the ceiling.
+        let e = validate_pool_settings(&fluidbox_db::PoolSettings {
+            min_connections: d.max_connections + 1,
+            ..d
+        })
+        .unwrap_err();
+        assert!(
+            e.contains("FLUIDBOX_DB_MIN_CONNECTIONS") && e.contains("FLUIDBOX_DB_MAX_CONNECTIONS"),
+            "got: {e}"
+        );
+        // min == max is legal (a fully warm pool), so the check must be strict.
+        assert!(validate_pool_settings(&fluidbox_db::PoolSettings {
+            min_connections: d.max_connections,
+            ..d
+        })
+        .is_ok());
+        // A zero acquire timeout fails every acquire that has to wait at all.
+        let e = validate_pool_settings(&fluidbox_db::PoolSettings {
+            acquire_timeout_secs: 0,
+            ..d
+        })
+        .unwrap_err();
+        assert!(e.contains("FLUIDBOX_DB_ACQUIRE_TIMEOUT_SECS"), "got: {e}");
+        // An idle timeout at (not merely past) Neon's autosuspend is already wrong.
+        let e = validate_pool_settings(&fluidbox_db::PoolSettings {
+            idle_timeout_secs: fluidbox_db::NEON_AUTOSUSPEND_SECS,
+            max_lifetime_secs: 3600,
+            ..d
+        })
+        .unwrap_err();
+        assert!(
+            e.contains("FLUIDBOX_DB_IDLE_TIMEOUT_SECS") && e.contains("autosuspend"),
+            "got: {e}"
+        );
+        assert!(validate_pool_settings(&fluidbox_db::PoolSettings {
+            idle_timeout_secs: fluidbox_db::NEON_AUTOSUSPEND_SECS - 1,
+            max_lifetime_secs: 3600,
+            ..d
+        })
+        .is_ok());
+        // Recycling faster than idling churns busy connections.
+        let e = validate_pool_settings(&fluidbox_db::PoolSettings {
+            idle_timeout_secs: 200,
+            max_lifetime_secs: 200,
+            ..d
+        })
+        .unwrap_err();
+        assert!(e.contains("FLUIDBOX_DB_MAX_LIFETIME_SECS"), "got: {e}");
+        // 0 = sqlx's "no lifetime cap", which is a choice, not a mistake.
+        assert!(validate_pool_settings(&fluidbox_db::PoolSettings {
+            max_lifetime_secs: 0,
+            ..d
+        })
+        .is_ok());
+    }
+
+    /// The pool knobs end-to-end: the exact variable NAMES, and the fact that
+    /// [`validate_pool_settings`] is actually reached. Neither is provable by
+    /// calling the validator directly — a typo'd name, or a deleted call, leaves
+    /// every other test in this file green while the knob silently does nothing.
+    #[test]
+    fn the_pool_knobs_are_read_by_name_and_validated() {
+        // A `get` that answers exactly one variable, as the environment would.
+        let only = |name: &'static str, value: &'static str| {
+            move |k: &str| {
+                if k == name {
+                    Ok(value.to_string())
+                } else {
+                    Err(std::env::VarError::NotPresent)
+                }
+            }
+        };
+        let none = |_: &str| Err(std::env::VarError::NotPresent);
+
+        // Nothing set ⇒ exactly the crate default.
+        assert_eq!(
+            parse_pool_settings(&none).unwrap(),
+            fluidbox_db::PoolSettings::default()
+        );
+        // Each documented name must MOVE its own field (and only its own).
+        let s = parse_pool_settings(&only("FLUIDBOX_DB_MAX_CONNECTIONS", "77")).unwrap();
+        assert_eq!(s.max_connections, 77);
+        let s = parse_pool_settings(&only("FLUIDBOX_DB_MIN_CONNECTIONS", "3")).unwrap();
+        assert_eq!(s.min_connections, 3);
+        let s = parse_pool_settings(&only("FLUIDBOX_DB_ACQUIRE_TIMEOUT_SECS", "9")).unwrap();
+        assert_eq!(s.acquire_timeout_secs, 9);
+        let s = parse_pool_settings(&only("FLUIDBOX_DB_IDLE_TIMEOUT_SECS", "120")).unwrap();
+        assert_eq!(s.idle_timeout_secs, 120);
+        let s = parse_pool_settings(&only("FLUIDBOX_DB_MAX_LIFETIME_SECS", "3600")).unwrap();
+        assert_eq!(s.max_lifetime_secs, 3600);
+        // …and the coherence gate must be REACHED from here, not merely exist: a
+        // floor above the ceiling is legal for each knob on its own.
+        let e = parse_pool_settings(&only("FLUIDBOX_DB_MIN_CONNECTIONS", "9999"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("FLUIDBOX_DB_MIN_CONNECTIONS"), "got: {e}");
+        // A per-knob parse failure still fails boot from this entry point.
+        assert!(parse_pool_settings(&only("FLUIDBOX_DB_MAX_CONNECTIONS", "0")).is_err());
+        assert!(parse_pool_settings(&only("FLUIDBOX_DB_IDLE_TIMEOUT_SECS", "4m")).is_err());
+    }
+
+    /// This file's PRODUCTION half — the source guard below counts occurrences, and
+    /// a test module that quotes the strings it counts would count itself.
+    fn production_src() -> &'static str {
+        let src = include_str!("config.rs");
+        let end = src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("this file has a test module");
+        &src[..end]
+    }
+
+    /// Same guard, for the Gap-6 workload-identity knob (Phase F). The name is
+    /// passed INTO the parser, so no amount of parser testing proves `from_env`
+    /// reads the variable an operator (or the Helm chart) actually sets.
+    #[test]
+    fn workload_identity_is_read_from_the_documented_variable() {
+        let src = production_src();
+        assert_eq!(
+            src.matches("\"FLUIDBOX_WORKLOAD_IDENTITY\"").count(),
+            2,
+            "from_env passes the same name to the parser that it reads from the env"
+        );
+        assert!(src.contains("workload_identity: parse_workload_identity("));
+    }
+
+    /// The knob itself: absent ⇒ off (Phase F must deploy as a no-op), the three
+    /// modes parse, and a malformed value FAILS BOOT with a message that names both
+    /// the variable and the legal values — never silently degrading to `off`.
+    #[test]
+    fn workload_identity_defaults_off_and_fails_boot_on_junk() {
+        let name = "FLUIDBOX_WORKLOAD_IDENTITY";
+        assert_eq!(
+            parse_workload_identity(name, None).unwrap(),
+            WorkloadIdentityMode::Off
+        );
+        assert_eq!(
+            parse_workload_identity(name, Some(String::new())).unwrap(),
+            WorkloadIdentityMode::Off
+        );
+        assert_eq!(
+            parse_workload_identity(name, Some("observe".into())).unwrap(),
+            WorkloadIdentityMode::Observe
+        );
+        assert_eq!(
+            parse_workload_identity(name, Some(" ENFORCE ".into())).unwrap(),
+            WorkloadIdentityMode::Enforce
+        );
+        // The typo that must never mean "off".
+        let e = parse_workload_identity(name, Some("enforc".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(name), "got: {e}");
+        assert!(e.contains("off, observe, enforce"), "got: {e}");
+        // And a boolean-shaped value is refused too: this is not an on/off flag.
+        assert!(parse_workload_identity(name, Some("true".into())).is_err());
+        assert!(parse_workload_identity(name, Some("1".into())).is_err());
+        // Round-trip through the log/banner spelling.
+        for m in [
+            WorkloadIdentityMode::Off,
+            WorkloadIdentityMode::Observe,
+            WorkloadIdentityMode::Enforce,
+        ] {
+            assert_eq!(WorkloadIdentityMode::parse(m.as_str()), Some(m));
+        }
+        assert_eq!(WorkloadIdentityMode::default(), WorkloadIdentityMode::Off);
+    }
+
+    /// `from_env` must read the body-limit knob under the name the docs, the boot
+    /// error, and the Helm chart all use. There is no way to prove this by calling
+    /// the parser — the name is passed IN — and a typo would leave a knob that
+    /// parses, validates, and is never set by anybody.
+    #[test]
+    fn the_body_limit_is_read_from_the_documented_variable() {
+        let src = production_src();
+        assert_eq!(
+            src.matches("\"FLUIDBOX_MAX_REQUEST_BODY_BYTES\"").count(),
+            2,
+            "from_env passes the same name to the parser that it reads from the env"
+        );
+        assert!(src.contains("max_request_body_bytes: parse_body_limit("));
+    }
+
+    /// The buffered-body ceiling (Phase F). Default equal to axum's implicit one,
+    /// malformed ⇒ named boot error, and a floor so the knob cannot be used to take
+    /// the whole write surface down while looking deliberate.
+    #[test]
+    fn the_body_limit_defaults_to_axums_own_and_refuses_a_useless_floor() {
+        assert_eq!(
+            parse_body_limit("B", None).unwrap(),
+            DEFAULT_MAX_REQUEST_BODY_BYTES
+        );
+        assert_eq!(
+            parse_body_limit("B", Some(String::new())).unwrap(),
+            DEFAULT_MAX_REQUEST_BODY_BYTES
+        );
+        // The default IS axum's own 2 MiB, so making the limit explicit is a no-op
+        // (the router test in `main.rs` proves that end-to-end over a real socket).
+        assert_eq!(DEFAULT_MAX_REQUEST_BODY_BYTES, 2 * 1024 * 1024);
+        // An explicit value wins, in both directions.
+        assert_eq!(
+            parse_body_limit("B", Some("16777216".into())).unwrap(),
+            16 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_body_limit("B", Some(MIN_MAX_REQUEST_BODY_BYTES.to_string())).unwrap(),
+            MIN_MAX_REQUEST_BODY_BYTES
+        );
+        // Below the floor ⇒ a named refusal, DERIVED from the constant.
+        let e = parse_body_limit(
+            "FLUIDBOX_MAX_REQUEST_BODY_BYTES",
+            Some((MIN_MAX_REQUEST_BODY_BYTES - 1).to_string()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("FLUIDBOX_MAX_REQUEST_BODY_BYTES") && e.contains("floor"),
+            "got: {e}"
+        );
+        // 0 is the value an operator reaches for meaning "no limit".
+        assert!(parse_body_limit("B", Some("0".into())).is_err());
+        // A typo (a `2MB`-style unit suffix is the likely one) is a boot error.
+        let e = parse_body_limit("FLUIDBOX_MAX_REQUEST_BODY_BYTES", Some("2MB".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("FLUIDBOX_MAX_REQUEST_BODY_BYTES") && e.contains("2MB"),
+            "got: {e}"
+        );
+    }
+
     #[test]
     fn tenant_knob_parsing_optional_and_fail_closed() {
         assert_eq!(parse_opt_f64("B", None).unwrap(), None);
@@ -792,5 +1542,86 @@ mod tests {
         assert_eq!(parse_opt_i64("R", None).unwrap(), None);
         assert_eq!(parse_opt_i64("R", Some("100".into())).unwrap(), Some(100));
         assert!(parse_opt_i64("R", Some("fast".into())).is_err());
+    }
+
+    // ---- Workspace-archive storage (Phase F, Task 4) ----------------------
+
+    /// Drive the REAL `parse_archive_store` — the function `from_env` calls —
+    /// through a fake environment. Testing `fluidbox_workspace::parse_store_config`
+    /// alone would prove the parser and nothing about whether boot consults it.
+    fn archive_env(
+        pairs: &[(&str, &str)],
+    ) -> impl Fn(&str) -> Result<String, std::env::VarError> + use<> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k: &str| map.get(k).cloned().ok_or(std::env::VarError::NotPresent)
+    }
+
+    #[test]
+    fn archive_store_defaults_to_fs_and_one_replica() {
+        let (store, replicas) = parse_archive_store(&archive_env(&[])).unwrap();
+        assert_eq!(store, fluidbox_workspace::ArchiveStoreConfig::Fs);
+        assert_eq!(replicas, 1);
+    }
+
+    #[test]
+    fn archive_store_boot_refusals() {
+        // An unknown backend.
+        let e = parse_archive_store(&archive_env(&[("FLUIDBOX_ARCHIVE_STORE", "gcs")]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("FLUIDBOX_ARCHIVE_STORE") && e.contains("known: fs, s3"),
+            "{e}"
+        );
+
+        // `s3` with nothing else names the first thing it needs.
+        let e = parse_archive_store(&archive_env(&[("FLUIDBOX_ARCHIVE_STORE", "s3")]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("FLUIDBOX_ARCHIVE_S3_BUCKET"), "{e}");
+
+        // A malformed replica count fails boot rather than disarming the guard.
+        let e = parse_archive_store(&archive_env(&[("FLUIDBOX_REPLICAS", "two")]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("FLUIDBOX_REPLICAS"), "{e}");
+        let e = parse_archive_store(&archive_env(&[("FLUIDBOX_REPLICAS", "0")]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("FLUIDBOX_REPLICAS"), "{e}");
+
+        // The cross-field refusal: >1 replica on the node-local fs store.
+        let e = parse_archive_store(&archive_env(&[("FLUIDBOX_REPLICAS", "3")]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("FLUIDBOX_REPLICAS=3"), "{e}");
+        assert!(e.contains("FLUIDBOX_ARCHIVE_STORE"), "{e}");
+    }
+
+    #[test]
+    fn archive_store_s3_boots_and_lifts_the_replica_refusal() {
+        let s3 = [
+            ("FLUIDBOX_ARCHIVE_STORE", "s3"),
+            ("FLUIDBOX_ARCHIVE_S3_BUCKET", "fbx-archives"),
+            ("FLUIDBOX_ARCHIVE_S3_REGION", "us-east-1"),
+            ("FLUIDBOX_ARCHIVE_S3_ACCESS_KEY_ID", "AKIA"),
+            ("FLUIDBOX_ARCHIVE_S3_SECRET_ACCESS_KEY", "SECRET"),
+        ];
+        let (store, replicas) = parse_archive_store(&archive_env(&s3)).unwrap();
+        assert!(matches!(
+            store,
+            fluidbox_workspace::ArchiveStoreConfig::S3(_)
+        ));
+        assert_eq!(replicas, 1);
+        // FALSE-GREEN guard: the SAME replica count that is refused on `fs` is
+        // accepted on `s3` — so the refusal above is about the store, not about
+        // `FLUIDBOX_REPLICAS` being rejected outright.
+        let mut many: Vec<(&str, &str)> = s3.to_vec();
+        many.push(("FLUIDBOX_REPLICAS", "3"));
+        let (_, replicas) = parse_archive_store(&archive_env(&many)).unwrap();
+        assert_eq!(replicas, 3);
     }
 }

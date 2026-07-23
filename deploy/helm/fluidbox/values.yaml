@@ -43,10 +43,46 @@ secretKeys:
   adminToken: FLUIDBOX_ADMIN_TOKEN
   credentialKey: FLUIDBOX_CREDENTIAL_KEY
   litellmMasterKey: LITELLM_MASTER_KEY
+  # Only read when server.archiveStore is "s3".
+  archiveS3AccessKeyId: FLUIDBOX_ARCHIVE_S3_ACCESS_KEY_ID
+  archiveS3SecretAccessKey: FLUIDBOX_ARCHIVE_S3_SECRET_ACCESS_KEY
 
 server:
-  # v1 is single-replica + Recreate (settled: multi-replica is a non-goal).
+  # Default stays 1. Phase F made >1 POSSIBLE, not automatic: raising this
+  # requires archiveStore "s3" (boot REFUSES "fs" with replicas > 1, because the
+  # alternative is an init container's archive GET landing on a replica that does
+  # not hold the file — which looks like a flaky run, not a misconfiguration).
+  # Setting archiveStore "s3" is the ONE switch: the chart then drops the
+  # node-local ReadWriteOnce archive PVC (nothing is shared on disk) and renders
+  # the Deployment with strategy RollingUpdate instead of Recreate — both derived
+  # from archiveStore in templates/server.yaml, so there is no separate strategy
+  # field to set. The node-local "" | "fs" path keeps its single RWO PVC and the
+  # Recreate strategy that one volume forces.
+  #
+  # The value is passed to the server as FLUIDBOX_REPLICAS. It is a DECLARATION —
+  # a process cannot observe its own replica count — so it is only as good as
+  # this chart setting it. A hand-rolled Deployment scaled to 2 without it still
+  # breaks silently.
   replicas: 1
+  # Workspace-archive storage (Phase F). "" or "fs" = node-local disk on the
+  # archive PVC, byte-for-byte today's behaviour, SINGLE REPLICA ONLY (chart
+  # renders the ReadWriteOnce PVC + Recreate strategy). "s3" = any S3-compatible
+  # bucket (AWS, MinIO, R2, GCS-XML) — this is what actually unblocks replicas > 1,
+  # because the k8s init container fetches the archive over HTTP from whichever
+  # replica the Service picks. In "s3" mode the chart mounts NO node-local PVC
+  # (replicas share nothing on disk) and switches to a RollingUpdate strategy.
+  #
+  # Credentials are STATIC key/secret from the secret above. IRSA, instance roles
+  # and STS auto-refresh are NOT supported: the AWS credential chain only helps
+  # against real AWS, and the point of this backend is that MinIO/R2 work
+  # identically. Pasted temporary credentials work until they expire.
+  archiveStore: ""
+  archiveS3:
+    bucket: ""
+    region: ""            # required — it is the SigV4 credential scope
+    endpoint: ""          # "" = real AWS; set for MinIO/R2/GCS-XML
+    prefix: "archives/"
+    forcePathStyle: ""    # "" = true when endpoint is set, false for AWS
   # Browser/AS-facing base URL (Ingress origin) — feeds OAuth redirect_uri +
   # CIMD + GitHub App webhooks. Set to your https origin in production.
   publicUrl: ""
@@ -58,7 +94,9 @@ server:
   # chart (review M2): a Helm install is a hosted, multi-user deployment, and the
   # documented Neon posture (neondb_owner / neon_superuser carries BYPASSRLS) makes
   # PostgreSQL skip EVERY 0018 policy — RLS applied, FORCEd, and completely inert.
-  # With FLUIDBOX_REQUIRE_SSO=1 (set via server.extraEnv) the server REFUSES TO BOOT
+  # With FLUIDBOX_REQUIRE_SSO=1 (set via server.extraEnv — and set web.mode: "sso"
+  # with it, or the dashboard proxy keeps injecting the admin token the SSO server
+  # refuses on /v1) the server REFUSES TO BOOT
   # in that state rather than serve with tenant isolation resting on predicates alone.
   #
   # "fluidbox_runtime" is the NOLOGIN least-privilege role 0018 creates and GRANTs
@@ -81,10 +119,60 @@ server:
   # Leave false: it turns migration 0018's policies into decoration. Only for a
   # local/single-user cluster whose database credential is unavoidably a superuser.
   allowRlsBypass: false
+  # Sized for the STARTER tier (see "Capacity tiers" under sandbox.quota below).
+  # The control plane holds, concurrently: one SSE tee per connected BROWSER (not
+  # per run), one buffered request body per in-flight request (≤ maxRequestBodyBytes,
+  # 2 MiB by default — 300 concurrent model requests is a 600 MiB envelope on its
+  # own), the connection pool, and the per-replica egress/MCP registries. 1 CPU /
+  # 1 GiB is a starter figure and does NOT cover the 300-run tier; raise both
+  # together with sandbox.quota, per the table below.
   resources:
     requests: { cpu: "250m", memory: "512Mi" }
     limits: { cpu: "1", memory: "1Gi" }
-  # Archive PVC (survives Recreate upgrades so init can still pull).
+  # Application connection-pool sizing (FLUIDBOX_DB_*, Phase F). "" = the server's
+  # own default, so the number lives in ONE place (crates/fluidbox-db PoolSettings)
+  # rather than being duplicated here and drifting.
+  #
+  # The figure that has to fit your Postgres is NOT this one — it is
+  #   replicas × (maxConnections + 2)
+  # the +2 being the two LISTEN/NOTIFY connections each replica holds outside the
+  # pool. Neon's smallest compute (0.25 CU) allows 112 connections in total, so the
+  # server default (25) supports three replicas with headroom for migrations and
+  # psql. Raise it on a larger compute; see the tier table below.
+  #
+  # The other four pool knobs are deliberately not chart fields — set them through
+  # extraEnv if you need them: FLUIDBOX_DB_MIN_CONNECTIONS,
+  # FLUIDBOX_DB_ACQUIRE_TIMEOUT_SECS, FLUIDBOX_DB_IDLE_TIMEOUT_SECS,
+  # FLUIDBOX_DB_MAX_LIFETIME_SECS. All five fail BOOT on a malformed or
+  # self-contradictory value rather than falling back to a default.
+  dbPool:
+    maxConnections: ""
+  # Ceiling on a buffered request body, in bytes ("" = the server default, 2 MiB —
+  # which is exactly what axum was already enforcing invisibly, so leaving this
+  # empty changes nothing). The LLM facade buffers the whole model request, so a
+  # long agent conversation is what actually reaches 2 MiB. Raising it multiplies
+  # by concurrency: budget `maxRequestBodyBytes × concurrent runs` against
+  # server.resources.limits.memory above before you move it.
+  maxRequestBodyBytes: ""
+  # Workload identity on the sandbox-facing internal gateway (Gap 6, Phase F).
+  # "" (default) = off, exactly today's behaviour. "observe" evaluates and logs
+  # without ever refusing — RUN THIS FIRST and watch for `workload_identity`
+  # mismatch lines before switching. "enforce" refuses a request whose socket
+  # peer contradicts the pod address the control plane recorded at provision.
+  #
+  # A run with no recorded address is ALWAYS admitted (counted and logged, never
+  # refused): the Docker provider reports none, and neither do sessions
+  # provisioned before migration 0025. Those runs are exactly as exposed as they
+  # were — the gain is that you can see how much of the fleet is actually covered
+  # instead of assuming all of it.
+  #
+  # This is a NETWORK-layer binding, not a cryptographic one: it does not
+  # distinguish another process in the same pod, a node-level attacker, or a
+  # fabric that permits source-address spoofing. mTLS is the stronger follow-up.
+  workloadIdentity: ""
+  # Archive PVC (survives Recreate upgrades so init can still pull). Rendered ONLY
+  # for the node-local "" | "fs" archive store; archiveStore "s3" mounts nothing
+  # local, so these fields are unused there.
   archivePvc:
     size: 10Gi
     storageClass: ""     # "" = cluster default; per-cloud presets set gp3/managed-csi/…
@@ -93,9 +181,19 @@ server:
 web:
   enabled: true
   replicas: 1
+  # Dashboard proxy credential mode (FLUIDBOX_WEB_MODE): "admin" injects the
+  # admin token server-side (today's single-admin default); "sso" carries NO
+  # admin token — the proxy forwards the __Host-fbx_web session cookie and the
+  # x-fluidbox-csrf header only, and the token is not even mounted into the
+  # pod. Set "sso" whenever the server runs FLUIDBOX_REQUIRE_SSO=1: in that
+  # mode the server refuses the admin token outside /v1/admin, so an
+  # "admin"-mode dashboard cannot render at all.
+  mode: "admin"
   resources:
     requests: { cpu: "100m", memory: "256Mi" }
     limits: { cpu: "500m", memory: "512Mi" }
+  # Extra env for the web container (mirrors server.extraEnv).
+  extraEnv: []
 
 # Bundled LiteLLM (digest-pinned, ClusterIP-only, unreachable from sandboxes).
 # External LiteLLM is the documented production default — keep this off in prod.
@@ -155,7 +253,42 @@ sandbox:
   # BYTES, default 2Gi) PLUS the unpacked staging tree PLUS the baseline
   # during init — size it for archive + ~2× the unpacked workspace.
   volumeSizeLimit: 10Gi
-  # Namespace ResourceQuota + application concurrent-run limit.
+  # Namespace ResourceQuota. This is the ONLY admission gate on concurrent runs —
+  # there is deliberately no application-side counter (an earlier revision of this
+  # comment claimed one; it never existed). The quota is enforced by the API server
+  # for every replica at once and cannot be bypassed by any code path, which an
+  # in-process counter could not match; the price is that it counts PODS, not runs,
+  # and it REJECTS rather than queues: once `pods` is reached, pod creation returns
+  # 403 and the run FAILS at provisioning (it is not held and retried). Size the
+  # tier you actually want rather than relying on the quota as a waiting room.
+  #
+  # requestsCpu / requestsMemory must be kept CONSISTENT with pods and with
+  # sandbox.resources.requests above — the quota counts REQUESTS, so the three are
+  # one setting expressed three ways:
+  #   requestsCpu    = pods × sandbox.resources.requests.cpu     (default 500m)
+  #   requestsMemory = pods × sandbox.resources.requests.memory  (default 1Gi)
+  # Leaving one behind silently caps you at whichever binds first.
+  #
+  # ── Capacity tiers ──────────────────────────────────────────────────────────
+  # From the design's planning assumptions (docs/plans/2026-07-14-multi-user-mcp-
+  # control-plane-design.md, "Derived working set"): 30–60 concurrent sandboxes is
+  # the normal 300-seat load, 300 is the full-seat stress case. The DEFAULT below
+  # is the starter tier — a namespace that can schedule 300 pods is its own hazard,
+  # so the larger tiers are opt-in and require cluster capacity you have checked.
+  #
+  #   tier      runs  quota.pods  requestsCpu  requestsMemory  server limits   server.dbPool.maxConnections
+  #   starter     20        "20"         "10"          "20Gi"  1 / 1Gi         "" (25)
+  #   normal      60        "60"         "30"          "60Gi"  2 / 2Gi         "" (25)
+  #   full-seat  300       "300"        "150"         "300Gi"  4 / 4Gi         "60"
+  #
+  # The memory column is the SCHEDULING envelope (requests), not utilisation: the
+  # design notes actual use is expected to be lower. The 300-run tier needs ~300 GiB
+  # of schedulable sandbox memory across the cluster — check that before setting it.
+  # Server limits rise because the control plane's per-run costs (SSE tees, buffered
+  # request bodies, pool) scale with concurrency; dbPool rises because pool
+  # throughput is maxConnections / mean query time and the per-run pollers at 300
+  # runs are hundreds of queries a second. Confirm the database can take
+  # `replicas × (maxConnections + 2)` before raising the last column.
   quota:
     enabled: true
     pods: "20"
