@@ -238,6 +238,8 @@ Start with the chart's annotated [`values.yaml`](./deploy/helm/fluidbox/values.y
 
 > **Full walkthrough → [Kubernetes deployment guide](./docs/guides/kubernetes.md).** Zero to a certified, run-serving cluster: the generic recipe, per-cloud setup and gotchas (EKS/GKE/AKS/DOKS), secrets, network-enforcement certification, verifying a run end to end, node sizing and cost, safe audited teardown, and a troubleshooting table — all from a live cloud acceptance.
 
+Live EKS acceptance evidence: [2026-07-17](./docs/reviews/2026-07-17-eks-acceptance.md) — v0.2.0 release chart and images, AWS-audited zero-orphan teardown · [2026-07-22](./docs/reviews/2026-07-22-eks-acceptance-phase-f.md) — current-branch images on arm64/Graviton nodes with the runtime-role RLS split active.
+
 ## Repository map
 
 ```text
