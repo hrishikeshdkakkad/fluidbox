@@ -151,7 +151,17 @@ cargo run -p fluidbox-cli -- run \
   --task "find and fix the failing test"
 ```
 
-If setup drifts, `just doctor` checks the documented failure points—database mode, bind address, key shape, runner images, dashboard token sync, and web dependencies—and prints the concrete fix.
+If setup drifts, `just doctor` checks the documented failure points—database mode, bind address, key shape, runner images, dashboard token sync, web dependencies, and auth-mode coherence—and prints the concrete fix.
+
+#### Local SSO (browser login against a real IdP)
+
+The local default is **admin mode**: no login wall, the dashboard proxy injects the operator token, and `/login` redirects into the app. To exercise the real browser-login experience locally (e.g. against Dex, as `scripts/identity-e2e.sh` does), all three pieces must agree — a partial setup degrades silently to the open admin dashboard:
+
+1. `FLUIDBOX_WEB_MODE=sso` in `apps/web/.env.local` — flips the dashboard to cookie passthrough and turns on the login wall (a sessionless browser is redirected to `/login` server-side).
+2. `FLUIDBOX_PUBLIC_URL=http://localhost:3000` in `.env` — the browser-facing `/v1/auth/*` legs must ride the **dashboard** origin (served there by the dev `/v1` rewrite) so the `__Host-` login cookies land where the browser started. Pointing this at `:8787` makes every callback refuse.
+3. `FLUIDBOX_REQUIRE_SSO=1` in `.env` for the full multi-user posture (confines the admin token to `/v1/admin/*`), plus an organization + IdP config registered via `/v1/admin/orgs`.
+
+`just doctor` flags every incoherent combination of these.
 
 ### Everyday commands
 
