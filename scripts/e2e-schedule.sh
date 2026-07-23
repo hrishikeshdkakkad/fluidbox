@@ -33,7 +33,11 @@ post()   { curl -s -o "$B" -w "%{http_code}" -X POST -H "$H" -H "$CT" -d "$2" "$
 tpost()  { curl -s -o "$B" -w "%{http_code}" -X POST -H "authorization: Bearer $1" -H "$CT" ${4:+-H "$4"} -d "$3" "$API/v1$2"; }
 sfield() { curl -s -H "$H" "$API/v1/sessions/$1" | j "['session']$2"; }
 tget()   { curl -s -H "$H" "$API/v1/triggers/$1"; }
-pq()     { psql "$DATABASE_URL" -qtA -c "$1" | head -1; }
+# Migration 0018 FORCEs RLS on every tenant table, which binds the table OWNER
+# too: a GUC-less psql session reads zero rows and every write trips the policy.
+# The bypass GUC is a session-level SET on a custom (dotted) option — no
+# privilege required — so it rides INSIDE the helper and every call carries it.
+pq()     { psql "$DATABASE_URL" -qtA -c "set fluidbox.bypass = 'system_worker'; $1" | head -1; }
 
 # Poll GET /v1/triggers/{id} until a python expression over it is truthy.
 wait_trig() { # sub-id python-expr [tries=20] [sleep=1]

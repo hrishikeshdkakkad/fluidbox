@@ -342,7 +342,7 @@ fn emitted_sql_is_shaped_and_deterministic() {
     assert!(sql1.contains("'community'"));
     assert!(sql1.contains("pinned 2026-07-14:cursorX"));
     assert!(sql1.contains("pinned abc123def456"));
-    assert!(sql1.contains("on conflict (slug) do update set"));
+    assert!(sql1.contains("on conflict (slug) where tenant_id is null do update set"));
     assert!(sql1.contains("in ('mcp-registry', 'open-connector')"));
     assert!(sql1.contains("jsonb_build_object('source','mcp-registry'"));
     assert!(

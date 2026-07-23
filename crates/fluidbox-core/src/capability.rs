@@ -31,7 +31,9 @@ const MAX_DESCRIPTION_CHARS: usize = 32_768;
 /// Whole-definition ceiling (serialized): with 16 servers × 64 tools ×
 /// 32 KiB descriptions the naive worst case is ~32 MiB — every byte of
 /// which would be frozen into each RunSpec jsonb. Cap it well below that.
-const MAX_DEFINITION_BYTES: usize = 2 * 1024 * 1024;
+/// Public so the connection-tool-snapshot path (server) enforces the same
+/// serialized ceiling against a discovered `tools/list` before it is stored.
+pub const MAX_DEFINITION_BYTES: usize = 2 * 1024 * 1024;
 
 /// The pin an agent revision stores per attached bundle (§17 #7, settled
 /// 2026-07-10: pin-only — attaching resolves to the newest version AT
@@ -73,6 +75,13 @@ pub struct ToolSnapshot {
     pub description: String,
     #[serde(default = "empty_object")]
     pub input_schema: Value,
+    /// The MCP `outputSchema` (2025-06-18+): the JSON Schema a tool's
+    /// `structuredContent` result conforms to. Preserved through the photograph
+    /// (Phase E, E7) so a run's frozen surface carries it; `None` for tools that
+    /// declare none. Part of the tools digest ONLY when `Some`, so pre-E
+    /// snapshots (no output schema) digest byte-identically to before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotations: Option<Value>,
 }
@@ -181,6 +190,18 @@ fn valid_tool_name(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
+/// Connector-catalog slug shape: `[a-z0-9][a-z0-9-]*` (first char alnum, the
+/// rest may add hyphens). Used only to sanity-check a requirement's optional
+/// catalog hint — the resolved connection, not the slug, is the authority.
+fn valid_catalog_slug(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    match bytes.next() {
+        Some(b) if b.is_ascii_lowercase() || b.is_ascii_digit() => {}
+        _ => return false,
+    }
+    bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 /// Snapshot-time poison screen (objective checks only): tool descriptions
 /// are model-visible attack surface (Invariant tool poisoning; Trail of
 /// Bits ANSI/zero-width concealment). Control characters, ANSI escapes,
@@ -215,7 +236,13 @@ pub fn lint_text(field: &str, s: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_tools(server: &str, tools: &[ToolSnapshot]) -> Result<(), String> {
+/// Validate a discovered/declared tool set: the per-server tool cap, the MCP
+/// name charset, duplicate-name rejection, the poison screen on every
+/// description ([`lint_text`]), and the object-shaped input schema. Public so
+/// the connection-snapshot photograph (Phase C) runs the IDENTICAL screen on an
+/// untrusted remote `tools/list` that bundle registration runs on declared
+/// tools — one validation path, no duplication.
+pub fn validate_tools(server: &str, tools: &[ToolSnapshot]) -> Result<(), String> {
     if tools.len() > MAX_TOOLS_PER_SERVER {
         return Err(format!(
             "server '{server}' declares {} tools (max {MAX_TOOLS_PER_SERVER})",
@@ -322,11 +349,19 @@ pub fn tools_digest(tools: &[ToolSnapshot]) -> String {
     let canonical: Vec<Value> = tools
         .iter()
         .map(|t| {
-            serde_json::json!({
+            let mut obj = serde_json::json!({
                 "name": t.name,
                 "description": t.description,
                 "input_schema": t.input_schema,
-            })
+            });
+            // E7: fold in `output_schema` ONLY when present, so a tool that
+            // declares none digests exactly as it did before this field existed
+            // (historical snapshots stay stable) while a tool that DOES declare
+            // one — and any later drift of it — is covered.
+            if let Some(os) = &t.output_schema {
+                obj["output_schema"] = os.clone();
+            }
+            obj
         })
         .collect();
     sha256_of(&serde_json::to_string(&canonical).unwrap_or_default())
@@ -391,6 +426,36 @@ pub fn capability_denial(bundles: &[FrozenBundle], tool: &str) -> Option<String>
     ))
 }
 
+/// Phase C availability check across BOTH attachment paths: the legacy frozen
+/// `capabilities` bundles (which historically embedded brokered servers) AND
+/// the binding-backed `brokered` surfaces. A `mcp__*` call is available if
+/// EITHER path advertises it. The message contract is byte-identical to
+/// [`capability_denial`] (malformed vs not-in-frozen-set) so the gate ledger
+/// output stays uniform whichever path a run uses. Task 6 swaps the gate onto
+/// this; until then `capability_denial` still serves the legacy-only vec.
+pub fn brokered_surface_denial(
+    brokered: &[crate::spec::BrokeredSurface],
+    capabilities: &[FrozenBundle],
+    tool: &str,
+) -> Option<String> {
+    if !tool.starts_with("mcp__") {
+        return None;
+    }
+    let Some((server, tool_name)) = parse_mcp_tool(tool) else {
+        return Some(format!(
+            "malformed MCP tool name '{tool}' (expected mcp__<server>__<tool>)"
+        ));
+    };
+    if find_tool(capabilities, server, tool_name).is_some()
+        || crate::spec::brokered_surfaces_have_tool(brokered, server, tool_name)
+    {
+        return None;
+    }
+    Some(format!(
+        "tool '{tool}' is not in this run's frozen capability set"
+    ))
+}
+
 /// Narrowing (§3.5): intersect the attached bundles with a keep-list of
 /// bundle names. Removal-only by construction — a name the attachment set
 /// lacks intersects to nothing; nothing can be added here.
@@ -419,6 +484,124 @@ pub fn server_collision(bundles: &[FrozenBundle]) -> Option<String> {
     None
 }
 
+// ─── Agent connection requirements (Phase C, design §"Agent connection
+//     requirement") ───────────────────────────────────────────────────────
+
+/// Which identity's credential should satisfy a requirement's binding at run
+/// creation (design §"Agent connection requirement"). The agent declares the
+/// mode; `create_run` resolves it to a concrete connection (Task 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingMode {
+    /// Bind to the invoking user's own connection for this connector.
+    InvokingUser,
+    /// Bind to an organization-owned connection.
+    Organization,
+}
+
+/// How a requirement names the connector it needs. `url` is the load-bearing
+/// selector (the brokered MCP endpoint); `slug` is an optional catalog hint
+/// for display/disambiguation only — the resolved connection is the authority,
+/// never the slug.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ConnectorSelector {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+}
+
+/// What an agent revision declares it needs, per slot — *what*, never *whose*
+/// (design §"Agent connection requirement", invariants 4–6). `required_tools`
+/// is a contract (`satisfaction: all`, fail closed): every entry must exist in
+/// the bound connection's snapshot at run creation, and the effective run
+/// surface is exactly this set. Stored append-only on the immutable revision.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ConnectionRequirement {
+    /// Local alias for the bound server — becomes the `mcp__<slot>__<tool>`
+    /// prefix, so it shares the server-alias charset (unique across the list).
+    pub slot: String,
+    pub connector: ConnectorSelector,
+    pub required_tools: Vec<String>,
+    pub binding_mode: BindingMode,
+}
+
+/// Validate a revision's declared requirements before they are stored. Reuses
+/// the bundle validators (`valid_server_alias`, `valid_tool_name`) so a slot
+/// alias and a required-tool name obey the exact same rules as a registered
+/// server/tool. Bounds mirror `MAX_SERVERS_PER_BUNDLE` / `MAX_TOOLS_PER_SERVER`.
+pub fn validate_requirements(reqs: &[ConnectionRequirement]) -> Result<(), String> {
+    if reqs.len() > MAX_SERVERS_PER_BUNDLE {
+        return Err(format!(
+            "at most {MAX_SERVERS_PER_BUNDLE} connection requirements (got {})",
+            reqs.len()
+        ));
+    }
+    let mut seen_slots = std::collections::BTreeSet::new();
+    for req in reqs {
+        if !valid_server_alias(&req.slot) {
+            return Err(format!(
+                "requirement slot '{}' must be 1-64 chars of [a-z0-9-] (it prefixes mcp__<slot>__<tool>)",
+                req.slot
+            ));
+        }
+        if !seen_slots.insert(req.slot.as_str()) {
+            return Err(format!("duplicate requirement slot '{}'", req.slot));
+        }
+        if req.connector.url.is_empty() {
+            return Err(format!(
+                "requirement slot '{}': connector.url is empty",
+                req.slot
+            ));
+        }
+        if !(req.connector.url.starts_with("http://") || req.connector.url.starts_with("https://"))
+        {
+            return Err(format!(
+                "requirement slot '{}': connector.url must be http(s)",
+                req.slot
+            ));
+        }
+        if let Some(slug) = &req.connector.slug {
+            if !valid_catalog_slug(slug) {
+                return Err(format!(
+                    "requirement slot '{}': connector.slug '{slug}' must match [a-z0-9][a-z0-9-]*",
+                    req.slot
+                ));
+            }
+        }
+        if req.required_tools.is_empty() {
+            return Err(format!(
+                "requirement slot '{}': required_tools must be non-empty (satisfaction: all)",
+                req.slot
+            ));
+        }
+        if req.required_tools.len() > MAX_TOOLS_PER_SERVER {
+            return Err(format!(
+                "requirement slot '{}': at most {MAX_TOOLS_PER_SERVER} required_tools (got {})",
+                req.slot,
+                req.required_tools.len()
+            ));
+        }
+        let mut seen_tools = std::collections::BTreeSet::new();
+        for t in &req.required_tools {
+            if !valid_tool_name(t) {
+                return Err(format!(
+                    "requirement slot '{}': tool name '{t}' must be 1-128 chars of [A-Za-z0-9_.-]",
+                    req.slot
+                ));
+            }
+            if !seen_tools.insert(t.as_str()) {
+                return Err(format!(
+                    "requirement slot '{}': duplicate required tool '{t}'",
+                    req.slot
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -431,6 +614,7 @@ mod tests {
             name: name.into(),
             description: format!("does {name}"),
             input_schema: json!({"type": "object", "properties": {}}),
+            output_schema: None,
             annotations: None,
         }
     }
@@ -679,6 +863,7 @@ mod tests {
                 r#"{"type":"object","properties":{"a":{"type":"string"}}}"#,
             )
             .unwrap(),
+            output_schema: None,
             annotations: None,
         };
         let t2 = ToolSnapshot {
@@ -696,7 +881,32 @@ mod tests {
         // Annotations are display-only: not part of the digest.
         let mut t4 = t1.clone();
         t4.annotations = Some(json!({"readOnlyHint": true}));
-        assert_eq!(tools_digest(&[t1]), tools_digest(&[t4]));
+        assert_eq!(tools_digest(std::slice::from_ref(&t1)), tools_digest(&[t4]));
+
+        // E7 back-compat: a tool with NO output_schema digests to the exact
+        // fixture value pre-change tools_digest produced (guards against the new
+        // field ever perturbing historical snapshot digests).
+        assert_eq!(
+            tools_digest(std::slice::from_ref(&t1)),
+            "sha256:ea1be7b9add671db75008caa4917c813a29960a3b914135db046d436c0d4129f",
+            "output_schema=None must digest identically to the pre-E7 canonical form"
+        );
+        // …and adding an output_schema DOES change the digest (drift-sensitive).
+        let mut t5 = t1.clone();
+        t5.output_schema =
+            Some(json!({"type": "object", "properties": {"n": {"type": "integer"}}}));
+        assert_ne!(
+            tools_digest(std::slice::from_ref(&t1)),
+            tools_digest(std::slice::from_ref(&t5)),
+            "an output_schema must be covered by the digest"
+        );
+        // Re-ordering output_schema keys does NOT change it (Value canonicalizes).
+        let mut t6 = t1.clone();
+        t6.output_schema = Some(
+            serde_json::from_str(r#"{"properties":{"n":{"type":"integer"}},"type":"object"}"#)
+                .unwrap(),
+        );
+        assert_eq!(tools_digest(&[t5]), tools_digest(&[t6]));
 
         let def = CapabilityBundleDef {
             servers: vec![sandbox("ws", vec![tool("count")])],
@@ -727,5 +937,170 @@ mod tests {
         assert_eq!(v["servers"][0]["class"], "brokered");
         let back: FrozenBundle = serde_json::from_value(v).unwrap();
         assert_eq!(back, f);
+    }
+
+    // ─── Phase C: connection requirements + unified brokered lookup ─────────
+
+    fn req_ok() -> ConnectionRequirement {
+        ConnectionRequirement {
+            slot: "github".into(),
+            connector: ConnectorSelector {
+                url: "https://mcp.github.test/mcp".into(),
+                slug: Some("github-mcp".into()),
+            },
+            required_tools: vec!["get_pull_request".into(), "create_review".into()],
+            binding_mode: BindingMode::InvokingUser,
+        }
+    }
+
+    #[test]
+    fn requirement_wire_shapes_and_deny_unknown_fields() {
+        // snake_case binding_mode on the wire.
+        assert_eq!(
+            serde_json::to_value(BindingMode::InvokingUser).unwrap(),
+            json!("invoking_user")
+        );
+        assert_eq!(
+            serde_json::to_value(BindingMode::Organization).unwrap(),
+            json!("organization")
+        );
+        // A requirement round-trips.
+        let r = req_ok();
+        let back: ConnectionRequirement =
+            serde_json::from_value(serde_json::to_value(&r).unwrap()).unwrap();
+        assert_eq!(back, r);
+        // slug may be absent on the wire (Option).
+        let no_slug: ConnectorSelector =
+            serde_json::from_value(json!({"url": "https://x.test/mcp"})).unwrap();
+        assert!(no_slug.slug.is_none());
+        // deny_unknown_fields: an unexpected key is refused (both types).
+        assert!(serde_json::from_value::<ConnectionRequirement>(json!({
+            "slot": "github", "connector": {"url": "https://x.test/mcp"},
+            "required_tools": ["a"], "binding_mode": "invoking_user", "surprise": true
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<ConnectorSelector>(
+            json!({"url": "https://x.test/mcp", "extra": 1})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn requirement_validation_matrix() {
+        // Baseline valid list passes.
+        validate_requirements(std::slice::from_ref(&req_ok())).unwrap();
+
+        // Duplicate slot across the list is rejected.
+        assert!(validate_requirements(&[req_ok(), req_ok()]).is_err());
+
+        // Bad slot shapes (mirror valid_server_alias: no uppercase, no
+        // underscore — it would break mcp__<slot>__<tool> parsing — no dbl).
+        for bad in ["Git", "gh_hub", "a__b", "-x", ""] {
+            let mut r = req_ok();
+            r.slot = bad.into();
+            assert!(
+                validate_requirements(&[r]).is_err(),
+                "slot '{bad}' must reject"
+            );
+        }
+
+        // required_tools: empty, bad name, duplicate all rejected.
+        let mut r = req_ok();
+        r.required_tools = vec![];
+        assert!(validate_requirements(&[r]).is_err(), "empty tools");
+        let mut r = req_ok();
+        r.required_tools = vec!["has space".into()];
+        assert!(validate_requirements(&[r]).is_err(), "bad tool name");
+        let mut r = req_ok();
+        r.required_tools = vec!["a".into(), "a".into()];
+        assert!(validate_requirements(&[r]).is_err(), "duplicate tool");
+
+        // connector.url: empty, non-http rejected.
+        let mut r = req_ok();
+        r.connector.url = String::new();
+        assert!(validate_requirements(&[r]).is_err(), "empty url");
+        let mut r = req_ok();
+        r.connector.url = "ftp://x.test".into();
+        assert!(validate_requirements(&[r]).is_err(), "non-http url");
+
+        // slug shape [a-z0-9][a-z0-9-]*: uppercase/underscore/leading-hyphen bad.
+        for bad in ["Bad", "a_b", "-lead", ""] {
+            let mut r = req_ok();
+            r.connector.slug = Some(bad.into());
+            assert!(
+                validate_requirements(&[r]).is_err(),
+                "slug '{bad}' must reject"
+            );
+        }
+        // slug absent is fine.
+        let mut r = req_ok();
+        r.connector.slug = None;
+        validate_requirements(&[r]).unwrap();
+
+        // Bounds: >16 requirements, >64 tools each.
+        let many: Vec<ConnectionRequirement> = (0..17)
+            .map(|i| {
+                let mut r = req_ok();
+                r.slot = format!("s{i}");
+                r
+            })
+            .collect();
+        assert!(validate_requirements(&many).is_err(), ">16 requirements");
+        let mut r = req_ok();
+        r.required_tools = (0..65).map(|i| format!("t{i}")).collect();
+        assert!(validate_requirements(&[r]).is_err(), ">64 tools");
+    }
+
+    #[test]
+    fn brokered_surface_denial_unions_and_matches_capability_denial_contract() {
+        use crate::spec::BrokeredSurface;
+        // Legacy embedded-brokered bundles (what historical RunSpecs carry).
+        let caps = vec![frozen(
+            "kb-tools",
+            vec![brokered("kb", vec![tool("kb_search")])],
+        )];
+        // Phase C brokered surfaces (the new binding-backed path).
+        let surfaces = vec![BrokeredSurface {
+            slot: "gh".into(),
+            url: "https://mcp.github.test/mcp".into(),
+            binding_id: Uuid::now_v7(),
+            snapshot_version: 3,
+            tools: vec![tool("get_pr")],
+            tools_digest: "sha256:abc".into(),
+            protocol_version: None,
+        }];
+
+        // Built-ins pass through (None), both attachment paths resolve.
+        assert_eq!(brokered_surface_denial(&surfaces, &caps, "Read"), None);
+        assert_eq!(
+            brokered_surface_denial(&surfaces, &caps, "mcp__kb__kb_search"),
+            None
+        );
+        assert_eq!(
+            brokered_surface_denial(&surfaces, &caps, "mcp__gh__get_pr"),
+            None
+        );
+        // Unknown server / unknown tool / malformed all denied.
+        assert!(brokered_surface_denial(&surfaces, &caps, "mcp__gh__ghost").is_some());
+        assert!(brokered_surface_denial(&surfaces, &caps, "mcp__ghost__x").is_some());
+        assert!(brokered_surface_denial(&surfaces, &caps, "mcp__gh").is_some());
+        // Empty union denies every mcp call (the ReadOnly / nothing-attached case).
+        assert!(brokered_surface_denial(&[], &[], "mcp__kb__kb_search").is_some());
+
+        // Message contract: with no brokered surfaces the denial text is
+        // byte-identical to capability_denial — the gate ledger stays uniform.
+        for t in [
+            "Read",
+            "mcp__kb__kb_search",
+            "mcp__kb__ghost",
+            "mcp__ghost__x",
+            "mcp__bad",
+        ] {
+            assert_eq!(
+                brokered_surface_denial(&[], &caps, t),
+                capability_denial(&caps, t),
+                "message contract diverged for {t}"
+            );
+        }
     }
 }

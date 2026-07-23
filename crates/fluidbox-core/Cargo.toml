@@ -17,6 +17,10 @@ globset.workspace = true
 regex.workspace = true
 sha2.workspace = true
 hex.workspace = true
+# Gap 12 (Phase E): validate brokered tool-call args against the run's FROZEN
+# inputSchema. default-features off (no HTTP/file $ref resolution) — see the
+# workspace dep note; hardened further by `schema_guard`.
+jsonschema.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 futures.workspace = true

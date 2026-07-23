@@ -18,6 +18,8 @@ pub async fn run(
     default_model: &str,
 ) -> anyhow::Result<SeedOutcome> {
     let tenant = ensure_default_tenant(pool).await?;
+    // The boot seed owns the default tenant — a verified scope by construction.
+    let scope = TenantScope::assume(tenant);
 
     // Policies from disk (idempotent upsert; version bumps on change).
     let mut default_policy_id = None;
@@ -40,7 +42,7 @@ pub async fn run(
                     let parsed = serde_json::to_value(&policy)?;
                     // Bootstrap only when absent — never clobber UI edits on reboot.
                     let (row, inserted) =
-                        seed_policy_if_absent(pool, tenant, &policy.name, &yaml, &parsed).await?;
+                        seed_policy_if_absent(pool, scope, &policy.name, &yaml, &parsed).await?;
                     if inserted {
                         tracing::info!(policy = %policy.name, "seeded policy from disk");
                     } else {
@@ -65,7 +67,7 @@ pub async fn run(
             let p = Policy::parse_yaml("name: default").unwrap();
             seed_policy_if_absent(
                 pool,
-                tenant,
+                scope,
                 "default",
                 "name: default",
                 &serde_json::to_value(&p)?,
@@ -79,17 +81,18 @@ pub async fn run(
     // The curated M1 agent: Claude Agent SDK harness, default policy.
     let agent = create_agent(
         pool,
-        tenant,
+        scope,
         "claude-fixer",
         Some("General coding agent on the Claude Agent SDK. Reads, edits, runs tests."),
     )
     .await?;
-    if latest_revision(pool, agent.id).await?.is_none() {
+    if latest_revision(pool, scope, agent.id).await?.is_none() {
         // The seed policy's budgets are the source of truth for the curated
         // agent; Budgets::default() is only the no-policy fallback.
         let budgets = serde_json::to_value(default_policy_budgets.unwrap_or_default())?;
         append_agent_revision(
             pool,
+            scope,
             agent.id,
             harness,
             sandbox_image,
@@ -98,6 +101,7 @@ pub async fn run(
             default_policy_id,
             &budgets,
             None,
+            &serde_json::json!([]),
             &serde_json::json!([]),
         )
         .await?;

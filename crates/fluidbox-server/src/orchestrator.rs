@@ -18,8 +18,10 @@ use crate::state::AppState;
 use fluidbox_core::event::{Actor, EventBody};
 use fluidbox_core::spec::{RunSpec, WorkspaceSpec};
 use fluidbox_core::state::SessionStatus;
-use fluidbox_core::traits::{CollectContext, CollectedArtifacts, SandboxHandle, SandboxSpec};
-use fluidbox_db::SessionRow;
+use fluidbox_core::traits::{
+    CollectContext, CollectedArtifacts, SandboxHandle, SandboxSpec, SandboxTokens,
+};
+use fluidbox_db::{SessionRow, TenantScope};
 use std::path::PathBuf;
 use std::time::Duration;
 use uuid::Uuid;
@@ -63,6 +65,81 @@ const PROVISION_SETTLE_SECS: i64 = 120;
 /// waste the cap, never wedge `finalizing`.
 const COLLECT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long a per-session driver lease is honored without a renew. Short enough
+/// that a crashed replica's sessions are re-drivable within a couple of worker
+/// ticks, long enough to cover the gaps between a healthy driver's renews (which
+/// happen at every lifecycle step). Bounded overlap with the 420 s finalization
+/// claim window and the 300 s driver timeout, so two drivers still never overlap.
+///
+/// **This TTL is the multi-replica cancel latency (review, minor).** A replica
+/// that finishes `run()` leaves its lease standing — nothing releases it on the
+/// way out, and only a driver renews. So a cancel that arrives on a DIFFERENT
+/// replica finds an unexpired lease, hands the finalization claim straight back
+/// (`drive_finalization`'s `hold_lease` early return) and waits for the 20 s
+/// `finalize_worker` tick to try again. Worst case is the lease's remaining life
+/// plus a full worker period — up to ~50 s, typically ~30-40 s — before the
+/// wind-down actually starts. The user-visible status flips immediately (`cancel`
+/// is an UNFENCED intent write accepted on any replica); it is the sandbox
+/// teardown that waits. Single-replica deployments never see this: the holder and
+/// the receiver are the same process, so `hold_lease` renews and proceeds. Cutting
+/// the TTL shortens the stall but raises the risk of stealing a session from a
+/// slow-but-live driver; releasing the lease at the end of `run()` is the real
+/// fix and is not built.
+const SESSION_LEASE_TTL_SECS: i64 = 30;
+
+/// This replica's identity, minted ONCE per process (Phase E, #33; Gap 13).
+///
+/// It is the `orchestrator_owner_id` written into every session lease this
+/// process takes — an identity, never a credential: it grants nothing, it only
+/// lets the database say "the driver that holds this session is (not) me", which
+/// is what turns the lease's monotonic `orchestrator_epoch` into a usable fencing
+/// token. Regenerated on restart BY DESIGN: a restarted process is a new driver
+/// and must re-acquire (bumping the epoch, invalidating anything the dead process
+/// had in flight).
+pub fn replica_id() -> Uuid {
+    static REPLICA_ID: std::sync::LazyLock<Uuid> = std::sync::LazyLock::new(Uuid::now_v7);
+    *REPLICA_ID
+}
+
+/// Take (or renew) this replica's driver lease on `id` and return the epoch to
+/// fence subsequent mutations with. `None` means ANOTHER replica holds an
+/// unexpired lease — this driver must stop mutating the session and let the owner
+/// finish (its own finalization claim / worker tick will re-drive if the owner
+/// dies).
+///
+/// Calling this repeatedly is the renew: the same owner keeps the same epoch, so
+/// a healthy driver's fence never moves under its own feet. Re-taking a lease of
+/// OURS that merely lapsed (nobody stole it) also keeps the epoch — the bump is
+/// gated on the owner actually changing. That is deliberate: self-fencing on a
+/// lapse would kill any launch slower than the lease TTL, and the
+/// `hold_lease(..) != Some(epoch)` re-proofs before `provision` and
+/// `collect_artifacts` depend on the epoch surviving a slow turn. The fence
+/// protects against a DIFFERENT owner having moved the session on, which is
+/// exactly when the epoch does move.
+async fn hold_lease(state: &AppState, scope: TenantScope, id: Uuid) -> Option<i64> {
+    match fluidbox_db::acquire_session_lease(
+        &state.pool,
+        scope,
+        id,
+        replica_id(),
+        SESSION_LEASE_TTL_SECS,
+    )
+    .await
+    {
+        Ok(Some(epoch)) => Some(epoch),
+        Ok(None) => {
+            tracing::info!("session {id}: another replica holds the orchestrator lease");
+            None
+        }
+        // A transient DB error is NOT proof of a lost lease, but it IS a reason to
+        // stop mutating: without a proven epoch there is no fencing token to carry.
+        Err(e) => {
+            tracing::warn!("session {id}: lease acquire failed: {e}");
+            None
+        }
+    }
+}
+
 /// Spawn the full run of a freshly-created session in the background.
 pub fn spawn_run(state: AppState, session_id: Uuid) {
     tokio::spawn(async move {
@@ -73,11 +150,77 @@ pub fn spawn_run(state: AppState, session_id: Uuid) {
     });
 }
 
-async fn transition(state: &AppState, id: Uuid, next: SessionStatus, reason: Option<&str>) -> bool {
-    match fluidbox_db::transition_session(&state.pool, id, next, reason).await {
-        Ok(Some((from, _))) => {
+async fn transition(
+    state: &AppState,
+    scope: TenantScope,
+    id: Uuid,
+    next: SessionStatus,
+    reason: Option<&str>,
+) -> bool {
+    transition_inner(
+        state,
+        scope,
+        id,
+        next,
+        reason,
+        fluidbox_db::transition_session(&state.pool, scope, id, next, reason).await,
+    )
+    .await
+}
+
+/// The epoch-fenced form of [`transition`] — the one DRIVER lifecycle mutations
+/// use (Phase E, #33; Gap 13). `expected_epoch` is the fencing token the driver
+/// got from its lease; if another replica has since stolen the session the epoch
+/// has moved and this transition matches zero rows, so a stale driver cannot
+/// overwrite the new owner's lifecycle work or re-fire its terminal side effects.
+///
+/// Request-side intent writes stay on the UNFENCED [`transition`]: `cancel`,
+/// `finalize_forced`, `fail`, and `maybe_resume` are idempotent CAS-style
+/// statements whose job is to be accepted from any replica at any time; fencing
+/// them would make a cancel depend on which replica happened to own the driver.
+async fn transition_fenced(
+    state: &AppState,
+    scope: TenantScope,
+    id: Uuid,
+    next: SessionStatus,
+    reason: Option<&str>,
+    expected_epoch: i64,
+) -> bool {
+    transition_inner(
+        state,
+        scope,
+        id,
+        next,
+        reason,
+        fluidbox_db::transition_session_fenced(
+            &state.pool,
+            scope,
+            id,
+            next,
+            reason,
+            expected_epoch,
+        )
+        .await,
+    )
+    .await
+}
+
+/// Shared tail of both transition forms: the ledger event and the terminal-entry
+/// side effects (token revocation + delivery enqueue) ride the SINGLE winner of
+/// whichever compare-and-set the caller ran.
+async fn transition_inner(
+    state: &AppState,
+    scope: TenantScope,
+    id: Uuid,
+    next: SessionStatus,
+    reason: Option<&str>,
+    outcome: sqlx::Result<Option<(SessionStatus, fluidbox_db::SessionRow)>>,
+) -> bool {
+    match outcome {
+        Ok(Some((from, row))) => {
             ledger::record(
                 state,
+                scope,
                 id,
                 Actor::System,
                 EventBody::StatusChanged {
@@ -87,12 +230,33 @@ async fn transition(state: &AppState, id: Uuid, next: SessionStatus, reason: Opt
                 },
             )
             .await;
+            // Operational metrics (Phase F, #34): this is the single status-writer
+            // funnel, so the active-runs gauge and lifecycle counters are exact —
+            // one CAS winner, one count. The gauge moves only on the band edges
+            // (see `metrics::active_delta`); a `dec` saturates at zero.
+            match crate::metrics::active_delta(from, next) {
+                1 => state.metrics.active_runs.inc(),
+                -1 => state.metrics.active_runs.dec(),
+                _ => {}
+            }
+            // Provisioning latency: measured ONLY on the initializing→running edge
+            // (the sandbox is ready), never on a re-entry to running from an
+            // approval pause, so the histogram is not polluted by mid-run pauses.
+            if from == SessionStatus::Initializing && next == SessionStatus::Running {
+                let ms = (chrono::Utc::now() - row.created_at).num_milliseconds();
+                if ms >= 0 {
+                    state.metrics.run_provisioning_ms.observe(ms as f64);
+                }
+            }
             if next.is_terminal() {
+                // The terminal outcome label is the status' own name
+                // (completed | failed | cancelled | budget_exceeded).
+                state.metrics.runs_terminal.inc(next.as_str());
                 // Defense-in-depth: kill the session's tokens the moment it
                 // goes terminal so a still-running or leaked token can't reach
                 // the facade/gateway. The PRIMARY guard is each endpoint's own
                 // terminal/wind-down check.
-                if let Err(e) = fluidbox_db::revoke_session_tokens(&state.pool, id).await {
+                if let Err(e) = fluidbox_db::revoke_session_tokens(&state.pool, scope, id).await {
                     tracing::warn!("revoke_session_tokens {id} failed: {e}");
                 }
                 // Publication is decoupled: enqueue rows; the delivery worker
@@ -154,6 +318,7 @@ pub async fn finalize_reported(
             reason: None,
             want_quiesce: false, // the runner exits on its own after /result
         },
+        None,
     )
     .await
 }
@@ -178,6 +343,7 @@ pub async fn finalize_forced(
             reason: Some(reason),
             want_quiesce: true,
         },
+        None,
     )
     .await
 }
@@ -186,8 +352,20 @@ pub async fn finalize_forced(
 /// whatever the agent produced, after the runner stopped (quiesce for live
 /// runners; pre-launch/dead sessions skip it via the locked snapshot).
 pub async fn fail(state: &AppState, id: Uuid, reason: &str) -> FinalizeStart {
+    // A worker/system entry with only a bare id: resolve the owning tenant once
+    // (cross-tenant loader) so the RunError event is scoped, then hand the SAME
+    // scope to begin_finalize so it does not re-load.
+    let scope = match fluidbox_db::system_worker::get_session(&state.pool, id).await {
+        Ok(Some(s)) => TenantScope::assume(s.tenant_id),
+        Ok(None) => return FinalizeStart::Missing,
+        Err(e) => {
+            tracing::error!("fail {id} tenant resolve failed: {e}");
+            return FinalizeStart::DbError;
+        }
+    };
     ledger::record(
         state,
+        scope,
         id,
         Actor::System,
         EventBody::RunError {
@@ -204,6 +382,7 @@ pub async fn fail(state: &AppState, id: Uuid, reason: &str) -> FinalizeStart {
             reason: Some(reason),
             want_quiesce: true,
         },
+        Some(scope),
     )
     .await
 }
@@ -214,7 +393,11 @@ pub async fn fail(state: &AppState, id: Uuid, reason: &str) -> FinalizeStart {
 /// worktree, then collect. `Persisted { created: true }` means THIS call
 /// recorded the cancellation; a lost race means some other outcome already
 /// owns the run — callers must not report "cancelled" then.
-pub async fn cancel(state: &AppState, id: Uuid, reason: &str) -> FinalizeStart {
+pub async fn cancel(state: &AppState, scope: TenantScope, id: Uuid, reason: &str) -> FinalizeStart {
+    // Callers reach this only after loading the session UNDER `scope` (the
+    // authenticated handler proved ownership; the concurrency-replace path holds
+    // the run it just resolved), so the tenant is already authorized — pass it
+    // through instead of re-resolving it cross-tenant in begin_finalize.
     begin_finalize(
         state,
         id,
@@ -224,6 +407,7 @@ pub async fn cancel(state: &AppState, id: Uuid, reason: &str) -> FinalizeStart {
             reason: Some(reason),
             want_quiesce: true,
         },
+        Some(scope),
     )
     .await
 }
@@ -232,10 +416,32 @@ pub async fn cancel(state: &AppState, id: Uuid, reason: &str) -> FinalizeStart {
 /// enter the wind-down state THE WINNING INTENT implies, and kick the driver.
 /// Idempotent: a racing second caller receives the winner's row and derives
 /// everything from it — its own outcome/quiesce arguments are discarded.
-async fn begin_finalize(state: &AppState, id: Uuid, params: FinalizeParams<'_>) -> FinalizeStart {
+async fn begin_finalize(
+    state: &AppState,
+    id: Uuid,
+    params: FinalizeParams<'_>,
+    // Some when the caller ALREADY resolved (and authorized) the session's
+    // tenant — the authenticated cancel path passes its scoped row's scope so
+    // this does not re-load cross-tenant. None on the worker/system entries
+    // (finalize_reported/forced, the crash-recovery `fail`), which hold only a
+    // bare id and resolve it here.
+    pre_scope: Option<TenantScope>,
+) -> FinalizeStart {
     use fluidbox_db::BeginFinalization as B;
+    let scope = match pre_scope {
+        Some(s) => s,
+        None => match fluidbox_db::system_worker::get_session(&state.pool, id).await {
+            Ok(Some(s)) => TenantScope::assume(s.tenant_id),
+            Ok(None) => return FinalizeStart::Missing,
+            Err(e) => {
+                tracing::error!("begin_finalization {id} tenant resolve failed: {e}");
+                return FinalizeStart::DbError;
+            }
+        },
+    };
     let begun = fluidbox_db::begin_finalization(
         &state.pool,
+        scope,
         id,
         params.outcome,
         params.summary,
@@ -265,7 +471,7 @@ async fn begin_finalize(state: &AppState, id: Uuid, params: FinalizeParams<'_>) 
     // arguments — the /result⇄cancel race fix). Failure here is fine: the
     // driver re-materializes the state from the intent.
     if SessionStatus::parse(&status).is_some_and(|s| !s.is_winding_down()) {
-        enter_winddown(state, id, &row).await;
+        enter_winddown(state, scope, id, &row, None).await;
     }
 
     let state2 = state.clone();
@@ -285,16 +491,33 @@ async fn begin_finalize(state: &AppState, id: Uuid, params: FinalizeParams<'_>) 
 /// wants quiesce (the runner's heartbeat channel keys off that status) —
 /// emitting `QuiesceRequested` only when Cancelling actually LANDS, wherever
 /// that happens (first caller or crash recovery). Derives only from the row.
-async fn enter_winddown(state: &AppState, id: Uuid, intent: &fluidbox_db::FinalizationRow) -> bool {
+/// `epoch` is `Some` on the DRIVER path (fenced by the session lease) and `None`
+/// on the REQUEST path (`begin_finalize`, reached from cancel / `finalize_forced`
+/// / watchdog `fail`). Request-side materialization deliberately stays unfenced:
+/// it is the idempotent expression of an intent that ANY replica may record, and
+/// making it depend on who currently drives the session would let a lease held
+/// elsewhere swallow a user's cancel. The driver re-materializes the same state
+/// under its own fence a moment later either way.
+async fn enter_winddown(
+    state: &AppState,
+    scope: TenantScope,
+    id: Uuid,
+    intent: &fluidbox_db::FinalizationRow,
+    epoch: Option<i64>,
+) -> bool {
     let target = if intent.needs_quiesce {
         SessionStatus::Cancelling
     } else {
         SessionStatus::Finalizing
     };
-    let applied = transition(state, id, target, intent.reason.as_deref()).await;
+    let applied = match epoch {
+        Some(e) => transition_fenced(state, scope, id, target, intent.reason.as_deref(), e).await,
+        None => transition(state, scope, id, target, intent.reason.as_deref()).await,
+    };
     if applied && intent.needs_quiesce {
         ledger::record(
             state,
+            scope,
             id,
             Actor::System,
             EventBody::QuiesceRequested {
@@ -357,7 +580,20 @@ fn plan_step(
 /// release the intent — only a session that verifiably does not exist, or a
 /// fully reconciled terminal session, does.
 pub async fn drive_finalization(state: &AppState, id: Uuid) {
-    let claimed = fluidbox_db::claim_finalization(&state.pool, id, FINALIZE_CLAIM_STALE_SECS).await;
+    // Recovery/terminal entry carries only a bare id (from the recovery worker
+    // or a spawned finalize). Resolve the owning tenant once via the
+    // cross-tenant loader; a finalization intent always has a session (FK), so
+    // None here means nothing is left to drive.
+    let scope = match fluidbox_db::system_worker::get_session(&state.pool, id).await {
+        Ok(Some(s)) => TenantScope::assume(s.tenant_id),
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("drive_finalization {id}: tenant resolve failed: {e}");
+            return;
+        }
+    };
+    let claimed =
+        fluidbox_db::claim_finalization(&state.pool, scope, id, FINALIZE_CLAIM_STALE_SECS).await;
     let intent = match claimed {
         Ok(Some(i)) => i,
         Ok(None) => return, // another driver owns it, or no intent — nothing to do
@@ -367,17 +603,43 @@ pub async fn drive_finalization(state: &AppState, id: Uuid) {
         }
     };
 
+    // Phase E (#33; Gap 13): the finalization claim (0011) is session-scoped and
+    // TIME-based only — no owner, no fencing token. The driver lease adds both.
+    // Acquired AFTER the claim (the claim is still what serializes drivers) and
+    // renewed at every loop turn; its epoch fences every lifecycle mutation below,
+    // so a driver that stalled past its lease and had the session stolen cannot
+    // resurrect a wind-down the new owner has moved past.
     let mut skip_collection = false;
     // Each arm either returns or strictly advances the machine
     // (active → Cancelling → Finalizing → collect/terminal → reconciled);
     // the bound is a belt against status flapping ever regressing.
     for _ in 0..6 {
-        let session = match fluidbox_db::get_session(&state.pool, id).await {
+        // Acquire on the first turn, renew on every later one (the same owner
+        // keeps the same epoch). A lease held by ANOTHER replica stops this driver
+        // rather than letting it mutate behind the owner.
+        //
+        // RELEASE THE CLAIM ON THE WAY OUT. `claim_finalization` above already
+        // stamped `claimed_at`, so simply returning would park the intent for the
+        // full 420 s stale window while this replica does no work — and every
+        // replica's 20 s finalize worker would be turned away by that stamp. That
+        // is a user-visible cancel stall in exactly the multi-replica mode this
+        // lease exists to support (a cancel arriving on a non-holder while the
+        // holder's lease is fresh). Same idiom as the provisioning-settle deferral
+        // below: a deliberate hand-back releases, it does not squat.
+        let Some(epoch) = hold_lease(state, scope, id).await else {
+            fluidbox_db::release_finalization_claim(&state.pool, scope, id)
+                .await
+                .ok();
+            return;
+        };
+        let session = match fluidbox_db::get_session(&state.pool, scope, id).await {
             Ok(Some(s)) => s,
             Ok(None) => {
                 // Verifiably gone (not a transient error) — nothing left to
                 // reconcile; release the intent.
-                fluidbox_db::delete_finalization(&state.pool, id).await.ok();
+                fluidbox_db::delete_finalization(&state.pool, scope, id)
+                    .await
+                    .ok();
                 return;
             }
             Err(e) => {
@@ -407,8 +669,8 @@ pub async fn drive_finalization(state: &AppState, id: Uuid) {
                 // On failure the loop re-reads: a racing writer may have
                 // moved the session (fine — plan again); a transient DB
                 // error leaves the intent for the next drive.
-                if !enter_winddown(state, id, &intent).await {
-                    match fluidbox_db::get_session(&state.pool, id).await {
+                if !enter_winddown(state, scope, id, &intent, Some(epoch)).await {
+                    match fluidbox_db::get_session(&state.pool, scope, id).await {
                         Ok(Some(s))
                             if s.status_enum().is_winding_down()
                                 || s.status_enum().is_terminal() => {} // progressed — re-plan
@@ -425,16 +687,18 @@ pub async fn drive_finalization(state: &AppState, id: Uuid) {
                     Some(handle) => !wait_runner_exit(state, &handle, deadline).await,
                     None => false,
                 };
-                transition(
+                transition_fenced(
                     state,
+                    scope,
                     id,
                     SessionStatus::Finalizing,
                     intent.reason.as_deref(),
+                    epoch,
                 )
                 .await;
             }
             WinddownStep::Collect => {
-                collect_and_terminalize(state, id, &intent, skip_collection).await;
+                collect_and_terminalize(state, scope, id, &intent, skip_collection, epoch).await;
                 return;
             }
         }
@@ -521,11 +785,13 @@ const MISSING_DIFF_PREFIX: &str = "(diff unavailable";
 /// transition is confirmed.
 async fn collect_and_terminalize(
     state: &AppState,
+    scope: TenantScope,
     id: Uuid,
     intent: &fluidbox_db::FinalizationRow,
     skip_collection: bool,
+    epoch: i64,
 ) {
-    let Ok(Some(session)) = fluidbox_db::get_session(&state.pool, id).await else {
+    let Ok(Some(session)) = fluidbox_db::get_session(&state.pool, scope, id).await else {
         return;
     };
 
@@ -539,7 +805,7 @@ async fn collect_and_terminalize(
     // previous drive stored. A real diff (including "(no changes)") is
     // final; a missing-marker may be upgraded by a successful re-collection
     // but never re-recorded.
-    let stored = match fluidbox_db::diff_artifact_content(&state.pool, id).await {
+    let stored = match fluidbox_db::diff_artifact_content(&state.pool, scope, id).await {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("diff artifact read failed for {id}: {e} — retrying next drive");
@@ -552,7 +818,7 @@ async fn collect_and_terminalize(
     let have_any_diff = stored.is_some();
     let record_missing_once = |reason: String| async move {
         if expected_diff && !have_any_diff {
-            record_missing(state, id, &reason).await
+            record_missing(state, scope, id, &reason).await
         } else {
             Ok(())
         }
@@ -592,7 +858,7 @@ async fn collect_and_terminalize(
                     // A deliberate wait, not a failure: release the claim so
                     // the finalize worker retries at its cadence instead of
                     // waiting out the 420 s stale window.
-                    fluidbox_db::release_finalization_claim(&state.pool, id)
+                    fluidbox_db::release_finalization_claim(&state.pool, scope, id)
                         .await
                         .ok();
                     return;
@@ -624,6 +890,17 @@ async fn collect_and_terminalize(
                     return;
                 }
             } else {
+                // Provider side effect ahead: re-prove the lease first. Reading a
+                // worktree the new owner is already collecting (or has torn down)
+                // would let a stale driver store a losing diff as the audit
+                // artifact. `hold_lease` renews on success, so this also keeps the
+                // lease alive across a slow collection's start.
+                if hold_lease(state, scope, id).await != Some(epoch) {
+                    tracing::info!(
+                        "collect for {id} abandoned: orchestrator lease moved to another replica"
+                    );
+                    return;
+                }
                 let ctx = CollectContext {
                     session_id: id,
                     base_commit: session.base_commit.clone(),
@@ -635,7 +912,7 @@ async fn collect_and_terminalize(
                 .await;
                 let stored_ok = match collected {
                     Ok(Ok(CollectedArtifacts::Collected(arts))) => {
-                        store_collected(state, id, arts).await
+                        store_collected(state, scope, id, arts).await
                     }
                     Ok(Ok(CollectedArtifacts::Missing { reason })) => {
                         record_missing_once(reason).await
@@ -655,7 +932,7 @@ async fn collect_and_terminalize(
     // destroys the retry path (the intent is released after cleanup), so a
     // swallowed write here would lose the summary forever.
     if let Some(s) = intent.summary.as_deref() {
-        if fluidbox_db::set_result_summary(&state.pool, id, s)
+        if fluidbox_db::set_result_summary(&state.pool, scope, id, s)
             .await
             .is_err()
         {
@@ -663,6 +940,7 @@ async fn collect_and_terminalize(
         }
         if fluidbox_db::upsert_artifact(
             &state.pool,
+            scope,
             id,
             "summary",
             "summary.md",
@@ -685,14 +963,23 @@ async fn collect_and_terminalize(
     // The single-winner gate: delivery enqueue rides this transition;
     // RunResult and the rest of the terminal side effects are reconciled
     // exactly-once by the cleanup below (emit-if-missing under the claim).
-    if transition(state, id, terminal, intent.reason.as_deref()).await {
+    if transition_fenced(state, scope, id, terminal, intent.reason.as_deref(), epoch).await {
         finish_terminal_cleanup(state, &session, intent).await;
     } else {
         // The transition did not apply. If another driver already
         // terminalized, cleanup may still be owed; a transient failure
         // leaves the intent for the next drive. H2: the intent (and the
         // workspace, archive, and sandbox) are NEVER destroyed on this path.
-        match fluidbox_db::get_session(&state.pool, id).await {
+        //
+        // NOTE the honest scope of the epoch fence: it gates the TRANSITION,
+        // not every terminal side effect. A driver fenced out here still runs
+        // `finish_terminal_cleanup` once it observes the session terminal — by
+        // design, because cleanup is the retry ticket and is idempotent
+        // throughout (token revocation is an UPDATE, delivery enqueue is
+        // deduped, provider deletes are UID-preconditioned). Do NOT "tighten"
+        // this into a fenced-only path: that would strand cleanup whenever the
+        // winner died between transitioning and finishing.
+        match fluidbox_db::get_session(&state.pool, scope, id).await {
             Ok(Some(s)) if s.status_enum().is_terminal() => {
                 finish_terminal_cleanup(state, &s, intent).await;
             }
@@ -716,15 +1003,17 @@ async fn finish_terminal_cleanup(
     intent: &fluidbox_db::FinalizationRow,
 ) {
     let id = session.id;
+    let scope = TenantScope::assume(session.tenant_id);
     // Exactly-once RunResult: emitted only after a CONFIRMED terminal
     // transition, and emit-if-missing under the claim — a crash between the
     // terminal commit and the emit is healed here, and a re-drive after a
     // successful emit skips it.
-    match fluidbox_db::has_run_result_event(&state.pool, id).await {
+    match fluidbox_db::has_run_result_event(&state.pool, scope, id).await {
         Ok(true) => {}
         Ok(false) => {
             ledger::record(
                 state,
+                scope,
                 id,
                 Actor::Harness,
                 EventBody::RunResult {
@@ -736,7 +1025,7 @@ async fn finish_terminal_cleanup(
             // `record` swallows append failures — VERIFY before the intent
             // may ever be released, or a failed append loses the event
             // forever (exactly-once requires at-least-once first).
-            match fluidbox_db::has_run_result_event(&state.pool, id).await {
+            match fluidbox_db::has_run_result_event(&state.pool, scope, id).await {
                 Ok(true) => {}
                 _ => {
                     tracing::warn!(
@@ -751,7 +1040,7 @@ async fn finish_terminal_cleanup(
             return;
         }
     }
-    if let Err(e) = fluidbox_db::revoke_session_tokens(&state.pool, id).await {
+    if let Err(e) = fluidbox_db::revoke_session_tokens(&state.pool, scope, id).await {
         tracing::warn!("terminal reconcile {id}: token revoke failed: {e}");
         return;
     }
@@ -768,10 +1057,25 @@ async fn finish_terminal_cleanup(
         );
         return;
     }
+    // Phase E (E5) + Phase F (Task 3): terminate any live upstream MCP sessions
+    // this run opened ON ANY REPLICA (best-effort DELETE) and evict the local
+    // registry entries. Fired FIRE-AND-FORGET so a wedged upstream never blocks
+    // terminalization — which ALSO means the teardown is NOT gated by the
+    // finalization receipt: if this reconciler completes (reaps + deletes the
+    // intent below) while the spawned cleanup fails or the process dies first,
+    // there is NO re-drive from the intent scan. The deployment-wide sweeper is the
+    // only backstop, and it retires a durable row it cannot DELETE by marking it
+    // `swept` WITHOUT contacting upstream — a disclosed upstream-session-SLOT leak
+    // (never custody; invariant 9 forbids sending an unresolvable credential). A
+    // durable, awaited teardown receipt is the follow-up.
+    tokio::spawn({
+        let state = state.clone();
+        async move { crate::broker::run_terminal_mcp_cleanup(&state, id).await }
+    });
     // Reap MUST succeed (or the sandbox be verifiably gone) before the
     // workspace, archive, and intent go away — especially on Docker, where
     // nothing else ever kills the container.
-    if reap(state, id).await.is_err() {
+    if reap(state, scope, id).await.is_err() {
         return;
     }
     if !state.cfg.keep_workspaces {
@@ -779,16 +1083,19 @@ async fn finish_terminal_cleanup(
             tracing::warn!("workspace cleanup failed for {id}: {e} — retrying next drive");
             return;
         }
-        if let Err(e) = delete_archive(&state.cfg.data_dir, id) {
+        if let Err(e) = delete_archive(state, id).await {
             tracing::warn!("archive removal failed for {id}: {e} — retrying next drive");
             return;
         }
     }
-    fluidbox_db::delete_finalization(&state.pool, id).await.ok();
+    fluidbox_db::delete_finalization(&state.pool, scope, id)
+        .await
+        .ok();
 }
 
 async fn store_collected(
     state: &AppState,
+    scope: TenantScope,
     id: Uuid,
     arts: Vec<fluidbox_core::traits::CollectedArtifact>,
 ) -> sqlx::Result<()> {
@@ -801,10 +1108,19 @@ async fn store_collected(
             } else {
                 (a.content.clone(), a.content_type.clone())
             };
-        fluidbox_db::upsert_artifact(&state.pool, id, &a.kind, &a.name, &content, &content_type)
-            .await?;
+        fluidbox_db::upsert_artifact(
+            &state.pool,
+            scope,
+            id,
+            &a.kind,
+            &a.name,
+            &content,
+            &content_type,
+        )
+        .await?;
         ledger::record(
             state,
+            scope,
             id,
             Actor::System,
             EventBody::ArtifactCollected {
@@ -820,9 +1136,15 @@ async fn store_collected(
     Ok(())
 }
 
-async fn record_missing(state: &AppState, id: Uuid, reason: &str) -> sqlx::Result<()> {
+async fn record_missing(
+    state: &AppState,
+    scope: TenantScope,
+    id: Uuid,
+    reason: &str,
+) -> sqlx::Result<()> {
     fluidbox_db::upsert_artifact(
         &state.pool,
+        scope,
         id,
         "diff",
         "changes.patch",
@@ -832,6 +1154,7 @@ async fn record_missing(state: &AppState, id: Uuid, reason: &str) -> sqlx::Resul
     .await?;
     ledger::record(
         state,
+        scope,
         id,
         Actor::System,
         EventBody::ArtifactMissing {
@@ -844,47 +1167,105 @@ async fn record_missing(state: &AppState, id: Uuid, reason: &str) -> sqlx::Resul
 }
 
 async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
-    let session = fluidbox_db::get_session(&state.pool, session_id)
+    // Spawned with only a bare session id; resolve the owning tenant once via
+    // the cross-tenant loader, then scope every lifecycle write to it.
+    let session = fluidbox_db::system_worker::get_session(&state.pool, session_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("session vanished"))?;
+    let scope = TenantScope::assume(session.tenant_id);
     let run_spec: RunSpec = serde_json::from_value(session.run_spec.clone())?;
 
+    // Phase E (#33; Gap 13): take this replica's driver lease BEFORE the first
+    // lifecycle mutation and carry its epoch as the fencing token through the
+    // launch. Every step below re-holds it (a renew keeps the epoch), so if a
+    // finalizer on ANOTHER replica takes the session mid-launch the epoch moves
+    // and our remaining transitions match zero rows instead of fighting it. The
+    // pre-existing intra-replica fences (`launch_ownership`, the
+    // `set_sandbox_handle` attach fence) are unchanged and still do their job —
+    // the lease is the CROSS-replica layer above them.
+    let Some(mut epoch) = hold_lease(&state, scope, session_id).await else {
+        anyhow::bail!("another replica owns this session's orchestrator lease");
+    };
+
     // created → provisioning
-    if !transition(&state, session_id, SessionStatus::Provisioning, None).await {
+    if !transition_fenced(
+        &state,
+        scope,
+        session_id,
+        SessionStatus::Provisioning,
+        None,
+        epoch,
+    )
+    .await
+    {
         anyhow::bail!("could not enter provisioning");
     }
 
-    // Mint the session token the sandbox authenticates with.
-    let session_token = format!("fbx_sess_{}", uuid_token());
-    fluidbox_db::create_session_token(
-        &state.pool,
-        state.tenant_id,
-        session_id,
-        &session_token,
-        SESSION_TOKEN_TTL_SECS,
-    )
-    .await?;
+    // Mint the FOUR audience-scoped credentials the sandbox authenticates with
+    // (Gap 10, invariant 19). One `api_tokens` row per audience, each valid ONLY
+    // on its routes; all are built from `SESSION_TOKEN_PREFIX` — the SAME
+    // constant the event.rs redaction test derives its samples from — so the
+    // Redactor (which scrubs by prefix) covers every one and cannot silently
+    // drift off them. `revoke_session_tokens` revokes by session_id, so the
+    // terminal transition kills all four together.
+    let prefix = fluidbox_core::event::SESSION_TOKEN_PREFIX;
+    let tokens = SandboxTokens {
+        control: format!("{prefix}{}", uuid_token()),
+        tool: format!("{prefix}{}", uuid_token()),
+        llm: format!("{prefix}{}", uuid_token()),
+        workspace: format!("{prefix}{}", uuid_token()),
+    };
+    for (token, audience) in [
+        (&tokens.control, crate::auth::AUD_CONTROL),
+        (&tokens.tool, crate::auth::AUD_TOOL),
+        (&tokens.llm, crate::auth::AUD_LLM),
+        (&tokens.workspace, crate::auth::AUD_WORKSPACE),
+    ] {
+        fluidbox_db::create_session_token(
+            &state.pool,
+            scope,
+            session_id,
+            token,
+            SESSION_TOKEN_TTL_SECS,
+            audience,
+        )
+        .await?;
+    }
 
     // provisioning → initializing (workspace materialization, control-plane
     // side, BEFORE the agent starts — a bad repo fails here at zero model
     // spend). A refused transition means a finalizer took ownership (cancel,
-    // watchdog): stop BEFORE materializing or provisioning anything.
-    if !transition(&state, session_id, SessionStatus::Initializing, None).await {
+    // watchdog) or another replica stole the lease: stop BEFORE materializing or
+    // provisioning anything.
+    epoch = hold_lease(&state, scope, session_id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("orchestrator lease lost before workspace init"))?;
+    if !transition_fenced(
+        &state,
+        scope,
+        session_id,
+        SessionStatus::Initializing,
+        None,
+        epoch,
+    )
+    .await
+    {
         anyhow::bail!("session left active state before workspace init");
     }
-    let (workspace_dir, base_commit) = materialize_workspace(&state, session_id, &run_spec).await?;
+    let (workspace_dir, base_commit) =
+        materialize_workspace(&state, scope, session_id, &run_spec, epoch).await?;
 
     // Ownership gate AFTER materialization, BEFORE anything else is created
     // (the K8s archive write included): a finalizer that took the session
     // while we copied may already have run terminal cleanup and released its
     // intent — the loser must remove what IT created or nothing ever will.
-    if !launch_ownership(&state, session_id).await? {
-        abandon_launch(&state, session_id).await;
+    if !launch_ownership(&state, scope, session_id).await? {
+        abandon_launch(&state, scope, session_id).await;
         anyhow::bail!("session ownership lost during workspace init; launch abandoned");
     }
 
     let control_url = state.cfg.public_control_url.clone();
-    let env = build_runner_env(&run_spec, &control_url, session_id, &session_token);
+    let env = build_runner_env(&run_spec, &control_url, session_id, &tokens);
 
     // 512 KiB serialized runner-env ceiling (env injection is the v1 config
     // channel; a Kubernetes Secret caps ~1 MiB). Fail closed at zero spend.
@@ -915,6 +1296,13 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
         session_id,
         image: run_spec.runner_image.clone(),
         env,
+        // The provider routes these per-audience (k8s: one Secret key each) and
+        // is the ONLY path the `workspace` token takes — it is deliberately
+        // absent from `env`, and NEITHER provider puts it in the runner
+        // container: k8s hands it to the init container alone, Docker (a
+        // HostDir transport with no init container and no packed archive) does
+        // not hand it out at all.
+        tokens: tokens.clone(),
         workspace_host_dir: workspace_dir.as_ref().map(|p| p.display().to_string()),
         workspace_archive,
         active_deadline_secs: run_spec.budgets.max_wall_clock_secs,
@@ -923,15 +1311,76 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
 
     // Ownership re-check immediately before creating a sandbox: a finalizer
     // that took the session during archive packing must find no container to
-    // race (the attach fence below catches the residual instants).
-    if !launch_ownership(&state, session_id).await? {
-        abandon_launch(&state, session_id).await;
+    // race (the attach fence below catches the residual instants). The lease
+    // re-hold is the cross-replica half of the same question — provisioning is a
+    // PROVIDER side effect, so it runs only while we still hold the session.
+    if hold_lease(&state, scope, session_id).await != Some(epoch)
+        || !launch_ownership(&state, scope, session_id).await?
+    {
+        abandon_launch(&state, scope, session_id).await;
         anyhow::bail!("session ownership lost before provisioning; launch abandoned");
     }
     let handle = state.provider.provision(&sandbox_spec).await?;
-    let attached =
-        fluidbox_db::set_sandbox_handle(&state.pool, session_id, &serde_json::to_value(&handle)?)
-            .await?;
+    // Gap 6 (Phase F): record the workload identity the provider reported, BEFORE
+    // the handle attach. The ordering is the point — `provision` returns only once
+    // the runner container is Running, so the sandbox may already be posting to
+    // `:8788`; every instant between "workload is live" and "its identity is
+    // recorded" is an instant where its own requests count as unbindable. Writing
+    // the identity first makes that window as small as a post-hoc capture can be.
+    // (It cannot be eliminated: the address does not exist until the pod is
+    // scheduled, so there is nothing to reserve in advance.) The residual window is
+    // FAIL-OPEN, not fail-closed, and deliberately so — an unbindable request is
+    // admitted, so a slow write costs coverage, never a broken run.
+    //
+    // A provider that reports nothing (Docker) writes an empty array, which is the
+    // same "unbindable" state as NULL. A failure here is logged and NOT fatal: this
+    // is defence in depth on a plane that still has its bearer tokens, and killing a
+    // provisioned run over it would trade a real outage for a marginal control.
+    let workload_addrs = crate::auth::workload_addrs_from_handle(&handle);
+    if let Err(e) =
+        fluidbox_db::set_workload_addrs(&state.pool, scope, session_id, &workload_addrs).await
+    {
+        // In ENFORCE mode, a run whose provider REPORTED a bindable address but whose
+        // identity we could NOT record would be admitted on the bearer token alone for
+        // its ENTIRE life — indistinguishable at the gate from the legitimately
+        // unbindable classes (Docker, pre-0025, adopted orphans). A transient write
+        // failure here would therefore silently defeat the enforcement the operator
+        // chose (a stolen token from another pod would be admitted). So refuse to run
+        // it unbound: terminate the just-provisioned sandbox (the same cleanup as a
+        // lost attach below) and fail the launch. observe/off keep the best-effort
+        // warning — there the binding is coverage, not a correctness boundary, and an
+        // empty `workload_addrs` (Docker reports none) has nothing to bind regardless.
+        if matches!(
+            state.cfg.workload_identity,
+            crate::config::WorkloadIdentityMode::Enforce
+        ) && !workload_addrs.is_empty()
+        {
+            tracing::error!(
+                "enforce: could not record workload identity for {session_id} ({e}); refusing to \
+                 run it unbound (terminating the sandbox)"
+            );
+            if let Err(te) = state.provider.terminate(&handle).await {
+                tracing::warn!(
+                    "workload-fail terminate for {session_id} failed ({te}); finalizer discovery will reap"
+                );
+            }
+            abandon_launch(&state, scope, session_id).await;
+            anyhow::bail!(
+                "enforce mode: workload identity for {session_id} could not be recorded; launch refused"
+            );
+        }
+        tracing::warn!(
+            "failed to record workload identity for {session_id} ({e}); this run will be \
+             UNBINDABLE at the internal gateway (admitted on the bearer token alone)"
+        );
+    }
+    let attached = fluidbox_db::set_sandbox_handle(
+        &state.pool,
+        scope,
+        session_id,
+        &serde_json::to_value(&handle)?,
+    )
+    .await?;
     if !attached {
         // The session entered wind-down or terminal while we were
         // provisioning — the finalizer owns it now. Best-effort immediate
@@ -943,18 +1392,45 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
                 "late-provision terminate for {session_id} failed ({e}); finalizer discovery will reap"
             );
         }
-        abandon_launch(&state, session_id).await;
+        abandon_launch(&state, scope, session_id).await;
         anyhow::bail!(
             "session left active state during provisioning; sandbox handed to the finalizer"
         );
     }
 
-    // initializing → running (traffic is now expected)
-    transition(&state, session_id, SessionStatus::Running, None).await;
-    fluidbox_db::heartbeat(&state.pool, session_id).await.ok();
+    // initializing → running (traffic is now expected).
+    //
+    // The result is HONORED (#33 review 4). Discarding it used to mean a
+    // transient DB error — or a transition refused because another replica took
+    // the session between the attach fence and here — left a LIVE sandbox parked
+    // in `initializing` behind a timeline that said "sandbox launched", while
+    // `run()` returned Ok so nothing initiated recovery; the stale-launch
+    // watchdog only notices ~30 minutes later. Failing instead routes through
+    // `spawn_run`'s `fail()`, which finalizes the session and reaps the sandbox
+    // now. The sandbox is already attached, so the finalizer terminates it from
+    // the handle — this is a fail-fast, not a leak.
+    if !transition_fenced(
+        &state,
+        scope,
+        session_id,
+        SessionStatus::Running,
+        None,
+        epoch,
+    )
+    .await
+    {
+        anyhow::bail!(
+            "could not enter running after the sandbox attached; failing the launch so the \
+             finalizer reaps it instead of leaving a live sandbox in 'initializing'"
+        );
+    }
+    fluidbox_db::heartbeat(&state.pool, scope, session_id)
+        .await
+        .ok();
 
     ledger::record(
         &state,
+        scope,
         session_id,
         Actor::System,
         EventBody::AgentMessage {
@@ -970,18 +1446,27 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Assemble the runner env. The generic FLUIDBOX_* block is the harness-neutral
-/// runner contract; per-harness extras ride `harness::runner_env`.
+/// Assemble the RUNNER CONTAINER's env. The generic FLUIDBOX_* block is the
+/// harness-neutral runner contract; per-harness extras ride `harness::runner_env`.
+///
+/// Gap 10 env contract: `FLUIDBOX_SESSION_TOKEN` keeps its NAME but now carries
+/// ONLY the runner-control audience (runner-lib compatibility — the shared
+/// contract client still reads that var), `FLUIDBOX_TOOL_TOKEN` carries the
+/// tool-intent audience, and the LLM token reaches the agent through the
+/// per-harness var (`ANTHROPIC_API_KEY` / `FLUIDBOX_LLM_TOKEN`). The `workspace`
+/// token is DELIBERATELY ABSENT: it goes to the init container only, via the
+/// provider (`SandboxSpec::tokens`).
 pub fn build_runner_env(
     run_spec: &RunSpec,
     control_url: &str,
     session_id: Uuid,
-    session_token: &str,
+    tokens: &SandboxTokens,
 ) -> Vec<(String, String)> {
     let mut env = vec![
         ("FLUIDBOX_CONTROL_URL".into(), control_url.to_string()),
         ("FLUIDBOX_SESSION_ID".into(), session_id.to_string()),
-        ("FLUIDBOX_SESSION_TOKEN".into(), session_token.to_string()),
+        ("FLUIDBOX_SESSION_TOKEN".into(), tokens.control.clone()),
+        ("FLUIDBOX_TOOL_TOKEN".into(), tokens.tool.clone()),
         ("FLUIDBOX_TASK".into(), run_spec.task.clone()),
         (
             "FLUIDBOX_AUTONOMY".into(),
@@ -993,7 +1478,7 @@ pub fn build_runner_env(
     env.extend(crate::harness::runner_env(
         &run_spec.harness,
         control_url,
-        session_token,
+        &tokens.llm,
         &run_spec.model,
     ));
     if let Some(sp) = &run_spec.system_prompt {
@@ -1013,18 +1498,36 @@ pub fn serialized_env_len(env: &[(String, String)]) -> usize {
     env.iter().map(|(k, v)| k.len() + v.len() + 2).sum()
 }
 
-/// The on-disk archive path for a session (PVC-backed in Kubernetes; survives
-/// a `Recreate` upgrade so init can still pull after a control-plane restart).
-pub fn archive_path(data_dir: &std::path::Path, session_id: Uuid) -> PathBuf {
-    data_dir
-        .join("archives")
-        .join(format!("{session_id}.tar.gz"))
+/// The configured archive store (Phase F, Task 4): node-local files (`fs`, the
+/// default and today's behaviour byte for byte) or an S3-compatible bucket
+/// (`s3`), which is what lets ANY replica serve ANY run's archive GET.
+///
+/// Built per call rather than held on `AppState`: it is a few `String` clones
+/// plus an `Arc` bump on the shared HTTP client, and the archive path touches it
+/// a handful of times per run (pack, serve, delete, hourly sweep). `state.http`
+/// is the plain outbound client — an S3 endpoint is an operator-configured seam
+/// exactly like GitHub or the LLM upstream (routinely a private-network MinIO),
+/// never attacker input.
+pub fn archive_store(state: &AppState) -> std::sync::Arc<dyn fluidbox_workspace::ArchiveStore> {
+    fluidbox_workspace::build_store(
+        &state.cfg.archive_store,
+        &state.cfg.data_dir,
+        state.http.clone(),
+    )
+}
+
+/// The session a stored archive belongs to, from its `{uuid}.tar.gz` (or
+/// `.partial`) name. None = not an archive this server named.
+pub fn archive_session_id(key: &fluidbox_workspace::ArchiveKey) -> Option<Uuid> {
+    key.session_id()
 }
 
 /// Pack the materialized workspace into an immutable archive, store it, and
 /// return the descriptor the init container verifies. The archive URL is on
 /// the INTERNAL listener (the pod reaches it with the session token it already
-/// holds — nothing new becomes reachable).
+/// holds — nothing new becomes reachable), whichever backend actually holds the
+/// bytes: the sandbox has `zeroEgress` and could not dial an object store even
+/// if we handed it a presigned URL.
 async fn pack_and_store_archive(
     state: &AppState,
     session_id: Uuid,
@@ -1032,7 +1535,12 @@ async fn pack_and_store_archive(
 ) -> anyhow::Result<fluidbox_core::traits::WorkspaceArchive> {
     let data_dir = state.cfg.data_dir.clone();
     let max_bytes = state.cfg.max_archive_bytes;
-    let dest = archive_path(&data_dir, session_id);
+    let store = archive_store(state);
+    // For `fs` this IS the final path (so the pack below is unchanged); for `s3`
+    // it is node-local staging the `put` uploads and then unlinks. Packing always
+    // goes to local disk first: the digest and length must be known before a
+    // single-chunk PUT can be signed, and the archive must never transit RAM.
+    let dest = store.staging_path(session_id);
     // Streamed to disk (GzEncoder<File>) — the archive never lives in RAM,
     // and the size cap fails the run HERE, before any sandbox or model spend.
     let packed = tokio::task::spawn_blocking(move || {
@@ -1044,6 +1552,9 @@ async fn pack_and_store_archive(
         Ok::<_, anyhow::Error>(packed)
     })
     .await??;
+    // Publish. A failure here fails the run during `initializing`, at zero model
+    // spend — the same place an over-cap pack already failed it.
+    store.put(session_id, &packed).await?;
 
     // The pod pulls from the internal control URL (the same base the runner
     // uses for every other internal call).
@@ -1066,75 +1577,35 @@ async fn pack_and_store_archive(
 /// sweep (`workers::archive_ttl_sweep`) is the backstop for the crash window
 /// between the terminal transition and this call. NOT called on heartbeats:
 /// init containers may legitimately re-execute and re-fetch.
-pub fn delete_archive(data_dir: &std::path::Path, session_id: Uuid) -> std::io::Result<()> {
-    match std::fs::remove_file(archive_path(data_dir, session_id)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
+pub async fn delete_archive(
+    state: &AppState,
+    session_id: Uuid,
+) -> Result<(), fluidbox_workspace::StoreError> {
+    archive_store(state).delete(session_id).await
 }
 
-/// List stored archives (incl. orphaned `.partial`s) whose mtime is older
-/// than `ttl` — sweep CANDIDATES only. Deletion is decided by the caller
-/// against SESSION STATE: age alone must never kill an archive a long-budget
-/// run could still re-fetch on an init re-execution. Failures are LOGGED,
-/// never silent — a persistent PVC error would otherwise retain a leak with
-/// no operational evidence.
-pub fn stale_archive_candidates(
-    data_dir: &std::path::Path,
+/// List stored archives (incl. orphaned `.partial`s) untouched for longer than
+/// `ttl` — sweep CANDIDATES only. Deletion is decided by the caller against
+/// SESSION STATE: age alone must never kill an archive a long-budget run could
+/// still re-fetch on an init re-execution. Failures are LOGGED, never silent —
+/// a persistent storage error would otherwise retain a leak with no operational
+/// evidence.
+///
+/// On the `s3` backend this covers BOTH halves: the objects, and any node-local
+/// staging file a crash left behind before it could be uploaded. Without the
+/// second half, moving the archive to object storage would merely have swapped
+/// one leak for another.
+pub async fn stale_archive_candidates(
+    state: &AppState,
     ttl: std::time::Duration,
-) -> Vec<PathBuf> {
-    let dir = data_dir.join("archives");
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        // No archives ever stored (e.g. the Docker provider): quiet no-op.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+) -> Vec<fluidbox_workspace::ArchiveKey> {
+    match archive_store(state).stale_candidates(ttl).await {
+        Ok(c) => c,
         Err(e) => {
-            tracing::warn!("archive TTL sweep cannot read {}: {e}", dir.display());
-            return Vec::new();
-        }
-    };
-    let now = std::time::SystemTime::now();
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("archive TTL sweep cannot stat {}: {e}", path.display());
-                continue;
-            }
-        };
-        if !meta.is_file() {
-            continue;
-        }
-        let mtime = match meta.modified() {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!("archive TTL sweep: no mtime for {}: {e}", path.display());
-                continue;
-            }
-        };
-        // A future-dated mtime (clock skew) reads as fresh — conservative.
-        let stale = now
-            .duration_since(mtime)
-            .map(|age| age >= ttl)
-            .unwrap_or(false);
-        if stale {
-            out.push(path);
+            tracing::warn!("archive TTL sweep listing failed: {e}");
+            Vec::new()
         }
     }
-    out
-}
-
-/// The session a stored archive belongs to, from its `{uuid}.tar.gz`
-/// (or `.partial`) filename. None = not an archive this server named.
-pub fn archive_session_id(path: &std::path::Path) -> Option<Uuid> {
-    let name = path.file_name()?.to_str()?;
-    let stem = name
-        .strip_suffix(".tar.gz.partial")
-        .or_else(|| name.strip_suffix(".tar.gz"))?;
-    Uuid::parse_str(stem).ok()
 }
 
 pub fn env_size_breakdown(env: &[(String, String)]) -> String {
@@ -1186,8 +1657,10 @@ fn runner_capability_manifest(
 
 async fn materialize_workspace(
     state: &AppState,
+    scope: TenantScope,
     session_id: Uuid,
     run_spec: &RunSpec,
+    epoch: i64,
 ) -> anyhow::Result<(Option<PathBuf>, Option<String>)> {
     let data_dir = state.cfg.data_dir.clone();
     let (ws, repo, r#ref) = match &run_spec.workspace {
@@ -1201,6 +1674,7 @@ async fn materialize_workspace(
         }
         WorkspaceSpec::GitRepository {
             connection_id,
+            binding_id,
             clone_url,
             r#ref,
             commit_sha,
@@ -1209,11 +1683,43 @@ async fn materialize_workspace(
             // The credential is unsealed here, used for the fetch, and
             // dropped — it never reaches the RunSpec, sandbox env, ledger,
             // or artifacts.
-            let auth_header = match connection_id {
-                Some(cid) => Some(connection_auth_header(state, *cid).await?),
-                None => None,
+            let auth_header = match binding_id {
+                // Phase C: the fetch credential rides the run's frozen
+                // `workspace_fetch` binding — recheck it (status + generation +
+                // owner membership) and mechanically enforce the frozen resource
+                // scope IMMEDIATELY before credential injection (design
+                // :705-723). Authority `none` = public fetch, no credential.
+                Some(bid) => {
+                    workspace_binding_auth_header(
+                        state,
+                        scope,
+                        session_id,
+                        *bid,
+                        clone_url,
+                        r#ref.as_deref(),
+                        commit_sha.as_deref(),
+                    )
+                    .await?
+                }
+                // Legacy runs froze no binding — the embedded connection_id
+                // path, unchanged (status-only fresh check inside
+                // connection_auth_header).
+                None => match connection_id {
+                    Some(cid) => Some(connection_auth_header(state, scope, *cid).await?),
+                    None => None,
+                },
             };
             let (url, rf, sha) = (clone_url.clone(), r#ref.clone(), commit_sha.clone());
+            // Phase E: derive the clone egress policy from the shared boundary
+            // (dev seam + operator allowlist + proxy). The configured clone base
+            // becomes the file:// prefix gate; git runs out-of-process, so this
+            // resolve-and-validate is its SSRF boundary (TOCTOU residual disclosed).
+            let git_egress = fluidbox_workspace::GitEgressPolicy {
+                dev_loopback: state.egress_policy.dev_loopback,
+                allow_cidrs: state.egress_policy.allow_cidrs.clone(),
+                clone_base_file_prefix: state.egress_policy.github_clone_base.clone(),
+                proxy: state.egress_policy.proxy.clone(),
+            };
             let ws = tokio::task::spawn_blocking(move || {
                 fluidbox_workspace::materialize_git(
                     &data_dir,
@@ -1222,6 +1728,7 @@ async fn materialize_workspace(
                     rf.as_deref(),
                     sha.as_deref(),
                     auth_header.as_deref(),
+                    &git_egress,
                 )
             })
             .await??;
@@ -1242,13 +1749,36 @@ async fn materialize_workspace(
         }
     };
 
+    // RE-PROVE THE LEASE ADJACENT TO THE EFFECT (#33 review 3). The clone/copy
+    // above can take minutes; the epoch we carry was proven BEFORE it. In that
+    // window a cancel on another replica can steal the lease and terminalize the
+    // session — and neither write below is fenced on its own (`set_base_commit`
+    // has no epoch or status predicate, and `append_event` accepts any seq), so a
+    // stale driver would go on to stamp a base commit and post
+    // `WorkspaceInitialized` onto a run that is already over. Proving ownership
+    // here rather than only at the next provider step is the cleaner fence: it
+    // sits immediately before the mutations it authorizes.
+    //
+    // Failure is ABANDON, not just skip-the-writes: the materialized workspace on
+    // disk belongs to a launch that is no longer ours. `abandon_launch` removes it
+    // only when no finalizer owns the session (it checks the intent first), so the
+    // finalizer's collection can never be destroyed out from under it.
+    if hold_lease(state, scope, session_id).await != Some(epoch) {
+        abandon_launch(state, scope, session_id).await;
+        anyhow::bail!(
+            "orchestrator lease moved during workspace materialization; abandoning before the \
+             base-commit and WorkspaceInitialized writes"
+        );
+    }
+
     if let Some(bc) = &ws.base_commit {
-        fluidbox_db::set_base_commit(&state.pool, session_id, bc)
+        fluidbox_db::set_base_commit(&state.pool, scope, session_id, bc)
             .await
             .ok();
     }
     ledger::record(
         state,
+        scope,
         session_id,
         Actor::System,
         EventBody::WorkspaceInitialized {
@@ -1267,13 +1797,13 @@ async fn materialize_workspace(
 /// wind-down transition, so a status-only check has a gap) on a session
 /// still in an active state. Transient read errors are retried here: a
 /// blip must not fail a healthy, fully materialized run.
-async fn launch_ownership(state: &AppState, id: Uuid) -> anyhow::Result<bool> {
+async fn launch_ownership(state: &AppState, scope: TenantScope, id: Uuid) -> anyhow::Result<bool> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..3u32 {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        let session = match fluidbox_db::get_session(&state.pool, id).await {
+        let session = match fluidbox_db::get_session(&state.pool, scope, id).await {
             Ok(Some(s)) => s,
             Ok(None) => return Ok(false),
             Err(e) => {
@@ -1284,7 +1814,7 @@ async fn launch_ownership(state: &AppState, id: Uuid) -> anyhow::Result<bool> {
         if !session.status_enum().accepts_work() {
             return Ok(false);
         }
-        match fluidbox_db::get_finalization(&state.pool, id).await {
+        match fluidbox_db::get_finalization(&state.pool, scope, id).await {
             Ok(Some(_)) => return Ok(false),
             Ok(None) => return Ok(true),
             Err(e) => {
@@ -1303,11 +1833,11 @@ async fn launch_ownership(state: &AppState, id: Uuid) -> anyhow::Result<bool> {
 /// runner that posted /result before its handle attached would lose its
 /// patch). Only a fully reconciled session (terminal, intent released)
 /// leaves the loser's debris with no other owner.
-async fn abandon_launch(state: &AppState, id: Uuid) {
+async fn abandon_launch(state: &AppState, scope: TenantScope, id: Uuid) {
     if state.cfg.keep_workspaces {
         return;
     }
-    match fluidbox_db::get_finalization(&state.pool, id).await {
+    match fluidbox_db::get_finalization(&state.pool, scope, id).await {
         Ok(None) => {}
         Ok(Some(_)) => return, // the finalizer owns collection + cleanup
         Err(e) => {
@@ -1318,17 +1848,96 @@ async fn abandon_launch(state: &AppState, id: Uuid) {
     if let Err(e) = fluidbox_workspace::cleanup_workspace(&state.cfg.data_dir, id) {
         tracing::warn!("abandoned-launch workspace cleanup for {id}: {e}");
     }
-    let _ = delete_archive(&state.cfg.data_dir, id);
+    let _ = delete_archive(state, id).await;
+}
+
+/// Phase C workspace fetch: resolve the git auth header from the run's frozen
+/// `workspace_fetch` binding. Mechanically enforces the frozen resource scope
+/// (the URL — and ref/commit when pinned — actually about to be fetched must
+/// equal what the binding froze, design `:718`) BEFORE any credential access,
+/// then reruns the connection-authority recheck (status + generation + owner
+/// membership) IMMEDIATELY before minting the credential. Authority `none`
+/// binding ⇒ public fetch, no credential (`Ok(None)`). Fails closed: a stale
+/// binding, drifted scope, or revoked authority stops the run during
+/// `initializing`, before any model spend.
+async fn workspace_binding_auth_header(
+    state: &AppState,
+    scope: TenantScope,
+    session_id: Uuid,
+    binding_id: Uuid,
+    clone_url: &str,
+    r#ref: Option<&str>,
+    commit_sha: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let binding = fluidbox_db::get_run_resource_binding(&state.pool, scope, binding_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("workspace binding {binding_id} not found"))?;
+    // Belt-and-braces: the binding must belong to THIS session (both frozen in
+    // one transaction — a mismatch is corruption).
+    if binding.session_id != session_id {
+        anyhow::bail!("workspace binding {binding_id} does not belong to this session");
+    }
+    // Mechanical resource-scope enforcement BEFORE credential resolution.
+    enforce_workspace_scope(&binding.resource_scope, clone_url, r#ref, commit_sha)?;
+    // Public / credentialless fetch: no authority to recheck, no header to mint.
+    if binding.authority_kind == "none" {
+        return Ok(None);
+    }
+    // Connection authority: recheck immediately before the credential mints.
+    let conn = crate::broker::recheck_binding(state, scope, &binding)
+        .await
+        .map_err(|e| anyhow::anyhow!("workspace binding recheck failed: {e}"))?;
+    Ok(Some(
+        crate::connectors::fetch_auth_header(state, &conn).await?,
+    ))
+}
+
+/// The mechanical `workspace_fetch` scope check (design `:718-720`): the URL
+/// about to be fetched must equal the frozen `resource_scope.url`, and the
+/// ref/commit must match when the scope pins them (a null pin is unconstrained).
+/// A clone of an admitted repo is not authority over some other url the RunSpec
+/// might carry — so a mismatch refuses before any credential is read.
+fn enforce_workspace_scope(
+    resource_scope: &serde_json::Value,
+    clone_url: &str,
+    r#ref: Option<&str>,
+    commit_sha: Option<&str>,
+) -> anyhow::Result<()> {
+    let scope_url = resource_scope.get("url").and_then(|v| v.as_str());
+    if scope_url != Some(clone_url) {
+        anyhow::bail!("workspace fetch url does not match the frozen binding scope");
+    }
+    if let Some(pinned) = resource_scope.get("ref").and_then(|v| v.as_str()) {
+        if r#ref != Some(pinned) {
+            anyhow::bail!("workspace fetch ref does not match the frozen binding scope");
+        }
+    }
+    if let Some(pinned) = resource_scope.get("commit").and_then(|v| v.as_str()) {
+        if commit_sha != Some(pinned) {
+            anyhow::bail!("workspace fetch commit does not match the frozen binding scope");
+        }
+    }
+    Ok(())
 }
 
 /// Resolve a connection into an `Authorization` header value for git fetch
 /// via the provider's connector (PAT, or a minted App installation token).
 /// Fails closed: missing/revoked connection or missing key stops the run
 /// during `initializing` — before any model spend.
-async fn connection_auth_header(state: &AppState, connection_id: Uuid) -> anyhow::Result<String> {
-    let conn = fluidbox_db::get_connection(&state.pool, connection_id)
+async fn connection_auth_header(
+    state: &AppState,
+    scope: TenantScope,
+    connection_id: Uuid,
+) -> anyhow::Result<String> {
+    // Unfiltered read by design: workspace init runs from the frozen RunSpec's
+    // resolved binding (control-plane side, no request principal) — authority is
+    // the binding, not an owner-visibility viewer. The tenant is known (the run's
+    // scope), so this executor-generic read rides a scoped_tx (RLS: set the GUC).
+    let mut conn_tx = fluidbox_db::scoped_tx(&state.pool, scope).await?;
+    let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, connection_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("connection {connection_id} not found"))?;
+    conn_tx.commit().await?;
     crate::connectors::fetch_auth_header(state, &conn).await
 }
 
@@ -1343,8 +1952,8 @@ const TERMINATE_TIMEOUT: Duration = Duration::from_secs(60);
 /// the intent) and retry. A missing or unparseable stored handle consults
 /// provider truth (`list_managed` by session label) — a live sandbox must
 /// never survive because its handle was lost or is garbage.
-pub async fn reap(state: &AppState, id: Uuid) -> Result<(), ()> {
-    let session = match fluidbox_db::get_session(&state.pool, id).await {
+pub async fn reap(state: &AppState, scope: TenantScope, id: Uuid) -> Result<(), ()> {
+    let session = match fluidbox_db::get_session(&state.pool, scope, id).await {
         Ok(Some(s)) => s,
         Ok(None) => return Ok(()),
         Err(e) => {
@@ -1473,44 +2082,206 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ttl_sweep_removes_only_stale_archives() {
+    /// The TTL sweep's listing, through the store the DEFAULT configuration
+    /// builds (`ArchiveStoreConfig::Fs` + `data_dir`) — the same expression
+    /// `archive_store()` evaluates to, so this is the fs behaviour the archive
+    /// path had before it became backend-agnostic.
+    #[tokio::test]
+    async fn ttl_sweep_removes_only_stale_archives() {
         let tmp = std::env::temp_dir().join(format!("fbx-ttl-{}", uuid::Uuid::now_v7()));
         let archives = tmp.join("archives");
         std::fs::create_dir_all(&archives).unwrap();
         let sid = uuid::Uuid::now_v7();
         std::fs::write(archives.join(format!("{sid}.tar.gz")), b"x").unwrap();
         std::fs::write(archives.join("b.tar.gz"), b"y").unwrap();
+        let store = |dir: &std::path::Path| {
+            fluidbox_workspace::build_store(
+                &fluidbox_workspace::ArchiveStoreConfig::Fs,
+                dir,
+                reqwest::Client::new(),
+            )
+        };
 
         // A generous TTL keeps fresh archives.
-        assert!(stale_archive_candidates(&tmp, std::time::Duration::from_secs(3600)).is_empty());
+        assert!(store(&tmp)
+            .stale_candidates(std::time::Duration::from_secs(3600))
+            .await
+            .unwrap()
+            .is_empty());
         assert!(archives.join("b.tar.gz").exists());
 
         // TTL zero: everything with mtime <= now is a candidate — nothing is
         // DELETED here; the worker decides against session state.
-        let mut candidates = stale_archive_candidates(&tmp, std::time::Duration::ZERO);
-        candidates.sort();
+        let mut candidates = store(&tmp)
+            .stale_candidates(std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        candidates.sort_by_key(|k| k.to_string());
         assert_eq!(candidates.len(), 2);
+        // One is a session's archive, one is not a name this server writes —
+        // both are candidates, and `archive_session_id` tells the worker which.
+        assert!(candidates
+            .iter()
+            .any(|k| archive_session_id(k) == Some(sid)));
+        assert!(candidates.iter().any(|k| archive_session_id(k).is_none()));
         assert!(archives.join("b.tar.gz").exists());
 
         // A missing archives dir (Docker provider) is a quiet no-op.
-        assert!(stale_archive_candidates(&tmp.join("nope"), std::time::Duration::ZERO).is_empty());
+        assert!(store(&tmp.join("nope"))
+            .stale_candidates(std::time::Duration::ZERO)
+            .await
+            .unwrap()
+            .is_empty());
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// CONFIRMED FALSE-GREEN CLASS, closed by construction. `archive_store()` is
+    /// the ONE place the backend is chosen, and every archive call site
+    /// (pack/serve/delete/sweep) goes through it — but nothing in a unit test can
+    /// build an `AppState`, so a controller that hardcoded `Fs` or a literal
+    /// directory would disable the whole `s3` backend with every server test
+    /// still green (exactly the defect this phase already shipped once). Assert
+    /// the construction itself reads the CONFIGURED store and the CONFIGURED
+    /// data dir. Needles are split so this test is not an occurrence of what it
+    /// searches for.
+    #[test]
+    fn the_archive_store_is_built_from_configuration_not_hardcoded() {
+        let src = include_str!("orchestrator.rs");
+        let anchor = concat!("pub fn archive_", "store(state: &AppState)");
+        let start = src.find(anchor).expect("archive_store must exist");
+        let body = &src[start..start + 400];
+        for needle in [
+            concat!("state.cfg.archive_", "store"),
+            concat!("state.cfg.data_", "dir"),
+        ] {
+            assert!(
+                body.contains(needle),
+                "archive_store must build from `{needle}` — hardcoding it disables the \
+                 configured backend with every test still passing"
+            );
+        }
+        assert!(
+            !body.contains(concat!("ArchiveStoreConfig::", "Fs")),
+            "archive_store must not pin a backend"
+        );
+    }
+
+    /// CONFIRMED FALSE-GREEN, closed. A reviewer deleted the lease re-proof that
+    /// guards `collect_artifacts` and all 323 tests still passed: the fence is a
+    /// two-replica race, so nothing in the suite (and nothing DB-gated) observes
+    /// its absence. This guard asserts the statement itself, so removing it fails
+    /// immediately, with or without a database.
+    ///
+    /// What the re-proof buys: `collect_artifacts` reads (and the teardown that
+    /// follows destroys) the workspace. A driver whose lease was stolen mid-drive
+    /// would otherwise read a worktree the NEW owner is already collecting or has
+    /// torn down, and store the loser's diff as the run's audit artifact.
+    ///
+    /// Sliced to the branch between the runner-exit check and the collect call —
+    /// the prose above it names both — and every needle is split so this test is
+    /// not itself an occurrence of what it searches for.
+    #[test]
+    fn the_collect_path_re_proves_the_lease_before_touching_the_workspace() {
+        let src = include_str!("orchestrator.rs");
+        let branch_anchor = concat!("if !runner_", "gone {");
+        let collect_anchor = concat!("state.provider.collect_", "artifacts(");
+        let start = src
+            .find(branch_anchor)
+            .expect("the runner-exit branch exists");
+        let end = src[start..]
+            .find(collect_anchor)
+            .map(|i| start + i)
+            .expect("the collect call follows it");
+        let needle = concat!("hold_lease(state, scope, id).await != ", "Some(epoch)");
+        assert!(
+            src[start..end].contains(needle),
+            "the collect path must re-prove the driver lease (`{needle}`) before \
+             reading the workspace; without it a stale driver whose session was \
+             stolen still collects, and stores a losing diff as the audit artifact"
+        );
+    }
+
+    /// #33 review 3, same class as the guard above and closed the same way. The
+    /// lease is proven once before workspace materialization and not re-proven
+    /// until the pre-`provision` gate; a clone can take minutes. `set_base_commit`
+    /// carries NO epoch or status predicate and `append_event` accepts any seq, so
+    /// a driver whose session was cancelled and terminalized on another replica
+    /// mid-clone would still stamp a base commit and post `WorkspaceInitialized`
+    /// onto a finished run. Only a two-replica race observes that, so this asserts
+    /// the statement — needles split so the test is not its own evidence.
+    #[test]
+    fn the_workspace_writes_re_prove_the_lease_before_mutating_the_session() {
+        let src = include_str!("orchestrator.rs");
+        let fn_anchor = concat!("async fn materialize_", "workspace(");
+        let write_anchor = concat!("fluidbox_db::set_base_", "commit(");
+        let start = src.find(fn_anchor).expect("materialize_workspace exists");
+        let end = src[start..]
+            .find(write_anchor)
+            .map(|i| start + i)
+            .expect("the base-commit write lives inside it");
+        let needle = concat!(
+            "hold_lease(state, scope, session_id).await != ",
+            "Some(epoch)"
+        );
+        assert!(
+            src[start..end].contains(needle),
+            "materialize_workspace must re-prove the driver lease (`{needle}`) after \
+             the clone and before the base-commit / WorkspaceInitialized writes; \
+             without it a stale driver mutates a session another replica already \
+             terminalized"
+        );
+    }
+
+    /// #33 review 4. The `initializing → running` CAS used to be called for effect
+    /// and its boolean dropped, so a refused or errored transition left a LIVE,
+    /// already-attached sandbox parked in `initializing` behind a timeline that
+    /// said it had launched — and `run()` returned `Ok`, so nothing initiated
+    /// recovery until the ~30-minute stale-launch watchdog. Honoring it is a
+    /// one-token change and reverts just as easily, so it is asserted here.
+    #[test]
+    fn the_launch_honors_the_final_running_transition() {
+        let src = include_str!("orchestrator.rs");
+        let start = src
+            .find(concat!("// initializing → ", "running"))
+            .expect("the final launch transition is commented");
+        let end = src[start..]
+            .find(concat!("sandbox launched", " ("))
+            .map(|i| start + i)
+            .expect("the launched ledger line follows it");
+        let needle = concat!("if !transition_", "fenced(");
+        assert!(
+            src[start..end].contains(needle),
+            "the launch must FAIL when the initializing→running transition does not \
+             apply (`{needle}`); discarding it reports success over a live sandbox \
+             stuck in 'initializing'"
+        );
     }
 
     #[test]
     fn archive_filenames_map_back_to_their_session() {
+        use fluidbox_workspace::ArchiveKey;
         let sid = uuid::Uuid::now_v7();
-        let p = std::path::PathBuf::from(format!("/data/archives/{sid}.tar.gz"));
-        assert_eq!(archive_session_id(&p), Some(sid));
-        let partial = std::path::PathBuf::from(format!("/data/archives/{sid}.tar.gz.partial"));
-        assert_eq!(archive_session_id(&partial), Some(sid));
+        let local = |s: String| ArchiveKey::Local(std::path::PathBuf::from(s));
         assert_eq!(
-            archive_session_id(std::path::Path::new("/data/archives/junk.tar.gz")),
+            archive_session_id(&local(format!("/data/archives/{sid}.tar.gz"))),
+            Some(sid)
+        );
+        assert_eq!(
+            archive_session_id(&local(format!("/data/archives/{sid}.tar.gz.partial"))),
+            Some(sid)
+        );
+        // The same mapping over an object key — the sweep's liveness check must
+        // work identically whichever backend produced the candidate.
+        assert_eq!(
+            archive_session_id(&ArchiveKey::Object(format!("archives/{sid}.tar.gz"))),
+            Some(sid)
+        );
+        assert_eq!(
+            archive_session_id(&local("/data/archives/junk.tar.gz".into())),
             None
         );
         assert_eq!(
-            archive_session_id(std::path::Path::new("/data/archives/notatar")),
+            archive_session_id(&local("/data/archives/notatar".into())),
             None
         );
     }

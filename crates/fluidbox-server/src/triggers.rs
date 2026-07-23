@@ -3,8 +3,9 @@
 //! allows and nothing else. §17 #6 (settled): caller task/workspace
 //! overrides are opt-in per subscription, default OFF.
 
-use crate::auth::{Admin, TriggerAuth};
+use crate::auth::{Principal, TriggerAuth};
 use crate::error::{ApiError, ApiResult};
+use crate::rbac;
 use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
@@ -121,6 +122,7 @@ pub fn narrow_workspace(
         r#ref,
         commit_sha,
         checkout_mode,
+        ..
     } = base
     else {
         return Err(
@@ -169,6 +171,9 @@ pub fn narrow_workspace(
     };
     Ok(WorkspaceSpec::GitRepository {
         connection_id: *connection_id,
+        // A narrowed workspace starts unbound; create_run resolves its
+        // workspace_fetch binding (Task 5), never narrow-time.
+        binding_id: None,
         repository,
         clone_url,
         r#ref: req.r#ref.clone().or_else(|| r#ref.clone()),
@@ -282,22 +287,27 @@ pub struct ScheduleInput {
 }
 
 pub async fn create(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Json(req): Json<CreateTrigger>,
 ) -> ApiResult<Json<Value>> {
+    if !rbac::can_manage_subscriptions(&principal) {
+        return Err(ApiError::Forbidden(
+            "managing trigger subscriptions requires admin or owner".into(),
+        ));
+    }
+    let scope = principal.scope();
     let name = req.name.trim();
     if name.is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
     }
     let agent = match Uuid::parse_str(&req.agent) {
-        Ok(id) => fluidbox_db::get_agent(&state.pool, id).await?,
-        Err(_) => fluidbox_db::get_agent_by_name(&state.pool, state.tenant_id, &req.agent).await?,
+        Ok(id) => fluidbox_db::get_agent(&state.pool, scope, id).await?,
+        Err(_) => fluidbox_db::get_agent_by_name(&state.pool, scope, &req.agent).await?,
     }
-    .filter(|a| a.tenant_id == state.tenant_id)
     .ok_or_else(|| ApiError::BadRequest(format!("unknown agent '{}'", req.agent)))?;
     if let Some(rid) = req.pinned_revision_id {
-        fluidbox_db::get_revision(&state.pool, rid)
+        fluidbox_db::get_revision(&state.pool, scope, rid)
             .await?
             .filter(|r| r.agent_id == agent.id)
             .ok_or_else(|| {
@@ -329,8 +339,8 @@ pub async fn create(
         None => None,
         Some(keep) => {
             let rev = match req.pinned_revision_id {
-                Some(rid) => fluidbox_db::get_revision(&state.pool, rid).await?,
-                None => fluidbox_db::latest_revision(&state.pool, agent.id).await?,
+                Some(rid) => fluidbox_db::get_revision(&state.pool, scope, rid).await?,
+                None => fluidbox_db::latest_revision(&state.pool, scope, agent.id).await?,
             }
             .ok_or_else(|| ApiError::BadRequest("agent has no revisions".into()))?;
             let pins: Vec<fluidbox_core::capability::BundleRef> =
@@ -406,10 +416,17 @@ pub async fn create(
             }
             let cid = Uuid::parse_str(conn_str.trim())
                 .map_err(|_| ApiError::BadRequest("connection must be a connection id".into()))?;
-            let conn = fluidbox_db::get_connection(&state.pool, cid)
+            // Tenant-scoped (not owner-scoped) by design: a subscription CONSUMES
+            // a connection, and the design routes that authority through run
+            // resource bindings (invariant 21, Task 5) + the broker
+            // owner-membership recheck (Task 6), not Task 4's connection-object
+            // viewer. Subscription create is admin/owner-gated already. See
+            // task-4-report "Deferred / flagged".
+            let mut conn_tx = fluidbox_db::scoped_tx(&state.pool, scope).await?;
+            let conn = fluidbox_db::get_connection(&mut *conn_tx, scope, cid)
                 .await?
-                .filter(|c| c.tenant_id == state.tenant_id)
                 .ok_or_else(|| ApiError::BadRequest(format!("unknown connection {cid}")))?;
+            conn_tx.commit().await?;
             if conn.status != "active" {
                 return Err(ApiError::BadRequest(format!(
                     "connection is {} — reconnect it first",
@@ -425,12 +442,14 @@ pub async fn create(
             // Legacy rows carry their own webhook secret; seamless rows
             // receive events on their REGISTRATION's app-level ingress.
             let can_receive = match conn.registration_id {
-                Some(rid) => {
-                    fluidbox_db::github_app_registration_webhook_secret_sealed(&state.pool, rid)
-                        .await?
-                        .is_some()
-                }
-                None => fluidbox_db::connection_webhook_secret_sealed(&state.pool, cid)
+                Some(rid) => fluidbox_db::github_app_registration_webhook_secret_sealed(
+                    &state.pool,
+                    scope,
+                    rid,
+                )
+                .await?
+                .is_some(),
+                None => fluidbox_db::connection_webhook_secret_sealed(&state.pool, scope, cid)
                     .await?
                     .is_some(),
             };
@@ -519,7 +538,17 @@ pub async fn create(
     };
     let workspace_value = match req.workspace {
         None => None,
-        Some(input) => match crate::api::resolve_workspace_input(&state, input).await? {
+        // Subscription config is an admin/owner mutation → operator lens; the
+        // per-run authority is re-resolved server-side at fire time.
+        Some(input) => match crate::api::resolve_workspace_input(
+            &state,
+            scope,
+            fluidbox_db::ConnectionViewer::All,
+            crate::api::LocalPathAuthority::of(&principal),
+            input,
+        )
+        .await?
+        {
             WorkspaceSpec::Scratch => None,
             spec => Some(serde_json::to_value(&spec)?),
         },
@@ -533,6 +562,13 @@ pub async fn create(
             if !(url.starts_with("http://") || url.starts_with("https://")) {
                 return Err(ApiError::BadRequest("callback_url must be http(s)".into()));
             }
+            // I2 / E3: admit the callback destination at SAVE time — a private/
+            // metadata/plain-http (outside the dev seam) target is refused here,
+            // mirroring the dial-time admission in the delivery worker. Existing
+            // rows are untouched and still enforced at dial. admit_url is
+            // literal+scheme only (no blocking DNS in the request handler).
+            crate::egress::admit_url(url, &state.egress_policy)
+                .map_err(|e| ApiError::BadRequest(format!("callback_url rejected: {e}")))?;
             let sealer = state.sealer.as_ref().ok_or_else(|| {
                 ApiError::BadRequest(
                     "signed callbacks are disabled: set FLUIDBOX_CREDENTIAL_KEY on the server"
@@ -540,9 +576,19 @@ pub async fn create(
                 )
             })?;
             let secret = random_hex_token(SECRET_PREFIX);
-            let sealed = sealer.seal(&secret);
-            let dests =
-                serde_json::to_value(vec![ResultDestination::SignedWebhook { url: url.clone() }])?;
+            let sealed = sealer
+                .seal(
+                    &secret,
+                    crate::seal::SealCtx::new(
+                        scope.tenant_id(),
+                        crate::seal::SealFamily::SubscriptionCallbackSecret,
+                    ),
+                )
+                .await?;
+            let dests = serde_json::to_value(vec![ResultDestination::SignedWebhook {
+                url: url.clone(),
+                binding_id: None,
+            }])?;
             (dests, Some(secret), Some(sealed))
         }
     };
@@ -565,9 +611,10 @@ pub async fn create(
             ),
         };
 
+    let (cb_bytes, cb_kv) = crate::seal::Sealed::split(&secret_sealed);
     let sub = fluidbox_db::create_trigger_subscription(
         &state.pool,
-        state.tenant_id,
+        scope,
         agent.id,
         name,
         trigger_kind,
@@ -584,7 +631,8 @@ pub async fn create(
             .as_ref(),
         workspace_value.as_ref(),
         &destinations,
-        secret_sealed.as_deref(),
+        cb_bytes,
+        cb_kv,
         connection_id,
         resource_selector.as_ref(),
         event_filter.as_ref(),
@@ -600,94 +648,148 @@ pub async fn create(
     })?;
 
     let token = random_hex_token(TOKEN_PREFIX);
-    fluidbox_db::create_trigger_token(&state.pool, state.tenant_id, sub.id, &token).await?;
+    fluidbox_db::create_trigger_token(&state.pool, scope, sub.id, &token).await?;
 
     let schedule_row = match schedule_cfg {
         None => None,
         Some((cron, tz, missed, first)) => Some(
-            fluidbox_db::create_schedule(&state.pool, sub.id, &cron, &tz, first, &missed).await?,
+            fluidbox_db::create_schedule(&state.pool, scope, sub.id, &cron, &tz, first, &missed)
+                .await?,
         ),
     };
 
     // token + callback_secret appear ONLY here, once, at creation.
+    //
+    // The absolute URLs are built server-side from FLUIDBOX_PUBLIC_URL: the
+    // control plane is the only party that knows its own browser/caller-facing
+    // address (the dashboard reaches it through a same-origin proxy, so it
+    // cannot derive it), and an integration contract with a placeholder host is
+    // not a contract. Trailing slashes are trimmed so joins never double up.
+    let base = state.cfg.public_url.trim_end_matches('/');
     Ok(Json(json!({
         "subscription": sub,
         "schedule": schedule_row,
         "token": token,
         "callback_secret": secret_plain,
         "ingress_path": ingress_path,
+        "base_url": base,
+        "invoke_url": format!("{base}/v1/triggers/{}/invoke", sub.id),
+        "poll_url_template": format!("{base}/v1/triggers/{}/runs/{{session_id}}", sub.id),
+        "ingress_url": ingress_path
+            .as_ref()
+            .map(|path| format!("{base}{path}")),
     })))
 }
 
-pub async fn list(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    let subscriptions =
-        fluidbox_db::list_trigger_subscriptions(&state.pool, state.tenant_id).await?;
-    let schedules = fluidbox_db::schedules_for_tenant(&state.pool, state.tenant_id).await?;
+pub async fn list(principal: Principal, State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    if !rbac::can_manage_subscriptions(&principal) {
+        return Err(ApiError::Forbidden(
+            "viewing trigger subscriptions requires admin or owner".into(),
+        ));
+    }
+    let scope = principal.scope();
+    let subscriptions = fluidbox_db::list_trigger_subscriptions(&state.pool, scope).await?;
+    let schedules = fluidbox_db::schedules_for_tenant(&state.pool, scope).await?;
     Ok(Json(
         json!({ "subscriptions": subscriptions, "schedules": schedules }),
     ))
 }
 
 pub async fn get(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let sub = fluidbox_db::get_trigger_subscription(&state.pool, id)
+    if !rbac::can_manage_subscriptions(&principal) {
+        return Err(ApiError::Forbidden(
+            "viewing a trigger subscription requires admin or owner".into(),
+        ));
+    }
+    let scope = principal.scope();
+    let sub = fluidbox_db::get_trigger_subscription(&state.pool, scope, id)
         .await?
-        .filter(|s| s.tenant_id == state.tenant_id)
         .ok_or(ApiError::NotFound)?;
-    let sessions = fluidbox_db::list_subscription_sessions(&state.pool, id, 20).await?;
-    let deliveries = fluidbox_db::list_subscription_deliveries(&state.pool, id, 20).await?;
-    let schedule = fluidbox_db::schedule_for_subscription(&state.pool, id).await?;
-    let invocations = fluidbox_db::list_subscription_invocations(&state.pool, id, 30).await?;
+    let sessions = fluidbox_db::list_subscription_sessions(&state.pool, scope, id, 20).await?;
+    let deliveries = fluidbox_db::list_subscription_deliveries(&state.pool, scope, id, 20).await?;
+    let schedule = fluidbox_db::schedule_for_subscription(&state.pool, scope, id).await?;
+    let invocations =
+        fluidbox_db::list_subscription_invocations(&state.pool, scope, id, 30).await?;
     Ok(Json(json!({
         "subscription": sub, "schedule": schedule, "sessions": sessions,
         "deliveries": deliveries, "invocations": invocations
     })))
 }
 
-async fn set_enabled(state: &AppState, id: Uuid, enabled: bool) -> ApiResult<Json<Value>> {
-    let sub = fluidbox_db::get_trigger_subscription(&state.pool, id)
+async fn set_enabled(
+    state: &AppState,
+    scope: fluidbox_db::TenantScope,
+    id: Uuid,
+    enabled: bool,
+) -> ApiResult<Json<Value>> {
+    let sub = fluidbox_db::get_trigger_subscription(&state.pool, scope, id)
         .await?
-        .filter(|s| s.tenant_id == state.tenant_id)
         .ok_or(ApiError::NotFound)?;
-    let row = fluidbox_db::set_trigger_subscription_enabled(&state.pool, sub.id, enabled)
+    let row = fluidbox_db::set_trigger_subscription_enabled(&state.pool, scope, sub.id, enabled)
         .await?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(json!({ "subscription": row })))
 }
 
 pub async fn enable(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    set_enabled(&state, id, true).await
+    if !rbac::can_manage_subscriptions(&principal) {
+        return Err(ApiError::Forbidden(
+            "managing trigger subscriptions requires admin or owner".into(),
+        ));
+    }
+    set_enabled(&state, principal.scope(), id, true).await
 }
 
 pub async fn disable(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    set_enabled(&state, id, false).await
+    if !rbac::can_manage_subscriptions(&principal) {
+        return Err(ApiError::Forbidden(
+            "managing trigger subscriptions requires admin or owner".into(),
+        ));
+    }
+    set_enabled(&state, principal.scope(), id, false).await
 }
 
 /// Rotation: every live token dies, one new token is minted and returned once.
 pub async fn rotate_token(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let sub = fluidbox_db::get_trigger_subscription(&state.pool, id)
+    if !rbac::can_manage_subscriptions(&principal) {
+        return Err(ApiError::Forbidden(
+            "managing trigger subscriptions requires admin or owner".into(),
+        ));
+    }
+    let scope = principal.scope();
+    let sub = fluidbox_db::get_trigger_subscription(&state.pool, scope, id)
         .await?
-        .filter(|s| s.tenant_id == state.tenant_id)
         .ok_or(ApiError::NotFound)?;
-    let revoked = fluidbox_db::revoke_trigger_tokens(&state.pool, sub.id).await?;
+    let revoked = fluidbox_db::revoke_trigger_tokens(&state.pool, scope, sub.id).await?;
     let token = random_hex_token(TOKEN_PREFIX);
-    fluidbox_db::create_trigger_token(&state.pool, state.tenant_id, sub.id, &token).await?;
-    Ok(Json(json!({ "token": token, "revoked": revoked })))
+    fluidbox_db::create_trigger_token(&state.pool, scope, sub.id, &token).await?;
+    // A rotated token needs the same contract as a freshly-created one — the
+    // caller has to re-wire an integration either way, and the dashboard cannot
+    // derive these URLs itself.
+    let base = state.cfg.public_url.trim_end_matches('/');
+    Ok(Json(json!({
+        "token": token,
+        "revoked": revoked,
+        "base_url": base,
+        "invoke_url": format!("{base}/v1/triggers/{}/invoke", sub.id),
+        "poll_url_template": format!("{base}/v1/triggers/{}/runs/{{session_id}}", sub.id),
+    })))
 }
 
 // ─── Scoped: invoke & poll ────────────────────────────────────────────────
@@ -748,9 +850,10 @@ pub async fn invoke(
     if auth.subscription_id != id {
         return Err(ApiError::Unauthorized);
     }
-    let sub = fluidbox_db::get_trigger_subscription(&state.pool, id)
+    // The token's tenant is the whole authority — every DB call scopes to it.
+    let scope = auth.scope;
+    let sub = fluidbox_db::get_trigger_subscription(&state.pool, scope, id)
         .await?
-        .filter(|s| s.tenant_id == state.tenant_id)
         .ok_or(ApiError::NotFound)?;
     if !sub.enabled {
         return Err(ApiError::Conflict(
@@ -818,8 +921,10 @@ pub async fn invoke(
                 Some(ws) => ws,
                 None => {
                     let rev = match sub.pinned_revision_id {
-                        Some(rid) => fluidbox_db::get_revision(&state.pool, rid).await?,
-                        None => fluidbox_db::latest_revision(&state.pool, sub.agent_id).await?,
+                        Some(rid) => fluidbox_db::get_revision(&state.pool, scope, rid).await?,
+                        None => {
+                            fluidbox_db::latest_revision(&state.pool, scope, sub.agent_id).await?
+                        }
                     }
                     .ok_or_else(|| ApiError::BadRequest("agent has no revisions".into()))?;
                     rev.default_workspace
@@ -861,7 +966,7 @@ pub async fn invoke(
         .clone()
         .unwrap_or_else(|| format!("auto-{}", Uuid::now_v7()));
 
-    let claim = fluidbox_db::claim_invocation(&state.pool, sub.id, &key, &digest).await?;
+    let claim = fluidbox_db::claim_invocation(&state.pool, scope, sub.id, &key, &digest).await?;
     let invocation_id = match claim {
         fluidbox_db::InvocationClaim::Replay {
             session_id,
@@ -872,7 +977,7 @@ pub async fn invoke(
                     "Idempotency-Key was already used with a different request body".into(),
                 ));
             }
-            let session = fluidbox_db::get_session(&state.pool, session_id)
+            let session = fluidbox_db::get_session(&state.pool, scope, session_id)
                 .await?
                 .ok_or(ApiError::NotFound)?;
             return Ok(Json(json!({
@@ -909,6 +1014,7 @@ pub async fn invoke(
 
     let created = crate::run_service::create_run(
         &state,
+        scope,
         crate::run_service::CreateRun {
             agent: sub.agent_id.to_string(),
             revision: match sub.pinned_revision_id {
@@ -917,6 +1023,10 @@ pub async fn invoke(
             },
             task,
             explicit_workspace,
+            // A local_copy can only arrive via the stored revision default,
+            // which passed the operator-only save gate; invoke overrides can
+            // never name a local path. Config-sanctioned ⇒ operator authority.
+            local_path_authority: crate::api::LocalPathAuthority::Operator,
             autonomy,
             trust_tier: fluidbox_core::spec::TrustTier::Trusted,
             budget_override,
@@ -925,6 +1035,14 @@ pub async fn invoke(
             // subscription, like every other override).
             capability_selection: None,
             invocation,
+            // A trigger-token invoke is not a directly-authenticated user.
+            invoked_by_user_id: None,
+            // Freeze the exact invoking token as the run's `trigger` principal
+            // (E1) so the binding recheck fails closed on token revocation.
+            invoking_token_id: Some(auth.token_id),
+            // Invoke overrides only narrow — a trigger never introduces a new
+            // connection (design/trap); the subscription derives its authority.
+            explicit_bindings: std::collections::HashMap::new(),
             result_destinations: destinations,
             bound_invocation: Some(invocation_id),
             bound_dispatch: None,
@@ -942,7 +1060,7 @@ pub async fn invoke(
         Ok(crate::run_service::RunCreation::SkippedOverlap { running_session_id }) => {
             // The skip is the terminal outcome of this key — recorded, not
             // retried; the caller uses a new key once the run finishes.
-            fluidbox_db::mark_invocation_skipped(&state.pool, invocation_id, "overlap")
+            fluidbox_db::mark_invocation_skipped(&state.pool, scope, invocation_id, "overlap")
                 .await
                 .ok();
             Err(ApiError::Conflict(format!(
@@ -952,7 +1070,7 @@ pub async fn invoke(
         Ok(crate::run_service::RunCreation::ReplaceUnpersisted { running_session_id }) => {
             // Transient, NOT terminal: free the key so the caller's retry
             // isn't wedged behind a 409 that lies about skip_if_running.
-            fluidbox_db::release_invocation(&state.pool, invocation_id)
+            fluidbox_db::release_invocation(&state.pool, scope, invocation_id)
                 .await
                 .ok();
             Err(ApiError::ServiceUnavailable(format!(
@@ -961,7 +1079,7 @@ pub async fn invoke(
         }
         Err(e) => {
             // Free the key so the caller's retry isn't wedged behind a failure.
-            fluidbox_db::release_invocation(&state.pool, invocation_id)
+            fluidbox_db::release_invocation(&state.pool, scope, invocation_id)
                 .await
                 .ok();
             Err(e)
@@ -969,7 +1087,11 @@ pub async fn invoke(
     }
 }
 
-/// Scoped polling: a trigger token can read exactly the runs it created.
+/// Scoped polling: a trigger token reads exactly its SUBSCRIPTION's runs.
+/// Deliberately subscription-scoped rather than token-scoped (PR #27 review,
+/// settled): every token of a subscription already shares its invoke
+/// authority, and keying polls to the minting token would strand pre-rotation
+/// runs after a routine credential rotation.
 pub async fn poll_run(
     auth: TriggerAuth,
     State(state): State<AppState>,
@@ -978,10 +1100,11 @@ pub async fn poll_run(
     if auth.subscription_id != id {
         return Err(ApiError::Unauthorized);
     }
-    if !fluidbox_db::subscription_owns_session(&state.pool, id, sid).await? {
+    let scope = auth.scope;
+    if !fluidbox_db::subscription_owns_session(&state.pool, scope, id, sid).await? {
         return Err(ApiError::NotFound);
     }
-    let session = fluidbox_db::get_session(&state.pool, sid)
+    let session = fluidbox_db::get_session(&state.pool, scope, sid)
         .await?
         .ok_or(ApiError::NotFound)?;
     let payload = crate::deliveries::result_payload(&state, &session, None, None).await?;
@@ -1024,6 +1147,7 @@ mod tests {
     fn git_base(connection: bool) -> WorkspaceSpec {
         WorkspaceSpec::GitRepository {
             connection_id: connection.then(Uuid::now_v7),
+            binding_id: None,
             repository: Some("acme/base".into()),
             clone_url: "https://github.com/acme/base.git".into(),
             r#ref: Some("main".into()),
@@ -1089,6 +1213,7 @@ mod tests {
         // repository swap on a non-github base (file:// fixture) → refused.
         let file_base = WorkspaceSpec::GitRepository {
             connection_id: None,
+            binding_id: None,
             repository: None,
             clone_url: "file:///tmp/fixture".into(),
             r#ref: None,
@@ -1108,6 +1233,7 @@ mod tests {
         // is refused too — local paths are not a provider namespace.
         let file_repo_base = WorkspaceSpec::GitRepository {
             connection_id: Some(Uuid::now_v7()),
+            binding_id: None,
             repository: Some("acme/base".into()),
             clone_url: "file:///tmp/fixture/acme/base".into(),
             r#ref: None,

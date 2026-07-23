@@ -8,27 +8,44 @@
 */
 
 :root {
-  --bg: #07080a;
-  --surface: #0c0e11;
-  --raised: #14171c;
-  --surface-soft: rgba(12, 14, 17, 0.78);
-  --surface-hover: #12151a;
-  --border: rgba(255, 255, 255, 0.075);
-  --border-strong: rgba(255, 255, 255, 0.15);
+  --bg: #111318;
+  --surface: #16191f;
+  --raised: #1d2129;
+  --surface-soft: rgba(22, 25, 31, 0.9);
+  --surface-hover: #20252d;
+  --border: rgba(231, 235, 241, 0.09);
+  --border-strong: rgba(231, 235, 241, 0.18);
 
-  --ink: #f2f4f6;
-  --ink-2: #9ca4ae;
-  --ink-3: #646d78;
+  --ink: #e7eaf0;
+  --ink-2: #a8b0bb;
+  --ink-3: #77818e;
 
-  --accent: #5de3d2;
-  --accent-dim: #3ecbbb;
-  --accent-tint: rgba(93, 227, 210, 0.1);
-  --amber: #f2b84b;
-  --amber-tint: rgba(242, 184, 75, 0.1);
-  --green: #54d889;
-  --green-tint: rgba(84, 216, 137, 0.1);
-  --red: #ff7373;
-  --red-tint: rgba(255, 115, 115, 0.1);
+  --accent: #70d8cb;
+  --accent-dim: #54c7ba;
+  --accent-tint: rgba(112, 216, 203, 0.11);
+  --amber: #e8b65a;
+  --amber-tint: rgba(232, 182, 90, 0.11);
+  --green: #62cf8e;
+  --green-tint: rgba(98, 207, 142, 0.11);
+  --red: #f47c7c;
+  --red-tint: rgba(244, 124, 124, 0.11);
+
+  --canvas-glow: rgba(58, 182, 166, 0.065);
+  --chrome-bg: rgba(17, 19, 24, 0.9);
+  --interactive-subtle: rgba(231, 235, 241, 0.035);
+  --interactive-hover: rgba(231, 235, 241, 0.075);
+  --control-bg: #13161b;
+  --primary-bg: #b7ebe4;
+  --primary-hover: #caf3ee;
+  --primary-ink: #12201f;
+  --overlay-bg: rgba(4, 5, 7, 0.7);
+  --selection-bg: rgba(112, 216, 203, 0.25);
+  --scrollbar: #343a44;
+  --scrollbar-hover: #444c58;
+  --panel-shadow: 0 18px 55px rgba(0, 0, 0, 0.16);
+  --modal-shadow: 0 30px 100px rgba(0, 0, 0, 0.58);
+  --skeleton-a: #20242b;
+  --skeleton-b: #2a3039;
 
   --font-sans: var(--font-geist-sans), system-ui, sans-serif;
   --font-mono: var(--font-geist-mono), ui-monospace, "SF Mono", Menlo, monospace;
@@ -36,6 +53,47 @@
 
   --radius: 12px;
   --radius-lg: 18px;
+}
+
+html[data-theme="light"] {
+  --bg: #f4f2ed;
+  --surface: #fbfaf7;
+  --raised: #ebe8e1;
+  --surface-soft: rgba(251, 250, 247, 0.9);
+  --surface-hover: #e7e4dc;
+  --border: rgba(38, 36, 31, 0.11);
+  --border-strong: rgba(38, 36, 31, 0.2);
+
+  --ink: #292722;
+  --ink-2: #5f5b53;
+  --ink-3: #7d776d;
+
+  --accent: #147d75;
+  --accent-dim: #0f6c65;
+  --accent-tint: rgba(20, 125, 117, 0.1);
+  --amber: #a86612;
+  --amber-tint: rgba(168, 102, 18, 0.1);
+  --green: #28784d;
+  --green-tint: rgba(40, 120, 77, 0.1);
+  --red: #b74646;
+  --red-tint: rgba(183, 70, 70, 0.1);
+
+  --canvas-glow: rgba(20, 125, 117, 0.075);
+  --chrome-bg: rgba(244, 242, 237, 0.92);
+  --interactive-subtle: rgba(38, 36, 31, 0.035);
+  --interactive-hover: rgba(38, 36, 31, 0.075);
+  --control-bg: #fffefa;
+  --primary-bg: #2c4845;
+  --primary-hover: #203c39;
+  --primary-ink: #f8faf8;
+  --overlay-bg: rgba(40, 37, 31, 0.45);
+  --selection-bg: rgba(20, 125, 117, 0.2);
+  --scrollbar: #cbc6bb;
+  --scrollbar-hover: #aaa397;
+  --panel-shadow: 0 18px 55px rgba(48, 43, 36, 0.08);
+  --modal-shadow: 0 30px 90px rgba(48, 43, 36, 0.2);
+  --skeleton-a: #e6e2d9;
+  --skeleton-b: #d7d2c7;
 }
 
 * {
@@ -52,6 +110,9 @@ html {
   color-scheme: dark;
   background: var(--bg);
   scrollbar-gutter: stable;
+}
+html[data-theme="light"] {
+  color-scheme: light;
 }
 
 body {
@@ -83,12 +144,12 @@ button {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #272c34;
+  background: var(--scrollbar);
   border: 3px solid var(--bg);
   border-radius: 999px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #343b45;
+  background: var(--scrollbar-hover);
 }
 
 a {
@@ -97,7 +158,7 @@ a {
 }
 
 ::selection {
-  background: rgba(62, 200, 210, 0.25);
+  background: var(--selection-bg);
 }
 
 *:focus-visible {
@@ -139,7 +200,7 @@ a {
   display: block;
   min-height: 100vh;
   background:
-    radial-gradient(circle at 76% -18%, rgba(34, 203, 184, 0.075), transparent 32rem),
+    radial-gradient(circle at 76% -18%, var(--canvas-glow), transparent 32rem),
     var(--bg);
 }
 
@@ -1958,6 +2019,18 @@ a.row:hover,
 
 /* ─── Timeline ───────────────────────────────────────────────────────── */
 
+.session-detail-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 300px);
+  gap: 18px;
+  align-items: start;
+}
+.session-detail-side {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
 .timeline {
   position: relative;
   padding-left: 20px;
@@ -2800,8 +2873,8 @@ pre.token {
    appears only where it identifies a resource or communicates live state. */
 
 .topbar {
-  background: rgba(7, 8, 10, 0.84);
-  border-bottom-color: rgba(255, 255, 255, 0.065);
+  background: var(--chrome-bg);
+  border-bottom-color: var(--border);
   backdrop-filter: blur(22px) saturate(130%);
 }
 .topbar-inner {
@@ -2860,14 +2933,14 @@ pre.token {
 }
 .masthead-nav {
   border-color: var(--border);
-  background: rgba(255, 255, 255, 0.025);
+  background: var(--interactive-subtle);
 }
 .masthead-nav a {
   color: var(--ink-2);
 }
 .masthead-nav a:hover,
 .masthead-nav a.active {
-  background: rgba(255, 255, 255, 0.07);
+  background: var(--interactive-hover);
   color: var(--ink);
 }
 .masthead-actions {
@@ -2882,16 +2955,16 @@ pre.token {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid rgba(255, 255, 255, 0.88);
+  border: 1px solid var(--primary-bg);
   border-radius: 8px;
-  background: var(--ink);
-  color: #08090b;
+  background: var(--primary-bg);
+  color: var(--primary-ink);
   font-size: 11.5px;
   font-weight: 620;
   transition: background 0.15s ease, transform 0.15s ease;
 }
 .topbar-action:hover {
-  background: #ffffff;
+  background: var(--primary-hover);
   transform: translateY(-1px);
 }
 
@@ -3007,7 +3080,7 @@ h1.title {
 .configuration-loading,
 .feature-card {
   background: var(--surface-soft);
-  box-shadow: 0 18px 55px rgba(0, 0, 0, 0.16);
+  box-shadow: var(--panel-shadow);
 }
 .run-row:hover,
 a.row:hover,
@@ -3126,7 +3199,7 @@ a.row:hover,
   margin-top: 12px;
 }
 .resource-items span {
-  background: rgba(255, 255, 255, 0.025);
+  background: var(--interactive-subtle);
 }
 .resource-actions {
   color: var(--ink);
@@ -3157,14 +3230,15 @@ a.row:hover,
 .btn:hover,
 .btn.ghost:hover {
   border-color: var(--border-strong);
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--interactive-hover);
 }
 .btn.primary {
-  background: var(--ink);
-  color: #08090b;
+  border-color: var(--primary-bg);
+  background: var(--primary-bg);
+  color: var(--primary-ink);
 }
 .btn.primary:hover {
-  background: #ffffff;
+  background: var(--primary-hover);
 }
 .btn.human {
   color: #11100d;
@@ -3176,12 +3250,12 @@ a.row:hover,
 input.inp,
 textarea.inp,
 select.inp {
-  background: #090b0e;
+  background: var(--control-bg);
 }
 .opt,
 .cap-row,
 .seg {
-  background: #090b0e;
+  background: var(--control-bg);
 }
 .opt:hover,
 .cap-row:hover,
@@ -3189,17 +3263,74 @@ select.inp {
   border-color: var(--border-strong);
 }
 .overlay {
-  background: rgba(0, 0, 0, 0.72);
+  background: var(--overlay-bg);
   backdrop-filter: blur(9px);
 }
 .modal {
-  box-shadow: 0 30px 100px rgba(0, 0, 0, 0.7);
+  box-shadow: var(--modal-shadow);
 }
 .modal .xbtn:hover {
-  background: rgba(255, 255, 255, 0.07);
+  background: var(--interactive-hover);
+}
+.discard-confirm {
+  padding: 11px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--amber-tint);
+}
+.discard-confirm strong,
+.discard-confirm small {
+  display: block;
+}
+.discard-confirm strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+.discard-confirm small {
+  margin-top: 2px;
+  color: var(--ink-2);
+  font-size: 10.5px;
+}
+.discard-actions {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+.context-switch-confirm {
+  margin: 10px 0 14px;
+  padding: 11px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  border: 1px solid color-mix(in srgb, var(--amber) 34%, var(--border));
+  border-radius: 9px;
+  background: var(--amber-tint);
+}
+.context-switch-confirm strong,
+.context-switch-confirm small {
+  display: block;
+}
+.context-switch-confirm strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+.context-switch-confirm small {
+  margin-top: 2px;
+  color: var(--ink-2);
+  font-size: 10.5px;
+  line-height: 1.4;
+}
+.embedded-discard {
+  margin: 0 0 14px;
+  border: 1px solid color-mix(in srgb, var(--amber) 34%, var(--border));
+  border-radius: 9px;
 }
 .skeleton {
-  background: linear-gradient(90deg, #12151a 20%, #1b2027 48%, #12151a 76%);
+  background: linear-gradient(90deg, var(--skeleton-a) 20%, var(--skeleton-b) 48%, var(--skeleton-a) 76%);
   background-size: 200% 100%;
 }
 
@@ -3358,6 +3489,9 @@ select.inp {
 }
 
 @media (max-width: 860px) {
+  .session-detail-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
   .shell {
     grid-template-columns: 1fr;
   }
@@ -3471,6 +3605,14 @@ select.inp {
 }
 
 @media (max-width: 640px) {
+  .tl-line {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .tl-tag {
+    min-width: 0;
+  }
   .main {
     padding-inline: 14px;
   }
@@ -3945,5 +4087,585 @@ select.inp {
   }
   .policy-row .run-arrow {
     display: none;
+  }
+}
+/* ─── Run composer: one form, one live spec ────────────────────────────
+   Replaces the five-step wizard. The left column is a single scrolling
+   form whose content reacts to earlier choices; the right column is a
+   sticky panel showing exactly what the RunSpec will freeze. Seeing the
+   spec assemble teaches the immutability model while you configure.
+   Namespaced `rc-` — `.composer`/`.spec-row` belong to the agent composer. */
+
+.rc-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 28px;
+  align-items: start;
+}
+.rc-form {
+  display: grid;
+  gap: 26px;
+  min-width: 0;
+}
+
+.rc-section {
+  display: grid;
+  gap: 14px;
+}
+.rc-section + .rc-section {
+  padding-top: 24px;
+  border-top: 1px solid var(--border);
+}
+.rc-section-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+.rc-section-index {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  color: var(--ink-2);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  display: grid;
+  place-items: center;
+  margin-top: 2px;
+}
+.rc-section-head h3 {
+  font-family: var(--font-display);
+  font-size: 17px;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+.rc-section-head p {
+  font-size: 12px;
+  color: var(--ink-2);
+  margin: 3px 0 0;
+  max-width: 62ch;
+}
+.rc-section-body {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+/* The selected trigger's settings, revealed in place under the choice
+   that asked for them. */
+.rc-trigger-detail {
+  border-left: 2px solid var(--accent);
+  background: var(--surface-hover);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  padding: 14px 16px;
+  display: grid;
+  gap: 14px;
+  animation: rc-reveal 180ms ease-out;
+}
+.rc-trigger-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-2);
+  max-width: 60ch;
+}
+@keyframes rc-reveal {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rc-trigger-detail { animation: none; }
+}
+
+.rc-binding-row {
+  display: grid;
+  gap: 4px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+/* ── Live spec panel ── */
+
+.rc-spec {
+  position: sticky;
+  top: 8px;
+  min-width: 0;
+}
+.rc-spec-inner {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--raised);
+}
+.rc-spec-head p {
+  font-size: 11.5px;
+  color: var(--ink-3);
+  margin: 4px 0 0;
+  line-height: 1.45;
+}
+
+.rc-row {
+  display: grid;
+  gap: 2px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.rc-row-label {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--ink-3);
+}
+.rc-row-value {
+  font-size: 13px;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.rc-row-value.rc-clamp {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.rc-row-sub {
+  font-size: 11.5px;
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+}
+.rc-row.pending .rc-row-value {
+  color: var(--ink-3);
+  font-style: italic;
+}
+.rc-row-binding {
+  font-size: 12px;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.rc-note {
+  font-size: 11.5px;
+  color: var(--amber);
+  margin: 0;
+  line-height: 1.45;
+}
+
+.rc-submit {
+  width: 100%;
+  justify-content: center;
+  margin-top: 2px;
+}
+.rc-blocker {
+  font-size: 11.5px;
+  color: var(--ink-3);
+  margin: 0;
+  text-align: center;
+  line-height: 1.45;
+}
+.rc-draft-note {
+  margin: 0;
+  color: var(--green);
+  font-size: 11px;
+  line-height: 1.45;
+  text-align: center;
+}
+.rc-error {
+  font-size: 12px;
+}
+
+@media (max-width: 900px) {
+  .rc-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 22px;
+  }
+  .rc-spec {
+    position: static;
+    order: 0;
+  }
+}
+
+/* ─── Schedule picker ──────────────────────────────────────────────────
+   Days and times, not cron fields. The generated expression stays visible
+   beside the plain-English summary so nothing is hidden — the sentence is
+   what a person checks, the cron is what the scheduler stores. */
+
+.sched {
+  display: grid;
+  gap: 14px;
+}
+.sched-freq {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.sched-freq-option {
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--ink-2);
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
+}
+.sched-freq-option:hover {
+  color: var(--ink);
+  border-color: var(--border-strong);
+}
+.sched-freq-option.on {
+  background: var(--accent-tint);
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
+.sched-detail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: flex-start;
+}
+.sched-detail > .field {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+.sched-detail > .sched-narrow {
+  flex: 0 0 150px;
+}
+.sched-detail > .sched-zone {
+  flex: 1 1 220px;
+}
+
+.sched-days {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.sched-day {
+  width: 42px;
+  padding: 6px 0;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--ink-3);
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
+}
+.sched-day:hover {
+  color: var(--ink);
+  border-color: var(--border-strong);
+}
+.sched-day.on {
+  background: var(--accent-tint);
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
+.sched-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+  margin: 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+  color: var(--ink);
+}
+.sched-cron {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-3);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 2px 7px;
+}
+
+/* ─── Automation integration contract ──────────────────────────────────
+   The panel shown once, at creation: secrets, real endpoint, declared
+   variables, and the responses to expect. Everything is copyable because
+   this is the only time the secrets exist. */
+
+.contract {
+  display: grid;
+  gap: 22px;
+}
+.contract-section {
+  display: grid;
+  gap: 10px;
+}
+.contract-section + .contract-section {
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+}
+.contract-section h4 {
+  font-family: var(--font-display);
+  font-size: 14px;
+  font-weight: 400;
+  letter-spacing: -0.005em;
+  margin: 0;
+  color: var(--ink);
+}
+.contract-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.contract-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-2);
+  line-height: 1.5;
+}
+.contract-note code,
+.contract-var code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.contract-var {
+  grid-template-columns: minmax(120px, 30%) 1fr;
+  gap: 10px;
+  padding: 7px 10px;
+  align-items: baseline;
+}
+.contract-var .mono {
+  font-size: 12px;
+  color: var(--accent);
+}
+.contract-var .faint {
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+/* A pinned bundle that Phase C refuses at run creation. Kept visible so a
+   legacy revision can be fixed, marked so it is not mistaken for usable. */
+.cap-row.blocked {
+  border-color: var(--red);
+  background: rgba(255, 115, 115, 0.06);
+}
+
+/* ─── Theme + responsive masthead ─────────────────────────────────────
+   The data-theme attribute is set before paint in the root layout. Components
+   consume semantic tokens only, so both palettes retain the same hierarchy. */
+
+.theme-toggle,
+.masthead-menu {
+  min-width: 36px;
+  min-height: 34px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--interactive-subtle);
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+.theme-toggle:hover,
+.masthead-menu:hover {
+  border-color: var(--border-strong);
+  background: var(--interactive-hover);
+  color: var(--ink);
+}
+.theme-toggle svg,
+.masthead-menu svg {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.masthead-menu {
+  display: none;
+  padding: 0;
+}
+.mobile-session {
+  display: none;
+}
+
+.dashboard-header {
+  margin-bottom: 34px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 24px;
+}
+.dashboard-header h1 {
+  margin: 0;
+  color: var(--ink);
+  font-size: clamp(29px, 3vw, 38px);
+  font-weight: 620;
+  line-height: 1.05;
+  letter-spacing: -0.045em;
+}
+.dashboard-header p {
+  margin: 8px 0 0;
+  color: var(--ink-2);
+  font-size: 13.5px;
+}
+
+/* A few legacy selectors predate the semantic palette. These overrides keep
+   the light theme from inheriting dark-only translucent fills. */
+html[data-theme="light"] .brand-symbol {
+  border-color: var(--border-strong);
+  background: linear-gradient(145deg, var(--accent-tint), var(--interactive-subtle));
+  box-shadow: 0 0 22px var(--accent-tint);
+}
+html[data-theme="light"] .connector-mark-github {
+  background: #292b2f;
+}
+html[data-theme="light"] .connector-mark-notion {
+  border-color: var(--border-strong);
+}
+html[data-theme="light"] .btn.human {
+  color: #2a2113;
+}
+html[data-theme="light"] .cap-row.blocked {
+  background: var(--red-tint);
+}
+
+@media (max-width: 760px) {
+  .topbar-inner {
+    min-height: 60px;
+    padding: 0 14px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 12px;
+  }
+  .masthead-brand {
+    min-width: 0;
+  }
+  .product-label {
+    display: none;
+  }
+  .masthead-actions {
+    margin-left: auto;
+    gap: 8px;
+  }
+  .masthead-state,
+  .topbar-action,
+  .masthead-actions [data-testid="session-shell"] {
+    display: none !important;
+  }
+  .theme-toggle {
+    width: 40px;
+    height: 40px;
+    min-width: 40px;
+    min-height: 40px;
+    padding: 0;
+  }
+  .theme-toggle span {
+    display: none;
+  }
+  .masthead-menu {
+    width: 40px;
+    height: 40px;
+    min-width: 40px;
+    min-height: 40px;
+    display: inline-flex;
+  }
+  .masthead-nav {
+    position: absolute;
+    top: calc(100% + 8px);
+    left: 14px;
+    right: 14px;
+    z-index: 40;
+    max-height: calc(100vh - 84px);
+    padding: 7px;
+    display: none;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 3px;
+    overflow-y: auto;
+    border: 1px solid var(--border-strong);
+    border-radius: 12px;
+    background: var(--surface);
+    box-shadow: var(--modal-shadow);
+  }
+  .masthead-nav.open {
+    display: flex;
+  }
+  .masthead-nav a {
+    width: 100%;
+    min-height: 44px;
+    padding: 9px 12px;
+    justify-content: space-between;
+    border-radius: 8px;
+    font-size: 13px;
+  }
+  .mobile-session {
+    margin-top: 4px;
+    padding: 11px 12px 6px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    border-top: 1px solid var(--border);
+  }
+  .mobile-session span,
+  .mobile-session strong,
+  .mobile-session small {
+    min-width: 0;
+    display: block;
+  }
+  .mobile-session strong {
+    color: var(--ink);
+    font-size: 12px;
+  }
+  .mobile-session small {
+    margin-top: 3px;
+    overflow: hidden;
+    color: var(--ink-3);
+    font-size: 10.5px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .discard-confirm,
+  .context-switch-confirm {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .discard-actions {
+    justify-content: flex-end;
+  }
+  .dashboard-header {
+    margin-bottom: 28px;
+    align-items: stretch;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .dashboard-header .btn {
+    width: 100%;
+    min-height: 44px;
+    justify-content: center;
+  }
+}
+
+@media (pointer: coarse) {
+  .btn,
+  .btn.sm,
+  .tab,
+  .xbtn,
+  .text-action,
+  .sched-freq-option,
+  .sched-day,
+  .trigger-kind-selector button {
+    min-height: 44px;
   }
 }

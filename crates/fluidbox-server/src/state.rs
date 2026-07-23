@@ -36,6 +36,108 @@ impl ApprovalRegistry {
     }
 }
 
+/// A cached short-lived provider token and its expiry.
+type CachedToken = (String, DateTime<Utc>);
+/// The access/installation-token cache, keyed by
+/// `(connection_id, authorization_generation)` (design :783-789).
+type ConnectorTokenCache = Mutex<HashMap<(Uuid, i32), CachedToken>>;
+
+/// Which brokered peer an upstream MCP session belongs to, WITHIN one run
+/// (Phase E, E5). The Phase C binding path keys on the run resource binding;
+/// the legacy embedded-connection path on the connection. Distinct variants so
+/// a run using both never collides two peers into one session.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum McpPeer {
+    Binding(Uuid),
+    Conn(Uuid),
+}
+
+impl McpPeer {
+    /// The `(peer_kind, peer_id)` pair stored in `mcp_upstream_sessions`
+    /// (Phase F, Task 3; migration 0024). The strings are a WIRE FORMAT with the
+    /// migration's CHECK constraint — they live in `fluidbox-db` so exactly one
+    /// definition exists.
+    pub fn parts(&self) -> (&'static str, Uuid) {
+        match self {
+            McpPeer::Binding(id) => (fluidbox_db::mcp_sessions::PEER_BINDING, *id),
+            McpPeer::Conn(id) => (fluidbox_db::mcp_sessions::PEER_CONNECTION, *id),
+        }
+    }
+
+    /// Reconstruct a peer from a durable row. `None` for an unrecognized kind:
+    /// teardown must re-resolve a credential THROUGH the peer, so a row whose kind
+    /// we cannot map is unusable and is skipped rather than guessed at.
+    pub fn from_parts(kind: &str, id: Uuid) -> Option<Self> {
+        match kind {
+            fluidbox_db::mcp_sessions::PEER_BINDING => Some(McpPeer::Binding(id)),
+            fluidbox_db::mcp_sessions::PEER_CONNECTION => Some(McpPeer::Conn(id)),
+            _ => None,
+        }
+    }
+}
+
+/// A live upstream MCP session for one `(run, peer)` (Phase E, E5). Created on
+/// the first post-gate brokered call to that peer, reused across later calls in
+/// the same run, and torn down (best-effort DELETE) at the run's terminal
+/// transition. Still replica-local, and deliberately so: a run whose calls land
+/// on a different replica simply re-initializes there, because ADOPTING another
+/// replica's session would put two replicas on one upstream session with no
+/// serialization and force a change to the per-entry `next_id` id space.
+///
+/// Phase F (Task 3) keeps that unchanged and adds the missing half: TEARDOWN is
+/// no longer replica-local. Every session id learned here is mirrored into
+/// `mcp_upstream_sessions` (migration 0024) keyed by `(run, peer, this replica)`,
+/// so the replica that finalizes the run DELETEs every replica's sessions, not
+/// just the ones in this map. See `broker::run_terminal_mcp_cleanup`.
+pub struct McpUpstreamSession {
+    /// The `Mcp-Session-Id` the server issued at initialize (absent = the
+    /// server runs sessionless; we still send `MCP-Protocol-Version`).
+    pub session_id: Option<String>,
+    /// The protocol version the server negotiated at initialize. Empty until a
+    /// successful handshake — the sentinel the session manager uses to decide
+    /// whether an `initialize` is still owed for this entry.
+    pub negotiated: String,
+    /// Monotonic JSON-RPC request-id counter — EVERY request (initialize
+    /// included) draws the next value, so ids are unique within the session.
+    pub next_id: u64,
+    /// The endpoint the session speaks to. Held so terminal cleanup can DELETE
+    /// the session without re-resolving the run's frozen surface.
+    pub url: String,
+}
+
+impl McpUpstreamSession {
+    /// A fresh, un-initialized session for `url` (registry entry or throwaway).
+    pub fn fresh(url: &str) -> Self {
+        McpUpstreamSession {
+            session_id: None,
+            negotiated: String::new(),
+            next_id: 0,
+            url: url.to_string(),
+        }
+    }
+
+    /// The next JSON-RPC request id (post-increment), used for every request.
+    pub fn next(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    /// Reset to un-initialized (404-with-session reinit): drop the dead session
+    /// id + negotiated version so the next attempt re-`initialize`s. The id
+    /// counter keeps advancing (never reused).
+    pub fn reset(&mut self) {
+        self.session_id = None;
+        self.negotiated.clear();
+    }
+}
+
+/// Per-run upstream MCP session registry (Phase E, E5). Keyed `(run session id,
+/// peer)`; the value is per-entry serialized (one in-flight request per upstream
+/// session — ids stay ordered and demuxing is unnecessary).
+pub(crate) type McpSessionRegistry =
+    Mutex<HashMap<(Uuid, McpPeer), Arc<Mutex<McpUpstreamSession>>>>;
+
 pub struct AppStateInner {
     pub cfg: Config,
     pub pool: PgPool,
@@ -48,24 +150,119 @@ pub struct AppStateInner {
     pub approvals: ApprovalRegistry,
     /// LISTEN/NOTIFY wakeups (session_id, seq) for SSE fanout.
     pub events_tx: broadcast::Sender<(Uuid, i64)>,
+    /// LISTEN/NOTIFY wakeups (approval_id) for the approval wait loop — the
+    /// cross-replica half of `approvals` above (Phase E, #33; Gap 13). Every
+    /// committed approval decision transaction notifies `fluidbox_approvals`;
+    /// `workers::spawn_approval_wakeups` relays it into THIS replica's registry,
+    /// so a handler blocked here learns about a decision served elsewhere without
+    /// waiting out its ≤2 s poll. The poll stays as the missed-notify backstop.
+    pub approvals_tx: broadcast::Sender<Uuid>,
+    /// The plain client for OPERATOR-configured seams only (GitHub REST/App, LLM
+    /// facade + admin). Those hosts are operator-set (GHES, a private LiteLLM),
+    /// never attacker input, so they are deliberately NOT run through the SSRF
+    /// private-IP block. Attacker-influenced destinations ride the hardened
+    /// clients below.
     pub http: reqwest::Client,
-    /// Seals/unseals connection credentials. None until
-    /// FLUIDBOX_CREDENTIAL_KEY is configured — connection endpoints and
-    /// connection-backed workspaces refuse to operate without it.
+    /// Per-hop-SSRF client for identity fetches (OIDC discovery, JWKS, token) AND
+    /// connector-OAuth (discovery, PRM, AS metadata, DCR, code exchange, refresh —
+    /// Phase E). Three complementary layers cover the SSRF surface, none of which
+    /// is sufficient alone: (1) the INITIAL hop's host literal is checked by
+    /// `egress::admit_url` PRE-FLIGHT at each call site — reqwest dials an IP
+    /// literal directly, so the resolver never sees it and the literal MUST be
+    /// caught before the request (oauth.rs/login.rs do this); (2) a DNS *name* is
+    /// filtered at resolve time by the custom resolver (rebinding-safe); (3) every
+    /// REDIRECT hop is re-validated by the custom redirect policy. See
+    /// `egress::build_identity_http` — callers into attacker-influenced endpoints
+    /// admit_url the target first.
+    pub identity_http: reqwest::Client,
+    /// Hardened client for connector traffic to ARBITRARY user endpoints: broker
+    /// MCP calls, snapshot/probe discovery, and delivery webhook publish (Phase
+    /// E). Refuses ALL redirects (`Policy::none`) and filters resolved addresses
+    /// via the same DNS resolver (see `egress::build_egress_http`).
+    pub egress_http: reqwest::Client,
+    /// The resolved egress boundary, built once in `main.rs` from config. The
+    /// broker/deliveries consult it via `egress::admit_url`; the orchestrator
+    /// derives the workspace `GitEgressPolicy` from it.
+    pub egress_policy: crate::egress::EgressPolicy,
+    /// Outbound rate limits + per-connection circuit breakers (Phase E, E14;
+    /// durable cross-replica tier added in Phase F, migration 0023). The broker
+    /// consults it AFTER the execution claim is won and BEFORE the dial, so a
+    /// refusal is a pre-write proof of non-dispatch (`NeverSent` ⇒
+    /// `failed_before_send` ⇒ re-claimable). TWO tiers: a per-replica in-memory
+    /// tier checked FIRST (fast, and the sole gate on `FLUIDBOX_EGRESS_DURABLE=0`),
+    /// then a durable Postgres tier (default on) that gives the DEPLOYMENT-WIDE
+    /// ceiling for the tenant/user/connection/(tenant,host) dimensions and a
+    /// cross-replica breaker. `host_global` deliberately stays per-replica (a
+    /// durable cross-tenant key would need a per-dial RLS bypass). A store error
+    /// DEGRADES to the local verdict (never fails a dial closed on governance).
+    pub governor: crate::governor::EgressGovernor,
+    /// Seals/unseals connection credentials (Phase D versioned envelope). Built
+    /// by `seal::build_sealer`: a legacy key (KMS off), a KMS-envelope backend
+    /// (static|aws), or None — sealing disabled — ONLY when KMS is off AND
+    /// FLUIDBOX_CREDENTIAL_KEY is unset. When None, connection endpoints and
+    /// connection-backed workspaces refuse to operate.
     pub sealer: Option<crate::seal::Sealer>,
     /// Short-lived provider tokens minted per connection (GitHub App
     /// installation tokens ~1h, OAuth access tokens) — a cache only; the
     /// durable credential (private key / rotating refresh token) stays
     /// sealed in the DB and entries re-mint on expiry or restart.
-    pub connector_tokens: Mutex<HashMap<Uuid, (String, DateTime<Utc>)>>,
+    /// Keyed by `(connection_id, authorization_generation)` (design :783-789):
+    /// a re-consent bump makes the old generation's cached token unreachable, so
+    /// a run bound to the old generation can never be served the new identity's
+    /// token. Eviction (`oauth::invalidate_access`) drops EVERY generation of a
+    /// connection.
+    pub connector_tokens: ConnectorTokenCache,
     /// Per-connection serialization of OAuth token refreshes: rotation means
     /// concurrent brokered calls must mint ONE new refresh token, not race
     /// each other into invalid_grant (Notion keeps ≤2 valid).
     pub oauth_locks: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
+    /// Per-run upstream MCP session manager (Phase E, E5): reuses one
+    /// `initialize`d session per `(run, peer)` across a run's brokered calls,
+    /// sends `MCP-Protocol-Version` on every post-init request, re-initializes
+    /// once on a 404-with-session, and DELETEs the session at the run's terminal
+    /// transition. Replica-local (invariant 11); a restart/failover re-inits.
+    /// Phase F (Task 3): the map is still the only place a LIVE session is reused,
+    /// but every learned session id is also durable (`mcp_upstream_sessions`), so
+    /// teardown covers other replicas' sessions and a crash no longer leaks them
+    /// until process exit.
+    pub mcp_sessions: McpSessionRegistry,
+    /// Per-tenant LiteLLM virtual keys, cached UNSEALED in memory (Phase D, #32),
+    /// keyed by tenant_id. The durable key stays sealed in `tenant_llm_keys`; this
+    /// is a read-through of that sealed column (re-seeded on a cold cache /
+    /// restart) so the facade avoids an unseal per model request. No TTL — a
+    /// virtual key is durable; rotation is the only invalidation
+    /// (`llm_keys::rotate_tenant_key` re-seeds it, `evict_tenant_llm_key` drops it).
+    /// Only populated in `FLUIDBOX_LLM_KEY_MODE=tenant`.
+    pub tenant_llm_keys: Mutex<HashMap<Uuid, String>>,
     /// Kubernetes netpol run-gate: false until a probe proves the CNI enforces
     /// NetworkPolicy. `create_run` refuses while false + require_enforced_netpol
     /// (fails closed). Always true for Docker (a different isolation model).
     pub netpol_verified: std::sync::atomic::AtomicBool,
+    /// OIDC login runtime: the generation-keyed JWKS cache (singleflight
+    /// refresh + negative-kid cache) and the fixed-window login rate counters.
+    /// In-memory, single-replica (v1); a restart re-seeds from the DB caches.
+    pub oidc: crate::login::OidcRuntime,
+    /// Compiled frozen-schema validator LRU (Phase E, Gap 12). Keyed
+    /// `(tools_digest, tool)` so a `/tools/refresh` (new digest) never reuses a
+    /// stale compilation; caps at 256 entries. The gate consults it to validate a
+    /// brokered `mcp__*` call's arguments against the run's FROZEN inputSchema
+    /// before the trust-tier/policy stages. Replica-local, rebuilt on restart.
+    pub schema_cache: fluidbox_core::schema_guard::SchemaCache,
+    /// Legacy→KMS re-seal singleton flag (Phase D, #32). `POST /v1/admin/reseal`
+    /// claims it with a compare-and-swap; a second POST while a job runs gets a
+    /// 409. The job is restart-safe by construction (predicate-driven paging), so
+    /// this flag lives only in memory — a crash mid-job leaves no lock to clear.
+    pub reseal_running: std::sync::atomic::AtomicBool,
+    /// Live progress of the current/last re-seal run (per-family
+    /// resealed/skipped/failed + last_error), surfaced by `GET /v1/admin/reseal`
+    /// alongside the authoritative live parity counts.
+    pub reseal_status: Mutex<crate::reseal::ResealStatus>,
+    /// Hand-rolled operational metrics (Phase F, issue #34): counters, gauges and
+    /// fixed-bucket histograms fed from the event/lifecycle funnels, rendered as
+    /// Prometheus text by `GET /v1/admin/metrics` (and the optional unauth
+    /// `FLUIDBOX_METRICS_BIND` listener). Replica-local and reset on restart — an
+    /// operational signal, not an audit record (the ledger is that).
+    pub metrics: crate::metrics::Metrics,
 }
 
 pub type AppState = Arc<AppStateInner>;

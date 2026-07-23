@@ -7,32 +7,51 @@
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import {
-  apiGet,
+  apiGetCached,
   apiPost,
   appIngressPath,
   Connection,
   GithubAppRegistration,
   ingressPath,
   isGitConnection,
+  OwnerChoice,
+  ownerOptions,
 } from "../lib/api";
 import { openVia } from "../lib/github-flows";
-import { GitHubMark, ModalShell, PageHead } from "../components/bits";
+import { useAuthMe } from "../lib/useAuthMe";
+import { GitHubMark, LoadingRows, ModalShell, OwnerTag, PageHead } from "../components/bits";
+import { OwnerPicker } from "../components/OwnerPicker";
+import type { AuthMe } from "../lib/api";
 
 export default function Integrations() {
+  const me = useAuthMe();
   const [connections, setConnections] = useState<Connection[]>([]);
   const [registrations, setRegistrations] = useState<GithubAppRegistration[]>([]);
   const [showManual, setShowManual] = useState(false);
   const [org, setOrg] = useState("");
   const [err, setErr] = useState("");
   const [note, setNote] = useState("");
+  const [loadErr, setLoadErr] = useState("");
+  const [hasSnapshot, setHasSnapshot] = useState(false);
+  const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
     const results = await Promise.allSettled([
-      apiGet<{ connections: Connection[] }>("/connections"),
-      apiGet<{ registrations: GithubAppRegistration[] }>("/github/app"),
+      apiGetCached<{ connections: Connection[] }>("/connections", { maxAgeMs: 10_000 }),
+      apiGetCached<{ registrations: GithubAppRegistration[] }>("/github/app", { maxAgeMs: 10_000 }),
     ]);
     if (results[0].status === "fulfilled") setConnections(results[0].value.connections);
     if (results[1].status === "fulfilled") setRegistrations(results[1].value.registrations);
+    const fulfilled = results.filter((result) => result.status === "fulfilled").length;
+    if (fulfilled > 0) setHasSnapshot(true);
+    setLoadErr(
+      fulfilled === 0
+        ? "Integrations could not be loaded because the control plane is unavailable."
+        : fulfilled < results.length
+          ? "Some integration data could not be refreshed; showing the available snapshot."
+          : ""
+    );
+    setLoading(false);
   }, []);
 
   useEffect(() => {
@@ -98,16 +117,56 @@ export default function Integrations() {
   const visibleRegs = registrations.filter((r) => r.status !== "revoked");
   const activeRegs = visibleRegs.filter((r) => r.status === "active");
   const gitConnections = connections.filter((c) => isGitConnection(c) && c.status !== "revoked");
+  const pageHead = (
+    <PageHead
+      title="Integrations"
+      sub="Platforms your agents work on. A connection powers workspace checkouts (repo, branch, commit), pull-request triggers, and publishing results back."
+    />
+  );
+
+  if (loading) {
+    return (
+      <>
+        {pageHead}
+        <div className="panel"><LoadingRows rows={3} /></div>
+      </>
+    );
+  }
+
+  if (!hasSnapshot) {
+    return (
+      <>
+        {pageHead}
+        <div className="note" style={{ marginBottom: 10 }}>{loadErr}</div>
+        <div className="panel launch-empty">
+          <div>
+            <h3>Integrations are unavailable.</h3>
+            <p>A failed read is not treated as an unconfigured GitHub account.</p>
+          </div>
+          <div className="empty-actions">
+            <button
+              className="btn"
+              type="button"
+              onClick={() => {
+                setLoading(true);
+                void load();
+              }}
+            >
+              Retry now
+            </button>
+          </div>
+        </div>
+      </>
+    );
+  }
 
   return (
     <>
-      <PageHead
-        title="Integrations"
-        sub="Platforms your agents work on. A connection powers workspace checkouts (repo, branch, commit), pull-request triggers, and publishing results back."
-      />
+      {pageHead}
 
       {err && <div className="err" style={{ marginBottom: 10 }}>{err}</div>}
       {note && <div className="note" style={{ marginBottom: 10 }}>{note}</div>}
+      {loadErr && <div className="note" style={{ marginBottom: 10 }}>{loadErr}</div>}
 
       {/* ── GitHub App: the seamless path ─────────────────────────────── */}
       {visibleRegs.length === 0 ? (
@@ -247,11 +306,10 @@ export default function Integrations() {
                 <span className="task">
                   {c.display_name}
                   {c.metadata?.login && c.metadata.login !== c.display_name ? ` (@${c.metadata.login})` : ""}
-                  {c.registration_id && (
-                    <span className="chip" style={{ marginLeft: 8 }}>
-                      via app
-                    </span>
-                  )}
+                  <span style={{ marginLeft: 8, display: "inline-flex", gap: 6, verticalAlign: "middle" }}>
+                    <OwnerTag connection={c} meUserId={me?.user_id} />
+                    {c.registration_id && <span className="chip">via app</span>}
+                  </span>
                   {c.granted_scopes?.length > 0 && (
                     <span className="faint" style={{ marginLeft: 8, fontSize: 12 }}>
                       scopes: {c.granted_scopes.join(", ")}
@@ -312,6 +370,7 @@ export default function Integrations() {
 
       {showManual && (
         <NewConnection
+          me={me}
           onClose={() => setShowManual(false)}
           onCreated={() => {
             setShowManual(false);
@@ -325,7 +384,15 @@ export default function Integrations() {
 
 /** Manual credential entry — the fallback path. The seamless GitHub App
  *  flow above replaces this for the common case. */
-function NewConnection({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
+function NewConnection({
+  me,
+  onClose,
+  onCreated,
+}: {
+  me: AuthMe | null;
+  onClose: () => void;
+  onCreated: () => void;
+}) {
   const [flavor, setFlavor] = useState<"github" | "github_app">("github");
   const [token, setToken] = useState("");
   const [appId, setAppId] = useState("");
@@ -333,8 +400,23 @@ function NewConnection({ onClose, onCreated }: { onClose: () => void; onCreated:
   const [privateKey, setPrivateKey] = useState("");
   const [webhookSecret, setWebhookSecret] = useState("");
   const [displayName, setDisplayName] = useState("");
+  const [ownerChoice, setOwnerChoice] = useState<OwnerChoice | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+
+  // A PAT may be personal or organization; a github_app is organization custody
+  // by construction (the server refuses personal for it).
+  const allowPersonal = flavor === "github";
+  const owner = ownerChoice ?? ownerOptions(me, allowPersonal).default;
+  const dirty =
+    flavor !== "github" ||
+    token.length > 0 ||
+    appId.length > 0 ||
+    installationId.length > 0 ||
+    privateKey.length > 0 ||
+    webhookSecret.length > 0 ||
+    displayName.length > 0 ||
+    ownerChoice !== null;
 
   const submit = async () => {
     setErr("");
@@ -358,6 +440,7 @@ function NewConnection({ onClose, onCreated }: { onClose: () => void; onCreated:
               provider: "github",
               token: token.trim(),
               display_name: displayName.trim() || null,
+              owner,
             }
           : {
               provider: "github_app",
@@ -366,6 +449,7 @@ function NewConnection({ onClose, onCreated }: { onClose: () => void; onCreated:
               private_key: privateKey,
               webhook_secret: webhookSecret.trim(),
               display_name: displayName.trim() || null,
+              owner: "organization",
             }
       );
       onCreated();
@@ -380,6 +464,7 @@ function NewConnection({ onClose, onCreated }: { onClose: () => void; onCreated:
       title="Add GitHub credentials manually"
       sub="Advanced fallback — Set up GitHub App above creates and custodies all of this automatically."
       onClose={onClose}
+      dirty={dirty}
     >
       <label className="field">
         <span className="lab">Connection flavor</span>
@@ -392,6 +477,7 @@ function NewConnection({ onClose, onCreated }: { onClose: () => void; onCreated:
           <option value="github_app">GitHub App installation — receives PR events, publishes reviews</option>
         </select>
       </label>
+      <OwnerPicker me={me} value={owner} onChange={setOwnerChoice} allowPersonal={allowPersonal} />
       {flavor === "github" ? (
         <>
           <p className="helper" style={{ marginTop: 0 }}>

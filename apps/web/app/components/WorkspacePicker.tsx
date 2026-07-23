@@ -6,7 +6,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  apiGet,
+  apiGetCached,
   apiPost,
   Connection,
   GithubAppRegistration,
@@ -91,6 +91,8 @@ export function WorkspacePicker({
   const [repos, setRepos] = useState<Repo[]>([]);
   const [repoErr, setRepoErr] = useState("");
   const [reposLoading, setReposLoading] = useState(false);
+  const [lookupsLoading, setLookupsLoading] = useState(true);
+  const [lookupError, setLookupError] = useState("");
   const [repoFilter, setRepoFilter] = useState("");
   const [flowErr, setFlowErr] = useState("");
   const [org, setOrg] = useState("");
@@ -107,11 +109,19 @@ export function WorkspacePicker({
   });
 
   const load = useCallback(async () => {
+    setLookupsLoading(true);
+    setLookupError("");
     const [c, r] = await Promise.allSettled([
-      apiGet<{ connections: Connection[] }>("/connections"),
-      apiGet<{ registrations: GithubAppRegistration[] }>("/github/app"),
+      apiGetCached<{ connections: Connection[] }>("/connections", { maxAgeMs: 10_000 }),
+      apiGetCached<{ registrations: GithubAppRegistration[] }>("/github/app", { maxAgeMs: 10_000 }),
     ]);
     if (r.status === "fulfilled") setRegistrations(r.value.registrations);
+    if (c.status !== "fulfilled" || r.status !== "fulfilled") {
+      setLookupError(
+        "GitHub setup could not be fully loaded. Existing choices and public clone URLs remain usable."
+      );
+    }
+    setLookupsLoading(false);
     if (c.status !== "fulfilled") return;
     // isGitConnection, not `!== "mcp_http"`: this list feeds a git checkout,
     // so a provider stays out until it is deliberately classified as git.
@@ -155,7 +165,9 @@ export function WorkspacePicker({
       // App sees no repositories while we are still asking would send them off
       // to install one they already have.
       setReposLoading(true);
-      apiGet<{ repos: Repo[] }>(`/connections/${draft.connectionId}/repos?per_page=100`)
+      apiGetCached<{ repos: Repo[] }>(`/connections/${draft.connectionId}/repos?per_page=100`, {
+        maxAgeMs: 30_000,
+      })
         .then((r) => setRepos(r.repos))
         .catch((e) => setRepoErr(String(e)))
         .finally(() => setReposLoading(false));
@@ -236,10 +248,16 @@ export function WorkspacePicker({
           <div className="field">
             <div className="bundle-picker-head">
               <span className="lab">Connection</span>
-              <button className="btn ghost sm" type="button" onClick={runGithubAction}>
-                + {GITHUB_ACTION_LABEL[action.kind]}
+              <button
+                className="btn ghost sm"
+                type="button"
+                onClick={runGithubAction}
+                disabled={lookupsLoading || !!lookupError}
+              >
+                + {lookupsLoading ? "Checking GitHub…" : GITHUB_ACTION_LABEL[action.kind]}
               </button>
             </div>
+            {lookupError && <div className="err" role="status">{lookupError}</div>}
             {action.kind === "create" && (
               <input
                 className="inp"

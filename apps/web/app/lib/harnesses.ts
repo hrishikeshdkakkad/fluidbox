@@ -6,7 +6,7 @@
 // clean 422 at agent-write time.
 
 import { useCallback, useEffect, useState } from "react";
-import { apiGet, HarnessInfo } from "./api";
+import { apiGetCached, HarnessInfo } from "./api";
 
 export interface HarnessCatalog {
   harnesses: HarnessInfo[];
@@ -29,7 +29,10 @@ export function useHarnesses(): HarnessCatalog {
 
   useEffect(() => {
     let active = true;
-    apiGet<{ harnesses: HarnessInfo[] }>("/harnesses")
+    apiGetCached<{ harnesses: HarnessInfo[] }>("/harnesses", {
+      maxAgeMs: 5 * 60_000,
+      force: request > 0,
+    })
       .then((response) => {
         if (active) setHarnesses(response.harnesses);
       })
