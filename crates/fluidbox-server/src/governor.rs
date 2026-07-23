@@ -1974,6 +1974,7 @@ mod tests {
             session_idle_secs: 0,
             session_absolute_secs: 0,
             oidc_discovery_max_age_secs: 0,
+            oidc_discovery_stale_grace_secs: 0,
             oidc_clock_skew_secs: 0,
             session_reauth_secs: 0,
             max_request_body_bytes: crate::config::DEFAULT_MAX_REQUEST_BODY_BYTES,

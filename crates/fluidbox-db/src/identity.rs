@@ -760,36 +760,73 @@ pub async fn resolve_web_session(
 }
 
 /// Is this browser session still authorized RIGHT NOW — not revoked, within
-/// both expiries, membership + user + tenant still active? Read-only and it does NOT
-/// bump idle (design lines 658-664: the bounded stream re-auth must not extend
-/// a session's life). Keyed on the session id under its verified scope.
-pub async fn web_session_live(
+/// both expiries, membership + user + tenant still active — and as WHOM?
+/// `None` = dead; `Some((user_id, roles))` = live, with the membership's
+/// CURRENT roles so the stream re-auth can re-run run visibility under fresh
+/// authority (a mid-stream role downgrade must narrow what keeps streaming).
+/// Read-only and it does NOT bump idle (design lines 658-664: the bounded
+/// stream re-auth must not extend a session's life). Keyed on the session id
+/// under its verified scope.
+pub async fn web_session_reauth(
     pool: &PgPool,
     scope: TenantScope,
     session_id: Uuid,
-) -> sqlx::Result<bool> {
+) -> sqlx::Result<Option<(Uuid, Vec<String>)>> {
     let mut tx = crate::scoped_tx(pool, scope).await?;
-    let (live,): (bool,) = sqlx::query_as(
-        "select exists(
-           select 1 from user_sessions s
-           join org_memberships m
-             on m.tenant_id = s.tenant_id and m.id = s.membership_id and m.user_id = s.user_id
-           join users u on u.tenant_id = s.tenant_id and u.id = s.user_id
-           join tenants t on t.id = s.tenant_id
-           where s.tenant_id = $1 and s.id = $2
-             and s.revoked_at is null
-             and s.idle_expires_at > now()
-             and s.absolute_expires_at > now()
-             and m.status = 'active'
-             and u.status = 'active'
-             and t.status = 'active')",
+    let __rls_out = sqlx::query_as(
+        "select s.user_id, m.roles from user_sessions s
+         join org_memberships m
+           on m.tenant_id = s.tenant_id and m.id = s.membership_id and m.user_id = s.user_id
+         join users u on u.tenant_id = s.tenant_id and u.id = s.user_id
+         join tenants t on t.id = s.tenant_id
+         where s.tenant_id = $1 and s.id = $2
+           and s.revoked_at is null
+           and s.idle_expires_at > now()
+           and s.absolute_expires_at > now()
+           and m.status = 'active'
+           and u.status = 'active'
+           and t.status = 'active'",
     )
     .bind(scope.tenant_id())
     .bind(session_id)
-    .fetch_one(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(live)
+    Ok(__rls_out)
+}
+
+/// The PAT twin of [`web_session_reauth`]: is this token still authorized
+/// RIGHT NOW — not revoked, unexpired, membership + user + tenant active —
+/// and as whom? A bearer stream authenticated once at its handshake; without
+/// this, revoking the PAT (or deactivating its membership) leaves the stream
+/// running until it ends naturally. Read-only: re-auth is not "use", so
+/// `last_used_at` is deliberately NOT bumped. Keyed on the token id under its
+/// verified scope.
+pub async fn pat_reauth(
+    pool: &PgPool,
+    scope: TenantScope,
+    token_id: Uuid,
+) -> sqlx::Result<Option<(Uuid, Vec<String>)>> {
+    let mut tx = crate::scoped_tx(pool, scope).await?;
+    let __rls_out = sqlx::query_as(
+        "select tok.user_id, m.roles from api_tokens tok
+         join org_memberships m
+           on m.tenant_id = tok.tenant_id and m.id = tok.membership_id and m.user_id = tok.user_id
+         join users u on u.tenant_id = tok.tenant_id and u.id = tok.user_id
+         join tenants t on t.id = tok.tenant_id
+         where tok.tenant_id = $1 and tok.id = $2 and tok.kind = 'pat'
+           and tok.revoked_at is null
+           and tok.expires_at > now()
+           and m.status = 'active'
+           and u.status = 'active'
+           and t.status = 'active'",
+    )
+    .bind(scope.tenant_id())
+    .bind(token_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
 }
 
 /// Revoke a single session (a row update, never a delete — the audit trail and

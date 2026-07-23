@@ -1016,6 +1016,9 @@ pub async fn create_session(
             revision: crate::run_service::RevisionSelector::Latest,
             task: req.task,
             explicit_workspace: explicit,
+            // Re-derived so the revision-default FALLBACK is held to the same
+            // operator-only local_copy rule as the explicit input above.
+            local_path_authority: LocalPathAuthority::of(&principal),
             autonomy,
             trust_tier: fluidbox_core::spec::TrustTier::Trusted,
             budget_override: req.budgets,
@@ -1102,11 +1105,13 @@ pub async fn cancel_session(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     use orchestrator::FinalizeStart;
-    // Prove tenant ownership + run visibility before cancelling.
+    // Prove tenant ownership, then CANCELLATION authority — a mutation, so
+    // deliberately stricter than run visibility (`runs.read_all` lets an
+    // approver judge approvals, not control every tenant run).
     let session = fluidbox_db::get_session(&state.pool, principal.scope(), id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    rbac::ensure_run_visible(&principal, &session)?;
+    rbac::authorize_run_cancellation(&principal, &session)?;
     // The session was just loaded under principal.scope() (ownership proven);
     // thread that scope so the finalizer does not re-resolve the tenant.
     match orchestrator::cancel(&state, principal.scope(), id, "cancelled by user").await {

@@ -14,22 +14,48 @@ use std::convert::Infallible;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// Re-authorize a cookie-authenticated stream mid-flight: `true` = the session
-/// is gone (revoked / expired / membership deactivated) and the stream must
-/// terminate. `None` (bearer/operator) is always live. Kept tiny so every
-/// re-auth branch — the DB-fetch race AND each per-event send — shares ONE
-/// liveness rule (design 658-664).
+/// What a long-lived stream re-authorizes AGAINST on its bounded tick. Design
+/// 658-664 says EVERY long-lived stream, so a PAT stream re-checks its token
+/// exactly as a browser stream re-checks its session — only the operator is
+/// static (the admin token has no revocation row to consult; rotating it is a
+/// deployment restart).
+enum ReauthSubject {
+    Static,
+    Web(Uuid),
+    Pat(Uuid),
+}
+
+impl ReauthSubject {
+    fn checks(&self) -> bool {
+        !matches!(self, ReauthSubject::Static)
+    }
+}
+
+/// Re-authorize a stream mid-flight: `true` = terminate. Dead means the
+/// credential is gone (revoked / expired / membership deactivated) OR the
+/// reloaded CURRENT roles no longer see this run (`rbac::run_visible_to_user`
+/// — the same rule the handshake applied, under fresh authority, so a role
+/// downgrade stops an ex-approver streaming another member's events). A DB
+/// error fails closed. Kept tiny so every re-auth branch — the DB-fetch race
+/// AND each per-event send — shares ONE rule (design 658-664).
 async fn reauth_dead(
     pool: &sqlx::PgPool,
     scope: fluidbox_db::TenantScope,
-    reauth: Option<Uuid>,
+    subject: &ReauthSubject,
+    invoked_by_user_id: Option<Uuid>,
 ) -> bool {
-    match reauth {
-        Some(sid) => !matches!(
-            fluidbox_db::identity::web_session_live(pool, scope, sid).await,
-            Ok(true)
-        ),
-        None => false,
+    let live: sqlx::Result<Option<(Uuid, Vec<String>)>> = match subject {
+        ReauthSubject::Static => return false,
+        ReauthSubject::Web(sid) => {
+            fluidbox_db::identity::web_session_reauth(pool, scope, *sid).await
+        }
+        ReauthSubject::Pat(tid) => fluidbox_db::identity::pat_reauth(pool, scope, *tid).await,
+    };
+    match live {
+        Ok(Some((user_id, roles))) => {
+            !rbac::run_visible_to_user(user_id, &roles, invoked_by_user_id)
+        }
+        _ => true,
     }
 }
 
@@ -47,17 +73,20 @@ pub async fn stream(
         .ok_or(ApiError::NotFound)?;
     rbac::ensure_run_visible(&principal, &session)?;
 
-    // A cookie-authenticated stream re-authorizes on a bounded interval
-    // (design 658-664): the extractor runs once, so a revocation / deactivation
-    // / expiry after the handshake must terminate the stream. Bearer/operator
-    // streams are unaffected (`reauth` stays None).
-    let reauth: Option<uuid::Uuid> = match &principal {
+    // EVERY user stream re-authorizes on a bounded interval (design 658-664):
+    // the extractor runs once, so a revocation / deactivation / expiry / role
+    // downgrade after the handshake must terminate the stream — for browser
+    // sessions AND PATs alike. Only the operator stream is static.
+    let reauth = match &principal {
         Principal::User(u) => match &u.auth {
-            AuthContext::BrowserSession { session_id, .. } => Some(*session_id),
-            AuthContext::Pat { .. } => None,
+            AuthContext::BrowserSession { session_id, .. } => ReauthSubject::Web(*session_id),
+            AuthContext::Pat { token_id } => ReauthSubject::Pat(*token_id),
         },
-        Principal::Operator { .. } => None,
+        Principal::Operator { .. } => ReauthSubject::Static,
     };
+    // The visibility fact the re-auth rule needs from the run row; the row
+    // itself is immutable on this axis, so capturing it at handshake is exact.
+    let invoked_by = session.invoked_by_user_id;
     let reauth_every = Duration::from_secs(state.cfg.session_reauth_secs.max(1) as u64);
 
     // Resume from Last-Event-ID (the seq) if present.
@@ -88,8 +117,8 @@ pub async fn stream(
         'backlog: loop {
             tokio::select! {
                 biased;
-                _ = reauth_tick.tick(), if reauth.is_some() => {
-                    if reauth_dead(&pool, scope, reauth).await {
+                _ = reauth_tick.tick(), if reauth.checks() => {
+                    if reauth_dead(&pool, scope, &reauth, invoked_by).await {
                         return; // revoked / expired / membership deactivated
                     }
                 }
@@ -105,8 +134,8 @@ pub async fn stream(
                         'send: loop {
                             tokio::select! {
                                 biased;
-                                _ = reauth_tick.tick(), if reauth.is_some() => {
-                                    if reauth_dead(&pool, scope, reauth).await {
+                                _ = reauth_tick.tick(), if reauth.checks() => {
+                                    if reauth_dead(&pool, scope, &reauth, invoked_by).await {
                                         return;
                                     }
                                 }
@@ -139,8 +168,8 @@ pub async fn stream(
         // past the bound (design 658-664).
         'follow: loop {
             let should_fetch = tokio::select! {
-                _ = reauth_tick.tick(), if reauth.is_some() => {
-                    if reauth_dead(&pool, scope, reauth).await {
+                _ = reauth_tick.tick(), if reauth.checks() => {
+                    if reauth_dead(&pool, scope, &reauth, invoked_by).await {
                         break 'follow; // revoked / expired / membership deactivated
                     }
                     false
@@ -161,8 +190,8 @@ pub async fn stream(
             let batch = loop {
                 tokio::select! {
                     biased;
-                    _ = reauth_tick.tick(), if reauth.is_some() => {
-                        if reauth_dead(&pool, scope, reauth).await {
+                    _ = reauth_tick.tick(), if reauth.checks() => {
+                        if reauth_dead(&pool, scope, &reauth, invoked_by).await {
                             break 'follow; // revoked / expired / membership deactivated
                         }
                     }
@@ -175,8 +204,8 @@ pub async fn stream(
                         'send: loop {
                             tokio::select! {
                                 biased;
-                                _ = reauth_tick.tick(), if reauth.is_some() => {
-                                    if reauth_dead(&pool, scope, reauth).await {
+                                _ = reauth_tick.tick(), if reauth.checks() => {
+                                    if reauth_dead(&pool, scope, &reauth, invoked_by).await {
                                         break 'follow;
                                     }
                                 }
@@ -203,8 +232,8 @@ pub async fn stream(
                     // rechecks liveness and, if live, just cuts the backoff short.
                     tokio::select! {
                         biased;
-                        _ = reauth_tick.tick(), if reauth.is_some() => {
-                            if reauth_dead(&pool, scope, reauth).await {
+                        _ = reauth_tick.tick(), if reauth.checks() => {
+                            if reauth_dead(&pool, scope, &reauth, invoked_by).await {
                                 break 'follow; // revoked / expired / membership deactivated
                             }
                         }

@@ -5,6 +5,7 @@
 //! the invocation context, and the result destinations. An invocation may
 //! narrow the agent's authority; nothing here can widen it.
 
+use crate::api::LocalPathAuthority;
 use crate::bindings::{self, BindingInputs, WorkspaceBindingInput};
 use crate::error::{ApiError, ApiResult};
 use crate::orchestrator;
@@ -40,6 +41,17 @@ pub struct CreateRun {
     /// validate their own inputs (admin API: resolve_workspace_input;
     /// triggers: narrowing; events: connector normalization).
     pub explicit_workspace: Option<WorkspaceSpec>,
+    /// Whether THIS invocation may materialize a `local_copy` workspace (a
+    /// control-plane host path). `resolve_workspace_input` gates only the
+    /// EXPLICIT input, so create_run re-gates the EFFECTIVE workspace: without
+    /// this, a member invoking an agent whose STORED default is a local_copy
+    /// (operator-authored — e.g. before SSO was enabled) would have the host
+    /// path copied into a sandbox its own task drives. API runs derive it from
+    /// the invoking principal; trigger/schedule/event runs carry `Operator`
+    /// (the stored default passed the operator-only save gate, subscription
+    /// wiring is admin-gated, and invoke overrides can never name a local
+    /// path).
+    pub local_path_authority: LocalPathAuthority,
     pub autonomy: Autonomy,
     /// Frozen into the RunSpec and enforced at the permission gate. Fork /
     /// untrusted event sources arrive pre-downgraded to ReadOnly (§7.3);
@@ -259,6 +271,20 @@ pub async fn create_run(
         .map_err(|e| ApiError::Internal(format!("bad stored default workspace: {e}")))?;
     // Mutable: binding resolution stamps the `workspace_fetch` binding id in.
     let mut workspace = WorkspaceSpec::resolve(req.explicit_workspace, revision_default);
+    // Re-gate the EFFECTIVE workspace (see `CreateRun::local_path_authority`):
+    // the explicit input was authorized by the caller, but the revision-default
+    // fallback was not — and a stored local_copy default must never materialize
+    // for a non-operator invocation.
+    if matches!(workspace, WorkspaceSpec::LocalCopy { .. })
+        && req.local_path_authority != LocalPathAuthority::Operator
+    {
+        return Err(ApiError::Forbidden(
+            "this agent's default workspace is a local_copy (a control-plane host path), \
+             which only the operator (admin token) may run — supply an explicit \
+             workspace or ask the operator to change the agent's default"
+                .into(),
+        ));
+    }
     // The workspace connection's status/generation/owner and (manual path)
     // caller-may-use are verified inside binding resolution below (invariant 21),
     // replacing the old status-only precheck.
