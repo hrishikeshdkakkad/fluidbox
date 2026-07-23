@@ -14,7 +14,7 @@ Open source. Written in Rust.
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Rust backend](https://img.shields.io/badge/control_plane-Rust-orange.svg)](./crates)
 
-[Try it](#try-fluidbox) · [Connect an event](#connect-an-event) · [How it works](#one-event-one-governed-run) · [Kubernetes](#kubernetes) · [Contributing](#contributing)
+[Try it](#try-fluidbox) · [Hosted multi-user](#hosted-multi-user-mode) · [Connect an event](#connect-an-event) · [How it works](#one-event-one-governed-run) · [Kubernetes](#kubernetes) · [Contributing](#contributing)
 
 </div>
 
@@ -82,12 +82,36 @@ The same lifecycle holds whether the run came from a button, a PR opening, a Mon
 | **Agent harnesses** | Claude Agent SDK and Codex behind one runner contract |
 | **Execution providers** | Docker for local/self-hosted runs; Kubernetes-native Pods and Helm chart in `v0.2.0` |
 | **Capabilities** | Versioned MCP bundles; sandbox-local stdio tools and control-plane-brokered remote tools |
-| **Connections** | Sealed static credentials, OAuth with PKCE, GitHub App installation flow, connector catalog, custom MCP servers |
+| **Identity** | Single-admin mode by default; opt-in per-organization OIDC, server-side sessions, personal API tokens, and RBAC |
+| **Connections** | Organization- and user-owned grants, sealed static credentials, OAuth with PKCE, GitHub App installation flow, connector catalog, and custom MCP servers |
 | **Governance** | YAML policies, managed per-tool overrides, human approvals, autonomous fallbacks, budgets, fork-PR read-only trust |
 | **Evidence** | Frozen `RunSpec`, live SSE timeline, append-only redacted ledger, model usage and cost, diff artifacts, delivery attempts |
 | **Results** | Dashboard/CLI result, HMAC-signed callback, GitHub PR comment, GitHub check |
+| **Dashboard** | Admin and SSO modes, responsive navigation, light/dark themes, draft recovery, visibility-aware polling, and explicit offline/retry states |
+| **Operations** | Prometheus metrics, configurable database pools, S3-compatible archives, multi-replica coordination primitives, and a guarded load harness |
 
 Native Slack and ServiceNow adapters do not ship yet. Events from either can reach the scoped trigger API today, and a future native adapter only needs to verify and normalize the event before handing it to the existing run path.
+
+## Hosted multi-user mode
+
+The `release/multi-user-mcp-control-plane` branch contains the merged Phase A–F implementation work and acceptance tooling for an opt-in hosted control plane while preserving the existing single-admin deployment as the default.
+
+| Area | What this branch adds |
+|---|---|
+| **Identity and authorization** | Per-organization OIDC login, JIT membership, server-side browser sessions, personal API tokens (`fbx_pat_`), role mapping, and an operator-only `/v1/admin/*` break-glass surface |
+| **Connection authority** | Connector definitions separated from organization- or user-owned credentials; agent revisions declare requirements and run creation freezes the exact connection, generation, and tool snapshot |
+| **Secret and data isolation** | Per-tenant envelope encryption with static or AWS KMS KEKs, tenant-scoped LiteLLM virtual keys, tenant-scoped repositories, and PostgreSQL RLS as defense in depth |
+| **Broker and runtime hardening** | Destination admission and redirect refusal, audience-scoped sandbox credentials, server-side MCP argument validation, durable tool-execution claims, budget reservations, and governed upstream sessions |
+| **Multi-replica operation** | Session leases and epoch fencing, cross-replica approval wakeups and delivery claims, durable egress governance, S3-compatible shared archives, workload-address binding, and operational metrics |
+
+Hosted mode is a deployment posture, not a single feature flag. Before admitting users:
+
+1. Set `FLUIDBOX_REQUIRE_SSO=1` on the server and `FLUIDBOX_WEB_MODE=sso` on the dashboard.
+2. Run the application pool through a non-owner, non-`BYPASSRLS` `FLUIDBOX_RUNTIME_ROLE`; multi-user boot refuses an unsafe role unless the operator explicitly overrides the guard.
+3. Enable KMS envelope sealing and per-tenant LiteLLM keys, then complete the documented re-seal and key-custody checks.
+4. Rebuild and pin both runner images from this branch. Multi-replica deployments additionally require the S3 archive backend; stage workload identity through `observe` before `enforce`.
+
+Start with the [hosted product boundary](./docs/hosted/README.md), then follow the [rollout gates](./docs/hosted/rollout-gates.md) and [KMS/RLS operations runbook](./docs/hosted/kms-operations.md). The implementation and automated acceptance machinery are present, but the real 60/150/300-concurrent-run exercises have not been executed. This branch therefore does **not** claim a proven 300-run production ceiling; capacity and residual-risk sign-off remain deployment gates.
 
 ## Try fluidbox
 
@@ -194,8 +218,11 @@ The control plane is the authority; the sandbox is workload-only. Both execution
 |---|---|
 | **Agent revision** | Versioned definition of harness, model, prompt, policy, budgets, workspace default, and capabilities |
 | **Trigger subscription** | Standing permission for an event source to borrow an agent |
-| **Connection** | Custody for credentials used by git, GitHub, OAuth, or a brokered MCP server |
-| **Capability bundle** | Versioned photograph of tools that may exist for an agent; attaching does not allow them |
+| **Connector definition** | Operator-admitted description of a remote tool source and its authentication contract |
+| **Connection** | Organization- or user-owned credential grant for git, GitHub, OAuth, or a brokered MCP server |
+| **Agent connection requirement** | A revision's named need for a connector and tool surface, without selecting a user's credential |
+| **Run resource binding** | Immutable resolution of a requirement to one connection, credential generation, and tool snapshot for a run |
+| **Capability bundle** | Versioned photograph of sandbox-local tools that may exist for an agent; attaching does not allow them |
 | **`RunSpec`** | Immutable evidence of the exact agent, authority, context, and limits resolved for one run |
 | **Session** | The live lifecycle and audit identity of that run |
 
@@ -210,7 +237,7 @@ fluidbox is pre-1.0 security software. Its guarantees come from explicit boundar
 - **Audit is redacted by construction.** The append path accepts only `Redacted<EventEnvelope>` values. The ledger keeps digests, decisions, usage, cost, lifecycle, and artifact metadata—not raw model prompts, secrets, or brokered tool payloads.
 - **Finalization is durable.** Terminal intent is persisted before acknowledgement; artifact collection precedes the terminal transition; interrupted finalizations are recovered after restart.
 
-The default deployment model is self-hosted and effectively single-tenant, with one admin bearer token. Multi-user mode — per-organization OIDC login, server-side sessions, personal API tokens (`fbx_pat_`), and RBAC — is available behind `FLUIDBOX_REQUIRE_SSO` (Phase B); single-admin mode is unchanged when it is off. Read [SECURITY.md](./SECURITY.md) before operating fluidbox outside a local environment.
+The default deployment model is self-hosted and effectively single-tenant, with one admin bearer token. The opt-in [hosted multi-user posture](#hosted-multi-user-mode) adds identity, ownership, custody, RLS, broker hardening, and multi-replica coordination, but production promotion still depends on the documented rollout gates and accepted residuals. Single-admin behavior is unchanged when SSO is off. Read [SECURITY.md](./SECURITY.md) and the hosted [threat model](./docs/hosted/threat-model.md) before operating fluidbox outside a local environment.
 
 ## Kubernetes
 
@@ -268,6 +295,8 @@ policies/                     versioned seed policy YAML
 - [Writing policies](./docs/guides/policies.md) — ordered rules, approvals, autonomy, and managed overrides.
 - [Triggers and schedules](./docs/guides/triggers.md) — scoped invocation, cron, callbacks, and GitHub events.
 - [MCP capabilities](./docs/guides/capabilities.md) — sandbox versus brokered tools, pinning, and connector custody.
+- [Hosted product boundary](./docs/hosted/README.md) — multi-user compatibility, network architecture, connector admission, threat model, rollout gates, and KMS/RLS operations.
+- [Multi-user control-plane design](./docs/plans/2026-07-14-multi-user-mcp-control-plane-design.md) — identity, ownership, frozen binding, custody, isolation, and scaling invariants.
 - [Kubernetes deployment guide](./docs/guides/kubernetes.md) — deploy to kind, EKS, GKE, AKS, or DOKS: recipe, per-cloud gotchas, certification, verifying a run, cost, and safe teardown.
 - [Kubernetes provider design](./docs/plans/2026-07-15-kubernetes-native-provider-design.md) — Pod lifecycle, network enforcement, archive transport, finalization, and reconciliation.
 
