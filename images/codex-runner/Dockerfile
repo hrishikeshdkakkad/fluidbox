@@ -85,8 +85,16 @@ RUN set -eux; \
     install -o runner -g runner -m 0644 /dev/null "$CODEX_HOME/.personality_migration"; \
     install -d -o runner -g runner -m 0755 \
         "$CODEX_HOME/skills" "$CODEX_HOME/tmp" "$CODEX_HOME/tmp/arg0" \
-        /opt/fluidbox-codex/state /opt/fluidbox-codex/state/log
+        /opt/fluidbox-codex/state /opt/fluidbox-codex/state/log; \
+    chmod 0755 /opt/fluidbox-codex/lib/entrypoint.sh
 
 USER runner
 WORKDIR /workspace
-ENTRYPOINT ["node", "/opt/fluidbox-codex/index.mjs"]
+# NOT `node index.mjs` directly: entrypoint.sh moves the runner-control token
+# out of the environment and hands it over on an unlinked-file fd, then `exec`s
+# this exact command — so node is still pid 1 (signals reach it unchanged) but
+# its execve-fixed /proc/<pid>/environ never contains the credential. It stays
+# root-owned here like the rest of /opt/fluidbox-codex, so the runner uid cannot
+# rewrite its own entrypoint. See images/runner-lib/entrypoint.sh, including
+# what it does NOT close (ptrace).
+ENTRYPOINT ["/opt/fluidbox-codex/lib/entrypoint.sh", "node", "/opt/fluidbox-codex/index.mjs"]

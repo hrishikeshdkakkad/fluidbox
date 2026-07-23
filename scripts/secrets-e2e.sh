@@ -135,7 +135,7 @@ trap cleanup EXIT INT TERM
 # revoke} inject conditions.
 start_as() {
   python3 - "$AS_PORT" <<'PYEOF' &
-import base64, hashlib, http.server, json, sys, threading, time, urllib.parse
+import base64, hashlib, http.server, json, os, sys, threading, time, urllib.parse
 port = int(sys.argv[1])
 BASE = f"http://127.0.0.1:{port}"
 RESOURCE = f"{BASE}/mcp"
@@ -156,6 +156,15 @@ def mint():
     S["access"][acc] = time.time() + S["mode"]["access_ttl"]
     S["refresh"].append(rt)
     return acc, rt
+# Parse-only JWKS fixture: this suite stages the IdP config to exercise
+# client_secret SEALING and never verifies a token from this issuer, but
+# save-time validation (correctly) refuses a zero-key JWKS since the PR #27
+# review (P2-8) — so publish ONE well-formed RSA public JWK. The modulus is
+# random bytes: syntactically valid, never used for a signature check.
+_nb = bytearray(os.urandom(256)); _nb[0] |= 0x80
+FIXTURE_JWK = {"kty": "RSA", "use": "sig", "alg": "RS256", "kid": "e2e-fixture",
+               "n": base64.urlsafe_b64encode(bytes(_nb)).rstrip(b"=").decode(),
+               "e": "AQAB"}
 class As(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def _send(self, code, obj, headers=None):
@@ -201,7 +210,7 @@ class As(http.server.BaseHTTPRequestHandler):
                 "id_token_signing_alg_values_supported": ["RS256"],
                 "scopes_supported": ["openid", "email", "profile"]})
         if u.path == "/jwks":
-            return self._send(200, {"keys": []})
+            return self._send(200, {"keys": [FIXTURE_JWK]})
         if u.path == "/authorize":
             q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
             S["authorize"].append(q)
@@ -516,6 +525,12 @@ _spawn() {
     export LITELLM_MASTER_KEY="$master"
     export RUST_LOG="${RUST_LOG:-warn,fluidbox_server=info}"
     if [ -n "${FLUIDBOX_SERVER_BIN:-}" ] && [ -x "${FLUIDBOX_SERVER_BIN}" ]; then
+      # The server self-loads ./.env (dotenvy) — booting from $ROOT lets a
+      # developer's real .env FILL IN variables this suite deliberately left
+      # ABSENT (FLUIDBOX_CREDENTIAL_KEY absent IS the retirement-gate test
+      # state), so run the binary from the .env-less work dir. CI has no .env
+      # and is unaffected; the cargo fallback below stays on $ROOT (dev seam).
+      cd "$WORK" || exit 1
       exec "$FLUIDBOX_SERVER_BIN"
     fi
     exec cargo run -q -p fluidbox-server
@@ -795,7 +810,7 @@ db "update integration_connections set authorization_generation = authorization_
 CALLS_G=$(as_field "['mcp'].__len__()")
 R=$(sess_call "$HRUN" "sess-h-$$" '{"tool_call_id":"h2","tool":"mcp__fxn__nt_search","input":{"query":"x"}}')
 { echo "$R" | grep -qi '"denied": *true' && echo "$R" | grep -qi "reauthorized"; } \
-  && ok "generation bump → the in-flight call is REFUSED (binding recheck: reauthorized; gen $GEN0→bumped)" \
+  && ok "generation bump → the in-flight call is REFUSED (binding recheck: reauthorized; gen ${GEN0}→bumped)" \
   || no "generation refusal wrong: $R"
 [ "$(as_field "['mcp'].__len__()")" = "$CALLS_G" ] && ok "the refused call reached the upstream ZERO times (recheck is before egress)" || no "a generation-refused call still hit the AS"
 # (h3) invalid_grant → connection status='error'. Inject a one-shot invalid_grant
@@ -884,7 +899,7 @@ if need "$CB_FA" "flow A produced no callback URL" && need "$FA_CONN" "connectio
   [ "$CF" = 403 ] && ok "B's cookie completing A's callback → 403 (per-flow binding, not mere cookie presence)" || no "cross-flow → $CF (want 403)"
   STA=$(db "select status from integration_connections where id='$FA_CONN'")
   GENA1=$(db "select authorization_generation from integration_connections where id='$FA_CONN'")
-  { [ "$STA" = pending ] && [ "$GENA0" = "$GENA1" ]; } && ok "connection A stayed pending, generation unchanged ($GENA0)" || no "connection A changed (status=$STA gen $GENA0→$GENA1)"
+  { [ "$STA" = pending ] && [ "$GENA0" = "$GENA1" ]; } && ok "connection A stayed pending, generation unchanged ($GENA0)" || no "connection A changed (status=$STA gen ${GENA0}→${GENA1})"
   CFA=$(complete_cb "$jarFA" "$CB_FA")  # A's own browser completes
   [ "$CFA" = 200 ] && ok "…A's own browser still completes (200) — A's flow was never burned" || no "A self-complete → $CFA (want 200)"
 fi
@@ -1117,7 +1132,11 @@ if boot_expect_refusal "p3-retire-refuse" static 0 shared 0 "$MASTER_KEY"; then
     && ok "legacy-absent boot with a v1 straggler → REFUSED, naming the family" \
     || no "boot refused but the log lacks the family-named gate reason: $(tail -5 "$SERVER_LOG")"
 else
-  no "a v1 straggler did NOT refuse the legacy-retired boot (it became healthy)"
+  # Forensics on the healthy-boot failure: hung vs healthy, row state, and the
+  # unfiltered tail showing how far boot actually got.
+  STRAG_AFTER=$(db "select count(*) from trigger_subscriptions where callback_secret_key_version=1 and callback_secret_sealed is not null")
+  HCODE=$(curl -s -o /dev/null -w '%{http_code}' "$API/v1/health")
+  no "a v1 straggler did NOT refuse the legacy-retired boot (health=$HCODE; straggler rows after boot=$STRAG_AFTER; log tail: $(tail -6 "$SERVER_LOG" | tr '\n' '|'))"
 fi
 # Restore parity so the tenant-mode boot is clean.
 db "update trigger_subscriptions set callback_secret_key_version=2 where callback_secret_sealed is not null" >/dev/null

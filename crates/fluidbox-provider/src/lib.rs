@@ -155,6 +155,22 @@ impl ExecutionProvider for DockerProvider {
             .await
             .map_err(map_err)?;
 
+        // Gap 6 (Phase F) — DELIBERATELY NO `workload_addrs` HERE. Read this before
+        // adding one: `create_container` does not return an address, so recording
+        // one would cost an extra `inspect_container` round trip on the
+        // provisioning path, and the value would then be wrong for the deployment
+        // this provider actually serves. Docker Desktop (macOS/Windows) reaches the
+        // host through a VM gateway, so EVERY container's traffic arrives at the
+        // control plane from ONE shared NAT address: recording per-container IPs
+        // there would produce a binding that is simultaneously false (the peer
+        // never matches) and useless (the addresses that would match are shared by
+        // all sandboxes). A Linux bridge network does preserve the container IP —
+        // if that case is ever worth supporting, inspect the container AFTER start
+        // and gate the capture on the daemon platform, rather than assuming.
+        //
+        // Consequence, stated plainly: a Docker-provider run is UNBINDABLE. The
+        // control plane counts it as such and admits it (`auth.rs::workload_verdict`),
+        // which is exactly today's posture — no worse, and now visible.
         Ok(SandboxHandle {
             runtime: "docker".to_string(),
             external_id: created.id,

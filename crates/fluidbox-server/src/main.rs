@@ -23,6 +23,7 @@ mod ledger;
 mod llm_keys;
 mod login;
 mod mcp_sse;
+mod metrics;
 mod oauth;
 mod orchestrator;
 mod rbac;
@@ -66,6 +67,42 @@ async fn build_provider(cfg: &config::Config) -> anyhow::Result<Arc<dyn Executio
     }
 }
 
+/// Apply the process-wide request bounds to a listener's router (Phase F).
+///
+/// **What this adds:** nothing, on purpose. Every body-consuming handler in this
+/// crate extracts `Bytes` or `Json`, and axum bounds those at 2 MiB by default, so
+/// the limit was ALREADY being enforced — it was simply invisible, unnamed and
+/// unmovable. `DEFAULT_MAX_REQUEST_BODY_BYTES` is that same 2 MiB, so an existing
+/// install sees byte-identical behaviour; what changes is that an operator can now
+/// see the number, move it, and be refused at boot for a nonsensical one. The
+/// accompanying test drives a real listener in BOTH directions (a smaller limit
+/// must reject what axum would accept, a larger one must accept what axum would
+/// reject) so the layer is proven to be the thing that binds.
+///
+/// **What this deliberately does NOT add**, because neither is safe here:
+///
+/// * a request TIMEOUT layer. Both listeners carry requests that are long-lived by
+///   design — `/v1/sessions/{id}/events/stream` (SSE, open for the life of a run),
+///   `/internal/llm/*` (the facade forwards a model turn under a
+///   [`config::UPSTREAM_HTTP_TIMEOUT_SECS`] = 900 s upstream budget and tees the SSE
+///   response back), `/internal/sessions/{id}/permission` (blocks until a human
+///   decides or the approval expires — MINUTES), and
+///   `/internal/sessions/{id}/tools/call` (blocks on the brokered dispatch, and on
+///   `poll_in_flight` for up to 30 s). A global timeout would cut model turns off
+///   mid-stream — leaving `llm_reservations` rows to be swept into conservative
+///   charges — and would convert a pending approval into a failed tool call.
+///
+/// * a global CONCURRENCY limit. `tower`'s releases its permit when the handler
+///   FUTURE resolves, and on the internal plane the three handlers above resolve
+///   only after a human, a model, or an upstream server does something. 300 runs
+///   parked in `/permission` would hold 300 permits and starve the `/heartbeat`
+///   posts that keep those very runs alive — the watchdog would then reap them.
+///   The back-pressure valve that IS in place is `FLUIDBOX_DB_ACQUIRE_TIMEOUT_SECS`
+///   (above): a saturated database sheds by failing acquires, not by queueing.
+fn bounded(router: Router, max_request_body_bytes: usize) -> Router {
+    router.layer(axum::extract::DefaultBodyLimit::max(max_request_body_bytes))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
@@ -84,7 +121,25 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&cfg.data_dir).ok();
 
     tracing::info!("connecting to database…");
-    let pool = fluidbox_db::connect(&cfg.database_url, cfg.runtime_role.as_deref()).await?;
+    // Phase F: the pool is SIZED, not defaulted. The deployment-wide connection
+    // count is `replicas × (max_connections + 2)` — the +2 being the two
+    // `PgListener` connections below, which live outside the pool — and it is that
+    // figure, not this one, that has to fit the Postgres/Neon compute's own ceiling.
+    let pool =
+        fluidbox_db::connect_with(&cfg.database_url, cfg.runtime_role.as_deref(), cfg.db_pool)
+            .await?;
+    {
+        let p = cfg.db_pool;
+        tracing::info!(
+            "database pool: max {} connections (min {}), acquire timeout {}s, idle {}s, recycle {}s \
+             — deployment total is replicas × (max + 2 listeners)",
+            p.max_connections,
+            p.min_connections,
+            p.acquire_timeout_secs,
+            p.idle_timeout_secs,
+            p.max_lifetime_secs
+        );
+    }
     if let Some(role) = &cfg.runtime_role {
         tracing::info!(
             "app pool runs under non-owner role '{role}' (RLS role split enabled; posture verified: \
@@ -228,15 +283,17 @@ async fn main() -> anyhow::Result<()> {
     let egress_policy = egress::EgressPolicy::from_config(&cfg);
     let identity_http = egress::build_identity_http(&egress_policy);
     let egress_http = egress::build_egress_http(&egress_policy);
-    // Phase E (E14): the outbound rate limits + per-connection circuit breakers
-    // the broker consults before every dial. In-memory and PER-REPLICA by design
-    // — see the `governor` module docs (durable limiter = Phase F).
+    // Phase E (E14) + Phase F (0023): the outbound rate limits + per-connection
+    // circuit breakers the broker consults before every dial. Two tiers — a
+    // per-replica in-memory tier checked first, then (default on) a durable
+    // Postgres tier giving the deployment-wide ceiling. See the `governor` docs.
     let governor = governor::EgressGovernor::from_config(&cfg);
     {
         let l = governor.limits();
         tracing::info!(
-            "outbound egress governor: {}/min per tenant, {}/min per connection, {}/min per host; breaker {} consecutive transport failures ⇒ open {}s (0 = disabled; per-replica)",
-            l.tenant_per_min, l.connection_per_min, l.host_per_min, l.breaker_threshold, l.breaker_open_secs
+            "outbound egress governor: {}/min per tenant, {}/min per connection, {}/min per host; breaker {} consecutive transport failures ⇒ open {}s (0 = disabled). Durable cross-replica tier: {} (host_global stays per-replica)",
+            l.tenant_per_min, l.connection_per_min, l.host_per_min, l.breaker_threshold, l.breaker_open_secs,
+            if cfg.egress_durable { "ON" } else { "OFF (per-replica only)" }
         );
     }
 
@@ -272,6 +329,7 @@ async fn main() -> anyhow::Result<()> {
         // progress, both in-memory (the job is restart-safe by construction).
         reseal_running: std::sync::atomic::AtomicBool::new(false),
         reseal_status: tokio::sync::Mutex::new(reseal::ResealStatus::default()),
+        metrics: metrics::Metrics::default(),
         pool,
         cfg,
     });
@@ -387,6 +445,10 @@ async fn main() -> anyhow::Result<()> {
         // count parity + job progress. The D4 retirement boot gate
         // (seal::check_retirement_gates) reads the same counts.
         .route("/admin/reseal", get(reseal::status).post(reseal::start))
+        // Operational metrics (Phase F, #34): admin-gated Prometheus exposition.
+        // The optional unauth `FLUIDBOX_METRICS_BIND` listener (below) serves the
+        // identical body on its own private port.
+        .route("/admin/metrics", get(metrics::admin_metrics))
         .route(
             "/capabilities",
             get(capabilities::list).post(capabilities::create),
@@ -505,33 +567,68 @@ async fn main() -> anyhow::Result<()> {
     if !is_k8s {
         public_root = public_root.nest("/internal", internal.clone());
     }
-    let public_app = public_root
-        // CIMD (spec 2025-11-25): this document's URL IS our OAuth
-        // client_id; authorization servers fetch it — public by nature.
-        .route("/.well-known/fluidbox-client.json", get(oauth::cimd_doc))
-        .layer(trace_layer())
-        // NO CORS layer (Phase B): the dashboard is a same-origin proxy
-        // (`/` → web, `/v1` → API, one origin), so cross-origin requests to
-        // `/v1` are never legitimate and no `Access-Control-*` grant should
-        // exist. The permissive layer removed here (design lines 649-653) was a
-        // cookie-auth CSRF footgun; browser writes now carry the
-        // `x-fluidbox-csrf` header + an Origin check instead.
-        .with_state(state.clone());
+    let public_app = bounded(
+        public_root
+            // CIMD (spec 2025-11-25): this document's URL IS our OAuth
+            // client_id; authorization servers fetch it — public by nature.
+            .route("/.well-known/fluidbox-client.json", get(oauth::cimd_doc))
+            .layer(trace_layer())
+            // NO CORS layer (Phase B): the dashboard is a same-origin proxy
+            // (`/` → web, `/v1` → API, one origin), so cross-origin requests to
+            // `/v1` are never legitimate and no `Access-Control-*` grant should
+            // exist. The permissive layer removed here (design lines 649-653) was a
+            // cookie-auth CSRF footgun; browser writes now carry the
+            // `x-fluidbox-csrf` header + an Origin check instead.
+            .with_state(state.clone()),
+        state.cfg.max_request_body_bytes,
+    );
 
     // Internal listener (:8788) — /internal ONLY, no /v1 route exists. This is
     // the sandbox-facing plane on Kubernetes (the internal Service targets it);
     // route absence means a sandbox cannot reach /v1 at the TCP level.
-    let internal_app = Router::new()
-        .nest("/internal", internal)
-        .layer(trace_layer())
-        .with_state(state.clone());
+    let internal_app = bounded(
+        Router::new()
+            .nest("/internal", internal)
+            .layer(trace_layer())
+            .with_state(state.clone()),
+        state.cfg.max_request_body_bytes,
+    );
 
     let public_listener = tokio::net::TcpListener::bind(&state.cfg.bind).await?;
     let internal_listener = tokio::net::TcpListener::bind(&state.cfg.internal_bind).await?;
+
+    // Optional UNAUTHENTICATED metrics listener (Phase F, #34). Bound at boot so a
+    // bad address fails boot (the established convention), then served on a
+    // background task: a metrics-endpoint fault must not take the control plane
+    // down, unlike the two planes above whose failure is fatal by design.
+    if let Some(metrics_addr) = state.cfg.metrics_bind.clone() {
+        let metrics_listener = tokio::net::TcpListener::bind(&metrics_addr).await?;
+        let metrics_app = Router::new()
+            .route("/metrics", get(metrics::metrics_endpoint))
+            .with_state(state.clone());
+        tracing::warn!(
+            "fluidbox metrics listening on http://{metrics_addr}/metrics (UNAUTHENTICATED — \
+             FLUIDBOX_METRICS_BIND must reach a private interface only)"
+        );
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(metrics_listener, metrics_app).await {
+                tracing::error!("metrics listener exited: {e}");
+            }
+        });
+    }
+
     tracing::info!("fluidbox public  listening on http://{}", state.cfg.bind);
     tracing::info!(
         "fluidbox internal listening on http://{} (/internal only)",
         state.cfg.internal_bind
+    );
+    // Gap 6 (Phase F): say which mode is live at boot. A security control whose
+    // state can only be learned by reading the deployment's env is a control
+    // nobody knows the state of; `off` is the default and is announced as loudly
+    // as the other two, so "we turned that on months ago" is checkable.
+    tracing::info!(
+        "workload identity on the internal gateway: {} (FLUIDBOX_WORKLOAD_IDENTITY)",
+        state.cfg.workload_identity.as_str()
     );
     tracing::info!("default agent: {}", seed.default_agent);
 
@@ -551,4 +648,138 @@ async fn main() -> anyhow::Result<()> {
         ) => r?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serve ONE body-consuming route on an ephemeral loopback port and report the
+    /// status code a `body_len`-byte POST gets back. `limit = None` skips
+    /// [`bounded`] entirely, which is what makes the assertions below meaningful:
+    /// axum's own implicit 2 MiB default is still in force on that arm, so a test
+    /// that only checked "big body ⇒ 413" would pass with the layer deleted.
+    async fn post_status(limit: Option<usize>, body_len: usize) -> u16 {
+        let app = Router::new().route(
+            "/echo",
+            post(|body: axum::body::Bytes| async move { body.len().to_string() }),
+        );
+        let app = match limit {
+            Some(n) => bounded(app, n),
+            None => app,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let status = reqwest::Client::new()
+            .post(format!("http://{addr}/echo"))
+            .body(vec![b'x'; body_len])
+            .send()
+            .await
+            .expect("the loopback request completes")
+            .status()
+            .as_u16();
+        server.abort();
+        status
+    }
+
+    /// The explicit limit must be the one that BINDS, in both directions — the only
+    /// way to tell a real layer from a decorative one, because axum silently
+    /// enforces 2 MiB on `Bytes`/`Json` whether or not we ask.
+    #[tokio::test]
+    async fn the_explicit_body_limit_is_the_one_that_binds() {
+        // Downward: 8 KiB is comfortably under axum's implicit default, so a 413
+        // here can ONLY have come from our layer.
+        assert_eq!(post_status(Some(4 * 1024), 8 * 1024).await, 413);
+        assert_eq!(post_status(None, 8 * 1024).await, 200);
+        // Upward: 3 MiB is over axum's implicit default, so a 200 here can ONLY
+        // have come from our layer raising it.
+        assert_eq!(
+            post_status(Some(4 * 1024 * 1024), 3 * 1024 * 1024).await,
+            200
+        );
+        assert_eq!(post_status(None, 3 * 1024 * 1024).await, 413);
+        // …and the SHIPPED default is exactly axum's, so making the limit explicit
+        // is a no-op on an existing install rather than a quiet re-tuning.
+        let d = config::DEFAULT_MAX_REQUEST_BODY_BYTES;
+        assert_eq!(post_status(Some(d), d + 1).await, 413);
+        assert_eq!(post_status(None, d + 1).await, 413);
+        assert_eq!(post_status(Some(d), d).await, 200);
+        assert_eq!(post_status(None, d).await, 200);
+    }
+
+    /// A layer that exists but is not wired to a listener bounds nothing. The
+    /// `include_str!` guards elsewhere in this crate exist for exactly this shape
+    /// of defect — a correct helper nobody calls — and no unit test on `bounded`
+    /// itself can catch it.
+    /// This file's PRODUCTION half. The source guards below count occurrences, and
+    /// a test module that quotes the very strings it is counting would count itself
+    /// (it did, on the first run) — so the test half is cut off first.
+    fn production_src() -> &'static str {
+        let src = include_str!("main.rs");
+        let end = src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("this file has a test module");
+        &src[..end]
+    }
+
+    #[test]
+    fn both_listeners_are_wired_through_the_bound_helper() {
+        let src = production_src();
+        assert!(
+            src.contains("let public_app = bounded("),
+            "the public listener must carry the request bounds"
+        );
+        assert!(
+            src.contains("let internal_app = bounded("),
+            "the internal listener must carry the request bounds"
+        );
+        // Both must take the CONFIGURED value, not a literal: a hardcoded bound
+        // here would look identical in review and ignore the env var entirely.
+        assert_eq!(
+            src.matches("state.cfg.max_request_body_bytes,").count(),
+            2,
+            "each listener passes the configured limit through"
+        );
+    }
+
+    /// The metrics surface must stay wired: the admin-gated route on the public
+    /// plane, and the optional unauth listener guarded by the config knob. A
+    /// dropped route or a listener that ignored `metrics_bind` would look identical
+    /// in review, and no handler unit test sees the wiring.
+    #[test]
+    fn the_metrics_endpoint_and_optional_listener_are_wired() {
+        let src = production_src();
+        assert!(
+            src.contains("get(metrics::admin_metrics)"),
+            "the admin-gated metrics route must be wired on the public plane"
+        );
+        assert!(
+            src.contains("if let Some(metrics_addr) = state.cfg.metrics_bind.clone()"),
+            "the optional metrics listener must be gated on the configured bind"
+        );
+        assert!(
+            src.contains("get(metrics::metrics_endpoint)"),
+            "the optional listener must serve the unauth metrics handler"
+        );
+    }
+
+    /// The pool must be built from the CONFIG, not from the crate default: a
+    /// `connect` (rather than `connect_with`) here would leave every
+    /// `FLUIDBOX_DB_*` knob parsed, validated, logged — and ignored.
+    #[test]
+    fn the_pool_is_built_from_the_configured_sizing() {
+        let src = production_src();
+        assert!(
+            src.contains("fluidbox_db::connect_with(") && src.contains("cfg.db_pool)"),
+            "boot must size the pool from cfg.db_pool"
+        );
+        // The mutation this is really here for: dropping back to the two-argument
+        // `connect`, which silently takes `PoolSettings::default()` and makes every
+        // FLUIDBOX_DB_* knob inert.
+        assert!(
+            !src.contains("fluidbox_db::connect(&cfg.database_url"),
+            "boot must not fall back to the default-sized `connect`"
+        );
+    }
 }

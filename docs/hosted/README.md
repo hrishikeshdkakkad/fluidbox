@@ -9,6 +9,8 @@ These documents define the supported product boundary for the hosted, multi-user
 | [Hosted network architecture](network-architecture.md) | The planes, listeners, and every network edge — initiator, authentication, cargo, and what must never cross |
 | [Threat model](threat-model.md) | Assets, adversaries, trust boundaries, scenario→control mapping with honest status, accepted residuals, and the gap register |
 
+**Rollout.** [Rollout gates](rollout-gates.md) — the Phase F staging plan: the design's five rollout stages restated as gates with checkable exit criteria, the capacity thresholds each one must hold, and which known residual stops being theoretical at which stage.
+
 **Operator runbook.** [KMS operations](kms-operations.md) — the Phase D custody layer: envelope sealing (DEK/KEK, the `FLUIDBOX_KMS_MODE` boot matrix), the resumable re-seal + legacy-key retirement procedure, disaster recovery, per-tenant LiteLLM virtual keys, and Row-Level Security operations.
 
 **Authority.** These documents *state* settled decisions; they make none. The normative sources are:

@@ -43,16 +43,26 @@ const MODEL = env.MODEL || "gpt-5.4-mini";
 // Afterwards codex sees only the LLM token (its model-provider env_key) and the
 // tool-intent token; neither can post /result, forge /events, or renew tokens.
 //
+// PHASE F: under the shipped image the credential never reached this
+// environment at all — lib/entrypoint.sh hands it over on an unlinked-file
+// descriptor and execve's this process with an environ region that never held
+// it, so /proc/<pid>/environ is clean too. The delete stays because it remains
+// exactly right for the COMPATIBILITY path (entrypoint bypassed ⇒ the token
+// really is in the environment) and for the spawned environment either way.
+// FLUIDBOX_SESSION_TOKEN_FD goes with it: the descriptor is already closed, so
+// an inherited pointer to it would only mislead.
+//
 // DISCLOSED RESIDUALS, both of them:
-//  1. This is an env-VISIBILITY boundary, not a process one. Same-uid children
-//     can still read THIS process's INITIAL environment via /proc/<pid>/environ,
-//     which the delete does not rewrite; true isolation needs a uid split or a
-//     sidecar, which the current cap_drop=ALL + no-new-privileges hardening
-//     blocks (design :1326-1329). Identical to the claude runner's residual.
+//  1. Narrowed, not gone: a same-uid child can still ptrace(2) THIS process and
+//     read the token out of live memory. cap_drop=ALL, no-new-privileges and
+//     seccomp RuntimeDefault do not block same-uid ptrace — only a uid split or
+//     a separate container (its own PID namespace) does. Identical to the
+//     claude runner's residual.
 //  2. codex COUPLES model egress and exec — it needs the LLM credential in its
 //     env, so codex-spawned shells can read the LLM token. That is inherent to
-//     env_key auth (survey B §5). Runner-control is what this delete closes.
+//     env_key auth (survey B §5). Runner-control is what this closes.
 delete process.env.FLUIDBOX_SESSION_TOKEN;
+delete process.env.FLUIDBOX_SESSION_TOKEN_FD;
 const CONTROL = env.CONTROL.replace(/\/$/, "");
 // Codex appends /responses to base_url; the facade route is /internal/llm/{*rest}.
 const FACADE_BASE = `${CONTROL}/internal/llm/v1`;
