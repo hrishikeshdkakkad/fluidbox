@@ -1,13 +1,120 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  apiGet,
+  apiGetCached,
+  apiPost,
   AuthMe,
   Connection,
   connectionMatchesConnector,
+  invalidateApiCache,
   isGitConnection,
   isToolConnection,
   ownerBadge,
   ownerOptions,
 } from "./api";
+
+const jsonResponse = (body: unknown, status = 200) =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+
+beforeEach(() => {
+  invalidateApiCache();
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+describe("private control-plane read cache", () => {
+  it("coalesces simultaneous GETs for the same projection", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ agents: ["one"] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const [first, second] = await Promise.all([
+      apiGet<{ agents: string[] }>("/agents"),
+      apiGet<{ agents: string[] }>("/agents"),
+    ]);
+
+    expect(first).toEqual({ agents: ["one"] });
+    expect(second).toEqual(first);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("reuses a fresh per-tab value and supports an explicit refresh", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ version: 1 }))
+      .mockResolvedValueOnce(jsonResponse({ version: 2 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(await apiGetCached("/catalog", { maxAgeMs: 60_000 })).toEqual({ version: 1 });
+    expect(await apiGetCached("/catalog", { maxAgeMs: 60_000 })).toEqual({ version: 1 });
+    expect(await apiGetCached("/catalog", { maxAgeMs: 60_000, force: true })).toEqual({
+      version: 2,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("invalidates read projections after a successful write", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ agents: ["before"] }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }))
+      .mockResolvedValueOnce(jsonResponse({ agents: ["after"] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await apiGetCached("/agents", { maxAgeMs: 60_000 });
+    await apiPost("/agents", { name: "reviewer" });
+    expect(await apiGetCached("/agents", { maxAgeMs: 60_000 })).toEqual({
+      agents: ["after"],
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not let a read started before a write repopulate stale cache", async () => {
+    let resolveOldRead: ((response: Response) => void) | undefined;
+    const oldReadResponse = new Promise<Response>((resolve) => {
+      resolveOldRead = resolve;
+    });
+    const fetchMock = vi
+      .fn()
+      .mockReturnValueOnce(oldReadResponse)
+      .mockResolvedValueOnce(jsonResponse({ ok: true }))
+      .mockResolvedValueOnce(jsonResponse({ agents: ["after"] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const oldRead = apiGetCached<{ agents: string[] }>("/agents", { maxAgeMs: 60_000 });
+    await apiPost("/agents", { name: "reviewer" });
+    const freshRead = await apiGetCached<{ agents: string[] }>("/agents", {
+      maxAgeMs: 60_000,
+    });
+    resolveOldRead?.(jsonResponse({ agents: ["before"] }));
+
+    expect(await oldRead).toEqual({ agents: ["before"] });
+    expect(freshRead).toEqual({ agents: ["after"] });
+    expect(await apiGetCached("/agents", { maxAgeMs: 60_000 })).toEqual({
+      agents: ["after"],
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not cache a failed read and releases its in-flight slot", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ error: "temporary" }, 503))
+      .mockResolvedValueOnce(jsonResponse({ ready: true }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(apiGetCached("/health", { maxAgeMs: 60_000 })).rejects.toThrow("503");
+    await expect(apiGetCached("/health", { maxAgeMs: 60_000 })).resolves.toEqual({
+      ready: true,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
 
 // Only `provider` is read by the predicates; the rest of Connection is noise.
 const conn = (provider: string): Connection => ({ provider }) as Connection;

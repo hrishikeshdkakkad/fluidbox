@@ -1,11 +1,11 @@
 "use client";
 
-import { Suspense, useEffect, useState, useCallback } from "react";
+import { Suspense, useEffect, useMemo, useState, useCallback } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { ChevronDown, ChevronRight, Search as SearchIcon } from "lucide-react";
 import {
-  apiGet,
+  apiGetCached,
   apiPost,
   Agent,
   BundleRef,
@@ -25,6 +25,7 @@ import {
   specToDraft,
   draftToInput,
 } from "../components/WorkspacePicker";
+import { useSessionDraft } from "../lib/useSessionDraft";
 
 type Tab = "agents" | "policies";
 
@@ -48,23 +49,27 @@ function Agents() {
   const [addRev, setAddRev] = useState<string | null>(null);
   const [q, setQ] = useState("");
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
 
   const load = useCallback(async () => {
     try {
-      const r = await apiGet<{ agents: Agent[] }>("/agents");
+      const r = await apiGetCached<{ agents: Agent[] }>("/agents", { maxAgeMs: 15_000 });
       setAgents(r.agents);
+      setLoadError("");
+    } catch (error) {
+      setLoadError(`Agents could not be loaded. ${String(error)}`);
     } finally {
       setLoading(false);
     }
   }, []);
 
   const loadRevs = useCallback(async (id: string) => {
-    const r = await apiGet<{ revisions: Revision[] }>(`/agents/${id}`);
+    const r = await apiGetCached<{ revisions: Revision[] }>(`/agents/${id}`, { maxAgeMs: 30_000 });
     setRevs((prev) => ({ ...prev, [id]: r.revisions }));
   }, []);
 
   useEffect(() => {
-    const first = window.setTimeout(() => void load().catch(() => {}), 0);
+    const first = window.setTimeout(() => void load(), 0);
     return () => clearTimeout(first);
   }, [load]);
 
@@ -74,7 +79,13 @@ function Agents() {
       return;
     }
     setOpen(id);
-    if (!revs[id]) await loadRevs(id);
+    if (!revs[id]) {
+      try {
+        await loadRevs(id);
+      } catch (error) {
+        setLoadError(`Agent revisions could not be loaded. ${String(error)}`);
+      }
+    }
   };
 
   return (
@@ -125,6 +136,7 @@ function Agents() {
       : agents;
     return (
       <>
+        {loadError && <div className="err" style={{ marginBottom: 10 }}>{loadError}</div>}
         {agents.length > 8 && (
           <div className="search" style={{ marginBottom: 12 }}>
             <SearchIcon />
@@ -139,6 +151,25 @@ function Agents() {
         <div className="panel">
           {loading ? (
             <LoadingRows />
+          ) : loadError && agents.length === 0 ? (
+            <div className="launch-empty">
+              <div>
+                <h3>Agents are unavailable.</h3>
+                <p>A failed request is not treated as an empty agent library.</p>
+              </div>
+              <div className="empty-actions">
+                <button
+                  className="btn"
+                  type="button"
+                  onClick={() => {
+                    setLoading(true);
+                    void load();
+                  }}
+                >
+                  Retry now
+                </button>
+              </div>
+            </div>
           ) : agents.length === 0 ? (
             <div className="empty">
               <div>No agents yet.</div>
@@ -243,27 +274,51 @@ function PoliciesTab() {
   const [name, setName] = useState("");
   const [validity, setValidity] = useState<{ ok: boolean; msg: string } | null>(null);
   const [saved, setSaved] = useState(false);
+  const [baselineYaml, setBaselineYaml] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
 
   const load = useCallback(async () => {
-    const r = await apiGet<{ policies: PolicyRow[] }>("/policies");
-    setPolicies(r.policies);
-    if (!selected && r.policies.length) {
-      const first = r.policies[0];
-      setSelected(first.id);
-      setName(first.name);
-      setYaml(first.yaml_source);
+    try {
+      const r = await apiGetCached<{ policies: PolicyRow[] }>("/policies", { maxAgeMs: 30_000 });
+      setPolicies(r.policies);
+      setLoadError("");
+      if (!selected && r.policies.length) {
+        const first = r.policies[0];
+        setSelected(first.id);
+        setName(first.name);
+        setYaml(first.yaml_source);
+        setBaselineYaml(first.yaml_source);
+      }
+    } catch (error) {
+      setLoadError(`Policies could not be loaded. ${String(error)}`);
+    } finally {
+      setLoading(false);
     }
   }, [selected]);
 
   useEffect(() => {
-    const first = window.setTimeout(() => void load().catch(() => {}), 0);
+    const first = window.setTimeout(() => void load(), 0);
     return () => clearTimeout(first);
   }, [load]);
+
+  const policyDraft = useMemo(() => ({ yaml }), [yaml]);
+  const restorePolicyDraft = useCallback((draft: { yaml: string }) => {
+    if (draft && typeof draft.yaml === "string") setYaml(draft.yaml);
+  }, []);
+  const clearPolicyDraft = useSessionDraft({
+    key: `fluidbox:draft:policy:${selected ?? "none"}`,
+    value: policyDraft,
+    onRestore: restorePolicyDraft,
+    shouldPersist: !!selected && yaml !== baselineYaml,
+    delayMs: 0,
+  });
 
   const pick = (p: PolicyRow) => {
     setSelected(p.id);
     setName(p.name);
     setYaml(p.yaml_source);
+    setBaselineYaml(p.yaml_source);
     setValidity(null);
     setSaved(false);
   };
@@ -283,7 +338,9 @@ function PoliciesTab() {
       await apiPost("/policies", { name, yaml });
       setValidity({ ok: true, msg: "saved — new version created" });
       setSaved(true);
-      load();
+      setBaselineYaml(yaml);
+      clearPolicyDraft();
+      void load();
     } catch (e) {
       setValidity({ ok: false, msg: String(e).replace(/^Error:\s*/, "") });
     }
@@ -296,7 +353,32 @@ function PoliciesTab() {
         autonomy narrows authority — it never widens it. Saving creates a new version; in-flight
         runs keep their snapshot.
       </p>
-      <div style={{ display: "grid", gridTemplateColumns: "200px 1fr", gap: 16, alignItems: "start" }}>
+      {loadError && <div className="err" style={{ marginBottom: 10 }}>{loadError}</div>}
+      {loading ? (
+        <div className="panel"><LoadingRows rows={3} /></div>
+      ) : loadError && policies.length === 0 ? (
+        <div className="panel launch-empty">
+          <div>
+            <h3>Policies are unavailable.</h3>
+            <p>The editor will not imply an empty policy set after a failed read.</p>
+          </div>
+          <div className="empty-actions">
+            <button
+              className="btn"
+              type="button"
+              onClick={() => {
+                setLoading(true);
+                void load();
+              }}
+            >
+              Retry now
+            </button>
+          </div>
+        </div>
+      ) : policies.length === 0 ? (
+        <div className="panel empty">No policies have been synced yet.</div>
+      ) : (
+      <div className="policy-editor-grid">
         <div className="panel">
           <div className="rows">
             {policies.map((p) => (
@@ -350,6 +432,7 @@ function PoliciesTab() {
           </div>
         </div>
       </div>
+      )}
     </>
   );
 }
@@ -378,6 +461,13 @@ function AddRevision({
   );
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  const dirty =
+    harness !== (current?.harness || "claude-agent-sdk") ||
+    model !== (current?.model || "claude-haiku-4-5") ||
+    systemPrompt !== (current?.system_prompt || "") ||
+    JSON.stringify(workspace) !== JSON.stringify(specToDraft(current?.default_workspace)) ||
+    JSON.stringify(pins) !== JSON.stringify(current?.capability_bundles ?? []) ||
+    JSON.stringify(requirements) !== JSON.stringify(current?.connection_requirements ?? []);
 
   const submit = async () => {
     setErr("");
@@ -409,6 +499,7 @@ function AddRevision({
       title={`Append revision ${current ? current.rev + 1 : 1}`}
       sub="Revisions are immutable. Running sessions keep their frozen spec; new runs use this one."
       onClose={onClose}
+      dirty={dirty}
     >
       <div className="field">
         <span className="lab">Harness</span>

@@ -7,7 +7,7 @@
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import {
-  apiGet,
+  apiGetCached,
   apiPost,
   appIngressPath,
   Connection,
@@ -19,7 +19,7 @@ import {
 } from "../lib/api";
 import { openVia } from "../lib/github-flows";
 import { useAuthMe } from "../lib/useAuthMe";
-import { GitHubMark, ModalShell, OwnerTag, PageHead } from "../components/bits";
+import { GitHubMark, LoadingRows, ModalShell, OwnerTag, PageHead } from "../components/bits";
 import { OwnerPicker } from "../components/OwnerPicker";
 import type { AuthMe } from "../lib/api";
 
@@ -31,14 +31,27 @@ export default function Integrations() {
   const [org, setOrg] = useState("");
   const [err, setErr] = useState("");
   const [note, setNote] = useState("");
+  const [loadErr, setLoadErr] = useState("");
+  const [hasSnapshot, setHasSnapshot] = useState(false);
+  const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
     const results = await Promise.allSettled([
-      apiGet<{ connections: Connection[] }>("/connections"),
-      apiGet<{ registrations: GithubAppRegistration[] }>("/github/app"),
+      apiGetCached<{ connections: Connection[] }>("/connections", { maxAgeMs: 10_000 }),
+      apiGetCached<{ registrations: GithubAppRegistration[] }>("/github/app", { maxAgeMs: 10_000 }),
     ]);
     if (results[0].status === "fulfilled") setConnections(results[0].value.connections);
     if (results[1].status === "fulfilled") setRegistrations(results[1].value.registrations);
+    const fulfilled = results.filter((result) => result.status === "fulfilled").length;
+    if (fulfilled > 0) setHasSnapshot(true);
+    setLoadErr(
+      fulfilled === 0
+        ? "Integrations could not be loaded because the control plane is unavailable."
+        : fulfilled < results.length
+          ? "Some integration data could not be refreshed; showing the available snapshot."
+          : ""
+    );
+    setLoading(false);
   }, []);
 
   useEffect(() => {
@@ -104,16 +117,56 @@ export default function Integrations() {
   const visibleRegs = registrations.filter((r) => r.status !== "revoked");
   const activeRegs = visibleRegs.filter((r) => r.status === "active");
   const gitConnections = connections.filter((c) => isGitConnection(c) && c.status !== "revoked");
+  const pageHead = (
+    <PageHead
+      title="Integrations"
+      sub="Platforms your agents work on. A connection powers workspace checkouts (repo, branch, commit), pull-request triggers, and publishing results back."
+    />
+  );
+
+  if (loading) {
+    return (
+      <>
+        {pageHead}
+        <div className="panel"><LoadingRows rows={3} /></div>
+      </>
+    );
+  }
+
+  if (!hasSnapshot) {
+    return (
+      <>
+        {pageHead}
+        <div className="note" style={{ marginBottom: 10 }}>{loadErr}</div>
+        <div className="panel launch-empty">
+          <div>
+            <h3>Integrations are unavailable.</h3>
+            <p>A failed read is not treated as an unconfigured GitHub account.</p>
+          </div>
+          <div className="empty-actions">
+            <button
+              className="btn"
+              type="button"
+              onClick={() => {
+                setLoading(true);
+                void load();
+              }}
+            >
+              Retry now
+            </button>
+          </div>
+        </div>
+      </>
+    );
+  }
 
   return (
     <>
-      <PageHead
-        title="Integrations"
-        sub="Platforms your agents work on. A connection powers workspace checkouts (repo, branch, commit), pull-request triggers, and publishing results back."
-      />
+      {pageHead}
 
       {err && <div className="err" style={{ marginBottom: 10 }}>{err}</div>}
       {note && <div className="note" style={{ marginBottom: 10 }}>{note}</div>}
+      {loadErr && <div className="note" style={{ marginBottom: 10 }}>{loadErr}</div>}
 
       {/* ── GitHub App: the seamless path ─────────────────────────────── */}
       {visibleRegs.length === 0 ? (
@@ -355,6 +408,15 @@ function NewConnection({
   // by construction (the server refuses personal for it).
   const allowPersonal = flavor === "github";
   const owner = ownerChoice ?? ownerOptions(me, allowPersonal).default;
+  const dirty =
+    flavor !== "github" ||
+    token.length > 0 ||
+    appId.length > 0 ||
+    installationId.length > 0 ||
+    privateKey.length > 0 ||
+    webhookSecret.length > 0 ||
+    displayName.length > 0 ||
+    ownerChoice !== null;
 
   const submit = async () => {
     setErr("");
@@ -402,6 +464,7 @@ function NewConnection({
       title="Add GitHub credentials manually"
       sub="Advanced fallback — Set up GitHub App above creates and custodies all of this automatically."
       onClose={onClose}
+      dirty={dirty}
     >
       <label className="field">
         <span className="lab">Connection flavor</span>
