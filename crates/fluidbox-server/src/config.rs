@@ -332,6 +332,11 @@ pub struct Config {
     pub session_absolute_secs: i64,
     /// Max age of a cached OIDC discovery document / JWKS before re-fetch.
     pub oidc_discovery_max_age_secs: i64,
+    /// Bounded grace PAST max-age within which a FAILED refresh may still fall
+    /// back to the cached (last-known-good) discovery/JWKS. Past it, logins
+    /// fail closed: an unbounded fallback would keep revoked signing keys and
+    /// moved endpoints trusted for as long as the issuer stays unreachable.
+    pub oidc_discovery_stale_grace_secs: i64,
     /// Permitted clock skew when validating ID-token time claims.
     pub oidc_clock_skew_secs: i64,
     /// Minimum interval between a browser session's re-authorization checks on
@@ -660,6 +665,14 @@ impl Config {
                 "FLUIDBOX_OIDC_DISCOVERY_MAX_AGE_SECS",
                 get("FLUIDBOX_OIDC_DISCOVERY_MAX_AGE_SECS").ok(),
                 3600,
+            )?,
+            // 24h default: generous for an issuer outage, bounded for key
+            // revocation (a revoked signing key stops verifying within
+            // max_age + grace even if the issuer never comes back).
+            oidc_discovery_stale_grace_secs: parse_i64_env(
+                "FLUIDBOX_OIDC_DISCOVERY_STALE_GRACE_SECS",
+                get("FLUIDBOX_OIDC_DISCOVERY_STALE_GRACE_SECS").ok(),
+                86400,
             )?,
             oidc_clock_skew_secs: parse_i64_env(
                 "FLUIDBOX_OIDC_CLOCK_SKEW_SECS",

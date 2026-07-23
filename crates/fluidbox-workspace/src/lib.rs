@@ -45,7 +45,9 @@ pub struct GitEgressPolicy {
     pub dev_loopback: bool,
     pub allow_cidrs: Vec<IpCidr>,
     /// The configured `FLUIDBOX_GITHUB_CLONE_BASE`; a `file://` clone URL is
-    /// allowed only when it starts with this prefix (or under the dev seam).
+    /// allowed only when its CANONICALIZED path is contained (component-wise)
+    /// under this base's path (or under the dev seam) — see
+    /// `validate_file_clone_within_base`.
     pub clone_base_file_prefix: Option<String>,
     /// `FLUIDBOX_EGRESS_PROXY`, exported to the git fetch subprocess as
     /// HTTPS_PROXY/https_proxy when present.
@@ -401,24 +403,57 @@ fn validate_clone_url(url: &str, egress: &GitEgressPolicy) -> Result<(), Workspa
         }
         resolve_and_validate_host(url, egress)
     } else if url.starts_with("file://") {
-        // file:// only under the configured clone base prefix (or the dev seam).
-        let allowed = egress.dev_loopback
-            || egress
-                .clone_base_file_prefix
-                .as_deref()
-                .map(|p| url.starts_with(p))
-                .unwrap_or(false);
-        if !allowed {
-            return Err(WorkspaceError::Invalid(
-                "refusing a file:// clone URL outside the configured clone base".into(),
-            ));
+        // file:// only under the configured clone base (or the dev seam).
+        if egress.dev_loopback {
+            return Ok(());
         }
-        Ok(())
+        match egress.clone_base_file_prefix.as_deref() {
+            Some(base) => validate_file_clone_within_base(url, base),
+            None => Err(WorkspaceError::Invalid(
+                "refusing a file:// clone URL outside the configured clone base".into(),
+            )),
+        }
     } else {
         Err(WorkspaceError::Invalid(format!(
             "clone_url must be http(s):// or file:// (got '{}')",
             url.chars().take(40).collect::<String>()
         )))
+    }
+}
+
+/// A `file://` clone must resolve INSIDE the configured clone base — compared
+/// on canonicalized paths, component-wise, never by raw string prefix (which
+/// admits `<base>-sibling/…` and `<base>/../…`; PR #27 review P2-5). The base
+/// itself must be a `file://` URL: any other configured base refuses every
+/// file clone. Canonicalization resolves symlinks and requires existence, so a
+/// nonexistent path (or a symlink escaping the base) fails closed HERE rather
+/// than surfacing from git. Percent-escapes are refused outright — git decodes
+/// them, so a raw-string compare would diverge from the path git actually
+/// opens.
+fn validate_file_clone_within_base(url: &str, base: &str) -> Result<(), WorkspaceError> {
+    let deny = || {
+        WorkspaceError::Invalid(
+            "refusing a file:// clone URL outside the configured clone base".into(),
+        )
+    };
+    let Some(base_path) = base.strip_prefix("file://") else {
+        return Err(deny());
+    };
+    if url.contains('%') {
+        return Err(deny());
+    }
+    // `file://host/path` (non-empty authority) is refused: the clone path must
+    // be local-absolute (`file:///…`), and so must the configured base.
+    let path = url.strip_prefix("file://").unwrap_or(url);
+    if !path.starts_with('/') || !base_path.starts_with('/') {
+        return Err(deny());
+    }
+    let canon = std::fs::canonicalize(path).map_err(|_| deny())?;
+    let canon_base = std::fs::canonicalize(base_path).map_err(|_| deny())?;
+    if canon.starts_with(&canon_base) {
+        Ok(())
+    } else {
+        Err(deny())
     }
 }
 
@@ -1057,14 +1092,58 @@ mod tests {
         assert!(validate_clone_url("http://127.0.0.1:9/r.git", &dev).is_ok());
         assert!(validate_clone_url("http://127.0.0.1:9/r.git", &prod).is_err());
 
-        // file:// — dev allows any; prod only under the configured clone base.
+        // file:// — dev allows any; prod only under the configured clone base
+        // (real-path containment cases follow below).
         assert!(validate_clone_url("file:///tmp/x", &dev).is_ok());
         assert!(validate_clone_url("file:///tmp/x", &prod).is_err());
-        assert!(validate_clone_url("file:///srv/mirror/o/r.git", &prod).is_ok());
 
         // Other schemes and option-injection are refused regardless of seam.
         assert!(validate_clone_url("ssh://h/r.git", &dev).is_err());
         assert!(validate_clone_url("--upload-pack=evil", &dev).is_err());
+
+        // Containment on REAL paths: raw string-prefix admitted `<base>-sibling`
+        // and `<base>/../…` (PR #27 review P2-5); canonicalized component-wise
+        // containment must not.
+        let root = std::env::temp_dir().join(format!("fbx-ws-clone-base-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("mirror/org/repo.git")).unwrap();
+        std::fs::create_dir_all(root.join("mirror-secret/org/repo.git")).unwrap();
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+        let based = GitEgressPolicy {
+            dev_loopback: false,
+            allow_cidrs: vec![],
+            clone_base_file_prefix: Some(format!("file://{}/mirror", root.display())),
+            proxy: None,
+        };
+        let case = |suffix: &str| format!("file://{}/{suffix}", root.display());
+        // Inside the base → admitted.
+        assert!(validate_clone_url(&case("mirror/org/repo.git"), &based).is_ok());
+        // A sibling directory sharing the base as a string prefix → refused.
+        assert!(validate_clone_url(&case("mirror-secret/org/repo.git"), &based).is_err());
+        // Dot-segment traversal out of the base → refused.
+        assert!(validate_clone_url(&case("mirror/../outside"), &based).is_err());
+        assert!(validate_clone_url(&case("mirror/org/../../../outside"), &based).is_err());
+        // Percent-escapes (git decodes them; a raw compare would not) → refused.
+        assert!(validate_clone_url(&case("mirror/%2e%2e/outside"), &based).is_err());
+        // A nonexistent path fails closed here rather than at git.
+        assert!(validate_clone_url(&case("mirror/absent/repo.git"), &based).is_err());
+        // A remote-authority file URL (file://host/…) is refused.
+        assert!(validate_clone_url("file://evil/mirror/org/repo.git", &based).is_err());
+        // A symlink INSIDE the base pointing OUT resolves out → refused.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("outside"), root.join("mirror/link")).unwrap();
+            assert!(validate_clone_url(&case("mirror/link"), &based).is_err());
+        }
+        // A base that is not itself file:// refuses every file clone.
+        let non_file_base = GitEgressPolicy {
+            dev_loopback: false,
+            allow_cidrs: vec![],
+            clone_base_file_prefix: Some("https://github.com".into()),
+            proxy: None,
+        };
+        assert!(validate_clone_url(&case("mirror/org/repo.git"), &non_file_base).is_err());
+        let _ = std::fs::remove_dir_all(&root);
 
         // FALSE-GREEN guard: the SAME private https literal that is refused above
         // is admitted once an allow-CIDR covers it.

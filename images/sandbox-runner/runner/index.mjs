@@ -62,11 +62,22 @@ function mcpServersConfig() {
   const servers = {};
   for (const srv of env.CAPABILITIES.servers) {
     if (srv.class === "sandbox") {
+      // SCRUBBED child env, mirroring runner-lib/sandbox-gate-shim.mjs: a
+      // sandbox-class server is credential-free by definition, so it must not
+      // inherit the tool/llm session tokens or any fluidbox wiring this
+      // runner still holds (the codex path already scrubs; keep the two
+      // harnesses aligned).
+      const childEnv = { ...process.env };
+      for (const k of Object.keys(childEnv)) {
+        if (k.startsWith("FLUIDBOX_") || k === "ANTHROPIC_API_KEY" || k === "OPENAI_API_KEY") {
+          delete childEnv[k];
+        }
+      }
       servers[srv.name] = {
         type: "stdio",
         command: srv.command,
         args: srv.args || [],
-        env: { ...process.env },
+        env: childEnv,
       };
     } else if (srv.class === "brokered") {
       servers[srv.name] = {

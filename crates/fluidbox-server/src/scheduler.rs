@@ -212,6 +212,9 @@ async fn build_and_create(
             },
             task,
             explicit_workspace,
+            // A local_copy can only arrive via the stored revision default,
+            // which passed the operator-only save gate (see CreateRun docs).
+            local_path_authority: crate::api::LocalPathAuthority::Operator,
             autonomy,
             trust_tier: fluidbox_core::spec::TrustTier::Trusted,
             budget_override,
