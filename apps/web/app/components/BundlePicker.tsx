@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { apiGet, BundleRef, CapabilityBundle } from "../lib/api";
+import { apiGetCached, BundleRef, CapabilityBundle } from "../lib/api";
 
 /** Multi-select over the capability-bundle registry, rendered as pin cards.
  *  Selection is EXPLICIT pins (name@version — §17 #7 made visible): a bundle
@@ -20,13 +20,33 @@ export function BundlePicker({
   onAddServer?: () => void;
 }) {
   const [registry, setRegistry] = useState<CapabilityBundle[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const [retryKey, setRetryKey] = useState(0);
   useEffect(() => {
-    apiGet<{ bundles: CapabilityBundle[] }>("/capabilities")
-      .then((r) => setRegistry(r.bundles))
-      .catch(() => {
-        /* offline handled by sidebar */
-      });
-  }, [refreshKey]);
+    let active = true;
+    const timer = window.setTimeout(() => {
+      setLoading(true);
+      setLoadError("");
+      apiGetCached<{ bundles: CapabilityBundle[] }>("/capabilities", {
+        maxAgeMs: 30_000,
+        force: refreshKey > 0 || retryKey > 0,
+      })
+        .then((r) => {
+          if (active) setRegistry(r.bundles);
+        })
+        .catch((error) => {
+          if (active) setLoadError(`Tool bundles could not be loaded. ${String(error)}`);
+        })
+        .finally(() => {
+          if (active) setLoading(false);
+        });
+    }, 0);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [refreshKey, retryKey]);
 
   // The list is (name, version desc) ordered — group to versions per name.
   const byName = new Map<string, CapabilityBundle[]>();
@@ -79,6 +99,27 @@ export function BundlePicker({
     onChange(pins.map((p) => (p.name === name ? { id: row.id, name, version } : p)));
   };
 
+  if (loading && names.length === 0) {
+    return (
+      <div className="field">
+        <span className="lab">Sandbox tool bundles</span>
+        <span className="helper">Loading registered bundles…</span>
+      </div>
+    );
+  }
+
+  if (loadError && names.length === 0) {
+    return (
+      <div className="field">
+        <span className="lab">Sandbox tool bundles</span>
+        <div className="err" role="alert">{loadError}</div>
+        <button className="btn" type="button" onClick={() => setRetryKey((current) => current + 1)}>
+          Retry bundles
+        </button>
+      </div>
+    );
+  }
+
   if (names.length === 0) {
     return (
       <div className="field">
@@ -102,6 +143,14 @@ export function BundlePicker({
           <button className="btn ghost sm" type="button" onClick={onAddServer}>Connect new MCP</button>
         )}
       </div>
+      {loadError && (
+        <div className="err" role="alert">
+          {loadError} Showing the last successful list.{" "}
+          <button className="btn sm" type="button" onClick={() => setRetryKey((current) => current + 1)}>
+            Retry
+          </button>
+        </div>
+      )}
       <div className="opt-list">
         {shownNames.map((name) => {
           const versions = byName.get(name)!;

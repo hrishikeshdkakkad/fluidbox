@@ -86,6 +86,10 @@ export function ModalShell({
   children,
   wide,
   maxWidth,
+  dismissOnBackdrop = false,
+  dirty = false,
+  discardTitle = "Discard unsaved changes?",
+  discardMessage = "This form is intentionally not stored in the browser.",
 }: {
   title: string;
   sub?: string;
@@ -94,25 +98,55 @@ export function ModalShell({
   wide?: boolean;
   /** Explicit shell width — beats `wide`. For layouts that need two panes. */
   maxWidth?: string;
+  /**
+   * Forms default to deliberate dismissal so a stray click outside a long
+   * draft cannot throw work away. Read-only panels may opt back in.
+   */
+  dismissOnBackdrop?: boolean;
+  /** Protect non-persisted forms (especially credential forms) from loss. */
+  dirty?: boolean;
+  /** Allows one-time-secret panels to explain their more specific loss mode. */
+  discardTitle?: string;
+  discardMessage?: string;
 }) {
   const modalRef = useRef<HTMLDivElement>(null);
   const onCloseRef = useRef(onClose);
+  const dirtyRef = useRef(dirty);
+  const [confirmDiscard, setConfirmDiscard] = React.useState(false);
   const titleId = useId();
+  const descriptionId = useId();
 
   useEffect(() => {
     onCloseRef.current = onClose;
   }, [onClose]);
+  useEffect(() => {
+    dirtyRef.current = dirty;
+  }, [dirty]);
+
+  const requestClose = () => {
+    if (dirtyRef.current) {
+      setConfirmDiscard(true);
+      return;
+    }
+    onCloseRef.current();
+  };
 
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
     const modal = modalRef.current;
+    const previousOverflow = document.body.style.overflow;
+    const previousPaddingRight = document.body.style.paddingRight;
+    const scrollbarWidth = window.innerWidth - document.documentElement.clientWidth;
+    document.body.style.overflow = "hidden";
+    if (scrollbarWidth > 0) document.body.style.paddingRight = `${scrollbarWidth}px`;
     const focusable = modal?.querySelector<HTMLElement>(
       'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
     );
     focusable?.focus();
+    if (modal) modal.scrollTop = 0;
 
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onCloseRef.current();
+      if (event.key === "Escape") requestClose();
       if (event.key !== "Tab" || !modal) return;
       const elements = Array.from(
         modal.querySelectorAll<HTMLElement>(
@@ -134,12 +168,19 @@ export function ModalShell({
     document.addEventListener("keydown", onKeyDown);
     return () => {
       document.removeEventListener("keydown", onKeyDown);
+      document.body.style.overflow = previousOverflow;
+      document.body.style.paddingRight = previousPaddingRight;
       previous?.focus();
     };
   }, []);
 
   return (
-    <div className="overlay" onClick={onClose}>
+    <div
+      className="overlay"
+      onMouseDown={(event) => {
+        if (dismissOnBackdrop && event.target === event.currentTarget) requestClose();
+      }}
+    >
       <div
         ref={modalRef}
         className="modal"
@@ -148,16 +189,33 @@ export function ModalShell({
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
+        aria-describedby={sub ? descriptionId : undefined}
       >
         <div className="mh">
           <div>
             <div className="t" id={titleId}>{title}</div>
-            {sub && <div className="s">{sub}</div>}
+            {sub && <div className="s" id={descriptionId}>{sub}</div>}
           </div>
-          <button className="xbtn" onClick={onClose} aria-label="Close">
+          <button className="xbtn" onClick={requestClose} aria-label="Close">
             <X />
           </button>
         </div>
+        {confirmDiscard && (
+          <div className="discard-confirm" role="alert">
+            <span>
+              <strong>{discardTitle}</strong>
+              <small>{discardMessage}</small>
+            </span>
+            <span className="discard-actions">
+              <button className="btn sm ghost" type="button" onClick={() => setConfirmDiscard(false)}>
+                Keep editing
+              </button>
+              <button className="btn sm danger" type="button" onClick={() => onCloseRef.current()}>
+                Discard
+              </button>
+            </span>
+          </div>
+        )}
         <div className="mb">{children}</div>
       </div>
     </div>

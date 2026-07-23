@@ -5,6 +5,7 @@ import Link from "next/link";
 import {
   Agent,
   apiGet,
+  apiGetCached,
   apiPost,
   ResultDelivery,
   Schedule,
@@ -14,6 +15,7 @@ import {
 } from "../lib/api";
 import { LoadingRows, Pill, short } from "./bits";
 import { MintedAutomation, ShowAutomationSecrets } from "./RunComposer";
+import { useSmartPolling } from "../lib/useSmartPolling";
 
 export function AutomationPanel({
   onNew,
@@ -29,13 +31,14 @@ export function AutomationPanel({
   const [agents, setAgents] = useState<Agent[]>([]);
   const [minted, setMinted] = useState<MintedAutomation | null>(null);
   const [err, setErr] = useState("");
+  const [loadErr, setLoadErr] = useState("");
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
     try {
       const [triggerResponse, agentResponse] = await Promise.all([
         apiGet<{ subscriptions: TriggerSubscription[]; schedules?: Schedule[] }>("/triggers"),
-        apiGet<{ agents: Agent[] }>("/agents"),
+        apiGetCached<{ agents: Agent[] }>("/agents", { maxAgeMs: 15_000 }),
       ]);
       setSubscriptions(triggerResponse.subscriptions);
       setSchedules(
@@ -45,8 +48,9 @@ export function AutomationPanel({
       );
       setAgents(agentResponse.agents);
       onCountChange?.(triggerResponse.subscriptions.length);
-    } catch {
-      /* The sidebar reports control-plane connectivity. */
+      setLoadErr("");
+    } catch (error) {
+      setLoadErr(`Automations could not be loaded. ${String(error)}`);
     } finally {
       setLoading(false);
     }
@@ -108,10 +112,28 @@ export function AutomationPanel({
       </div>
 
       {err && <div className="err automation-error">{err}</div>}
+      {loadErr && <div className="note automation-error">{loadErr}</div>}
 
       <div className="run-list automation-list">
         {loading ? (
           <LoadingRows />
+        ) : loadErr && subscriptions.length === 0 ? (
+          <div className="automation-empty">
+            <div>
+              <h3>Automations are unavailable.</h3>
+              <p>A failed request is not treated as an empty automation list.</p>
+            </div>
+            <button
+              className="btn"
+              type="button"
+              onClick={() => {
+                setLoading(true);
+                void load();
+              }}
+            >
+              Retry now
+            </button>
+          </div>
         ) : subscriptions.length === 0 ? (
           <div className="automation-empty">
             <div>
@@ -233,31 +255,21 @@ function AutomationActivity({ id }: { id: string }) {
   const [deliveries, setDeliveries] = useState<ResultDelivery[]>([]);
   const [invocations, setInvocations] = useState<TriggerInvocation[]>([]);
 
-  useEffect(() => {
-    let alive = true;
-    const poll = async () => {
-      try {
-        const response = await apiGet<{
-          sessions: Session[];
-          deliveries: ResultDelivery[];
-          invocations?: TriggerInvocation[];
-        }>(`/triggers/${id}`);
-        if (alive) {
-          setSessions(response.sessions);
-          setDeliveries(response.deliveries);
-          setInvocations(response.invocations || []);
-        }
-      } catch {
-        /* Keep the last successful activity snapshot. */
-      }
-    };
-    void poll();
-    const timer = setInterval(poll, 4000);
-    return () => {
-      alive = false;
-      clearInterval(timer);
-    };
+  const poll = useCallback(async () => {
+    try {
+      const response = await apiGet<{
+        sessions: Session[];
+        deliveries: ResultDelivery[];
+        invocations?: TriggerInvocation[];
+      }>(`/triggers/${id}`);
+      setSessions(response.sessions);
+      setDeliveries(response.deliveries);
+      setInvocations(response.invocations || []);
+    } catch {
+      /* Keep the last successful activity snapshot. */
+    }
   }, [id]);
+  useSmartPolling(poll, 4000);
 
   return (
     <div className="automation-activity">

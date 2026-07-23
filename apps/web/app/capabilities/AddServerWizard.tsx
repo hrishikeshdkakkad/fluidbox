@@ -7,7 +7,7 @@
 // catalog (POST /mcp/probe, POST /mcp/servers); a BYO server becomes an
 // ordinary custom Store card afterward.
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
   apiGet,
@@ -26,6 +26,7 @@ import {
 } from "../lib/api";
 import { ModalShell } from "../components/bits";
 import { OwnerPicker } from "../components/OwnerPicker";
+import { useSmartPolling } from "../lib/useSmartPolling";
 
 type Step = "url" | "detected" | "done";
 type AuthChoice = "none" | "api_key" | "oauth";
@@ -69,11 +70,13 @@ export function AddServerWizard({
   onClose,
   embedded = false,
   onCompleted,
+  onDirtyChange,
   me = null,
 }: {
   onClose: () => void;
   embedded?: boolean;
   onCompleted?: (result: AddServerCompletion | null) => void;
+  onDirtyChange?: (dirty: boolean) => void;
   me?: AuthMe | null;
 }) {
   const [step, setStep] = useState<Step>("url");
@@ -103,13 +106,24 @@ export function AddServerWizard({
   const [doneConnection, setDoneConnection] = useState<Connection | null>(null);
   const [doneSnapshot, setDoneSnapshot] = useState<ConnectionToolSnapshot | null>(null);
   const [doneSlug, setDoneSlug] = useState<string | null>(null);
-  const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [confirmClose, setConfirmClose] = useState(false);
+  const [watchConnectionId, setWatchConnectionId] = useState<string | null>(null);
+  const watchDeadline = useRef(0);
+  const dirty =
+    step !== "done" &&
+    (url.length > 0 ||
+      step === "detected" ||
+      name.length > 0 ||
+      token.length > 0 ||
+      headerName.length > 0 ||
+      clientId.length > 0 ||
+      clientSecret.length > 0 ||
+      ownerChoice !== null);
 
   useEffect(() => {
-    return () => {
-      if (pollTimer.current) clearInterval(pollTimer.current);
-    };
-  }, []);
+    onDirtyChange?.(dirty);
+    return () => onDirtyChange?.(false);
+  }, [dirty, onDirtyChange]);
 
   const detect = async () => {
     setErr("");
@@ -136,10 +150,10 @@ export function AddServerWizard({
   const flattenTools = (servers: BundleServer[] | undefined): ToolPreview[] =>
     (servers ?? []).flatMap((s) => s.tools);
 
-  const stopPolling = () => {
-    if (pollTimer.current) clearInterval(pollTimer.current);
+  const stopPolling = useCallback(() => {
     setWaiting(false);
-  };
+    setWatchConnectionId(null);
+  }, []);
 
   // Watch the connection until the OAuth callback flips it active. A failed
   // dance sets status='error' (invalid_grant etc.), so we stop and surface it
@@ -150,60 +164,60 @@ export function AddServerWizard({
       setErr("The server didn't return a connection to track — try again.");
       return;
     }
+    watchDeadline.current = Date.now() + 5 * 60_000;
+    setWatchConnectionId(connId);
     setWaiting(true);
-    let waited = 0;
-    const MAX_WAIT = 300; // seconds
-    pollTimer.current = setInterval(async () => {
-      waited += 2;
-      try {
-        const list = await apiGet<{ connections: Connection[] }>("/connections");
-        const c = list.connections.find((x) => x.id === connId);
-        if (c?.status === "error") {
+  };
+
+  const checkAuthorization = useCallback(async () => {
+    if (!watchConnectionId) return;
+    try {
+      const list = await apiGet<{ connections: Connection[] }>("/connections");
+      const connection = list.connections.find((candidate) => candidate.id === watchConnectionId);
+      if (connection?.status === "error") {
+        stopPolling();
+        setErr("Authorization didn't complete — the sign-in was refused. You can try again.");
+        return;
+      }
+      if (connection?.status === "active") {
+        // `active` can briefly precede the post-activation photograph. Complete
+        // only when the snapshot belongs to this authorization generation.
+        const snapshot = await fetchConnectionTools(connection.id).catch(() => null);
+        if (
+          snapshot &&
+          snapshot.authorization_generation === connection.authorization_generation
+        ) {
           stopPolling();
-          setErr("Authorization didn't complete — the sign-in was refused. You can try again.");
+          setDoneConnection(connection);
+          setDoneSnapshot(snapshot);
+          setDoneTools(snapshot.tools.map((tool) => ({
+            name: tool.name,
+            description: tool.description,
+          })));
+          setDoneMsg(
+            `Connected — photographed ${snapshot.tools.length} tool(s) with the fresh credential.`
+          );
+          setStep("done");
           return;
         }
-        if (c?.status === "active") {
-          // `active` can briefly PRECEDE the post-activation photograph, so a
-          // /tools fetch here can 404 → null. Only COMPLETE once the snapshot has
-          // landed AND was taken under THIS connection's current authorization
-          // generation; otherwise keep polling within the budget rather than
-          // finishing with no tools (F2).
-          const snap = await fetchConnectionTools(c.id).catch(() => null);
-          if (snap && snap.authorization_generation === c.authorization_generation) {
-            stopPolling();
-            setDoneConnection(c);
-            setDoneSnapshot(snap);
-            setDoneTools(snap.tools.map((t) => ({ name: t.name, description: t.description })));
-            setDoneMsg(
-              `Connected — photographed ${snap.tools.length} tool(s) with the fresh credential.`
-            );
-            setStep("done");
-            return;
-          }
-          // Active but the photograph hasn't settled yet — fall through and keep
-          // polling until it lands or the budget is exhausted (handled below).
-        }
-        if (waited >= MAX_WAIT) {
-          stopPolling();
-          if (c?.status === "active") {
-            // Connected, but the photograph never settled within the budget.
-            // Surface it explicitly (the connection IS live) rather than
-            // completing with nothing.
-            setDoneConnection(c);
-            setDoneMsg(
-              "Connected — tools are still photographing. Refresh in Integrations in a moment to see them."
-            );
-            setStep("done");
-          } else {
-            setErr("Timed out waiting for authorization. Finish the sign-in in the opened tab, then retry.");
-          }
-        }
-      } catch {
-        /* transient list failure — keep polling until MAX_WAIT */
       }
-    }, 2000);
-  };
+      if (Date.now() >= watchDeadline.current) {
+        stopPolling();
+        if (connection?.status === "active") {
+          setDoneConnection(connection);
+          setDoneMsg(
+            "Connected — tools are still photographing. Refresh in Integrations in a moment to see them."
+          );
+          setStep("done");
+        } else {
+          setErr("Timed out waiting for authorization. Finish the sign-in in the opened tab, then retry.");
+        }
+      }
+    } catch {
+      // Transient list failure — keep polling until the wall-clock deadline.
+    }
+  }, [stopPolling, watchConnectionId]);
+  useSmartPolling(checkAuthorization, 2_000, waiting && !!watchConnectionId);
 
   const add = async () => {
     setErr("");
@@ -280,6 +294,13 @@ export function AddServerWizard({
     });
     onClose();
   };
+  const requestClose = () => {
+    if (dirty) {
+      setConfirmClose(true);
+      return;
+    }
+    onClose();
+  };
 
   const content = (
     <>
@@ -292,7 +313,6 @@ export function AddServerWizard({
               placeholder="https://mcp.example.com/mcp"
               value={url}
               onChange={(e) => setUrl(e.target.value)}
-              autoFocus
             />
           </label>
           <p className="helper" style={{ marginTop: 0 }}>
@@ -480,8 +500,24 @@ export function AddServerWizard({
             <h3>Add an MCP server</h3>
             <p>Detect its authentication, connect it, and attach the resulting bundle without leaving this flow.</p>
           </div>
-          <button className="btn ghost sm" type="button" onClick={onClose}>Back to capabilities</button>
+          <button className="btn ghost sm" type="button" onClick={requestClose}>Back to capabilities</button>
         </div>
+        {confirmClose && (
+          <div className="discard-confirm embedded-discard" role="alert">
+            <span>
+              <strong>Discard this server setup?</strong>
+              <small>Credentials are never stored as a browser draft.</small>
+            </span>
+            <span className="discard-actions">
+              <button className="btn sm ghost" type="button" onClick={() => setConfirmClose(false)}>
+                Keep editing
+              </button>
+              <button className="btn sm danger" type="button" onClick={onClose}>
+                Discard
+              </button>
+            </span>
+          </div>
+        )}
         {content}
       </section>
     );
@@ -492,6 +528,7 @@ export function AddServerWizard({
       title="Add your own MCP server"
       sub="Paste a URL — we detect the auth, preview the tools, and register it."
       onClose={onClose}
+      dirty={dirty}
     >
       {content}
     </ModalShell>

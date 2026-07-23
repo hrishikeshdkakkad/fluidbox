@@ -4,23 +4,33 @@
 // happens when they ask. The control plane resolves every verdict; this page
 // only renders what it sends.
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { ChevronRight } from "lucide-react";
-import { apiGet, PolicySummary } from "../lib/api";
+import { apiGetCached, PolicySummary } from "../lib/api";
 import { LoadingRows, PageHead } from "../components/bits";
 
 export default function GovernancePage() {
   const [policies, setPolicies] = useState<PolicySummary[]>([]);
   const [err, setErr] = useState("");
   const [loading, setLoading] = useState(true);
+  const [hasSnapshot, setHasSnapshot] = useState(false);
 
-  useEffect(() => {
-    apiGet<{ policies: PolicySummary[] }>("/policies")
-      .then((r) => setPolicies(r.policies))
+  const load = useCallback(() => {
+    setErr("");
+    apiGetCached<{ policies: PolicySummary[] }>("/policies", { maxAgeMs: 30_000 })
+      .then((r) => {
+        setPolicies(r.policies);
+        setHasSnapshot(true);
+      })
       .catch((reason) => setErr(`Policies could not be loaded. ${String(reason)}`))
       .finally(() => setLoading(false));
   }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(load, 0);
+    return () => window.clearTimeout(timer);
+  }, [load]);
 
   return (
     <>
@@ -34,6 +44,25 @@ export default function GovernancePage() {
       <div className="panel">
         {loading ? (
           <LoadingRows />
+        ) : err && !hasSnapshot ? (
+          <div className="launch-empty">
+            <div>
+              <h3>Governance is unavailable.</h3>
+              <p>A failed read is not treated as an empty policy set.</p>
+            </div>
+            <div className="empty-actions">
+              <button
+                className="btn"
+                type="button"
+                onClick={() => {
+                  setLoading(true);
+                  load();
+                }}
+              >
+                Retry now
+              </button>
+            </div>
+          </div>
         ) : policies.length === 0 ? (
           <div className="empty">
             <div>No policies yet.</div>

@@ -1,9 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Agent,
-  apiGet,
+  apiGetCached,
   apiPost,
   BundleRef,
   Connection,
@@ -28,10 +28,65 @@ import {
   WorkspacePicker,
 } from "./WorkspacePicker";
 import { ModalShell } from "./bits";
+import { useSessionDraft } from "../lib/useSessionDraft";
 
 export type RunMode = "once" | "automation";
 type TriggerKind = "api" | "schedule" | "event";
 type AgentChoice = "existing" | "new";
+type PendingAgentSwitch =
+  | { choice: "existing"; name: string }
+  | { choice: "new" };
+
+interface RunComposerDraft {
+  version: 1;
+  mode: RunMode;
+  task: string;
+  autonomous: boolean;
+  agentChoice: AgentChoice;
+  selectedAgentName: string;
+  revisionTouched: boolean;
+  newAgentName: string;
+  description: string;
+  harness: string;
+  model: string;
+  systemPrompt: string;
+  workspace: WorkspaceDraft;
+  pins: BundleRef[];
+  requirements: ConnectionRequirement[];
+  bindings: Record<string, string>;
+  kind: TriggerKind;
+  automationName: string;
+  allowTask: boolean;
+  allowWorkspace: boolean;
+  callbackUrl: string;
+  concurrency: string;
+  cron: string;
+  timezone: string;
+  missedPolicy: string;
+  connection: string;
+  repositories: string;
+  evOpened: boolean;
+  evReopened: boolean;
+  evSync: boolean;
+  pubComment: boolean;
+  pubCheck: boolean;
+  capabilityKeepList: string;
+}
+
+function isRunComposerDraft(value: unknown): value is RunComposerDraft {
+  if (!value || typeof value !== "object") return false;
+  const draft = value as Partial<RunComposerDraft>;
+  return (
+    draft.version === 1 &&
+    (draft.mode === "once" || draft.mode === "automation") &&
+    (draft.agentChoice === "existing" || draft.agentChoice === "new") &&
+    typeof draft.task === "string" &&
+    !!draft.workspace &&
+    typeof draft.workspace === "object" &&
+    Array.isArray(draft.pins) &&
+    Array.isArray(draft.requirements)
+  );
+}
 
 export interface MintedAutomation {
   subscription: TriggerSubscription;
@@ -101,8 +156,12 @@ export function RunComposer({
   const [requirements, setRequirements] = useState<ConnectionRequirement[]>([]);
   const [bindings, setBindings] = useState<Record<string, string>>({});
   const [bindableConnections, setBindableConnections] = useState<Connection[]>([]);
+  const [bindingConnectionsError, setBindingConnectionsError] = useState("");
   const [capabilityRefresh, setCapabilityRefresh] = useState(0);
+  const [connectionRefresh, setConnectionRefresh] = useState(0);
   const [addingMcp, setAddingMcp] = useState(false);
+  const [addingMcpDirty, setAddingMcpDirty] = useState(false);
+  const [pendingAgentSwitch, setPendingAgentSwitch] = useState<PendingAgentSwitch | null>(null);
 
   const [kind, setKind] = useState<TriggerKind>("api");
   const [automationName, setAutomationName] = useState("");
@@ -114,6 +173,7 @@ export function RunComposer({
   const [timezone, setTimezone] = useState(localTimezone);
   const [missedPolicy, setMissedPolicy] = useState("skip");
   const [connections, setConnections] = useState<Connection[]>([]);
+  const [eventConnectionsError, setEventConnectionsError] = useState("");
   const [connection, setConnection] = useState("");
   const [repositories, setRepositories] = useState("");
   const [evOpened, setEvOpened] = useState(true);
@@ -125,9 +185,132 @@ export function RunComposer({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
+  const draftKey = agentOnly
+    ? "fluidbox:draft:new-agent"
+    : "fluidbox:draft:run-composer";
+  const draft = useMemo<RunComposerDraft>(
+    () => ({
+      version: 1,
+      mode,
+      task,
+      autonomous,
+      agentChoice,
+      selectedAgentName,
+      revisionTouched,
+      newAgentName,
+      description,
+      harness,
+      model,
+      systemPrompt,
+      workspace,
+      pins,
+      requirements,
+      bindings,
+      kind,
+      automationName,
+      allowTask,
+      allowWorkspace,
+      callbackUrl,
+      concurrency,
+      cron,
+      timezone,
+      missedPolicy,
+      connection,
+      repositories,
+      evOpened,
+      evReopened,
+      evSync,
+      pubComment,
+      pubCheck,
+      capabilityKeepList,
+    }),
+    [
+      mode, task, autonomous, agentChoice, selectedAgentName, revisionTouched, newAgentName,
+      description, harness, model, systemPrompt, workspace, pins, requirements, bindings, kind,
+      automationName, allowTask, allowWorkspace, callbackUrl, concurrency, cron, timezone,
+      missedPolicy, connection, repositories, evOpened, evReopened, evSync, pubComment, pubCheck,
+      capabilityKeepList,
+    ]
+  );
+  // Loading an existing revision is not user input. Only persist agent fields
+  // when they belong to a new definition or the operator has actually edited
+  // the existing revision; this avoids creating phantom drafts on every open.
+  const hasAgentDefinitionDraft =
+    agentChoice === "new"
+      ? newAgentName.trim().length > 0 ||
+        description.trim().length > 0 ||
+        harness !== "claude-agent-sdk" ||
+        model !== "claude-haiku-4-5" ||
+        systemPrompt.trim().length > 0 ||
+        workspace.mode !== "scratch" ||
+        pins.length > 0 ||
+        requirements.length > 0
+      : revisionTouched;
+  const hasDraft =
+    mode !== initialMode ||
+    task.trim().length > 0 ||
+    autonomous ||
+    hasAgentDefinitionDraft ||
+    automationName.trim().length > 0 ||
+    kind !== "api" ||
+    allowTask ||
+    allowWorkspace ||
+    callbackUrl.trim().length > 0 ||
+    concurrency !== "allow" ||
+    cron.trim().length > 0 ||
+    missedPolicy !== "skip" ||
+    repositories.trim().length > 0 ||
+    !evOpened ||
+    !evReopened ||
+    evSync ||
+    !pubComment ||
+    pubCheck ||
+    capabilityKeepList.trim().length > 0;
+  const restoreDraft = useCallback((saved: RunComposerDraft) => {
+    if (!isRunComposerDraft(saved)) return;
+    setMode(saved.mode);
+    setTask(saved.task);
+    setAutonomous(saved.autonomous);
+    setAgentChoice(saved.agentChoice);
+    setSelectedAgentName(saved.selectedAgentName);
+    setRevisionTouched(saved.revisionTouched);
+    setNewAgentName(saved.newAgentName);
+    setDescription(saved.description);
+    setHarness(saved.harness);
+    setModel(saved.model);
+    setSystemPrompt(saved.systemPrompt);
+    setWorkspace(saved.workspace);
+    setPins(saved.pins);
+    setRequirements(saved.requirements);
+    setBindings(saved.bindings);
+    setKind(saved.kind);
+    setAutomationName(saved.automationName);
+    setAllowTask(saved.allowTask);
+    setAllowWorkspace(saved.allowWorkspace);
+    setCallbackUrl(saved.callbackUrl);
+    setConcurrency(saved.concurrency);
+    setCron(saved.cron);
+    setTimezone(saved.timezone);
+    setMissedPolicy(saved.missedPolicy);
+    setConnection(saved.connection);
+    setRepositories(saved.repositories);
+    setEvOpened(saved.evOpened);
+    setEvReopened(saved.evReopened);
+    setEvSync(saved.evSync);
+    setPubComment(saved.pubComment);
+    setPubCheck(saved.pubCheck);
+    setCapabilityKeepList(saved.capabilityKeepList);
+  }, []);
+  const clearDraft = useSessionDraft({
+    key: draftKey,
+    value: draft,
+    onRestore: restoreDraft,
+    shouldPersist: hasDraft,
+  });
+
   useEffect(() => {
     let active = true;
-    apiGet<{ agents: Agent[] }>("/agents")
+    apiGetCached<{ agents: Agent[] }>("/agents", { maxAgeMs: 15_000 })
       .then((response) => {
         if (!active) return;
         setAgents(response.agents);
@@ -145,14 +328,14 @@ export function RunComposer({
   }, []);
 
   useEffect(() => {
-    if (agentChoice !== "existing" || !selectedAgentName) return;
+    if (agentChoice !== "existing" || !selectedAgentName || revisionTouched) return;
     const selected = agents.find((candidate) => candidate.name === selectedAgentName);
     if (!selected) return;
     let active = true;
     const start = window.setTimeout(() => {
       setRevisionLoading(true);
       setErr("");
-      apiGet<{ revisions: Revision[] }>(`/agents/${selected.id}`)
+      apiGetCached<{ revisions: Revision[] }>(`/agents/${selected.id}`, { maxAgeMs: 30_000 })
         .then((response) => {
           if (!active) return;
           const latest = response.revisions[0] ?? null;
@@ -174,36 +357,57 @@ export function RunComposer({
       active = false;
       window.clearTimeout(start);
     };
-  }, [agentChoice, agents, selectedAgentName]);
+  }, [agentChoice, agents, revisionTouched, selectedAgentName]);
 
   useEffect(() => {
     if (mode !== "automation" || kind !== "event" || connections.length > 0) return;
-    apiGet<{ connections: Connection[] }>("/connections")
+    apiGetCached<{ connections: Connection[] }>("/connections", {
+      maxAgeMs: 10_000,
+      force: connectionRefresh > 0,
+    })
       .then((response) => {
         const activeApps = response.connections.filter(
           (candidate) => candidate.provider === "github_app" && candidate.status === "active"
         );
+        setEventConnectionsError("");
         setConnections(activeApps);
         setConnection((current) => current || activeApps[0]?.id || "");
       })
-      .catch(() => {});
-  }, [connections.length, kind, mode]);
+      .catch((reason) =>
+        setEventConnectionsError(`GitHub App connections could not be loaded. ${String(reason)}`)
+      );
+  }, [connectionRefresh, connections.length, kind, mode]);
 
   // The invoking-user-visible connections used to offer per-slot binding options
   // for a "once" run whose agent declares brokered requirements. The list is
   // already viewer-filtered server-side; the server re-verifies every binding.
   useEffect(() => {
     if (mode !== "once" || requirements.length === 0 || bindableConnections.length > 0) return;
-    apiGet<{ connections: Connection[] }>("/connections")
-      .then((response) => setBindableConnections(response.connections))
-      .catch(() => {});
-  }, [mode, requirements.length, bindableConnections.length]);
+    apiGetCached<{ connections: Connection[] }>("/connections", {
+      maxAgeMs: 10_000,
+      force: connectionRefresh > 0,
+    })
+      .then((response) => {
+        setBindingConnectionsError("");
+        setBindableConnections(response.connections);
+      })
+      .catch((reason) =>
+        setBindingConnectionsError(`Specific connection choices could not be loaded. ${String(reason)}`)
+      );
+  }, [bindableConnections.length, connectionRefresh, mode, requirements.length]);
 
   const touchRevision = () => {
     if (agentChoice === "existing") setRevisionTouched(true);
   };
 
-  const chooseNewAgent = () => {
+  const commitExistingAgent = (name: string) => {
+    setAgentChoice("existing");
+    setSelectedAgentName(name);
+    setRevisionTouched(false);
+    setPendingAgentSwitch(null);
+  };
+
+  const commitNewAgent = () => {
     const defaultHarness = harnesses.find((candidate) => candidate.available)?.id || "claude-agent-sdk";
     setAgentChoice("new");
     setHarness(defaultHarness);
@@ -214,6 +418,34 @@ export function RunComposer({
     setRequirements([]); // a new agent declares its requirements in the editor
     setBindings({});
     setRevisionTouched(false);
+    setPendingAgentSwitch(null);
+  };
+
+  const requestExistingAgent = (name: string) => {
+    if (agentChoice === "existing" && selectedAgentName === name) return;
+    if (
+      (agentChoice === "existing" && revisionTouched) ||
+      (agentChoice === "new" && hasAgentDefinitionDraft)
+    ) {
+      setPendingAgentSwitch({ choice: "existing", name });
+      return;
+    }
+    commitExistingAgent(name);
+  };
+
+  const requestNewAgent = () => {
+    if (agentChoice === "new") return;
+    if (revisionTouched) {
+      setPendingAgentSwitch({ choice: "new" });
+      return;
+    }
+    commitNewAgent();
+  };
+
+  const confirmAgentSwitch = () => {
+    if (!pendingAgentSwitch) return;
+    if (pendingAgentSwitch.choice === "new") commitNewAgent();
+    else commitExistingAgent(pendingAgentSwitch.name);
   };
 
   // One always-live gate instead of five per-step gates. The form is a single
@@ -225,6 +457,9 @@ export function RunComposer({
       if (mode === "automation" && !automationName.trim()) return "Give this automation a unique name.";
       if (mode === "automation" && kind === "schedule" && !cron.trim()) {
         return "Enter the schedule as a cron expression.";
+      }
+      if (mode === "automation" && kind === "event" && eventConnectionsError) {
+        return "Reload GitHub App connections before continuing.";
       }
       if (mode === "automation" && kind === "event" && !connection) {
         return "Choose an active GitHub App connection.";
@@ -242,7 +477,7 @@ export function RunComposer({
     }
     return "";
   }, [
-    agentOnly, mode, automationName, kind, cron, connection, task, agentsLoading, revisionLoading,
+    agentOnly, mode, automationName, kind, cron, connection, eventConnectionsError, task, agentsLoading, revisionLoading,
     agentChoice, selectedAgentName, newAgentName, harnessesError, harnessesLoading, harnesses.length,
     model, workspace,
   ]);
@@ -285,6 +520,7 @@ export function RunComposer({
       }
 
       if (agentOnly) {
+        clearDraft();
         onAgentCreated?.();
         return;
       }
@@ -304,6 +540,7 @@ export function RunComposer({
         };
         if (Object.keys(explicit).length > 0) body.bindings = explicit;
         await apiPost("/sessions", body);
+        clearDraft();
         onRunCreated();
         return;
       }
@@ -353,6 +590,7 @@ export function RunComposer({
         poll_url_template: string | null;
         ingress_url: string | null;
       }>("/triggers", body);
+      clearDraft();
       onAutomationCreated(response);
     } catch (reason) {
       if (createdAgent) {
@@ -392,12 +630,17 @@ export function RunComposer({
       }
       onClose={onClose}
       maxWidth="min(1120px, 96vw)"
+      dirty={addingMcp && addingMcpDirty}
     >
       {addingMcp ? (
         <AddServerWizard
           embedded
           me={me}
-          onClose={() => setAddingMcp(false)}
+          onDirtyChange={setAddingMcpDirty}
+          onClose={() => {
+            setAddingMcpDirty(false);
+            setAddingMcp(false);
+          }}
           onCompleted={(result) => {
             setCapabilityRefresh((current) => current + 1);
             if (!result) return;
@@ -461,7 +704,7 @@ export function RunComposer({
                 <div className="automation-setup">
                   <label className="field">
                     <span className="lab">Automation name</span>
-                    <input className="inp mono" value={automationName} onChange={(event) => setAutomationName(event.target.value)} placeholder="weekday-incident-triage" autoFocus />
+                    <input className="inp mono" value={automationName} onChange={(event) => setAutomationName(event.target.value)} placeholder="weekday-incident-triage" />
                   </label>
                   <div className="field">
                     <span className="lab">Start this run from</span>
@@ -504,10 +747,31 @@ export function RunComposer({
 
                   {kind === "event" && (
                     <div className="event-config">
+                      {eventConnectionsError && (
+                        <div className="catalog-state error-state" role="alert">
+                          <div>
+                            <strong>GitHub App connections are unavailable.</strong>
+                            <span>{eventConnectionsError}</span>
+                          </div>
+                          <button
+                            className="btn"
+                            type="button"
+                            onClick={() => setConnectionRefresh((current) => current + 1)}
+                          >
+                            Retry
+                          </button>
+                        </div>
+                      )}
                       <label className="field">
                         <span className="lab">GitHub App connection</span>
                         <select className="inp" value={connection} onChange={(event) => setConnection(event.target.value)}>
-                          {connections.length === 0 && <option value="">No active GitHub App connections</option>}
+                          {connections.length === 0 && (
+                            <option value="">
+                              {eventConnectionsError
+                                ? "Connections unavailable"
+                                : "No active GitHub App connections"}
+                            </option>
+                          )}
                           {connections.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.display_name}</option>)}
                         </select>
                       </label>
@@ -545,7 +809,6 @@ export function RunComposer({
                 value={task}
                 onChange={(event) => setTask(event.target.value)}
                 placeholder={mode === "once" ? "Review the latest changes, identify regressions, and prepare a safe patch…" : "Investigate {{ticket}} and report the root cause…"}
-                autoFocus={mode === "once"}
               />
               {mode === "automation" && <span className="field-hint">{templateHint}</span>}
             </label>
@@ -568,15 +831,40 @@ export function RunComposer({
                   type="button"
                   className={agentChoice === "existing" ? "selected" : ""}
                   disabled={agents.length === 0}
-                  onClick={() => setAgentChoice("existing")}
+                  onClick={() =>
+                    requestExistingAgent(selectedAgentName || agents[0]?.name || "")
+                  }
                 >
                   <strong>Use an existing agent</strong>
                   <span>{agents.length > 0 ? `${agents.length} available` : "None created yet"}</span>
                 </button>
-                <button type="button" className={agentChoice === "new" ? "selected" : ""} onClick={chooseNewAgent}>
+                <button type="button" className={agentChoice === "new" ? "selected" : ""} onClick={requestNewAgent}>
                   <strong>Create a new agent</strong>
                   <span>Define it without leaving this run</span>
                 </button>
+              </div>
+            )}
+
+            {pendingAgentSwitch && (
+              <div className="context-switch-confirm" role="alert">
+                <span>
+                  <strong>Switch agent context?</strong>
+                  <small>
+                    Unsaved agent configuration will be replaced. The run task and trigger draft stay saved.
+                  </small>
+                </span>
+                <span className="discard-actions">
+                  <button
+                    className="btn sm ghost"
+                    type="button"
+                    onClick={() => setPendingAgentSwitch(null)}
+                  >
+                    Keep current
+                  </button>
+                  <button className="btn sm danger" type="button" onClick={confirmAgentSwitch}>
+                    Switch
+                  </button>
+                </span>
               </div>
             )}
 
@@ -589,7 +877,7 @@ export function RunComposer({
                       key={candidate.id}
                       type="button"
                       className={`opt ${selectedAgentName === candidate.name ? "on" : ""}`}
-                      onClick={() => setSelectedAgentName(candidate.name)}
+                      onClick={() => requestExistingAgent(candidate.name)}
                     >
                       <span className="t">
                         {candidate.name}
@@ -606,7 +894,12 @@ export function RunComposer({
               <div className="agent-creator-grid">
                 <label className="field">
                   <span className="lab">Name</span>
-                  <input className="inp mono" value={newAgentName} onChange={(event) => setNewAgentName(event.target.value)} placeholder="release-reviewer" autoFocus />
+                  <input
+                    className="inp mono"
+                    value={newAgentName}
+                    onChange={(event) => setNewAgentName(event.target.value)}
+                    placeholder="release-reviewer"
+                  />
                 </label>
                 <label className="field">
                   <span className="lab">Description <span className="optional-label">optional</span></span>
@@ -709,6 +1002,23 @@ export function RunComposer({
                   to let the server pick per its binding mode, or bind a specific connection you
                   can use.
                 </span>
+                {bindingConnectionsError && (
+                  <div className="catalog-state error-state" role="status">
+                    <div>
+                      <strong>Specific binding choices are unavailable.</strong>
+                      <span>
+                        Automatic server-side resolution still works. {bindingConnectionsError}
+                      </span>
+                    </div>
+                    <button
+                      className="btn"
+                      type="button"
+                      onClick={() => setConnectionRefresh((current) => current + 1)}
+                    >
+                      Retry choices
+                    </button>
+                  </div>
+                )}
                 <div className="opt-list">
                   {requirements.map((req) => {
                     const matches = bindableConnections.filter(
@@ -905,6 +1215,9 @@ export function RunComposer({
             >
               {busy ? "Saving…" : finalAction}
             </button>
+            {hasDraft && !busy && (
+              <p className="rc-draft-note">Draft saved in this tab. Closing this panel will not lose it.</p>
+            )}
             {blockingIssue && !busy && <p className="rc-blocker">{blockingIssue}</p>}
           </div>
         </aside>
@@ -1065,6 +1378,9 @@ export function ShowAutomationSecrets({
       sub="The token and signing secret exist only in this response — they are stored hashed and sealed and can never be shown again."
       onClose={onClose}
       maxWidth="min(760px, 96vw)"
+      dirty
+      discardTitle="Close without copying the secrets?"
+      discardMessage="They cannot be shown again after this panel closes."
     >
       <div className="contract">
         <section className="contract-section">

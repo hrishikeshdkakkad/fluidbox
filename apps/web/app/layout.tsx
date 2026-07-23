@@ -4,6 +4,7 @@ import "./globals.css";
 import "./geist.css";
 import { Shell } from "./components/Shell";
 import { webMode } from "./lib/proxy-auth";
+import { THEME_INIT_SCRIPT } from "./lib/theme";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -24,8 +25,8 @@ export const metadata: Metadata = {
 };
 
 export const viewport: Viewport = {
-  colorScheme: "dark",
-  themeColor: "#000000",
+  colorScheme: "dark light",
+  themeColor: "#111318",
 };
 
 // Static deployment configuration (see the proxy route): `sso` turns on the
@@ -40,9 +41,14 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} dark dark-theme`}
+      className={`${geistSans.variable} ${geistMono.variable}`}
+      data-theme="dark"
       data-web-mode={WEB_MODE}
+      suppressHydrationWarning
     >
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
+      </head>
       <body>
         <Shell mode={WEB_MODE}>{children}</Shell>
       </body>

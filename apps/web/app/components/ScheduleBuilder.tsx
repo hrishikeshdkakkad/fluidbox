@@ -162,7 +162,7 @@ export function ScheduleBuilder({
   onTimezone: (timezone: string) => void;
 }) {
   const [state, setState] = useState<BuilderState>(() => parseCron(cron));
-  const zones = useMemo(timezones, []);
+  const zones = useMemo(() => timezones(), []);
 
   // The builder owns the expression: every state change republishes the cron so
   // the parent never has to know how it was authored.

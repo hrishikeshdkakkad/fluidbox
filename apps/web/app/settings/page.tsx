@@ -6,11 +6,15 @@ import { PageHead } from "../components/bits";
 
 export default function Settings() {
   const [ready, setReady] = useState<{ db: boolean; docker: boolean } | null>(null);
+  const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
 
   useEffect(() => {
     apiGet<{ db: boolean; docker: boolean }>("/health/ready")
-      .then(setReady)
-      .catch(() => setReady(null));
+      .then((response) => {
+        setReady(response);
+        setStatus("ready");
+      })
+      .catch(() => setStatus("error"));
   }, []);
 
   return (
@@ -21,8 +25,11 @@ export default function Settings() {
         <div className="sectitle" style={{ marginTop: 0 }}>
           Health
         </div>
-        <Health label="Database (Neon Postgres)" ok={ready?.db ?? false} />
-        <Health label="Sandbox runtime (Docker)" ok={ready?.docker ?? false} />
+        {status === "error" && (
+          <p className="note">Health status is unavailable; no component is being reported down from a failed read.</p>
+        )}
+        <Health label="Database (Neon Postgres)" status={status} ok={ready?.db ?? false} />
+        <Health label="Sandbox runtime (Docker)" status={status} ok={ready?.docker ?? false} />
 
         <div className="sectitle">Security model</div>
         <ul style={{ margin: 0, paddingLeft: 18, color: "var(--ink-2)", fontSize: 13, lineHeight: 1.9 }}>
@@ -36,11 +43,21 @@ export default function Settings() {
   );
 }
 
-function Health({ label, ok }: { label: string; ok: boolean }) {
+function Health({
+  label,
+  ok,
+  status,
+}: {
+  label: string;
+  ok: boolean;
+  status: "loading" | "ready" | "error";
+}) {
+  const labelText = status === "loading" ? "checking" : status === "error" ? "unavailable" : ok ? "connected" : "down";
+  const badgeTone = status === "ready" ? (ok ? "ok" : "err") : "warn";
   return (
     <div className="spread" style={{ padding: "9px 0", borderBottom: "1px solid var(--border)" }}>
       <span style={{ fontSize: 13 }}>{label}</span>
-      <span className={`badge ${ok ? "ok" : "err"}`}>{ok ? "connected" : "down"}</span>
+      <span className={`badge ${badgeTone}`}>{labelText}</span>
     </div>
   );
 }

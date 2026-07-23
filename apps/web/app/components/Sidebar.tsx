@@ -2,8 +2,10 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useEffect, useState } from "react";
-import { apiGet, AuthMe, logout } from "../lib/api";
+import { useCallback, useEffect, useState } from "react";
+import { apiGet, apiGetCached, AuthMe, logout } from "../lib/api";
+import { useSmartPolling } from "../lib/useSmartPolling";
+import { ThemeToggle } from "./ThemeToggle";
 
 /**
  * The component name remains Sidebar to keep the layout seam stable, but the
@@ -19,11 +21,12 @@ export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
   const [pending, setPending] = useState(0);
   const [online, setOnline] = useState(true);
   const [me, setMe] = useState<AuthMe | null>(null);
+  const [mobileOpen, setMobileOpen] = useState(false);
 
   useEffect(() => {
     if (mode !== "sso") return;
     let alive = true;
-    apiGet<AuthMe>("/auth/me")
+    apiGetCached<AuthMe>("/auth/me", { maxAgeMs: 60_000 })
       .then((m) => {
         if (alive) setMe(m);
       })
@@ -36,26 +39,16 @@ export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
     };
   }, [mode]);
 
-  useEffect(() => {
-    let alive = true;
-    const poll = async () => {
-      try {
-        const response = await apiGet<{ approvals: unknown[] }>("/approvals");
-        if (alive) {
-          setPending(response.approvals.length);
-          setOnline(true);
-        }
-      } catch {
-        if (alive) setOnline(false);
-      }
-    };
-    void poll();
-    const timer = setInterval(poll, 4000);
-    return () => {
-      alive = false;
-      clearInterval(timer);
-    };
+  const poll = useCallback(async () => {
+    try {
+      const response = await apiGet<{ approvals: unknown[] }>("/approvals");
+      setPending(response.approvals.length);
+      setOnline(true);
+    } catch {
+      setOnline(false);
+    }
   }, []);
+  useSmartPolling(poll, 8000);
 
   const resourcesActive = ["/agents", "/capabilities", "/integrations"].some(
     (route) => pathname.startsWith(route)
@@ -63,32 +56,71 @@ export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
   const activityActive = ["/sessions", "/automations"].some(
     (route) => pathname.startsWith(route)
   );
+  const closeMobileNav = () => setMobileOpen(false);
 
   return (
     <header className="topbar">
       <div className="topbar-inner">
-        <Link href="/" className="brand masthead-brand">
+        <Link href="/" className="brand masthead-brand" onNavigate={closeMobileNav}>
           <span className="wordmark">fluidbox</span>
           <span className="product-label">control plane</span>
         </Link>
 
-        <nav className="masthead-nav" aria-label="Primary navigation">
-          <Link className={pathname === "/" ? "active" : ""} href="/">
+        <nav
+          className={`masthead-nav ${mobileOpen ? "open" : ""}`}
+          id="primary-navigation"
+          aria-label="Primary navigation"
+        >
+          <Link className={pathname === "/" ? "active" : ""} href="/" onNavigate={closeMobileNav}>
             Overview
           </Link>
-          <Link className={resourcesActive ? "active" : ""} href="/#configuration">
+          <Link
+            className={resourcesActive ? "active" : ""}
+            href="/#configuration"
+            onNavigate={closeMobileNav}
+          >
             Resources
           </Link>
-          <Link className={activityActive ? "active" : ""} href="/#operations">
+          <Link
+            className={activityActive ? "active" : ""}
+            href="/#operations"
+            onNavigate={closeMobileNav}
+          >
             Activity
             {pending > 0 && <span className="masthead-count">{pending}</span>}
           </Link>
-          <Link className={pathname.startsWith("/governance") ? "active" : ""} href="/governance">
+          <Link
+            className={pathname.startsWith("/governance") ? "active" : ""}
+            href="/governance"
+            onNavigate={closeMobileNav}
+          >
             Governance
           </Link>
-          <Link className={pathname === "/settings" ? "active" : ""} href="/settings">
+          <Link
+            className={pathname === "/settings" ? "active" : ""}
+            href="/settings"
+            onNavigate={closeMobileNav}
+          >
             Settings
           </Link>
+          <Link
+            className="mobile-primary-action"
+            href="/?action=new-run"
+            onNavigate={closeMobileNav}
+          >
+            New Run
+          </Link>
+          {mode === "sso" && me?.user && (
+            <div className="mobile-session">
+              <span>
+                <strong>{me.org?.display_name ?? me.org?.slug ?? "Signed in"}</strong>
+                <small>{me.user.email}</small>
+              </span>
+              <button className="btn sm ghost" type="button" onClick={() => void logout()}>
+                Log out
+              </button>
+            </div>
+          )}
         </nav>
 
         <div className="masthead-actions">
@@ -99,6 +131,7 @@ export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
           <Link className="topbar-action" href="/?action=new-run">
             New Run
           </Link>
+          <ThemeToggle />
           {mode === "sso" && me?.user && (
             <div
               style={{ display: "flex", alignItems: "center", gap: 10 }}
@@ -124,8 +157,34 @@ export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
               </button>
             </div>
           )}
+          <button
+            className="masthead-menu"
+            type="button"
+            aria-label={mobileOpen ? "Close navigation" : "Open navigation"}
+            aria-expanded={mobileOpen}
+            aria-controls="primary-navigation"
+            onClick={() => setMobileOpen((open) => !open)}
+          >
+            {mobileOpen ? <CloseIcon /> : <MenuIcon />}
+          </button>
         </div>
       </div>
     </header>
+  );
+}
+
+function MenuIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M4 7h16M4 12h16M4 17h16" />
+    </svg>
+  );
+}
+
+function CloseIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="m6 6 12 12M18 6 6 18" />
+    </svg>
   );
 }

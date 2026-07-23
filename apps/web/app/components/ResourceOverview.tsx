@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import {
   Agent,
-  apiGet,
+  apiGetCached,
   apiPost,
   CapabilityBundle,
   Connection,
@@ -40,20 +40,35 @@ export function ResourceOverview({
   const [snapshot, setSnapshot] = useState<ResourceSnapshot>(EMPTY);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
+  const [loadErr, setLoadErr] = useState("");
+  const [hasSnapshot, setHasSnapshot] = useState(false);
 
   const load = useCallback(async () => {
     const results = await Promise.allSettled([
-      apiGet<{ agents: Agent[] }>("/agents"),
-      apiGet<{ bundles: CapabilityBundle[] }>("/capabilities"),
-      apiGet<{ connections: Connection[] }>("/connections"),
-      apiGet<{ registrations: GithubAppRegistration[] }>("/github/app"),
+      apiGetCached<{ agents: Agent[] }>("/agents", { maxAgeMs: 15_000 }),
+      apiGetCached<{ bundles: CapabilityBundle[] }>("/capabilities", { maxAgeMs: 30_000 }),
+      apiGetCached<{ connections: Connection[] }>("/connections", { maxAgeMs: 10_000 }),
+      apiGetCached<{ registrations: GithubAppRegistration[] }>("/github/app", { maxAgeMs: 10_000 }),
     ]);
-    setSnapshot({
-      agents: results[0].status === "fulfilled" ? results[0].value.agents : [],
-      bundles: results[1].status === "fulfilled" ? results[1].value.bundles : [],
-      connections: results[2].status === "fulfilled" ? results[2].value.connections : [],
-      registrations: results[3].status === "fulfilled" ? results[3].value.registrations : [],
-    });
+    const fulfilled = results.filter((result) => result.status === "fulfilled").length;
+    setSnapshot((current) => ({
+      agents: results[0].status === "fulfilled" ? results[0].value.agents : current.agents,
+      bundles: results[1].status === "fulfilled" ? results[1].value.bundles : current.bundles,
+      connections:
+        results[2].status === "fulfilled" ? results[2].value.connections : current.connections,
+      registrations:
+        results[3].status === "fulfilled"
+          ? results[3].value.registrations
+          : current.registrations,
+    }));
+    if (fulfilled > 0) setHasSnapshot(true);
+    setLoadErr(
+      fulfilled === 0
+        ? "Resource status is unavailable because the control plane could not be reached."
+        : fulfilled < results.length
+          ? "Some resource status could not be refreshed; showing the last available values."
+          : ""
+    );
     setLoading(false);
   }, []);
 
@@ -93,6 +108,7 @@ export function ResourceOverview({
     (bundle, index, bundles) => bundles.findIndex((candidate) => candidate.name === bundle.name) === index
   );
   const ready = snapshot.agents.length > 0;
+  const unavailable = !loading && !hasSnapshot;
 
   return (
     <section className="configuration-section" id="configuration" aria-labelledby="configuration-heading">
@@ -103,19 +119,38 @@ export function ResourceOverview({
             Reusable definitions and connections available to every run.
           </p>
         </div>
-        <div className={`readiness ${ready ? "ready" : "needs-setup"}`}>
-          <span className="signal" />
+        <div className={`readiness ${unavailable ? "unavailable" : ready ? "ready" : "needs-setup"}`}>
+          <span className={`signal ${unavailable ? "down" : ""}`} />
           <span>
-            <strong>{ready ? "Ready" : "Setup Required"}</strong>
-            <small>{ready ? `${snapshot.agents.length} agent${snapshot.agents.length === 1 ? "" : "s"}` : "Create an agent"}</small>
+            <strong>{unavailable ? "Unavailable" : ready ? "Ready" : "Setup Required"}</strong>
+            <small>
+              {unavailable
+                ? "Control plane offline"
+                : ready
+                  ? `${snapshot.agents.length} agent${snapshot.agents.length === 1 ? "" : "s"}`
+                  : "Create an agent"}
+            </small>
           </span>
         </div>
       </div>
 
       {err && <div className="err configuration-error">{err}</div>}
+      {loadErr && <div className="note configuration-error">{loadErr}</div>}
 
       {loading ? (
         <div className="configuration-loading"><LoadingRows rows={3} /></div>
+      ) : unavailable ? (
+        <div className="panel launch-empty">
+          <div>
+            <h3>Resources could not be loaded.</h3>
+            <p>No setup assumptions were made from a failed response.</p>
+          </div>
+          <div className="empty-actions">
+            <button className="btn" type="button" onClick={() => void load()}>
+              Retry now
+            </button>
+          </div>
+        </div>
       ) : (
         <div className="resource-grid">
           <ResourceCard
