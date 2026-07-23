@@ -21,12 +21,16 @@ function ssoMode(): boolean {
 const CSRF_HEADERS = { "x-fluidbox-csrf": "1" } as const;
 
 /** In sso mode a 401 means "no live session" — route the browser to the login
- *  page. Guarded against a redirect loop when already on /login. Admin mode
- *  never triggers this (the injected bearer is always present). */
+ *  page, carrying the current location so the deep link survives the IdP
+ *  round-trip (login-form.tsx forwards it as redirect_to; the control plane
+ *  validates it). Guarded against a redirect loop when already on /login.
+ *  Admin mode never triggers this (the injected bearer is always present). */
 function redirectOnUnauthorized(res: Response): void {
   if (res.status !== 401 || !ssoMode() || typeof window === "undefined") return;
   if (window.location.pathname !== "/login") {
-    window.location.href = "/login";
+    const here = window.location.pathname + window.location.search;
+    const next = here === "/" ? "" : `?next=${encodeURIComponent(here)}`;
+    window.location.href = `/login${next}`;
   }
 }
 

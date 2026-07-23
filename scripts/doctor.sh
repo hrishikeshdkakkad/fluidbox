@@ -361,6 +361,46 @@ fi
   && ok "web dependencies installed" \
   || warn "apps/web/node_modules missing" "run: cd apps/web && pnpm install   (just setup does this too)"
 
+# Auth-mode coherence: FLUIDBOX_WEB_MODE (dashboard) vs FLUIDBOX_REQUIRE_SSO
+# (server). Each is valid alone; a MISMATCH degrades silently — the dashboard
+# falls back to admin mode, every proxied call 401s with no redirect, and the
+# app looks broken with no explanation. The mode may live in apps/web/.env.local
+# (the documented place) or ride .env via the justfile's dotenv-load.
+web_mode=$(env_get "$WEB_ENV" FLUIDBOX_WEB_MODE)
+[ -n "$web_mode" ] || web_mode=$(env_get "$ENV" FLUIDBOX_WEB_MODE)
+require_sso=$(env_get "$ENV" FLUIDBOX_REQUIRE_SSO)
+case "$web_mode" in
+  ""|admin)
+    if [ "$require_sso" = 1 ]; then
+      bad "FLUIDBOX_REQUIRE_SSO=1 but the dashboard runs in admin mode (FLUIDBOX_WEB_MODE unset/admin)" \
+        "the server confines the admin token to /v1/admin/*, so EVERY dashboard panel 401s silently — set FLUIDBOX_WEB_MODE=sso in apps/web/.env.local"
+    else
+      ok "auth mode coherent: admin dashboard, admin-token server (local default — no login wall)"
+    fi;;
+  sso)
+    if [ "$require_sso" = 1 ]; then
+      ok "auth mode coherent: sso dashboard, FLUIDBOX_REQUIRE_SSO=1 (multi-user posture)"
+    else
+      warn "FLUIDBOX_WEB_MODE=sso but FLUIDBOX_REQUIRE_SSO is not 1" \
+        "browser login works, but the control plane still honors the admin token on every route — set FLUIDBOX_REQUIRE_SSO=1 in .env for the full multi-user posture"
+    fi
+    # The browser-facing /v1/auth/* legs (login start, IdP callback) must set
+    # __Host- cookies on the SAME origin the dashboard runs on. Locally that is
+    # the dashboard origin via the next.config.ts /v1 rewrite; pointing
+    # FLUIDBOX_PUBLIC_URL at the control plane splits the cookie across origins
+    # and the callback refuses with "this browser did not start the flow".
+    public_url=$(env_get "$ENV" FLUIDBOX_PUBLIC_URL)
+    case "${public_url:-http://127.0.0.1:8787}" in
+      *:8787*)
+        bad "FLUIDBOX_WEB_MODE=sso but FLUIDBOX_PUBLIC_URL points at the control plane (:8787)" \
+          "OIDC login cannot complete: the callback's __Host- cookie lives on the dashboard origin — set FLUIDBOX_PUBLIC_URL=http://localhost:3000 in .env (the /v1 rewrite serves the callback there)";;
+      *) ok "FLUIDBOX_PUBLIC_URL points away from the control-plane origin (browser-facing legs can share the dashboard origin)";;
+    esac;;
+  *)
+    bad "FLUIDBOX_WEB_MODE=\"$web_mode\" is not a valid mode" \
+      "must be \"admin\" or \"sso\" (or unset for the local admin default) — the dashboard proxy refuses to boot on any other value";;
+esac
+
 say "control plane"
 if curl -fsS -m 2 "http://127.0.0.1:8787/v1/health" >/dev/null 2>&1; then
   ok "server responding on :8787 (note: just e2e needs this port free — stop just dev first)"

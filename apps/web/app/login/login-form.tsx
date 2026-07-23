@@ -14,8 +14,12 @@ import { useState } from "react";
  *
  * Rendered only in sso mode — the /login server boundary (page.tsx) redirects
  * to "/" in admin mode before this ever loads.
+ *
+ * `redirectTo` is the already-sanitized local path to land on after the IdP
+ * round-trip (page.tsx clamps it; the control plane re-validates). It rides the
+ * login flow as `redirect_to`, so a deep link survives the whole dance.
  */
-export default function LoginForm() {
+export default function LoginForm({ redirectTo = "/" }: { redirectTo?: string }) {
   const [org, setOrg] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -28,7 +32,7 @@ export default function LoginForm() {
     // 302 + Set-Cookie back to the browser, which stores the login cookie and
     // follows the redirect to the identity provider.
     window.location.assign(
-      `/api/fluidbox/auth/login/${encodeURIComponent(slug)}/start?redirect_to=%2F`
+      `/api/fluidbox/auth/login/${encodeURIComponent(slug)}/start?redirect_to=${encodeURIComponent(redirectTo)}`
     );
   };
 
