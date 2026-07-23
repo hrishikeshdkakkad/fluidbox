@@ -94,7 +94,9 @@ server:
   # chart (review M2): a Helm install is a hosted, multi-user deployment, and the
   # documented Neon posture (neondb_owner / neon_superuser carries BYPASSRLS) makes
   # PostgreSQL skip EVERY 0018 policy — RLS applied, FORCEd, and completely inert.
-  # With FLUIDBOX_REQUIRE_SSO=1 (set via server.extraEnv) the server REFUSES TO BOOT
+  # With FLUIDBOX_REQUIRE_SSO=1 (set via server.extraEnv — and set web.mode: "sso"
+  # with it, or the dashboard proxy keeps injecting the admin token the SSO server
+  # refuses on /v1) the server REFUSES TO BOOT
   # in that state rather than serve with tenant isolation resting on predicates alone.
   #
   # "fluidbox_runtime" is the NOLOGIN least-privilege role 0018 creates and GRANTs
@@ -179,9 +181,19 @@ server:
 web:
   enabled: true
   replicas: 1
+  # Dashboard proxy credential mode (FLUIDBOX_WEB_MODE): "admin" injects the
+  # admin token server-side (today's single-admin default); "sso" carries NO
+  # admin token — the proxy forwards the __Host-fbx_web session cookie and the
+  # x-fluidbox-csrf header only, and the token is not even mounted into the
+  # pod. Set "sso" whenever the server runs FLUIDBOX_REQUIRE_SSO=1: in that
+  # mode the server refuses the admin token outside /v1/admin, so an
+  # "admin"-mode dashboard cannot render at all.
+  mode: "admin"
   resources:
     requests: { cpu: "100m", memory: "256Mi" }
     limits: { cpu: "500m", memory: "512Mi" }
+  # Extra env for the web container (mirrors server.extraEnv).
+  extraEnv: []
 
 # Bundled LiteLLM (digest-pinned, ClusterIP-only, unreachable from sandboxes).
 # External LiteLLM is the documented production default — keep this off in prod.

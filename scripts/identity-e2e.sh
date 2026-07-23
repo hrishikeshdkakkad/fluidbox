@@ -798,6 +798,62 @@ else
   no "could not seed the SSE fixture (no claude-fixer agent/revision?)"
 fi
 
+# ── (k) SSE stream on a PAT terminates after PAT revocation ───────────────────
+say "(k) SSE termination — a revoked PAT's stream closes within the re-auth window"
+# The PAT twin of (j): design 658-664 says EVERY long-lived stream re-authorizes
+# on the bounded interval, so a bearer stream must die on token revocation just
+# as a cookie stream dies on deactivation (PR #27 review P1-2 — PATs previously
+# never re-checked). Carol (granted read_all in (j), session still live) mints
+# TWO PATs: one is revoked mid-stream (must close), the other keeps streaming
+# (the control — proving the close is revocation-specific).
+if [ -n "${SID:-}" ]; then
+  curl -s -H 'x-fluidbox-csrf: 1' -b "$jarL" -H 'content-type: application/json' \
+    -d '{"name":"sse-victim","expires_in":3600}' "$API/v1/auth/tokens" > "$WORK/pat_sse.json"
+  KPAT=$(j "['token']" < "$WORK/pat_sse.json")
+  KPATID=$(python3 -c "import sys,json;print(json.load(open('$WORK/pat_sse.json'))['pat']['id'])" 2>/dev/null)
+  KCTL=$(curl -s -H 'x-fluidbox-csrf: 1' -b "$jarL" -H 'content-type: application/json' \
+    -d '{"name":"sse-control","expires_in":3600}' "$API/v1/auth/tokens" | j "['token']")
+  if need "$KPAT" "victim PAT mint failed" && need "$KPATID" "victim PAT id missing" \
+     && need "$KCTL" "control PAT mint failed"; then
+    : > "$WORK/sse_pat.out"; : > "$WORK/sse_pat_ctl.out"
+    ( curl -s -N --max-time 30 -H "authorization: Bearer $KPAT" \
+        "$API/v1/sessions/$SID/events/stream" > "$WORK/sse_pat.out" 2>/dev/null ) &
+    KPID=$!
+    ( curl -s -N --max-time 30 -H "authorization: Bearer $KCTL" \
+        "$API/v1/sessions/$SID/events/stream" > "$WORK/sse_pat_ctl.out" 2>/dev/null ) &
+    KCTL_PID=$!
+    sleep 2
+    # ESTABLISHMENT before revocation — same false-pass guard as (j)(a).
+    grep -q '^data:' "$WORK/sse_pat.out" && ok "PAT stream ESTABLISHED (flushed a data line pre-revocation)" || no "PAT stream produced no SSE data line (reset-at-open?): $(head -c120 "$WORK/sse_pat.out")"
+    grep -q '^data:' "$WORK/sse_pat_ctl.out" && ok "control PAT stream ESTABLISHED" || no "control PAT stream produced no data line: $(head -c120 "$WORK/sse_pat_ctl.out")"
+    # Revoke the victim PAT mid-stream via carol's browser session.
+    KDEL=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -b "$jarL" -H 'x-fluidbox-csrf: 1' "$API/v1/auth/tokens/$KPATID")
+    [ "$KDEL" = 200 ] && ok "revoked the victim PAT mid-stream" || no "PAT revoke → $KDEL (want 200)"
+    # The stream must close within the re-auth bound (same window as (j)(b)).
+    KCLOSED=0
+    for _ in $(seq 1 12); do
+      kill -0 "$KPID" 2>/dev/null || { KCLOSED=1; break; }
+      sleep 0.5
+    done
+    if [ "$KCLOSED" = 1 ]; then wait "$KPID"; KRC=$?; else kill "$KPID" 2>/dev/null; wait "$KPID" 2>/dev/null; KRC=$?; fi
+    echo "    (PAT SSE curl exit code: $KRC)"
+    [ "$KCLOSED" = 1 ] && ok "PAT stream closed within the re-auth interval after revocation" || no "PAT stream did NOT close within ~6s after revocation (curl rc=$KRC)"
+    if [ "$KCLOSED" = 1 ]; then
+      case "$KRC" in
+        0|18) ok "PAT SSE curl exited cleanly on the server-side close (rc=$KRC ∈ {0,18})" ;;
+        *)    no "PAT SSE curl exited $KRC (want 0 or 18 for a server-closed stream)" ;;
+      esac
+    fi
+    # The unrevoked control PAT stream must STILL be open.
+    if kill -0 "$KCTL_PID" 2>/dev/null; then ok "control PAT stream STILL OPEN (close is revocation-specific)"; else no "control PAT stream also closed — close not attributable to the revocation"; fi
+    kill "$KCTL_PID" 2>/dev/null; wait "$KCTL_PID" 2>/dev/null
+    HCODE=$(curl -s -o /dev/null -w '%{http_code}' "$API/v1/health")
+    [ "$HCODE" = 200 ] && ok "server still healthy after the mid-stream PAT revocation" || no "server /v1/health → $HCODE after PAT-stream close (crash?)"
+  fi
+else
+  no "no SSE fixture session from (j) — PAT stream case skipped"
+fi
+
 # ── (l) REQUIRE_SSO confines the operator token to /v1/admin/* ────────────────
 say "(l) REQUIRE_SSO — operator confined to /v1/admin/*, cookie still works"
 stop_server
