@@ -12,7 +12,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import {
-  apiGet,
+  apiGetCached,
   BindingMode,
   CatalogEntry,
   Connection,
@@ -78,17 +78,40 @@ export function RequirementsEditor({
   const [catalog, setCatalog] = useState<CatalogEntry[]>([]);
   const [connections, setConnections] = useState<Connection[]>([]);
   const [snapshots, setSnapshots] = useState<Record<string, ConnectionToolSnapshot | null>>({});
+  const [lookupError, setLookupError] = useState(false);
   const fetching = useRef<Set<string>>(new Set());
 
   useEffect(() => {
-    apiGet<{ connectors: CatalogEntry[] }>("/catalog")
-      .then((r) => setCatalog(r.connectors.filter((e) => !!e.url)))
-      .catch(() => {
-        /* offline handled by the sidebar */
-      });
-    apiGet<{ connections: Connection[] }>("/connections")
-      .then((r) => setConnections(r.connections))
-      .catch(() => {});
+    const timer = window.setTimeout(() => {
+      setRows((current) =>
+        JSON.stringify(toRequirements(current)) === JSON.stringify(value)
+          ? current
+          : seedRows(value)
+      );
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [value]);
+
+  useEffect(() => {
+    let active = true;
+    Promise.allSettled([
+      apiGetCached<{ connectors: CatalogEntry[] }>("/catalog", { maxAgeMs: 5 * 60_000 }),
+      apiGetCached<{ connections: Connection[] }>("/connections", { maxAgeMs: 10_000 }),
+    ]).then(([catalogResult, connectionResult]) => {
+      if (!active) return;
+      if (catalogResult.status === "fulfilled") {
+        setCatalog(catalogResult.value.connectors.filter((entry) => !!entry.url));
+      }
+      if (connectionResult.status === "fulfilled") {
+        setConnections(connectionResult.value.connections);
+      }
+      setLookupError(
+        catalogResult.status === "rejected" || connectionResult.status === "rejected"
+      );
+    });
+    return () => {
+      active = false;
+    };
   }, []);
 
   const update = (next: Row[]) => {
@@ -174,6 +197,11 @@ export function RequirementsEditor({
           Add requirement
         </button>
       </div>
+      {lookupError && (
+        <span className="helper" role="status">
+          Connector suggestions are unavailable. Existing values and custom URL/tool entry still work.
+        </span>
+      )}
       {rows.length === 0 ? (
         <span className="helper">
           None. Declare a brokered MCP server the agent must be bound to at run time — a

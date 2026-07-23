@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { apiGet, AuthMe } from "./api";
+import { apiGetCached, AuthMe } from "./api";
 
 /**
  * Fetch GET /auth/me once for ownership rendering (badges, owner pickers).
@@ -17,7 +17,7 @@ export function useAuthMe(): AuthMe | null {
   const [me, setMe] = useState<AuthMe | null>(null);
   useEffect(() => {
     let alive = true;
-    apiGet<AuthMe>("/auth/me")
+    apiGetCached<AuthMe>("/auth/me", { maxAgeMs: 60_000 })
       .then((m) => {
         if (alive) setMe(m);
       })

@@ -30,13 +30,73 @@ function redirectOnUnauthorized(res: Response): void {
   }
 }
 
-export async function apiGet<T = unknown>(path: string): Promise<T> {
+type CachedGet = { value: unknown; expiresAt: number };
+const getCache = new Map<string, CachedGet>();
+const inflightGets = new Map<string, Promise<unknown>>();
+let cacheGeneration = 0;
+
+async function fetchGet<T>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`, { cache: "no-store" });
   if (!res.ok) {
     redirectOnUnauthorized(res);
     throw new Error(`${res.status}: ${await res.text()}`);
   }
   return res.json();
+}
+
+/**
+ * Forget cached read models after a write. Prefix invalidation is available for
+ * targeted refresh buttons; writes clear everything because these projections
+ * overlap (a new connection changes catalog, resources, and picker options).
+ */
+export function invalidateApiCache(prefix = ""): void {
+  cacheGeneration += 1;
+  for (const path of getCache.keys()) {
+    if (!prefix || path.startsWith(prefix)) getCache.delete(path);
+  }
+  for (const path of inflightGets.keys()) {
+    if (!prefix || path.startsWith(prefix)) inflightGets.delete(path);
+  }
+}
+
+export async function apiGet<T = unknown>(path: string): Promise<T> {
+  const existing = inflightGets.get(path);
+  if (existing) return existing as Promise<T>;
+
+  const request = fetchGet<T>(path);
+  const tracked = request.finally(() => {
+    // An invalidation may have removed this request and allowed a newer one to
+    // occupy the same path. The older completion must not evict the newer read.
+    if (inflightGets.get(path) === tracked) inflightGets.delete(path);
+  });
+  inflightGets.set(path, tracked);
+  return tracked;
+}
+
+/**
+ * Private, per-tab read-through cache for reusable control-plane projections.
+ * The underlying response remains `no-store`, so credentials and tenant data
+ * never enter a browser or shared HTTP cache.
+ */
+export async function apiGetCached<T = unknown>(
+  path: string,
+  { maxAgeMs = 15_000, force = false }: { maxAgeMs?: number; force?: boolean } = {}
+): Promise<T> {
+  if (force) invalidateApiCache(path);
+  const cached = getCache.get(path);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.value as T;
+  }
+
+  const generation = cacheGeneration;
+  const value = await apiGet<T>(path);
+  // A successful write or explicit refresh may have invalidated this read
+  // while it was in flight. Return it to its original caller, but never let
+  // that older projection repopulate the shared per-tab cache.
+  if (generation === cacheGeneration) {
+    getCache.set(path, { value, expiresAt: Date.now() + Math.max(0, maxAgeMs) });
+  }
+  return value;
 }
 
 export async function apiPost<T = unknown>(path: string, body: unknown): Promise<T> {
@@ -50,6 +110,7 @@ export async function apiPost<T = unknown>(path: string, body: unknown): Promise
     redirectOnUnauthorized(res);
     throw new Error(text || `${res.status}`);
   }
+  invalidateApiCache();
   return text ? JSON.parse(text) : ({} as T);
 }
 
@@ -64,6 +125,7 @@ export async function apiPut<T = unknown>(path: string, body: unknown): Promise<
     redirectOnUnauthorized(res);
     throw new Error(text || `${res.status}`);
   }
+  invalidateApiCache();
   return text ? JSON.parse(text) : ({} as T);
 }
 
@@ -80,6 +142,7 @@ export async function apiPatch<T = unknown>(path: string, body: unknown): Promis
     redirectOnUnauthorized(res);
     throw new Error(text || `${res.status}`);
   }
+  invalidateApiCache();
   return text ? JSON.parse(text) : ({} as T);
 }
 
@@ -90,6 +153,7 @@ export async function apiDelete<T = unknown>(path: string): Promise<T> {
     redirectOnUnauthorized(res);
     throw new Error(text || `${res.status}`);
   }
+  invalidateApiCache();
   return text ? JSON.parse(text) : ({} as T);
 }
 
