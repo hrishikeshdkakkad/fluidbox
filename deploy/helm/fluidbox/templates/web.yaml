@@ -32,12 +32,23 @@ spec:
             capabilities: { drop: ["ALL"] }
           ports:
             - { name: http, containerPort: 3000 }
+          {{- if not (has .Values.web.mode (list "admin" "sso")) }}
+          {{- fail (printf "web.mode must be \"admin\" or \"sso\", got %q" .Values.web.mode) }}
+          {{- end }}
           env:
-            # The dashboard proxy talks to the server's public Service; the
-            # admin token comes from the same existing Secret.
+            # The dashboard proxy talks to the server's public Service.
             - { name: FLUIDBOX_API_URL, value: "http://{{ include "fluidbox.serverName" . }}:8787" }
+            - { name: FLUIDBOX_WEB_MODE, value: {{ .Values.web.mode | quote }} }
+            {{- if eq .Values.web.mode "admin" }}
+            # The admin token is mounted ONLY in admin mode: an sso-mode proxy
+            # forwards the session cookie + CSRF header and carries no operator
+            # credential at all (it cannot leak what it does not hold).
             - name: FLUIDBOX_ADMIN_TOKEN
               valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.adminToken | quote }} } }
+            {{- end }}
+            {{- with .Values.web.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           resources: {{- toYaml .Values.web.resources | nindent 12 }}
 ---
 apiVersion: v1

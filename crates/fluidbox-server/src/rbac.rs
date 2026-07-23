@@ -185,10 +185,15 @@ pub fn authorize_approval_decision(
     }
 }
 
+/// The roles holding `runs.read_all` — shared between the request-time
+/// predicate ([`can_read_all_runs`]) and the SSE stream's bounded re-auth
+/// ([`run_visible_to_user`]), so the two can never drift apart.
+const READ_ALL_ROLES: &[&str] = &["approver", "admin", "owner"];
+
 /// May read every run in the tenant (`runs.read_all`) — implied by
 /// `approval.decide_org`, so the same role set.
 pub fn can_read_all_runs(principal: &Principal) -> bool {
-    principal.is_operator() || any_role(principal, &["approver", "admin", "owner"])
+    principal.is_operator() || any_role(principal, READ_ALL_ROLES)
 }
 
 /// May manage trigger subscriptions (`subscriptions.manage`) — admin/owner.
@@ -236,17 +241,64 @@ pub fn connection_viewer(principal: &Principal) -> ConnectionViewer {
     }
 }
 
+/// The user arm of run visibility as a pure function of `(user_id, roles,
+/// invoker)` — the ONE rule, DB-free. [`ensure_run_visible`] applies it at
+/// request time with the extractor's principal; the SSE stream re-applies it
+/// on every bounded re-auth tick with roles RELOADED from the live membership,
+/// so a role downgrade mid-stream terminates a stream the old roles authorized.
+pub fn run_visible_to_user(
+    user_id: Uuid,
+    roles: &[String],
+    invoked_by_user_id: Option<Uuid>,
+) -> bool {
+    roles.iter().any(|r| READ_ALL_ROLES.contains(&r.as_str()))
+        || invoked_by_user_id == Some(user_id)
+}
+
 /// Enforce `run.read` after a tenant-scoped fetch has already proven the run
 /// belongs to the caller's tenant. Operator / `runs.read_all` holders see every
 /// run; a plain member sees only runs it invoked. A non-visible run is a 404
 /// (its existence is not revealed), not a 403.
 pub fn ensure_run_visible(principal: &Principal, session: &SessionRow) -> Result<(), ApiError> {
-    if can_read_all_runs(principal) {
+    if principal.is_operator() {
         return Ok(());
     }
     match principal.user_id() {
-        Some(uid) if session.invoked_by_user_id == Some(uid) => Ok(()),
+        Some(uid) if run_visible_to_user(uid, principal.roles(), session.invoked_by_user_id) => {
+            Ok(())
+        }
         _ => Err(ApiError::NotFound),
+    }
+}
+
+/// May cancel this run? Cancellation is a MUTATION, so `runs.read_all` — which
+/// exists so approvers can judge approvals — deliberately does NOT imply it.
+/// The invoker may always cancel their own run; admin/owner and the operator
+/// may cancel any tenant run; an approver who needs a runaway run stopped
+/// escalates. Visibility is checked first so a non-visible run stays a 404
+/// (existence unrevealed) while a visible-but-unauthorized cancel is a 403.
+pub fn authorize_run_cancellation(
+    principal: &Principal,
+    session: &SessionRow,
+) -> Result<(), ApiError> {
+    ensure_run_visible(principal, session)?;
+    cancellation_decision(principal, session.invoked_by_user_id)
+}
+
+/// The pure decision behind [`authorize_run_cancellation`], split out so the
+/// rule is testable without constructing a `SessionRow`.
+fn cancellation_decision(
+    principal: &Principal,
+    invoked_by_user_id: Option<Uuid>,
+) -> Result<(), ApiError> {
+    if principal.is_operator() || any_role(principal, &["admin", "owner"]) {
+        return Ok(());
+    }
+    match principal.user_id() {
+        Some(uid) if invoked_by_user_id == Some(uid) => Ok(()),
+        _ => Err(ApiError::Forbidden(
+            "cancelling another member's run requires the admin or owner role".into(),
+        )),
     }
 }
 
@@ -475,6 +527,46 @@ mod tests {
         assert!(authorize_approval_decision(&a, Some(other), Some(mine), true).is_ok());
         // Operator (no user id) decides via decide_org.
         assert!(authorize_approval_decision(&a, Some(other), None, true).is_ok());
+    }
+
+    #[test]
+    fn cancellation_is_invoker_or_admin_never_mere_read_all() {
+        let alice = Uuid::now_v7();
+        let bob = Uuid::now_v7();
+        // The invoker (any role) cancels their own run.
+        let member = user(&["member"]);
+        assert!(cancellation_decision(&member, member.user_id()).is_ok());
+        // A plain member cannot cancel someone else's run.
+        assert!(matches!(
+            cancellation_decision(&member, Some(alice)),
+            Err(ApiError::Forbidden(_))
+        ));
+        // An approver holds runs.read_all (can SEE every run) but read is not
+        // control: cancelling another member's run is refused.
+        let approver = user(&["approver"]);
+        assert!(can_read_all_runs(&approver));
+        assert!(matches!(
+            cancellation_decision(&approver, Some(bob)),
+            Err(ApiError::Forbidden(_))
+        ));
+        // Admin, owner, and the operator cancel any tenant run.
+        assert!(cancellation_decision(&user(&["admin"]), Some(bob)).is_ok());
+        assert!(cancellation_decision(&user(&["owner"]), Some(bob)).is_ok());
+        assert!(cancellation_decision(&operator(), Some(bob)).is_ok());
+        // The operator also cancels invoker-less (trigger/schedule) runs.
+        assert!(cancellation_decision(&operator(), None).is_ok());
+    }
+
+    #[test]
+    fn run_visible_to_user_is_read_all_roles_or_invoker() {
+        let alice = Uuid::now_v7();
+        let bob = Uuid::now_v7();
+        let member: Vec<String> = vec!["member".into()];
+        let approver: Vec<String> = vec!["approver".into()];
+        assert!(run_visible_to_user(alice, &member, Some(alice)));
+        assert!(!run_visible_to_user(alice, &member, Some(bob)));
+        assert!(run_visible_to_user(alice, &approver, Some(bob)));
+        assert!(!run_visible_to_user(alice, &member, None));
     }
 
     #[test]

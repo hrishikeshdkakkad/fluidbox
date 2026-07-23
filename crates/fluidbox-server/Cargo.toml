@@ -7,7 +7,9 @@ license.workspace = true
 [dependencies]
 fluidbox-core.workspace = true
 fluidbox-db.workspace = true
-fluidbox-workspace.workspace = true
+# `store`: the archive object-store backends (Phase F, Task 4). Only the control
+# plane needs them — the in-pod `workspaced` binary keeps the default features.
+fluidbox-workspace = { workspace = true, features = ["store"] }
 fluidbox-provider.workspace = true
 fluidbox-provider-k8s.workspace = true
 axum.workspace = true

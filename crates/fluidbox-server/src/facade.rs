@@ -288,6 +288,11 @@ fn conservative_reservation(
 /// expiry sweep converts it into a conservative charge, which is the safe
 /// direction.
 async fn release_reservation(state: &AppState, scope: TenantScope, request_id: Uuid) {
+    // Count the INTENT to release (proven non-dispatch), not the DB result: a
+    // failed release is swept as a conservative charge, and counting only the
+    // success would undercount proven non-dispatches (the metric mirrors the
+    // release-set decision, the sweeper metric mirrors the fallback).
+    state.metrics.reservations.inc("released");
     if let Err(e) = fluidbox_db::release_llm_reservation(&state.pool, scope, request_id).await {
         tracing::warn!(
             "facade: releasing LLM reservation {request_id} failed: {e} — it will be swept \
@@ -353,6 +358,8 @@ async fn reconcile_reservation(
     }
     if let Err(e) = fluidbox_db::charge_llm_reservation(&state.pool, scope, request_id).await {
         tracing::warn!("facade: charging LLM reservation {request_id} failed: {e}");
+    } else {
+        state.metrics.reservations.inc("charged");
     }
 }
 
@@ -537,12 +544,27 @@ pub async fn messages(
     Path(rest): Path<String>,
     State(state): State<AppState>,
     headers: HeaderMap,
+    crate::auth::PeerAddr(peer): crate::auth::PeerAddr,
     body: axum::body::Bytes,
 ) -> ApiResult<Response> {
     let token = session_token(&headers).ok_or(ApiError::Unauthorized)?;
     let sess_auth = fluidbox_db::session_for_token(&state.pool, &token)
         .await?
         .ok_or(ApiError::Unauthorized)?;
+    // Gap 6 (Phase F): the facade resolves the session token by hand rather than
+    // through the `SessionAuth` extractor, so the workload binding has to be
+    // asserted here too — and this is the route where it matters most, because the
+    // sandbox's fake `ANTHROPIC_API_KEY` IS this token and it is the only sandbox
+    // credential that spends money. Refused BEFORE the audience check, the session
+    // load, the budget check and any dispatch, for the same reason the extractor
+    // does: a caller at the wrong address learns nothing.
+    crate::auth::enforce_workload_identity(
+        state.cfg.workload_identity,
+        sess_auth.session_id,
+        &sess_auth.workload_addrs,
+        peer,
+        "/internal/llm",
+    )?;
     // Gap 10: model egress is the LLM audience. The sandbox's fake provider key
     // is now the LLM-scoped token ONLY — a runner-control or tool-intent
     // credential can no longer spend the run's model budget. Refused at the auth
@@ -757,7 +779,9 @@ pub async fn messages(
     )
     .await?
     {
-        fluidbox_db::ReserveOutcome::Reserved => {}
+        fluidbox_db::ReserveOutcome::Reserved => {
+            state.metrics.reservations.inc("booked");
+        }
         // The run wound down between the status check above and the booking —
         // same refusal the pre-existing check emits, byte for byte.
         fluidbox_db::ReserveOutcome::SessionTerminal => {
@@ -768,6 +792,7 @@ pub async fn messages(
             ));
         }
         fluidbox_db::ReserveOutcome::CeilingExceeded { active, ceiling } => {
+            state.metrics.reservations.inc("refused");
             return Ok(reservation_refusal(
                 dialect,
                 "llm_reservation_ceiling_exceeded",
@@ -781,6 +806,7 @@ pub async fn messages(
         // remaining budget. They reconcile (or expire) and the retry proceeds —
         // or the accumulated check / budget sweeper stops the run for real.
         fluidbox_db::ReserveOutcome::BudgetExceeded { budget, active } => {
+            state.metrics.reservations.inc("refused");
             return Ok(reservation_refusal(
                 dialect,
                 "llm_budget_reservation_exceeded",

@@ -2740,36 +2740,47 @@ mod tests {
         );
     }
 
-    /// Both token legs must ride the NO-REDIRECT client. `identity_http` follows
-    /// any admitted https hop, and a 307/308 REPLAYS the request body — so the
-    /// code + PKCE verifier (exchange) or the refresh token (refresh) would be
-    /// forwarded to a different host of the AS's choosing. Header-level
+    /// EVERY token leg must ride the NO-REDIRECT client. `identity_http`
+    /// follows any admitted https hop, and a 307/308 REPLAYS the request body —
+    /// so the code + PKCE verifier (exchange), the refresh token (refresh), or
+    /// the login exchange's code + verifier + `client_secret_post` secret would
+    /// be forwarded to a different host of the issuer's choosing. Header-level
     /// protections do not cover a body, so the client itself must refuse.
     ///
-    /// Asserted against the source because these two builders are the whole
-    /// property and neither is reachable without a live `AppState`.
+    /// Asserted against the source because these builders are the whole
+    /// property and none is reachable without a live `AppState`. Scans BOTH
+    /// files that build token legs — the original oauth-only scan let the
+    /// identically-shaped login leg ship on the redirect-following client
+    /// (PR #27 review); a token leg in a NEW file still needs adding here.
     #[test]
     fn token_legs_use_the_no_redirect_client() {
-        let src = include_str!("oauth.rs");
+        // (file, expected leg count): oauth = code exchange + stored-bag
+        // refresh; login = the OIDC code exchange.
+        let sources = [
+            ("oauth.rs", include_str!("oauth.rs"), 2),
+            ("login.rs", include_str!("login.rs"), 1),
+        ];
         // Assembled at runtime so the scan does not count its own source text.
         let needle = format!(".post({})", "token_endpoint");
-        let legs: Vec<usize> = src.match_indices(&needle).map(|(i, _)| i).collect();
-        assert_eq!(
-            legs.len(),
-            2,
-            "expected exactly the code-exchange and refresh legs; found {}",
-            legs.len()
-        );
-        for at in legs {
-            let window = &src[at.saturating_sub(200)..at];
-            assert!(
-                window.contains("egress_http"),
-                "a token leg does not use the no-redirect egress_http client"
+        for (name, src, expected) in sources {
+            let legs: Vec<usize> = src.match_indices(&needle).map(|(i, _)| i).collect();
+            assert_eq!(
+                legs.len(),
+                expected,
+                "{name}: expected {expected} token legs; found {}",
+                legs.len()
             );
-            assert!(
-                !window.contains("identity_http"),
-                "a token leg still uses the redirect-following identity_http client"
-            );
+            for at in legs {
+                let window = &src[at.saturating_sub(200)..at];
+                assert!(
+                    window.contains("egress_http"),
+                    "{name}: a token leg does not use the no-redirect egress_http client"
+                );
+                assert!(
+                    !window.contains("identity_http"),
+                    "{name}: a token leg still uses the redirect-following identity_http client"
+                );
+            }
         }
     }
 

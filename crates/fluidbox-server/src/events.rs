@@ -282,6 +282,10 @@ async fn dispatch_one(
             // Event-derived workspace outranks everything (§3.3): the event
             // IS the work; a subscription override cannot retarget it.
             explicit_workspace: event.workspace.clone(),
+            // Event workspaces are connector-normalized git repositories; a
+            // local_copy can only arrive via the stored revision default,
+            // which passed the operator-only save gate (see CreateRun docs).
+            local_path_authority: crate::api::LocalPathAuthority::Operator,
             autonomy,
             trust_tier: event.trust_tier,
             budget_override,

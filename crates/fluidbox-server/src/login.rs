@@ -115,11 +115,24 @@ pub struct OidcRuntime {
     refresh_version: std::sync::atomic::AtomicU64,
 }
 
+/// Cap on distinct fixed-window rate keys held in memory. Per-IP keys (with
+/// `FLUIDBOX_TRUST_FORWARDED_FOR` especially) would otherwise accrete forever —
+/// a slow leak. Past the cap, stale windows are pruned; peak growth is bounded
+/// by one minute of distinct callers.
+const RATE_MAP_CAP: usize = 4096;
+/// Same bounding for the negative-kid cache (keys churn with rotated kids).
+const NEGATIVE_KID_CAP: usize = 1024;
+
 impl OidcRuntime {
     /// Fixed-window: true while this window's count is within `limit`.
     async fn allow(&self, key: &str, limit: u32) -> bool {
         let minute = Utc::now().timestamp() / 60;
         let mut m = self.rate.lock().await;
+        if m.len() >= RATE_MAP_CAP && !m.contains_key(key) {
+            // Drop every stale window; live (current-minute) counters survive,
+            // so pruning never resets an active limiter.
+            m.retain(|_, e| e.0 == minute);
+        }
         let e = m.entry(key.to_string()).or_insert((minute, 0));
         if e.0 != minute {
             *e = (minute, 0);
@@ -201,10 +214,14 @@ impl OidcRuntime {
     }
 
     async fn mark_kid_negative(&self, key: JwksKey, kid: &str) {
-        self.negative_kids
-            .lock()
-            .await
-            .insert((key, kid.to_string()), Utc::now().timestamp());
+        let now = Utc::now().timestamp();
+        let mut m = self.negative_kids.lock().await;
+        if m.len() >= NEGATIVE_KID_CAP {
+            // Expired entries are dead weight (the TTL check on read already
+            // ignores them); prune rather than accrete.
+            m.retain(|_, &mut t| now - t < NEGATIVE_KID_TTL_SECS);
+        }
+        m.insert((key, kid.to_string()), now);
     }
 }
 
@@ -238,6 +255,13 @@ fn parse_jwks(v: &Value) -> Result<Vec<Jwk>, String> {
                 raw: entry.clone(),
             });
         }
+    }
+    // Zero usable keys — `{"keys":[]}` or every entry malformed — is a broken
+    // issuer, not a valid key set: refused HERE so save-time validation rejects
+    // the configuration instead of letting it activate and then fail key
+    // selection on every callback.
+    if keys.is_empty() {
+        return Err("jwks document contains no usable signing keys".into());
     }
     Ok(keys)
 }
@@ -666,8 +690,24 @@ pub(crate) async fn refresh_discovery(
     Ok((meta, jwks))
 }
 
+/// May a FAILED refresh still fall back to the cached discovery/JWKS? Only
+/// within a bounded stale-grace window past max-age — an unbounded fallback
+/// would keep revoked signing keys and moved endpoints trusted for as long as
+/// the issuer stays unreachable (or an attacker keeps our egress to it
+/// blocked). Pure so the bound is unit-testable.
+fn cache_within_stale_grace(
+    discovered_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    max_age_secs: i64,
+    grace_secs: i64,
+) -> bool {
+    discovered_at.is_some_and(|t| (now - t).num_seconds() < max_age_secs.saturating_add(grace_secs))
+}
+
 /// Fresh cache is used as-is; a stale cache triggers a refresh; a refresh
-/// failure with a still-valid cache uses the cache; with none it refuses.
+/// failure falls back to the cache ONLY within the bounded stale-grace window
+/// (`FLUIDBOX_OIDC_DISCOVERY_STALE_GRACE_SECS` past max-age) — past it, or
+/// with no cache at all, it refuses and logins fail closed.
 async fn ensure_discovery(
     state: &AppState,
     scope: TenantScope,
@@ -700,7 +740,20 @@ async fn ensure_discovery(
             view_from(&meta, jwks)
         }
         Err(e) => match (&config.discovered_metadata, &config.jwks) {
-            (Some(meta), Some(jwks)) => view_from(meta, jwks.clone()),
+            (Some(meta), Some(jwks))
+                if cache_within_stale_grace(
+                    config.discovered_at,
+                    Utc::now(),
+                    max_age,
+                    state.cfg.oidc_discovery_stale_grace_secs,
+                ) =>
+            {
+                view_from(meta, jwks.clone())
+            }
+            (Some(_), Some(_)) => Err(format!(
+                "issuer refresh failed and the cached discovery is past the stale \
+                 grace window — refusing last-known-good metadata: {e}"
+            )),
             _ => Err(e),
         },
     }
@@ -1689,8 +1742,8 @@ async fn token_exchange(
     code: &str,
     verifier: &str,
 ) -> Result<Tokens, String> {
-    // SSRF-validate the token endpoint before posting to it (the identity
-    // client re-validates every redirect hop + resolved address underneath).
+    // SSRF-validate the token endpoint before posting to it; the dial below
+    // rides the NO-REDIRECT client, so this pre-flight is the only admission.
     let dev = egress::dev_loopback(&state.cfg.public_url);
     let u =
         reqwest::Url::parse(token_endpoint).map_err(|_| "invalid token endpoint".to_string())?;
@@ -1733,8 +1786,17 @@ async fn token_exchange(
         }
     }
     let body = url_form(&form);
+    // NO-REDIRECT client (`egress_http`, `redirect::Policy::none()`) — NOT the
+    // redirect-following `identity_http` the discovery GETs use. On a 307/308
+    // reqwest REPLAYS the body, so a token-leg redirect would forward the
+    // authorization code + PKCE verifier (and, for client_secret_post, the
+    // client secret) to whatever host the issuer names; per-hop SSRF checks do
+    // nothing for a BODY. Discovery named `token_endpoint` exactly, so a
+    // redirect here means it moved under us — refused outright (a 3xx is just
+    // a non-success status below). Same rule as the connector-OAuth token legs
+    // in oauth.rs; the shared source-grep test pins all three.
     let mut req = state
-        .identity_http
+        .egress_http
         .post(token_endpoint)
         .timeout(HTTP_TIMEOUT)
         .header("content-type", "application/x-www-form-urlencoded")
@@ -1749,8 +1811,9 @@ async fn token_exchange(
         .send()
         .await
         .map_err(|e| format!("token exchange failed: {e}"))?;
-    // Final-URL re-validation for symmetry with fetch_json_ssrf (defense in
-    // depth on top of the per-hop identity client).
+    // Final-URL re-validation for symmetry with fetch_json_ssrf. With the
+    // no-redirect client this is always the pre-validated URL — pure defense
+    // in depth, kept so the two fetch shapes stay grep-identical.
     egress::validate_fetch_target(&res.url().clone(), dev, &state.egress_policy.allow_cidrs)
         .await?;
     let status = res.status();
@@ -2586,6 +2649,47 @@ uIATiz1iFxtbjHI9UNGig2aiz3j22PuZSNeJqpxryrgzfWd1s828kecc31+KEIP6
     fn parse_jwks_rejects_non_array_keys() {
         assert!(parse_jwks(&json!({"keys":"nope"})).is_err());
         assert!(parse_jwks(&json!({})).is_err());
+    }
+
+    #[test]
+    fn parse_jwks_rejects_zero_usable_keys() {
+        // An empty key set must fail at SAVE-time validation, not activate and
+        // then fail key selection on every callback.
+        assert!(parse_jwks(&json!({"keys": []})).is_err());
+        // Every entry malformed → also zero usable keys → refused.
+        assert!(parse_jwks(&json!({"keys": [{"kty": "???"}, 42]})).is_err());
+    }
+
+    // ─── discovery stale-grace bound (PR #27 review P1-4) ──────────────────
+    #[test]
+    fn stale_cache_fallback_is_bounded() {
+        let now = Utc::now();
+        let max_age = 3600;
+        let grace = 86400;
+        // Within max-age (fresh) and within the grace window → usable.
+        assert!(cache_within_stale_grace(
+            Some(now - chrono::Duration::seconds(60)),
+            now,
+            max_age,
+            grace
+        ));
+        assert!(cache_within_stale_grace(
+            Some(now - chrono::Duration::seconds(max_age + grace - 60)),
+            now,
+            max_age,
+            grace
+        ));
+        // Past max-age + grace → the fallback must fail closed.
+        assert!(!cache_within_stale_grace(
+            Some(now - chrono::Duration::seconds(max_age + grace + 60)),
+            now,
+            max_age,
+            grace
+        ));
+        // Never discovered → nothing to fall back to.
+        assert!(!cache_within_stale_grace(None, now, max_age, grace));
+        // Degenerate overflow guard: saturating add, still refuses correctly.
+        assert!(cache_within_stale_grace(Some(now), now, i64::MAX, i64::MAX));
     }
 
     // ─── fix 6: present-but-malformed optional claims fail closed ──────────
