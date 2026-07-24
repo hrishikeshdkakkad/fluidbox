@@ -1,0 +1,62 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "bootstrap-sha": "1b87a89",
+  "packages": {
+    ".": {
+      "release-type": "rust",
+      "package-name": "fluidbox",
+      "changelog-path": "CHANGELOG.md",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": false,
+      "draft": false,
+      "prerelease": false,
+      "include-component-in-tag": false,
+      "include-v-in-tag": true,
+      "changelog-sections": [
+        { "type": "feat", "section": "Added" },
+        { "type": "fix", "section": "Fixed" },
+        { "type": "perf", "section": "Performance" },
+        { "type": "refactor", "section": "Changed" },
+        { "type": "docs", "section": "Documentation" },
+        { "type": "build", "section": "Build" },
+        { "type": "ci", "section": "CI", "hidden": true },
+        { "type": "test", "section": "Tests", "hidden": true },
+        { "type": "chore", "section": "Chores", "hidden": true },
+        { "type": "style", "section": "Style", "hidden": true }
+      ],
+      "extra-files": [
+        {
+          "type": "json",
+          "path": "apps/web/package.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "images/sandbox-runner/runner/package.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "images/codex-runner/runner/package.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "yaml",
+          "path": "deploy/helm/fluidbox/Chart.yaml",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "yaml",
+          "path": "deploy/helm/fluidbox/Chart.yaml",
+          "jsonpath": "$.appVersion"
+        },
+        "images/runner-lib/broker-shim.mjs",
+        "images/runner-lib/sandbox-gate-shim.mjs",
+        "images/codex-runner/runner/index.mjs",
+        "images/sandbox-runner/runner/servers/workspace-info.mjs",
+        "README.md",
+        "docs/guides/kubernetes.md"
+      ]
+    }
+  }
+}
