@@ -1,7 +1,12 @@
-# fluidbox codex baseline config — materialized root-owned READ-ONLY into
-# $CODEX_HOME each boot (see entrypoint.sh). The supervisor ALSO re-asserts
-# every security-critical setting per-thread (thread/start) and as `-c` CLI
-# overrides, so a tampered file cannot loosen governance (defense in depth).
+# fluidbox codex baseline config — copied root-owned READ-ONLY into $CODEX_HOME
+# at BUILD time (see the `install`/`chmod 0444` block in codex-runner/Dockerfile;
+# containers are always fresh from the image, so "baked at build" == "fresh each
+# boot"). There is no boot-time materialization step: the image's ENTRYPOINT is
+# runner-lib/entrypoint.sh, whose ONLY job is the off-environment credential
+# hand-off, and it touches nothing under $CODEX_HOME. The supervisor ALSO
+# re-asserts every security-critical setting per-thread (thread/start) and as
+# `-c` CLI overrides, so a tampered file cannot loosen governance (defense in
+# depth).
 #
 # The governance model: the fluidbox permission gate is the authority, reached
 # because EVERY exec/edit escalates to an approval the supervisor answers. That

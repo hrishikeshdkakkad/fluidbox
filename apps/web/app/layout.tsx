@@ -2,7 +2,9 @@ import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import "./geist.css";
-import { Sidebar } from "./components/Sidebar";
+import { Shell } from "./components/Shell";
+import { webMode } from "./lib/proxy-auth";
+import { THEME_INIT_SCRIPT } from "./lib/theme";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -23,9 +25,15 @@ export const metadata: Metadata = {
 };
 
 export const viewport: Viewport = {
-  colorScheme: "dark",
-  themeColor: "#000000",
+  colorScheme: "dark light",
+  themeColor: "#111318",
 };
+
+// Static deployment configuration (see the proxy route): `sso` turns on the
+// hosted session shell + login redirects; anything else is today's admin shell.
+// Stamped onto <html data-web-mode> so client code (api.ts) is mode-aware
+// without a second env var, and passed to the shell so it renders session UI.
+const WEB_MODE = webMode(process.env.FLUIDBOX_WEB_MODE);
 
 export default function RootLayout({
   children,
@@ -33,13 +41,16 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} dark dark-theme`}
+      className={`${geistSans.variable} ${geistMono.variable}`}
+      data-theme="dark"
+      data-web-mode={WEB_MODE}
+      suppressHydrationWarning
     >
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
+      </head>
       <body>
-        <div className="shell">
-          <Sidebar />
-          <main className="main">{children}</main>
-        </div>
+        <Shell mode={WEB_MODE}>{children}</Shell>
       </body>
     </html>
   );

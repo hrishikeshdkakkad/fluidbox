@@ -59,7 +59,10 @@ addons:
 managedNodeGroups:
   - name: ng-1
     amiFamily: AmazonLinux2023   # supports the netpol eBPF nodeagent
-    instanceType: t3.medium      # smallest viable; 2 vCPU / 4 GiB
+    # t4g (arm64/Graviton) for THIS acceptance run: the current-branch images
+    # are built natively on an arm64 Mac (an amd64 Rust build under QEMU takes
+    # hours). Same vCPU/RAM envelope as the t3.medium the epic validated.
+    instanceType: t4g.medium     # smallest viable; 2 vCPU / 4 GiB (arm64)
     availabilityZones:           # pin to a known-good AZ (see AZ note above)
       - us-east-1b
     desiredCapacity: 2

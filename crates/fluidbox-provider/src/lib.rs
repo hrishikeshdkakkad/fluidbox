@@ -81,6 +81,25 @@ impl ExecutionProvider for DockerProvider {
         let internal = matches!(spec.network, NetworkMode::Hardened);
         self.ensure_network(&net_name, internal).await?;
 
+        // Flat env, one container, one uid — unchanged by the Gap 10 audience
+        // split. The runner env already carries the control/tool/llm tokens
+        // under their own vars, and that is ALL this container gets.
+        //
+        // The WORKSPACE token is deliberately NOT here. Docker is a HostDir
+        // transport: it bind-mounts /workspace, so no archive is ever packed
+        // (`orchestrator::run` skips `pack_and_store_archive`), the workspace
+        // route would 404 for these sessions, there is no init container, and
+        // nothing in either runner image reads `FLUIDBOX_WORKSPACE_TOKEN`. The
+        // token bought this container exactly nothing, so it does not get one —
+        // the same rule the k8s provider enforces structurally (workspace token
+        // to the init container ONLY), applied here by omission.
+        //
+        // Docker still does NOT get k8s's per-audience process isolation:
+        // `HostDev` is explicitly NEVER a hosted security boundary (design
+        // :834) — one process, one uid, one env. The audience split buys real
+        // blast-radius reduction here anyway (a leaked llm/tool token cannot
+        // post /result or forge /events); true per-audience process isolation
+        // is a hardened-provider property only.
         let env: Vec<String> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
 
         let mut labels = HashMap::new();
@@ -136,6 +155,22 @@ impl ExecutionProvider for DockerProvider {
             .await
             .map_err(map_err)?;
 
+        // Gap 6 (Phase F) — DELIBERATELY NO `workload_addrs` HERE. Read this before
+        // adding one: `create_container` does not return an address, so recording
+        // one would cost an extra `inspect_container` round trip on the
+        // provisioning path, and the value would then be wrong for the deployment
+        // this provider actually serves. Docker Desktop (macOS/Windows) reaches the
+        // host through a VM gateway, so EVERY container's traffic arrives at the
+        // control plane from ONE shared NAT address: recording per-container IPs
+        // there would produce a binding that is simultaneously false (the peer
+        // never matches) and useless (the addresses that would match are shared by
+        // all sandboxes). A Linux bridge network does preserve the container IP —
+        // if that case is ever worth supporting, inspect the container AFTER start
+        // and gate the capture on the daemon platform, rather than assuming.
+        //
+        // Consequence, stated plainly: a Docker-provider run is UNBINDABLE. The
+        // control plane counts it as such and admits it (`auth.rs::workload_verdict`),
+        // which is exactly today's posture — no worse, and now visible.
         Ok(SandboxHandle {
             runtime: "docker".to_string(),
             external_id: created.id,

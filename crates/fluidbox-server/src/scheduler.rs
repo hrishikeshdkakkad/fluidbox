@@ -13,7 +13,7 @@ use crate::triggers::{render_task_template, schedule_context, sub_run_params, Su
 use chrono::{DateTime, SecondsFormat, Utc};
 use fluidbox_core::schedule::{CronSchedule, MissedRunPolicy};
 use fluidbox_core::spec::{InvocationContext, InvocationKind};
-use fluidbox_db::ScheduleRow;
+use fluidbox_db::{ScheduleRow, TenantScope};
 use std::time::Duration;
 
 const TICK: Duration = Duration::from_secs(1);
@@ -35,7 +35,7 @@ pub fn spawn_worker(state: AppState) {
         let mut tick = tokio::time::interval(TICK);
         loop {
             tick.tick().await;
-            let due = match fluidbox_db::due_schedules(&state.pool, 20).await {
+            let due = match fluidbox_db::system_worker::due_schedules(&state.pool, 20).await {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::warn!("schedule poll failed: {e}");
@@ -53,7 +53,14 @@ async fn fire_one(state: &AppState, sched: &ScheduleRow) {
     let Some(fire_time) = sched.next_fire_at else {
         return;
     };
-    let sub = match fluidbox_db::get_trigger_subscription(&state.pool, sched.subscription_id).await
+    // Worker path: the schedule row from the global `due_schedules` scan carries
+    // only a subscription id, so resolve the subscription cross-tenant, then
+    // derive the owning tenant's scope for every subsequent call.
+    let sub = match fluidbox_db::system_worker::get_trigger_subscription(
+        &state.pool,
+        sched.subscription_id,
+    )
+    .await
     {
         Ok(Some(s)) => s,
         Ok(None) => return, // subscription deleted mid-tick; cascade wins
@@ -62,6 +69,7 @@ async fn fire_one(state: &AppState, sched: &ScheduleRow) {
             return;
         }
     };
+    let scope = TenantScope::assume(sub.tenant_id);
     // create() validated cron+tz; a parse failure here means a manual DB
     // edit. Loud log, no advance (we cannot compute one) — visible, bounded.
     let cron = match CronSchedule::parse(&sched.cron, &sched.timezone) {
@@ -84,38 +92,43 @@ async fn fire_one(state: &AppState, sched: &ScheduleRow) {
     // get no rows — recording a thundering herd is as bad as firing one.
     if missed && missed_policy == MissedRunPolicy::Skip {
         if let Ok(fluidbox_db::InvocationClaim::Claimed { invocation_id }) =
-            fluidbox_db::claim_invocation(&state.pool, sub.id, &key, &digest).await
+            fluidbox_db::claim_invocation(&state.pool, scope, sub.id, &key, &digest).await
         {
-            fluidbox_db::mark_invocation_skipped(&state.pool, invocation_id, "missed")
+            fluidbox_db::mark_invocation_skipped(&state.pool, scope, invocation_id, "missed")
                 .await
                 .ok();
             tracing::info!("schedule {}: missed {} → skipped", sched.id, key);
         }
-        advance(state, sched, fire_time, next, None).await;
+        advance(state, scope, sched, fire_time, next, None).await;
         return;
     }
 
     // On-time fire, or the single catch-up firing for a missed gap.
-    match fluidbox_db::claim_invocation(&state.pool, sub.id, &key, &digest).await {
+    match fluidbox_db::claim_invocation(&state.pool, scope, sub.id, &key, &digest).await {
         Ok(fluidbox_db::InvocationClaim::Claimed { invocation_id }) => {
             let created =
-                build_and_create(state, &sub, sched, fire_time, missed, invocation_id).await;
+                build_and_create(state, scope, &sub, sched, fire_time, missed, invocation_id).await;
             match created {
                 Ok(RunCreation::Created(session)) => {
                     tracing::info!("schedule {}: fired {} → run {}", sched.id, key, session.id);
-                    advance(state, sched, fire_time, next, Some(fire_time)).await;
+                    advance(state, scope, sched, fire_time, next, Some(fire_time)).await;
                 }
                 Ok(RunCreation::SkippedOverlap { running_session_id }) => {
-                    fluidbox_db::mark_invocation_skipped(&state.pool, invocation_id, "overlap")
-                        .await
-                        .ok();
+                    fluidbox_db::mark_invocation_skipped(
+                        &state.pool,
+                        scope,
+                        invocation_id,
+                        "overlap",
+                    )
+                    .await
+                    .ok();
                     tracing::info!(
                         "schedule {}: {} skipped (run {} still active)",
                         sched.id,
                         key,
                         running_session_id
                     );
-                    advance(state, sched, fire_time, next, None).await;
+                    advance(state, scope, sched, fire_time, next, None).await;
                 }
                 Ok(RunCreation::ReplaceUnpersisted { running_session_id }) => {
                     // Transient replace failure: record a visible skip and
@@ -123,6 +136,7 @@ async fn fire_one(state: &AppState, sched: &ScheduleRow) {
                     // which would mark this firing permanently lost).
                     fluidbox_db::mark_invocation_skipped(
                         &state.pool,
+                        scope,
                         invocation_id,
                         "replace_cancel_unpersisted",
                     )
@@ -134,20 +148,21 @@ async fn fire_one(state: &AppState, sched: &ScheduleRow) {
                         key,
                         running_session_id
                     );
-                    advance(state, sched, fire_time, next, None).await;
+                    advance(state, scope, sched, fire_time, next, None).await;
                 }
                 Err(e) => {
                     // A failed firing is recorded, not retried — retrying a
                     // config error every tick would loop forever.
                     fluidbox_db::mark_invocation_skipped(
                         &state.pool,
+                        scope,
                         invocation_id,
                         &format!("error: {e}"),
                     )
                     .await
                     .ok();
                     tracing::warn!("schedule {}: firing {} failed: {e}", sched.id, key);
-                    advance(state, sched, fire_time, next, None).await;
+                    advance(state, scope, sched, fire_time, next, None).await;
                 }
             }
         }
@@ -155,7 +170,7 @@ async fn fire_one(state: &AppState, sched: &ScheduleRow) {
         // (a bound run or a recorded skip) — advance past it, fire nothing.
         Ok(fluidbox_db::InvocationClaim::Replay { .. })
         | Ok(fluidbox_db::InvocationClaim::Skipped { .. }) => {
-            advance(state, sched, fire_time, next, None).await;
+            advance(state, scope, sched, fire_time, next, None).await;
         }
         // Another worker holds this fire mid-creation: leave next_fire_at
         // alone; the next tick resolves to Replay/Skipped.
@@ -164,8 +179,10 @@ async fn fire_one(state: &AppState, sched: &ScheduleRow) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_and_create(
     state: &AppState,
+    scope: TenantScope,
     sub: &fluidbox_db::TriggerSubscriptionRow,
     sched: &ScheduleRow,
     fire_time: DateTime<Utc>,
@@ -186,6 +203,7 @@ async fn build_and_create(
     } = sub_run_params(sub)?;
     run_service::create_run(
         state,
+        scope,
         CreateRun {
             agent: sub.agent_id.to_string(),
             revision: match sub.pinned_revision_id {
@@ -194,6 +212,9 @@ async fn build_and_create(
             },
             task,
             explicit_workspace,
+            // A local_copy can only arrive via the stored revision default,
+            // which passed the operator-only save gate (see CreateRun docs).
+            local_path_authority: crate::api::LocalPathAuthority::Operator,
             autonomy,
             trust_tier: fluidbox_core::spec::TrustTier::Trusted,
             budget_override,
@@ -213,6 +234,12 @@ async fn build_and_create(
                 received_at: Some(Utc::now()),
                 ..Default::default()
             },
+            // A schedule tick has no directly-authenticated user.
+            invoked_by_user_id: None,
+            // A schedule run's principal is its subscription, not a trigger token.
+            invoking_token_id: None,
+            // Server-derived authority only; a schedule names no explicit binding.
+            explicit_bindings: std::collections::HashMap::new(),
             result_destinations,
             bound_invocation: Some(invocation_id),
             bound_dispatch: None,
@@ -223,12 +250,13 @@ async fn build_and_create(
 
 async fn advance(
     state: &AppState,
+    scope: TenantScope,
     sched: &ScheduleRow,
     from: DateTime<Utc>,
     to: Option<DateTime<Utc>>,
     fired_at: Option<DateTime<Utc>>,
 ) {
-    match fluidbox_db::advance_schedule(&state.pool, sched.id, from, to, fired_at).await {
+    match fluidbox_db::advance_schedule(&state.pool, scope, sched.id, from, to, fired_at).await {
         Ok(true) => {}
         Ok(false) => tracing::debug!("schedule {}: advance lost CAS (benign)", sched.id),
         Err(e) => tracing::warn!("schedule {}: advance failed: {e}", sched.id),

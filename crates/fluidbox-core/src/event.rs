@@ -139,12 +139,26 @@ pub enum EventBody {
         tool_call_id: String,
         tool: String,
         server: String,
+        /// The `run_resource_bindings` row (mcp slot) whose connection served
+        /// this call (Phase C). `#[serde(default)]` keeps legacy tool.brokered
+        /// events — frozen before bindings existed — parseable; None on the
+        /// legacy embedded-connection broker path (no binding to reference).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding_id: Option<Uuid>,
         ok: bool,
         latency_ms: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result_digest: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// The durable execution-claim state this call settled at (Phase E, #33;
+        /// Gap 11): `succeeded` | `failed_upstream` | `failed_before_send` |
+        /// `ambiguous`. `#[serde(default)]` keeps legacy tool.brokered events —
+        /// and the stale-claim sweep's ledger path — round-tripping; None on the
+        /// events written before claims existed. Additive: no payloads, so the
+        /// Redactor (which round-trips the whole body) needs no change.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<String>,
     },
     /// Forward-compat: events written by newer components still round-trip.
     #[serde(untagged)]
@@ -225,6 +239,15 @@ impl<T> Redacted<T> {
     }
 }
 
+/// The prefix EVERY runner session credential carries, whichever audience it
+/// is scoped to (Gap 10 mints four per run). This constant is what the MINTING
+/// site builds its tokens from (`fluidbox-server`'s `orchestrator::run`), and
+/// what the redaction test below derives its samples from — while the
+/// Redactor's own rule stays a DELIBERATELY independent regex literal. That
+/// independence is the point: change the minted prefix here and the samples
+/// move while the rule does not, so the test fails instead of moving with it.
+pub const SESSION_TOKEN_PREFIX: &str = "fbx_sess_";
+
 /// Scrubs secret-shaped strings out of event payloads. Model prompts never
 /// reach the ledger at all (the facade streams bytes without persisting);
 /// this catches secrets that leak into tool summaries or agent text.
@@ -235,16 +258,16 @@ pub struct Redactor {
 impl Default for Redactor {
     fn default() -> Self {
         let raw = [
-            r"sk-ant-[A-Za-z0-9_\-]{8,}",       // Anthropic keys / oauth tokens
+            r"sk-ant-[A-Za-z0-9_\-]{8,}",   // Anthropic keys / oauth tokens
             r"sk-proj-[A-Za-z0-9_\-]{16,}", // OpenAI project keys (hyphenated — not caught below)
             r"sk-[A-Za-z0-9]{20,}",         // OpenAI-style keys
-            r"fbx_(sess|trig)_[A-Za-z0-9]{8,}", // fluidbox session / trigger tokens
-            r"ghp_[A-Za-z0-9]{20,}",        // GitHub PAT
-            r"github_pat_[A-Za-z0-9_]{20,}", // GitHub fine-grained PAT
-            r"gho_[A-Za-z0-9]{20,}",        // GitHub OAuth
-            r"AKIA[0-9A-Z]{16}",            // AWS access key id
-            r"xox[baprs]-[A-Za-z0-9\-]{10,}", // Slack tokens
-            r"npg_[A-Za-z0-9]{8,}",         // Neon passwords
+            r"fbx_(sess|trig|web|pat)_[A-Za-z0-9]{8,}", // fluidbox session / trigger / web-session / PAT tokens
+            r"ghp_[A-Za-z0-9]{20,}",                    // GitHub PAT
+            r"github_pat_[A-Za-z0-9_]{20,}",            // GitHub fine-grained PAT
+            r"gho_[A-Za-z0-9]{20,}",                    // GitHub OAuth
+            r"AKIA[0-9A-Z]{16}",                        // AWS access key id
+            r"xox[baprs]-[A-Za-z0-9\-]{10,}",           // Slack tokens
+            r"npg_[A-Za-z0-9]{8,}",                     // Neon passwords
             r"(?i)bearer\s+[A-Za-z0-9\._\-]{16,}",
             r"postgres(ql)?://[^\s:]+:[^@\s]+@", // connection-string passwords
         ];
@@ -312,6 +335,28 @@ mod tests {
         };
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["type"], "tool.decision");
+        // The NESTING LEVEL is part of the ledger contract, not an encoding
+        // detail. `events.payload` stores this value verbatim (fluidbox-db
+        // `append_event_in_tx` binds `serde_json::to_value(&env.body)`), so every
+        // out-of-process reader — the acceptance suites' SQL, the events API's
+        // consumers, the dashboard — addresses body fields as `payload->'data'->…`.
+        // Switching to an internally-tagged enum would flatten them to the top
+        // level and every such reader would start silently reading NULL/zero
+        // rather than failing: `payload->>'source'` becomes SQL NULL and
+        // `payload->>'tool_call_id' = 'x'` matches nothing. Both directions are
+        // asserted so the level cannot move without this test failing.
+        assert_eq!(json["data"]["source"], "autonomy_rewrite");
+        assert_eq!(json["data"]["tool_call_id"], "t1");
+        assert_eq!(json["data"]["original_verdict"], "require_approval");
+        assert!(
+            json.get("source").is_none() && json.get("tool_call_id").is_none(),
+            "body fields must live UNDER 'data', never at the payload top level: {json}"
+        );
+        assert_eq!(
+            json.as_object().map(|o| o.len()),
+            Some(2),
+            "the payload envelope is exactly {{type, data}}: {json}"
+        );
         let back: EventBody = serde_json::from_value(json).unwrap();
         assert_eq!(back.type_name(), "tool.decision");
     }
@@ -326,21 +371,54 @@ mod tests {
         assert_eq!(v["type"], "capability.frozen");
         assert_eq!(frozen.type_name(), "capability.frozen");
 
+        let binding_id = Uuid::now_v7();
         let brokered = EventBody::BrokeredToolCall {
             tool_call_id: "t1".into(),
             tool: "mcp__kb__kb_search".into(),
             server: "kb".into(),
+            binding_id: Some(binding_id),
             ok: true,
             latency_ms: 42,
             result_digest: Some("sha256:abcd".into()),
             error: None,
+            outcome: Some("succeeded".into()),
         };
         let v = serde_json::to_value(&brokered).unwrap();
         assert_eq!(v["type"], "tool.brokered");
         assert_eq!(v["data"]["latency_ms"], 42);
+        assert_eq!(v["data"]["binding_id"], binding_id.to_string());
         assert!(v["data"].get("error").is_none());
-        let back: EventBody = serde_json::from_value(v).unwrap();
+        // Phase E: the claim outcome rides the event (additive, serde-default).
+        assert_eq!(v["data"]["outcome"], "succeeded");
+        let back: EventBody = serde_json::from_value(v.clone()).unwrap();
         assert_eq!(back.type_name(), "tool.brokered");
+        // Phase C round-trip: binding_id survives.
+        assert!(matches!(
+            back,
+            EventBody::BrokeredToolCall { binding_id: Some(b), .. } if b == binding_id
+        ));
+
+        // Legacy tool.brokered events (frozen before Phase C) carry no
+        // binding_id and MUST still parse — to None, not an error.
+        let legacy = serde_json::json!({
+            "type": "tool.brokered",
+            "data": {
+                "tool_call_id": "t0",
+                "tool": "mcp__kb__kb_search",
+                "server": "kb",
+                "ok": true,
+                "latency_ms": 7,
+            }
+        });
+        let back: EventBody = serde_json::from_value(legacy).unwrap();
+        assert!(matches!(
+            back,
+            EventBody::BrokeredToolCall {
+                binding_id: None,
+                outcome: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -375,6 +453,42 @@ mod tests {
         let r = Redactor::default();
         let s = r.scrub_text("postgresql://user:supersecret@host/db");
         assert!(!s.contains("supersecret"));
+    }
+
+    #[test]
+    fn redactor_scrubs_fluidbox_token_prefixes() {
+        let r = Redactor::default();
+        // Runner-session, trigger, browser-session, and PAT tokens all scrub.
+        //
+        // What the session-token half PINS: the Redactor's rule (an independent
+        // regex literal above) still matches a credential built the way the
+        // MINTING site builds one — i.e. `SESSION_TOKEN_PREFIX` + random. The
+        // samples are DERIVED from that constant rather than typed out, so
+        // changing the minted prefix breaks this test instead of silently
+        // sailing past a rule that no longer covers the tokens we issue.
+        //
+        // What it does NOT pin: the audience NAMES. Those live in the server
+        // crate (auth.rs's `AUD_*`), which core cannot see; the four suffixes
+        // below are hand-maintained labels making the samples readable, and a
+        // fifth audience added there would not fail anything here. It costs
+        // nothing, because a new audience is covered the moment it is minted
+        // from this constant — the rule keys on the PREFIX, not the audience.
+        let p = SESSION_TOKEN_PREFIX;
+        for tok in [
+            format!("{p}0123456789abcdef"),
+            // one sample per minted audience — all built from the same prefix
+            format!("{p}control0123456789abcdef"),
+            format!("{p}tool0123456789abcdef"),
+            format!("{p}llm0123456789abcdef"),
+            format!("{p}workspace0123456789abcdef"),
+            "fbx_trig_0123456789abcdef".to_string(),
+            "fbx_web_0123456789abcdef".to_string(),
+            "fbx_pat_0123456789abcdef".to_string(),
+        ] {
+            let out = r.scrub_text(&format!("token {tok} end"));
+            assert!(!out.contains(&tok), "{tok} must be redacted");
+            assert!(out.contains("‹redacted›"));
+        }
     }
 
     #[test]

@@ -7,7 +7,9 @@ license.workspace = true
 [dependencies]
 fluidbox-core.workspace = true
 fluidbox-db.workspace = true
-fluidbox-workspace.workspace = true
+# `store`: the archive object-store backends (Phase F, Task 4). Only the control
+# plane needs them — the in-pod `workspaced` binary keeps the default features.
+fluidbox-workspace = { workspace = true, features = ["store"] }
 fluidbox-provider.workspace = true
 fluidbox-provider-k8s.workspace = true
 axum.workspace = true
@@ -32,9 +34,15 @@ hex.workspace = true
 bytes.workspace = true
 dotenvy.workspace = true
 sqlx.workspace = true
+async-trait.workspace = true
 chacha20poly1305.workspace = true
 base64.workspace = true
+# Phase D (#32) envelope sealing: KEK-wrapping backends + DEK zeroization.
+zeroize.workspace = true
+aws-sdk-kms.workspace = true
+aws-config.workspace = true
 jsonwebtoken.workspace = true
+openidconnect.workspace = true
 async-stream = "0.3"
 # kube-rs pulls rustls 0.23, which needs a process-level CryptoProvider chosen
 # explicitly when several backends are in the tree (sqlx = ring). Install ring.
