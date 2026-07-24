@@ -18,6 +18,10 @@ Open source. Written in Rust.
 
 </div>
 
+https://github.com/user-attachments/assets/579df2f1-9c55-4946-988b-952d15feb35d
+
+*The product film (2:56, narrated): register a versioned agent, connect an event, then follow one incident through frozen authority, a disposable sandbox, the policy gate, and three independently owned reviews to a delivered pull request. A [full-resolution 1080p copy](https://fluidbox-oss-assets.s3.us-east-1.amazonaws.com/demo-film/v7/fluidbox-demo.mp4) is available for download.*
+
 Agents can act. The hard part is deciding **when they may run, what authority they receive, where they execute, and what evidence remains afterward**.
 
 fluidbox is the authority layer between an external event and an AI agent. Register a versioned agent once, then borrow it from a pull request, a schedule, a scoped API call, a webhook, or a manual run. Every invocation becomes the same governed run: its configuration is frozen, its workspace is isolated, its actions meet policy, and its outcome is recorded and delivered.
@@ -47,10 +51,6 @@ fluidbox is the authority layer between an external event and an AI agent. Regis
 ```
 
 fluidbox is not another chat UI, and a trigger is not a second execution system. Manual, API, schedule, and event-driven invocations all converge on one Rust control plane and one immutable run contract.
-
-https://github.com/user-attachments/assets/579df2f1-9c55-4946-988b-952d15feb35d
-
-*The product film (2:56, narrated): register a versioned agent, connect an event, then follow one incident through frozen authority, a disposable sandbox, the policy gate, and three independently owned reviews to a delivered pull request. A [full-resolution 1080p copy](https://fluidbox-oss-assets.s3.us-east-1.amazonaws.com/demo-film/v7/fluidbox-demo.mp4) is available for download.*
 
 ## Why fluidbox
 
