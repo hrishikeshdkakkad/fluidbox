@@ -391,6 +391,20 @@ jobs:
         with:
           command: check
 
+  # Version drift guard. Every in-repo version field sat at 0.1.0 through TWO
+  # releases because release.yml derived the published version from the git
+  # tag — the artifacts were right, so nothing ever failed. This is the
+  # missing consumer. Seconds to run, no DB, no network.
+  #
+  # It matters most on a release-please Release PR: merging that PR publishes
+  # to GHCR with no further gate, so this job is the last thing standing
+  # between a bad version and permanent public artifacts.
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: bash scripts/version-check.sh
+
   # The full acceptance suite, no-model tier: builds BOTH runner images
   # (base-image bumps can't be vacuously green — closes the #14 gap) and
   # drives the real stack over HTTP. Live tiers are skipped — CI never
