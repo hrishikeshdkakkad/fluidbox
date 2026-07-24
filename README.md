@@ -80,7 +80,7 @@ The same lifecycle holds whether the run came from a button, a PR opening, a Mon
 |---|---|
 | **Event sources** | Manual UI/CLI, subscription-scoped API, cron schedules, webhook-style invocation, native GitHub PR events |
 | **Agent harnesses** | Claude Agent SDK and Codex behind one runner contract |
-| **Execution providers** | Docker for local/self-hosted runs; Kubernetes-native Pods and Helm chart in `v0.2.0` |
+| **Execution providers** | Docker for local/self-hosted runs; Kubernetes-native Pods and an OCI Helm chart |
 | **Capabilities** | Versioned MCP bundles; sandbox-local stdio tools and control-plane-brokered remote tools |
 | **Identity** | Single-admin mode by default; opt-in per-organization OIDC, server-side sessions, personal API tokens, and RBAC |
 | **Connections** | Organization- and user-owned grants, sealed static credentials, OAuth with PKCE, GitHub App installation flow, connector catalog, and custom MCP servers |
@@ -94,9 +94,9 @@ Native Slack and ServiceNow adapters do not ship yet. Events from either can rea
 
 ## Hosted multi-user mode
 
-The `release/multi-user-mcp-control-plane` branch contains the merged Phase A–F implementation work and acceptance tooling for an opt-in hosted control plane while preserving the existing single-admin deployment as the default.
+`v0.3.0` ships the opt-in hosted control plane — Phases A–F of the multi-user MCP epic — while preserving the existing single-admin deployment as the default. With `FLUIDBOX_REQUIRE_SSO` unset, nothing below is active and the product behaves exactly as it did in `v0.2.0`.
 
-| Area | What this branch adds |
+| Area | What this adds |
 |---|---|
 | **Identity and authorization** | Per-organization OIDC login, JIT membership, server-side browser sessions, personal API tokens (`fbx_pat_`), role mapping, and an operator-only `/v1/admin/*` break-glass surface |
 | **Connection authority** | Connector definitions separated from organization- or user-owned credentials; agent revisions declare requirements and run creation freezes the exact connection, generation, and tool snapshot |
@@ -109,9 +109,9 @@ Hosted mode is a deployment posture, not a single feature flag. Before admitting
 1. Set `FLUIDBOX_REQUIRE_SSO=1` on the server and `FLUIDBOX_WEB_MODE=sso` on the dashboard.
 2. Run the application pool through a non-owner, non-`BYPASSRLS` `FLUIDBOX_RUNTIME_ROLE`; multi-user boot refuses an unsafe role unless the operator explicitly overrides the guard.
 3. Enable KMS envelope sealing and per-tenant LiteLLM keys, then complete the documented re-seal and key-custody checks.
-4. Rebuild and pin both runner images from this branch. Multi-replica deployments additionally require the S3 archive backend; stage workload identity through `observe` before `enforce`.
+4. Pin both runner images to this release. Multi-replica deployments additionally require the S3 archive backend; stage workload identity through `observe` before `enforce`.
 
-Start with the [hosted product boundary](./docs/hosted/README.md), then follow the [rollout gates](./docs/hosted/rollout-gates.md) and [KMS/RLS operations runbook](./docs/hosted/kms-operations.md). The implementation and automated acceptance machinery are present, but the real 60/150/300-concurrent-run exercises have not been executed. This branch therefore does **not** claim a proven 300-run production ceiling; capacity and residual-risk sign-off remain deployment gates.
+Start with the [hosted product boundary](./docs/hosted/README.md), then follow the [rollout gates](./docs/hosted/rollout-gates.md) and [KMS/RLS operations runbook](./docs/hosted/kms-operations.md). The implementation and automated acceptance machinery are present, but the real 60/150/300-concurrent-run exercises have not been executed. `v0.3.0` therefore does **not** claim a proven 300-run production ceiling; capacity and residual-risk sign-off remain deployment gates.
 
 ## Try fluidbox
 
@@ -251,17 +251,17 @@ The default deployment model is self-hosted and effectively single-tenant, with 
 
 ## Kubernetes
 
-`v0.2.0` adds a Kubernetes-native provider alongside Docker. One run becomes one bare Pod in a dedicated sandbox namespace: workspace init container, unmodified agent runner, and an in-pod collector. Per-run Secrets are owner-referenced for garbage collection, artifact collection uses a pristine git baseline, and reconciliation adopts or terminates resources after control-plane restarts.
+fluidbox ships a Kubernetes-native provider alongside Docker. One run becomes one bare Pod in a dedicated sandbox namespace: workspace init container, unmodified agent runner, and an in-pod collector. Per-run Secrets are owner-referenced for garbage collection, artifact collection uses a pristine git baseline, and reconciliation adopts or terminates resources after control-plane restarts.
 
 The Helm chart is published as an OCI artifact:
 
 ```bash
 # First create the required `fluidbox-secrets` Secret and a values file.
 helm show values oci://ghcr.io/hrishikeshdkakkad/charts/fluidbox \
-  --version 0.2.0 > fluidbox-values.yaml
+  --version 0.3.0 > fluidbox-values.yaml
 
 helm install fluidbox oci://ghcr.io/hrishikeshdkakkad/charts/fluidbox \
-  --version 0.2.0 \
+  --version 0.3.0 \
   --namespace fluidbox \
   --create-namespace \
   --values fluidbox-values.yaml
@@ -275,7 +275,7 @@ Start with the chart's annotated [`values.yaml`](./deploy/helm/fluidbox/values.y
 
 > **Full walkthrough → [Kubernetes deployment guide](./docs/guides/kubernetes.md).** Zero to a certified, run-serving cluster: the generic recipe, per-cloud setup and gotchas (EKS/GKE/AKS/DOKS), secrets, network-enforcement certification, verifying a run end to end, node sizing and cost, safe audited teardown, and a troubleshooting table — all from a live cloud acceptance.
 
-Live EKS acceptance evidence: [2026-07-17](./docs/reviews/2026-07-17-eks-acceptance.md) — v0.2.0 release chart and images, AWS-audited zero-orphan teardown · [2026-07-22](./docs/reviews/2026-07-22-eks-acceptance-phase-f.md) — current-branch images on arm64/Graviton nodes with the runtime-role RLS split active.
+Live EKS acceptance evidence: [2026-07-17](./docs/reviews/2026-07-17-eks-acceptance.md) — v0.2.0 release chart and images, AWS-audited zero-orphan teardown · [2026-07-22](./docs/reviews/2026-07-22-eks-acceptance-phase-f.md) — pre-release `v0.3.0` images on arm64/Graviton nodes with the runtime-role RLS split active.
 
 ## Repository map
 
@@ -312,7 +312,7 @@ policies/                     versioned seed policy YAML
 
 ## Project status
 
-fluidbox is early, usable, and moving quickly. `v0.1.0` shipped the governed vertical slice; `v0.2.0` added Kubernetes-native execution and hardened finalization while keeping Docker fully supported. The acceptance suites cover the Rust control plane, dashboard, both harnesses, event paths, connectors, and provider-specific isolation checks.
+fluidbox is early, usable, and moving quickly. `v0.1.0` shipped the governed vertical slice; `v0.2.0` added Kubernetes-native execution and hardened finalization while keeping Docker fully supported; `v0.3.0` added the opt-in multi-user control plane — identity, connection ownership, per-run resource bindings, envelope-sealed custody, and a hardened egress and broker boundary — with single-admin behavior unchanged when SSO is off. The acceptance suites cover the Rust control plane, dashboard, both harnesses, event paths, connectors, identity and tenant isolation, and provider-specific isolation checks.
 
 Expect breaking changes before `v1.0`. Near-term work includes the native Slack event vertical, AWS Lambda MicroVM/BYOC execution, customer-built signed runner images, and brokered git writes. See the [changelog](./CHANGELOG.md) for release evidence and the [roadmap](./ROADMAP.md) for sequencing.
 
