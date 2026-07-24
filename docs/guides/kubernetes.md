@@ -1,6 +1,6 @@
 # Kubernetes deployment guide
 
-fluidbox runs on any conformant Kubernetes cluster with an **enforcing CNI** — kind, AWS EKS, Google GKE, Azure AKS, DigitalOcean DOKS, or anything else in its support window. `v0.2.0` ships the Kubernetes-native execution provider and an OCI Helm chart. This guide takes you from zero to a **certified, run-serving cluster**, with the real-world gotchas and costs from a live cloud acceptance.
+fluidbox runs on any conformant Kubernetes cluster with an **enforcing CNI** — kind, AWS EKS, Google GKE, Azure AKS, DigitalOcean DOKS, or anything else in its support window. fluidbox ships a Kubernetes-native execution provider and an OCI Helm chart. This guide takes you from zero to a **certified, run-serving cluster**, with the real-world gotchas and costs from a live cloud acceptance.
 
 > **Just want to try fluidbox?** Kubernetes is one of two execution providers. For a single machine, the [Docker path](../../README.md#try-fluidbox) is faster and cheaper. See [Which provider?](#which-provider) to choose.
 
@@ -116,7 +116,7 @@ Every managed cloud follows the same five steps; only the **CNI enforcement** an
 3. **`helm install` from the OCI registry** with the cloud's values preset:
    ```bash
    helm install fluidbox oci://ghcr.io/hrishikeshdkakkad/charts/fluidbox \
-     --version 0.2.0 \
+     --version 0.3.0 \
      -n fluidbox --create-namespace \
      -f deploy/helm/fluidbox/values/<cloud>.yaml
    ```
@@ -179,7 +179,7 @@ kubectl create namespace fluidbox
 # ...create fluidbox-secrets (see Secrets)...
 
 helm install fluidbox oci://ghcr.io/hrishikeshdkakkad/charts/fluidbox \
-  --version 0.2.0 -n fluidbox \
+  --version 0.3.0 -n fluidbox \
   -f deploy/helm/fluidbox/values/eks.yaml \
   --set litellm.enabled=true \
   --set litellm.resources.limits.memory=2Gi   # see field notes
