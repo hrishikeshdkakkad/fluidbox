@@ -5,7 +5,7 @@
 
 import { use, useCallback, useEffect, useState } from "react";
 import { apiDelete, apiGet, apiPut, PolicyAction, PolicyDetail } from "../../lib/api";
-import { PageHead } from "../../components/bits";
+import { LoadingRows, PageHead } from "../../components/bits";
 import { PermissionMatrix } from "../../components/PermissionMatrix";
 import { PolicyLimits } from "../../components/PolicyLimits";
 
@@ -13,18 +13,23 @@ export default function PolicyDetailPage({ params }: { params: Promise<{ name: s
   const { name } = use(params);
   const [detail, setDetail] = useState<PolicyDetail | null>(null);
   const [err, setErr] = useState("");
+  const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
 
   const load = useCallback(async () => {
+    setErr("");
     try {
       setDetail(await apiGet<PolicyDetail>(`/policies/${name}`));
     } catch (reason) {
       setErr(`This policy could not be loaded. ${String(reason)}`);
+    } finally {
+      setLoading(false);
     }
   }, [name]);
 
   useEffect(() => {
-    void load();
+    const timer = window.setTimeout(() => void load(), 0);
+    return () => window.clearTimeout(timer);
   }, [load]);
 
   // The server is the single writer: apply, then re-read the resolved policy
@@ -51,7 +56,31 @@ export default function PolicyDetailPage({ params }: { params: Promise<{ name: s
     return (
       <>
         <PageHead title={name} crumbs={[{ href: "/governance", label: "Governance" }]} />
-        {err ? <div className="err">{err}</div> : null}
+        {err ? <div className="err" role="alert">{err}</div> : null}
+        <div className="panel">
+          {loading ? (
+            <LoadingRows />
+          ) : (
+            <div className="launch-empty">
+              <div>
+                <h3>Policy detail is unavailable.</h3>
+                <p>No policy rules or limits were inferred from the failed response.</p>
+              </div>
+              <div className="empty-actions">
+                <button
+                  className="btn"
+                  type="button"
+                  onClick={() => {
+                    setLoading(true);
+                    void load();
+                  }}
+                >
+                  Retry now
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
       </>
     );
   }

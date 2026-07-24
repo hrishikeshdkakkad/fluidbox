@@ -21,6 +21,7 @@ import {
   ShowAutomationSecrets,
 } from "./components/RunComposer";
 import { AutoPill, LoadingRows, Pill, short, timeAgo } from "./components/bits";
+import { useSmartPolling } from "./lib/useSmartPolling";
 
 type OperateView = "history" | "automations";
 
@@ -36,6 +37,9 @@ export default function Runs() {
   const [automationRefresh, setAutomationRefresh] = useState(0);
   const [resourceRefresh, setResourceRefresh] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [hasSnapshot, setHasSnapshot] = useState(false);
+  const [offline, setOffline] = useState(false);
+  const [actionErr, setActionErr] = useState("");
 
   const load = useCallback(async () => {
     try {
@@ -45,21 +49,18 @@ export default function Runs() {
       ]);
       setSessions(sessionResponse.sessions);
       setApprovals(approvalResponse.approvals);
+      setHasSnapshot(true);
+      setOffline(false);
     } catch {
-      /* The sidebar reports control-plane connectivity. */
+      // Keep the last good snapshot, but never present a failed first read as
+      // real zero activity.
+      setOffline(true);
     } finally {
       setLoading(false);
     }
   }, []);
 
-  useEffect(() => {
-    const first = window.setTimeout(() => void load(), 0);
-    const timer = setInterval(load, 2500);
-    return () => {
-      clearTimeout(first);
-      clearInterval(timer);
-    };
-  }, [load]);
+  useSmartPolling(load, 2500);
 
   const selectView = (nextView: OperateView) => {
     setView(nextView);
@@ -68,8 +69,13 @@ export default function Runs() {
   };
 
   const decide = async (id: string, decision: string) => {
-    await apiPost(`/approvals/${id}/decision`, { decision, decided_by: "dashboard" });
-    void load();
+    setActionErr("");
+    try {
+      await apiPost(`/approvals/${id}/decision`, { decision });
+      void load();
+    } catch (error) {
+      setActionErr(`The decision could not be saved. ${String(error)}`);
+    }
   };
 
   const active = sessions.filter((session) => !isTerminal(session.status)).length;
@@ -103,28 +109,31 @@ export default function Runs() {
             <h2 id="operations-summary-heading">Operations</h2>
             <p>Current activity across manual runs and automations.</p>
           </div>
-          <span className="overview-status"><span className="signal" /> Operational</span>
+          <span className="overview-status">
+            <span className={`signal ${offline ? "down" : ""}`} />
+            {offline ? "Offline" : loading && !hasSnapshot ? "Checking" : "Operational"}
+          </span>
         </div>
         <div className="ops-strip" aria-label="Run summary">
           <div className="ops-metric">
             <span className="metric-label">Active</span>
-            <strong>{active}</strong>
-            <small>{active === 1 ? "sandbox running" : "sandboxes running"}</small>
+            <strong>{hasSnapshot ? active : "—"}</strong>
+            <small>{hasSnapshot ? (active === 1 ? "sandbox running" : "sandboxes running") : "control plane unavailable"}</small>
           </div>
           <div className={`ops-metric ${approvals.length ? "attention" : ""}`}>
             <span className="metric-label">Needs Review</span>
-            <strong>{approvals.length}</strong>
-            <small>{approvals.length ? "decision required" : "no pending decisions"}</small>
+            <strong>{hasSnapshot ? approvals.length : "—"}</strong>
+            <small>{hasSnapshot ? (approvals.length ? "decision required" : "no pending decisions") : "status unavailable"}</small>
           </div>
           <div className="ops-metric">
             <span className="metric-label">Completed</span>
-            <strong>{done}</strong>
-            <small>recent runs</small>
+            <strong>{hasSnapshot ? done : "—"}</strong>
+            <small>{hasSnapshot ? "recent runs" : "history unavailable"}</small>
           </div>
           <div className="ops-metric">
             <span className="metric-label">Success Rate</span>
-            <strong>{completionRate}</strong>
-            <small>terminal runs</small>
+            <strong>{hasSnapshot ? completionRate : "—"}</strong>
+            <small>{hasSnapshot ? "terminal runs" : "history unavailable"}</small>
           </div>
         </div>
       </section>
@@ -134,6 +143,8 @@ export default function Runs() {
         onCreateAgent={() => setAgentComposer(true)}
         onAddCapability={() => setShowCapabilityWizard(true)}
       />
+
+      {actionErr && <div className="err">{actionErr}</div>}
 
       {approvals.length > 0 && (
         <section className="attention-section">
@@ -212,6 +223,18 @@ export default function Runs() {
           <div className="run-list">
             {loading ? (
               <LoadingRows />
+            ) : offline && !hasSnapshot ? (
+              <div className="launch-empty">
+                <div>
+                  <h3>Control plane unavailable.</h3>
+                  <p>Run history could not be loaded. Your browser will keep retrying in the background.</p>
+                </div>
+                <div className="empty-actions">
+                  <button className="btn" type="button" onClick={() => void load()}>
+                    Retry now
+                  </button>
+                </div>
+              </div>
             ) : sessions.length === 0 ? (
               <div className="launch-empty">
                 <div>

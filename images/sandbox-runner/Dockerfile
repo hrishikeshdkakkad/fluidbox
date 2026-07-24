@@ -21,11 +21,19 @@ COPY sandbox-runner/runner/servers ./servers
 # The shared runner contract lib + shims (broker-shim, sandbox-gate-shim).
 COPY runner-lib ./lib
 
-# Non-root. /workspace is bind-mounted rw by the provider.
+# Non-root. /workspace is bind-mounted rw by the provider. The mode on
+# entrypoint.sh is asserted here rather than inherited from the build context,
+# so a lost exec bit in a checkout can never make the image unstartable.
 RUN useradd -m -u 10001 runner \
     && mkdir -p /workspace \
+    && chmod 0755 /opt/fluidbox-runner/lib/entrypoint.sh \
     && chown -R runner:runner /opt/fluidbox-runner /workspace
 USER runner
 
 WORKDIR /workspace
-ENTRYPOINT ["node", "/opt/fluidbox-runner/index.mjs"]
+# NOT `node index.mjs` directly: entrypoint.sh moves the runner-control token
+# out of the environment and hands it over on an unlinked-file fd, then `exec`s
+# this exact command — so node is still pid 1 (signals reach it unchanged) but
+# its execve-fixed /proc/<pid>/environ never contains the credential. See
+# images/runner-lib/entrypoint.sh, including what it does NOT close (ptrace).
+ENTRYPOINT ["/opt/fluidbox-runner/lib/entrypoint.sh", "node", "/opt/fluidbox-runner/index.mjs"]

@@ -10,6 +10,9 @@ members = [
     "crates/fluidbox-server",
     "crates/fluidbox-cli",
     "crates/fluidbox-catalog-import",
+    # Phase F (#34) load-test harness. Drives a RUNNING deployment; never built
+    # into the server, never on a request path.
+    "crates/fluidbox-loadgen",
 ]
 
 [workspace.package]
@@ -40,7 +43,7 @@ futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 axum = { version = "0.8", features = ["macros"] }
-tower-http = { version = "0.7", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["trace"] }
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls-ring-webpki",
@@ -68,8 +71,42 @@ clap = { version = "4", features = ["derive", "env"] }
 bytes = "1"
 async-trait = "0.1"
 dotenvy = "0.15"
-chacha20poly1305 = "0.11"
+# The `zeroize` feature is NOT default: without it the cipher keeps its expanded
+# key in ordinary memory and leaves it in the allocator on drop, so the claim
+# below ("key material is scrubbed") only held for the buffers we own. With it,
+# every XChaCha20-Poly1305 instance zeroizes its key on drop — which matters
+# because a cipher is built per seal/open from a DEK, a KEK, or the legacy key.
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 base64 = "0.22"
+# Phase D (#32) envelope sealing. zeroize scrubs unwrapped DEK bytes from memory;
+# aws-sdk-kms/aws-config back the `aws` KeyWrapper (first AWS SDK in tree — the
+# credential chain supports IRSA). Static-KEK + local dev never touch these.
+zeroize = "1"
+# default-features=false drops aws-sdk-kms's `rustls` feature, which is the
+# LEGACY stack (aws-smithy-runtime/tls-rustls → aws-smithy-http-client/
+# legacy-rustls-ring → hyper 0.14 + rustls 0.21 + rustls-webpki 0.101, the line
+# RUSTSEC-2026-0098/0099/0104 flag). `default-https-client` is the modern one
+# (hyper 1.x + rustls 0.23 + aws-lc-rs) and is what aws-config already pulls, so
+# the SDK reuses the tree's existing 0.23 stack instead of adding a second.
+aws-sdk-kms = { version = "1", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
+aws-config = { version = "1", features = ["behavior-version-latest"] }
 # v10 requires choosing exactly one crypto provider; rust_crypto keeps the
 # whole tree on the pure-Rust stack (rustls/RustCrypto), no C toolchain.
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+# IdP-agnostic OIDC login (Phase B). default-features=false = "bring your own
+# HTTP client": no bundled reqwest/native-tls — every OIDC fetch rides
+# `state.http` under our own SSRF policy, and the JWKS types + signature
+# primitives (CoreJsonWebKey/CoreJwsSigningAlgorithm/AccessTokenHash) come from
+# the base crate (RustCrypto backends, no C toolchain). MIT/Apache-2.0.
+openidconnect = { version = "4", default-features = false }
+# Phase E (#33, Gap 12): frozen-schema argument enforcement at the gate.
+# default-features=false is LOAD-BEARING — it drops `resolve-http`/`resolve-file`/
+# `resolve-async`/`reqwest`/`tls-*`, so the validator has NO external-$ref
+# resolution path at the FEATURE level (a hostile photographed inputSchema can
+# never make the control plane dial out). A deny-everything retriever is layered
+# on top in code, and `schema_guard::guard_schema` rejects any non-local `$ref`
+# before compilation. MIT.
+jsonschema = { version = "0.48", default-features = false }

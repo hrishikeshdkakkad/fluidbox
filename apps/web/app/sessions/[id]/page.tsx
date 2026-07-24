@@ -15,7 +15,8 @@ import {
   EventRow,
   workspaceLabel,
 } from "../../lib/api";
-import { Pill, AutoPill, DiffView, short } from "../../components/bits";
+import { Pill, AutoPill, DiffView, LoadingRows, short } from "../../components/bits";
+import { useSmartPolling } from "../../lib/useSmartPolling";
 
 export default function SessionDetail({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
@@ -25,27 +26,58 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [deliveries, setDeliveries] = useState<ResultDelivery[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [hasSnapshot, setHasSnapshot] = useState(false);
+  const [loadError, setLoadError] = useState("");
+  const [actionError, setActionError] = useState("");
+  const [actingOn, setActingOn] = useState<string | null>(null);
+  const [streamReconnecting, setStreamReconnecting] = useState(false);
   const seenSeq = useRef<Set<number>>(new Set());
 
   const loadMeta = useCallback(async () => {
-    try {
-      const s = await apiGet<{ session: Session; usage: Usage }>(`/sessions/${id}`);
-      setSession(s.session);
-      setUsage(s.usage);
-      const a = await apiGet<{ approvals: Approval[] }>(`/sessions/${id}/approvals`);
-      setApprovals(a.approvals);
-      const ar = await apiGet<{ artifacts: Artifact[] }>(`/sessions/${id}/artifacts`);
-      setArtifacts(ar.artifacts);
-      const d = await apiGet<{ deliveries: ResultDelivery[] }>(`/sessions/${id}/deliveries`);
-      setDeliveries(d.deliveries);
-    } catch {
-      /* ignore */
+    const [core, approvalResult, artifactResult, deliveryResult] = await Promise.allSettled([
+      apiGet<{ session: Session; usage: Usage }>(`/sessions/${id}`),
+      apiGet<{ approvals: Approval[] }>(`/sessions/${id}/approvals`),
+      apiGet<{ artifacts: Artifact[] }>(`/sessions/${id}/artifacts`),
+      apiGet<{ deliveries: ResultDelivery[] }>(`/sessions/${id}/deliveries`),
+    ]);
+    const failed: string[] = [];
+
+    if (core.status === "fulfilled") {
+      setSession(core.value.session);
+      setUsage(core.value.usage);
+      setHasSnapshot(true);
+    } else {
+      failed.push("run");
     }
+    if (approvalResult.status === "fulfilled") {
+      setApprovals(approvalResult.value.approvals);
+    } else {
+      failed.push("approvals");
+    }
+    if (artifactResult.status === "fulfilled") {
+      setArtifacts(artifactResult.value.artifacts);
+    } else {
+      failed.push("artifacts");
+    }
+    if (deliveryResult.status === "fulfilled") {
+      setDeliveries(deliveryResult.value.deliveries);
+    } else {
+      failed.push("deliveries");
+    }
+
+    setLoadError(
+      failed.length > 0
+        ? `Could not refresh ${failed.join(", ")}. Last successful values remain visible.`
+        : ""
+    );
+    setLoading(false);
   }, [id]);
 
   // Live SSE timeline.
   useEffect(() => {
     const es = new EventSource(streamUrl(id));
+    es.onopen = () => setStreamReconnecting(false);
     es.onmessage = (e) => {
       try {
         const ev: EventRow = JSON.parse(e.data);
@@ -65,28 +97,38 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
       }
     };
     es.onerror = () => {
-      /* browser auto-reconnects with Last-Event-ID */
+      setStreamReconnecting(true);
+      // The browser auto-reconnects with Last-Event-ID.
     };
     return () => es.close();
   }, [id, loadMeta]);
 
-  useEffect(() => {
-    const first = window.setTimeout(() => void loadMeta(), 0);
-    const t = setInterval(loadMeta, 4000);
-    return () => {
-      clearTimeout(first);
-      clearInterval(t);
-    };
-  }, [loadMeta]);
+  useSmartPolling(loadMeta, 4000);
 
   const decide = async (approvalId: string, decision: string) => {
-    await apiPost(`/approvals/${approvalId}/decision`, { decision, decided_by: "dashboard" });
-    loadMeta();
+    setActionError("");
+    setActingOn(approvalId);
+    try {
+      await apiPost(`/approvals/${approvalId}/decision`, { decision });
+      await loadMeta();
+    } catch (error) {
+      setActionError(`The decision could not be saved. ${String(error)}`);
+    } finally {
+      setActingOn(null);
+    }
   };
 
   const cancel = async () => {
-    await apiPost(`/sessions/${id}/cancel`, {});
-    loadMeta();
+    setActionError("");
+    setActingOn("cancel");
+    try {
+      await apiPost(`/sessions/${id}/cancel`, {});
+      await loadMeta();
+    } catch (error) {
+      setActionError(`The run could not be cancelled. ${String(error)}`);
+    } finally {
+      setActingOn(null);
+    }
   };
 
   const pending = approvals.filter((a) => a.status === "pending");
@@ -127,12 +169,61 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
           </div>
         </div>
         {session && !terminal && (
-          <button className="btn danger" onClick={cancel}>
-            Cancel run
+          <button
+            className="btn danger"
+            type="button"
+            onClick={cancel}
+            disabled={actingOn === "cancel"}
+          >
+            {actingOn === "cancel" ? "Cancelling…" : "Cancel run"}
           </button>
         )}
       </div>
 
+      {loadError && hasSnapshot && (
+        <div className="err" role="alert">
+          {loadError}{" "}
+          <button
+            className="btn sm"
+            type="button"
+            onClick={() => {
+              setLoading(true);
+              void loadMeta();
+            }}
+          >
+            Retry now
+          </button>
+        </div>
+      )}
+      {actionError && <div className="err" role="alert">{actionError}</div>}
+
+      {!hasSnapshot ? (
+        <div className="panel">
+          {loading ? (
+            <LoadingRows />
+          ) : (
+            <div className="launch-empty">
+              <div>
+                <h3>Run detail is unavailable.</h3>
+                <p>No cost, usage, or activity assumptions were made from the failed response.</p>
+              </div>
+              <div className="empty-actions">
+                <button
+                  className="btn"
+                  type="button"
+                  onClick={() => {
+                    setLoading(true);
+                    void loadMeta();
+                  }}
+                >
+                  Retry now
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      ) : (
+      <>
       {/* Approval banners */}
       {pending.map((a) => (
         <div className="approval" key={a.id} style={{ marginBottom: 14 }}>
@@ -145,27 +236,44 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
             </div>
           </div>
           <div className="acts">
-            <button className="btn human sm" onClick={() => decide(a.id, "approved_once")}>
+            <button
+              className="btn human sm"
+              type="button"
+              disabled={actingOn === a.id}
+              onClick={() => decide(a.id, "approved_once")}
+            >
               Approve once
             </button>
-            <button className="btn sm" onClick={() => decide(a.id, "approved_session")}>
+            <button
+              className="btn sm"
+              type="button"
+              disabled={actingOn === a.id}
+              onClick={() => decide(a.id, "approved_session")}
+            >
               Whole session
             </button>
-            <button className="btn sm ghost danger" onClick={() => decide(a.id, "denied")}>
+            <button
+              className="btn sm ghost danger"
+              type="button"
+              disabled={actingOn === a.id}
+              onClick={() => decide(a.id, "denied")}
+            >
               Deny
             </button>
           </div>
         </div>
       ))}
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 300px", gap: 18, alignItems: "start" }}>
+      <div className="session-detail-grid">
         {/* Timeline */}
         <div className="panel pad">
           <div className="sectitle" style={{ marginTop: 0 }}>
             timeline
           </div>
           {events.length === 0 ? (
-            <div className="empty">waiting for events…</div>
+            <div className="empty" aria-live="polite">
+              {streamReconnecting ? "Live timeline is reconnecting…" : "Waiting for events…"}
+            </div>
           ) : (
             <div className="timeline">
               {events.map((ev) => (
@@ -176,7 +284,7 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
         </div>
 
         {/* Cost + meta */}
-        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+        <div className="session-detail-side">
           <div className="panel pad">
             <div className="sectitle" style={{ marginTop: 0 }}>
               cost & usage
@@ -279,6 +387,8 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
           <div className="sectitle">changes</div>
           <DiffView content={diff.content} />
         </>
+      )}
+      </>
       )}
     </>
   );
@@ -438,13 +548,18 @@ function TimelineItem({ ev }: { ev: EventRow }) {
       break;
     case "tool.brokered": {
       const ok = d.ok === true;
-      cls = ok ? "good" : "danger";
+      const outcome = s("outcome");
+      // An ambiguous dispatch is neither a success nor a proven failure — the
+      // side effect may or may not have landed upstream, and it is never
+      // retried automatically. Amber keeps it visually distinct from a
+      // definite failure so an operator can act on it.
+      cls = outcome === "ambiguous" ? "human" : ok ? "good" : "danger";
       tag = "brokered";
       body = (
         <>
           <code>{s("tool")}</code> executed by the control plane{" "}
           <span className="mut">
-            ({ok ? "ok" : "failed"} · {s("latency_ms")}ms
+            ({outcome || (ok ? "ok" : "failed")} · {s("latency_ms")}ms
             {s("error") ? ` · ${s("error")}` : ""})
           </span>
         </>

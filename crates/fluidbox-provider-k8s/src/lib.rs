@@ -77,11 +77,27 @@ impl KubernetesProvider {
         }
     }
 
-    fn handle(&self, name: &str, uid: &str) -> SandboxHandle {
+    /// Build the persisted handle. `workload_addrs` carries the Gap-6 workload
+    /// identity (Phase F): the pod's own source addresses, taken from a Pod object
+    /// we ALREADY fetched. It is a required parameter rather than an `Option` with
+    /// a default precisely so a new call site has to state, in code, whether it
+    /// knows the address — a defaulted field is how this kind of capture silently
+    /// stops happening.
+    ///
+    /// The attribute NAME is a contract with the control plane
+    /// (`fluidbox_server::auth::WORKLOAD_ADDR_ATTR`, which reads it back out of the
+    /// stored jsonb). A test over there `include_str!`s THIS file and fails if the
+    /// two ever disagree, so renaming one side alone cannot silently disable the
+    /// binding.
+    fn handle(&self, name: &str, uid: &str, workload_addrs: &[String]) -> SandboxHandle {
         SandboxHandle {
             runtime: RUNTIME.into(),
             external_id: name.into(),
-            attrs: serde_json::json!({ "namespace": self.namespace, "uid": uid }),
+            attrs: serde_json::json!({
+                "namespace": self.namespace,
+                "uid": uid,
+                "workload_addrs": workload_addrs,
+            }),
         }
     }
 
@@ -130,6 +146,44 @@ fn map_err(e: impl std::fmt::Display) -> ProviderError {
 /// (~1 s in practice) — by design, not misconfiguration. Only a config error
 /// persisting past this pod age is real (M6).
 pub const CONFIG_ERROR_GRACE_SECS: i64 = 120;
+
+/// The pod's own source addresses — the Gap-6 workload identity (Phase F).
+///
+/// COSTS NOTHING. `status.podIP`/`status.podIPs` are populated on the very Pod
+/// object the provisioning poll already fetched to learn the runner container was
+/// Running, and on the list response `list_managed` already has. There is no extra
+/// API call and no extra latency: this is a field read on a response we paid for.
+///
+/// BOTH families, deduplicated. A dual-stack pod carries `podIPs = [v4, v6]` and
+/// may legitimately source traffic from EITHER depending on the destination, so
+/// recording only the primary `podIP` would manufacture false mismatches on
+/// dual-stack clusters — the fastest known way to get a security control switched
+/// back off. `podIP` is included even though Kubernetes documents it as
+/// `podIPs[0]`, because "documented to be" is not "is" on every apiserver version.
+///
+/// Values are NOT parsed or validated here: this crate's job is to report what the
+/// apiserver said. `auth.rs` parses them to `IpAddr` and treats an unparseable
+/// entry as UNVERIFIABLE (loud, fail-closed under `enforce`) rather than silently
+/// as a non-match.
+pub fn pod_workload_addrs(pod: &Pod) -> Vec<String> {
+    let Some(status) = pod.status.as_ref() else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |ip: &str| {
+        let ip = ip.trim();
+        if !ip.is_empty() && !out.iter().any(|x| x == ip) {
+            out.push(ip.to_string());
+        }
+    };
+    if let Some(ip) = status.pod_ip.as_deref() {
+        push(ip);
+    }
+    for entry in status.pod_ips.iter().flatten() {
+        push(&entry.ip);
+    }
+    out
+}
 
 /// Map a Pod to the structured status of its NAMED runner container (not Pod
 /// phase). Init failure surfaces as a terminated runner so the orchestrator
@@ -301,10 +355,18 @@ impl ExecutionProvider for KubernetesProvider {
         //    reality and the workspace endpoint can't race the state gate.
         let deadline = std::time::Instant::now()
             + Duration::from_secs(self.cfg.init_grace_secs.max(60) as u64);
+        // Gap 6 (Phase F): the workload's own addresses, read off the SAME poll
+        // response that proves the runner Running. Captured at the break rather
+        // than after the loop so it costs no additional `get_opt` — a pod that has
+        // a Running container always has an address assigned.
+        let workload_addrs;
         loop {
             match self.pods.get_opt(&name).await.map_err(map_err)? {
                 Some(pod) => match runner_status(&pod) {
-                    SandboxStatus::Running => break,
+                    SandboxStatus::Running => {
+                        workload_addrs = pod_workload_addrs(&pod);
+                        break;
+                    }
                     SandboxStatus::Terminated { exit_code, reason } => {
                         let _ = self.delete_pod(&name, Some(&uid)).await;
                         return Err(ProviderError::Other(format!(
@@ -328,7 +390,17 @@ impl ExecutionProvider for KubernetesProvider {
             tokio::time::sleep(Duration::from_millis(1000)).await;
         }
 
-        Ok(self.handle(&name, &uid))
+        if workload_addrs.is_empty() {
+            // Not fatal — the control plane treats "no recorded address" as
+            // unbindable and admits it (counted). But it means Gap-6 enforcement
+            // will not cover this run, and an operator deciding whether to move
+            // from `observe` to `enforce` needs to see that, not infer it.
+            tracing::warn!(
+                "pod {name} reported no podIP at runner start; this run has NO workload \
+                 identity and is exempt from FLUIDBOX_WORKLOAD_IDENTITY enforcement"
+            );
+        }
+        Ok(self.handle(&name, &uid, &workload_addrs))
     }
 
     async fn state(&self, handle: &SandboxHandle) -> Result<SandboxStatus, ProviderError> {
@@ -451,7 +523,15 @@ impl ExecutionProvider for KubernetesProvider {
                 continue;
             };
             let name = pod.name_any();
-            out.push((sid, self.handle(&name, &uid)));
+            // The adoption path also has the Pod in hand, so the handle it builds
+            // carries the same identity a fresh provision would. NOTE (residual):
+            // adoption writes only `sessions.sandbox_handle`
+            // (`adopt_sandbox_handle`), not `sessions.workload_addrs`, so an
+            // ADOPTED orphan stays unbindable at the gateway until it is
+            // reprovisioned. Recording it here keeps the handle honest and leaves
+            // the adopt-path write a one-line follow-up.
+            let addrs = pod_workload_addrs(&pod);
+            out.push((sid, self.handle(&name, &uid, &addrs)));
         }
         Ok(out)
     }
@@ -1103,5 +1183,97 @@ mod tests {
             parse_collected(b"garbage"),
             CollectedArtifacts::Missing { .. }
         ));
+    }
+
+    // ─── Gap 6 workload identity (Phase F) ─────────────────────────────────
+
+    fn pod_with_status(status: serde_json::Value) -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "fbx-x", "namespace": "fluidbox-sandboxes" },
+            "status": status,
+        }))
+        .expect("pod fixture")
+    }
+
+    #[test]
+    fn workload_addrs_are_read_off_the_pod_status() {
+        // Single-stack: podIP and podIPs agree, and the duplicate is collapsed.
+        assert_eq!(
+            pod_workload_addrs(&pod_with_status(serde_json::json!({
+                "podIP": "10.4.2.9",
+                "podIPs": [{ "ip": "10.4.2.9" }],
+            }))),
+            vec!["10.4.2.9".to_string()]
+        );
+        // Dual-stack: BOTH families, primary first. Recording only the primary
+        // would make a v6-sourced request from this very pod a false mismatch.
+        assert_eq!(
+            pod_workload_addrs(&pod_with_status(serde_json::json!({
+                "podIP": "10.4.2.9",
+                "podIPs": [{ "ip": "10.4.2.9" }, { "ip": "fd00::5" }],
+            }))),
+            vec!["10.4.2.9".to_string(), "fd00::5".to_string()]
+        );
+        // podIPs alone (an apiserver that populates only the list).
+        assert_eq!(
+            pod_workload_addrs(&pod_with_status(
+                serde_json::json!({ "podIPs": [{ "ip": "fd00::5" }] })
+            )),
+            vec!["fd00::5".to_string()]
+        );
+        // Not yet assigned, or no status at all ⇒ nothing. The control plane
+        // treats this as unbindable; it must never become a bogus entry.
+        assert!(
+            pod_workload_addrs(&pod_with_status(serde_json::json!({ "phase": "Pending" })))
+                .is_empty()
+        );
+        assert!(
+            pod_workload_addrs(&pod_with_status(serde_json::json!({ "podIP": "   " }))).is_empty()
+        );
+        let bare: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod", "metadata": { "name": "fbx-x" }
+        }))
+        .unwrap();
+        assert!(pod_workload_addrs(&bare).is_empty());
+    }
+
+    /// The capture must ride the poll response that ALREADY proved the runner
+    /// Running — no second `get_opt`, no `list`, no added provisioning latency.
+    /// `provision` needs a live apiserver, so this is asserted on the source: the
+    /// capture happens INSIDE the `SandboxStatus::Running` arm of the existing
+    /// loop, and the handle is built from what that arm produced.
+    #[test]
+    fn the_capture_adds_no_api_call_to_provisioning() {
+        let src = include_str!("lib.rs");
+        let end = src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("this file has a test module");
+        let prod = &src[..end];
+        assert!(
+            prod.contains(
+                "SandboxStatus::Running => {\n                        workload_addrs = pod_workload_addrs(&pod);\n                        break;"
+            ),
+            "the address must be captured from the poll response that proves Running"
+        );
+        assert!(prod.contains("Ok(self.handle(&name, &uid, &workload_addrs))"));
+        // `provision` still issues exactly ONE apiserver read (the poll), and no
+        // list. Scoped to the function body so an added call anywhere else in the
+        // file cannot mask an added call here — or be mistaken for one.
+        let start = prod
+            .find("async fn provision(")
+            .expect("provision is defined here");
+        let end = start
+            + prod[start..]
+                .find("async fn state(")
+                .expect("state follows provision");
+        let body = &prod[start..end];
+        assert_eq!(
+            body.matches(".get_opt(").count(),
+            1,
+            "provisioning must not grow an apiserver round trip"
+        );
+        assert_eq!(body.matches(".list(").count(), 0);
     }
 }

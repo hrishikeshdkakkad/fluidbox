@@ -21,6 +21,21 @@ jobs:
     # DATABASE_URL they self-skip and the persistence layer goes untested.
     # Vanilla PG is fine here: Neon is only special in production, and
     # LISTEN/NOTIFY + the migration path are stock Postgres.
+    #
+    # RLS CAVEAT (Phase D, #32) — this job connects as the SUPERUSER `postgres`,
+    # for whom Postgres skips row-level security entirely. So nothing here proves
+    # migration 0018 enforces anything, and it never will: the fixtures write
+    # across tenants, which under FORCE RLS requires the audited bypass anyway
+    # (`fluidbox-db::test_connect` supplies it, so the suite also passes on an
+    # RLS-BOUND owner). What DOES prove enforcement:
+    #   • the four `rls_*` tests below, which open their OWN
+    #     `SET ROLE fluidbox_runtime` connection/pool — the policy actually runs
+    #     there regardless of the base user's privilege;
+    #   • the identity / bindings / secrets jobs below, whose control planes boot
+    #     with FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime, so their entire HTTP
+    #     surface — every repository fn a request touches — executes RLS-bound.
+    # Do NOT "simplify" by dropping that env var: without it a repository fn that
+    # forgot `scoped_tx` returns rows in CI and nothing in production.
     services:
       postgres:
         image: postgres:16
@@ -51,6 +66,291 @@ jobs:
       - name: test
         run: cargo test --workspace
 
+  # Identity acceptance: the IdP-agnostic OIDC login surface driven end-to-end
+  # against a REAL conformant issuer (Dex in a container) over HTTP, plus the
+  # flow-level negative matrix (replay, wrong-browser, expired, forced-login
+  # switch, deactivation, issuer migration, REQUIRE_SSO, no-IdP). The
+  # token-crafting negatives (HS256/none/azp/at_hash/kid-less JWKS) are unit
+  # vectors in login.rs and are NOT re-driven here. This job is hermetic — it
+  # owns its Dex + control plane and spends no model credits — so it runs on
+  # every PR like the other cheap gates. A distinct Postgres DB name keeps it
+  # isolated from the `rust` job's schema even if they overlap.
+  identity:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: fluidbox_identity
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/fluidbox_identity
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Share the debug build cache with the `rust` job — same profile, so the
+      # compiled dependencies are reused rather than rebuilt.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: debug
+      - name: build server
+        run: cargo build -p fluidbox-server
+      # psql is REQUIRED by the acceptance script (it ages rows + counts audit
+      # rows to PROVE the expired-flow/expired-arm/expired-switch/idempotence/SSE
+      # cases). The script aborts if psql is missing, so install the client here.
+      - name: install postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: identity acceptance (Dex round-trip + negative matrix)
+        env:
+          # Reuse the just-built binary so the script `exec`s it directly (clean
+          # single-process lifecycle) instead of `cargo run`. Docker is available
+          # on ubuntu-latest for the Dex container.
+          FLUIDBOX_SERVER_BIN: ${{ github.workspace }}/target/debug/fluidbox-server
+        run: bash scripts/identity-e2e.sh
+
+  # Phase C acceptance: connection ownership + run resource bindings, driven
+  # end-to-end over HTTP against a REAL issuer (Dex) and a bearer-checked fake
+  # brokered MCP server, with FLUIDBOX_REQUIRE_SSO=1. It proves the design's
+  # Phase C acceptance list: same agent → different per-user connections; neither
+  # user can inspect the other's personal connection; identical model aliases but
+  # the broker resolves the correct binding; a third-user approval never changes
+  # credential identity; missing/ambiguous bindings fail before provisioning; and
+  # the generation / membership / legacy-cutoff fail-closed matrix. Hermetic and
+  # spends no model credits (runs never launch a sandbox), so it runs on every PR
+  # like the other cheap gates. A distinct Postgres DB name keeps it isolated.
+  bindings:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: fluidbox_bindings
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/fluidbox_bindings
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Share the debug build cache with the `rust` job — same profile.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: debug
+      - name: build server
+        run: cargo build -p fluidbox-server
+      # psql is REQUIRED by the acceptance script (it PROVES the binding rows,
+      # snapshot versions, the generation bump, and the legacy-bundle fixture).
+      - name: install postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: bindings acceptance (Dex + fake MCP + per-user binding matrix)
+        env:
+          # Reuse the just-built binary so the script `exec`s it directly (clean
+          # single-process lifecycle). Docker on ubuntu-latest runs the Dex
+          # container; the missing runner image makes each run fail provisioning,
+          # which is exactly what the forged-run fixture expects.
+          FLUIDBOX_SERVER_BIN: ${{ github.workspace }}/target/debug/fluidbox-server
+        run: bash scripts/bindings-e2e.sh
+
+  # Phase D acceptance: the secrets/KMS control plane, driven end-to-end over HTTP
+  # against python-stdlib fakes (OAuth AS + MCP + OIDC issuer, GitHub manifest
+  # conversions, LiteLLM virtual-key admin). It proves the #32 matrix — the KMS
+  # boot matrix + versioned envelope sealing + resumable re-seal with count parity
+  # + the D4 retirement gate, invariant-20 one-time browser-bound OAuth flows
+  # (replay/wrong-browser/expired/tampered/cross-flow), reusable client
+  # registrations, refresh singleflight/rotation/generation/revoke, per-tenant
+  # LiteLLM virtual keys (master confined to provisioning), RLS tenant isolation,
+  # and log-hygiene redaction. Hermetic (no Dex, no docker, no model spend — runs
+  # never launch a sandbox), so it runs on every PR like the other cheap gates. A
+  # distinct Postgres DB name keeps it isolated.
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: fluidbox_secrets
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/fluidbox_secrets
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Share the debug build cache with the `rust` job — same profile.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: debug
+      - name: build server
+        run: cargo build -p fluidbox-server
+      # psql is REQUIRED by the acceptance script (it PROVES key_version flips, RLS
+      # visibility, the forged session/token fixtures, and the retirement-gate matrix).
+      - name: install postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: secrets acceptance (KMS + envelope + reseal + invariant-20 + virtual keys + RLS)
+        env:
+          # Reuse the just-built binary so the script `exec`s it directly (clean
+          # single-process lifecycle across the many boots the KMS/LLM matrix needs).
+          FLUIDBOX_SERVER_BIN: ${{ github.workspace }}/target/debug/fluidbox-server
+        run: bash scripts/secrets-e2e.sh
+
+  # Phase E acceptance: broker and network hardening, driven end-to-end over HTTP
+  # against python-stdlib fakes (a recording MCP server + a redirect server). It
+  # proves the #33 matrix — the SSRF/egress boundary (private + metadata literals
+  # refused at admission and at dial, redirects refused not followed), the
+  # 2025-11-25 conformance contract (initialize-first, offered version, protocol
+  # header, version drift, 404-reinit, server-request -32601, SSE assembly,
+  # session DELETE, SEP-835 insufficient-scope marking the connection), frozen
+  # schema argument enforcement including the gate-ORDER proof the unit tests
+  # structurally cannot give, and the durable execution claims (one dispatch per
+  # duplicated intent, failed_upstream never ambiguous, failed_before_send
+  # re-claimable, ambiguous never re-dispatched, cancel-during-approval).
+  hardening:
+    runs-on: ubuntu-latest
+    # 45, not the 25 this job was created with. The budget has to cover a
+    # cache-MISS debug build of the workspace (10-18 min on its own) plus the
+    # script, which has grown from 1666 to ~3650 lines, 25 to 43 runs, ~5 s to
+    # ~36 s of fixed sleeps, and 1 to 3 boots of replica A plus a second replica.
+    # A timeout kill is indistinguishable from a hang in the log, so headroom
+    # here is what keeps a slow runner from reading as a broker deadlock.
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: fluidbox_hardening
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/fluidbox_hardening
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Share the debug build cache with the `rust` job — same profile.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: debug
+      - name: build server
+        run: cargo build -p fluidbox-server
+      # psql is REQUIRED by the acceptance script (it PROVES the claim-row states,
+      # the schema-denial ledger source, and the SEP-835 connection status write —
+      # the assertions that cannot be made from the HTTP surface alone).
+      - name: install postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: hardening acceptance (egress/SSRF + MCP conformance + schema gate + execution claims)
+        env:
+          # Reuse the just-built binary so the script `exec`s it directly (clean
+          # single-process lifecycle across the boots the matrix needs).
+          FLUIDBOX_SERVER_BIN: ${{ github.workspace }}/target/debug/fluidbox-server
+        run: bash scripts/hardening-e2e.sh
+      # FORENSICS. The script owns its stack in a mktemp dir and its EXIT trap
+      # `rm -rf`s it, so a CI-only failure used to leave nothing but the pass/fail
+      # lines — no control-plane log, no recorder JSONL, nothing to reconstruct
+      # which upstream request did or did not happen. The script now copies those
+      # files to a FIXED path (hardening-e2e-artifacts/) before deleting the work
+      # dir, but ONLY when the run failed and only under CI — which is why this
+      # step is `if: failure()` and why a green run uploads nothing. Copy-out was
+      # chosen over "keep the work dir": upload-artifact needs a path known when
+      # this YAML is written, and the work dir's name is random.
+      - name: upload hardening forensics (server logs + recorder JSONLs)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hardening-e2e-logs
+          path: hardening-e2e-artifacts/
+          if-no-files-found: warn
+          retention-days: 7
+
+  # Phase F acceptance (#34): the scale/reliability suite. Today it proves the
+  # FAST session forge and that the gate answers every one of N concurrent
+  # sessions exactly once, recorded exactly once in the ledger — the precondition
+  # every later scale section depends on. Sections (b)-(j) are listed in the
+  # script as comments, deliberately NOT as stub assertions: an assertion that
+  # cannot fail is the most damaging thing this suite could contain.
+  #
+  # Hermetic and cheap: no runner image, no upstream, no model spend. The runs it
+  # creates use an absent local_copy workspace, which fails during `initializing`
+  # before the provider is ever asked for a sandbox.
+  scale:
+    runs-on: ubuntu-latest
+    # 45, not the 25 this job was created with. The first real run PROVED the
+    # point `hardening` makes: 25 was eaten almost entirely by a cache-MISS debug
+    # build of the workspace (10-18 min on its own), leaving the script too
+    # little, and GitHub reports a timeout kill as "cancelled" — indistinguishable
+    # in the checks list from a job someone cancelled, and in the log from a hang.
+    # Headroom here is what keeps a slow runner from reading as a deadlock.
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: fluidbox_scale
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/fluidbox_scale
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Share the debug build cache with the `rust` job — same profile.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: debug
+      - name: build server
+        run: cargo build -p fluidbox-server
+      # psql is REQUIRED: the fixture forge and every ledger assertion go through
+      # it, and none of them may silently skip.
+      - name: install postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: scale acceptance (fast session forge + concurrent gate decisions)
+        env:
+          # Reuse the just-built binary so the script `exec`s it directly (clean
+          # single-process lifecycle across the boots later sections will need).
+          FLUIDBOX_SERVER_BIN: ${{ github.workspace }}/target/debug/fluidbox-server
+        run: bash scripts/scale-e2e.sh
+      # FORENSICS — same rationale as the hardening job: the script owns its stack
+      # in a mktemp dir its EXIT trap deletes, so it copies logs and per-request
+      # recorders to a fixed path first, but only on failure and only under CI.
+      - name: upload scale forensics (server logs + per-request recorders)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: scale-e2e-logs
+          path: scale-e2e-artifacts/
+          if-no-files-found: warn
+          retention-days: 7
+
   web:
     runs-on: ubuntu-latest
     defaults:
@@ -68,6 +368,19 @@ jobs:
           cache-dependency-path: apps/web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
+      # Proxy-auth + sso-route unit tests (vitest) — the credential-boundary logic
+      # (webMode strictness, cookie allowlist, no-bearer forward, Set-Cookie
+      # propagation) is unit-tested; run it in CI alongside the build.
+      - run: pnpm test
+      # The runner-lib credential hand-off (Phase F). node:test, zero deps, so it
+      # rides the Node this job already set up rather than earning its own job.
+      # THREE of its assertions are Linux-only (procfs: that the exec'd process's
+      # /proc/self/environ is clean, and that the hand-off file is unlinked and
+      # 0600 while the descriptor is open) and self-skip elsewhere — this runner
+      # is Linux, so CI is where they actually execute. They are the assertions
+      # that prove the residual is closed, so a green `web` job is their proof.
+      - run: node --test images/runner-lib/*.test.mjs
+        working-directory: .
 
   # Supply-chain gate: advisories, licenses, bans, sources (deny.toml).
   deny:

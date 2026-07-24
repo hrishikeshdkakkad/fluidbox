@@ -1,45 +1,191 @@
-// Browser-side client. All calls go to the same-origin proxy, which injects
-// the admin token server-side. The browser never holds a credential.
+// Browser-side client. All calls go to the same-origin proxy. In admin mode the
+// proxy injects the admin token server-side; in sso mode it forwards the
+// browser's session cookie. Either way the browser never holds a credential.
 
 const BASE = "/api/fluidbox";
 
-export async function apiGet<T = unknown>(path: string): Promise<T> {
+// The deployment mode is server-authoritative: the root layout stamps it onto
+// <html data-web-mode>. Only two things vary by mode client-side, and both are
+// presentation, not authorization: writes carry the CSRF header (required in
+// sso, inert under the admin bearer path), and a 401 in sso mode means the
+// browser session is missing/expired, so we send the user to /login.
+function ssoMode(): boolean {
+  return (
+    typeof document !== "undefined" &&
+    document.documentElement.dataset.webMode === "sso"
+  );
+}
+
+/** Cookie-authenticated writes require this header (the control plane rejects
+ *  cookie non-GETs without it); the admin bearer path ignores it. */
+const CSRF_HEADERS = { "x-fluidbox-csrf": "1" } as const;
+
+/** In sso mode a 401 means "no live session" — route the browser to the login
+ *  page, carrying the current location so the deep link survives the IdP
+ *  round-trip (login-form.tsx forwards it as redirect_to; the control plane
+ *  validates it). Guarded against a redirect loop when already on /login.
+ *  Admin mode never triggers this (the injected bearer is always present). */
+function redirectOnUnauthorized(res: Response): void {
+  if (res.status !== 401 || !ssoMode() || typeof window === "undefined") return;
+  if (window.location.pathname !== "/login") {
+    const here = window.location.pathname + window.location.search;
+    const next = here === "/" ? "" : `?next=${encodeURIComponent(here)}`;
+    window.location.href = `/login${next}`;
+  }
+}
+
+type CachedGet = { value: unknown; expiresAt: number };
+const getCache = new Map<string, CachedGet>();
+const inflightGets = new Map<string, Promise<unknown>>();
+let cacheGeneration = 0;
+
+async function fetchGet<T>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`, { cache: "no-store" });
-  if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+  if (!res.ok) {
+    redirectOnUnauthorized(res);
+    throw new Error(`${res.status}: ${await res.text()}`);
+  }
   return res.json();
+}
+
+/**
+ * Forget cached read models after a write. Prefix invalidation is available for
+ * targeted refresh buttons; writes clear everything because these projections
+ * overlap (a new connection changes catalog, resources, and picker options).
+ */
+export function invalidateApiCache(prefix = ""): void {
+  cacheGeneration += 1;
+  for (const path of getCache.keys()) {
+    if (!prefix || path.startsWith(prefix)) getCache.delete(path);
+  }
+  for (const path of inflightGets.keys()) {
+    if (!prefix || path.startsWith(prefix)) inflightGets.delete(path);
+  }
+}
+
+export async function apiGet<T = unknown>(path: string): Promise<T> {
+  const existing = inflightGets.get(path);
+  if (existing) return existing as Promise<T>;
+
+  const request = fetchGet<T>(path);
+  const tracked = request.finally(() => {
+    // An invalidation may have removed this request and allowed a newer one to
+    // occupy the same path. The older completion must not evict the newer read.
+    if (inflightGets.get(path) === tracked) inflightGets.delete(path);
+  });
+  inflightGets.set(path, tracked);
+  return tracked;
+}
+
+/**
+ * Private, per-tab read-through cache for reusable control-plane projections.
+ * The underlying response remains `no-store`, so credentials and tenant data
+ * never enter a browser or shared HTTP cache.
+ */
+export async function apiGetCached<T = unknown>(
+  path: string,
+  { maxAgeMs = 15_000, force = false }: { maxAgeMs?: number; force?: boolean } = {}
+): Promise<T> {
+  if (force) invalidateApiCache(path);
+  const cached = getCache.get(path);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.value as T;
+  }
+
+  const generation = cacheGeneration;
+  const value = await apiGet<T>(path);
+  // A successful write or explicit refresh may have invalidated this read
+  // while it was in flight. Return it to its original caller, but never let
+  // that older projection repopulate the shared per-tab cache.
+  if (generation === cacheGeneration) {
+    getCache.set(path, { value, expiresAt: Date.now() + Math.max(0, maxAgeMs) });
+  }
+  return value;
 }
 
 export async function apiPost<T = unknown>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...CSRF_HEADERS },
     body: JSON.stringify(body),
   });
   const text = await res.text();
-  if (!res.ok) throw new Error(text || `${res.status}`);
+  if (!res.ok) {
+    redirectOnUnauthorized(res);
+    throw new Error(text || `${res.status}`);
+  }
+  invalidateApiCache();
   return text ? JSON.parse(text) : ({} as T);
 }
 
 export async function apiPut<T = unknown>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     method: "PUT",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...CSRF_HEADERS },
     body: JSON.stringify(body),
   });
   const text = await res.text();
-  if (!res.ok) throw new Error(text || `${res.status}`);
+  if (!res.ok) {
+    redirectOnUnauthorized(res);
+    throw new Error(text || `${res.status}`);
+  }
+  invalidateApiCache();
+  return text ? JSON.parse(text) : ({} as T);
+}
+
+// No call sites yet — this exists so a future partial-update goes through the
+// sanctioned surface (CSRF header + 401→/login) instead of a raw fetch.
+export async function apiPatch<T = unknown>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json", ...CSRF_HEADERS },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    redirectOnUnauthorized(res);
+    throw new Error(text || `${res.status}`);
+  }
+  invalidateApiCache();
   return text ? JSON.parse(text) : ({} as T);
 }
 
 export async function apiDelete<T = unknown>(path: string): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, { method: "DELETE" });
+  const res = await fetch(`${BASE}${path}`, { method: "DELETE", headers: { ...CSRF_HEADERS } });
   const text = await res.text();
-  if (!res.ok) throw new Error(text || `${res.status}`);
+  if (!res.ok) {
+    redirectOnUnauthorized(res);
+    throw new Error(text || `${res.status}`);
+  }
+  invalidateApiCache();
   return text ? JSON.parse(text) : ({} as T);
 }
 
 export function streamUrl(sessionId: string): string {
   return `${BASE}/sessions/${sessionId}/events/stream`;
+}
+
+/** GET /auth/me — who the current browser session belongs to (sso mode). The
+ *  admin token yields `{ operator: true }` instead; users get org + identity.
+ *  The dashboard renders this; it never derives authority from it. */
+export interface AuthMe {
+  operator?: boolean;
+  /** Stable id of the signed-in user (Phase C): lets the dashboard tell "my
+   *  personal connection" from a teammate's. Absent for the operator and in
+   *  admin mode — ownership rendering degrades to org/personal without "yours".
+   *  The server still owner-filters; this is presentation only. */
+  user_id?: string;
+  org?: { slug: string; display_name: string } | null;
+  user?: { email: string | null; name: string | null } | null;
+  roles?: string[];
+  auth_kind?: string;
+}
+
+/** sso mode: end the browser session, then return to the login page. The write
+ *  carries the CSRF header; the response body is irrelevant. */
+export async function logout(): Promise<void> {
+  await fetch(`${BASE}/auth/logout`, { method: "POST", headers: { ...CSRF_HEADERS } });
+  if (typeof window !== "undefined") window.location.href = "/login";
 }
 
 // ─── Types ────────────────────────────────────────────────────────────────
@@ -98,7 +244,32 @@ export interface Revision {
   default_workspace: WorkspaceSpec | null;
   /** §17 #7 pins: exact bundle versions resolved at attach time. */
   capability_bundles: BundleRef[];
+  /** Phase C (design :349-389): brokered connection requirements this revision
+   *  declares — *what* it needs per slot, never *whose* credential. Resolved
+   *  per-run into bindings. Defaults to [] on pre-Phase-C revisions. */
+  connection_requirements?: ConnectionRequirement[];
   created_at: string;
+}
+
+/** Which identity's credential should satisfy a requirement's binding at run
+ *  creation (mirrors fluidbox-core BindingMode, snake_case on the wire). */
+export type BindingMode = "invoking_user" | "organization";
+
+/** How a requirement names the connector it needs. `url` is the load-bearing
+ *  selector (the brokered MCP endpoint); `slug` is an optional catalog hint. */
+export interface ConnectorSelector {
+  url: string;
+  slug?: string | null;
+}
+
+/** What an agent revision declares it needs per slot (mirrors fluidbox-core
+ *  ConnectionRequirement). `required_tools` is a fail-closed contract: every
+ *  entry must exist in the bound connection's snapshot at run creation. */
+export interface ConnectionRequirement {
+  slot: string;
+  connector: ConnectorSelector;
+  required_tools: string[];
+  binding_mode: BindingMode;
 }
 
 /** Mirrors fluidbox-core BundleRef (agent_revisions.capability_bundles). */
@@ -166,11 +337,25 @@ export interface Connection {
     installation_id?: string;
     registration_id?: string;
     base_url?: string;
+    /** The exact MCP endpoint a static mcp_http connection was photographed at
+     *  (= base_url for a static server). Used to match a connection to an agent
+     *  requirement's connector url — display convenience; the server re-verifies. */
+    endpoint_url?: string;
     header_name?: string;
     scheme?: string;
   };
   /** static (pasted secret) | oauth (custodied rotating refresh token). */
   auth_kind: string;
+  /** Ownership (Phase C, design :274-296). `owner_type` is the WIRE value —
+   *  "organization" (visible to every member) or "user" (one member's personal
+   *  custody, rendered as "Personal"). `owner_user_id` is set iff owner_type is
+   *  "user". These arrive on every row post-Phase-C; the list is already
+   *  viewer-filtered server-side, so other users' personal rows never appear. */
+  owner_type?: "organization" | "user";
+  owner_user_id?: string | null;
+  created_by_user_id?: string | null;
+  /** Bumps on every re-consent/rotation so stale run bindings fail closed. */
+  authorization_generation?: number;
   /** Non-secret OAuth custody state; null on static connections. */
   oauth: {
     resource?: string;
@@ -219,6 +404,116 @@ export const isGitConnection = (c: Connection): boolean =>
 export const isToolConnection = (c: Connection): boolean =>
   PROVIDER_CLASS[c.provider as ConnectionProvider] === "tool";
 
+// ─── Connection ownership (Phase C, presentation only) ──────────────────────
+// The server is the sole authority on who may see/use a connection (the list is
+// already viewer-filtered). Everything below only SHAPES the UI: badges, which
+// owner radios to offer. Every write re-checks server-side.
+
+/** The badge for a connection row: "Organization" or "Personal", with `yours`
+ *  set only when a personal connection's owner matches the viewer. Needs
+ *  `meUserId` (from GET /auth/me); absent in admin mode, where `yours` stays
+ *  false. Returns null when the row carries no ownership (pre-Phase-C shape). */
+export interface OwnerBadge {
+  label: "Organization" | "Personal";
+  yours: boolean;
+}
+export function ownerBadge(c: Connection, meUserId?: string | null): OwnerBadge | null {
+  if (!c.owner_type) return null;
+  if (c.owner_type === "user") {
+    return { label: "Personal", yours: !!meUserId && c.owner_user_id === meUserId };
+  }
+  return { label: "Organization", yours: false };
+}
+
+export type OwnerChoice = "organization" | "personal";
+
+/** Which owner options a principal may pick when creating a connection, and the
+ *  default. Mirrors the server's `resolve_owner` gate (design :274-296):
+ *  `organization` needs admin/owner (or the operator); `personal` needs a
+ *  signed-in member and is refused for the operator and for github_app custody
+ *  (`allowPersonal=false`). Pure so the radio gating is unit-tested; the server
+ *  RE-ENFORCES — this only shapes the form. */
+export interface OwnerOptions {
+  canOrganization: boolean;
+  canPersonal: boolean;
+  default: OwnerChoice;
+}
+export function ownerOptions(me: AuthMe | null, allowPersonal = true): OwnerOptions {
+  const operator = !!me?.operator;
+  const isUser = !!me && !operator; // a signed-in member (browser/pat)
+  const roles = me?.roles ?? [];
+  const elevated = operator || roles.includes("admin") || roles.includes("owner");
+  // me absent (auth/me failed) → fall back to organization-only, the
+  // pre-Phase-C behavior; the server still enforces authority.
+  const canOrganization = elevated || !me;
+  const canPersonal = allowPersonal && isUser;
+  const dflt: OwnerChoice =
+    canOrganization && (elevated || !me) ? "organization" : canPersonal ? "personal" : "organization";
+  return { canOrganization, canPersonal, default: dflt };
+}
+
+/** Normalize a URL to origin+path without a trailing slash, lowercased — so
+ *  `https://H/mcp/` and `https://h/mcp` compare equal. Falls back to a trimmed
+ *  string for non-URLs. */
+function normUrl(u: string): string {
+  const trimmed = u.trim();
+  try {
+    const p = new URL(trimmed);
+    return (p.origin + p.pathname).replace(/\/+$/, "").toLowerCase();
+  } catch {
+    return trimmed.replace(/\/+$/, "").toLowerCase();
+  }
+}
+
+/** Does this connection back the connector at `connectorUrl`? Matched against
+ *  the stored `endpoint_url`/`base_url` (equal, or one contains the other at a
+ *  path boundary — audience binding). Display-only convenience for the run
+ *  composer's per-slot picker; the server re-verifies every binding. */
+export function connectionMatchesConnector(c: Connection, connectorUrl: string): boolean {
+  const target = normUrl(connectorUrl);
+  if (!target) return false;
+  const candidates = [c.metadata?.endpoint_url, c.metadata?.base_url]
+    .filter((x): x is string => !!x && x.trim().length > 0)
+    .map(normUrl);
+  return candidates.some(
+    (u) => u === target || target.startsWith(`${u}/`) || u.startsWith(`${target}/`)
+  );
+}
+
+/** A connection's append-only tool photograph (GET /connections/{id}/tools).
+ *  Mirrors the server's `snapshot_json` (schemas stay server-side). */
+export interface ConnectionToolSnapshot {
+  version: number;
+  protocol_version: string;
+  tools_digest: string;
+  discovered_at: string;
+  authorization_generation: number;
+  tools: { name: string; description: string }[];
+}
+
+/** GET /connections/{id}/tools — the latest snapshot, or null when none has
+ *  been photographed yet (404) or the row is not visible. Other errors throw. */
+export async function fetchConnectionTools(id: string): Promise<ConnectionToolSnapshot | null> {
+  try {
+    const r = await apiGet<{ snapshot: ConnectionToolSnapshot }>(`/connections/${id}/tools`);
+    return r.snapshot;
+  } catch (e) {
+    if (e instanceof Error && e.message.startsWith("404")) return null;
+    throw e;
+  }
+}
+
+/** POST /connections/{id}/tools/refresh — re-photograph into a new version.
+ *  4xx bodies (e.g. reauthorization guidance) are actionable — surface them
+ *  verbatim to the caller (this throws them as-is). */
+export async function refreshConnectionTools(id: string): Promise<ConnectionToolSnapshot> {
+  const r = await apiPost<{ snapshot: ConnectionToolSnapshot }>(
+    `/connections/${id}/tools/refresh`,
+    {}
+  );
+  return r.snapshot;
+}
+
 /** One connector-catalog entry (untrusted reference data; tool_hints are
  *  policy-default seeds — the permission gate stays the judge). */
 export interface CatalogEntry {
@@ -257,7 +552,9 @@ export interface CatalogEntry {
 export interface CatalogConnectResult {
   bundle?: { name: string; version: number };
   connection?: Connection;
-  authorize_url?: string;
+  /** OAuth: the control-plane /v1/oauth/go URL — it binds the per-flow browser
+   *  cookie, then 302s to the authorization server (invariant 20). */
+  go_url?: string;
   /** Photographed servers/tools (none/api_key connects). */
   servers?: BundleServer[];
 }
@@ -297,13 +594,31 @@ export interface ProbeResult {
   notes: string[];
 }
 
-/** POST /mcp/servers response (fields vary by auth_mode, + derived slug). */
+/** POST /mcp/servers response (fields vary by auth_mode, + derived slug).
+ *  Phase C: a remote (none/api_key) connect returns `{connection, snapshot}`
+ *  (brokered tools are a per-connection snapshot now, not a bundle); a sandbox
+ *  (stdio) connect still returns a `bundle`; oauth returns `{connection,
+ *  go_url}` and the snapshot is photographed by the callback. */
 export interface AddServerResult {
   slug?: string;
   bundle?: { name: string; version: number };
   servers?: BundleServer[];
   connection?: Connection;
-  authorize_url?: string;
+  snapshot?: ConnectionToolSnapshot;
+  /** OAuth: the control-plane /v1/oauth/go URL (binds the browser cookie, then
+   *  302s to the authorization server — invariant 20). */
+  go_url?: string;
+}
+
+/** What the Add-server wizard hands back on success: the sandbox bundle (legacy
+ *  path) OR the freshly-connected brokered connection + its photographed
+ *  snapshot + derived slug (Phase C), so an embedded caller can append a
+ *  matching ConnectionRequirement. */
+export interface AddServerCompletion {
+  bundle: { name: string; version: number } | null;
+  connection?: Connection;
+  snapshot?: ConnectionToolSnapshot;
+  slug?: string;
 }
 
 /** One model offered for a harness (GET /harnesses). */

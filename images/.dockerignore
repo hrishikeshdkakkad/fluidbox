@@ -1,0 +1,6 @@
+# Build context = images/ for BOTH runner images (see justfile `sandbox-build` /
+# `codex-build` and the release workflow's context resolver), and each Dockerfile
+# does `COPY runner-lib ./lib` wholesale. Keep the runner-lib unit tests out of
+# the shipped images: they are CI-only, and the runner tree is agent-writable in
+# the claude image, so anything we ship there is surface we did not need.
+**/*.test.mjs

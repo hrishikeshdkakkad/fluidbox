@@ -151,6 +151,9 @@ pub struct PublishOutcome {
 /// Provider-neutral inputs a publisher needs — built by deliveries.rs from
 /// the session + frozen RunSpec, no provider types involved.
 pub struct PublishContext {
+    /// The run's owning tenant — every DB read the publish path makes scopes to
+    /// it (the delivery worker derives it from the session row).
+    pub scope: fluidbox_db::TenantScope,
     pub session_id: Uuid,
     pub subscription_id: Option<Uuid>,
     pub subscription_name: String,

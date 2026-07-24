@@ -38,11 +38,49 @@ cargo build -q -p fluidbox-server || exit 1
 B=/tmp/fbx-conn-body.json
 post()  { curl -s -o "$B" -w "%{http_code}" -X POST -H "$H" -H "$CT" -d "$2" "$API/v1$1"; }
 get()   { curl -s -H "$H" "$API/v1$1"; }
-pq()    { psql "$DATABASE_URL" -qtA -c "$1" | head -1; }
+# Migration 0018 FORCEs RLS on every tenant table, which binds the table OWNER
+# too: a GUC-less psql session reads zero rows and every write trips the policy.
+# The bypass GUC is a session-level SET on a custom (dotted) option — no
+# privilege required — so it rides INSIDE the helper and every call carries it.
+pq()    { psql "$DATABASE_URL" -qtA -c "set fluidbox.bypass = 'system_worker'; $1" | head -1; }
+# Same GUC, for the two raw non-capturing psql writes below.
+pqw()   { psql "$DATABASE_URL" -qc "set fluidbox.bypass = 'system_worker'; $1"; }
 jb()    { python3 -c "import sys,json;d=json.load(open('$B'));print(d$1)" 2>/dev/null; }
 sfield(){ curl -s -H "$H" "$API/v1/sessions/$1" | j "['session']$2"; }
 
 CONN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fbx-conn.XXXXXX")
+
+# ── Driving the OAuth dance (invariant 20: start → go(cookie) → callback) ─────
+# The start/connect endpoints no longer hand back an `authorize_url` the script
+# can curl: they return a `go_url` on the CONTROL-PLANE origin, and GET-ing it is
+# what mints the browser-binding `__Host-fbx_oauth_flow` cookie before the 302 to
+# the authorization server. The callback REQUIRES that cookie, so every leg of a
+# dance must ride ONE curl cookie jar — a jar IS a browser here.
+location_from_headers() { grep -i '^location:' "$1" | head -1 | sed -E 's/^[Ll]ocation: *//' | tr -d '\r'; }
+new_jar() { local p="$CONN_DIR/jar-$1.txt"; : > "$p"; echo "$p"; }
+# go_authz: GET go_url in `jar` (the flow cookie lands in the jar) and echo the AS
+# authorize URL from the 302 Location WITHOUT following it — the assertions below
+# read the authorize URL's params, exactly as they used to read `authorize_url`.
+go_authz() { # jar go_url → authorize URL ("" on failure)
+  curl -s -c "$1" -b "$1" -D "$CONN_DIR/h.go" -o /dev/null "$2"
+  location_from_headers "$CONN_DIR/h.go"
+}
+# cb_from_authz: the fake AS auto-consents (302 straight to our callback);
+# %{redirect_url} yields that URL without fetching it, so the caller completes the
+# callback itself — in the jar that carries the flow cookie.
+cb_from_authz() { curl -s -o /dev/null -w '%{redirect_url}' "$1"; }
+complete_cb()   { curl -s -c "$1" -b "$1" "$2"; }
+# One-shot: start (or catalog-connect) response is already in $B → drive the whole
+# dance in a fresh jar and echo the callback page body.
+drive_dance() { # jar-name → callback body ("" on failure)
+  local jar authz cb
+  jar=$(new_jar "$1")
+  authz=$(go_authz "$jar" "$(jb "['go_url']")")
+  [ -z "$authz" ] && { echo ""; return 1; }
+  cb=$(cb_from_authz "$authz")
+  [ -z "$cb" ] && { echo ""; return 1; }
+  complete_cb "$jar" "$cb"
+}
 
 # ── Fake Sentry-shaped MCP (static key via CUSTOM header) ─────────────────
 SN_PORT=8896
@@ -305,7 +343,7 @@ as_admin() { curl -s -X POST -d "${2:-{\}}" "http://127.0.0.1:$AS_PORT/admin/$1"
 export FLUIDBOX_PUBLIC_URL="http://127.0.0.1:8787"
 # Rerun hygiene: custom catalog slugs are DB-unique and the API is
 # deliberately create-only — drop this suite's previous test entries.
-psql "$DATABASE_URL" -qc "delete from connector_catalog where tier='custom' and (slug like 'fx-%' or slug like 'byo-%')" 2>/dev/null
+pqw "delete from connector_catalog where tier='custom' and (slug like 'fx-%' or slug like 'byo-%')" 2>/dev/null
 start_server || exit 1
 ok "stack up (control plane + fake sentry :$SN_PORT + fake oauth AS/MCP :$AS_PORT)"
 
@@ -336,11 +374,12 @@ CODE=$(post "/policies" "{\"name\":\"conn-e2e\",\"yaml\":$PY}")
 [ "$CODE" = "200" ] && ok "conn-e2e policy created" || { no "policy → $CODE: $(cat "$B")"; exit 1; }
 
 PROBE_BUDGET='{"max_wall_clock_secs": 240, "max_cost_usd": 0.05}'
-token_for() { # session → token (kills the runner so probes own the contract)
+token_for() { # session → TOOL-audience token (kills the runner so probes own the contract)
+  # Gap 10: this phase drives /tools/call only — the TOOL-INTENT audience.
   local sid=$1 cid tok=""
   for _ in $(seq 1 30); do
     cid=$(docker ps -a --filter "label=fluidbox.session=$sid" --format '{{.ID}}' | head -1)
-    [ -n "$cid" ] && { tok=$(docker inspect "$cid" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^FLUIDBOX_SESSION_TOKEN=' | cut -d= -f2-); break; }
+    [ -n "$cid" ] && { tok=$(docker inspect "$cid" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^FLUIDBOX_TOOL_TOKEN=' | cut -d= -f2-); break; }
     sleep 1
   done
   [ -n "$cid" ] && docker kill "$cid" >/dev/null 2>&1
@@ -402,11 +441,15 @@ CODE=$(post "/catalog/workspace-info/connect" "{}")
   || { no "authless connect → $CODE: $(cat "$B")"; exit 1; }
 
 # ── INC 1: api_key connect with a CUSTOM header (the Sentry shape) ────────
-say "CONNECT (api_key) — sealed key, custom header honored, photograph proves it"
+# Phase C: a REMOTE (streamable_http) connect no longer auto-registers a
+# capability bundle — it creates a CONNECTION and photographs its tool surface
+# into a connection SNAPSHOT ({connection, snapshot}). Bundles now survive only
+# for in-image sandbox (stdio) entries (workspace-info above).
+say "CONNECT (api_key) — sealed key, custom header honored, snapshot proves it"
 CODE=$(post "/catalog/fx-sentry/connect" "{\"token\":\"$SN_KEY\"}")
-[ "$CODE" = "200" ] && ok "fx-sentry connected (connection + bundle in one step)" || { no "connect → $CODE: $(cat "$B")"; exit 1; }
+[ "$CODE" = "200" ] && ok "fx-sentry connected (connection + snapshot in one step)" || { no "connect → $CODE: $(cat "$B")"; exit 1; }
 SNCONN=$(jb "['connection']['id']")
-[ "$(jb "['bundle']['name']")" = "fx-sentry" ] && ok "bundle fx-sentry auto-registered (settle #4)" || no "bundle: $(cat "$B")"
+[ "$(jb "['snapshot']['version']")" = "1" ] && ok "connection snapshot v1 photographed (Phase C: snapshots, not bundles)" || no "snapshot: $(cat "$B")"
 grep -q "$SN_KEY" "$B" && no "api key echoed in connect response!" || ok "api key not in the connect response"
 get "/connections" | grep -q "$SN_KEY" && no "api key in connection listing!" || ok "api key not in the listing"
 LAST_LIST=$(grep '"method": "tools/list"' "$SN_LOG" | tail -1)
@@ -418,9 +461,9 @@ DECOR=$(get "/catalog" | python3 -c "
 import sys, json
 d = {c['slug']: c for c in json.load(sys.stdin)['connectors']}
 e = d.get('fx-sentry', {})
-conn, bundle = e.get('connection') or {}, e.get('bundle') or {}
-print('ok' if conn.get('status') == 'active' and bundle.get('version', 0) >= 1 else str((conn, bundle)))")
-[ "$DECOR" = "ok" ] && ok "catalog entries decorate with live connection + bundle state (UI renders connected/disconnect)" || no "decoration: $DECOR"
+conn = e.get('connection') or {}
+print('ok' if conn.get('status') == 'active' else str(conn))")
+[ "$DECOR" = "ok" ] && ok "catalog entries decorate with live connection state (UI renders connected/disconnect)" || no "decoration: $DECOR"
 
 CODE=$(post "/catalog/fx-sentry/connect" "{\"token\":\"wrong-key\",\"bundle_name\":\"fx-sentry-bad\",\"display_name\":\"sentry-bad\"}")
 [ "$CODE" = "400" ] && grep -q "rejected this credential" "$B" \
@@ -432,7 +475,10 @@ print(sum(1 for c in cs if c['display_name'] == 'sentry-bad' and c['status'] == 
 [ "$ACTIVE_BAD" = "0" ] && ok "refused credential's connection rolled back (no active row)" || no "dangling connection!"
 
 say "BROKER (api_key) — end-to-end through the custom header"
-post "/agents" "{\"name\":\"conn-sn-$$\",\"policy\":\"conn-e2e\",\"capability_bundles\":[\"fx-sentry\"]}" >/dev/null
+# Phase C: the agent DECLARES a connection requirement (slot fx-sentry, organization
+# binding — the operator has no personal identity); create_run resolves it to the
+# fx-sentry connection's snapshot and freezes a brokered surface in the RunSpec.
+post "/agents" "{\"name\":\"conn-sn-$$\",\"policy\":\"conn-e2e\",\"connection_requirements\":[{\"slot\":\"fx-sentry\",\"connector\":{\"url\":\"http://127.0.0.1:$SN_PORT/mcp\",\"slug\":\"fx-sentry\"},\"required_tools\":[\"sn_find_issues\"],\"binding_mode\":\"organization\"}]}" >/dev/null
 SID_SN=$(probe_session "conn-sn-$$")
 TOK_SN=$(token_for "$SID_SN")
 [ -n "$TOK_SN" ] && ok "probe session launched; runner killed (we drive the contract)" || { no "no session token"; exit 1; }
@@ -471,23 +517,20 @@ CODE=$(post "/mcp/probe" "{\"url\":\"http://127.0.0.1:1/mcp\"}")
 BYO="byo-sentry-$$"
 CODE=$(post "/mcp/servers" "{\"url\":\"http://127.0.0.1:$SN_PORT/mcp\",\"name\":\"$BYO\",
   \"auth_mode\":\"api_key\",\"token\":\"$SN_KEY\",\"header_name\":\"Sentry-Bearer\",\"scheme\":\"\"}")
-[ "$CODE" = "200" ] && ok "one-shot BYO connect → 200 (entry + connection + bundle in one call)" || { no "byo connect → $CODE: $(cat "$B")"; exit 1; }
+[ "$CODE" = "200" ] && ok "one-shot BYO connect → 200 (entry + connection + snapshot in one call)" || { no "byo connect → $CODE: $(cat "$B")"; exit 1; }
+BYOCONN=$(jb "['connection']['id']")
 [ "$(jb "['slug']")" = "$BYO" ] && ok "slug derived server-side ($BYO)" || no "slug: $(jb "['slug']")"
 [ "$(pq "select tier from connector_catalog where slug='$BYO'")" = "custom" ] && ok "BYO server became a tier=custom catalog entry (reuse-the-catalog)" || no "no custom catalog row"
-grep -q "sn_find_issues" "$B" && ok "connect response previews the PHOTOGRAPHED tools (sn_find_issues)" || no "no tool preview in connect response: $(cat "$B")"
+grep -q "sn_find_issues" "$B" && ok "connect response previews the PHOTOGRAPHED snapshot tools (sn_find_issues)" || no "no tool preview in connect response: $(cat "$B")"
 grep -q "$SN_KEY" "$B" && no "api key echoed in BYO connect response!" || ok "api key not in the BYO connect response"
 
-# Tool preview API: GET /capabilities/{id} now returns per-server tool lists.
-BID=$(get "/capabilities" | python3 -c "
+# Tool surface API (Phase C): GET /connections/{id}/tools returns the latest
+# connection snapshot's per-tool list (name + description) for the UI preview.
+PREV=$(get "/connections/$BYOCONN/tools" | python3 -c "
 import sys, json
-bs = [b for b in json.load(sys.stdin)['bundles'] if b['name'] == '$BYO']
-print(bs[0]['id'] if bs else '')")
-PREV=$(get "/capabilities/$BID" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-ts = [t for s in d.get('servers', []) for t in s.get('tools', [])]
+ts = json.load(sys.stdin).get('snapshot', {}).get('tools', [])
 print('ok' if any(t.get('name') and 'description' in t for t in ts) else 'no')")
-[ "$PREV" = "ok" ] && ok "GET /capabilities/{id} exposes per-server tools (name + description) for the UI preview" || no "no tool preview in bundle detail"
+[ "$PREV" = "ok" ] && ok "GET /connections/{id}/tools exposes the snapshot's tools (name + description) for the UI preview" || no "no tool preview in the connection snapshot"
 
 # Orphan cleanup: a refused key rolls BOTH the connection AND the custom entry.
 BYO_BAD="byo-bad-$$"
@@ -516,10 +559,16 @@ CODE=$(post "/agents" "{\"name\":\"byo-match-$$\",\"policy\":\"conn-e2e\",\"harn
 say "OAUTH DANCE — 401 → PRM → AS metadata → PKCE+resource → callback → sealed rotating refresh"
 as_admin mode '{"cimd": false, "access_ttl": 3600}'
 CODE=$(post "/catalog/fx-notion/connect" "{\"display_name\":\"fx-notion-main\"}")
-[ "$CODE" = "200" ] && ok "oauth connect → pending connection + authorize_url" || { no "connect → $CODE: $(cat "$B")"; exit 1; }
+[ "$CODE" = "200" ] && ok "oauth connect → pending connection + go_url" || { no "connect → $CODE: $(cat "$B")"; exit 1; }
 NTCONN=$(jb "['connection']['id']")
-AUTH_URL=$(jb "['authorize_url']")
 [ "$(jb "['connection']['status']")" = "pending" ] && ok "connection starts pending (fail-closed until the exchange)" || no "status: $(jb "['connection']['status']")"
+# The "browser" for this dance. GET-ing go_url is what binds it (the
+# __Host-fbx_oauth_flow cookie lands in the jar); the callback below refuses
+# without that cookie, so both legs ride the SAME jar.
+JAR_NT=$(new_jar nt)
+AUTH_URL=$(go_authz "$JAR_NT" "$(jb "['go_url']")")
+[ -n "$AUTH_URL" ] && grep -qi '__Host-fbx_oauth_flow' "$JAR_NT" \
+  && ok "go leg bound the browser (per-flow cookie) and 302'd to the AS" || { no "go leg: authz='$AUTH_URL' jar=$(cat "$JAR_NT")"; exit 1; }
 echo "$AUTH_URL" | grep -q "code_challenge_method=S256" && echo "$AUTH_URL" | grep -q "code_challenge=" \
   && ok "authorize URL carries PKCE S256" || no "authorize url: $AUTH_URL"
 echo "$AUTH_URL" | grep -q "resource=http%3A%2F%2F127.0.0.1%3A$AS_PORT%2Fmcp" \
@@ -530,15 +579,16 @@ echo "$AUTH_URL" | grep -q "client_id=dcr-client-" \
 echo "$AUTH_URL" | grep -q "offline_access" \
   && ok "offline_access requested (AS advertises it)" || no "no offline_access in scope"
 
-# The "browser": follow the auto-consent redirect, then hit our callback.
-CB_URL=$(curl -s -o /dev/null -w '%{redirect_url}' "$AUTH_URL")
+# Follow the auto-consent redirect, then hit our callback IN THE SAME JAR.
+CB_URL=$(cb_from_authz "$AUTH_URL")
 echo "$CB_URL" | grep -q "^http://127.0.0.1:8787/v1/oauth/callback?" \
   && ok "AS redirected to THE one stable callback" || { no "redirect: $CB_URL"; exit 1; }
-CB_BODY=$(curl -s "$CB_URL")
+CB_BODY=$(complete_cb "$JAR_NT" "$CB_URL")
 echo "$CB_BODY" | grep -q "Connected" && ok "callback (unauthenticated route) completed the exchange" || { no "callback: $CB_BODY"; exit 1; }
-# Version-agnostic: the bundle registry is append-only, so reruns publish
-# the next fx-notion version.
-echo "$CB_BODY" | grep -qE "fx-notion@[0-9]+" && ok "pending bundle auto-registered with the fresh token" || no "bundle note missing: $CB_BODY"
+# Phase C: the callback photographs the pending_snapshot (not a brokered bundle)
+# with the freshly minted access token — the "Connected" page reports the count.
+echo "$CB_BODY" | grep -qiE "snapshotted [0-9]+ tool" && echo "$CB_BODY" | grep -qE "\(v[0-9]+\)" \
+  && ok "pending_snapshot photographed with the fresh token (connection snapshot, not a bundle)" || no "snapshot note missing: $CB_BODY"
 NTSTATUS=$(get "/connections" | python3 -c "
 import sys, json
 print([c['status'] for c in json.load(sys.stdin)['connections'] if c['id'] == '$NTCONN'][0])")
@@ -572,7 +622,10 @@ print(json.dumps(gs[-1]) if gs else '')"
 # container's session ~60s after its last heartbeat, so each cluster gets
 # its own just-in-time session.
 say "REFRESH — reactive 401 + atomic rotation (old token dead) + proactive pre-expiry"
-post "/agents" "{\"name\":\"conn-nt-$$\",\"policy\":\"conn-e2e\",\"capability_bundles\":[\"fx-notion\"]}" >/dev/null
+# Phase C: the OAuth custody rides the connection; the agent declares a
+# requirement (slot fx-notion) that create_run resolves to the fx-notion
+# connection's snapshot — the broker mint/refresh/rotation below is unchanged.
+post "/agents" "{\"name\":\"conn-nt-$$\",\"policy\":\"conn-e2e\",\"connection_requirements\":[{\"slot\":\"fx-notion\",\"connector\":{\"url\":\"http://127.0.0.1:$AS_PORT/mcp\",\"slug\":\"fx-notion\"},\"required_tools\":[\"nt_search\"],\"binding_mode\":\"organization\"}]}" >/dev/null
 SID_NT=$(probe_session "conn-nt-$$")
 TOK_NT=$(token_for "$SID_NT")
 R=$(broke "$SID_NT" "$TOK_NT" n1 "mcp__fx-notion__nt_search" '{"query":"roadmap"}')
@@ -626,7 +679,8 @@ CODE=$(post "/connections" "{\"provider\":\"mcp_http\",\"auth_kind\":\"oauth\",\
 [ "$CODE" = "200" ] && ok "direct oauth connection created (non-catalog path)" || { no "conn → $CODE: $(cat "$B")"; exit 1; }
 CIMDCONN=$(jb "['connection']['id']")
 CODE=$(post "/connections/$CIMDCONN/oauth/start" "{}")
-AUTH_URL2=$(jb "['authorize_url']")
+JAR_CIMD=$(new_jar cimd)
+AUTH_URL2=$(go_authz "$JAR_CIMD" "$(jb "['go_url']")")
 # The AS advertises CIMD, but this deployment's public URL is loopback
 # http — an AS could never FETCH our client document (real Notion answered
 # "Unknown OAuth client" to exactly this). The eligibility guard must fall
@@ -635,14 +689,14 @@ echo "$AUTH_URL2" | grep -q "client_id=dcr-client-" \
   && ok "CIMD advertised but public URL is loopback http → DCR used (eligibility guard)" || no "guard client_id: $AUTH_URL2"
 [ "$(as_field "['register'].__len__()")" = "$((REG_BEFORE + 1))" ] \
   && ok "fresh DCR registration minted for the new connection" || no "register count: $(as_field "['register'].__len__()")"
-CB2=$(curl -s "$(curl -s -o /dev/null -w '%{redirect_url}' "$AUTH_URL2")")
+CB2=$(complete_cb "$JAR_CIMD" "$(cb_from_authz "$AUTH_URL2")")
 echo "$CB2" | grep -q "Connected" && ok "guarded dance completed" || no "guarded callback: $CB2"
 # Reconnect re-resolution: seed the pre-guard footgun — a STORED CIMD
 # identity from a loopback deployment — and start again; it must be
 # re-resolved to DCR, never replayed at the AS.
-psql "$DATABASE_URL" -qc "update integration_connections set oauth = oauth || '{\"client_id\": \"http://127.0.0.1:8787/.well-known/fluidbox-client.json\", \"client_id_source\": \"cimd\"}'::jsonb where id = '$CIMDCONN'"
+pqw "update integration_connections set oauth = oauth || '{\"client_id\": \"http://127.0.0.1:8787/.well-known/fluidbox-client.json\", \"client_id_source\": \"cimd\"}'::jsonb where id = '$CIMDCONN'"
 post "/connections/$CIMDCONN/oauth/start" "{}" >/dev/null
-AUTH_URL2B=$(jb "['authorize_url']")
+AUTH_URL2B=$(go_authz "$(new_jar cimd2)" "$(jb "['go_url']")")
 echo "$AUTH_URL2B" | grep -q "client_id=dcr-client-" \
   && ok "stale stored CIMD identity re-resolved on reconnect (not replayed)" || no "stale reuse: $AUTH_URL2B"
 
@@ -651,10 +705,11 @@ CODE=$(post "/connections" "{\"provider\":\"mcp_http\",\"auth_kind\":\"oauth\",\
   \"display_name\":\"fx-notion-conf\",\"client_id\":\"pre-client-7\",\"client_secret\":\"$PRE_SECRET\"}")
 CONFCONN=$(jb "['connection']['id']")
 post "/connections/$CONFCONN/oauth/start" "{}" >/dev/null
-AUTH_URL3=$(jb "['authorize_url']")
+JAR_CONF=$(new_jar conf)
+AUTH_URL3=$(go_authz "$JAR_CONF" "$(jb "['go_url']")")
 echo "$AUTH_URL3" | grep -q "client_id=pre-client-7" \
   && ok "pre-registered client_id wins over CIMD/DCR (priority order)" || no "conf client_id: $AUTH_URL3"
-CB3=$(curl -s "$(curl -s -o /dev/null -w '%{redirect_url}' "$AUTH_URL3")")
+CB3=$(complete_cb "$JAR_CONF" "$(cb_from_authz "$AUTH_URL3")")
 echo "$CB3" | grep -q "Connected" && ok "confidential dance completed" || no "conf callback: $CB3"
 CONF_AUTH=$(as_state | python3 -c "
 import sys, json, base64
@@ -690,13 +745,23 @@ CODE=$(post "/sessions" "{\"agent\":\"conn-nt-$$\",\"task\":\"should fail closed
 
 CODE=$(post "/connections/$NTCONN/oauth/start" "{}")
 [ "$CODE" = "200" ] && ok "reconnect: the dance restarts on the SAME connection" || { no "restart → $CODE: $(cat "$B")"; exit 1; }
-AUTH_URL4=$(jb "['authorize_url']")
-CB4=$(curl -s "$(curl -s -o /dev/null -w '%{redirect_url}' "$AUTH_URL4")")
+CB4=$(drive_dance reconnect)
 echo "$CB4" | grep -q "Connected" && ok "reconnect dance completed" || no "reconnect callback: $CB4"
 NTSTATUS=$(get "/connections" | python3 -c "
 import sys, json
 print([c['status'] for c in json.load(sys.stdin)['connections'] if c['id'] == '$NTCONN'][0])")
 [ "$NTSTATUS" = "active" ] && ok "connection revived (error → active)" || no "status after reconnect: $NTSTATUS"
+# R3.1-tail: the reconnect (from error, NOT a first connect) bumped the
+# authorization generation atomically in the activation, and a post-reconnect
+# tools refresh photographs a snapshot stamped at the NEW generation — so any run
+# binding frozen under the old generation fails closed.
+NTGEN=$(pq "select authorization_generation from integration_connections where id='$NTCONN'")
+[ "$NTGEN" = "2" ] && ok "reconnect bumped authorization_generation → 2 (re-consent may be a new grant)" || no "generation after reconnect: $NTGEN (want 2)"
+CODE=$(post "/connections/$NTCONN/tools/refresh" "{}")
+RSGEN=$(jb "['snapshot']['authorization_generation']")
+{ [ "$CODE" = "200" ] && [ "$RSGEN" = "2" ]; } \
+  && ok "post-reconnect tools refresh photographs at the new generation (snapshot gen $RSGEN)" \
+  || no "post-reconnect refresh → $CODE snapshot gen '$RSGEN' (want 200 / gen 2)"
 CODE=$(post "/sessions" "{\"agent\":\"conn-nt-$$\",\"task\":\"works again\",\"autonomous\":true,\"budgets\":$PROBE_BUDGET}")
 [ "$CODE" = "200" ] && ok "new run creates again after reconnect" || no "run after reconnect → $CODE"
 SID_RE=$(jb "['session']['id']")

@@ -14,12 +14,14 @@
 //!   oauth   → pending connection + the oauth.rs dance; the callback
 //!             photographs with the freshly minted access token
 
-use crate::auth::Admin;
+use crate::auth::Principal;
 use crate::error::{ApiError, ApiResult};
+use crate::rbac;
 use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::Json;
 use fluidbox_core::capability::{CapabilityServer, ToolSnapshot};
+use fluidbox_db::TenantScope;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -49,10 +51,18 @@ fn is_connectable(transport: &str) -> bool {
 /// latest bundle named after the slug. Pure presentation derivation, done
 /// server-side so the dashboard stays logic-free; overridden bundle names
 /// deliberately don't count as "this entry's bundle".
-pub async fn list(_: Admin, State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    let rows = fluidbox_db::list_catalog(&state.pool).await?;
-    let conns = fluidbox_db::list_connections(&state.pool, state.tenant_id).await?;
-    let bundles = fluidbox_db::list_capability_bundles(&state.pool, state.tenant_id).await?;
+pub async fn list(principal: Principal, State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let scope = principal.scope();
+    let rows = fluidbox_db::list_catalog(&state.pool, scope).await?;
+    // Owner-filtered so a teammate's PERSONAL connection never renders an entry
+    // as "connected" for someone who can't see it (design :274-296).
+    let conns = fluidbox_db::list_connections_visible(
+        &state.pool,
+        scope,
+        rbac::connection_viewer(&principal),
+    )
+    .await?;
+    let bundles = fluidbox_db::list_capability_bundles(&state.pool, scope).await?;
     let connectors: Vec<Value> = rows
         .iter()
         .map(|r| {
@@ -111,11 +121,12 @@ fn entry_bundle(
 }
 
 pub async fn get(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(slug): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    let row = fluidbox_db::get_catalog_by_slug(&state.pool, &slug)
+    let scope = principal.scope();
+    let row = fluidbox_db::get_catalog_by_slug(&state.pool, scope, &slug)
         .await?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(json!({ "connector": row })))
@@ -152,11 +163,16 @@ pub struct CreateEntry {
 /// `POST /v1/catalog` — add a CUSTOM entry (the tier is forced server-side;
 /// verified/community are curation judgements the API cannot self-award).
 pub async fn create(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Json(req): Json<CreateEntry>,
 ) -> ApiResult<Json<Value>> {
-    let row = create_entry_row(&state, &req).await?;
+    if !rbac::can_mutate_resources(&principal) {
+        return Err(ApiError::Forbidden(
+            "adding catalog entries requires admin or owner".into(),
+        ));
+    }
+    let row = create_entry_row(&state, principal.scope(), &req).await?;
     Ok(Json(json!({ "connector": row })))
 }
 
@@ -165,6 +181,7 @@ pub async fn create(
 /// (`add_custom`) so a pasted URL and a raw catalog POST land identically.
 async fn create_entry_row(
     state: &AppState,
+    scope: TenantScope,
     req: &CreateEntry,
 ) -> ApiResult<fluidbox_db::ConnectorCatalogRow> {
     let slug = req.slug.trim();
@@ -221,7 +238,10 @@ async fn create_entry_row(
             )));
         }
     }
-    if fluidbox_db::get_catalog_by_slug(&state.pool, slug)
+    // Scoped pre-check: a slug already visible to this tenant (its own custom
+    // row OR a shadowing-eligible global) is a 409. The DB `not exists (global)`
+    // guard is the race backstop (returns None → mapped to 409 below).
+    if fluidbox_db::get_catalog_by_slug(&state.pool, scope, slug)
         .await?
         .is_some()
     {
@@ -231,6 +251,7 @@ async fn create_entry_row(
     }
     let row = fluidbox_db::create_catalog_entry(
         &state.pool,
+        scope,
         slug,
         name,
         req.icon.as_deref(),
@@ -245,7 +266,12 @@ async fn create_entry_row(
         req.tool_hints.as_ref().unwrap_or(&json!([])),
         req.sandbox_launch.as_ref(),
     )
-    .await?;
+    .await?
+    .ok_or_else(|| {
+        ApiError::Conflict(format!(
+            "catalog slug '{slug}' collides with a global entry"
+        ))
+    })?;
     Ok(row)
 }
 
@@ -269,20 +295,30 @@ pub struct ConnectReq {
     pub client_secret: Option<String>,
     #[serde(default)]
     pub scopes: Option<Vec<String>>,
+    /// `organization` (default; requires admin/owner) or `personal` (any
+    /// member's private custody). Mirrors `POST /v1/connections` (design
+    /// :274-296).
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 /// `POST /v1/catalog/{slug}/connect` — settle #4: one click from catalog
 /// entry to attachable bundle, branched on the entry's auth_mode.
 pub async fn connect(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Path(slug): Path<String>,
     Json(req): Json<ConnectReq>,
 ) -> ApiResult<Json<Value>> {
-    let entry = fluidbox_db::get_catalog_by_slug(&state.pool, &slug)
+    // Ownership + authorization: catalog Connect only ever produces an mcp_http
+    // connection (or an org sandbox bundle), so resolve against that provider —
+    // `organization` needs admin/owner, `personal` any member (design :274-296).
+    let owner = crate::connections::resolve_owner(&principal, "mcp_http", req.owner.as_deref())?;
+    let scope = principal.scope();
+    let entry = fluidbox_db::get_catalog_by_slug(&state.pool, scope, &slug)
         .await?
         .ok_or(ApiError::NotFound)?;
-    connect_entry(&state, entry, req).await
+    connect_entry(&state, scope, owner, entry, req).await
 }
 
 /// The three-branch connect body (none / api_key / oauth), factored out of the
@@ -291,6 +327,8 @@ pub async fn connect(
 /// photograph, and the OAuth dance all live here unchanged.
 async fn connect_entry(
     state: &AppState,
+    scope: TenantScope,
+    owner: crate::connections::OwnerContext,
     entry: fluidbox_db::ConnectorCatalogRow,
     req: ConnectReq,
 ) -> ApiResult<Json<Value>> {
@@ -314,15 +352,83 @@ async fn connect_entry(
 
     match entry.auth_mode.as_str() {
         "none" => {
-            let server = authless_server(&entry)?;
-            let row = crate::capabilities::register_bundle(
-                state,
-                &bundle_name,
-                entry.description.as_deref(),
-                vec![server],
+            // Sandbox (in-image stdio) entries keep the bundle path — bundles
+            // survive for sandbox tools (design :320-323).
+            if entry.sandbox_launch.is_some() {
+                // A capability bundle is a credential-free, org-SHARED resource
+                // with no personal custody — `personal` doesn't apply. Since
+                // `resolve_owner` already required admin/owner for `organization`,
+                // rejecting a personal request here also blocks a plain member
+                // from registering an org bundle (no privilege escalation).
+                if !matches!(owner.owner, fluidbox_db::ConnectionOwner::Organization) {
+                    return Err(ApiError::BadRequest(
+                        "in-image (stdio) connectors are organization capability bundles and \
+                         cannot be personal — connect them as an organization connection"
+                            .into(),
+                    ));
+                }
+                let server = sandbox_launch_server(&entry)?;
+                let row = crate::capabilities::register_bundle(
+                    state,
+                    scope,
+                    &bundle_name,
+                    entry.description.as_deref(),
+                    vec![server],
+                )
+                .await?;
+                return Ok(Json(crate::capabilities::bundle_json(&row)));
+            }
+            // Credentialless remote: a real `auth_kind="none"` connection (NULL
+            // credential) whose tool surface is photographed into a snapshot.
+            let url = entry.url.as_deref().ok_or_else(|| {
+                ApiError::BadRequest("catalog entry has neither url nor sandbox_launch".into())
+            })?;
+            let host = reqwest::Url::parse(url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_else(|| "mcp".into());
+            let metadata =
+                json!({ "base_url": url, "endpoint_url": url, "catalog_slug": entry.slug });
+            let row = fluidbox_db::create_connection(
+                &state.pool,
+                scope,
+                "mcp_http",
+                &host,
+                req.display_name.as_deref().unwrap_or(&entry.name),
+                None,
+                1,
+                &json!([]),
+                &json!({}),
+                &metadata,
+                None,
+                1,
+                fluidbox_db::ConnectionAuth {
+                    auth_kind: "none",
+                    status: "active",
+                    oauth: None,
+                    client_secret_sealed: None,
+                    client_secret_key_version: 1,
+                    registration_id: None,
+                },
+                owner.owner,
+                owner.created_by_user_id,
             )
             .await?;
-            Ok(Json(crate::capabilities::bundle_json(&row)))
+            match crate::snapshots::photograph_connection(state, scope, row.id, url).await {
+                Ok(snap) => Ok(Json(json!({
+                    "connection": row,
+                    "snapshot": crate::snapshots::snapshot_json(&snap),
+                }))),
+                Err(e) => {
+                    fluidbox_db::revoke_connection(&state.pool, scope, row.id)
+                        .await
+                        .ok();
+                    Err(crate::snapshots::rolled_back(
+                        "the MCP server could not be photographed",
+                        e,
+                    ))
+                }
+            }
         }
         "api_key" => {
             let url = entry
@@ -357,46 +463,35 @@ async fn connect_entry(
                 scopes: None,
                 client_id: None,
                 client_secret: None,
+                // Ownership is passed to `create_mcp_http_connection` via the
+                // `owner` arg, not this request body.
+                owner: None,
             };
-            let created = crate::connections::create_mcp_http_connection(state, create).await?;
-            let connection_id = created.id;
-            let server = CapabilityServer::Brokered {
-                name: entry.slug.clone(),
-                url: url.to_string(),
-                connection_id: Some(connection_id),
-                identity: None,
-                tools: Vec::new(),
-            };
-            match crate::capabilities::register_bundle(
+            let created = crate::connections::create_mcp_http_connection(
                 state,
-                &bundle_name,
-                entry.description.as_deref(),
-                vec![server],
+                scope,
+                owner,
+                create,
+                Some(&entry.slug),
             )
-            .await
-            {
-                Ok(row) => {
-                    // Return the photographed servers/tools too so the wizard's
-                    // success screen can show what was discovered.
-                    let bj = crate::capabilities::bundle_json(&row);
-                    Ok(Json(json!({
-                        "connection": created,
-                        "bundle": bj["bundle"],
-                        "servers": bj["servers"],
-                    })))
-                }
+            .await?;
+            let connection_id = created.id;
+            // The photograph is the credential's proof-of-life AND freezes the
+            // tool surface into a snapshot; a refused key must not leave a
+            // dangling connection.
+            match crate::snapshots::photograph_connection(state, scope, connection_id, url).await {
+                Ok(snap) => Ok(Json(json!({
+                    "connection": created,
+                    "snapshot": crate::snapshots::snapshot_json(&snap),
+                }))),
                 Err(e) => {
-                    // The photograph is the credential's proof-of-life; a
-                    // refused key must not leave a dangling connection.
-                    fluidbox_db::revoke_connection(&state.pool, connection_id)
+                    fluidbox_db::revoke_connection(&state.pool, scope, connection_id)
                         .await
                         .ok();
-                    Err(match e {
-                        ApiError::BadRequest(m) => ApiError::BadRequest(format!(
-                            "the server rejected this credential (connection rolled back): {m}"
-                        )),
-                        other => other,
-                    })
+                    Err(crate::snapshots::rolled_back(
+                        "the server rejected this credential",
+                        e,
+                    ))
                 }
             }
         }
@@ -427,10 +522,12 @@ async fn connect_entry(
                     scopes.push(s);
                 }
             }
+            // Phase C: the callback photographs a connection snapshot (not a
+            // brokered bundle) at `pending_snapshot.url` after activation.
             let mut oauth = json!({
                 "resource": resource,
                 "scopes": scopes,
-                "pending_bundle": { "name": bundle_name, "url": url },
+                "pending_snapshot": { "url": url },
                 "catalog_slug": entry.slug,
             });
             if let Some(cid) = req
@@ -442,40 +539,62 @@ async fn connect_entry(
                 oauth["client_id"] = json!(cid);
                 oauth["client_id_source"] = json!("preregistered");
             }
-            let sealed_secret = req
+            let sealed_secret = match req
                 .client_secret
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(|s| sealer.seal(s));
+            {
+                Some(s) => Some(
+                    sealer
+                        .seal(
+                            s,
+                            crate::seal::SealCtx::new(
+                                scope.tenant_id(),
+                                crate::seal::SealFamily::ConnectionClientSecret,
+                            ),
+                        )
+                        .await?,
+                ),
+                None => None,
+            };
+            let (cs_bytes, cs_kv) = crate::seal::Sealed::split(&sealed_secret);
             let host = reqwest::Url::parse(url)
                 .ok()
                 .and_then(|u| u.host_str().map(str::to_string))
                 .unwrap_or_else(|| "mcp".into());
             let row = fluidbox_db::create_connection(
                 &state.pool,
-                state.tenant_id,
+                scope,
                 "mcp_http",
                 &host,
                 req.display_name.as_deref().unwrap_or(&entry.name),
                 None,
+                1,
                 &json!([]),
                 &json!({}),
-                &json!({ "base_url": url }),
+                &json!({ "base_url": url, "endpoint_url": url, "catalog_slug": entry.slug }),
                 None,
+                1,
                 fluidbox_db::ConnectionAuth {
                     auth_kind: "oauth",
                     status: "pending",
                     oauth: Some(&oauth),
-                    client_secret_sealed: sealed_secret.as_deref(),
+                    client_secret_sealed: cs_bytes,
+                    client_secret_key_version: cs_kv,
                     registration_id: None,
                 },
+                owner.owner,
+                owner.created_by_user_id,
             )
             .await?;
-            let authorize_url = crate::oauth::start_dance(state, row.id).await?;
+            // The initiating user (from the resolved owner; None for the operator)
+            // is bound onto the one-time flow row (invariant 20).
+            let go_url =
+                crate::oauth::start_dance(state, scope, owner.created_by_user_id, row.id).await?;
             Ok(Json(json!({
                 "connection": row,
-                "authorize_url": authorize_url,
+                "go_url": go_url,
             })))
         }
         other => Err(ApiError::BadRequest(format!(
@@ -484,43 +603,36 @@ async fn connect_entry(
     }
 }
 
-/// Build the server for an authless entry: in-image stdio launch (declared
-/// tools) or a credential-free remote (photographed without a connection).
-fn authless_server(entry: &fluidbox_db::ConnectorCatalogRow) -> ApiResult<CapabilityServer> {
-    if let Some(launch) = &entry.sandbox_launch {
-        let command = launch["command"]
-            .as_str()
-            .filter(|c| !c.is_empty())
-            .ok_or_else(|| ApiError::BadRequest("catalog sandbox_launch has no command".into()))?
-            .to_string();
-        let args: Vec<String> = launch["args"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let tools: Vec<ToolSnapshot> = serde_json::from_value(launch["tools"].clone())
-            .map_err(|e| ApiError::BadRequest(format!("catalog sandbox_launch tools: {e}")))?;
-        return Ok(CapabilityServer::Sandbox {
-            name: entry.slug.clone(),
-            command,
-            args,
-            identity: None,
-            tools,
-        });
-    }
-    let url = entry.url.as_deref().ok_or_else(|| {
-        ApiError::BadRequest("catalog entry has neither url nor sandbox_launch".into())
+/// Build the sandbox (in-image stdio) server for an authless entry that carries
+/// a `sandbox_launch`. Brokered/remote authless entries no longer become
+/// bundles — they become credentialless connections + snapshots (see the `none`
+/// connect branch), so this handles only the sandbox case.
+fn sandbox_launch_server(entry: &fluidbox_db::ConnectorCatalogRow) -> ApiResult<CapabilityServer> {
+    let launch = entry.sandbox_launch.as_ref().ok_or_else(|| {
+        ApiError::BadRequest("catalog entry has no sandbox_launch to publish".into())
     })?;
-    Ok(CapabilityServer::Brokered {
+    let command = launch["command"]
+        .as_str()
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("catalog sandbox_launch has no command".into()))?
+        .to_string();
+    let args: Vec<String> = launch["args"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let tools: Vec<ToolSnapshot> = serde_json::from_value(launch["tools"].clone())
+        .map_err(|e| ApiError::BadRequest(format!("catalog sandbox_launch tools: {e}")))?;
+    Ok(CapabilityServer::Sandbox {
         name: entry.slug.clone(),
-        url: url.to_string(),
-        connection_id: None,
+        command,
+        args,
         identity: None,
-        tools: Vec::new(),
+        tools,
     })
 }
 
@@ -539,10 +651,15 @@ pub struct ProbeReq {
 /// both) is surfaced via `oauth_available` + `static_possible` + `notes`,
 /// never guessed silently.
 pub async fn probe(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Json(req): Json<ProbeReq>,
 ) -> ApiResult<Json<Value>> {
+    if !rbac::can_mutate_resources(&principal) {
+        return Err(ApiError::Forbidden(
+            "probing MCP servers requires admin or owner".into(),
+        ));
+    }
     let url = req.url.trim();
     let parsed = reqwest::Url::parse(url)
         .map_err(|_| ApiError::BadRequest("a valid http(s) url is required".into()))?;
@@ -551,7 +668,7 @@ pub async fn probe(
     }
     let mut notes: Vec<String> = Vec::new();
     match crate::broker::probe_tools(&state, url).await {
-        crate::broker::ProbeOutcome::Tools(tools) => {
+        crate::broker::ProbeOutcome::Tools { tools, truncated } => {
             // Display-only preview (capped at the core per-server tool cap of
             // 64); the authoritative photograph still runs at connect.
             let preview: Vec<Value> = tools
@@ -559,6 +676,15 @@ pub async fn probe(
                 .take(64)
                 .map(|t| json!({ "name": t.name, "description": t.description }))
                 .collect();
+            // M10: the probe used to silently truncate at the discovery page cap
+            // and show a PREFIX as if it were the whole surface. Say so — and say
+            // that connect will refuse, because `discover_snapshot` will not
+            // freeze a partial surface.
+            if truncated {
+                notes.push(
+                    "This server lists more tools than the discovery page cap, so the preview above is only the first pages — connecting will be refused until the server pages within the cap.".into(),
+                );
+            }
             Ok(Json(json!({
                 "url": url,
                 "transport": "streamable_http",
@@ -567,6 +693,7 @@ pub async fn probe(
                 "oauth_available": false,
                 "static_possible": false,
                 "tools_preview": preview,
+                "tools_truncated": truncated,
                 "oauth": Value::Null,
                 "auth_hints": {},
                 "notes": notes,
@@ -662,6 +789,12 @@ pub struct AddCustomReq {
     pub client_id: Option<String>,
     #[serde(default)]
     pub client_secret: Option<String>,
+    /// `organization` (default; requires admin/owner) or `personal` (any
+    /// member's private custody). The auto-created tier=custom catalog entry
+    /// stays organization reference data regardless — only the CONNECTION it
+    /// produces carries the personal owner.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 /// `POST /v1/mcp/servers` — the one-shot "bring your own MCP server" flow: a
@@ -671,10 +804,15 @@ pub struct AddCustomReq {
 /// no orphan card survives; for oauth the entry MUST persist (the callback
 /// re-fetches it by `catalog_slug` to auto-register the bundle).
 pub async fn add_custom(
-    _: Admin,
+    principal: Principal,
     State(state): State<AppState>,
     Json(req): Json<AddCustomReq>,
 ) -> ApiResult<Json<Value>> {
+    // Ownership + authorization (design :274-296): `organization` needs
+    // admin/owner, `personal` any member. The tier=custom catalog entry created
+    // below is org reference data regardless; only the connection is owned.
+    let owner = crate::connections::resolve_owner(&principal, "mcp_http", req.owner.as_deref())?;
+    let scope = principal.scope();
     let url = req.url.trim();
     let parsed = reqwest::Url::parse(url)
         .map_err(|_| ApiError::BadRequest("a valid http(s) url is required".into()))?;
@@ -692,7 +830,7 @@ pub async fn add_custom(
         ));
     }
     let host = parsed.host_str().unwrap_or("mcp");
-    let slug = derive_slug(&state, host, name).await?;
+    let slug = derive_slug(&state, scope, host, name).await?;
 
     // api_key custom header/scheme ride the entry's auth_hints — exactly the
     // shape connect_entry's api_key branch reads (Sentry's custom header etc.).
@@ -731,7 +869,7 @@ pub async fn add_custom(
         tool_hints: None,
         sandbox_launch: None,
     };
-    let entry = create_entry_row(&state, &create).await?;
+    let entry = create_entry_row(&state, scope, &create).await?;
 
     let connect_req = ConnectReq {
         display_name: req.display_name.clone(),
@@ -740,6 +878,9 @@ pub async fn add_custom(
         client_id: req.client_id.clone(),
         client_secret: req.client_secret.clone(),
         scopes: req.scopes.clone(),
+        // Ownership is carried by the `owner` arg to `connect_entry`, resolved
+        // once above — this inner request never re-resolves it.
+        owner: None,
     };
 
     let with_slug = |mut out: Json<Value>| {
@@ -754,10 +895,10 @@ pub async fn add_custom(
     // rolls it back on FAILURE — including a failed OAuth dance (a discover /
     // insert / start_dance error means no callback is ever coming, so the
     // entry would otherwise orphan exactly like a refused api_key).
-    match connect_entry(&state, entry, connect_req).await {
+    match connect_entry(&state, scope, owner, entry, connect_req).await {
         Ok(out) => Ok(with_slug(out)),
         Err(e) => {
-            if let Err(del) = fluidbox_db::delete_catalog_entry(&state.pool, &slug).await {
+            if let Err(del) = fluidbox_db::delete_catalog_entry(&state.pool, scope, &slug).await {
                 tracing::warn!(
                     "BYO connect for '{slug}' failed ({e}); entry rollback also failed: {del}"
                 );
@@ -789,7 +930,12 @@ fn slugify(s: &str) -> String {
 
 /// Derive a UNIQUE catalog slug from the server name (host as fallback),
 /// appending `-2`, `-3`, … on collision.
-async fn derive_slug(state: &AppState, host: &str, name: &str) -> ApiResult<String> {
+async fn derive_slug(
+    state: &AppState,
+    scope: TenantScope,
+    host: &str,
+    name: &str,
+) -> ApiResult<String> {
     let mut base = slugify(name);
     if !valid_slug(&base) {
         base = slugify(host);
@@ -804,7 +950,7 @@ async fn derive_slug(state: &AppState, host: &str, name: &str) -> ApiResult<Stri
             format!("{base}-{}", n + 1)
         };
         if valid_slug(&cand)
-            && fluidbox_db::get_catalog_by_slug(&state.pool, &cand)
+            && fluidbox_db::get_catalog_by_slug(&state.pool, scope, &cand)
                 .await?
                 .is_none()
         {

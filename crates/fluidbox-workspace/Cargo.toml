@@ -6,6 +6,24 @@ license.workspace = true
 repository.workspace = true
 description = "fluidbox workspace lifecycle: materialization, pristine baselines, hardened diff collection"
 
+[features]
+default = []
+# The control-plane-side archive object store (Phase F, Task 4: `store.rs` +
+# `sigv4.rs`). OFF by default and enabled ONLY by `fluidbox-server`, so the
+# in-pod `workspaced` musl binary — which merely unpacks an archive it already
+# downloaded with blocking `ureq` — never links an async runtime, an HTTP client
+# or a signer it has no use for.
+store = [
+    "dep:async-trait",
+    "dep:bytes",
+    "dep:chrono",
+    "dep:futures",
+    "dep:hmac",
+    "dep:reqwest",
+    "dep:tokio",
+    "dep:tracing",
+]
+
 [dependencies]
 fluidbox-core = { workspace = true }
 thiserror = { workspace = true }
@@ -17,3 +35,13 @@ uuid = { workspace = true }
 # keeps the collector a trivially static musl binary — no zstd-sys C toolchain.
 tar = "0.4"
 flate2 = "1"
+
+# `store` feature only — see the feature comment above.
+async-trait = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }

@@ -251,7 +251,7 @@ async fn main() -> Result<()> {
             let res = client
                 .post(
                     &format!("/v1/approvals/{id}/decision"),
-                    json!({ "decision": decision, "decided_by": "cli" }),
+                    json!({ "decision": decision }),
                 )
                 .await?;
             println!(
@@ -263,7 +263,7 @@ async fn main() -> Result<()> {
             client
                 .post(
                     &format!("/v1/approvals/{id}/decision"),
-                    json!({ "decision": "denied", "decided_by": "cli" }),
+                    json!({ "decision": "denied" }),
                 )
                 .await?;
             println!("✗ denied");
