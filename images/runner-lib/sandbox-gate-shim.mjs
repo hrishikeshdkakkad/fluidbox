@@ -101,7 +101,7 @@ for (const k of Object.keys(childEnv)) {
     delete childEnv[k];
   }
 }
-const child = new Client({ name: `fluidbox-gate-${SERVER_NAME}`, version: "0.1.0" }, { capabilities: {} });
+const child = new Client({ name: `fluidbox-gate-${SERVER_NAME}`, version: "0.3.0" }, { capabilities: {} });
 const childTransport = new StdioClientTransport({
   command: CHILD_COMMAND,
   args: CHILD_ARGS,
@@ -109,7 +109,7 @@ const childTransport = new StdioClientTransport({
 });
 
 const server = new Server(
-  { name: `fluidbox-gate-${SERVER_NAME}`, version: "0.1.0" },
+  { name: `fluidbox-gate-${SERVER_NAME}`, version: "0.3.0" },
   { capabilities: { tools: {} } },
 );
 
