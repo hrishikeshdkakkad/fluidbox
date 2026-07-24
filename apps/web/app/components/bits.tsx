@@ -2,6 +2,7 @@
 
 import React, { useEffect, useId, useRef } from "react";
 import Link from "next/link";
+import { Connection, ownerBadge } from "../lib/api";
 
 export function Pill({ status }: { status: string }) {
   const label = status.replace(/_/g, " ");
@@ -17,6 +18,27 @@ export function Pill({ status }: { status: string }) {
 export function AutoPill({ autonomy }: { autonomy: string }) {
   return (
     <span className={`badge ${autonomy === "autonomous" ? "warn" : ""}`}>{autonomy}</span>
+  );
+}
+
+/** Ownership chip for a connection row (Phase C): "Organization" / "Personal",
+ *  with a "yours" marker when a personal connection's owner matches the viewer
+ *  (needs `meUserId`; absent in admin mode → no marker). Renders nothing for a
+ *  row without ownership data (pre-Phase-C shape). Presentation only. */
+export function OwnerTag({
+  connection,
+  meUserId,
+}: {
+  connection: Connection;
+  meUserId?: string | null;
+}) {
+  const badge = ownerBadge(connection, meUserId);
+  if (!badge) return null;
+  return (
+    <span className="chip" title={badge.label === "Personal" ? "Personal connection" : "Organization connection"}>
+      {badge.label}
+      {badge.yours && <span className="faint" style={{ marginLeft: 4 }}>· yours</span>}
+    </span>
   );
 }
 
@@ -63,31 +85,68 @@ export function ModalShell({
   onClose,
   children,
   wide,
+  maxWidth,
+  dismissOnBackdrop = false,
+  dirty = false,
+  discardTitle = "Discard unsaved changes?",
+  discardMessage = "This form is intentionally not stored in the browser.",
 }: {
   title: string;
   sub?: string;
   onClose: () => void;
   children: React.ReactNode;
   wide?: boolean;
+  /** Explicit shell width — beats `wide`. For layouts that need two panes. */
+  maxWidth?: string;
+  /**
+   * Forms default to deliberate dismissal so a stray click outside a long
+   * draft cannot throw work away. Read-only panels may opt back in.
+   */
+  dismissOnBackdrop?: boolean;
+  /** Protect non-persisted forms (especially credential forms) from loss. */
+  dirty?: boolean;
+  /** Allows one-time-secret panels to explain their more specific loss mode. */
+  discardTitle?: string;
+  discardMessage?: string;
 }) {
   const modalRef = useRef<HTMLDivElement>(null);
   const onCloseRef = useRef(onClose);
+  const dirtyRef = useRef(dirty);
+  const [confirmDiscard, setConfirmDiscard] = React.useState(false);
   const titleId = useId();
+  const descriptionId = useId();
 
   useEffect(() => {
     onCloseRef.current = onClose;
   }, [onClose]);
+  useEffect(() => {
+    dirtyRef.current = dirty;
+  }, [dirty]);
+
+  const requestClose = () => {
+    if (dirtyRef.current) {
+      setConfirmDiscard(true);
+      return;
+    }
+    onCloseRef.current();
+  };
 
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
     const modal = modalRef.current;
+    const previousOverflow = document.body.style.overflow;
+    const previousPaddingRight = document.body.style.paddingRight;
+    const scrollbarWidth = window.innerWidth - document.documentElement.clientWidth;
+    document.body.style.overflow = "hidden";
+    if (scrollbarWidth > 0) document.body.style.paddingRight = `${scrollbarWidth}px`;
     const focusable = modal?.querySelector<HTMLElement>(
       'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
     );
     focusable?.focus();
+    if (modal) modal.scrollTop = 0;
 
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onCloseRef.current();
+      if (event.key === "Escape") requestClose();
       if (event.key !== "Tab" || !modal) return;
       const elements = Array.from(
         modal.querySelectorAll<HTMLElement>(
@@ -109,30 +168,54 @@ export function ModalShell({
     document.addEventListener("keydown", onKeyDown);
     return () => {
       document.removeEventListener("keydown", onKeyDown);
+      document.body.style.overflow = previousOverflow;
+      document.body.style.paddingRight = previousPaddingRight;
       previous?.focus();
     };
   }, []);
 
   return (
-    <div className="overlay" onClick={onClose}>
+    <div
+      className="overlay"
+      onMouseDown={(event) => {
+        if (dismissOnBackdrop && event.target === event.currentTarget) requestClose();
+      }}
+    >
       <div
         ref={modalRef}
         className="modal"
-        style={wide ? { width: "min(680px, 92vw)" } : undefined}
+        style={maxWidth ? { width: maxWidth } : wide ? { width: "min(680px, 92vw)" } : undefined}
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
+        aria-describedby={sub ? descriptionId : undefined}
       >
         <div className="mh">
           <div>
             <div className="t" id={titleId}>{title}</div>
-            {sub && <div className="s">{sub}</div>}
+            {sub && <div className="s" id={descriptionId}>{sub}</div>}
           </div>
-          <button className="xbtn" onClick={onClose} aria-label="Close">
+          <button className="xbtn" onClick={requestClose} aria-label="Close">
             <X />
           </button>
         </div>
+        {confirmDiscard && (
+          <div className="discard-confirm" role="alert">
+            <span>
+              <strong>{discardTitle}</strong>
+              <small>{discardMessage}</small>
+            </span>
+            <span className="discard-actions">
+              <button className="btn sm ghost" type="button" onClick={() => setConfirmDiscard(false)}>
+                Keep editing
+              </button>
+              <button className="btn sm danger" type="button" onClick={() => onCloseRef.current()}>
+                Discard
+              </button>
+            </span>
+          </div>
+        )}
         <div className="mb">{children}</div>
       </div>
     </div>

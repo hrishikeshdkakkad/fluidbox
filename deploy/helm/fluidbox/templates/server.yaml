@@ -1,5 +1,15 @@
 {{- $fullname := include "fluidbox.fullname" . -}}
 {{- $sandboxNs := .Values.sandbox.namespace -}}
+{{- /*
+  Archive backend split. "" and "fs" are the node-local backend: a single
+  ReadWriteOnce PVC holds the workspace archives, which forces one replica and a
+  Recreate upgrade (the old pod must release the volume before the new one binds
+  it). "s3" shares nothing on disk — every replica serves any archive over S3 —
+  so no node-local PVC is mounted and a RollingUpdate is safe. The server boot
+  gate enforces the same rule (it REFUSES "fs" with replicas > 1), so
+  archiveStore != "s3" is exactly the node-local / single-replica case.
+*/}}
+{{- $nodeLocalArchive := ne .Values.server.archiveStore "s3" -}}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -68,6 +78,9 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "fluidbox.serverName" . }}
     namespace: {{ .Release.Namespace }}
+{{- if $nodeLocalArchive }}
+{{- /* Node-local archive PVC — only for the "" | "fs" backend (single replica).
+       Not rendered for archiveStore "s3": replicas share nothing on disk. */}}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -82,6 +95,7 @@ spec:
   resources:
     requests:
       storage: {{ .Values.server.archivePvc.size }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -91,7 +105,16 @@ metadata:
 spec:
   replicas: {{ .Values.server.replicas }}
   strategy:
+    {{- if $nodeLocalArchive }}
+    {{- /* Single RWO archive PVC forces Recreate: the old pod must release the
+           volume before the replacement can attach it. */}}
     type: Recreate
+    {{- else }}
+    {{- /* archiveStore "s3": no shared RWO volume, so a rolling upgrade is safe
+           and avoids the full downtime Recreate would impose. maxSurge /
+           maxUnavailable are left at the Kubernetes defaults (25% each). */}}
+    type: RollingUpdate
+    {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "fluidbox.name" . }}
@@ -175,6 +198,60 @@ spec:
             {{- with $up }}
             - { name: LLM_UPSTREAM_URL, value: {{ . | quote }} }
             {{- end }}
+            {{- with .Values.server.runtimeRole }}
+            # RLS pool split (migration 0018): every pooled connection SET ROLEs to
+            # this NON-owner role. Boot FAILS if it does not exist, or if its posture
+            # is unsafe (LOGIN/SUPERUSER/BYPASSRLS/inherited or foreign memberships).
+            - { name: FLUIDBOX_RUNTIME_ROLE, value: {{ . | quote }} }
+            {{- end }}
+            {{- with .Values.server.dbPool.maxConnections }}
+            # Phase F capacity knob. Rendered ONLY when set, so an unset value keeps
+            # the server's own default rather than pinning a copy of it in the chart.
+            # The deployment-wide figure is replicas × (this + 2 listener
+            # connections) — that is what has to fit the Postgres/Neon compute.
+            - { name: FLUIDBOX_DB_MAX_CONNECTIONS, value: {{ . | quote }} }
+            {{- end }}
+            {{- with .Values.server.maxRequestBodyBytes }}
+            # Buffered-body ceiling. Costs `value × concurrent requests` of server
+            # memory — raise server.resources.limits.memory with it.
+            - { name: FLUIDBOX_MAX_REQUEST_BODY_BYTES, value: {{ . | quote }} }
+            {{- end }}
+            # Phase F: a DECLARATION of the replica count, not an observation.
+            # Boot refuses archiveStore "fs" when this is > 1.
+            - { name: FLUIDBOX_REPLICAS, value: {{ .Values.server.replicas | quote }} }
+            {{- with .Values.server.archiveStore }}
+            - { name: FLUIDBOX_ARCHIVE_STORE, value: {{ . | quote }} }
+            {{- end }}
+            {{- if eq .Values.server.archiveStore "s3" }}
+            - { name: FLUIDBOX_ARCHIVE_S3_BUCKET, value: {{ .Values.server.archiveS3.bucket | quote }} }
+            - { name: FLUIDBOX_ARCHIVE_S3_REGION, value: {{ .Values.server.archiveS3.region | quote }} }
+            {{- with .Values.server.archiveS3.endpoint }}
+            - { name: FLUIDBOX_ARCHIVE_S3_ENDPOINT, value: {{ . | quote }} }
+            {{- end }}
+            - { name: FLUIDBOX_ARCHIVE_S3_PREFIX, value: {{ .Values.server.archiveS3.prefix | quote }} }
+            {{- with .Values.server.archiveS3.forcePathStyle }}
+            - { name: FLUIDBOX_ARCHIVE_S3_FORCE_PATH_STYLE, value: {{ . | quote }} }
+            {{- end }}
+            - name: FLUIDBOX_ARCHIVE_S3_ACCESS_KEY_ID
+              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.archiveS3AccessKeyId | quote }} } }
+            - name: FLUIDBOX_ARCHIVE_S3_SECRET_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.archiveS3SecretAccessKey | quote }} } }
+            {{- end }}
+            {{- with .Values.server.workloadIdentity }}
+            # Gap 6 workload identity on the sandbox-facing internal gateway.
+            # Only meaningful under FLUIDBOX_PROVIDER=kubernetes, and only while
+            # NOTHING NATs or proxies between sandbox pods and the internal
+            # Service — introducing a mesh sidecar or egress gateway on that path
+            # turns every run into a mismatch, and the control would have to be
+            # redesigned rather than reconfigured.
+            - { name: FLUIDBOX_WORKLOAD_IDENTITY, value: {{ . | quote }} }
+            {{- end }}
+            {{- if .Values.server.allowRlsBypass }}
+            # Review M2 escape hatch: accept a pool role that bypasses RLS even in
+            # multi-user mode. Local/single-user only — a hosted install must instead
+            # set server.runtimeRole (or a non-superuser DATABASE_URL).
+            - { name: FLUIDBOX_ALLOW_RLS_BYPASS, value: "1" }
+            {{- end }}
             - name: DATABASE_URL
               valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.databaseUrl | quote }} } }
             - name: FLUIDBOX_ADMIN_TOKEN
@@ -186,17 +263,21 @@ spec:
             {{- with .Values.server.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          {{- if $nodeLocalArchive }}
           volumeMounts:
             - { name: archives, mountPath: /var/lib/fluidbox }
+          {{- end }}
           readinessProbe:
             httpGet: { path: /v1/health, port: public }
             initialDelaySeconds: 5
             periodSeconds: 10
           resources: {{- toYaml .Values.server.resources | nindent 12 }}
+      {{- if $nodeLocalArchive }}
       volumes:
         - name: archives
           persistentVolumeClaim:
             claimName: {{ include "fluidbox.serverName" . }}-archives
+      {{- end }}
 ---
 # Public Service (:8787): dashboard + CLI + OAuth + webhooks. Ingress origin.
 apiVersion: v1

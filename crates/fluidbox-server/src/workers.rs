@@ -6,7 +6,44 @@ use crate::orchestrator;
 use crate::state::AppState;
 use fluidbox_core::spec::RunSpec;
 use fluidbox_core::traits::SandboxHandle;
+use fluidbox_db::TenantScope;
 use std::time::Duration;
+use tokio::time::MissedTickBehavior;
+
+/// How many rows one tick of a periodic sweep may take. Each swept row costs at
+/// least one SERIAL follow-up write (a ledger append), so the batch — not the
+/// backlog — is what a tick's duration is sized against.
+const SWEEP_BATCH: i64 = 200;
+
+/// How long after a run goes TERMINAL the deployment-wide GC may retire its
+/// leftover `mcp_upstream_sessions` rows (Phase F, Task 3).
+///
+/// This is a deliberate handicap, not a timeout. The run-terminal teardown path
+/// (`broker::run_terminal_mcp_cleanup`) is the ONLY thing that ever sends the
+/// upstream `DELETE`, it now sees every replica's rows, and — because the rows are
+/// durable — a reconciler pass that could not finish is re-driven. The grace period
+/// exists so the sweeper never retires a row out from under a teardown that is
+/// still owed a retry. 15 minutes is comfortably past both the finalize driver's
+/// re-drive cadence and the longest single teardown (a peer count × the 5 s
+/// `MCP_DELETE_TIMEOUT`).
+const MCP_SESSION_GRACE_SECS: i64 = 900;
+
+/// Every periodic worker uses this. `tokio::time::interval` defaults to `Burst`:
+/// after a tick that overran its period, the missed ticks fire BACK-TO-BACK to
+/// "catch up", so one slow sweep is immediately followed by several with no gap —
+/// exactly when the database is least able to take them. `Delay` re-phases from
+/// the moment the slow tick finished, guaranteeing a full period of breathing
+/// room afterwards.
+///
+/// `Delay` rather than `Skip` because every one of these ticks is a scan of
+/// "whatever is due NOW" — never work bound to a wall-clock slot — so nothing is
+/// lost by re-phasing, and `Skip` (which preserves the original phase) can still
+/// leave a fraction-of-a-period gap after a long tick.
+fn periodic(period: Duration) -> tokio::time::Interval {
+    let mut tick = tokio::time::interval(period);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    tick
+}
 
 /// Reap any sandboxes the provider manages that have no matching live session
 /// (or whose session is already terminal), and resume any finalization the
@@ -23,24 +60,27 @@ pub async fn boot_orphan_sweep(state: AppState) {
                 // parse (a status written by a NEWER deploy is not proof of
                 // death — a rollback restart must not kill its live pods),
                 // and a DB error skips rather than terminates.
-                let terminal = match fluidbox_db::get_session(&state.pool, session_id).await {
-                    Ok(None) => true, // unknown session → orphan
-                    Ok(Some(s)) => match fluidbox_core::state::SessionStatus::parse(&s.status) {
-                        Some(st) => st.is_terminal(),
-                        None => {
-                            tracing::warn!(
-                                "boot sweep: session {session_id} has unknown status '{}' \
+                let terminal =
+                    match fluidbox_db::system_worker::get_session(&state.pool, session_id).await {
+                        Ok(None) => true, // unknown session → orphan
+                        Ok(Some(s)) => {
+                            match fluidbox_core::state::SessionStatus::parse(&s.status) {
+                                Some(st) => st.is_terminal(),
+                                None => {
+                                    tracing::warn!(
+                                        "boot sweep: session {session_id} has unknown status '{}' \
                                      (newer deploy?); leaving its sandbox alone",
-                                s.status
-                            );
+                                        s.status
+                                    );
+                                    false
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("boot sweep: session lookup {session_id} failed: {e}");
                             false
                         }
-                    },
-                    Err(e) => {
-                        tracing::warn!("boot sweep: session lookup {session_id} failed: {e}");
-                        false
-                    }
-                };
+                    };
                 if terminal {
                     tracing::info!("boot sweep: reaping orphan sandbox for {session_id}");
                     let _ = state.provider.terminate(&handle).await;
@@ -55,7 +95,7 @@ pub async fn boot_orphan_sweep(state: AppState) {
 /// reached terminal — the restart-recovery + crashed-driver path. Claim-
 /// guarded in `drive_finalization`, so this never double-finalizes.
 async fn recover_finalizations(state: &AppState) {
-    match fluidbox_db::pending_finalizations(&state.pool).await {
+    match fluidbox_db::system_worker::pending_finalizations(&state.pool).await {
         Ok(ids) => {
             for id in ids {
                 tracing::info!("resuming interrupted finalization for {id}");
@@ -84,6 +124,9 @@ pub fn spawn_all(state: AppState) {
     tokio::spawn(watchdog(state.clone()));
     tokio::spawn(budget_sweeper(state.clone()));
     tokio::spawn(approval_expiry(state.clone()));
+    // Cross-replica approval wakeups (Gap 13): every replica wakes its OWN
+    // waiters off the shared NOTIFY channel.
+    spawn_approval_wakeups(state.clone());
     // Archive-transport providers only: host-dir providers (Docker) never
     // store archives, so the sweep would scan an absent directory forever.
     if state.provider.workspace_transport() == fluidbox_core::traits::WorkspaceTransport::Archive {
@@ -138,7 +181,7 @@ fn reconcile_action(session: SessionLookup, has_handle: bool) -> ReconcileAction
 /// pod nobody owned; and a cancel-during-provisioning reaped before the
 /// handle landed, leaking the pod until the next restart.
 async fn reconcile_managed(state: AppState) {
-    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    let mut tick = periodic(Duration::from_secs(60));
     loop {
         tick.tick().await;
         let managed = match state.provider.list_managed().await {
@@ -149,16 +192,17 @@ async fn reconcile_managed(state: AppState) {
             }
         };
         for (session_id, handle) in managed {
-            let session = match fluidbox_db::get_session(&state.pool, session_id).await {
-                Ok(s) => s,
-                // A transient DB error is NOT proof the session is unknown —
-                // unlike the boot sweep, a periodic worker must never kill a
-                // possibly-live sandbox on a blip. Next tick retries.
-                Err(e) => {
-                    tracing::warn!("reconcile: session lookup {session_id} failed: {e}");
-                    continue;
-                }
-            };
+            let session =
+                match fluidbox_db::system_worker::get_session(&state.pool, session_id).await {
+                    Ok(s) => s,
+                    // A transient DB error is NOT proof the session is unknown —
+                    // unlike the boot sweep, a periodic worker must never kill a
+                    // possibly-live sandbox on a blip. Next tick retries.
+                    Err(e) => {
+                        tracing::warn!("reconcile: session lookup {session_id} failed: {e}");
+                        continue;
+                    }
+                };
             // STRICT status parse — never status_enum(), whose unparseable→
             // Failed fallback would read a newer deploy's status as terminal.
             let lookup = match &session {
@@ -203,7 +247,14 @@ async fn reconcile_managed(state: AppState) {
                     let Ok(v) = serde_json::to_value(&handle) else {
                         continue;
                     };
-                    match fluidbox_db::adopt_sandbox_handle(&state.pool, session_id, &v).await {
+                    // Adopt implies a Known session — scope to its own tenant.
+                    let Some(scope) = session.as_ref().map(|s| TenantScope::assume(s.tenant_id))
+                    else {
+                        continue;
+                    };
+                    match fluidbox_db::adopt_sandbox_handle(&state.pool, scope, session_id, &v)
+                        .await
+                    {
                         Ok(true) => {
                             tracing::warn!(
                                 "reconcile: adopted sandbox {} for handle-less session {session_id}",
@@ -211,6 +262,7 @@ async fn reconcile_managed(state: AppState) {
                             );
                             crate::ledger::record(
                                 &state,
+                                scope,
                                 session_id,
                                 fluidbox_core::event::Actor::System,
                                 fluidbox_core::event::EventBody::AgentMessage {
@@ -249,55 +301,57 @@ async fn archive_ttl_sweep(state: AppState) {
             "FLUIDBOX_ARCHIVE_TTL_SECS={configured} is below the {ARCHIVE_TTL_FLOOR_SECS}s floor; using the floor"
         );
     }
-    let mut tick = tokio::time::interval(Duration::from_secs(3600));
+    let mut tick = periodic(Duration::from_secs(3600));
     loop {
         tick.tick().await;
-        let data_dir = state.cfg.data_dir.clone();
-        let candidates = tokio::task::spawn_blocking(move || {
-            orchestrator::stale_archive_candidates(&data_dir, ttl)
-        })
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!("archive TTL sweep task failed: {e}");
-            Vec::new()
-        });
+        // Listing is the STORE's job now (Phase F, Task 4): a directory scan on
+        // `fs`, a ListObjectsV2 over the prefix on `s3` — plus, on `s3`, this
+        // node's leftover staging files, which no object listing would ever show.
+        let store = orchestrator::archive_store(&state);
+        let candidates = orchestrator::stale_archive_candidates(&state, ttl).await;
         let mut removed = 0usize;
-        for path in candidates {
+        for key in candidates {
             // Age alone is not proof of leak: a run with a wall-clock budget
             // longer than the TTL still needs its archive for a possible
             // init re-execution. Only a terminal/unknown session's archive
             // is reclaimable; a DB blip keeps the file for the next pass.
-            let deletable = match orchestrator::archive_session_id(&path) {
+            let deletable = match orchestrator::archive_session_id(&key) {
                 None => true, // not a name this server writes — reclaim
-                Some(sid) => match fluidbox_db::get_session(&state.pool, sid).await {
-                    Ok(None) => true,
-                    Ok(Some(s)) => match fluidbox_core::state::SessionStatus::parse(&s.status) {
-                        Some(st) => st.is_terminal(),
-                        None => false, // newer deploy's status — fail safe
-                    },
-                    Err(e) => {
-                        tracing::warn!("archive TTL sweep: session lookup failed: {e}");
-                        false
+                Some(sid) => {
+                    match fluidbox_db::system_worker::get_session(&state.pool, sid).await {
+                        Ok(None) => true,
+                        Ok(Some(s)) => {
+                            match fluidbox_core::state::SessionStatus::parse(&s.status) {
+                                Some(st) => st.is_terminal(),
+                                None => false, // newer deploy's status — fail safe
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("archive TTL sweep: session lookup failed: {e}");
+                            false
+                        }
                     }
-                },
+                }
             };
             if !deletable {
                 tracing::warn!(
-                    "archive TTL sweep: {} outlived the TTL but its session is still live; keeping",
-                    path.display()
+                    "archive TTL sweep: {key} outlived the TTL but its session is still live; keeping"
                 );
                 continue;
             }
-            match std::fs::remove_file(&path) {
+            match store.delete_key(&key).await {
                 Ok(()) => {
-                    tracing::info!("archive TTL sweep removed {}", path.display());
+                    tracing::info!("archive TTL sweep removed {key}");
                     removed += 1;
                 }
-                Err(e) => tracing::warn!("archive TTL sweep failed on {}: {e}", path.display()),
+                Err(e) => tracing::warn!("archive TTL sweep failed on {key}: {e}"),
             }
         }
         if removed > 0 {
-            tracing::info!("archive TTL sweep reclaimed {removed} stale archive(s)");
+            tracing::info!(
+                "archive TTL sweep reclaimed {removed} stale archive(s) from the {} store",
+                store.backend()
+            );
         }
     }
 }
@@ -320,10 +374,10 @@ fn stale_launch_mins() -> i32 {
 /// Fail sessions whose sandbox died or whose heartbeat went stale.
 async fn watchdog(state: AppState) {
     let stale_launch_mins = stale_launch_mins();
-    let mut tick = tokio::time::interval(Duration::from_secs(15));
+    let mut tick = periodic(Duration::from_secs(15));
     loop {
         tick.tick().await;
-        let active = match fluidbox_db::sessions_in_status(
+        let active = match fluidbox_db::system_worker::sessions_in_status(
             &state.pool,
             &["running", "awaiting_approval", "initializing"],
         )
@@ -355,7 +409,9 @@ async fn watchdog(state: AppState) {
         }
 
         // Sessions stuck before launch (created/provisioning/initializing).
-        match fluidbox_db::stale_nonstarted_sessions(&state.pool, stale_launch_mins).await {
+        match fluidbox_db::system_worker::stale_nonstarted_sessions(&state.pool, stale_launch_mins)
+            .await
+        {
             Ok(stale) => {
                 for s in stale {
                     tracing::warn!(
@@ -394,26 +450,150 @@ async fn sandbox_dead(state: &AppState, handle_json: &Option<serde_json::Value>)
 /// Enforce wall-clock budgets (token/cost budgets are enforced inline in the
 /// facade; tool-call budgets inline in the permission gate).
 async fn budget_sweeper(state: AppState) {
-    let mut tick = tokio::time::interval(Duration::from_secs(10));
+    let mut tick = periodic(Duration::from_secs(10));
     loop {
         tick.tick().await;
-        let active =
-            match fluidbox_db::sessions_in_status(&state.pool, &["running", "awaiting_approval"])
-                .await
-            {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
+
+        // Phase E (#33; Gap 11): sweep stale execution claims on the same 10s
+        // cadence. A `claimed` row whose control-plane dispatcher crashed
+        // mid-flight is CAS'd to `ambiguous` past its TTL (never auto-retried —
+        // invariant 15) and ledgered so the timeline records the unknown outcome.
+        // BOUNDED like the reservation sweep below (review, minor): each swept row
+        // costs a SERIAL ledger append, so an unbounded batch could make one tick
+        // outrun its own 10 s period. A backlog drains over several ticks instead.
+        match fluidbox_db::system_worker::sweep_stale_execution_claims(
+            &state.pool,
+            chrono::Utc::now(),
+            SWEEP_BATCH,
+        )
+        .await
+        {
+            Ok(swept) => {
+                for (tenant_id, session_id, tool_call_id, tool) in swept {
+                    // Scope from the returned row's tenant, like every worker.
+                    let scope = TenantScope::assume(tenant_id);
+                    let tool = tool.unwrap_or_else(|| "(unknown)".to_string());
+                    let server = fluidbox_core::capability::parse_mcp_tool(&tool)
+                        .map(|(s, _)| s.to_string())
+                        .unwrap_or_else(|| "broker".to_string());
+                    crate::ledger::record(
+                        &state,
+                        scope,
+                        session_id,
+                        fluidbox_core::event::Actor::System,
+                        fluidbox_core::event::EventBody::BrokeredToolCall {
+                            tool_call_id,
+                            tool,
+                            server,
+                            binding_id: None,
+                            ok: false,
+                            latency_ms: 0,
+                            result_digest: None,
+                            error: Some("execution claim expired — outcome unknown".into()),
+                            outcome: Some("ambiguous".into()),
+                        },
+                    )
+                    .await;
+                }
+            }
+            Err(e) => tracing::warn!("stale execution-claim sweep failed: {e}"),
+        }
+
+        // Phase E (#33; Gap 14): reconcile expired LLM budget reservations on the
+        // same tick, BEFORE the budget loop reads usage totals — so a booking whose
+        // facade request died is already counted as (conservative) usage by the
+        // time this session's budget is judged, rather than a tick late. The
+        // conversion is one statement in the DB (usage row keyed on the request id,
+        // then the CAS), so it is idempotent against a late drain in either order.
+        match fluidbox_db::system_worker::sweep_expired_llm_reservations(
+            &state.pool,
+            chrono::Utc::now(),
+            SWEEP_BATCH,
+        )
+        .await
+        {
+            Ok(swept) => {
+                for r in swept {
+                    let scope = TenantScope::assume(r.tenant_id);
+                    let cost = r
+                        .reserved_cost_usd
+                        .map(|c| format!(", ~${c:.4}"))
+                        .unwrap_or_default();
+                    crate::ledger::record(
+                        &state,
+                        scope,
+                        r.session_id,
+                        fluidbox_core::event::Actor::System,
+                        fluidbox_core::event::EventBody::AgentMessage {
+                            role: "system".into(),
+                            text: format!(
+                                "model request {} never reported usage — charging the \
+                                 conservative reservation ({} tokens{cost})",
+                                r.request_id, r.reserved_tokens
+                            ),
+                        },
+                    )
+                    .await;
+                }
+            }
+            Err(e) => tracing::warn!("expired LLM-reservation sweep failed: {e}"),
+        }
+
+        // Phase F (Task 3): retire `mcp_upstream_sessions` rows whose run has been
+        // terminal for at least the grace period.
+        //
+        // This is a GARBAGE COLLECTOR, not a delivery mechanism: it does NOT send
+        // the upstream DELETE (the reasoning lives on
+        // `mcp_sessions::sweep_orphaned_upstream_sessions`). What reaches it is the
+        // residue the run-terminal path could not send — dominated by rows whose
+        // credential is unresolvable, which is exactly where invariant 9 forbids
+        // sending one. The disclosed cost is that such an upstream session stays
+        // allocated until the upstream expires it itself; the alternative is a
+        // second retry/backoff system dialing a wedged server on a timer.
+        //
+        // Bounded like the sweeps above, and no ledger row per swept session — the
+        // row is a teardown receipt, not a run event, and a run that ended 15
+        // minutes ago should not gain timeline entries.
+        let terminal_before =
+            chrono::Utc::now() - chrono::Duration::seconds(MCP_SESSION_GRACE_SECS);
+        match fluidbox_db::mcp_sessions::sweep_orphaned_upstream_sessions(
+            &state.pool,
+            terminal_before,
+            SWEEP_BATCH,
+        )
+        .await
+        {
+            Ok(swept) if !swept.is_empty() => tracing::info!(
+                "retired {} orphaned upstream MCP session row(s) without an upstream DELETE \
+                 (their sessions expire on the upstream's own schedule)",
+                swept.len()
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("orphaned upstream MCP session sweep failed: {e}"),
+        }
+
+        let active = match fluidbox_db::system_worker::sessions_in_status(
+            &state.pool,
+            &["running", "awaiting_approval"],
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
         let now = chrono::Utc::now();
         for s in active {
             let Ok(run_spec) = serde_json::from_value::<RunSpec>(s.run_spec.clone()) else {
                 continue;
             };
+            // Budget reads scope to the session's own tenant (from the fetched row).
+            let scope = TenantScope::assume(s.tenant_id);
             if let Some(max) = run_spec.budgets.max_wall_clock_secs {
                 if let Some(started) = s.started_at {
                     if (now - started).num_seconds() as u64 > max {
                         crate::ledger::record(
                             &state,
+                            scope,
                             s.id,
                             fluidbox_core::event::Actor::System,
                             fluidbox_core::event::EventBody::BudgetExceeded {
@@ -445,11 +625,39 @@ async fn budget_sweeper(state: AppState) {
             // sweep is the crash-durable driver, and the only one for an
             // idle runner that makes no further requests. Thresholds mirror
             // the inline checks exactly (>=).
+            //
+            // Phase E (#33; Gap 14): the projection now includes LIVE reservations
+            // (`state='reserved'`), not just recorded usage — a budget check that
+            // ignores booked-but-unreported spend is the very bug Gap 14 names.
+            //
+            // DISCLOSED CONSEQUENCE, at its real bound (review, minor). In steady
+            // state a healthy run holds one reservation at a time, so this stops it
+            // within ONE conservative reservation of the ceiling. That is NOT the
+            // worst case: a reservation is drained by the facade request that made
+            // it, so a control-plane RESTART (or any crash between booking and
+            // drain) leaves reservations stranded `reserved` until the 30-min TTL
+            // sweep converts them — and up to the per-session ceiling
+            // (`FLUIDBOX_LLM_MAX_CONCURRENT_RESERVATIONS`, default 32) can be
+            // stranded at once. Every stranded booking counts here immediately, so a
+            // run whose SANDBOX survived the restart can be `finalize_forced` early
+            // by up to `ceiling` conservative reservations' worth of phantom spend,
+            // not one. It self-heals as the sweep charges them (they become real
+            // usage rows, so the projection stops double-counting) — but the early
+            // stop happens on the tick, not after the heal.
+            //
+            // Still the "over-charge in the safe direction" the design asks for
+            // (:1122-1123) and the counterpart to the facade's sole-claimant
+            // admission — that carve-out keeps a lone request from livelocking on
+            // 429s, and this is where such a run is stopped properly instead:
+            // once, with a ledgered BudgetExceeded.
             let mut over: Option<&'static str> = None;
             if run_spec.budgets.max_tokens.is_some() || run_spec.budgets.max_cost_usd.is_some() {
-                if let Ok(totals) = fluidbox_db::usage_totals(&state.pool, s.id).await {
+                if let Ok(totals) = fluidbox_db::usage_totals(&state.pool, scope, s.id).await {
+                    let booked = fluidbox_db::active_reservation_totals(&state.pool, scope, s.id)
+                        .await
+                        .unwrap_or_default();
                     if let Some(max) = run_spec.budgets.max_cost_usd {
-                        if totals.cost_usd >= max {
+                        if totals.cost_usd + booked.cost_usd >= max {
                             over = Some("max_cost_usd");
                         }
                     }
@@ -458,8 +666,8 @@ async fn budget_sweeper(state: AppState) {
                             let used = (totals.input_tokens
                                 + totals.output_tokens
                                 + totals.cache_read_tokens
-                                + totals.cache_write_tokens)
-                                as u64;
+                                + totals.cache_write_tokens
+                                + booked.tokens) as u64;
                             if used >= max {
                                 over = Some("max_tokens");
                             }
@@ -469,7 +677,7 @@ async fn budget_sweeper(state: AppState) {
             }
             if over.is_none() {
                 if let Some(max) = run_spec.budgets.max_tool_calls {
-                    if let Ok(n) = fluidbox_db::tool_call_count(&state.pool, s.id).await {
+                    if let Ok(n) = fluidbox_db::tool_call_count(&state.pool, scope, s.id).await {
                         // STRICTLY greater — the gate permits exactly `max`
                         // calls (it denies at used > max, with the current
                         // call's intent already counted); firing at >= would
@@ -495,19 +703,76 @@ async fn budget_sweeper(state: AppState) {
 }
 
 /// Expire pending approvals whose deadline passed, and wake their waiters.
+///
+/// Phase E (#33; Gap 13): the sweep is now a cross-tenant READ followed by a
+/// per-row, tenant-SCOPED decision transaction. Three things fall out of that
+/// split, all of them the point:
+///   * the expiry decision emits its canonical `approval.decided` +
+///     `tool.decision` INSIDE the CAS that makes it, like every other decision
+///     site — waiters no longer emit, so this is the only place those rows can
+///     come from on the timeout path;
+///   * the CAS (`status = 'pending' and expires_at < now()`) is the single-winner
+///     test, so N replicas sweeping the same row still produce ONE decision and
+///     ONE pair of events;
+///   * the same transaction `pg_notify`s `fluidbox_approvals`, so a waiter on
+///     ANOTHER replica wakes on the expiry instead of only on its ≤2 s poll floor
+///     (the local `wake` below stays as the zero-latency path for this replica).
 async fn approval_expiry(state: AppState) {
-    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    let mut tick = periodic(Duration::from_secs(5));
     loop {
         tick.tick().await;
-        match fluidbox_db::expire_stale_approvals(&state.pool).await {
-            Ok(expired) => {
-                for a in expired {
-                    state.approvals.wake(a.id).await;
+        let due =
+            match fluidbox_db::system_worker::expired_pending_approvals(&state.pool, 200).await {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("approval expiry scan failed: {e}");
+                    continue;
                 }
+            };
+        for a in due {
+            let scope = TenantScope::assume(a.tenant_id);
+            let events = crate::internal::approval_decision_events(
+                &state,
+                a.session_id,
+                a.id,
+                &a.tool_call_id,
+                &a.tool,
+                "expired",
+                "timeout",
+            );
+            match fluidbox_db::expire_approval_tx(&state.pool, scope, a.id, events).await {
+                // Lost the CAS (a human decided it, or another replica expired it
+                // first) — that winner ledgered and notified; nothing owed here.
+                Ok(None) => {}
+                Ok(Some(_)) => state.approvals.wake(a.id).await,
+                Err(e) => tracing::warn!("approval {} expiry failed: {e}", a.id),
             }
-            Err(e) => tracing::warn!("approval expiry sweep failed: {e}"),
         }
     }
+}
+
+/// Relay committed approval decisions from the `fluidbox_approvals` LISTEN
+/// channel into THIS replica's in-memory waiter registry (Phase E, #33; Gap 13).
+///
+/// Without it, a `/permission` handler blocked on replica B never learns that
+/// replica A served the approve — it only discovers the decision on its next
+/// ≤2 s poll. That poll stays (it is the missed-notify and Neon scale-to-zero
+/// backstop, exactly as `events_after` is for SSE); this makes the common case
+/// immediate. A lagged/closed broadcast receiver is not an error: the poll floor
+/// covers it, so the loop just keeps consuming.
+pub fn spawn_approval_wakeups(state: AppState) {
+    tokio::spawn(async move {
+        let mut rx = state.approvals_tx.subscribe();
+        loop {
+            match rx.recv().await {
+                Ok(id) => state.approvals.wake(id).await,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!("approval wakeup relay lagged {n} notifications; waiters fall back to the poll floor");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    });
 }
 
 /// Kubernetes netpol run-gate (design 2026-07-15): probe that the CNI enforces
@@ -592,7 +857,7 @@ pub fn spawn_netpol_gate(state: AppState) {
 /// (stale claim). The claim in `drive_finalization` makes this idempotent —
 /// a healthy in-progress finalization is never disturbed.
 async fn finalize_worker(state: AppState) {
-    let mut tick = tokio::time::interval(Duration::from_secs(20));
+    let mut tick = periodic(Duration::from_secs(20));
     loop {
         tick.tick().await;
         recover_finalizations(&state).await;
@@ -603,6 +868,105 @@ async fn finalize_worker(state: AppState) {
 mod tests {
     use super::*;
     use fluidbox_core::state::SessionStatus;
+
+    /// The Gap-13 worker rule, asserted rather than asserted-in-prose (Phase E,
+    /// #33; design :1094-1096): the three PERIODIC lifecycle workers — watchdog,
+    /// budget sweeper, approval expiry — run on EVERY replica and must never
+    /// perform a side effect themselves. They may only record a single-winner
+    /// intent (`orchestrator::fail` / `orchestrator::finalize_forced`, both of
+    /// which reduce to `begin_finalization`'s `on conflict do nothing`) or CAS an
+    /// approval; the cleanup / artifact collection / publication that follows is
+    /// performed by `drive_finalization` alone, under the finalization claim AND
+    /// the epoch-fenced session lease. So two replicas double-firing a worker is
+    /// benign by construction.
+    ///
+    /// A source guard, so it runs without a database. It slices each worker's
+    /// body and refuses any provider MUTATION in it. `state()` (a read probe) is
+    /// deliberately allowed — the watchdog must confirm a sandbox is dead before
+    /// recording its verdict.
+    ///
+    /// NOT covered, deliberately: `boot_orphan_sweep` and `reconcile_managed` DO
+    /// terminate sandboxes without a lease. They are not lifecycle drivers — they
+    /// reap sandboxes whose session is already terminal or unknown, which is
+    /// durable truth rather than a race, and their mutation is idempotent
+    /// (terminate treats already-gone as success) and UID-preconditioned on
+    /// Kubernetes against name reuse.
+    #[test]
+    fn periodic_lifecycle_workers_perform_no_provider_side_effects() {
+        let src = include_str!("workers.rs");
+        for (worker, next_item) in [
+            ("async fn watchdog(", "async fn sandbox_dead("),
+            ("async fn budget_sweeper(", "/// Expire pending approvals"),
+            ("async fn approval_expiry(", "/// Relay committed approval"),
+        ] {
+            let start = src
+                .find(worker)
+                .unwrap_or_else(|| panic!("{worker} exists"));
+            let end = src[start..]
+                .find(next_item)
+                .map(|i| start + i)
+                .unwrap_or_else(|| panic!("{worker} body is delimited by {next_item}"));
+            let body = &src[start..end];
+            for mutation in [
+                ".provider.terminate(",
+                ".provider.provision(",
+                ".provider.collect_artifacts(",
+            ] {
+                assert!(
+                    !body.contains(mutation),
+                    "{worker} must not call {mutation}: a periodic worker runs on every \
+                     replica, so its side effects would fire N times. Record the intent \
+                     (fail / finalize_forced) and let the lease-holding finalization \
+                     driver act."
+                );
+            }
+        }
+    }
+
+    /// Gap 14's half of the budget sweeper, asserted from source so it stays
+    /// mutation-provable without a database. TWO properties:
+    ///   * expired reservations are RECONCILED on this tick, and BEFORE the
+    ///     budget loop reads usage totals — otherwise a crashed request's
+    ///     conservative charge is counted a tick late;
+    ///   * the token AND cost projections include LIVE reservations. A budget
+    ///     check that sees only recorded usage is precisely the Gap-14 defect,
+    ///     and this worker is the crash-durable driver for an idle runner.
+    #[test]
+    fn budget_sweeper_reconciles_and_projects_live_reservations() {
+        let src = include_str!("workers.rs");
+        let start = src
+            .find("async fn budget_sweeper(")
+            .expect("budget_sweeper exists");
+        let end = src[start..]
+            .find("/// Expire pending approvals")
+            .map(|i| start + i)
+            .expect("budget_sweeper's body is delimited");
+        let body = &src[start..end];
+
+        let sweep = body
+            .find("sweep_expired_llm_reservations(")
+            .expect("the sweeper converts expired LLM reservations into usage");
+        let totals = body
+            .find("fluidbox_db::usage_totals(")
+            .expect("the budget loop reads usage totals");
+        assert!(
+            sweep < totals,
+            "expired reservations must be converted BEFORE usage totals are read, \
+             so a crashed request's conservative charge is judged on this tick"
+        );
+        assert!(
+            body.contains("active_reservation_totals("),
+            "the budget projection must count LIVE reservations, not just recorded usage"
+        );
+        assert!(
+            body.contains("totals.cost_usd + booked.cost_usd >= max"),
+            "the COST arm must include live reservations"
+        );
+        assert!(
+            body.contains("+ booked.tokens) as u64"),
+            "the TOKEN arm must include live reservations"
+        );
+    }
 
     #[test]
     fn reconcile_decision_table() {
