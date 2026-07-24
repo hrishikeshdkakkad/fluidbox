@@ -91,7 +91,12 @@ lint:
 test:
     cargo test --workspace
 
-check: fmt lint test
+# Version drift guard: every in-repo version site must agree with
+# Cargo.toml's [workspace.package]. Needs no DB and no network.
+version-check:
+    bash scripts/version-check.sh
+
+check: fmt lint test version-check
     cd apps/web && pnpm test
     cd apps/web && pnpm build
 
