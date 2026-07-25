@@ -39,7 +39,11 @@ export default function PolicyDetailPage({ params }: { params: Promise<{ name: s
   const encoded = encodeURIComponent(name);
   const [detail, setDetail] = useState<PolicyDetail | null>(null);
   const [draft, setDraft] = useState<PolicyContent | null>(null);
-  const [preview, setPreview] = useState<PolicyPreview | null>(null);
+  // The preview is stored WITH the fingerprint of the draft it resolved, and
+  // consulted only while the fingerprints match: a lagging response can never
+  // present verdicts for a draft the user has since edited (stale indices,
+  // stale matrix, a publish button armed by the wrong preview).
+  const [preview, setPreview] = useState<{ forDraft: string; data: PolicyPreview } | null>(null);
   const [previewError, setPreviewError] = useState("");
   const [summary, setSummary] = useState("");
   const [err, setErr] = useState("");
@@ -82,11 +86,12 @@ export default function PolicyDetailPage({ params }: { params: Promise<{ name: s
       return;
     }
     const seq = ++previewSeq.current;
+    const fingerprint = JSON.stringify(draft);
     const timer = window.setTimeout(() => {
       apiPost<PolicyPreview>("/policies/preview", { content: draft, name })
         .then((resolved) => {
           if (previewSeq.current !== seq) return;
-          setPreview(resolved);
+          setPreview({ forDraft: fingerprint, data: resolved });
           setPreviewError("");
         })
         .catch((reason) => {
@@ -99,9 +104,12 @@ export default function PolicyDetailPage({ params }: { params: Promise<{ name: s
   }, [dirty, draft, name]);
 
   const resolved: Resolved | null = useMemo(() => {
-    if (dirty) return preview;
+    if (dirty) {
+      if (!preview || preview.forDraft !== JSON.stringify(draft)) return null;
+      return { matrix: preview.data.matrix, autonomy_summary: preview.data.autonomy_summary };
+    }
     return detail ? { matrix: detail.matrix, autonomy_summary: detail.autonomy_summary } : null;
-  }, [detail, dirty, preview]);
+  }, [detail, dirty, draft, preview]);
 
   // The matrix edits the DRAFT: an exact-name head rule per decided tool. The
   // WINNING rule index comes from the server-resolved row — the page checks
@@ -256,7 +264,7 @@ export default function PolicyDetailPage({ params }: { params: Promise<{ name: s
               <button
                 className="btn primary"
                 type="button"
-                disabled={publishing || !summary.trim() || !!previewError || (dirty && !preview)}
+                disabled={publishing || !summary.trim() || !!previewError || (dirty && !resolved)}
                 onClick={() => void publish()}
               >
                 {publishing ? "Publishing…" : `Publish v${detail.policy.version + 1}`}

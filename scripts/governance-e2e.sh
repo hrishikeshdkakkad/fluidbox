@@ -158,6 +158,18 @@ BASE_VER=$(pver "$GOV")
 AUTHOR=$(get "/policies/$GOV" | j "['versions'][0]['author']")
 [ "$AUTHOR" = "api" ] && ok "the import minted a version with author 'api' (provenance recorded)" \
   || no "latest version author: $AUTHOR"
+V1_CONTENT=$(get "/policies/$GOV/versions/$BASE_VER" | python3 -c "import sys,json;print(json.dumps(json.load(sys.stdin)['content'],sort_keys=True))")
+
+# A typo'd key in imported YAML is refused too (strict parse on every
+# authoring path, not just structured publish). 'permited' is the misspelling
+# that would otherwise silently leave autonomy.permitted at its default.
+TYPO_YAML=$(printf '%s' "$GOV_YAML" | python3 -c "
+import sys
+print(sys.stdin.read().replace('  permitted: true', '  permited: true'), end='')")
+CODE=$(post "/policies" "$(printf '%s' "$TYPO_YAML" | gov_body)")
+[ "$CODE" = "422" ] && grep -q "permited" "$GB" \
+  && ok "typo'd key in imported YAML → 422 naming 'permited' (strict on the import path too)" \
+  || no "typo import: $CODE: $(cat "$GB")"
 
 # 3. The matrix resolves each tool's REAL status.
 R=$(prow "$GOV" Edit)
@@ -190,15 +202,12 @@ R=$(prow "$GOV" WebFetch)
   && ok "publish → v$V_ALLOW and WebFetch now resolves ALLOW (the edit is live for future runs)" \
   || no "publish: code=$CODE version=$V_ALLOW row=$R"
 
-# 6. IMMUTABILITY — the pre-publish version is still readable, deny intact.
-OLD_ACTION=$(get "/policies/$GOV/versions/$BASE_VER" | python3 -c "
-import sys, json
-c = json.load(sys.stdin)['content']
-r = next(x for x in c['tools'] if 'WebFetch' in x['match'])
-print(r['action'])" 2>/dev/null)
-[ "$OLD_ACTION" = "deny" ] \
-  && ok "INVARIANT A: v$BASE_VER still reads back with its deny — publishes never rewrite history" \
-  || no "v$BASE_VER WebFetch action: $OLD_ACTION"
+# 6. IMMUTABILITY — the pre-publish version reads back BYTE-EQUAL (canonical
+# json compare), deny and all.
+V1_AGAIN=$(get "/policies/$GOV/versions/$BASE_VER" | python3 -c "import sys,json;print(json.dumps(json.load(sys.stdin)['content'],sort_keys=True))")
+[ "$V1_AGAIN" = "$V1_CONTENT" ] \
+  && ok "INVARIANT A: v$BASE_VER reads back byte-equal after the publish — history is immutable" \
+  || no "v$BASE_VER content changed across the publish"
 
 # 7. STALE GUARD — a publish carrying the OLD base_version is a 409 that
 # wrote nothing (editor B cannot silently overwrite editor A).
@@ -208,9 +217,10 @@ d = json.load(sys.stdin)
 print(json.dumps({'content': d['content'], 'summary': 'stale write', 'base_version': $BASE_VER}))")
 CODE=$(post "/policies/$GOV/publish" "$STALE")
 NOW=$(pver "$GOV")
-[ "$CODE" = "409" ] && [ "$NOW" = "$V_ALLOW" ] \
-  && ok "INVARIANT B: stale base_version → 409, still v$V_ALLOW (nothing written)" \
-  || no "stale publish: code=$CODE version=$V_ALLOW→$NOW: $(cat "$GB")"
+NVERS=$(get "/policies/$GOV" | python3 -c "import sys,json;print(len(json.load(sys.stdin)['versions']))")
+[ "$CODE" = "409" ] && [ "$NOW" = "$V_ALLOW" ] && [ "$NVERS" = "2" ] \
+  && ok "INVARIANT B: stale base_version → 409; still v$V_ALLOW and exactly 2 versions (nothing written)" \
+  || no "stale publish: code=$CODE version=$V_ALLOW→$NOW versions=$NVERS: $(cat "$GB")"
 
 # 8. STRICT PARSER — a typo'd field ('pathz') is a 422, never silently dropped.
 TYPO=$(get "/policies/$GOV" | python3 -c "
@@ -275,6 +285,14 @@ CODE=$(post "/policies/clone" "{\"name\": \"$CLONE\", \"from\": \"$GOV\"}")
 [ "$CODE" = "409" ] && ok "cloning onto an existing name → 409" || no "dup clone: $CODE"
 CODE=$(post "/policies/clone" '{"name": "bad/name"}')
 [ "$CODE" = "400" ] && ok "an unroutable policy name → 400" || no "bad name: $CODE"
+CODE=$(post "/policies/clone" '{"name": "preview"}')
+[ "$CODE" = "400" ] && ok "a route-reserved name ('preview') → 400" || no "reserved name: $CODE"
+CODE=$(post "/policies/clone" "{\"name\": \"gov-e2e-pin-$RANDOM\", \"from\": \"$GOV\", \"from_version\": $BASE_VER}")
+PINROW=$(j "['policy']['version']" < "$GB")
+[ "$CODE" = "200" ] && [ "$PINROW" = "1" ] && ok "clone pinned to from_version=$BASE_VER → v1 minted from that exact version" \
+  || no "pinned clone: code=$CODE v=$PINROW"
+CODE=$(post "/policies/clone" '{"name": "gov-e2e-orphan", "from_version": 1}')
+[ "$CODE" = "400" ] && ok "from_version without from → 400" || no "orphan from_version: $CODE"
 
 # 12. The override routes are GONE — the fold retired the mechanism.
 CODE=$(put "/policies/$GOV/overrides/WebFetch" '{"action":"allow"}')
@@ -294,9 +312,12 @@ silence_runner "$S"
 # the run's law is a specific immutable version row, not "whatever the
 # policy says later".
 DEFV=$(pver default)
-FROZE=$(curl -s -H "$H" "$API/v1/sessions/$S" | j "['session']['run_spec']['policy_version']")
-[ "$FROZE" = "$DEFV" ] && ok "RunSpec froze default's latest version (v$DEFV)" \
-  || no "frozen policy_version=$FROZE, policy latest=$DEFV"
+FROZE=$(curl -s -H "$H" "$API/v1/sessions/$S" | python3 -c "
+import sys, json
+spec = json.load(sys.stdin)['session']['run_spec']
+print('%s|%s' % (spec.get('policy_version'), spec.get('policy_snapshot', {}).get('name')))")
+[ "$FROZE" = "$DEFV|default" ] && ok "RunSpec froze default's latest version (v$DEFV) with its snapshot content" \
+  || no "frozen policy_version|snapshot=$FROZE, expected $DEFV|default"
 
 # safe tool → allow
 D=$(perm "$T" "$S" '{"tool_call_id":"g1","tool":"Read","input":{"file_path":"/workspace/x"}}' | j "['decision']")
