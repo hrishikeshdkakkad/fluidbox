@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ## [Unreleased]
 
+### Added
+
+- **DB-native policies (§17 #11)** — policies are now versioned, authorable, and attachable from the dashboard. Every edit is an immutable `policy_versions` row (author, summary, date; migration `0026`); publish/revert/clone ride optimistic concurrency (`base_version` → 409 on a moved head) and a strict parser (an unknown field is a 422, never a silently-weaker policy); history is append-only at the database level (the runtime role can only read and append). The Governance page gains a draft rule editor (ordered rules, path/shell constraints, budgets/approvals/autonomy/egress forms), version history with diff and one-click revert, and New policy (clone or blank); the run composer gains a policy select and disables autonomy when the policy forbids it. `managed_overrides` folds into ordinary head rules (verdict-preserving, property-tested); `just policy-sync` is retired — YAML survives as a boot seed and an idempotent import/export format (`POST /v1/policies`).
+
 ## [0.3.0] — 2026-07-24
 
 **Multi-user MCP control plane.** Six phases (A–F) and migrations `0011`→`0025` turn fluidbox from a single-admin control plane into one that can host many organizations, many users, and many separately-owned credentials without ever letting a model pick an identity. Every hosted capability is **opt-in behind a flag, and the default single-admin Docker deployment is byte-for-byte the same product** — `FLUIDBOX_REQUIRE_SSO` unset means today's behavior, unchanged.
