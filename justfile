@@ -108,11 +108,6 @@ check: fmt lint test version-check
 e2e:
     bash scripts/e2e.sh
 
-# Push policies/*.yaml to the running control plane (bumps policy version;
-# in-flight runs keep their frozen snapshot).
-policy-sync:
-    bash scripts/policy-sync.sh
-
 # ── Connector catalog import (offline dev tool) ──────────────────────────
 #
 # Regenerate the append-only connector-catalog import migration from the

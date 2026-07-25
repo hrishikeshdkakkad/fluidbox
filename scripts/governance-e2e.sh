@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Governance-plane E2E over real HTTP. Two halves, both against the live
 # server + Neon, no model required:
-#   1. the POLICY API — the Governance page's server: the tool matrix, the
-#      per-tool override write/clear, and the policy-sync merge
+#   1. the POLICY API — the Governance page's server: the tool matrix,
+#      append-only versions (import / publish / revert / clone), the
+#      optimistic-concurrency guard, and the strict authoring parser
 #   2. the INTERNAL GATEWAY driven with a real session token (exactly the
 #      runner's contract): policy eval, approval pause/resume, idempotency,
 #      session-scope, autonomous auto-deny
@@ -59,49 +60,59 @@ silence_runner() {
 
 # ── Policy API — the Governance page's server ───────────────────────────
 # The dashboard is presentation-only: every fact it renders and every write
-# it offers is decided HERE. Two things must never happen, both of them real
-# review finds:
+# it offers is decided HERE. The storage model is append-only versions
+# (design 2026-07-14, §17 #11): the identity row is stable, every edit is an
+# immutable policy_versions row, the LATEST governs future runs, and the
+# RunSpec still freezes. What must never happen, and is asserted below:
 #
-#   A. A CONDITIONAL rule cannot be flattened. A rule carrying paths/shell
-#      has a verdict that depends on the path touched or the command run
-#      ("allow in /workspace · deny .env · ask elsewhere"). Setting it to one
-#      action would DELETE paths.deny **/.env. The server refuses — never the
-#      UI alone.
-#   B. policy-sync cannot silently kill a constraint. Overrides are consulted
-#      BEFORE the rules, so a shell/paths block added to a rule that already
-#      holds a live override could never fire — silently, forever, while the
-#      page still displayed it. So upsert merges the stored overrides in and
-#      validates the MERGED policy: the override survives a pristine re-POST,
-#      and a yaml that would strand a constraint is refused outright.
+#   A. History is immutable: an old version stays readable, byte-equal,
+#      after any number of publishes — and revert publishes FORWARD.
+#   B. A stale editor cannot silently overwrite a newer publish: base_version
+#      is compared under the append lock, and the loser gets a 409 that
+#      wrote nothing.
+#   C. The authoring parser is STRICT: a typo'd field is a 422, never a
+#      silently-dropped key publishing a weaker policy than reviewed.
+#   D. Versions are not just numbers: a publish CHANGES what the matrix (and
+#      the gate) resolves, and a revert changes it back.
 #
 # Writes go to a THROWAWAY policy carrying the seed's rule shapes (paths on
-# Edit, shell on Bash, flat deny on WebFetch) — a policy with zero agents is
-# a much safer subject than the seed. The seed policy is only READ here; the
-# shape of its rules is pinned by fluidbox-core's `tool_matrix_of_the_seed_policy`
-# / `autonomy_summary_of_the_seed_policy` tests, which parse the real yaml.
-say "POLICY API — matrix, per-tool overrides, and the sync merge"
+# Edit, shell on Bash, flat deny on WebFetch). The seed policy is only READ
+# here; its rule shapes are pinned by fluidbox-core's tests.
+say "POLICY API — matrix, append-only versions, publish/revert/clone"
 CT='content-type: application/json'
 GB=/tmp/fbx-gov-body.json
 post() { curl -s -o "$GB" -w "%{http_code}" -X POST    -H "$H" -H "$CT" -d "$2" "$API/v1$1"; }
 put()  { curl -s -o "$GB" -w "%{http_code}" -X PUT     -H "$H" -H "$CT" -d "$2" "$API/v1$1"; }
-del()  { curl -s -o "$GB" -w "%{http_code}" -X DELETE  -H "$H"                  "$API/v1$1"; }
 get()  { curl -s -H "$H" "$API/v1$1"; }
 
-# One matrix row, flattened for comparison: "status|action|overridable".
+# One matrix row, flattened for comparison: "status|action".
 prow() { # policy tool
   get "/policies/$1" | python3 -c "
 import sys, json
 rows = json.load(sys.stdin)['matrix']
 r = next((x for x in rows if x['tool'] == '$2'), None)
-print('MISSING' if r is None else '%s|%s|%s' % (
-    r['status']['status'], r['status'].get('action'), r['overridable']))
+print('MISSING' if r is None else '%s|%s' % (
+    r['status']['status'], r['status'].get('action')))
 " 2>/dev/null
 }
 pver() { get "/policies/$1" | j "['policy']['version']"; }
-# The API takes {name, yaml} — exactly the shape scripts/policy-sync.sh POSTs.
+# The API takes {name, yaml} — the historical import wire shape.
 gov_body() { python3 -c "import json,sys;print(json.dumps({'name':'gov-e2e','yaml':sys.stdin.read()}))"; }
+# The current content with the WebFetch rule's action rewritten, wrapped as a
+# publish body {content, summary, base_version}. Reads the DETAIL payload on
+# stdin — the editor's exact flow: load content, edit structure, publish.
+publish_body() { # action summary
+  python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+c = d['content']
+for rule in c['tools']:
+    if 'WebFetch' in rule['match']:
+        rule['action'] = '$1'
+print(json.dumps({'content': c, 'summary': '$2', 'base_version': d['policy']['version']}))"
+}
 
-# 1. The seed policy's detail payload — read-only, and override-independent.
+# 1. The seed policy's detail payload — read-only.
 SEED=$(get "/policies/default")
 FB=$(echo "$SEED" | j "['autonomy_summary']['default_fallback']")
 [ "$FB" = "deny" ] && ok "seed policy: autonomy fallback is deny (human absence narrows, never widens)" \
@@ -139,97 +150,137 @@ tools:
     risk: network egress from sandbox
 EOF
 )
-# The SAME yaml, plus a shell classifier on the WebFetch rule — the exact
-# constraint an override consulted first would strand (invariant B).
-POISON_YAML=$(printf '%s' "$GOV_YAML" | python3 -c "
-import sys
-y = sys.stdin.read()
-print(y.replace('    risk: network egress from sandbox',
-                '    risk: network egress from sandbox\n    shell:\n      on_no_match: approve'), end='')
-")
 CODE=$(post "/policies" "$(printf '%s' "$GOV_YAML" | gov_body)")
 [ "$CODE" = "200" ] \
-  && ok "throwaway policy '$GOV' published (seed shapes: paths on Edit, shell on Bash, flat deny on WebFetch)" \
-  || { no "policy create → $CODE: $(cat "$GB")"; exit 1; }
+  && ok "throwaway policy '$GOV' imported (seed shapes: paths on Edit, shell on Bash, flat deny on WebFetch)" \
+  || { no "policy import → $CODE: $(cat "$GB")"; exit 1; }
+BASE_VER=$(pver "$GOV")
+AUTHOR=$(get "/policies/$GOV" | j "['versions'][0]['author']")
+[ "$AUTHOR" = "api" ] && ok "the import minted a version with author 'api' (provenance recorded)" \
+  || no "latest version author: $AUTHOR"
 
 # 3. The matrix resolves each tool's REAL status.
 R=$(prow "$GOV" Edit)
-[ "$R" = "conditional|allow|False" ] \
-  && ok "Edit → conditional, overridable=false ('Edit → Allow' would be a lie)" || no "Edit row: $R"
+[ "$R" = "conditional|allow" ] \
+  && ok "Edit → conditional ('Edit → Allow' would be a lie)" || no "Edit row: $R"
 EDENY=$(get "/policies/$GOV" | python3 -c "
 import sys, json
 r = next(x for x in json.load(sys.stdin)['matrix'] if x['tool'] == 'Edit')
 print(','.join(r['status']['constraints']['paths_deny']))" 2>/dev/null)
 echo "$EDENY" | grep -q '\.env' \
-  && ok "Edit's row carries the paths.deny **/.env that flattening would delete" || no "Edit constraints: $EDENY"
-R=$(prow "$GOV" Read)
-[ "$R" = "unconditional|allow|True" ] && ok "Read → unconditional allow, overridable" || no "Read row: $R"
+  && ok "Edit's row carries the paths.deny **/.env a flat action would delete" || no "Edit constraints: $EDENY"
 R=$(prow "$GOV" WebFetch)
-[ "$R" = "unconditional|deny|True" ] && ok "WebFetch → unconditional deny, overridable" || no "WebFetch row: $R"
+[ "$R" = "unconditional|deny" ] && ok "WebFetch → unconditional deny" || no "WebFetch row: $R"
 
-# 4. INVARIANT A — the server refuses to flatten a conditional rule.
-CODE=$(put "/policies/$GOV/overrides/Edit" '{"action":"allow"}')
-[ "$CODE" = "400" ] \
-  && ok "INVARIANT A: PUT override Edit=allow → 400 (paths.deny **/.env survives the click)" \
-  || no "wanted 400, got $CODE: $(cat "$GB")"
-grep -q "conditional rule" "$GB" && ok "…and the refusal says WHY (conditional rule)" || no "refusal body: $(cat "$GB")"
-
-# 5. Exact names only — a wildcard/unknown override would be un-reviewable.
-CODE=$(put "/policies/$GOV/overrides/NotARealTool" '{"action":"allow"}')
-[ "$CODE" = "400" ] && ok "unknown tool → 400 (overrides take exact canonical or mcp__* names)" \
-  || no "wanted 400, got $CODE: $(cat "$GB")"
-
-# 5b. `mcp__*` is a NAMESPACE, not a roster — the name shape alone proves
-# nothing exists. Such an override would be consulted FIRST by every future
-# evaluation while the matrix (canonical + currently-attached tools only)
-# rendered no row for it: a permission granted once, invisibly, and never
-# re-decided when the bundle finally arrives. The write must pass the same
-# roster the matrix is drawn from.
-CODE=$(put "/policies/$GOV/overrides/mcp__nonexistent__tool" '{"action":"allow"}')
-[ "$CODE" = "400" ] \
-  && ok "unattached mcp tool → 400 (an override no page could render never lands)" \
-  || no "wanted 400, got $CODE: $(cat "$GB")"
-grep -q "MCP tools this policy" "$GB" \
-  && ok "…and the refusal names the roster, not the name shape" || no "refusal body: $(cat "$GB")"
-
-# 6. The one click a human makes.
-CODE=$(put "/policies/$GOV/overrides/WebFetch" '{"action":"allow"}')
-[ "$CODE" = "200" ] && ok "PUT override WebFetch=allow → 200 (unconditional rows are safe to control)" \
-  || no "wanted 200, got $CODE: $(cat "$GB")"
-R=$(prow "$GOV" WebFetch)
-[ "$R" = "overridden|allow|True" ] && ok "WebFetch row → overridden (the underlying rule is kept, not rewritten)" \
-  || no "after override: $R"
-
-# 7. INVARIANT B (survival) — the yaml is never the policy that RUNS.
+# 4. Idempotent import: a byte-equal re-POST appends NOTHING.
 CODE=$(post "/policies" "$(printf '%s' "$GOV_YAML" | gov_body)")
-[ "$CODE" = "200" ] && ok "pristine policy-sync re-POST → 200" || no "re-sync → $CODE: $(cat "$GB")"
-R=$(prow "$GOV" WebFetch)
-[ "$R" = "overridden|allow|True" ] \
-  && ok "INVARIANT B: the override SURVIVED policy-sync (upsert merges the column back in)" \
-  || no "override dropped by sync: $R"
-
-# 8. INVARIANT B (rejection) — a constraint that could never fire is refused,
-# and the refusal must be a real block, not just a reported one.
-VER=$(pver "$GOV")
-CODE=$(post "/policies" "$(printf '%s' "$POISON_YAML" | gov_body)")
-[ "$CODE" = "422" ] \
-  && ok "INVARIANT B: yaml adding shell to WebFetch (which holds a live override) → 422" \
-  || no "wanted 422, got $CODE: $(cat "$GB")"
+APPENDED=$(j "['appended']" < "$GB")
 NOW=$(pver "$GOV")
-[ "$NOW" = "$VER" ] && ok "…and the refused sync wrote NOTHING (version still $VER — a dead constraint never landed)" \
-  || no "version moved $VER → $NOW: the write was NOT blocked"
+[ "$CODE" = "200" ] && [ "$APPENDED" = "False" ] && [ "$NOW" = "$BASE_VER" ] \
+  && ok "byte-equal re-import → appended=false, still v$BASE_VER (history cannot inflate)" \
+  || no "re-import: code=$CODE appended=$APPENDED version=$BASE_VER→$NOW"
 
-# 9. Clearing removes; it never rewrites the rule underneath.
-CODE=$(del "/policies/$GOV/overrides/WebFetch")
-[ "$CODE" = "200" ] && ok "DELETE override → 200" || no "wanted 200, got $CODE: $(cat "$GB")"
+# 5. PUBLISH (the structured path) flips WebFetch deny→allow: version+1 AND
+# the resolved matrix changes with it (a version is meaning, not a number).
+CODE=$(get "/policies/$GOV" | publish_body allow "open egress for the e2e" | \
+       curl -s -o "$GB" -w "%{http_code}" -X POST -H "$H" -H "$CT" -d @- "$API/v1/policies/$GOV/publish")
+V_ALLOW=$(pver "$GOV")
 R=$(prow "$GOV" WebFetch)
-[ "$R" = "unconditional|deny|True" ] && ok "WebFetch fell back to the rule's own deny" || no "after clear: $R"
+[ "$CODE" = "200" ] && [ "$V_ALLOW" = "$((BASE_VER + 1))" ] && [ "$R" = "unconditional|allow" ] \
+  && ok "publish → v$V_ALLOW and WebFetch now resolves ALLOW (the edit is live for future runs)" \
+  || no "publish: code=$CODE version=$V_ALLOW row=$R"
 
-# 10. Leave the subject exactly as found: pristine yaml, zero overrides.
-OVR=$(get "/policies/$GOV" | python3 -c "
+# 6. IMMUTABILITY — the pre-publish version is still readable, deny intact.
+OLD_ACTION=$(get "/policies/$GOV/versions/$BASE_VER" | python3 -c "
 import sys, json
-print(sum(1 for x in json.load(sys.stdin)['matrix'] if x['status']['status'] == 'overridden'))" 2>/dev/null)
-[ "$OVR" = "0" ] && ok "'$GOV' left as found — pristine yaml, no lingering overrides" || no "lingering overrides: $OVR"
+c = json.load(sys.stdin)['content']
+r = next(x for x in c['tools'] if 'WebFetch' in x['match'])
+print(r['action'])" 2>/dev/null)
+[ "$OLD_ACTION" = "deny" ] \
+  && ok "INVARIANT A: v$BASE_VER still reads back with its deny — publishes never rewrite history" \
+  || no "v$BASE_VER WebFetch action: $OLD_ACTION"
+
+# 7. STALE GUARD — a publish carrying the OLD base_version is a 409 that
+# wrote nothing (editor B cannot silently overwrite editor A).
+STALE=$(get "/policies/$GOV" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(json.dumps({'content': d['content'], 'summary': 'stale write', 'base_version': $BASE_VER}))")
+CODE=$(post "/policies/$GOV/publish" "$STALE")
+NOW=$(pver "$GOV")
+[ "$CODE" = "409" ] && [ "$NOW" = "$V_ALLOW" ] \
+  && ok "INVARIANT B: stale base_version → 409, still v$V_ALLOW (nothing written)" \
+  || no "stale publish: code=$CODE version=$V_ALLOW→$NOW: $(cat "$GB")"
+
+# 8. STRICT PARSER — a typo'd field ('pathz') is a 422, never silently dropped.
+TYPO=$(get "/policies/$GOV" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+c = d['content']; c['tools'][1]['pathz'] = {'deny': []}
+print(json.dumps({'content': c, 'summary': 'typo', 'base_version': d['policy']['version']}))")
+CODE=$(post "/policies/$GOV/publish" "$TYPO")
+NOW=$(pver "$GOV")
+[ "$CODE" = "422" ] && [ "$NOW" = "$V_ALLOW" ] \
+  && ok "INVARIANT C: unknown field 'pathz' → 422, nothing written" \
+  || no "typo publish: code=$CODE version=$NOW: $(cat "$GB")"
+grep -q "pathz" "$GB" && ok "…and the refusal names the typo'd key" || no "refusal body: $(cat "$GB")"
+
+# 8b. A blank summary is refused — the review beat is not optional.
+NOSUM=$(get "/policies/$GOV" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(json.dumps({'content': d['content'], 'summary': '  ', 'base_version': d['policy']['version']}))")
+CODE=$(post "/policies/$GOV/publish" "$NOSUM")
+[ "$CODE" = "400" ] && ok "blank summary → 400 (publish states what changed and why)" \
+  || no "blank summary: code=$CODE: $(cat "$GB")"
+
+# 9. PREVIEW resolves a DRAFT server-side and persists nothing.
+DRAFT=$(get "/policies/$GOV" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+c = d['content']
+for rule in c['tools']:
+    if 'WebFetch' in rule['match']:
+        rule['action'] = 'approve'
+print(json.dumps({'content': c, 'name': 'gov-e2e'}))")
+PREV=$(curl -s -X POST -H "$H" -H "$CT" -d "$DRAFT" "$API/v1/policies/preview" | python3 -c "
+import sys, json
+rows = json.load(sys.stdin)['matrix']
+r = next(x for x in rows if x['tool'] == 'WebFetch')
+print('%s|%s' % (r['status']['status'], r['status'].get('action')))" 2>/dev/null)
+NOW=$(pver "$GOV")
+[ "$PREV" = "unconditional|approve" ] && [ "$NOW" = "$V_ALLOW" ] \
+  && ok "preview resolves the draft (WebFetch→approve) and persisted nothing (still v$V_ALLOW)" \
+  || no "preview: row=$PREV version=$NOW"
+
+# 10. REVERT publishes the old content FORWARD: version+1, deny restored.
+CODE=$(post "/policies/$GOV/revert" "{\"version\": $BASE_VER, \"base_version\": $V_ALLOW}")
+V_REVERT=$(pver "$GOV")
+R=$(prow "$GOV" WebFetch)
+SUM=$(get "/policies/$GOV" | j "['versions'][0]['summary']")
+[ "$CODE" = "200" ] && [ "$V_REVERT" = "$((V_ALLOW + 1))" ] && [ "$R" = "unconditional|deny" ] \
+  && ok "revert → v$V_REVERT with v$BASE_VER's content: WebFetch resolves DENY again" \
+  || no "revert: code=$CODE version=$V_REVERT row=$R"
+[ "$SUM" = "revert to v$BASE_VER" ] && ok "…and the version says so: '$SUM'" || no "revert summary: $SUM"
+
+# 11. CLONE mints a new policy (identity + v1) from the source's content.
+CLONE="gov-e2e-clone-$RANDOM"
+CODE=$(post "/policies/clone" "{\"name\": \"$CLONE\", \"from\": \"$GOV\"}")
+CV=$(pver "$CLONE")
+CR=$(prow "$CLONE" WebFetch)
+[ "$CODE" = "200" ] && [ "$CV" = "1" ] && [ "$CR" = "unconditional|deny" ] \
+  && ok "clone '$CLONE' → v1 carrying the source's rules" \
+  || no "clone: code=$CODE v=$CV row=$CR: $(cat "$GB")"
+CODE=$(post "/policies/clone" "{\"name\": \"$CLONE\", \"from\": \"$GOV\"}")
+[ "$CODE" = "409" ] && ok "cloning onto an existing name → 409" || no "dup clone: $CODE"
+CODE=$(post "/policies/clone" '{"name": "bad/name"}')
+[ "$CODE" = "400" ] && ok "an unroutable policy name → 400" || no "bad name: $CODE"
+
+# 12. The override routes are GONE — the fold retired the mechanism.
+CODE=$(put "/policies/$GOV/overrides/WebFetch" '{"action":"allow"}')
+[ "$CODE" = "404" ] || [ "$CODE" = "405" ] \
+  && ok "PUT /overrides/{tool} → $CODE (retired: an override IS a head rule now)" \
+  || no "override route still answers: $CODE"
 rm -f "$GB"
 
 # ── Supervised session ──────────────────────────────────────────────────
@@ -238,6 +289,14 @@ S=$(new_session false); echo "  session $S"
 T=$(token_for "$S")
 [ -n "$T" ] && ok "sandbox launched; got tool-audience session token" || { no "no token"; exit 1; }
 silence_runner "$S"
+
+# The RunSpec froze the policy's LATEST version at creation (design §4.2):
+# the run's law is a specific immutable version row, not "whatever the
+# policy says later".
+DEFV=$(pver default)
+FROZE=$(curl -s -H "$H" "$API/v1/sessions/$S" | j "['session']['run_spec']['policy_version']")
+[ "$FROZE" = "$DEFV" ] && ok "RunSpec froze default's latest version (v$DEFV)" \
+  || no "frozen policy_version=$FROZE, policy latest=$DEFV"
 
 # safe tool → allow
 D=$(perm "$T" "$S" '{"tool_call_id":"g1","tool":"Read","input":{"file_path":"/workspace/x"}}' | j "['decision']")
