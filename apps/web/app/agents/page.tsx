@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useEffect, useMemo, useState, useCallback } from "react";
+import { Suspense, useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { ChevronDown, ChevronRight, Search as SearchIcon } from "lucide-react";
@@ -10,6 +10,7 @@ import {
   Agent,
   BundleRef,
   ConnectionRequirement,
+  PolicySummary,
   Revision,
   workspaceLabel,
   bundleRefsLabel,
@@ -25,9 +26,6 @@ import {
   specToDraft,
   draftToInput,
 } from "../components/WorkspacePicker";
-import { useSessionDraft } from "../lib/useSessionDraft";
-
-type Tab = "agents" | "policies";
 
 export default function AgentsPage() {
   return (
@@ -40,8 +38,12 @@ export default function AgentsPage() {
 function Agents() {
   const router = useRouter();
   const params = useSearchParams();
-  const tab = ((params.get("tab") as Tab) || "agents") as Tab;
-  const setTab = (t: Tab) => router.replace(t === "agents" ? "/agents" : `/agents?tab=${t}`);
+  // The YAML policies tab retired with DB-native policies (§17 #11):
+  // Governance is the authoring surface. Old bookmarks land there.
+  const legacyPoliciesTab = params.get("tab") === "policies";
+  useEffect(() => {
+    if (legacyPoliciesTab) router.replace("/governance");
+  }, [legacyPoliciesTab, router]);
 
   const [agents, setAgents] = useState<Agent[]>([]);
   const [open, setOpen] = useState<string | null>(null);
@@ -92,27 +94,15 @@ function Agents() {
     <>
       <PageHead
         title="Agents"
-        sub="Versioned recipes and the policies that govern them. Editing appends an immutable revision — running sessions keep their frozen spec."
+        sub="Versioned recipes. Editing appends an immutable revision — running sessions keep their frozen spec. Policies are authored in Governance."
         right={
-          tab === "agents" ? (
-            <Link className="btn primary" href="/?action=new-agent#configuration">
-              New agent
-            </Link>
-          ) : undefined
+          <Link className="btn primary" href="/?action=new-agent#configuration">
+            New agent
+          </Link>
         }
       />
 
-      <div className="tabs">
-        <button className={`tab ${tab === "agents" ? "active" : ""}`} onClick={() => setTab("agents")}>
-          Agents
-          <span className="n">{agents.length}</span>
-        </button>
-        <button className={`tab ${tab === "policies" ? "active" : ""}`} onClick={() => setTab("policies")}>
-          Policies
-        </button>
-      </div>
-
-      {tab === "policies" ? <PoliciesTab /> : agentsList()}
+      {agentsList()}
 
       {addRev && (
         <AddRevision
@@ -258,185 +248,6 @@ function Agents() {
   }
 }
 
-/* ─── Policies tab (YAML editor, versioned saves) ────────────────────── */
-
-interface PolicyRow {
-  id: string;
-  name: string;
-  version: number;
-  yaml_source: string;
-}
-
-function PoliciesTab() {
-  const [policies, setPolicies] = useState<PolicyRow[]>([]);
-  const [selected, setSelected] = useState<string | null>(null);
-  const [yaml, setYaml] = useState("");
-  const [name, setName] = useState("");
-  const [validity, setValidity] = useState<{ ok: boolean; msg: string } | null>(null);
-  const [saved, setSaved] = useState(false);
-  const [baselineYaml, setBaselineYaml] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState("");
-
-  const load = useCallback(async () => {
-    try {
-      const r = await apiGetCached<{ policies: PolicyRow[] }>("/policies", { maxAgeMs: 30_000 });
-      setPolicies(r.policies);
-      setLoadError("");
-      if (!selected && r.policies.length) {
-        const first = r.policies[0];
-        setSelected(first.id);
-        setName(first.name);
-        setYaml(first.yaml_source);
-        setBaselineYaml(first.yaml_source);
-      }
-    } catch (error) {
-      setLoadError(`Policies could not be loaded. ${String(error)}`);
-    } finally {
-      setLoading(false);
-    }
-  }, [selected]);
-
-  useEffect(() => {
-    const first = window.setTimeout(() => void load(), 0);
-    return () => clearTimeout(first);
-  }, [load]);
-
-  const policyDraft = useMemo(() => ({ yaml }), [yaml]);
-  const restorePolicyDraft = useCallback((draft: { yaml: string }) => {
-    if (draft && typeof draft.yaml === "string") setYaml(draft.yaml);
-  }, []);
-  const clearPolicyDraft = useSessionDraft({
-    key: `fluidbox:draft:policy:${selected ?? "none"}`,
-    value: policyDraft,
-    onRestore: restorePolicyDraft,
-    shouldPersist: !!selected && yaml !== baselineYaml,
-    delayMs: 0,
-  });
-
-  const pick = (p: PolicyRow) => {
-    setSelected(p.id);
-    setName(p.name);
-    setYaml(p.yaml_source);
-    setBaselineYaml(p.yaml_source);
-    setValidity(null);
-    setSaved(false);
-  };
-
-  const validate = async () => {
-    try {
-      const r = await apiPost<{ valid: boolean; name: string }>("/policies/validate", { yaml });
-      setValidity({ ok: true, msg: `valid · ${r.name}` });
-    } catch (e) {
-      setValidity({ ok: false, msg: String(e).replace(/^Error:\s*/, "") });
-    }
-  };
-
-  const save = async () => {
-    setSaved(false);
-    try {
-      await apiPost("/policies", { name, yaml });
-      setValidity({ ok: true, msg: "saved — new version created" });
-      setSaved(true);
-      setBaselineYaml(yaml);
-      clearPolicyDraft();
-      void load();
-    } catch (e) {
-      setValidity({ ok: false, msg: String(e).replace(/^Error:\s*/, "") });
-    }
-  };
-
-  return (
-    <>
-      <p className="helper" style={{ margin: "0 0 12px", maxWidth: 640 }}>
-        First match wins over tool calls. Fail-safe defaults: unknown tools ask a human, and
-        autonomy narrows authority — it never widens it. Saving creates a new version; in-flight
-        runs keep their snapshot.
-      </p>
-      {loadError && <div className="err" style={{ marginBottom: 10 }}>{loadError}</div>}
-      {loading ? (
-        <div className="panel"><LoadingRows rows={3} /></div>
-      ) : loadError && policies.length === 0 ? (
-        <div className="panel launch-empty">
-          <div>
-            <h3>Policies are unavailable.</h3>
-            <p>The editor will not imply an empty policy set after a failed read.</p>
-          </div>
-          <div className="empty-actions">
-            <button
-              className="btn"
-              type="button"
-              onClick={() => {
-                setLoading(true);
-                void load();
-              }}
-            >
-              Retry now
-            </button>
-          </div>
-        </div>
-      ) : policies.length === 0 ? (
-        <div className="panel empty">No policies have been synced yet.</div>
-      ) : (
-      <div className="policy-editor-grid">
-        <div className="panel">
-          <div className="rows">
-            {policies.map((p) => (
-              <div
-                key={p.id}
-                className="row click"
-                style={{
-                  gridTemplateColumns: "1fr",
-                  cursor: "pointer",
-                  background: selected === p.id ? "var(--raised)" : undefined,
-                }}
-                onClick={() => pick(p)}
-              >
-                <span className="mono" style={{ fontSize: 12.5, color: selected === p.id ? "var(--accent)" : "var(--ink)" }}>
-                  {p.name}
-                  <span className="faint" style={{ marginLeft: 8, fontSize: 11 }}>
-                    v{p.version}
-                  </span>
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div>
-          <textarea
-            className="inp code"
-            value={yaml}
-            onChange={(e) => {
-              setYaml(e.target.value);
-              setSaved(false);
-            }}
-            spellCheck={false}
-          />
-          <div className="spread" style={{ marginTop: 12 }}>
-            <div className="mono" style={{ fontSize: 12.5 }}>
-              {validity && (
-                <span style={{ color: validity.ok ? "var(--green)" : "var(--red)" }}>
-                  {validity.ok ? "Valid: " : "Invalid: "}{validity.msg}
-                </span>
-              )}
-            </div>
-            <div style={{ display: "flex", gap: 8 }}>
-              <button className="btn" onClick={validate}>
-                Validate
-              </button>
-              <button className="btn primary" onClick={save}>
-                {saved ? "Saved" : "Save version"}
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-      )}
-    </>
-  );
-}
-
 /* ─── Modals (unchanged flows, new chrome) ───────────────────────────── */
 
 function AddRevision({
@@ -459,12 +270,30 @@ function AddRevision({
   const [requirements, setRequirements] = useState<ConnectionRequirement[]>(
     current?.connection_requirements ?? []
   );
+  // Spec A: the revision is where an EXISTING agent changes policy. Options
+  // come from the policy summaries; the initial value is the current
+  // revision's attachment, resolved id → name once the list loads.
+  const [policies, setPolicies] = useState<PolicySummary[]>([]);
+  const [policyName, setPolicyName] = useState<string | null>(null);
+  const currentPolicyName =
+    policies.find((p) => p.id === current?.policy_id)?.name ?? null;
+  useEffect(() => {
+    let active = true;
+    apiGetCached<{ policies: PolicySummary[] }>("/policies", { maxAgeMs: 30_000 })
+      .then((r) => active && setPolicies(r.policies))
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
+  const effectivePolicyName = policyName ?? currentPolicyName;
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const dirty =
     harness !== (current?.harness || "claude-agent-sdk") ||
     model !== (current?.model || "claude-haiku-4-5") ||
     systemPrompt !== (current?.system_prompt || "") ||
+    (policyName !== null && policyName !== currentPolicyName) ||
     JSON.stringify(workspace) !== JSON.stringify(specToDraft(current?.default_workspace)) ||
     JSON.stringify(pins) !== JSON.stringify(current?.capability_bundles ?? []) ||
     JSON.stringify(requirements) !== JSON.stringify(current?.connection_requirements ?? []);
@@ -473,7 +302,8 @@ function AddRevision({
     setErr("");
     setBusy(true);
     try {
-      // Inherits policy/image/budgets from the latest revision.
+      // Inherits image/budgets from the latest revision; the policy is sent
+      // only when the operator changed it here (omitted → inherit).
       // The workspace is sent explicitly (WYSIWYG): scratch clears a default.
       // Capability pins are WYSIWYG too: exactly the name@version refs
       // shown in the picker are attached (§17 #7 — nothing floats, and an
@@ -483,6 +313,9 @@ function AddRevision({
         harness,
         model,
         system_prompt: systemPrompt.trim() || null,
+        ...(policyName !== null && policyName !== currentPolicyName
+          ? { policy: policyName }
+          : {}),
         default_workspace: draftToInput(workspace),
         capability_bundles: pins.map((p) => `${p.name}@${p.version}`),
         connection_requirements: requirements,
@@ -540,12 +373,32 @@ function AddRevision({
           onChange={(e) => setSystemPrompt(e.target.value)}
         />
       </label>
+      <label className="field">
+        <span className="lab">Policy</span>
+        <select
+          className="inp"
+          value={effectivePolicyName ?? ""}
+          onChange={(e) => setPolicyName(e.target.value)}
+          disabled={policies.length === 0}
+        >
+          {policies.length === 0 && <option value="">Loading policies…</option>}
+          {policies.map((p) => (
+            <option key={p.id} value={p.name}>
+              {p.name} · v{p.version}
+              {p.id === current?.policy_id ? " (current)" : ""}
+            </option>
+          ))}
+        </select>
+        <span className="helper">
+          Governs every run of this revision. <Link href="/governance">Author policies in Governance.</Link>
+        </span>
+      </label>
       <WorkspacePicker draft={workspace} onChange={setWorkspace} />
       <BundlePicker pins={pins} onChange={setPins} />
       <RequirementsEditor value={requirements} onChange={setRequirements} />
       {err && <div className="err">{err}</div>}
       <div className="spread" style={{ marginTop: 14 }}>
-        <span className="helper">Inherits harness · policy · image · budgets.</span>
+        <span className="helper">Inherits image · budgets.</span>
         <button className="btn primary" onClick={submit} disabled={busy || harnessesLoading || !!harnessesError}>
           {busy ? "Appending…" : "Append revision"}
         </button>

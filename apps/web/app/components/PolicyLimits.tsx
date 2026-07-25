@@ -1,14 +1,23 @@
 "use client";
 
-// Budgets · Approvals · Egress — read-only. The permissions matrix answers what
-// an agent may do; this answers what a run may SPEND doing it, how long a human
-// has to answer, and whether the sandbox may reach the network.
+// Budgets · Approvals · Autonomy · Network · Defaults — the flat knobs of a
+// policy (design §4.4). The permissions matrix answers what an agent may do;
+// this answers what a run may SPEND doing it, how long a human has to answer,
+// what happens when nobody is watching, and whether the sandbox may reach the
+// network.
 //
-// Presentation only, like everything else on this page: every value here was
-// resolved by the control plane and sent over the wire. This file chooses words
-// and units for a number, never the number.
+// Editing writes STRUCTURE into the client-side draft; nothing persists until
+// Publish, and every resolved consequence (the autonomy summary, the matrix)
+// is re-fetched from the server's preview. This file chooses words and units
+// for a number, never the number.
 
-import { ApprovalScope, ApprovalSettings, Budgets, Egress, EgressMode } from "../lib/api";
+import {
+  ApprovalScope,
+  Budgets,
+  EgressMode,
+  PolicyAction,
+  PolicyContent,
+} from "../lib/api";
 import { VERB } from "./PermissionMatrix";
 
 /** A cap the policy did not set. `spec::Budgets` is four `Option`s, so an unset
@@ -16,8 +25,8 @@ import { VERB } from "./PermissionMatrix";
 const NO_CAP = "No limit";
 
 const SCOPE: Record<ApprovalScope, string> = {
-  once: "Once",
-  session: "Session",
+  once: "Once per call",
+  session: "Once per session scope",
 };
 
 const EGRESS: Record<EgressMode, string> = {
@@ -37,66 +46,189 @@ function duration(secs: number): string {
   return `${num(Math.round(scaled * 10) / 10)} ${secs < 3600 ? "min" : "hr"}`;
 }
 
-/** 2.5 → "$2.50". A sub-cent ceiling keeps its digits rather than rounding up
- *  to a limit the policy does not actually grant. */
-function usd(n: number): string {
-  return n.toLocaleString("en-US", {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: 2,
-    maximumFractionDigits: n > 0 && n < 0.01 ? 4 : 2,
-  });
-}
-
-/** Applies a formatter only to a cap that exists. */
-function cap(value: number | null, format: (n: number) => string): string {
-  return value == null ? NO_CAP : format(value);
-}
-
-function Fact({ k, v }: { k: string; v: string }) {
+/** A nullable numeric cap: empty = no ceiling of that kind. */
+function CapField({
+  label,
+  hint,
+  value,
+  onChange,
+}: {
+  label: string;
+  hint?: string;
+  value: number | null;
+  onChange: (next: number | null) => void;
+}) {
   return (
-    <div className="spec-row">
-      <span className="k">{k}</span>
-      <span className="v">{v}</span>
-    </div>
+    <label className="field">
+      <span className="lab">
+        {label} {hint ? <span className="optional-label">{hint}</span> : null}
+      </span>
+      <input
+        className="inp mono"
+        type="number"
+        min={0}
+        step="any"
+        value={value ?? ""}
+        placeholder={NO_CAP}
+        onChange={(e) => {
+          const raw = e.target.value.trim();
+          onChange(raw === "" ? null : Number(raw));
+        }}
+      />
+    </label>
   );
 }
 
+/** The flat forms, editing the draft in place. */
 export function PolicyLimits({
-  budgets,
-  approvals,
-  egress,
+  content,
+  onChange,
 }: {
-  budgets: Budgets;
-  approvals: ApprovalSettings;
-  egress: Egress;
+  content: PolicyContent;
+  onChange: (next: PolicyContent) => void;
 }) {
+  const set = (patch: Partial<PolicyContent>) => onChange({ ...content, ...patch });
+  const { budgets, approvals, autonomy, egress, defaults } = content;
+
   return (
     <>
       <div className="sectitle" style={{ marginTop: 0 }}>
-        What a run may spend
+        Default verdict
       </div>
       <p className="helper" style={{ marginBottom: 4 }}>
-        A ceiling, not an allowance: an agent and each run may tighten these, never widen them.
+        When no rule matches a tool. Fail-safe is Ask — a human decides the unknown.
       </p>
-      <div>
-        <Fact k="Wall clock" v={cap(budgets.max_wall_clock_secs, duration)} />
-        <Fact k="Tokens" v={cap(budgets.max_tokens, num)} />
-        <Fact k="Cost" v={cap(budgets.max_cost_usd, usd)} />
-        <Fact k="Tool calls" v={cap(budgets.max_tool_calls, num)} />
+      <label className="field">
+        <span className="lab">Unmatched tools</span>
+        <select
+          className="inp"
+          value={defaults.tool_action}
+          onChange={(e) =>
+            set({ defaults: { tool_action: e.target.value as PolicyAction } })
+          }
+        >
+          {(["allow", "approve", "deny"] as PolicyAction[]).map((a) => (
+            <option key={a} value={a}>
+              {VERB[a]}
+            </option>
+          ))}
+        </select>
+      </label>
+
+      <div className="sectitle">What a run may spend</div>
+      <p className="helper" style={{ marginBottom: 4 }}>
+        A ceiling, not an allowance: an agent and each run may tighten these, never widen them.
+        Empty means no ceiling of that kind.
+      </p>
+      <div className="agent-creator-grid">
+        <CapField
+          label="Wall clock (seconds)"
+          hint={budgets.max_wall_clock_secs != null ? duration(budgets.max_wall_clock_secs) : undefined}
+          value={budgets.max_wall_clock_secs}
+          onChange={(v) => set({ budgets: { ...budgets, max_wall_clock_secs: v } })}
+        />
+        <CapField
+          label="Tokens"
+          value={budgets.max_tokens}
+          onChange={(v) => set({ budgets: { ...budgets, max_tokens: v } })}
+        />
+        <CapField
+          label="Cost (USD)"
+          value={budgets.max_cost_usd}
+          onChange={(v) => set({ budgets: { ...budgets, max_cost_usd: v } })}
+        />
+        <CapField
+          label="Tool calls"
+          value={budgets.max_tool_calls}
+          onChange={(v) => set({ budgets: { ...budgets, max_tool_calls: v } })}
+        />
       </div>
 
       <div className="sectitle">Approvals</div>
-      <div>
-        <Fact k="Request expires after" v={duration(approvals.default_ttl_secs)} />
-        <Fact k="Scope" v={SCOPE[approvals.scope]} />
-        <Fact k="If nobody answers" v={VERB[approvals.timeout_action]} />
+      <div className="agent-creator-grid">
+        <label className="field">
+          <span className="lab">
+            Request expires after (seconds){" "}
+            <span className="optional-label">{duration(approvals.default_ttl_secs)}</span>
+          </span>
+          <input
+            className="inp mono"
+            type="number"
+            min={1}
+            value={approvals.default_ttl_secs}
+            onChange={(e) =>
+              set({
+                approvals: {
+                  ...approvals,
+                  default_ttl_secs: Math.max(1, Number(e.target.value) || 1),
+                },
+              })
+            }
+          />
+        </label>
+        <label className="field">
+          <span className="lab">One decision reaches</span>
+          <select
+            className="inp"
+            value={approvals.scope}
+            onChange={(e) =>
+              set({ approvals: { ...approvals, scope: e.target.value as ApprovalScope } })
+            }
+          >
+            {(Object.keys(SCOPE) as ApprovalScope[]).map((s) => (
+              <option key={s} value={s}>
+                {SCOPE[s]}
+              </option>
+            ))}
+          </select>
+        </label>
       </div>
+      <p className="helper">If nobody answers in time: {VERB[approvals.timeout_action]}.</p>
+
+      <div className="sectitle">Unattended runs</div>
+      <label className="check">
+        <input
+          type="checkbox"
+          checked={autonomy.permitted}
+          onChange={(e) => set({ autonomy: { ...autonomy, permitted: e.target.checked } })}
+        />
+        Permit autonomous runs of this policy
+      </label>
+      <label className="field">
+        <span className="lab">When an action would ask a human</span>
+        <select
+          className="inp"
+          value={autonomy.on_approval_rule}
+          onChange={(e) =>
+            set({
+              autonomy: {
+                ...autonomy,
+                on_approval_rule: e.target.value as "allow" | "deny",
+              },
+            })
+          }
+          disabled={!autonomy.permitted}
+        >
+          <option value="deny">Deny it (human absence narrows)</option>
+          <option value="allow">Allow it</option>
+        </select>
+      </label>
 
       <div className="sectitle">Network</div>
-      <div>
-        <Fact k="Egress" v={EGRESS[egress.mode]} />
-      </div>
+      <label className="field">
+        <span className="lab">Egress</span>
+        <select
+          className="inp"
+          value={egress.mode}
+          onChange={(e) => set({ egress: { mode: e.target.value as EgressMode } })}
+        >
+          {(Object.keys(EGRESS) as EgressMode[]).map((m) => (
+            <option key={m} value={m}>
+              {EGRESS[m]}
+            </option>
+          ))}
+        </select>
+      </label>
     </>
   );
 }
