@@ -38,7 +38,7 @@ mod tokens;
 mod triggers;
 mod workers;
 
-use axum::routing::{delete, get, patch, post, put};
+use axum::routing::{delete, get, patch, post};
 use axum::Router;
 use fluidbox_core::traits::ExecutionProvider;
 use state::{AppStateInner, ApprovalRegistry};
@@ -354,10 +354,14 @@ async fn main() -> anyhow::Result<()> {
             get(api::list_policies).post(api::upsert_policy),
         )
         .route("/policies/validate", post(api::validate_policy))
+        .route("/policies/preview", post(api::preview_policy))
+        .route("/policies/clone", post(api::clone_policy))
         .route("/policies/{name}", get(api::get_policy))
+        .route("/policies/{name}/publish", post(api::publish_policy))
+        .route("/policies/{name}/revert", post(api::revert_policy))
         .route(
-            "/policies/{name}/overrides/{tool}",
-            put(api::put_policy_override).delete(api::delete_policy_override),
+            "/policies/{name}/versions/{version}",
+            get(api::get_policy_version),
         )
         .route(
             "/sessions",

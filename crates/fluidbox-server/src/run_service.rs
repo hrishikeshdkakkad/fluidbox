@@ -163,7 +163,15 @@ pub async fn create_run(
     let policy_row = fluidbox_db::get_policy(&state.pool, scope, rev.policy_id)
         .await?
         .ok_or_else(|| ApiError::Internal("revision policy missing".into()))?;
-    let policy: Policy = serde_json::from_value(policy_row.parsed.clone())
+    // The LATEST version governs future runs (design §4.2); its content is
+    // what freezes into the RunSpec below. A policy with zero versions is a
+    // bug, not a state — fail closed before any provisioning or model spend.
+    let policy_version = fluidbox_db::latest_policy_version(&state.pool, scope, rev.policy_id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::Internal(format!("policy '{}' has no versions", policy_row.name))
+        })?;
+    let policy: Policy = serde_json::from_value(policy_version.content.clone())
         .map_err(|e| ApiError::Internal(format!("bad stored policy: {e}")))?;
 
     // Autonomy permission gate: a policy may forbid autonomous runs.
@@ -400,7 +408,7 @@ pub async fn create_run(
         trust_tier: req.trust_tier,
         budgets: effective_budgets.clone(),
         policy_id: policy_row.id,
-        policy_version: policy_row.version,
+        policy_version: policy_version.version,
         policy_snapshot: policy,
         invocation: req.invocation.clone(),
         result_destinations: result_destinations.clone(),

@@ -9,21 +9,48 @@
 -- `override_fold_preserves_every_verdict` property test; this SQL is only the
 -- mechanism.
 --
+-- FROZEN RunSpecs ARE NOT TOUCHED — terminal or in-flight. `sessions.run_spec`
+-- stays byte-identical; the ENGINE folds a legacy snapshot's
+-- `managed_overrides` at deserialization (fluidbox-core::policy), so an
+-- in-flight run keeps exactly the semantics it froze while its stored audit
+-- record keeps exactly its bytes.
+--
 -- DEPLOY ORDER: stop-the-old-binary, migrate, then deploy (the 0018 posture).
 -- An old binary `select *`s columns this migration drops, so it cannot serve
--- beside it — and since migrations run on the new binary's boot, the ordinary
--- single-binary deploy already satisfies this.
+-- beside it — and because the drops land in the same migration, there is NO
+-- binary rollback past this point (a pre-0026 binary cannot boot against a
+-- post-0026 database). Since migrations run on the new binary's boot, the
+-- ordinary single-binary deploy already satisfies the order.
 
 set local lock_timeout = '5s';
 
 -- This is the first DATA-BACKFILLING migration since 0018 ENABLE+FORCEd RLS on
--- `policies` and `sessions`. The migration connection carries no tenant GUC, so
--- without the audited bypass the backfill's `select … from policies` would read
--- ZERO rows (silently — an empty backfill, not an error) and the in-flight
--- snapshot fold below would update nothing. Transaction-local by construction
--- (sqlx runs each migration file in one transaction; `set local` above relies
--- on the same fact).
+-- `policies`. The migration connection carries no tenant GUC, so without the
+-- audited bypass the backfill's `select … from policies` would read ZERO rows
+-- — silently: an empty backfill, not an error. Transaction-local by
+-- construction (sqlx runs each migration file in one transaction; the
+-- `set local` above relies on the same fact).
 select set_config('fluidbox.bypass', 'system_worker', true);
+
+-- Preflight: the fold below trusts `managed_overrides` to be an array of
+-- {"tool": <text>, "action": "allow"|"approve"|"deny"} rows (the shape the
+-- retired write path enforced). A malformed value would abort mid-fold with an
+-- error naming no policy — fail HERE, naming the row, instead.
+do $$
+declare bad record;
+begin
+    select p.id, p.name into bad
+      from policies p
+     where jsonb_typeof(p.managed_overrides) is distinct from 'array'
+        or exists (
+            select 1 from jsonb_array_elements(p.managed_overrides) o
+             where jsonb_typeof(o->'tool') is distinct from 'string'
+                or o->>'action' not in ('allow', 'approve', 'deny'))
+     limit 1;
+    if found then
+        raise exception 'migration 0026: policy % (%) carries a malformed managed_overrides value; repair it before migrating', bad.id, bad.name;
+    end if;
+end $$;
 
 -- Composite-FK target on the parent (0012's `unique (tenant_id, id)` pattern —
 -- the 0013/0019/0022 child-table precedent).
@@ -32,8 +59,8 @@ alter table policies add constraint policies_tenant_id_id_key unique (tenant_id,
 create table policy_versions (
     id              uuid primary key,
     tenant_id       uuid not null references tenants(id),
-    policy_id       uuid not null references policies(id) on delete cascade,
-    version         int  not null,
+    policy_id       uuid not null,
+    version         int  not null check (version > 0),
     -- The canonical Policy document. Structure is the source of truth; YAML is
     -- an interchange format (design §4.1).
     content         jsonb not null,
@@ -53,6 +80,10 @@ create table policy_versions (
     author_user_id  uuid,
     created_at      timestamptz not null default now(),
     unique (policy_id, version),
+    -- ONE parent FK, the composite (0022's shape): it both anchors the row to
+    -- its policy AND proves the version cannot point at another tenant's
+    -- policy — a second direct `references policies(id)` would only re-check
+    -- the same relationship on every write.
     foreign key (tenant_id, policy_id) references policies (tenant_id, id) on delete cascade
 );
 
@@ -78,34 +109,6 @@ select
   p.yaml_source, 'migrated from 0010 managed_overrides', 'import'
 from policies p;
 
--- In-flight runs: the engine no longer reads `managed_overrides`, so a
--- NON-TERMINAL session whose frozen snapshot carries overrides would silently
--- change verdicts at its next tool call. Fold those snapshots with the SAME
--- verdict-preserving transform — the run's law is unchanged in meaning, only
--- in representation. TERMINAL sessions stay byte-identical: a completed run's
--- audit record is never rewritten (the fold's `where` is the state machine's
--- terminal vocabulary, fluidbox-core::state).
-update sessions s
-   set run_spec = jsonb_set(
-     s.run_spec, '{policy_snapshot}',
-     jsonb_set(
-       (s.run_spec->'policy_snapshot') - 'managed_overrides', '{tools}',
-       coalesce(
-         (select jsonb_agg(jsonb_build_object('match', jsonb_build_array(o->>'tool'),
-                                              'action', o->'action')
-                           order by ord)
-            from jsonb_array_elements(s.run_spec->'policy_snapshot'->'managed_overrides')
-                 with ordinality t(o, ord)),
-         '[]'::jsonb
-       ) || coalesce(s.run_spec->'policy_snapshot'->'tools', '[]'::jsonb),
-       true
-     ),
-     false
-   )
- where s.status not in ('completed', 'failed', 'cancelled', 'budget_exceeded')
-   and jsonb_array_length(coalesce(s.run_spec->'policy_snapshot'->'managed_overrides',
-                                   '[]'::jsonb)) > 0;
-
 -- Drop what moved or is superseded. `version` lives on the version row now;
 -- `parsed`/`yaml_source` live on `content`/`yaml_source` there; the 0010
 -- override column dies with its feature.
@@ -126,13 +129,17 @@ create policy tenant_isolation on policy_versions as permissive for all to publi
 
 -- Enumerated DML grant to the deployment's runtime role (resolved from the
 -- session GUC `fluidbox.runtime_role`, default `fluidbox_runtime` — NEVER
--- hardcoded). Copied from 0018 (e) via the 0022 template.
+-- hardcoded). DELIBERATELY select+insert ONLY — no update, no delete: history
+-- is append-only, and here that is a DATABASE property, not an application
+-- convention (the 0012 auth_audit_log posture). The one sanctioned erasure
+-- path is deleting the parent policy through the composite FK's cascade — and
+-- no application surface deletes policies today.
 do $$
 declare
     v_role text := coalesce(nullif(current_setting('fluidbox.runtime_role', true), ''),
                             'fluidbox_runtime');
 begin
     if exists (select 1 from pg_roles where rolname = v_role) then
-        execute format('grant select, insert, update, delete on table policy_versions to %I', v_role);
+        execute format('grant select, insert on table policy_versions to %I', v_role);
     end if;
 end $$;

@@ -4,7 +4,7 @@ use serde_json::Value;
 
 // ─── Policy document (YAML v0) ────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Policy {
     pub name: String,
     #[serde(default)]
@@ -19,6 +19,73 @@ pub struct Policy {
     pub autonomy: AutonomySettings,
     #[serde(default)]
     pub tools: Vec<ToolRule>,
+}
+
+/// The lenient wire shape behind [`Policy`]'s `Deserialize`, plus the LEGACY
+/// pre-0026 `managed_overrides` key.
+#[derive(Deserialize)]
+struct PolicyDe {
+    name: String,
+    #[serde(default)]
+    defaults: PolicyDefaults,
+    #[serde(default)]
+    egress: Egress,
+    #[serde(default)]
+    budgets: crate::spec::Budgets,
+    #[serde(default)]
+    approvals: ApprovalSettings,
+    #[serde(default)]
+    autonomy: AutonomySettings,
+    #[serde(default)]
+    tools: Vec<ToolRule>,
+    #[serde(default)]
+    managed_overrides: Vec<LegacyToolOverride>,
+}
+
+/// The retired 0010 per-tool override shape, accepted ONLY at this boundary.
+#[derive(Deserialize)]
+struct LegacyToolOverride {
+    tool: String,
+    action: RuleAction,
+}
+
+/// Deserialization FOLDS a legacy `managed_overrides` key into head rules —
+/// `{match: [tool], action}`, stored order, ahead of the authored rules — the
+/// exact transform migration 0026 applies to stored policies (pinned
+/// equivalent by `override_fold_preserves_every_verdict`). This is what keeps
+/// a pre-0026 frozen RunSpec snapshot governing its in-flight run with
+/// PRECISELY the semantics it froze, while `sessions.run_spec` stays
+/// byte-identical: the engine has no override branch, the compat lives here.
+/// Serialization never emits the key — a Policy that round-trips through us
+/// is post-fold, canonically. Unknown keys stay IGNORED (never
+/// `deny_unknown_fields` here — old blobs must keep deserializing); the
+/// authoring path gets its strictness from [`Policy::parse_strict`] instead.
+impl<'de> Deserialize<'de> for Policy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = PolicyDe::deserialize(deserializer)?;
+        let head = raw.managed_overrides.into_iter().map(|o| ToolRule {
+            r#match: vec![o.tool],
+            action: o.action,
+            risk: None,
+            paths: None,
+            shell: None,
+            on_autonomous: None,
+            approval_ttl_secs: None,
+            approval_scope: None,
+        });
+        Ok(Policy {
+            name: raw.name,
+            defaults: raw.defaults,
+            egress: raw.egress,
+            budgets: raw.budgets,
+            approvals: raw.approvals,
+            autonomy: raw.autonomy,
+            tools: head.chain(raw.tools).collect(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,6 +246,207 @@ pub struct ShellRules {
     /// Verdict when neither deny nor an allow-prefix hits. Fail-safe: approve.
     #[serde(default = "default_tool_action")]
     pub on_no_match: RuleAction,
+}
+
+// ─── Strict authoring mirror ──────────────────────────────────────────────
+//
+// The publish path parses drafts through THIS shape (`deny_unknown_fields` at
+// every level), so a typo'd field name is a 422 — never a silently-dropped
+// key publishing a weaker policy than its author reviewed. Stored blobs keep
+// the lenient [`Policy`] deserializer above: frozen snapshots carry keys
+// (`managed_overrides`) this shape deliberately refuses.
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftPolicy {
+    name: String,
+    #[serde(default)]
+    defaults: DraftDefaults,
+    #[serde(default)]
+    egress: DraftEgress,
+    #[serde(default)]
+    budgets: DraftBudgets,
+    #[serde(default)]
+    approvals: DraftApprovals,
+    #[serde(default)]
+    autonomy: DraftAutonomy,
+    #[serde(default)]
+    tools: Vec<DraftToolRule>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct DraftDefaults {
+    #[serde(default = "default_tool_action")]
+    tool_action: RuleAction,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct DraftEgress {
+    #[serde(default)]
+    mode: EgressMode,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftBudgets {
+    max_wall_clock_secs: Option<u64>,
+    max_tokens: Option<u64>,
+    max_cost_usd: Option<f64>,
+    max_tool_calls: Option<u64>,
+}
+
+impl Default for DraftBudgets {
+    fn default() -> Self {
+        let b = crate::spec::Budgets::default();
+        Self {
+            max_wall_clock_secs: b.max_wall_clock_secs,
+            max_tokens: b.max_tokens,
+            max_cost_usd: b.max_cost_usd,
+            max_tool_calls: b.max_tool_calls,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftApprovals {
+    #[serde(default = "default_ttl")]
+    default_ttl_secs: u64,
+    #[serde(default)]
+    scope: ApprovalScope,
+    #[serde(default)]
+    timeout_action: TimeoutAction,
+}
+
+impl Default for DraftApprovals {
+    fn default() -> Self {
+        Self {
+            default_ttl_secs: default_ttl(),
+            scope: ApprovalScope::default(),
+            timeout_action: TimeoutAction::default(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftAutonomy {
+    #[serde(default = "default_true")]
+    permitted: bool,
+    #[serde(default)]
+    on_approval_rule: AutonomousFallback,
+}
+
+impl Default for DraftAutonomy {
+    fn default() -> Self {
+        Self {
+            permitted: true,
+            on_approval_rule: AutonomousFallback::default(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftToolRule {
+    r#match: Vec<String>,
+    action: RuleAction,
+    #[serde(default)]
+    risk: Option<String>,
+    #[serde(default)]
+    paths: Option<DraftPathRules>,
+    #[serde(default)]
+    shell: Option<DraftShellRules>,
+    #[serde(default)]
+    on_autonomous: Option<AutonomousFallback>,
+    #[serde(default)]
+    approval_ttl_secs: Option<u64>,
+    #[serde(default)]
+    approval_scope: Option<ApprovalScope>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftPathRules {
+    #[serde(default)]
+    allow: Vec<String>,
+    #[serde(default)]
+    deny: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftShellRules {
+    #[serde(default)]
+    allow_prefixes: Vec<String>,
+    #[serde(default)]
+    deny_regex: Vec<String>,
+    #[serde(default = "default_tool_action")]
+    on_no_match: RuleAction,
+}
+
+impl From<DraftPolicy> for Policy {
+    fn from(d: DraftPolicy) -> Self {
+        Policy {
+            name: d.name,
+            defaults: PolicyDefaults {
+                tool_action: d.defaults.tool_action,
+            },
+            egress: Egress {
+                mode: d.egress.mode,
+            },
+            budgets: crate::spec::Budgets {
+                max_wall_clock_secs: d.budgets.max_wall_clock_secs,
+                max_tokens: d.budgets.max_tokens,
+                max_cost_usd: d.budgets.max_cost_usd,
+                max_tool_calls: d.budgets.max_tool_calls,
+            },
+            approvals: ApprovalSettings {
+                default_ttl_secs: d.approvals.default_ttl_secs,
+                scope: d.approvals.scope,
+                timeout_action: d.approvals.timeout_action,
+            },
+            autonomy: AutonomySettings {
+                permitted: d.autonomy.permitted,
+                on_approval_rule: d.autonomy.on_approval_rule,
+            },
+            tools: d
+                .tools
+                .into_iter()
+                .map(|r| ToolRule {
+                    r#match: r.r#match,
+                    action: r.action,
+                    risk: r.risk,
+                    paths: r.paths.map(|p| PathRules {
+                        allow: p.allow,
+                        deny: p.deny,
+                    }),
+                    shell: r.shell.map(|s| ShellRules {
+                        allow_prefixes: s.allow_prefixes,
+                        deny_regex: s.deny_regex,
+                        on_no_match: s.on_no_match,
+                    }),
+                    on_autonomous: r.on_autonomous,
+                    approval_ttl_secs: r.approval_ttl_secs,
+                    approval_scope: r.approval_scope,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl Policy {
+    /// Parse AUTHORED content (the publish/preview paths): unknown fields are
+    /// refused at every level, then the result passes [`Policy::validate`].
+    /// Legacy stored blobs go through the lenient `Deserialize` instead.
+    pub fn parse_strict(value: Value) -> Result<Policy, String> {
+        let draft: DraftPolicy = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        let policy: Policy = draft.into();
+        policy.validate()?;
+        Ok(policy)
+    }
 }
 
 // ─── Evaluation ───────────────────────────────────────────────────────────
@@ -1062,27 +1330,108 @@ tools:
         );
     }
 
-    /// Historical RunSpec snapshots (pre-0026) carry a `managed_overrides` key.
-    /// They must keep DESERIALIZING (serde stays lenient — never
-    /// `deny_unknown_fields` on `Policy`) and the engine must IGNORE the key:
-    /// overrides were folded into head rules by migration 0026, so a snapshot
-    /// that still carries the raw key is a terminal session's audit record, not
-    /// something to evaluate. Consulting it would resurrect the deleted branch.
+    /// Historical RunSpec snapshots (pre-0026) carry a `managed_overrides` key
+    /// and their in-flight runs must keep EXACTLY the semantics they froze —
+    /// while `sessions.run_spec` stays byte-identical. Deserialization folds
+    /// the key into head rules (the 0026 transform), so the override still
+    /// wins over the rules below it, and re-serialization emits a post-fold
+    /// document with no legacy key.
     #[test]
-    fn stored_managed_overrides_are_ignored_by_the_engine() {
+    fn stored_managed_overrides_fold_into_head_rules_on_read() {
         let p: Policy = serde_json::from_value(json!({
             "name": "t",
             "defaults": { "tool_action": "approve" },
-            "tools": [],
+            "tools": [{ "match": ["SomeTool"], "action": "deny" }],
             "managed_overrides": [{ "tool": "SomeTool", "action": "allow" }],
         }))
         .expect("pre-0026 snapshots must keep deserializing");
         let out = p.evaluate(&req("SomeTool", json!({})), Autonomy::Supervised);
-        assert!(
-            matches!(out.effective, Verdict::RequireApproval { .. }),
-            "the engine must resolve from rules/defaults only, got {:?}",
-            out.effective
+        assert_eq!(
+            out.effective,
+            Verdict::Allow,
+            "the frozen override must keep beating the rules below it"
         );
+        assert_eq!(
+            out.matched_rule,
+            Some(0),
+            "the fold made it a REAL head rule"
+        );
+        let round_tripped = serde_json::to_value(&p).expect("serializes");
+        assert!(
+            round_tripped.get("managed_overrides").is_none(),
+            "serialization must emit the post-fold canonical document"
+        );
+        assert_eq!(round_tripped["tools"][0]["match"], json!(["SomeTool"]));
+    }
+
+    /// Unknown keys stay IGNORED on the lenient path — an old blob with keys
+    /// this build has never heard of must still deserialize.
+    #[test]
+    fn lenient_deserialization_ignores_unknown_keys() {
+        let p: Policy = serde_json::from_value(json!({
+            "name": "t",
+            "tools": [],
+            "some_future_field": {"x": 1},
+        }))
+        .expect("stored blobs must survive unknown keys");
+        assert_eq!(p.name, "t");
+    }
+
+    /// The AUTHORING path is strict at every level: a typo'd field must be a
+    /// refusal naming the key, never a silently-dropped weakening.
+    #[test]
+    fn parse_strict_refuses_unknown_fields_at_every_level() {
+        let ok = Policy::parse_strict(json!({
+            "name": "t",
+            "defaults": { "tool_action": "deny" },
+            "tools": [{ "match": ["Bash"], "action": "allow",
+                        "shell": { "allow_prefixes": ["ls"], "on_no_match": "approve" } }],
+        }))
+        .expect("a well-formed draft parses");
+        assert_eq!(ok.defaults.tool_action, RuleAction::Deny);
+
+        // Top level, nested rule, nested constraint — each refusal names the key.
+        for (draft, key) in [
+            (
+                json!({ "name": "t", "paths_deny": ["**/.env"] }),
+                "paths_deny",
+            ),
+            (
+                json!({ "name": "t",
+                        "tools": [{ "match": ["Edit"], "action": "allow",
+                                    "path": { "deny": ["**/.env"] } }] }),
+                "path",
+            ),
+            (
+                json!({ "name": "t",
+                        "tools": [{ "match": ["Edit"], "action": "allow",
+                                    "paths": { "deny": ["**/.env"], "denied": [] } }] }),
+                "denied",
+            ),
+            // The legacy override key is an authoring refusal too: drafts
+            // cannot smuggle the retired mechanism back in.
+            (
+                json!({ "name": "t",
+                        "managed_overrides": [{ "tool": "Bash", "action": "allow" }] }),
+                "managed_overrides",
+            ),
+        ] {
+            let err = Policy::parse_strict(draft).expect_err("unknown field must refuse");
+            assert!(err.contains(key), "error must name {key:?}: {err}");
+        }
+    }
+
+    /// parse_strict runs validate(): structurally-known-but-invalid content
+    /// (a bad regex) is refused with the validator's message.
+    #[test]
+    fn parse_strict_runs_validate() {
+        let err = Policy::parse_strict(json!({
+            "name": "t",
+            "tools": [{ "match": ["Bash"], "action": "allow",
+                        "shell": { "deny_regex": ["("] } }],
+        }))
+        .expect_err("a bad regex must refuse");
+        assert!(err.contains("deny_regex"), "{err}");
     }
 
     #[test]
@@ -1205,7 +1554,6 @@ tools:
             Verdict::Allow
         );
     }
-
 }
 
 /// Property tests: the security invariants the example-based tests above pin
@@ -1544,10 +1892,29 @@ mod proptests {
             };
             let autonomy = if autonomous { Autonomy::Autonomous } else { Autonomy::Supervised };
             let pre = evaluate_with_overrides(&p, &ov, &req(tool.clone(), input.clone()), autonomy);
-            let post = fold_overrides(&ov, &p)
-                .evaluate(&req(tool, input), autonomy)
+            let folded = fold_overrides(&ov, &p);
+            let post = folded
+                .evaluate(&req(tool.clone(), input.clone()), autonomy)
                 .effective;
-            prop_assert_eq!(pre, post);
+            prop_assert_eq!(&pre, &post);
+
+            // Third leg: the LENIENT DESERIALIZER applies the identical fold.
+            // A pre-0026 blob (policy + managed_overrides key) deserializes to
+            // exactly the folded document — this is what keeps an in-flight
+            // run's frozen snapshot governing with the semantics it froze.
+            let mut legacy = serde_json::to_value(&p).unwrap();
+            legacy["managed_overrides"] = serde_json::Value::Array(
+                ov.iter()
+                    .map(|(tool, action)| {
+                        serde_json::json!({ "tool": tool, "action": action })
+                    })
+                    .collect(),
+            );
+            let deserialized: Policy = serde_json::from_value(legacy).unwrap();
+            prop_assert_eq!(
+                serde_json::to_value(&deserialized).unwrap(),
+                serde_json::to_value(&folded).unwrap()
+            );
         }
     }
 }
