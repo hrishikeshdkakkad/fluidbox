@@ -38,10 +38,22 @@ pub async fn run(
         entries.sort_by_key(|e| e.path());
         for entry in entries {
             let yaml = std::fs::read_to_string(entry.path())?;
-            // Strict: a typo'd key in a seed file must fail the seed loudly,
-            // never boot a silently-weaker default policy.
+            // Strict AND fail-closed: a typo'd key in a seed file must fail
+            // the BOOT, never seed a silently-weaker policy (and never fall
+            // through to the bare `name: default` fallback below, which would
+            // replace the configured budgets/rules with fail-safe defaults).
             match Policy::parse_yaml_strict(&yaml) {
                 Ok(policy) => {
+                    // The static /v1/policies/* routes shadow /{name}; the API
+                    // refuses these names (api.rs::reject_reserved_name) and a
+                    // seed must not smuggle one in from disk.
+                    if matches!(policy.name.as_str(), "validate" | "preview" | "clone") {
+                        anyhow::bail!(
+                            "seed policy file {} uses the API-reserved name '{}'",
+                            entry.path().display(),
+                            policy.name
+                        );
+                    }
                     let parsed = serde_json::to_value(&policy)?;
                     // Bootstrap only when absent — never clobber UI edits on reboot.
                     let (row, inserted) =
@@ -57,7 +69,11 @@ pub async fn run(
                     }
                 }
                 Err(e) => {
-                    tracing::error!(file = %entry.path().display(), "invalid seed policy: {e}");
+                    anyhow::bail!(
+                        "invalid seed policy {}: {e} — repair the file; refusing to boot a \
+                         weaker policy than authored",
+                        entry.path().display()
+                    );
                 }
             }
         }
