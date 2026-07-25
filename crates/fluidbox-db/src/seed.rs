@@ -38,7 +38,9 @@ pub async fn run(
         entries.sort_by_key(|e| e.path());
         for entry in entries {
             let yaml = std::fs::read_to_string(entry.path())?;
-            match Policy::parse_yaml(&yaml) {
+            // Strict: a typo'd key in a seed file must fail the seed loudly,
+            // never boot a silently-weaker default policy.
+            match Policy::parse_yaml_strict(&yaml) {
                 Ok(policy) => {
                     let parsed = serde_json::to_value(&policy)?;
                     // Bootstrap only when absent — never clobber UI edits on reboot.

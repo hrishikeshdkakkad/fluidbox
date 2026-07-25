@@ -143,9 +143,12 @@ function NewPolicyDialog({
     setErr("");
     setBusy(true);
     try {
+      // Pin the exact version the dialog DISPLAYED — a publish landing while
+      // this dialog is open must not silently change what gets cloned.
+      const fromVersion = policies.find((p) => p.name === from)?.version;
       await apiPost("/policies/clone", {
         name: name.trim(),
-        ...(from ? { from } : {}),
+        ...(from ? { from, from_version: fromVersion } : {}),
       });
       onCreated(name.trim());
     } catch (reason) {

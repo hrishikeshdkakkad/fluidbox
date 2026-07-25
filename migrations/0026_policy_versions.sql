@@ -19,8 +19,13 @@
 -- An old binary `select *`s columns this migration drops, so it cannot serve
 -- beside it — and because the drops land in the same migration, there is NO
 -- binary rollback past this point (a pre-0026 binary cannot boot against a
--- post-0026 database). Since migrations run on the new binary's boot, the
--- ordinary single-binary deploy already satisfies the order.
+-- post-0026 database). A single-binary docker/dev deploy satisfies this by
+-- construction (migrations run on the new binary's boot, after the old one
+-- stopped). **The Helm chart does NOT**: its Deployment uses RollingUpdate,
+-- so a new pod would run this migration while old pods still serve queries
+-- against the dropped columns. For THIS upgrade, scale the server Deployment
+-- to zero first (or switch its strategy to Recreate for one release) —
+-- exactly the 0018 operational posture.
 
 set local lock_timeout = '5s';
 
@@ -35,7 +40,10 @@ select set_config('fluidbox.bypass', 'system_worker', true);
 -- Preflight: the fold below trusts `managed_overrides` to be an array of
 -- {"tool": <text>, "action": "allow"|"approve"|"deny"} rows (the shape the
 -- retired write path enforced). A malformed value would abort mid-fold with an
--- error naming no policy — fail HERE, naming the row, instead.
+-- error naming no policy — fail HERE, naming the row, instead. Each entry's
+-- tool AND action must be JSON strings (a missing/null action makes `->>`
+-- yield SQL NULL, and `NULL NOT IN (…)` is NULL — never rely on it); the
+-- array check guards `jsonb_array_elements` via CASE, not evaluation order.
 do $$
 declare bad record;
 begin
@@ -43,8 +51,11 @@ begin
       from policies p
      where jsonb_typeof(p.managed_overrides) is distinct from 'array'
         or exists (
-            select 1 from jsonb_array_elements(p.managed_overrides) o
+            select 1 from jsonb_array_elements(
+                case when jsonb_typeof(p.managed_overrides) = 'array'
+                     then p.managed_overrides else '[]'::jsonb end) o
              where jsonb_typeof(o->'tool') is distinct from 'string'
+                or jsonb_typeof(o->'action') is distinct from 'string'
                 or o->>'action' not in ('allow', 'approve', 'deny'))
      limit 1;
     if found then
@@ -91,6 +102,13 @@ create table policy_versions (
 -- the odometer's number. Overrides are PREPENDED as head rules in stored order
 -- — exactly where `evaluate_supervised` consulted them — and the legacy
 -- `managed_overrides` key is stripped from the canonical content.
+--
+-- `yaml_source` survives ONLY when there was nothing to fold: the authored
+-- YAML never contained the overrides (0010 kept them in their own column), so
+-- for a folded policy the stored YAML would DESCRIBE A DIFFERENT POLICY than
+-- the canonical content — and the export/history endpoint prefers stored YAML.
+-- NULL makes export regenerate from the folded truth; the un-folded majority
+-- keeps its authored comments.
 insert into policy_versions
     (id, tenant_id, policy_id, version, content, yaml_source, summary, author)
 select
@@ -106,7 +124,8 @@ select
     ) || coalesce(p.parsed->'tools', '[]'::jsonb),
     true
   ),
-  p.yaml_source, 'migrated from 0010 managed_overrides', 'import'
+  case when jsonb_array_length(p.managed_overrides) = 0 then p.yaml_source end,
+  'migrated from 0010 managed_overrides', 'import'
 from policies p;
 
 -- Drop what moved or is superseded. `version` lives on the version row now;

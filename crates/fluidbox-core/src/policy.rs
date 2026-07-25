@@ -447,6 +447,15 @@ impl Policy {
         policy.validate()?;
         Ok(policy)
     }
+
+    /// [`Policy::parse_strict`] for AUTHORED YAML (the import, validate, and
+    /// boot-seed paths): a typo'd key in a yaml file must refuse, not silently
+    /// weaken the policy it describes. `parse_yaml` stays lenient for stored
+    /// blobs and test fixtures.
+    pub fn parse_yaml_strict(yaml: &str) -> Result<Policy, String> {
+        let value: Value = serde_yaml::from_str(yaml).map_err(|e| e.to_string())?;
+        Self::parse_strict(value)
+    }
 }
 
 // ─── Evaluation ───────────────────────────────────────────────────────────
@@ -1415,6 +1424,33 @@ tools:
                         "managed_overrides": [{ "tool": "Bash", "action": "allow" }] }),
                 "managed_overrides",
             ),
+            (
+                json!({ "name": "t",
+                        "tools": [{ "match": ["Bash"], "action": "allow",
+                                    "shell": { "allow_prefix": ["ls"] } }] }),
+                "allow_prefix",
+            ),
+            (
+                json!({ "name": "t", "defaults": { "tool_actions": "deny" } }),
+                "tool_actions",
+            ),
+            (
+                json!({ "name": "t", "egress": { "modes": "none" } }),
+                "modes",
+            ),
+            (
+                json!({ "name": "t", "budgets": { "max_token": 1 } }),
+                "max_token",
+            ),
+            (
+                json!({ "name": "t", "approvals": { "ttl_secs": 5 } }),
+                "ttl_secs",
+            ),
+            // The misspelling that would silently leave `permitted: true`.
+            (
+                json!({ "name": "t", "autonomy": { "permited": false } }),
+                "permited",
+            ),
         ] {
             let err = Policy::parse_strict(draft).expect_err("unknown field must refuse");
             assert!(err.contains(key), "error must name {key:?}: {err}");
@@ -1659,21 +1695,32 @@ mod proptests {
             prop::collection::vec(arb_rule(), 0..5),
             arb_action(),
             arb_fallback(),
+            // Randomized so the fold-equivalence property really covers the
+            // POLICY-DEFAULT ttl/scope an override's approval verdict carries
+            // (defaults alone would only ever prove 600s/once).
+            1..3600u64,
+            prop_oneof![Just(ApprovalScope::Once), Just(ApprovalScope::Session)],
         )
-            .prop_map(|(tools, default_action, on_approval_rule)| Policy {
-                name: "prop".into(),
-                defaults: PolicyDefaults {
-                    tool_action: default_action,
+            .prop_map(
+                |(tools, default_action, on_approval_rule, ttl, scope)| Policy {
+                    name: "prop".into(),
+                    defaults: PolicyDefaults {
+                        tool_action: default_action,
+                    },
+                    egress: Egress::default(),
+                    budgets: crate::spec::Budgets::default(),
+                    approvals: ApprovalSettings {
+                        default_ttl_secs: ttl,
+                        scope,
+                        timeout_action: TimeoutAction::Deny,
+                    },
+                    autonomy: AutonomySettings {
+                        permitted: true,
+                        on_approval_rule,
+                    },
+                    tools,
                 },
-                egress: Egress::default(),
-                budgets: crate::spec::Budgets::default(),
-                approvals: ApprovalSettings::default(),
-                autonomy: AutonomySettings {
-                    permitted: true,
-                    on_approval_rule,
-                },
-                tools,
-            })
+            )
     }
 
     /// Arbitrary printable inputs in the shapes the gate actually receives.
