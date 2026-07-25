@@ -299,7 +299,7 @@ pub async fn connect_with(
     }
     // `migrate!` BAKES the migrations directory into the binary at COMPILE time —
     // adding a .sql file only takes effect once this crate recompiles, so any
-    // change under migrations/ must touch this file. Latest: 0024
+    // change under migrations/ must touch this file. Latest: 0026
     // (mcp_upstream_sessions — cross-replica teardown of upstream MCP sessions).
     // This line was stale at 0020 through all four Phase E migrations: the
     // mechanism still worked, because every one of them also edited this file for
@@ -1050,6 +1050,12 @@ pub async fn import_policy_yaml(
     else {
         unreachable!("expected_base is None: the append cannot be stale");
     };
+    // The append bumped `policies.updated_at`; answer with the row as COMMITTED,
+    // not the pre-append capture.
+    let policy: PolicyRow = sqlx::query_as("select * from policies where id = $1")
+        .bind(policy.id)
+        .fetch_one(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok((policy, version, true))
 }
@@ -10178,6 +10184,21 @@ mod tests {
         .execute(&scratch)
         .await
         .unwrap();
+        // A second policy WITHOUT overrides: its authored YAML still describes
+        // its content, so the fold must PRESERVE it (only folded policies null
+        // theirs — stored YAML must never describe a different policy than the
+        // canonical content beside it).
+        let plain_id = Uuid::now_v7();
+        sqlx::query(
+            "insert into policies (id, tenant_id, name, version, yaml_source, parsed, managed_overrides)
+             values ($1, $2, 'legacy-plain', 2, 'name: legacy-plain', $3, '[]'::jsonb)",
+        )
+        .bind(plain_id)
+        .bind(tenant)
+        .bind(serde_json::json!({"name": "legacy-plain", "tools": []}))
+        .execute(&scratch)
+        .await
+        .unwrap();
         sqlx::query("insert into agents (id, tenant_id, name) values ($1, $2, 'legacy-agent')")
             .bind(agent_id)
             .bind(tenant)
@@ -10235,8 +10256,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((version, author.as_str()), (7, "import"));
-        assert_eq!(yaml.as_deref(), Some("name: legacy"));
+        assert_eq!(
+            yaml, None,
+            "a FOLDED policy's stored YAML would describe a different policy \
+             than its content — export must regenerate from the folded truth"
+        );
         assert!(content.get("managed_overrides").is_none(), "key stripped");
+        let (plain_yaml,): (Option<String>,) =
+            sqlx::query_as("select yaml_source from policy_versions where policy_id = $1")
+                .bind(plain_id)
+                .fetch_one(&scratch)
+                .await
+                .unwrap();
+        assert_eq!(
+            plain_yaml.as_deref(),
+            Some("name: legacy-plain"),
+            "an un-folded policy keeps its authored YAML (and its comments)"
+        );
         assert_eq!(
             content["tools"],
             serde_json::json!([
@@ -10280,6 +10316,126 @@ mod tests {
             .await
             .expect("drop scratch db");
         let _ = std::fs::remove_dir_all(&staged);
+    }
+
+    /// The 0026 grant claim, proven AS THE RUNTIME ROLE (test_connect's pool
+    /// carries the system_worker bypass, so it proves nothing about RLS or
+    /// grants): under `fluidbox_runtime` + a tenant GUC, tenant A reads its own
+    /// versions and ZERO of tenant B's, and UPDATE/DELETE are permission-denied
+    /// — append-only is a database property, not an application convention.
+    #[tokio::test]
+    async fn policy_versions_are_append_only_and_isolated_under_the_runtime_role() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        use sqlx::Executor;
+        let pool = test_connect(&url).await.expect("connect");
+        let (a, b) = (
+            throwaway_policy_tenant(&pool).await,
+            throwaway_policy_tenant(&pool).await,
+        );
+        let pa = upsert_policy(&pool, a, "rt", "name: rt", &policy_json("rt"))
+            .await
+            .unwrap();
+        upsert_policy(&pool, b, "rt", "name: rt", &policy_json("rt"))
+            .await
+            .unwrap();
+
+        let as_runtime = PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    conn.execute("set role fluidbox_runtime").await?;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .expect("runtime-role pool");
+        let mut tx = as_runtime.begin().await.unwrap();
+        sqlx::query("select set_config('fluidbox.tenant_id', $1, true)")
+            .bind(a.tenant_id().to_string())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let (own, foreign): (i64, i64) = (
+            sqlx::query_scalar("select count(*) from policy_versions where policy_id = $1")
+                .bind(pa.id)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap(),
+            sqlx::query_scalar(
+                "select count(*) from policy_versions v
+                  where exists (select 1 from policies p
+                                 where p.id = v.policy_id and p.tenant_id <> $1)",
+            )
+            .bind(a.tenant_id())
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            (own, foreign),
+            (1, 0),
+            "RLS: own rows visible, no stranger's"
+        );
+        let update_err =
+            sqlx::query("update policy_versions set summary = 'x' where policy_id = $1")
+                .bind(pa.id)
+                .execute(&mut *tx)
+                .await
+                .expect_err("UPDATE must be permission-denied");
+        assert!(
+            update_err.to_string().contains("permission denied"),
+            "{update_err}"
+        );
+        tx.rollback().await.unwrap();
+        // A failed statement poisons the tx; DELETE gets its own.
+        let mut tx = as_runtime.begin().await.unwrap();
+        sqlx::query("select set_config('fluidbox.tenant_id', $1, true)")
+            .bind(a.tenant_id().to_string())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let delete_err = sqlx::query("delete from policy_versions where policy_id = $1")
+            .bind(pa.id)
+            .execute(&mut *tx)
+            .await
+            .expect_err("DELETE must be permission-denied");
+        assert!(
+            delete_err.to_string().contains("permission denied"),
+            "{delete_err}"
+        );
+        tx.rollback().await.unwrap();
+    }
+
+    /// TWO racing boots (the multi-replica case the row lock exists for) mint
+    /// exactly one seed version between them.
+    #[tokio::test]
+    async fn concurrent_seeds_mint_exactly_one_version() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let scope = throwaway_policy_tenant(&pool).await;
+        let content = policy_json("race");
+        let (r1, r2) = tokio::join!(
+            seed_policy_if_absent(&pool, scope, "race", "name: race", &content),
+            seed_policy_if_absent(&pool, scope, "race", "name: race", &content),
+        );
+        let (p1, _) = r1.unwrap();
+        let (p2, _) = r2.unwrap();
+        assert_eq!(p1.id, p2.id, "one identity");
+        assert_eq!(
+            list_policy_versions(&pool, scope, p1.id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "one seed version between the racers"
+        );
     }
 
     /// Version rows never leak across tenants: the same policy name in two

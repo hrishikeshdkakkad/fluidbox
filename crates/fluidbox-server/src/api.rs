@@ -862,12 +862,15 @@ pub async fn upsert_policy(
             "editing policies requires admin or owner".into(),
         ));
     }
-    let policy = Policy::parse_yaml(&req.yaml).map_err(ApiError::UnprocessableEntity)?;
+    // Strict: a typo'd key in an imported yaml must refuse, never silently
+    // weaken the policy it describes (the same posture as publish).
+    let policy = Policy::parse_yaml_strict(&req.yaml).map_err(ApiError::UnprocessableEntity)?;
     if policy.name != req.name {
         return Err(ApiError::BadRequest(
             "policy name must match yaml `name`".into(),
         ));
     }
+    reject_reserved_name(&req.name)?;
     let scope = principal.scope();
     let parsed = serde_json::to_value(&policy)?;
     let (row, version, appended) = fluidbox_db::import_policy_yaml(
@@ -896,7 +899,7 @@ pub async fn validate_policy(
     _principal: Principal,
     Json(req): Json<ValidatePolicy>,
 ) -> ApiResult<Json<Value>> {
-    match Policy::parse_yaml(&req.yaml) {
+    match Policy::parse_yaml_strict(&req.yaml) {
         Ok(p) => Ok(Json(json!({ "valid": true, "name": p.name }))),
         Err(e) => Err(ApiError::UnprocessableEntity(e)),
     }
@@ -1118,14 +1121,25 @@ fn validate_policy_name(name: &str) -> Result<(), ApiError> {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-    if ok {
-        Ok(())
-    } else {
-        Err(ApiError::BadRequest(
+    if !ok {
+        return Err(ApiError::BadRequest(
             "policy names are 1-64 characters of a-z A-Z 0-9 . _ - and do not start with '.'"
                 .into(),
-        ))
+        ));
     }
+    reject_reserved_name(name)
+}
+
+/// The static `/v1/policies/*` routes shadow `/{name}` in axum, so a policy
+/// carrying one of their names would be unreachable by its own URL. Refused on
+/// EVERY creating path (clone AND the yaml import).
+fn reject_reserved_name(name: &str) -> Result<(), ApiError> {
+    if matches!(name, "validate" | "preview" | "clone") {
+        return Err(ApiError::BadRequest(format!(
+            "'{name}' is reserved by the policies API — pick another name"
+        )));
+    }
+    Ok(())
 }
 
 /// `POST /v1/policies/clone` — create a new policy (identity + version 1 in
@@ -1142,6 +1156,11 @@ pub async fn clone_policy(
         ));
     }
     validate_policy_name(&req.name)?;
+    if req.from.is_none() && req.from_version.is_some() {
+        return Err(ApiError::BadRequest(
+            "`from_version` needs `from` — a blank policy has no source version".into(),
+        ));
+    }
     let scope = principal.scope();
     let (policy, summary) = match &req.from {
         Some(source) => {

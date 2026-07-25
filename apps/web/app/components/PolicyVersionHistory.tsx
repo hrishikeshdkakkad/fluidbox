@@ -86,9 +86,13 @@ export function PolicyVersionHistory({
           `/policies/${encoded}/versions/${version}`
         );
         setDetail(current);
-        if (version > 1) {
+        // The PRECEDING version comes from the listed history, never from
+        // `version - 1`: migration 0026 kept each policy's odometer, so a
+        // migrated history can legitimately start at v7 with nothing below it.
+        const precedingVersion = versions.find((entry) => entry.version < version)?.version;
+        if (precedingVersion != null) {
           setPrevious(
-            await apiGet<PolicyVersionDetail>(`/policies/${encoded}/versions/${version - 1}`)
+            await apiGet<PolicyVersionDetail>(`/policies/${encoded}/versions/${precedingVersion}`)
           );
         }
       } catch (reason) {
@@ -96,7 +100,7 @@ export function PolicyVersionHistory({
         setOpenVersion(null);
       }
     },
-    [name, onError]
+    [name, onError, versions]
   );
 
   // A publish/revert elsewhere on the page invalidates an open view.
@@ -180,11 +184,11 @@ export function PolicyVersionHistory({
               <div className="spread" style={{ alignItems: "center" }}>
                 <div className="sectitle" style={{ margin: 0 }}>
                   v{openVersion}
-                  {previous && showDiff ? ` — changes since v${openVersion - 1}` : " — YAML export"}
+                  {previous && showDiff ? ` — changes since v${previous.version.version}` : " — YAML export"}
                 </div>
                 {previous && (
                   <button type="button" className="btn sm" onClick={() => setShowDiff((s) => !s)}>
-                    {showDiff ? "Show full YAML" : `Diff against v${openVersion - 1}`}
+                    {showDiff ? "Show full YAML" : `Diff against v${previous.version.version}`}
                   </button>
                 )}
               </div>
