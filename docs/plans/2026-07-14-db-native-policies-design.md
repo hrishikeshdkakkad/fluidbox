@@ -421,3 +421,59 @@ B before C is not negotiable. A can ship at any time.
 three-way control still cannot express a `paths`/`shell` rule, so the *matrix* still refuses
 one — the *rule editor* is where such a rule is edited); the canonical vocabulary as data;
 the gate order and the layers above policy.
+
+---
+
+## 9. Implementation addendum (2026-07-25)
+
+Implemented on post-multi-user main (Phases A–F, migrations through 0025), which
+settled several things this document predates, plus adjudications from an
+adversarial model review of the implementation plan
+(`docs/plans/2026-07-25-db-native-policies-implementation.md`):
+
+1. **The migration is `0026`, not `0011`**, and carries the post-Phase-D
+   obligations this document predates: the RLS triple (ENABLE+FORCE, a
+   child-EXISTS `tenant_isolation` policy, an enumerated runtime-role grant),
+   a `tenant_id` column with the composite FK `(tenant_id, policy_id) →
+   policies (tenant_id, id)` (the 0013/0019/0022 shape), and the
+   transaction-local `system_worker` bypass GUC — it is the first
+   data-backfilling migration since 0018 FORCEd RLS, and without the GUC the
+   backfill reads zero rows silently.
+2. **Append-only is a database property**, not an application convention: the
+   runtime role is granted `select, insert` only on `policy_versions` (the
+   `auth_audit_log` posture). `check (version > 0)`; a preflight names any
+   malformed `managed_overrides` row before folding.
+3. **Frozen RunSpecs are never rewritten.** §4.7's fold applies to stored
+   policies only. A pre-0026 snapshot's `managed_overrides` key is folded **at
+   deserialization** inside the engine (the identical transform, pinned equal
+   by the fold property test), so an in-flight run keeps exactly the semantics
+   it froze while `sessions.run_spec` stays byte-identical. One observable
+   delta, disclosed: a legacy override now reports `matched_rule = Some(0)`
+   (a real head rule) where the retired branch reported `None`; the verdict,
+   ttl/scope, and autonomy fallback are unchanged.
+4. **Attribution gained a person.** Multi-user identity shipped (2026-07-24)
+   between this design and its implementation, so §3's "no user model" is
+   stale: `author` keeps the provenance channel exactly as designed, and a new
+   nullable `author_user_id` records the authenticated user for api/ui
+   versions (no FK — the 0012 "history outlives users" precedent).
+5. **Publish/revert carry `base_version`** (optimistic concurrency): a publish
+   over a moved head is a 409 that wrote nothing, which also makes retrying a
+   committed publish inert. Publish requires a non-blank summary — the §3
+   review beat is not optional.
+6. **Drafts parse strictly.** `Policy::parse_strict` (`deny_unknown_fields`
+   at every level) guards publish/preview so a typo'd field cannot silently
+   publish a weaker policy; stored blobs keep the lenient deserializer.
+7. **`POST /v1/policies/preview`** resolves a draft's matrix/autonomy
+   server-side, keeping §4.4's "the dashboard never resolves a verdict" true
+   while a draft diverges from the stored policy.
+8. **The YAML import is idempotent** on byte-equal canonical content
+   (`appended: false`) — amends the implicit every-write-appends reading of
+   §4.6; publish/revert deliberately still append (a human's identical
+   re-publish is an audit event).
+9. **Clone is `POST /v1/policies/clone {name, from?, from_version?}`** — the
+   §4.6 path form was ambiguous about source vs target. New names are
+   validated to a routable charset; only the name-uniqueness violation maps
+   to 409.
+10. **`overridable` left the matrix payload** with `ToolStatus::Overridden`:
+    the UI keys the matrix affordance off `status != "conditional"`, the same
+    fact from the same source.
