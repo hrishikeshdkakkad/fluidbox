@@ -21,7 +21,8 @@ pub async fn run(
     // The boot seed owns the default tenant — a verified scope by construction.
     let scope = TenantScope::assume(tenant);
 
-    // Policies from disk (idempotent upsert; version bumps on change).
+    // Policies from disk (seed-if-absent; an absent policy gets its identity
+    // and version 1, author 'seed', in one transaction).
     let mut default_policy_id = None;
     let mut default_policy_budgets = None;
     if policies_dir.is_dir() {
@@ -46,7 +47,7 @@ pub async fn run(
                     if inserted {
                         tracing::info!(policy = %policy.name, "seeded policy from disk");
                     } else {
-                        tracing::debug!(policy = %policy.name, version = row.version, "policy exists; leaving UI-managed version intact");
+                        tracing::debug!(policy = %policy.name, id = %row.id, "policy exists; leaving UI-managed versions intact");
                     }
                     if policy.name == "default" {
                         default_policy_id = Some(row.id);
