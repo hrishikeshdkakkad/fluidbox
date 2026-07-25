@@ -10338,7 +10338,7 @@ mod tests {
         let pa = upsert_policy(&pool, a, "rt", "name: rt", &policy_json("rt"))
             .await
             .unwrap();
-        upsert_policy(&pool, b, "rt", "name: rt", &policy_json("rt"))
+        let pb = upsert_policy(&pool, b, "rt", "name: rt", &policy_json("rt"))
             .await
             .unwrap();
 
@@ -10365,15 +10365,14 @@ mod tests {
                 .fetch_one(&mut *tx)
                 .await
                 .unwrap(),
-            sqlx::query_scalar(
-                "select count(*) from policy_versions v
-                  where exists (select 1 from policies p
-                                 where p.id = v.policy_id and p.tenant_id <> $1)",
-            )
-            .bind(a.tenant_id())
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap(),
+            // B's CAPTURED policy id, queried DIRECTLY: a join through
+            // `policies` would be hidden by the PARENT's RLS and false-green
+            // even if policy_versions itself leaked.
+            sqlx::query_scalar("select count(*) from policy_versions where policy_id = $1")
+                .bind(pb.id)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap(),
         );
         assert_eq!(
             (own, foreign),

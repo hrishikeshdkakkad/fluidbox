@@ -155,9 +155,11 @@ CODE=$(post "/policies" "$(printf '%s' "$GOV_YAML" | gov_body)")
   && ok "throwaway policy '$GOV' imported (seed shapes: paths on Edit, shell on Bash, flat deny on WebFetch)" \
   || { no "policy import → $CODE: $(cat "$GB")"; exit 1; }
 BASE_VER=$(pver "$GOV")
-AUTHOR=$(get "/policies/$GOV" | j "['versions'][0]['author']")
+# The OLDEST version is always this suite's own first import — rerun-safe
+# (on a reused DB the LATEST may be a prior run's revert, author 'ui').
+AUTHOR=$(get "/policies/$GOV" | j "['versions'][-1]['author']")
 [ "$AUTHOR" = "api" ] && ok "the import minted a version with author 'api' (provenance recorded)" \
-  || no "latest version author: $AUTHOR"
+  || no "oldest version author: $AUTHOR"
 V1_CONTENT=$(get "/policies/$GOV/versions/$BASE_VER" | python3 -c "import sys,json;print(json.dumps(json.load(sys.stdin)['content'],sort_keys=True))")
 
 # A typo'd key in imported YAML is refused too (strict parse on every
@@ -215,12 +217,13 @@ STALE=$(get "/policies/$GOV" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 print(json.dumps({'content': d['content'], 'summary': 'stale write', 'base_version': $BASE_VER}))")
+VERS_BEFORE=$(get "/policies/$GOV" | python3 -c "import sys,json;print(len(json.load(sys.stdin)['versions']))")
 CODE=$(post "/policies/$GOV/publish" "$STALE")
 NOW=$(pver "$GOV")
-NVERS=$(get "/policies/$GOV" | python3 -c "import sys,json;print(len(json.load(sys.stdin)['versions']))")
-[ "$CODE" = "409" ] && [ "$NOW" = "$V_ALLOW" ] && [ "$NVERS" = "2" ] \
-  && ok "INVARIANT B: stale base_version → 409; still v$V_ALLOW and exactly 2 versions (nothing written)" \
-  || no "stale publish: code=$CODE version=$V_ALLOW→$NOW versions=$NVERS: $(cat "$GB")"
+VERS_AFTER=$(get "/policies/$GOV" | python3 -c "import sys,json;print(len(json.load(sys.stdin)['versions']))")
+[ "$CODE" = "409" ] && [ "$NOW" = "$V_ALLOW" ] && [ "$VERS_AFTER" = "$VERS_BEFORE" ] \
+  && ok "INVARIANT B: stale base_version → 409; still v$V_ALLOW, version count unchanged (nothing written)" \
+  || no "stale publish: code=$CODE version=$V_ALLOW→$NOW versions=$VERS_BEFORE→$VERS_AFTER: $(cat "$GB")"
 
 # 8. STRICT PARSER — a typo'd field ('pathz') is a 422, never silently dropped.
 TYPO=$(get "/policies/$GOV" | python3 -c "
@@ -287,10 +290,15 @@ CODE=$(post "/policies/clone" '{"name": "bad/name"}')
 [ "$CODE" = "400" ] && ok "an unroutable policy name → 400" || no "bad name: $CODE"
 CODE=$(post "/policies/clone" '{"name": "preview"}')
 [ "$CODE" = "400" ] && ok "a route-reserved name ('preview') → 400" || no "reserved name: $CODE"
-CODE=$(post "/policies/clone" "{\"name\": \"gov-e2e-pin-$RANDOM\", \"from\": \"$GOV\", \"from_version\": $BASE_VER}")
-PINROW=$(j "['policy']['version']" < "$GB")
-[ "$CODE" = "200" ] && [ "$PINROW" = "1" ] && ok "clone pinned to from_version=$BASE_VER → v1 minted from that exact version" \
-  || no "pinned clone: code=$CODE v=$PINROW"
+# Pin to v$V_ALLOW (WebFetch=allow) — the ONE version that differs from the
+# current head (the revert restored deny), so the row below proves the PIN
+# was honored, not just that a clone happened.
+PIN="gov-e2e-pin-$RANDOM"
+CODE=$(post "/policies/clone" "{\"name\": \"$PIN\", \"from\": \"$GOV\", \"from_version\": $V_ALLOW}")
+PINROW=$(prow "$PIN" WebFetch)
+[ "$CODE" = "200" ] && [ "$PINROW" = "unconditional|allow" ] \
+  && ok "clone pinned to from_version=$V_ALLOW carries THAT version's allow (head says deny)" \
+  || no "pinned clone: code=$CODE row=$PINROW"
 CODE=$(post "/policies/clone" '{"name": "gov-e2e-orphan", "from_version": 1}')
 [ "$CODE" = "400" ] && ok "from_version without from → 400" || no "orphan from_version: $CODE"
 
@@ -315,9 +323,11 @@ DEFV=$(pver default)
 FROZE=$(curl -s -H "$H" "$API/v1/sessions/$S" | python3 -c "
 import sys, json
 spec = json.load(sys.stdin)['session']['run_spec']
-print('%s|%s' % (spec.get('policy_version'), spec.get('policy_snapshot', {}).get('name')))")
-[ "$FROZE" = "$DEFV|default" ] && ok "RunSpec froze default's latest version (v$DEFV) with its snapshot content" \
-  || no "frozen policy_version|snapshot=$FROZE, expected $DEFV|default"
+print('%s|%s' % (spec.get('policy_version'), json.dumps(spec.get('policy_snapshot'), sort_keys=True)))")
+WANT=$(get "/policies/default/versions/$DEFV" | python3 -c "import sys,json;print(json.dumps(json.load(sys.stdin)['content'],sort_keys=True))")
+[ "$FROZE" = "$DEFV|$WANT" ] \
+  && ok "RunSpec froze default v$DEFV — snapshot BYTE-EQUAL to that version's content" \
+  || no "frozen snapshot differs from default v$DEFV's content"
 
 # safe tool → allow
 D=$(perm "$T" "$S" '{"tool_call_id":"g1","tool":"Read","input":{"file_path":"/workspace/x"}}' | j "['decision']")
