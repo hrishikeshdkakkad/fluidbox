@@ -462,6 +462,14 @@ export function RunComposer({
         : policies.find((candidate) => candidate.id === agentPolicyId) ?? null,
     [agentChoice, agentPolicyId, policies, policyName]
   );
+  // Three states, and the asymmetry is deliberate. RESOLVED + permitted →
+  // offer the toggle. RESOLVED + not permitted (including a version-less
+  // policy, whose `autonomy_summary` is null) → forbid: `?.permitted` is
+  // `undefined` there, so the `!` closes it. UNRESOLVED (`governingPolicy`
+  // null — the list is still loading, or the agent's policy is not in it) →
+  // OFFER it: the server is the enforcer and answers 400, whereas disabling a
+  // legitimate choice because a list has not arrived is a real cost for no
+  // security gain. This gate exists to explain a refusal early, not to be one.
   const autonomyForbidden = governingPolicy !== null && !governingPolicy.autonomy_summary?.permitted;
 
   // A policy that forbids unattended runs FORCES supervised — merely disabling

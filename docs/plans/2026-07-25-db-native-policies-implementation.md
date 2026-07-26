@@ -345,3 +345,198 @@ addendum):
 7. Append-only is enforced in the DATABASE: `policy_versions` grants are
    select+insert only; single composite FK; `check (version > 0)`; a
    preflight names malformed override rows before folding.
+
+## 10. Review-response addendum (2026-07-25, second pass)
+
+A full-diff review raised eleven items. Adjudications and what shipped:
+
+*(Two rounds of second-model review ran against this addendum itself; §10.12
+records what the second round found in the first round's work.)*
+
+1. **Seed-file strictness had a wider blast radius than its rationale.**
+   `seed.rs` refused the BOOT on any file that failed the strict parse — even
+   when the policy already existed, where `seed_policy_if_absent` is a no-op
+   and the file writes nothing. The stated reason (never fall through to the
+   bare `name: default` fallback) only applies to `default`, and only when it
+   is absent. Now the file's SUBJECT is read with the lenient parser first, and
+   the refusal is scoped: **absent ⇒ refuse the boot** (the file is the
+   policy's only source), **present ⇒ warn and boot**. A file that will not
+   parse at all names no policy and still refuses. Pinned by
+   `seeding_refuses_only_when_the_file_is_the_policys_only_source`.
+   The loop moved into `seed::seed_policies_from_dir` so it is testable against
+   a throwaway tenant instead of the default one.
+2. **The default policy's budgets now come from the GOVERNING version**, not
+   from disk. They feed the curated agent's first revision; on a fresh database
+   the two agree, on an existing one only the database is true — and the warn
+   path above has no disk document to read at all.
+3. **0026's preflight trusted `parsed` and the override `tool`.** It checked
+   `action` values but would have aborted mid-fold on a non-object `parsed`
+   (`cannot delete from scalar`, naming no row) or folded a `tools` scalar into
+   the rule list. Both are now named refusals. Every branch was exercised
+   directly against postgres.
+4. **A TRAILING-WILDCARD override is DROPPED, not folded — in BOTH folds.** The
+   retired engine matched overrides by exact string equality, so `mcp__*` was
+   unreachable; folding it into a head rule would put it through `tool_matches`
+   and hand the namespace that action — a silent widening of a policy already
+   governing runs. 0026 drops such entries with a `raise warning` (refusing
+   instead would block an upgrade on a provably inert row), and
+   `fluidbox-core`'s deserialize-time fold filters them identically, so a
+   migrated policy and a still-frozen snapshot of it stay equivalent.
+   The predicate is `ends_with('*')` / `like '%*'`, **not** "contains a star":
+   only a TRAILING `*` is a wildcard to `tool_matches`, so `fo*o` folds to an
+   exact-equality rule meaning exactly what the override meant and is KEPT.
+   **The equivalence has a stated bound, and it is not "always fail-safe".**
+   `ToolCallRequest.tool` is unconstrained, so a tool whose literal name ends
+   in `*` can exist; for that one name the dropped entry no longer decides and
+   the verdict falls through — which can WIDEN (override `deny` + default
+   `allow`). Dropping still wins on blast radius (one literal name vs. a whole
+   namespace), and the divergence is pinned by
+   `a_wildcard_override_diverges_only_for_star_suffixed_tool_names` with an
+   input where it widens, so no comment can quietly reclaim "fail-safe".
+   The property test GENERATES `*`-bearing tools rather than filtering them
+   out, and documents the request-tool filter as a precondition of the claim
+   rather than a convenience. The upgrade harness plants both a trailing-star
+   entry (dropped) and a mid-string one (kept), and additionally asserts the
+   SQL fold and the engine fold agree on the same legacy document.
+   *(Found by the second-model review; the first version of this comment
+   claimed dropping "only ever narrows", which is false.)*
+5. **`DELETE /v1/policies/{name}`** added — without it the only way to create a
+   policy was also the only way to accumulate them forever, and the e2e minted
+   two permanent rows per run. Refused (409) while ANY agent revision names it
+   (not just the latest: revisions are immutable), with the FK as the actual
+   guarantee and the count only for the message. The cascade reaches
+   `policy_versions` despite the runtime role having no DELETE grant there —
+   referential actions run with the referencing table's owner privileges — and
+   that is now pinned as a test rather than assumed.
+6. **The e2e leaves no trace.** Deterministic names replace `$RANDOM` (which
+   both leaked a row per run and could collide into a spurious 409); the suite
+   deletes what it creates, pre-cleans on entry so version numbers are
+   deterministic, and asserts the in-use refusal.
+7. **Tenant predicates restored** on the four internal policy queries that
+   relied on a preceding statement for scoping. Safe before, but the invariant
+   is "grep-able", not "arguable".
+8. **`author` is a CHECK-constrained set**; the RLS policy moved to 0018's
+   section-(b) direct-tenant template (the column is present and the composite
+   FK binds it), dropping a correlated subquery from `create_run`'s path.
+9. **`ToolStatus::Unconditional { rule }` is no longer optional** — nothing has
+   constructed `None` since `Overridden` retired. The wire type and both
+   consumers lost their dead null-checks, along with an unreachable
+   `disabled={!configurable}`.
+10. **The editor no longer blanks on an invalid draft.** A failed preview kept
+    reporting as "loading" in three panels while the matrix unmounted — most
+    easily reached by clicking "Add rule", whose empty matcher list is refused.
+    The last resolved verdicts now stay on screen, dimmed and marked stale,
+    with the reason stated; the controls go INERT while stale because
+    `status.rule` indexes the draft the server resolved. Rule cards gained
+    stable ids (index keys carried a card's pending text across a reorder), and
+    budget fields clamp instead of shipping `-1` to a `u64`.
+11. **Reserved names are one const in `fluidbox-core`**, shared by the API and
+    the boot seed, and `policy_routes_are_all_reserved` scrapes `main.rs` to
+    pin it against the router in both directions. Verified by deliberate
+    mutation (adding an unreserved `/policies/export` route fails the test).
+
+Also: drafts are BOUNDED at the authoring boundary (rule/matcher/pattern counts
+and string lengths) because a draft freezes into every future RunSpec; stored
+blobs are deliberately not re-bounded, so a later bound cannot strand a policy
+that is already governing runs. And the 0026 upgrade harness no longer leaks a
+scratch database when an assertion fails.
+
+
+## 11. Second-model review of the review response (2026-07-25)
+
+The response above was itself reviewed adversarially. Four of its claims were
+wrong; each was verified against a live PostgreSQL 16 or a running engine
+before being accepted, and one reported finding was REJECTED on evidence.
+
+1. **`Policy::parse_yaml` validates, so it could not be used to read a name.**
+   `seed_policies_from_dir` used it to learn which policy a file was about
+   before deciding present-vs-absent — but it runs `validate()`, so a file that
+   was merely INVALID (`match: []`) refused the boot before the existence check
+   ever ran, defeating the whole point of §10.1 for that class of file. The
+   subject name now comes from a parse that judges nothing (YAML → `Value` →
+   top-level string `name`), and "names no policy" means exactly that. The old
+   comment claiming such a file "names no policy" was wrong.
+2. **The default policy's budgets were still lost when `default.yaml` was
+   ABSENT.** §10.2 resolved them from the governing version, but did so inside
+   the per-file loop — so with no `default.yaml` on disk the resolution never
+   ran and the curated agent silently got `Budgets::default()` instead of the
+   ceiling its policy actually sets. Resolution moved to ONE place in `run`,
+   after seeding, covering all three routes (file valid / file invalid / no
+   file). This was a latent pre-existing bug that §10.2 documented away without
+   fixing.
+3. **A version-less `default` booted silently.** `seed_policy_if_absent`
+   no-ops on an existing identity, so it cannot mint v1 for one; the budget
+   lookup then returned `None` and `unwrap_or_default()` turned a bug state
+   into plausible-looking budgets, with the curated agent pointed at a policy
+   every run would fail closed on. Boot now refuses, naming the row.
+4. **The wildcard drop is NOT "always fail-safe".** §10.4's first version
+   claimed dropping "only ever narrows". It does not: `ToolCallRequest.tool` is
+   unconstrained, so for a tool whose literal name ends in `*` the dropped
+   entry no longer decides and the verdict falls through — which WIDENS when
+   the override was `deny` and the default is `allow`. Verified by running the
+   engine. The claim is now stated with its bound, the property test documents
+   its request-tool filter as a precondition rather than a convenience, and
+   `a_wildcard_override_diverges_only_for_star_suffixed_tool_names` pins the
+   divergence with an input where it widens, so the comment cannot drift back.
+   Dropping remains right — on blast radius (one literal name vs. a namespace),
+   not on direction.
+5. **The delete's "count/delete race" is impossible, and saying otherwise was
+   wrong.** `select … for update` on the policy row conflicts with the `FOR KEY
+   SHARE` an `agent_revisions` insert takes on that same row for its FK, so the
+   two serialize — measured: the insert blocks for the full 3 s the lock is
+   held. The count is race-free by construction. The 23503 arm stays as a
+   deliberate backstop against a future relaxation of that locking, and now
+   says so instead of claiming a race it cannot see.
+6. **Also tightened, from the same round:** the cascade test now proves RLS is
+   engaged (a stranger's policy is invisible to the delete, affecting zero
+   rows) rather than only proving grants are; the router-scraping test fails
+   loudly if the policy routes are ever `.nest()`ed, which would otherwise make
+   it silently vacuous; and the existence check moved onto the strict-parse
+   FAILURE path only, which both removes a query from the happy path and
+   narrows the window against a racing replica.
+
+**REJECTED:** a report that `jsonb_set('1'::jsonb, '{tools}', …, true)` returns
+the scalar unchanged, making the preflight's comment wrong. PostgreSQL 16
+raises `cannot set path in scalar`; the comment is correct and stands.
+
+## 12. Third review round — the dashboard (2026-07-25)
+
+The editor changes from §10.10 were reviewed separately. Four defects, all real:
+
+1. **A cap could be WIDENED by a keystroke.** `<input type="number">` reports
+   `value === ""` not only for a cleared field but for every intermediate state
+   the browser cannot parse — `-`, `1e`, `1.`. The form derived the draft from
+   that, so typing the `e` of `1e5` set the cap to `null`: **no ceiling**, the
+   one direction an edit must never take by accident. Publish could then ship
+   it. The fields now hold their own raw text, and what a string MEANS is
+   `lib/policy-caps.ts::coerceCap` — a pure function with tests, because the
+   rule is security-relevant enough to deserve them. Usable values are only
+   ever moved DOWN (negatives to 0, fractional integer caps FLOORED — rounding
+   `1.5` up to `2` grants a tool call nobody asked for — and anything past
+   `MAX_SAFE_INTEGER` clamped, which also stops `1e20` reaching the `u64`
+   parser as a serde error). The approval TTL had the same shape and the same
+   fix; its old `Number("") || 1` turned a cleared field into a one-second
+   approval window.
+2. **A same-length draft replacement re-pointed a card's local state.** The
+   rule editor's id syncing keyed off `rules.length`, so a revert landing while
+   a matcher was half-typed kept every id and committed that text onto a
+   different rule. The page now bumps a `formEpoch` whenever it replaces the
+   draft from outside the editors (load, discard, revert) and the editors are
+   keyed on it, so they remount. The length check remains as the in-editor
+   case, and its comment no longer claims to be the whole story.
+3. **The stale-index guard was not atomic with the update.** `resolved.stale`
+   was read when the handler was created; a `load()` landing between that
+   render and the click would rebase the edit onto a different draft, where the
+   same rule index can name a different — or shadowed — rule. Both updaters now
+   re-check the draft fingerprint inside `setDraft`, turning that into a no-op.
+4. **A fixed draft still read as invalid.** `previewError` was a bare string,
+   so an error from an earlier draft was reported against the current one until
+   the next response landed — and the publish button stayed disabled on a stale
+   reason. It now carries the draft it belongs to. The copy also stopped
+   promising the fallback is "one edit behind": after a run of invalid edits it
+   is the last draft that RESOLVED, which can be several back.
+
+Sound on review: the publish gate (already fail-closed — current, error-free
+resolution required, and the server strictly revalidates regardless), and the
+`ToolStatus.rule` narrowing (every consumer updated; the server cannot emit
+null).

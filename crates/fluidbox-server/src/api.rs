@@ -1133,8 +1133,12 @@ fn validate_policy_name(name: &str) -> Result<(), ApiError> {
 /// The static `/v1/policies/*` routes shadow `/{name}` in axum, so a policy
 /// carrying one of their names would be unreachable by its own URL. Refused on
 /// EVERY creating path (clone AND the yaml import).
+///
+/// The list lives in `fluidbox-core` because the boot seed enforces it too and
+/// the two crates cannot see each other; `policy_routes_are_all_reserved`
+/// below pins it against the router's actual static segments.
 fn reject_reserved_name(name: &str) -> Result<(), ApiError> {
-    if matches!(name, "validate" | "preview" | "clone") {
+    if fluidbox_core::policy::is_reserved_policy_name(name) {
         return Err(ApiError::BadRequest(format!(
             "'{name}' is reserved by the policies API — pick another name"
         )));
@@ -1227,6 +1231,80 @@ pub async fn clone_policy(
         "name": row.name,
         "version": version.version,
     }})))
+}
+
+/// `DELETE /v1/policies/{name}` — remove a policy identity and, through the
+/// composite FK's cascade, its whole version history.
+///
+/// The counterpart to `clone`: without it the only way to create a policy is
+/// also the only way to accumulate them forever, and a test suite that mints
+/// one per run has nowhere to put it back.
+///
+/// Refuses (409) while ANY agent revision names it — every revision, not just
+/// the latest, because revisions are immutable and a historical one must keep
+/// resolving its policy. RUNS are never at stake: a RunSpec froze the whole
+/// policy document, so no run needs the row to survive.
+pub async fn delete_policy(
+    principal: Principal,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    if !rbac::can_mutate_resources(&principal) {
+        return Err(ApiError::Forbidden(
+            "deleting policies requires admin or owner".into(),
+        ));
+    }
+    let scope = principal.scope();
+    let row = fluidbox_db::get_policy_by_name(&state.pool, scope, &name)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    // `None` = the FK refused rather than our count. Same refusal, without
+    // claiming a count we did not measure. See the arm below for when that can
+    // actually happen (short answer: not today).
+    let in_use = |revisions: Option<i64>| {
+        let named = match revisions {
+            Some(n) => format!("{n} agent revision{}", if n == 1 { "" } else { "s" }),
+            None => "an agent revision created while this delete was in flight".to_string(),
+        };
+        ApiError::Conflict(format!(
+            "'{name}' is still named by {named} — including historical revisions, which stay \
+             immutable. Point those agents at another policy and delete the agents that no \
+             longer need this one."
+        ))
+    };
+    match fluidbox_db::delete_policy(&state.pool, scope, row.id).await {
+        Ok(fluidbox_db::DeletePolicy::Deleted) => Ok(Json(
+            json!({ "deleted": { "id": row.id, "name": row.name } }),
+        )),
+        Ok(fluidbox_db::DeletePolicy::InUse { revisions }) => Err(in_use(Some(revisions))),
+        // UNREACHABLE TODAY, and kept deliberately.
+        //
+        // The obvious story — "a revision landed between the count and the
+        // delete" — is not actually possible: `delete_policy` takes the parent
+        // row `FOR UPDATE`, and inserting an `agent_revision` takes `FOR KEY
+        // SHARE` on that same row to satisfy the FK. Those conflict, so the two
+        // serialize: a revision already in flight makes our lock wait and is
+        // then counted, and a revision starting after our lock waits for us and
+        // fails. There is no window between the count and the delete.
+        //
+        // The arm stays because it is the FK — not the count — that actually
+        // guarantees the invariant. If the lock ordering above is ever relaxed
+        // (a `FOR NO KEY UPDATE`, a count moved outside the transaction), this
+        // degrades the outcome to the correct 409 instead of a 500. Only THIS
+        // constraint: any other 23503 here is a bug that deserves its 500.
+        Err(sqlx::Error::Database(db))
+            if db.code().as_deref() == Some("23503")
+                && db.constraint() == Some("agent_revisions_policy_id_fkey") =>
+        {
+            Err(in_use(None))
+        }
+        // The row vanished between the name lookup above and the delete (a
+        // concurrent delete won). 404 is the honest answer, and it is the same
+        // one a second DELETE of the same name gets — so a client retrying is
+        // never told something different about the same end state.
+        Ok(fluidbox_db::DeletePolicy::NotFound) => Err(ApiError::NotFound),
+        Err(e) => Err(ApiError::Db(e)),
+    }
 }
 
 // ─── Sessions ─────────────────────────────────────────────────────────────
@@ -1818,5 +1896,67 @@ mod tests {
             inherit_unless_switched(None, None, false, "img:default"),
             "img:default"
         );
+    }
+
+    /// The reserved-name list and the ROUTER must not drift. axum matches a
+    /// static segment before `/{name}`, so a policy named after any static
+    /// `/policies/*` segment would be unreachable by its own URL — and a wrong
+    /// constant here is invisible to every other test (the same failure mode
+    /// CLAUDE.md flags for the audience mapping, so it gets the same treatment:
+    /// read the router's source and compare).
+    ///
+    /// Reads `main.rs` rather than the built `Router` because axum exposes no
+    /// way to enumerate registered paths.
+    #[test]
+    fn policy_routes_are_all_reserved() {
+        let main_rs = include_str!("main.rs");
+        let mut segments: Vec<&str> = Vec::new();
+        for line in main_rs.lines() {
+            // `.route("/policies/<seg>...` — the FIRST segment after
+            // `/policies/` is the only one that can shadow `/{name}`.
+            let Some(rest) = line.split("\"/policies/").nth(1) else {
+                continue;
+            };
+            let Some(path) = rest.split('"').next() else {
+                continue;
+            };
+            let seg = path.split('/').next().unwrap_or_default();
+            // `{name}` IS the capture this test exists to protect.
+            if seg.is_empty() || seg.starts_with('{') {
+                continue;
+            }
+            segments.push(seg);
+        }
+        assert!(
+            !segments.is_empty(),
+            "found no static /policies/* routes in main.rs — the scraper broke, \
+             which would make this test vacuously green"
+        );
+        // The scraper understands `.route("/policies/…")` and nothing else. If
+        // the policy routes are ever moved under a nested Router, every path
+        // above becomes invisible and this test goes quietly vacuous — so make
+        // that a loud failure instead of a silent one.
+        assert!(
+            !main_rs.contains(".nest(\"/policies"),
+            "policy routes are now NESTED; this test only scrapes `.route(\"/policies/…\")` \
+             and would no longer see them. Teach the scraper the new shape before trusting it."
+        );
+        for seg in &segments {
+            assert!(
+                fluidbox_core::policy::is_reserved_policy_name(seg),
+                "route /policies/{seg} shadows /{{name}}, but '{seg}' is absent from \
+                 fluidbox_core::policy::RESERVED_POLICY_NAMES — a policy named '{seg}' \
+                 would be unreachable by its own URL. Add it there."
+            );
+        }
+        // …and nothing is reserved that no longer needs to be (a stale entry
+        // silently forbids a name users could otherwise have).
+        for name in fluidbox_core::policy::RESERVED_POLICY_NAMES {
+            assert!(
+                segments.contains(name),
+                "'{name}' is reserved but no /policies/{name} route exists — drop it \
+                 from RESERVED_POLICY_NAMES rather than forbidding a usable name."
+            );
+        }
     }
 }

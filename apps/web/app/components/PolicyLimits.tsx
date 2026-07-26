@@ -11,6 +11,7 @@
 // is re-fetched from the server's preview. This file chooses words and units
 // for a number, never the number.
 
+import { useState } from "react";
 import {
   ApprovalScope,
   Budgets,
@@ -18,6 +19,7 @@ import {
   PolicyAction,
   PolicyContent,
 } from "../lib/api";
+import { coerceCap, coerceTtlSecs } from "../lib/policy-caps";
 import { VERB } from "./PermissionMatrix";
 
 /** A cap the policy did not set. `spec::Budgets` is four `Option`s, so an unset
@@ -46,18 +48,41 @@ function duration(secs: number): string {
   return `${num(Math.round(scaled * 10) / 10)} ${secs < 3600 ? "min" : "hr"}`;
 }
 
-/** A nullable numeric cap: empty = no ceiling of that kind. */
+/** A nullable numeric cap: an EMPTY field means no ceiling of that kind.
+ *
+ *  `integer` marks the caps that are `u64` server-side (seconds, tokens, tool
+ *  calls) as opposed to the `f64` cost.
+ *
+ *  This is a TEXT input holding its own raw string, and both of those are
+ *  load-bearing. `<input type="number">` reports `value === ""` for any
+ *  intermediate state the browser cannot parse — `-`, `1e`, `1.` — which is
+ *  indistinguishable from a cleared field. Deriving the draft from it turned
+ *  every such keystroke into `null`, i.e. NO CEILING: a silent WIDENING, the
+ *  one direction an edit must never take by accident. Holding the raw text
+ *  locally makes "" mean exactly what the person typed.
+ *
+ *  What a given string MEANS is `lib/policy-caps.ts::coerceCap`, which is
+ *  where that rule is stated and tested. */
 function CapField({
   label,
   hint,
   value,
+  integer = false,
   onChange,
 }: {
   label: string;
   hint?: string;
   value: number | null;
+  integer?: boolean;
   onChange: (next: number | null) => void;
 }) {
+  const [raw, setRaw] = useState(value == null ? "" : String(value));
+  const edit = (next: string) => {
+    setRaw(next);
+    const out = coerceCap(next, integer);
+    if (out.kind === "clear") onChange(null);
+    else if (out.kind === "set") onChange(out.value);
+  };
   return (
     <label className="field">
       <span className="lab">
@@ -65,14 +90,39 @@ function CapField({
       </span>
       <input
         className="inp mono"
-        type="number"
-        min={0}
-        step="any"
-        value={value ?? ""}
+        type="text"
+        inputMode={integer ? "numeric" : "decimal"}
+        value={raw}
         placeholder={NO_CAP}
+        spellCheck={false}
+        onChange={(e) => edit(e.target.value)}
+      />
+    </label>
+  );
+}
+
+/** The approval TTL. Not a `CapField`: it is NOT nullable — every approval has
+ *  an expiry — so an empty field has no meaning to send, and the same raw-text
+ *  handling applies for the same reason (a `type="number"` intermediate state
+ *  used to collapse to `Number("") || 1`, i.e. one second). The rule is
+ *  `lib/policy-caps.ts::coerceTtlSecs`. */
+function TtlField({ value, onChange }: { value: number; onChange: (next: number) => void }) {
+  const [raw, setRaw] = useState(String(value));
+  return (
+    <label className="field">
+      <span className="lab">
+        Request expires after (seconds) <span className="optional-label">{duration(value)}</span>
+      </span>
+      <input
+        className="inp mono"
+        type="text"
+        inputMode="numeric"
+        value={raw}
+        spellCheck={false}
         onChange={(e) => {
-          const raw = e.target.value.trim();
-          onChange(raw === "" ? null : Number(raw));
+          setRaw(e.target.value);
+          const out = coerceTtlSecs(e.target.value);
+          if (out.kind === "set") onChange(out.value);
         }}
       />
     </label>
@@ -123,12 +173,14 @@ export function PolicyLimits({
       <div className="agent-creator-grid">
         <CapField
           label="Wall clock (seconds)"
+          integer
           hint={budgets.max_wall_clock_secs != null ? duration(budgets.max_wall_clock_secs) : undefined}
           value={budgets.max_wall_clock_secs}
           onChange={(v) => set({ budgets: { ...budgets, max_wall_clock_secs: v } })}
         />
         <CapField
           label="Tokens"
+          integer
           value={budgets.max_tokens}
           onChange={(v) => set({ budgets: { ...budgets, max_tokens: v } })}
         />
@@ -139,6 +191,7 @@ export function PolicyLimits({
         />
         <CapField
           label="Tool calls"
+          integer
           value={budgets.max_tool_calls}
           onChange={(v) => set({ budgets: { ...budgets, max_tool_calls: v } })}
         />
@@ -146,26 +199,10 @@ export function PolicyLimits({
 
       <div className="sectitle">Approvals</div>
       <div className="agent-creator-grid">
-        <label className="field">
-          <span className="lab">
-            Request expires after (seconds){" "}
-            <span className="optional-label">{duration(approvals.default_ttl_secs)}</span>
-          </span>
-          <input
-            className="inp mono"
-            type="number"
-            min={1}
-            value={approvals.default_ttl_secs}
-            onChange={(e) =>
-              set({
-                approvals: {
-                  ...approvals,
-                  default_ttl_secs: Math.max(1, Number(e.target.value) || 1),
-                },
-              })
-            }
-          />
-        </label>
+        <TtlField
+          value={approvals.default_ttl_secs}
+          onChange={(default_ttl_secs) => set({ approvals: { ...approvals, default_ttl_secs } })}
+        />
         <label className="field">
           <span className="lab">One decision reaches</span>
           <select

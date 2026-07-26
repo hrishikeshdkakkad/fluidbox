@@ -60,22 +60,55 @@ struct LegacyToolOverride {
 /// is post-fold, canonically. Unknown keys stay IGNORED (never
 /// `deny_unknown_fields` here — old blobs must keep deserializing); the
 /// authoring path gets its strictness from [`Policy::parse_strict`] instead.
+///
+/// TRAILING-WILDCARD entries are DROPPED rather than folded, and 0026 does the
+/// same. The retired engine matched an override by exact string equality,
+/// never through `tool_matches`, so a stored `mcp__*` decided nothing for
+/// `mcp__kb__search`; folding it into a head rule would put it through
+/// `tool_matches` and hand the whole namespace that action — a silent
+/// WIDENING of a policy that is already governing a run.
+///
+/// The test is `ends_with('*')`, not `contains('*')`, because it must name
+/// exactly what `tool_matches` treats as a wildcard. A `*` in the MIDDLE
+/// (`fo*o`) is not special there, so such an entry folds to an exact-equality
+/// rule meaning precisely what the override meant — dropping it would narrow
+/// for no reason.
+///
+/// EXACT SCOPE OF THE EQUIVALENCE, stated honestly: the fold preserves every
+/// verdict for every tool whose LITERAL NAME DOES NOT END IN `*`. For a tool
+/// that DOES — `ToolCallRequest.tool` is unconstrained, and an MCP server
+/// names its own tools — the dropped entry used to decide by exact equality
+/// and now does not, so the verdict falls through to the rules. That can go
+/// EITHER WAY, including wider (override `deny` + policy default `allow` ⇒
+/// allow). It is not "always fail-safe" and this comment does not claim it is;
+/// `a_wildcard_override_diverges_only_for_star_suffixed_tool_names` pins the
+/// divergence with exactly that input.
+///
+/// Dropping is still the right side of the trade, on BLAST RADIUS rather than
+/// direction: dropping can change the verdict for the ONE literal name, while
+/// keeping changes it for an entire namespace. The API never permitted such an
+/// entry (`validate()` refused wildcard overrides from the day the column
+/// shipped), so reaching this at all takes a hand-edited database.
 impl<'de> Deserialize<'de> for Policy {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let raw = PolicyDe::deserialize(deserializer)?;
-        let head = raw.managed_overrides.into_iter().map(|o| ToolRule {
-            r#match: vec![o.tool],
-            action: o.action,
-            risk: None,
-            paths: None,
-            shell: None,
-            on_autonomous: None,
-            approval_ttl_secs: None,
-            approval_scope: None,
-        });
+        let head = raw
+            .managed_overrides
+            .into_iter()
+            .filter(|o| !o.tool.ends_with('*'))
+            .map(|o| ToolRule {
+                r#match: vec![o.tool],
+                action: o.action,
+                risk: None,
+                paths: None,
+                shell: None,
+                on_autonomous: None,
+                approval_ttl_secs: None,
+                approval_scope: None,
+            });
         Ok(Policy {
             name: raw.name,
             defaults: raw.defaults,
@@ -437,13 +470,117 @@ impl From<DraftPolicy> for Policy {
     }
 }
 
+/// Policy names that the `/v1/policies/*` routes claim as STATIC segments. A
+/// policy carrying one would be unreachable by its own URL, so every creating
+/// path refuses it — the API (clone + yaml import) and the boot seed alike.
+///
+/// It lives in `fluidbox-core` because it has exactly two consumers in two
+/// crates that cannot see each other (`fluidbox-server::api` and
+/// `fluidbox-db::seed`), and a list duplicated across them is a list that
+/// drifts. `fluidbox-server`'s `policy_routes_are_all_reserved` test pins it
+/// against the router's actual static segments, so adding a route without
+/// adding its name here is a test failure rather than a policy nobody can
+/// open.
+pub const RESERVED_POLICY_NAMES: &[&str] = &["validate", "preview", "clone"];
+
+/// Is `name` claimed by a static `/v1/policies/*` route?
+pub fn is_reserved_policy_name(name: &str) -> bool {
+    RESERVED_POLICY_NAMES.contains(&name)
+}
+
+// ─── Authoring bounds ─────────────────────────────────────────────────────
+//
+// A draft is UNTRUSTED input that ends up frozen into EVERY future RunSpec of
+// every agent on the policy, so it is bounded at the authoring boundary the
+// same way `schema_guard` bounds a frozen tool schema. The numbers are far
+// above any real policy (the seed has 12 rules) and far below anything that
+// would bloat a snapshot: the point is a definite refusal naming the limit,
+// not a tuned budget. Stored blobs are NOT re-checked — an existing policy
+// that predates a bound must keep governing its runs.
+
+/// Ordered rules in one policy.
+const MAX_RULES: usize = 512;
+/// Matchers on one rule.
+const MAX_MATCHERS_PER_RULE: usize = 256;
+/// Globs/regexes/prefixes in one constraint list.
+const MAX_CONSTRAINT_PATTERNS: usize = 256;
+/// Any single authored string (name, matcher, glob, regex, prefix, risk note).
+const MAX_AUTHORED_STRING: usize = 1024;
+
+fn bound_strings(what: &str, values: &[String]) -> Result<(), String> {
+    for v in values {
+        if v.len() > MAX_AUTHORED_STRING {
+            return Err(format!(
+                "{what}: {:?}… is {} bytes; the limit is {MAX_AUTHORED_STRING}",
+                v.chars().take(32).collect::<String>(),
+                v.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn bound_draft(p: &Policy) -> Result<(), String> {
+    if p.name.len() > MAX_AUTHORED_STRING {
+        return Err(format!(
+            "policy name is {} bytes; the limit is {MAX_AUTHORED_STRING}",
+            p.name.len()
+        ));
+    }
+    if p.tools.len() > MAX_RULES {
+        return Err(format!("{} rules; the limit is {MAX_RULES}", p.tools.len()));
+    }
+    for (i, rule) in p.tools.iter().enumerate() {
+        if rule.r#match.len() > MAX_MATCHERS_PER_RULE {
+            return Err(format!(
+                "tools[{i}]: {} matchers; the limit is {MAX_MATCHERS_PER_RULE}",
+                rule.r#match.len()
+            ));
+        }
+        bound_strings(&format!("tools[{i}].match"), &rule.r#match)?;
+        if let Some(risk) = &rule.risk {
+            bound_strings(&format!("tools[{i}].risk"), std::slice::from_ref(risk))?;
+        }
+        if let Some(paths) = &rule.paths {
+            for (field, list) in [("allow", &paths.allow), ("deny", &paths.deny)] {
+                if list.len() > MAX_CONSTRAINT_PATTERNS {
+                    return Err(format!(
+                        "tools[{i}].paths.{field}: {} patterns; the limit is {MAX_CONSTRAINT_PATTERNS}",
+                        list.len()
+                    ));
+                }
+                bound_strings(&format!("tools[{i}].paths.{field}"), list)?;
+            }
+        }
+        if let Some(shell) = &rule.shell {
+            for (field, list) in [
+                ("allow_prefixes", &shell.allow_prefixes),
+                ("deny_regex", &shell.deny_regex),
+            ] {
+                if list.len() > MAX_CONSTRAINT_PATTERNS {
+                    return Err(format!(
+                        "tools[{i}].shell.{field}: {} patterns; the limit is {MAX_CONSTRAINT_PATTERNS}",
+                        list.len()
+                    ));
+                }
+                bound_strings(&format!("tools[{i}].shell.{field}"), list)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Policy {
     /// Parse AUTHORED content (the publish/preview paths): unknown fields are
-    /// refused at every level, then the result passes [`Policy::validate`].
-    /// Legacy stored blobs go through the lenient `Deserialize` instead.
+    /// refused at every level, the document is BOUNDED (it will be frozen into
+    /// every future RunSpec), then the result passes [`Policy::validate`].
+    /// Legacy stored blobs go through the lenient `Deserialize` instead — and
+    /// are deliberately not re-bounded, so a bound introduced later can never
+    /// strand a policy that is already governing runs.
     pub fn parse_strict(value: Value) -> Result<Policy, String> {
         let draft: DraftPolicy = serde_json::from_value(value).map_err(|e| e.to_string())?;
         let policy: Policy = draft.into();
+        bound_draft(&policy)?;
         policy.validate()?;
         Ok(policy)
     }
@@ -550,7 +687,13 @@ pub struct ConstraintSummary {
 pub enum ToolStatus {
     Unconditional {
         action: RuleAction,
-        rule: Option<usize>,
+        /// The rule that decided it. Never optional: with `Overridden` retired
+        /// (0026 folded overrides into ordinary head rules) EVERY
+        /// unconditional verdict comes from a real, indexable rule — and the
+        /// dashboard indexes the draft with it to recognise a matrix-authored
+        /// head rule. An `Option` here would be dead width that every consumer
+        /// still had to null-check.
+        rule: usize,
     },
     Conditional {
         /// The rule's CONSTRAINT-SATISFIED action — what happens when the
@@ -657,7 +800,7 @@ impl Policy {
             if !conditional {
                 return ToolStatus::Unconditional {
                     action: rule.action,
-                    rule: Some(i),
+                    rule: i,
                 };
             }
             let mut c = ConstraintSummary::default();
@@ -1312,7 +1455,7 @@ tools:
     }
 
     /// A matrix-authored (folded) head rule is a REAL rule: the matrix reports
-    /// it as `Unconditional { rule: Some(0) }`, never a distinct status — the
+    /// it as `Unconditional { rule: 0 }`, never a distinct status — the
     /// `Overridden` variant is gone and nothing constructs it (design §4.3).
     #[test]
     fn a_matrix_authored_head_rule_resolves_as_unconditional_rule_zero() {
@@ -1334,7 +1477,7 @@ tools:
             m["mcp__cloudflare__kv_list"],
             ToolStatus::Unconditional {
                 action: RuleAction::Allow,
-                rule: Some(0)
+                rule: 0
             }
         );
     }
@@ -1371,6 +1514,104 @@ tools:
             "serialization must emit the post-fold canonical document"
         );
         assert_eq!(round_tripped["tools"][0]["match"], json!(["SomeTool"]));
+    }
+
+    /// A TRAILING-WILDCARD override is dropped by the fold, not turned into a
+    /// wildcard rule — the one place the transform deliberately loses an entry.
+    ///
+    /// The retired engine matched overrides by exact string equality, so
+    /// `mcp__*` decided nothing for `mcp__kb__search`. Folding it into a head
+    /// rule would put it through `tool_matches` and hand the ENTIRE namespace
+    /// that action: an in-flight run's frozen law, silently widened at the
+    /// moment its snapshot is read. Migration 0026 drops such entries with a
+    /// `raise warning`; this pins that the engine agrees, so a migrated policy
+    /// and a still-frozen snapshot of it resolve identically.
+    ///
+    /// A `*` that is NOT trailing is kept, because `tool_matches` does not
+    /// treat it as a wildcard either — folding it yields exact equality, which
+    /// is precisely what the override meant.
+    #[test]
+    fn a_wildcard_override_is_dropped_not_folded() {
+        let legacy = json!({
+            "name": "t",
+            "defaults": { "tool_action": "deny" },
+            "tools": [],
+            "managed_overrides": [
+                { "tool": "mcp__*", "action": "allow" },
+                { "tool": "fo*o", "action": "allow" },
+                { "tool": "mcp__kb__search", "action": "approve" },
+            ],
+        });
+        let p: Policy = serde_json::from_value(legacy).expect("deserializes");
+        assert_eq!(
+            p.tools.len(),
+            2,
+            "the trailing-wildcard entry is dropped; the mid-string one is not: {:?}",
+            p.tools
+        );
+        assert_eq!(p.tools[0].r#match, vec!["fo*o".to_string()]);
+        assert_eq!(p.tools[1].r#match, vec!["mcp__kb__search".to_string()]);
+        // `fo*o` folds to EXACT equality — the same thing the override meant.
+        assert_eq!(
+            p.evaluate(&req("fo*o", json!({})), Autonomy::Supervised)
+                .effective,
+            Verdict::Allow
+        );
+        assert!(matches!(
+            p.evaluate(&req("food", json!({})), Autonomy::Supervised)
+                .effective,
+            Verdict::Deny { .. }
+        ));
+        // A sibling in the namespace keeps falling through to the DEFAULT —
+        // exactly what the pre-fold engine did, and NOT what a folded
+        // `mcp__*` rule would have done (allow).
+        assert!(matches!(
+            p.evaluate(&req("mcp__other__thing", json!({})), Autonomy::Supervised)
+                .effective,
+            Verdict::Deny { .. }
+        ));
+    }
+
+    /// The fold's ONE divergence, pinned with the input that shows it going the
+    /// WRONG way — because a test that only demonstrated the comfortable
+    /// direction would let the comment above drift back into claiming the fold
+    /// is always fail-safe. It is not.
+    ///
+    /// `ToolCallRequest.tool` is unconstrained (an MCP server names its own
+    /// tools), so a tool whose LITERAL name ends in `*` can exist. Pre-fold, an
+    /// override on that exact name decided it. Post-fold the entry is gone, so
+    /// the verdict falls through to the rules — which here are more permissive
+    /// than the override was. That is a WIDENING.
+    ///
+    /// Dropping is still the right trade, but on blast radius, not direction:
+    /// dropping moves the verdict for ONE literal name, keeping moves it for a
+    /// whole namespace. Reaching this at all takes a hand-edited database — the
+    /// API refused wildcard overrides from the day the column shipped.
+    #[test]
+    fn a_wildcard_override_diverges_only_for_star_suffixed_tool_names() {
+        let p: Policy = serde_json::from_value(json!({
+            "name": "t",
+            "defaults": { "tool_action": "allow" },
+            "tools": [],
+            "managed_overrides": [{ "tool": "*", "action": "deny" }],
+        }))
+        .expect("deserializes");
+        assert!(p.tools.is_empty(), "the entry is dropped");
+        assert_eq!(
+            p.evaluate(&req("*", json!({})), Autonomy::Supervised)
+                .effective,
+            Verdict::Allow,
+            "pre-fold this was DENY (exact `*` == `*`); post-fold it falls through to the \
+             default. The divergence is real and it WIDENS here — the comment on \
+             `Deserialize for Policy` must keep saying so."
+        );
+        // …and it is confined to that shape: a tool whose name does not end in
+        // `*` is untouched by the dropped entry, before or after.
+        assert_eq!(
+            p.evaluate(&req("Bash", json!({})), Autonomy::Supervised)
+                .effective,
+            Verdict::Allow
+        );
     }
 
     /// Unknown keys stay IGNORED on the lenient path — an old blob with keys
@@ -1468,6 +1709,105 @@ tools:
         }))
         .expect_err("a bad regex must refuse");
         assert!(err.contains("deny_regex"), "{err}");
+    }
+
+    /// A draft is frozen into EVERY future RunSpec of every agent on the
+    /// policy, so the authoring boundary bounds it. Each limit refuses with a
+    /// message naming the field and the limit.
+    #[test]
+    fn parse_strict_bounds_the_draft() {
+        let rule = |n: usize| json!({ "match": [format!("T{n}")], "action": "allow" });
+
+        // Rule count.
+        let err = Policy::parse_strict(json!({
+            "name": "t",
+            "tools": (0..MAX_RULES + 1).map(rule).collect::<Vec<_>>(),
+        }))
+        .expect_err("too many rules must refuse");
+        assert!(err.contains(&MAX_RULES.to_string()), "{err}");
+        // …and exactly at the limit is fine.
+        Policy::parse_strict(json!({
+            "name": "t",
+            "tools": (0..MAX_RULES).map(rule).collect::<Vec<_>>(),
+        }))
+        .expect("the limit itself is allowed");
+
+        // Matchers on one rule.
+        let err = Policy::parse_strict(json!({
+            "name": "t",
+            "tools": [{ "match": vec!["T"; MAX_MATCHERS_PER_RULE + 1], "action": "allow" }],
+        }))
+        .expect_err("too many matchers must refuse");
+        assert!(
+            err.contains("tools[0]") && err.contains("matchers"),
+            "{err}"
+        );
+
+        // Patterns in one constraint list, on both constraint kinds.
+        for (field, constraint) in [
+            (
+                "paths",
+                json!({ "deny": vec!["**"; MAX_CONSTRAINT_PATTERNS + 1] }),
+            ),
+            (
+                "shell",
+                json!({ "allow_prefixes": vec!["ls"; MAX_CONSTRAINT_PATTERNS + 1] }),
+            ),
+        ] {
+            let err = Policy::parse_strict(json!({
+                "name": "t",
+                "tools": [{ "match": ["Bash"], "action": "allow", field: constraint }],
+            }))
+            .expect_err("too many patterns must refuse");
+            assert!(err.contains(field) && err.contains("patterns"), "{err}");
+        }
+
+        // Any single authored string, wherever it appears.
+        let huge = "x".repeat(MAX_AUTHORED_STRING + 1);
+        for draft in [
+            json!({ "name": huge }),
+            json!({ "name": "t", "tools": [{ "match": [huge], "action": "allow" }] }),
+            json!({ "name": "t", "tools": [{ "match": ["Bash"], "action": "allow",
+                                            "risk": huge }] }),
+            json!({ "name": "t", "tools": [{ "match": ["Edit"], "action": "allow",
+                                            "paths": { "deny": [huge] } }] }),
+            json!({ "name": "t", "tools": [{ "match": ["Bash"], "action": "allow",
+                                            "shell": { "deny_regex": [huge] } }] }),
+        ] {
+            let err = Policy::parse_strict(draft).expect_err("an oversized string must refuse");
+            assert!(
+                err.contains(&MAX_AUTHORED_STRING.to_string()),
+                "the refusal must name the limit: {err}"
+            );
+        }
+    }
+
+    /// Bounds are an AUTHORING boundary only. A stored blob that exceeds one
+    /// (authored before the bound existed, or by an older build) must keep
+    /// deserializing and governing — stranding a live policy would be a much
+    /// worse failure than the oversized document.
+    #[test]
+    fn bounds_do_not_apply_to_stored_blobs() {
+        let stored = json!({
+            "name": "t",
+            "tools": (0..MAX_RULES + 10)
+                .map(|n| json!({ "match": [format!("T{n}")], "action": "allow" }))
+                .collect::<Vec<_>>(),
+        });
+        let p: Policy = serde_json::from_value(stored).expect("stored blobs are not re-bounded");
+        assert_eq!(p.tools.len(), MAX_RULES + 10);
+    }
+
+    /// The reserved list is one const shared by the API and the boot seed;
+    /// both refuse the same names. (The router side is pinned by
+    /// `fluidbox-server`'s `policy_routes_are_all_reserved`.)
+    #[test]
+    fn reserved_policy_names_are_the_static_route_segments() {
+        for name in RESERVED_POLICY_NAMES {
+            assert!(is_reserved_policy_name(name), "{name}");
+        }
+        assert!(!is_reserved_policy_name("default"));
+        assert!(!is_reserved_policy_name("Validate"), "match is exact");
     }
 
     #[test]
@@ -1843,38 +2183,63 @@ mod proptests {
     //
     // Migration 0026 folds every `managed_overrides` entry into a HEAD rule
     // (`{match: [tool], action}`), prepended in stored order. The property
-    // below is the fold's correctness proof: for any policy, any valid
-    // override set, and any request, the PRE-FOLD engine (overrides consulted
+    // below is the fold's correctness proof, WITHIN ITS STATED BOUND (request
+    // tools whose name does not end in `*`; the one divergence outside it has
+    // its own test): for any policy, any stored
+    // override set, and any such request, the PRE-FOLD engine (overrides consulted
     // first, exact-name, policy-default ttl/scope/autonomy-fallback — mirrored
     // by `evaluate_with_overrides` because the branch itself is deleted) and
     // the POST-FOLD engine agree verdict for verdict, in both autonomy modes.
     // The SQL in 0026 is the mechanism; this test is the guarantee.
 
-    /// Valid override sets under the RETIRED validate() contract: exact names
-    /// (no wildcards), unique per tool.
+    /// Stored override sets. Unique per tool (`.find()` made a second entry a
+    /// lie), but `*`-BEARING TOOLS ARE INCLUDED on purpose: the retired `validate()`
+    /// refused them at the API, yet the fold must be correct for whatever is
+    /// actually in the column, and "the write path enforced it" is not a
+    /// property a migration gets to assume.
     fn arb_overrides() -> impl Strategy<Value = Vec<(String, RuleAction)>> {
-        prop::collection::vec((arb_tool(), arb_action()), 0..4).prop_map(|v| {
+        let tool = prop_oneof![
+            9 => arb_tool(),
+            // The shapes a `*`-bearing entry could have taken. The first
+            // three are wildcards to `tool_matches` and must be DROPPED; the
+            // last is not (only a TRAILING `*` is special), so it must be
+            // KEPT and folded — and the property covers both outcomes.
+            1 => prop_oneof![
+                Just("mcp__*".to_string()),
+                Just("*".to_string()),
+                Just("Read*".to_string()),
+                Just("fo*o".to_string()),
+            ],
+        ];
+        prop::collection::vec((tool, arb_action()), 0..4).prop_map(|v| {
             let mut seen = std::collections::HashSet::new();
             v.into_iter()
-                .filter(|(t, _)| !t.contains('*') && seen.insert(t.clone()))
+                .filter(|(t, _)| seen.insert(t.clone()))
                 .collect()
         })
     }
 
     /// The 0026 fold, mirrored in Rust: overrides become head rules in stored
-    /// order, ahead of the authored rules.
+    /// order, ahead of the authored rules — except WILDCARD entries, which are
+    /// dropped (0026 drops them with a `raise warning`, and the lenient
+    /// deserializer filters them). Folding one would convert an entry that
+    /// exact-equality matching made unreachable into a live namespace-wide
+    /// rule; the property below is what proves dropping changes no verdict.
     fn fold_overrides(overrides: &[(String, RuleAction)], p: &Policy) -> Policy {
         let mut folded = p.clone();
-        let head = overrides.iter().map(|(tool, action)| ToolRule {
-            r#match: vec![tool.clone()],
-            action: *action,
-            risk: None,
-            paths: None,
-            shell: None,
-            on_autonomous: None,
-            approval_ttl_secs: None,
-            approval_scope: None,
-        });
+        let head = overrides
+            .iter()
+            .filter(|(tool, _)| !tool.ends_with('*'))
+            .map(|(tool, action)| ToolRule {
+                r#match: vec![tool.clone()],
+                action: *action,
+                risk: None,
+                paths: None,
+                shell: None,
+                on_autonomous: None,
+                approval_ttl_secs: None,
+                approval_scope: None,
+            });
         folded.tools = head.chain(p.tools.iter().cloned()).collect();
         folded
     }
@@ -1932,8 +2297,19 @@ mod proptests {
         ) {
             // Half the requests target an override's exact tool so the folded
             // head rules are actually exercised, not just walked past.
-            let tool = if hit_override && !ov.is_empty() {
-                ov[pick.index(ov.len())].0.clone()
+            //
+            // Only entries that SURVIVE the fold are eligible targets, and
+            // that bound is the exact scope of this property: the folds agree
+            // for every tool whose name does not END IN `*`. They provably do
+            // NOT agree for one that does — see
+            // `a_wildcard_override_diverges_only_for_star_suffixed_tool_names`,
+            // which pins that divergence with an input where it WIDENS. This
+            // filter is therefore a stated precondition, not a convenience;
+            // removing it would make the property false, not merely noisy.
+            let targets: Vec<&String> =
+                ov.iter().map(|(t, _)| t).filter(|t| !t.ends_with('*')).collect();
+            let tool = if hit_override && !targets.is_empty() {
+                targets[pick.index(targets.len())].clone()
             } else {
                 free_tool
             };
