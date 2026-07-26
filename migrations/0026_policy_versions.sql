@@ -37,29 +37,112 @@ set local lock_timeout = '5s';
 -- `set local` above relies on the same fact).
 select set_config('fluidbox.bypass', 'system_worker', true);
 
--- Preflight: the fold below trusts `managed_overrides` to be an array of
--- {"tool": <text>, "action": "allow"|"approve"|"deny"} rows (the shape the
--- retired write path enforced). A malformed value would abort mid-fold with an
--- error naming no policy — fail HERE, naming the row, instead. Each entry's
--- tool AND action must be JSON strings (a missing/null action makes `->>`
--- yield SQL NULL, and `NULL NOT IN (…)` is NULL — never rely on it); the
--- array check guards `jsonb_array_elements` via CASE, not evaluation order.
+-- Preflight: the fold below trusts the shapes the retired write path enforced.
+-- A violation would otherwise abort mid-fold with a postgres error naming no
+-- policy (`cannot delete from scalar`), or — worse — fold silently into
+-- nonsense. Fail HERE instead, naming the row AND the reason.
+--
+-- Checked, in order (the CASE short-circuits, and every `jsonb_array_elements`
+-- is guarded by an inner CASE rather than by evaluation order — the planner is
+-- free to hoist a subexpression, so the guard must be in the expression):
+--
+--   1. `parsed` is a json OBJECT. The fold does `parsed - 'managed_overrides'`
+--      and `jsonb_set(parsed, '{tools}', …)`; both raise on a scalar.
+--   2. `parsed.tools`, when present, is an ARRAY. `heads || parsed->'tools'`
+--      against a scalar (including json `null`) yields an array with a
+--      non-rule element in it, which no engine can deserialize. Absent is
+--      fine — the fold coalesces it to `[]`.
+--   3. `managed_overrides` is an ARRAY.
+--   4. Every entry's tool AND action are json STRINGS with a known action. A
+--      missing/null action makes `->>` yield SQL NULL, and `NULL NOT IN (…)`
+--      is NULL — never rely on it, hence the explicit type checks.
+--
+-- Trailing-WILDCARD tools are handled separately, below: they are droppable
+-- rather than fatal, so blocking an upgrade on one would be the wrong trade.
 do $$
 declare bad record;
 begin
-    select p.id, p.name into bad
+    select p.id, p.name, r.reason into bad
       from policies p
-     where jsonb_typeof(p.managed_overrides) is distinct from 'array'
-        or exists (
-            select 1 from jsonb_array_elements(
-                case when jsonb_typeof(p.managed_overrides) = 'array'
-                     then p.managed_overrides else '[]'::jsonb end) o
-             where jsonb_typeof(o->'tool') is distinct from 'string'
-                or jsonb_typeof(o->'action') is distinct from 'string'
-                or o->>'action' not in ('allow', 'approve', 'deny'))
+      cross join lateral (select case
+          when jsonb_typeof(p.parsed) is distinct from 'object'
+            then 'its `parsed` column is not a json object'
+          when jsonb_typeof(p.parsed->'tools') is not null
+               and jsonb_typeof(p.parsed->'tools') <> 'array'
+            then 'its `parsed.tools` is present but not an array'
+          when jsonb_typeof(p.managed_overrides) is distinct from 'array'
+            then 'its `managed_overrides` is not an array'
+          when exists (
+              select 1 from jsonb_array_elements(
+                  case when jsonb_typeof(p.managed_overrides) = 'array'
+                       then p.managed_overrides else '[]'::jsonb end) o
+               where jsonb_typeof(o->'tool') is distinct from 'string'
+                  or jsonb_typeof(o->'action') is distinct from 'string'
+                  or o->>'action' not in ('allow', 'approve', 'deny'))
+            then 'its `managed_overrides` carries an entry that is not {"tool": <string>, "action": "allow"|"approve"|"deny"}'
+        end as reason) r
+     where r.reason is not null
      limit 1;
     if found then
-        raise exception 'migration 0026: policy % (%) carries a malformed managed_overrides value; repair it before migrating', bad.id, bad.name;
+        raise exception 'migration 0026: cannot fold policy % (%): %; repair the row before migrating',
+            bad.id, bad.name, bad.reason;
+    end if;
+end $$;
+
+-- TRAILING-WILDCARD overrides are DROPPED, loudly, rather than folded.
+--
+-- The retired engine matched an override by EXACT STRING EQUALITY
+-- (`o.tool == req.tool`), never through `tool_matches`. A stored `mcp__*`
+-- therefore fired for nothing except a tool whose LITERAL name was `mcp__*`.
+-- Folded into a head rule it would go through `tool_matches` and match the
+-- whole namespace — a silent WIDENING of the policy, which is precisely the
+-- class of change this migration exists to make impossible.
+--
+-- The predicate is `like '%*'`, not `like '%*%'`, because it must name exactly
+-- the strings `tool_matches` treats as wildcards: a TRAILING `*` (prefix
+-- match) or the bare `*` (matches everything, and which `'%*'` also covers).
+-- A `*` anywhere ELSE — `fo*o` — is not special to `tool_matches`, so such an
+-- entry folds to an exact-equality rule that means precisely what the override
+-- meant. Dropping it would narrow for no reason.
+--
+-- EXACT SCOPE, stated honestly: dropping preserves every verdict for every
+-- tool whose LITERAL NAME DOES NOT END IN `*` — which is every tool anyone
+-- would name. For a tool that DOES (tool names are not constrained; an MCP
+-- server names its own), the entry used to decide by exact equality and now
+-- does not, so the verdict falls through to the rules. That can go EITHER WAY,
+-- including WIDER (override `deny` + policy default `allow` ⇒ allow). This is
+-- NOT "always fail-safe", and fluidbox-core's
+-- `a_wildcard_override_diverges_only_for_star_suffixed_tool_names` pins the
+-- divergence with exactly that input so the claim cannot drift.
+--
+-- Dropping is still the right side of the trade, on BLAST RADIUS rather than
+-- direction: dropping can move the verdict for the ONE literal name, keeping
+-- moves it for an entire namespace. The API never allowed such an entry
+-- (`validate()` refused wildcard overrides from the day the column shipped),
+-- so reaching this at all takes a hand-edited database — which is also why the
+-- warning above exists rather than a silent rewrite.
+do $$
+declare v record; v_n int := 0;
+begin
+    for v in
+        select p.id, p.name, o.value->>'tool' as tool
+          from policies p
+          cross join lateral jsonb_array_elements(p.managed_overrides) o
+         where o.value->>'tool' like '%*'
+    loop
+        raise warning 'migration 0026: policy % (%) carried a TRAILING-WILDCARD managed override for %; it was unreachable under exact-name matching and has been dropped rather than folded into a wildcard rule (which would widen the policy)',
+            v.id, v.name, v.tool;
+        v_n := v_n + 1;
+    end loop;
+    if v_n > 0 then
+        update policies p
+           set managed_overrides = coalesce(
+                 (select jsonb_agg(o.value order by o.ord)
+                    from jsonb_array_elements(p.managed_overrides) with ordinality o(value, ord)
+                   where o.value->>'tool' not like '%*'),
+                 '[]'::jsonb)
+         where exists (select 1 from jsonb_array_elements(p.managed_overrides) o
+                        where o.value->>'tool' like '%*');
     end if;
 end $$;
 
@@ -80,11 +163,14 @@ create table policy_versions (
     yaml_source     text,
     -- Publish note; null for seeds and imports.
     summary         text,
-    -- Provenance channel: 'seed' | 'api' | 'ui' | 'import' (design §3). The
-    -- acting USER, when one exists, is the column below — multi-user shipped
-    -- after the design froze this as text precisely so a principal could ride
-    -- alongside without a migration.
-    author          text not null,
+    -- Provenance channel (design §3). CONSTRAINED, not merely documented: the
+    -- dashboard renders one label per channel and falls back to "dashboard",
+    -- so an unconstrained column would let a typo'd channel silently
+    -- mis-attribute a version in the audit trail. The acting USER, when one
+    -- exists, is the column below — multi-user shipped after the design froze
+    -- this as text precisely so a principal could ride alongside without a
+    -- migration.
+    author          text not null check (author in ('seed', 'api', 'ui', 'import')),
     -- The authenticated user behind an api/ui version; null for the operator
     -- token, seeds, and the 0026 import. Deliberately NO foreign key (the 0012
     -- `sessions.invoked_by_user_id` precedent: history may outlive users).
@@ -136,15 +222,26 @@ alter table policies drop column parsed;
 alter table policies drop column managed_overrides;
 alter table policies drop column version;
 
--- ─── RLS triple (0018's rule for a new tenant-owned table; 0022 template) ───
+-- ─── RLS triple (0018's rule for a new tenant-owned table) ─────────────────
 alter table policy_versions enable row level security;
 alter table policy_versions force row level security;
--- Child-EXISTS: the parent `policies` policy composes through the subquery (it
--- runs under RLS too), so a version is visible/writable iff its policy is, and
--- the system_worker bypass opens the parent (and thus the child).
+-- 0018's section-(b) template VERBATIM — the predicate for a table that CARRIES
+-- `tenant_id`, keyed directly on the GUC with the system_worker bypass arm.
+--
+-- Not the section-(c) child-EXISTS shape, even though this table has a parent:
+-- (c) exists for children with NO tenant_id, where the parent FK is the only
+-- expression of tenancy. Here `tenant_id` is present AND the composite FK below
+-- proves it equals the parent's, so the direct predicate is both the cheaper
+-- one (no correlated subquery per row, and `latest_policy_version` is on
+-- `create_run`'s path) and the one a reader expects to find next to a
+-- `tenant_id` column. Isolation is unchanged and closes both ways: a row naming
+-- another tenant fails THIS predicate, and a row naming our tenant but a
+-- stranger's policy fails the composite FK.
 create policy tenant_isolation on policy_versions as permissive for all to public
-    using (exists (select 1 from policies p where p.id = policy_versions.policy_id))
-    with check (exists (select 1 from policies p where p.id = policy_versions.policy_id));
+    using (tenant_id::text = current_setting('fluidbox.tenant_id', true)
+           or current_setting('fluidbox.bypass', true) = 'system_worker')
+    with check (tenant_id::text = current_setting('fluidbox.tenant_id', true)
+           or current_setting('fluidbox.bypass', true) = 'system_worker');
 
 -- Enumerated DML grant to the deployment's runtime role (resolved from the
 -- session GUC `fluidbox.runtime_role`, default `fluidbox_runtime` — NEVER

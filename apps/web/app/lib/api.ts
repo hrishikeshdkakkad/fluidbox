@@ -802,7 +802,10 @@ export interface RuleConstraints {
  *  Flattening one from the matrix would delete `paths.deny: **\/.env` with a
  *  click, so the matrix never offers a control for it. */
 export type ToolStatus =
-  | { status: "unconditional"; action: PolicyAction; rule: number | null }
+  // `rule` is never null: with per-tool overrides retired (they are ordinary
+  // head rules now) every unconditional verdict names a real rule index, which
+  // is what lets the editor find that rule in the draft it is holding.
+  | { status: "unconditional"; action: PolicyAction; rule: number }
   | {
       status: "conditional";
       action: PolicyAction;

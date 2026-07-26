@@ -356,7 +356,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/policies/validate", post(api::validate_policy))
         .route("/policies/preview", post(api::preview_policy))
         .route("/policies/clone", post(api::clone_policy))
-        .route("/policies/{name}", get(api::get_policy))
+        .route(
+            "/policies/{name}",
+            get(api::get_policy).delete(api::delete_policy),
+        )
         .route("/policies/{name}/publish", post(api::publish_policy))
         .route("/policies/{name}/revert", post(api::revert_policy))
         .route(

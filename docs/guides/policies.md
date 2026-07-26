@@ -6,6 +6,7 @@ A policy is evaluated on **every tool call** an agent makes. The verdict is one 
 
 - **The database is the source of truth.** A policy is a stable identity (`policies`) plus an append-only history (`policy_versions`); the latest version governs future runs. History is immutable — the runtime role can only read and append, and "undo" is a *revert*, which publishes the old content forward as a new version.
 - **`policies/*.yaml` is a boot seed, nothing more.** A fresh database seeds each file once (`seed_policy_if_absent`); reboots never clobber what you authored in the UI. To change the seed itself, change the YAML **and** the `seed_policy_semantics` test that pins it.
+  Seed files are parsed **strictly** — an unknown key is an error, not a dropped field. The consequence is scoped to what is at stake: if the policy does not exist yet the file is its only source and the server **refuses to boot** (naming the file, the key, and the policy); if it already exists the database's versions govern, the file writes nothing, and the server **warns and boots**.
 - **YAML survives as an interchange format.** `POST /v1/policies {name, yaml}` imports a document as a new version (idempotent: byte-equal content appends nothing), and every version exports as YAML from `GET /v1/policies/{name}/versions/{n}`.
 
 ## Authoring (the Governance page)
@@ -17,7 +18,7 @@ A policy is evaluated on **every tool call** an agent makes. The verdict is one 
 - **Publish** — validates server-side (strictly: an unknown field is refused, never silently dropped), requires a summary, and carries the version your draft loaded from — a publish over a moved head is a 409, so two editors can't silently overwrite each other.
 - **History** — every version with author, summary, and date; view any version, diff it, revert to it.
 
-New policies are created by **cloning** an existing one (or starting blank) — `POST /v1/policies/clone {name, from?}`.
+New policies are created by **cloning** an existing one (or starting blank) — `POST /v1/policies/clone {name, from?}` — and removed with `DELETE /v1/policies/{name}`, which also removes their history. A delete is refused while **any** agent revision names the policy (including historical revisions, which are immutable); runs are never affected, because each froze its own snapshot.
 
 ## The document
 
@@ -82,7 +83,7 @@ tools:                   # ORDERED rules; first rule whose `match` hits wins
 ## The API
 
 ```bash
-# validate YAML without saving (422 with the parse error on bad YAML)
+# validate YAML without saving (strict: an unknown key is a 422 naming it)
 curl -s -X POST localhost:8787/v1/policies/validate \
   -H "authorization: Bearer $FLUIDBOX_ADMIN_TOKEN" -H "content-type: application/json" \
   -d "$(jq -n --rawfile y policies/default.yaml '{yaml: $y}')"
@@ -106,7 +107,13 @@ curl -s -X POST localhost:8787/v1/policies/default/revert \
 curl -s -X POST localhost:8787/v1/policies/clone \
   -H "authorization: Bearer $FLUIDBOX_ADMIN_TOKEN" -H "content-type: application/json" \
   -d '{"name": "staging", "from": "default"}'
+
+# delete a policy and its history (409 while any agent revision names it)
+curl -s -X DELETE localhost:8787/v1/policies/staging \
+  -H "authorization: Bearer $FLUIDBOX_ADMIN_TOKEN"
 ```
+
+Policy names are constrained on creation to `a-z A-Z 0-9 . _ -` (1–64 characters, not starting with `.`) because they travel in URLs, and a handful — `validate`, `preview`, `clone` — are reserved by the static `/v1/policies/*` routes.
 
 An agent revision names its policy; the policy's `budgets` are a ceiling the revision and each run may only tighten. Autonomy is chosen per run (`"autonomous": true` on `POST /v1/sessions`) or per trigger subscription — a policy with `autonomy.permitted: false` refuses those outright.
 

@@ -8,7 +8,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ### Added
 
-- **DB-native policies (§17 #11)** — policies are now versioned, authorable, and attachable from the dashboard. Every edit is an immutable `policy_versions` row (author, summary, date; migration `0026`); publish/revert/clone ride optimistic concurrency (`base_version` → 409 on a moved head) and a strict parser (an unknown field is a 422, never a silently-weaker policy); history is append-only at the database level (the runtime role can only read and append). The Governance page gains a draft rule editor (ordered rules, path/shell constraints, budgets/approvals/autonomy/egress forms), version history with diff and one-click revert, and New policy (clone or blank); the run composer gains a policy select and disables autonomy when the policy forbids it. `managed_overrides` folds into ordinary head rules (verdict-preserving, property-tested); `just policy-sync` is retired — YAML survives as a boot seed and an idempotent import/export format (`POST /v1/policies`).
+- **DB-native policies (§17 #11)** — policies are now versioned, authorable, and attachable from the dashboard. Every edit is an immutable `policy_versions` row (author, summary, date; migration `0026`); publish/revert/clone ride optimistic concurrency (`base_version` → 409 on a moved head) and a strict parser (an unknown field is a 422, never a silently-weaker policy); history is append-only at the database level (the runtime role can only read and append). The Governance page gains a draft rule editor (ordered rules, path/shell constraints, budgets/approvals/autonomy/egress forms), version history with diff and one-click revert, New policy (clone or blank), and Delete; the run composer gains a policy select and disables autonomy when the policy forbids it. `managed_overrides` folds into ordinary head rules (verdict-preserving, property-tested); `just policy-sync` is retired — YAML survives as a boot seed and an idempotent import/export format (`POST /v1/policies`).
+- **`DELETE /v1/policies/{name}`** — removes a policy and cascades its version history. Refused (409) while any agent revision names it, including historical revisions, which stay immutable. Runs are never affected: each froze its own policy snapshot.
+
+### Changed
+
+- **Seed policy files are parsed STRICTLY, and an invalid one can refuse the boot.** `policies/*.yaml` now goes through the same strict parser as the API, so an unknown key is an error rather than a silently-dropped field. The refusal is scoped to where it matters: if the policy does **not yet exist in the database**, the file is its only source and the server refuses to start (naming the file, the key, and the policy); if the policy **already exists**, its stored versions govern, the file writes nothing, and the server logs a warning and boots. Upgrading with a hand-edited policies directory: run `POST /v1/policies/validate` against each file first, or expect a startup warning.
+
+### Upgrade notes
+
+- Migration `0026` drops `policies.{parsed,yaml_source,managed_overrides,version}`, so this is **stop the old binary, migrate, then deploy** (the `0018` posture) and there is no binary rollback past it. The Helm chart's Deployment uses `RollingUpdate`: scale the server to zero first, or switch it to `Recreate` for one release.
+- A `managed_overrides` entry naming a **wildcard** tool (e.g. `mcp__*`) is dropped with a warning rather than folded. Such an entry was unreachable — the retired engine matched overrides by exact name — and folding it into a rule would have matched the whole namespace. The API never allowed one, so this should log nothing.
 
 ## [0.3.0] — 2026-07-24
 

@@ -887,10 +887,17 @@ async fn append_policy_version_tx(
     .fetch_optional(&mut **tx)
     .await?
     .ok_or(sqlx::Error::RowNotFound)?;
+    // `tenant_id` is redundant here — the locked row above already proved this
+    // policy is ours, and `policies.id` is globally unique — but every
+    // tenant-owned read in this crate carries the predicate so the property
+    // stays MECHANICALLY checkable (grep, not argument). Same below and in
+    // `import_policy_yaml` / `seed_policy_if_absent`.
     let (head,): (i32,) = sqlx::query_as(
-        "select coalesce(max(version), 0)::int from policy_versions where policy_id = $1",
+        "select coalesce(max(version), 0)::int from policy_versions
+          where policy_id = $1 and tenant_id = $2",
     )
     .bind(policy_id)
+    .bind(tenant_id)
     .fetch_one(&mut **tx)
     .await?;
     if let Some(base) = expected_base {
@@ -1017,14 +1024,19 @@ pub async fn import_policy_yaml(
     .await?;
     // Same lock the append takes — the equality check and the append decide
     // under one serialization point, so a racing import cannot double-append.
-    sqlx::query_as::<_, (Uuid,)>("select id from policies where id = $1 for update")
-        .bind(policy.id)
-        .fetch_one(&mut *tx)
-        .await?;
-    let head: Option<PolicyVersionRow> = sqlx::query_as(
-        "select * from policy_versions where policy_id = $1 order by version desc limit 1",
+    sqlx::query_as::<_, (Uuid,)>(
+        "select id from policies where id = $1 and tenant_id = $2 for update",
     )
     .bind(policy.id)
+    .bind(scope.tenant_id())
+    .fetch_one(&mut *tx)
+    .await?;
+    let head: Option<PolicyVersionRow> = sqlx::query_as(
+        "select * from policy_versions where policy_id = $1 and tenant_id = $2
+          order by version desc limit 1",
+    )
+    .bind(policy.id)
+    .bind(scope.tenant_id())
     .fetch_optional(&mut *tx)
     .await?;
     if let Some(h) = head {
@@ -1052,10 +1064,12 @@ pub async fn import_policy_yaml(
     };
     // The append bumped `policies.updated_at`; answer with the row as COMMITTED,
     // not the pre-append capture.
-    let policy: PolicyRow = sqlx::query_as("select * from policies where id = $1")
-        .bind(policy.id)
-        .fetch_one(&mut *tx)
-        .await?;
+    let policy: PolicyRow =
+        sqlx::query_as("select * from policies where id = $1 and tenant_id = $2")
+            .bind(policy.id)
+            .bind(scope.tenant_id())
+            .fetch_one(&mut *tx)
+            .await?;
     tx.commit().await?;
     Ok((policy, version, true))
 }
@@ -1089,15 +1103,20 @@ pub async fn seed_policy_if_absent(
     // Racing replica: it may have committed the identity AND v1 between our
     // absence check and this transaction. Lock the policy row (the same lock
     // the version append takes), then mint v1 only if none exists.
-    sqlx::query_as::<_, (Uuid,)>("select id from policies where id = $1 for update")
-        .bind(row.id)
-        .fetch_one(&mut *tx)
-        .await?;
-    let (existing_versions,): (i64,) =
-        sqlx::query_as("select count(*) from policy_versions where policy_id = $1")
-            .bind(row.id)
-            .fetch_one(&mut *tx)
-            .await?;
+    sqlx::query_as::<_, (Uuid,)>(
+        "select id from policies where id = $1 and tenant_id = $2 for update",
+    )
+    .bind(row.id)
+    .bind(scope.tenant_id())
+    .fetch_one(&mut *tx)
+    .await?;
+    let (existing_versions,): (i64,) = sqlx::query_as(
+        "select count(*) from policy_versions where policy_id = $1 and tenant_id = $2",
+    )
+    .bind(row.id)
+    .bind(scope.tenant_id())
+    .fetch_one(&mut *tx)
+    .await?;
     if existing_versions == 0 {
         append_policy_version_tx(
             &mut tx,
@@ -1265,6 +1284,82 @@ pub async fn policy_agents_using(
     .await?;
     tx.commit().await?;
     Ok(__rls_out)
+}
+
+/// The outcome of a policy delete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeletePolicy {
+    /// The identity and — through the composite FK's cascade — its whole
+    /// version history are gone.
+    Deleted,
+    NotFound,
+    /// At least one `agent_revision` still names it. `agent_revisions.policy_id`
+    /// is ON DELETE NO ACTION on purpose and the count spans EVERY revision,
+    /// not just the latest: revisions are immutable, so a historical one must
+    /// keep resolving its policy identity. Detach by appending a revision on a
+    /// different policy — which does NOT free this one, because the old
+    /// revision survives — or delete the agent.
+    InUse {
+        revisions: i64,
+    },
+}
+
+/// Delete a policy identity and cascade its versions.
+///
+/// This is the ONE sanctioned erasure path for `policy_versions` (0026 grants
+/// the runtime role no DELETE on that table; the cascade runs with the
+/// referencing table owner's privileges, which is why append-only survives as
+/// a database property while this still works — pinned by
+/// `deleting_a_policy_cascades_its_versions_under_the_runtime_role`).
+///
+/// In-flight and historical RUNS are unaffected: a RunSpec froze the whole
+/// policy document, so a run's audit record never needed the row to survive.
+pub async fn delete_policy(
+    pool: &PgPool,
+    scope: TenantScope,
+    policy_id: Uuid,
+) -> sqlx::Result<DeletePolicy> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let locked = sqlx::query_as::<_, (Uuid,)>(
+        "select id from policies where id = $1 and tenant_id = $2 for update",
+    )
+    .bind(policy_id)
+    .bind(scope.tenant_id())
+    .fetch_optional(&mut *tx)
+    .await?;
+    if locked.is_none() {
+        tx.rollback().await?;
+        return Ok(DeletePolicy::NotFound);
+    }
+    // Counted for a MESSAGE; the FK is what guarantees the invariant.
+    //
+    // The count is nonetheless RACE-FREE, and by construction rather than by
+    // luck: the `FOR UPDATE` above conflicts with the `FOR KEY SHARE` an
+    // `agent_revisions` insert takes on this same parent row to satisfy its FK.
+    // So a revision already in flight makes our lock wait and is then counted,
+    // and one starting after our lock waits for us and then fails. There is no
+    // window in which the count is stale. (`api.rs` still maps the FK's 23503
+    // to the same 409 — belt and braces for a future change to that locking.)
+    let (revisions,): (i64,) = sqlx::query_as(
+        "select count(*) from agent_revisions r
+           join agents a on a.id = r.agent_id
+          where a.tenant_id = $1 and r.policy_id = $2",
+    )
+    .bind(scope.tenant_id())
+    .bind(policy_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if revisions > 0 {
+        tx.rollback().await?;
+        return Ok(DeletePolicy::InUse { revisions });
+    }
+    sqlx::query("delete from policies where id = $1 and tenant_id = $2")
+        .bind(policy_id)
+        .bind(scope.tenant_id())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(DeletePolicy::Deleted)
 }
 
 /// The union of `mcp__<server>__<tool>` names an agent on this policy can call —
@@ -10051,6 +10146,414 @@ mod tests {
         assert_eq!(versions[0].yaml_source.as_deref(), Some("name: sd"));
     }
 
+    /// Boot seeding refuses PROPORTIONALLY. A strict-parse failure means the
+    /// file cannot be trusted to mint version 1 — but whether that should stop
+    /// a control plane from booting depends entirely on whether the file was
+    /// ever going to write anything:
+    ///
+    ///   • policy ABSENT  → the file is its only source     → refuse the boot
+    ///   • policy PRESENT → `seed_policy_if_absent` no-ops  → warn and carry on
+    ///
+    /// Getting this backwards means a repo with one stale policy file takes the
+    /// whole deployment down on upgrade, over a file whose policy the database
+    /// already governs.
+    #[tokio::test]
+    async fn seeding_refuses_only_when_the_file_is_the_policys_only_source() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let scope = throwaway_policy_tenant(&pool).await;
+        let dir = std::env::temp_dir().join(format!("fbx-seed-{}", Uuid::now_v7().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("default.yaml");
+        async fn budgets_of(
+            pool: &PgPool,
+            scope: TenantScope,
+            name: &str,
+        ) -> Option<fluidbox_core::spec::Budgets> {
+            let row = get_policy_by_name(pool, scope, name).await.unwrap()?;
+            let v = latest_policy_version(pool, scope, row.id).await.unwrap()?;
+            Some(
+                serde_json::from_value::<fluidbox_core::policy::Policy>(v.content)
+                    .unwrap()
+                    .budgets,
+            )
+        }
+        // `permited` is the misspelling that would otherwise silently leave
+        // autonomy.permitted at its permissive default.
+        let typo = "name: default\nautonomy:\n  permited: false\n";
+
+        // 1. ABSENT + invalid → the boot refuses, naming the policy and why.
+        std::fs::write(&file, typo).unwrap();
+        let err = crate::seed::seed_policies_from_dir(&pool, scope, &dir)
+            .await
+            .expect_err("an unseeded policy's only source must not be silently skipped");
+        let msg = err.to_string();
+        assert!(msg.contains("permited"), "names the typo: {msg}");
+        assert!(msg.contains("ONLY source"), "says why it is fatal: {msg}");
+        assert!(
+            budgets_of(&pool, scope, "default").await.is_none(),
+            "a refused seed writes nothing"
+        );
+
+        // 2. Valid → seeds.
+        std::fs::write(&file, "name: default\nbudgets:\n  max_tokens: 1234\n").unwrap();
+        crate::seed::seed_policies_from_dir(&pool, scope, &dir)
+            .await
+            .expect("a valid seed file seeds");
+        assert_eq!(
+            budgets_of(&pool, scope, "default")
+                .await
+                .unwrap()
+                .max_tokens,
+            Some(1234)
+        );
+
+        // 3. PRESENT + invalid → boots, and appends nothing.
+        std::fs::write(&file, typo).unwrap();
+        crate::seed::seed_policies_from_dir(&pool, scope, &dir)
+            .await
+            .expect("an invalid file for an EXISTING policy must not stop the boot");
+        let id = get_policy_by_name(&pool, scope, "default")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        assert_eq!(
+            list_policy_versions(&pool, scope, id).await.unwrap().len(),
+            1,
+            "the invalid file appended nothing"
+        );
+        assert_eq!(
+            budgets_of(&pool, scope, "default")
+                .await
+                .unwrap()
+                .max_tokens,
+            Some(1234),
+            "the stored version still governs"
+        );
+
+        // 4. A file that is STRUCTURALLY VALID YAML but an INVALID POLICY
+        //    (empty `match`) names its policy perfectly well — so it must take
+        //    the present/absent branch, NOT the unnameable one. `parse_yaml`
+        //    would have refused it outright (it validates), which is exactly
+        //    the trap this case exists to pin.
+        std::fs::write(
+            &file,
+            "name: default\ntools:\n- match: []\n  action: allow\n",
+        )
+        .unwrap();
+        crate::seed::seed_policies_from_dir(&pool, scope, &dir)
+            .await
+            .expect("an INVALID-but-nameable file for an existing policy still boots");
+        // …and the same file for a policy that does NOT exist refuses.
+        std::fs::write(
+            dir.join("other.yaml"),
+            "name: other\ntools:\n- match: []\n  action: allow\n",
+        )
+        .unwrap();
+        let err = crate::seed::seed_policies_from_dir(&pool, scope, &dir)
+            .await
+            .expect_err("absent policy, invalid file");
+        assert!(err.to_string().contains("ONLY source"), "{err}");
+        std::fs::remove_file(dir.join("other.yaml")).unwrap();
+
+        // 5. A file that names NO policy cannot be reasoned about at all.
+        std::fs::write(&file, "just a bare string").unwrap();
+        let err = crate::seed::seed_policies_from_dir(&pool, scope, &dir)
+            .await
+            .expect_err("an unnameable file must refuse");
+        assert!(err.to_string().contains("unreadable"), "{err}");
+
+        // 6. A route-reserved name must never arrive from disk either.
+        std::fs::write(&file, "name: default\n").unwrap();
+        std::fs::write(dir.join("clone.yaml"), "name: clone\n").unwrap();
+        let err = crate::seed::seed_policies_from_dir(&pool, scope, &dir)
+            .await
+            .expect_err("a reserved name must refuse");
+        assert!(err.to_string().contains("reserved"), "{err}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `author` is a CLOSED set at the DATABASE level, not just in prose: the
+    /// dashboard renders one label per channel and falls back to "dashboard",
+    /// so an unconstrained column would let a typo mis-attribute a version in
+    /// the audit trail — silently, and forever (the row is immutable).
+    #[tokio::test]
+    async fn policy_version_author_is_constrained_to_the_known_channels() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let scope = throwaway_policy_tenant(&pool).await;
+        let content = policy_json("auth");
+        let policy = upsert_policy(&pool, scope, "auth", "name: auth", &content)
+            .await
+            .unwrap();
+        // Every channel the application actually writes is accepted.
+        for author in ["seed", "api", "ui", "import"] {
+            append_policy_version(
+                &pool,
+                scope,
+                policy.id,
+                None,
+                NewPolicyVersion {
+                    content: &content,
+                    yaml_source: None,
+                    summary: Some(author),
+                    author,
+                    author_user_id: None,
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("author {author:?} must be accepted: {e}"));
+        }
+        let err = append_policy_version(
+            &pool,
+            scope,
+            policy.id,
+            None,
+            NewPolicyVersion {
+                content: &content,
+                yaml_source: None,
+                summary: Some("typo"),
+                author: "iu",
+                author_user_id: None,
+            },
+        )
+        .await
+        .expect_err("an unknown channel must be refused by the CHECK constraint");
+        let is_check_violation = matches!(
+            &err,
+            sqlx::Error::Database(db) if db.code().as_deref() == Some("23514")
+        );
+        assert!(is_check_violation, "expected 23514, got {err:?}");
+    }
+
+    /// Deleting a policy cascades its whole history — proven AS THE RUNTIME
+    /// ROLE, because that role deliberately has NO delete grant on
+    /// `policy_versions` (append-only is a database property). The cascade
+    /// works anyway: postgres runs referential actions with the referencing
+    /// table owner's privileges, and RI bypasses RLS. If that ever stopped
+    /// being true, `delete_policy` would fail closed in RLS deployments only —
+    /// exactly the kind of split-brain this test exists to prevent.
+    #[tokio::test]
+    async fn deleting_a_policy_cascades_its_versions_under_the_runtime_role() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        use sqlx::Executor;
+        let pool = test_connect(&url).await.expect("connect");
+        let scope = throwaway_policy_tenant(&pool).await;
+        let content = policy_json("del");
+        let policy = upsert_policy(&pool, scope, "del", "name: del", &content)
+            .await
+            .unwrap();
+        for n in 0..2 {
+            append_policy_version(
+                &pool,
+                scope,
+                policy.id,
+                None,
+                NewPolicyVersion {
+                    content: &content,
+                    yaml_source: None,
+                    summary: Some(&format!("v{n}")),
+                    author: "ui",
+                    author_user_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            list_policy_versions(&pool, scope, policy.id)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+
+        let as_runtime = PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    conn.execute("set role fluidbox_runtime").await?;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .expect("runtime-role pool");
+        let mut tx = as_runtime.begin().await.unwrap();
+        sqlx::query("select set_config('fluidbox.tenant_id', $1, true)")
+            .bind(scope.tenant_id().to_string())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("delete from policies where id = $1")
+            .bind(policy.id)
+            .execute(&mut *tx)
+            .await
+            .expect("the runtime role may delete its own policy");
+        let (left,): (i64,) =
+            sqlx::query_as("select count(*) from policy_versions where policy_id = $1")
+                .bind(policy.id)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(left, 0, "the composite FK cascade took the history with it");
+        tx.commit().await.unwrap();
+        assert!(get_policy(&pool, scope, policy.id).await.unwrap().is_none());
+
+        // …and RLS is genuinely engaged on this pool, not merely the grants: a
+        // stranger's policy is invisible to the delete, so it removes ZERO
+        // rows instead of erroring. Without this the test above would still
+        // pass on a pool that bypassed RLS entirely, which is exactly the
+        // false-green `test_connect` would have given us.
+        let other = throwaway_policy_tenant(&pool).await;
+        let theirs = upsert_policy(&pool, other, "rt2", "name: rt2", &content)
+            .await
+            .unwrap();
+        let mut tx = as_runtime.begin().await.unwrap();
+        sqlx::query("select set_config('fluidbox.tenant_id', $1, true)")
+            .bind(scope.tenant_id().to_string())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let affected = sqlx::query("delete from policies where id = $1")
+            .bind(theirs.id)
+            .execute(&mut *tx)
+            .await
+            .expect("RLS hides the row; it does not error")
+            .rows_affected();
+        assert_eq!(
+            affected, 0,
+            "a stranger's policy must be invisible to DELETE"
+        );
+        tx.commit().await.unwrap();
+        assert!(
+            get_policy(&pool, other, theirs.id).await.unwrap().is_some(),
+            "and it is still there"
+        );
+    }
+
+    /// The delete guard: ANY agent revision naming a policy blocks it, not just
+    /// the latest one. Revisions are immutable, so a historical revision must
+    /// keep resolving its policy — `policy_agents_using` (which counts only
+    /// LATEST revisions) is therefore NOT the right question here, and this
+    /// test pins the difference.
+    #[tokio::test]
+    async fn deleting_a_policy_named_by_any_revision_is_refused() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let scope = throwaway_policy_tenant(&pool).await;
+        let old = upsert_policy(&pool, scope, "old", "name: old", &policy_json("old"))
+            .await
+            .unwrap();
+        let new = upsert_policy(&pool, scope, "new", "name: new", &policy_json("new"))
+            .await
+            .unwrap();
+        let agent = create_agent(&pool, scope, "a", None).await.unwrap();
+        let budgets = serde_json::json!({});
+        for policy_id in [old.id, new.id] {
+            append_agent_revision(
+                &pool,
+                scope,
+                agent.id,
+                "claude-agent-sdk",
+                "img:test",
+                "claude-haiku-4-5",
+                None,
+                policy_id,
+                &budgets,
+                None,
+                &serde_json::json!([]),
+                &serde_json::json!([]),
+            )
+            .await
+            .unwrap();
+        }
+        // `old` is nobody's LATEST revision …
+        assert_eq!(policy_agents_using(&pool, scope, old.id).await.unwrap(), 0);
+        // … and is still undeletable, because rev 1 is immutable and names it.
+        assert_eq!(
+            delete_policy(&pool, scope, old.id).await.unwrap(),
+            DeletePolicy::InUse { revisions: 1 },
+        );
+        assert_eq!(
+            delete_policy(&pool, scope, new.id).await.unwrap(),
+            DeletePolicy::InUse { revisions: 1 },
+        );
+        // An unreferenced policy in the same tenant deletes cleanly, and a
+        // second delete of the same id is NotFound rather than an error.
+        let free = upsert_policy(&pool, scope, "free", "name: free", &policy_json("free"))
+            .await
+            .unwrap();
+        assert_eq!(
+            delete_policy(&pool, scope, free.id).await.unwrap(),
+            DeletePolicy::Deleted
+        );
+        assert_eq!(
+            delete_policy(&pool, scope, free.id).await.unwrap(),
+            DeletePolicy::NotFound
+        );
+
+        // `api.rs::delete_policy` maps THIS constraint name — and only it — to
+        // a 409 for the count-then-delete race. A rename would silently turn
+        // that race into a 500, and no other test would notice.
+        let (fk,): (i64,) = sqlx::query_as(
+            "select count(*) from pg_constraint
+              where conname = 'agent_revisions_policy_id_fkey'
+                and conrelid = 'agent_revisions'::regclass
+                and confrelid = 'policies'::regclass",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            fk, 1,
+            "agent_revisions_policy_id_fkey is the constraint api.rs keys its 409 on"
+        );
+    }
+
+    /// A policy is only deletable BY ITS OWN TENANT: `delete_policy` scoped to a
+    /// stranger answers NotFound and leaves the row standing (the `TenantScope`
+    /// signature plus the `tenant_id` predicate, checked rather than assumed).
+    #[tokio::test]
+    async fn deleting_another_tenants_policy_is_not_found() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (a, b) = (
+            throwaway_policy_tenant(&pool).await,
+            throwaway_policy_tenant(&pool).await,
+        );
+        let mine = upsert_policy(&pool, a, "x", "name: x", &policy_json("x"))
+            .await
+            .unwrap();
+        assert_eq!(
+            delete_policy(&pool, b, mine.id).await.unwrap(),
+            DeletePolicy::NotFound
+        );
+        assert!(get_policy(&pool, a, mine.id).await.unwrap().is_some());
+        assert_eq!(
+            list_policy_versions(&pool, a, mine.id).await.unwrap().len(),
+            1,
+            "a stranger's refused delete took no history with it"
+        );
+    }
+
     /// `create_policy` (the clone/blank path) mints identity + v1 in one
     /// transaction and refuses a duplicate name via unique(tenant_id, name).
     #[tokio::test]
@@ -10123,13 +10626,23 @@ mod tests {
             Some(p) => format!("{prefix}/{dbname}?{p}"),
             None => format!("{prefix}/{dbname}"),
         };
-
-        // Stage migrations 0001..0025 into a temp dir and run them — the
-        // public Migrator::new path, so bookkeeping rows are real and the
-        // full chain below applies exactly 0026.
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
         let staged = std::env::temp_dir().join(format!("fbx-mig26-{suffix}"));
         std::fs::create_dir_all(&staged).unwrap();
+
+        // Everything that can FAIL runs in a spawned task, so a panicking
+        // assertion arrives here as a `JoinError` instead of unwinding past
+        // the cleanup below. Without this, the first regression leaks a
+        // database — on the configured server, which per CLAUDE.md is real
+        // Neon — and every rerun leaks another onto a dirtier server. The
+        // panic is re-raised verbatim after cleanup, so the failure still
+        // reads exactly as it would have.
+        let body = tokio::spawn({
+            let (scratch_url, src, staged) = (scratch_url.clone(), src.clone(), staged.clone());
+            async move {
+        // Stage migrations 0001..0025 into a temp dir and run them — the
+        // public Migrator::new path, so bookkeeping rows are real and the
+        // full chain below applies exactly 0026.
         for entry in std::fs::read_dir(&src).unwrap() {
             let entry = entry.unwrap();
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -10159,6 +10672,17 @@ mod tests {
             "tools": [{"match": ["WebFetch"], "action": "deny"}],
             "managed_overrides": [
                 {"tool": "WebFetch", "action": "allow"},
+                // A TRAILING-WILDCARD entry: refused by the retired API's
+                // validate(), but a migration does not get to assume the write
+                // path held. Exact-equality matching made it unreachable, so
+                // 0026 drops it (with a warning) instead of folding it into a
+                // rule that WOULD match the whole namespace.
+                {"tool": "mcp__*", "action": "allow"},
+                // A `*` that is NOT trailing is not a wildcard to
+                // `tool_matches` either, so it must be KEPT and folded to an
+                // exact-equality rule — the drop is precise, not a blanket
+                // "contains a star".
+                {"tool": "fo*o", "action": "approve"},
                 {"tool": "Read", "action": "deny"},
             ],
         });
@@ -10277,14 +10801,35 @@ mod tests {
             content["tools"],
             serde_json::json!([
                 {"match": ["WebFetch"], "action": "allow"},
+                {"match": ["fo*o"], "action": "approve"},
                 {"match": ["Read"], "action": "deny"},
                 {"match": ["WebFetch"], "action": "deny"},
             ]),
-            "overrides fold to HEAD rules in stored order, authored rules after"
+            "overrides fold to HEAD rules in stored order, authored rules after — \
+             and the WILDCARD entry between them is DROPPED, never folded into a \
+             namespace-wide rule"
         );
         let folded: fluidbox_core::policy::Policy =
             serde_json::from_value(content.clone()).expect("folded content is a valid Policy");
-        assert_eq!(folded.tools.len(), 3);
+        assert_eq!(folded.tools.len(), 4);
+        // The migration's SQL fold and the engine's deserialize-time fold must
+        // be the SAME transform, or a MIGRATED policy and a still-FROZEN
+        // snapshot of it would resolve differently — the exact split this
+        // whole design exists to avoid.
+        //
+        // Compared after both have been through the engine, not as raw jsonb:
+        // the SQL fold writes terse rule objects (`{match, action}`) while
+        // serde emits every optional field as an explicit null. Those are the
+        // same document to every reader that matters, and `Policy`'s own
+        // canonical serialization is the arbiter of that.
+        let via_engine: fluidbox_core::policy::Policy =
+            serde_json::from_value(parsed.clone()).expect("legacy blob deserializes");
+        assert_eq!(
+            serde_json::to_value(&via_engine).unwrap(),
+            serde_json::to_value(&folded).unwrap(),
+            "0026's SQL fold and fluidbox-core's deserialize-time fold disagree; an \
+             in-flight run would not keep the semantics its snapshot froze"
+        );
 
         // 2. Frozen RunSpecs untouched — byte for byte, terminal AND running.
         let specs_after: Vec<(Uuid, String)> =
@@ -10308,14 +10853,25 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(survivors, 0);
-
         scratch.close().await;
+            }
+        })
+        .await;
+
+        // Cleanup runs on BOTH paths.
         let drop_db = format!("drop database {dbname} with (force)");
         sqlx::raw_sql(sqlx::AssertSqlSafe(drop_db))
             .execute(&admin)
             .await
             .expect("drop scratch db");
         let _ = std::fs::remove_dir_all(&staged);
+        // …and only then does the failure surface, unchanged.
+        if let Err(e) = body {
+            if e.is_panic() {
+                std::panic::resume_unwind(e.into_panic());
+            }
+            panic!("migration 0026 harness task did not run to completion: {e}");
+        }
     }
 
     /// The 0026 grant claim, proven AS THE RUNTIME ROLE (test_connect's pool
