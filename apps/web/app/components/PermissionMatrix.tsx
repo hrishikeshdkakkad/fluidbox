@@ -125,6 +125,7 @@ function groupRows(rows: MatrixRow[]): Group[] {
 export function PermissionMatrix({
   rows,
   tools,
+  stale = false,
   onSet,
   onClear,
 }: {
@@ -132,6 +133,13 @@ export function PermissionMatrix({
   /** The DRAFT's rule list — used only to recognise matrix-authored exact
    *  head rules (structure, not verdicts). */
   tools: ToolRule[];
+  /** These verdicts were resolved for an EARLIER draft (a preview is in
+   *  flight, or the current draft does not validate). The rows stay on screen
+   *  — blanking a resolved matrix on every keystroke is worse than showing a
+   *  slightly-behind one — but the controls go inert, because `status.rule`
+   *  indexes the draft the server resolved, not the one being held now.
+   *  Acting on a stale index could edit a rule the user is not looking at. */
+  stale?: boolean;
   /** Set this tool's action in the draft (edit/create an exact head rule). */
   onSet: (tool: string, action: PolicyAction) => void;
   /** Remove this tool's matrix-authored head rule from the draft. */
@@ -140,14 +148,25 @@ export function PermissionMatrix({
   return (
     <>
       {groupRows(rows).map((group) => (
-        <section key={group.key} className="matrix-group">
+        <section
+          key={group.key}
+          className={`matrix-group${stale ? " matrix-stale" : ""}`}
+          aria-busy={stale || undefined}
+        >
           <div className="sectitle">
             {group.label}
             {group.mcp && <span className="chip">MCP server</span>}
           </div>
           <div className="matrix">
             {group.rows.map((row) => (
-              <Row key={row.tool} row={row} tools={tools} onSet={onSet} onClear={onClear} />
+              <Row
+                key={row.tool}
+                row={row}
+                tools={tools}
+                stale={stale}
+                onSet={onSet}
+                onClear={onClear}
+              />
             ))}
           </div>
         </section>
@@ -159,20 +178,21 @@ export function PermissionMatrix({
 function Row({
   row,
   tools,
+  stale,
   onSet,
   onClear,
 }: {
   row: MatrixRow;
   tools: ToolRule[];
+  stale: boolean;
   onSet: (tool: string, action: PolicyAction) => void;
   onClear: (tool: string) => void;
 }) {
   const status = row.status;
   // A conditional rule's verdict depends on the path touched or the command
-  // run, so no single action can express it — its home is the rules editor.
-  const configurable = status.status !== "conditional";
-  const winningRule =
-    status.status !== "default" && status.rule != null ? tools[status.rule] : undefined;
+  // run, so no single action can express it — its home is the rules editor,
+  // and the branch below renders it as a sentence with no control at all.
+  const winningRule = status.status === "unconditional" ? tools[status.rule] : undefined;
   const matrixAuthored = isExactHeadRule(winningRule, row.tool);
 
   return (
@@ -192,7 +212,7 @@ function Row({
           // exclusivity, "1 of 3", and arrow-key navigation are the browser's,
           // not ours. Choosing what is already in force writes nothing (the
           // draft only changes when the action actually differs).
-          <fieldset className="seg">
+          <fieldset className="seg" disabled={stale}>
             <legend className="sr-only">Permission for {row.tool}</legend>
             {ACTIONS.map((action) => (
               <label key={action} className={status.action === action ? "on" : ""}>
@@ -201,7 +221,6 @@ function Row({
                   name={`perm-${row.tool}`}
                   value={action}
                   checked={status.action === action}
-                  disabled={!configurable}
                   onChange={() => {
                     if (status.action !== action) onSet(row.tool, action);
                   }}
@@ -218,6 +237,7 @@ function Row({
           <button
             type="button"
             className="text-action"
+            disabled={stale}
             onClick={() => onClear(row.tool)}
             title="Remove this per-tool rule from the draft — the tool falls back to the rules below"
           >

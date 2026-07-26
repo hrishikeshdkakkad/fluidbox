@@ -7,7 +7,7 @@
 // what these rules MEAN (the matrix, the autonomy summary), and Publish is
 // where validation and persistence happen.
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { ArrowDown, ArrowUp, Plus, Trash2 } from "lucide-react";
 import { ApprovalScope, PolicyAction, ToolRule } from "../lib/api";
 import { VERB } from "./PermissionMatrix";
@@ -65,7 +65,7 @@ function MatchChips({
   onChange: (next: string[]) => void;
 }) {
   const [pending, setPending] = useState("");
-  const add = () => {
+  const commit = () => {
     const value = pending.trim();
     if (!value || rule.match.includes(value)) return;
     onChange([...rule.match, value]);
@@ -99,11 +99,24 @@ function MatchChips({
           onKeyDown={(e) => {
             if (e.key === "Enter") {
               e.preventDefault();
-              add();
+              commit();
             }
           }}
-          onBlur={add}
+          // Committing on blur is deliberate: silently DISCARDING typed text
+          // when the user tabs away or clicks Publish is the worse failure —
+          // a stray chip is visible and removable, a lost matcher is neither.
+          // A partial name is inert anyway: matching is exact unless the
+          // matcher ends in `*`, so `Ba` matches nothing called `Bash`.
+          onBlur={commit}
         />
+        <button
+          type="button"
+          className="btn sm"
+          disabled={!pending.trim() || rule.match.includes(pending.trim())}
+          onClick={commit}
+        >
+          Add
+        </button>
         <datalist id={`rule-tools-${index}`}>
           {knownTools.map((t) => (
             <option key={t} value={t} />
@@ -175,6 +188,11 @@ function RuleCard({
       </div>
 
       <MatchChips rule={rule} index={index} knownTools={knownTools} onChange={(m) => set({ match: m })} />
+      {rule.match.length === 0 && (
+        <p className="err" style={{ marginTop: -4 }} role="status">
+          This rule matches nothing yet — add at least one tool name before publishing.
+        </p>
+      )}
 
       <div className="agent-creator-grid">
         <label className="field">
@@ -362,6 +380,31 @@ export function PolicyRulesEditor({
   knownTools: string[];
   onChange: (next: ToolRule[]) => void;
 }) {
+  // Stable per-CARD identity. A `ToolRule` carries no id (the strict publish
+  // parser refuses unknown fields, so one cannot ride in the document), and
+  // the array index is NOT identity: reorder or delete a rule and React would
+  // hand the next rule the previous one's card — carrying that card's own
+  // state, the half-typed matcher and the open/closed <details>, onto a
+  // different rule. So the editor keeps a parallel id list and moves it in
+  // lockstep with every mutation it performs.
+  const idSeq = useRef(0);
+  const ids = useRef<string[]>([]);
+  if (ids.current.length !== rules.length) {
+    // The list changed from OUTSIDE this editor and the LENGTH moved with it —
+    // a matrix click prepending a head rule is the live case. Old ids cannot be
+    // mapped onto new positions without knowing what happened, so re-key.
+    // (Length now matches, so a StrictMode double render does not re-key
+    // again.)
+    //
+    // This length check is NOT the whole story, and must not be mistaken for
+    // it: a SAME-LENGTH external replacement — a revert landing while the
+    // editor is open — keeps every id, which would carry a card's uncommitted
+    // matcher text onto a different rule. That case is handled a level up, by
+    // the page remounting this component on `formEpoch` whenever it replaces
+    // the draft from outside the editors. Do not delete that key.
+    ids.current = rules.map(() => `rule-${idSeq.current++}`);
+  }
+
   const replace = (index: number, next: ToolRule) =>
     onChange(rules.map((r, i) => (i === index ? next : r)));
   const move = (index: number, delta: -1 | 1) => {
@@ -369,7 +412,16 @@ export function PolicyRulesEditor({
     if (target < 0 || target >= rules.length) return;
     const next = [...rules];
     [next[index], next[target]] = [next[target], next[index]];
+    [ids.current[index], ids.current[target]] = [ids.current[target], ids.current[index]];
     onChange(next);
+  };
+  const remove = (index: number) => {
+    ids.current = ids.current.filter((_, i) => i !== index);
+    onChange(rules.filter((_, i) => i !== index));
+  };
+  const add = () => {
+    ids.current = [...ids.current, `rule-${idSeq.current++}`];
+    onChange([...rules, { match: [], action: "approve" }]);
   };
 
   return (
@@ -381,22 +433,18 @@ export function PolicyRulesEditor({
       ) : (
         rules.map((rule, index) => (
           <RuleCard
-            key={index}
+            key={ids.current[index]}
             rule={rule}
             index={index}
             count={rules.length}
             knownTools={knownTools}
             onChange={(next) => replace(index, next)}
             onMove={(delta) => move(index, delta)}
-            onRemove={() => onChange(rules.filter((_, i) => i !== index))}
+            onRemove={() => remove(index)}
           />
         ))
       )}
-      <button
-        type="button"
-        className="btn"
-        onClick={() => onChange([...rules, { match: [], action: "approve" }])}
-      >
+      <button type="button" className="btn" onClick={add}>
         <Plus size={13} /> Add rule
       </button>
     </>

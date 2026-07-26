@@ -83,6 +83,7 @@ CT='content-type: application/json'
 GB=/tmp/fbx-gov-body.json
 post() { curl -s -o "$GB" -w "%{http_code}" -X POST    -H "$H" -H "$CT" -d "$2" "$API/v1$1"; }
 put()  { curl -s -o "$GB" -w "%{http_code}" -X PUT     -H "$H" -H "$CT" -d "$2" "$API/v1$1"; }
+del()  { curl -s -o "$GB" -w "%{http_code}" -X DELETE  -H "$H"                  "$API/v1$1"; }
 get()  { curl -s -H "$H" "$API/v1$1"; }
 
 # One matrix row, flattened for comparison: "status|action".
@@ -124,6 +125,10 @@ AU=$(echo "$SEED" | j "['agents_using']")
 # 2. A throwaway with the seed's shapes. Quoted heredoc: the deny_regex must
 # reach YAML as "\\bcurl\\b" (→ the regex \bcurl\b), unmangled by the shell.
 GOV=gov-e2e
+# Start from nothing: a previous run's versions would make the version numbers
+# below depend on history. DELETE makes the suite idempotent AND trace-free —
+# it is cleaned up again at the end of this section.
+del "/policies/gov-e2e" >/dev/null
 GOV_YAML=$(cat <<'EOF'
 name: gov-e2e
 defaults:
@@ -155,8 +160,9 @@ CODE=$(post "/policies" "$(printf '%s' "$GOV_YAML" | gov_body)")
   && ok "throwaway policy '$GOV' imported (seed shapes: paths on Edit, shell on Bash, flat deny on WebFetch)" \
   || { no "policy import → $CODE: $(cat "$GB")"; exit 1; }
 BASE_VER=$(pver "$GOV")
-# The OLDEST version is always this suite's own first import — rerun-safe
-# (on a reused DB the LATEST may be a prior run's revert, author 'ui').
+[ "$BASE_VER" = "1" ] \
+  && ok "…at v1 — the pre-run delete made the version numbers below deterministic" \
+  || no "expected a fresh v1, got v$BASE_VER (stale rows from a previous run?)"
 AUTHOR=$(get "/policies/$GOV" | j "['versions'][-1]['author']")
 [ "$AUTHOR" = "api" ] && ok "the import minted a version with author 'api' (provenance recorded)" \
   || no "oldest version author: $AUTHOR"
@@ -277,7 +283,11 @@ SUM=$(get "/policies/$GOV" | j "['versions'][0]['summary']")
 [ "$SUM" = "revert to v$BASE_VER" ] && ok "…and the version says so: '$SUM'" || no "revert summary: $SUM"
 
 # 11. CLONE mints a new policy (identity + v1) from the source's content.
-CLONE="gov-e2e-clone-$RANDOM"
+# Names are DETERMINISTIC, not $RANDOM: this suite deletes what it creates
+# (below), so a fixed name is re-runnable, while a random one both leaks a row
+# per run and can collide into a spurious 409.
+CLONE="gov-e2e-clone"
+del "/policies/$CLONE" >/dev/null   # a previous run that died mid-suite
 CODE=$(post "/policies/clone" "{\"name\": \"$CLONE\", \"from\": \"$GOV\"}")
 CV=$(pver "$CLONE")
 CR=$(prow "$CLONE" WebFetch)
@@ -293,7 +303,8 @@ CODE=$(post "/policies/clone" '{"name": "preview"}')
 # Pin to v$V_ALLOW (WebFetch=allow) — the ONE version that differs from the
 # current head (the revert restored deny), so the row below proves the PIN
 # was honored, not just that a clone happened.
-PIN="gov-e2e-pin-$RANDOM"
+PIN="gov-e2e-pin"
+del "/policies/$PIN" >/dev/null
 CODE=$(post "/policies/clone" "{\"name\": \"$PIN\", \"from\": \"$GOV\", \"from_version\": $V_ALLOW}")
 PINROW=$(prow "$PIN" WebFetch)
 [ "$CODE" = "200" ] && [ "$PINROW" = "unconditional|allow" ] \
@@ -302,11 +313,45 @@ PINROW=$(prow "$PIN" WebFetch)
 CODE=$(post "/policies/clone" '{"name": "gov-e2e-orphan", "from_version": 1}')
 [ "$CODE" = "400" ] && ok "from_version without from → 400" || no "orphan from_version: $CODE"
 
-# 12. The override routes are GONE — the fold retired the mechanism.
+# 12. DELETE closes the loop on create. Without it every run of this suite
+# would leave two permanent policies in the tenant — visible in Governance and
+# in the run composer's policy picker, forever, with no way to remove them.
+VERS=$(get "/policies/$PIN" | python3 -c "import sys,json;print(len(json.load(sys.stdin)['versions']))")
+CODE=$(del "/policies/$PIN")
+GONE=$(curl -s -o /dev/null -w "%{http_code}" -H "$H" "$API/v1/policies/$PIN")
+[ "$CODE" = "200" ] && [ "$GONE" = "404" ] \
+  && ok "DELETE '$PIN' → 200; the policy and its $VERS version(s) are gone" \
+  || no "delete: code=$CODE then GET=$GONE: $(cat "$GB")"
+CODE=$(del "/policies/$PIN")
+[ "$CODE" = "404" ] && ok "deleting it again → 404 (not an error path that lingers)" \
+  || no "second delete: $CODE"
+CODE=$(del "/policies/$CLONE")
+[ "$CODE" = "200" ] && ok "DELETE '$CLONE' → 200" || no "delete clone: $CODE"
+
+# …but a policy an agent revision still names is REFUSED. `default` governs the
+# seeded agent, so it is the honest subject — and the refusal proves the delete
+# cannot orphan an immutable revision.
+DEFV_BEFORE=$(pver default)
+CODE=$(del "/policies/default")
+DEFV_AFTER=$(pver default)
+[ "$CODE" = "409" ] && [ "$DEFV_AFTER" = "$DEFV_BEFORE" ] \
+  && ok "DELETE 'default' → 409 (an agent revision names it) and nothing changed" \
+  || no "delete in-use: code=$CODE v=$DEFV_BEFORE→$DEFV_AFTER: $(cat "$GB")"
+grep -q "agent revision" "$GB" && ok "…and the refusal says what is holding it" \
+  || no "refusal body: $(cat "$GB")"
+
+# 13. The override routes are GONE — the fold retired the mechanism.
 CODE=$(put "/policies/$GOV/overrides/WebFetch" '{"action":"allow"}')
-[ "$CODE" = "404" ] || [ "$CODE" = "405" ] \
+{ [ "$CODE" = "404" ] || [ "$CODE" = "405" ]; } \
   && ok "PUT /overrides/{tool} → $CODE (retired: an override IS a head rule now)" \
   || no "override route still answers: $CODE"
+
+# Leave NO trace: every policy this section created is removed again. Test
+# fixtures are indistinguishable from real data in a shared tenant, so a suite
+# that mints governance objects has to clean them up.
+CODE=$(del "/policies/$GOV")
+[ "$CODE" = "200" ] && ok "'$GOV' removed — the suite leaves the tenant as it found it" \
+  || no "final cleanup of $GOV: $CODE"
 rm -f "$GB"
 
 # ── Supervised session ──────────────────────────────────────────────────
