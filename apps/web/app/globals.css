@@ -4019,6 +4019,17 @@ select.inp {
   align-items: center;
   gap: 8px;
 }
+/* Verdicts resolved for an EARLIER draft: still the best answer we have, so
+   they stay legible and in place (blanking the matrix on every keystroke is
+   worse), but visibly not-current and inert. The banner above the matrix is
+   what states WHY — this is only the visual echo of it. */
+.matrix-group.matrix-stale {
+  opacity: 0.55;
+  transition: opacity 120ms ease-out;
+}
+.matrix-group.matrix-stale .matrix {
+  border-style: dashed;
+}
 .matrix {
   display: flex;
   flex-direction: column;

@@ -9,7 +9,7 @@ use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use fluidbox_core::capability::{validate_requirements, ConnectionRequirement};
-use fluidbox_core::policy::{Policy, RuleAction, ToolOverride};
+use fluidbox_core::policy::Policy;
 use fluidbox_core::spec::{
     Autonomy, Budgets, CheckoutMode, InvocationContext, InvocationKind, WorkspaceSpec,
 };
@@ -686,23 +686,47 @@ pub async fn list_policies(
     let rows = fluidbox_db::list_policies(&state.pool, scope).await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let policy: Policy = serde_json::from_value(row.parsed.clone())
-            .map_err(|e| ApiError::Internal(format!("bad stored policy: {e}")))?;
+        // `version` is the LATEST version number (design §4.6: unchanged wire
+        // shape, new source of truth). A version-less policy is a bug state;
+        // surfacing `version: 0` with no summary beats hiding the row.
+        let autonomy_summary = match &row.latest_content {
+            Some(content) => {
+                let policy: Policy = serde_json::from_value(content.clone())
+                    .map_err(|e| ApiError::Internal(format!("bad stored policy: {e}")))?;
+                serde_json::to_value(policy.autonomy_summary())?
+            }
+            None => Value::Null,
+        };
         let agents_using = fluidbox_db::policy_agents_using(&state.pool, scope, row.id).await?;
         out.push(json!({
             "id": row.id,
             "name": row.name,
-            "version": row.version,
+            "version": row.latest_version,
             "updated_at": row.updated_at,
-            "autonomy_summary": policy.autonomy_summary(),
+            "autonomy_summary": autonomy_summary,
             "agents_using": agents_using,
         }));
     }
     Ok(Json(json!({ "policies": out })))
 }
 
+/// Resolve a policy's LATEST version or fail closed — a policy with zero
+/// versions is a bug, not a state (design §4.2), and every read/append path
+/// says so the same way.
+async fn require_latest_version(
+    state: &AppState,
+    scope: TenantScope,
+    row: &fluidbox_db::PolicyRow,
+) -> ApiResult<fluidbox_db::PolicyVersionRow> {
+    fluidbox_db::latest_policy_version(&state.pool, scope, row.id)
+        .await?
+        .ok_or_else(|| ApiError::Internal(format!("policy '{}' has no versions", row.name)))
+}
+
 /// The Governance page's detail payload. The dashboard renders this verbatim —
-/// it never parses YAML and never resolves policy semantics.
+/// it never parses YAML and never resolves policy semantics. `content` is the
+/// editor's input (the latest version's canonical document); `versions` is the
+/// history metadata (content fetched per version via the versions route).
 pub async fn get_policy(
     principal: Principal,
     State(state): State<AppState>,
@@ -712,7 +736,8 @@ pub async fn get_policy(
     let row = fluidbox_db::get_policy_by_name(&state.pool, scope, &name)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let policy: Policy = serde_json::from_value(row.parsed.clone())
+    let latest = require_latest_version(&state, scope, &row).await?;
+    let policy: Policy = serde_json::from_value(latest.content.clone())
         .map_err(|e| ApiError::Internal(format!("bad stored policy: {e}")))?;
 
     let mut names: Vec<String> = fluidbox_core::tools::CANONICAL
@@ -720,9 +745,39 @@ pub async fn get_policy(
         .map(|t| t.name.to_string())
         .collect();
     names.extend(fluidbox_db::policy_mcp_tools(&state.pool, scope, row.id).await?);
+    let matrix = matrix_payload(&policy, &names);
 
-    let matrix: Vec<Value> = policy
-        .tool_matrix(&names)
+    let versions: Vec<Value> = fluidbox_db::list_policy_versions(&state.pool, scope, row.id)
+        .await?
+        .into_iter()
+        .map(version_meta)
+        .collect();
+
+    Ok(Json(json!({
+        "policy": {
+            "id": row.id,
+            "name": row.name,
+            "version": latest.version,
+            "updated_at": row.updated_at,
+        },
+        "content": latest.content,
+        "versions": versions,
+        "agents_using": fluidbox_db::policy_agents_using(&state.pool, scope, row.id).await?,
+        "autonomy_summary": policy.autonomy_summary(),
+        "defaults": policy.defaults,
+        "budgets": policy.budgets,
+        "approvals": policy.approvals,
+        "egress": policy.egress,
+        "matrix": matrix,
+    })))
+}
+
+/// The resolved permission matrix rows, exactly as the dashboard renders them
+/// — shared by the detail payload and the draft preview so the two can never
+/// disagree about how a verdict is presented.
+fn matrix_payload(policy: &Policy, names: &[String]) -> Vec<Value> {
+    policy
+        .tool_matrix(names)
         .into_iter()
         .map(|(tool, status)| {
             let group = fluidbox_core::tools::CANONICAL
@@ -738,26 +793,52 @@ pub async fn get_policy(
                 "tool": tool,
                 "group": group,
                 "server": server,
-                "overridable": status.is_overridable(),
                 "status": status,
             })
         })
-        .collect();
+        .collect()
+}
 
+/// One version's metadata — never its content (the versions route serves that).
+fn version_meta(v: fluidbox_db::PolicyVersionRow) -> Value {
+    json!({
+        "version": v.version,
+        "author": v.author,
+        "author_user_id": v.author_user_id,
+        "summary": v.summary,
+        "created_at": v.created_at,
+    })
+}
+
+/// `GET /v1/policies/{name}/versions/{version}` — one immutable version, for
+/// diff, revert preview, and export. `yaml` is the stored source when the
+/// version arrived as YAML, else generated from the canonical content.
+pub async fn get_policy_version(
+    principal: Principal,
+    State(state): State<AppState>,
+    Path((name, version)): Path<(String, i32)>,
+) -> ApiResult<Json<Value>> {
+    let scope = principal.scope();
+    let row = fluidbox_db::get_policy_by_name(&state.pool, scope, &name)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let v = fluidbox_db::get_policy_version(&state.pool, scope, row.id, version)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let yaml = match &v.yaml_source {
+        Some(y) => y.clone(),
+        None => {
+            let policy: Policy = serde_json::from_value(v.content.clone())
+                .map_err(|e| ApiError::Internal(format!("bad stored policy: {e}")))?;
+            serde_yaml::to_string(&policy)
+                .map_err(|e| ApiError::Internal(format!("yaml export failed: {e}")))?
+        }
+    };
     Ok(Json(json!({
-        "policy": {
-            "id": row.id,
-            "name": row.name,
-            "version": row.version,
-            "updated_at": row.updated_at,
-        },
-        "agents_using": fluidbox_db::policy_agents_using(&state.pool, scope, row.id).await?,
-        "autonomy_summary": policy.autonomy_summary(),
-        "defaults": policy.defaults,
-        "budgets": policy.budgets,
-        "approvals": policy.approvals,
-        "egress": policy.egress,
-        "matrix": matrix,
+        "policy": { "id": row.id, "name": row.name },
+        "version": version_meta(v.clone()),
+        "content": v.content,
+        "yaml": yaml,
     })))
 }
 
@@ -767,6 +848,10 @@ pub struct UpsertPolicy {
     pub yaml: String,
 }
 
+/// `POST /v1/policies` — the YAML IMPORT path (design §4.5): the wire shape
+/// `scripts/policy-sync.sh` used to POST, kept because the e2e depends on it.
+/// It now APPENDS a version (author 'api') rather than force-overwriting —
+/// which is exactly why the sync script could retire.
 pub async fn upsert_policy(
     principal: Principal,
     State(state): State<AppState>,
@@ -777,33 +862,32 @@ pub async fn upsert_policy(
             "editing policies requires admin or owner".into(),
         ));
     }
-    let mut policy = Policy::parse_yaml(&req.yaml).map_err(ApiError::UnprocessableEntity)?;
+    // Strict: a typo'd key in an imported yaml must refuse, never silently
+    // weaken the policy it describes (the same posture as publish).
+    let policy = Policy::parse_yaml_strict(&req.yaml).map_err(ApiError::UnprocessableEntity)?;
     if policy.name != req.name {
         return Err(ApiError::BadRequest(
             "policy name must match yaml `name`".into(),
         ));
     }
-    // The authored yaml is never the policy that RUNS: the overrides live in
-    // their own column and are re-merged into every republished `parsed`. So
-    // validate the merged result, not the yaml — otherwise `shell.deny_regex`
-    // added to a rule that already carries an override would be silently dead
-    // (overrides are consulted BEFORE the rules) while the page still shows it.
-    //
-    // Assign, never append: `managed_overrides` is `#[serde(default)]`, so yaml
-    // could author one, and the column — the only sanctioned writer, `[]` for a
-    // policy that does not exist yet — is the truth `parsed` must agree with.
+    reject_reserved_name(&req.name)?;
     let scope = principal.scope();
-    let existing = fluidbox_db::get_policy_by_name(&state.pool, scope, &req.name).await?;
-    policy.managed_overrides = match &existing {
-        Some(row) => serde_json::from_value(row.managed_overrides.clone())
-            .map_err(|e| ApiError::Internal(format!("bad stored overrides: {e}")))?,
-        None => Vec::new(),
-    };
-    policy.validate().map_err(ApiError::UnprocessableEntity)?;
-
     let parsed = serde_json::to_value(&policy)?;
-    let row = fluidbox_db::upsert_policy(&state.pool, scope, &req.name, &req.yaml, &parsed).await?;
-    Ok(Json(json!({ "policy": row })))
+    let (row, version, appended) = fluidbox_db::import_policy_yaml(
+        &state.pool,
+        scope,
+        &req.name,
+        &req.yaml,
+        &parsed,
+        principal.user_id(),
+    )
+    .await?;
+    Ok(Json(json!({ "policy": {
+        "id": row.id,
+        "name": row.name,
+        "version": version.version,
+        "updated_at": row.updated_at,
+    }, "appended": appended })))
 }
 
 #[derive(Deserialize)]
@@ -815,35 +899,124 @@ pub async fn validate_policy(
     _principal: Principal,
     Json(req): Json<ValidatePolicy>,
 ) -> ApiResult<Json<Value>> {
-    match Policy::parse_yaml(&req.yaml) {
+    match Policy::parse_yaml_strict(&req.yaml) {
         Ok(p) => Ok(Json(json!({ "valid": true, "name": p.name }))),
         Err(e) => Err(ApiError::UnprocessableEntity(e)),
     }
 }
 
 #[derive(Deserialize)]
-pub struct SetOverride {
-    pub action: RuleAction,
+pub struct PublishPolicy {
+    /// The whole draft, as structure. The server validates; the browser never
+    /// resolves a verdict (design §4.4).
+    pub content: Value,
+    /// The review beat (design §3): what changed and why. Required, non-blank.
+    pub summary: String,
+    /// The head version this draft was loaded from — optimistic concurrency.
+    /// A publish over a moved head is a 409, never a silent overwrite of the
+    /// other editor's intent; a post-commit retry of one's own publish lands
+    /// on the same 409, which is what makes the write safe to retry.
+    pub base_version: i32,
 }
 
-/// The override write raced a policy delete: the pre-check found the row, the
-/// write did not. A vanished policy is a 404, not a 500.
-fn policy_gone(e: sqlx::Error) -> ApiError {
-    match e {
-        sqlx::Error::RowNotFound => ApiError::NotFound,
-        other => ApiError::Db(other),
+/// Map an optimistic append to its response or its 409.
+fn appended_or_conflict(
+    out: fluidbox_db::AppendPolicyVersion,
+    base_version: i32,
+) -> Result<fluidbox_db::PolicyVersionRow, ApiError> {
+    match out {
+        fluidbox_db::AppendPolicyVersion::Appended(v) => Ok(v),
+        fluidbox_db::AppendPolicyVersion::Stale { head } => Err(ApiError::Conflict(format!(
+            "the policy moved to v{head} since this draft loaded v{base_version} — reload, \
+             re-apply your edit, and publish again"
+        ))),
     }
 }
 
-/// The server enforces what the UI renders — never the UI alone. A conditional
-/// rule's verdict depends on the path touched or the command run, so a flat
-/// action cannot express it and flattening it would delete the rule's
-/// paths.deny / shell constraints.
-pub async fn put_policy_override(
+/// The publish/revert summary is the review beat — bound it, and refuse blank.
+fn validate_summary(summary: &str) -> Result<(), ApiError> {
+    let trimmed = summary.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::BadRequest(
+            "a publish needs a non-empty summary — say what changed and why".into(),
+        ));
+    }
+    if trimmed.len() > 500 {
+        return Err(ApiError::BadRequest(
+            "summary is limited to 500 characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// `POST /v1/policies/{name}/publish` — mint ONE immutable version from a
+/// draft. The draft parses STRICTLY (`Policy::parse_strict`: an unknown field
+/// at any level is a 422, never a silently-dropped key publishing a weaker
+/// policy than its author reviewed), and the stored content is the
+/// re-serialized canonical struct.
+pub async fn publish_policy(
     principal: Principal,
     State(state): State<AppState>,
-    Path((name, tool)): Path<(String, String)>,
-    Json(req): Json<SetOverride>,
+    Path(name): Path<String>,
+    Json(req): Json<PublishPolicy>,
+) -> ApiResult<Json<Value>> {
+    if !rbac::can_mutate_resources(&principal) {
+        return Err(ApiError::Forbidden(
+            "editing policies requires admin or owner".into(),
+        ));
+    }
+    validate_summary(&req.summary)?;
+    let scope = principal.scope();
+    let row = fluidbox_db::get_policy_by_name(&state.pool, scope, &name)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let policy = Policy::parse_strict(req.content)
+        .map_err(|e| ApiError::UnprocessableEntity(format!("bad policy content: {e}")))?;
+    if policy.name != name {
+        return Err(ApiError::BadRequest(
+            "policy content `name` must match the path".into(),
+        ));
+    }
+    let content = serde_json::to_value(&policy)?;
+    let version = appended_or_conflict(
+        fluidbox_db::append_policy_version(
+            &state.pool,
+            scope,
+            row.id,
+            Some(req.base_version),
+            fluidbox_db::NewPolicyVersion {
+                content: &content,
+                yaml_source: None,
+                summary: Some(req.summary.trim()),
+                author: "ui",
+                author_user_id: principal.user_id(),
+            },
+        )
+        .await?,
+        req.base_version,
+    )?;
+    Ok(Json(json!({ "policy": {
+        "id": row.id,
+        "name": row.name,
+        "version": version.version,
+    }})))
+}
+
+#[derive(Deserialize)]
+pub struct RevertPolicy {
+    pub version: i32,
+    /// Same optimistic guard as publish: the head the reverter was looking at.
+    pub base_version: i32,
+}
+
+/// `POST /v1/policies/{name}/revert` — publish an OLD version's content
+/// forward as a NEW version. History is never mutated: the reverted-over
+/// versions stay readable (design §3, "revert publishes forward").
+pub async fn revert_policy(
+    principal: Principal,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<RevertPolicy>,
 ) -> ApiResult<Json<Value>> {
     if !rbac::can_mutate_resources(&principal) {
         return Err(ApiError::Forbidden(
@@ -854,89 +1027,284 @@ pub async fn put_policy_override(
     let row = fluidbox_db::get_policy_by_name(&state.pool, scope, &name)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let mut policy: Policy = serde_json::from_value(row.parsed.clone())
-        .map_err(|e| ApiError::Internal(format!("bad stored policy: {e}")))?;
-
-    // Exact names only — a wildcard override would be an un-reviewable blanket
-    // rule authored by a click.
-    if !fluidbox_core::tools::is_canonical(&tool) && !fluidbox_core::tools::is_mcp(&tool) {
-        return Err(ApiError::BadRequest(format!(
-            "'{tool}' is not a known tool — overrides take exact canonical or mcp__* names"
-        )));
-    }
-    // `mcp__*` is a NAMESPACE, not a roster: the name shape alone proves
-    // nothing exists. A blanket `mcp__*` rule (the seed has one) resolves any
-    // invented name to an overridable row, so without this the override lands
-    // in the column for a tool that no bundle photographed — consulted FIRST by
-    // every future evaluation, yet rendered by no page (the matrix lists only
-    // canonical + currently-attached tools). Attach that bundle later and the
-    // tool arrives pre-decided, invisible, never re-decided. So a write must
-    // pass the same roster the matrix is drawn from.
-    if fluidbox_core::tools::is_mcp(&tool)
-        && !fluidbox_db::policy_mcp_tools(&state.pool, scope, row.id)
-            .await?
-            .iter()
-            .any(|t| t == &tool)
-    {
-        return Err(ApiError::BadRequest(format!(
-            "'{tool}' is not among the MCP tools this policy's agents can call — attach a \
-             capability bundle providing it before setting a permission for it"
-        )));
-    }
-    let status = policy
-        .tool_matrix(std::slice::from_ref(&tool))
-        .pop()
-        .map(|(_, s)| s)
-        .ok_or_else(|| ApiError::Internal("tool_matrix returned no row".into()))?;
-    if !status.is_overridable() {
-        return Err(ApiError::BadRequest(format!(
-            "'{tool}' is governed by a conditional rule (paths/shell); its verdict depends on \
-             the path touched or command run, so it cannot be set to a single action"
-        )));
-    }
-
-    // Fail-closed backstop. The checks above give a precise 400 for the one
-    // click a human makes; `validate()` is the invariant the ENGINE keeps, so
-    // run it against the merged policy that would actually be persisted —
-    // nothing reaches the column that `validate()` would refuse on the sync
-    // path. Replace, never append: one decision per tool.
-    policy.managed_overrides.retain(|o| o.tool != tool);
-    policy.managed_overrides.push(ToolOverride {
-        tool: tool.clone(),
-        action: req.action,
-    });
-    policy.validate().map_err(ApiError::BadRequest)?;
-
-    let row = fluidbox_db::set_policy_override(&state.pool, scope, &name, &tool, req.action)
-        .await
-        .map_err(policy_gone)?;
-    Ok(Json(
-        json!({ "policy": { "name": row.name, "version": row.version } }),
-    ))
+    let target = fluidbox_db::get_policy_version(&state.pool, scope, row.id, req.version)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let summary = format!("revert to v{}", target.version);
+    let version = appended_or_conflict(
+        fluidbox_db::append_policy_version(
+            &state.pool,
+            scope,
+            row.id,
+            Some(req.base_version),
+            fluidbox_db::NewPolicyVersion {
+                content: &target.content,
+                yaml_source: target.yaml_source.as_deref(),
+                summary: Some(&summary),
+                author: "ui",
+                author_user_id: principal.user_id(),
+            },
+        )
+        .await?,
+        req.base_version,
+    )?;
+    Ok(Json(json!({ "policy": {
+        "id": row.id,
+        "name": row.name,
+        "version": version.version,
+    }})))
 }
 
-pub async fn delete_policy_override(
+#[derive(Deserialize)]
+pub struct PreviewPolicy {
+    pub content: Value,
+    /// Resolving an EXISTING policy's name folds its agents' mcp__* roster
+    /// into the matrix names; a brand-new draft previews canonical tools only.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// `POST /v1/policies/preview` — validate a draft and resolve its matrix +
+/// autonomy summary SERVER-SIDE. This is what keeps the editor presentation-
+/// only while a draft diverges from the stored policy: the browser posts
+/// structure, the policy engine answers, nothing is derived in TypeScript.
+pub async fn preview_policy(
     principal: Principal,
     State(state): State<AppState>,
-    Path((name, tool)): Path<(String, String)>,
+    Json(req): Json<PreviewPolicy>,
+) -> ApiResult<Json<Value>> {
+    let scope = principal.scope();
+    let policy = Policy::parse_strict(req.content)
+        .map_err(|e| ApiError::UnprocessableEntity(format!("bad policy content: {e}")))?;
+    let mut names: Vec<String> = fluidbox_core::tools::CANONICAL
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    if let Some(name) = &req.name {
+        if let Some(row) = fluidbox_db::get_policy_by_name(&state.pool, scope, name).await? {
+            names.extend(fluidbox_db::policy_mcp_tools(&state.pool, scope, row.id).await?);
+        }
+    }
+    Ok(Json(json!({
+        "content": serde_json::to_value(&policy)?,
+        "autonomy_summary": policy.autonomy_summary(),
+        "defaults": policy.defaults,
+        "budgets": policy.budgets,
+        "approvals": policy.approvals,
+        "egress": policy.egress,
+        "matrix": matrix_payload(&policy, &names),
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct ClonePolicy {
+    /// The NEW policy's name.
+    pub name: String,
+    /// Clone source (a policy name). Omitted = start blank: an empty rule set
+    /// under the fail-safe defaults (everything asks a human).
+    #[serde(default)]
+    pub from: Option<String>,
+    /// Pin the exact source version (the one the dialog displayed). Omitted =
+    /// the source's latest at execution time.
+    #[serde(default)]
+    pub from_version: Option<i32>,
+}
+
+/// NEW policy names travel in URL paths and dashboard links, so creation
+/// constrains them to a routable set. Existing stored names are untouched —
+/// this gates the clone/create path only (the YAML import path keeps its
+/// legacy latitude, documented).
+fn validate_policy_name(name: &str) -> Result<(), ApiError> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !ok {
+        return Err(ApiError::BadRequest(
+            "policy names are 1-64 characters of a-z A-Z 0-9 . _ - and do not start with '.'"
+                .into(),
+        ));
+    }
+    reject_reserved_name(name)
+}
+
+/// The static `/v1/policies/*` routes shadow `/{name}` in axum, so a policy
+/// carrying one of their names would be unreachable by its own URL. Refused on
+/// EVERY creating path (clone AND the yaml import).
+///
+/// The list lives in `fluidbox-core` because the boot seed enforces it too and
+/// the two crates cannot see each other; `policy_routes_are_all_reserved`
+/// below pins it against the router's actual static segments.
+fn reject_reserved_name(name: &str) -> Result<(), ApiError> {
+    if fluidbox_core::policy::is_reserved_policy_name(name) {
+        return Err(ApiError::BadRequest(format!(
+            "'{name}' is reserved by the policies API — pick another name"
+        )));
+    }
+    Ok(())
+}
+
+/// `POST /v1/policies/clone` — create a new policy (identity + version 1 in
+/// one transaction) by cloning a parent's content or starting blank (design
+/// §4.4 "New policy").
+pub async fn clone_policy(
+    principal: Principal,
+    State(state): State<AppState>,
+    Json(req): Json<ClonePolicy>,
 ) -> ApiResult<Json<Value>> {
     if !rbac::can_mutate_resources(&principal) {
         return Err(ApiError::Forbidden(
-            "editing policies requires admin or owner".into(),
+            "creating policies requires admin or owner".into(),
+        ));
+    }
+    validate_policy_name(&req.name)?;
+    if req.from.is_none() && req.from_version.is_some() {
+        return Err(ApiError::BadRequest(
+            "`from_version` needs `from` — a blank policy has no source version".into(),
         ));
     }
     let scope = principal.scope();
-    fluidbox_db::get_policy_by_name(&state.pool, scope, &name)
+    let (policy, summary) = match &req.from {
+        Some(source) => {
+            let source_row = fluidbox_db::get_policy_by_name(&state.pool, scope, source)
+                .await?
+                .ok_or_else(|| ApiError::BadRequest(format!("unknown source policy '{source}'")))?;
+            let source_version = match req.from_version {
+                Some(n) => fluidbox_db::get_policy_version(&state.pool, scope, source_row.id, n)
+                    .await?
+                    .ok_or_else(|| {
+                        ApiError::BadRequest(format!("source policy '{source}' has no v{n}"))
+                    })?,
+                None => require_latest_version(&state, scope, &source_row).await?,
+            };
+            let mut policy: Policy = serde_json::from_value(source_version.content.clone())
+                .map_err(|e| ApiError::Internal(format!("bad stored policy: {e}")))?;
+            policy.name = req.name.clone();
+            (
+                policy,
+                format!("cloned from '{}' v{}", source, source_version.version),
+            )
+        }
+        None => (
+            Policy {
+                name: req.name.clone(),
+                defaults: Default::default(),
+                egress: Default::default(),
+                budgets: Default::default(),
+                approvals: Default::default(),
+                autonomy: Default::default(),
+                tools: Vec::new(),
+            },
+            "created blank".to_string(),
+        ),
+    };
+    policy.validate().map_err(ApiError::UnprocessableEntity)?;
+    let content = serde_json::to_value(&policy)?;
+    let (row, version) = fluidbox_db::create_policy(
+        &state.pool,
+        scope,
+        &req.name,
+        fluidbox_db::NewPolicyVersion {
+            content: &content,
+            yaml_source: None,
+            summary: Some(&summary),
+            author: "ui",
+            author_user_id: principal.user_id(),
+        },
+    )
+    .await
+    .map_err(|e| match &e {
+        // ONLY the name constraint maps to 409 — a different unique violation
+        // here would be a bug worth its 500, not a user-facing conflict.
+        sqlx::Error::Database(db)
+            if db.code().as_deref() == Some("23505")
+                && db.constraint() == Some("policies_tenant_id_name_key") =>
+        {
+            ApiError::Conflict(format!("a policy named '{}' already exists", req.name))
+        }
+        _ => ApiError::Db(e),
+    })?;
+    Ok(Json(json!({ "policy": {
+        "id": row.id,
+        "name": row.name,
+        "version": version.version,
+    }})))
+}
+
+/// `DELETE /v1/policies/{name}` — remove a policy identity and, through the
+/// composite FK's cascade, its whole version history.
+///
+/// The counterpart to `clone`: without it the only way to create a policy is
+/// also the only way to accumulate them forever, and a test suite that mints
+/// one per run has nowhere to put it back.
+///
+/// Refuses (409) while ANY agent revision names it — every revision, not just
+/// the latest, because revisions are immutable and a historical one must keep
+/// resolving its policy. RUNS are never at stake: a RunSpec froze the whole
+/// policy document, so no run needs the row to survive.
+pub async fn delete_policy(
+    principal: Principal,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    if !rbac::can_mutate_resources(&principal) {
+        return Err(ApiError::Forbidden(
+            "deleting policies requires admin or owner".into(),
+        ));
+    }
+    let scope = principal.scope();
+    let row = fluidbox_db::get_policy_by_name(&state.pool, scope, &name)
         .await?
         .ok_or(ApiError::NotFound)?;
-    // Clearing only ever REMOVES an override, so the merged policy it leaves
-    // behind is a subset of one that already validated — nothing to re-check.
-    let row = fluidbox_db::clear_policy_override(&state.pool, scope, &name, &tool)
-        .await
-        .map_err(policy_gone)?;
-    Ok(Json(
-        json!({ "policy": { "name": row.name, "version": row.version } }),
-    ))
+    // `None` = the FK refused rather than our count. Same refusal, without
+    // claiming a count we did not measure. See the arm below for when that can
+    // actually happen (short answer: not today).
+    let in_use = |revisions: Option<i64>| {
+        let named = match revisions {
+            Some(n) => format!("{n} agent revision{}", if n == 1 { "" } else { "s" }),
+            None => "an agent revision created while this delete was in flight".to_string(),
+        };
+        ApiError::Conflict(format!(
+            "'{name}' is still named by {named} — including historical revisions, which stay \
+             immutable. Point those agents at another policy and delete the agents that no \
+             longer need this one."
+        ))
+    };
+    match fluidbox_db::delete_policy(&state.pool, scope, row.id).await {
+        Ok(fluidbox_db::DeletePolicy::Deleted) => Ok(Json(
+            json!({ "deleted": { "id": row.id, "name": row.name } }),
+        )),
+        Ok(fluidbox_db::DeletePolicy::InUse { revisions }) => Err(in_use(Some(revisions))),
+        // UNREACHABLE TODAY, and kept deliberately.
+        //
+        // The obvious story — "a revision landed between the count and the
+        // delete" — is not actually possible: `delete_policy` takes the parent
+        // row `FOR UPDATE`, and inserting an `agent_revision` takes `FOR KEY
+        // SHARE` on that same row to satisfy the FK. Those conflict, so the two
+        // serialize: a revision already in flight makes our lock wait and is
+        // then counted, and a revision starting after our lock waits for us and
+        // fails. There is no window between the count and the delete.
+        //
+        // The arm stays because it is the FK — not the count — that actually
+        // guarantees the invariant. If the lock ordering above is ever relaxed
+        // (a `FOR NO KEY UPDATE`, a count moved outside the transaction), this
+        // degrades the outcome to the correct 409 instead of a 500. Only THIS
+        // constraint: any other 23503 here is a bug that deserves its 500.
+        Err(sqlx::Error::Database(db))
+            if db.code().as_deref() == Some("23503")
+                && db.constraint() == Some("agent_revisions_policy_id_fkey") =>
+        {
+            Err(in_use(None))
+        }
+        // The row vanished between the name lookup above and the delete (a
+        // concurrent delete won). 404 is the honest answer, and it is the same
+        // one a second DELETE of the same name gets — so a client retrying is
+        // never told something different about the same end state.
+        Ok(fluidbox_db::DeletePolicy::NotFound) => Err(ApiError::NotFound),
+        Err(e) => Err(ApiError::Db(e)),
+    }
 }
 
 // ─── Sessions ─────────────────────────────────────────────────────────────
@@ -1528,5 +1896,67 @@ mod tests {
             inherit_unless_switched(None, None, false, "img:default"),
             "img:default"
         );
+    }
+
+    /// The reserved-name list and the ROUTER must not drift. axum matches a
+    /// static segment before `/{name}`, so a policy named after any static
+    /// `/policies/*` segment would be unreachable by its own URL — and a wrong
+    /// constant here is invisible to every other test (the same failure mode
+    /// CLAUDE.md flags for the audience mapping, so it gets the same treatment:
+    /// read the router's source and compare).
+    ///
+    /// Reads `main.rs` rather than the built `Router` because axum exposes no
+    /// way to enumerate registered paths.
+    #[test]
+    fn policy_routes_are_all_reserved() {
+        let main_rs = include_str!("main.rs");
+        let mut segments: Vec<&str> = Vec::new();
+        for line in main_rs.lines() {
+            // `.route("/policies/<seg>...` — the FIRST segment after
+            // `/policies/` is the only one that can shadow `/{name}`.
+            let Some(rest) = line.split("\"/policies/").nth(1) else {
+                continue;
+            };
+            let Some(path) = rest.split('"').next() else {
+                continue;
+            };
+            let seg = path.split('/').next().unwrap_or_default();
+            // `{name}` IS the capture this test exists to protect.
+            if seg.is_empty() || seg.starts_with('{') {
+                continue;
+            }
+            segments.push(seg);
+        }
+        assert!(
+            !segments.is_empty(),
+            "found no static /policies/* routes in main.rs — the scraper broke, \
+             which would make this test vacuously green"
+        );
+        // The scraper understands `.route("/policies/…")` and nothing else. If
+        // the policy routes are ever moved under a nested Router, every path
+        // above becomes invisible and this test goes quietly vacuous — so make
+        // that a loud failure instead of a silent one.
+        assert!(
+            !main_rs.contains(".nest(\"/policies"),
+            "policy routes are now NESTED; this test only scrapes `.route(\"/policies/…\")` \
+             and would no longer see them. Teach the scraper the new shape before trusting it."
+        );
+        for seg in &segments {
+            assert!(
+                fluidbox_core::policy::is_reserved_policy_name(seg),
+                "route /policies/{seg} shadows /{{name}}, but '{seg}' is absent from \
+                 fluidbox_core::policy::RESERVED_POLICY_NAMES — a policy named '{seg}' \
+                 would be unreachable by its own URL. Add it there."
+            );
+        }
+        // …and nothing is reserved that no longer needs to be (a stale entry
+        // silently forbids a name users could otherwise have).
+        for name in fluidbox_core::policy::RESERVED_POLICY_NAMES {
+            assert!(
+                segments.contains(name),
+                "'{name}' is reserved but no /policies/{name} route exists — drop it \
+                 from RESERVED_POLICY_NAMES rather than forbidding a usable name."
+            );
+        }
     }
 }

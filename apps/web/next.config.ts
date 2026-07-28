@@ -12,7 +12,9 @@ const nextConfig: NextConfig = {
   async redirects() {
     return [
       { source: "/approvals", destination: "/", permanent: true },
-      { source: "/policies", destination: "/agents?tab=policies", permanent: true },
+      // Policies moved twice: first into an /agents tab, then (2026-07-25,
+      // DB-native policies) to Governance — the authoring surface.
+      { source: "/policies", destination: "/governance", permanent: true },
       { source: "/connections", destination: "/integrations", permanent: true },
       { source: "/triggers", destination: "/automations", permanent: true },
       // Briefly (2026-07-11) capabilities lived inside /integrations tabs.
