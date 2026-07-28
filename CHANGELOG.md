@@ -17,7 +17,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ### Upgrade notes
 
-- Migration `0026` drops `policies.{parsed,yaml_source,managed_overrides,version}`, so this is **stop the old binary, migrate, then deploy** (the `0018` posture) and there is no binary rollback past it. The Helm chart's Deployment uses `RollingUpdate`: scale the server to zero first, or switch it to `Recreate` for one release.
+- Migration `0026` drops `policies.{parsed,yaml_source,managed_overrides,version}`, so this is **stop the old binary, migrate, then deploy** (the `0018` posture) and there is no binary rollback past it — a pre-0026 binary refuses to boot against a 0026 database (`migration 26 was previously applied but is missing in the resolved migrations`), so the failure is loud rather than silent.
+  - **Helm, default values — no action needed.** `server.archiveStore: ""` (the default) and `values/eks.yaml` render `strategy: Recreate` with `replicas: 1`, which satisfies stop-the-old-binary by construction: the old pod is fully terminated before the new one starts, so `0026` runs only after the old binary is gone. Cost is ~30s of downtime, not a correctness risk.
+  - **Helm, `server.archiveStore: "s3"` — act before upgrading.** Only that configuration (the multi-replica shape) renders `RollingUpdate`, where old and new pods coexist. Scale the server to zero first, or switch the strategy to `Recreate` for one release. Otherwise surviving old replicas answer policy queries with `column "version" does not exist` until they are replaced, and their in-flight transactions can block the migration's `ACCESS EXCLUSIVE` DDL against its 5s `lock_timeout`.
 - A `managed_overrides` entry naming a **wildcard** tool (e.g. `mcp__*`) is dropped with a warning rather than folded. Such an entry was unreachable — the retired engine matched overrides by exact name — and folding it into a rule would have matched the whole namespace. The API never allowed one, so this should log nothing.
 
 ## [0.3.0] — 2026-07-24
