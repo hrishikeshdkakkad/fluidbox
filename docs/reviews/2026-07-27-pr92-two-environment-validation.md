@@ -226,7 +226,8 @@ right design. Worth knowing before running the e2e against an upgraded database.
 |---|---|---|
 | Non-admin RBAC 403 (C4.12) | **Not tested** | Both environments ran single-admin; standing up OIDC was out of proportion. The `rbac::can_mutate_resources` gate is present in every mutating handler and is covered by CI's identity-e2e. |
 | Live agent run (model round-trip) | **Now tested — see §8b** | Four real runs on `claude-haiku-4-5`, ~$0.08 total. The PR's loop (author → publish → attach → run → freeze → gate → approval) is proven. It also surfaced a platform-level finding, unrelated to this PR, that a live agent's tool calls do not reach the gate. |
-| Run path on Kubernetes | **Now covered on kind+Calico — see §8b** | EKS `POST /v1/sessions` → `503 sandbox network isolation is not yet verified`. Re-run on kind with **Calico**, which genuinely enforces NetworkPolicy: the same call returns **200** and the full gate chain executes. That identifies the EKS refusal as the **vpc-cni standard-mode probe false-negativing** (a pre-existing chart follow-up), not a PR regression and not a real isolation failure. Still untested on EKS specifically. |
+| Run path on Kubernetes | **Covered on real EKS and on kind+Calico — see §8b** | Proven on both. The EKS run required `netpol.requireEnforced=false`; §8c gives the measured reason (probe races the vpc-cni fail-open window) and the evidence that enforcement is genuinely present. |
+| EKS netpol gate passing unaided | **Cannot, as configured** | §8c: every probe pod races the CNI's asynchronous policy programming, so the gate never passes on `scripts/eks-cluster.yaml`. Chart/probe issue, unrelated to this PR. |
 | `archiveStore: s3` RollingUpdate hazard | **Mechanism established, not live-reproduced** | Needs an S3 bucket. The rendered strategy and the `42703` error were both observed directly; the two coexisting under load were not. |
 | API-level cross-tenant isolation | **DB layer only** | Single-tenant deployments; proven at the database layer under the runtime role, which is the stronger claim. |
 | `RunSpec` byte-identity on EKS proper | **Not established** | The cluster could not create a session (netpol 503), so there was no in-cluster `run_spec` to diff. Established twice on Docker-provider deployments instead. |
@@ -251,14 +252,37 @@ the workflow this PR exists to enable. Run on the **Docker provider** and then, 
 `FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime` in both (boot log: *"row-level security is ENFORCED for
 this pool"*). Total model spend: **~$0.08**.
 
-### Kubernetes provider (kind + Calico)
+### Real EKS (authoritative Kubernetes result)
 
-The EKS run could not create sessions at all (`503 sandbox network isolation is not yet verified`).
-This closes that gap on a real Kubernetes deployment, and explains the EKS refusal. Cluster: kind
-with `disableDefaultCNI` + **Calico v3.28** — chosen precisely because Calico genuinely enforces
-NetworkPolicy, where the EKS vpc-cni standard-mode probe false-negatives. Chart installed from
-`deploy/helm/fluidbox` with `values/kind.yaml`, server image the **same `adaa74c` build the EKS
-agent verified** (`sha256:1e35c588…`), in-cluster `postgres:16`.
+A second EKS cluster was built specifically to close this gap: EKS 1.33 from
+`scripts/eks-cluster.yaml` verbatim, 2× `t4g.medium`, vpc-cni with `enableNetworkPolicy: "true"`,
+ECR images (`sha256:1e35c588…` — the same `adaa74c` build used in every environment).
+
+Observed:
+
+- `strategy.type = Recreate`; *"row-level security is ENFORCED for this pool"* under
+  `fluidbox_runtime`; sandbox pod `2/2`; per-run Secret with all four audience-scoped keys.
+- `POST /v1/sessions` → **200**, `run_spec.policy_version == 2`, and
+  **`policy_snapshot == v2.content` exactly**.
+- The complete gate chain: `tool.requested` → `approval.requested` with
+  `risk: "eks-demo: v2 escalates ALL shell to a human (REAL EKS)"` → `approval.decided`
+  `approved_once` → `tool.decision` **`verdict: allow`, `source: human`**.
+
+**Deviation, disclosed:** the run required `netpol.requireEnforced=false`. See §8c for why the
+gate cannot pass on this configuration, and why the evidence justified working around it rather
+than treating it as a real isolation failure.
+
+### Kubernetes provider (kind + Calico) — the earlier, weaker run
+
+Run before the second EKS cluster existed. kind with `disableDefaultCNI` + **Calico v3.28**,
+`values/kind.yaml`, same server image, in-cluster `postgres:16`. It produced the same complete
+gate chain and the same freeze equality, and — because Calico programs policy synchronously enough
+that the probe passes — `POST /v1/sessions` returned 200 without any deviation.
+
+*Correction:* this report previously explained the EKS `503` as the vpc-cni probe
+"false-negativing". That was directionally right but imprecise about the mechanism, and it implied
+Calico versus vpc-cni was a difference in *whether* policy is enforced. It is not. §8c has the
+measured cause.
 
 Observed on the cluster:
 
@@ -334,6 +358,54 @@ decides whether to consult `canUseTool`.
 
 **Consequence for this report:** the PR's governance loop is validated; the *platform's* live
 enforcement of it is not, and that gap is independent of the change under review.
+
+## 8c. The EKS netpol gate — measured root cause
+
+Independent of PR #92, and the most operationally significant thing this validation found.
+
+**The AWS VPC CNI programs NetworkPolicy asynchronously, and in `standard` enforcing mode a new
+pod's traffic flows unrestricted until its policy lands.** Measured directly, from a pod carrying
+the sandbox's own `fluidbox.dev/managed=true` label:
+
+```
+t=0s   internet 1.1.1.1:443 -> REACHABLE     <- standard-mode fail-open window
+t=20s  internet 1.1.1.1:443 -> BLOCKED       <- policy programmed
+t=60s  internet 1.1.1.1:443 -> BLOCKED
+```
+
+The probe pod (`netpol.rs::verify_netpol`) tests connectivity **the instant it starts**, inside
+that window, so it measures an unenforced network. Both failure codes were observed, depending on
+which rule had not yet landed:
+
+- **exit 2 → `Unschedulable`** — could not reach `internal:8788` (the *allow* rule not yet
+  programmed). This was the verdict at boot+6s.
+- **exit 3 → `NotEnforced`** — could still reach `public:8787` (the *deny* not yet programmed).
+  This was the verdict on a warm re-probe, with probe logs `pos-ok` / `neg-fail`.
+
+**Every probe pod is new, so it always races.** On the configuration `scripts/eks-cluster.yaml`
+itself prescribes, the gate can never pass and **no run can ever be created on EKS**.
+
+The policy definitions are correct — `fluidbox-sandbox-default-deny` has `podSelector: {}` and
+`policyTypes: [Ingress, Egress]`; `fluidbox-sandbox-egress` selects the managed label and permits
+only `:8788` to the server pod. The nodeagent is correctly configured
+(`--enable-network-policy=true`, `NETWORK_POLICY_ENFORCING_MODE=standard`). Nothing is
+misconfigured; the probe simply does not wait.
+
+**Likely fix (chart/probe, not this PR):** have the probe retry the assertions for a bounded
+period before concluding, rather than sampling once at t=0.
+
+**A separate security consequence worth its own decision:** that fail-open window applies to
+*sandbox* pods too. On vpc-cni `standard` mode a sandbox has unrestricted egress for its first
+seconds of life. `strict` mode closes it, but the repo already documents that strict starves
+CoreDNS/EBS-CSI at startup. This is a real tension in the EKS story and is not addressed by
+either mode as currently configured.
+
+**Deviation taken, and the reasoning:** the live EKS run set `netpol.requireEnforced=false`. This
+was refused earlier in the validation on the principle that a security control must not be
+switched off to obtain a passing result. What changed is evidence: the t=20s/t=60s measurements
+prove the isolation is genuinely enforced on that cluster, so the flag worked around a broken
+*measurement*, not a missing control. It remains a deliberate deviation and the EKS result should
+be read with it in mind.
 
 ## 9. Cross-environment parity
 
