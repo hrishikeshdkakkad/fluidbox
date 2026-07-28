@@ -1,10 +1,17 @@
 "use client";
 
 // The resolved permission matrix. Every verdict here was decided by the policy
-// engine in the control plane and sent over the wire — this component chooses
-// how to SHOW a verdict, never what the verdict is.
+// engine in the control plane and sent over the wire — for a saved policy via
+// GET /policies/{name}, for an in-progress draft via POST /policies/preview.
+// This component chooses how to SHOW a verdict, never what the verdict is.
+//
+// Editing is the DRAFT flow (design §4.4): clicking an action edits/creates an
+// exact-name HEAD rule in the client-side draft; nothing is written until
+// Publish. Conditional rows (paths/shell) stay display-only here — the rules
+// editor is where constraints are edited, because a flat action cannot express
+// "allow in /workspace · never .env · ask elsewhere".
 
-import { MatrixRow, PolicyAction, RuleConstraints } from "../lib/api";
+import { MatrixRow, PolicyAction, RuleConstraints, ToolRule } from "../lib/api";
 
 /** The policy engine's vocabulary, in the product's words. "approve" means the
  *  run pauses and waits for a human, so it reads as "Ask". Exported so every
@@ -75,6 +82,24 @@ function toolLabel(row: MatrixRow): string {
   return row.server && row.tool.startsWith(prefix) ? row.tool.slice(prefix.length) : row.tool;
 }
 
+/** Is the rule that decided this row a MATRIX-authored head rule for exactly
+ *  this tool — one exact matcher, no constraints, no per-rule overrides? Such
+ *  a rule is safe to remove from the matrix (the tool falls back to whatever
+ *  the rules below say). This inspects the DRAFT'S STRUCTURE the user is
+ *  editing — it re-derives no verdict. */
+export function isExactHeadRule(rule: ToolRule | undefined, tool: string): boolean {
+  return (
+    !!rule &&
+    rule.match.length === 1 &&
+    rule.match[0] === tool &&
+    !rule.paths &&
+    !rule.shell &&
+    !rule.on_autonomous &&
+    rule.approval_ttl_secs == null &&
+    rule.approval_scope == null
+  );
+}
+
 type Group = { key: string; label: string; mcp: boolean; rows: MatrixRow[] };
 
 /** `group` keys canonical tools; for `mcp__*` rows `group` is null and the
@@ -99,20 +124,35 @@ function groupRows(rows: MatrixRow[]): Group[] {
 
 export function PermissionMatrix({
   rows,
-  busy,
+  tools,
+  stale = false,
   onSet,
   onClear,
 }: {
   rows: MatrixRow[];
-  /** Tool with a request in flight; its controls are disabled meanwhile. */
-  busy: string | null;
+  /** The DRAFT's rule list — used only to recognise matrix-authored exact
+   *  head rules (structure, not verdicts). */
+  tools: ToolRule[];
+  /** These verdicts were resolved for an EARLIER draft (a preview is in
+   *  flight, or the current draft does not validate). The rows stay on screen
+   *  — blanking a resolved matrix on every keystroke is worse than showing a
+   *  slightly-behind one — but the controls go inert, because `status.rule`
+   *  indexes the draft the server resolved, not the one being held now.
+   *  Acting on a stale index could edit a rule the user is not looking at. */
+  stale?: boolean;
+  /** Set this tool's action in the draft (edit/create an exact head rule). */
   onSet: (tool: string, action: PolicyAction) => void;
+  /** Remove this tool's matrix-authored head rule from the draft. */
   onClear: (tool: string) => void;
 }) {
   return (
     <>
       {groupRows(rows).map((group) => (
-        <section key={group.key} className="matrix-group">
+        <section
+          key={group.key}
+          className={`matrix-group${stale ? " matrix-stale" : ""}`}
+          aria-busy={stale || undefined}
+        >
           <div className="sectitle">
             {group.label}
             {group.mcp && <span className="chip">MCP server</span>}
@@ -122,7 +162,8 @@ export function PermissionMatrix({
               <Row
                 key={row.tool}
                 row={row}
-                busy={busy === row.tool}
+                tools={tools}
+                stale={stale}
                 onSet={onSet}
                 onClear={onClear}
               />
@@ -136,23 +177,23 @@ export function PermissionMatrix({
 
 function Row({
   row,
-  busy,
+  tools,
+  stale,
   onSet,
   onClear,
 }: {
   row: MatrixRow;
-  busy: boolean;
+  tools: ToolRule[];
+  stale: boolean;
   onSet: (tool: string, action: PolicyAction) => void;
   onClear: (tool: string) => void;
 }) {
   const status = row.status;
-
   // A conditional rule's verdict depends on the path touched or the command
-  // run, so no single action can express it. Offering a three-way control here
-  // would let one click flatten the rule and drop `paths.deny: **/.env`. The
-  // server refuses such an override with a 400; the UI must not offer what the
-  // server will refuse. `overridable` is the same answer from the same source.
-  const configurable = status.status !== "conditional" && row.overridable;
+  // run, so no single action can express it — its home is the rules editor,
+  // and the branch below renders it as a sentence with no control at all.
+  const winningRule = status.status === "unconditional" ? tools[status.rule] : undefined;
+  const matrixAuthored = isExactHeadRule(winningRule, row.tool);
 
   return (
     <div className="matrix-row">
@@ -165,13 +206,13 @@ function Row({
           <span className="matrix-conditional" title={detail(status.constraints)}>
             {describe(status.constraints, status.action)}
           </span>
-        ) : configurable ? (
+        ) : (
           // Three mutually exclusive options, so: a real radio group. Native
           // radios are what make the control honest to a screen reader —
           // exclusivity, "1 of 3", and arrow-key navigation are the browser's,
-          // not ours. The <legend> names the group and is hidden visually only;
-          // `.seg` keeps the look, with each <label> as one option.
-          <fieldset className="seg" disabled={busy}>
+          // not ours. Choosing what is already in force writes nothing (the
+          // draft only changes when the action actually differs).
+          <fieldset className="seg" disabled={stale}>
             <legend className="sr-only">Permission for {row.tool}</legend>
             {ACTIONS.map((action) => (
               <label key={action} className={status.action === action ? "on" : ""}>
@@ -180,16 +221,6 @@ function Row({
                   name={`perm-${row.tool}`}
                   value={action}
                   checked={status.action === action}
-                  // Choosing what is already in force must not write anything:
-                  // a PUT here would mint an override with an identical action,
-                  // bumping the policy version and flipping this row's tail
-                  // from "policy default" to "Overridden" — a global change the
-                  // click never asked for. `status.action` is the server's
-                  // resolved verdict, so this compares, it never re-derives.
-                  // (An overridden row re-selecting its own action is likewise
-                  // a no-op; the tail's "clear" button is what reverts it.)
-                  // A radio fires no change event when re-picked, so this is
-                  // belt-and-braces — the invariant should not rest on that.
                   onChange={() => {
                     if (status.action !== action) onSet(row.tool, action);
                   }}
@@ -198,24 +229,24 @@ function Row({
               </label>
             ))}
           </fieldset>
-        ) : (
-          <span className="matrix-fixed">{VERB[status.action]}</span>
         )}
       </div>
 
       <div className="matrix-tail">
-        {status.status === "overridden" ? (
+        {matrixAuthored ? (
           <button
             type="button"
             className="text-action"
-            disabled={busy}
+            disabled={stale}
             onClick={() => onClear(row.tool)}
-            title={`Clear this override — restores ${VERB[status.underlying.action]}`}
+            title="Remove this per-tool rule from the draft — the tool falls back to the rules below"
           >
-            Overridden · clear
+            Per-tool rule · remove
           </button>
         ) : status.status === "default" ? (
           <span className="faint">policy default</span>
+        ) : status.status === "conditional" ? (
+          <span className="faint">edit in Rules</span>
         ) : null}
       </div>
     </div>

@@ -798,10 +798,13 @@ export interface RuleConstraints {
 
 /** Internally tagged on `status`. A `conditional` rule carries path/shell
  *  constraints, so no single action can express it — such rows are shown as a
- *  sentence and never as a control. Setting one would flatten the rule and
- *  drop its constraints (e.g. `paths.deny: **\/.env`); the server refuses the
- *  same override with a 400, and the UI must not offer what it will refuse. */
+ *  sentence in the matrix (the RULES editor is where constraints are edited).
+ *  Flattening one from the matrix would delete `paths.deny: **\/.env` with a
+ *  click, so the matrix never offers a control for it. */
 export type ToolStatus =
+  // `rule` is never null: with per-tool overrides retired (they are ordinary
+  // head rules now) every unconditional verdict names a real rule index, which
+  // is what lets the editor find that rule in the draft it is holding.
   | { status: "unconditional"; action: PolicyAction; rule: number }
   | {
       status: "conditional";
@@ -809,17 +812,15 @@ export type ToolStatus =
       rule: number;
       constraints: RuleConstraints;
     }
-  | { status: "default"; action: PolicyAction }
-  | { status: "overridden"; action: PolicyAction; underlying: ToolStatus };
+  | { status: "default"; action: PolicyAction };
 
-/** One row of the resolved permission matrix (GET /policies/{name}).
- *  `group` is set for canonical tools; for `mcp__*` rows it is null and
- *  `server` carries the grouping key instead. */
+/** One row of the resolved permission matrix (GET /policies/{name} and
+ *  POST /policies/preview). `group` is set for canonical tools; for `mcp__*`
+ *  rows it is null and `server` carries the grouping key instead. */
 export interface MatrixRow {
   tool: string;
   group: string | null;
   server: string | null;
-  overridable: boolean;
   status: ToolStatus;
 }
 
@@ -867,20 +868,104 @@ export interface Egress {
   mode: EgressMode;
 }
 
-/** GET /policies list row. */
+/** GET /policies list row. `version` is the LATEST version number. A
+ *  version-less policy (a bug state — `create_run` fails closed on it)
+ *  surfaces as `version: 0` with a null summary rather than hiding. */
 export interface PolicySummary {
   id: string;
   name: string;
   version: number;
   updated_at: string;
   agents_using: number;
-  autonomy_summary: AutonomySummary;
+  autonomy_summary: AutonomySummary | null;
 }
 
-/** GET /policies/{name} — the fully-resolved policy behind a run. */
+// ─── Policy content (the editable document) ───────────────────────────────
+// The DRAFT the editor mutates and POSTs back whole. It mirrors the server's
+// canonical Policy document STRUCTURALLY — the browser edits structure and
+// renders server-resolved payloads (preview/matrix); it never computes a
+// verdict from these fields. The server parses drafts STRICTLY: an unknown
+// field is a 422, so this shape must stay exact.
+
+export interface PathRules {
+  allow: string[];
+  deny: string[];
+}
+
+export interface ShellRules {
+  allow_prefixes: string[];
+  deny_regex: string[];
+  on_no_match: PolicyAction;
+}
+
+export interface ToolRule {
+  match: string[];
+  action: PolicyAction;
+  risk?: string | null;
+  paths?: PathRules | null;
+  shell?: ShellRules | null;
+  on_autonomous?: "allow" | "deny" | null;
+  approval_ttl_secs?: number | null;
+  approval_scope?: ApprovalScope | null;
+}
+
+export interface AutonomySettings {
+  permitted: boolean;
+  on_approval_rule: "allow" | "deny";
+}
+
+export interface PolicyContent {
+  name: string;
+  defaults: PolicyDefaults;
+  egress: Egress;
+  budgets: Budgets;
+  approvals: ApprovalSettings;
+  autonomy: AutonomySettings;
+  tools: ToolRule[];
+}
+
+/** One version's metadata (GET /policies/{name} `versions`; content via the
+ *  versions route). `author` is the provenance channel — seed | api | ui |
+ *  import — and `author_user_id` the authenticated user when one existed. */
+export interface PolicyVersionMeta {
+  version: number;
+  author: string;
+  author_user_id: string | null;
+  summary: string | null;
+  created_at: string;
+}
+
+/** GET /policies/{name}/versions/{n} — one immutable version. `yaml` is the
+ *  stored source when the version arrived as YAML, else a server-side export
+ *  of the canonical content. */
+export interface PolicyVersionDetail {
+  policy: { id: string; name: string };
+  version: PolicyVersionMeta;
+  content: PolicyContent;
+  yaml: string;
+}
+
+/** GET /policies/{name} — the fully-resolved policy behind a run, plus the
+ *  editor's inputs: the latest `content` and the version history metadata. */
 export interface PolicyDetail {
   policy: { id: string; name: string; version: number; updated_at: string };
+  content: PolicyContent;
+  versions: PolicyVersionMeta[];
   agents_using: number;
+  autonomy_summary: AutonomySummary;
+  defaults: PolicyDefaults;
+  budgets: Budgets;
+  approvals: ApprovalSettings;
+  egress: Egress;
+  matrix: MatrixRow[];
+}
+
+/** POST /policies/preview — a DRAFT resolved server-side (validated strictly,
+ *  nothing persisted): the canonical content plus the matrix and summaries the
+ *  detail payload carries. This is what keeps the editor presentation-only
+ *  while a draft diverges from the stored policy. */
+export interface PolicyPreview {
+  content: PolicyContent;
   autonomy_summary: AutonomySummary;
   defaults: PolicyDefaults;
   budgets: Budgets;
