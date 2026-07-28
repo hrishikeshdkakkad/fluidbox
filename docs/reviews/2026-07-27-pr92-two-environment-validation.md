@@ -51,6 +51,14 @@ rollback.
 | RLS | boot log: *"row-level security is ENFORCED for this pool"* | same, on both images |
 | Model spend | zero (`LLM_UPSTREAM_URL` black-holed) | zero |
 
+**Image provenance.** The EKS images were built from `git archive adaa74c | tar -x` into clean
+contexts, not from a working tree, so build-time `HEAD` is irrelevant. Verified three ways: the PR
+context's migrations end at `0026_policy_versions.sql` with `put_policy_override` count 0, the
+baseline context ends at `0025` with count 1, and empirically only the PR image migrated the
+database to 26 and dropped the four columns. This matters because both worktrees were initially
+created at the wrong ref (`7b75b20`, post-v0.3.0 *without* the PR); validating the wrong tree would
+have voided the run silently.
+
 A non-superuser owner was used deliberately in **both** environments. Under a superuser or
 `BYPASSRLS` role, migration 0018's `FORCE`d RLS is silently inert and every RLS/append-only
 assertion becomes vacuous. Verifying `rolsuper=f, rolbypassrls=f` is what makes §5 and §6 mean
@@ -95,7 +103,16 @@ agent revisions; sessions with frozen `run_spec`s), then apply `0026`.
 | Columns dropped (C1.8) | `policies` = `id, tenant_id, name, created_at, updated_at` only |
 | Constraints (C1.5) | version 0 → `23514`; duplicate → `23505`; bad author → `23514`; cross-tenant FK → `23503` |
 | Preflight aborts (C1.2) | all four malformed shapes abort naming the row; database left unchanged |
-| **Frozen `RunSpec` byte-identity (P7)** | Docker md5 `4bc33fa8`, EKS md5 `7c073c08…` (len 2975) — **identical before and after** |
+| **Frozen `RunSpec` byte-identity (P7)** | md5 `4bc33fa8` (Docker, containerized deployment) and md5 `7c073c08…`, len 2975 (the EKS agent's local non-superuser lab) — **identical before and after** in both. See the attribution note below. |
+
+**Attribution note on P7.** The second measurement was taken in the EKS agent's *local*
+non-superuser lab — a faithful mirror of the chart-default posture — **not on the cluster
+itself**. The EKS deployment could not create a session at all (the netpol run-gate returns 503;
+see §8), so there was no in-cluster `run_spec` to diff. Byte-identity across `0026` is therefore
+established twice on Docker-provider deployments and **not** established on EKS proper. It is a
+property of the migration SQL, which never references the `sessions` table, so the risk of it
+differing by environment is low — but the evidence does not cover it, and this report does not
+claim otherwise.
 
 The `RunSpec` byte-identity result is the load-bearing one: it is the evidence that in-flight
 runs keep exactly the governance they froze while the schema moves underneath them.
@@ -164,9 +181,16 @@ pods coexist, and an old pod's `select version, parsed, … from policies` retur
 "version" does not exist` (42703) until it is replaced; its in-flight transactions can also block
 the migration's `ACCESS EXCLUSIVE` DDL against the 5s `lock_timeout`.
 
-**Fixed:** `CHANGELOG.md` now states that the default needs no action and that only
-`archiveStore: "s3"` requires the scale-to-zero. The mechanism is quoted so an operator can
-recognise the symptom.
+A third problem sits inside the original remedy itself: *"switch it to `Recreate` for one
+release"* **cannot be done.** `values.yaml:57` states that strategy and PVC are "both derived from
+archiveStore … so there is no separate strategy" knob, and `server.yaml:107-117` confirms it —
+the strategy is a pure function of `archiveStore`. Patching the Deployment does not help either,
+because the same `helm upgrade` rewrites the field. The only workable remedy in `s3` mode is to
+scale the Deployment to zero, upgrade, and scale back.
+
+**Fixed:** `CHANGELOG.md` now states that the default needs no action, scopes the precaution to
+`archiveStore: "s3"`, prescribes scale-to-zero as the *only* workable remedy, and says explicitly
+that no values knob exists. The 42703 symptom is quoted so an operator can recognise it.
 
 **Deliberately not fixed:** the identical claim inside `migrations/0026_policy_versions.sql`.
 Editing an applied migration changes its sqlx checksum, and any database that already ran `0026`
@@ -205,6 +229,8 @@ right design. Worth knowing before running the e2e against an upgraded database.
 | Run path on EKS (C5.1/C5.2/C6.3) | **Docker only** | EKS `POST /v1/sessions` → `503 sandbox network isolation is not yet verified on this cluster`. This is the **pre-existing** netpol boot gate under vpc-cni standard mode (a known chart follow-up), not a PR regression — and it is correct fail-closed behaviour. |
 | `archiveStore: s3` RollingUpdate hazard | **Mechanism established, not live-reproduced** | Needs an S3 bucket. The rendered strategy and the `42703` error were both observed directly; the two coexisting under load were not. |
 | API-level cross-tenant isolation | **DB layer only** | Single-tenant deployments; proven at the database layer under the runtime role, which is the stronger claim. |
+| `RunSpec` byte-identity on EKS proper | **Not established** | The cluster could not create a session (netpol 503), so there was no in-cluster `run_spec` to diff. Established twice on Docker-provider deployments instead. |
+| Neon-specific RLS behaviour | **Not exercised** | Both environments used a self-managed Postgres with a non-superuser owner. Neon's default `neon_superuser` carries `BYPASSRLS`, which would make these RLS assertions vacuous — that interaction is covered by the existing boot refusal, not by this validation. |
 
 ### Evidence strength, stated honestly
 
