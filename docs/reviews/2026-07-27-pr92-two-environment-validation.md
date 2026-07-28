@@ -225,7 +225,7 @@ right design. Worth knowing before running the e2e against an upgraded database.
 | Area | Status | Why |
 |---|---|---|
 | Non-admin RBAC 403 (C4.12) | **Not tested** | Both environments ran single-admin; standing up OIDC was out of proportion. The `rbac::can_mutate_resources` gate is present in every mutating handler and is covered by CI's identity-e2e. |
-| Live agent run (model round-trip) | **Not tested** | Zero-spend mandate. The control-plane side — `RunSpec` freeze, fail-closed ordering, approval choreography — was exercised. |
+| Live agent run (model round-trip) | **Now tested — see §8b** | Four real runs on `claude-haiku-4-5`, ~$0.08 total. The PR's loop (author → publish → attach → run → freeze → gate → approval) is proven. It also surfaced a platform-level finding, unrelated to this PR, that a live agent's tool calls do not reach the gate. |
 | Run path on EKS (C5.1/C5.2/C6.3) | **Docker only** | EKS `POST /v1/sessions` → `503 sandbox network isolation is not yet verified on this cluster`. This is the **pre-existing** netpol boot gate under vpc-cni standard mode (a known chart follow-up), not a PR regression — and it is correct fail-closed behaviour. |
 | `archiveStore: s3` RollingUpdate hazard | **Mechanism established, not live-reproduced** | Needs an S3 bucket. The rendered strategy and the `42703` error were both observed directly; the two coexisting under load were not. |
 | API-level cross-tenant isolation | **DB layer only** | Single-tenant deployments; proven at the database layer under the runtime role, which is the stronger claim. |
@@ -241,6 +241,67 @@ retained. Not every assertion has an independent raw capture; some are recorded 
 in the agents' matrices. Findings I regarded as load-bearing (D1, D2, D3, backfill parity, RunSpec
 byte-identity, the rendered strategies) were re-verified directly rather than accepted from an
 agent summary.
+
+## 8b. Live agent run — the end-to-end governance loop
+
+Added after the initial report, because a validation that never ran a real agent had not exercised
+the workflow this PR exists to enable. Docker provider, real `ANTHROPIC_API_KEY` via the pinned
+LiteLLM gateway, `claude-haiku-4-5` only, hermetic `postgres:16` with a non-superuser owner and
+`FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime` (boot log: *"row-level security is ENFORCED for this
+pool"*). Total model spend across four runs: **~$0.08**.
+
+**The PR's own loop is PROVEN end to end.**
+
+1. `POST /v1/policies/clone` — `default` → `live-demo` v1.
+2. `POST /v1/policies/live-demo/publish` with `base_version: 1` — v2, prepending a head rule
+   `{match:["Bash"], action:"approve", risk:"live-demo: v2 escalates ALL shell to a human"}`.
+3. `POST /v1/agents` — a new agent attached to `live-demo`, pinning an explicit runner image.
+4. `POST /v1/sessions` — a real supervised run. Sandbox launched, real model traffic
+   (`model.response` events carrying genuine token counts and cost).
+5. **`run_spec.policy_version == 2`, and `run_spec.policy_snapshot` equals v2's `content` exactly**
+   — the freeze, observed on a live run rather than inferred.
+6. Driving `/internal/sessions/{id}/permission` with the session's **tool-audience** token and a
+   `Bash` call produced `tool.requested` → `approval.requested`, a pending approval row, and —
+   decisively — `risk: "live-demo: v2 escalates ALL shell to a human"`, **the exact string authored
+   through the API in step 2**.
+
+Step 6 is the load-bearing evidence: a policy authored through the new versioned API reached a
+real human approval prompt, verbatim, via a frozen RunSpec. That is the user-facing loop, closed.
+
+**A serious finding OUTSIDE this PR's scope, surfaced by the same exercise.**
+
+A real agent's tool calls **did not reach the permission gate at all**. Proven, not inferred:
+
+- Task designed so the answer cannot be fabricated — `printf '<random-nonce>' | sha256sum`. The
+  agent returned the exact digest of a nonce generated seconds earlier
+  (`cbd2c6c1…`, and again `6191925f…` on a second nonce). Executing the tool is the only way to
+  produce that. **Bash really ran.**
+- The ledger for those runs contains **zero** `tool.requested` / `tool.decision` /
+  `approval.requested` events. That absence is meaningful: `internal.rs:1857-1865` *drops*
+  runner-submitted `tool.requested` precisely because "tool.requested is server-authoritative —
+  the gate writes it". If the gate had run, the event would exist.
+- The governing frozen snapshot said `Bash → approve`.
+- **Not a stale-image artifact:** reproduced with a runner image built fresh from current source
+  during this session, carrying the same pinned `@anthropic-ai/claude-agent-sdk 0.3.205`.
+- The runner is wired correctly in source — `canUseTool` passed to `query()`,
+  `permissionMode: "default"`, `settingSources: []`, with the comment *"Everything routes through
+  canUseTool → our gateway"* (`images/sandbox-runner/runner/index.mjs:102-157`).
+- The sandbox could reach the control plane throughout — it posted `agent.message` events,
+  heartbeats and its final `/result`. It simply never asked for permission.
+
+So the **server-side gate is sound** (step 6 above, plus `governance-e2e.sh`, which drives
+`/permission` directly). What is not happening is the **SDK harness invoking `canUseTool`**, which
+means a live agent's tool calls are not being gated in this configuration.
+
+**Attribution.** This is **not** a regression from PR #92. The PR touches the migration, policy
+engine, storage layer, the policy handlers in `api.rs`, two lines of `run_service.rs`, `seed.rs`
+and the dashboard. It does not touch `images/`, `internal.rs`, or the permission path. The
+behaviour would be identical on `main`. It is reported here because this validation is what
+surfaced it, and it warrants its own investigation — the most likely locus is how SDK 0.3.205
+decides whether to consult `canUseTool`.
+
+**Consequence for this report:** the PR's governance loop is validated; the *platform's* live
+enforcement of it is not, and that gap is independent of the change under review.
 
 ## 9. Cross-environment parity
 
@@ -290,9 +351,18 @@ under genuine simultaneity, and every "bug, not a state" path fails closed befor
 spend. The upgrade is safe in the shipped default configuration, and the no-rollback boundary
 fails loudly rather than silently.
 
+The user-facing loop is proven on a real agent run (§8b): a policy version authored through the
+new API reached a live human approval prompt verbatim, through a frozen RunSpec.
+
 The risks are bounded and stated: one operator-facing instruction was wrong (now corrected), the
 `s3`/multi-replica upgrade hazard is real but reproduced only at the mechanism level, and
-non-admin RBAC and a live model run were not exercised here.
+non-admin RBAC was not exercised.
+
+**One finding outside this PR's scope should not be lost in a PR review** (§8b): a live agent's
+tool calls do not reach the permission gate — proven with an unfabricatable nonce digest and a
+ledger with zero gate events, reproduced on a runner image built fresh from current source. The
+server-side gate is sound; the SDK harness is not consulting it. This behaviour is identical on
+`main` and blocks nothing here, but it deserves its own investigation.
 
 This report describes what was validated and how strongly. It is not a correctness or robustness
 guarantee.
