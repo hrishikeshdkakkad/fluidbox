@@ -226,7 +226,7 @@ right design. Worth knowing before running the e2e against an upgraded database.
 |---|---|---|
 | Non-admin RBAC 403 (C4.12) | **Not tested** | Both environments ran single-admin; standing up OIDC was out of proportion. The `rbac::can_mutate_resources` gate is present in every mutating handler and is covered by CI's identity-e2e. |
 | Live agent run (model round-trip) | **Now tested — see §8b** | Four real runs on `claude-haiku-4-5`, ~$0.08 total. The PR's loop (author → publish → attach → run → freeze → gate → approval) is proven. It also surfaced a platform-level finding, unrelated to this PR, that a live agent's tool calls do not reach the gate. |
-| Run path on EKS (C5.1/C5.2/C6.3) | **Docker only** | EKS `POST /v1/sessions` → `503 sandbox network isolation is not yet verified on this cluster`. This is the **pre-existing** netpol boot gate under vpc-cni standard mode (a known chart follow-up), not a PR regression — and it is correct fail-closed behaviour. |
+| Run path on Kubernetes | **Now covered on kind+Calico — see §8b** | EKS `POST /v1/sessions` → `503 sandbox network isolation is not yet verified`. Re-run on kind with **Calico**, which genuinely enforces NetworkPolicy: the same call returns **200** and the full gate chain executes. That identifies the EKS refusal as the **vpc-cni standard-mode probe false-negativing** (a pre-existing chart follow-up), not a PR regression and not a real isolation failure. Still untested on EKS specifically. |
 | `archiveStore: s3` RollingUpdate hazard | **Mechanism established, not live-reproduced** | Needs an S3 bucket. The rendered strategy and the `42703` error were both observed directly; the two coexisting under load were not. |
 | API-level cross-tenant isolation | **DB layer only** | Single-tenant deployments; proven at the database layer under the runtime role, which is the stronger claim. |
 | `RunSpec` byte-identity on EKS proper | **Not established** | The cluster could not create a session (netpol 503), so there was no in-cluster `run_spec` to diff. Established twice on Docker-provider deployments instead. |
@@ -242,13 +242,45 @@ in the agents' matrices. Findings I regarded as load-bearing (D1, D2, D3, backfi
 byte-identity, the rendered strategies) were re-verified directly rather than accepted from an
 agent summary.
 
-## 8b. Live agent run — the end-to-end governance loop
+## 8b. Live agent run — the end-to-end governance loop, on BOTH providers
 
 Added after the initial report, because a validation that never ran a real agent had not exercised
-the workflow this PR exists to enable. Docker provider, real `ANTHROPIC_API_KEY` via the pinned
-LiteLLM gateway, `claude-haiku-4-5` only, hermetic `postgres:16` with a non-superuser owner and
-`FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime` (boot log: *"row-level security is ENFORCED for this
-pool"*). Total model spend across four runs: **~$0.08**.
+the workflow this PR exists to enable. Run on the **Docker provider** and then, separately, on the
+**Kubernetes provider**. Real `ANTHROPIC_API_KEY` via the pinned LiteLLM gateway,
+`claude-haiku-4-5` only, hermetic `postgres:16` with a non-superuser owner and
+`FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime` in both (boot log: *"row-level security is ENFORCED for
+this pool"*). Total model spend: **~$0.08**.
+
+### Kubernetes provider (kind + Calico)
+
+The EKS run could not create sessions at all (`503 sandbox network isolation is not yet verified`).
+This closes that gap on a real Kubernetes deployment, and explains the EKS refusal. Cluster: kind
+with `disableDefaultCNI` + **Calico v3.28** — chosen precisely because Calico genuinely enforces
+NetworkPolicy, where the EKS vpc-cni standard-mode probe false-negatives. Chart installed from
+`deploy/helm/fluidbox` with `values/kind.yaml`, server image the **same `adaa74c` build the EKS
+agent verified** (`sha256:1e35c588…`), in-cluster `postgres:16`.
+
+Observed on the cluster:
+
+- `strategy.type = Recreate` on the live Deployment — a **third** independent confirmation of D1.
+- *"row-level security is ENFORCED for this pool"* under `fluidbox_runtime`; `policy_versions`
+  `relrowsecurity=t relforcerowsecurity=t`; schema at 26.
+- **`POST /v1/sessions` → HTTP 200.** The netpol gate that blocked EKS passes under an enforcing
+  CNI, confirming the EKS `503` was the probe, not a genuine isolation failure.
+- Sandbox pod `2/2 Running`, and its per-run Secret carried exactly the four audience-scoped keys
+  — `llm-token`, `session-token`, `tool-token`, `workspace-token` (Phase E invariant 19, live).
+- `run_spec.policy_version == 2`, snapshot carrying the authored head rule.
+- Driving `/internal/.../permission` with the **tool-audience** token produced the complete chain:
+  `tool.requested` → `approval.requested` with
+  `risk: "k8s-demo: v2 escalates ALL shell to a human (kubernetes provider)"` → (approve) →
+  `approval.decided` `approved_once` → `tool.decision` **`verdict: allow`, `source: human`,
+  `reason: human:operator`**.
+
+So the loop — author, publish, attach, run, freeze, gate, approve, allow — is proven on **both**
+providers, with the policy text authored through the new API surfacing verbatim in a human
+approval prompt in each.
+
+### Docker provider
 
 **The PR's own loop is PROVEN end to end.**
 
