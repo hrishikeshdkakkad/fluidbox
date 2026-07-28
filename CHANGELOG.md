@@ -6,6 +6,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ## [Unreleased]
 
+### Added
+
+- **DB-native policies (§17 #11)** — policies are now versioned, authorable, and attachable from the dashboard. Every edit is an immutable `policy_versions` row (author, summary, date; migration `0026`); publish/revert/clone ride optimistic concurrency (`base_version` → 409 on a moved head) and a strict parser (an unknown field is a 422, never a silently-weaker policy); history is append-only at the database level (the runtime role can only read and append). The Governance page gains a draft rule editor (ordered rules, path/shell constraints, budgets/approvals/autonomy/egress forms), version history with diff and one-click revert, New policy (clone or blank), and Delete; the run composer gains a policy select and disables autonomy when the policy forbids it. `managed_overrides` folds into ordinary head rules (verdict-preserving, property-tested); `just policy-sync` is retired — YAML survives as a boot seed and an idempotent import/export format (`POST /v1/policies`).
+- **`DELETE /v1/policies/{name}`** — removes a policy and cascades its version history. Refused (409) while any agent revision names it, including historical revisions, which stay immutable. Runs are never affected: each froze its own policy snapshot.
+
+### Changed
+
+- **Seed policy files are parsed STRICTLY, and an invalid one can refuse the boot.** `policies/*.yaml` now goes through the same strict parser as the API, so an unknown key is an error rather than a silently-dropped field. The refusal is scoped to where it matters: if the policy does **not yet exist in the database**, the file is its only source and the server refuses to start (naming the file, the key, and the policy); if the policy **already exists**, its stored versions govern, the file writes nothing, and the server logs a warning and boots. Upgrading with a hand-edited policies directory: run `POST /v1/policies/validate` against each file first, or expect a startup warning.
+
+### Upgrade notes
+
+- Migration `0026` drops `policies.{parsed,yaml_source,managed_overrides,version}`, so this is **stop the old binary, migrate, then deploy** (the `0018` posture) and there is no binary rollback past it — a pre-0026 binary refuses to boot against a 0026 database (`migration 26 was previously applied but is missing in the resolved migrations`), so the failure is loud rather than silent.
+  - **Helm, default values — no action needed.** `server.archiveStore: ""` (the default) and `values/eks.yaml` render `strategy: Recreate` with `replicas: 1`, which satisfies stop-the-old-binary by construction: the old pod is fully terminated before the new one starts, so `0026` runs only after the old binary is gone. Cost is ~30s of downtime, not a correctness risk.
+  - **Helm, `server.archiveStore: "s3"` — act before upgrading.** Only that configuration (the multi-replica shape) renders `RollingUpdate`, where old and new pods coexist. **Scale the server Deployment to zero, upgrade, then scale back up.** Note there is no values knob for this: the strategy is derived from `archiveStore` alone (`values.yaml:57`), so it cannot be forced to `Recreate` for one release, and patching the Deployment does not help because the same `helm upgrade` rewrites the field. Without the scale-to-zero, surviving old replicas answer policy queries with `column "version" does not exist` (42703) until they are replaced, and their in-flight transactions can block the migration's `ACCESS EXCLUSIVE` DDL against its 5s `lock_timeout`.
+- A `managed_overrides` entry naming a **wildcard** tool (e.g. `mcp__*`) is dropped with a warning rather than folded. Such an entry was unreachable — the retired engine matched overrides by exact name — and folding it into a rule would have matched the whole namespace. The API never allowed one, so this should log nothing.
+
 ## [0.3.0] — 2026-07-24
 
 **Multi-user MCP control plane.** Six phases (A–F) and migrations `0011`→`0025` turn fluidbox from a single-admin control plane into one that can host many organizations, many users, and many separately-owned credentials without ever letting a model pick an identity. Every hosted capability is **opt-in behind a flag, and the default single-admin Docker deployment is byte-for-byte the same product** — `FLUIDBOX_REQUIRE_SSO` unset means today's behavior, unchanged.

@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 import {
   Agent,
   apiGetCached,
@@ -11,6 +12,7 @@ import {
   connectionMatchesConnector,
   isToolConnection,
   ownerBadge,
+  PolicySummary,
   Revision,
   TriggerSubscription,
 } from "../lib/api";
@@ -50,6 +52,8 @@ interface RunComposerDraft {
   harness: string;
   model: string;
   systemPrompt: string;
+  /** New-agent policy attachment (spec A); absent in pre-attachment drafts. */
+  policyName?: string;
   workspace: WorkspaceDraft;
   pins: BundleRef[];
   requirements: ConnectionRequirement[];
@@ -148,6 +152,13 @@ export function RunComposer({
   const [harness, setHarness] = useState("claude-agent-sdk");
   const [model, setModel] = useState("claude-haiku-4-5");
   const [systemPrompt, setSystemPrompt] = useState("");
+  // Spec A (design §4.8): the policy select replaces the old hardcoded
+  // "default", and the governing policy's autonomy_summary gates the autonomy
+  // toggle instead of letting the server 400 at submit.
+  const [policyName, setPolicyName] = useState("default");
+  const [agentPolicyId, setAgentPolicyId] = useState<string | null>(null);
+  const [policies, setPolicies] = useState<PolicySummary[]>([]);
+  const [policiesError, setPoliciesError] = useState("");
   const [workspace, setWorkspace] = useState<WorkspaceDraft>(emptyDraft("scratch"));
   const [pins, setPins] = useState<BundleRef[]>([]);
   // Phase C: the selected revision's declared brokered connection requirements,
@@ -202,6 +213,7 @@ export function RunComposer({
       harness,
       model,
       systemPrompt,
+      policyName,
       workspace,
       pins,
       requirements,
@@ -226,7 +238,7 @@ export function RunComposer({
     }),
     [
       mode, task, autonomous, agentChoice, selectedAgentName, revisionTouched, newAgentName,
-      description, harness, model, systemPrompt, workspace, pins, requirements, bindings, kind,
+      description, harness, model, systemPrompt, policyName, workspace, pins, requirements, bindings, kind,
       automationName, allowTask, allowWorkspace, callbackUrl, concurrency, cron, timezone,
       missedPolicy, connection, repositories, evOpened, evReopened, evSync, pubComment, pubCheck,
       capabilityKeepList,
@@ -279,6 +291,7 @@ export function RunComposer({
     setHarness(saved.harness);
     setModel(saved.model);
     setSystemPrompt(saved.systemPrompt);
+    setPolicyName(saved.policyName ?? "default");
     setWorkspace(saved.workspace);
     setPins(saved.pins);
     setRequirements(saved.requirements);
@@ -307,6 +320,22 @@ export function RunComposer({
     onRestore: restoreDraft,
     shouldPersist: hasDraft,
   });
+
+  // Policy summaries feed the attachment select AND the autonomy gate; the
+  // server computed autonomy_summary — the browser only renders it.
+  useEffect(() => {
+    let active = true;
+    apiGetCached<{ policies: PolicySummary[] }>("/policies", { maxAgeMs: 30_000 })
+      .then((response) => {
+        if (!active) return;
+        setPolicies(response.policies);
+        setPoliciesError("");
+      })
+      .catch((reason) => active && setPoliciesError(`Policies could not be loaded. ${String(reason)}`));
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -347,6 +376,7 @@ export function RunComposer({
             setPins(latest.capability_bundles ?? []);
             setRequirements(latest.connection_requirements ?? []);
             setBindings({}); // re-resolve automatically for the new agent
+            setAgentPolicyId(latest.policy_id);
           }
           setRevisionTouched(false);
         })
@@ -413,6 +443,7 @@ export function RunComposer({
     setHarness(defaultHarness);
     setModel(defaultModelFor(harnesses, defaultHarness) || "claude-haiku-4-5");
     setSystemPrompt("");
+    setPolicyName("default");
     setWorkspace(emptyDraft("scratch"));
     setPins([]);
     setRequirements([]); // a new agent declares its requirements in the editor
@@ -420,6 +451,32 @@ export function RunComposer({
     setRevisionTouched(false);
     setPendingAgentSwitch(null);
   };
+
+  // The policy governing THIS run: the new agent's selection, or the existing
+  // agent's latest revision's attachment. Everything rendered from it —
+  // autonomy permitted, the fallback line — was resolved by the server.
+  const governingPolicy = useMemo(
+    () =>
+      agentChoice === "new"
+        ? policies.find((candidate) => candidate.name === policyName) ?? null
+        : policies.find((candidate) => candidate.id === agentPolicyId) ?? null,
+    [agentChoice, agentPolicyId, policies, policyName]
+  );
+  // Three states, and the asymmetry is deliberate. RESOLVED + permitted →
+  // offer the toggle. RESOLVED + not permitted (including a version-less
+  // policy, whose `autonomy_summary` is null) → forbid: `?.permitted` is
+  // `undefined` there, so the `!` closes it. UNRESOLVED (`governingPolicy`
+  // null — the list is still loading, or the agent's policy is not in it) →
+  // OFFER it: the server is the enforcer and answers 400, whereas disabling a
+  // legitimate choice because a list has not arrived is a real cost for no
+  // security gain. This gate exists to explain a refusal early, not to be one.
+  const autonomyForbidden = governingPolicy !== null && !governingPolicy.autonomy_summary?.permitted;
+
+  // A policy that forbids unattended runs FORCES supervised — merely disabling
+  // the toggle would trap a stale `true` and 400 at submit.
+  useEffect(() => {
+    if (autonomyForbidden && autonomous) setAutonomous(false);
+  }, [autonomous, autonomyForbidden]);
 
   const requestExistingAgent = (name: string) => {
     if (agentChoice === "existing" && selectedAgentName === name) return;
@@ -495,7 +552,7 @@ export function RunComposer({
           harness,
           model,
           system_prompt: systemPrompt.trim() || null,
-          policy: "default",
+          policy: policyName,
           default_workspace: draftToInput(workspace),
           capability_bundles: pins.map((pin) => `${pin.name}@${pin.version}`),
           // Send the draft brokered requirements (incl. any appended by the
@@ -963,6 +1020,33 @@ export function RunComposer({
                 placeholder="You are a careful reviewer. Prefer minimal changes and explain consequential decisions."
               />
             </label>
+            {agentChoice === "new" && (
+              <label className="field">
+                <span className="lab">Policy</span>
+                {policiesError ? (
+                  <span className="err">{policiesError}</span>
+                ) : (
+                  <select
+                    className="inp"
+                    value={policyName}
+                    onChange={(event) => setPolicyName(event.target.value)}
+                  >
+                    {policies.map((candidate) => (
+                      <option key={candidate.id} value={candidate.name}>
+                        {candidate.name} · v{candidate.version}
+                      </option>
+                    ))}
+                    {!policies.some((candidate) => candidate.name === policyName) && (
+                      <option value={policyName}>{policyName}</option>
+                    )}
+                  </select>
+                )}
+                <span className="field-hint">
+                  What this agent may do, and what pauses for a human.{" "}
+                  <Link href="/governance">Author policies in Governance.</Link>
+                </span>
+              </label>
+            )}
           </>
         </ComposerSection>
 
@@ -1088,14 +1172,22 @@ export function RunComposer({
                 className={`toggle mode-card ${autonomous ? "on" : ""}`}
                 onClick={() => setAutonomous((current) => !current)}
                 aria-pressed={autonomous}
+                disabled={autonomyForbidden}
+                title={
+                  autonomyForbidden
+                    ? `Policy '${governingPolicy?.name}' does not permit unattended runs`
+                    : undefined
+                }
               >
                 <span className="sw" />
                 <span>
                   <strong>{autonomous ? "Autonomous runs" : "Supervised runs"}</strong>
                   <span className="faint mode-description">
-                    {autonomous
-                      ? "Policy fallback decides risky actions without waiting for a person."
-                      : "Risky actions pause and wait for your approval."}
+                    {autonomyForbidden
+                      ? `Policy '${governingPolicy?.name}' does not permit unattended runs — every risky action waits for a person.`
+                      : autonomous
+                        ? "Policy fallback decides risky actions without waiting for a person."
+                        : "Risky actions pause and wait for your approval."}
                   </span>
                 </span>
               </button>
@@ -1176,6 +1268,15 @@ export function RunComposer({
               label="Workspace"
               value={workspaceSummary(workspace)}
               sub={`${pins.length} sandbox bundle${pins.length === 1 ? "" : "s"} attached`}
+            />
+            <SpecRow
+              label="Policy"
+              value={governingPolicy ? `${governingPolicy.name} · v${governingPolicy.version}` : agentChoice === "new" ? policyName : "resolving…"}
+              sub={
+                autonomyForbidden
+                  ? "unattended runs not permitted"
+                  : `${governingPolicy?.agents_using ?? 0} agent${(governingPolicy?.agents_using ?? 0) === 1 ? "" : "s"} governed`
+              }
             />
 
             {requirements.length > 0 && (

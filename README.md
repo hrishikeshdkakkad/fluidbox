@@ -174,7 +174,6 @@ The local default is **admin mode**: no login wall, the dashboard proxy injects 
 | `just sandbox-build` | Rebuild the Claude Agent SDK runner image |
 | `just codex-build` | Rebuild the Codex runner image |
 | `just k8s-dev` | Prepare the local kind + Calico Kubernetes development path |
-| `just policy-sync` | Publish `policies/*.yaml`; active runs keep their frozen snapshot |
 
 ## Connect an event
 

@@ -21,62 +21,55 @@ pub async fn run(
     // The boot seed owns the default tenant — a verified scope by construction.
     let scope = TenantScope::assume(tenant);
 
-    // Policies from disk (idempotent upsert; version bumps on change).
-    let mut default_policy_id = None;
-    let mut default_policy_budgets = None;
-    if policies_dir.is_dir() {
-        let mut entries: Vec<_> = std::fs::read_dir(policies_dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .map(|x| x == "yaml" || x == "yml")
-                    .unwrap_or(false)
-            })
-            .collect();
-        entries.sort_by_key(|e| e.path());
-        for entry in entries {
-            let yaml = std::fs::read_to_string(entry.path())?;
-            match Policy::parse_yaml(&yaml) {
-                Ok(policy) => {
-                    let parsed = serde_json::to_value(&policy)?;
-                    // Bootstrap only when absent — never clobber UI edits on reboot.
-                    let (row, inserted) =
-                        seed_policy_if_absent(pool, scope, &policy.name, &yaml, &parsed).await?;
-                    if inserted {
-                        tracing::info!(policy = %policy.name, "seeded policy from disk");
-                    } else {
-                        tracing::debug!(policy = %policy.name, version = row.version, "policy exists; leaving UI-managed version intact");
-                    }
-                    if policy.name == "default" {
-                        default_policy_id = Some(row.id);
-                        default_policy_budgets = Some(policy.budgets.clone());
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(file = %entry.path().display(), "invalid seed policy: {e}");
-                }
-            }
-        }
-    }
+    // Policies from disk (seed-if-absent; an absent policy gets its identity
+    // and version 1, author 'seed', in one transaction).
+    seed_policies_from_dir(pool, scope, policies_dir).await?;
 
-    let default_policy_id = match default_policy_id {
-        Some(id) => id,
-        None => {
-            // Guarantee a fail-safe policy exists even with an empty dir.
-            let p = Policy::parse_yaml("name: default").unwrap();
-            seed_policy_if_absent(
-                pool,
-                scope,
-                "default",
-                "name: default",
-                &serde_json::to_value(&p)?,
+    // The default policy is resolved HERE, in ONE place, from the DATABASE —
+    // not per-file while seeding. Both parts of that matter:
+    //
+    //   • ONE place, so every route into this line agrees: `default.yaml`
+    //     present and valid, present but invalid (warned above), or absent
+    //     entirely. Resolving it inside the seeding loop made it conditional
+    //     on a `default.yaml` EXISTING, which silently handed the curated
+    //     agent `Budgets::default()` whenever the file was not there — a
+    //     ceiling nobody configured.
+    //   • from the DATABASE, because what actually caps a run is the version
+    //     the control plane will evaluate. On a fresh database that is the
+    //     disk document; on an existing one (UI-edited, or a file we just
+    //     warned about) only the stored version is true.
+    //
+    // `seed_policy_if_absent` is the no-op-or-bootstrap that guarantees a
+    // fail-safe `default` exists even with an empty policies dir.
+    let bare = Policy::parse_yaml("name: default").unwrap();
+    let (default_policy, _) = seed_policy_if_absent(
+        pool,
+        scope,
+        "default",
+        "name: default",
+        &serde_json::to_value(&bare)?,
+    )
+    .await?;
+    let default_policy_id = default_policy.id;
+    // A policy with zero versions is a bug, not a state (design §4.2). For
+    // `default` it is a bug that would make EVERY run fail closed at
+    // `create_run`, after provisioning — so refuse the boot instead, where the
+    // message can name the row. `seed_policy_if_absent` cannot heal it: the
+    // identity already exists, so it no-ops, and minting v1 from disk over
+    // someone else's version-less policy would be a guess.
+    let default_policy_budgets = latest_policy_version(pool, scope, default_policy_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "policy 'default' ({default_policy_id}) has no versions — every run on it \
+                 would fail closed after provisioning; repair the row before booting"
             )
-            .await?
-            .0
-            .id
-        }
-    };
+        })
+        .and_then(|v| {
+            serde_json::from_value::<Policy>(v.content)
+                .map_err(|e| anyhow::anyhow!("stored default policy does not deserialize: {e}"))
+        })?
+        .budgets;
 
     // The curated M1 agent: Claude Agent SDK harness, default policy.
     let agent = create_agent(
@@ -87,9 +80,9 @@ pub async fn run(
     )
     .await?;
     if latest_revision(pool, scope, agent.id).await?.is_none() {
-        // The seed policy's budgets are the source of truth for the curated
-        // agent; Budgets::default() is only the no-policy fallback.
-        let budgets = serde_json::to_value(default_policy_budgets.unwrap_or_default())?;
+        // The GOVERNING version's budgets are the source of truth for the
+        // curated agent — resolved above, from the database, on every path.
+        let budgets = serde_json::to_value(default_policy_budgets)?;
         append_agent_revision(
             pool,
             scope,
@@ -112,4 +105,127 @@ pub async fn run(
         tenant_id: tenant,
         default_agent: "claude-fixer".into(),
     })
+}
+
+/// Seed every `*.yaml` in `policies_dir`.
+///
+/// Split out of [`run`] so the refusal rules below are testable against a
+/// throwaway tenant: `run` itself owns the DEFAULT tenant, and a test that
+/// seeded through it would write the curated agent into whatever database
+/// `DATABASE_URL` points at.
+///
+/// Resolving the default policy is deliberately NOT this function's job — see
+/// the comment in [`run`]: doing it per-file made it depend on a `default.yaml`
+/// existing, which silently handed the curated agent `Budgets::default()`
+/// whenever the file was absent.
+pub async fn seed_policies_from_dir(
+    pool: &PgPool,
+    scope: TenantScope,
+    policies_dir: &Path,
+) -> anyhow::Result<()> {
+    if !policies_dir.is_dir() {
+        return Ok(());
+    }
+    let mut entries: Vec<_> = std::fs::read_dir(policies_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map(|x| x == "yaml" || x == "yml")
+                .unwrap_or(false)
+        })
+        .collect();
+    entries.sort_by_key(|e| e.path());
+    for entry in entries {
+        let path = entry.path();
+        let yaml = std::fs::read_to_string(&path)?;
+        // The file's SUBJECT, extracted WITHOUT validating it.
+        //
+        // Not `Policy::parse_yaml`: that one also runs `validate()`, so a file
+        // that is merely INVALID (`match: []`) — as opposed to unnameable —
+        // would refuse the boot here, before the existence check below ever
+        // ran. That is precisely the distinction this function exists to draw,
+        // so the name has to come from a parse that judges nothing.
+        //
+        // "Names a policy" therefore means exactly: parses as YAML, and has a
+        // top-level string `name`. A file that fails THAT cannot be reasoned
+        // about at all, so it refuses regardless of what exists.
+        let subject_name = serde_yaml::from_str::<serde_json::Value>(&yaml)
+            .ok()
+            .and_then(|v| {
+                v.get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|n| n.to_string())
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unreadable seed policy {}: it is not YAML with a top-level string `name`, \
+                     so there is no policy to reason about",
+                    path.display()
+                )
+            })?;
+        // The static /v1/policies/* routes shadow /{name}; the API refuses
+        // these names (api.rs::reject_reserved_name, off the same core
+        // const) and a seed must not smuggle one in from disk.
+        if fluidbox_core::policy::is_reserved_policy_name(&subject_name) {
+            anyhow::bail!(
+                "seed policy file {} uses the API-reserved name '{}' — the static \
+                 /v1/policies/* routes shadow /{{name}}, so the policy would be \
+                 unreachable by its own URL",
+                path.display(),
+                subject_name
+            );
+        }
+
+        // STRICT is what may actually SEED: a typo'd key must never become a
+        // silently-weaker version 1. The CONSEQUENCE, though, is scaled to what
+        // is actually at stake — refusing a boot is itself an outage, and it
+        // buys nothing when the file cannot write anything:
+        //
+        //   • policy ABSENT  — the file is its only source. Refuse the boot.
+        //   • policy PRESENT — `seed_policy_if_absent` is already a no-op for
+        //     it; the database's versions govern and the file writes NOTHING.
+        //     Warn loudly and carry on.
+        //
+        // The existence check happens HERE, on the failure path only. That is
+        // both cheaper (the happy path loses a query) and tighter: the answer
+        // is read as late as possible, so a policy created by a racing replica
+        // between the parse and this lookup is seen, not missed.
+        match Policy::parse_yaml_strict(&yaml) {
+            Ok(policy) => {
+                let parsed = serde_json::to_value(&policy)?;
+                // Bootstrap only when absent — never clobber UI edits on reboot.
+                let (row, inserted) =
+                    seed_policy_if_absent(pool, scope, &policy.name, &yaml, &parsed).await?;
+                if inserted {
+                    tracing::info!(policy = %policy.name, "seeded policy from disk");
+                } else {
+                    tracing::debug!(policy = %policy.name, id = %row.id, "policy exists; leaving UI-managed versions intact");
+                }
+            }
+            Err(e) => {
+                if get_policy_by_name(pool, scope, &subject_name)
+                    .await?
+                    .is_some()
+                {
+                    tracing::warn!(
+                        policy = %subject_name,
+                        file = %path.display(),
+                        "seed policy file is INVALID and was NOT seeded: {e} — this policy \
+                         already exists, so its database versions govern and the file writes \
+                         nothing; repair it before it is needed on a fresh database"
+                    );
+                } else {
+                    anyhow::bail!(
+                        "invalid seed policy {}: {e} — policy '{}' does not exist yet, so this \
+                         file is its ONLY source; repair it rather than boot a weaker policy \
+                         than authored",
+                        path.display(),
+                        subject_name
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
