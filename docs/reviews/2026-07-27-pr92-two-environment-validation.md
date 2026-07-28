@@ -444,6 +444,23 @@ CloudFormation stacks, ECR repositories and IAM/OIDC. Pre-existing unrelated inf
 same account (the `forceplatforms` VPC/NAT and a `DELETE_FAILED` ECS stack dating to 2025-01-08)
 was identified and left untouched.
 
+## 11b. Where each finding was filed
+
+Everything not fixed inside PR #92 has a tracking item. Routing follows `SECURITY.md`, which
+directs vulnerabilities to private advisories rather than public issues — the repository is public.
+
+| Finding | Filed as |
+|---|---|
+| Agent tool calls bypass the permission gate (§8b) | **Private advisory** `GHSA-74v8-gg34-28q8` (draft) — includes the sandbox fail-open egress window as a related containment gap |
+| Sandbox has unrestricted egress during the VPC CNI fail-open window (§8c) | same advisory |
+| netpol probe races async policy programming ⇒ no run can be created on EKS (§8c) | [#96](https://github.com/hrishikeshdkakkad/fluidbox/issues/96) — fails **closed**, so availability rather than vulnerability |
+| `0026` header misdescribes the chart's update strategy (D1) | [#97](https://github.com/hrishikeshdkakkad/fluidbox/issues/97) — CHANGELOG corrected in this PR; the migration comment deliberately left unedited (sqlx checksum) |
+| Serializer asymmetry, tenant-predicate convention, N+1, clone bounds, import `yaml_source` drift (D3, F3-F6) | [#98](https://github.com/hrishikeshdkakkad/fluidbox/issues/98) |
+| `governance-e2e` cannot catch runner-side regressions | [#99](https://github.com/hrishikeshdkakkad/fluidbox/issues/99) |
+
+Fixed inside this PR and therefore not filed: the CHANGELOG upgrade guidance (D1) and the
+`just policy-sync` reference in `policies/default.yaml` (D2).
+
 ## 12. Verdict
 
 **PASS WITH RISKS — merge-ready.**
