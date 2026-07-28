@@ -4,8 +4,11 @@
 # The shell classifier and budgets below are the PLAN.md §10 #1/#3 decisions,
 # resolved 2026-07-10 from live-run ledger data and pinned by the
 # `seed_policy_semantics` test in fluidbox-core (change both together).
-# Applying edits to a running deployment: `just policy-sync` (version++;
-# in-flight runs keep their frozen snapshot).
+# This file is the BOOT SEED for a fresh database only — `seed_policy_if_absent`
+# never re-applies it over an existing policy. Edit a running deployment through
+# the Governance page (each publish appends an immutable version), or import YAML
+# with `POST /v1/policies` (also appends; byte-equal content is a no-op). Either
+# way, in-flight runs keep the snapshot their RunSpec froze.
 name: default
 defaults:
   tool_action: approve
