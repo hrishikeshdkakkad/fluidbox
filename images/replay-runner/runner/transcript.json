@@ -1,0 +1,26 @@
+[
+  {
+    "say": "This is a replay of a recorded run — deterministic, no model calls. Task: fix the failing test, then deploy. Starting with the test suite."
+  },
+  { "tool": "Bash", "input": { "command": "./run_tests.sh" } },
+  {
+    "say": "greet() returns the literal string \"Hello, name!\" instead of using its argument. Fixing app.js."
+  },
+  {
+    "tool": "Edit",
+    "input": {
+      "file_path": "/workspace/app.js",
+      "old_string": "\"Hello, name!\"",
+      "new_string": "\"Hello, \" + name + \"!\""
+    }
+  },
+  { "tool": "Bash", "input": { "command": "./run_tests.sh" } },
+  { "say": "Tests are green. Checking the service's upstream health endpoint before deploying." },
+  {
+    "tool": "Bash",
+    "input": { "command": "curl -s https://status.demo.internal/health" },
+    "on_deny_say": "Outbound network calls are denied by policy in this sandbox — skipping the health check and moving on."
+  },
+  { "tool": "Bash", "input": { "command": "./deploy.sh" } },
+  { "say": "Done. The failing test is fixed and verified; the deploy decision was yours." }
+]
