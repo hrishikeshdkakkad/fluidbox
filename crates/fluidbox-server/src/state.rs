@@ -238,6 +238,16 @@ pub struct AppStateInner {
     /// NetworkPolicy. `create_run` refuses while false + require_enforced_netpol
     /// (fails closed). Always true for Docker (a different isolation model).
     pub netpol_verified: std::sync::atomic::AtomicBool,
+    /// The netpol gate's resolved probe targets (internal/public Service
+    /// ClusterIPs), stored by the gate worker BEFORE each verification so a
+    /// `netpol_verified=true` gate implies targets are present. The
+    /// orchestrator freezes them into every sandbox's `NetworkAdmission` —
+    /// the per-pod startup-isolation gate observes the same two targets the
+    /// certification probe did. Never cleared once set (ClusterIPs are stable
+    /// for a Service's lifetime); on lock poisoning readers fail toward None,
+    /// which the k8s provider REFUSES fail-closed when enforcement is
+    /// required.
+    pub netpol_targets: std::sync::RwLock<Option<NetpolTargets>>,
     /// OIDC login runtime: the generation-keyed JWKS cache (singleflight
     /// refresh + negative-kid cache) and the fixed-window login rate counters.
     /// In-memory, single-replica (v1); a restart re-seeds from the DB caches.
@@ -266,3 +276,13 @@ pub struct AppStateInner {
 }
 
 pub type AppState = Arc<AppStateInner>;
+
+/// The two netpol probe targets, as resolved by the gate worker: the internal
+/// Service ClusterIP (positive — must be reachable from a sandbox) and the
+/// public Service ClusterIP (negative — must be blocked). Ports are the
+/// chart-fixed Service ports (8788/8787), applied where these are consumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetpolTargets {
+    pub internal_ip: String,
+    pub public_ip: String,
+}

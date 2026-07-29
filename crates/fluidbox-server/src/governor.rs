@@ -1965,6 +1965,7 @@ mod tests {
             network_mode: fluidbox_core::traits::NetworkMode::HostDev,
             require_enforced_netpol: false,
             netpol_probe_image: String::new(),
+            netpol_wait_secs: crate::config::DEFAULT_NETPOL_WAIT_SECS,
             internal_service: None,
             internal_service_namespace: None,
             max_archive_bytes: 0,
