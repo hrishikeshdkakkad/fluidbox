@@ -1,9 +1,40 @@
-# Local dev composition. Only the LiteLLM model gateway runs in Docker here;
-# the fluidbox server and dashboard run on the host (`just dev`).
+# Local dev composition: the Postgres control-plane database and the LiteLLM
+# model gateway. The fluidbox server and dashboard run on the host (`just dev`).
 #
 # LiteLLM is pinned to a known-clean release and bound to loopback only.
 # Sandboxes never talk to it — only the fluidbox session facade does.
 services:
+  # The control-plane database. This is a DIRECT connection (no PgBouncer), so
+  # LISTEN/NOTIFY and sqlx prepared statements both work — the property the
+  # Neon setup had to get right by picking the non-pooler endpoint.
+  #
+  # Bound to 5433 on the host, NOT 5432: a Homebrew postgres already owns 5432
+  # on this machine and silently connecting to the wrong server is worse than
+  # a port that looks unusual.
+  #
+  # Data lives in the named volume `fluidbox-pgdata` and survives `down`,
+  # restarts, and reboots. `docker compose down -v` is the only thing that
+  # deletes it — see `just db-reset`.
+  postgres:
+    image: postgres:17-alpine
+    ports:
+      - "127.0.0.1:5433:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-fluidbox}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fluidbox}
+      POSTGRES_DB: ${POSTGRES_DB:-fluidbox}
+    volumes:
+      - fluidbox-pgdata:/var/lib/postgresql/data
+    # The server runs all 26 migrations on boot and fails loudly on a half-open
+    # database, so `just dev` must not race the first-boot initdb.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fluidbox} -d ${POSTGRES_DB:-fluidbox}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    restart: unless-stopped
+
   litellm:
     image: ${LITELLM_IMAGE:-ghcr.io/berriai/litellm:main-stable}
     command: ["--config", "/etc/litellm/config.yaml", "--port", "4000"]
@@ -16,3 +47,6 @@ services:
     volumes:
       - ./litellm/config.yaml:/etc/litellm/config.yaml:ro
     restart: unless-stopped
+
+volumes:
+  fluidbox-pgdata:
