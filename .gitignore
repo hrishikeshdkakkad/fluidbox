@@ -27,3 +27,4 @@ apps/web/.env.local
 
 # Local-only notes (artifact index, scratch docs) — never committed
 *.local.md
+data-gate/
