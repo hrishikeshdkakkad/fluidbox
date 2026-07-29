@@ -5,11 +5,13 @@ import { apiGet } from "../lib/api";
 import { PageHead } from "../components/bits";
 
 export default function Settings() {
-  const [ready, setReady] = useState<{ db: boolean; docker: boolean } | null>(null);
+  // Field names must match `health_ready` in crates/fluidbox-server/src/api.rs —
+  // this generic is an unchecked assertion, not a verified contract.
+  const [ready, setReady] = useState<{ db: boolean; provider_ok: boolean } | null>(null);
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
 
   useEffect(() => {
-    apiGet<{ db: boolean; docker: boolean }>("/health/ready")
+    apiGet<{ db: boolean; provider_ok: boolean }>("/health/ready")
       .then((response) => {
         setReady(response);
         setStatus("ready");
@@ -28,8 +30,8 @@ export default function Settings() {
         {status === "error" && (
           <p className="note">Health status is unavailable; no component is being reported down from a failed read.</p>
         )}
-        <Health label="Database (Neon Postgres)" status={status} ok={ready?.db ?? false} />
-        <Health label="Sandbox runtime (Docker)" status={status} ok={ready?.docker ?? false} />
+        <Health label="Database (Neon Postgres)" status={status} ok={ready?.db} />
+        <Health label="Sandbox runtime (Docker)" status={status} ok={ready?.provider_ok} />
 
         <div className="sectitle">Security model</div>
         <ul style={{ margin: 0, paddingLeft: 18, color: "var(--ink-2)", fontSize: 13, lineHeight: 1.9 }}>
@@ -49,9 +51,13 @@ function Health({
   status,
 }: {
   label: string;
-  ok: boolean;
+  /** `undefined` = the read succeeded but said nothing about this component. */
+  ok: boolean | undefined;
   status: "loading" | "ready" | "error";
 }) {
+  // TODO(you): decide how a successful read that OMITS this component should render.
+  // Today `undefined` falls through to "down"/err — the same output as an observed
+  // failure — which is what made the Docker row lie when the API renamed the field.
   const labelText = status === "loading" ? "checking" : status === "error" ? "unavailable" : ok ? "connected" : "down";
   const badgeTone = status === "ready" ? (ok ? "ok" : "err") : "warn";
   return (

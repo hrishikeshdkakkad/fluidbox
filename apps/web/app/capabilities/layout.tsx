@@ -1,8 +1,8 @@
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
-  title: "Capabilities",
-  description: "Tool connections and immutable capability bundles for agents.",
+  title: "MCP",
+  description: "MCP tool connections and immutable server bundles for agents.",
 };
 
 export default function CapabilitiesLayout({ children }: LayoutProps<"/capabilities">) {
