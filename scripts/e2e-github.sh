@@ -474,8 +474,11 @@ wait_req POST "/repos/acme/site/check-runs" 2 "" 40 \
 [ "$(req_count POST "/repos/acme/site/issues/1/comments" "$AGA")" = "1" ] && ok "A's comment carries agent name (attributable)" || no "A attribution"
 [ "$(req_count POST "/repos/acme/site/check-runs" "fluidbox/gh-sub-b-$$")" = "1" ] && ok "B's check named fluidbox/<subscription>" || no "B check name"
 [ "$(req_count POST "/repos/acme/site/check-runs" "$HEAD1")" = "2" ] && ok "checks pinned to the head SHA" || no "check sha"
+# A: comment. C: comment + check — checks record their own identity row since
+# #33 (adoption keys on the app-controlled external_id, which needs the row).
+# The old expectation of 2 predates that and was stale.
 ER=$(pq "select count(*) from external_results where subscription_id in ('$SUBA','$SUBC')")
-[ "$ER" = "2" ] && ok "stable comment identities recorded (one per subscription+PR)" || no "external_results: $ER"
+[ "$ER" = "3" ] && ok "stable publish identities recorded (A comment; C comment+check)" || no "external_results: $ER"
 AUTH_OK=$(python3 - "$GH_LOG" <<'PYEOF'
 import json, sys
 n = 0
@@ -661,7 +664,11 @@ C3S=$(pq "select status from integration_connections where provider='github_app'
 curl -s -X POST "http://127.0.0.1:$GH_PORT/_fixture/add/$FOREIGN_IID" -d '{"login":"acme4","app":"9876"}' >/dev/null
 pq "insert into integration_connections
       (id, tenant_id, provider, external_account_id, display_name, credential_sealed, auth_kind, status)
-    values (gen_random_uuid(), (select id from tenants limit 1), 'github_app', '$FOREIGN_IID',
+    values (gen_random_uuid(),
+            -- the REGISTRATION's tenant, never 'limit 1': the suite DB holds
+            -- dozens of tenants and an unordered pick lands the fixture in the
+            -- wrong one, where the tenant-scoped sync can't see it (flake).
+            (select tenant_id from github_app_registrations where id='$REG'), 'github_app', '$FOREIGN_IID',
             'e2e-foreign-$FOREIGN_IID', '\\x00'::bytea, 'static', 'active')" >/dev/null
 CODE=$(post "/github/app/$REG/sync" '{}')
 [ "$CODE" = "200" ] && ok "sync & activate ran (admin intent)" || no "sync: $CODE $(cat "$B")"

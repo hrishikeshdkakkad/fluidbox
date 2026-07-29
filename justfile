@@ -27,8 +27,10 @@ k8s-doctor NS="fluidbox":
 collector-build:
     docker build -t ${FLUIDBOX_COLLECTOR_IMAGE:-fluidbox-workspaced:dev} -f deploy/workspaced.Dockerfile .
 
-# Everything: LiteLLM gateway + server + web (ctrl-c stops all)
+# Everything: Postgres + LiteLLM gateway + server + web (ctrl-c stops the
+# host processes; the containers keep running — `just db-down` stops the DB).
 dev:
+    just db-up
     just gateway-up
     (trap 'kill 0' EXIT; cargo run -p fluidbox-server & (cd apps/web && pnpm dev) & wait)
 
@@ -44,8 +46,10 @@ web:
 gateway-up:
     docker compose -f deploy/docker-compose.dev.yml up -d litellm
 
+# Stops ONLY the gateway. It used to `down` the whole composition, which now
+# would take the database with it.
 gateway-down:
-    docker compose -f deploy/docker-compose.dev.yml down
+    docker compose -f deploy/docker-compose.dev.yml stop litellm
 
 # Build the Claude sandbox runner image (context = images/, shared with codex)
 sandbox-build:
@@ -56,8 +60,34 @@ codex-build:
     docker build -t ${FLUIDBOX_CODEX_SANDBOX_IMAGE:-fluidbox-codex-runner:dev} -f images/codex-runner/Dockerfile images
 
 # ── Database ─────────────────────────────────────────────────────────────
+#
+# Local development runs Postgres in a container with a named volume
+# (`fluidbox-pgdata`), published on 127.0.0.1:5433 — 5432 is commonly already
+# taken by a Homebrew postgres. Data survives restarts and reboots; only
+# `just db-reset` destroys it. The server applies all migrations on boot, so
+# a fresh volume needs no manual step.
 
-# Provision a Neon project and write the DIRECT connection string into .env
+# Start the local Postgres container and wait until it accepts connections.
+db-up:
+    docker compose -f deploy/docker-compose.dev.yml up -d --wait postgres
+
+# Stop the database, KEEPING the data volume.
+db-down:
+    docker compose -f deploy/docker-compose.dev.yml stop postgres
+
+# DESTROY the local database and start a clean one (drops the volume, then
+# re-creates it; the next server boot re-runs migrations and re-seeds).
+db-reset:
+    docker compose -f deploy/docker-compose.dev.yml rm -sf postgres
+    docker volume rm -f deploy_fluidbox-pgdata
+    just db-up
+
+# Tail the database container's logs.
+db-logs:
+    docker compose -f deploy/docker-compose.dev.yml logs -f postgres
+
+# Provision a Neon project and write the DIRECT connection string into .env.
+# Only needed for a hosted/remote deployment — local dev uses `just db-up`.
 neon-setup:
     ./scripts/neon-setup.sh
 

@@ -537,11 +537,13 @@ function TimelineItem({ ev }: { ev: EventRow }) {
         </>
       );
       break;
+    // NOTE: the case key is the control plane's event type — do not rename it.
+    // `tag` and the body below are display copy only.
     case "capability.frozen":
-      tag = "capability";
+      tag = "mcp";
       body = (
         <>
-          capabilities frozen: <span className="em">{((d.bundles as string[]) || []).join(", ")}</span>
+          MCP servers frozen: <span className="em">{((d.bundles as string[]) || []).join(", ")}</span>
           <span className="mut"> · {s("tools")} tools photographed</span>
         </>
       );
