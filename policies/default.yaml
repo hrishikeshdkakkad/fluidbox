@@ -34,7 +34,14 @@ autonomy:
   on_approval_rule: deny
 tools:
   # Reading and searching are safe anywhere in the sandbox.
-  - match: ["Read", "Glob", "Grep", "LS", "TodoWrite", "Task", "NotebookRead"]
+  #
+  # ToolSearch is here because the gate can now SEE it. Until the PreToolUse
+  # hook landed, the Claude Code CLI auto-approved this whole class and the
+  # calls never reached /permission at all; with the gate mandatory they do,
+  # and an unmatched tool falls to defaults.tool_action (approve), which would
+  # pause every run on the agent's own tool-discovery calls. It reads tool
+  # schemas and executes nothing, so it belongs with the other read-only tools.
+  - match: ["Read", "Glob", "Grep", "LS", "TodoWrite", "Task", "NotebookRead", "ToolSearch"]
     action: allow
 
   # Edits are free inside the workspace; anything else asks a human.
