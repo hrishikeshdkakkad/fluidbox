@@ -119,7 +119,7 @@ Phases, each timed and printed:
    demo containers by label) is torn down first; `just demo` is therefore idempotent and
    double-invocation-safe.
 3. **Start** — compose project `fluidbox-demo` (its own file
-   `deploy/docker-compose.demo.yml`): `postgres:17-alpine` on `127.0.0.1:5434`, volume
+   `deploy/docker-compose.demo.yml`): `postgres:17-alpine` on `127.0.0.1:15434`, volume
    `fluidbox-demo-pgdata`. `cargo build` (first run compiles; say so honestly with a
    progress note) then run `fluidbox-server` bound to the demo ports with a
    generated-per-run admin token, `FLUIDBOX_DATA_DIR=$DEMO_DIR/data`,
@@ -148,8 +148,8 @@ Phases, each timed and printed:
 
 Isolation: demo never reads `.env` (self-contained env; only peeks at
 `ANTHROPIC_API_KEY` for the next-step hint), never touches `fluidbox-pgdata`, dev ports
-(8787/8788/5433/4000/3000), or the user's data dir. Demo ports: server **8790** (public)
-/ **8791** (internal bind, set explicitly), Postgres **5434**; overridable via
+(8787/8788/5433/4000/3000), or the user's data dir. Demo ports: server **19790** (public)
+/ **19791** (internal bind, set explicitly), Postgres **15434**; overridable via
 `FLUIDBOX_DEMO_PORT` / `FLUIDBOX_DEMO_DB_PORT`. `$DEMO_DIR` = `.demo/` in the repo
 (gitignored).
 
@@ -168,7 +168,7 @@ Isolation: demo never reads `.env` (self-contained env; only peeks at
 
 On this machine, with the user's dev stack left running untouched: approve path,
 deny path, approval-timeout path, Ctrl-C mid-run, double invocation, port-collision
-drill (occupy 8790), docker-down drill (DOCKER_HOST pointed at a dead socket), health
+drill (occupy the demo port), docker-down drill (DOCKER_HOST pointed at a dead socket), health
 timeout drill (unreachable DB port), and `just demo-down` leaving zero
 containers/volumes/processes/dirs. Each drill's transcript is captured under
 `docs/reviews/2026-07-29-demo-validation/` together with the raw events JSON, artifact
