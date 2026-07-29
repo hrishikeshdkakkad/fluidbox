@@ -22,18 +22,19 @@ just check          # fmt + clippy -D warnings + test + web build (the full bar)
 just e2e            # full acceptance: live demo A + governance + git workspaces + api triggers + schedules + github fan-out + capability catalog + connector catalog/oauth + failure paths (owns the stack; stop `just dev` first)
 
 cargo test -p fluidbox-core                              # fast, no DB needed
-cargo test -p fluidbox-db                                # needs DATABASE_URL (real Neon)
+cargo test -p fluidbox-db                                # needs DATABASE_URL (local container Postgres)
 cargo test -p fluidbox-core policy::tests::               # a single module's tests
 cargo run -p fluidbox-cli -- run --task "…" --repo /path # drive a run from the CLI
 ```
 
-The `fluidbox-db` and workspace-wide test runs hit **real Neon** — `set -a; source .env; set +a` first so `DATABASE_URL` is present, otherwise the DB test self-skips.
+The `fluidbox-db` and workspace-wide test runs hit the **local container Postgres** (`just db-up` first) — `set -a; source .env; set +a` so `DATABASE_URL` is present, otherwise the DB test self-skips. These no longer touch a hosted database, so they are cheap and safe to run: the full workspace suite is 850 tests in seconds.
 
 ## Environment & setup gotchas (these cost real debugging time)
 
 - **`FLUIDBOX_BIND` must be `0.0.0.0:8787`, not loopback.** Sandboxes reach the control plane via `host.docker.internal`, which resolves to the host's gateway IP — a `127.0.0.1` bind is unreachable from a container.
 - **`FLUIDBOX_DATA_DIR` is canonicalized to an absolute path at startup** (`config.rs`). Docker bind mounts reject relative paths; don't undo this.
-- **Neon: use the DIRECT (non-`-pooler`) connection string.** PgBouncer transaction mode breaks sqlx prepared statements and `LISTEN/NOTIFY` (`PgListener` needs a direct connection). `scripts/neon-setup.sh` enforces this.
+- **Local dev runs Postgres in a container, NOT Neon** (`deploy/docker-compose.dev.yml`, `just db-up`): `postgres:17-alpine`, named volume `fluidbox-pgdata`, published on **127.0.0.1:5433** — 5432 is commonly already taken by a Homebrew postgres. Data survives restarts; only `just db-reset` destroys it. The server applies all migrations on boot, so a fresh volume needs no provisioning step. The container's `POSTGRES_USER` is a SUPERUSER, i.e. the same RLS posture Neon's `neondb_owner` had (0018's policies exist but PostgreSQL skips them; boot warns, single-user tolerated) — set `FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime` to actually enforce RLS locally (0018 creates that role NOLOGIN/non-super/non-bypass, verified present).
+- **Neon (hosted only): use the DIRECT (non-`-pooler`) connection string.** PgBouncer transaction mode breaks sqlx prepared statements and `LISTEN/NOTIFY` (`PgListener` needs a direct connection). `scripts/neon-setup.sh` enforces this. Nothing in the Rust is Neon-specific — `NEON_AUTOSUSPEND_SECS` only bounds the pool idle timeout — so any direct Postgres works.
 - **The Anthropic key lives ONLY in the LiteLLM container**, injected via docker-compose from `.env`. The Rust server never holds it (it authenticates to LiteLLM with `LITELLM_MASTER_KEY`). No server restart is needed after adding the key — just `just gateway-up`.
 - **`.env` is gitignored; `apps/web/.env.local` too** (it carries the admin token for the dashboard proxy). Never commit either.
 - sqlx needs the `macros` + `derive` features; clap needs `env`; reqwest 0.13 uses the `rustls` feature (not `rustls-tls`). LiteLLM is pinned by **digest** in `.env` (`LITELLM_IMAGE=...@sha256:...`); tag `main-v1.91.1` does not exist as an image — use `main-stable` and re-pin the digest.

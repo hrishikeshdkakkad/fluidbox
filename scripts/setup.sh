@@ -89,6 +89,22 @@ else
   note "already in sync with .env"
 fi
 
+say "local database"
+# The default DATABASE_URL points at this container. Starting it here means a
+# fresh clone can boot the server immediately — migrations run on boot, so
+# there is nothing else to provision. A hosted deployment overrides
+# DATABASE_URL and simply never uses this container.
+db_url=$(env_get "$ENV" DATABASE_URL)
+case "$db_url" in
+  *127.0.0.1:5433*|*localhost:5433*)
+    docker compose -f "$ROOT/deploy/docker-compose.dev.yml" up -d --wait postgres
+    note "local Postgres up on 127.0.0.1:5433 (named volume: fluidbox-pgdata)"
+    ;;
+  *)
+    note "DATABASE_URL points elsewhere — skipping the local Postgres container"
+    ;;
+esac
+
 say "dashboard dependencies"
 (cd "$ROOT/apps/web" && pnpm install)
 
