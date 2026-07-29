@@ -160,7 +160,7 @@ export function ResourceOverview({
             count={snapshot.agents.length}
             description={
               snapshot.agents.length === 0
-                ? "Create the reusable runtime, model, instructions, workspace, and capability configuration for a run."
+                ? "Create the reusable runtime, model, instructions, workspace, and MCP configuration for a run."
                 : "Versioned definitions available to manual and automated runs."
             }
             items={snapshot.agents.map((agent) => agent.name)}
@@ -194,7 +194,7 @@ export function ResourceOverview({
           <ResourceCard
             tone="capability"
             eyebrow="Optional"
-            title="Capabilities"
+            title="MCP"
             count={latestBundles.length}
             description={
               latestBundles.length === 0
@@ -202,7 +202,7 @@ export function ResourceOverview({
                 : `${activeToolConnections.length} active tool connection${activeToolConnections.length === 1 ? "" : "s"}; exact bundle versions are pinned on agents.`
             }
             items={latestBundles.map((bundle) => `${bundle.name}@${bundle.version}`)}
-            action={<button className="btn sm" type="button" onClick={onAddCapability}>{latestBundles.length === 0 ? "Add Capability" : "Add Another"}</button>}
+            action={<button className="btn sm" type="button" onClick={onAddCapability}>{latestBundles.length === 0 ? "Add MCP Server" : "Add Another"}</button>}
             secondary={<Link className="resource-secondary" href="/capabilities">Manage</Link>}
           />
         </div>

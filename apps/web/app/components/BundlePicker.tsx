@@ -36,7 +36,7 @@ export function BundlePicker({
           if (active) setRegistry(r.bundles);
         })
         .catch((error) => {
-          if (active) setLoadError(`Tool bundles could not be loaded. ${String(error)}`);
+          if (active) setLoadError(`Tools could not be loaded. ${String(error)}`);
         })
         .finally(() => {
           if (active) setLoading(false);
@@ -102,8 +102,8 @@ export function BundlePicker({
   if (loading && names.length === 0) {
     return (
       <div className="field">
-        <span className="lab">Sandbox tool bundles</span>
-        <span className="helper">Loading registered bundles…</span>
+        <span className="lab">Built-in tools</span>
+        <span className="helper">Loading…</span>
       </div>
     );
   }
@@ -111,10 +111,10 @@ export function BundlePicker({
   if (loadError && names.length === 0) {
     return (
       <div className="field">
-        <span className="lab">Sandbox tool bundles</span>
+        <span className="lab">Built-in tools</span>
         <div className="err" role="alert">{loadError}</div>
         <button className="btn" type="button" onClick={() => setRetryKey((current) => current + 1)}>
-          Retry bundles
+          Try again
         </button>
       </div>
     );
@@ -123,14 +123,14 @@ export function BundlePicker({
   if (names.length === 0) {
     return (
       <div className="field">
-        <span className="lab">Sandbox tool bundles</span>
+        <span className="lab">Built-in tools</span>
         <span className="helper">
-          None registered yet. Connect an MCP server to photograph its tools into a versioned bundle.
+          None yet. Add a tool server to make its tools available to your agents.
         </span>
         {onAddServer ? (
-          <button className="btn" type="button" onClick={onAddServer}>Connect an MCP server</button>
+          <button className="btn" type="button" onClick={onAddServer}>Add a tool server</button>
         ) : (
-          <Link href="/capabilities" className="btn">Open capabilities</Link>
+          <Link href="/capabilities" className="btn">Open MCP</Link>
         )}
       </div>
     );
@@ -138,9 +138,9 @@ export function BundlePicker({
   return (
     <div className="field">
       <div className="bundle-picker-head">
-        <span className="lab">Sandbox tool bundles — exact version pins</span>
+        <span className="lab">Built-in tools</span>
         {onAddServer && (
-          <button className="btn ghost sm" type="button" onClick={onAddServer}>Connect new MCP</button>
+          <button className="btn ghost sm" type="button" onClick={onAddServer}>Add a tool server</button>
         )}
       </div>
       {loadError && (
@@ -187,7 +187,7 @@ export function BundlePicker({
                 {shown.tool_count} tool{shown.tool_count === 1 ? "" : "s"}
                 {[...new Set(shown.classes)].map((c) => (
                   <span key={c} className={`badge ${c === "brokered" ? "brand" : ""}`}>
-                    {c}
+                    {c === "brokered" ? "needs an account" : "built in"}
                   </span>
                 ))}
               </span>

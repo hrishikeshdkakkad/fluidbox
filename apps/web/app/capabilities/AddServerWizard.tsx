@@ -477,12 +477,12 @@ export function AddServerWizard({
               </Link>
             )}
             <button className="btn primary" onClick={finish}>
-              {embedded ? "Use this capability" : "Done"}
+              {embedded ? "Use this MCP server" : "Done"}
             </button>
           </div>
           {doneBundle && (
             <p className="helper" style={{ marginTop: 8 }}>
-              Pick <span className="mono">{doneBundle.name}</span> under Capabilities when composing
+              Pick <span className="mono">{doneBundle.name}</span> under MCP when composing
               the agent.
             </p>
           )}
@@ -496,11 +496,11 @@ export function AddServerWizard({
       <section className="embedded-connector" aria-label="Connect an MCP server">
         <div className="embedded-connector-head">
           <div>
-            <span className="section-kicker">Capability setup</span>
+            <span className="section-kicker">MCP setup</span>
             <h3>Add an MCP server</h3>
             <p>Detect its authentication, connect it, and attach the resulting bundle without leaving this flow.</p>
           </div>
-          <button className="btn ghost sm" type="button" onClick={requestClose}>Back to capabilities</button>
+          <button className="btn ghost sm" type="button" onClick={requestClose}>Back to MCP</button>
         </div>
         {confirmClose && (
           <div className="discard-confirm embedded-discard" role="alert">

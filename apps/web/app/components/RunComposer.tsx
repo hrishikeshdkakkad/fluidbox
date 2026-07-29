@@ -19,7 +19,7 @@ import {
 import { AddServerWizard } from "../capabilities/AddServerWizard";
 import { defaultModelFor, modelsFor, useHarnesses } from "../lib/harnesses";
 import { useAuthMe } from "../lib/useAuthMe";
-import { BundlePicker } from "./BundlePicker";
+import { AppPicker } from "./AppPicker";
 import { HarnessPicker } from "./HarnessPicker";
 import { describeSchedule, localTimezone, parseCron, ScheduleBuilder } from "./ScheduleBuilder";
 import {
@@ -54,6 +54,9 @@ interface RunComposerDraft {
   systemPrompt: string;
   /** New-agent policy attachment (spec A); absent in pre-attachment drafts. */
   policyName?: string;
+  /** Guardrail-preset rules switch for an EXISTING agent (rides the appended
+   *  revision as `policy`); null/absent = keep the agent's own rules. */
+  policyOverride?: string | null;
   workspace: WorkspaceDraft;
   pins: BundleRef[];
   requirements: ConnectionRequirement[];
@@ -157,6 +160,9 @@ export function RunComposer({
   // toggle instead of letting the server 400 at submit.
   const [policyName, setPolicyName] = useState("default");
   const [agentPolicyId, setAgentPolicyId] = useState<string | null>(null);
+  // Guardrail presets can switch an EXISTING agent's rules; the switch rides
+  // the same appended revision as any other change (AddRevision.policy).
+  const [policyOverride, setPolicyOverride] = useState<string | null>(null);
   const [policies, setPolicies] = useState<PolicySummary[]>([]);
   const [policiesError, setPoliciesError] = useState("");
   const [workspace, setWorkspace] = useState<WorkspaceDraft>(emptyDraft("scratch"));
@@ -172,6 +178,12 @@ export function RunComposer({
   const [connectionRefresh, setConnectionRefresh] = useState(0);
   const [addingMcp, setAddingMcp] = useState(false);
   const [addingMcpDirty, setAddingMcpDirty] = useState(false);
+  // Launching an EXISTING agent shows a one-line "uses its saved setup"
+  // summary instead of the full workspace/apps editors; this opts back into
+  // the editors. Defining a new agent always shows them.
+  const [customizeSetup, setCustomizeSetup] = useState(false);
+  // Guardrails: show the raw rules/approvals axes under the presets.
+  const [customGuardrails, setCustomGuardrails] = useState(false);
   const [pendingAgentSwitch, setPendingAgentSwitch] = useState<PendingAgentSwitch | null>(null);
 
   const [kind, setKind] = useState<TriggerKind>("api");
@@ -214,6 +226,7 @@ export function RunComposer({
       model,
       systemPrompt,
       policyName,
+      policyOverride,
       workspace,
       pins,
       requirements,
@@ -238,7 +251,7 @@ export function RunComposer({
     }),
     [
       mode, task, autonomous, agentChoice, selectedAgentName, revisionTouched, newAgentName,
-      description, harness, model, systemPrompt, policyName, workspace, pins, requirements, bindings, kind,
+      description, harness, model, systemPrompt, policyName, policyOverride, workspace, pins, requirements, bindings, kind,
       automationName, allowTask, allowWorkspace, callbackUrl, concurrency, cron, timezone,
       missedPolicy, connection, repositories, evOpened, evReopened, evSync, pubComment, pubCheck,
       capabilityKeepList,
@@ -292,6 +305,7 @@ export function RunComposer({
     setModel(saved.model);
     setSystemPrompt(saved.systemPrompt);
     setPolicyName(saved.policyName ?? "default");
+    setPolicyOverride(saved.policyOverride ?? null);
     setWorkspace(saved.workspace);
     setPins(saved.pins);
     setRequirements(saved.requirements);
@@ -434,6 +448,7 @@ export function RunComposer({
     setAgentChoice("existing");
     setSelectedAgentName(name);
     setRevisionTouched(false);
+    setPolicyOverride(null); // presets re-derive from the newly selected agent
     setPendingAgentSwitch(null);
   };
 
@@ -444,6 +459,7 @@ export function RunComposer({
     setModel(defaultModelFor(harnesses, defaultHarness) || "claude-haiku-4-5");
     setSystemPrompt("");
     setPolicyName("default");
+    setPolicyOverride(null);
     setWorkspace(emptyDraft("scratch"));
     setPins([]);
     setRequirements([]); // a new agent declares its requirements in the editor
@@ -459,8 +475,10 @@ export function RunComposer({
     () =>
       agentChoice === "new"
         ? policies.find((candidate) => candidate.name === policyName) ?? null
-        : policies.find((candidate) => candidate.id === agentPolicyId) ?? null,
-    [agentChoice, agentPolicyId, policies, policyName]
+        : policyOverride !== null
+          ? policies.find((candidate) => candidate.name === policyOverride) ?? null
+          : policies.find((candidate) => candidate.id === agentPolicyId) ?? null,
+    [agentChoice, agentPolicyId, policies, policyName, policyOverride]
   );
   // Three states, and the asymmetry is deliberate. RESOLVED + permitted →
   // offer the toggle. RESOLVED + not permitted (including a version-less
@@ -477,6 +495,74 @@ export function RunComposer({
   useEffect(() => {
     if (autonomyForbidden && autonomous) setAutonomous(false);
   }, [autonomous, autonomyForbidden]);
+
+  // ── Guardrail presets ──────────────────────────────────────────────────
+  // Rules (policy, on the revision) and approvals (autonomous, on the run)
+  // are orthogonal axes with two dead-ish cells. The presets name the three
+  // coherent bundles; Custom keeps the raw axes for anyone who wants them.
+  // "Unrestricted" is resolved by NAME from the loaded summaries — if a
+  // deployment has no such policy, Free rein disables rather than inventing
+  // one.
+  const UNRESTRICTED_RULES = "unrestricted";
+  const unrestrictedPolicy =
+    policies.find((candidate) => candidate.name === UNRESTRICTED_RULES) ?? null;
+  const governedFallback =
+    policies.find((candidate) => candidate.name === "default") ??
+    policies.find((candidate) => candidate.name !== UNRESTRICTED_RULES) ??
+    null;
+  const rulesAreUnrestricted = governingPolicy?.name === UNRESTRICTED_RULES;
+  const basePolicyName =
+    policies.find((candidate) => candidate.id === agentPolicyId)?.name ?? null;
+  // Which preset the current (rules, approvals) state corresponds to; null =
+  // Custom (e.g. unrestricted rules + supervised — the vacuous cell).
+  const activePreset: "autopilot" | "ask" | "free" | null = rulesAreUnrestricted
+    ? autonomous
+      ? "free"
+      : null
+    : autonomous
+      ? "autopilot"
+      : "ask";
+  // The rules a governed preset would run under (used for gating + honesty in
+  // the card copy): the current rules, unless they are unrestricted, in which
+  // case the preset switches to the governed fallback.
+  const governedTarget = rulesAreUnrestricted ? governedFallback : governingPolicy;
+  const applyRules = (name: string) => {
+    if (agentChoice === "new") {
+      setPolicyName(name);
+      return;
+    }
+    if (name === basePolicyName) {
+      setPolicyOverride(null);
+      return;
+    }
+    if ((governingPolicy?.name ?? null) !== name) {
+      setPolicyOverride(name);
+      touchRevision();
+    }
+  };
+  const applyPreset = (preset: "autopilot" | "ask" | "free") => {
+    if (preset === "free") {
+      if (!unrestrictedPolicy) return;
+      applyRules(UNRESTRICTED_RULES);
+      setAutonomous(true);
+      return;
+    }
+    if (rulesAreUnrestricted && governedFallback) applyRules(governedFallback.name);
+    setAutonomous(preset === "autopilot");
+  };
+  // Does picking this preset rewrite an existing agent's rules? Said on the
+  // card BEFORE the click — a run-level choice must not silently edit the
+  // agent. Returns the rules name it would switch to, or null for no change.
+  const presetChangesRules = (preset: "autopilot" | "ask" | "free"): string | null => {
+    if (agentChoice !== "existing") return null;
+    const target =
+      preset === "free"
+        ? UNRESTRICTED_RULES
+        : rulesAreUnrestricted
+          ? (governedFallback?.name ?? null)
+          : (governingPolicy?.name ?? basePolicyName);
+    return target && target !== basePolicyName ? target : null;
+  };
 
   const requestExistingAgent = (name: string) => {
     if (agentChoice === "existing" && selectedAgentName === name) return;
@@ -522,6 +608,12 @@ export function RunComposer({
         return "Choose an active GitHub App connection.";
       }
       if (mode === "once" && !task.trim()) return "Describe what this run should accomplish.";
+      // Mirrors the server's dead-config rule (triggers.rs): an automation
+      // with no task template and no caller override could never produce a
+      // task. Catch it here so the button explains instead of a raw 400.
+      if (mode === "automation" && !task.trim() && !allowTask) {
+        return "Describe the task, or allow the caller to provide one (under advanced controls).";
+      }
     }
     if (agentsLoading || revisionLoading) return "Loading the agent configuration…";
     if (agentChoice === "existing" && !selectedAgentName) return "Choose an agent or create one here.";
@@ -534,7 +626,7 @@ export function RunComposer({
     }
     return "";
   }, [
-    agentOnly, mode, automationName, kind, cron, connection, eventConnectionsError, task, agentsLoading, revisionLoading,
+    agentOnly, mode, automationName, kind, cron, connection, eventConnectionsError, task, allowTask, agentsLoading, revisionLoading,
     agentChoice, selectedAgentName, newAgentName, harnessesError, harnessesLoading, harnesses.length,
     model, workspace,
   ]);
@@ -572,6 +664,9 @@ export function RunComposer({
           default_workspace: draftToInput(workspace),
           capability_bundles: pins.map((pin) => `${pin.name}@${pin.version}`),
           ...(requirements.length > 0 ? { connection_requirements: requirements } : {}),
+          // A guardrail preset that switches rules rides the same revision;
+          // omitted, the revision inherits the agent's current policy.
+          ...(policyOverride !== null ? { policy: policyOverride } : {}),
         });
         setRevisionTouched(false);
       }
@@ -673,7 +768,7 @@ export function RunComposer({
   const kindLabel = kind === "api" ? "API call" : kind === "schedule" ? "Schedule" : "Pull request";
   const bindingLabel = (slot: string): string => {
     const id = bindings[slot];
-    if (!id) return "resolve automatically";
+    if (!id) return "chosen automatically";
     return bindableConnections.find((candidate) => candidate.id === id)?.display_name ?? "selected connection";
   };
 
@@ -682,7 +777,7 @@ export function RunComposer({
       title={agentOnly ? "Create Agent" : "Configure Run"}
       sub={
         agentOnly
-          ? "Define the agent, give it a workspace and capabilities. Everything here becomes one immutable revision."
+          ? "Give your agent a name, something to work on, and the apps it can use."
           : "Everything this run freezes is on this page. The panel on the right updates as you go."
       }
       onClose={onClose}
@@ -1022,7 +1117,7 @@ export function RunComposer({
             </label>
             {agentChoice === "new" && (
               <label className="field">
-                <span className="lab">Policy</span>
+                <span className="lab">Rules</span>
                 {policiesError ? (
                   <span className="err">{policiesError}</span>
                 ) : (
@@ -1042,8 +1137,8 @@ export function RunComposer({
                   </select>
                 )}
                 <span className="field-hint">
-                  What this agent may do, and what pauses for a human.{" "}
-                  <Link href="/governance">Author policies in Governance.</Link>
+                  What this agent may do on its own, and what must ask first.{" "}
+                  <Link href="/governance">Manage the rules in Governance.</Link>
                 </span>
               </label>
             )}
@@ -1052,14 +1147,40 @@ export function RunComposer({
 
         <ComposerSection
           index={agentOnly ? 2 : 3}
-          title="Workspace & tools"
-          hint="What the agent can see and call. Attaching a tool is not the same as allowing it — every call still passes the permission gate."
+          title="What it works on, and with what"
+          hint="Pick what the agent can see and which apps it may use. Adding a tool does not mean it runs freely — every action is still checked against your policy."
         >
           <>
+            {!agentOnly && mode === "once" && agentChoice === "existing" && !revisionTouched && !customizeSetup ? (
+              // The common case — run an existing agent as it is. One glance,
+              // zero decisions; everything stays one click away.
+              <div className="rc-quick-setup">
+                <div className="rc-quick-setup-copy">
+                  <strong>{workspaceSummary(workspace)}</strong>
+                  <span>
+                    {pins.length + requirements.length === 0
+                      ? "no apps attached"
+                      : `${pins.length + requirements.length} app${
+                          pins.length + requirements.length === 1 ? "" : "s"
+                        } attached`}
+                    {" · "}
+                    {selectedAgentName || "this agent"}&apos;s saved setup
+                  </span>
+                </div>
+                <button
+                  className="btn ghost sm"
+                  type="button"
+                  onClick={() => setCustomizeSetup(true)}
+                >
+                  Customize
+                </button>
+              </div>
+            ) : (
+              <>
             {agentChoice === "existing" && (
               <div className="revision-note">
                 <strong>Revision-safe change</strong>
-                <span>Any workspace or capability change appends a new revision to {selectedAgentName} before this run starts.</span>
+                <span>Changing anything here saves a new version of {selectedAgentName} before this run starts.</span>
               </div>
             )}
             <WorkspacePicker
@@ -1069,22 +1190,32 @@ export function RunComposer({
                 touchRevision();
               }}
             />
-            <BundlePicker
+            {/*
+              ONE grid for both tool classes (§8.3): sandbox bundle pins and
+              brokered connection requirements. AppPicker routes each card to
+              the right object internally — the split is the system's anatomy,
+              not the user's. Full-control editors live on the agent page.
+            */}
+            <AppPicker
               pins={pins}
+              requirements={requirements}
               refreshKey={capabilityRefresh}
               onAddServer={() => setAddingMcp(true)}
-              onChange={(nextPins) => {
+              onPinsChange={(nextPins) => {
                 setPins(nextPins);
+                touchRevision();
+              }}
+              onRequirementsChange={(nextRequirements) => {
+                setRequirements(nextRequirements);
                 touchRevision();
               }}
             />
             {mode === "once" && requirements.length > 0 && (
               <div className="field">
-                <span className="lab">Connection bindings</span>
+                <span className="lab">Which account each app uses</span>
                 <span className="field-hint">
-                  This agent needs brokered connections. Leave a slot on “Resolve automatically”
-                  to let the server pick per its binding mode, or bind a specific connection you
-                  can use.
+                  This agent uses apps that need an account. Leave one on “Choose automatically” and
+                  we pick the right account when it runs, or choose a specific one.
                 </span>
                 {bindingConnectionsError && (
                   <div className="catalog-state error-state" role="status">
@@ -1133,7 +1264,7 @@ export function RunComposer({
                             setBindings((current) => ({ ...current, [req.slot]: event.target.value }))
                           }
                         >
-                          <option value="">Resolve automatically</option>
+                          <option value="">Choose automatically</option>
                           {matches.map((c) => {
                             const badge = ownerBadge(c, me?.user_id);
                             const suffix = badge ? ` (${badge.label}${badge.yours ? " · yours" : ""})` : "";
@@ -1157,40 +1288,210 @@ export function RunComposer({
                 </div>
               </div>
             )}
+              </>
+            )}
           </>
         </ComposerSection>
 
         {!agentOnly && (
           <ComposerSection
             index={4}
-            title="Governance"
-            hint="Supervised runs pause before risky actions. Autonomous runs defer to the configured policy."
+            title="Guardrails"
+            hint="How much freedom this run gets. Every action is logged either way."
           >
             <>
-              <button
-                type="button"
-                className={`toggle mode-card ${autonomous ? "on" : ""}`}
-                onClick={() => setAutonomous((current) => !current)}
-                aria-pressed={autonomous}
-                disabled={autonomyForbidden}
-                title={
-                  autonomyForbidden
-                    ? `Policy '${governingPolicy?.name}' does not permit unattended runs`
-                    : undefined
-                }
-              >
-                <span className="sw" />
-                <span>
-                  <strong>{autonomous ? "Autonomous runs" : "Supervised runs"}</strong>
-                  <span className="faint mode-description">
-                    {autonomyForbidden
-                      ? `Policy '${governingPolicy?.name}' does not permit unattended runs — every risky action waits for a person.`
-                      : autonomous
-                        ? "Policy fallback decides risky actions without waiting for a person."
-                        : "Risky actions pause and wait for your approval."}
-                  </span>
+              {/*
+                Three outcome-named presets over the two raw axes (rules ×
+                approvals). Each card states its mechanics in the footer and
+                says UP FRONT when picking it would update the agent's rules —
+                a run-level click must never silently edit the agent. The raw
+                axes stay available below ("choose separately"), and a state
+                no preset matches auto-reveals them as Custom.
+              */}
+              <div className="opt-grid">
+                {(() => {
+                  const fallbackWord =
+                    governedTarget?.autonomy_summary?.default_fallback === "allow"
+                      ? "allowed automatically"
+                      : "declined automatically";
+                  const autopilotBlocked =
+                    (governedTarget !== null && !governedTarget.autonomy_summary?.permitted) ||
+                    (rulesAreUnrestricted && !governedFallback);
+                  const askBlocked = rulesAreUnrestricted && !governedFallback;
+                  const freeBlocked = !unrestrictedPolicy;
+                  const ruleNote = (preset: "autopilot" | "ask" | "free") => {
+                    const target = presetChangesRules(preset);
+                    return target ? (
+                      <>
+                        {" "}
+                        Updates {selectedAgentName || "the agent"}&apos;s rules to “{target}”.
+                      </>
+                    ) : null;
+                  };
+                  return (
+                    <>
+                      <button
+                        type="button"
+                        className={`opt ${activePreset === "autopilot" ? "on" : ""} ${autopilotBlocked ? "off" : ""}`}
+                        onClick={() => !autopilotBlocked && applyPreset("autopilot")}
+                        disabled={autopilotBlocked}
+                        aria-pressed={activePreset === "autopilot"}
+                      >
+                        <span className="t">
+                          Autopilot, reviewed
+                          {activePreset === "autopilot" && (
+                            <span className="selected-label">Selected</span>
+                          )}
+                        </span>
+                        <div className="d">
+                          {governedTarget !== null && !governedTarget.autonomy_summary?.permitted
+                            ? `The ${governedTarget.name} rules require a person to approve — autopilot is off the table.`
+                            : (
+                              <>
+                                Runs start to finish in an isolated copy. Anything the rules flag
+                                is {fallbackWord}; you review the result.
+                                {ruleNote("autopilot")}
+                              </>
+                            )}
+                        </div>
+                        <div className="id">
+                          {governedTarget?.name ?? "current"} rules · runs on its own
+                        </div>
+                      </button>
+                      <button
+                        type="button"
+                        className={`opt ${activePreset === "ask" ? "on" : ""} ${askBlocked ? "off" : ""}`}
+                        onClick={() => !askBlocked && applyPreset("ask")}
+                        disabled={askBlocked}
+                        aria-pressed={activePreset === "ask"}
+                      >
+                        <span className="t">
+                          Ask me as it works
+                          {activePreset === "ask" && <span className="selected-label">Selected</span>}
+                        </span>
+                        <div className="d">
+                          Pauses for your OK whenever it wants to do something the rules flag
+                          {mode === "automation" ? " — approvals land in Activity" : ""}.
+                          {ruleNote("ask")}
+                        </div>
+                        <div className="id">
+                          {governedTarget?.name ?? "current"} rules · waits for you
+                        </div>
+                      </button>
+                      <button
+                        type="button"
+                        className={`opt ${activePreset === "free" ? "on" : ""} ${freeBlocked ? "off" : ""}`}
+                        onClick={() => !freeBlocked && applyPreset("free")}
+                        disabled={freeBlocked}
+                        aria-pressed={activePreset === "free"}
+                      >
+                        <span className="t">
+                          Free rein
+                          {activePreset === "free" && <span className="selected-label">Selected</span>}
+                        </span>
+                        <div className="d">
+                          {freeBlocked
+                            ? "No fully-permissive rules exist yet — create them in Governance."
+                            : (
+                              <>
+                                Never asks, nothing is declined by the rules. Budgets and the
+                                isolated sandbox are the only limits.
+                                {ruleNote("free")}
+                              </>
+                            )}
+                        </div>
+                        <div className="id">unrestricted rules · runs on its own</div>
+                      </button>
+                    </>
+                  );
+                })()}
+              </div>
+              {activePreset !== null ? (
+                <button
+                  className="btn ghost sm"
+                  type="button"
+                  style={{ justifySelf: "start" }}
+                  onClick={() => setCustomGuardrails((current) => !current)}
+                >
+                  {customGuardrails
+                    ? "Hide the separate controls"
+                    : "Choose rules and approvals separately"}
+                </button>
+              ) : (
+                <span className="helper" style={{ margin: 0 }}>
+                  These settings don&apos;t match a preset — shown in full below.
                 </span>
-              </button>
+              )}
+              {(customGuardrails || activePreset === null) && (
+                <>
+              {/*
+                One explicit either/or instead of a flip-toggle whose label
+                changed under the cursor. The rules (policy) are NAMED here so
+                the relationship is visible, and the autonomous card says
+                CONCRETELY what happens to ask-first actions — read from the
+                server-computed autonomy_summary, never derived in the browser.
+              */}
+              {governingPolicy && (
+                <span className="helper" style={{ margin: 0 }}>
+                  This {mode === "once" ? "run" : "automation"} follows the{" "}
+                  <Link href={`/governance/${governingPolicy.name}`} className="link">
+                    {governingPolicy.name}
+                  </Link>{" "}
+                  rules{agentChoice === "new" ? " — chosen in the agent definition above" : ""}.
+                </span>
+              )}
+              <div className="opt-grid">
+                <button
+                  type="button"
+                  className={`opt ${!autonomous ? "on" : ""}`}
+                  onClick={() => setAutonomous(false)}
+                  aria-pressed={!autonomous}
+                >
+                  <span className="t">
+                    Wait for me
+                    {!autonomous && <span className="selected-label">Selected</span>}
+                  </span>
+                  <div className="d">
+                    When the rules say “ask first”, the run pauses until you approve or decline
+                    {mode === "automation" ? " from the Activity feed" : ""}.
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  className={`opt ${autonomous ? "on" : ""} ${autonomyForbidden ? "off" : ""}`}
+                  onClick={() => !autonomyForbidden && setAutonomous(true)}
+                  aria-pressed={autonomous}
+                  disabled={autonomyForbidden}
+                >
+                  <span className="t">
+                    Run on its own
+                    {autonomous && <span className="selected-label">Selected</span>}
+                  </span>
+                  <div className="d">
+                    {autonomyForbidden
+                      ? `The ${governingPolicy?.name ?? "current"} rules don't allow this — a person must be available to approve.`
+                      : `Never pauses. Anything that would ask first is automatically ${
+                          governingPolicy?.autonomy_summary?.default_fallback === "allow"
+                            ? "allowed"
+                            : "declined"
+                        }${
+                          (governingPolicy?.autonomy_summary?.allow_overrides ?? 0) +
+                            (governingPolicy?.autonomy_summary?.deny_overrides ?? 0) >
+                          0
+                            ? " (the rules make a few per-tool exceptions)"
+                            : ""
+                        }, and every action is logged.`}
+                  </div>
+                </button>
+              </div>
+                </>
+              )}
+              {mode === "automation" && !autonomous && (
+                <span className="field-hint">
+                  Automations can fire while you&apos;re away — approvals wait in Activity and are
+                  declined if the time limit passes.
+                </span>
+              )}
 
               {mode === "automation" && (
                 <details className="advanced-config">
@@ -1207,9 +1508,9 @@ export function RunComposer({
                       </select>
                     </label>
                     <label className="field">
-                      <span className="lab">Capability keep-list <span className="optional-label">optional</span></span>
-                      <input className="inp mono" value={capabilityKeepList} onChange={(event) => setCapabilityKeepList(event.target.value)} placeholder="Empty keeps every attached bundle" />
-                      <span className="field-hint">Comma-separated bundle names; this can only remove capabilities.</span>
+                      <span className="lab">Limit tools for this run <span className="optional-label">optional</span></span>
+                      <input className="inp mono" value={capabilityKeepList} onChange={(event) => setCapabilityKeepList(event.target.value)} placeholder="Leave empty to keep all of them" />
+                      <span className="field-hint">Comma-separated names. This can only take tools away, never add them.</span>
                     </label>
                     <label className="field">
                       <span className="lab">Signed callback URL <span className="optional-label">optional</span></span>
@@ -1226,8 +1527,8 @@ export function RunComposer({
         <aside className="rc-spec" aria-label="Configuration summary">
           <div className="rc-spec-inner">
             <div className="rc-spec-head">
-              <span className="section-kicker">{agentOnly ? "Revision 1" : "Frozen at launch"}</span>
-              <p>{agentOnly ? "This becomes the agent's first immutable revision." : "Resolved before the sandbox starts. In-flight runs keep this exact spec."}</p>
+              <span className="section-kicker">{agentOnly ? "Summary" : "Locked in at launch"}</span>
+              <p>{agentOnly ? "This is version 1. Editing it later creates a new version." : "Settled before the agent starts. A running agent keeps exactly these settings."}</p>
             </div>
 
             {!agentOnly && (
@@ -1267,15 +1568,17 @@ export function RunComposer({
             <SpecRow
               label="Workspace"
               value={workspaceSummary(workspace)}
-              sub={`${pins.length} sandbox bundle${pins.length === 1 ? "" : "s"} attached`}
+              sub={`${pins.length + requirements.length} tool${pins.length + requirements.length === 1 ? "" : "s"} added`}
             />
             <SpecRow
-              label="Policy"
+              label="Rules"
               value={governingPolicy ? `${governingPolicy.name} · v${governingPolicy.version}` : agentChoice === "new" ? policyName : "resolving…"}
               sub={
-                autonomyForbidden
-                  ? "unattended runs not permitted"
-                  : `${governingPolicy?.agents_using ?? 0} agent${(governingPolicy?.agents_using ?? 0) === 1 ? "" : "s"} governed`
+                policyOverride !== null
+                  ? `will update ${selectedAgentName || "the agent"}'s rules`
+                  : autonomyForbidden
+                    ? "someone must be available to approve"
+                    : `${governingPolicy?.agents_using ?? 0} agent${(governingPolicy?.agents_using ?? 0) === 1 ? "" : "s"} follow${(governingPolicy?.agents_using ?? 0) === 1 ? "s" : ""} these rules`
               }
             />
 
@@ -1293,9 +1596,25 @@ export function RunComposer({
 
             {!agentOnly && (
               <SpecRow
-                label="Governance"
-                value={autonomous ? "Autonomous" : "Supervised"}
-                sub={autonomous ? "policy fallback decides" : "risky actions wait for approval"}
+                label="Guardrails"
+                value={
+                  activePreset === "free"
+                    ? "Free rein"
+                    : activePreset === "autopilot"
+                      ? "Autopilot, reviewed"
+                      : activePreset === "ask"
+                        ? "Ask me as it works"
+                        : "Custom"
+                }
+                sub={
+                  autonomous
+                    ? `ask-first actions auto-${
+                        governingPolicy?.autonomy_summary?.default_fallback === "allow"
+                          ? "allowed"
+                          : "declined"
+                      }`
+                    : "ask-first actions pause for you"
+                }
               />
             )}
 
