@@ -59,6 +59,10 @@ sandbox-build:
 codex-build:
     docker build -t ${FLUIDBOX_CODEX_SANDBOX_IMAGE:-fluidbox-codex-runner:dev} -f images/codex-runner/Dockerfile images
 
+# Build the deterministic replay runner image (used by `just demo`)
+replay-build:
+    docker build -t ${FLUIDBOX_REPLAY_IMAGE:-fluidbox-replay-runner:dev} -f images/replay-runner/Dockerfile images
+
 # ── Database ─────────────────────────────────────────────────────────────
 #
 # Local development runs Postgres in a container with a named volume
