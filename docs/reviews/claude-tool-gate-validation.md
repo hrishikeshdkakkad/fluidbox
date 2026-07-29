@@ -1,8 +1,9 @@
 # The Claude runner executed tools without a fluidbox decision — reproduction, root cause, fix, validation
 
 **Date:** 2026-07-29
-**Branch:** `worktree-claude-tool-gate`
-**Commit:** _see the last section — filled in at commit time_
+**Branch:** `fix/claude-tool-gate`
+**Commits:** `58b4b02` (the fix, tests and this report) + `505674b` (register `ToolSearch`
+in the canonical vocabulary — see §5.4)
 **Severity:** P0 (launch-blocking). fluidbox's central promise — *no sandbox tool call
 executes without a control-plane decision* — was false for a large class of calls on the
 `claude-agent-sdk` harness.
@@ -187,7 +188,72 @@ digest 0de67b1da13b0648e218950ab465aef26e1ee68b06743d8779bb26c1e42566f4: 0 occur
 The gate saw the call, denied it from the authored policy, and the digest of the fresh
 nonce appears **nowhere** — the command did not run.
 
-_Suite results are recorded in §5.3._
+### 5.3 Suite results
+
+```
+PHASE 1 — deny at the gate prevents execution (LIVE agent, Docker provider)
+  SKIP: no reachable model (LLM upstream refused a 4-token probe)
+
+PHASE 2 — an approval holds the tool call, then releases it exactly once
+  ✓ sandbox tool-audience token extracted (session 019fac8e-df85-78a2-b9b1-4f4c005e9f78)
+  ✓ session paused at awaiting_approval
+  ✓ the tool call is still blocked — no verdict issued yet
+  ✓ a pending approval is queued for a human
+  ✓ approval recorded by a human decision
+  ✓ after approval the blocked call returns allow
+  ✓ approved_once decided exactly once (a faithful replay adopts, 1 intent)
+
+PHASE 3 — the gate fails closed
+  ✓ unknown tool → deny (policy default, never an implicit allow)
+  ✓ invalid token refused (401) — no verdict issued at all
+  ✓ runner-control credential rejected by audience (fatal, not a deny)
+  ✓ first use of a tool_call_id decided normally (allow)
+  ✓ same tool_call_id replayed with different input → deny
+  ✓ after cancellation the session credential is revoked (no verdict issued)
+
+PHASE 4 — an approval that expires denies, never allows
+  ✓ expired approval → deny (timeout_action)
+
+RESULT: 14 passed, 0 failed
+```
+
+Two notes on what these assertions actually pin:
+
+- **"still blocked — no verdict issued yet"** is the ordering property the P0 was about: at
+  the moment the session reads `awaiting_approval`, the runner's `/permission` call has not
+  returned, so the tool provably cannot have run. It is asserted by checking the in-flight
+  request is still alive, not by inspecting a status field.
+- **Cancellation** produces a `401`, not a deny verdict: the terminal transition revokes the
+  session's tokens, so no verdict is issued at all. `contract.mjs::requestPermission` maps
+  401/403 at that route to a hard deny, so the tool still cannot run — the suite accepts
+  either shape and fails only on an `allow`.
+
+### 5.4 Other repository checks
+
+| check | result |
+|---|---|
+| `cargo test -p fluidbox-core` | **119 passed, 0 failed** |
+| `node --test images/runner-lib/*.test.mjs` | **18 passed, 0 failed** |
+| `cargo fmt --check -p fluidbox-core` | clean |
+| `cargo clippy -p fluidbox-core --all-targets -- -D warnings` | clean |
+
+`cargo test -p fluidbox-core` initially **failed**, which is worth recording because it
+caught a real omission rather than a formality:
+
+```
+policy matches "ToolSearch", which is neither canonical nor mcp__* —
+add it to CANONICAL or fix the policy      (tools.rs:139)
+```
+
+The canonical tool vocabulary (`fluidbox-core::tools::CANONICAL`) is a contract: a name the
+seed policy governs must be enumerable, or the Governance matrix silently omits a tool the
+policy has an opinion about. `ToolSearch` is now registered there (`ToolGroup::Meta`). This
+is a second-order consequence of the fix that is easy to miss — making the gate mandatory
+does not only change enforcement, it changes *which tool names the control plane ever sees*,
+and everything keyed on that vocabulary has to follow.
+
+The DB-backed and full-workspace suites were not run: they need `DATABASE_URL` and, for the
+live tiers, model credits.
 
 ## 6. Residual risks — stated plainly
 
