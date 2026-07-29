@@ -816,18 +816,33 @@ pub fn spawn_netpol_gate(state: AppState) {
                     .flatten();
             match (internal_ip, public_ip) {
                 (Some(i), Some(p)) => {
+                    // Publish the targets BEFORE probing: a verified gate must
+                    // imply targets are present, because the orchestrator
+                    // freezes them into every sandbox's `NetworkAdmission`
+                    // (the per-pod startup-isolation gate observes the same
+                    // pair the certification probe does).
+                    if let Ok(mut t) = state.netpol_targets.write() {
+                        *t = Some(crate::state::NetpolTargets {
+                            internal_ip: i.clone(),
+                            public_ip: p.clone(),
+                        });
+                    }
                     let r = fluidbox_provider_k8s::netpol::verify_netpol(
                         &k8s_cfg,
                         &state.cfg.netpol_probe_image,
                         &i,
                         &p,
+                        state.cfg.netpol_wait_secs,
                     )
                     .await;
                     use fluidbox_provider_k8s::netpol::NetpolResult;
                     let ok = r == NetpolResult::Enforced;
                     state.netpol_verified.store(ok, Ordering::SeqCst);
                     if ok {
-                        tracing::info!("netpol gate: enforcement verified (+:8788 -:8787)");
+                        tracing::info!(
+                            "netpol gate: enforcement verified (+:8788 -:8787, observed within {}s)",
+                            state.cfg.netpol_wait_secs
+                        );
                     } else {
                         tracing::warn!("netpol gate: NOT verified ({r:?}) — runs blocked");
                     }
