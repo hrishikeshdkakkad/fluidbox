@@ -1,0 +1,23 @@
+# The five-minute demo's OWN Postgres — deliberately separate from the dev
+# composition (project name, port, and volume all differ) so `just demo` and
+# `just dev` coexist and `just demo-down` can destroy state with confidence.
+# Run with: docker compose -p fluidbox-demo -f deploy/docker-compose.demo.yml …
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: fluidbox
+      POSTGRES_PASSWORD: fluidbox
+      POSTGRES_DB: fluidbox
+    ports:
+      - "127.0.0.1:${FLUIDBOX_DEMO_DB_PORT:-5434}:5432"
+    volumes:
+      - fluidbox-demo-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fluidbox -d fluidbox"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  fluidbox-demo-pgdata:
