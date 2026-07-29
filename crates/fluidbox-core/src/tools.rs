@@ -95,6 +95,15 @@ pub const CANONICAL: &[ToolDef] = &[
         name: "Task",
         group: ToolGroup::Meta,
     },
+    // Tool-schema discovery. Registered because the gate can now SEE it: until
+    // the Claude runner's PreToolUse hook landed, the CLI auto-approved this
+    // class and the calls never reached /permission, so the vocabulary never
+    // had to name it. Now every call arrives, the seed policy has an opinion
+    // about it, and the Governance matrix must list that opinion.
+    ToolDef {
+        name: "ToolSearch",
+        group: ToolGroup::Meta,
+    },
 ];
 
 /// Is this an exact canonical tool name? (Not a matcher — no wildcards.)

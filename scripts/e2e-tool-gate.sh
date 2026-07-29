@@ -253,10 +253,23 @@ if [ -n "$T3" ]; then
   for _ in $(seq 1 30); do
     case "$(sstatus "$S3")" in cancelled|failed) break ;; esac; sleep 1
   done
+  # Two fail-closed shapes are correct here and which one you get is a race
+  # with token revocation on the terminal transition:
+  #   • a deny verdict ("session is not active"), or
+  #   • an outright 401 — the terminal transition revoked the session's tokens,
+  #     so no verdict is issued at all. The runner maps 401/403 at this route to
+  #     a hard deny (contract.mjs::requestPermission), so the tool still cannot
+  #     run. What must NEVER appear is an allow.
   CN=$(perm "$T3" "$S3" '{"tool_call_id":"tg-cancel-1","tool":"Read","input":{"file_path":"/workspace/x"}}')
-  echo "$CN" | grep -q '"decision": *"deny"' \
-    && ok "after cancellation the gate denies even a normally-allowed tool" \
-    || no "post-cancel response was: $(echo "$CN" | head -c 120)"
+  if echo "$CN" | grep -q '"decision": *"allow"'; then
+    no "AFTER CANCELLATION THE GATE ALLOWED A TOOL: $CN"
+  elif echo "$CN" | grep -q '"decision": *"deny"'; then
+    ok "after cancellation the gate denies even a normally-allowed tool"
+  elif echo "$CN" | grep -qE 'unauthorized|forbidden'; then
+    ok "after cancellation the session credential is revoked (no verdict issued)"
+  else
+    no "post-cancel response was neither a deny nor a refusal: $(echo "$CN" | head -c 120)"
+  fi
 fi
 
 # ═══ PHASE 4 — an approval that times out denies ═══════════════════════════
