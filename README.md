@@ -115,6 +115,24 @@ Start with the [hosted product boundary](./docs/hosted/README.md), then follow t
 
 ## Try fluidbox
 
+### Five minutes, no API key
+
+Watch a full governed run — policy verdicts, a live approval pause, the diff,
+the cost line, and a security receipt — without an Anthropic key. The run is a
+**deterministic replay** (a scripted agent, clearly labelled; no model calls)
+driving the real control plane, the real policy gate, and a real sandbox
+container:
+
+```bash
+git clone https://github.com/hrishikeshdkakkad/fluidbox.git
+cd fluidbox
+just demo        # prerequisites: Rust, Docker, just (first run compiles the server)
+```
+
+The demo is fully isolated (its own ports, database volume, and state under
+`.demo/`) and cleans up after itself; `just demo-down` removes every trace at
+any time. At the end it prints the exact commands to graduate to a live agent.
+
 ### Docker — fastest path
 
 No Rust toolchain, Node installation, or external Postgres required:
@@ -167,6 +185,8 @@ The local default is **admin mode**: no login wall, the dashboard proxy injects 
 
 | Command | Purpose |
 |---|---|
+| `just demo` | The five-minute no-key first-run (deterministic replay through the real gate) |
+| `just demo-down` | Remove every demo resource (containers, volume, state) |
 | `just dev` | Start the gateway, control plane, and dashboard; one Ctrl-C stops them |
 | `just doctor` | Validate the local environment and explain failures |
 | `just check` | Run format, Clippy with `-D warnings`, Rust tests, and the web build |
