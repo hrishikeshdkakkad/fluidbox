@@ -56,6 +56,31 @@ pub struct SandboxSpec {
     /// compute if the control plane is down. None = installation default.
     pub active_deadline_secs: Option<u64>,
     pub network: NetworkMode,
+    /// Startup network-isolation admission (Kubernetes netpol race fix): when
+    /// set, the provider MUST prove — from inside the sandbox's own network
+    /// identity, BEFORE any untrusted runner code starts — that the positive
+    /// target is reachable AND the negative target is blocked, bounded by
+    /// `wait_secs` and failing closed on expiry. CNIs that program
+    /// NetworkPolicy asynchronously (AWS VPC CNI `standard` mode fails OPEN
+    /// for a new pod's first seconds) otherwise hand untrusted code an
+    /// unrestricted network at t=0. None = the deployment does not require
+    /// verified enforcement (dev posture) or the provider has no such race
+    /// (Docker's per-session bridge is synchronous with container start).
+    pub network_admission: Option<NetworkAdmission>,
+}
+
+/// The observable startup-isolation protocol's frozen targets: one address
+/// that MUST be reachable (proves the allow rule landed and the control plane
+/// is up) and one that MUST be blocked (proves the deny landed — the target
+/// is a live listener, so "blocked" is evidence of policy, not of a dead
+/// host). Both must hold in the SAME observation within `wait_secs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkAdmission {
+    pub positive_addr: String,
+    pub positive_port: u16,
+    pub negative_addr: String,
+    pub negative_port: u16,
+    pub wait_secs: u64,
 }
 
 /// How a provider hands the workspace to the sandbox. Host-dir providers bind
