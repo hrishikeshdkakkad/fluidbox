@@ -861,6 +861,12 @@ a.row:hover,
   padding: 18px 24px;
   border-bottom: 1px solid var(--ds-gray-alpha-200);
   background: var(--surface-soft);
+  /* The header is position:sticky, and --surface-soft is translucent (0.94).
+     Without a backdrop filter the scrolled content ghosts straight through it,
+     which reads as a rendering bug rather than as frost. The sidebar rail pairs
+     the same alpha with blur(16px) — this just forgot to. */
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
 }
 
 .modal .mh .t {
