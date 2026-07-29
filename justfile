@@ -63,6 +63,17 @@ codex-build:
 replay-build:
     docker build -t ${FLUIDBOX_REPLAY_IMAGE:-fluidbox-replay-runner:dev} -f images/replay-runner/Dockerfile images
 
+# ── Demo ─────────────────────────────────────────────────────────────────
+
+# The five-minute first-run: a full governed run with NO API key (deterministic
+# replay through the real policy gate). Isolated from `just dev` (own ports,
+# own Postgres volume, state under .demo/). `just demo-down` removes everything.
+demo:
+    bash scripts/demo.sh up
+
+demo-down:
+    bash scripts/demo.sh down
+
 # ── Database ─────────────────────────────────────────────────────────────
 #
 # Local development runs Postgres in a container with a named volume
