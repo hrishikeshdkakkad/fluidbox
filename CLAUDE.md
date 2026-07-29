@@ -13,6 +13,8 @@ Hard constraints (from PLAN.md, non-negotiable): fluidbox-authored backend is 10
 ```bash
 just setup          # fresh-clone bootstrap (idempotent): .env + secrets, apps/web/.env.local, pnpm install, runner image
 just doctor         # preflight — validates every env gotcha below and prints the exact fix
+just demo           # five-minute no-key first-run: deterministic replay through the real gate (isolated: ports 19790/19791/15434, own volume, .demo/); `just demo-down` removes everything
+just replay-build   # rebuild the replay runner image after editing images/replay-runner/
 just dev            # LiteLLM gateway + server + dashboard together
 just server         # Rust control plane only (migrations auto-run on boot)
 just web            # dashboard only (Next.js, port 3000)
