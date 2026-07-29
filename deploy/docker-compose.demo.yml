@@ -10,7 +10,7 @@ services:
       POSTGRES_PASSWORD: fluidbox
       POSTGRES_DB: fluidbox
     ports:
-      - "127.0.0.1:${FLUIDBOX_DEMO_DB_PORT:-5434}:5432"
+      - "127.0.0.1:${FLUIDBOX_DEMO_DB_PORT:-15434}:5432"
     volumes:
       - fluidbox-demo-pgdata:/var/lib/postgresql/data
     healthcheck:

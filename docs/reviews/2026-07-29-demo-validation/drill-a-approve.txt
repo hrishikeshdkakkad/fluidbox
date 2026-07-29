@@ -1,0 +1,116 @@
+
+[1;36m== preflight (no API key required — this demo is a deterministic replay) ==[0m
+  [1;32m✓[0m docker daemon reachable
+  [1;32m✓[0m ports 19790/19791/15434 are free
+
+[1;36m== starting the demo stack (isolated: project fluidbox-demo, port 19790, db 15434) ==[0m
+ Network fluidbox-demo_default Creating 
+ Network fluidbox-demo_default Created 
+ Volume fluidbox-demo_fluidbox-demo-pgdata Creating 
+ Volume fluidbox-demo_fluidbox-demo-pgdata Created 
+ Container fluidbox-demo-postgres-1 Creating 
+ Container fluidbox-demo-postgres-1 Created 
+ Container fluidbox-demo-postgres-1 Starting 
+ Container fluidbox-demo-postgres-1 Started 
+ Container fluidbox-demo-postgres-1 Waiting 
+ Container fluidbox-demo-postgres-1 Healthy 
+  [1;32m✓[0m demo Postgres healthy on 127.0.0.1:15434 (volume fluidbox-demo-pgdata)
+  [1;32m✓[0m replay runner image ready (fluidbox-replay-runner:dev)
+  [1;32m✓[0m control plane healthy on http://127.0.0.1:19790 (migrations applied on boot)
+
+[1;36m== seeding the demo (policy + agent + sample repo) ==[0m
+  [1;32m✓[0m policy 'demo' imported (allow tests/edits · deny curl/wget · approval for deploy)
+  [1;32m✓[0m agent 'demo-fixer' created (runner_image=fluidbox-replay-runner:dev, policy=demo)
+  [1;32m✓[0m sample repo staged at .demo/repo (fluidbox will run against a copy of the copy)
+
+[1;36m== the run — watch the gate work; your approval is the only thing that releases the deploy ==[0m
+  [1;32m✓[0m run created: 019fac7b-2422-7ae1-b24f-ea2273789cd0
+  [2m[  1] session.created[0m
+  [2m[  2][0m [1;36mstate[0m created → [1mprovisioning[0m
+  [2m[  3][0m [1;36mstate[0m provisioning → [1minitializing[0m
+  [2m[  4][0m workspace ready: 5 files, base 634d240eb3
+  [2m[  5][0m [1;36mstate[0m initializing → [1mrunning[0m
+  [2m[  6][0m [1magent[0m │ sandbox launched (de63e1fd9542)
+  [2m[  7][0m [1magent[0m │ deterministic replay runner starting — scripted transcript, no model calls (autonomy=supervised)
+  [2m[  8][0m [1magent[0m │ This is a replay of a recorded run — deterministic, no model calls. Task: fix the failing test, then deploy. Starting with the test suite.
+  [2m[  9][0m tool.requested  [1mBash[0m [2m./run_tests.sh[0m
+  [2m[ 10][0m tool.decision   [1;32m✓ allow[0m [2m(source=policy)[0m
+  [2m[ 11][0m [1magent[0m │ $ ./run_tests.sh
+        FAIL greet("Ada") -> "Hello, name!" (expected "Hello, Ada!")
+        → exit 1
+  [2m[ 12][0m [1magent[0m │ greet() returns the literal string "Hello, name!" instead of using its argument. Fixing app.js.
+  [2m[ 13][0m tool.requested  [1mEdit[0m [2mEdit: /workspace/app.js[0m
+  [2m[ 14][0m tool.decision   [1;32m✓ allow[0m [2m(source=policy)[0m
+  [2m[ 15][0m [1magent[0m │ edited app.js
+  [2m[ 16][0m tool.requested  [1mBash[0m [2m./run_tests.sh[0m
+  [2m[ 17][0m tool.decision   [1;32m✓ allow[0m [2m(source=policy)[0m
+  [2m[ 18][0m [1magent[0m │ $ ./run_tests.sh
+        PASS 1/1 greet returns a personal greeting
+  [2m[ 19][0m [1magent[0m │ Tests are green. Checking the service's upstream health endpoint before deploying.
+  [2m[ 20][0m tool.requested  [1mBash[0m [2mcurl -s https://status.demo.internal/health[0m
+  [2m[ 21][0m tool.decision   [1;31m✗ deny[0m [2m(source=policy, shell command matches deny pattern "\\bcurl\\b")[0m
+  [2m[ 22][0m [1magent[0m │ Outbound network calls are denied by policy in this sandbox — skipping the health check and moving on.
+  [2m[ 23][0m tool.requested  [1mBash[0m [2m./deploy.sh[0m
+
+  [1;33m[1m⏸  APPROVAL REQUIRED[0m  Bash: ./deploy.sh
+  [2mpolicy 'demo' sends unlisted commands to a human; auto-deny at 2026-07-29T06:09:22.989907Z[0m
+  [2m(no TTY — auto-approving; set FLUIDBOX_DEMO_DECISION=deny for the other path)[0m
+  [1;32m→ you approved it[0m (recorded in the audit ledger)
+  [2m[ 25][0m approval.decided → [1mapproved_once[0m by operator
+  [2m[ 26][0m tool.decision   [1;32m✓ allow[0m [2m(source=human, human:operator)[0m
+  [2m[ 27][0m [1magent[0m │ $ ./deploy.sh
+        [deploy] 2026-07-29T06:06:25Z released demo build to demo-target
+  [2m[ 28][0m [1magent[0m │ Done. The failing test is fixed and verified; the deploy decision was yours.
+  [2m[ 29][0m [1;36mstate[0m running → [1mfinalizing[0m
+  [2m[ 30][0m artifact: diff (470 bytes, sha256 sha256:e6e4c…)
+  [2m[ 31][0m [1;36mstate[0m finalizing → [1mcompleted[0m
+  [2m[ 32][0m [1mresult[0m: completed — Replay complete: 4 executed, 1 denied.
+
+[1;36m== receipts — everything below is read back from the control plane, not asserted by this script ==[0m
+
+[1m── the diff (what actually changed in the workspace) ─────────────[0m
+  [2mdiff --git a/app.js b/app.js[0m
+  [2mindex ba0a0b6..0cd436d 100644[0m
+  [2m--- a/app.js[0m
+  [2m+++ b/app.js[0m
+  [2m@@ -1,5 +1,5 @@[0m
+  [2m // demo-service: the tiny app the five-minute demo repairs.[0m
+  [2m function greet(name) {[0m
+  [31m-  return "Hello, name!";[0m
+  [1;32m+  return "Hello, " + name + "!";[0m
+  [2m }[0m
+  [2m module.exports = { greet };[0m
+  [2mdiff --git a/deploy.log b/deploy.log[0m
+  [2mnew file mode 100644[0m
+  [2mindex 0000000..ddb6b4b[0m
+  [2m--- /dev/null[0m
+  [2m+++ b/deploy.log[0m
+  [2m@@ -0,0 +1 @@[0m
+  [1;32m+[deploy] 2026-07-29T06:06:25Z released demo build to demo-target[0m
+
+[1m── the bill ──────────────────────────────────────────────────────[0m
+  model spend: [1;32m$0.00[0m · 0 model requests · 5 tool calls
+  [2m$0.00 is a property of replay mode — a live run meters real usage here[0m
+
+[1m── the security receipt ──────────────────────────────────────────[0m
+  every tool call crossed the server-side gate: 5 decisions
+    allow              ×1  [2m(source=human)[0m
+    allow              ×3  [2m(source=policy)[0m
+    deny               ×1  [2m(source=policy)[0m
+  approval 019fac7b… Bash «./deploy.sh» → [1mapproved_once[0m by operator
+  sandbox container (captured live at the approval pause):
+    image=fluidbox-replay-runner:dev  user=runner  network=fluidbox-net-019fac7b-2422-7ae1-b24f-ea2273789cd0
+    cap_drop=['ALL']  pids_limit=512  memory=2GiB
+    [2mfresh container per run; full JSON: .demo/sandbox-inspect.json[0m
+  [2mledger stores digests + verdicts, never raw model prompts; RunSpec froze the policy at create[0m
+  [2mfull evidence: .demo/receipt-*.json (events, cost, artifacts, approvals, session)[0m
+
+[1;36m== next steps ==[0m
+  To graduate to a LIVE agent (a real model, same governance):
+    1. add ANTHROPIC_API_KEY=sk-ant-… to .env   (only the LiteLLM container ever sees it)
+    2. just demo-down && just dev
+    3. cargo run -p fluidbox-cli -- run --task "fix the failing test" --repo scripts/demo-fixture
+
+  [2mtotal: 12s[0m
+  [1;33m⚠[0m FLUIDBOX_DEMO_KEEP set — leaving the stack up (API http://127.0.0.1:19790, token in .demo/admin-token)
+  [1;33m⚠[0m tear down later with: just demo-down
