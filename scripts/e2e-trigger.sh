@@ -169,17 +169,11 @@ N_RUNS=$(curl -s -H "$H" "$API/v1/triggers/$SUB1" | python3 -c "
 import sys, json; print(len(json.load(sys.stdin)['sessions']))")
 [ "$N_RUNS" = "1" ] && ok "subscription has exactly one run" || no "expected 1 run, got $N_RUNS"
 
-say "DISABLE / ENABLE / ROTATE"
+say "DISABLE / ENABLE"
 post "/triggers/$SUB1/disable" "{}" >/dev/null
 CODE=$(tpost "$TOK1" "/triggers/$SUB1/invoke" '{"context":{"ticket":"x"}}')
 [ "$CODE" = "409" ] && ok "disabled subscription → 409" || no "wanted 409, got $CODE"
 post "/triggers/$SUB1/enable" "{}" >/dev/null
-post "/triggers/$SUB1/rotate_token" "{}" >/dev/null
-TOK1_NEW=$(cat "$B" | j "['token']")
-CODE=$(tpost "$TOK1" "/triggers/$SUB1/invoke" '{"context":{"ticket":"INC-42"}}' "Idempotency-Key: key-A")
-[ "$CODE" = "401" ] && ok "old token dead after rotation" || no "wanted 401, got $CODE"
-CODE=$(tpost "$TOK1_NEW" "/triggers/$SUB1/invoke" '{"context":{"ticket":"INC-42"}}' "Idempotency-Key: key-A")
-[ "$CODE" = "200" ] && ok "new token works (and key-A still replays)" || no "wanted 200, got $CODE"
 
 say "SIGNED CALLBACK — terminal run → one verified delivery"
 FINAL1=$(wait_terminal "$S1" 420) || true
@@ -209,6 +203,21 @@ assert 'cost_usd' in p['usage'] and isinstance(p['artifacts'], list) and 'summar
   DSTAT=$(curl -s -H "$H" "$API/v1/sessions/$S1/deliveries" | j "['deliveries'][0]['status']")
   [ "$DSTAT" = "delivered" ] && ok "delivery row marked delivered" || no "delivery status '$DSTAT'"
 fi
+
+# ROTATION runs only after S1's callback has been observed. The delivery
+# recheck (#31, E1) deliberately fails closed when a run's invoking token has
+# been revoked — so rotating while S1's delivery was still in flight made this
+# phase green only when the live run happened to finish first (a race, red
+# whenever the model was slow). Sequencing rotation after the observation
+# asserts BOTH truths: a live token's run delivers, and rotation kills the old
+# credential.
+say "ROTATE — old token dies, new token carries the authority"
+post "/triggers/$SUB1/rotate_token" "{}" >/dev/null
+TOK1_NEW=$(cat "$B" | j "['token']")
+CODE=$(tpost "$TOK1" "/triggers/$SUB1/invoke" '{"context":{"ticket":"INC-42"}}' "Idempotency-Key: key-A")
+[ "$CODE" = "401" ] && ok "old token dead after rotation" || no "wanted 401, got $CODE"
+CODE=$(tpost "$TOK1_NEW" "/triggers/$SUB1/invoke" '{"context":{"ticket":"INC-42"}}' "Idempotency-Key: key-A")
+[ "$CODE" = "200" ] && ok "new token works (and key-A still replays)" || no "wanted 200, got $CODE"
 
 say "DEAD DESTINATION — the run stays terminal; only the delivery retries"
 CODE=$(tpost "$TOK3" "/triggers/$SUB3/invoke" '{"workspace":{"ref":"feature"},"context":{}}')
