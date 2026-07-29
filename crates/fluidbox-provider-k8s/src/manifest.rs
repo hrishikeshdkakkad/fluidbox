@@ -11,6 +11,13 @@ pub const LABEL_MANAGED: &str = "fluidbox.dev/managed";
 pub const RUNNER_CONTAINER: &str = "runner";
 pub const COLLECTOR_CONTAINER: &str = "workspace-collector";
 pub const INIT_CONTAINER: &str = "workspace-init";
+/// The startup network-admission gate: FIRST init container when the spec
+/// carries a `NetworkAdmission`. Init containers complete before app
+/// containers start (kubelet contract), so the untrusted runner cannot
+/// execute until this gate has OBSERVED the pod's own NetworkPolicy enforced
+/// — closing the CNI fail-open window (AWS VPC CNI `standard` mode) during
+/// which a fresh pod has unrestricted egress.
+pub const NETPOL_GATE_CONTAINER: &str = "netpol-gate";
 /// One Secret key per audience-scoped credential (Gap 10, invariant 19). The
 /// runner container references control/tool/llm; the INIT container references
 /// `workspace-token` and NOTHING else, so the archive-fetch credential never
@@ -125,6 +132,43 @@ pub fn build_pod(spec: &SandboxSpec, cfg: &K8sConfig) -> Value {
         { "name": "FLUIDBOX_BASE_COMMIT", "value": base_commit },
     ]);
 
+    // Init chain: the network-admission gate FIRST (when required), then the
+    // workspace fetch. Ordering is deliberate: nothing — not even the trusted
+    // archive fetch — runs until the pod's own network is proven enforced,
+    // and the kubelet's init-container contract then keeps the untrusted
+    // runner off the network for free.
+    let mut init_containers: Vec<Value> = Vec::new();
+    if let Some(adm) = &spec.network_admission {
+        let script = crate::netpol::enforcement_script(
+            (adm.positive_addr.as_str(), adm.positive_port),
+            (adm.negative_addr.as_str(), adm.negative_port),
+            adm.wait_secs,
+        );
+        init_containers.push(json!({
+            "name": NETPOL_GATE_CONTAINER,
+            "image": cfg.netpol_probe_image,
+            "command": ["/bin/sh", "-c", script],
+            "securityContext": container_sc,
+            // Tiny and explicit: the gate must never inflate the pod's
+            // effective request (quota) past the main containers.
+            "resources": {
+                "requests": { "cpu": "10m", "memory": "16Mi" },
+                "limits": { "cpu": "200m", "memory": "64Mi" },
+            },
+        }));
+    }
+    init_containers.push(json!({
+        "name": INIT_CONTAINER,
+        "image": cfg.collector_image,
+        "command": ["workspaced", "init"],
+        "env": init_env,
+        "securityContext": container_sc,
+        "volumeMounts": [
+            { "name": "workspace", "mountPath": "/workspace" },
+            { "name": "collector", "mountPath": "/collector" },
+        ],
+    }));
+
     let mut pod_spec = json!({
         "restartPolicy": "Never",
         "automountServiceAccountToken": false,
@@ -141,17 +185,7 @@ pub fn build_pod(spec: &SandboxSpec, cfg: &K8sConfig) -> Value {
             { "name": "workspace", "emptyDir": { "sizeLimit": cfg.volume_size_limit } },
             { "name": "collector", "emptyDir": { "sizeLimit": cfg.volume_size_limit } },
         ],
-        "initContainers": [{
-            "name": INIT_CONTAINER,
-            "image": cfg.collector_image,
-            "command": ["workspaced", "init"],
-            "env": init_env,
-            "securityContext": container_sc,
-            "volumeMounts": [
-                { "name": "workspace", "mountPath": "/workspace" },
-                { "name": "collector", "mountPath": "/collector" },
-            ],
-        }],
+        "initContainers": init_containers,
         "containers": [
             {
                 "name": RUNNER_CONTAINER,
@@ -315,6 +349,17 @@ mod tests {
             }),
             active_deadline_secs: Some(600),
             network: NetworkMode::Hardened,
+            network_admission: None,
+        }
+    }
+
+    fn admission() -> fluidbox_core::traits::NetworkAdmission {
+        fluidbox_core::traits::NetworkAdmission {
+            positive_addr: "10.96.0.10".into(),
+            positive_port: 8788,
+            negative_addr: "10.96.0.11".into(),
+            negative_port: 8787,
+            wait_secs: 60,
         }
     }
 
@@ -408,6 +453,55 @@ mod tests {
         // Three container roles: init + runner + collector.
         assert_eq!(pod["spec"]["initContainers"].as_array().unwrap().len(), 1);
         assert_eq!(pod["spec"]["containers"].as_array().unwrap().len(), 2);
+    }
+
+    /// The netpol admission race fix: with a `NetworkAdmission` frozen into
+    /// the spec, the gate init container runs FIRST — before the workspace
+    /// fetch and (by the kubelet's init-container contract) before the
+    /// untrusted runner — observing the pod's OWN network until enforcement
+    /// holds, bounded and fail-closed.
+    #[test]
+    fn network_admission_gate_is_the_first_init_container() {
+        let mut s = spec();
+        s.network_admission = Some(admission());
+        let pod = build_pod(&s, &cfg());
+        let inits = pod["spec"]["initContainers"].as_array().unwrap();
+        assert_eq!(inits.len(), 2, "gate + workspace-init");
+        let gate = &inits[0];
+        assert_eq!(gate["name"], NETPOL_GATE_CONTAINER);
+        assert_eq!(
+            inits[1]["name"], INIT_CONTAINER,
+            "workspace fetch must run AFTER the gate"
+        );
+        // The gate runs the shared observation script against the frozen
+        // targets — the same protocol the certification probe runs.
+        let script = gate["command"][2].as_str().unwrap();
+        assert!(script.contains("nc -z -w 2 10.96.0.10 8788"));
+        assert!(script.contains("nc -z -w 2 10.96.0.11 8787"));
+        assert!(script.contains("while :"), "the gate observes, not samples");
+        assert!(script.contains("exit 3"), "fail-closed on not-enforced");
+        // Restricted-PSS compliant like every other container.
+        assert_eq!(gate["securityContext"]["allowPrivilegeEscalation"], false);
+        assert_eq!(gate["securityContext"]["capabilities"]["drop"][0], "ALL");
+        // The gate image is the probe image knob (busybox by default).
+        assert_eq!(gate["image"], cfg().netpol_probe_image);
+        // Tiny explicit resources: never the LimitRange defaults, never a
+        // quota-relevant effective request.
+        assert_eq!(gate["resources"]["requests"]["cpu"], "10m");
+        // No volume mounts and no env: the gate needs the network only —
+        // it must never see tokens or the workspace.
+        assert!(gate.get("volumeMounts").is_none());
+        assert!(gate.get("env").is_none());
+    }
+
+    /// Without a `NetworkAdmission` (dev posture / Docker parity) the pod
+    /// shape is byte-identical to before the fix: one init container.
+    #[test]
+    fn no_admission_means_no_gate_container() {
+        let pod = build_pod(&spec(), &cfg());
+        let inits = pod["spec"]["initContainers"].as_array().unwrap();
+        assert_eq!(inits.len(), 1);
+        assert_eq!(inits[0]["name"], INIT_CONTAINER);
     }
 
     #[test]
