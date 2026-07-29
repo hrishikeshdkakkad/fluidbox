@@ -1,0 +1,33 @@
+# The five-minute demo's policy. Three verdict classes on purpose:
+#   allow            — tests, edits inside the workspace, read-only git
+#   deny             — outbound network commands (curl/wget), rm -rf
+#   require_approval — anything else, notably ./deploy.sh (the human moment)
+name: demo
+defaults:
+  tool_action: approve
+approvals:
+  default_ttl_secs: 180
+  timeout_action: deny
+tools:
+  - match: [Read, Glob, Grep, LS]
+    action: allow
+  - match: [Edit, Write, MultiEdit]
+    action: allow
+    paths:
+      allow: ["/workspace/**"]
+      deny: ["**/.env", "**/secrets*"]
+  - match: [Bash]
+    action: allow
+    shell:
+      allow_prefixes:
+        - "./run_tests.sh"
+        - "ls"
+        - "cat "
+        - "git status"
+        - "git diff"
+        - "git log"
+      deny_regex:
+        - '\bcurl\b'
+        - '\bwget\b'
+        - 'rm\s+-rf'
+      on_no_match: approve
