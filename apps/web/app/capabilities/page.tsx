@@ -32,7 +32,12 @@ import {
   refreshConnectionTools,
 } from "../lib/api";
 import { useAuthMe } from "../lib/useAuthMe";
-import { GitHubMark, LoadingRows, ModalShell, OwnerTag, PageHead, timeAgo } from "../components/bits";
+import { LoadingRows, ModalShell, OwnerTag, PageHead, timeAgo } from "../components/bits";
+import {
+  ConnectorCard,
+  connectorAttention,
+  connectorConnected,
+} from "../components/ConnectorCard";
 import { OwnerPicker } from "../components/OwnerPicker";
 import { useSmartPolling } from "../lib/useSmartPolling";
 import { AddServerWizard } from "./AddServerWizard";
@@ -80,9 +85,9 @@ function Capabilities() {
     if (fulfilled > 0) setHasSnapshot(true);
     setLoadErr(
       fulfilled === 0
-        ? "Capabilities could not be loaded because the control plane is unavailable."
+        ? "MCP servers could not be loaded because the control plane is unavailable."
         : fulfilled < results.length
-          ? "Some capability data could not be refreshed; showing what is currently available."
+          ? "Some MCP data could not be refreshed; showing what is currently available."
           : ""
     );
     setLoading(false);
@@ -129,8 +134,8 @@ function Capabilities() {
   return (
     <>
       <PageHead
-        title="Capabilities"
-        sub="Tools your agents can call during a run. Connect a service once — every call still passes the permission gate. Attach ≠ allow."
+        title="MCP"
+        sub="MCP tools your agents can call during a run. Connect a service once — every call still passes the permission gate. Attach ≠ allow."
       />
 
       <div className="tabs">
@@ -158,7 +163,7 @@ function Capabilities() {
       ) : !hasSnapshot ? (
         <div className="panel launch-empty">
           <div>
-            <h3>Capabilities are unavailable.</h3>
+            <h3>MCP servers are unavailable.</h3>
             <p>A failed request is not treated as an empty connector store.</p>
           </div>
           <div className="empty-actions">
@@ -315,71 +320,34 @@ function Store({
   );
 }
 
+// The Store's use of the shared card: its trailing action is the CONNECT
+// lifecycle. The card shell, mark, and connected/attention predicates live in
+// components/ConnectorCard so the requirement picker cannot drift from this.
 function StoreCard({ entry, onOpen }: { entry: CatalogEntry; onOpen: () => void }) {
-  const connected =
-    entry.connection?.status === "active" || (entry.auth_mode === "none" && !!entry.bundle);
-  const attention = !!entry.connection && entry.connection.status !== "active" && !connected;
+  const connected = connectorConnected(entry);
+  const attention = connectorAttention(entry);
   // Imported `rest_action` cards are reference-only: browsable, but Connect is
   // refused until the REST action executor lands (bulk-import plan D3).
   const referenceOnly = entry.connectable === false;
 
   return (
-    <button className="connector-card" type="button" onClick={onOpen}>
-      <ConnectorMark entry={entry} />
-      <span className="connector-card-copy">
-        <span className="connector-card-title">
-          <span className="nm">{entry.name}</span>
-          {entry.tier !== "verified" && <span className="badge">{entry.tier}</span>}
-        </span>
-        <span className="desc">{entry.description || "Connect this service as a governed run capability."}</span>
-        <span className="connector-card-meta">
-          {entry.auth_mode === "none"
-            ? "No credential"
-            : entry.auth_mode === "api_key"
-              ? "API key"
-              : "OAuth"}
-          {entry.bundle ? ` · v${entry.bundle.version}` : ""}
-        </span>
-      </span>
-      <span className="connector-card-action">
-        {connected ? (
+    <ConnectorCard
+      entry={entry}
+      onClick={onOpen}
+      action={
+        connected ? (
           <span className="state ok">Connected</span>
         ) : attention ? (
-          <span className="state err">{entry.connection!.status}</span>
+          <span className="state err">{attention}</span>
         ) : referenceOnly ? (
           <span className="state" style={{ color: "var(--muted)" }}>
             Reference only
           </span>
         ) : (
           <span className="state">Connect</span>
-        )}
-      </span>
-    </button>
-  );
-}
-
-function ConnectorMark({ entry }: { entry: CatalogEntry }) {
-  const tone = [
-    "atlassian",
-    "github",
-    "linear",
-    "notion",
-    "sentry",
-    "stripe",
-    "workspace",
-  ].includes(entry.slug) ? entry.slug : "custom";
-  const initials = entry.name
-    .split(/\s+/)
-    .filter(Boolean)
-    .slice(0, 2)
-    .map((part) => part[0])
-    .join("")
-    .toUpperCase();
-
-  return (
-    <span className={`connector-mark connector-mark-${tone}`} aria-hidden="true">
-      {entry.slug === "github" ? <GitHubMark size={21} /> : <span>{initials || "C"}</span>}
-    </span>
+        )
+      }
+    />
   );
 }
 
@@ -982,20 +950,6 @@ function ConnectCatalog({
               </div>
             </div>
           )}
-          {entry.tool_hints.length > 0 && (
-            <div className="meta-row">
-              <span className="meta-label">Policy hints — your policy decides</span>
-              <div className="hint-list">
-                {entry.tool_hints.map((h) => (
-                  <div key={h.pattern} className="hint-row">
-                    <span className="hint-pattern">{h.pattern}</span>
-                    <span className="hint-arrow">→</span>
-                    <span className={`hint-action ${h.action}`}>{h.action}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
         </div>
       )}
       {done ? (
@@ -1182,50 +1136,80 @@ function ConnectCatalog({
             </label>
           )}
           {entry.auth_mode === "oauth" && (
-            <>
-              <p className="helper">
-                Connecting opens the provider&apos;s consent page once. fluidbox then custodies a
-                rotating refresh token (sealed at rest) and mints short-lived access tokens at
-                call time — nothing ever enters a sandbox.
-              </p>
-              <label className="field">
-                <span className="lab">Pre-registered client id (optional)</span>
-                <input
-                  className="inp mono"
-                  value={clientId}
-                  onChange={(e) => setClientId(e.target.value)}
-                  placeholder="Leave empty to use CIMD/DCR"
-                />
-              </label>
-              <label className="field">
-                <span className="lab">Client secret (optional, confidential clients)</span>
-                <input
-                  className="inp mono"
-                  type="password"
-                  value={clientSecret}
-                  onChange={(e) => setClientSecret(e.target.value)}
-                />
-              </label>
-            </>
+            <p className="helper">
+              Connect opens {entry.name}&apos;s sign-in page once. fluidbox keeps only a sealed
+              sign-in token and mints short-lived access at call time — your agents never see it.
+            </p>
           )}
           <OwnerPicker me={me} value={owner} onChange={setOwnerChoice} />
-          <label className="field">
-            <span className="lab">Display name (optional)</span>
-            <input className="inp" value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
-          </label>
           {err && <div className="err">{err}</div>}
-          <div className="spread" style={{ marginTop: 16 }}>
+          <div className="spread" style={{ marginTop: 12 }}>
             <span className="helper">
               {entry.auth_mode === "none"
                 ? "Registers the bundle immediately."
                 : entry.auth_mode === "api_key"
                   ? "The key is sealed at rest and proven by registration."
-                  : "You will be redirected to authorize once."}
+                  : "You'll sign in once, then it's ready for every agent you allow."}
             </span>
             <button className="btn primary" onClick={submit} disabled={busy}>
               {busy ? "Connecting…" : "Connect"}
             </button>
           </div>
+          {/*
+            The 1% lives here, closed by default: a manually registered OAuth
+            client for authorization servers without DCR, a custom label, and
+            the catalog's suggested per-tool verdicts. The 99% path is the
+            Connect button above with everything empty.
+          */}
+          <details className="advanced-config" style={{ marginTop: 12 }}>
+            <summary>Advanced</summary>
+            <div className="advanced-config-body">
+              {entry.auth_mode === "oauth" && (
+                <>
+                  <label className="field">
+                    <span className="lab">Pre-registered client id (optional)</span>
+                    <input
+                      className="inp mono"
+                      value={clientId}
+                      onChange={(e) => setClientId(e.target.value)}
+                      placeholder="Leave empty — fluidbox registers its own"
+                    />
+                    <span className="field-hint">
+                      Only needed when the provider doesn&apos;t support automatic client
+                      registration.
+                    </span>
+                  </label>
+                  <label className="field">
+                    <span className="lab">Client secret (optional, confidential clients)</span>
+                    <input
+                      className="inp mono"
+                      type="password"
+                      value={clientSecret}
+                      onChange={(e) => setClientSecret(e.target.value)}
+                    />
+                  </label>
+                </>
+              )}
+              <label className="field">
+                <span className="lab">Display name (optional)</span>
+                <input className="inp" value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
+              </label>
+              {entry.tool_hints.length > 0 && (
+                <div className="meta-row">
+                  <span className="meta-label">Suggested rules — your policy decides</span>
+                  <div className="hint-list">
+                    {entry.tool_hints.map((h) => (
+                      <div key={h.pattern} className="hint-row">
+                        <span className="hint-pattern">{h.pattern}</span>
+                        <span className="hint-arrow">→</span>
+                        <span className={`hint-action ${h.action}`}>{h.action}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </details>
         </>
       )}
     </ModalShell>
@@ -1294,9 +1278,9 @@ function NewBundle({ onClose, onCreated }: { onClose: () => void; onCreated: () 
         tools inline, as above.
       </p>
       <p className="helper" style={{ marginTop: 0 }}>
-        For a brokered (remote) MCP server, connect it under{" "}
-        <Link href="/capabilities">Integrations</Link> instead — its tools are photographed into a
-        per-connection snapshot, and an agent names it through a connection requirement.
+        For a remote server, use <Link href="/capabilities">the Store&apos;s Connect flow</Link>{" "}
+        instead — its tools are photographed into a per-connection snapshot, and an agent names it
+        through a connection requirement.
       </p>
       <label className="field">
         <span className="lab">Name</span>
