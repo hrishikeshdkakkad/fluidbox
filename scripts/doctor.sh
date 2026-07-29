@@ -64,7 +64,7 @@ else
 
   db_url=$(env_get "$ENV" DATABASE_URL)
   case "$db_url" in
-    ""|*ep-xxx*) bad "DATABASE_URL not set" "run: just neon-setup   (provisions Neon and writes the DIRECT string into .env)";;
+    ""|*ep-xxx*) bad "DATABASE_URL not set" "run: just db-up   (starts the local Postgres container; for a hosted deployment use just neon-setup)";;
     *-pooler*)   bad "DATABASE_URL is the POOLED (-pooler) Neon string" "use the DIRECT endpoint — PgBouncer transaction mode breaks sqlx prepared statements and LISTEN/NOTIFY (just neon-setup fetches it)";;
     *)
       ok "DATABASE_URL set (direct endpoint)"
@@ -172,7 +172,7 @@ else
               fi;;
           esac
         else
-          warn "database not reachable right now" "Neon scale-to-zero can add a cold-start delay; retry, or check the connection string with: just db"
+          warn "database not reachable right now" "local: run 'just db-up' (container may be stopped); hosted: Neon scale-to-zero can add a cold-start delay, retry or check the string with 'just db'"
         fi
       fi
       ;;
