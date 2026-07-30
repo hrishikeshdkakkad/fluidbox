@@ -150,7 +150,15 @@ for f in "${generic_files[@]}"; do
     [[ -z "$hit" ]] && continue
     lineno="${hit%%:*}"
     # First semver on the annotated line is the one release-please rewrites.
-    found=$(sed -E 's/.*[^0-9]([0-9]+\.[0-9]+\.[0-9]+).*/\1/' <<<"${hit#*:}")
+    #
+    # The prerelease suffix is part of the version, not noise. Without the
+    # optional `-…` group this guard cannot express a release CANDIDATE at all:
+    # a canonical of `0.4.0-rc.1` extracted `0.4.0` from every annotated site
+    # and reported all six as MISMATCH, so `just check` and the CI version-check
+    # job failed on any `-rc`/`-beta` version — the exact versions a release is
+    # supposed to be staged through. The charset matches the SemVer gate in
+    # release.yml's chart job, so the two agree on what is publishable.
+    found=$(sed -E 's/.*[^0-9]([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?).*/\1/' <<<"${hit#*:}")
     if [[ "$found" != "$canonical" ]]; then
       printf 'MISMATCH  %-34s %s\n' "annotated site" "$found"
       printf '          %s:%s\n          fix: set to %s\n\n' "$f" "$lineno" "$canonical"
