@@ -75,7 +75,10 @@ services:
     environment:
       DATABASE_URL: postgres://postgres:fluidbox@postgres:5432/fluidbox
       FLUIDBOX_BIND: 0.0.0.0:8787
-      FLUIDBOX_ADMIN_TOKEN: ${FLUIDBOX_ADMIN_TOKEN:?set a random admin token first — the published default was removed because it granted anyone on your network full admin authority. Run: export FLUIDBOX_ADMIN_TOKEN=$(openssl rand -hex 32)}
+      # QUOTED, and no ": " inside the message. An unquoted YAML scalar holding a
+      # colon-space is a mapping, so the whole file stops parsing — and the guard
+      # script only greps, so `docker compose config` is what catches it.
+      FLUIDBOX_ADMIN_TOKEN: "${FLUIDBOX_ADMIN_TOKEN:?required — the published default was removed because it granted anyone on your network full admin authority. Generate one with 'openssl rand -hex 32' and export FLUIDBOX_ADMIN_TOKEN}"
       FLUIDBOX_CREDENTIAL_KEY: ${FLUIDBOX_CREDENTIAL_KEY:-}
       LLM_UPSTREAM_URL: http://litellm:4000
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-litellm-eval-only}
@@ -106,7 +109,7 @@ services:
       - "127.0.0.1:3000:3000"
     environment:
       FLUIDBOX_API_URL: http://server:8787
-      FLUIDBOX_ADMIN_TOKEN: ${FLUIDBOX_ADMIN_TOKEN:?set a random admin token first — see the server service above}
+      FLUIDBOX_ADMIN_TOKEN: "${FLUIDBOX_ADMIN_TOKEN:?required — see the server service above}"
 
   # Pull-only entries (never started): `--profile runners pull` fetches the
   # runner images the server will spawn as sibling containers.
