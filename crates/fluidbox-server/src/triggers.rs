@@ -337,6 +337,168 @@ pub struct ScheduleInput {
     pub missed_run_policy: Option<String>,
 }
 
+/// PATCH body — the mutable surface ONLY. deny_unknown_fields is the
+/// immutability enforcement: `agent`, `trigger_kind`, `connection`, etc.
+/// are refused with 400, not silently ignored (serde's default would
+/// otherwise accept-and-drop them, returning a lying 200).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // wired to the PATCH handler in Task 4
+pub struct UpdateTrigger {
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Some("") clears the template (valid only when the resolved state
+    /// still passes the dead-config rule); omitted = unchanged.
+    #[serde(default)]
+    pub task_template: Option<String>,
+    #[serde(default)]
+    pub allow_task_override: Option<bool>,
+    #[serde(default)]
+    pub allow_workspace_override: Option<bool>,
+    #[serde(default)]
+    pub concurrency_policy: Option<String>,
+    /// Some("") removes the signed-webhook callback; Some(url) sets/replaces
+    /// it (mints a new secret, returned once); omitted = unchanged.
+    #[serde(default)]
+    pub callback_url: Option<String>,
+    /// Schedule-kind subscriptions only. Partial: omitted fields keep the
+    /// existing schedule's values (a cron-only PATCH must NOT reset
+    /// timezone/missed policy to defaults).
+    #[serde(default)]
+    pub schedule: Option<ScheduleUpdate>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // wired to the PATCH handler in Task 4
+pub struct ScheduleUpdate {
+    #[serde(default)]
+    pub cron: Option<String>,
+    #[serde(default)]
+    pub timezone: Option<String>,
+    #[serde(default)]
+    pub missed_run_policy: Option<String>,
+}
+
+impl UpdateTrigger {
+    /// True when the PATCH names nothing — the handler answers with the
+    /// current state WITHOUT writing (an empty {} must not advance
+    /// updated_at; the detail page's "as of" stamp would lie).
+    #[allow(dead_code)] // wired to the PATCH handler in Task 4
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none()
+            && self.task_template.is_none()
+            && self.allow_task_override.is_none()
+            && self.allow_workspace_override.is_none()
+            && self.concurrency_policy.is_none()
+            && self.callback_url.is_none()
+            && self.schedule.is_none()
+    }
+}
+
+#[allow(dead_code)] // wired to the PATCH handler in Task 4
+pub(crate) struct ResolvedUpdate {
+    pub name: String,
+    pub task_template: Option<String>,
+    pub allow_task_override: bool,
+    pub allow_workspace_override: bool,
+    pub concurrency_policy: String,
+}
+
+#[allow(dead_code)] // wired to the PATCH handler in Task 4
+fn resolve_update(
+    current: &fluidbox_db::TriggerSubscriptionRow,
+    req: &UpdateTrigger,
+    render_ctx: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<ResolvedUpdate, String> {
+    let name = match &req.name {
+        None => current.name.clone(),
+        Some(n) => {
+            let n = n.trim();
+            if n.is_empty() {
+                return Err("name must not be empty".into());
+            }
+            n.to_string()
+        }
+    };
+    let concurrency_policy = match &req.concurrency_policy {
+        None => current.concurrency_policy.clone(),
+        Some(c) => {
+            if ConcurrencyPolicy::parse(c).is_none() {
+                return Err("concurrency_policy must be allow | skip_if_running | replace".into());
+            }
+            c.clone()
+        }
+    };
+    let allow_task_override = req.allow_task_override.unwrap_or(current.allow_task_override);
+    let allow_workspace_override = req
+        .allow_workspace_override
+        .unwrap_or(current.allow_workspace_override);
+    let task_template = match &req.task_template {
+        None => current.task_template.clone(),
+        Some(t) => {
+            let t = t.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        }
+    };
+    // The create-time dead-config rule holds across every edit.
+    if task_template.is_none() && !allow_task_override {
+        return Err("provide a task_template or set allow_task_override".into());
+    }
+    // Schedule/event kinds fire with no caller: the template must exist and
+    // must render from the kind's sample context alone.
+    if let Some(ctx) = render_ctx {
+        let tpl = task_template.as_deref().ok_or_else(|| {
+            format!(
+                "a {} subscription needs a task_template (there is no caller)",
+                current.trigger_kind
+            )
+        })?;
+        render_task_template(tpl, ctx).map_err(|e| {
+            format!(
+                "task_template must render from the {} context ({}): {e}",
+                current.trigger_kind,
+                ctx.keys()
+                    .map(|k| format!("{{{{{k}}}}}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        })?;
+    }
+    Ok(ResolvedUpdate {
+        name,
+        task_template,
+        allow_task_override,
+        allow_workspace_override,
+        concurrency_policy,
+    })
+}
+
+/// Merge a partial schedule PATCH over the existing row → (cron, timezone,
+/// missed_run_policy), all still to be validated by the caller.
+#[allow(dead_code)] // wired to the PATCH handler in Task 4
+fn merge_schedule(current: &fluidbox_db::ScheduleRow, upd: &ScheduleUpdate) -> (String, String, String) {
+    (
+        upd.cron
+            .as_deref()
+            .unwrap_or(&current.cron)
+            .trim()
+            .to_string(),
+        upd.timezone
+            .as_deref()
+            .unwrap_or(&current.timezone)
+            .to_string(),
+        upd.missed_run_policy
+            .as_deref()
+            .unwrap_or(&current.missed_run_policy)
+            .to_string(),
+    )
+}
+
 pub async fn create(
     principal: Principal,
     State(state): State<AppState>,
@@ -1389,5 +1551,122 @@ mod tests {
 
         let m = contract_urls("https://fb.example", id, Some("/v1/ingress/github/app/7"));
         assert_eq!(m["ingress_url"], "https://fb.example/v1/ingress/github/app/7");
+    }
+
+    fn sub_row(kind: &str, template: Option<&str>, allow_task: bool) -> fluidbox_db::TriggerSubscriptionRow {
+        fluidbox_db::TriggerSubscriptionRow {
+            id: Uuid::nil(),
+            tenant_id: Uuid::nil(),
+            agent_id: Uuid::nil(),
+            name: "n".into(),
+            trigger_kind: kind.into(),
+            pinned_revision_id: None,
+            enabled: true,
+            task_template: template.map(str::to_string),
+            allow_task_override: allow_task,
+            allow_workspace_override: false,
+            autonomy: None,
+            concurrency_policy: "allow".into(),
+            budget_override: None,
+            workspace_override: None,
+            result_destinations: json!([]),
+            connection_id: None,
+            resource_selector: None,
+            event_filter: None,
+            event_publish: None,
+            capability_bundles: None,
+            authority_generation: 1,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn upd() -> UpdateTrigger {
+        UpdateTrigger {
+            name: None,
+            task_template: None,
+            allow_task_override: None,
+            allow_workspace_override: None,
+            concurrency_policy: None,
+            callback_url: None,
+            schedule: None,
+        }
+    }
+
+    #[test]
+    fn update_trigger_refuses_unknown_fields() {
+        // Immutability enforcement: agent/kind are not silently ignored.
+        for body in [r#"{"agent":"other"}"#, r#"{"trigger_kind":"schedule"}"#] {
+            assert!(serde_json::from_str::<UpdateTrigger>(body).is_err(), "{body}");
+        }
+        let ok: UpdateTrigger = serde_json::from_str(r#"{"name":"x"}"#).unwrap();
+        assert!(!ok.is_empty());
+        let empty: UpdateTrigger = serde_json::from_str("{}").unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn resolve_update_keeps_omitted_fields() {
+        let cur = sub_row("api", Some("do {{ticket}}"), false);
+        let r = resolve_update(&cur, &upd(), None).unwrap();
+        assert_eq!(r.name, "n");
+        assert_eq!(r.task_template.as_deref(), Some("do {{ticket}}"));
+        assert_eq!(r.concurrency_policy, "allow");
+    }
+
+    #[test]
+    fn resolve_update_rejects_dead_config() {
+        let cur = sub_row("api", Some("t"), false);
+        let mut req = upd();
+        req.task_template = Some("  ".into());
+        assert!(resolve_update(&cur, &req, None).is_err());
+        let cur = sub_row("api", Some("t"), true);
+        let r = resolve_update(&cur, &req, None).unwrap();
+        assert_eq!(r.task_template, None);
+    }
+
+    #[test]
+    fn resolve_update_rejects_empty_name_and_bad_concurrency() {
+        let cur = sub_row("api", Some("t"), false);
+        let mut req = upd();
+        req.name = Some("  ".into());
+        assert!(resolve_update(&cur, &req, None).is_err());
+        let mut req = upd();
+        req.concurrency_policy = Some("sometimes".into());
+        assert!(resolve_update(&cur, &req, None).is_err());
+    }
+
+    #[test]
+    fn resolve_update_revalidates_template_against_kind_context() {
+        let cur = sub_row("schedule", Some("sweep at {{fire_time}}"), false);
+        let mut req = upd();
+        req.task_template = Some("do {{ticket}}".into()); // not in schedule ctx
+        let ctx = ctx(&[("fire_time", "2026-01-01T00:00:00Z")]);
+        assert!(resolve_update(&cur, &req, Some(&ctx)).is_err());
+        req.task_template = Some("sweep {{fire_time}} again".into());
+        let r = resolve_update(&cur, &req, Some(&ctx)).unwrap();
+        assert_eq!(r.task_template.as_deref(), Some("sweep {{fire_time}} again"));
+        // A schedule can never clear its template (there is no caller).
+        req.task_template = Some("".into());
+        assert!(resolve_update(&cur, &req, Some(&ctx)).is_err());
+    }
+
+    #[test]
+    fn merge_schedule_keeps_omitted_fields() {
+        let row = fluidbox_db::ScheduleRow {
+            id: Uuid::nil(),
+            subscription_id: Uuid::nil(),
+            cron: "0 9 * * 1-5".into(),
+            timezone: "America/Chicago".into(),
+            next_fire_at: None,
+            missed_run_policy: "catch_up".into(),
+            last_fired_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        // A cron-only PATCH must not reset timezone/missed policy.
+        let upd = ScheduleUpdate { cron: Some("0 8 * * *".into()), timezone: None, missed_run_policy: None };
+        let (cron, tz, missed) = merge_schedule(&row, &upd);
+        assert_eq!((cron.as_str(), tz.as_str(), missed.as_str()), ("0 8 * * *", "America/Chicago", "catch_up"));
     }
 }
