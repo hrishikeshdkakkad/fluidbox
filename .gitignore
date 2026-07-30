@@ -28,4 +28,7 @@ apps/web/.env.local
 # Local-only notes (artifact index, scratch docs) — never committed
 *.local.md
 data-gate/
-.demo-bin/
+# `just demo` state. Ignoring the whole directory matters: a kept demo stack
+# (FLUIDBOX_DEMO_KEEP=1, or answering "n" at the teardown prompt) leaves
+# .demo/admin-token — a live admin credential for the running stack — on disk.
+.demo/
