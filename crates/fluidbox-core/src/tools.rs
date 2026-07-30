@@ -104,7 +104,139 @@ pub const CANONICAL: &[ToolDef] = &[
         name: "ToolSearch",
         group: ToolGroup::Meta,
     },
+    // ── The rest of the pinned Claude Code CLI's advertised surface ─────────
+    //
+    // Same second-order consequence as ToolSearch above, at scale. Making the
+    // gate mandatory did not only change ENFORCEMENT, it changed WHICH NAMES
+    // the control plane ever sees: 23 tools the CLI advertises used to be
+    // auto-approved below `canUseTool` and so never needed a vocabulary entry.
+    // They now all arrive at `/permission`, where an unregistered name is
+    // un-enumerable (absent from the Governance matrix) and an ungoverned name
+    // falls to `defaults.tool_action`. Registering them is what lets the seed
+    // policy state a deliberate opinion per tool instead of one blanket
+    // fallback. Grouped into the EXISTING five groups on purpose — a new
+    // ToolGroup variant needs a matching label in the dashboard's
+    // PermissionMatrix or the row renders unlabelled.
+    //
+    // The dispositions live in policies/default.yaml and are pinned by
+    // `seed_policy_governs_the_advertised_surface` in policy.rs. Three classes:
+    //   * observational (no side effect)         → allow
+    //   * NESTING (spawns sub-execution)         → deny, see below
+    //   * persistent/external side effect        → approve
+    //
+    // NESTING IS THE LOAD-BEARING ONE. `Agent`, `Task`, `Workflow`, `Skill` and
+    // `TaskCreate` start execution whose nested tool calls may never surface as
+    // top-level tool_use/tool_result blocks — so they would be neither routed
+    // by the PreToolUse hook nor caught by the GateWitness tripwire, which
+    // documents itself as "a knowingly incomplete detector" (contract.mjs). A
+    // human approving one of these authorises an unbounded, unobserved tool
+    // tree, which is why the seed DENIES them rather than asking.
+    ToolDef {
+        name: "Agent",
+        group: ToolGroup::Meta,
+    },
+    ToolDef {
+        name: "Workflow",
+        group: ToolGroup::Meta,
+    },
+    ToolDef {
+        name: "Skill",
+        group: ToolGroup::Meta,
+    },
+    ToolDef {
+        name: "TaskCreate",
+        group: ToolGroup::Meta,
+    },
+    ToolDef {
+        name: "TaskGet",
+        group: ToolGroup::Meta,
+    },
+    ToolDef {
+        name: "TaskList",
+        group: ToolGroup::Meta,
+    },
+    ToolDef {
+        name: "TaskOutput",
+        group: ToolGroup::Meta,
+    },
+    ToolDef {
+        name: "TaskStop",
+        group: ToolGroup::Meta,
+    },
+    ToolDef {
+        name: "TaskUpdate",
+        group: ToolGroup::Meta,
+    },
+    ToolDef {
+        name: "SendMessage",
+        group: ToolGroup::Meta,
+    },
+    ToolDef {
+        name: "AskUserQuestion",
+        group: ToolGroup::Meta,
+    },
+    ToolDef {
+        name: "EnterPlanMode",
+        group: ToolGroup::Meta,
+    },
+    ToolDef {
+        name: "ExitPlanMode",
+        group: ToolGroup::Meta,
+    },
+    ToolDef {
+        name: "ReportFindings",
+        group: ToolGroup::Meta,
+    },
+    ToolDef {
+        name: "Monitor",
+        group: ToolGroup::Meta,
+    },
+    ToolDef {
+        name: "CronCreate",
+        group: ToolGroup::Meta,
+    },
+    ToolDef {
+        name: "CronDelete",
+        group: ToolGroup::Meta,
+    },
+    ToolDef {
+        name: "CronList",
+        group: ToolGroup::Meta,
+    },
+    ToolDef {
+        name: "ScheduleWakeup",
+        group: ToolGroup::Meta,
+    },
+    ToolDef {
+        name: "PushNotification",
+        group: ToolGroup::Meta,
+    },
+    // Egress-shaped: syncs to an external design service. Grouped with the
+    // other network tools so the matrix shows it beside WebFetch/WebSearch.
+    ToolDef {
+        name: "DesignSync",
+        group: ToolGroup::Web,
+    },
+    // Git worktree context switches. Shell, not Files: they create and move
+    // between trees rather than editing a file, and `EnterWorktree` can put the
+    // agent somewhere the Edit rule's `/workspace/**` assumption no longer
+    // describes.
+    ToolDef {
+        name: "EnterWorktree",
+        group: ToolGroup::Shell,
+    },
+    ToolDef {
+        name: "ExitWorktree",
+        group: ToolGroup::Shell,
+    },
 ];
+
+/// Tools that start execution whose nested tool calls the gate may never see.
+///
+/// Kept as data so the seed-policy test can assert the seed never `allow`s one,
+/// and so a future harness that proves nested calls DO reach `/permission` has a
+/// single place to revise. See the NESTING note in `CANONICAL`.
+pub const NESTING: &[&str] = &["Agent", "Task", "Workflow", "Skill", "TaskCreate"];
 
 /// Is this an exact canonical tool name? (Not a matcher — no wildcards.)
 pub fn is_canonical(name: &str) -> bool {
