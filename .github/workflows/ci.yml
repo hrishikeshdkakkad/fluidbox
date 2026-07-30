@@ -381,6 +381,13 @@ jobs:
       # that prove the residual is closed, so a green `web` job is their proof.
       - run: node --test images/runner-lib/*.test.mjs
         working-directory: .
+      # The replay runner's own suite. It ran in NO pipeline until the
+      # release-candidate pass: the glob above is single-level under
+      # images/runner-lib/, so it never reached images/replay-runner/runner/test/
+      # — and the replay driver is what `just demo` puts in front of every new
+      # user, through the real permission gate.
+      - run: node --test images/replay-runner/runner/test/*.test.mjs
+        working-directory: .
 
   # Supply-chain gate: advisories, licenses, bans, sources (deny.toml).
   deny:
@@ -404,6 +411,53 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: bash scripts/version-check.sh
+
+  # Compose-file guard. The Helm chart had `deploy/helm/chart-assertions.sh` in
+  # the k8s workflow; the compose files had nothing — no job, script, or `just`
+  # recipe even referenced docker-compose.eval.yml. That is how the eval profile
+  # shipped three releases publishing an admin token committed to this
+  # repository, on a port open to the network segment, beside a mounted docker
+  # socket. Seconds to run, no daemon, no network.
+  compose-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: bash deploy/compose-assertions.sh
+
+  # AT-01b/AT-01d, at zero model cost. Proves the property the whole product is
+  # named for — a tool call the control plane denied does not execute — by
+  # driving the REAL runner image and the REAL Claude Code CLI against a mock
+  # upstream and a mock control plane, and then looking for a real filesystem
+  # side effect in the bind-mounted workspace.
+  #
+  # This is the gate that was missing when the bypass shipped. `governance-e2e`
+  # kills the real runner and drives /permission itself, so it validates the
+  # server and structurally cannot validate the harness; the only suite that ran
+  # a live agent was workflow_dispatch-only AND needed model credits. This one
+  # needs neither, so it can gate a PR.
+  gate-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'push' ||
+      github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+      - name: build the sandbox runner image from source
+        run: docker build -t fluidbox-sandbox-runner:gateproof -f images/sandbox-runner/Dockerfile images
+      - name: the gate proof (no API key, no model spend)
+        env:
+          GATEPROOF_IMAGE: fluidbox-sandbox-runner:gateproof
+        run: bash scripts/gate-proof.sh
+      - name: upload gate-proof evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gate-proof-evidence
+          path: gate-proof-evidence/
+          if-no-files-found: warn
+          retention-days: 14
 
   # The full acceptance suite, no-model tier: builds BOTH runner images
   # (base-image bumps can't be vacuously green — closes the #14 gap) and

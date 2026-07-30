@@ -178,3 +178,30 @@ test("the Claude runner reconciles tool results against decisions", () => {
   assert.match(src, /witness\.ungovernedResult\(/, "must check results against decisions");
   assert.match(src, /abortUngoverned\(/, "must abort on an ungoverned execution");
 });
+
+// Closes a third mutation hole, found by re-running the mutation matrix during
+// the release-candidate pass. The assertion above tests for the PRESENCE of the
+// identifier `abortUngoverned(` — which the function's own DECLARATION
+// satisfies. So deleting the tripwire's only CALL SITE left the suite at 14/14
+// green while the second layer of the gate was gone. "Is the name in the file?"
+// is not the same question as "is the code reached?", and only the second one is
+// worth asserting.
+test("the tripwire is actually CALLED, not merely declared", () => {
+  const src = fs.readFileSync(CLAUDE_RUNNER, "utf8");
+  const declarations = src.match(/^\s*(?:async\s+)?function\s+abortUngoverned\s*\(/gm) || [];
+  const allMentions = src.match(/\babortUngoverned\s*\(/g) || [];
+  assert.equal(declarations.length, 1, "expected exactly one abortUngoverned declaration");
+  assert.ok(
+    allMentions.length > declarations.length,
+    "abortUngoverned is declared but never called — the ungoverned-execution " +
+      "tripwire is dead code, so a tool that runs without a decision would be " +
+      "detected and then silently ignored",
+  );
+  // ...and it must be awaited from the tool_result reconciliation, not from some
+  // unrelated branch: the whole point is that it fires on an undecided result.
+  assert.match(
+    src,
+    /ungovernedResult\([\s\S]{0,200}?abortUngoverned\(/,
+    "abortUngoverned must be invoked from the ungovernedResult check",
+  );
+});
