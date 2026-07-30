@@ -63,6 +63,14 @@ codex-build:
 replay-build:
     docker build -t ${FLUIDBOX_REPLAY_IMAGE:-fluidbox-replay-runner:dev} -f images/replay-runner/Dockerfile images
 
+# Prove the permission gate end to end with NO API key and NO model spend: the
+# real runner image and the real Claude Code CLI, a mock upstream that returns a
+# canned tool_use, and a mock control plane whose verdict each scenario chooses.
+# Asserts on real filesystem side effects and on the digest of a freshly-minted
+# nonce. This is the gate that was missing when the canUseTool bypass shipped.
+gate-proof: sandbox-build
+    GATEPROOF_IMAGE=$FLUIDBOX_SANDBOX_IMAGE bash scripts/gate-proof.sh
+
 # ── Demo ─────────────────────────────────────────────────────────────────
 
 # The five-minute first-run: a full governed run with NO API key (deterministic
