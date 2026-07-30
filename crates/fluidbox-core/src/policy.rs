@@ -1359,7 +1359,10 @@ tools:
 
         // Spot-checks of the three dispositions, so a careless bulk edit that
         // collapses them into one action fails here.
-        let verdict = |t: &str| p.evaluate(&req(t, json!({})), Autonomy::Supervised).effective;
+        let verdict = |t: &str| {
+            p.evaluate(&req(t, json!({})), Autonomy::Supervised)
+                .effective
+        };
         assert_eq!(verdict("ExitPlanMode"), Verdict::Allow, "observational");
         assert_eq!(verdict("TaskList"), Verdict::Allow, "read-only bookkeeping");
         assert!(
