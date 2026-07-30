@@ -3907,6 +3907,117 @@ pub async fn set_trigger_subscription_enabled(
     Ok(__rls_out)
 }
 
+/// What PATCH does to the callback destination: leave it alone, remove it,
+/// or replace it with a freshly sealed secret. Owns its data — the sealed
+/// bytes are produced inside the handler's match arm.
+pub enum CallbackUpdate {
+    Keep,
+    Clear,
+    Set {
+        destinations: Value,
+        sealed: Vec<u8>,
+        key_version: i16,
+    },
+}
+
+pub struct ScheduleConfigUpdate {
+    pub cron: String,
+    pub timezone: String,
+    pub missed_run_policy: String,
+    pub next_fire_at: DateTime<Utc>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn update_trigger_subscription(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    expect_updated_at: DateTime<Utc>,
+    name: &str,
+    task_template: Option<&str>,
+    allow_task_override: bool,
+    allow_workspace_override: bool,
+    concurrency_policy: &str,
+    callback: CallbackUpdate,
+    schedule: Option<&ScheduleConfigUpdate>,
+) -> sqlx::Result<Option<(TriggerSubscriptionRow, Option<ScheduleRow>)>> {
+    // key_version 1 when bytes are NULL: the column CHECKs in (1,2) and the
+    // version is moot without bytes (Sealed::split's convention).
+    let (cb_touched, cb_dests, cb_sealed, cb_kv): (bool, Value, Option<Vec<u8>>, i16) =
+        match callback {
+            CallbackUpdate::Keep => (false, Value::Array(vec![]), None, 1),
+            CallbackUpdate::Clear => (true, Value::Array(vec![]), None, 1),
+            CallbackUpdate::Set {
+                destinations,
+                sealed,
+                key_version,
+            } => (true, destinations, Some(sealed), key_version),
+        };
+    let mut tx = scoped_tx(pool, scope).await?;
+
+    let sub: Option<TriggerSubscriptionRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "update trigger_subscriptions set
+           name = $2, task_template = $3, allow_task_override = $4,
+           allow_workspace_override = $5, concurrency_policy = $6,
+           result_destinations = case when $7 then $8 else result_destinations end,
+           callback_secret_sealed = case when $7 then $9 else callback_secret_sealed end,
+           callback_secret_key_version =
+             case when $7 then $10 else callback_secret_key_version end,
+           authority_generation =
+             authority_generation + case when $7 then 1 else 0 end,
+           updated_at = now()
+         where id = $1 and tenant_id = $11 and updated_at = $12
+         returning {SUBSCRIPTION_COLS}"
+    )))
+    .bind(id)
+    .bind(name)
+    .bind(task_template)
+    .bind(allow_task_override)
+    .bind(allow_workspace_override)
+    .bind(concurrency_policy)
+    .bind(cb_touched)
+    .bind(cb_dests)
+    .bind(cb_sealed)
+    .bind(cb_kv)
+    .bind(scope.tenant_id())
+    .bind(expect_updated_at)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(sub) = sub else {
+        // Stale expect_updated_at or vanished row: nothing written, tx drops.
+        return Ok(None);
+    };
+
+    let schedule_row = match schedule {
+        None => None,
+        Some(s) => Some(
+            sqlx::query_as::<_, ScheduleRow>(
+                "update schedules set cron = $2, timezone = $3,
+                   missed_run_policy = $4, next_fire_at = $5, updated_at = now()
+                 where subscription_id = $1
+                   and exists (select 1 from trigger_subscriptions sub
+                               where sub.id = $1 and sub.tenant_id = $6)
+                 returning *",
+            )
+            .bind(id)
+            .bind(&s.cron)
+            .bind(&s.timezone)
+            .bind(&s.missed_run_policy)
+            .bind(s.next_fire_at)
+            .bind(scope.tenant_id())
+            .fetch_optional(&mut *tx)
+            .await?
+            // A schedule-kind subscription without its schedules row is
+            // corruption; error → the WHOLE tx (incl. the subscription
+            // update above) rolls back.
+            .ok_or(sqlx::Error::RowNotFound)?,
+        ),
+    };
+
+    tx.commit().await?;
+    Ok(Some((sub, schedule_row)))
+}
+
 /// The only reader of the sealed callback secret. Deliveries for in-flight
 /// runs must still sign after a disable, so this does not require `enabled`.
 pub async fn subscription_callback_secret_sealed(
