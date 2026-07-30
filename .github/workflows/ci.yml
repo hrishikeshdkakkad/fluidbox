@@ -423,6 +423,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: bash deploy/compose-assertions.sh
+      # Static self-checks for the demo script. Cheap, and they cover the class of
+      # defect that only shows up on a FRESH CLONE — the one environment the demo
+      # exists to serve and the hardest to keep in a test loop.
+      - run: bash scripts/demo-selftest.sh
 
   # AT-01b/AT-01d, at zero model cost. Proves the property the whole product is
   # named for — a tool call the control plane denied does not execute — by
