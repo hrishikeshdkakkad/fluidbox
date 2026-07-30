@@ -383,7 +383,7 @@ function SettingsSection({
               placeholder="https://your-service.example/fluidbox/callback"
             />
             <span className="field-hint">
-              Clearing removes the signed callback; changing it mints a NEW signing secret shown once
+              Clearing removes the signed callback; changing it mints a NEW signing secret shown once. Either change abandons deliveries still pending for earlier runs.
             </span>
           </label>
           {sub.trigger_kind === "schedule" && schedule && (

@@ -389,7 +389,17 @@ impl UpdateTrigger {
             && self.allow_workspace_override.is_none()
             && self.concurrency_policy.is_none()
             && self.callback_url.is_none()
-            && self.schedule.is_none()
+            // `{"schedule": {}}` names no schedule field, so it is a no-op too:
+            // fold an all-None schedule object into "nothing to write".
+            && self.schedule.as_ref().is_none_or(ScheduleUpdate::is_empty)
+    }
+}
+
+impl ScheduleUpdate {
+    /// True when the schedule PATCH names no field — writing it would advance
+    /// `updated_at` (and, pre-F1, reset the fire clock) for no change.
+    pub fn is_empty(&self) -> bool {
+        self.cron.is_none() && self.timezone.is_none() && self.missed_run_policy.is_none()
     }
 }
 
@@ -496,6 +506,14 @@ fn merge_schedule(
             .unwrap_or(&current.missed_run_policy)
             .to_string(),
     )
+}
+
+/// Did a schedule PATCH change the firing cadence (cron OR timezone)? A
+/// cadence-neutral PATCH (e.g. missed_run_policy only) must NOT reset the fire
+/// clock — recomputing `next_fire_at` there would skip an imminent fire and
+/// discard missed-run state.
+fn cadence_changed(current: &fluidbox_db::ScheduleRow, merged_cron: &str, merged_tz: &str) -> bool {
+    merged_cron != current.cron || merged_tz != current.timezone
 }
 
 pub async fn create(
@@ -998,7 +1016,12 @@ pub async fn update(
             let mut tx = fluidbox_db::scoped_tx(&state.pool, scope).await?;
             let conn = fluidbox_db::get_connection(&mut *tx, scope, cid)
                 .await?
-                .ok_or(ApiError::NotFound)?;
+                .ok_or_else(|| {
+                    ApiError::BadRequest(
+                        "this subscription's connection no longer exists — reconnect it before editing"
+                            .into(),
+                    )
+                })?;
             tx.commit().await?;
             let connector = crate::connectors::connector_for(&conn.provider).ok_or_else(|| {
                 ApiError::Internal(format!("provider '{}' has no connector", conn.provider))
@@ -1060,7 +1083,12 @@ pub async fn update(
     // fields keep the existing row's values (a cron-only PATCH must not
     // reset America/Chicago to UTC).
     let schedule_cfg = match &req.schedule {
+        // An all-None schedule object is a no-op — treat it like an omitted
+        // schedule (is_empty() already folds it into the top-level no-op path;
+        // this arm is the belt-and-braces guard should this handler run with a
+        // non-empty PATCH that carries an empty schedule alongside it).
         None => None,
+        Some(s) if s.is_empty() => None,
         Some(s) => {
             if current.trigger_kind != "schedule" {
                 return Err(ApiError::BadRequest(
@@ -1071,20 +1099,29 @@ pub async fn update(
                 ApiError::Internal("schedule subscription has no schedule row".into())
             })?;
             let (cron_expr, tz, missed) = merge_schedule(row, s);
+            // Validate the merged cron regardless of whether the cadence moved
+            // — validation must not weaken on a partial PATCH.
             let cron = CronSchedule::parse(&cron_expr, &tz).map_err(ApiError::BadRequest)?;
             if MissedRunPolicy::parse(&missed).is_none() {
                 return Err(ApiError::BadRequest(
                     "missed_run_policy must be skip | catch_up".into(),
                 ));
             }
-            let first = cron.next_fire_after(chrono::Utc::now()).ok_or_else(|| {
-                ApiError::BadRequest("cron expression never fires in the future".into())
-            })?;
+            // Cadence unchanged (e.g. a missed_run_policy-only PATCH): carry
+            // the existing row's clock through unchanged (F1). Only a changed
+            // cron/timezone resets it to the next fire from now.
+            let next_fire_at = if cadence_changed(row, &cron_expr, &tz) {
+                Some(cron.next_fire_after(chrono::Utc::now()).ok_or_else(|| {
+                    ApiError::BadRequest("cron expression never fires in the future".into())
+                })?)
+            } else {
+                row.next_fire_at
+            };
             Some(fluidbox_db::ScheduleConfigUpdate {
                 cron: cron_expr,
                 timezone: tz,
                 missed_run_policy: missed,
-                next_fire_at: first,
+                next_fire_at,
             })
         }
     };
@@ -1807,6 +1844,15 @@ mod tests {
         assert!(!ok.is_empty());
         let empty: UpdateTrigger = serde_json::from_str("{}").unwrap();
         assert!(empty.is_empty());
+        // `{"schedule": {}}` names no field — a full no-op PATCH (F4).
+        let empty_sched: ScheduleUpdate = serde_json::from_str("{}").unwrap();
+        assert!(empty_sched.is_empty());
+        let sched_noop: UpdateTrigger = serde_json::from_str(r#"{"schedule":{}}"#).unwrap();
+        assert!(sched_noop.is_empty());
+        // A schedule naming a field is NOT a no-op.
+        let sched_set: UpdateTrigger =
+            serde_json::from_str(r#"{"schedule":{"missed_run_policy":"skip"}}"#).unwrap();
+        assert!(!sched_set.is_empty());
     }
 
     #[test]
@@ -1882,5 +1928,25 @@ mod tests {
             (cron.as_str(), tz.as_str(), missed.as_str()),
             ("0 8 * * *", "America/Chicago", "catch_up")
         );
+    }
+
+    #[test]
+    fn cadence_changed_ignores_missed_run_policy() {
+        let row = fluidbox_db::ScheduleRow {
+            id: Uuid::nil(),
+            subscription_id: Uuid::nil(),
+            cron: "0 9 * * 1-5".into(),
+            timezone: "America/Chicago".into(),
+            next_fire_at: None,
+            missed_run_policy: "skip".into(),
+            last_fired_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        // Same cron+tz (a missed_run_policy-only PATCH) is cadence-neutral (F1).
+        assert!(!cadence_changed(&row, "0 9 * * 1-5", "America/Chicago"));
+        // A changed cron OR timezone moves the cadence.
+        assert!(cadence_changed(&row, "0 8 * * 1-5", "America/Chicago"));
+        assert!(cadence_changed(&row, "0 9 * * 1-5", "UTC"));
     }
 }

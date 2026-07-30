@@ -3924,7 +3924,11 @@ pub struct ScheduleConfigUpdate {
     pub cron: String,
     pub timezone: String,
     pub missed_run_policy: String,
-    pub next_fire_at: DateTime<Utc>,
+    /// The `schedules.next_fire_at` column is nullable. `None` preserves the
+    /// "no future fire" state: a cadence-neutral PATCH (e.g. missed_run_policy
+    /// only) carries the existing row's clock through unchanged rather than
+    /// resetting it, and that clock may itself be `None`.
+    pub next_fire_at: Option<DateTime<Utc>>,
 }
 
 #[allow(clippy::too_many_arguments)]
