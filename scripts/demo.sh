@@ -152,17 +152,33 @@ preflight() {
 }
 
 # ── server binary ────────────────────────────────────────────────────────
-server_bin() {
+# Sets the global SERVER_BIN. It does NOT print the path.
+#
+# It used to `echo` the path and be called as `BIN=$(server_bin)`, which was
+# broken on the one path that matters most: a genuinely fresh clone. `warn`, `ok`
+# and `die` all print to STDOUT, so on the from-source branch the command
+# substitution captured the "first run: compiling the control plane" line AND the
+# path, and the launcher then tried to exec that whole multi-line string as a
+# command name — "No such file or directory", after a successful build, with the
+# real diagnostic swallowed into the variable. `die` was invisible for the same
+# reason, and being inside `$( )` its `exit 1` only left the subshell.
+#
+# The from-source branch is exactly the branch every new user takes, and it was
+# missed because the validation drills all set FLUIDBOX_DEMO_SERVER_BIN, whose
+# early return prints nothing. A global has no stream to pollute.
+resolve_server_bin() {
   if [ -n "${FLUIDBOX_DEMO_SERVER_BIN:-}" ]; then
     [ -x "$FLUIDBOX_DEMO_SERVER_BIN" ] || die "FLUIDBOX_DEMO_SERVER_BIN is not executable: $FLUIDBOX_DEMO_SERVER_BIN"
-    echo "$FLUIDBOX_DEMO_SERVER_BIN"; return
+    SERVER_BIN="$FLUIDBOX_DEMO_SERVER_BIN"; return
   fi
   if [ ! -x "$ROOT/target/debug/fluidbox-server" ]; then
     need_cmd cargo "Install Rust via https://rustup.rs — the demo builds the control plane from source."
-    warn "first run: compiling the control plane (one-time; later runs skip this)"
+    warn "first run: compiling the control plane (one-time; later runs skip this — expect a few minutes)"
     (cd "$ROOT" && cargo build -p fluidbox-server) || die "cargo build failed" "Fix the build error above and re-run."
   fi
-  echo "$ROOT/target/debug/fluidbox-server"
+  SERVER_BIN="$ROOT/target/debug/fluidbox-server"
+  [ -x "$SERVER_BIN" ] || die "the control plane binary is missing after a successful build: $SERVER_BIN" \
+      "Re-run, or build it yourself: cargo build -p fluidbox-server"
 }
 
 # ── up ───────────────────────────────────────────────────────────────────
@@ -172,7 +188,7 @@ demo_up() {
   preflight
 
   say "starting the demo stack (isolated: project fluidbox-demo, port $PORT, db $DB_PORT)"
-  local BIN; BIN=$(server_bin) || exit 1
+  SERVER_BIN=""; resolve_server_bin
   mkdir -p "$DEMO_DIR/data"
   FLUIDBOX_DEMO_DB_PORT="$DB_PORT" "${COMPOSE[@]}" up -d --wait --quiet-pull postgres \
     || die "demo Postgres failed to start" "Inspect: docker compose -p fluidbox-demo -f deploy/docker-compose.demo.yml logs postgres"
@@ -205,7 +221,7 @@ demo_up() {
     LITELLM_MASTER_KEY="demo-unused-no-model-calls" \
     LLM_UPSTREAM_URL="http://127.0.0.1:9" \
     RUST_LOG="${RUST_LOG:-info}" \
-    "$BIN" >> "$DEMO_DIR/server.log" 2>&1 &
+    "$SERVER_BIN" >> "$DEMO_DIR/server.log" 2>&1 &
   echo $! > "$DEMO_DIR/server.pid"
   disown
 
