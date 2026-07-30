@@ -36,14 +36,14 @@
 Single scrolling page (no tabs). List rows on the Automations page link to it; "Rotate token" remains in both places.
 
 - **Header**: name, kind badge, enabled toggle, agent link, next-fire time for schedules.
-- **API section** (kind=api; events show their ingress URL here): invoke/poll URLs, curl with token placeholder, variables table, response codes (200/400/401/409), callback signature block — each a `CopyBlock`. Plus Rotate token.
+- **API section** (kind=api; events show their ingress URL here): invoke/poll URLs, curl with token placeholder, variables table, response codes (200/400/401/409 concurrency/422 idempotency-key reuse with a different body — 422 matches what the server actually returns), callback signature block — each a `CopyBlock`. Plus Rotate token.
 - **Configuration section**: agent, autonomy, concurrency, overrides, schedule facts, with **Edit** on the mutable subset (§4).
 - **Template section**: rendered template with placeholder chips; **Edit template** inline (textarea + the same validation as create — must render from the kind's sample context). Saving PATCHes; the API section re-renders immediately. A line under the contract reads *"Reflects the configuration as of {updated_at}"* so edits are visible, not silent.
 - **Activity section**: reuse `AutomationActivity` (runs / firings & skips / deliveries). The list-row expander stays but gains an "Open →" link.
 
 ## 4. Backend changes
 
-- **URL fields on read**: `GET /v1/triggers/{id}` and `GET /v1/triggers` gain `base_url`, `invoke_url`, `poll_url_template`, `ingress_url` — same derivation as create/rotate (`public_url` + id; no secrets). Refactor the duplicated JSON block into one helper used by all four sites.
+- **URL fields on read**: `GET /v1/triggers/{id}` gains `base_url`, `invoke_url`, `poll_url_template`, `ingress_url` — same derivation as create/rotate (`public_url` + id; no secrets); `GET /v1/triggers` gains `base_url` only (the list UI never renders contracts; the detail page carries the full block). Refactor the duplicated JSON block into one helper used by every response that carries the contract.
 - **`PATCH /v1/triggers/{id}`** — mutable surface only:
   - `name`, `task_template`, `allow_task_override`, `allow_workspace_override`, `callback_url` (re-runs the same SSRF admission check as create), `concurrency_policy`; for schedules also `cron`, `timezone`, `missed_policy`.
   - Trigger kind and agent are immutable — attempting to change them is a 400; changing those means a new automation.
