@@ -233,6 +233,7 @@ pub fn normalize(
 
 /// Representative context for config-time template validation. Keys must
 /// stay a superset-match of what `normalize` produces.
+// Mirrored by apps/web/app/lib/automation-contract.ts SYSTEM_VARIABLES.event — keep in lockstep (vitest pins the list).
 pub fn sample_context() -> BTreeMap<String, String> {
     [
         ("repository", "acme/site"),

@@ -59,13 +59,6 @@ export function AutomationContract({
   );
   const declared = [...callerVars, ...systemVars, ...invalidVars];
 
-  const curl = buildCurl({
-    invokeUrl,
-    token,
-    caller: callerVars,
-    hasTemplate: !!subscription.task_template,
-  });
-
   const responseExample = [
     "200 OK",
     JSON.stringify(
@@ -168,7 +161,12 @@ export function AutomationContract({
           <h4>Request</h4>
           <CopyBlock
             label="Example"
-            value={curl}
+            value={buildCurl({
+              invokeUrl,
+              token,
+              caller: callerVars,
+              hasTemplate: !!subscription.task_template,
+            })}
             hint="Idempotency-Key is optional but strongly recommended: replaying the same key returns the original run instead of starting a second one."
           />
         </section>
