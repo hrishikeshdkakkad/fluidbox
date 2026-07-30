@@ -4389,6 +4389,8 @@ select.inp {
   letter-spacing: 0.07em;
   color: var(--ink-3);
 }
+.rc-api-preview { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+.rc-api-preview-curl { font-size: 11px; max-height: 140px; overflow: auto; }
 .rc-row-value {
   font-size: 13px;
   color: var(--ink);
