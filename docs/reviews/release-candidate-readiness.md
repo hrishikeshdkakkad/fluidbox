@@ -393,21 +393,26 @@ During:
 
 ## 11. Commits on this branch
 
-Eight commits on top of the integration:
+Eleven focused commits on top of the integration at `2e57b5c`, oldest first:
 
 ```
-fix(eval):     require an admin token; loopback the dashboard; guard both in CI
-fix(core):     govern every tool the pinned CLI advertises; deny sub-execution
-fix(demo):     fail when the run fails; agree with the server on the docker daemon
-feat(ci):      prove the permission gate with no model spend, and gate it on every PR
-fix(release):  let the version guard express a prerelease
-docs:          correct the gate, egress and acceptance claims to what is actually proven
-chore(release): 0.4.0-rc.1
-fix(eval):     quote the required-token message, and make the guard parse the file
-fix(demo):     the from-source first run was broken; add static self-checks
-fix(demo):     prove the daemon can read the checkout before running
-docs(release):  claims matrix, compatibility matrix, upgrade/rollback guide, beta package
+3bbf73b  fix(eval):      require an admin token; loopback the dashboard; guard both in CI
+c0aa531  fix(core):      govern every tool the pinned CLI advertises; deny sub-execution
+40ce3c9  fix(demo):      fail when the run fails; agree with the server on the docker daemon
+0e49849  feat(ci):       prove the permission gate with no model spend, and gate it on every PR
+4d6abf3  fix(release):   let the version guard express a prerelease
+c8c61cc  docs:           correct the gate, egress and acceptance claims to what is proven
+c4ed867  chore(release): 0.4.0-rc.1
+4377c96  fix(eval):      quote the required-token message, and make the guard parse the file
+b52a554  fix(demo):      the from-source first run was broken; add static self-checks
+18fc153  fix(demo):      prove the daemon can read the checkout before running
+3a4a5af  docs(release):  claims matrix, compatibility matrix, upgrade guide, beta package
 ```
+
+Three of those (`4377c96`, `b52a554`, `18fc153`) fix defects introduced or exposed
+*during this pass* rather than inherited — the YAML quoting in my own guard, and
+the two fresh-clone failures the zero-state validation surfaced. They are separate
+commits rather than amendments so the provenance of each fix stays legible.
 
 ## 12. Reproduction
 
