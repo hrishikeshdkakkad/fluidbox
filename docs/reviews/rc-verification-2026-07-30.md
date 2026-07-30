@@ -14,6 +14,14 @@ re-derive the load-bearing ones independently.
 **To** `READY FOR CONTROLLED BETA AFTER THREE NAMED FIXES` — listed in §8, all
 small, none architectural.
 
+> **UPDATE — the three fixes are applied.** See §11. All three were made and
+> red-green verified after this report was first written; the guards are now
+> **18** and **10** assertions and the false absolute is gone from all seven
+> places it had propagated to. On the strength of that, **the verdict rises to
+> `READY FOR CONTROLLED BETA`** — with the three P2 items in §11 still open and
+> the pre-existing risks (no live Claude run, one platform, untouched supply
+> chain) unchanged and still owned by the maintainer.
+
 This is a downgrade of the *report*, not a repudiation of the work. The single
 most important claim — that the P0 permission-gate bypass is closed and that
 `scripts/gate-proof.sh` is real evidence rather than a harness that would pass
@@ -803,3 +811,130 @@ mode this whole exercise exists to prevent.
   rather than relieving it. Notably, finding §3 is *itself* platform-specific,
   which is a live illustration of why the compatibility matrix's insistence on
   VALIDATED-vs-EXPECTED is the right discipline.
+
+---
+
+## 11. The three fixes, applied and verified
+
+Done in the commit following this report. Each was red-green verified: the guard
+passes on correct code, and fails on the exact mutation that previously slipped
+through.
+
+### Fix 1 — the false absolute is gone (blocker 1)
+
+It had propagated to **seven** places, which is the argument for treating a
+claims matrix as load-bearing text rather than commentary: the error was written
+once in a compose comment and copied into both user-facing security documents.
+
+| File | Was | Now |
+|---|---|---|
+| `deploy/docker-compose.eval.yml` | "The API port CANNOT be moved to loopback… every run fails during provisioning" | The `FLUIDBOX_BIND` vs `FLUIDBOX_EVAL_API_BIND` distinction spelled out, with per-engine measured/expected status |
+| `README.md` | "published on all interfaces **and cannot be loopback-bound**" | "published on all interfaces **by default**", plus how to narrow it and what to verify after |
+| `SECURITY.md` | "a loopback publish would break every run" | engine-dependent, with the measured/expected split |
+| `docs/release/claims-matrix.md` | C1 asserted the absolute | C1 corrected; **new row C1a** carries the engine-dependent claim at its true evidence class |
+| `docs/release/upgrade-and-rollback.md` | "**cannot** be loopback-bound… breaks every run" | narrowing is engine-dependent, verify a run afterwards |
+| `deploy/compose-assertions.sh` | comment repeated it; assertion text said "cannot be loopback" | comment states the trade-off; assertion renamed to "explains the trade-off behind its non-loopback **default**" |
+| `docs/reviews/release-candidate-readiness.md` §4.1 | the original claim | dated **CORRECTION** block quoting what it said and why it was wrong |
+
+The house convention for amending a claim (visible dated correction, not a silent
+rewrite — as `CLAUDE.md` does for the OAuth confirmation claim) is followed
+throughout.
+
+**What I deliberately did NOT do: flip the default to `127.0.0.1`.** My own §3
+recommended "reconsider" it, and on reflection the evidence does not support
+changing a shipped default. I measured the *network path* on one engine; I never
+completed an end-to-end fluidbox run with the loopback bind, and on native Linux
+Docker the narrowing is expected to break. Flipping a default on a mechanism test
+alone would be the same overreach this pass exists to catch. The exposure is now
+accurately described and one environment variable away from being closed, which
+is the honest state.
+
+### Fix 2 — the admin-token guard now tests the property (blocker 2, Hole 1)
+
+Two layers replace the single file-wide `grep -q 'FLUIDBOX_ADMIN_TOKEN:?'`:
+
+- **Per-occurrence, source-level** (no docker needed): every non-comment
+  `FLUIDBOX_ADMIN_TOKEN:` assignment in all three files must be a
+  `${FLUIDBOX_ADMIN_TOKEN:?…}` substitution. The old check asked "does the
+  required form appear *anywhere*", which the `web` service satisfied while
+  `server` held a literal.
+- **Rendered-document** (docker): with a sentinel injected, every rendered
+  `FLUIDBOX_ADMIN_TOKEN` value must equal that sentinel. A literal cannot survive
+  this whatever its spelling, because a literal does not change when the
+  environment does.
+
+Red-green — the mutation that previously passed 14/14:
+
+```
+FLUIDBOX_ADMIN_TOKEN: "fluidbox-eval-only"     # server service
+
+  FAIL  …eval.yml has an admin-token assignment that is not a required substitution
+  FAIL  …eval.yml renders an admin token the operator did not supply
+compose-assertions.sh: 16 passed, 2 failed
+```
+
+Unmutated: **18 passed, 0 failed**. Both original defect shapes (`:-` default,
+quoted `0.0.0.0` publish) still caught — the `:-` default now trips both layers.
+
+### Fix 3 — the mount-probe check has teeth (blocker 3, Hole 3)
+
+Two grep-for-a-string assertions became three real properties: the probe must
+**exist**, be **reachable**, and be **ordered** before the control-plane launch.
+
+Reachability uses the defs-and-uses form check 3 already had, generalised so it
+works for a function invoked from a `case` arm (`up) demo_up ;;`), where the name
+is neither at line start nor the first word after the indent. Definitions and
+calls are told apart by what *follows* the name: `(` in a definition, anything
+else in a call.
+
+Red-green on both new properties:
+
+```
+probe wrapped in a never-called function:
+  FAIL  the bind-mount probe is unreachable — it sits in unused_mount_probe (defs=1 calls=0)
+probe moved after the control-plane launch:
+  FAIL  the bind-mount probe does not precede the control-plane launch
+```
+
+Unmutated: **10 passed, 0 failed**; both original defects still caught.
+
+**A note on getting this wrong first.** My initial version failed the *unmutated*
+file: I assumed the definition line would match the call-regex and set the
+threshold to `>1`, but `demo_up(` is followed by an open paren and never matched.
+That is the same error class as the bug being fixed — asserting a pattern's
+behaviour instead of measuring it — and it is why green-verification matters as
+much as red. A guard that cries wolf on correct code gets deleted, which is
+strictly worse than no guard. This is the third time that exact trap has been hit
+in this file's history; it is recorded here so the fourth is cheaper.
+
+### Verification after the fixes
+
+```
+compose-assertions.sh       18 passed, 0 failed
+demo-selftest.sh            10 passed, 0 failed
+gate-proof.sh               14 passed, 0 failed   (unchanged — not touched)
+docker compose config       all three files parse
+bash -n                     both guards parse
+```
+
+No Rust, no policy, and no runner source was modified, so the 857-test baseline
+and the gate proof are unaffected by these fixes.
+
+### Still open — the P2 items, deliberately not fixed here
+
+Named so they are not mistaken for closed:
+
+1. **`compose-assertions.sh` misses an unquoted port publish** (Hole 2). Its
+   `published_ports()` regex requires double quotes; `- 9999:9999` is a real
+   all-interfaces publish and is invisible. The fix is to read ports from
+   `docker compose config`, which normalises both forms with an explicit
+   `host_ip`. Left alone because it reworks the loopback logic, and reworking a
+   guard is how guards acquire holes.
+2. **`gate-proof.sh`'s `permission_calls()` returns `"0\n0"`** and throws
+   `[: integer expected`. Fails closed; diagnostics corrupt. One-line fix
+   (`|| true`, or `| wc -l`) — untouched here because the gate proof is the one
+   artifact whose behaviour I would not want changed in the same commit that
+   claims it still passes.
+3. **`Monitor` is `allow`-listed but runs bash and opens outbound WebSockets.**
+   A policy-content decision for the maintainer, not a guard defect: the pinning
+   test can only assert a rule exists, not that it is the right rule.

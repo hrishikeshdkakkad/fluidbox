@@ -115,11 +115,16 @@ credential everyone has.
 
 Two related changes: the dashboard now publishes on `127.0.0.1` only, and
 `FLUIDBOX_EVAL_API_BIND` lets you pin the API port's interface. The API port
-itself still publishes on all interfaces by default and **cannot** be
-loopback-bound — sandboxes are sibling containers that reach the control plane
-over `host.docker.internal`, which resolves to the host gateway rather than
-`127.0.0.1`, so a loopback publish breaks every run. Run this profile on a
-network you trust.
+itself still publishes on all interfaces **by default**, so run this profile on a
+network you trust — or narrow it.
+
+Narrowing is engine-dependent, not impossible. Sandboxes are sibling containers
+that reach the control plane over `host.docker.internal`. On colima a
+`127.0.0.1`-published port was **measured** to answer there (Docker Desktop and
+OrbStack share that mechanism and are expected to match); on native Linux Docker
+`host-gateway` is the bridge gateway and a loopback publish is expected to break.
+So set `FLUIDBOX_EVAL_API_BIND=127.0.0.1` if the default exposure is not
+acceptable, and confirm one run completes end to end afterwards.
 
 ## 4. Before you weaken the sub-execution deny
 

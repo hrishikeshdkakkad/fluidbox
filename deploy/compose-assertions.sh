@@ -44,12 +44,48 @@ for f in "$EVAL" "$DEV" "$DEMO"; do
   fi
 done
 
-# The eval profile must go further and REQUIRE the token, so `up` refuses rather
-# than booting an unauthenticated-in-practice control plane.
-if grep -qE 'FLUIDBOX_ADMIN_TOKEN:\?' "$EVAL"; then
+# EVERY assignment must be a required-variable substitution — checked one
+# occurrence at a time, not once per file.
+#
+# This check used to be `grep -q 'FLUIDBOX_ADMIN_TOKEN:?' "$EVAL"` — "does the
+# required form appear ANYWHERE in this file". Two services set the token
+# (`server` and `web`), so that passed while the server's value was a hardcoded
+# literal, which is BLK-04 itself: a working admin credential published in this
+# repository. Verified: reintroducing `FLUIDBOX_ADMIN_TOKEN: "fluidbox-eval-only"`
+# on the server left the suite fully green.
+#
+# The `:-` check above tests one SPELLING of the defect. This tests the property:
+# whatever the spelling, the value must come from the environment and must have
+# no fallback.
+for f in "$EVAL" "$DEV" "$DEMO"; do
+  [ -f "$f" ] || continue
+  # Whole-line comments are stripped first: the eval header explains the OLD
+  # default in prose, and a checker that cannot tell an assignment from a
+  # description of the bug it hunts fails on the file that fixed the bug.
+  assignments=$(grep -vE '^[[:space:]]*#' "$f" | grep -E '^[[:space:]]*FLUIDBOX_ADMIN_TOKEN:' || true)
+  offenders=""
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    printf '%s' "$line" | grep -qE '\$\{FLUIDBOX_ADMIN_TOKEN:\?' \
+      || offenders="$offenders
+      $line"
+  done <<<"$assignments"
+  if [ -n "$offenders" ]; then
+    bad "$f has an admin-token assignment that is not a required substitution" \
+        "$offenders" \
+        "fix: FLUIDBOX_ADMIN_TOKEN: \"\${FLUIDBOX_ADMIN_TOKEN:?<how to generate one>}\"" \
+        "A literal here is a working credential committed to this repository."
+  else
+    ok "$f: every admin-token assignment is a required substitution"
+  fi
+done
+
+# ...and the eval profile must actually SET it, so `up` refuses rather than
+# booting a control plane whose admin surface is unauthenticated in practice.
+if grep -vE '^[[:space:]]*#' "$EVAL" | grep -qE '^[[:space:]]*FLUIDBOX_ADMIN_TOKEN:'; then
   ok "$EVAL requires FLUIDBOX_ADMIN_TOKEN (compose refuses to start without it)"
 else
-  bad "$EVAL does not REQUIRE an admin token" \
+  bad "$EVAL does not set an admin token at all" \
       "fix: FLUIDBOX_ADMIN_TOKEN: \${FLUIDBOX_ADMIN_TOKEN:?...}"
 fi
 
@@ -58,12 +94,16 @@ fi
 # Extracted from the file rather than from `docker compose config`, so this runs
 # with no daemon. Docker's short syntax with no host-IP part binds 0.0.0.0.
 #
-# The eval API port (8787) is the ONE allowed exception and it is allowed only
-# while it stays explained: sandboxes are sibling containers on per-run networks
-# and reach the control plane over host.docker.internal, so a loopback publish
-# breaks every run. The assertion therefore is not "8787 is loopback" (that
-# would be false and would break the product) but "8787 is bind-configurable and
-# the file says why", plus "everything else is loopback".
+# The eval API port (8787) is the ONE allowed exception, and it is allowed only
+# while it stays CONFIGURABLE and EXPLAINED. Sandboxes are sibling containers on
+# per-run networks that reach the control plane over host.docker.internal;
+# whether a loopback publish stays reachable from them depends on how the engine
+# forwards ports (measured working on colima, expected to break on native Linux
+# Docker), so the default is open for portability rather than by necessity.
+#
+# The assertion therefore is not "8787 is loopback" — that would break the
+# product on some engines — but "8787 is bind-configurable and the file explains
+# the trade-off", plus "everything else is loopback".
 published_ports() { # file -> lines like `- "127.0.0.1:5433:5432"`
   # POSIX classes, not \s: BSD sed (macOS) does not understand \s, and this
   # script has to give the same answer on a maintainer's laptop and in CI.
@@ -99,9 +139,9 @@ fi
 # ...and the exception must stay explained in the file, so a future reader does
 # not "clean it up" into a silent 0.0.0.0 publish.
 if grep -q 'host.docker.internal' "$EVAL"; then
-  ok "$EVAL explains why its API port cannot be loopback"
+  ok "$EVAL explains the trade-off behind its non-loopback API default"
 else
-  bad "$EVAL no longer explains the non-loopback API port" \
+  bad "$EVAL no longer explains the non-loopback API default" \
       "fix: keep the host.docker.internal rationale in the file"
 fi
 check_loopback "$EVAL" 'FLUIDBOX_EVAL_API_BIND'
@@ -147,6 +187,29 @@ if command -v docker >/dev/null 2>&1; then
         "the :? form must refuse an empty value, not just an unset one"
   else
     ok "$EVAL refuses an empty admin token"
+  fi
+
+  # The same property again, but measured on the RENDERED document rather than
+  # on the source text. The grep above can only reject spellings it anticipates;
+  # this asks the question that actually matters — "after compose resolves every
+  # substitution, does any service hold a token the operator did not supply?" —
+  # and a literal cannot survive it whatever its spelling, because a literal does
+  # not change when the environment does.
+  sentinel="fbx-rendered-token-sentinel-$$"
+  rendered=$(FLUIDBOX_ADMIN_TOKEN="$sentinel" ANTHROPIC_API_KEY=parse-check \
+             LITELLM_MASTER_KEY=parse-check POSTGRES_PASSWORD=parse-check \
+             docker compose -f "$EVAL" config 2>/dev/null \
+             | grep -E '^[[:space:]]*FLUIDBOX_ADMIN_TOKEN:' || true)
+  strays=$(printf '%s\n' "$rendered" | grep -v "$sentinel" | grep -E '[^[:space:]]' || true)
+  if [ -z "$rendered" ]; then
+    bad "$EVAL renders no FLUIDBOX_ADMIN_TOKEN at all" \
+        "the admin surface would be unauthenticated in practice"
+  elif [ -n "$strays" ]; then
+    bad "$EVAL renders an admin token the operator did not supply" \
+        "$strays" \
+        "every rendered value must be the caller's, not a literal baked into the file"
+  else
+    ok "$EVAL renders the operator's admin token in every service that sets it"
   fi
 else
   printf '  SKIP      %s\n' "docker absent — compose parse check not run"
