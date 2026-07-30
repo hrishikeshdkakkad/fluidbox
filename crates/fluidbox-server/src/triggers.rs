@@ -343,7 +343,6 @@ pub struct ScheduleInput {
 /// otherwise accept-and-drop them, returning a lying 200).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)] // wired to the PATCH handler in Task 4
 pub struct UpdateTrigger {
     #[serde(default)]
     pub name: Option<String>,
@@ -370,7 +369,6 @@ pub struct UpdateTrigger {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)] // wired to the PATCH handler in Task 4
 pub struct ScheduleUpdate {
     #[serde(default)]
     pub cron: Option<String>,
@@ -384,7 +382,6 @@ impl UpdateTrigger {
     /// True when the PATCH names nothing — the handler answers with the
     /// current state WITHOUT writing (an empty {} must not advance
     /// updated_at; the detail page's "as of" stamp would lie).
-    #[allow(dead_code)] // wired to the PATCH handler in Task 4
     pub fn is_empty(&self) -> bool {
         self.name.is_none()
             && self.task_template.is_none()
@@ -396,7 +393,6 @@ impl UpdateTrigger {
     }
 }
 
-#[allow(dead_code)] // wired to the PATCH handler in Task 4
 pub(crate) struct ResolvedUpdate {
     pub name: String,
     pub task_template: Option<String>,
@@ -405,7 +401,6 @@ pub(crate) struct ResolvedUpdate {
     pub concurrency_policy: String,
 }
 
-#[allow(dead_code)] // wired to the PATCH handler in Task 4
 fn resolve_update(
     current: &fluidbox_db::TriggerSubscriptionRow,
     req: &UpdateTrigger,
@@ -430,7 +425,9 @@ fn resolve_update(
             c.clone()
         }
     };
-    let allow_task_override = req.allow_task_override.unwrap_or(current.allow_task_override);
+    let allow_task_override = req
+        .allow_task_override
+        .unwrap_or(current.allow_task_override);
     let allow_workspace_override = req
         .allow_workspace_override
         .unwrap_or(current.allow_workspace_override);
@@ -480,8 +477,10 @@ fn resolve_update(
 
 /// Merge a partial schedule PATCH over the existing row → (cron, timezone,
 /// missed_run_policy), all still to be validated by the caller.
-#[allow(dead_code)] // wired to the PATCH handler in Task 4
-fn merge_schedule(current: &fluidbox_db::ScheduleRow, upd: &ScheduleUpdate) -> (String, String, String) {
+fn merge_schedule(
+    current: &fluidbox_db::ScheduleRow,
+    upd: &ScheduleUpdate,
+) -> (String, String, String) {
     (
         upd.cron
             .as_deref()
@@ -934,6 +933,201 @@ pub async fn get(
     body.insert("sessions".into(), serde_json::to_value(&sessions)?);
     body.insert("deliveries".into(), serde_json::to_value(&deliveries)?);
     body.insert("invocations".into(), serde_json::to_value(&invocations)?);
+    body.extend(contract_urls(
+        &state.cfg.public_url,
+        sub.id,
+        ingress_path.as_deref(),
+    ));
+    Ok(Json(Value::Object(body)))
+}
+
+/// PATCH — the mutable surface only: name, task_template, overrides,
+/// concurrency_policy, callback_url, and (schedule kind) the clock. Trigger
+/// kind and agent are immutable: UpdateTrigger is deny_unknown_fields, so a
+/// PATCH naming them (or anything else) is a 400, never a silent no-op.
+/// In-flight runs keep their frozen RunSpec; future firings use the updated
+/// values — the platform's existing immutability model.
+pub async fn update(
+    principal: Principal,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(raw): Json<Value>,
+) -> ApiResult<Json<Value>> {
+    if !rbac::can_manage_subscriptions(&principal) {
+        return Err(ApiError::Forbidden(
+            "managing trigger subscriptions requires admin or owner".into(),
+        ));
+    }
+    let req: UpdateTrigger = serde_json::from_value(raw).map_err(|e| {
+        ApiError::BadRequest(format!(
+            "invalid PATCH body ({e}). Mutable fields: name, task_template, \
+             allow_task_override, allow_workspace_override, concurrency_policy, \
+             callback_url, schedule{{cron,timezone,missed_run_policy}}. \
+             Trigger kind and agent are immutable — create a new automation instead."
+        ))
+    })?;
+    let scope = principal.scope();
+    let current = fluidbox_db::get_trigger_subscription(&state.pool, scope, id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let existing_schedule = fluidbox_db::schedule_for_subscription(&state.pool, scope, id).await?;
+
+    // An empty {} PATCH answers with current state, WITHOUT writing — the
+    // "as of" stamp must not advance for a no-op.
+    if req.is_empty() {
+        let ingress_path = ingress_path_for(&state, scope, &current).await?;
+        let mut body = serde_json::Map::new();
+        body.insert("subscription".into(), serde_json::to_value(&current)?);
+        body.insert("schedule".into(), serde_json::to_value(&existing_schedule)?);
+        body.insert("callback_secret".into(), Value::Null);
+        body.extend(contract_urls(
+            &state.cfg.public_url,
+            current.id,
+            ingress_path.as_deref(),
+        ));
+        return Ok(Json(Value::Object(body)));
+    }
+
+    // The kind's no-caller render context, when it has one.
+    let render_ctx = match current.trigger_kind.as_str() {
+        "schedule" => Some(schedule_context("2026-01-01T00:00:00Z")),
+        "event" => {
+            let cid = current
+                .connection_id
+                .ok_or_else(|| ApiError::Internal("event subscription has no connection".into()))?;
+            let mut tx = fluidbox_db::scoped_tx(&state.pool, scope).await?;
+            let conn = fluidbox_db::get_connection(&mut *tx, scope, cid)
+                .await?
+                .ok_or(ApiError::NotFound)?;
+            tx.commit().await?;
+            let connector = crate::connectors::connector_for(&conn.provider).ok_or_else(|| {
+                ApiError::Internal(format!("provider '{}' has no connector", conn.provider))
+            })?;
+            Some(crate::connectors::sample_context(connector))
+        }
+        _ => None,
+    };
+    let resolved =
+        resolve_update(&current, &req, render_ctx.as_ref()).map_err(ApiError::BadRequest)?;
+
+    // Callback: same admission + sealing as create; any change bumps the
+    // subscription's authority generation (Task 3 handles the bump).
+    let (callback, secret_plain) = match req.callback_url.as_deref().map(str::trim) {
+        None => (fluidbox_db::CallbackUpdate::Keep, None),
+        Some("") => (fluidbox_db::CallbackUpdate::Clear, None),
+        Some(url) => {
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return Err(ApiError::BadRequest("callback_url must be http(s)".into()));
+            }
+            crate::egress::admit_url(url, &state.egress_policy)
+                .map_err(|e| ApiError::BadRequest(format!("callback_url rejected: {e}")))?;
+            let sealer = state.sealer.as_ref().ok_or_else(|| {
+                ApiError::BadRequest(
+                    "signed callbacks are disabled: set FLUIDBOX_CREDENTIAL_KEY on the server"
+                        .into(),
+                )
+            })?;
+            let secret = random_hex_token(SECRET_PREFIX);
+            let sealed = sealer
+                .seal(
+                    &secret,
+                    crate::seal::SealCtx::new(
+                        scope.tenant_id(),
+                        crate::seal::SealFamily::SubscriptionCallbackSecret,
+                    ),
+                )
+                .await?;
+            let dests = serde_json::to_value(vec![ResultDestination::SignedWebhook {
+                url: url.to_string(),
+                binding_id: None,
+            }])?;
+            // Destructure the owned Sealed — do NOT call Sealed::split on a
+            // temporary Option (it returns a borrow of the temporary and
+            // does not compile).
+            let crate::seal::Sealed { bytes, key_version } = sealed;
+            (
+                fluidbox_db::CallbackUpdate::Set {
+                    destinations: dests,
+                    sealed: bytes,
+                    key_version,
+                },
+                Some(secret),
+            )
+        }
+    };
+
+    // Schedule: only meaningful on a schedule subscription; PARTIAL — omitted
+    // fields keep the existing row's values (a cron-only PATCH must not
+    // reset America/Chicago to UTC).
+    let schedule_cfg = match &req.schedule {
+        None => None,
+        Some(s) => {
+            if current.trigger_kind != "schedule" {
+                return Err(ApiError::BadRequest(
+                    "only schedule subscriptions carry a schedule".into(),
+                ));
+            }
+            let row = existing_schedule.as_ref().ok_or_else(|| {
+                ApiError::Internal("schedule subscription has no schedule row".into())
+            })?;
+            let (cron_expr, tz, missed) = merge_schedule(row, s);
+            let cron = CronSchedule::parse(&cron_expr, &tz).map_err(ApiError::BadRequest)?;
+            if MissedRunPolicy::parse(&missed).is_none() {
+                return Err(ApiError::BadRequest(
+                    "missed_run_policy must be skip | catch_up".into(),
+                ));
+            }
+            let first = cron.next_fire_after(chrono::Utc::now()).ok_or_else(|| {
+                ApiError::BadRequest("cron expression never fires in the future".into())
+            })?;
+            Some(fluidbox_db::ScheduleConfigUpdate {
+                cron: cron_expr,
+                timezone: tz,
+                missed_run_policy: missed,
+                next_fire_at: first,
+            })
+        }
+    };
+
+    let updated = fluidbox_db::update_trigger_subscription(
+        &state.pool,
+        scope,
+        id,
+        current.updated_at,
+        &resolved.name,
+        resolved.task_template.as_deref(),
+        resolved.allow_task_override,
+        resolved.allow_workspace_override,
+        &resolved.concurrency_policy,
+        callback,
+        schedule_cfg.as_ref(),
+    )
+    .await
+    .map_err(|e| match &e {
+        sqlx::Error::Database(db) if db.is_unique_violation() => ApiError::Conflict(format!(
+            "a trigger named '{}' already exists",
+            resolved.name
+        )),
+        _ => ApiError::Db(e),
+    })?;
+    let Some((sub, updated_schedule)) = updated else {
+        // The stale-guard fired: someone else edited between our read and
+        // write. Nothing was written; the one-time secret (if minted) was
+        // never stored and dies here with this error.
+        return Err(ApiError::Conflict(
+            "the automation changed since it was loaded — reload and retry".into(),
+        ));
+    };
+
+    let schedule = match updated_schedule {
+        Some(row) => Some(row),
+        None => fluidbox_db::schedule_for_subscription(&state.pool, scope, id).await?,
+    };
+    let ingress_path = ingress_path_for(&state, scope, &sub).await?;
+    let mut body = serde_json::Map::new();
+    body.insert("subscription".into(), serde_json::to_value(&sub)?);
+    body.insert("schedule".into(), serde_json::to_value(&schedule)?);
+    body.insert("callback_secret".into(), json!(secret_plain));
     body.extend(contract_urls(
         &state.cfg.public_url,
         sub.id,
@@ -1550,10 +1744,17 @@ mod tests {
         assert_eq!(m["ingress_url"], Value::Null);
 
         let m = contract_urls("https://fb.example", id, Some("/v1/ingress/github/app/7"));
-        assert_eq!(m["ingress_url"], "https://fb.example/v1/ingress/github/app/7");
+        assert_eq!(
+            m["ingress_url"],
+            "https://fb.example/v1/ingress/github/app/7"
+        );
     }
 
-    fn sub_row(kind: &str, template: Option<&str>, allow_task: bool) -> fluidbox_db::TriggerSubscriptionRow {
+    fn sub_row(
+        kind: &str,
+        template: Option<&str>,
+        allow_task: bool,
+    ) -> fluidbox_db::TriggerSubscriptionRow {
         fluidbox_db::TriggerSubscriptionRow {
             id: Uuid::nil(),
             tenant_id: Uuid::nil(),
@@ -1597,7 +1798,10 @@ mod tests {
     fn update_trigger_refuses_unknown_fields() {
         // Immutability enforcement: agent/kind are not silently ignored.
         for body in [r#"{"agent":"other"}"#, r#"{"trigger_kind":"schedule"}"#] {
-            assert!(serde_json::from_str::<UpdateTrigger>(body).is_err(), "{body}");
+            assert!(
+                serde_json::from_str::<UpdateTrigger>(body).is_err(),
+                "{body}"
+            );
         }
         let ok: UpdateTrigger = serde_json::from_str(r#"{"name":"x"}"#).unwrap();
         assert!(!ok.is_empty());
@@ -1645,7 +1849,10 @@ mod tests {
         assert!(resolve_update(&cur, &req, Some(&ctx)).is_err());
         req.task_template = Some("sweep {{fire_time}} again".into());
         let r = resolve_update(&cur, &req, Some(&ctx)).unwrap();
-        assert_eq!(r.task_template.as_deref(), Some("sweep {{fire_time}} again"));
+        assert_eq!(
+            r.task_template.as_deref(),
+            Some("sweep {{fire_time}} again")
+        );
         // A schedule can never clear its template (there is no caller).
         req.task_template = Some("".into());
         assert!(resolve_update(&cur, &req, Some(&ctx)).is_err());
@@ -1665,8 +1872,15 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
         // A cron-only PATCH must not reset timezone/missed policy.
-        let upd = ScheduleUpdate { cron: Some("0 8 * * *".into()), timezone: None, missed_run_policy: None };
+        let upd = ScheduleUpdate {
+            cron: Some("0 8 * * *".into()),
+            timezone: None,
+            missed_run_policy: None,
+        };
         let (cron, tz, missed) = merge_schedule(&row, &upd);
-        assert_eq!((cron.as_str(), tz.as_str(), missed.as_str()), ("0 8 * * *", "America/Chicago", "catch_up"));
+        assert_eq!(
+            (cron.as_str(), tz.as_str(), missed.as_str()),
+            ("0 8 * * *", "America/Chicago", "catch_up")
+        );
     }
 }
