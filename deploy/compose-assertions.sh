@@ -117,5 +117,40 @@ else
       "fix: - \"127.0.0.1:3000:3000\""
 fi
 
+# ── 4. Every file must still PARSE ─────────────────────────────────────────
+#
+# Learned the hard way while writing the assertions above: a required-variable
+# message containing ": " turned the whole eval file into invalid YAML, and every
+# grep-based assertion here passed anyway because a grep does not care whether
+# the document is well-formed. Only `docker compose config` caught it. So the
+# guard now includes the one check that is not about content at all.
+#
+# Needs a docker CLI (not a running daemon — `config` is local parsing). Skipped
+# with a visible note rather than silently when docker is absent, so a green run
+# in an environment without it never reads as "the files parse".
+if command -v docker >/dev/null 2>&1; then
+  for f in "$EVAL" "$DEV" "$DEMO"; do
+    [ -f "$f" ] || continue
+    # Every required variable gets a dummy value: we are checking the SHAPE of
+    # the document, not whether the caller configured a deployment.
+    if err=$(FLUIDBOX_ADMIN_TOKEN=parse-check ANTHROPIC_API_KEY=parse-check \
+             LITELLM_MASTER_KEY=parse-check POSTGRES_PASSWORD=parse-check \
+             docker compose -f "$f" config 2>&1 >/dev/null); then
+      ok "$f parses (docker compose config)"
+    else
+      bad "$f does not parse" "$(printf '%s' "$err" | head -3)"
+    fi
+  done
+  # ...and the required-variable refusal actually refuses.
+  if FLUIDBOX_ADMIN_TOKEN= docker compose -f "$EVAL" config >/dev/null 2>&1; then
+    bad "$EVAL accepted an EMPTY admin token" \
+        "the :? form must refuse an empty value, not just an unset one"
+  else
+    ok "$EVAL refuses an empty admin token"
+  fi
+else
+  printf '  SKIP      %s\n' "docker absent — compose parse check not run"
+fi
+
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
