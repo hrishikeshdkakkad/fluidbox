@@ -154,6 +154,7 @@ spec:
             - { name: FLUIDBOX_COLLECTOR_IMAGE, value: {{ include "fluidbox.flatImage" (dict "value" .Values.images.collector "name" "workspaced" "ctx" $) | quote }} }
             - { name: FLUIDBOX_SANDBOX_IMAGE, value: {{ include "fluidbox.flatImage" (dict "value" .Values.images.sandboxRunner "name" "sandbox-runner" "ctx" $) | quote }} }
             - { name: FLUIDBOX_CODEX_SANDBOX_IMAGE, value: {{ include "fluidbox.flatImage" (dict "value" .Values.images.codexRunner "name" "codex-runner" "ctx" $) | quote }} }
+            - { name: FLUIDBOX_QWEN_SANDBOX_IMAGE, value: {{ include "fluidbox.flatImage" (dict "value" .Values.images.qwenRunner "name" "qwen-runner" "ctx" $) | quote }} }
             {{- with .Values.sandbox.runtimeClassName }}
             - { name: FLUIDBOX_K8S_RUNTIME_CLASS, value: {{ . | quote }} }
             {{- end }}

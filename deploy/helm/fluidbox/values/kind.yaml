@@ -6,6 +6,7 @@ images:
   web: { repository: fluidbox-web, tag: dev, pullPolicy: IfNotPresent }
   sandboxRunner: fluidbox-sandbox-runner:dev
   codexRunner: fluidbox-codex-runner:dev
+  qwenRunner: fluidbox-qwen-runner:dev
   collector: fluidbox-workspaced:dev
 server:
   archivePvc:

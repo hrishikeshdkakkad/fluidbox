@@ -27,6 +27,7 @@ images:
   # "" → the official GHCR image at the chart appVersion.
   sandboxRunner: ""
   codexRunner: ""
+  qwenRunner: ""
   collector: ""
   # imagePullSecrets for private registries (mirroring to ECR/GCR/ACR), as
   # [{name: …}]. Applied to the Deployments AND — by name, via

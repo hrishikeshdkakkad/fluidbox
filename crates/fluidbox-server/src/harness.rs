@@ -13,9 +13,10 @@ use crate::config::Config;
 
 pub const CLAUDE_AGENT_SDK: &str = "claude-agent-sdk";
 pub const CODEX: &str = "codex";
+pub const QWEN_CODE: &str = "qwen-code";
 
 /// Every harness id the control plane accepts. Order is display order.
-pub const KNOWN: &[&str] = &[CLAUDE_AGENT_SDK, CODEX];
+pub const KNOWN: &[&str] = &[CLAUDE_AGENT_SDK, CODEX, QWEN_CODE];
 
 pub fn is_known(harness: &str) -> bool {
     KNOWN.contains(&harness)
@@ -26,6 +27,7 @@ pub fn default_runner_image<'a>(harness: &str, cfg: &'a Config) -> Option<&'a st
     match harness {
         CLAUDE_AGENT_SDK => Some(&cfg.sandbox_image),
         CODEX => Some(&cfg.codex_sandbox_image),
+        QWEN_CODE => Some(&cfg.qwen_sandbox_image),
         _ => None,
     }
 }
@@ -35,6 +37,7 @@ pub fn default_model<'a>(harness: &str, cfg: &'a Config) -> Option<&'a str> {
     match harness {
         CLAUDE_AGENT_SDK => Some(&cfg.default_model),
         CODEX => Some(&cfg.default_codex_model),
+        QWEN_CODE => Some(&cfg.default_qwen_model),
         _ => None,
     }
 }
@@ -52,6 +55,7 @@ pub fn display_name(harness: &str) -> &'static str {
     match harness {
         CLAUDE_AGENT_SDK => "Claude Agent SDK",
         CODEX => "Codex",
+        QWEN_CODE => "Qwen Code",
         _ => "",
     }
 }
@@ -61,6 +65,7 @@ pub fn hint(harness: &str) -> &'static str {
     match harness {
         CLAUDE_AGENT_SDK => "Claude Code in the sandbox — live timeline, gated tools, approvals.",
         CODEX => "OpenAI Codex on the same governed runner contract.",
+        QWEN_CODE => "Alibaba's Qwen Code on the same governed runner contract.",
         _ => "",
     }
 }
@@ -105,6 +110,18 @@ pub fn models(harness: &str) -> &'static [HarnessModel] {
                 hint: "Most capable.",
             },
         ],
+        QWEN_CODE => &[
+            HarnessModel {
+                id: "qwen3-coder-plus",
+                display_name: "Qwen3 Coder Plus",
+                hint: "Qwen's flagship coder — the default.",
+            },
+            HarnessModel {
+                id: "qwen3-coder-flash",
+                display_name: "Qwen3 Coder Flash",
+                hint: "Fastest and cheapest.",
+            },
+        ],
         _ => &[],
     }
 }
@@ -129,6 +146,10 @@ pub fn model_belongs(harness: &str, model: &str) -> bool {
 ///   model-provider `env_key`. (It used to read `FLUIDBOX_SESSION_TOKEN`; that
 ///   var is now runner-control ONLY and is deleted from the env before codex
 ///   spawns.)
+/// - qwen-code: `FLUIDBOX_LLM_TOKEN`, same shape as codex — the supervisor
+///   deletes it from its own env and injects `OPENAI_API_KEY`/`OPENAI_BASE_URL`/
+///   `OPENAI_MODEL` into the spawned CLI's env only, so the container env never
+///   carries provider-shaped vars.
 ///
 /// Unknown harnesses get nothing: no identity material for an id the registry
 /// doesn't know (create_run refuses those before launch anyway).
@@ -172,7 +193,7 @@ pub fn runner_env(
             ("ANTHROPIC_API_KEY".into(), llm_token.to_string()),
             ("ANTHROPIC_MODEL".into(), model.to_string()),
         ],
-        CODEX => vec![("FLUIDBOX_LLM_TOKEN".into(), llm_token.to_string())],
+        CODEX | QWEN_CODE => vec![("FLUIDBOX_LLM_TOKEN".into(), llm_token.to_string())],
         _ => Vec::new(),
     }
 }
@@ -195,6 +216,8 @@ mod tests {
             default_model: "claude-haiku-4-5".into(),
             codex_sandbox_image: "fluidbox-codex-runner:dev".into(),
             default_codex_model: "gpt-5.4-mini".into(),
+            qwen_sandbox_image: "fluidbox-qwen-runner:dev".into(),
+            default_qwen_model: "qwen3-coder-plus".into(),
             llm_upstream_url: String::new(),
             llm_upstream_key: String::new(),
             llm_upstream_is_anthropic: false,
@@ -265,7 +288,9 @@ mod tests {
     fn known_ids() {
         assert!(is_known("claude-agent-sdk"));
         assert!(is_known("codex"));
+        assert!(is_known("qwen-code"));
         assert!(!is_known("codex-cli"));
+        assert!(!is_known("qwen")); // the CLI brand is not the harness id
         assert!(!is_known("Claude-Agent-SDK")); // ids are exact, no case folding
         assert!(!is_known(""));
     }
@@ -281,12 +306,17 @@ mod tests {
             default_runner_image("codex", &cfg),
             Some("fluidbox-codex-runner:dev")
         );
+        assert_eq!(
+            default_runner_image("qwen-code", &cfg),
+            Some("fluidbox-qwen-runner:dev")
+        );
         assert_eq!(default_runner_image("nope", &cfg), None);
         assert_eq!(
             default_model("claude-agent-sdk", &cfg),
             Some("claude-haiku-4-5")
         );
         assert_eq!(default_model("codex", &cfg), Some("gpt-5.4-mini"));
+        assert_eq!(default_model("qwen-code", &cfg), Some("qwen3-coder-plus"));
         assert_eq!(default_model("nope", &cfg), None);
     }
 
@@ -323,8 +353,14 @@ mod tests {
             runner_env("codex", "http://c", "fbx_sess_llm", "m"),
             vec![("FLUIDBOX_LLM_TOKEN".to_string(), "fbx_sess_llm".to_string())]
         );
-        // Neither harness may leak the control token into the agent's env: the
-        // only credential either arm emits is the one it was handed.
+        // qwen-code rides the same shape: the supervisor owns the OPENAI_* wiring
+        // for the spawned CLI; the container env carries only the llm token.
+        assert_eq!(
+            runner_env("qwen-code", "http://c", "fbx_sess_llm", "m"),
+            vec![("FLUIDBOX_LLM_TOKEN".to_string(), "fbx_sess_llm".to_string())]
+        );
+        // No harness may leak the control token into the agent's env: the
+        // only credential any arm emits is the one it was handed.
         assert!(runner_env("mystery", "http://c", "fbx_sess_llm", "m").is_empty());
     }
 
@@ -340,6 +376,7 @@ mod tests {
         let mut cfg = test_cfg();
         cfg.sandbox_image = "ghcr.io/fluidbox/sandbox-runner:v9".into();
         cfg.codex_sandbox_image = "ghcr.io/fluidbox/codex-runner:v9".into();
+        cfg.qwen_sandbox_image = "ghcr.io/fluidbox/qwen-runner:v9".into();
         assert_eq!(
             default_runner_image(CLAUDE_AGENT_SDK, &cfg),
             Some("ghcr.io/fluidbox/sandbox-runner:v9")
@@ -347,6 +384,10 @@ mod tests {
         assert_eq!(
             default_runner_image(CODEX, &cfg),
             Some("ghcr.io/fluidbox/codex-runner:v9")
+        );
+        assert_eq!(
+            default_runner_image(QWEN_CODE, &cfg),
+            Some("ghcr.io/fluidbox/qwen-runner:v9")
         );
     }
 
@@ -358,15 +399,19 @@ mod tests {
         // models skip the belongs check on that assumption.
         assert!(model_belongs(CLAUDE_AGENT_SDK, &cfg.default_model));
         assert!(model_belongs(CODEX, &cfg.default_codex_model));
+        assert!(model_belongs(QWEN_CODE, &cfg.default_qwen_model));
     }
 
     #[test]
     fn model_belongs_is_per_harness() {
         assert!(model_belongs(CLAUDE_AGENT_SDK, "claude-opus-4-8"));
         assert!(model_belongs(CODEX, "gpt-5.6-sol"));
+        assert!(model_belongs(QWEN_CODE, "qwen3-coder-flash"));
         // Cross-harness models are rejected — the murky-failure gap.
         assert!(!model_belongs(CLAUDE_AGENT_SDK, "gpt-5.4"));
         assert!(!model_belongs(CODEX, "claude-opus-4-8"));
+        assert!(!model_belongs(CODEX, "qwen3-coder-plus"));
+        assert!(!model_belongs(QWEN_CODE, "gpt-5.4-mini"));
         assert!(!model_belongs(CLAUDE_AGENT_SDK, "made-up-model"));
         assert!(models("nope").is_empty());
     }

@@ -6,12 +6,14 @@
 //! client-executed tool types only, codex forced stateless), swaps in the
 //! real upstream credential, forwards to the gateway (LiteLLM or, in
 //! fallback, api.anthropic.com), and tees the SSE stream to meter usage into
-//! the ledger. Two dialects ride one route, dispatched on RunSpec.harness:
-//! `claude-agent-sdk` (Anthropic Messages) and `codex` (OpenAI Responses).
-//! Response bytes reach the runner verbatim; request bytes are RE-SERIALIZED
-//! from the validated body for BOTH dialects (so what we validated is exactly
-//! what we forward — no duplicate-key differential), with codex additionally
-//! forced stateless (`store=false`).
+//! the ledger. Three dialects ride one route, dispatched on RunSpec.harness:
+//! `claude-agent-sdk` (Anthropic Messages), `codex` (OpenAI Responses), and
+//! `qwen-code` (OpenAI Chat Completions). Response bytes reach the runner
+//! verbatim; request bytes are RE-SERIALIZED from the validated body for ALL
+//! dialects (so what we validated is exactly what we forward — no
+//! duplicate-key differential), with codex additionally forced stateless
+//! (`store=false`) and qwen's streaming requests guaranteed to carry
+//! `stream_options.include_usage` (so metering can never go blind).
 
 use crate::error::{ApiError, ApiResult};
 use crate::harness;
@@ -34,26 +36,36 @@ use uuid::Uuid;
 enum Dialect {
     Anthropic,
     OpenAi,
+    /// OpenAI Chat Completions (`/v1/chat/completions`) — the qwen-code
+    /// dialect. Same error envelope and Bearer auth as `OpenAi`; different
+    /// suffix, usage transport (a final usage-only chunk gated on
+    /// `stream_options.include_usage`) and body screen (no Responses-style
+    /// server state exists, so there is nothing to force stateless — but
+    /// non-`function` tool types are rejected LOUD like Anthropic's screen,
+    /// because the pinned qwen CLI never sends one).
+    OpenAiChat,
 }
 
 fn dialect_for(harness_id: &str) -> Option<Dialect> {
     match harness_id {
         harness::CLAUDE_AGENT_SDK => Some(Dialect::Anthropic),
         harness::CODEX => Some(Dialect::OpenAi),
+        harness::QWEN_CODE => Some(Dialect::OpenAiChat),
         _ => None,
     }
 }
 
 /// Error-shape hint for exits that fire BEFORE the session's dialect is
 /// resolved (terminal-session, unknown-harness): the requested suffix is
-/// enough — only codex uses v1/responses. Auth/lookup failures upstream of
-/// this still use the generic envelope (a runner that can't authenticate
-/// never gets far enough for the shape to matter).
+/// enough — only codex uses v1/responses and only qwen-code uses
+/// v1/chat/completions. Auth/lookup failures upstream of this still use the
+/// generic envelope (a runner that can't authenticate never gets far enough
+/// for the shape to matter).
 fn shape_hint(rest: &str) -> Dialect {
-    if rest == "v1/responses" {
-        Dialect::OpenAi
-    } else {
-        Dialect::Anthropic
+    match rest {
+        "v1/responses" => Dialect::OpenAi,
+        "v1/chat/completions" => Dialect::OpenAiChat,
+        _ => Dialect::Anthropic,
     }
 }
 
@@ -75,6 +87,13 @@ fn resolve_suffix(dialect: Dialect, rest: &str) -> Option<&'static str> {
             "v1/responses" => Some("v1/responses"),
             _ => None,
         },
+        Dialect::OpenAiChat => match rest {
+            // The qwen CLI's openai client posts {OPENAI_BASE_URL}/chat/
+            // completions; the runner points OPENAI_BASE_URL at
+            // {control}/internal/llm/v1.
+            "v1/chat/completions" => Some("v1/chat/completions"),
+            _ => None,
+        },
     }
 }
 
@@ -86,7 +105,8 @@ fn dialect_error(dialect: Dialect, status: StatusCode, message: &str) -> Respons
             "type": "error",
             "error": { "type": "invalid_request_error", "message": message }
         }),
-        Dialect::OpenAi => json!({
+        // Chat Completions and Responses share OpenAI's error envelope.
+        Dialect::OpenAi | Dialect::OpenAiChat => json!({
             "error": {
                 "message": message,
                 "type": "invalid_request_error",
@@ -128,7 +148,7 @@ fn facade_refusal(dialect: Dialect, code: &str, message: &str) -> Response {
             "type": "error",
             "error": { "type": code, "message": full }
         }),
-        Dialect::OpenAi => json!({
+        Dialect::OpenAi | Dialect::OpenAiChat => json!({
             "error": {
                 "message": full,
                 "type": "invalid_request_error",
@@ -156,7 +176,7 @@ fn reservation_refusal(dialect: Dialect, code: &str, message: &str) -> Response 
             "type": "error",
             "error": { "type": code, "message": full }
         }),
-        Dialect::OpenAi => json!({
+        Dialect::OpenAi | Dialect::OpenAiChat => json!({
             "error": {
                 "message": full,
                 "type": "rate_limit_error",
@@ -267,6 +287,11 @@ fn conservative_reservation(
     let declared = match dialect {
         Dialect::Anthropic => parsed.get("max_tokens"),
         Dialect::OpenAi => parsed.get("max_output_tokens"),
+        // Chat Completions: the pinned qwen CLI sends `max_tokens`; the
+        // successor spelling `max_completion_tokens` is accepted defensively.
+        Dialect::OpenAiChat => parsed
+            .get("max_tokens")
+            .or_else(|| parsed.get("max_completion_tokens")),
     }
     .and_then(|v| v.as_u64())
     .filter(|n| *n > 0)
@@ -392,6 +417,11 @@ fn is_client_tool(dialect: Dialect, tool: &Value) -> bool {
             Some("tool_search") => tool.get("execution").and_then(|x| x.as_str()) == Some("client"),
             _ => false,
         },
+        // Chat Completions tools are exactly `{type:"function", function:{…}}`;
+        // the pinned qwen CLI's whole census (nine core tools + MCP) rides that
+        // shape. Anything else is a server-executed or unknown surface —
+        // fail-closed.
+        Dialect::OpenAiChat => matches!(ty, Some("function")),
     }
 }
 
@@ -424,10 +454,11 @@ fn validate_body(
             format!("model '{model}' does not match the run's frozen model '{frozen_model}'"),
         ));
     }
-    // Anthropic: a server-executed tool is misconfiguration (the Agent SDK
-    // never sends one unless explicitly asked) — reject LOUD. Codex: don't
-    // reject here; strip_server_tools sanitizes below.
-    if dialect == Dialect::Anthropic {
+    // Anthropic + Chat Completions: a server-executed tool is
+    // misconfiguration (neither the Agent SDK nor the pinned qwen CLI ever
+    // sends one) — reject LOUD. Codex: don't reject here;
+    // strip_server_tools sanitizes below.
+    if matches!(dialect, Dialect::Anthropic | Dialect::OpenAiChat) {
         if let Some(tools) = parsed.get("tools").and_then(|t| t.as_array()) {
             for t in tools {
                 if !is_client_tool(dialect, t) {
@@ -441,6 +472,21 @@ fn validate_body(
                     ));
                 }
             }
+        }
+    }
+    if dialect == Dialect::OpenAiChat {
+        // The legacy pre-tools spelling reaches the same execution surface as
+        // `tools` without crossing the allowlist above; the pinned qwen CLI
+        // never sends it — refuse rather than screen it.
+        if parsed
+            .get("functions")
+            .map(|v| !v.is_null())
+            .unwrap_or(false)
+        {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "legacy 'functions' is not supported through the facade — use 'tools'".into(),
+            ));
         }
     }
     if dialect == Dialect::OpenAi {
@@ -491,6 +537,34 @@ fn validate_body(
     Ok(())
 }
 
+/// Chat Completions only reports usage on a streaming response when the
+/// request opts in via `stream_options.include_usage`. The pinned qwen CLI
+/// already sends it, but the facade is the metering source of truth — force
+/// it on every streaming request so a CLI drift can never blind the meter (a
+/// blind meter retains the Gap-14 reservation and the sweep over-charges;
+/// forcing the flag keeps billing authoritative instead). Non-streaming
+/// requests are untouched (their usage rides the response body).
+fn force_include_usage(parsed: &mut Value) {
+    if !parsed
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let Some(obj) = parsed.as_object_mut() else {
+        return;
+    };
+    let so = obj.entry("stream_options").or_insert_with(|| json!({}));
+    if let Some(so_obj) = so.as_object_mut() {
+        so_obj.insert("include_usage".into(), json!(true));
+    } else {
+        // A non-object stream_options is malformed; replace it with the one
+        // shape the meter depends on.
+        obj.insert("stream_options".into(), json!({"include_usage": true}));
+    }
+}
+
 /// Build and send ONE upstream model request with the given credential. Extracted
 /// from `messages` so the reactive tenant-key recovery can replay the identical
 /// request under a re-provisioned key (see
@@ -531,8 +605,8 @@ async fn send_upstream(
                     .header("x-api-key", upstream_key);
             }
         }
-        Dialect::OpenAi => {
-            // Bearer only — the OpenAI dialect never sees x-api-key.
+        Dialect::OpenAi | Dialect::OpenAiChat => {
+            // Bearer only — the OpenAI dialects never see x-api-key.
             req = req.header("authorization", format!("Bearer {upstream_key}"));
         }
     }
@@ -601,12 +675,12 @@ pub async fn messages(
     };
 
     // Deployment sanity: the direct-Anthropic fallback upstream cannot serve
-    // the OpenAI Responses dialect.
-    if dialect == Dialect::OpenAi && state.cfg.llm_upstream_is_anthropic {
+    // either OpenAI-shaped dialect.
+    if dialect != Dialect::Anthropic && state.cfg.llm_upstream_is_anthropic {
         return Ok(dialect_error(
             dialect,
             StatusCode::BAD_GATEWAY,
-            "this deployment's LLM upstream is direct-Anthropic; codex runs need the gateway",
+            "this deployment's LLM upstream is direct-Anthropic; codex/qwen runs need the gateway",
         ));
     }
 
@@ -701,6 +775,9 @@ pub async fn messages(
                 "facade: stripped {stripped} server-executed tool(s) from the codex request"
             );
         }
+    }
+    if dialect == Dialect::OpenAiChat {
+        force_include_usage(&mut parsed);
     }
     let upstream_body: axum::body::Bytes = serde_json::to_vec(&parsed)
         .map_err(|e| ApiError::Internal(format!("body reserialize: {e}")))?
@@ -1202,7 +1279,9 @@ fn parse_usage_json(dialect: Dialect, body: &[u8]) -> Option<UsageDelta> {
     let u = v.get("usage")?;
     Some(match dialect {
         Dialect::Anthropic => anthropic_usage_from_value(u),
-        Dialect::OpenAi => openai_usage_from_value(u),
+        // Chat Completions' prompt_/completion_ spellings (and their _details
+        // cached count) are already first-class in the OpenAI parser.
+        Dialect::OpenAi | Dialect::OpenAiChat => openai_usage_from_value(u),
     })
 }
 
@@ -1288,6 +1367,7 @@ impl SseLineDecoder {
 enum Meter {
     Anthropic(AnthropicAccumulator),
     OpenAi(OpenAiAccumulator),
+    OpenAiChat(OpenAiChatAccumulator),
 }
 
 impl Meter {
@@ -1295,6 +1375,7 @@ impl Meter {
         match dialect {
             Dialect::Anthropic => Meter::Anthropic(AnthropicAccumulator::default()),
             Dialect::OpenAi => Meter::OpenAi(OpenAiAccumulator::default()),
+            Dialect::OpenAiChat => Meter::OpenAiChat(OpenAiChatAccumulator::default()),
         }
     }
 
@@ -1312,6 +1393,7 @@ impl Meter {
         match self {
             Meter::Anthropic(a) => a.on_event(&v),
             Meter::OpenAi(o) => o.on_event(&v),
+            Meter::OpenAiChat(o) => o.on_event(&v),
         }
     }
 
@@ -1319,6 +1401,7 @@ impl Meter {
         match self {
             Meter::Anthropic(a) => a.seen,
             Meter::OpenAi(o) => o.seen,
+            Meter::OpenAiChat(o) => o.seen,
         }
     }
 
@@ -1326,6 +1409,7 @@ impl Meter {
         match self {
             Meter::Anthropic(a) => a.into_delta(),
             Meter::OpenAi(o) => o.delta,
+            Meter::OpenAiChat(o) => o.delta,
         }
     }
 }
@@ -1406,6 +1490,26 @@ impl OpenAiAccumulator {
     }
 }
 
+/// OpenAI Chat Completions SSE usage: every `chat.completion.chunk` carries
+/// `usage: null` until the FINAL usage-only chunk (empty `choices`), emitted
+/// because the facade forces `stream_options.include_usage` on every
+/// streaming request. Authoritative on any chunk whose `usage` is a non-null
+/// object — last wins, matching the Responses accumulator's discipline.
+#[derive(Default)]
+struct OpenAiChatAccumulator {
+    delta: UsageDelta,
+    seen: bool,
+}
+
+impl OpenAiChatAccumulator {
+    fn on_event(&mut self, v: &Value) {
+        if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
+            self.delta = openai_usage_from_value(u);
+            self.seen = true;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1417,6 +1521,7 @@ mod tests {
         for (dialect, code) in [
             (Dialect::Anthropic, "tenant_llm_keys_required"),
             (Dialect::OpenAi, "tenant_llm_key_unavailable"),
+            (Dialect::OpenAiChat, "tenant_llm_key_unavailable"),
         ] {
             let resp = facade_refusal(dialect, code, "nope");
             assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1429,7 +1534,7 @@ mod tests {
                     assert_eq!(v["type"], "error");
                     assert_eq!(v["error"]["type"], code);
                 }
-                Dialect::OpenAi => {
+                Dialect::OpenAi | Dialect::OpenAiChat => {
                     assert_eq!(v["error"]["code"], code);
                 }
             }
@@ -1447,6 +1552,7 @@ mod tests {
         for (dialect, code) in [
             (Dialect::Anthropic, "llm_reservation_ceiling_exceeded"),
             (Dialect::OpenAi, "llm_budget_reservation_exceeded"),
+            (Dialect::OpenAiChat, "llm_budget_reservation_exceeded"),
         ] {
             let resp = reservation_refusal(dialect, code, "retry shortly");
             assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -1456,7 +1562,7 @@ mod tests {
             let v: Value = serde_json::from_slice(&bytes).unwrap();
             match dialect {
                 Dialect::Anthropic => assert_eq!(v["error"]["type"], code),
-                Dialect::OpenAi => {
+                Dialect::OpenAi | Dialect::OpenAiChat => {
                     assert_eq!(v["error"]["code"], code);
                     assert_eq!(v["error"]["type"], "rate_limit_error");
                 }
@@ -2073,5 +2179,150 @@ mod tests {
             (d.input_tokens, d.cache_read_tokens, d.output_tokens),
             (60, 40, 9)
         );
+    }
+
+    // ─── OpenAI Chat Completions (qwen-code, third dialect) ────────────────
+
+    #[test]
+    fn chat_suffix_allowlist_is_exactly_chat_completions() {
+        assert_eq!(
+            resolve_suffix(Dialect::OpenAiChat, "v1/chat/completions"),
+            Some("v1/chat/completions")
+        );
+        // Cross-dialect suffixes never resolve — the qwen llm token cannot
+        // reach the Responses or Messages upstreams, and vice versa.
+        assert_eq!(resolve_suffix(Dialect::OpenAiChat, "v1/responses"), None);
+        assert_eq!(resolve_suffix(Dialect::OpenAiChat, "v1/messages"), None);
+        assert_eq!(resolve_suffix(Dialect::OpenAiChat, ""), None);
+        assert_eq!(
+            resolve_suffix(Dialect::OpenAiChat, "v1/chat/completions/extra"),
+            None
+        );
+        assert_eq!(resolve_suffix(Dialect::OpenAiChat, "key/info"), None);
+        assert_eq!(
+            resolve_suffix(Dialect::OpenAi, "v1/chat/completions"),
+            None,
+            "codex must not reach the chat-completions upstream"
+        );
+        assert_eq!(
+            resolve_suffix(Dialect::Anthropic, "v1/chat/completions"),
+            None
+        );
+        // shape_hint recognizes the chat path for pre-dialect exits.
+        assert!(matches!(
+            shape_hint("v1/chat/completions"),
+            Dialect::OpenAiChat
+        ));
+    }
+
+    #[test]
+    fn chat_validate_body_pins_model_and_rejects_non_function_tools() {
+        let ok = json!({
+            "model": "qwen3-coder-plus",
+            "messages": [],
+            "tools": [{"type": "function", "function": {"name": "read_file"}}]
+        });
+        assert!(validate_body(Dialect::OpenAiChat, "qwen3-coder-plus", &ok).is_ok());
+        // Model pin: 422 on mismatch, same as every dialect.
+        let err = validate_body(Dialect::OpenAiChat, "qwen3-coder-flash", &ok).unwrap_err();
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        // Non-function tool types are REJECTED loud (Anthropic discipline, not
+        // codex's strip): the pinned qwen CLI never sends one, so presence is
+        // misconfiguration or an escape attempt.
+        for bad_tool in [
+            json!({"type": "web_search"}),
+            json!({"type": "custom", "name": "x"}),
+            json!({"name": "typeless"}),
+        ] {
+            let bad = json!({"model": "m", "messages": [], "tools": [bad_tool]});
+            assert!(
+                validate_body(Dialect::OpenAiChat, "m", &bad).is_err(),
+                "non-function tool must be rejected"
+            );
+        }
+        // The legacy pre-`tools` spelling reaches the same surface without
+        // crossing the allowlist — refused outright.
+        let legacy = json!({"model": "m", "messages": [], "functions": [{"name": "f"}]});
+        assert!(validate_body(Dialect::OpenAiChat, "m", &legacy).is_err());
+        // Chat Completions has no Responses-style server state, so the
+        // statelessness screen doesn't apply — a plain body passes.
+        let plain = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        assert!(validate_body(Dialect::OpenAiChat, "m", &plain).is_ok());
+    }
+
+    #[test]
+    fn chat_reservation_reads_max_tokens_with_successor_fallback() {
+        // The pinned qwen CLI declares `max_tokens` (proven live: 32768).
+        let body = json!({"model": "m", "max_tokens": 64});
+        let (tokens, _) = conservative_reservation(Dialect::OpenAiChat, &body, 40, "m");
+        assert_eq!(tokens, 64 + 40);
+        // The successor spelling is accepted defensively.
+        let body = json!({"model": "m", "max_completion_tokens": 32});
+        let (tokens, _) = conservative_reservation(Dialect::OpenAiChat, &body, 0, "m");
+        assert_eq!(tokens, 32);
+        // No declared cap → the large fallback, never a small guess.
+        let (tokens, _) = conservative_reservation(Dialect::OpenAiChat, &json!({}), 0, "m");
+        assert_eq!(tokens, FALLBACK_MAX_OUTPUT_TOKENS);
+    }
+
+    #[test]
+    fn chat_force_include_usage_covers_every_streaming_shape() {
+        // Missing stream_options → injected.
+        let mut v = json!({"model": "m", "stream": true});
+        force_include_usage(&mut v);
+        assert_eq!(v["stream_options"]["include_usage"], json!(true));
+        // Present but opted OUT → forced back on (the meter is not optional).
+        let mut v = json!({"model": "m", "stream": true,
+                           "stream_options": {"include_usage": false}});
+        force_include_usage(&mut v);
+        assert_eq!(v["stream_options"]["include_usage"], json!(true));
+        // Malformed stream_options → replaced with the one shape the meter needs.
+        let mut v = json!({"model": "m", "stream": true, "stream_options": "junk"});
+        force_include_usage(&mut v);
+        assert_eq!(v["stream_options"], json!({"include_usage": true}));
+        // Non-streaming requests are untouched (usage rides the body).
+        let mut v = json!({"model": "m", "stream": false});
+        force_include_usage(&mut v);
+        assert!(v.get("stream_options").is_none());
+        let mut v = json!({"model": "m"});
+        force_include_usage(&mut v);
+        assert!(v.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn chat_meter_takes_the_final_usage_only_chunk() {
+        let mut meter = Meter::for_dialect(Dialect::OpenAiChat);
+        // Ordinary content chunks carry usage: null — never authoritative.
+        meter.on_line(
+            r#"data: {"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"}}],"usage":null}"#,
+        );
+        assert!(!meter.any(), "usage:null chunks must not count");
+        meter.on_line(
+            r#"data: {"object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":null}"#,
+        );
+        assert!(!meter.any());
+        // The final usage-only chunk (empty choices) is authoritative; the
+        // LiteLLM prompt_/completion_ spellings parse identically.
+        meter.on_line(
+            r#"data: {"object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":40},"completion_tokens":9}}"#,
+        );
+        assert!(meter.any());
+        meter.on_line("data: [DONE]");
+        let d = meter.into_delta();
+        assert_eq!(
+            (d.input_tokens, d.cache_read_tokens, d.output_tokens),
+            (60, 40, 9)
+        );
+    }
+
+    #[test]
+    fn chat_nonstream_usage_parses() {
+        let chat = serde_json::to_vec(&json!({
+            "object": "chat.completion",
+            "usage": {"prompt_tokens": 20, "completion_tokens": 3}
+        }))
+        .unwrap();
+        let d = parse_usage_json(Dialect::OpenAiChat, &chat).unwrap();
+        assert_eq!((d.input_tokens, d.output_tokens), (20, 3));
     }
 }

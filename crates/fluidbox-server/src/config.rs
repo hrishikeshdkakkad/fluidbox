@@ -178,6 +178,10 @@ pub struct Config {
     pub codex_sandbox_image: String,
     /// Default model for `codex` agents (the haiku-analog cost directive).
     pub default_codex_model: String,
+    /// Runner image for `qwen-code` agents (the third harness).
+    pub qwen_sandbox_image: String,
+    /// Default model for `qwen-code` agents (the haiku-analog cost directive).
+    pub default_qwen_model: String,
     /// Facade upstream: LiteLLM (default) or api.anthropic.com (fallback).
     pub llm_upstream_url: String,
     /// Key the facade presents to LiteLLM. For the direct-Anthropic fallback
@@ -501,6 +505,10 @@ impl Config {
                 .unwrap_or_else(|_| "fluidbox-codex-runner:dev".into()),
             default_codex_model: get("FLUIDBOX_DEFAULT_CODEX_MODEL")
                 .unwrap_or_else(|_| "gpt-5.4-mini".into()),
+            qwen_sandbox_image: get("FLUIDBOX_QWEN_SANDBOX_IMAGE")
+                .unwrap_or_else(|_| "fluidbox-qwen-runner:dev".into()),
+            default_qwen_model: get("FLUIDBOX_DEFAULT_QWEN_MODEL")
+                .unwrap_or_else(|_| "qwen3-coder-plus".into()),
             llm_upstream_url: upstream,
             llm_upstream_key: upstream_key,
             llm_upstream_is_anthropic: is_anthropic,

@@ -1930,6 +1930,8 @@ mod tests {
             default_model: String::new(),
             codex_sandbox_image: String::new(),
             default_codex_model: String::new(),
+            qwen_sandbox_image: String::new(),
+            default_qwen_model: String::new(),
             llm_upstream_url: String::new(),
             llm_upstream_key: String::new(),
             llm_upstream_is_anthropic: false,

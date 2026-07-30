@@ -1,0 +1,12 @@
+{
+  "name": "fluidbox-qwen-runner",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "description": "fluidbox sandbox payload: the Qwen Code harness (via @qwen-code/sdk), governed by the fluidbox control plane.",
+  "dependencies": {
+    "@qwen-code/sdk": "0.1.8",
+    "@qwen-code/qwen-code": "0.21.1",
+    "@modelcontextprotocol/sdk": "1.29.0"
+  }
+}
