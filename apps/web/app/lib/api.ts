@@ -702,6 +702,7 @@ export interface TriggerSubscription {
   /** Capability keep-list (§3.5 narrowing); null = keep all attached. */
   capability_bundles: string[] | null;
   created_at: string;
+  updated_at: string;
 }
 
 /** The clock on a subscription (schedules table). */
@@ -736,6 +737,20 @@ export interface ResultDelivery {
   last_error: string | null;
   delivered_at: string | null;
   created_at: string;
+}
+
+/** GET /v1/triggers/{id} — subscription + activity + the caller-facing URLs
+ *  (server-derived from FLUIDBOX_PUBLIC_URL; the dashboard never builds hosts). */
+export interface TriggerDetail {
+  subscription: TriggerSubscription;
+  schedule: Schedule | null;
+  sessions: Session[];
+  deliveries: ResultDelivery[];
+  invocations: TriggerInvocation[];
+  base_url: string;
+  invoke_url: string;
+  poll_url_template: string;
+  ingress_url: string | null;
 }
 
 export interface Approval {
