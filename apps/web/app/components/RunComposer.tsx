@@ -18,7 +18,8 @@ import {
 } from "../lib/api";
 import { AddServerWizard } from "../capabilities/AddServerWizard";
 import { defaultModelFor, modelsFor, useHarnesses } from "../lib/harnesses";
-import { CopyBlock } from "./AutomationContract";
+import { CopyBlock, TemplateChips } from "./AutomationContract";
+import { buildCurl, classifyVariables } from "../lib/automation-contract";
 import { useAuthMe } from "../lib/useAuthMe";
 import { AppPicker } from "./AppPicker";
 import { HarnessPicker } from "./HarnessPicker";
@@ -615,6 +616,9 @@ export function RunComposer({
       if (mode === "automation" && !task.trim() && !allowTask) {
         return "Describe the task, or allow the caller to provide one (under advanced controls).";
       }
+      if (mode === "automation" && (kind === "schedule" || kind === "event") && !task.trim()) {
+        return "This trigger fires without a caller — write the task template it should run.";
+      }
     }
     if (agentsLoading || revisionLoading) return "Loading the agent configuration…";
     if (agentChoice === "existing" && !selectedAgentName) return "Choose an agent or create one here.";
@@ -758,10 +762,10 @@ export function RunComposer({
 
   const templateHint =
     kind === "schedule"
-      ? "You can use {{fire_time}} in these instructions."
+      ? "Saved with the automation. {{fire_time}} is filled in at each firing; any other {{name}} is refused at save (a schedule has no caller to supply it)."
       : kind === "event"
-        ? "Pull request values such as {{repository}}, {{pr_number}}, and {{pr_title}} are available."
-        : "API callers can supply values for placeholders such as {{ticket}}.";
+        ? "Saved with the automation. Pull-request values ({{repository}}, {{pr_number}}, {{pr_title}}, {{pr_url}}, {{pr_author}}, …) are filled from the event; any other {{name}} is refused at save."
+        : "Saved with the automation. Every {{name}} you add becomes a required context value the API caller sends on invoke.";
 
   const agentDisplayName = agentChoice === "new" ? newAgentName.trim() || "New agent" : selectedAgentName;
   const finalAction = agentOnly ? "Create Agent" : mode === "once" ? "Start Run" : "Save Automation";
@@ -954,15 +958,32 @@ export function RunComposer({
 
             <label className="field">
               <span className="lab">
-                {mode === "once" ? "What should the agent accomplish?" : "What should happen each time?"}
-                {mode === "automation" && <span className="optional-label"> optional template</span>}
+                {mode === "once"
+                  ? "What should the agent accomplish?"
+                  : kind === "api"
+                    ? "Task template — rendered for every API invocation"
+                    : kind === "schedule"
+                      ? "Task template — rendered at every scheduled firing"
+                      : "Task template — rendered for every matching PR event"}
+                {mode === "automation" && kind === "api" && allowTask && (
+                  <span className="optional-label"> optional — callers may send their own task</span>
+                )}
               </span>
               <textarea
                 className="inp run-task-input"
                 value={task}
                 onChange={(event) => setTask(event.target.value)}
-                placeholder={mode === "once" ? "Review the latest changes, identify regressions, and prepare a safe patch…" : "Investigate {{ticket}} and report the root cause…"}
+                placeholder={
+                  mode === "once"
+                    ? "Review the latest changes, identify regressions, and prepare a safe patch…"
+                    : kind === "schedule"
+                      ? "Sweep the queue as of {{fire_time}} and file a summary…"
+                      : kind === "event"
+                        ? "Review {{repository}} PR #{{pr_number}}: {{pr_title}}…"
+                        : "Investigate {{ticket}} and report the root cause…"
+                }
               />
+              {mode === "automation" && <TemplateChips kind={kind} template={task} />}
               {mode === "automation" && <span className="field-hint">{templateHint}</span>}
             </label>
           </ComposerSection>
@@ -1619,6 +1640,10 @@ export function RunComposer({
               />
             )}
 
+            {!agentOnly && mode === "automation" && kind === "api" && !blockingIssue && (
+              <ApiPreview task={task} allowTask={allowTask} />
+            )}
+
             {agentChoice === "existing" && revisionTouched && (
               <p className="rc-note">
                 One new revision will be appended to {selectedAgentName}. Active runs keep the
@@ -1695,6 +1720,59 @@ function SpecRow({
       <span className="rc-row-label">{label}</span>
       <span className={`rc-row-value ${clamp ? "rc-clamp" : ""}`}>{value}</span>
       {sub && <span className="rc-row-sub">{sub}</span>}
+    </div>
+  );
+}
+
+/** Pre-save preview of the integration contract. Deliberately labeled a
+ *  preview: the id and token exist only after save, so those two are
+ *  placeholders — but the base URL is the server's real answer. */
+function ApiPreview({ task, allowTask }: { task: string; allowTask: boolean }) {
+  const [copied, setCopied] = useState(false);
+  const [baseUrl, setBaseUrl] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    apiGetCached<{ base_url?: string }>("/triggers", { maxAgeMs: 60_000 })
+      .then((response) => {
+        if (!cancelled && response.base_url) setBaseUrl(response.base_url);
+      })
+      .catch(() => {
+        /* preview keeps the {base_url} placeholder */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const { caller } = classifyVariables("api", task || null);
+  const hasTemplate = task.trim().length > 0;
+  const curl = buildCurl({
+    invokeUrl: `${baseUrl ?? "{base_url}"}/v1/triggers/{id-assigned-on-save}/invoke`,
+    token: "<minted-on-save>",
+    caller,
+    hasTemplate: hasTemplate || !allowTask,
+  });
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(curl);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
+    } catch {
+      /* clipboard unavailable — the text is selectable either way */
+    }
+  };
+  return (
+    <div className="rc-api-preview">
+      <div className="contract-head">
+        <span className="rc-row-label">API preview</span>
+        <button type="button" className="btn ghost sm" onClick={copy}>
+          {copied ? "Copied" : "Copy preview"}
+        </button>
+      </div>
+      <pre className="token rc-api-preview-curl">{curl}</pre>
+      <span className="field-hint">
+        The id and one-time token are minted when you save; the full contract then lives on
+        the automation&apos;s page.
+      </span>
     </div>
   );
 }
