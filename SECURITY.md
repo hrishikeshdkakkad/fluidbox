@@ -22,11 +22,14 @@ surprised a reviewer:
    host's network position. Kubernetes `zeroEgress` and Docker `Hardened` are the
    modes that close it. Combined with (1), the default Docker profile is
    convenient rather than contained.
-3. **The eval Docker profile publishes its API on all interfaces**, because
-   sandboxes reach the control plane over the host gateway and a loopback publish
-   would break every run. Its admin token is now **required** rather than
-   defaulted (the old default was published in this repository), so the token is
-   what protects it — not your network position. Run it on a trusted network.
+3. **The eval Docker profile publishes its API on all interfaces by default.**
+   Its admin token is now **required** rather than defaulted (the old default was
+   published in this repository), so the token is what protects it — not your
+   network position. Run it on a trusted network. You can often narrow the
+   exposure with `FLUIDBOX_EVAL_API_BIND=127.0.0.1`; whether a loopback publish
+   stays reachable from sandboxes depends on your container engine (measured
+   working on colima, expected to break on native Linux Docker), so verify one
+   run completes after changing it.
 
 Full detail: [`docs/release/claims-matrix.md`](./docs/release/claims-matrix.md)
 lists every material claim with the command that checks it, and
