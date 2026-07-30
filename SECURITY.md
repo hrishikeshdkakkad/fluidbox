@@ -2,6 +2,37 @@
 
 fluidbox's core promise is **containment and accountability** for AI coding agents. Security reports are not an inconvenience here — they are exactly the contributions we value most.
 
+## ⚠ Read this before you deploy anything
+
+Three properties of the shipped defaults, stated up front because each one has
+surprised a reviewer:
+
+1. **Two different strengths of "gated".** A **brokered MCP** call cannot execute
+   without a server-side decision *structurally* — the control plane executes it.
+   An **in-sandbox** call (`Bash`, `Edit`, `Read`, sandbox stdio MCP) is executed
+   by the sandbox, and the gate binds it because the runner **routes** every call
+   there (on the Claude harness, a mandatory `PreToolUse` hook; proven by
+   `scripts/gate-proof.sh`, which needs no API key). That is a real control
+   against a prompt-injected model. It is **not** a control against a workload
+   already executing arbitrary code, and an older pinned `runner_image` routes
+   nothing and is not detected server-side. For those, **containment** — not the
+   gate — is the binding control.
+2. **The Docker default is not an egress boundary.** `NetworkMode::HostDev` is
+   the default: general internet egress **plus** `host.docker.internal`, i.e. the
+   host's network position. Kubernetes `zeroEgress` and Docker `Hardened` are the
+   modes that close it. Combined with (1), the default Docker profile is
+   convenient rather than contained.
+3. **The eval Docker profile publishes its API on all interfaces**, because
+   sandboxes reach the control plane over the host gateway and a loopback publish
+   would break every run. Its admin token is now **required** rather than
+   defaulted (the old default was published in this repository), so the token is
+   what protects it — not your network position. Run it on a trusted network.
+
+Full detail: [`docs/release/claims-matrix.md`](./docs/release/claims-matrix.md)
+lists every material claim with the command that checks it, and
+[`docs/hosted/threat-model.md`](./docs/hosted/threat-model.md) carries the
+adversary model and the accepted residuals.
+
 ## Reporting a vulnerability
 
 **Please do not open a public issue for security problems.**
@@ -18,7 +49,7 @@ Anything that breaks the security model described in [`docs/ARCHITECTURE.md`](./
 
 - **Sandbox escape or egress** — an agent workload reaching the network, host filesystem, or credentials it shouldn't.
 - **Credential exposure** — provider API keys, git credentials, OAuth/refresh tokens, or webhook secrets reaching a sandbox, a log, the ledger, or an API response. (Credentials are supposed to be sealed at rest and only ever used control-plane-side.)
-- **Policy/approval bypass** — executing a tool call without the permission gate deciding it, escalating a fork PR's read-only trust tier, or replaying/forging an approval.
+- **Policy/approval bypass** — executing a tool call without the permission gate deciding it, escalating a fork PR's read-only trust tier, or replaying/forging an approval. **Especially valuable:** a tool call that reaches execution without a `tool.decision` in the ledger. That is the shape of the defect fixed in `v0.4.0-rc.1`, where the Claude Code CLI auto-approved its read-only classification beneath the SDK's permission callback. If you can make `scripts/gate-proof.sh` produce a side effect under a `deny` verdict, that is a report we want. Nested sub-execution (`Agent`, `Task`, `Workflow`, `Skill`, `TaskCreate`) is the known-untested case — the seed policy denies it rather than claiming to mediate it.
 - **Audit-trail integrity** — writing unredacted prompts to the ledger, mutating a frozen `RunSpec` or policy snapshot, gaps or forgeries in the per-session event sequence.
 - **Ingress authentication** — webhook signature bypass, trigger tokens reaching admin surfaces, OAuth `state`/PKCE weaknesses in the connector flow, forged GitHub App installation handling.
 - **Budget/metering bypass** — driving model usage past a run's budget stop.

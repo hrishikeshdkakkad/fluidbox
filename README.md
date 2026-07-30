@@ -270,6 +270,8 @@ fluidbox is pre-1.0 security software. Its guarantees come from explicit boundar
 - **Audit is redacted by construction.** The append path accepts only `Redacted<EventEnvelope>` values. The ledger keeps digests, decisions, usage, cost, lifecycle, and artifact metadata—not raw model prompts, secrets, or brokered tool payloads.
 - **Finalization is durable.** Terminal intent is persisted before acknowledgement; artifact collection precedes the terminal transition; interrupted finalizations are recovered after restart.
 
+**Where to check any of this.** [`docs/release/claims-matrix.md`](./docs/release/claims-matrix.md) lists every material claim above with its evidence class and the command that verifies it; [`docs/release/compatibility-matrix.md`](./docs/release/compatibility-matrix.md) separates what has actually been run on which platform from what is merely expected to work, and states plainly which release-artifact properties (signing, SBOM, provenance, checksums, reproducible runner images) do **not** exist.
+
 The default deployment model is self-hosted and effectively single-tenant, with one admin bearer token. The opt-in [hosted multi-user posture](#hosted-multi-user-mode) adds identity, ownership, custody, RLS, broker hardening, and multi-replica coordination, but production promotion still depends on the documented rollout gates and accepted residuals. Single-admin behavior is unchanged when SSO is off. Read [SECURITY.md](./SECURITY.md) and the hosted [threat model](./docs/hosted/threat-model.md) before operating fluidbox outside a local environment.
 
 ## Kubernetes
