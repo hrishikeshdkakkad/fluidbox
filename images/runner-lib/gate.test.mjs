@@ -123,6 +123,38 @@ test("the Claude runner passes a PreToolUse hook to query()", () => {
   );
 });
 
+// The two tests below close a hole found by mutation testing during the
+// 2026-07-29 integration review: the suite caught "hook deleted" but passed
+// 12/12 on two mutations that fully restore the bypass, because nothing
+// asserted what the WIRED hook returns or that it is unscoped.
+
+test("the wired PreToolUse hook delegates to forceGateDecision, so it answers `ask`", () => {
+  const src = fs.readFileSync(CLAUDE_RUNNER, "utf8");
+  // Mutation this catches: `const preToolUseGate = async () => ({})`. The
+  // `hooks:` wiring above stays intact, so the wiring test cannot see it — but
+  // a hook that returns {} lets the CLI execute the call with no decision
+  // (measured: hook fires, canUseTool does not, command runs).
+  assert.match(
+    src,
+    /const\s+preToolUseGate\s*=\s*async\s*\([^)]*\)\s*=>\s*forceGateDecision\(\)\s*;/,
+    "preToolUseGate must delegate to forceGateDecision() — any other return " +
+      "value (including {} or a hardcoded allow) un-governs the call",
+  );
+});
+
+test("the PreToolUse hook carries no matcher, so it fires for every tool", () => {
+  const src = fs.readFileSync(CLAUDE_RUNNER, "utf8");
+  // Mutation this catches: `[{ hooks: [preToolUseGate], matcher: "Write" }]`.
+  // A matcher scopes the hook to a subset; every tool outside that subset goes
+  // straight back to being auto-approved with the gate never consulted.
+  assert.doesNotMatch(
+    src,
+    /matcher/,
+    "a PreToolUse matcher scopes the gate to a subset of tools — the hook " +
+      "must stay unscoped for the gate to be mandatory",
+  );
+});
+
 test("the Claude runner never asks for a permission mode that skips the callback", () => {
   const src = fs.readFileSync(CLAUDE_RUNNER, "utf8");
   // bypassPermissions auto-approves before the callback; acceptEdits does the
