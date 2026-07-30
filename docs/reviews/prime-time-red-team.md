@@ -5,7 +5,31 @@
 **Mandate:** independently assess whether fluidbox is ready for a public launch. Adversarial by design: find what a competent attacker or a competent skeptical reviewer would find, and say so without softening.
 **Constraints observed:** no runtime, deployment, test, or README changes; no cloud resources created; no model API spend; no other worktree touched. Output is four documents and nothing else.
 
-**Verdict: NO-GO for a broad public launch in the current state.** The reasoning, the two paths to GO, and the acceptance tests are in [`../launch/launch-blockers.md`](../launch/launch-blockers.md).
+> ## ⚠ STATUS ADDENDUM — 2026-07-29 (integration review)
+>
+> Assessed against `9515069` (main). The central finding below (§3, BLK-01) has
+> since been **root-caused and fixed**, and the fix is integrated on this branch
+> and independently verified. §5's BLK-05 is also closed. Everything else stands.
+> Current status per blocker, and the superseding evidence, is in
+> [`overnight-integration-review.md`](overnight-integration-review.md).
+>
+> Two corrections to this document specifically:
+>
+> 1. **§2.2 and §7 say live reproduction of the gate finding was impossible
+>    without model spend.** That turned out to be false. Pointing the runner's
+>    `ANTHROPIC_BASE_URL` at a mock upstream that returns a canned `tool_use`
+>    drives the *real* runner image and the *real* Claude Code CLI through the
+>    *real* hook/callback path for **$0**, and yields a stronger witness than a
+>    live model does: the harness is deterministic and the probe's nonce digest
+>    is unfabricatable. The gap was a missing test technique, not a budget.
+> 2. **§3.2's diagnosis is confirmed and sharpened.** `canUseTool` is indeed
+>    ask-path only, and the fix is upstream's own documented remedy — a
+>    `PreToolUse` hook. Measured here on the unfixed image: a read-only-classified
+>    `Bash` command executed while the gate was configured to deny everything,
+>    with **zero** `/permission` calls. A *mutating* command in the same image
+>    **was** gated — which is exactly why the failure looked intermittent.
+
+**Original verdict (pre-integration): NO-GO for a broad public launch in the current state.** The reasoning, the two paths to GO, and the acceptance tests are in [`../launch/launch-blockers.md`](../launch/launch-blockers.md).
 
 ---
 

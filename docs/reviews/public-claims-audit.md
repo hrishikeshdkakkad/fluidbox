@@ -29,7 +29,23 @@
 > **"Every tool call still flows through the policy gateway and lands in the ledger in both modes."** — `PLAN.md:39` (convergence invariant 6)
 > **"Each tool call passes the single decision gate."** — `docs/ARCHITECTURE.md:29`
 
-**Verdict: CONTRADICTED for in-sandbox tools; PROVEN for brokered MCP tools.**
+**Verdict (against `9515069`): CONTRADICTED for in-sandbox tools; PROVEN for brokered MCP tools.**
+
+> **UPDATED 2026-07-29 (integration review) — now PARTIALLY PROVEN for in-sandbox
+> tools on the Claude harness.** The `PreToolUse` hook fix is integrated on this
+> branch and independently verified with real side effects: the denial reaches the
+> gate and the command does not run, on the exact read-only-classified tool class
+> that previously bypassed it. What is **still not** supportable is the
+> *absolute* wording ("**every** tool call", "**each** tool call"), for three
+> reasons: the Codex harness was never examined for the analogous gap; enforcement
+> was measured for `Bash` (both classes) but not for all 30 tools the pinned CLI
+> advertises; and mediation remains runner-side, so an older pinned `runner_image`
+> on a newer server still bypasses with no server-side detection (AT-01a was never
+> built). Corrected wording that is now true: *"Brokered MCP calls cannot execute
+> without a server-side decision. On the Claude harness every tool call is routed
+> to that decision by a PreToolUse hook; containment is the control that binds a
+> harness or image that does not route."* See
+> [`overnight-integration-review.md`](overnight-integration-review.md).
 
 | | |
 |---|---|
