@@ -1,0 +1,81 @@
+{
+  "//": "fluidbox qwen-runner SYSTEM-scope settings — the governance analogue of the codex image's config.toml. Baked root-owned READ-ONLY and pointed at by QWEN_CODE_SYSTEM_SETTINGS_PATH; system scope outranks workspace/user scopes for scalars and the permissions arrays merge as a UNION (lower scopes can only ADD rules, and ask beats allow), so a repo-committed .qwen/settings.json cannot relax any of this. Verified against the pinned @qwen-code/qwen-code@0.21.1 — see docs/research/2026-07-30-qwen-code-sdk-protocol.md.",
+  "security": {
+    "auth": {
+      "selectedType": "openai"
+    }
+  },
+  "tools": {
+    "//approvalMode": "The upstream DEFAULT is 'auto' — an LLM classifier that auto-approves 'safe' calls, bypassing the gate AND burning facade calls. 'default' routes every confirmation to the SDK channel (canUseTool).",
+    "approvalMode": "default",
+    "//sandbox": "The fluidbox container IS the sandbox; qwen's own nesting (docker/podman) is impossible under cap_drop=ALL anyway.",
+    "sandbox": false,
+    "webSearch": {
+      "enabled": false
+    },
+    "computerUse": {
+      "enabled": false
+    },
+    "//disabled": "Unregisters the tool entirely (stronger than a deny rule: it never appears in the model's schema). PROVEN TRAP: disabling tool_search surfaces the deferred-tool registry (computer_use__*, cron_*, send_message, …) directly into the schema — so every deferred/agentic tool is disabled EXPLICITLY alongside it. agent/subagents are killed because inner tool calls degrade to deny without individual gating; web_fetch is ON upstream by default and must die (egress-free sandbox). With this list the live census is EXACTLY the nine core tools: edit, glob, grep_search, list_directory, notebook_edit, read_file, run_shell_command, todo_write, write_file.",
+    "disabled": [
+      "web_fetch",
+      "web_search",
+      "agent",
+      "monitor",
+      "skill",
+      "save_memory",
+      "tool_search",
+      "ask_user_question",
+      "enter_plan_mode",
+      "exit_plan_mode",
+      "zoom_image",
+      "image_gen",
+      "lsp",
+      "read_mcp_resource",
+      "enter_worktree",
+      "exit_worktree",
+      "structured_output",
+      "create_sub_session",
+      "list_agents",
+      "cron_create",
+      "cron_delete",
+      "cron_list",
+      "loop_wakeup",
+      "send_message",
+      "task_stop",
+      "task_create",
+      "task_update",
+      "task_list",
+      "team_create",
+      "team_delete",
+      "team_plan_approval"
+    ]
+  },
+  "permissions": {
+    "allow": [],
+    "//ask": "THE interception closure (rule priority deny > ask > allow > mode default): read-only tools default to 'allow' and would otherwise execute without ever reaching canUseTool. An ask rule forces the confirmation, which the SDK channel routes to canUseTool → the fluidbox /permission gate. Both the alias meta-categories AND the raw tool names are listed (union-merged) so neither an alias-semantics change nor a raw-name change can silently open a gap alone; 'mcp__' prefix-matches every MCP tool. PROVEN LIVE: read_file crosses canUseTool under this config, and an SDK allow maps to proceed_once — never a persistent grant.",
+    "ask": [
+      "Read",
+      "Edit",
+      "Write",
+      "NotebookEdit",
+      "Bash",
+      "WebFetch",
+      "Agent",
+      "Skill",
+      "mcp__",
+      "read_file",
+      "grep_search",
+      "glob",
+      "list_directory",
+      "edit",
+      "write_file",
+      "notebook_edit",
+      "run_shell_command",
+      "todo_write"
+    ]
+  },
+  "telemetry": {
+    "enabled": false
+  }
+}

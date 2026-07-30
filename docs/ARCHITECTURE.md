@@ -64,7 +64,7 @@ Connected-service events ride one provider-ignorant spine: ingress → verify �
 Two seams are designed so that nothing above them changes (`PLAN.md` §6.2):
 
 - **New execution backend** → implement the `ExecutionProvider` trait (`fluidbox-core/src/traits.rs`). The planned AWS Lambda MicroVM provider is the next one; `SandboxHandle`'s serializability exists for exactly this.
-- **New agent harness** → a new runner image implementing the HTTP runner contract (`/permission`, `/events`, `/heartbeat`, `/result`, the broker shim, the canonical tool vocabulary) plus one arm in the `harness.rs` registry. Two harnesses exist today — Claude Agent SDK (`images/sandbox-runner`) and Codex (`images/codex-runner`) — sharing `images/runner-lib`. The LLM facade dispatches per-harness between the Anthropic Messages and OpenAI Responses dialects.
+- **New agent harness** → a new runner image implementing the HTTP runner contract (`/permission`, `/events`, `/heartbeat`, `/result`, the broker shim, the canonical tool vocabulary) plus one arm in the `harness.rs` registry. Three harnesses exist today — Claude Agent SDK (`images/sandbox-runner`), Codex (`images/codex-runner`), and Qwen Code (`images/qwen-runner`) — sharing `images/runner-lib`. The LLM facade dispatches per-harness between the Anthropic Messages, OpenAI Responses, and OpenAI Chat Completions dialects.
 
 Both registries are deliberately plain `match` statements, not trait-object plugin systems: with a handful of variants, greppability beats indirection.
 

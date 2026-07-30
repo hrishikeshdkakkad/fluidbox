@@ -59,6 +59,10 @@ sandbox-build:
 codex-build:
     docker build -t ${FLUIDBOX_CODEX_SANDBOX_IMAGE:-fluidbox-codex-runner:dev} -f images/codex-runner/Dockerfile images
 
+# Build the Qwen Code runner image (the third harness)
+qwen-build:
+    docker build -t ${FLUIDBOX_QWEN_SANDBOX_IMAGE:-fluidbox-qwen-runner:dev} -f images/qwen-runner/Dockerfile images
+
 # ── Database ─────────────────────────────────────────────────────────────
 #
 # Local development runs Postgres in a container with a named volume

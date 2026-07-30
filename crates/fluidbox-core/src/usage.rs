@@ -67,6 +67,17 @@ pub fn price_for(model: &str) -> Option<ModelPrice> {
         // gpt-5.4 / 5.5 / 5.6-{luna,sol,terra} + unknown gpt-5* → big-tier
         // (conservative upper bound).
         openai(1.25, 10.0)
+    } else if m.starts_with("qwen") && m.contains("flash") {
+        // qwen3-coder-flash — DashScope's cheap coder tier. DashScope prices
+        // tiered by input length; these pin the TOP (longest-context) tier so
+        // the estimate errs high (same OpenAI-style cache split: cached input
+        // 0.1×, no cache-write charge).
+        openai(0.45, 4.5)
+    } else if m.starts_with("qwen") {
+        // qwen3-coder-plus (the qwen-code default) + unknown qwen* → the
+        // flagship-coder top-tier rate, the same over-estimating catch-all
+        // discipline as gpt-5* above.
+        openai(1.8, 18.0)
     } else {
         return None;
     };
@@ -122,6 +133,21 @@ mod tests {
         let mini = price_for("gpt-5.4-mini").unwrap();
         let big = price_for("gpt-5.6-sol").unwrap();
         assert!(mini.input_per_mtok < big.input_per_mtok);
+    }
+
+    #[test]
+    fn qwen_family_priced_flash_below_plus() {
+        // Without a qwen arm the cost budget is silently blind for every
+        // qwen-code run — this is the regression this test pins.
+        assert!(price_for("qwen3-coder-plus").is_some());
+        assert!(price_for("qwen3-coder-flash").is_some());
+        // Unknown qwen variants hit the over-estimating catch-all, not None.
+        assert!(price_for("qwen3-coder-preview").is_some());
+        let flash = price_for("qwen3-coder-flash").unwrap();
+        let plus = price_for("qwen3-coder-plus").unwrap();
+        assert!(flash.input_per_mtok < plus.input_per_mtok);
+        // OpenAI-style cache split: no cache-write charge.
+        assert_eq!(plus.cache_write_per_mtok, 0.0);
     }
 
     #[test]

@@ -34,6 +34,7 @@ services:
     environment:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-litellm-eval-only}
     volumes:
       - ./litellm/config.yaml:/etc/litellm/config.yaml:ro
@@ -60,6 +61,7 @@ services:
       FLUIDBOX_DATA_DIR: ${FLUIDBOX_EVAL_DATA:-/tmp/fluidbox-eval-data}
       FLUIDBOX_SANDBOX_IMAGE: ${FLUIDBOX_SANDBOX_IMAGE:-ghcr.io/hrishikeshdkakkad/fluidbox-sandbox-runner:latest}
       FLUIDBOX_CODEX_SANDBOX_IMAGE: ${FLUIDBOX_CODEX_SANDBOX_IMAGE:-ghcr.io/hrishikeshdkakkad/fluidbox-codex-runner:latest}
+      FLUIDBOX_QWEN_SANDBOX_IMAGE: ${FLUIDBOX_QWEN_SANDBOX_IMAGE:-ghcr.io/hrishikeshdkakkad/fluidbox-qwen-runner:latest}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${FLUIDBOX_EVAL_DATA:-/tmp/fluidbox-eval-data}:${FLUIDBOX_EVAL_DATA:-/tmp/fluidbox-eval-data}
@@ -88,6 +90,10 @@ services:
     entrypoint: ["true"]
   codex-runner:
     image: ${FLUIDBOX_CODEX_SANDBOX_IMAGE:-ghcr.io/hrishikeshdkakkad/fluidbox-codex-runner:latest}
+    profiles: ["runners"]
+    entrypoint: ["true"]
+  qwen-runner:
+    image: ${FLUIDBOX_QWEN_SANDBOX_IMAGE:-ghcr.io/hrishikeshdkakkad/fluidbox-qwen-runner:latest}
     profiles: ["runners"]
     entrypoint: ["true"]
 

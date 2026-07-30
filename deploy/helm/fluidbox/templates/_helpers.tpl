@@ -52,7 +52,7 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
 {{- end -}}
 {{- end -}}
 
-{{/* Full ref for a flat image value (sandboxRunner/codexRunner/collector):
+{{/* Full ref for a flat image value (sandboxRunner/codexRunner/qwenRunner/collector):
      any non-empty value (tag or @sha256 ref) passes through verbatim; "" is
      the official GHCR image at the chart appVersion. Call with
      (dict "value" .Values.images.collector "name" "workspaced" "ctx" $). */}}

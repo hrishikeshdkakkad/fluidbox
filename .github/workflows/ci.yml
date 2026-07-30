@@ -447,6 +447,7 @@ jobs:
           FLUIDBOX_DATA_DIR=./data
           FLUIDBOX_SANDBOX_IMAGE=fluidbox-sandbox-runner:ci
           FLUIDBOX_CODEX_SANDBOX_IMAGE=fluidbox-codex-runner:ci
+          FLUIDBOX_QWEN_SANDBOX_IMAGE=fluidbox-qwen-runner:ci
           LITELLM_MASTER_KEY=sk-litellm-ci-only
           LLM_UPSTREAM_URL=http://127.0.0.1:4000
           EOF
