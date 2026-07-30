@@ -18,6 +18,7 @@ import {
 } from "../lib/api";
 import { AddServerWizard } from "../capabilities/AddServerWizard";
 import { defaultModelFor, modelsFor, useHarnesses } from "../lib/harnesses";
+import { buildCurl, classifyVariables } from "../lib/automation-contract";
 import { useAuthMe } from "../lib/useAuthMe";
 import { AppPicker } from "./AppPicker";
 import { HarnessPicker } from "./HarnessPicker";
@@ -1704,23 +1705,6 @@ function SpecRow({
    the secrets that exist only in this response, the variables this automation
    declares, and the responses to expect. */
 
-/** Placeholders the platform fills in itself, per trigger kind. Anything else
- *  in the template is the caller's to supply in `context`. */
-const SYSTEM_VARIABLES: Record<string, string[]> = {
-  schedule: ["fire_time"],
-  event: ["repository", "pr_number", "pr_title"],
-  api: [],
-};
-
-function templateVariables(template: string | null): string[] {
-  if (!template) return [];
-  const found = new Set<string>();
-  for (const match of template.matchAll(/\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g)) {
-    found.add(match[1]);
-  }
-  return [...found];
-}
-
 function CopyBlock({ label, value, hint }: { label: string; value: string; hint?: string }) {
   const [copied, setCopied] = useState(false);
   const copy = async () => {
@@ -1760,23 +1744,14 @@ export function ShowAutomationSecrets({
   const invokeUrl = minted.invoke_url || `<control-plane>/v1/triggers/${sub.id}/invoke`;
   const pollUrl = minted.poll_url_template || `<control-plane>/v1/triggers/${sub.id}/runs/{session_id}`;
 
-  const system = SYSTEM_VARIABLES[kind] ?? [];
-  const declared = templateVariables(sub.task_template);
-  const callerVars = declared.filter((name) => !system.includes(name));
-  const systemVars = declared.filter((name) => system.includes(name));
-
-  const contextExample =
-    callerVars.length > 0
-      ? `{"context": {${callerVars.map((name) => `"${name}": "…"`).join(", ")}}}`
-      : `{}`;
-
-  const curl = [
-    `curl -X POST '${invokeUrl}' \\`,
-    `  -H 'Authorization: Bearer ${minted.token}' \\`,
-    `  -H 'Content-Type: application/json' \\`,
-    `  -H 'Idempotency-Key: <your-unique-key>' \\`,
-    `  -d '${contextExample}'`,
-  ].join("\n");
+  const { caller: callerVars, system: systemVars } = classifyVariables(kind, sub.task_template);
+  const declared = [...callerVars, ...systemVars];
+  const curl = buildCurl({
+    invokeUrl,
+    token: minted.token,
+    caller: callerVars,
+    hasTemplate: !!sub.task_template,
+  });
 
   const responseExample = [
     "200 OK",
