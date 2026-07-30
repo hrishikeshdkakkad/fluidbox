@@ -220,6 +220,57 @@ fn random_hex_token(prefix: &str) -> String {
     )
 }
 
+/// Caller-facing URL block for a subscription's integration contract.
+/// The control plane is the only party that knows its own public address
+/// (the dashboard reaches it through a same-origin proxy), so create,
+/// rotate, get, and update all hand these over rather than letting a client
+/// guess. Nothing here is secret: it is public_url + subscription id.
+fn contract_urls(
+    base: &str,
+    sub_id: Uuid,
+    ingress_path: Option<&str>,
+) -> serde_json::Map<String, Value> {
+    let base = base.trim_end_matches('/');
+    let mut m = serde_json::Map::new();
+    m.insert("base_url".into(), json!(base));
+    m.insert(
+        "invoke_url".into(),
+        json!(format!("{base}/v1/triggers/{sub_id}/invoke")),
+    );
+    m.insert(
+        "poll_url_template".into(),
+        json!(format!("{base}/v1/triggers/{sub_id}/runs/{{session_id}}")),
+    );
+    m.insert(
+        "ingress_url".into(),
+        json!(ingress_path.map(|p| format!("{base}{p}"))),
+    );
+    m
+}
+
+/// Recompute an event subscription's ingress path (registration-level for
+/// seamless connections, per-connection otherwise) so the contract is
+/// rebuildable forever, not a one-time artifact of the create response.
+/// api/schedule kinds have no ingress.
+async fn ingress_path_for(
+    state: &AppState,
+    scope: fluidbox_db::TenantScope,
+    sub: &fluidbox_db::TriggerSubscriptionRow,
+) -> ApiResult<Option<String>> {
+    let ("event", Some(cid)) = (sub.trigger_kind.as_str(), sub.connection_id) else {
+        return Ok(None);
+    };
+    let mut tx = fluidbox_db::scoped_tx(&state.pool, scope).await?;
+    let conn = fluidbox_db::get_connection(&mut *tx, scope, cid).await?;
+    tx.commit().await?;
+    Ok(conn.and_then(|c| {
+        crate::connectors::connector_for(&c.provider).map(|connector| match c.registration_id {
+            Some(rid) => format!("/v1/ingress/{connector}/app/{rid}"),
+            None => format!("/v1/ingress/{connector}/{cid}"),
+        })
+    }))
+}
+
 #[derive(Deserialize)]
 pub struct CreateTrigger {
     /// Agent id or name.
@@ -665,20 +716,18 @@ pub async fn create(
     // address (the dashboard reaches it through a same-origin proxy, so it
     // cannot derive it), and an integration contract with a placeholder host is
     // not a contract. Trailing slashes are trimmed so joins never double up.
-    let base = state.cfg.public_url.trim_end_matches('/');
-    Ok(Json(json!({
-        "subscription": sub,
-        "schedule": schedule_row,
-        "token": token,
-        "callback_secret": secret_plain,
-        "ingress_path": ingress_path,
-        "base_url": base,
-        "invoke_url": format!("{base}/v1/triggers/{}/invoke", sub.id),
-        "poll_url_template": format!("{base}/v1/triggers/{}/runs/{{session_id}}", sub.id),
-        "ingress_url": ingress_path
-            .as_ref()
-            .map(|path| format!("{base}{path}")),
-    })))
+    let mut body = serde_json::Map::new();
+    body.insert("subscription".into(), serde_json::to_value(&sub)?);
+    body.insert("schedule".into(), serde_json::to_value(&schedule_row)?);
+    body.insert("token".into(), json!(token));
+    body.insert("callback_secret".into(), json!(secret_plain));
+    body.insert("ingress_path".into(), json!(ingress_path));
+    body.extend(contract_urls(
+        &state.cfg.public_url,
+        sub.id,
+        ingress_path.as_deref(),
+    ));
+    Ok(Json(Value::Object(body)))
 }
 
 pub async fn list(principal: Principal, State(state): State<AppState>) -> ApiResult<Json<Value>> {
@@ -690,9 +739,11 @@ pub async fn list(principal: Principal, State(state): State<AppState>) -> ApiRes
     let scope = principal.scope();
     let subscriptions = fluidbox_db::list_trigger_subscriptions(&state.pool, scope).await?;
     let schedules = fluidbox_db::schedules_for_tenant(&state.pool, scope).await?;
-    Ok(Json(
-        json!({ "subscriptions": subscriptions, "schedules": schedules }),
-    ))
+    Ok(Json(json!({
+        "subscriptions": subscriptions,
+        "schedules": schedules,
+        "base_url": state.cfg.public_url.trim_end_matches('/'),
+    })))
 }
 
 pub async fn get(
@@ -714,10 +765,19 @@ pub async fn get(
     let schedule = fluidbox_db::schedule_for_subscription(&state.pool, scope, id).await?;
     let invocations =
         fluidbox_db::list_subscription_invocations(&state.pool, scope, id, 30).await?;
-    Ok(Json(json!({
-        "subscription": sub, "schedule": schedule, "sessions": sessions,
-        "deliveries": deliveries, "invocations": invocations
-    })))
+    let ingress_path = ingress_path_for(&state, scope, &sub).await?;
+    let mut body = serde_json::Map::new();
+    body.insert("subscription".into(), serde_json::to_value(&sub)?);
+    body.insert("schedule".into(), serde_json::to_value(&schedule)?);
+    body.insert("sessions".into(), serde_json::to_value(&sessions)?);
+    body.insert("deliveries".into(), serde_json::to_value(&deliveries)?);
+    body.insert("invocations".into(), serde_json::to_value(&invocations)?);
+    body.extend(contract_urls(
+        &state.cfg.public_url,
+        sub.id,
+        ingress_path.as_deref(),
+    ));
+    Ok(Json(Value::Object(body)))
 }
 
 async fn set_enabled(
@@ -782,14 +842,16 @@ pub async fn rotate_token(
     // A rotated token needs the same contract as a freshly-created one — the
     // caller has to re-wire an integration either way, and the dashboard cannot
     // derive these URLs itself.
-    let base = state.cfg.public_url.trim_end_matches('/');
-    Ok(Json(json!({
-        "token": token,
-        "revoked": revoked,
-        "base_url": base,
-        "invoke_url": format!("{base}/v1/triggers/{}/invoke", sub.id),
-        "poll_url_template": format!("{base}/v1/triggers/{}/runs/{{session_id}}", sub.id),
-    })))
+    let ingress_path = ingress_path_for(&state, scope, &sub).await?;
+    let mut body = serde_json::Map::new();
+    body.insert("token".into(), json!(token));
+    body.insert("revoked".into(), json!(revoked));
+    body.extend(contract_urls(
+        &state.cfg.public_url,
+        sub.id,
+        ingress_path.as_deref(),
+    ));
+    Ok(Json(Value::Object(body)))
 }
 
 // ─── Scoped: invoke & poll ────────────────────────────────────────────────
@@ -1308,5 +1370,24 @@ mod tests {
         assert_eq!(a, b); // BTreeMap canonicalizes key order
         let c = canonical_digest(&Some("t2".into()), &ctx(&[("a", "1"), ("b", "2")]), &None);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn contract_urls_shapes_and_trims() {
+        let id = Uuid::nil();
+        let m = contract_urls("https://fb.example/", id, None);
+        assert_eq!(m["base_url"], "https://fb.example");
+        assert_eq!(
+            m["invoke_url"],
+            format!("https://fb.example/v1/triggers/{id}/invoke")
+        );
+        assert_eq!(
+            m["poll_url_template"],
+            format!("https://fb.example/v1/triggers/{id}/runs/{{session_id}}")
+        );
+        assert_eq!(m["ingress_url"], Value::Null);
+
+        let m = contract_urls("https://fb.example", id, Some("/v1/ingress/github/app/7"));
+        assert_eq!(m["ingress_url"], "https://fb.example/v1/ingress/github/app/7");
     }
 }
