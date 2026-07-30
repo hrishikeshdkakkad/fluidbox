@@ -4,6 +4,18 @@
 **Branch:** `release/prime-time-rc` (based on the four-worktree integration at `2e57b5c`)
 **Mandate:** independently verify the integration evidence; if it holds, prepare a publishable release candidate and a 20-person private beta. Nothing pushed, tagged, published, or merged; no PR opened; `main` untouched; no cloud resources created; live-model spend capped at $10.
 
+> **STATUS — superseded in part, 2026-07-30.** An independent adversarial pass
+> ([`rc-verification-2026-07-30.md`](rc-verification-2026-07-30.md)) re-derived
+> this document's load-bearing claims. It **confirmed the central one**:
+> `scripts/gate-proof.sh` is real evidence — removing the `PreToolUse` hook and
+> rebuilding the image collapses it to 12/14 with exit 1, so the P0 closure holds.
+> It **contradicted** the BLK-04 reasoning in §4.1 (corrected in place below) and
+> found three guard holes, since fixed. Consequently the assertion counts quoted
+> throughout this document are a **snapshot of 2026-07-30 morning**:
+> `compose-assertions.sh` is now **18**, `demo-selftest.sh` **10**;
+> `gate-proof.sh` is unchanged at 14. Treat the verification report as current
+> where the two disagree.
+
 ## Verdict
 
 # READY FOR CONTROLLED BETA
@@ -133,7 +145,9 @@ Seven, of which three were release-blocking and would have shipped.
 
 ### 4.1 The eval quickstart (BLK-04) — and why the obvious fix was wrong
 
-The review called this "one line plus a token default". It is not. Loopback-binding the API port **breaks every run**: the Docker provider puts each sandbox on its **own per-run network** and reaches the control plane via `host.docker.internal:host-gateway`, which resolves to the host gateway, not `127.0.0.1`. A loopback publish makes the control plane unreachable from every sandbox.
+The review called this "one line plus a token default". The token half was right and is the half that removes the defect.
+
+> **CORRECTION — 2026-07-30.** This section originally continued: *"Loopback-binding the API port **breaks every run**… A loopback publish makes the control plane unreachable from every sandbox."* **That was wrong**, and the adversarial verification pass measured it wrong on the very engine this candidate was validated on. A `127.0.0.1`-published port answered on `host.docker.internal` from a sibling container on its own isolated per-run network, on colima. The argument conflated two settings: `FLUIDBOX_BIND` (the server's listen interface *inside* its container — hardcoded `0.0.0.0`, genuinely unable to be loopback, and the real CLAUDE.md gotcha) with `FLUIDBOX_EVAL_API_BIND` (the *host-side* interface of the port publish, which is what was actually under discussion). The accurate claim is that narrowing is **engine-dependent**: expected to work wherever the engine forwards published ports the way colima does, expected to break on native Linux Docker where `host-gateway` is the bridge gateway. The default stays open for portability, not by necessity. See [`rc-verification-2026-07-30.md`](rc-verification-2026-07-30.md) §3.
 
 BLK-04 bundles four things — an open port, a published credential, a mounted socket, an unconstrained `local_copy` — and only one is the defect. The fix removes the **credential**: `FLUIDBOX_ADMIN_TOKEN` is now required (`:?`), so compose refuses to start. The dashboard, which nothing in a container needs, moved to loopback. The API port stays published, is now bind-configurable via `FLUIDBOX_EVAL_API_BIND`, and the residual is stated in the file and the README instead of implied away.
 

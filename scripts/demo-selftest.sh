@@ -113,11 +113,46 @@ fi
 # failing, so the run completes with every command reporting "No such file or
 # directory", a 0-byte diff, and a success-shaped receipt. Measured on a colima
 # host: a /tmp checkout produced exactly that.
-if grep -q 'fluidbox-mount-probe' "$S" && grep -q 'cannot read files from this checkout' "$S"; then
-  ok "the workspace bind mount is probed before the run"
-else
+#
+# THREE properties, because presence alone is not one. This check used to be two
+# greps for the probe's marker string and its error message — and a grep is
+# satisfied by dead code. Verified: wrapping the whole probe in a function that
+# nothing calls left this suite at 9/9 while the demo probed nothing. That is the
+# same trap documented above check 3, reproduced here in the check written to
+# guard against it. So: the probe must EXIST, be REACHABLE, and run BEFORE the
+# control plane starts.
+probe_line=$(grep -nF 'fluidbox-mount-probe' "$S" | head -1 | cut -d: -f1)
+if [ -z "$probe_line" ] || ! grep -q 'cannot read files from this checkout' "$S"; then
   bad "the workspace bind mount is not probed" \
       "an unshared checkout would produce a demo that succeeds while proving nothing"
+else
+  # (a) REACHABLE — the probe's enclosing function must be invoked somewhere.
+  # A probe in a function nobody calls is a comment with extra steps.
+  enclosing=$(awk -v L="$probe_line" \
+    'NR<=L && /^[a-z_][a-z0-9_]*\(\) \{/ {sub(/\(\).*/,""); f=$0} END{print f}' "$S")
+  # Definitions and calls counted separately, as check 3 does. The two are told
+  # apart by what FOLLOWS the name: in a definition it is `(`, in every call it
+  # is anything else — which keeps this working for a function invoked from a
+  # `case` arm (`up) demo_up ;;`), where the name is neither at the start of the
+  # line nor the first word after the indent.
+  enc_defs=$(grep -cE "^${enclosing}\(\)" "$S")
+  enc_calls=$(grep -cE "(^|[^[:alnum:]_])${enclosing}([^[:alnum:]_(]|$)" "$S")
+  if [ -n "$enclosing" ] && [ "$enc_defs" -eq 1 ] && [ "$enc_calls" -ge 1 ]; then
+    ok "the bind-mount probe is reachable (inside ${enclosing}, which is called)"
+  else
+    bad "the bind-mount probe is unreachable — it sits in ${enclosing:-<top level>} (defs=${enc_defs:-0} calls=${enc_calls:-0})" \
+        "the demo would not probe the mount, and an unshared checkout would once again" \
+        "produce a run that exits 0 having proven nothing"
+  fi
+  # (b) ORDERED — probing after the control plane starts protects nothing.
+  launch_line=$(grep -nE '^[[:space:]]*"\$SERVER_BIN"' "$S" | head -1 | cut -d: -f1)
+  if [ -n "$launch_line" ] && [ "$probe_line" -lt "$launch_line" ]; then
+    ok "the bind mount is probed BEFORE the control plane starts"
+  else
+    bad "the bind-mount probe does not precede the control-plane launch" \
+        "probe at line ${probe_line:-?}, launch at line ${launch_line:-?} (comment-stripped)" \
+        "a probe that runs after the run has begun cannot prevent the meaningless run"
+  fi
 fi
 
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$pass" "$fail"

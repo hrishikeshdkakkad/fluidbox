@@ -22,16 +22,39 @@
 # host on the same network segment. Compose refuses to start without a token, so
 # that combination is no longer reachable by following the quickstart verbatim.
 #
-# The API port CANNOT be moved to loopback: the server spawns sandboxes as
-# SIBLING containers on their own per-run networks, and they reach the control
-# plane over `host.docker.internal`, which resolves to the host's gateway
-# address — not 127.0.0.1. A loopback-published API is unreachable from them and
-# every run fails during provisioning. So the residual is real and stated
-# plainly: on this profile the API is reachable from your network segment, and
-# the control protecting it is the token, not the network position. Pin it to a
-# specific interface with FLUIDBOX_EVAL_API_BIND (e.g. your docker bridge
-# gateway) if that is not acceptable. The dashboard has no such constraint and
-# IS loopback-only below.
+# The API port is published on ALL INTERFACES BY DEFAULT, and whether you can
+# narrow it is ENGINE-DEPENDENT. (Corrected 2026-07-30: this comment previously
+# said the port "CANNOT be moved to loopback" and that a loopback publish makes
+# "every run fail during provisioning". That was measured to be false on the
+# engine the claim was written on — see docs/reviews/rc-verification-2026-07-30.md
+# §3.)
+#
+# The mechanism, stated accurately. The server spawns sandboxes as SIBLING
+# containers on their own per-run networks; they reach the control plane over
+# `host.docker.internal`. Two DIFFERENT settings get confused here:
+#
+#   * FLUIDBOX_BIND (below) is the server process's listen interface INSIDE its
+#     container. It must be 0.0.0.0 — a loopback bind really is unreachable from
+#     a sibling. It is hardcoded and not configurable. This is the CLAUDE.md
+#     gotcha, and it is unaffected by anything on this line.
+#   * FLUIDBOX_EVAL_API_BIND is the HOST-side interface of the port publish
+#     below. Whether a loopback publish is reachable from a sandbox depends on
+#     how your engine forwards published ports:
+#       - colima (MEASURED): reachable. `host.docker.internal` resolves to
+#         192.168.5.2 and a 127.0.0.1-published port answers there, including
+#         from a container on its own isolated network.
+#       - Docker Desktop / OrbStack: same port-forwarding shape, EXPECTED to
+#         behave like colima. Not measured.
+#       - native Linux Docker: `host-gateway` is the bridge gateway (172.17.0.1
+#         or similar), which a 127.0.0.1-published port does NOT answer on.
+#         EXPECTED to break. Not measured.
+#
+# The default therefore stays open for portability, not because narrowing is
+# impossible. If the exposure is not acceptable on your network, set
+# FLUIDBOX_EVAL_API_BIND=127.0.0.1 and confirm one run completes end to end;
+# on a Mac engine it is expected to work. Either way the control protecting this
+# profile is the TOKEN, not your network position. The dashboard has no such
+# question and IS loopback-only below.
 name: fluidbox-eval
 
 services:
@@ -68,9 +91,11 @@ services:
         condition: service_started
     ports:
       # Sandboxes are SIBLING containers on their own per-run networks and reach
-      # the control plane via host.docker.internal (the host gateway), so this
-      # cannot be 127.0.0.1 — see the header. Override the bind interface if the
-      # default all-interfaces publish is not acceptable on your network.
+      # the control plane via host.docker.internal, so whether this may be
+      # 127.0.0.1 depends on how your engine forwards published ports — see the
+      # header. Open by default for portability, NOT because it must be: on
+      # colima a loopback publish was measured reachable. Narrow it here if the
+      # default exposure is not acceptable on your network.
       - "${FLUIDBOX_EVAL_API_BIND:-0.0.0.0}:8787:8787"
     environment:
       DATABASE_URL: postgres://postgres:fluidbox@postgres:5432/fluidbox
