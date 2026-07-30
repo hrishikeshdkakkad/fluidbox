@@ -107,5 +107,18 @@ else
       "which is how a run fails with 'No such image' after a green preflight"
 fi
 
+# ── 4. the workspace bind mount must be PROVEN, not assumed ──────────────────
+#
+# A daemon that cannot share the checkout mounts an EMPTY directory instead of
+# failing, so the run completes with every command reporting "No such file or
+# directory", a 0-byte diff, and a success-shaped receipt. Measured on a colima
+# host: a /tmp checkout produced exactly that.
+if grep -q 'fluidbox-mount-probe' "$S" && grep -q 'cannot read files from this checkout' "$S"; then
+  ok "the workspace bind mount is probed before the run"
+else
+  bad "the workspace bind mount is not probed" \
+      "an unshared checkout would produce a demo that succeeds while proving nothing"
+fi
+
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
