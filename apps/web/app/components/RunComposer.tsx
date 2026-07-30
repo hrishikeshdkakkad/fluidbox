@@ -18,7 +18,7 @@ import {
 } from "../lib/api";
 import { AddServerWizard } from "../capabilities/AddServerWizard";
 import { defaultModelFor, modelsFor, useHarnesses } from "../lib/harnesses";
-import { buildCurl, classifyVariables } from "../lib/automation-contract";
+import { CopyBlock } from "./AutomationContract";
 import { useAuthMe } from "../lib/useAuthMe";
 import { AppPicker } from "./AppPicker";
 import { HarnessPicker } from "./HarnessPicker";
@@ -1699,36 +1699,12 @@ function SpecRow({
   );
 }
 
-/* ─── Automation integration contract ─────────────────────────────────────
-   What a caller needs to actually integrate, in one copyable place: the real
-   endpoint (absolute, from the control plane — never a `<placeholder>` host),
-   the secrets that exist only in this response, the variables this automation
-   declares, and the responses to expect. */
-
-function CopyBlock({ label, value, hint }: { label: string; value: string; hint?: string }) {
-  const [copied, setCopied] = useState(false);
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(value);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1600);
-    } catch {
-      /* clipboard unavailable — the text is selectable either way */
-    }
-  };
-  return (
-    <div className="field">
-      <div className="contract-head">
-        <span className="lab">{label}</span>
-        <button type="button" className="btn ghost sm" onClick={copy}>
-          {copied ? "Copied" : "Copy"}
-        </button>
-      </div>
-      <pre className="token">{value}</pre>
-      {hint && <span className="field-hint">{hint}</span>}
-    </div>
-  );
-}
+/* ─── One-time secrets modal ───────────────────────────────────────────────
+   Shown once after minting or rotating an automation's credentials. The token
+   and signing secret are stored hashed/sealed and can never be re-displayed,
+   so this panel exists solely to hand them over. Everything else about the
+   automation (endpoint, request shape, variables, responses) lives on the
+   durable /automations/{id} page via <AutomationContract>. */
 
 export function ShowAutomationSecrets({
   minted,
@@ -1738,39 +1714,11 @@ export function ShowAutomationSecrets({
   onClose: () => void;
 }) {
   const sub = minted.subscription;
-  const kind = sub.trigger_kind;
-  // Fall back to a relative path only if an older control plane omitted the
-  // absolute URLs; the placeholder is then honest about being one.
-  const invokeUrl = minted.invoke_url || `<control-plane>/v1/triggers/${sub.id}/invoke`;
-  const pollUrl = minted.poll_url_template || `<control-plane>/v1/triggers/${sub.id}/runs/{session_id}`;
-
-  const { caller: callerVars, system: systemVars } = classifyVariables(kind, sub.task_template);
-  const declared = [...callerVars, ...systemVars];
-  const curl = buildCurl({
-    invokeUrl,
-    token: minted.token,
-    caller: callerVars,
-    hasTemplate: !!sub.task_template,
-  });
-
-  const responseExample = [
-    "200 OK",
-    JSON.stringify(
-      {
-        session_id: "019f…",
-        status: "queued",
-        replay: false,
-        poll_url: `/v1/triggers/${sub.id}/runs/{session_id}`,
-      },
-      null,
-      2
-    ),
-  ].join("\n");
 
   return (
     <ModalShell
       title={minted.rotated ? "Token rotated" : `“${sub.name}” is live`}
-      sub="The token and signing secret exist only in this response — they are stored hashed and sealed and can never be shown again."
+      sub="The token and signing secret exist only in this response — they are stored hashed and sealed and can never be shown again. Everything else stays available on the automation's page."
       onClose={onClose}
       maxWidth="min(760px, 96vw)"
       dirty
@@ -1795,100 +1743,16 @@ export function ShowAutomationSecrets({
         </section>
 
         <section className="contract-section">
-          <h4>Endpoint</h4>
-          <CopyBlock label="Invoke" value={`POST ${invokeUrl}`} />
-          <CopyBlock
-            label="Poll a run"
-            value={`GET ${pollUrl}`}
-            hint="Substitute the session_id returned by invoke."
-          />
-          {minted.ingress_url && (
-            <CopyBlock
-              label="Webhook ingress"
-              value={minted.ingress_url}
-              hint="Deliveries are authenticated by their signature, so this URL needs no token."
-            />
-          )}
-        </section>
-
-        <section className="contract-section">
-          <h4>Variables</h4>
-          {declared.length === 0 ? (
-            <p className="contract-note">
-              This automation&apos;s task has no placeholders, so callers send an empty body.
-              Add <code>{"{{name}}"}</code> to the task template to accept values.
-            </p>
-          ) : (
-            <div className="rows">
-              {callerVars.map((name) => (
-                <div key={name} className="row contract-var">
-                  <span className="mono">{`{{${name}}}`}</span>
-                  <span className="faint">
-                    you supply it in <code>context</code>
-                  </span>
-                </div>
-              ))}
-              {systemVars.map((name) => (
-                <div key={name} className="row contract-var">
-                  <span className="mono">{`{{${name}}}`}</span>
-                  <span className="faint">filled in by fluidbox</span>
-                </div>
-              ))}
-            </div>
-          )}
+          <h4>Where everything else lives</h4>
           <p className="contract-note">
-            <strong>{sub.allow_task_override ? "Task override allowed" : "Task override refused"}</strong> ·{" "}
-            <strong>{sub.allow_workspace_override ? "workspace override allowed" : "workspace override refused"}</strong>.
-            Sending a refused field returns 400. Context values must be flat strings.
+            The endpoint, request shape, variables, and response contract are always
+            available at{" "}
+            <Link className="link" href={`/automations/${sub.id}`} onClick={onClose}>
+              Automations → {sub.name} → API
+            </Link>
+            {" "}— only the secrets above are shown once. Lost token? Rotate it there.
           </p>
         </section>
-
-        <section className="contract-section">
-          <h4>Request</h4>
-          <CopyBlock
-            label="Example"
-            value={curl}
-            hint="Idempotency-Key is optional but strongly recommended: replaying the same key returns the original run instead of starting a second one."
-          />
-        </section>
-
-        <section className="contract-section">
-          <h4>Responses</h4>
-          <pre className="token">{responseExample}</pre>
-          <div className="rows">
-            <div className="row contract-var">
-              <span className="mono">409</span>
-              <span className="faint">
-                a run is already active and this automation is set to{" "}
-                <code>{sub.concurrency_policy}</code>, or the key was reused with a different body
-              </span>
-            </div>
-            <div className="row contract-var">
-              <span className="mono">400</span>
-              <span className="faint">an override this subscription does not allow</span>
-            </div>
-            <div className="row contract-var">
-              <span className="mono">401</span>
-              <span className="faint">wrong token, or the token was revoked</span>
-            </div>
-          </div>
-        </section>
-
-        {minted.callback_secret && (
-          <section className="contract-section">
-            <h4>Result delivery</h4>
-            <p className="contract-note">
-              When the run finishes, fluidbox POSTs the result to your callback URL and retries
-              with backoff over roughly an hour. Delivery is at-least-once — deduplicate on{" "}
-              <code>x-fluidbox-delivery</code>.
-            </p>
-            <CopyBlock
-              label="Signature"
-              value={'x-fluidbox-signature: v1=hmac-sha256(secret, "{timestamp}.{body}")'}
-              hint="Also sent: x-fluidbox-delivery (unique id) and x-fluidbox-timestamp. Verify before trusting the payload."
-            />
-          </section>
-        )}
       </div>
 
       <div className="modal-footer secret-footer">
