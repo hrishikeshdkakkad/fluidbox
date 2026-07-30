@@ -201,6 +201,45 @@ demo_up() {
   fi
   ok "replay runner image ready ($REPLAY_IMAGE)"
 
+  # Can the daemon actually SEE this checkout? Probe it, do not assume.
+  #
+  # fluidbox bind-mounts the run's workspace from FLUIDBOX_DATA_DIR (under
+  # .demo/) into the sandbox. If the daemon cannot share that host path, docker
+  # does not fail — it mounts an EMPTY directory. The run then completes with
+  # every command reporting "No such file or directory", a 0-byte diff, and a
+  # cheerful "N executed, 1 denied": a success-shaped receipt from a run in which
+  # nothing could possibly have worked. Exactly the failure mode the exit-code fix
+  # above exists to prevent, arriving by a different route.
+  #
+  # Real and common, not theoretical: a colima VM shares only the paths it was
+  # started with (typically $HOME), and Docker Desktop on macOS has an explicit
+  # File Sharing list. A checkout under /tmp is invisible to both. Measured on
+  # this machine: a /tmp bind mount produced an empty directory while the same
+  # probe under $HOME worked.
+  local probe="$DEMO_DIR/data/.mountprobe"
+  mkdir -p "$probe"
+  printf 'fluidbox-mount-probe' > "$probe/marker"
+  local seen
+  seen=$(docker run --rm --entrypoint sh -v "$probe:/probe" "$REPLAY_IMAGE" \
+           -c 'cat /probe/marker 2>/dev/null' 2>/dev/null || true)
+  rm -rf "$probe"
+  if [ "$seen" != "fluidbox-mount-probe" ]; then
+    demo_down >/dev/null 2>&1
+    die "the docker daemon cannot read files from this checkout." \
+        "It mounted $DEMO_DIR/data as an EMPTY directory, so the agent would see an" \
+        "empty /workspace and the demo would 'succeed' while proving nothing." \
+        "" \
+        "Cause: the daemon shares only certain host paths." \
+        "  • colima      — started with --mount; \$HOME is shared, /tmp usually is not." \
+        "                  Re-run from a checkout under \$HOME, or restart colima with" \
+        "                  --mount \"\$(pwd):w\"" \
+        "  • Docker Desktop (macOS/Windows) — add this directory under" \
+        "                  Settings → Resources → File Sharing" \
+        "" \
+        "This checkout: $ROOT"
+  fi
+  ok "the daemon can read this checkout (workspace bind mount verified)"
+
   local ADMIN_TOKEN; ADMIN_TOKEN=$(openssl rand -hex 32 2>/dev/null || python3 -c "import secrets;print(secrets.token_hex(32))")
   ( umask 077; echo "$ADMIN_TOKEN" > "$DEMO_DIR/admin-token" )
 
