@@ -4,7 +4,32 @@
 **Tree:** `9515069` (main)
 **Purpose:** a decision instrument. Each item carries a reproduction path, an impact statement, the deployment profiles it applies to, the evidence it rests on, and an **acceptance test written so that another engineer can tell, without judgement, whether it is closed.**
 
-**Recommendation: NO-GO for a broad public launch until BLK-01 and BLK-04 are closed or the product's public claims are rewritten around them.**
+> ## ⚠ STATUS ADDENDUM — 2026-07-29 (integration review)
+>
+> This document was written against `9515069` (main). Two of its blockers have
+> since been **closed on this branch** and independently re-verified; the rest
+> are open. Read [`../reviews/overnight-integration-review.md`](../reviews/overnight-integration-review.md)
+> before acting on any row below.
+>
+> | Blocker | Status on this branch | Evidence |
+> |---|---|---|
+> | **BLK-01** gate not enforced for in-sandbox tools | **CLOSED (Claude harness)** — AT-01b met | Vulnerability reproduced on unfixed `main` (read-only-classified `Bash` executed, **0** gate calls) and closed by the fix (gate called, command did **not** run), proven by real side effects with zero model spend |
+> | **BLK-05** netpol probe measures wrong pod / blocks EKS runs | **CLOSED** — AT-05a + AT-05b met | Bounded observation protocol + per-sandbox `netpol-gate` init container; kind 12/12 re-run in this review, EKS 9/9 from the branch |
+> | BLK-02 fork-PR ungated execution | **BOUNDED**, not closed | The read-only floor is now reached at the gate; still composes with BLK-03 |
+> | BLK-03 `HostDev` default | **OPEN** — verified `#[default] HostDev` unchanged | |
+> | **BLK-04** eval compose binds `0.0.0.0` + published admin token | **OPEN** — verified verbatim | The single largest remaining launch blocker |
+> | BLK-06 CI/release gating | **OPEN** — verified `ci.yml:417` still `workflow_dispatch`; release still ungated | AT-01d not met |
+> | BLK-07 supply chain | **OPEN (mechanism)** — no lockfile, `npm install`, no dependabot npm entry for either runner | Drift *consequence* not observed: two builds a week apart had byte-identical 106-package trees |
+> | BLK-11 stale EKS framing | **OPEN** — AT-05c not met | |
+>
+> **New findings from this review, not in the original assessment:** a
+> tool-vocabulary/policy mismatch that the BLK-01 fix exposes (23 of the 30
+> tools the pinned CLI advertises have no policy rule, and with the gate now
+> mandatory they fall to `approve` ⇒ every supervised run pauses), and a gate
+> test-suite hole (two mutations restoring the bypass passed 12/12 — since
+> closed). Both are detailed in the integration review.
+
+**Original recommendation (2026-07-29, pre-integration): NO-GO for a broad public launch until BLK-01 and BLK-04 are closed or the product's public claims are rewritten around them.**
 
 The engineering here is, in most places, unusually good — the tenant-isolation floor, the credential inversion, the frozen-`RunSpec` immutability across a column-dropping migration, and the audience-scoped tokens are all real, independently measured, and better-evidenced than the norm at this stage. The blockers are concentrated in three places: **the one property the product is named for** (BLK-01), **the defaults on the paths users are told to take first** (BLK-03, BLK-04), and **the gap between what CI gates and what the README claims** (BLK-06), which is the mechanism that let BLK-01 reach a release.
 
