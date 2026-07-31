@@ -21,7 +21,6 @@ import {
   PolicyContent,
   PolicyDetail,
   PolicyPreview,
-  ToolRule,
 } from "../../../lib/api";
 import { LoadingRows, PageHead } from "../../../components/bits";
 import { isExactHeadRule, PermissionMatrix } from "../../../components/PermissionMatrix";
