@@ -16,11 +16,13 @@ export const metadata: Metadata = {
 // an "on this page" rail on the right.
 export default function DocsLayout({ children }: LayoutProps<"/docs">) {
   return (
-    <div className="docs-shell">
-      <aside className="docs-rail">
-        <DocsNav />
-      </aside>
-      <div className="docs-content">{children}</div>
+    <div className="site-container docs-outer">
+      <div className="docs-shell">
+        <aside className="docs-rail">
+          <DocsNav />
+        </aside>
+        <div className="docs-content">{children}</div>
+      </div>
     </div>
   );
 }

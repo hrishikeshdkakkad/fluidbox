@@ -5519,6 +5519,9 @@ html[data-theme="light"] .cap-row.blocked {
 }
 .docs-code pre {
   margin: 0;
+  /* Long unbroken lines (compose commands, URLs) scroll inside the block —
+     the page body must never scroll horizontally. */
+  overflow-x: auto;
 }
 .docs-body .shiki {
   background-color: var(--surface-soft) !important;
@@ -5707,4 +5710,847 @@ html[data-theme="light"] .docs-body .shiki span {
 }
 .docs-hub-section .docs-hub-grid {
   margin-top: 12px;
+}
+
+/* ═══ Public site (marketing + shared chrome) — 2026-07-30 ═══════════════
+   Same materials as the app (tokens, hairlines, 6/12px radii, Geist),
+   different information architecture. One bold element — the governed run
+   ledger in the hero — everything else stays quiet. */
+
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  z-index: 200;
+  padding: 10px 16px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  color: var(--ink);
+  font-size: 13px;
+}
+.skip-link:focus {
+  left: 16px;
+  top: 12px;
+}
+
+.site-page {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+.site-main {
+  flex: 1;
+}
+.site-container {
+  width: 100%;
+  max-width: 1180px;
+  margin: 0 auto;
+  padding-inline: clamp(18px, 4vw, 32px);
+}
+.docs-outer {
+  padding-top: 30px;
+  padding-bottom: 56px;
+}
+
+/* ── Header ── */
+.site-header {
+  position: sticky;
+  top: 0;
+  z-index: 60;
+  background: var(--chrome-bg);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--border);
+}
+.site-header-inner {
+  display: flex;
+  align-items: center;
+  gap: 26px;
+  height: 58px;
+}
+.site-nav {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+}
+.site-nav a {
+  padding: 7px 11px;
+  border-radius: var(--radius);
+  font-size: 13.5px;
+  color: var(--ink-2);
+  text-decoration: none;
+  transition: color 0.12s, background 0.12s;
+}
+.site-nav a:hover {
+  color: var(--ink);
+  background: var(--interactive-subtle, var(--ds-gray-alpha-100));
+}
+.site-nav a.active {
+  color: var(--ink);
+}
+.site-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.site-nav-mobile-actions {
+  display: none;
+}
+.site-menu-btn {
+  display: none;
+}
+
+/* ── Section scaffolding ── */
+.site-section {
+  padding-block: clamp(56px, 9vw, 104px);
+}
+.site-section.tight {
+  padding-block: clamp(36px, 6vw, 64px);
+}
+.site-band {
+  background: var(--surface);
+  border-block: 1px solid var(--border);
+}
+.site-kicker {
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 11.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin-bottom: 14px;
+}
+.site-h2 {
+  font-size: clamp(24px, 3.4vw, 34px);
+  font-weight: 600;
+  letter-spacing: -0.022em;
+  line-height: 1.15;
+  margin: 0 0 12px;
+  color: var(--ink);
+  max-width: 620px;
+}
+.site-lead {
+  font-size: 15.5px;
+  line-height: 1.65;
+  color: var(--ink-2);
+  max-width: 640px;
+  margin: 0 0 8px;
+}
+.site-lead a,
+.site-p a {
+  color: var(--accent);
+  text-decoration: none;
+}
+.site-lead a:hover,
+.site-p a:hover {
+  text-decoration: underline;
+}
+.site-p {
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--ink-2);
+  max-width: 640px;
+}
+
+/* ── Hero ── */
+.hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1.02fr) minmax(0, 0.98fr);
+  gap: clamp(28px, 5vw, 64px);
+  align-items: center;
+  padding-block: clamp(48px, 8vw, 96px) clamp(40px, 6vw, 72px);
+}
+.hero-kicker {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 11.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 5px 12px;
+  margin-bottom: 22px;
+}
+.hero-kicker .signal {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green);
+}
+.hero-title {
+  font-size: clamp(34px, 5.4vw, 56px);
+  font-weight: 650;
+  letter-spacing: -0.035em;
+  line-height: 1.04;
+  margin: 0 0 18px;
+  color: var(--ink);
+}
+.hero-godmode {
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 0.86em;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  text-decoration: line-through;
+  text-decoration-color: var(--red);
+  text-decoration-thickness: 0.09em;
+  white-space: nowrap;
+}
+.hero-sub {
+  font-size: 16px;
+  line-height: 1.65;
+  color: var(--ink-2);
+  max-width: 520px;
+  margin: 0 0 26px;
+}
+.hero-ctas {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 26px;
+}
+.hero-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+.hero-meta strong {
+  color: var(--ink-2);
+  font-weight: 500;
+}
+
+/* ── The governed-run ledger (signature) ── */
+.ledger {
+  margin: 0;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--panel-shadow, 0 1px 2px rgba(0, 0, 0, 0.25));
+  overflow: hidden;
+  font-family: var(--font-geist-mono), monospace;
+}
+.ledger-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 16px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11.5px;
+  color: var(--ink-3);
+}
+.ledger-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 0 3px var(--green-tint);
+}
+.ledger-title {
+  color: var(--ink);
+  font-weight: 500;
+}
+.ledger-body {
+  padding: 12px 6px 14px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.lr {
+  display: grid;
+  grid-template-columns: 30px 118px 58px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 8px;
+  padding: 3.5px 10px;
+  animation: ledger-in 0.4s cubic-bezier(0.2, 0.7, 0.3, 1) both;
+  animation-delay: var(--d, 0s);
+}
+.lr-seq {
+  color: var(--ink-3);
+  text-align: right;
+  font-size: 11px;
+}
+.lr-type {
+  color: var(--ink);
+  font-weight: 500;
+  font-size: 11.5px;
+}
+.lr-chip,
+.lr-chip-space {
+  justify-self: start;
+  font-size: 10.5px;
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+}
+.lr-chip.allow,
+.lr-chip.ok {
+  color: var(--green);
+  background: var(--green-tint);
+  border-color: color-mix(in srgb, var(--green) 30%, transparent);
+}
+.lr-chip.approve {
+  color: var(--amber);
+  background: var(--amber-tint);
+  border-color: color-mix(in srgb, var(--amber) 30%, transparent);
+}
+.lr-chip.deny {
+  color: var(--red);
+  background: var(--red-tint);
+  border-color: color-mix(in srgb, var(--red) 30%, transparent);
+}
+.lr-detail {
+  color: var(--ink-2);
+  font-size: 11.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lr-pause {
+  display: block;
+  text-align: center;
+  color: var(--amber);
+  font-size: 11px;
+  padding: 7px 10px;
+}
+.lr-note {
+  display: block;
+  margin: 8px 10px 0;
+  padding: 8px 10px;
+  border-top: 1px dashed var(--border-strong);
+  color: var(--ink-3);
+  font-size: 11px;
+}
+@keyframes ledger-in {
+  from {
+    opacity: 0;
+    transform: translateY(7px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .lr {
+    animation: none;
+  }
+}
+
+/* ── Gate strip ── */
+.gate {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background: var(--surface);
+}
+.gate-step {
+  position: relative;
+  padding: 16px 16px 18px;
+  border-right: 1px solid var(--border);
+}
+.gate-step:last-child {
+  border-right: 0;
+}
+.gate-index {
+  display: block;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 10.5px;
+  color: var(--ink-3);
+  margin-bottom: 10px;
+}
+.gate-name {
+  display: block;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--ink);
+  margin-bottom: 6px;
+}
+.gate-note {
+  display: block;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--ink-3);
+}
+
+/* ── Feature grid ── */
+.features {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+  gap: 14px;
+  margin-top: 34px;
+}
+.feature {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 20px 20px 18px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  transition: border-color 0.14s;
+}
+.feature:hover {
+  border-color: var(--border-strong);
+}
+.feature-k {
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 10.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.feature-t {
+  font-size: 15.5px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+}
+.feature-b {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--ink-2);
+  flex: 1;
+}
+.feature-code {
+  margin-top: 8px;
+  padding: 10px 12px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--ink-2);
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+.feature-link {
+  margin-top: 10px;
+  font-size: 12.5px;
+  color: var(--accent);
+  text-decoration: none;
+}
+.feature-link:hover {
+  text-decoration: underline;
+}
+/* The odd-one-out card spans the full row (7 features on a 3-column grid
+   would otherwise orphan it); its artifact sits beside the copy. */
+@media (min-width: 961px) {
+  .feature-wide {
+    grid-column: 1 / -1;
+    display: grid;
+    grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+    gap: 6px 32px;
+    align-items: center;
+  }
+  .feature-wide .feature-k,
+  .feature-wide .feature-t,
+  .feature-wide .feature-b,
+  .feature-wide .feature-link {
+    grid-column: 1;
+  }
+  .feature-wide .feature-code {
+    grid-column: 2;
+    grid-row: 1 / span 4;
+    margin-top: 0;
+  }
+}
+
+/* ── Architecture ── */
+.arch-wrap {
+  margin-top: 30px;
+  padding: clamp(10px, 2vw, 24px);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow-x: auto;
+}
+.arch {
+  display: block;
+  width: 100%;
+  min-width: 720px;
+  height: auto;
+}
+.arch-box {
+  fill: var(--bg);
+  stroke: var(--border-strong);
+  stroke-width: 1;
+}
+.arch-box-main {
+  fill: var(--surface);
+}
+.arch-sandbox {
+  stroke-dasharray: 5 4;
+}
+.arch-inner {
+  fill: var(--raised);
+  stroke: var(--border);
+  stroke-width: 1;
+}
+.arch-db {
+  fill: var(--bg);
+}
+.arch-title {
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 12.5px;
+  font-weight: 500;
+  fill: var(--ink);
+}
+.arch-label {
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 12px;
+  font-weight: 500;
+  fill: var(--ink);
+}
+.arch-sub {
+  font-family: var(--font-geist-sans), sans-serif;
+  font-size: 10.5px;
+  fill: var(--ink-3);
+}
+.arch-wire {
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 10.5px;
+  fill: var(--accent);
+}
+.arch-line {
+  stroke: var(--ds-gray-500);
+  stroke-width: 1.1;
+  fill: none;
+}
+.arch-arrhead {
+  fill: none;
+  stroke: var(--ds-gray-500);
+  stroke-width: 1.2;
+}
+.arch-hidden {
+  opacity: 0;
+}
+
+/* ── Try-it / DX ── */
+.try-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 26px;
+  margin-top: 30px;
+  align-items: start;
+}
+.try-col-title {
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 11.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin: 0 0 10px;
+}
+.try-col .docs-code pre,
+.try-col .docs-code > div {
+  font-size: 12px;
+}
+.try-note {
+  margin-top: 10px;
+  font-size: 12.5px;
+  color: var(--ink-3);
+}
+.try-note a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+/* ── OSS band + final CTA ── */
+.oss-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+  gap: clamp(24px, 5vw, 60px);
+  align-items: start;
+}
+.oss-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  border-top: 1px solid var(--border);
+}
+.oss-list li {
+  border-bottom: 1px solid var(--border);
+}
+.oss-list a {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 13px 4px;
+  text-decoration: none;
+  color: var(--ink);
+  font-size: 14px;
+  transition: padding-left 0.14s;
+}
+.oss-list a:hover {
+  padding-left: 10px;
+  color: var(--accent);
+}
+.oss-list a small {
+  color: var(--ink-3);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.cta-final {
+  text-align: center;
+  padding-block: clamp(64px, 10vw, 120px);
+}
+.cta-final .site-h2 {
+  margin-inline: auto;
+}
+.cta-final .hero-ctas {
+  justify-content: center;
+  margin-top: 26px;
+}
+
+/* ── Pricing ── */
+.pricing {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 16px;
+  margin-top: 34px;
+  max-width: 860px;
+}
+.price-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 26px 26px 24px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+}
+.price-name {
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.price-amount {
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 13px;
+  color: var(--ink-3);
+}
+.price-desc {
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--ink-2);
+}
+.price-list {
+  list-style: none;
+  margin: 6px 0 10px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+}
+.price-list li {
+  display: flex;
+  gap: 9px;
+  font-size: 13px;
+  color: var(--ink-2);
+  line-height: 1.5;
+}
+.price-list li::before {
+  content: "✓";
+  color: var(--green);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* ── Changelog ── */
+.cl-entry {
+  display: grid;
+  grid-template-columns: 150px minmax(0, 1fr);
+  gap: 28px;
+  padding-block: 36px;
+  border-top: 1px solid var(--border);
+}
+.cl-entry:first-of-type {
+  border-top: 0;
+}
+.cl-rail {
+  position: sticky;
+  top: 84px;
+  align-self: start;
+}
+.cl-version {
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.cl-date {
+  margin-top: 4px;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 11.5px;
+  color: var(--ink-3);
+}
+.cl-body {
+  min-width: 0;
+  max-width: 760px;
+}
+
+/* ── Footer ── */
+.site-footer {
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  padding-block: 44px 28px;
+  margin-top: clamp(40px, 7vw, 80px);
+}
+.site-footer-grid {
+  display: grid;
+  grid-template-columns: 1.4fr repeat(4, 1fr);
+  gap: 28px;
+}
+.site-footer-brand p {
+  margin-top: 12px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--ink-3);
+  max-width: 240px;
+}
+.site-footer-title {
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 10.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin-bottom: 12px;
+}
+.site-footer ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.site-footer ul a {
+  font-size: 13px;
+  color: var(--ink-2);
+  text-decoration: none;
+}
+.site-footer ul a:hover {
+  color: var(--ink);
+}
+.site-footer-bottom {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 36px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--ink-3);
+}
+.site-footer-bottom a {
+  color: var(--ink-3);
+  text-decoration: none;
+  font-family: var(--font-geist-mono), monospace;
+}
+.site-footer-bottom a:hover {
+  color: var(--ink);
+}
+
+/* ── Responsive ── */
+@media (max-width: 960px) {
+  .hero {
+    grid-template-columns: 1fr;
+  }
+  .gate {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .gate-step:nth-child(3) {
+    border-right: 0;
+  }
+  .gate-step:nth-child(-n + 3) {
+    border-bottom: 1px solid var(--border);
+  }
+  .try-grid,
+  .oss-grid {
+    /* minmax(0, …) so a wide <pre> scrolls inside its column instead of
+       widening the track past the viewport. */
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .site-footer-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .site-footer-brand {
+    grid-column: 1 / -1;
+  }
+}
+@media (max-width: 860px) {
+  .site-nav {
+    position: fixed;
+    inset: 58px 0 auto 0;
+    z-index: 55;
+    display: none;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 2px;
+    padding: 10px 14px 16px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border-strong);
+    box-shadow: var(--modal-shadow, 0 24px 60px rgba(0, 0, 0, 0.4));
+  }
+  .site-nav.open {
+    display: flex;
+  }
+  .site-nav a {
+    padding: 11px 10px;
+    font-size: 14.5px;
+  }
+  .site-nav-mobile-actions {
+    display: flex;
+    gap: 8px;
+    padding: 10px 10px 0;
+  }
+  .site-nav-mobile-actions .btn {
+    flex: 1;
+    justify-content: center;
+  }
+  .site-signin,
+  .site-getstarted {
+    display: none;
+  }
+  .site-menu-btn {
+    display: inline-flex;
+  }
+}
+@media (max-width: 640px) {
+  .gate {
+    grid-template-columns: 1fr;
+  }
+  .gate-step {
+    border-right: 0 !important;
+    border-bottom: 1px solid var(--border);
+  }
+  .gate-step:last-child {
+    border-bottom: 0;
+  }
+  .cl-entry {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+  .cl-rail {
+    position: static;
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+  }
+  .docs-search-trigger {
+    width: auto;
+    margin: 0 8px 0 0;
+  }
+  .lr {
+    grid-template-columns: 24px 104px 50px minmax(0, 1fr);
+    gap: 6px;
+  }
 }

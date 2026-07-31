@@ -2,6 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 import { slugify } from "../../lib/markdown";
 import { hrefFor } from "./nav";
 import type { SearchSection } from "./generated/search";
@@ -98,7 +99,12 @@ export function DocsSearch() {
         <kbd>⌘K</kbd>
       </button>
 
-      {open && (
+      {/* Portaled to <body>: the rail lives inside a sticky stacking context
+          that would otherwise cap the overlay's z-index and let page content
+          paint over the dialog. Client-only and open-gated, so there is no
+          SSR markup to mismatch. */}
+      {open &&
+        createPortal(
         <div
           className="docs-search-overlay"
           onMouseDown={(e) => {
@@ -184,7 +190,8 @@ export function DocsSearch() {
               </span>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
     </>
   );
