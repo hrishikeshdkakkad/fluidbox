@@ -10,6 +10,7 @@ pub mod capability;
 pub mod event;
 pub mod netpolicy;
 pub mod policy;
+pub mod recipe;
 pub mod schedule;
 pub mod schema_guard;
 pub mod spec;
