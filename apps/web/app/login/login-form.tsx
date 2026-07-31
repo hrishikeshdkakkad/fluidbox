@@ -13,13 +13,13 @@ import { useState } from "react";
  * in the Rust control plane; this form decides nothing.
  *
  * Rendered only in sso mode — the /login server boundary (page.tsx) redirects
- * to "/" in admin mode before this ever loads.
+ * to /app in admin mode before this ever loads.
  *
  * `redirectTo` is the already-sanitized local path to land on after the IdP
  * round-trip (page.tsx clamps it; the control plane re-validates). It rides the
  * login flow as `redirect_to`, so a deep link survives the whole dance.
  */
-export default function LoginForm({ redirectTo = "/" }: { redirectTo?: string }) {
+export default function LoginForm({ redirectTo = "/app" }: { redirectTo?: string }) {
   const [org, setOrg] = useState("");
   const [busy, setBusy] = useState(false);
 

@@ -2,7 +2,6 @@ import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import "./geist.css";
-import { Shell } from "./components/Shell";
 import { webMode } from "./lib/proxy-auth";
 import { THEME_INIT_SCRIPT } from "./lib/theme";
 
@@ -16,12 +15,18 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
+/** Browser-facing base URL for canonical/OG metadata. Local default keeps
+ *  dev builds working; deployments set NEXT_PUBLIC_SITE_URL. */
+const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || "http://localhost:3000";
+
 export const metadata: Metadata = {
+  metadataBase: new URL(SITE_URL),
   title: {
-    default: "fluidbox — control plane",
+    default: "fluidbox — the open-source control plane for governed AI agents",
     template: "%s · fluidbox",
   },
-  description: "Run AI coding agents in governed, disposable sandboxes.",
+  description:
+    "Run AI agents without giving them God mode. Isolated sandboxes, server-side tool policy, human approval gates, budgets, and append-only audit receipts.",
 };
 
 export const viewport: Viewport = {
@@ -32,9 +37,12 @@ export const viewport: Viewport = {
 // Static deployment configuration (see the proxy route): `sso` turns on the
 // hosted session shell + login redirects; anything else is today's admin shell.
 // Stamped onto <html data-web-mode> so client code (api.ts) is mode-aware
-// without a second env var, and passed to the shell so it renders session UI.
+// without a second env var.
 const WEB_MODE = webMode(process.env.FLUIDBOX_WEB_MODE);
 
+// The root layout is chrome-free since the 2026-07-30 public-site split: the
+// marketing/docs group ((site)/layout.tsx) and the dashboard (app/layout.tsx)
+// each mount their own shells. Only fonts, theme, and global CSS live here.
 export default function RootLayout({
   children,
 }: Readonly<{ children: React.ReactNode }>) {
@@ -49,9 +57,7 @@ export default function RootLayout({
       <head>
         <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
       </head>
-      <body>
-        <Shell mode={WEB_MODE}>{children}</Shell>
-      </body>
+      <body>{children}</body>
     </html>
   );
 }
