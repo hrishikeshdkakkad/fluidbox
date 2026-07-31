@@ -1,0 +1,14 @@
+- generic [active] [ref=f14e1]:
+  - generic [ref=f14e3]:
+    - generic: This is a temporary environment
+    - generic [ref=f14e18]:
+      - heading "This is not a valid redirect URI" [level=1] [ref=f14e23]
+      - generic [ref=f14e24]:
+        - paragraph [ref=f14e25]:
+          - text: Redirect URIs must match the values configured in your WorkOS application's
+          - link "Redirects" [ref=f14e26] [cursor=pointer]:
+            - /url: https://dashboard.workos.com/environment_01KYV4104N76DWWXW4R545Q3DE/applications/app_01KYV410N19TW0KJ8PNQ4MR6WZ/redirects
+          - text: settings.
+        - paragraph [ref=f14e27]: One-Shot Team's Application
+        - paragraph [ref=f14e28]: http://localhost:3000/callback
+  - alert [ref=f14e29]

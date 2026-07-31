@@ -5682,7 +5682,7 @@ html[data-theme="light"] .docs-body .shiki span {
   gap: 14px;
   padding: 8px 14px;
   font-size: 11.5px;
-  color: var(--ink-3);
+  color: var(--ds-gray-800);
   border-top: 1px solid var(--border);
 }
 .docs-search-foot span {
@@ -5817,7 +5817,7 @@ html[data-theme="light"] .docs-body .shiki span {
   font-size: 11.5px;
   letter-spacing: 0.14em;
   text-transform: uppercase;
-  color: var(--ink-3);
+  color: var(--ds-gray-800);
   margin-bottom: 14px;
 }
 .site-h2 {
@@ -5839,7 +5839,9 @@ html[data-theme="light"] .docs-body .shiki span {
 .site-lead a,
 .site-p a {
   color: var(--accent);
-  text-decoration: none;
+  text-decoration: underline;
+  text-underline-offset: 2.5px;
+  text-decoration-color: color-mix(in srgb, var(--accent) 45%, transparent);
 }
 .site-lead a:hover,
 .site-p a:hover {
@@ -5868,7 +5870,7 @@ html[data-theme="light"] .docs-body .shiki span {
   font-size: 11.5px;
   letter-spacing: 0.1em;
   text-transform: uppercase;
-  color: var(--ink-3);
+  color: var(--ds-gray-800);
   border: 1px solid var(--border);
   border-radius: 999px;
   padding: 5px 12px;
@@ -5917,7 +5919,7 @@ html[data-theme="light"] .docs-body .shiki span {
   gap: 8px 20px;
   font-family: var(--font-geist-mono), monospace;
   font-size: 12px;
-  color: var(--ink-3);
+  color: var(--ds-gray-800);
 }
 .hero-meta strong {
   color: var(--ink-2);
@@ -5969,7 +5971,7 @@ html[data-theme="light"] .docs-body .shiki span {
   animation-delay: var(--d, 0s);
 }
 .lr-seq {
-  color: var(--ink-3);
+  color: var(--ds-gray-800);
   text-align: right;
   font-size: 11px;
 }
@@ -5989,17 +5991,17 @@ html[data-theme="light"] .docs-body .shiki span {
 }
 .lr-chip.allow,
 .lr-chip.ok {
-  color: var(--green);
+  color: var(--ds-green-900);
   background: var(--green-tint);
   border-color: color-mix(in srgb, var(--green) 30%, transparent);
 }
 .lr-chip.approve {
-  color: var(--amber);
+  color: var(--ds-amber-900);
   background: var(--amber-tint);
   border-color: color-mix(in srgb, var(--amber) 30%, transparent);
 }
 .lr-chip.deny {
-  color: var(--red);
+  color: var(--ds-red-900);
   background: var(--red-tint);
   border-color: color-mix(in srgb, var(--red) 30%, transparent);
 }
@@ -6022,7 +6024,7 @@ html[data-theme="light"] .docs-body .shiki span {
   margin: 8px 10px 0;
   padding: 8px 10px;
   border-top: 1px dashed var(--border-strong);
-  color: var(--ink-3);
+  color: var(--ds-gray-800);
   font-size: 11px;
 }
 @keyframes ledger-in {
@@ -6058,7 +6060,7 @@ html[data-theme="light"] .docs-body .shiki span {
   display: block;
   font-family: var(--font-geist-mono), monospace;
   font-size: 10.5px;
-  color: var(--ink-3);
+  color: var(--ds-gray-800);
   margin-bottom: 10px;
 }
 .gate-name {
@@ -6101,7 +6103,7 @@ html[data-theme="light"] .docs-body .shiki span {
   font-size: 10.5px;
   letter-spacing: 0.12em;
   text-transform: uppercase;
-  color: var(--ink-3);
+  color: var(--ds-gray-800);
 }
 .feature-t {
   font-size: 15.5px;
@@ -6243,7 +6245,7 @@ html[data-theme="light"] .docs-body .shiki span {
   font-size: 11.5px;
   letter-spacing: 0.12em;
   text-transform: uppercase;
-  color: var(--ink-3);
+  color: var(--ds-gray-800);
   margin: 0 0 10px;
 }
 .try-col .docs-code pre,
@@ -6257,7 +6259,9 @@ html[data-theme="light"] .docs-body .shiki span {
 }
 .try-note a {
   color: var(--accent);
-  text-decoration: none;
+  text-decoration: underline;
+  text-underline-offset: 2.5px;
+  text-decoration-color: color-mix(in srgb, var(--accent) 45%, transparent);
 }
 
 /* ── OSS band + final CTA ── */
@@ -6333,7 +6337,7 @@ html[data-theme="light"] .docs-body .shiki span {
 .price-amount {
   font-family: var(--font-geist-mono), monospace;
   font-size: 13px;
-  color: var(--ink-3);
+  color: var(--ds-gray-800);
 }
 .price-desc {
   font-size: 13.5px;
@@ -6389,7 +6393,7 @@ html[data-theme="light"] .docs-body .shiki span {
   margin-top: 4px;
   font-family: var(--font-geist-mono), monospace;
   font-size: 11.5px;
-  color: var(--ink-3);
+  color: var(--ds-gray-800);
 }
 .cl-body {
   min-width: 0;
@@ -6420,7 +6424,7 @@ html[data-theme="light"] .docs-body .shiki span {
   font-size: 10.5px;
   letter-spacing: 0.12em;
   text-transform: uppercase;
-  color: var(--ink-3);
+  color: var(--ds-gray-800);
   margin-bottom: 12px;
 }
 .site-footer ul {

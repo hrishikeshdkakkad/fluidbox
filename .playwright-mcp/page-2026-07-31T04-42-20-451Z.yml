@@ -1,0 +1,28 @@
+- generic [ref=f18e1]:
+  - generic [ref=f18e3]:
+    - generic: This is a temporary environment
+    - generic [ref=f18e16]:
+      - heading "Sign in" [level=1] [ref=f18e18]
+      - generic [ref=f18e19]:
+        - generic [ref=f18e21]:
+          - generic [ref=f18e22]:
+            - generic [ref=f18e23]:
+              - generic [ref=f18e24]: Email
+              - textbox "Email" [active] [ref=f18e27]:
+                - /placeholder: Your email address
+            - button "Continue with email" [ref=f18e28] [cursor=pointer]
+          - generic [ref=f18e30]: OR
+          - generic [ref=f18e32]:
+            - link [ref=f18e34] [cursor=pointer]:
+              - /url: ./api/login?provider=GoogleOAuth&state=Fe26.2%2A1%2Aa657c5e2d61b94e764ce9743ffb07c3599b3acb1001f0f8ab21dc23c6c5ee42b%2AtTNIa-xv_Yukd8pbFcGM5A%2Arv8t_6cHITFVs-W8VTnYevj4olyv2qrudquIStFyxankFuhfwl9T0KfVks37cW-xTIMGJh7Drfw-ZDBpiEdcqsqClbmDpdt0QuD3t3GsIkdvBXTy_5vuiFC59FxPRv4iiWteujz9yR3mjLnwmVzhNQ7K7fL906Poq1jgaDqQ_U3r1PWzfyTUxdKbtmEz0_p5%2A1785473539471%2Abe5dd572c160cd4cc25deafbb0d6546b57933541307eb7abdd2fb04416bfb93e%2ABHu01z-McKKFtwUq1Vn6uv1oCs_j0Jy0WoPngdUnmAc~2&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&client_id=client_01KYV410MB035TNSMAK24K659Z&source=signin&authorization_session_id=01KYV7NXPTAP8P3B0FC49KD3C9
+            - link [ref=f18e42] [cursor=pointer]:
+              - /url: ./api/login?provider=MicrosoftOAuth&state=Fe26.2%2A1%2Aa657c5e2d61b94e764ce9743ffb07c3599b3acb1001f0f8ab21dc23c6c5ee42b%2AtTNIa-xv_Yukd8pbFcGM5A%2Arv8t_6cHITFVs-W8VTnYevj4olyv2qrudquIStFyxankFuhfwl9T0KfVks37cW-xTIMGJh7Drfw-ZDBpiEdcqsqClbmDpdt0QuD3t3GsIkdvBXTy_5vuiFC59FxPRv4iiWteujz9yR3mjLnwmVzhNQ7K7fL906Poq1jgaDqQ_U3r1PWzfyTUxdKbtmEz0_p5%2A1785473539471%2Abe5dd572c160cd4cc25deafbb0d6546b57933541307eb7abdd2fb04416bfb93e%2ABHu01z-McKKFtwUq1Vn6uv1oCs_j0Jy0WoPngdUnmAc~2&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&client_id=client_01KYV410MB035TNSMAK24K659Z&source=signin&authorization_session_id=01KYV7NXPTAP8P3B0FC49KD3C9
+            - link [ref=f18e50] [cursor=pointer]:
+              - /url: ./api/login?provider=GitHubOAuth&state=Fe26.2%2A1%2Aa657c5e2d61b94e764ce9743ffb07c3599b3acb1001f0f8ab21dc23c6c5ee42b%2AtTNIa-xv_Yukd8pbFcGM5A%2Arv8t_6cHITFVs-W8VTnYevj4olyv2qrudquIStFyxankFuhfwl9T0KfVks37cW-xTIMGJh7Drfw-ZDBpiEdcqsqClbmDpdt0QuD3t3GsIkdvBXTy_5vuiFC59FxPRv4iiWteujz9yR3mjLnwmVzhNQ7K7fL906Poq1jgaDqQ_U3r1PWzfyTUxdKbtmEz0_p5%2A1785473539471%2Abe5dd572c160cd4cc25deafbb0d6546b57933541307eb7abdd2fb04416bfb93e%2ABHu01z-McKKFtwUq1Vn6uv1oCs_j0Jy0WoPngdUnmAc~2&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&client_id=client_01KYV410MB035TNSMAK24K659Z&source=signin&authorization_session_id=01KYV7NXPTAP8P3B0FC49KD3C9
+            - link [ref=f18e54] [cursor=pointer]:
+              - /url: ./api/login?provider=AppleOAuth&state=Fe26.2%2A1%2Aa657c5e2d61b94e764ce9743ffb07c3599b3acb1001f0f8ab21dc23c6c5ee42b%2AtTNIa-xv_Yukd8pbFcGM5A%2Arv8t_6cHITFVs-W8VTnYevj4olyv2qrudquIStFyxankFuhfwl9T0KfVks37cW-xTIMGJh7Drfw-ZDBpiEdcqsqClbmDpdt0QuD3t3GsIkdvBXTy_5vuiFC59FxPRv4iiWteujz9yR3mjLnwmVzhNQ7K7fL906Poq1jgaDqQ_U3r1PWzfyTUxdKbtmEz0_p5%2A1785473539471%2Abe5dd572c160cd4cc25deafbb0d6546b57933541307eb7abdd2fb04416bfb93e%2ABHu01z-McKKFtwUq1Vn6uv1oCs_j0Jy0WoPngdUnmAc~2&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&client_id=client_01KYV410MB035TNSMAK24K659Z&source=signin&authorization_session_id=01KYV7NXPTAP8P3B0FC49KD3C9
+        - paragraph [ref=f18e58]:
+          - text: Don't have an account?
+          - link "Sign up" [ref=f18e59] [cursor=pointer]:
+            - /url: /sign-up?state=Fe26.2%2A1%2Aa657c5e2d61b94e764ce9743ffb07c3599b3acb1001f0f8ab21dc23c6c5ee42b%2AtTNIa-xv_Yukd8pbFcGM5A%2Arv8t_6cHITFVs-W8VTnYevj4olyv2qrudquIStFyxankFuhfwl9T0KfVks37cW-xTIMGJh7Drfw-ZDBpiEdcqsqClbmDpdt0QuD3t3GsIkdvBXTy_5vuiFC59FxPRv4iiWteujz9yR3mjLnwmVzhNQ7K7fL906Poq1jgaDqQ_U3r1PWzfyTUxdKbtmEz0_p5%2A1785473539471%2Abe5dd572c160cd4cc25deafbb0d6546b57933541307eb7abdd2fb04416bfb93e%2ABHu01z-McKKFtwUq1Vn6uv1oCs_j0Jy0WoPngdUnmAc~2&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&authorization_session_id=01KYV7NXPTAP8P3B0FC49KD3C9
+  - alert [ref=f18e60]

@@ -168,24 +168,23 @@ export function Sidebar({
           <ThemeToggle />
           {workosSession && (
             <div
-              style={{ display: "flex", alignItems: "center", gap: 10 }}
+              style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}
               data-testid="workos-session-shell"
             >
-              <div
+              <span
+                title={`${workosSession.label} · ${workosSession.email}`}
                 style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  lineHeight: 1.15,
-                  textAlign: "right",
+                  fontSize: 11.5,
+                  color: "var(--ds-gray-800)",
+                  fontFamily: "var(--font-geist-mono), monospace",
+                  maxWidth: 150,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
                 }}
               >
-                <span style={{ fontSize: 12, color: "var(--ds-gray-1000)", fontWeight: 500 }}>
-                  {workosSession.label}
-                </span>
-                <span style={{ fontSize: 11, color: "var(--ds-gray-800)" }}>
-                  {workosSession.email}
-                </span>
-              </div>
+                {workosSession.email}
+              </span>
               {signOut && (
                 <form action={signOut}>
                   <button className="btn sm ghost" type="submit">

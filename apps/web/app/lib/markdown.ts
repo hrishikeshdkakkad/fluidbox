@@ -26,15 +26,18 @@ export type Block =
   | { kind: "table"; header: Inline[][]; rows: Inline[][][] }
   | { kind: "rule" };
 
-/** Stable anchor id for a heading (matches the GitHub convention closely
- *  enough for our own intra-doc links). */
+/** Stable anchor id for a heading, matching the GitHub convention: strip
+ *  punctuation, then map EACH whitespace character to one hyphen — never
+ *  collapse runs. "Local (kind + Calico)" is `local-kind--calico` on GitHub
+ *  (the space each side of the dropped "+" survives as its own hyphen), and
+ *  guides author their intra-doc links against that convention. */
 export function slugify(text: string): string {
   return text
     .toLowerCase()
     .replace(/`/g, "")
     .replace(/[^a-z0-9_\s-]/g, "")
     .trim()
-    .replace(/\s+/g, "-");
+    .replace(/\s/g, "-");
 }
 
 /** Parse inline markdown: `code`, **strong**, *em*, [text](href). Code spans

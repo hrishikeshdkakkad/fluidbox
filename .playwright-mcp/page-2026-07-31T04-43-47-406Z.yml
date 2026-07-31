@@ -1,0 +1,28 @@
+- generic [ref=f26e1]:
+  - generic [ref=f26e3]:
+    - generic: This is a temporary environment
+    - generic [ref=f26e16]:
+      - heading "Sign in" [level=1] [ref=f26e18]
+      - generic [ref=f26e19]:
+        - generic [ref=f26e21]:
+          - generic [ref=f26e22]:
+            - generic [ref=f26e23]:
+              - generic [ref=f26e24]: Email
+              - textbox "Email" [active] [ref=f26e27]:
+                - /placeholder: Your email address
+            - button "Continue with email" [ref=f26e28] [cursor=pointer]
+          - generic [ref=f26e30]: OR
+          - generic [ref=f26e32]:
+            - link [ref=f26e34] [cursor=pointer]:
+              - /url: ./api/login?provider=GoogleOAuth&state=Fe26.2%2A1%2A0b1f771650b148d0f261f0178fe852eee0b552aadc2084020649f7e64bb7c533%2Aj4IbOskX6oM0g1H_aQv_Sw%2AlIGeIZvj5NmobBAQRtOE2sBKk5bBmfwmLYGdKjo4AINAKre8UJwAM7t9gAIjQfDVsD3oYsYrMSxFRg42TIPgZ597fRAy9NEt7nk77Q_WT6oCyqeGavH0OozDa2kj0lXAm7ChsStvJYkGZuQEz1ESzR8-T57g4wwZt6Fk0oUJnTT8AHdgsnLTXqlqGSFHlyeW%2A1785473626595%2Ac5d223f419468bfbf13bfeee4a9f48fbcf85f2d45ebe105ffd6986486252e24e%2AKqLDT8Wyof8hfXZUofOzRNI2CeoHV5ooTAihi0Rdhf8~2&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&client_id=client_01KYV410MB035TNSMAK24K659Z&source=signin&authorization_session_id=01KYV7RJQBEX01T96WTANJ0CRQ
+            - link [ref=f26e42] [cursor=pointer]:
+              - /url: ./api/login?provider=MicrosoftOAuth&state=Fe26.2%2A1%2A0b1f771650b148d0f261f0178fe852eee0b552aadc2084020649f7e64bb7c533%2Aj4IbOskX6oM0g1H_aQv_Sw%2AlIGeIZvj5NmobBAQRtOE2sBKk5bBmfwmLYGdKjo4AINAKre8UJwAM7t9gAIjQfDVsD3oYsYrMSxFRg42TIPgZ597fRAy9NEt7nk77Q_WT6oCyqeGavH0OozDa2kj0lXAm7ChsStvJYkGZuQEz1ESzR8-T57g4wwZt6Fk0oUJnTT8AHdgsnLTXqlqGSFHlyeW%2A1785473626595%2Ac5d223f419468bfbf13bfeee4a9f48fbcf85f2d45ebe105ffd6986486252e24e%2AKqLDT8Wyof8hfXZUofOzRNI2CeoHV5ooTAihi0Rdhf8~2&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&client_id=client_01KYV410MB035TNSMAK24K659Z&source=signin&authorization_session_id=01KYV7RJQBEX01T96WTANJ0CRQ
+            - link [ref=f26e50] [cursor=pointer]:
+              - /url: ./api/login?provider=GitHubOAuth&state=Fe26.2%2A1%2A0b1f771650b148d0f261f0178fe852eee0b552aadc2084020649f7e64bb7c533%2Aj4IbOskX6oM0g1H_aQv_Sw%2AlIGeIZvj5NmobBAQRtOE2sBKk5bBmfwmLYGdKjo4AINAKre8UJwAM7t9gAIjQfDVsD3oYsYrMSxFRg42TIPgZ597fRAy9NEt7nk77Q_WT6oCyqeGavH0OozDa2kj0lXAm7ChsStvJYkGZuQEz1ESzR8-T57g4wwZt6Fk0oUJnTT8AHdgsnLTXqlqGSFHlyeW%2A1785473626595%2Ac5d223f419468bfbf13bfeee4a9f48fbcf85f2d45ebe105ffd6986486252e24e%2AKqLDT8Wyof8hfXZUofOzRNI2CeoHV5ooTAihi0Rdhf8~2&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&client_id=client_01KYV410MB035TNSMAK24K659Z&source=signin&authorization_session_id=01KYV7RJQBEX01T96WTANJ0CRQ
+            - link [ref=f26e54] [cursor=pointer]:
+              - /url: ./api/login?provider=AppleOAuth&state=Fe26.2%2A1%2A0b1f771650b148d0f261f0178fe852eee0b552aadc2084020649f7e64bb7c533%2Aj4IbOskX6oM0g1H_aQv_Sw%2AlIGeIZvj5NmobBAQRtOE2sBKk5bBmfwmLYGdKjo4AINAKre8UJwAM7t9gAIjQfDVsD3oYsYrMSxFRg42TIPgZ597fRAy9NEt7nk77Q_WT6oCyqeGavH0OozDa2kj0lXAm7ChsStvJYkGZuQEz1ESzR8-T57g4wwZt6Fk0oUJnTT8AHdgsnLTXqlqGSFHlyeW%2A1785473626595%2Ac5d223f419468bfbf13bfeee4a9f48fbcf85f2d45ebe105ffd6986486252e24e%2AKqLDT8Wyof8hfXZUofOzRNI2CeoHV5ooTAihi0Rdhf8~2&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&client_id=client_01KYV410MB035TNSMAK24K659Z&source=signin&authorization_session_id=01KYV7RJQBEX01T96WTANJ0CRQ
+        - paragraph [ref=f26e58]:
+          - text: Don't have an account?
+          - link "Sign up" [ref=f26e59] [cursor=pointer]:
+            - /url: /sign-up?state=Fe26.2%2A1%2A0b1f771650b148d0f261f0178fe852eee0b552aadc2084020649f7e64bb7c533%2Aj4IbOskX6oM0g1H_aQv_Sw%2AlIGeIZvj5NmobBAQRtOE2sBKk5bBmfwmLYGdKjo4AINAKre8UJwAM7t9gAIjQfDVsD3oYsYrMSxFRg42TIPgZ597fRAy9NEt7nk77Q_WT6oCyqeGavH0OozDa2kj0lXAm7ChsStvJYkGZuQEz1ESzR8-T57g4wwZt6Fk0oUJnTT8AHdgsnLTXqlqGSFHlyeW%2A1785473626595%2Ac5d223f419468bfbf13bfeee4a9f48fbcf85f2d45ebe105ffd6986486252e24e%2AKqLDT8Wyof8hfXZUofOzRNI2CeoHV5ooTAihi0Rdhf8~2&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&authorization_session_id=01KYV7RJQBEX01T96WTANJ0CRQ
+  - alert [ref=f26e60]
