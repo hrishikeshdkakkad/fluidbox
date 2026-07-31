@@ -250,6 +250,12 @@ assert p['first_run'] and p['cost_ceiling_usd']>0" \
 CODE=$(getc "/recipes/instances")
 [ "$(jb "['instances'].__len__()")" = "0" ] && ok "dry-run wrote nothing" || no "dry-run wrote instances!"
 
+# Every seeded recipe's DEFAULTS must survive the engine's per-object checks —
+# the 2026-07-31 live pass found pr-review-panel undeployable because its seed
+# spoke "opened" while the subscription vocabulary is "pull_request.opened".
+CODE=$(post "/recipes/pr-review-panel/deploy" "{\"name\":\"Panel defaults\",\"dry_run\":true,\"params\":{\"github_connection\":\"$CONN\",\"repositories\":[\"acme/site\"]}}")
+[ "$CODE" = "200" ] && ok "pr-review-panel dry-run with schema defaults → 200" || no "pr-review-panel defaults → $CODE $(cat "$B")"
+
 # ═══ 5. Deploy for real — atomic stamp + first run ═════════════════════════
 say "DEPLOY — codebase-brief stamps policy + agent + subscription + fires"
 CODE=$(post "/recipes/codebase-brief/deploy" "{\"name\":\"Acme brief\",\"params\":{\"github_connection\":\"$CONN\",\"repository\":\"acme/site\",\"question\":\"Explain src/math.js and how it is tested.\"}}")
