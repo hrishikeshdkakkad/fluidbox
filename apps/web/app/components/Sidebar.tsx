@@ -118,6 +118,13 @@ export function Sidebar({
             {pending > 0 && <span className="masthead-count">{pending}</span>}
           </Link>
           <Link
+            className={pathname.startsWith("/app/recipes") ? "active" : ""}
+            href="/app/recipes"
+            onNavigate={closeMobileNav}
+          >
+            Recipes
+          </Link>
+          <Link
             className={pathname.startsWith("/app/governance") ? "active" : ""}
             href="/app/governance"
             onNavigate={closeMobileNav}
