@@ -39,7 +39,11 @@ use manifest::{
 };
 use std::path::{Path, PathBuf};
 
-const RUNTIME: &str = "kubernetes";
+/// The provider's runtime name, public so the server can ask "is the active
+/// provider this one" (e.g. when deciding whether to freeze
+/// `NetworkAdmission` targets) without string-literal drift.
+pub const RUNTIME_NAME: &str = "kubernetes";
+const RUNTIME: &str = RUNTIME_NAME;
 /// Diff artifacts are bounded at this many bytes over exec (the collector
 /// already caps them; this is the receive-side ceiling).
 const MAX_DIFF_BYTES: usize = 16 * 1024 * 1024;
@@ -319,9 +323,28 @@ fn fatal_waiting(reason: Option<&str>) -> bool {
     )
 }
 
+/// Startup-isolation invariant (the netpol admission race): when this
+/// deployment REQUIRES verified enforcement, every sandbox must carry the
+/// admission targets its `netpol-gate` init container observes before the
+/// untrusted runner may start. A spec without them means a control-plane
+/// wiring bug (or a bypassed run gate) — refuse here rather than launch a
+/// pod whose first seconds ride the CNI's fail-open window unobserved.
+fn require_network_admission(cfg: &K8sConfig, spec: &SandboxSpec) -> Result<(), ProviderError> {
+    if cfg.require_enforced_netpol && spec.network_admission.is_none() {
+        return Err(ProviderError::Other(
+            "refusing to provision: FLUIDBOX_REQUIRE_ENFORCED_NETPOL is set but the run \
+             carries no network-admission targets (the enforcement gate has not verified \
+             this cluster, or the control plane failed to freeze the targets)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl ExecutionProvider for KubernetesProvider {
     async fn provision(&self, spec: &SandboxSpec) -> Result<SandboxHandle, ProviderError> {
+        require_network_admission(&self.cfg, spec)?;
         let name = object_name(spec.session_id);
 
         // 1. Create the Pod referencing the not-yet-existing Secret. The
@@ -1183,6 +1206,49 @@ mod tests {
             parse_collected(b"garbage"),
             CollectedArtifacts::Missing { .. }
         ));
+    }
+
+    // ─── Startup network admission (netpol race fix) ───────────────────────
+
+    fn bare_spec(admission: Option<fluidbox_core::traits::NetworkAdmission>) -> SandboxSpec {
+        SandboxSpec {
+            session_id: Uuid::nil(),
+            image: "ghcr.io/x/runner:dev".into(),
+            env: vec![],
+            tokens: fluidbox_core::traits::SandboxTokens {
+                control: "c".into(),
+                tool: "t".into(),
+                llm: "l".into(),
+                workspace: "w".into(),
+            },
+            workspace_host_dir: None,
+            workspace_archive: None,
+            active_deadline_secs: None,
+            network: fluidbox_core::traits::NetworkMode::Hardened,
+            network_admission: admission,
+        }
+    }
+
+    /// Defense in depth for the admission gate: an enforcement-required
+    /// deployment REFUSES to launch a sandbox whose spec lost its admission
+    /// targets — the fail-open window must never be reachable through a
+    /// wiring bug upstream.
+    #[test]
+    fn provision_refuses_enforcement_required_spec_without_admission() {
+        let mut cfg = K8sConfig::from_env();
+        cfg.require_enforced_netpol = true;
+        assert!(require_network_admission(&cfg, &bare_spec(None)).is_err());
+        let adm = fluidbox_core::traits::NetworkAdmission {
+            positive_addr: "10.0.0.5".into(),
+            positive_port: 8788,
+            negative_addr: "10.0.0.6".into(),
+            negative_port: 8787,
+            wait_secs: 60,
+        };
+        assert!(require_network_admission(&cfg, &bare_spec(Some(adm))).is_ok());
+        // Dev posture (requireEnforced=false): no admission is legitimate.
+        cfg.require_enforced_netpol = false;
+        assert!(require_network_admission(&cfg, &bare_spec(None)).is_ok());
     }
 
     // ─── Gap 6 workload identity (Phase F) ─────────────────────────────────

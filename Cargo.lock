@@ -1628,7 +1628,7 @@ dependencies = [
 
 [[package]]
 name = "fluidbox-catalog-import"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1640,7 +1640,7 @@ dependencies = [
 
 [[package]]
 name = "fluidbox-cli"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1654,7 +1654,7 @@ dependencies = [
 
 [[package]]
 name = "fluidbox-core"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1677,7 +1677,7 @@ dependencies = [
 
 [[package]]
 name = "fluidbox-db"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1696,7 +1696,7 @@ dependencies = [
 
 [[package]]
 name = "fluidbox-loadgen"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1713,7 +1713,7 @@ dependencies = [
 
 [[package]]
 name = "fluidbox-provider"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1732,7 +1732,7 @@ dependencies = [
 
 [[package]]
 name = "fluidbox-provider-k8s"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1753,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "fluidbox-server"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1796,7 +1796,7 @@ dependencies = [
 
 [[package]]
 name = "fluidbox-workspace"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5533,7 +5533,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "workspaced"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 dependencies = [
  "fluidbox-workspace",
  "hex",

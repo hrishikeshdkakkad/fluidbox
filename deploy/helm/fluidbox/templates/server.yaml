@@ -184,6 +184,7 @@ spec:
             - { name: FLUIDBOX_NETWORK_MODE, value: "hardened" }
             - { name: FLUIDBOX_REQUIRE_ENFORCED_NETPOL, value: {{ .Values.netpol.requireEnforced | quote }} }
             - { name: FLUIDBOX_NETPOL_PROBE_IMAGE, value: {{ .Values.netpol.probeImage | quote }} }
+            - { name: FLUIDBOX_NETPOL_WAIT_SECS, value: {{ .Values.netpol.waitSeconds | quote }} }
             # Boot-resolve the internal Service ClusterIP → the runner's
             # control URL (no DNS under zeroEgress).
             - { name: FLUIDBOX_INTERNAL_SERVICE, value: {{ include "fluidbox.internalServiceName" . | quote }} }

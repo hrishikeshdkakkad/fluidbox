@@ -209,6 +209,9 @@ metadata:
 spec:
   restartPolicy: Never
   automountServiceAccountToken: false
+  # The script self-terminates at netpol.waitSeconds; this only adds
+  # scheduling/pull slack so a still-observing probe is never killed early.
+  activeDeadlineSeconds: {{ add .Values.netpol.waitSeconds 60 }}
   {{- with .Values.sandbox.runtimeClassName }}
   runtimeClassName: {{ . }}
   {{- end }}
@@ -245,22 +248,33 @@ spec:
           valueFrom: { configMapKeyRef: { name: {{ $targetsCm }}, key: publicIp } }
       command: ["/bin/sh", "-c"]
       args:
+        # The bounded observation loop (same protocol as the server's boot
+        # probe and the per-sandbox netpol-gate init container): a fresh pod's
+        # policy may land ASYNCHRONOUSLY (AWS VPC CNI `standard` mode fails
+        # open for its first seconds), so a t=0 sample measures the
+        # unprogrammed network and false-fails a healthy cluster. Poll until
+        # BOTH assertions hold in the SAME observation; fail closed at the
+        # deadline with the reason last observed.
         - |
           set -u
           if [ -z "$INT_IP" ] || [ -z "$PUB_IP" ]; then
             echo "FAIL: probe targets unresolved (resolver Job did not publish)"; exit 1
           fi
-          echo "probe: internal=$INT_IP:8788  public=$PUB_IP:8787"
-          # POSITIVE: the internal listener must be reachable.
-          if nc -z -w 4 "$INT_IP" 8788; then
-            echo "OK positive: internal :8788 reachable"
-          else
-            echo "FAIL positive: internal :8788 UNREACHABLE (egress policy too tight, or server down)"; exit 1
-          fi
-          # NEGATIVE: the public listener must be BLOCKED by NetworkPolicy.
-          if nc -z -w 4 "$PUB_IP" 8787; then
-            echo "FAIL negative: public :8787 REACHABLE — the CNI is NOT enforcing NetworkPolicy"; exit 1
-          else
-            echo "OK negative: public :8787 blocked (policy enforced)"
-          fi
-          echo "PASS: NetworkPolicy enforced (+:8788 -:8787)"
+          echo "probe: internal=$INT_IP:8788  public=$PUB_IP:8787 (observing up to {{ .Values.netpol.waitSeconds }}s)"
+          end=$(( $(date +%s) + {{ .Values.netpol.waitSeconds }} )); i=0
+          while :; do
+            i=$((i+1)); pos=fail; neg=blocked
+            nc -z -w 2 "$INT_IP" 8788 && pos=ok
+            nc -z -w 2 "$PUB_IP" 8787 && neg=open
+            echo "obs $i t=$(date +%s) pos=$pos neg=$neg"
+            if [ "$pos" = ok ] && [ "$neg" = blocked ]; then
+              echo "PASS: NetworkPolicy enforced (+:8788 -:8787, observation $i)"; exit 0
+            fi
+            if [ $(date +%s) -ge $end ]; then
+              if [ "$neg" = open ]; then
+                echo "FAIL negative: public :8787 still REACHABLE after {{ .Values.netpol.waitSeconds }}s — the CNI is NOT enforcing NetworkPolicy"; exit 1
+              fi
+              echo "FAIL positive: internal :8788 still UNREACHABLE after {{ .Values.netpol.waitSeconds }}s (egress policy too tight, or server down)"; exit 1
+            fi
+            sleep 1
+          done

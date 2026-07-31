@@ -324,6 +324,9 @@ async fn main() -> anyhow::Result<()> {
         // Docker needs no netpol gate; Kubernetes starts unverified and the
         // worker below flips it once the CNI is proven to enforce policy.
         netpol_verified: std::sync::atomic::AtomicBool::new(!is_k8s),
+        // Filled by the gate worker before its first probe; the orchestrator
+        // freezes these into every sandbox's per-pod admission gate.
+        netpol_targets: std::sync::RwLock::new(None),
         oidc: Default::default(),
         // Phase D (#32) legacy→KMS re-seal: the singleton claim flag + live
         // progress, both in-memory (the job is restart-safe by construction).

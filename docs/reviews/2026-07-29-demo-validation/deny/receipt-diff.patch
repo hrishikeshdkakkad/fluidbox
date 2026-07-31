@@ -1,0 +1,11 @@
+diff --git a/app.js b/app.js
+index ba0a0b6..0cd436d 100644
+--- a/app.js
++++ b/app.js
+@@ -1,5 +1,5 @@
+ // demo-service: the tiny app the five-minute demo repairs.
+ function greet(name) {
+-  return "Hello, name!";
++  return "Hello, " + name + "!";
+ }
+ module.exports = { greet };
