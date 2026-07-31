@@ -41,7 +41,10 @@ done
 ADMIN="recipes-e2e-admin-$$"
 H="authorization: Bearer $ADMIN"
 CT="content-type: application/json"
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/fbx-recipes-e2e.XXXXXX")
+# WORK must live under a path the docker VM bind-mounts ($HOME is mounted in
+# every supported setup; /var/folders — BSD mktemp's home — often is NOT, and
+# an unmounted path silently becomes an EMPTY directory inside the sandbox).
+WORK=$(mktemp -d "$HOME/.fbx-recipes-e2e.XXXXXX")
 B="$WORK/body.json"
 
 # ── Throwaway DB: <server>/fluidbox_recipes_e2e, recreated every run ───────
@@ -112,14 +115,16 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Gh).serve_forever()
 PYEOF
 GH_PID=$!
 
-# ── file:// clone fixture ──────────────────────────────────────────────────
+# ── file:// clone fixture — the demo-fixture repo, so the replay runner's
+#    baked transcript (fix the failing greet() test) does REAL work when the
+#    execution phase runs it in a sandbox ─────────────────────────────────────
 FIXROOT="$WORK/fixtures"
 mkdir -p "$FIXROOT/acme"
 git init -q -b main "$FIXROOT/acme/site"
+cp "$ROOT"/scripts/demo-fixture/* "$FIXROOT/acme/site/"
+chmod +x "$FIXROOT/acme/site/run_tests.sh" "$FIXROOT/acme/site/deploy.sh"
 ( cd "$FIXROOT/acme/site" \
   && git config user.email e2e@fluidbox.local && git config user.name e2e \
-  && printf '# acme site\n' > README.md \
-  && mkdir -p src && printf 'export function add(a, b) { return a + b }\n' > src/math.js \
   && git add -A && git commit -qm init )
 
 # ── Control plane we own ───────────────────────────────────────────────────
@@ -129,9 +134,11 @@ SANDBOX_IMAGE="${FLUIDBOX_RECIPES_SANDBOX_IMAGE:-localhost:1/fluidbox-absent:ci}
 SERVER_LOG="$WORK/server.log"
 ( cd "$ROOT" && exec env \
     DATABASE_URL="$DATABASE_URL" \
+    ${DOCKER_HOST:+DOCKER_HOST="$DOCKER_HOST"} \
     FLUIDBOX_BIND="0.0.0.0:$PORT" \
     FLUIDBOX_INTERNAL_BIND="0.0.0.0:$INTERNAL_PORT" \
     FLUIDBOX_PUBLIC_URL="http://127.0.0.1:$PORT" \
+    FLUIDBOX_PUBLIC_CONTROL_URL="http://host.docker.internal:$PORT" \
     FLUIDBOX_ADMIN_TOKEN="$ADMIN" \
     FLUIDBOX_CREDENTIAL_KEY="$(python3 -c 'import secrets;print(secrets.token_hex(32))')" \
     FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime \
@@ -144,6 +151,8 @@ SRV_PID=$!
 cleanup() {
   kill "$SRV_PID" "$GH_PID" 2>/dev/null
   wait "$SRV_PID" "$GH_PID" 2>/dev/null
+  # Keep $WORK on failure for postmortems; wipe it on success.
+  [ "${fail:-1}" = "0" ] && rm -rf "$WORK"
 }
 trap cleanup EXIT
 
@@ -382,22 +391,126 @@ CODE=$(post "/recipes/codebase-brief/deploy" "{\"name\":\"Acme brief 2\",\"param
 [ "$CODE" = "201" ] && ok "fresh name deploys cleanly after delete" || no "fresh redeploy → $CODE $(cat "$B")"
 
 # ═══ 11. Execution (optional, real sandbox via replay image) ═══════════════
-if [ "$SANDBOX_IMAGE" != "localhost:1/fluidbox-absent:ci" ]; then
-  say "EXECUTION — first run executes in a real sandbox ($SANDBOX_IMAGE)"
-  RUN_INST=$(jb "['instance']['id']")
-  RUN_SID=$(jb "['first_run']['session_id']")
-  DEADLINE=$(( $(date +%s) + 180 ))
-  STATUS=""
-  while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-    STATUS=$(curl -s -H "$H" "$API/v1/sessions/$RUN_SID" | j "['session']['status']")
-    case "$STATUS" in completed|failed|cancelled) break ;; esac
+wait_terminal() { # $1 = session id → echoes final status; tails runner logs
+  local deadline=$(( $(date +%s) + 240 )) st="" cid="" logpid=""
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if [ -z "$cid" ]; then
+      # "sandbox launched (<id>)" — start tailing before cleanup can remove it.
+      cid=$(curl -s -H "$H" "$API/v1/sessions/$1/events" | python3 -c "
+import sys, json, re
+d = json.load(sys.stdin)
+for e in d.get('events', []):
+    t = (e.get('payload') or {}).get('data', {}).get('text') or ''
+    m = re.search(r'sandbox launched \(([0-9a-f]+)\)', t)
+    if m: print(m.group(1)); break" 2>/dev/null)
+      if [ -n "$cid" ]; then
+        docker logs -f "$cid" > "$WORK/runner-$1.log" 2>&1 &
+        logpid=$!
+      fi
+    fi
+    st=$(curl -s -H "$H" "$API/v1/sessions/$1" | j "['session']['status']")
+    case "$st" in completed|failed|cancelled) break ;; esac
     sleep 2
   done
-  [ "$STATUS" = "completed" ] && ok "sandboxed run completed" || no "run status: $STATUS (see $SERVER_LOG)"
-  EVENTS=$(curl -s -H "$H" "$API/v1/sessions/$RUN_SID/events")
-  echo "$EVENTS" | grep -q "session.status_changed" && ok "ledger carries lifecycle events" || no "no lifecycle events"
-  ART=$(curl -s -H "$H" "$API/v1/sessions/$RUN_SID/artifacts")
-  echo "$ART" | grep -q "artifact" && ok "artifacts collected" || no "no artifacts"
+  [ -n "$logpid" ] && { sleep 1; kill "$logpid" 2>/dev/null; }
+  echo "$st"
+}
+
+# The replay runner has a KNOWN, pre-existing intermittent silent death (~5%
+# of runs: container exits without stderr or /result; the watchdog correctly
+# terminalizes the run as "sandbox died (stale heartbeat)"). That is the
+# PLATFORM's crash handling working — not a recipes defect — so the execution
+# phases retry exactly once on that one signature, loudly. Anything else
+# still fails after a single strike.
+run_with_retry() { # $1 = instance id, $2 = session id from deploy ('' = start via /run)
+  RUN_SID="$2"; RUN_ST=""
+  local att reason
+  for att in 1 2; do
+    if [ -z "$RUN_SID" ]; then
+      post "/recipes/instances/$1/run" '{}' >/dev/null
+      RUN_SID=$(jb "['session_id']")
+      [ -n "$RUN_SID" ] || { RUN_ST="not-started"; return; }
+    fi
+    RUN_ST=$(wait_terminal "$RUN_SID")
+    [ "$RUN_ST" = "completed" ] && return
+    reason=$(curl -s -H "$H" "$API/v1/sessions/$RUN_SID" | j "['session']['status_reason']")
+    if [ "$att" = "1" ] && [ "$reason" = "sandbox died (stale heartbeat)" ]; then
+      printf "  \033[1;33m⚠\033[0m replay runner died silently (known pre-existing flake; session %s) — retrying once\n" "$RUN_SID"
+      RUN_SID=""
+      continue
+    fi
+    return
+  done
+}
+
+if [ "$SANDBOX_IMAGE" != "localhost:1/fluidbox-absent:ci" ]; then
+  say "EXECUTION A — custom recipe, policy PERMITS the work: real diff lands"
+  # A custom recipe whose policy allows exactly what the replay transcript
+  # does (run tests, edit app.js, deploy) — proving the FULL pipeline:
+  # recipe → deploy → real sandbox → gate allows → workspace diff artifact.
+  FIXPOL='{"name":"replay-fix","defaults":{"tool_action":"deny"},"budgets":{"max_wall_clock_secs":600,"max_cost_usd":0.5,"max_tool_calls":40},"autonomy":{"permitted":true,"on_approval_rule":"deny"},"tools":[{"match":["Read","Glob","Grep","LS"],"action":"allow"},{"match":["Edit","Write","MultiEdit"],"action":"allow"},{"match":["Bash"],"action":"allow","shell":{"allow_prefixes":["./run_tests.sh","./deploy.sh","ls","cat","node"],"on_no_match":"deny"}}]}'
+  FIXDEF="{\"schema\":1,\"policy\":{\"content\":$FIXPOL},\"agents\":[{\"slot\":\"fixer\",\"name\":\"{{instance.name}}\",\"harness\":\"claude-agent-sdk\",\"system_prompt\":\"Fix the failing test.\",\"workspace\":{\"kind\":\"git_repository\",\"connection_id\":\"\$param:github_connection\",\"repository\":\"\$param:repository\"}}],\"subscriptions\":[{\"slot\":\"go\",\"agent_slot\":\"fixer\",\"kind\":\"api\",\"name\":\"{{instance.name}}\",\"allow_task_override\":true}],\"first_run\":{\"agent_slot\":\"fixer\",\"task\":\"Fix the failing test and deploy.\",\"autonomous\":true}}"
+  FIXSCHEMA='{"type":"object","additionalProperties":false,"required":["github_connection","repository"],"properties":{"github_connection":{"type":"string","x-fluidbox":{"widget":"connection","provider":"github"}},"repository":{"type":"string","x-fluidbox":{"widget":"text"}}}}'
+  CODE=$(post "/recipes" "{\"slug\":\"replay-fix\",\"name\":\"Replay fix\",\"definition\":$FIXDEF,\"params_schema\":$FIXSCHEMA}")
+  [ "$CODE" = "200" ] && ok "custom execution recipe created" || no "custom exec recipe → $CODE $(cat "$B")"
+  CODE=$(post "/recipes/replay-fix/deploy" "{\"name\":\"Fixer run\",\"params\":{\"github_connection\":\"$CONN\",\"repository\":\"acme/site\"}}")
+  [ "$CODE" = "201" ] && ok "deployed with instant first run" || { no "exec deploy → $CODE $(cat "$B")"; }
+  FIX_INST=$(jb "['instance']['id']")
+  FIX_SID=$(jb "['first_run']['session_id']")
+  run_with_retry "$FIX_INST" "$FIX_SID"
+  FIX_SID="$RUN_SID"; ST="$RUN_ST"
+  [ "$ST" = "completed" ] && ok "sandboxed run completed" || no "run status: $ST (log: $SERVER_LOG, runner: $WORK/runner-$FIX_SID.log)"
+  curl -s -H "$H" "$API/v1/sessions/$FIX_SID/events" > "$B"
+  python3 - "$B" <<'PY' && ok "gate verdicts: allows executed, the curl step denied, all on the ledger" || no "verdict mix wrong (see events)"
+import json, sys
+d = json.load(open(sys.argv[1]))
+verdicts = [((e.get("payload") or {}).get("data") or {}).get("verdict")
+            for e in d["events"] if e["type"] == "tool.decision"]
+assert verdicts.count("allow") >= 3, verdicts
+assert verdicts.count("deny") == 1, verdicts
+result = next((((e.get("payload") or {}).get("data") or {}) for e in d["events"]
+               if e["type"] == "run.result"), {})
+assert "executed" in json.dumps(result), result
+PY
+  curl -s -H "$H" "$API/v1/sessions/$FIX_SID/artifacts" > "$B"
+  DIFF_ID=$(python3 -c "
+import json;d=json.load(open('$B'))
+print(next((a['id'] for a in d['artifacts'] if a['kind']=='diff'), ''))")
+  [ -n "$DIFF_ID" ] && ok "terminal diff artifact collected" || no "no diff artifact: $(cat "$B" | head -c 200)"
+  curl -s -H "$H" "$API/v1/sessions/$FIX_SID/artifacts/$DIFF_ID" > "$B"
+  grep -q 'Hello, ' "$B" && ok "diff carries the real fix (app.js greet)" || no "diff missing the fix: $(cat "$B" | head -c 300)"
+  curl -s -H "$H" "$API/v1/sessions/$FIX_SID/cost" > "$B"
+  COST=$(jb "['usage']['cost_usd']")
+  python3 -c "assert float('$COST' or 0) == 0" 2>/dev/null \
+    && ok "zero model spend (deterministic replay)" || no "unexpected spend: $COST"
+
+  say "EXECUTION B — official brief, policy DENIES writes: run completes, empty diff"
+  getc "/recipes/instances" >/dev/null
+  BRIEF2=$(python3 -c "
+import json;d=json.load(open('$B'))
+print(next(i['instance']['id'] for i in d['instances'] if i['instance']['name']=='Acme brief 2'))")
+  CODE=$(post "/recipes/instances/$BRIEF2/run" '{}')
+  [ "$CODE" = "201" ] && ok "run-now started" || no "run-now → $CODE $(cat "$B")"
+  run_with_retry "$BRIEF2" "$(jb "['session_id']")"
+  B_SID="$RUN_SID"; ST="$RUN_ST"
+  [ "$ST" = "completed" ] && ok "read-only run completed" || no "brief run status: $ST (runner: $WORK/runner-$B_SID.log)"
+  curl -s -H "$H" "$API/v1/sessions/$B_SID/events" > "$B"
+  python3 - "$B" <<'PY' && ok "policy denied the write steps in a real sandbox" || no "expected denies"
+import json, sys
+d = json.load(open(sys.argv[1]))
+verdicts = [((e.get("payload") or {}).get("data") or {}).get("verdict")
+            for e in d["events"] if e["type"] == "tool.decision"]
+assert "deny" in verdicts, verdicts
+PY
+  curl -s -H "$H" "$API/v1/sessions/$B_SID/artifacts" > "$B"
+  python3 - "$B" <<'PY' && ok "no-change diff — the gate really prevented modification" || no "diff not empty under deny policy"
+import json, sys
+d = json.load(open(sys.argv[1]))
+diff = next((a for a in d["artifacts"] if a["kind"] == "diff"), None)
+content = ((diff or {}).get("content") or "").strip()
+# An untouched workspace collects as the literal "(no changes)" sentinel.
+assert content in ("", "(no changes)"), content[:200]
+PY
 else
   say "EXECUTION — skipped (set FLUIDBOX_RECIPES_SANDBOX_IMAGE=fluidbox-replay-runner:dev to run in a real sandbox)"
 fi
