@@ -288,7 +288,7 @@ export function RequirementsEditor({
                           <span className="mcp-catalogue-count">{needsConnecting.length}</span>
                           <a
                             className="link mcp-catalogue-link"
-                            href="/capabilities"
+                            href="/app/capabilities"
                             target="_blank"
                             rel="noreferrer"
                           >
@@ -362,7 +362,7 @@ export function RequirementsEditor({
                               Not set up yet —{" "}
                               <a
                                 className="link"
-                                href="/capabilities"
+                                href="/app/capabilities"
                                 target="_blank"
                                 rel="noreferrer"
                               >

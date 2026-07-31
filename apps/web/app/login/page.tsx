@@ -31,7 +31,7 @@ async function sessionIsLive(cookieValue: string): Promise<boolean> {
 /**
  * Server boundary for /login. In admin (single-tenant / local) mode there is NO
  * login UI — the operator authenticates with the admin token — so /login
- * redirects to "/" server-side, before any client code loads (proxy.ts answers
+ * redirects to /app server-side, before any client code loads (proxy.ts answers
  * first for full navigations; this guard remains for anything the matcher
  * misses). In sso mode the page is session-aware: a browser that already holds
  * a live session is sent back into the app (to `?next=` when present — the
@@ -46,7 +46,7 @@ export default async function LoginPage({
   searchParams: Promise<{ next?: string }>;
 }) {
   if (webMode(process.env.FLUIDBOX_WEB_MODE) === "admin") {
-    redirect("/");
+    redirect("/app");
   }
   const next = sanitizeNext((await searchParams).next);
   const session = (await cookies()).get(SESSION_COOKIE)?.value;
