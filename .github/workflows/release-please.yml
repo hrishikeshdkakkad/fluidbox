@@ -12,8 +12,21 @@ name: release-please
 # releases months from now.
 #
 # Publishing is UNGATED by deliberate choice: merging the Release PR ships to
-# GHCR. The Release PR's own CI is therefore the last checkpoint before public,
-# effectively permanent artifacts — which is why `version-check` runs in CI.
+# GHCR.
+#
+# This file used to say the Release PR's own CI was therefore the last
+# checkpoint before public, effectively permanent artifacts. **That was not
+# true**, and it was measured to be untrue on PR #111 (2026-07-31): the Release
+# PR's `ci` run sat at `action_required`, held for manual approval and never
+# executed, because a PR authored by GITHUB_TOKEN does not get a normal
+# `pull_request` run. A merge at that moment would have published with nothing
+# behind it.
+#
+# The real floor is now the `verify-release` job below, which runs the static
+# version/compose/demo guards on the release commit and gates `publish`. It is
+# unconditional: no approval setting or fork policy can skip it. The Release
+# PR's full CI is still valuable — it is just no longer the ONLY thing standing
+# between a merge and GHCR.
 on:
   push:
     branches: [main]
@@ -91,9 +104,39 @@ jobs:
           git push origin "$BRANCH"
           echo "Cargo.lock re-resolved and pushed to $BRANCH"
 
-  # Only runs on the push that merged a Release PR.
-  publish:
+  # The last checkpoint, made UNCONDITIONAL.
+  #
+  # The header above claims the Release PR's own CI is what stands between a
+  # merge and permanent public artifacts. Measured on PR #111, that claim was
+  # false: the Release PR's `ci` run sat at `action_required` — held for manual
+  # approval, not run. Publishing is ungated by choice, so a Release PR merged
+  # without someone noticing that would have shipped images to GHCR with NO CI
+  # behind the release commit at all.
+  #
+  # These are the fast, static checks that catch the failure mode that actually
+  # matters here — a release whose version sites disagree, which is how a
+  # mislabelled artifact gets published. They take seconds, need no database,
+  # no daemon and no network, and they run on the RELEASE COMMIT itself. They
+  # cannot be skipped by an approval setting, a fork policy, or a bot-authored
+  # PR not triggering `pull_request`.
+  #
+  # This does not replace the full CI suite; it guarantees a floor.
+  verify-release:
     needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: version sites agree
+        run: bash scripts/version-check.sh
+      - name: compose files hold their invariants
+        run: bash deploy/compose-assertions.sh
+      - name: the demo's static self-checks hold
+        run: bash scripts/demo-selftest.sh
+
+  # Only runs on the push that merged a Release PR, and only behind the floor.
+  publish:
+    needs: [release-please, verify-release]
     if: needs.release-please.outputs.release_created == 'true'
     permissions:
       contents: read

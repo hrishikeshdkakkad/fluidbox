@@ -201,7 +201,20 @@ ws_read() { # scenario_workspace, filename -> contents on stdout, empty if absen
 }
 
 # ── helpers that read the recorded evidence ────────────────────────────────
-permission_calls() { grep -c '"kind": "permission"' "$SC_LOG" 2>/dev/null || echo 0; }
+# `grep -c` prints 0 AND exits non-zero when there are no matches, so the old
+# `|| echo 0` fired too and this returned the two-line string "0\n0" — making
+# every caller's `[ "$(permission_calls)" -ge 1 ]` a syntax error
+# (`[: 0\n0: integer expected`). It failed CLOSED, so no result was ever wrong,
+# but the assertion messages printed a mangled count and scenario F's attempt
+# arithmetic rested on it. `|| true` keeps grep's own single `0`.
+# It must ALWAYS print exactly one integer: `grep -c` on a MISSING file prints
+# nothing at all (the error goes to /dev/null), which would leave the comparison
+# just as broken as before, with an empty operand instead of two.
+permission_calls() {
+  local n
+  n=$(grep -c '"kind": "permission"' "$SC_LOG" 2>/dev/null || true)
+  printf '%s' "${n:-0}"
+}
 digest_of() { printf '%s' "$1" | shasum -a 256 2>/dev/null | cut -d' ' -f1 || printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
 # Did the command's OUTPUT come back to the model? (turn-2 tool_result)
 executed_by_digest() { grep -q "$1" "$SC_LOG" 2>/dev/null; }

@@ -59,7 +59,6 @@ tools:
         "ExitPlanMode",
         "AskUserQuestion",
         "ReportFindings",
-        "Monitor",
         "TaskGet",
         "TaskList",
         "TaskOutput",
@@ -182,7 +181,16 @@ tools:
   # Network tools: the sandbox has no business fetching the internet.
   # DesignSync joins them because it syncs to an external service — same egress
   # shape, same answer.
-  - match: ["WebFetch", "WebSearch", "DesignSync"]
+  # `Monitor` is here, not in the allow list above, and the reason is worth
+  # stating: it is NOT observational. The pinned CLI's own tool text says
+  # "Monitor runs bash" and "The script runs in the same shell environment as
+  # Bash", and it accepts a `ws:` source that opens an outbound WebSocket to an
+  # arbitrary URL. So it carries BOTH the shell surface that `Bash` gets
+  # classified for and the egress surface these tools are denied for, while
+  # being subject to neither. It was allow-listed when the 23 previously
+  # ungoverned tools were registered — every tool got a rule, but this one got
+  # the wrong rule, which a pinning test cannot catch.
+  - match: ["WebFetch", "WebSearch", "DesignSync", "Monitor"]
     action: deny
     risk: network egress from sandbox
 

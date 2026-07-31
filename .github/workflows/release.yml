@@ -122,6 +122,14 @@ jobs:
       - name: create manifest
         working-directory: /tmp/digests
         run: |
+          # SC2046 is DELIBERATE on both lines and must stay unquoted. The first
+          # expands to `-t tagA -t tagB …` and the second to one digest
+          # reference per file — quoting either collapses it into a single
+          # argument and `imagetools create` then publishes one mangled tag
+          # instead of the set. shellcheck cannot tell intended word-splitting
+          # from accidental, so it is disabled here WITH the reason, rather than
+          # left as a standing warning somebody eventually "fixes".
+          # shellcheck disable=SC2046
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ github.repository_owner }}/fluidbox-${{ matrix.image }}@sha256:%s ' *)

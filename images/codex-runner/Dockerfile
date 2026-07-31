@@ -26,8 +26,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /opt/fluidbox-codex
 # Pin the codex binary (bin/codex.js + the platform-specific binary via
 # optional deps) and the MCP SDK (broker-shim / sandbox-gate-shim).
-COPY codex-runner/runner/package.json ./package.json
-RUN npm install --omit=dev && npm cache clean --force
+# package-lock.json is COPIED and `npm ci` is used so the image is built from
+# a RESOLVED dependency graph rather than re-resolving at build time. With
+# `npm install` and no lock, two builds of the same commit could differ --
+# for the code that runs beside an untrusted workspace, that is the least
+# verifiable thing we shipped. `npm ci` also FAILS if the lock and the
+# manifest disagree, instead of silently drifting.
+COPY codex-runner/runner/package.json codex-runner/runner/package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
 
 COPY codex-runner/runner/index.mjs ./index.mjs
 COPY codex-runner/config.toml ./config.toml

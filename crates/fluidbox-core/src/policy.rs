@@ -1373,6 +1373,20 @@ tools:
             matches!(verdict("DesignSync"), Verdict::Deny { .. }),
             "external egress, same answer as WebFetch"
         );
+        // `Monitor` is NOT observational and must never drift back into the
+        // allow list. The pinned CLI's own tool text says "Monitor runs bash"
+        // and "The script runs in the same shell environment as Bash", and it
+        // takes a `ws:` source that opens an arbitrary outbound WebSocket. It
+        // WAS allow-listed when the previously-ungoverned tools were
+        // registered: every tool got a rule, but this one got the wrong rule —
+        // which `seed_policy_governs_the_advertised_surface`'s
+        // "has-a-rule" assertion cannot catch by construction. Hence an
+        // explicit disposition assertion.
+        assert!(
+            matches!(verdict("Monitor"), Verdict::Deny { .. }),
+            "Monitor runs bash and can open outbound WebSockets — it belongs \
+             with the egress denies, not the observational allows"
+        );
 
         // And the fail-safe default still applies to anything unregistered: the
         // fix must not have introduced a catch-all rule.
