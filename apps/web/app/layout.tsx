@@ -27,6 +27,15 @@ export const metadata: Metadata = {
   },
   description:
     "Run AI agents without giving them God mode. Isolated sandboxes, server-side tool policy, human approval gates, budgets, and append-only audit receipts.",
+  openGraph: {
+    siteName: "fluidbox",
+    type: "website",
+    images: [{ url: "/og.png", width: 1200, height: 630, alt: "fluidbox — run AI agents without giving them God mode" }],
+  },
+  twitter: {
+    card: "summary_large_image",
+    images: ["/og.png"],
+  },
 };
 
 export const viewport: Viewport = {
