@@ -170,6 +170,36 @@ run_scenario() {
   cp "$WORK/$name.runner.log" "$EVIDENCE/$name.runner.log" 2>/dev/null || true
 }
 
+# ── reading a side effect back, on every platform ──────────────────────────
+#
+# The image runs as uid 10001 and the CLI's Bash tool writes with umask 077, so
+# a side-effect file lands 0600 owned by 10001. Whether the HOST can then read
+# it depends on the engine:
+#
+#   * colima / Docker Desktop — lima's virtiofs remaps ownership to the invoking
+#     user, so a host-side `grep` on a 0600 file just works. This is why the
+#     defect below was invisible for the whole of this candidate's validation.
+#   * native Linux (CI) — no remapping. The file really is owned by 10001 and
+#     the runner (uid 1001) gets EACCES.
+#
+# The failure that produced was maximally misleading: the POSITIVE CONTROL
+# reported "the allowed command produced no side effect" — declaring every
+# negative result in the run uninterpretable — when the command had in fact
+# produced exactly the side effect it was supposed to, and only the harness
+# could not read it. An environment problem wearing the costume of a result,
+# which is the pattern this whole suite exists to avoid.
+#
+# So evidence is read back THROUGH a container as root. Same answer on every
+# engine, and it never depends on how the host's uid happens to line up.
+ws_exists() { # scenario_workspace, filename
+  docker run --rm --label fluidbox.gateproof=1 --user 0:0 -v "$1:/ws:ro" \
+    --entrypoint sh "$IMAGE" -c "[ -f \"/ws/$2\" ]" >/dev/null 2>&1
+}
+ws_read() { # scenario_workspace, filename -> contents on stdout, empty if absent
+  docker run --rm --label fluidbox.gateproof=1 --user 0:0 -v "$1:/ws:ro" \
+    --entrypoint sh "$IMAGE" -c "cat \"/ws/$2\" 2>/dev/null" 2>/dev/null
+}
+
 # ── helpers that read the recorded evidence ────────────────────────────────
 permission_calls() { grep -c '"kind": "permission"' "$SC_LOG" 2>/dev/null || echo 0; }
 digest_of() { printf '%s' "$1" | shasum -a 256 2>/dev/null | cut -d' ' -f1 || printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
@@ -197,8 +227,11 @@ fi
 
 printf "\n%s B — deny everything, MUTATING probe (host-visible side effect)%s\n" "$BOLD" "$RESET"
 run_scenario B deny 0 "printf '@NONCE@' > @WS@/SIDE_EFFECT.txt"
-if [ -f "$SC_DIR/workspace/SIDE_EFFECT.txt" ]; then
-  no "the denied command wrote a file" "$(cat "$SC_DIR/workspace/SIDE_EFFECT.txt")"
+# Checked through a container, not with a host stat: this assertion's failure
+# mode is a FALSE PASS. A file the host cannot see for permission reasons would
+# read as "the gate held".
+if ws_exists "$SC_DIR/workspace" SIDE_EFFECT.txt; then
+  no "the denied command wrote a file" "$(ws_read "$SC_DIR/workspace" SIDE_EFFECT.txt)"
 else
   ok "no side effect in the bind-mounted workspace"
 fi
@@ -208,8 +241,16 @@ fi
 printf "\n%s C — allow, MUTATING probe (POSITIVE CONTROL)%s\n" "$BOLD" "$RESET"
 note "Without this, B proves nothing: an inert harness also produces no side effect."
 run_scenario C allow 0 "printf '@NONCE@' > @WS@/SIDE_EFFECT.txt"
-if [ -f "$SC_DIR/workspace/SIDE_EFFECT.txt" ] && grep -q "$SC_NONCE" "$SC_DIR/workspace/SIDE_EFFECT.txt"; then
+C_CONTENT=$(ws_read "$SC_DIR/workspace" SIDE_EFFECT.txt)
+if printf '%s' "$C_CONTENT" | grep -q "$SC_NONCE"; then
   ok "the allowed command DID execute — the harness can produce the side effect"
+elif ws_exists "$SC_DIR/workspace" SIDE_EFFECT.txt; then
+  # Distinguished deliberately: "wrote the wrong bytes" and "wrote nothing" are
+  # different faults, and conflating them is what made the CI failure read as a
+  # security result.
+  no "POSITIVE CONTROL FAILED — the allowed command wrote a file with unexpected content" \
+     "expected the nonce $SC_NONCE, got: $(printf '%s' "$C_CONTENT" | head -c 120)" \
+     "Runner log: $EVIDENCE/C.runner.log"
 else
   no "POSITIVE CONTROL FAILED — the allowed command produced no side effect" \
      "Every negative result in this run is therefore uninterpretable." \
@@ -229,7 +270,7 @@ fi
 
 printf "\n%s E — approval PRECEDES execution (verdict held open 6s)%s\n" "$BOLD" "$RESET"
 run_scenario E allow 6 "printf '@NONCE@' > @WS@/SIDE_EFFECT.txt"
-if [ -f "$SC_DIR/workspace/SIDE_EFFECT.txt" ]; then
+if ws_exists "$SC_DIR/workspace" SIDE_EFFECT.txt; then
   REQ=$(grep '"kind": "permission"' "$SC_LOG" | head -1 | python3 -c 'import sys,json;print(json.loads(sys.stdin.readline())["t_ms"])' 2>/dev/null || echo 0)
   ANS=$(grep '"kind": "permission_answered"' "$SC_LOG" | head -1 | python3 -c 'import sys,json;print(json.loads(sys.stdin.readline())["t_ms"])' 2>/dev/null || echo 0)
   WROTE=$(python3 -c "import os,sys;print(int(os.path.getmtime(sys.argv[1])*1000))" "$SC_DIR/workspace/SIDE_EFFECT.txt")
@@ -252,7 +293,7 @@ for spec in "http500:25" "unauth401:60" "wrongaud403:60" "nonjson:60" "emptyjson
   m="${spec%%:*}"; lim="${spec##*:}"
   run_scenario "F-$m" "$m" 0 "printf '@NONCE@' > @WS@/SIDE_EFFECT.txt" "$lim"
   attempts=$(permission_calls)
-  if [ -f "$SC_DIR/workspace/SIDE_EFFECT.txt" ]; then
+  if ws_exists "$SC_DIR/workspace" SIDE_EFFECT.txt; then
     no "$m ALLOWED execution" "a broken control-plane answer must never become an allow"
   elif [ "$m" = "http500" ]; then
     if [ "$SC_TIMED_OUT" = "1" ] && [ "$attempts" -ge 2 ]; then

@@ -938,3 +938,71 @@ Named so they are not mistaken for closed:
 3. **`Monitor` is `allow`-listed but runs bash and opens outbound WebSockets.**
    A policy-content decision for the maintainer, not a guard defect: the pinning
    test can only assert a rule exists, not that it is the right rule.
+
+---
+
+## 12. Postscript — the first Linux/amd64 CI run found a harness defect macOS hid
+
+PR #105's first pipeline: **14 of 15 jobs green**, and the one failure was
+`gate-proof` — the artifact this whole report rests on. Worth recording in full,
+because the failure looked like a security result and was not one.
+
+```
+ C — allow, MUTATING probe (POSITIVE CONTROL)
+grep: /tmp/gateproof.ai9pWlxB/C/workspace/SIDE_EFFECT.txt: Permission denied
+  ✗ POSITIVE CONTROL FAILED — the allowed command produced no side effect
+      Every negative result in this run is therefore uninterpretable.
+  RESULT: 13 passed, 1 failed
+```
+
+**Diagnosis, measured not guessed.** The runner image runs as uid 10001 and the
+CLI's Bash tool writes with umask 077, so a side-effect file lands `0600` owned
+by 10001 — confirmed by keeping the workspaces (`GP_KEEP=1`) and stat-ing them:
+
+```
+-rw-------  uid=501  …/C/workspace/SIDE_EFFECT.txt
+```
+
+On **colima** that `uid=501` is the giveaway: lima's virtiofs remaps ownership to
+the invoking user, so a host-side `grep` on a `0600` file succeeds. On **native
+Linux** there is no remapping — the file really is owned by 10001, the CI runner
+is uid 1001, and the read is `EACCES`.
+
+So the defect was **invisible for the entire validation of this candidate**, on
+both passes, because both ran on the same engine. The compatibility matrix's
+insistence on VALIDATED-vs-EXPECTED, and its "one platform, one architecture"
+risk, were not bookkeeping — the first run on the untested platform found a real
+bug in the evidence harness within ninety seconds.
+
+**Why it was not a security failure.** `[ -f ]` is a *stat*; it needs traverse on
+the parent directories, not read on the file. So scenario C's existence check
+passed (the file was there) and only the content `grep` failed — the allowed
+command had produced exactly the side effect it was supposed to. Scenario B's
+deny case, D's HTTP-digest witness, and E's ordering proof all passed on their
+own terms. The gate's behaviour was never in question; the harness's ability to
+*read its own evidence* was.
+
+That distinction is the whole point, and the script obscured it: its message said
+the command "produced no side effect" and declared every negative result
+uninterpretable. **A fourth instance of this codebase's signature pattern — an
+environment problem wearing the costume of a result** — this time inside the
+suite built to prevent exactly that.
+
+**The fix, and a hardening it exposed.** Evidence is now read back *through a
+container* as root (`ws_exists` / `ws_read`), which gives the same answer on
+every engine regardless of how host uids line up. C additionally distinguishes
+"wrote the wrong bytes" from "wrote nothing", so the two faults can never again
+be conflated.
+
+While fixing C I found the more dangerous half. B and F also used host-side
+`[ -f ]`, and **their failure mode is a false PASS**: a file the host cannot see
+for permission reasons reads as "the gate held". C's defect cost a red build; the
+same defect in B would have cost a green one. All workspace checks now route
+through the container, so no host permission quirk can manufacture a passing
+security assertion. E's existence check moved too (its mtime read is a stat and
+needs no read bit).
+
+**Re-verified both directions** after the change: **14/14** against the fixed
+runner, and **12/14 with the two scenario-A assertions failing** against a runner
+with the `PreToolUse` hook deleted. The fix does not weaken the mutation
+sensitivity that makes this suite worth having.
