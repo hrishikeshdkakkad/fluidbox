@@ -1,0 +1,27 @@
+
+[1;36m== preflight (no API key required — this demo is a deterministic replay) ==[0m
+  [1;32m✓[0m docker daemon reachable
+  [1;32m✓[0m ports 19790/19791/15434 are free
+
+[1;36m== starting the demo stack (isolated: project fluidbox-demo, port 19790, db 15434) ==[0m
+ Network fluidbox-demo_default Creating 
+ Network fluidbox-demo_default Created 
+ Volume fluidbox-demo_fluidbox-demo-pgdata Creating 
+ Volume fluidbox-demo_fluidbox-demo-pgdata Created 
+ Container fluidbox-demo-postgres-1 Creating 
+ Container fluidbox-demo-postgres-1 Created 
+ Container fluidbox-demo-postgres-1 Starting 
+ Container fluidbox-demo-postgres-1 Started 
+ Container fluidbox-demo-postgres-1 Waiting 
+ Container fluidbox-demo-postgres-1 Healthy 
+  [1;32m✓[0m demo Postgres healthy on 127.0.0.1:15434 (volume fluidbox-demo-pgdata)
+  [1;32m✓[0m replay runner image ready (fluidbox-replay-runner:dev)
+[1;31m  ✗ control plane did not become healthy in 60s. Last log lines:
+[0m    full log: /Users/hrishikeshkakkad/Documents/infra/.claude/worktrees/five-minute-demo-film/.demo/server.log
+    likely causes: demo db port unreachable, or a migration failure (see above)
+
+[1;36m== demo teardown ==[0m
+  [1;32m✓[0m control plane stopped (pid 69504)
+  [1;32m✓[0m demo Postgres + volume removed
+  [1;32m✓[0m removed /Users/hrishikeshkakkad/Documents/infra/.claude/worktrees/five-minute-demo-film/.demo
+  [1;32m✓[0m nothing demo-related is left running

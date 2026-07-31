@@ -1307,6 +1307,7 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
         workspace_archive,
         active_deadline_secs: run_spec.budgets.max_wall_clock_secs,
         network: state.cfg.network_mode,
+        network_admission: network_admission(&state),
     };
 
     // Ownership re-check immediately before creating a sandbox: a finalizer
@@ -1444,6 +1445,36 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
     .await;
 
     Ok(())
+}
+
+/// The chart-fixed Service ports the netpol probe and the per-sandbox gate
+/// dial (`deploy/helm/fluidbox/templates/server.yaml`: public :8787, internal
+/// :8788 — the same literals `verify_netpol` scripts).
+const NETPOL_INTERNAL_SERVICE_PORT: u16 = 8788;
+const NETPOL_PUBLIC_SERVICE_PORT: u16 = 8787;
+
+/// Freeze the startup network-admission targets for this sandbox, when the
+/// deployment requires verified enforcement. The targets are the SAME pair
+/// the certification probe verified (stored by the gate worker before every
+/// probe), so the per-pod gate re-observes exactly the certified property
+/// from inside the pod's own network identity. None when enforcement is not
+/// required (dev posture / Docker) — and if targets are unexpectedly absent
+/// under enforcement, the k8s provider refuses to provision (fail closed)
+/// rather than launch an unobserved pod.
+fn network_admission(state: &AppState) -> Option<fluidbox_core::traits::NetworkAdmission> {
+    if !state.cfg.require_enforced_netpol
+        || state.provider.runtime_name() != fluidbox_provider_k8s::RUNTIME_NAME
+    {
+        return None;
+    }
+    let targets = state.netpol_targets.read().ok().and_then(|g| g.clone())?;
+    Some(fluidbox_core::traits::NetworkAdmission {
+        positive_addr: targets.internal_ip,
+        positive_port: NETPOL_INTERNAL_SERVICE_PORT,
+        negative_addr: targets.public_ip,
+        negative_port: NETPOL_PUBLIC_SERVICE_PORT,
+        wait_secs: state.cfg.netpol_wait_secs,
+    })
 }
 
 /// Assemble the RUNNER CONTAINER's env. The generic FLUIDBOX_* block is the

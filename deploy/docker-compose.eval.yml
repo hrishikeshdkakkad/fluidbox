@@ -1,6 +1,7 @@
-# Try fluidbox in one command — no Rust toolchain, no pnpm, no Neon account:
+# Try fluidbox without a Rust toolchain, pnpm, or a Neon account:
 #
 #   docker compose -f deploy/docker-compose.eval.yml --profile runners pull
+#   export FLUIDBOX_ADMIN_TOKEN=$(openssl rand -hex 32)
 #   ANTHROPIC_API_KEY=sk-ant-... docker compose -f deploy/docker-compose.eval.yml up -d
 #   open http://localhost:3000
 #
@@ -8,9 +9,52 @@
 # daemon (they are not services — the server spawns them as sibling containers
 # over the mounted Docker socket, so they must exist host-side).
 #
-# EVAL ONLY. Defaults favor zero-setup over hardening: a bundled Postgres, a
-# well-known admin token, no credential key (Connections/webhooks disabled).
-# For real use follow the README quickstart (`just setup`).
+# ── READ THIS BEFORE RUNNING IT ANYWHERE BUT A TRUSTED NETWORK ──────────────
+#
+# EVAL ONLY. Defaults favor zero-setup over hardening: a bundled Postgres, no
+# credential key (Connections/webhooks disabled). For real use follow the README
+# quickstart (`just setup`).
+#
+# `FLUIDBOX_ADMIN_TOKEN` is now REQUIRED rather than defaulted. It used to
+# default to the literal `fluidbox-eval-only`, which is published in this
+# repository — combined with the API port below, that handed full admin
+# authority (and, via an operator `local_copy` workspace, host-file read) to any
+# host on the same network segment. Compose refuses to start without a token, so
+# that combination is no longer reachable by following the quickstart verbatim.
+#
+# The API port is published on ALL INTERFACES BY DEFAULT, and whether you can
+# narrow it is ENGINE-DEPENDENT. (Corrected 2026-07-30: this comment previously
+# said the port "CANNOT be moved to loopback" and that a loopback publish makes
+# "every run fail during provisioning". That was measured to be false on the
+# engine the claim was written on — see docs/reviews/rc-verification-2026-07-30.md
+# §3.)
+#
+# The mechanism, stated accurately. The server spawns sandboxes as SIBLING
+# containers on their own per-run networks; they reach the control plane over
+# `host.docker.internal`. Two DIFFERENT settings get confused here:
+#
+#   * FLUIDBOX_BIND (below) is the server process's listen interface INSIDE its
+#     container. It must be 0.0.0.0 — a loopback bind really is unreachable from
+#     a sibling. It is hardcoded and not configurable. This is the CLAUDE.md
+#     gotcha, and it is unaffected by anything on this line.
+#   * FLUIDBOX_EVAL_API_BIND is the HOST-side interface of the port publish
+#     below. Whether a loopback publish is reachable from a sandbox depends on
+#     how your engine forwards published ports:
+#       - colima (MEASURED): reachable. `host.docker.internal` resolves to
+#         192.168.5.2 and a 127.0.0.1-published port answers there, including
+#         from a container on its own isolated network.
+#       - Docker Desktop / OrbStack: same port-forwarding shape, EXPECTED to
+#         behave like colima. Not measured.
+#       - native Linux Docker: `host-gateway` is the bridge gateway (172.17.0.1
+#         or similar), which a 127.0.0.1-published port does NOT answer on.
+#         EXPECTED to break. Not measured.
+#
+# The default therefore stays open for portability, not because narrowing is
+# impossible. If the exposure is not acceptable on your network, set
+# FLUIDBOX_EVAL_API_BIND=127.0.0.1 and confirm one run completes end to end;
+# on a Mac engine it is expected to work. Either way the control protecting this
+# profile is the TOKEN, not your network position. The dashboard has no such
+# question and IS loopback-only below.
 name: fluidbox-eval
 
 services:
@@ -46,11 +90,20 @@ services:
       litellm:
         condition: service_started
     ports:
-      - "8787:8787" # published: sandboxes reach it via host.docker.internal
+      # Sandboxes are SIBLING containers on their own per-run networks and reach
+      # the control plane via host.docker.internal, so whether this may be
+      # 127.0.0.1 depends on how your engine forwards published ports — see the
+      # header. Open by default for portability, NOT because it must be: on
+      # colima a loopback publish was measured reachable. Narrow it here if the
+      # default exposure is not acceptable on your network.
+      - "${FLUIDBOX_EVAL_API_BIND:-0.0.0.0}:8787:8787"
     environment:
       DATABASE_URL: postgres://postgres:fluidbox@postgres:5432/fluidbox
       FLUIDBOX_BIND: 0.0.0.0:8787
-      FLUIDBOX_ADMIN_TOKEN: ${FLUIDBOX_ADMIN_TOKEN:-fluidbox-eval-only}
+      # QUOTED, and no ": " inside the message. An unquoted YAML scalar holding a
+      # colon-space is a mapping, so the whole file stops parsing — and the guard
+      # script only greps, so `docker compose config` is what catches it.
+      FLUIDBOX_ADMIN_TOKEN: "${FLUIDBOX_ADMIN_TOKEN:?required — the published default was removed because it granted anyone on your network full admin authority. Generate one with 'openssl rand -hex 32' and export FLUIDBOX_ADMIN_TOKEN}"
       FLUIDBOX_CREDENTIAL_KEY: ${FLUIDBOX_CREDENTIAL_KEY:-}
       LLM_UPSTREAM_URL: http://litellm:4000
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-litellm-eval-only}
@@ -75,10 +128,13 @@ services:
       server:
         condition: service_healthy
     ports:
-      - "3000:3000"
+      # Loopback ONLY. Nothing in a container needs the dashboard, so unlike the
+      # API port above there is no reason for this to leave the machine — and it
+      # carries the admin token server-side in `admin` web mode.
+      - "127.0.0.1:3000:3000"
     environment:
       FLUIDBOX_API_URL: http://server:8787
-      FLUIDBOX_ADMIN_TOKEN: ${FLUIDBOX_ADMIN_TOKEN:-fluidbox-eval-only}
+      FLUIDBOX_ADMIN_TOKEN: "${FLUIDBOX_ADMIN_TOKEN:?required — see the server service above}"
 
   # Pull-only entries (never started): `--profile runners pull` fetches the
   # runner images the server will spawn as sibling containers.

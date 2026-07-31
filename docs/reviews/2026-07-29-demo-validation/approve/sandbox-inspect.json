@@ -1,0 +1,232 @@
+[
+    {
+        "Id": "de63e1fd95420d9f808aaf674a8963950337af4971907654e72baed459f77fd0",
+        "Created": "2026-07-29T06:06:19.731925532Z",
+        "Path": "/opt/fluidbox-runner/lib/entrypoint.sh",
+        "Args": [
+            "node",
+            "/opt/fluidbox-replay/index.mjs"
+        ],
+        "State": {
+            "Status": "running",
+            "Running": true,
+            "Paused": false,
+            "Restarting": false,
+            "OOMKilled": false,
+            "Dead": false,
+            "Pid": 115251,
+            "ExitCode": 0,
+            "Error": "",
+            "StartedAt": "2026-07-29T06:06:19.766104655Z",
+            "FinishedAt": "0001-01-01T00:00:00Z"
+        },
+        "Image": "sha256:40e414073511a733e2c4ea513ef8eb4f172ecbbfdf28fb62d033f2b5bbb0b120",
+        "ResolvConfPath": "/var/lib/docker/containers/de63e1fd95420d9f808aaf674a8963950337af4971907654e72baed459f77fd0/resolv.conf",
+        "HostnamePath": "/var/lib/docker/containers/de63e1fd95420d9f808aaf674a8963950337af4971907654e72baed459f77fd0/hostname",
+        "HostsPath": "/var/lib/docker/containers/de63e1fd95420d9f808aaf674a8963950337af4971907654e72baed459f77fd0/hosts",
+        "LogPath": "/var/lib/docker/containers/de63e1fd95420d9f808aaf674a8963950337af4971907654e72baed459f77fd0/de63e1fd95420d9f808aaf674a8963950337af4971907654e72baed459f77fd0-json.log",
+        "Name": "/fluidbox-019fac7b-2422-7ae1-b24f-ea2273789cd0",
+        "RestartCount": 0,
+        "Driver": "overlayfs",
+        "Platform": "linux",
+        "MountLabel": "",
+        "ProcessLabel": "",
+        "AppArmorProfile": "docker-default",
+        "ExecIDs": null,
+        "HostConfig": {
+            "Binds": [
+                "/Users/hrishikeshkakkad/Documents/infra/.claude/worktrees/five-minute-demo-film/.demo/data/workspaces/019fac7b-2422-7ae1-b24f-ea2273789cd0/repo:/workspace:rw"
+            ],
+            "ContainerIDFile": "",
+            "LogConfig": {
+                "Type": "json-file",
+                "Config": {}
+            },
+            "NetworkMode": "fluidbox-net-019fac7b-2422-7ae1-b24f-ea2273789cd0",
+            "PortBindings": {},
+            "RestartPolicy": {
+                "Name": "no",
+                "MaximumRetryCount": 0
+            },
+            "AutoRemove": false,
+            "VolumeDriver": "",
+            "VolumesFrom": null,
+            "ConsoleSize": [
+                0,
+                0
+            ],
+            "CapAdd": null,
+            "CapDrop": [
+                "ALL"
+            ],
+            "CgroupnsMode": "private",
+            "Dns": null,
+            "DnsOptions": null,
+            "DnsSearch": null,
+            "ExtraHosts": [
+                "host.docker.internal:host-gateway"
+            ],
+            "GroupAdd": null,
+            "IpcMode": "private",
+            "Cgroup": "",
+            "Links": null,
+            "OomScoreAdj": 0,
+            "PidMode": "",
+            "Privileged": false,
+            "PublishAllPorts": false,
+            "ReadonlyRootfs": false,
+            "SecurityOpt": [
+                "no-new-privileges"
+            ],
+            "UTSMode": "",
+            "UsernsMode": "",
+            "ShmSize": 67108864,
+            "Runtime": "runc",
+            "Isolation": "",
+            "CpuShares": 0,
+            "Memory": 2147483648,
+            "NanoCpus": 0,
+            "CgroupParent": "",
+            "BlkioWeight": 0,
+            "BlkioWeightDevice": null,
+            "BlkioDeviceReadBps": null,
+            "BlkioDeviceWriteBps": null,
+            "BlkioDeviceReadIOps": null,
+            "BlkioDeviceWriteIOps": null,
+            "CpuPeriod": 0,
+            "CpuQuota": 0,
+            "CpuRealtimePeriod": 0,
+            "CpuRealtimeRuntime": 0,
+            "CpusetCpus": "",
+            "CpusetMems": "",
+            "Devices": null,
+            "DeviceCgroupRules": null,
+            "DeviceRequests": null,
+            "MemoryReservation": 0,
+            "MemorySwap": 4294967296,
+            "MemorySwappiness": null,
+            "OomKillDisable": null,
+            "PidsLimit": 512,
+            "Ulimits": null,
+            "CpuCount": 0,
+            "CpuPercent": 0,
+            "IOMaximumIOps": 0,
+            "IOMaximumBandwidth": 0,
+            "MaskedPaths": [
+                "/proc/acpi",
+                "/proc/asound",
+                "/proc/interrupts",
+                "/proc/kcore",
+                "/proc/keys",
+                "/proc/latency_stats",
+                "/proc/sched_debug",
+                "/proc/scsi",
+                "/proc/timer_list",
+                "/proc/timer_stats",
+                "/sys/devices/virtual/powercap",
+                "/sys/firmware"
+            ],
+            "ReadonlyPaths": [
+                "/proc/bus",
+                "/proc/fs",
+                "/proc/irq",
+                "/proc/sys",
+                "/proc/sysrq-trigger"
+            ]
+        },
+        "Storage": {
+            "RootFS": {
+                "Snapshot": {
+                    "Name": "overlayfs"
+                }
+            }
+        },
+        "Mounts": [
+            {
+                "Type": "bind",
+                "Source": "/Users/hrishikeshkakkad/Documents/infra/.claude/worktrees/five-minute-demo-film/.demo/data/workspaces/019fac7b-2422-7ae1-b24f-ea2273789cd0/repo",
+                "Destination": "/workspace",
+                "Mode": "rw",
+                "RW": true,
+                "Propagation": "rprivate"
+            }
+        ],
+        "Config": {
+            "Hostname": "de63e1fd9542",
+            "Domainname": "",
+            "User": "runner",
+            "AttachStdin": false,
+            "AttachStdout": false,
+            "AttachStderr": false,
+            "Tty": false,
+            "OpenStdin": false,
+            "StdinOnce": false,
+            "Env": [
+                "FLUIDBOX_CONTROL_URL=http://host.docker.internal:19790",
+                "FLUIDBOX_SESSION_ID=019fac7b-2422-7ae1-b24f-ea2273789cd0",
+                "FLUIDBOX_SESSION_TOKEN=fbx_sess_59f186685fd34790adfd9508b416a6c6",
+                "FLUIDBOX_TOOL_TOKEN=fbx_sess_1b88fdf88e2c4281823792681eb3eada",
+                "FLUIDBOX_TASK=Fix the failing test in demo-service, then deploy. [deterministic replay — no model calls]",
+                "FLUIDBOX_AUTONOMY=supervised",
+                "FLUIDBOX_MODEL=claude-haiku-4-5",
+                "FLUIDBOX_WORKSPACE=/workspace",
+                "ANTHROPIC_BASE_URL=http://host.docker.internal:19790/internal/llm",
+                "ANTHROPIC_API_KEY=fbx_sess_45cf788ebf3a42a9babc59c56ca77117",
+                "ANTHROPIC_MODEL=claude-haiku-4-5",
+                "FLUIDBOX_SYSTEM_PROMPT=Deterministic replay of a recorded run. No model is consulted.",
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "NODE_VERSION=24.18.0",
+                "YARN_VERSION=1.22.22"
+            ],
+            "Cmd": null,
+            "Image": "fluidbox-replay-runner:dev",
+            "Volumes": null,
+            "WorkingDir": "/workspace",
+            "Entrypoint": [
+                "/opt/fluidbox-runner/lib/entrypoint.sh",
+                "node",
+                "/opt/fluidbox-replay/index.mjs"
+            ],
+            "Labels": {
+                "fluidbox.managed": "1",
+                "fluidbox.session": "019fac7b-2422-7ae1-b24f-ea2273789cd0"
+            }
+        },
+        "NetworkSettings": {
+            "SandboxID": "cedd07494316a28714866ef74f93d2e010ce878a114badfb0ee385dc3137ebca",
+            "SandboxKey": "/var/run/docker/netns/cedd07494316",
+            "Ports": {},
+            "Networks": {
+                "fluidbox-net-019fac7b-2422-7ae1-b24f-ea2273789cd0": {
+                    "IPAMConfig": null,
+                    "Links": null,
+                    "Aliases": null,
+                    "DriverOpts": null,
+                    "GwPriority": 0,
+                    "NetworkID": "a8ac4bdb4ef8a96b3d319f2c6d3729441d7af125827f29bdef5ed7e8f77cda8c",
+                    "EndpointID": "da93e8096fb7d38e2720ce299267025af6453933e79064f77a22c46078fa51e8",
+                    "Gateway": "172.22.0.1",
+                    "IPAddress": "172.22.0.2",
+                    "MacAddress": "4e:fc:24:27:38:9e",
+                    "IPPrefixLen": 16,
+                    "IPv6Gateway": "",
+                    "GlobalIPv6Address": "",
+                    "GlobalIPv6PrefixLen": 0,
+                    "DNSNames": [
+                        "fluidbox-019fac7b-2422-7ae1-b24f-ea2273789cd0",
+                        "de63e1fd9542"
+                    ]
+                }
+            }
+        },
+        "ImageManifestDescriptor": {
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": "sha256:d180481fb168a2e8decbacb7aa8385ee8d7dff9aa0d8f87b3feefd4bb0a3e802",
+            "size": 2758,
+            "platform": {
+                "architecture": "arm64",
+                "os": "linux"
+            }
+        }
+    }
+]
