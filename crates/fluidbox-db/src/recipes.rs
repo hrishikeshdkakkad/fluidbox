@@ -308,13 +308,12 @@ pub async fn append_custom_recipe_version(
     changelog: Option<&str>,
 ) -> sqlx::Result<Option<RecipeVersionRow>> {
     let mut tx = scoped_tx(pool, scope).await?;
-    let owned: Option<(Uuid,)> = sqlx::query_as(
-        "select id from recipes where id = $1 and tenant_id = $2 for update",
-    )
-    .bind(recipe_id)
-    .bind(scope.tenant_id())
-    .fetch_optional(&mut *tx)
-    .await?;
+    let owned: Option<(Uuid,)> =
+        sqlx::query_as("select id from recipes where id = $1 and tenant_id = $2 for update")
+            .bind(recipe_id)
+            .bind(scope.tenant_id())
+            .fetch_optional(&mut *tx)
+            .await?;
     if owned.is_none() {
         tx.rollback().await?;
         return Ok(None);
@@ -733,7 +732,10 @@ mod tests {
     #[tokio::test]
     async fn custom_recipes_shadow_and_isolate() {
         let Some(pool) = pool().await else { return };
-        let (t1, t2) = (tenant(&pool, "shadow-a").await, tenant(&pool, "shadow-b").await);
+        let (t1, t2) = (
+            tenant(&pool, "shadow-a").await,
+            tenant(&pool, "shadow-b").await,
+        );
         let def = json!({
             "schema": 1,
             "agents": [{ "slot": "main", "name": "x", "harness": "claude-agent-sdk" }]
@@ -741,8 +743,18 @@ mod tests {
         let schema = json!({ "type": "object", "additionalProperties": false, "properties": {} });
         // Official slug collision refused (returns None).
         let collided = create_custom_recipe(
-            &pool, t1, "pr-review-panel", "shadow", "", "", "general",
-            &json!([]), "custom", &def, &schema, None,
+            &pool,
+            t1,
+            "pr-review-panel",
+            "shadow",
+            "",
+            "",
+            "general",
+            &json!([]),
+            "custom",
+            &def,
+            &schema,
+            None,
         )
         .await
         .expect("query ok");
@@ -750,8 +762,18 @@ mod tests {
         // A fresh slug creates, lists for its tenant, and stays invisible to
         // the other tenant.
         let (recipe, v1) = create_custom_recipe(
-            &pool, t1, "my-recipe", "Mine", "", "", "general",
-            &json!([]), "custom", &def, &schema, None,
+            &pool,
+            t1,
+            "my-recipe",
+            "Mine",
+            "",
+            "",
+            "general",
+            &json!([]),
+            "custom",
+            &def,
+            &schema,
+            None,
         )
         .await
         .expect("query ok")
@@ -781,10 +803,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(append_custom_recipe_version(&pool, t1, global.id, &def, &schema, None)
-            .await
-            .expect("query ok")
-            .is_none());
+        assert!(
+            append_custom_recipe_version(&pool, t1, global.id, &def, &schema, None)
+                .await
+                .expect("query ok")
+                .is_none()
+        );
         cleanup(&pool, t1).await;
         cleanup(&pool, t2).await;
     }
@@ -799,25 +823,55 @@ mod tests {
             .unwrap();
         let mut tx = crate::scoped_tx(&pool, t1).await.unwrap();
         let inst = create_recipe_instance_tx(
-            &mut tx, t1.tenant_id(), recipe.id, &recipe.slug, version.version,
-            "brief one", &json!({}), "digest", None,
+            &mut tx,
+            t1.tenant_id(),
+            recipe.id,
+            &recipe.slug,
+            version.version,
+            "brief one",
+            &json!({}),
+            "digest",
+            None,
         )
         .await
         .unwrap();
-        insert_instance_object_tx(&mut tx, t1.tenant_id(), inst.id, "agent", Uuid::now_v7(), "guide")
-            .await
-            .unwrap();
+        insert_instance_object_tx(
+            &mut tx,
+            t1.tenant_id(),
+            inst.id,
+            "agent",
+            Uuid::now_v7(),
+            "guide",
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
         // Tenant isolation both ways.
-        assert!(get_recipe_instance(&pool, t1, inst.id).await.unwrap().is_some());
-        assert!(get_recipe_instance(&pool, t2, inst.id).await.unwrap().is_none());
+        assert!(get_recipe_instance(&pool, t1, inst.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(get_recipe_instance(&pool, t2, inst.id)
+            .await
+            .unwrap()
+            .is_none());
         assert_eq!(instance_objects(&pool, t1, inst.id).await.unwrap().len(), 1);
-        assert!(instance_objects(&pool, t2, inst.id).await.unwrap().is_empty());
+        assert!(instance_objects(&pool, t2, inst.id)
+            .await
+            .unwrap()
+            .is_empty());
         // Duplicate live name refused; delete frees it.
         let mut tx = crate::scoped_tx(&pool, t1).await.unwrap();
         let dup = create_recipe_instance_tx(
-            &mut tx, t1.tenant_id(), recipe.id, &recipe.slug, version.version,
-            "brief one", &json!({}), "digest", None,
+            &mut tx,
+            t1.tenant_id(),
+            recipe.id,
+            &recipe.slug,
+            version.version,
+            "brief one",
+            &json!({}),
+            "digest",
+            None,
         )
         .await;
         assert!(matches!(&dup,
@@ -834,8 +888,15 @@ mod tests {
         assert!(list_recipe_instances(&pool, t1).await.unwrap().is_empty());
         let mut tx = crate::scoped_tx(&pool, t1).await.unwrap();
         create_recipe_instance_tx(
-            &mut tx, t1.tenant_id(), recipe.id, &recipe.slug, version.version,
-            "brief one", &json!({}), "digest", None,
+            &mut tx,
+            t1.tenant_id(),
+            recipe.id,
+            &recipe.slug,
+            version.version,
+            "brief one",
+            &json!({}),
+            "digest",
+            None,
         )
         .await
         .expect("deleted instance frees its name");
@@ -857,28 +918,50 @@ mod tests {
             .unwrap();
         let mut tx = crate::scoped_tx(&pool, scope).await.unwrap();
         let inst = create_recipe_instance_tx(
-            &mut tx, scope.tenant_id(), recipe.id, &recipe.slug, version.version,
-            "atomic test", &json!({}), "digest", None,
+            &mut tx,
+            scope.tenant_id(),
+            recipe.id,
+            &recipe.slug,
+            version.version,
+            "atomic test",
+            &json!({}),
+            "digest",
+            None,
         )
         .await
         .unwrap();
         insert_instance_object_tx(
-            &mut tx, scope.tenant_id(), inst.id, "agent", Uuid::now_v7(), "guide",
+            &mut tx,
+            scope.tenant_id(),
+            inst.id,
+            "agent",
+            Uuid::now_v7(),
+            "guide",
         )
         .await
         .unwrap();
         // Induce a mid-stamp failure: the duplicate name violates the live
         // unique index inside the SAME transaction.
         let boom = create_recipe_instance_tx(
-            &mut tx, scope.tenant_id(), recipe.id, &recipe.slug, version.version,
-            "atomic test", &json!({}), "digest", None,
+            &mut tx,
+            scope.tenant_id(),
+            recipe.id,
+            &recipe.slug,
+            version.version,
+            "atomic test",
+            &json!({}),
+            "digest",
+            None,
         )
         .await;
         assert!(boom.is_err());
         drop(boom);
         tx.rollback().await.unwrap();
         assert!(
-            list_recipe_instances(&pool, scope).await.unwrap().is_empty(),
+            list_recipe_instances(&pool, scope)
+                .await
+                .unwrap()
+                .is_empty(),
             "rollback must leave nothing"
         );
         cleanup(&pool, scope).await;

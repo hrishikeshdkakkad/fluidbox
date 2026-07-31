@@ -265,10 +265,16 @@ impl RecipeDefinition {
             }
             match s.kind.as_str() {
                 "schedule" if s.schedule.is_none() => {
-                    return Err(format!("subscription '{}' is schedule-kind but has no schedule", s.slot));
+                    return Err(format!(
+                        "subscription '{}' is schedule-kind but has no schedule",
+                        s.slot
+                    ));
                 }
                 "event" if s.connection.is_none() => {
-                    return Err(format!("subscription '{}' is event-kind but has no connection", s.slot));
+                    return Err(format!(
+                        "subscription '{}' is event-kind but has no connection",
+                        s.slot
+                    ));
                 }
                 "api" | "schedule" if s.connection.is_some() => {
                     return Err(format!(
@@ -337,7 +343,9 @@ pub enum ParamWidget {
     Repositories,
     Cron,
     Timezone,
-    Model { harness: String },
+    Model {
+        harness: String,
+    },
     /// Pick an existing tenant-visible connection. `provider` filters (e.g.
     /// "github"); `mcp` restricts to MCP-capable (brokered) connections.
     Connection {
@@ -345,7 +353,9 @@ pub enum ParamWidget {
         mcp: bool,
     },
     /// Pick tool names from another connection param's live snapshot.
-    ConnectionTools { connection_param: String },
+    ConnectionTools {
+        connection_param: String,
+    },
     Events,
 }
 
@@ -454,7 +464,9 @@ pub fn param_specs(schema: &Value) -> Result<Vec<ParamSpec>, String> {
                     .and_then(|x| x.get("connection_param"))
                     .and_then(Value::as_str)
                     .ok_or_else(|| {
-                        format!("param '{name}': connection_tools widget needs \"connection_param\"")
+                        format!(
+                            "param '{name}': connection_tools widget needs \"connection_param\""
+                        )
                     })?;
                 if !props.contains_key(cp) {
                     return Err(format!(
@@ -478,10 +490,7 @@ pub fn param_specs(schema: &Value) -> Result<Vec<ParamSpec>, String> {
                         .and_then(|i| i.get("type"))
                         .and_then(Value::as_str)
                         == Some("string")
-                        || po
-                            .get("items")
-                            .and_then(|i| i.get("enum"))
-                            .is_some();
+                        || po.get("items").and_then(|i| i.get("enum")).is_some();
                     if items_str {
                         ParamWidget::StringList
                     } else {
@@ -509,14 +518,18 @@ pub fn param_specs(schema: &Value) -> Result<Vec<ParamSpec>, String> {
             | ParamWidget::Model { .. }
                 if ptype != Some("string") =>
             {
-                return Err(format!("param '{name}': this widget requires \"type\": \"string\""));
+                return Err(format!(
+                    "param '{name}': this widget requires \"type\": \"string\""
+                ));
             }
             ParamWidget::Repositories
             | ParamWidget::ConnectionTools { .. }
             | ParamWidget::Events
                 if ptype != Some("array") =>
             {
-                return Err(format!("param '{name}': this widget requires \"type\": \"array\""));
+                return Err(format!(
+                    "param '{name}': this widget requires \"type\": \"array\""
+                ));
             }
             _ => {}
         }
@@ -574,12 +587,16 @@ pub fn apply_defaults(schema: &Value, params: &Map<String, Value>) -> Map<String
 /// blob is caller data but the error strings travel into responses and logs).
 pub fn validate_params(schema: &Value, params: &Map<String, Value>) -> Result<(), Vec<String>> {
     let blob = Value::Object(params.clone());
-    let size = serde_json::to_vec(&blob).map(|v| v.len()).unwrap_or(usize::MAX);
+    let size = serde_json::to_vec(&blob)
+        .map(|v| v.len())
+        .unwrap_or(usize::MAX);
     if size > MAX_PARAMS_BYTES {
         return Err(vec![format!("params exceed {MAX_PARAMS_BYTES} bytes")]);
     }
     if !bounded_depth(&blob, MAX_PARAMS_DEPTH) {
-        return Err(vec![format!("params nest deeper than {MAX_PARAMS_DEPTH} levels")]);
+        return Err(vec![format!(
+            "params nest deeper than {MAX_PARAMS_DEPTH} levels"
+        )]);
     }
     match crate::schema_guard::validate_args(
         schema,
@@ -641,9 +658,7 @@ pub fn render_value(v: &Value, ctx: &RenderCtx<'_>) -> Result<Option<Value>, Str
                         // A resolved reference object injects its id when used
                         // bare — the common case ("$param:github_connection"
                         // in a connection_id position).
-                        Value::Object(o) if o.contains_key("id") => {
-                            Ok(Some(o["id"].clone()))
-                        }
+                        Value::Object(o) if o.contains_key("id") => Ok(Some(o["id"].clone())),
                         other => Ok(Some(other.clone())),
                     },
                     Some(f) => match val {
@@ -958,7 +973,10 @@ fn opt_bool(v: Option<&Value>, ctx: &RenderCtx<'_>) -> Result<Option<bool>, Stri
         Some(v) => match render_value(v, ctx)? {
             None => Ok(None),
             Some(Value::Bool(b)) => Ok(Some(b)),
-            Some(other) => Err(format!("must render to a boolean (got {})", kind_of(&other))),
+            Some(other) => Err(format!(
+                "must render to a boolean (got {})",
+                kind_of(&other)
+            )),
         },
     }
 }
@@ -969,7 +987,10 @@ fn opt_object(v: Option<&Value>, ctx: &RenderCtx<'_>) -> Result<Option<Value>, S
         Some(v) => match render_value(v, ctx)? {
             None => Ok(None),
             Some(o @ Value::Object(_)) => Ok(Some(o)),
-            Some(other) => Err(format!("must render to an object (got {})", kind_of(&other))),
+            Some(other) => Err(format!(
+                "must render to an object (got {})",
+                kind_of(&other)
+            )),
         },
     }
 }
@@ -994,9 +1015,10 @@ fn opt_string_list(v: Option<&Value>, ctx: &RenderCtx<'_>) -> Result<Option<Vec<
                 }
                 Ok(Some(out))
             }
-            Some(other) => {
-                Err(format!("must render to an array of strings (got {})", kind_of(&other)))
-            }
+            Some(other) => Err(format!(
+                "must render to an array of strings (got {})",
+                kind_of(&other)
+            )),
         },
     }
 }
@@ -1049,15 +1071,21 @@ mod tests {
     #[test]
     fn definition_refuses_unknown_fields() {
         let mut d = minimal_def(json!({}));
-        d.as_object_mut().unwrap().insert("surprise".into(), json!(1));
-        assert!(RecipeDefinition::parse(&d).unwrap_err().contains("does not parse"));
+        d.as_object_mut()
+            .unwrap()
+            .insert("surprise".into(), json!(1));
+        assert!(RecipeDefinition::parse(&d)
+            .unwrap_err()
+            .contains("does not parse"));
     }
 
     #[test]
     fn definition_refuses_newer_schema() {
         let d = minimal_def(json!({ "schema": 2 }));
         // Overwrite schema key (extend put 2 in already via minimal_def merge).
-        assert!(RecipeDefinition::parse(&d).unwrap_err().contains("not supported"));
+        assert!(RecipeDefinition::parse(&d)
+            .unwrap_err()
+            .contains("not supported"));
     }
 
     #[test]
@@ -1069,12 +1097,16 @@ mod tests {
                 { "slot": "a", "name": "y", "harness": "claude-agent-sdk" }
             ]
         });
-        assert!(RecipeDefinition::parse(&d).unwrap_err().contains("duplicate agent slot"));
+        assert!(RecipeDefinition::parse(&d)
+            .unwrap_err()
+            .contains("duplicate agent slot"));
         let d = json!({
             "schema": 1,
             "agents": [{ "slot": "Bad_Slot", "name": "x", "harness": "claude-agent-sdk" }]
         });
-        assert!(RecipeDefinition::parse(&d).unwrap_err().contains("[a-z0-9-]"));
+        assert!(RecipeDefinition::parse(&d)
+            .unwrap_err()
+            .contains("[a-z0-9-]"));
     }
 
     #[test]
@@ -1177,7 +1209,9 @@ mod tests {
             json!({ "k": { "type": "string", "x-fluidbox": { "widget": "secret" } } }),
             json!([]),
         );
-        assert!(param_specs(&schema).unwrap_err().contains("never recipe parameters"));
+        assert!(param_specs(&schema)
+            .unwrap_err()
+            .contains("never recipe parameters"));
         let schema = schema_with(
             json!({ "k": { "type": "string", "x-fluidbox": { "widget": "wat" } } }),
             json!([]),
@@ -1204,7 +1238,9 @@ mod tests {
                      "x-fluidbox": { "widget": "connection_tools", "connection_param": "nope" } } }),
             json!([]),
         );
-        assert!(param_specs(&schema).unwrap_err().contains("not a declared param"));
+        assert!(param_specs(&schema)
+            .unwrap_err()
+            .contains("not a declared param"));
     }
 
     // ── validation + defaults ──
@@ -1248,7 +1284,10 @@ mod tests {
         });
         let out = render_value(&v, &ctx).unwrap().unwrap();
         assert_eq!(out["repositories"], json!(["acme/site", "acme/api"]));
-        assert_eq!(out["connection"], json!("11111111-1111-7111-8111-111111111111"));
+        assert_eq!(
+            out["connection"],
+            json!("11111111-1111-7111-8111-111111111111")
+        );
         assert_eq!(out["url"], json!("https://mcp.example/x"));
         // {{repository}} is runtime-namespace: untouched.
         assert_eq!(
@@ -1321,9 +1360,15 @@ mod tests {
         assert_eq!(r.agents[0].name, "acme pr review reviewer");
         assert_eq!(r.agents[0].model.as_deref(), Some("claude-haiku-4-5"));
         let sub = &r.subscriptions[0];
-        assert_eq!(sub.connection_id.as_deref(), Some("22222222-2222-7222-8222-222222222222"));
+        assert_eq!(
+            sub.connection_id.as_deref(),
+            Some("22222222-2222-7222-8222-222222222222")
+        );
         assert_eq!(sub.repositories, vec!["acme/site"]);
-        assert_eq!(sub.events, Some(vec!["opened".to_string(), "reopened".to_string()]));
+        assert_eq!(
+            sub.events,
+            Some(vec!["opened".to_string(), "reopened".to_string()])
+        );
         assert!(sub.autonomous);
         assert_eq!(
             sub.task_template.as_deref(),
