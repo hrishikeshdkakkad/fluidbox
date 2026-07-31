@@ -14,7 +14,6 @@
 import { useState } from "react";
 import {
   ApprovalScope,
-  Budgets,
   EgressMode,
   PolicyAction,
   PolicyContent,
