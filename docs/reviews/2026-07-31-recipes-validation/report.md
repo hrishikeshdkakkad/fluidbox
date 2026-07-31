@@ -107,11 +107,50 @@ Evidence: `deployment-page.jpg`, `run-timeline-gate-denials.jpg`, `deployments-l
   agent→agent chaining destination, browser-automation recipes, marketplace/community lane,
   per-org catalog curation controls.
 
+## Addendum 2026-07-31 (evening) — live-model pass via the ngrok GitHub App
+
+Operator-triggered. Fresh GitHub App **fluidbox-kia-pantomimic** minted via the manifest+install
+dance through the ngrok tunnel (prior custody was wiped with the local volume); private test repo
+`hrishikeshdkakkad/fluidbox-recipes-live-demo`; PR #1 planted three findings (a `new Function`
+RCE sink, an unvalidated negative discount, zero new tests).
+
+**Two launch-blocking seed bugs found and fixed (commits `4f44641`, `29cd81e`):**
+
+1. **pr-review-panel was undeployable.** Its schema spoke `"opened"` while the subscription
+   vocabulary is `"pull_request.opened"` — the schema refused the qualified names and the engine
+   refused the short ones. The e2e had never dry-run this recipe; it now asserts every seeded
+   default survives the engine's per-object checks.
+2. **All five seed policies were codex-blind for reads.** Shell allowlists carried
+   cat/rg/git-log-family but not `sed -n`/`pwd`/`git rev-parse`; the claude harness reads via
+   native Read/Grep so never noticed, but codex reads through the shell — the panel's security
+   reviewer was denied every file read and returned an honest but ungrounded review. All five
+   seeds gained the read staples. (The allowlist was never the write barrier — `cat` admits
+   redirection; fork-PR ReadOnly is.)
+
+**What the live pass proved** (claude panel + custom codex variant `pr-review-panel-codex`,
+authored via the custom-recipes API — itself a live exercise of that path):
+
+- webhook → HMAC verify → exactly-3-run fan-out; paused instance stayed silent through the same
+  delivery; reopen re-fired cleanly (dedup keyed per delivery).
+- Real sandboxes checked out the PR head; the permission gate stayed live mid-run (v2 security
+  run: 13 allows, 4 denies — `nl`, `git show-ref` — and the agent adapted with allowed commands).
+- Anthropic account had no credits → all three claude runs failed HONESTLY: checks published as
+  fail, stable comment disclosed the incomplete review, $0 charged. The publish spine is
+  independent of run success.
+- Codex panel (gpt-5.4-mini): all three reviewers completed grounded. Correctness found both
+  planted bugs with file:line + verdict "request changes"; security traced the exact
+  coupon.rule → applyDiscount → Function() attack path with remediation; tests enumerated every
+  untested branch. One stable comment per subscription, one check per reviewer per head SHA.
+- **Total live spend: ~$0.04 across 6 runs** (metered per-session in `usage_entries`).
+
+Residual noted: a run's check conclusion reflects run completion, not the review verdict — a
+"request changes" review lands as a green check. Worth a `neutral`/`action_required` mapping
+pass later.
+
 ## Recommended next work
 
 1. Chaining destination (`ResultDestination::Trigger`) for investigator→fixer pipelines.
 2. `issues.*` events in the GitHub connector → issue-to-code recipes.
 3. Per-instance run/cost rollups on the deployment page; recipe analytics.
 4. Root-cause the replay-runner silent death; catalog curation (pin/feature, approval-before-deploy).
-5. Live-model realistic-workload pass on the PR-review panel via the ngrok GitHub App (needs
-   operator-triggered spend).
+5. Map review verdicts onto check conclusions (see addendum residual).
