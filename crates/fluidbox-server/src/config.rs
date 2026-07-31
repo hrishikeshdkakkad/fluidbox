@@ -304,6 +304,13 @@ pub struct Config {
     pub require_enforced_netpol: bool,
     /// The probe image used by the boot-time netpol run-gate.
     pub netpol_probe_image: String,
+    /// The bounded observation window (seconds) for netpol enforcement: the
+    /// certification probe AND every sandbox's `netpol-gate` init container
+    /// poll (positive reachable AND negative blocked) until this deadline
+    /// before failing closed. Covers CNIs that program policy asynchronously
+    /// (AWS VPC CNI `standard` lands ~20s after pod start — measured);
+    /// NEVER a sleep: the first successful observation ends the wait.
+    pub netpol_wait_secs: u64,
     /// The server's own internal Service (name, namespace) — resolved to a
     /// ClusterIP at boot for the runner's no-DNS control URL under zeroEgress.
     pub internal_service: Option<String>,
@@ -423,6 +430,15 @@ pub const MAX_RUNNER_ENV_BYTES: usize = 512 * 1024;
 /// `facade`'s test derives its assertion from this constant, so raising the
 /// timeout past the TTL fails there instead of silently breaking the guarantee.
 pub const UPSTREAM_HTTP_TIMEOUT_SECS: u64 = 15 * 60;
+
+/// Default bounded observation window for netpol enforcement
+/// (`FLUIDBOX_NETPOL_WAIT_SECS`). Sized at 3× the measured AWS VPC CNI
+/// `standard`-mode programming latency (~20s for a fresh pod,
+/// docs/reviews/2026-07-27 §8c): enough headroom that a healthy cluster
+/// converges well inside it, short enough that a genuinely non-enforcing CNI
+/// (kindnet) is called out within a minute. The wait ENDS at the first
+/// successful observation — this is a deadline, not a delay.
+pub const DEFAULT_NETPOL_WAIT_SECS: u64 = 60;
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
@@ -629,6 +645,10 @@ impl Config {
                 .unwrap_or(true),
             netpol_probe_image: get("FLUIDBOX_NETPOL_PROBE_IMAGE")
                 .unwrap_or_else(|_| "busybox:1.36".into()),
+            netpol_wait_secs: get("FLUIDBOX_NETPOL_WAIT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_NETPOL_WAIT_SECS),
             internal_service: get("FLUIDBOX_INTERNAL_SERVICE")
                 .ok()
                 .filter(|s| !s.is_empty()),

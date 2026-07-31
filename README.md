@@ -69,7 +69,7 @@ fluidbox is not another chat UI, and a trigger is not a second execution system.
 2. **Connect the event.** Start it manually, invoke a subscription-scoped endpoint, add a cron schedule, or bind a GitHub App event. Production automations can pin an exact agent revision.
 3. **Freeze the authority.** fluidbox resolves the invocation into an immutable `RunSpec`: agent revision, task, policy snapshot, capability schemas, budget ceilings, trust tier, workspace, trigger context, and result destinations.
 4. **Prepare the workspace.** Credentialed repository access happens on the control-plane side. The agent receives only a disposable copy; the original repository is never the working tree.
-5. **Run and decide.** A fresh sandbox starts the Claude Agent SDK or Codex runner. Canonical tool intents and MCP calls flow through the server-side decision gate for capability, trust, policy, approval, and budget checks.
+5. **Run and decide.** A fresh sandbox starts the Claude Agent SDK or Codex runner. Brokered MCP calls **cannot execute without** a server-side decision — the control plane is what executes them. Canonical in-sandbox tool intents are **routed to** that same decision by the runner (on the Claude harness, by a mandatory `PreToolUse` hook), where they get capability, trust, policy, approval, and budget checks. See [Security boundaries](#security-boundaries) for what each of those two words is worth.
 6. **Finalize and deliver.** fluidbox settles the runner, collects a bounded diff, records cost and audit events, transitions the run, then publishes signed callbacks or GitHub results. Delivery failure never changes the run's outcome.
 
 The same lifecycle holds whether the run came from a button, a PR opening, a Monday-morning schedule, or a ServiceNow automation calling the scoped endpoint.
@@ -115,6 +115,24 @@ Start with the [hosted product boundary](./docs/hosted/README.md), then follow t
 
 ## Try fluidbox
 
+### Five minutes, no API key
+
+Watch a full governed run — policy verdicts, a live approval pause, the diff,
+the cost line, and a security receipt — without an Anthropic key. The run is a
+**deterministic replay** (a scripted agent, clearly labelled; no model calls)
+driving the real control plane, the real policy gate, and a real sandbox
+container:
+
+```bash
+git clone https://github.com/hrishikeshdkakkad/fluidbox.git
+cd fluidbox
+just demo        # prerequisites: Rust, Docker, just (first run compiles the server)
+```
+
+The demo is fully isolated (its own ports, database volume, and state under
+`.demo/`) and cleans up after itself; `just demo-down` removes every trace at
+any time. At the end it prints the exact commands to graduate to a live agent.
+
 ### Docker — fastest path
 
 No Rust toolchain, Node installation, or external Postgres required:
@@ -123,10 +141,15 @@ No Rust toolchain, Node installation, or external Postgres required:
 git clone https://github.com/hrishikeshdkakkad/fluidbox.git
 cd fluidbox
 docker compose -f deploy/docker-compose.eval.yml --profile runners pull
+export FLUIDBOX_ADMIN_TOKEN=$(openssl rand -hex 32)   # required; there is no default
 ANTHROPIC_API_KEY=sk-ant-... docker compose -f deploy/docker-compose.eval.yml up -d
 ```
 
-Open <http://localhost:3000>. The eval stack uses bundled Postgres and a well-known admin token, and leaves credential-backed integrations and webhook ingress disabled. It is for trying the run loop, not for exposing to a network.
+Open <http://localhost:3000>. The eval stack uses bundled Postgres and leaves credential-backed integrations and webhook ingress disabled.
+
+**Know what this profile exposes.** The dashboard is published on loopback only, but the **API port (8787) is published on all interfaces by default**, so it is reachable from your network segment. The control protecting it is the admin token, not your network position — which is why the token is now required rather than defaulted (it used to default to a value published in this repository). The server container also mounts the Docker socket, and an operator-authenticated `local_copy` workspace can name **any** path the server can read. Run it on a network you trust.
+
+You can often narrow it. Set **`FLUIDBOX_EVAL_API_BIND=127.0.0.1`** and confirm one run completes end to end. Whether that works depends on how your engine forwards published ports: sandboxes are sibling containers that reach the control plane over `host.docker.internal`, and on a Mac engine (colima — measured; Docker Desktop and OrbStack — same mechanism, unmeasured) a loopback-published port answers there. On **native Linux Docker** `host-gateway` is the bridge gateway, which a loopback publish does not answer on, so it is expected to break there. The default is open for portability, not because narrowing is impossible.
 
 ### Develop from source
 
@@ -167,6 +190,8 @@ The local default is **admin mode**: no login wall, the dashboard proxy injects 
 
 | Command | Purpose |
 |---|---|
+| `just demo` | The five-minute no-key first-run (deterministic replay through the real gate) |
+| `just demo-down` | Remove every demo resource (containers, volume, state) |
 | `just dev` | Start the gateway, control plane, and dashboard; one Ctrl-C stops them |
 | `just doctor` | Validate the local environment and explain failures |
 | `just check` | Run format, Clippy with `-D warnings`, Rust tests, and the web build |
@@ -237,14 +262,17 @@ The control plane is the authority; the sandbox is workload-only. Both execution
 
 ## Security boundaries
 
-fluidbox is pre-1.0 security software. Its guarantees come from explicit boundaries, not from the agent behaving well:
+fluidbox is pre-1.0 security software. Its guarantees come from explicit boundaries, not from the agent *reasoning* well — but read the first bullet before relying on that sentence, because one of those boundaries depends on the agent *runtime* cooperating:
 
+- **Two different strengths of "gated", and the difference is the security model.** A **brokered MCP** call cannot execute without a server-side decision *structurally*: the control plane executes it, so nothing the sandbox does can produce the effect. An **in-sandbox** call (`Bash`, `Edit`, `Read`, sandbox stdio MCP) is executed by the sandbox itself, so the gate binds it because the runner **routes** it — on the Claude harness by a mandatory `PreToolUse` hook, which is upstream's own documented remedy and is proven end-to-end, with real side effects and at zero model cost, by `scripts/gate-proof.sh` (a CI job). That is a real control against a prompt-injected model. It is **not** a control against a workload already executing arbitrary code, and an older pinned `runner_image` on a newer server routes nothing and is not detected server-side. For those, **containment** — not the gate — is the binding control. See the [threat model](./docs/hosted/threat-model.md).
 - **No real upstream credential is placed in a sandbox.** The runner gets a short-lived session token. Model credentials remain behind the LLM facade, repository credentials are used during control-plane materialization, and brokered MCP credentials are unsealed only for the upstream call.
 - **Isolation is provider- and profile-specific.** Kubernetes defaults to a `zeroEgress` sandbox namespace and blocks run admission until a probe proves the cluster's CNI enforces NetworkPolicy. Docker hardened mode uses an internal bridge. Docker's default `host-dev` mode is intentionally convenient and is not a structural zero-egress boundary.
 - **Authority is frozen before spend.** Policy, capability schemas, trust tier, budgets, workspace, agent revision, and invocation are stored in the `RunSpec`; later edits affect future runs only.
-- **Attach does not mean allow.** A capability must exist in the frozen set and still pass trust, policy, approval, and budget checks at call time. Fork PRs lose their MCP surface and receive a read-only trust floor that approvals cannot widen.
+- **Attach does not mean allow.** A capability must exist in the frozen set and still pass trust, policy, approval, and budget checks at call time. Fork PRs lose their MCP surface **structurally, before provisioning** — that half needs no gate — and receive a read-only trust floor that approvals cannot widen. The floor itself is enforced *at the gate*, so for in-sandbox tools it inherits the first bullet's qualification: against an anonymous fork-PR author it is only as strong as the runner's routing plus containment.
 - **Audit is redacted by construction.** The append path accepts only `Redacted<EventEnvelope>` values. The ledger keeps digests, decisions, usage, cost, lifecycle, and artifact metadata—not raw model prompts, secrets, or brokered tool payloads.
 - **Finalization is durable.** Terminal intent is persisted before acknowledgement; artifact collection precedes the terminal transition; interrupted finalizations are recovered after restart.
+
+**Where to check any of this.** [`docs/release/claims-matrix.md`](./docs/release/claims-matrix.md) lists every material claim above with its evidence class and the command that verifies it; [`docs/release/compatibility-matrix.md`](./docs/release/compatibility-matrix.md) separates what has actually been run on which platform from what is merely expected to work, and states plainly which release-artifact properties (signing, SBOM, provenance, checksums, reproducible runner images) do **not** exist.
 
 The default deployment model is self-hosted and effectively single-tenant, with one admin bearer token. The opt-in [hosted multi-user posture](#hosted-multi-user-mode) adds identity, ownership, custody, RLS, broker hardening, and multi-replica coordination, but production promotion still depends on the documented rollout gates and accepted residuals. Single-admin behavior is unchanged when SSO is off. Read [SECURITY.md](./SECURITY.md) and the hosted [threat model](./docs/hosted/threat-model.md) before operating fluidbox outside a local environment.
 
@@ -256,7 +284,7 @@ The Helm chart is published as an OCI artifact:
 
 ```bash
 # First create the required `fluidbox-secrets` Secret and a values file.
-FLUIDBOX_VERSION=0.3.0 # x-release-please-version
+FLUIDBOX_VERSION=0.4.0-rc.1 # x-release-please-version
 
 helm show values oci://ghcr.io/hrishikeshdkakkad/charts/fluidbox \
   --version "$FLUIDBOX_VERSION" > fluidbox-values.yaml
@@ -276,7 +304,15 @@ Start with the chart's annotated [`values.yaml`](./deploy/helm/fluidbox/values.y
 
 > **Full walkthrough → [Kubernetes deployment guide](./docs/guides/kubernetes.md).** Zero to a certified, run-serving cluster: the generic recipe, per-cloud setup and gotchas (EKS/GKE/AKS/DOKS), secrets, network-enforcement certification, verifying a run end to end, node sizing and cost, safe audited teardown, and a troubleshooting table — all from a live cloud acceptance.
 
-Live EKS acceptance evidence: [2026-07-17](./docs/reviews/2026-07-17-eks-acceptance.md) — v0.2.0 release chart and images, AWS-audited zero-orphan teardown · [2026-07-22](./docs/reviews/2026-07-22-eks-acceptance-phase-f.md) — pre-release `v0.3.0` images on arm64/Graviton nodes with the runtime-role RLS split active.
+**Live EKS acceptance evidence, with the version and date each one covers** — read the dates, because a cloud acceptance is evidence about a *configuration at a time*, not a standing guarantee:
+
+| Date | Covers | Notes |
+|---|---|---|
+| [2026-07-17](./docs/reviews/2026-07-17-eks-acceptance.md) | `v0.2.0` release chart + images | AWS-audited zero-orphan teardown |
+| [2026-07-22](./docs/reviews/2026-07-22-eks-acceptance-phase-f.md) | pre-release `v0.3.0` images, arm64/Graviton, runtime-role RLS split | AWS-audited zero-orphan teardown |
+| [2026-07-29](./docs/reviews/k8s-network-admission-validation.md) | the NetworkPolicy admission protocol | 9/9 on EKS 1.33 + VPC CNI `standard`, plus 12/12 on kind + Calico |
+
+**Both of the first two predate a defect they could not have caught.** Between them and 2026-07-28 it was measured that on EKS with VPC CNI `standard` mode — the mode `scripts/eks-cluster.yaml` itself prescribes — the certification probe sampled its assertions once at container start, inside the CNI's asynchronous fail-open programming window, so it could never pass and **every `POST /v1/sessions` returned 503**. It failed closed, so no run was ever mis-governed, but no run could be created either. The workaround at the time was to turn the control off (`netpol.requireEnforced=false`). That is fixed in this release by a bounded observation protocol plus a per-sandbox `netpol-gate` init container, and the third row is its evidence. Re-running the first two acceptances against this release has **not** been done.
 
 ## Repository map
 
@@ -313,7 +349,7 @@ policies/                     versioned seed policy YAML
 
 ## Project status
 
-fluidbox is early, usable, and moving quickly. `v0.1.0` shipped the governed vertical slice; `v0.2.0` added Kubernetes-native execution and hardened finalization while keeping Docker fully supported; `v0.3.0` added the opt-in multi-user control plane — identity, connection ownership, per-run resource bindings, envelope-sealed custody, and a hardened egress and broker boundary — with single-admin behavior unchanged when SSO is off. The acceptance suites cover the Rust control plane, dashboard, both harnesses, event paths, connectors, identity and tenant isolation, and provider-specific isolation checks.
+fluidbox is early, usable, and moving quickly. `v0.1.0` shipped the governed vertical slice; `v0.2.0` added Kubernetes-native execution and hardened finalization while keeping Docker fully supported; `v0.3.0` added the opt-in multi-user control plane — identity, connection ownership, per-run resource bindings, envelope-sealed custody, and a hardened egress and broker boundary — with single-admin behavior unchanged when SSO is off. The acceptance suites cover the Rust control plane, dashboard, both harnesses, event paths, connectors, identity and tenant isolation, and provider-specific isolation checks — but **"cover" and "gate" are different words and only some of these gate a change.** On every pull request: the Rust suite, the dashboard build and unit tests, the identity/bindings/secrets/hardening/scale acceptance suites, `cargo-deny`, the version and compose guards, the runner-lib and replay-runner node suites, and `scripts/gate-proof.sh` (which proves the permission gate end-to-end with no model spend). **Not** gated: the full `just e2e` live-agent tiers, which are `workflow_dispatch`-only because they need model credits — and four of their phases are known red ([#100](https://github.com/hrishikeshdkakkad/fluidbox/issues/100)). Publishing a release is also ungated by deliberate choice. The gap between the first list and the second is how a permission-gate bypass reached a release once; the gate proof exists to make that specific gap smaller.
 
 Expect breaking changes before `v1.0`. Near-term work includes the native Slack event vertical, AWS Lambda MicroVM/BYOC execution, customer-built signed runner images, and brokered git writes. See the [changelog](./CHANGELOG.md) for release evidence and the [roadmap](./ROADMAP.md) for sequencing.
 
