@@ -77,6 +77,21 @@ describe("gateDecision — sso mode", () => {
       ).toEqual({ kind: "pass" });
     }
   });
+
+  it("passes /developer and everything under it without a session (public docs)", () => {
+    for (const pathname of ["/developer", "/developer/quickstart", "/developer/reference"]) {
+      expect(
+        gateDecision({ mode: "sso", pathname, search: "", hasSession: false })
+      ).toEqual({ kind: "pass" });
+    }
+  });
+
+  it("does not let the /developer prefix leak onto sibling routes", () => {
+    // "/developers" or a lookalike must still gate — startsWith needs the slash.
+    expect(
+      gateDecision({ mode: "sso", pathname: "/developers", search: "", hasSession: false })
+    ).toEqual({ kind: "to-login", next: "/developers" });
+  });
 });
 
 describe("SESSION_COOKIE", () => {
