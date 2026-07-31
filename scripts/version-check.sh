@@ -56,6 +56,20 @@ json_version() {
   python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('version',''))" "$1" 2>/dev/null || echo ""
 }
 
+# --- version.txt ------------------------------------------------------------
+# release-please's `simple` strategy ALWAYS writes a version file (default
+# `version.txt`, and there is no option to skip it -- see strategies/simple.js).
+# We use `simple` because the `rust` strategy cannot handle this workspace: it
+# rewrites `package.version` in every member (ours inherit via
+# `version.workspace = true`) and then demands the ROOT be a package manifest
+# (ours is a virtual workspace). So version.txt is not cruft we tolerate, it is
+# a site release-please owns -- which means it can drift, which means it gets
+# checked like every other site.
+check "version.txt" \
+  "$(tr -d '[:space:]' < version.txt 2>/dev/null)" \
+  "version.txt" \
+  "release-please simple strategy version file"
+
 # --- npm packages -----------------------------------------------------------
 check "apps/web" \
   "$(json_version apps/web/package.json)" \
