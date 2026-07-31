@@ -16,12 +16,14 @@
 // Both modes stream SSE through untouched.
 
 import { allowedCookieHeader, webMode } from "../../../lib/proxy-auth";
+import { webAuthMode } from "../../../lib/web-auth";
 
 const API = process.env.FLUIDBOX_API_URL || "http://127.0.0.1:8787";
-// Resolve the mode once at module scope (static deployment config, not
-// per-request). The allowlist + mode logic lives in ./lib/proxy-auth, where it
-// is unit-tested.
+// Resolve the modes once at module scope (static deployment config, not
+// per-request). The allowlist + mode logic lives in ./lib/proxy-auth and
+// ./lib/web-auth, where it is unit-tested.
 const MODE = webMode(process.env.FLUIDBOX_WEB_MODE);
+const AUTH = webAuthMode(process.env.FLUIDBOX_WEB_AUTH);
 
 // Read the operator token ONLY in admin mode. In sso mode this value is never
 // dereferenced, so operator authority is absent from the request path even if
@@ -32,6 +34,23 @@ const ADMIN_TOKEN =
 export const dynamic = "force-dynamic";
 
 async function forward(req: Request, path: string[]) {
+  // WorkOS web tier (FLUIDBOX_WEB_AUTH=workos): every control-plane call
+  // requires a live AuthKit session, validated HERE, independently of the
+  // navigation gate — middleware assists UX; this check is the boundary. A
+  // missing/expired session answers 401 JSON (never a redirect: this is a
+  // fetch surface). Runs BEFORE any credential is attached, so an anonymous
+  // caller can never ride the injected operator token.
+  if (AUTH === "workos") {
+    const { withAuth } = await import("@workos-inc/authkit-nextjs");
+    const { user } = await withAuth();
+    if (!user) {
+      return new Response(JSON.stringify({ error: "unauthorized" }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      });
+    }
+  }
+
   const url = new URL(req.url);
   const target = `${API}/v1/${path.join("/")}${url.search}`;
 
