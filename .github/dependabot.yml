@@ -21,6 +21,31 @@ updates:
       - dependency-name: "@types/node"
         update-types: ["version-update:semver-major"]
 
+  # The runner images' own npm dependencies — the code that executes BESIDE an
+  # untrusted workspace. These directories had no Dependabot entry at all, so a
+  # CVE in the Agent SDK or the MCP SDK would have gone unnoticed indefinitely,
+  # while `apps/web` (which runs nowhere near a sandbox) was watched. They are
+  # only watchable now that each carries a package-lock.json.
+  #
+  # Grouped and minor/patch-only on purpose: a MAJOR bump of the Agent SDK or
+  # the MCP SDK can change the harness contract (the permission callback, the
+  # tool vocabulary), and `scripts/gate-proof.sh` is what has to adjudicate
+  # that — so majors are taken deliberately, not merged on a schedule.
+  - package-ecosystem: npm
+    directories:
+      - /images/sandbox-runner/runner
+      - /images/codex-runner/runner
+    schedule:
+      interval: weekly
+    groups:
+      runner-minor-patch:
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: "@anthropic-ai/claude-agent-sdk"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@modelcontextprotocol/sdk"
+        update-types: ["version-update:semver-major"]
+
   - package-ecosystem: github-actions
     directory: /
     schedule:
