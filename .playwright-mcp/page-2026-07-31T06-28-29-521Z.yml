@@ -1,0 +1,452 @@
+- generic [active] [ref=f42e1]:
+  - link "Skip to main content" [ref=f42e2] [cursor=pointer]:
+    - /url: "#main-content"
+  - generic [ref=f42e5]:
+    - generic [ref=f42e8]:
+      - link [ref=f42e9] [cursor=pointer]:
+        - /url: /replay/2026
+        - paragraph [ref=f42e10]: New features for faster build and reliable AI | See what you missed at Replay 2026 ›
+      - navigation "top bar menu" [ref=f42e11]:
+        - link "About" [ref=f42e12] [cursor=pointer]:
+          - /url: /about
+        - link "Careers" [ref=f42e13] [cursor=pointer]:
+          - /url: /careers
+        - link "Talk to Sales" [ref=f42e14] [cursor=pointer]:
+          - /url: https://pages.temporal.io/contact-us
+    - navigation [ref=f42e15]:
+      - link "Home" [ref=f42e16] [cursor=pointer]:
+        - /url: /
+        - img "Temporal Logo" [ref=f42e17]
+      - list [ref=f42e18]:
+        - listitem [ref=f42e19]:
+          - text: Platform
+          - list [ref=f42e20]:
+            - listitem:
+              - link "Overview":
+                - /url: /product
+            - listitem:
+              - link "How Temporal Works":
+                - /url: /how-it-works
+            - listitem:
+              - link "Temporal Cloud":
+                - /url: /cloud
+            - listitem:
+              - link "Security":
+                - /url: /security
+        - listitem [ref=f42e21]:
+          - link "Docs" [ref=f42e22] [cursor=pointer]:
+            - /url: https://docs.temporal.io
+        - listitem [ref=f42e23]:
+          - link "Pricing" [ref=f42e24] [cursor=pointer]:
+            - /url: /pricing
+        - listitem [ref=f42e25]:
+          - text: Use Cases
+          - list [ref=f42e26]:
+            - listitem:
+              - link "Customer Stories":
+                - /url: /in-use
+            - listitem:
+              - paragraph: By Industry
+              - list:
+                - listitem:
+                  - link "AI":
+                    - /url: /solutions/ai
+                - listitem:
+                  - link "Financial Services":
+                    - /url: /solutions/financial-services
+            - listitem:
+              - paragraph: By Audience
+              - list:
+                - listitem:
+                  - link "Platform Engineering":
+                    - /url: /solutions/platform-engineering
+                - listitem:
+                  - link "Startups":
+                    - /url: /startup
+                - listitem:
+                  - link "Partners":
+                    - /url: /partners
+        - listitem [ref=f42e27]:
+          - text: Resources
+          - list [ref=f42e28]:
+            - listitem:
+              - link "Resource Library":
+                - /url: /resources
+            - listitem:
+              - link "Learn Temporal":
+                - /url: https://learn.temporal.io
+            - listitem:
+              - link "Community":
+                - /url: /community
+            - listitem:
+              - link "Code Exchange":
+                - /url: /code-exchange
+            - listitem:
+              - link "Blog":
+                - /url: /blog
+            - listitem:
+              - link "Changelog":
+                - /url: /changelog
+      - generic [ref=f42e29]:
+        - button "Search" [ref=f42e30] [cursor=pointer]
+        - link "Temporal on GitHub" [ref=f42e33] [cursor=pointer]:
+          - /url: https://github.com/temporalio
+        - generic [ref=f42e36]:
+          - link "Try Free" [ref=f42e37] [cursor=pointer]:
+            - /url: /get-cloud
+          - link "Log In" [ref=f42e38] [cursor=pointer]:
+            - /url: https://cloud.temporal.io/
+    - main [ref=f42e39]:
+      - generic [ref=f42e40]:
+        - generic [ref=f42e42]:
+          - heading "Build AI apps and agents on an open foundation" [level=1] [ref=f42e43]
+          - paragraph [ref=f42e45]: Use any model, framework, language, or tool. Temporal provides the Durable Execution layer that keeps AI applications and agents running reliably in production.
+          - generic [ref=f42e46]:
+            - link "Get Started for Free" [ref=f42e47] [cursor=pointer]:
+              - /url: /get-cloud
+            - link "Run Locally" [ref=f42e48] [cursor=pointer]:
+              - /url: https://docs.temporal.io/quickstarts
+        - generic [ref=f42e50]:
+          - button "Copy code sample" [ref=f42e56]
+          - generic [ref=f42e64]:
+            - generic:
+              - code [ref=f42e66]:
+                - text: "@workflow.defn class AgentWorkflow: @workflow.run async def run("
+                - generic [ref=f42e67]: "self, goal: str"
+                - text: ") -> str: messages = [{\"role\": \"user\", \"content\": goal}] while True: # Agent loops until it decides it's done # LLM calls automatically retry on failure response = await workflow.execute_activity( call_llm, args=[messages, tools], start_to_close_timeout=timedelta(seconds=60)) if not response.tool_calls: return response.content # Agent is done # Tool execution is durable - survives crashes result = await workflow.execute_activity( run_tool, args=[response.tool_call], start_to_close_timeout=timedelta(minutes=5)) # Add LLM response and Tool result to the agent context messages.append(response.message) messages.append({\"role\": \"tool\", \"content\": result})"
+              - code [ref=f42e69]:
+                - text: "@workflow.defn class AgentWorkflow: @workflow.run async def run("
+                - generic [ref=f42e70]: "self, goal: str"
+                - text: ") -> str: messages = [{\"role\": \"user\", \"content\": goal}] while True: # Agent loops until it decides it's done # LLM calls automatically retry on failure response = await workflow.execute_activity( call_llm, args=[messages, tools], start_to_close_timeout=timedelta(seconds=60)) if not response.tool_calls: return response.content # Agent is done # Tool execution is durable - survives crashes result = await workflow.execute_activity( run_tool, args=[response.tool_call], start_to_close_timeout=timedelta(minutes=5)) # Add LLM response and Tool result to the agent context messages.append(response.message) messages.append({\"role\": \"tool\", \"content\": result})"
+          - tablist "Code sample tabs" [ref=f42e71]:
+            - tab "PYTHON" [selected] [ref=f42e72] [cursor=pointer]
+            - tab "GO" [ref=f42e73] [cursor=pointer]
+            - tab "TYPESCRIPT" [ref=f42e74] [cursor=pointer]
+            - tab "RUBY" [ref=f42e75] [cursor=pointer]
+            - tab "C#" [ref=f42e76] [cursor=pointer]
+            - tab "JAVA" [ref=f42e77] [cursor=pointer]
+            - tab "PHP" [ref=f42e78] [cursor=pointer]
+      - generic [ref=f42e79]:
+        - generic [ref=f42e81]:
+          - img "Qualtrics logo - light" [ref=f42e82]
+          - img "REA Group Logo" [ref=f42e83]
+          - img "Snap logomark - light" [ref=f42e84]
+          - img "Macquarie Logo" [ref=f42e85]
+          - img "anz logo" [ref=f42e87]
+          - img "OpenAI logo" [ref=f42e88]
+          - img "Yum! Brand Logo" [ref=f42e89]
+          - img "Gray lowercase letters 'd' and 'c' connected in a modern, minimalist logo design on white background." [ref=f42e91]
+          - img "Vodafone Logo" [ref=f42e92]
+          - img "Cloudflare Logo" [ref=f42e93]
+          - img "GitLab Logo" [ref=f42e94]
+          - img "Remitly Logo" [ref=f42e95]
+          - img "Light gray or white blank rectangular background with no visible content or elements." [ref=f42e97]
+          - img "Bentley Systems Logo" [ref=f42e98]
+          - img "Bestseller Logo" [ref=f42e99]
+          - img "Deloitte" [ref=f42e100]
+          - img "White or light gray blank rectangular background with no visible content or elements." [ref=f42e102]
+          - img "Doordash Logo" [ref=f42e103]
+          - img "Light gray textured background with subtle variations in tone creating a minimalist, neutral surface." [ref=f42e105]
+          - img "Checkr Logo" [ref=f42e106]
+          - img "Turo logo - light" [ref=f42e107]
+          - img "Mollie Logo" [ref=f42e108]
+          - img "Lovable AI Logo" [ref=f42e109]
+          - img "Abridge logo" [ref=f42e110]
+          - img "Hebbia logo" [ref=f42e111]
+        - generic [ref=f42e143]:
+          - generic [ref=f42e145]:
+            - paragraph [ref=f42e146]: What you missed at Replay 2026
+            - heading "New features for faster build and reliable AI" [level=3] [ref=f42e147]
+            - paragraph [ref=f42e149]: At Replay 2026, we announced Serverless Workers, Standalone Activities, Workflow Streams, and new integrations with Google ADK and OpenAI Agents SDK. Check it out. Your production environment will thank you.
+            - link "Read Announcement" [ref=f42e151] [cursor=pointer]:
+              - /url: /blog/replay-2026-product-announcements
+          - img "Temporal Replay 2026 graphic" [ref=f42e157]
+        - generic [ref=f42e158]:
+          - generic [ref=f42e160]:
+            - heading "Write code as if failure doesn’t exist" [level=3] [ref=f42e161]
+            - generic [ref=f42e162]:
+              - paragraph [ref=f42e163]: Distributed systems break, APIs fail, networks flake, and services crash. That’s not your problem anymore. Managing reliability shouldn’t mean constant firefighting.
+              - paragraph [ref=f42e164]: Temporal Workflows automatically capture state at every step, and in the event of failure, can pick up exactly where they left off.
+              - paragraph [ref=f42e165]: No lost progress, no orphaned processes, and no manual recovery required.
+          - generic [ref=f42e167]:
+            - generic:
+              - img "Purple laptop displaying a green pixelated smiley face on dark screen, surrounded by colorful geometric shapes and icons."
+        - generic [ref=f42e168]:
+          - generic [ref=f42e170]:
+            - heading "You have to see it to believe it" [level=3] [ref=f42e171]
+            - paragraph [ref=f42e173]: Temporal doesn’t work like anything you’ve used before. Watch how we guarantee the Durable Execution of your code in the face of any failure.
+            - link "Watch a Demo" [ref=f42e175] [cursor=pointer]:
+              - /url: https://youtu.be/dNVmRfWsNkM
+          - generic [ref=f42e179]:
+            - img "Magic Graphic"
+        - generic [ref=f42e180]:
+          - generic [ref=f42e182]:
+            - paragraph [ref=f42e183]: How It Works
+            - heading "Create failproof apps using our SDKs" [level=3] [ref=f42e184]
+            - paragraph [ref=f42e186]: Write your business logic in the programming languages you already use with our native SDKs. Your days of writing reconciliation logic or boilerplate code are over.
+          - generic [ref=f42e188]:
+            - img "Temporal SDKs Graphic"
+        - generic [ref=f42e189]:
+          - generic [ref=f42e191]:
+            - heading "Build Workflows that handle failures for you" [level=3] [ref=f42e192]
+            - generic [ref=f42e193]:
+              - paragraph [ref=f42e194]: Write your business logic as code as a Temporal Workflow. Workflows might involve moving money between bank accounts, processing orders, deploying cloud infrastructure, training an AI model, or something else entirely.
+              - paragraph [ref=f42e195]: Because the full running state of a Workflow is durable and fault tolerant by default, your business logic can be recovered, replayed, or paused at any point.
+          - generic [ref=f42e197]:
+            - img "Workflow Graphic"
+        - generic [ref=f42e198]:
+          - generic [ref=f42e200]:
+            - heading "Write Activities to handle and retry failure-prone logic" [level=3] [ref=f42e201]
+            - generic [ref=f42e202]:
+              - paragraph [ref=f42e203]: APIs fail, networks time out, and users abandon sessions.
+              - paragraph [ref=f42e204]: "Temporal treats these interactions as Activities: functions that retry automatically and recover seamlessly."
+          - generic [ref=f42e206]:
+            - img "Activities Graphic"
+        - generic [ref=f42e207]:
+          - generic [ref=f42e209]:
+            - heading "Replace your brittle state machines" [level=3] [ref=f42e210]
+            - generic [ref=f42e211]:
+              - paragraph [ref=f42e212]: The Temporal Service persists the state of your application and has built-in retries, task queues, signals, and timers, to make sure your code always picks up where it left off.
+              - paragraph [ref=f42e213]:
+                - text: Host the Temporal Service yourself as part of the
+                - link "open-source project" [ref=f42e214] [cursor=pointer]:
+                  - /url: https://docs.temporal.io/develop/
+                - text: ", or let us host it for you with"
+                - link "Temporal Cloud" [ref=f42e215] [cursor=pointer]:
+                  - /url: /cloud
+                - text: .
+          - generic [ref=f42e217]:
+            - img "State Machine Graphic"
+        - generic [ref=f42e220]:
+          - heading "Get full visibility into your running code" [level=3] [ref=f42e221]
+          - paragraph [ref=f42e223]: No more wasting time sifting through logs. Get visibility into the exact state of each of your Workflow executions.
+        - generic [ref=f42e228]:
+          - paragraph [ref=f42e230]: Common patterns and use cases
+          - generic [ref=f42e231]:
+            - generic [ref=f42e234]:
+              - paragraph [ref=f42e237]: Agents, MCP, & AI Pipelines
+              - paragraph [ref=f42e239]: Develop agents that survive real-world chaos, reliable MCP & orchestrate training pipelines.
+            - generic [ref=f42e242]:
+              - paragraph [ref=f42e245]: Humans-in-the-Loop
+              - paragraph [ref=f42e247]: "No more duct-taping Workflows around human input: just clean, durable orchestration."
+            - generic [ref=f42e250]:
+              - paragraph [ref=f42e253]: Compensating Patterns (Saga)
+              - paragraph [ref=f42e255]: "Make Saga easy: what if Saga was simply a try...catch?"
+            - generic [ref=f42e258]:
+              - paragraph [ref=f42e261]: Long-running Workflows
+              - paragraph [ref=f42e263]: Run Workflows for days, weeks, or months without losing progress or adding complexity.
+            - generic [ref=f42e266]:
+              - paragraph [ref=f42e269]: Order Fulfillment
+              - paragraph [ref=f42e271]: One bad service shouldn’t break the cart. Temporal keeps the order moving.
+            - generic [ref=f42e274]:
+              - paragraph [ref=f42e277]: Durable Ledgers
+              - paragraph [ref=f42e279]: Track transactions with code you can trust down to the last cent.
+            - generic [ref=f42e282]:
+              - paragraph [ref=f42e285]: CI/CD
+              - paragraph [ref=f42e287]: Deploy with confidence. Temporal gives you clean retries, rollbacks, and visibility.
+            - generic [ref=f42e290]:
+              - paragraph [ref=f42e293]: Customer Acquisition
+              - paragraph [ref=f42e295]: Route leads, onboard users, and engage customers without dropped steps or hacks.
+            - generic [ref=f42e298]:
+              - paragraph [ref=f42e301]: DAG
+              - paragraph [ref=f42e303]: Don’t glue together DAGs with bash and hope. Temporal does it right.
+        - generic [ref=f42e305]:
+          - paragraph [ref=f42e307]: Global enterprises and top startups choose Temporal
+          - generic [ref=f42e308]:
+            - generic [ref=f42e309]:
+              - img "Video thumbnail showing code for while loops in Temporal with a green play button overlay and presenter on right side" [ref=f42e311]
+              - generic [ref=f42e312]:
+                - paragraph [ref=f42e314]: NVIDIA manages their GPU fleet across clouds with Temporal
+                - link "Watch NVIDIA's talk" [ref=f42e316] [cursor=pointer]:
+                  - /url: https://www.youtube.com/watch?v=HqGtUPLc_qI&t=1s
+            - generic [ref=f42e319]:
+              - img "Video player showing code editor with green play button overlay, titled Background Heartbeats with Salesforce cloud logo" [ref=f42e321]
+              - generic [ref=f42e322]:
+                - paragraph [ref=f42e324]: Salesforce migrated their monolith to Temporal
+                - link "Watch Salesforce's talk" [ref=f42e326] [cursor=pointer]:
+                  - /url: https://www.youtube.com/watch?v=1TDX9WEJRMA&t=1s
+            - generic [ref=f42e329]:
+              - img "Video thumbnail with green play button and text reading Temporal Blessed Technology on purple gradient background" [ref=f42e331]
+              - generic [ref=f42e332]:
+                - paragraph [ref=f42e334]: Twilio left their homegrown systems for Temporal Cloud
+                - link "Watch Twilio's talk" [ref=f42e336] [cursor=pointer]:
+                  - /url: https://youtu.be/H7Vh3PPyeTw?si=L3PW2zKpjr7csOCX&t=1
+            - generic [ref=f42e339]:
+              - img "Video thumbnail showing a man wearing glasses and an olive green shirt with a green play button overlay in the center." [ref=f42e341]
+              - generic [ref=f42e342]:
+                - paragraph [ref=f42e344]: Descript improved their AI uptime with Temporal
+                - link "Watch Descript's talk" [ref=f42e346] [cursor=pointer]:
+                  - /url: https://www.youtube.com/watch?v=4EaZZhmk9zg&t=0s
+        - grid [ref=f42e352]:
+          - generic [ref=f42e354]:
+            - generic [ref=f42e355]:
+              - paragraph [ref=f42e360]: Durable execution is a core requirement for modern AI systems, and Temporal offers a compelling platform to help build it in from the start. As AI systems become more complex and long-running, durability is as important as performance. Temporal plays a role in how we think about reliable execution at scale, supporting teams in focusing on product development.
+              - generic [ref=f42e361]:
+                - generic [ref=f42e362]:
+                  - img "Venkat Venkataramani, VP of App Infrastructure at OpenAI • Former CEO & Co-founder of Rockset" [ref=f42e364]
+                  - generic [ref=f42e365]:
+                    - paragraph [ref=f42e366]: Venkat Venkataramani
+                    - paragraph [ref=f42e367]: VP of App Infrastructure, OpenAI • Former CEO & Co-founder of Rockset
+                - img "OpenAI • Former CEO & Co-founder of Rockset"
+            - generic [ref=f42e368]:
+              - generic [ref=f42e372]:
+                - paragraph [ref=f42e373]: Temporal's technology satisfied all of these requirements out of the box and allowed our developers to focus on business logic.
+                - paragraph [ref=f42e374]: Without Temporal's technology, we would've spent a significant amount of time rebuilding Temporal and would've very likely done a worse job.
+              - generic [ref=f42e375]:
+                - generic [ref=f42e376]:
+                  - img "Mitchell Hashimoto, Co-founder at Hashicorp" [ref=f42e378]
+                  - generic [ref=f42e379]:
+                    - paragraph [ref=f42e380]: Mitchell Hashimoto
+                    - paragraph [ref=f42e381]: Co-founder, Hashicorp
+                - img "Hashicorp"
+        - generic [ref=f42e382]:
+          - generic [ref=f42e384]:
+            - paragraph [ref=f42e385]: Committed to the open-source community
+            - heading "100% open-source" [level=3] [ref=f42e386]
+            - paragraph [ref=f42e388]: MIT-licensed, built in the open, and backed by a thriving developer community.
+            - generic [ref=f42e389]:
+              - img "Open Source Initiative Logo" [ref=f42e390]
+              - link "21,980 Stars" [ref=f42e391] [cursor=pointer]:
+                - /url: https://github.com/temporalio/temporal
+          - generic [ref=f42e396]:
+            - img "Open Source Graphic"
+        - generic [ref=f42e397]:
+          - generic [ref=f42e399]:
+            - paragraph [ref=f42e400]: As Reliable as Gravity
+            - heading "Fully battle tested, 9 years in production" [level=3] [ref=f42e401]
+            - paragraph [ref=f42e403]: Temporal was built with over 20 years of development from the minds behind AWS SQS, AWS SWF, Azure Durable functions, and the Cadence project that powers Uber.
+          - generic [ref=f42e405]:
+            - img "Battle Tested Graphic"
+        - generic [ref=f42e406]:
+          - generic [ref=f42e408]:
+            - paragraph [ref=f42e409]: Deploy it your way
+            - heading "One platform, two great hosting paths" [level=3] [ref=f42e410]
+            - generic [ref=f42e411]:
+              - paragraph [ref=f42e412]: Temporal is an open-source project that you are free to use and host in your own environment. You can also let us host the Temporal Service for you with Temporal Cloud. Either way, we never see your code.
+              - paragraph [ref=f42e413]:
+                - link "Sign up for Temporal Cloud and get $1,000 in free credits ›" [ref=f42e414] [cursor=pointer]:
+                  - /url: /get-cloud
+          - generic [ref=f42e416]:
+            - img "Self-Hosted vs. Cloud Graphic"
+        - generic [ref=f42e418]:
+          - paragraph [ref=f42e419]: Build invincible applications
+          - generic [ref=f42e420]:
+            - link "Get started" [ref=f42e421] [cursor=pointer]:
+              - /url: https://docs.temporal.io/quickstarts
+            - link "Talk to your Temporal team" [ref=f42e424] [cursor=pointer]:
+              - /url: https://calendly.com/d/ds6h-yzn-7zj/global-payments-temporal-intro
+            - link "Join our community" [ref=f42e427] [cursor=pointer]:
+              - /url: https://temporal.io/community
+    - contentinfo [ref=f42e428]:
+      - generic [ref=f42e429]:
+        - generic [ref=f42e431]:
+          - generic [ref=f42e432]:
+            - link [ref=f42e433] [cursor=pointer]:
+              - /url: https://status.temporal.io/
+              - text: •
+              - paragraph [ref=f42e434]: ALL SYSTEMS OPERATIONAL
+            - paragraph [ref=f42e435]: 99.9999% trailing 30-day uptime
+          - generic [ref=f42e436]:
+            - generic [ref=f42e437]: Sign up for our newsletter
+            - generic [ref=f42e439]:
+              - generic [ref=f42e440]: Email Address
+              - textbox "Email Address" [ref=f42e441]
+              - button "Subscribe" [ref=f42e442]
+        - generic [ref=f42e446]:
+          - generic [ref=f42e447]:
+            - paragraph [ref=f42e448]: Discover
+            - link "Overview" [ref=f42e449] [cursor=pointer]:
+              - /url: /product
+            - link "How Temporal Works" [ref=f42e450] [cursor=pointer]:
+              - /url: /how-it-works
+            - link "Temporal Cloud" [ref=f42e451] [cursor=pointer]:
+              - /url: /cloud
+            - link "Pricing" [ref=f42e452] [cursor=pointer]:
+              - /url: /pricing
+            - link "Security" [ref=f42e453] [cursor=pointer]:
+              - /url: /security
+            - link "Trust Center" [ref=f42e454] [cursor=pointer]:
+              - /url: https://trust.temporal.io
+            - link "Startups" [ref=f42e455] [cursor=pointer]:
+              - /url: /startup
+          - generic [ref=f42e457]:
+            - paragraph [ref=f42e458]: Explore
+            - link "Customer Stories" [ref=f42e459] [cursor=pointer]:
+              - /url: /in-use
+            - link "Project-based tutorials" [ref=f42e460] [cursor=pointer]:
+              - /url: https://learn.temporal.io/tutorials/
+            - link "Example applications" [ref=f42e461] [cursor=pointer]:
+              - /url: https://learn.temporal.io/examples/
+            - link "Code Exchange" [ref=f42e462] [cursor=pointer]:
+              - /url: /code-exchange
+            - link "Replay 2026 Recap" [ref=f42e463] [cursor=pointer]:
+              - /url: /replay/2026
+            - link "Ask an expert" [ref=f42e464] [cursor=pointer]:
+              - /url: https://pages.temporal.io/ask-an-expert
+            - link "Blog" [ref=f42e465] [cursor=pointer]:
+              - /url: /blog
+          - generic [ref=f42e467]:
+            - paragraph [ref=f42e468]: Developers
+            - link "Getting Started with Temporal" [ref=f42e469] [cursor=pointer]:
+              - /url: https://docs.temporal.io/quickstarts
+            - link "Start building your next app" [ref=f42e470] [cursor=pointer]:
+              - /url: https://docs.temporal.io/develop
+            - link "Temporal Cloud docs" [ref=f42e471] [cursor=pointer]:
+              - /url: https://docs.temporal.io/cloud
+            - link "Production deployments" [ref=f42e472] [cursor=pointer]:
+              - /url: https://docs.temporal.io/production-deployment
+            - link "Temporal 101" [ref=f42e473] [cursor=pointer]:
+              - /url: https://learn.temporal.io/courses/temporal_101/
+            - link "Temporal 102" [ref=f42e474] [cursor=pointer]:
+              - /url: https://learn.temporal.io/courses/temporal_102/
+            - link "Introduction to Temporal Cloud" [ref=f42e475] [cursor=pointer]:
+              - /url: https://learn.temporal.io/courses/intro_to_temporal_cloud/
+          - generic [ref=f42e477]:
+            - paragraph [ref=f42e478]: Community
+            - link "Join our Slack group" [ref=f42e479] [cursor=pointer]:
+              - /url: https://t.mp/slack
+            - link "Find a meetup near you" [ref=f42e480] [cursor=pointer]:
+              - /url: /community
+            - link "Community forum" [ref=f42e481] [cursor=pointer]:
+              - /url: https://community.temporal.io/
+            - link "Events" [ref=f42e482] [cursor=pointer]:
+              - /url: /events
+            - link "Crystal Palace" [ref=f42e483] [cursor=pointer]:
+              - /url: /cpfc
+          - generic [ref=f42e485]:
+            - paragraph [ref=f42e486]: Company
+            - link "About" [ref=f42e487] [cursor=pointer]:
+              - /url: /about
+            - link "Careers" [ref=f42e488] [cursor=pointer]:
+              - /url: /careers
+            - link "News" [ref=f42e489] [cursor=pointer]:
+              - /url: /news
+            - link "Contact us" [ref=f42e490] [cursor=pointer]:
+              - /url: https://pages.temporal.io/contact-us
+            - link "Partners" [ref=f42e491] [cursor=pointer]:
+              - /url: /partners
+        - generic [ref=f42e494]:
+          - paragraph [ref=f42e496]: 2026 © Temporal Technologies. All Rights Reserved.
+          - generic [ref=f42e497]:
+            - link "Privacy Policy" [ref=f42e498] [cursor=pointer]:
+              - /url: /global-privacy-policy
+            - link "Candidate Privacy Policy" [ref=f42e499] [cursor=pointer]:
+              - /url: /candidate-privacy-policy
+            - link "Terms of Service" [ref=f42e500] [cursor=pointer]:
+              - /url: /terms-of-service
+            - link "Code of Conduct" [ref=f42e501] [cursor=pointer]:
+              - /url: /code-of-conduct
+            - link "Sitemap" [ref=f42e502] [cursor=pointer]:
+              - /url: /sitemap
+            - button "Your Privacy Choices" [ref=f42e503] [cursor=pointer]
+          - generic [ref=f42e511]:
+            - link "Follow us on YouTube" [ref=f42e512] [cursor=pointer]:
+              - /url: https://www.youtube.com/temporalio
+            - link "Follow us on Twitter" [ref=f42e515] [cursor=pointer]:
+              - /url: https://twitter.com/temporalio
+            - link "Follow us on GitHub" [ref=f42e518] [cursor=pointer]:
+              - /url: https://github.com/temporalio
+            - link "Follow us on Linkedin" [ref=f42e521] [cursor=pointer]:
+              - /url: https://www.linkedin.com/company/temporal-technologies
+            - link "Join us on Slack" [ref=f42e524] [cursor=pointer]:
+              - /url: https://t.mp/slack
