@@ -29,7 +29,7 @@ function redirectOnUnauthorized(res: Response): void {
   if (res.status !== 401 || !ssoMode() || typeof window === "undefined") return;
   if (window.location.pathname !== "/login") {
     const here = window.location.pathname + window.location.search;
-    const next = here === "/" ? "" : `?next=${encodeURIComponent(here)}`;
+    const next = here === "/app" ? "" : `?next=${encodeURIComponent(here)}`;
     window.location.href = `/login${next}`;
   }
 }

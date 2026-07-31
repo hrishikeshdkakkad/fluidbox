@@ -17,7 +17,7 @@ RES="$(curl -s -X POST -H "Authorization: Bearer $ADMIN" -H "Content-Type: appli
 SID="$(printf '%s' "$RES" | grep -oiE '[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)"
 if [ -n "$SID" ]; then
   echo "started agent '$AGENT' -> session $SID"
-  echo "watch/approve: http://localhost:3000/sessions/$SID"
+  echo "watch/approve: http://localhost:3000/app/sessions/$SID"
 else
   echo "failed: $RES"
 fi

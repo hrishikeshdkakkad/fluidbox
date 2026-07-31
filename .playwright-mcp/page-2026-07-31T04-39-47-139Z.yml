@@ -1,0 +1,74 @@
+- generic [active] [ref=f13e1]:
+  - generic [ref=f13e2]:
+    - banner [ref=f13e3]:
+      - generic [ref=f13e4]:
+        - link "fluidbox control plane" [ref=f13e5] [cursor=pointer]:
+          - /url: /app
+          - generic [ref=f13e6]: fluidbox
+          - generic [ref=f13e7]: control plane
+        - navigation "Primary navigation" [ref=f13e8]:
+          - link "Overview" [ref=f13e9] [cursor=pointer]:
+            - /url: /app
+          - link "Resources" [ref=f13e10] [cursor=pointer]:
+            - /url: /app#configuration
+          - link "Activity" [ref=f13e11] [cursor=pointer]:
+            - /url: /app#operations
+          - link "Governance" [ref=f13e12] [cursor=pointer]:
+            - /url: /app/governance
+          - link "Docs" [ref=f13e13] [cursor=pointer]:
+            - /url: /docs
+          - link "Settings" [ref=f13e14] [cursor=pointer]:
+            - /url: /app/settings
+        - generic [ref=f13e15]:
+          - generic "Control plane online" [ref=f13e16]: Operational
+          - link "New Run" [ref=f13e19] [cursor=pointer]:
+            - /url: /app?action=new-run
+          - button "Use dark theme" [ref=f13e20] [cursor=pointer]:
+            - generic [ref=f13e23]: Dark
+    - main [ref=f13e24]:
+      - generic [ref=f13e26]:
+        - heading "Overview" [level=1] [ref=f13e27]
+        - paragraph [ref=f13e28]: Configure, automate, and monitor governed agent runs.
+      - region [ref=f13e29]:
+        - generic [ref=f13e30]:
+          - generic [ref=f13e31]:
+            - heading "Operations" [level=2] [ref=f13e32]
+            - paragraph [ref=f13e33]: Current activity across manual runs and automations.
+          - generic [ref=f13e34]: Checking
+        - generic "Run summary" [ref=f13e36]:
+          - generic [ref=f13e37]:
+            - text: Active
+            - strong [ref=f13e38]: —
+            - generic [ref=f13e39]: control plane unavailable
+          - generic [ref=f13e40]:
+            - text: Needs Review
+            - strong [ref=f13e41]: —
+            - generic [ref=f13e42]: status unavailable
+          - generic [ref=f13e43]:
+            - text: Completed
+            - strong [ref=f13e44]: —
+            - generic [ref=f13e45]: history unavailable
+          - generic [ref=f13e46]:
+            - text: Success Rate
+            - strong [ref=f13e47]: —
+            - generic [ref=f13e48]: history unavailable
+      - region [ref=f13e49]:
+        - generic [ref=f13e50]:
+          - generic [ref=f13e51]:
+            - heading "Resources" [level=2] [ref=f13e52]
+            - paragraph [ref=f13e53]: Reusable definitions and connections available to every run.
+          - generic [ref=f13e56]:
+            - strong [ref=f13e57]: Setup Required
+            - generic [ref=f13e58]: Create an agent
+        - generic "Loading" [ref=f13e60]
+      - tablist "Runs and automations" [ref=f13e73]:
+        - tab "Run history 0" [selected] [ref=f13e74] [cursor=pointer]
+        - tab "Automations" [ref=f13e75] [cursor=pointer]
+      - tabpanel [ref=f13e76]:
+        - generic [ref=f13e77]:
+          - generic [ref=f13e78]:
+            - text: Every invocation
+            - heading "Run history" [level=2] [ref=f13e79]
+          - generic [ref=f13e80]: Manual and automated runs share one timeline.
+        - generic "Loading" [ref=f13e82]
+  - alert [ref=f13e99]

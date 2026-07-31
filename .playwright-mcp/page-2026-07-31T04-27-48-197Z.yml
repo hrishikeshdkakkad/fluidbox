@@ -1,0 +1,315 @@
+- generic [active] [ref=f7e1]:
+  - generic [ref=f7e2]:
+    - link "Skip to content" [ref=f7e3] [cursor=pointer]:
+      - /url: "#content"
+    - banner [ref=f7e4]:
+      - generic [ref=f7e5]:
+        - link "fluidbox" [ref=f7e6] [cursor=pointer]:
+          - /url: /
+        - navigation "Site" [ref=f7e8]:
+          - link "Product" [ref=f7e9] [cursor=pointer]:
+            - /url: /product
+          - link "Open Source" [ref=f7e10] [cursor=pointer]:
+            - /url: /open-source
+          - link "Docs" [ref=f7e11] [cursor=pointer]:
+            - /url: /docs
+          - link "Security" [ref=f7e12] [cursor=pointer]:
+            - /url: /security
+          - link "GitHub ↗" [ref=f7e13] [cursor=pointer]:
+            - /url: https://github.com/hrishikeshdkakkad/fluidbox
+        - generic [ref=f7e14]:
+          - button "Use light theme" [ref=f7e15] [cursor=pointer]:
+            - generic [ref=f7e19]: Light
+          - link "Sign in" [ref=f7e20] [cursor=pointer]:
+            - /url: /sign-in
+          - link "Get started" [ref=f7e21] [cursor=pointer]:
+            - /url: /docs/getting-started
+    - main [ref=f7e22]:
+      - generic [ref=f7e24]:
+        - complementary [ref=f7e25]:
+          - navigation "Documentation" [ref=f7e26]:
+            - link "Documentation" [ref=f7e27] [cursor=pointer]:
+              - /url: /docs
+              - generic [ref=f7e28]: ⌘
+              - text: Documentation
+            - button "Search docs… ⌘K" [ref=f7e29] [cursor=pointer]:
+              - generic [ref=f7e30]: Search docs…
+              - generic [ref=f7e31]: ⌘K
+            - generic [ref=f7e32]:
+              - generic [ref=f7e33]: Start here
+              - link "Getting started" [ref=f7e34] [cursor=pointer]:
+                - /url: /docs/getting-started
+              - link "Concepts" [ref=f7e35] [cursor=pointer]:
+                - /url: /docs/concepts
+            - generic [ref=f7e36]:
+              - generic [ref=f7e37]: Running agents
+              - link "Agents & revisions" [ref=f7e38] [cursor=pointer]:
+                - /url: /docs/agents
+              - link "Runs & the timeline" [ref=f7e39] [cursor=pointer]:
+                - /url: /docs/runs
+              - link "Triggers & schedules" [ref=f7e40] [cursor=pointer]:
+                - /url: /docs/triggers
+            - generic [ref=f7e41]:
+              - generic [ref=f7e42]: Governance
+              - link "The permission gate" [ref=f7e43] [cursor=pointer]:
+                - /url: /docs/governance
+              - link "Policies" [ref=f7e44] [cursor=pointer]:
+                - /url: /docs/policies
+              - link "Approvals" [ref=f7e45] [cursor=pointer]:
+                - /url: /docs/approvals
+              - link "Capabilities" [ref=f7e46] [cursor=pointer]:
+                - /url: /docs/capabilities
+            - generic [ref=f7e47]:
+              - generic [ref=f7e48]: Deployment
+              - link "Docker" [ref=f7e49] [cursor=pointer]:
+                - /url: /docs/docker
+              - link "Kubernetes" [ref=f7e50] [cursor=pointer]:
+                - /url: /docs/kubernetes
+              - link "Security model" [ref=f7e51] [cursor=pointer]:
+                - /url: /docs/security
+            - generic [ref=f7e52]:
+              - generic [ref=f7e53]: Extending
+              - link "Building a harness" [ref=f7e54] [cursor=pointer]:
+                - /url: /docs/runner-contract
+            - generic [ref=f7e55]:
+              - generic [ref=f7e56]: Reference
+              - link "API overview" [ref=f7e57] [cursor=pointer]:
+                - /url: /docs/api
+              - link "Authentication" [ref=f7e58] [cursor=pointer]:
+                - /url: /docs/authentication
+              - link "API reference" [ref=f7e59] [cursor=pointer]:
+                - /url: /docs/api/reference
+            - generic [ref=f7e60]:
+              - generic [ref=f7e61]: Spec
+              - link "Schemas & examples" [ref=f7e62] [cursor=pointer]:
+                - /url: /docs/api.html
+              - link "openapi.yaml ↓" [ref=f7e63] [cursor=pointer]:
+                - /url: /docs/openapi.yaml
+        - generic [ref=f7e66]:
+          - generic [ref=f7e67]:
+            - generic [ref=f7e68]: fluidbox · documentation
+            - heading "Build against the control plane." [level=1] [ref=f7e69]: Build against thecontrol plane.
+            - paragraph [ref=f7e70]: Run AI agents in governed, disposable sandboxes — and integrate the runs, the approvals, and the audit trail into your own systems.
+            - generic [ref=f7e71]:
+              - link "Getting started →" [ref=f7e72] [cursor=pointer]:
+                - /url: /docs/getting-started
+              - link "API reference" [ref=f7e73] [cursor=pointer]:
+                - /url: /docs/api/reference
+              - link "OpenAPI 3.1 ↓" [ref=f7e74] [cursor=pointer]:
+                - /url: /docs/openapi.yaml
+            - generic [ref=f7e75]:
+              - generic [ref=f7e76]:
+                - strong [ref=f7e77]: "106"
+                - text: operations
+              - generic [ref=f7e79]:
+                - text: spec
+                - strong [ref=f7e80]: v0.3.0
+              - generic [ref=f7e82]:
+                - strong [ref=f7e83]: "16"
+                - text: pages
+          - generic [ref=f7e84]:
+            - heading "Start here" [level=2] [ref=f7e85]
+            - generic [ref=f7e86]:
+              - link "Start here Getting started Get a governed run — one that actually pauses for your approval — in about five minutes." [ref=f7e87] [cursor=pointer]:
+                - /url: /docs/getting-started
+                - generic [ref=f7e88]: Start here
+                - generic [ref=f7e89]: Getting started
+                - paragraph [ref=f7e90]: Get a governed run — one that actually pauses for your approval — in about five minutes.
+              - link "Start here Concepts The object model, in the order you meet it. Each of these is a real API object; none of them is decorative. If you only read one page before integrating, read this one — the most common mistakes are all vocabulary mistakes." [ref=f7e91] [cursor=pointer]:
+                - /url: /docs/concepts
+                - generic [ref=f7e92]: Start here
+                - generic [ref=f7e93]: Concepts
+                - paragraph [ref=f7e94]: The object model, in the order you meet it. Each of these is a real API object; none of them is decorative. If you only read one page before integrating, read this one — the most common mistakes are all vocabulary mistakes.
+          - generic [ref=f7e95]:
+            - heading "Running agents" [level=2] [ref=f7e96]
+            - generic [ref=f7e97]:
+              - link "Running agents Agents & revisions An agent is a stable name with an append-only history. Every property that shapes behavior lives on a revision; a run always uses the latest revision at creation and freezes it into the RunSpec. Nothing here is ever edited in place — that is what keeps last month's audit trail meaningful." [ref=f7e98] [cursor=pointer]:
+                - /url: /docs/agents
+                - generic [ref=f7e99]: Running agents
+                - generic [ref=f7e100]: Agents & revisions
+                - paragraph [ref=f7e101]: An agent is a stable name with an append-only history. Every property that shapes behavior lives on a revision; a run always uses the latest revision at creation and freezes it into the RunSpec. Nothing here is ever edited in place — that is what keeps last month's audit trail meaningful.
+              - 'link "Running agents Runs & the timeline A run is one governed execution of an agent: an immutable specification, a fresh sandbox, a live event timeline, and a terminal record with a diff and a cost report. The API calls runs sessions; the two words mean the same object." [ref=f7e102] [cursor=pointer]':
+                - /url: /docs/runs
+                - generic [ref=f7e103]: Running agents
+                - generic [ref=f7e104]: Runs & the timeline
+                - paragraph [ref=f7e105]: "A run is one governed execution of an agent: an immutable specification, a fresh sandbox, a live event timeline, and a terminal record with a diff and a cost report. The API calls runs sessions; the two words mean the same object."
+              - 'link "Running agents Triggers & schedules \"Borrow the agent, on demand\": any external circumstance — an API call, a cron tick, a webhook — can start a run of a registered agent and get the outcome delivered back, signed. Every entry point converges on the same governed run path (frozen RunSpec, policy gate, budgets); a trigger never widens what an agent may do." [ref=f7e106] [cursor=pointer]':
+                - /url: /docs/triggers
+                - generic [ref=f7e107]: Running agents
+                - generic [ref=f7e108]: Triggers & schedules
+                - paragraph [ref=f7e109]: "\"Borrow the agent, on demand\": any external circumstance — an API call, a cron tick, a webhook — can start a run of a registered agent and get the outcome delivered back, signed. Every entry point converges on the same governed run path (frozen RunSpec, policy gate, budgets); a trigger never widens what an agent may do."
+          - generic [ref=f7e110]:
+            - heading "Governance" [level=2] [ref=f7e111]
+            - generic [ref=f7e112]:
+              - link "Governance The permission gate There is exactly one place in fluidbox where \"can this happen?\" is answered. Every tool call — from the model's own Bash to a brokered MCP call reaching a customer's Jira — passes through it, and the order of its stages is the security model." [ref=f7e113] [cursor=pointer]:
+                - /url: /docs/governance
+                - generic [ref=f7e114]: Governance
+                - generic [ref=f7e115]: The permission gate
+                - paragraph [ref=f7e116]: There is exactly one place in fluidbox where "can this happen?" is answered. Every tool call — from the model's own Bash to a brokered MCP call reaching a customer's Jira — passes through it, and the order of its stages is the security model.
+              - 'link "Governance Policies A policy is evaluated on every tool call an agent makes. The verdict is one of allow, deny, or approve (pause for a human). Policies live in the control plane as append-only versions: the Governance page is the authoring surface, every publish is an immutable version with an author and a summary, and every run freezes a snapshot of its policy''s latest version into the RunSpec — editing a policy only affects future runs, never in-flight ones." [ref=f7e117] [cursor=pointer]':
+                - /url: /docs/policies
+                - generic [ref=f7e118]: Governance
+                - generic [ref=f7e119]: Policies
+                - paragraph [ref=f7e120]: "A policy is evaluated on every tool call an agent makes. The verdict is one of allow, deny, or approve (pause for a human). Policies live in the control plane as append-only versions: the Governance page is the authoring surface, every publish is an immutable version with an author and a summary, and every run freezes a snapshot of its policy's latest version into the RunSpec — editing a policy only affects future runs, never in-flight ones."
+              - link "Governance Approvals The pause in the middle of a run. When the permission gate resolves a tool call to approve, the run enters awaiting_approval, an approval.requested event appears on the timeline, and the tool call blocks until a human decides — or the approval expires." [ref=f7e121] [cursor=pointer]:
+                - /url: /docs/approvals
+                - generic [ref=f7e122]: Governance
+                - generic [ref=f7e123]: Approvals
+                - paragraph [ref=f7e124]: The pause in the middle of a run. When the permission gate resolves a tool call to approve, the run enters awaiting_approval, an approval.requested event appears on the timeline, and the tool call blocks until a human decides — or the approval expires.
+              - link "Governance Capabilities There are exactly two tool classes, and the split is the security model:" [ref=f7e125] [cursor=pointer]:
+                - /url: /docs/capabilities
+                - generic [ref=f7e126]: Governance
+                - generic [ref=f7e127]: Capabilities
+                - paragraph [ref=f7e128]: "There are exactly two tool classes, and the split is the security model:"
+          - generic [ref=f7e129]:
+            - heading "Deployment" [level=2] [ref=f7e130]
+            - generic [ref=f7e131]:
+              - 'link "Deployment Docker Two Docker paths: the eval stack (published images, one command, nothing built locally) and the from-source stack (just recipes around a local build). Both run the same control plane; the difference is posture." [ref=f7e132] [cursor=pointer]':
+                - /url: /docs/docker
+                - generic [ref=f7e133]: Deployment
+                - generic [ref=f7e134]: Docker
+                - paragraph [ref=f7e135]: "Two Docker paths: the eval stack (published images, one command, nothing built locally) and the from-source stack (just recipes around a local build). Both run the same control plane; the difference is posture."
+              - link "Deployment Kubernetes fluidbox runs on any conformant Kubernetes cluster with an enforcing CNI — kind, AWS EKS, Google GKE, Azure AKS, DigitalOcean DOKS, or anything else in its support window. fluidbox ships a Kubernetes-native execution provider and an OCI Helm chart. This guide takes you from zero to a certified, run-serving cluster, with the real-world gotchas and costs from a live cloud acceptance." [ref=f7e136] [cursor=pointer]:
+                - /url: /docs/kubernetes
+                - generic [ref=f7e137]: Deployment
+                - generic [ref=f7e138]: Kubernetes
+                - paragraph [ref=f7e139]: fluidbox runs on any conformant Kubernetes cluster with an enforcing CNI — kind, AWS EKS, Google GKE, Azure AKS, DigitalOcean DOKS, or anything else in its support window. fluidbox ships a Kubernetes-native execution provider and an OCI Helm chart. This guide takes you from zero to a certified, run-serving cluster, with the real-world gotchas and costs from a live cloud acceptance.
+              - 'link "Deployment Security model fluidbox''s promise is containment and accountability: hand an agent a repository and a credential, and still be able to answer, afterwards, exactly what it did and why it was allowed to. This page is the map of how that promise is enforced; the threat model and PLAN.md carry the full rationale." [ref=f7e140] [cursor=pointer]':
+                - /url: /docs/security
+                - generic [ref=f7e141]: Deployment
+                - generic [ref=f7e142]: Security model
+                - paragraph [ref=f7e143]: "fluidbox's promise is containment and accountability: hand an agent a repository and a credential, and still be able to answer, afterwards, exactly what it did and why it was allowed to. This page is the map of how that promise is enforced; the threat model and PLAN.md carry the full rationale."
+          - generic [ref=f7e144]:
+            - heading "Extending" [level=2] [ref=f7e145]
+            - link "Extending Building a harness A harness is an agent framework running inside a sandbox. fluidbox ships two — the Claude Agent SDK and Codex — and adding a third is a first-class extension point rather than a fork." [ref=f7e147] [cursor=pointer]:
+              - /url: /docs/runner-contract
+              - generic [ref=f7e148]: Extending
+              - generic [ref=f7e149]: Building a harness
+              - paragraph [ref=f7e150]: A harness is an agent framework running inside a sandbox. fluidbox ships two — the Claude Agent SDK and Codex — and adding a third is a first-class extension point rather than a fork.
+          - generic [ref=f7e151]:
+            - heading "Reference" [level=2] [ref=f7e152]
+            - generic [ref=f7e153]:
+              - link "Reference API overview One HTTP surface at /v1, JSON in and out, designed so that the credential you hold determines exactly what you can reach — and so that a record exists for everything you do with it." [ref=f7e154] [cursor=pointer]:
+                - /url: /docs/api
+                - generic [ref=f7e155]: Reference
+                - generic [ref=f7e156]: API overview
+                - paragraph [ref=f7e157]: One HTTP surface at /v1, JSON in and out, designed so that the credential you hold determines exactly what you can reach — and so that a record exists for everything you do with it.
+              - link "Reference Authentication fluidbox has four kinds of credential, and they are not interchangeable. Picking the wrong one is the single most common integration mistake, so this page is mostly about which rather than how." [ref=f7e158] [cursor=pointer]:
+                - /url: /docs/authentication
+                - generic [ref=f7e159]: Reference
+                - generic [ref=f7e160]: Authentication
+                - paragraph [ref=f7e161]: fluidbox has four kinds of credential, and they are not interchangeable. Picking the wrong one is the single most common integration mistake, so this page is mostly about which rather than how.
+              - link "Reference API reference Every endpoint across the four planes — 106 operations generated from the same OpenAPI description you can download above." [ref=f7e162] [cursor=pointer]:
+                - /url: /docs/api/reference
+                - generic [ref=f7e163]: Reference
+                - generic [ref=f7e164]: API reference
+                - paragraph [ref=f7e165]: Every endpoint across the four planes — 106 operations generated from the same OpenAPI description you can download above.
+          - generic [ref=f7e166]:
+            - heading "The four planes" [level=2] [ref=f7e167]
+            - generic [ref=f7e168]:
+              - paragraph [ref=f7e169]: The HTTP surface is four audiences with four different credentials. Mixing them up is the most common integration mistake.
+              - table [ref=f7e171]:
+                - rowgroup [ref=f7e172]:
+                  - row [ref=f7e173]:
+                    - columnheader "Plane" [ref=f7e174]
+                    - columnheader "Base path" [ref=f7e175]
+                    - columnheader "Who calls it" [ref=f7e176]
+                    - columnheader "Credential" [ref=f7e177]
+                - rowgroup [ref=f7e178]:
+                  - row [ref=f7e179]:
+                    - cell "Public API" [ref=f7e180]
+                    - cell [ref=f7e181]:
+                      - code [ref=f7e182]: /v1
+                    - cell "Your code, the CLI, the dashboard" [ref=f7e183]
+                    - cell "Admin token, PAT, or session cookie" [ref=f7e184]
+                  - row [ref=f7e185]:
+                    - cell "Runner contract" [ref=f7e186]
+                    - cell [ref=f7e187]:
+                      - code [ref=f7e188]: /internal
+                    - cell "Only the in-sandbox runner" [ref=f7e189]
+                    - cell "Audience-scoped session token" [ref=f7e190]
+                  - row [ref=f7e191]:
+                    - cell "Operator" [ref=f7e192]
+                    - cell [ref=f7e193]:
+                      - code [ref=f7e194]: /v1/admin
+                    - cell "Break-glass tooling" [ref=f7e195]
+                    - cell "Admin token only" [ref=f7e196]
+                  - row [ref=f7e197]:
+                    - cell "Ingress" [ref=f7e198]
+                    - cell [ref=f7e199]:
+                      - code [ref=f7e200]: /v1/ingress
+                    - cell "GitHub and other services" [ref=f7e201]
+                    - cell "Webhook signature" [ref=f7e202]
+              - paragraph [ref=f7e203]:
+                - text: On Kubernetes the runner contract is served on a
+                - strong [ref=f7e204]: separate listener
+                - text: and
+                - code [ref=f7e205]: /internal
+                - text: does not exist on the public one at all — route absence is a stronger boundary than bearer authentication.
+    - contentinfo [ref=f7e206]:
+      - generic [ref=f7e207]:
+        - generic [ref=f7e208]:
+          - generic [ref=f7e209]:
+            - text: fluidbox
+            - paragraph [ref=f7e210]: The open-source control plane for governed AI agents. Run agents without giving them God mode.
+          - navigation "Product" [ref=f7e211]:
+            - list [ref=f7e213]:
+              - listitem [ref=f7e214]:
+                - link "Overview" [ref=f7e215] [cursor=pointer]:
+                  - /url: /product
+              - listitem [ref=f7e216]:
+                - link "Pricing" [ref=f7e217] [cursor=pointer]:
+                  - /url: /pricing
+              - listitem [ref=f7e218]:
+                - link "Changelog" [ref=f7e219] [cursor=pointer]:
+                  - /url: /changelog
+              - listitem [ref=f7e220]:
+                - link "Dashboard" [ref=f7e221] [cursor=pointer]:
+                  - /url: /app
+          - navigation "Documentation" [ref=f7e222]:
+            - list [ref=f7e224]:
+              - listitem [ref=f7e225]:
+                - link "Getting started" [ref=f7e226] [cursor=pointer]:
+                  - /url: /docs/getting-started
+              - listitem [ref=f7e227]:
+                - link "Concepts" [ref=f7e228] [cursor=pointer]:
+                  - /url: /docs/concepts
+              - listitem [ref=f7e229]:
+                - link "API" [ref=f7e230] [cursor=pointer]:
+                  - /url: /docs/api
+              - listitem [ref=f7e231]:
+                - link "Kubernetes" [ref=f7e232] [cursor=pointer]:
+                  - /url: /docs/kubernetes
+          - navigation "Project" [ref=f7e233]:
+            - list [ref=f7e235]:
+              - listitem [ref=f7e236]:
+                - link "GitHub ↗" [ref=f7e237] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox
+              - listitem [ref=f7e238]:
+                - link "Roadmap ↗" [ref=f7e239] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/ROADMAP.md
+              - listitem [ref=f7e240]:
+                - link "Contributing ↗" [ref=f7e241] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/CONTRIBUTING.md
+              - listitem [ref=f7e242]:
+                - link "Good first issues ↗" [ref=f7e243] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22
+          - navigation "Trust" [ref=f7e244]:
+            - list [ref=f7e246]:
+              - listitem [ref=f7e247]:
+                - link "Security" [ref=f7e248] [cursor=pointer]:
+                  - /url: /security
+              - listitem [ref=f7e249]:
+                - link "Disclosure policy ↗" [ref=f7e250] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/SECURITY.md
+              - listitem [ref=f7e251]:
+                - link "MIT license ↗" [ref=f7e252] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/LICENSE
+              - listitem [ref=f7e253]:
+                - link "Code of conduct ↗" [ref=f7e254] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/CODE_OF_CONDUCT.md
+        - generic [ref=f7e255]:
+          - generic [ref=f7e256]: fluidbox — MIT licensed, built in the open.
+          - link "github.com/hrishikeshdkakkad/fluidbox" [ref=f7e257] [cursor=pointer]:
+            - /url: https://github.com/hrishikeshdkakkad/fluidbox
+  - alert [ref=f7e258]

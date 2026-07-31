@@ -1,0 +1,326 @@
+- generic [active] [ref=f11e1]:
+  - generic [ref=f11e2]:
+    - link "Skip to content" [ref=f11e3] [cursor=pointer]:
+      - /url: "#content"
+    - banner [ref=f11e4]:
+      - generic [ref=f11e5]:
+        - link "fluidbox" [ref=f11e6] [cursor=pointer]:
+          - /url: /
+        - generic [ref=f11e8]:
+          - button "Use dark theme" [ref=f11e9] [cursor=pointer]
+          - button "Open navigation" [ref=f11e12] [cursor=pointer]
+    - main [ref=f11e15]:
+      - generic [ref=f11e17]:
+        - complementary [ref=f11e18]:
+          - navigation "Documentation" [ref=f11e19]:
+            - link "Documentation" [ref=f11e20] [cursor=pointer]:
+              - /url: /docs
+              - generic [ref=f11e21]: ⌘
+              - text: Documentation
+            - button "Search docs… ⌘K" [ref=f11e22] [cursor=pointer]:
+              - generic [ref=f11e23]: Search docs…
+              - generic [ref=f11e24]: ⌘K
+            - generic [ref=f11e25]:
+              - link "Getting started" [ref=f11e26] [cursor=pointer]:
+                - /url: /docs/getting-started
+              - link "Concepts" [ref=f11e27] [cursor=pointer]:
+                - /url: /docs/concepts
+            - generic [ref=f11e28]:
+              - link "Agents & revisions" [ref=f11e29] [cursor=pointer]:
+                - /url: /docs/agents
+              - link "Runs & the timeline" [ref=f11e30] [cursor=pointer]:
+                - /url: /docs/runs
+              - link "Triggers & schedules" [ref=f11e31] [cursor=pointer]:
+                - /url: /docs/triggers
+            - generic [ref=f11e32]:
+              - link "The permission gate" [ref=f11e33] [cursor=pointer]:
+                - /url: /docs/governance
+              - link "Policies" [ref=f11e34] [cursor=pointer]:
+                - /url: /docs/policies
+              - link "Approvals" [ref=f11e35] [cursor=pointer]:
+                - /url: /docs/approvals
+              - link "Capabilities" [ref=f11e36] [cursor=pointer]:
+                - /url: /docs/capabilities
+            - generic [ref=f11e37]:
+              - link "Docker" [ref=f11e38] [cursor=pointer]:
+                - /url: /docs/docker
+              - link "Kubernetes" [ref=f11e39] [cursor=pointer]:
+                - /url: /docs/kubernetes
+              - link "Security model" [ref=f11e40] [cursor=pointer]:
+                - /url: /docs/security
+            - link "Building a harness" [ref=f11e42] [cursor=pointer]:
+              - /url: /docs/runner-contract
+            - generic [ref=f11e43]:
+              - link "API overview" [ref=f11e44] [cursor=pointer]:
+                - /url: /docs/api
+              - link "Authentication" [ref=f11e45] [cursor=pointer]:
+                - /url: /docs/authentication
+              - link "API reference" [ref=f11e46] [cursor=pointer]:
+                - /url: /docs/api/reference
+            - generic [ref=f11e47]:
+              - link "Schemas & examples" [ref=f11e48] [cursor=pointer]:
+                - /url: /docs/api.html
+              - link "openapi.yaml ↓" [ref=f11e49] [cursor=pointer]:
+                - /url: /docs/openapi.yaml
+        - article [ref=f11e52]:
+          - generic [ref=f11e53]:
+            - link "Docs" [ref=f11e54] [cursor=pointer]:
+              - /url: /docs
+            - generic [ref=f11e55]: /
+            - generic [ref=f11e56]: Running agents
+          - heading "Runs & the timeline" [level=1] [ref=f11e57]
+          - generic [ref=f11e58]:
+            - paragraph [ref=f11e59]:
+              - text: "A run is one governed execution of an agent: an immutable specification, a fresh sandbox, a live event timeline, and a terminal record with a diff and a cost report. The API calls runs"
+              - emphasis [ref=f11e60]: sessions
+              - text: ; the two words mean the same object.
+            - heading [level=3] [ref=f11e61]:
+              - link "Start a run" [ref=f11e62] [cursor=pointer]:
+                - /url: "#start-a-run"
+            - generic [ref=f11e63]:
+              - code [ref=f11e66]:
+                - generic [ref=f11e67]: RUN=$(curl -sX POST "$FLUIDBOX_URL/v1/sessions" \
+                - generic [ref=f11e68]: "-H \"Authorization: Bearer $FLUIDBOX_ADMIN_TOKEN\" \\"
+                - generic [ref=f11e69]: "-H 'content-type: application/json' \\"
+                - generic [ref=f11e70]: "-d '{"
+                - generic [ref=f11e71]: "\"agent\": \"fixer\","
+                - generic [ref=f11e72]: "\"task\": \"Fix the failing test in crates/fluidbox-core.\","
+                - generic [ref=f11e73]: "\"workspace\": { \"kind\": \"local_copy\", \"path\": \"'\"$PWD\"'\" }"
+                - generic [ref=f11e74]: "}' | jq -r .session.id)"
+              - button "Copy code" [ref=f11e75] [cursor=pointer]: Copy
+            - list [ref=f11e76]:
+              - listitem [ref=f11e77]:
+                - code [ref=f11e78]: agent
+                - text: — name or id; the run uses the agent's
+                - strong [ref=f11e79]: latest revision
+                - text: .
+              - listitem [ref=f11e80]:
+                - code [ref=f11e81]: task
+                - text: — what to do
+                - emphasis [ref=f11e82]: this time
+                - text: (the system prompt lives on the revision).
+              - listitem [ref=f11e83]:
+                - code [ref=f11e84]: workspace
+                - text: "— optional; falls back to the revision's default:"
+              - listitem [ref=f11e85]:
+                - code [ref=f11e86]: "{\"kind\":\"scratch\"}"
+                - text: — an empty directory;
+              - listitem [ref=f11e87]:
+                - code [ref=f11e88]: "{\"kind\":\"local_copy\",\"path\":\"/abs/path\"}"
+                - text: — copies the path. The original is never touched;
+              - listitem [ref=f11e89]:
+                - code [ref=f11e90]: "{\"kind\":\"git_repository\",\"connection_id\":\"…\",\"repository\":\"acme/widgets\",\"ref\":\"main\"}"
+                - text: — fetched
+                - strong [ref=f11e91]: control-plane-side
+                - text: through the connection's credential, before the agent exists. The sandbox sees a bind-mounted copy at
+                - code [ref=f11e92]: /workspace
+                - text: and needs no network egress.
+              - listitem [ref=f11e93]:
+                - code [ref=f11e94]: "autonomous: true"
+                - text: "— no human in the loop:"
+                - code [ref=f11e95]: approve
+                - text: verdicts are rewritten to the policy's fallback
+                - emphasis [ref=f11e96]: inside
+                - text: the engine (both verdicts recorded). A policy may forbid autonomy outright.
+            - heading [level=3] [ref=f11e97]:
+              - link "What freezes at creation" [ref=f11e98] [cursor=pointer]:
+                - /url: "#what-freezes-at-creation"
+            - paragraph [ref=f11e99]:
+              - text: The
+              - strong [ref=f11e100]: RunSpec
+              - text: ": the revision's model and system prompt, the task, a"
+              - strong [ref=f11e101]: full policy snapshot
+              - text: ", the resolved workspace, the effective budgets (policy ∩ revision ∩ run — tightening only), the exact tool surface (sandbox tool schemas and brokered bindings with their tool snapshots), and the invocation context (who or what started this run). Everything the run is judged by is in that snapshot; nothing that happens later can rewrite it."
+            - heading [level=3] [ref=f11e102]:
+              - link "The lifecycle" [ref=f11e103] [cursor=pointer]:
+                - /url: "#the-lifecycle"
+            - paragraph [ref=f11e104]:
+              - code [ref=f11e105]: initializing
+              - text: (workspace prepared control-plane-side) →
+              - code [ref=f11e106]: running
+              - text: →
+              - code [ref=f11e107]: awaiting_approval
+              - text: "(paused on a human decision, possibly repeatedly) → one of four terminal states:"
+              - code [ref=f11e108]: completed
+              - text: ","
+              - code [ref=f11e109]: failed
+              - text: ","
+              - code [ref=f11e110]: cancelled
+              - text: ","
+              - code [ref=f11e111]: budget_exceeded
+              - text: . The
+              - strong [ref=f11e112]: server is the single status writer
+              - text: — the runner only reports; a crashed sandbox is noticed by the heartbeat watchdog, a stuck run by the wall-clock sweeper.
+            - generic [ref=f11e113]:
+              - code [ref=f11e116]:
+                - generic [ref=f11e117]: curl -sX POST "$FLUIDBOX_URL/v1/sessions/$RUN/cancel" \
+                - generic [ref=f11e118]: "-H \"Authorization: Bearer $FLUIDBOX_ADMIN_TOKEN\""
+              - button "Copy code" [ref=f11e119] [cursor=pointer]: Copy
+            - heading [level=3] [ref=f11e120]:
+              - link "Follow the timeline" [ref=f11e121] [cursor=pointer]:
+                - /url: "#follow-the-timeline"
+            - paragraph [ref=f11e122]: "Streaming:"
+            - generic [ref=f11e123]:
+              - code [ref=f11e126]:
+                - generic [ref=f11e127]: curl -N "$FLUIDBOX_URL/v1/sessions/$RUN/events/stream" \
+                - generic [ref=f11e128]: "-H \"Authorization: Bearer $FLUIDBOX_ADMIN_TOKEN\""
+              - button "Copy code" [ref=f11e129] [cursor=pointer]: Copy
+            - paragraph [ref=f11e130]:
+              - text: Every event carries a **gapless per-session
+              - code [ref=f11e131]: seq
+              - text: "**. The stream is resumable — reconnect with"
+              - code [ref=f11e132]: "Last-Event-ID: <last seq>"
+              - text: "and delivery continues exactly where it stopped. Under the hood a database notification is only a wakeup; the sequence catch-up query is the delivery source of truth, so polling and streaming are exact about each other:"
+            - generic [ref=f11e133]:
+              - code [ref=f11e136]:
+                - generic [ref=f11e137]: curl -s "$FLUIDBOX_URL/v1/sessions/$RUN/events?after=42" \
+                - generic [ref=f11e138]: "-H \"Authorization: Bearer $FLUIDBOX_ADMIN_TOKEN\""
+              - button "Copy code" [ref=f11e139] [cursor=pointer]: Copy
+            - paragraph [ref=f11e140]: "The vocabulary you will see, in the order a governed tool call produces it:"
+            - table [ref=f11e142]:
+              - rowgroup [ref=f11e143]:
+                - row [ref=f11e144]:
+                  - columnheader "Event" [ref=f11e145]
+                  - columnheader "Meaning" [ref=f11e146]
+              - rowgroup [ref=f11e147]:
+                - row [ref=f11e148]:
+                  - cell [ref=f11e149]:
+                    - code [ref=f11e150]: tool.requested
+                  - cell "The agent asked to use a tool (arguments digested, never stored raw)." [ref=f11e151]
+                - row [ref=f11e152]:
+                  - cell [ref=f11e153]:
+                    - code [ref=f11e154]: tool.decision
+                  - cell "The gate's verdict — allow, deny, or \"ask a human\" — with its source (budget, capability, schema, trust tier, policy, approval)." [ref=f11e155]
+                - row [ref=f11e156]:
+                  - cell [ref=f11e157]:
+                    - code [ref=f11e158]: approval.requested
+                    - text: /
+                    - code [ref=f11e159]: approval.decided
+                  - cell "The pause and the human (or expiry) decision." [ref=f11e160]
+                - row [ref=f11e161]:
+                  - cell [ref=f11e162]:
+                    - code [ref=f11e163]: tool.brokered
+                  - 'cell "A control-plane-executed tool call completed: latency and a result digest, never payloads." [ref=f11e164]'
+                - row [ref=f11e165]:
+                  - cell "usage events" [ref=f11e166]
+                  - cell "Metered model usage as the facade tees the stream." [ref=f11e167]
+            - paragraph [ref=f11e168]: Prompts and file contents never appear — the ledger only accepts redacted events, and that is enforced by construction, not convention.
+            - heading [level=3] [ref=f11e169]:
+              - link "Read the outcome" [ref=f11e170] [cursor=pointer]:
+                - /url: "#read-the-outcome"
+            - generic [ref=f11e171]:
+              - code [ref=f11e174]:
+                - generic [ref=f11e175]: "curl -s \"$FLUIDBOX_URL/v1/sessions/$RUN\" -H \"Authorization: Bearer $FLUIDBOX_ADMIN_TOKEN\" | jq .session.status"
+                - generic [ref=f11e176]: "curl -s \"$FLUIDBOX_URL/v1/sessions/$RUN/cost\" -H \"Authorization: Bearer $FLUIDBOX_ADMIN_TOKEN\""
+                - generic [ref=f11e177]: "curl -s \"$FLUIDBOX_URL/v1/sessions/$RUN/artifacts\" -H \"Authorization: Bearer $FLUIDBOX_ADMIN_TOKEN\""
+              - button "Copy code" [ref=f11e178] [cursor=pointer]: Copy
+            - paragraph [ref=f11e179]:
+              - text: Artifacts include the workspace
+              - strong [ref=f11e180]: diff
+              - text: — what the agent actually changed, reviewable before anything leaves the machine. Cost is
+              - strong [ref=f11e181]: measured, not estimated
+              - text: ": usage is teed off the streaming model response by the facade as it passes through, and the same numbers back the budget stop."
+            - heading [level=3] [ref=f11e182]:
+              - link "Runs started by machines" [ref=f11e183] [cursor=pointer]:
+                - /url: "#runs-started-by-machines"
+            - paragraph [ref=f11e184]:
+              - text: API triggers, schedules, and connected-service events all converge on the same creation path and freeze the same RunSpec — with the invocation context recorded (which subscription, which delivery, which actor). See
+              - link "Triggers & schedules" [ref=f11e185] [cursor=pointer]:
+                - /url: /docs/triggers
+              - text: . Results can be delivered outward by signed, retrying webhooks — decoupled from the run, so a dead receiver never affects one.
+            - heading [level=3] [ref=f11e186]:
+              - link "Next" [ref=f11e187] [cursor=pointer]:
+                - /url: "#next"
+            - list [ref=f11e188]:
+              - listitem [ref=f11e189]:
+                - link "Approvals" [ref=f11e190] [cursor=pointer]:
+                  - /url: /docs/approvals
+                - text: — the pause in the middle
+              - listitem [ref=f11e191]:
+                - link "The permission gate" [ref=f11e192] [cursor=pointer]:
+                  - /url: /docs/governance
+                - text: — how each
+                - code [ref=f11e193]: tool.decision
+                - text: is made
+              - listitem [ref=f11e194]:
+                - link "API overview" [ref=f11e195] [cursor=pointer]:
+                  - /url: /docs/api
+                - text: — credentials, errors, and the full surface
+          - link "Edit this page on GitHub ↗" [ref=f11e197] [cursor=pointer]:
+            - /url: https://github.com/hrishikeshdkakkad/fluidbox/edit/main/docs/guides/runs.md
+          - navigation "Pagination" [ref=f11e198]:
+            - link "← Previous Agents & revisions" [ref=f11e199] [cursor=pointer]:
+              - /url: /docs/agents
+              - generic [ref=f11e200]: ← Previous
+              - generic [ref=f11e201]: Agents & revisions
+            - link "Next → Triggers & schedules" [ref=f11e202] [cursor=pointer]:
+              - /url: /docs/triggers
+              - generic [ref=f11e203]: Next →
+              - generic [ref=f11e204]: Triggers & schedules
+    - contentinfo [ref=f11e205]:
+      - generic [ref=f11e206]:
+        - generic [ref=f11e207]:
+          - generic [ref=f11e208]:
+            - text: fluidbox
+            - paragraph [ref=f11e209]: The open-source control plane for governed AI agents. Run agents without giving them God mode.
+          - navigation "Product" [ref=f11e210]:
+            - list [ref=f11e212]:
+              - listitem [ref=f11e213]:
+                - link "Overview" [ref=f11e214] [cursor=pointer]:
+                  - /url: /product
+              - listitem [ref=f11e215]:
+                - link "Pricing" [ref=f11e216] [cursor=pointer]:
+                  - /url: /pricing
+              - listitem [ref=f11e217]:
+                - link "Changelog" [ref=f11e218] [cursor=pointer]:
+                  - /url: /changelog
+              - listitem [ref=f11e219]:
+                - link "Dashboard" [ref=f11e220] [cursor=pointer]:
+                  - /url: /app
+          - navigation "Documentation" [ref=f11e221]:
+            - list [ref=f11e223]:
+              - listitem [ref=f11e224]:
+                - link "Getting started" [ref=f11e225] [cursor=pointer]:
+                  - /url: /docs/getting-started
+              - listitem [ref=f11e226]:
+                - link "Concepts" [ref=f11e227] [cursor=pointer]:
+                  - /url: /docs/concepts
+              - listitem [ref=f11e228]:
+                - link "API" [ref=f11e229] [cursor=pointer]:
+                  - /url: /docs/api
+              - listitem [ref=f11e230]:
+                - link "Kubernetes" [ref=f11e231] [cursor=pointer]:
+                  - /url: /docs/kubernetes
+          - navigation "Project" [ref=f11e232]:
+            - list [ref=f11e234]:
+              - listitem [ref=f11e235]:
+                - link "GitHub ↗" [ref=f11e236] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox
+              - listitem [ref=f11e237]:
+                - link "Roadmap ↗" [ref=f11e238] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/ROADMAP.md
+              - listitem [ref=f11e239]:
+                - link "Contributing ↗" [ref=f11e240] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/CONTRIBUTING.md
+              - listitem [ref=f11e241]:
+                - link "Good first issues ↗" [ref=f11e242] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22
+          - navigation "Trust" [ref=f11e243]:
+            - list [ref=f11e245]:
+              - listitem [ref=f11e246]:
+                - link "Security" [ref=f11e247] [cursor=pointer]:
+                  - /url: /security
+              - listitem [ref=f11e248]:
+                - link "Disclosure policy ↗" [ref=f11e249] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/SECURITY.md
+              - listitem [ref=f11e250]:
+                - link "MIT license ↗" [ref=f11e251] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/LICENSE
+              - listitem [ref=f11e252]:
+                - link "Code of conduct ↗" [ref=f11e253] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/CODE_OF_CONDUCT.md
+        - generic [ref=f11e254]:
+          - generic [ref=f11e255]: fluidbox — MIT licensed, built in the open.
+          - link "github.com/hrishikeshdkakkad/fluidbox" [ref=f11e256] [cursor=pointer]:
+            - /url: https://github.com/hrishikeshdkakkad/fluidbox
+  - alert [ref=f11e257]

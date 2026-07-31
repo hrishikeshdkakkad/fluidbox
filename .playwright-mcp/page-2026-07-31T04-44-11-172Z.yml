@@ -1,0 +1,188 @@
+- generic [active] [ref=f34e1]:
+  - generic [ref=f34e2]:
+    - banner [ref=f34e3]:
+      - generic [ref=f34e4]:
+        - link "fluidbox control plane" [ref=f34e5] [cursor=pointer]:
+          - /url: /app
+          - generic [ref=f34e6]: fluidbox
+          - generic [ref=f34e7]: control plane
+        - navigation "Primary navigation" [ref=f34e8]:
+          - link "Overview" [ref=f34e9] [cursor=pointer]:
+            - /url: /app
+          - link "Resources" [ref=f34e10] [cursor=pointer]:
+            - /url: /app#configuration
+          - link "Activity" [ref=f34e11] [cursor=pointer]:
+            - /url: /app#operations
+          - link "Governance" [ref=f34e12] [cursor=pointer]:
+            - /url: /app/governance
+          - link "Docs" [ref=f34e13] [cursor=pointer]:
+            - /url: /docs
+          - link "Settings" [ref=f34e14] [cursor=pointer]:
+            - /url: /app/settings
+        - generic [ref=f34e15]:
+          - generic "Control plane online" [ref=f34e16]: Operational
+          - link "New Run" [ref=f34e19] [cursor=pointer]:
+            - /url: /app?action=new-run
+          - button "Use dark theme" [ref=f34e20] [cursor=pointer]:
+            - generic [ref=f34e23]: Dark
+          - generic [ref=f34e24]:
+            - generic [ref=f34e25]:
+              - generic [ref=f34e26]: Signed in
+              - generic [ref=f34e27]: e2e-user@fluidbox-site-test.dev
+            - button "Sign out" [ref=f34e29] [cursor=pointer]
+    - main [ref=f34e30]:
+      - generic [ref=f34e32]:
+        - heading "Overview" [level=1] [ref=f34e33]
+        - paragraph [ref=f34e34]: Configure, automate, and monitor governed agent runs.
+      - region [ref=f34e35]:
+        - generic [ref=f34e36]:
+          - generic [ref=f34e37]:
+            - heading "Operations" [level=2] [ref=f34e38]
+            - paragraph [ref=f34e39]: Current activity across manual runs and automations.
+          - generic [ref=f34e40]: Operational
+        - generic "Run summary" [ref=f34e42]:
+          - generic [ref=f34e43]:
+            - text: Active
+            - strong [ref=f34e44]: "0"
+            - generic [ref=f34e45]: sandboxes running
+          - generic [ref=f34e46]:
+            - text: Needs Review
+            - strong [ref=f34e47]: "0"
+            - generic [ref=f34e48]: no pending decisions
+          - generic [ref=f34e49]:
+            - text: Completed
+            - strong [ref=f34e50]: "0"
+            - generic [ref=f34e51]: recent runs
+          - generic [ref=f34e52]:
+            - text: Success Rate
+            - strong [ref=f34e53]: 0%
+            - generic [ref=f34e54]: terminal runs
+      - region [ref=f34e55]:
+        - generic [ref=f34e56]:
+          - generic [ref=f34e57]:
+            - heading "Resources" [level=2] [ref=f34e58]
+            - paragraph [ref=f34e59]: Reusable definitions and connections available to every run.
+          - generic [ref=f34e62]:
+            - strong [ref=f34e63]: Ready
+            - generic [ref=f34e64]: 5 agents
+        - generic [ref=f34e65]:
+          - article [ref=f34e66]:
+            - generic [ref=f34e71]:
+              - generic [ref=f34e72]:
+                - heading "Agents" [level=3] [ref=f34e73]
+                - generic [ref=f34e74]: Required
+                - generic [ref=f34e75]: "5"
+              - paragraph [ref=f34e76]: Versioned definitions available to manual and automated runs.
+              - generic [ref=f34e77]:
+                - generic [ref=f34e78]: claude-fixer
+                - generic [ref=f34e79]: test
+                - generic [ref=f34e80]: tg-approve-agent
+                - generic [ref=f34e81]: +2 more
+            - generic [ref=f34e82]:
+              - button "New Agent" [ref=f34e83] [cursor=pointer]
+              - link "Manage" [ref=f34e84] [cursor=pointer]:
+                - /url: /app/agents
+          - article [ref=f34e85]:
+            - generic [ref=f34e92]:
+              - generic [ref=f34e93]:
+                - heading "Integrations" [level=3] [ref=f34e94]
+                - generic [ref=f34e95]: Optional
+                - generic [ref=f34e96]: "0"
+              - paragraph [ref=f34e97]: Connect GitHub when runs need private repositories, pull-request triggers, or result publishing.
+            - button "Connect GitHub" [ref=f34e99] [cursor=pointer]
+          - article [ref=f34e100]:
+            - generic [ref=f34e105]:
+              - generic [ref=f34e106]:
+                - heading "MCP" [level=3] [ref=f34e107]
+                - generic [ref=f34e108]: Optional
+                - generic [ref=f34e109]: "0"
+              - paragraph [ref=f34e110]: Add a remote tool server when an agent needs governed access to an external service.
+            - generic [ref=f34e111]:
+              - button "Add MCP Server" [ref=f34e112] [cursor=pointer]
+              - link "Manage" [ref=f34e113] [cursor=pointer]:
+                - /url: /app/capabilities
+      - tablist "Runs and automations" [ref=f34e114]:
+        - tab "Run history 6" [selected] [ref=f34e115] [cursor=pointer]
+        - tab "Automations" [ref=f34e116] [cursor=pointer]
+      - tabpanel [ref=f34e117]:
+        - generic [ref=f34e118]:
+          - generic [ref=f34e119]:
+            - text: Every invocation
+            - heading "Run history" [level=2] [ref=f34e120]
+          - generic [ref=f34e121]: Manual and automated runs share one timeline.
+        - generic [ref=f34e123]:
+          - link "t\\run tests 019fb2e5 · schedule · scratch failed 16h ago" [ref=f34e124] [cursor=pointer]:
+            - /url: /sessions/019fb2e5-504b-7ed1-a35a-be6db025c74c
+            - generic [ref=f34e125]:
+              - strong [ref=f34e126]: t\run tests
+              - generic [ref=f34e127]:
+                - generic [ref=f34e128]: 019fb2e5
+                - generic [ref=f34e129]: ·
+                - generic [ref=f34e130]: schedule
+                - generic [ref=f34e131]: ·
+                - generic [ref=f34e132]: scratch
+            - generic [ref=f34e133]: failed
+            - generic [ref=f34e136]: 16h ago
+          - link "governance probe 019fb156 · manual · scratch cancelled autonomous 23h ago" [ref=f34e137] [cursor=pointer]:
+            - /url: /sessions/019fb156-d5b1-7702-b483-372e5906a320
+            - generic [ref=f34e138]:
+              - strong [ref=f34e139]: governance probe
+              - generic [ref=f34e140]:
+                - generic [ref=f34e141]: 019fb156
+                - generic [ref=f34e142]: ·
+                - generic [ref=f34e143]: manual
+                - generic [ref=f34e144]: ·
+                - generic [ref=f34e145]: scratch
+            - generic [ref=f34e146]:
+              - generic [ref=f34e147]: cancelled
+              - generic [ref=f34e149]: autonomous
+            - generic [ref=f34e150]: 23h ago
+          - link "governance probe 019fb156 · manual · scratch cancelled 23h ago" [ref=f34e151] [cursor=pointer]:
+            - /url: /sessions/019fb156-c385-7353-92fb-1315c98970e3
+            - generic [ref=f34e152]:
+              - strong [ref=f34e153]: governance probe
+              - generic [ref=f34e154]:
+                - generic [ref=f34e155]: 019fb156
+                - generic [ref=f34e156]: ·
+                - generic [ref=f34e157]: manual
+                - generic [ref=f34e158]: ·
+                - generic [ref=f34e159]: scratch
+            - generic [ref=f34e160]: cancelled
+            - generic [ref=f34e163]: 23h ago
+          - link "tool gate probe 019fb152 · manual · scratch cancelled 1d ago" [ref=f34e164] [cursor=pointer]:
+            - /url: /sessions/019fb152-4086-7562-9e68-6b469bbb3a3c
+            - generic [ref=f34e165]:
+              - strong [ref=f34e166]: tool gate probe
+              - generic [ref=f34e167]:
+                - generic [ref=f34e168]: 019fb152
+                - generic [ref=f34e169]: ·
+                - generic [ref=f34e170]: manual
+                - generic [ref=f34e171]: ·
+                - generic [ref=f34e172]: scratch
+            - generic [ref=f34e173]: cancelled
+            - generic [ref=f34e176]: 1d ago
+          - link "tool gate probe 019fb152 · manual · scratch cancelled 1d ago" [ref=f34e177] [cursor=pointer]:
+            - /url: /sessions/019fb152-36ba-7680-b746-4f247a8d2af1
+            - generic [ref=f34e178]:
+              - strong [ref=f34e179]: tool gate probe
+              - generic [ref=f34e180]:
+                - generic [ref=f34e181]: 019fb152
+                - generic [ref=f34e182]: ·
+                - generic [ref=f34e183]: manual
+                - generic [ref=f34e184]: ·
+                - generic [ref=f34e185]: scratch
+            - generic [ref=f34e186]: cancelled
+            - generic [ref=f34e189]: 1d ago
+          - link "tool gate probe 019fb152 · manual · scratch failed 1d ago" [ref=f34e190] [cursor=pointer]:
+            - /url: /sessions/019fb152-2d35-7c13-927a-a542d7b34b27
+            - generic [ref=f34e191]:
+              - strong [ref=f34e192]: tool gate probe
+              - generic [ref=f34e193]:
+                - generic [ref=f34e194]: 019fb152
+                - generic [ref=f34e195]: ·
+                - generic [ref=f34e196]: manual
+                - generic [ref=f34e197]: ·
+                - generic [ref=f34e198]: scratch
+            - generic [ref=f34e199]: failed
+            - generic [ref=f34e202]: 1d ago
+  - alert [ref=f34e203]

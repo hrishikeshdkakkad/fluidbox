@@ -55,7 +55,6 @@
         "images/runner-lib/sandbox-gate-shim.mjs",
         "images/codex-runner/runner/index.mjs",
         "images/sandbox-runner/runner/servers/workspace-info.mjs",
-        "README.md",
         "docs/guides/kubernetes.md"
       ]
     }
