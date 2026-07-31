@@ -165,7 +165,7 @@ export function ResourceOverview({
             }
             items={snapshot.agents.map((agent) => agent.name)}
             action={<button className="btn sm" type="button" onClick={onCreateAgent}>{snapshot.agents.length === 0 ? "Create Agent" : "New Agent"}</button>}
-            secondary={snapshot.agents.length > 0 ? <Link className="resource-secondary" href="/agents">Manage</Link> : undefined}
+            secondary={snapshot.agents.length > 0 ? <Link className="resource-secondary" href="/app/agents">Manage</Link> : undefined}
           />
 
           <ResourceCard
@@ -182,11 +182,11 @@ export function ResourceOverview({
             action={
               activeConnections.length === 0 && activeRegistrations.length === 0
                 ? <button className="btn sm" type="button" onClick={openGithubSetup}>Connect GitHub</button>
-                : <Link className="btn sm" href="/integrations">Manage</Link>
+                : <Link className="btn sm" href="/app/integrations">Manage</Link>
             }
             secondary={
               activeRegistrations.length > 0 && activeConnections.length === 0
-                ? <Link className="resource-secondary" href="/integrations">Add Repositories</Link>
+                ? <Link className="resource-secondary" href="/app/integrations">Add Repositories</Link>
                 : undefined
             }
           />
@@ -203,7 +203,7 @@ export function ResourceOverview({
             }
             items={latestBundles.map((bundle) => `${bundle.name}@${bundle.version}`)}
             action={<button className="btn sm" type="button" onClick={onAddCapability}>{latestBundles.length === 0 ? "Add MCP Server" : "Add Another"}</button>}
-            secondary={<Link className="resource-secondary" href="/capabilities">Manage</Link>}
+            secondary={<Link className="resource-secondary" href="/app/capabilities">Manage</Link>}
           />
         </div>
       )}

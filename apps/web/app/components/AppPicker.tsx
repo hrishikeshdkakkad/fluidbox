@@ -280,7 +280,7 @@ export function AppPicker({
                   {!ready && (
                     <span className="app-card-sub-warn">
                       Won&apos;t start until set up —{" "}
-                      <a className="link" href="/capabilities" target="_blank" rel="noreferrer">
+                      <a className="link" href="/app/capabilities" target="_blank" rel="noreferrer">
                         set it up ↗
                       </a>
                     </span>

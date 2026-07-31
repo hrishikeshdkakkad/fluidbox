@@ -23,7 +23,14 @@ pnpm dev           # dashboard only — the control plane must already be runnin
 just dev           # (from the repo root) gateway + server + dashboard together
 ```
 
-Open <http://localhost:3000>. Top-level routes: Runs `/` (home, with the approvals attention strip), Agents `/agents`, Capabilities `/capabilities`, Integrations `/integrations`, Automations `/automations`, Settings — run detail lives at `/sessions/{id}`.
+Open <http://localhost:3000>. The origin serves three surfaces: the public
+marketing site at `/` (`/product`, `/open-source`, `/security`, `/changelog`,
+`/pricing`), the public developer docs at `/docs`, and the application under
+`/app` — Runs `/app` (home, with the approvals attention strip), Agents
+`/app/agents`, Capabilities `/app/capabilities`, Integrations
+`/app/integrations`, Automations `/app/automations`, Settings `/app/settings`;
+run detail lives at `/app/sessions/{id}`. Pre-split URLs (`/agents`,
+`/developer/…`, …) redirect permanently.
 
 ## Gotchas
 

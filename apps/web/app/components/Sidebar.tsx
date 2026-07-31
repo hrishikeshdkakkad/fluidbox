@@ -4,7 +4,6 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { apiGet, apiGetCached, AuthMe, logout } from "../lib/api";
-import { isPublicPath } from "../lib/auth-gate";
 import { useSmartPolling } from "../lib/useSmartPolling";
 import { ThemeToggle } from "./ThemeToggle";
 
@@ -12,6 +11,12 @@ import { ThemeToggle } from "./ThemeToggle";
  * The component name remains Sidebar to keep the layout seam stable, but the
  * product navigation is now a compact masthead. The dashboard owns the
  * information architecture; this shell only provides global context.
+ *
+ * Since the 2026-07-30 public-site split this masthead renders ONLY under
+ * /app/* (the dashboard layout mounts it), so every viewer is inside the
+ * authenticated area: the /approvals poll and /auth/me lookup run
+ * unconditionally, and the old public-route suppression is gone with the
+ * public routes themselves (marketing + /docs carry their own chrome).
  *
  * `mode` is the static deployment configuration (see the proxy route). In
  * `admin` it renders exactly as before — no session UI at all. In `sso` it adds
@@ -24,14 +29,8 @@ export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
   const [me, setMe] = useState<AuthMe | null>(null);
   const [mobileOpen, setMobileOpen] = useState(false);
 
-  // Public routes (/developer) render for anonymous browsers in sso mode, and
-  // the api layer hard-redirects any 401 to /login — so the authed background
-  // work must not run there. The masthead itself stays: signed-in users keep
-  // their nav; anonymous readers see chrome without live state.
-  const publicRoute = isPublicPath(pathname);
-
   useEffect(() => {
-    if (mode !== "sso" || publicRoute) return;
+    if (mode !== "sso") return;
     let alive = true;
     apiGetCached<AuthMe>("/auth/me", { maxAgeMs: 60_000 })
       .then((m) => {
@@ -44,7 +43,7 @@ export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
     return () => {
       alive = false;
     };
-  }, [mode, publicRoute]);
+  }, [mode]);
 
   const poll = useCallback(async () => {
     try {
@@ -55,12 +54,12 @@ export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
       setOnline(false);
     }
   }, []);
-  useSmartPolling(poll, 8000, !publicRoute);
+  useSmartPolling(poll, 8000, true);
 
-  const resourcesActive = ["/agents", "/capabilities", "/integrations"].some(
+  const resourcesActive = ["/app/agents", "/app/capabilities", "/app/integrations"].some(
     (route) => pathname.startsWith(route)
   );
-  const activityActive = ["/sessions", "/automations"].some(
+  const activityActive = ["/app/sessions", "/app/automations"].some(
     (route) => pathname.startsWith(route)
   );
   const closeMobileNav = () => setMobileOpen(false);
@@ -68,7 +67,7 @@ export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
   return (
     <header className="topbar">
       <div className="topbar-inner">
-        <Link href="/" className="brand masthead-brand" onNavigate={closeMobileNav}>
+        <Link href="/app" className="brand masthead-brand" onNavigate={closeMobileNav}>
           <span className="wordmark">fluidbox</span>
           <span className="product-label">control plane</span>
         </Link>
@@ -78,48 +77,48 @@ export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
           id="primary-navigation"
           aria-label="Primary navigation"
         >
-          <Link className={pathname === "/" ? "active" : ""} href="/" onNavigate={closeMobileNav}>
+          <Link
+            className={pathname === "/app" ? "active" : ""}
+            href="/app"
+            onNavigate={closeMobileNav}
+          >
             Overview
           </Link>
           <Link
             className={resourcesActive ? "active" : ""}
-            href="/#configuration"
+            href="/app#configuration"
             onNavigate={closeMobileNav}
           >
             Resources
           </Link>
           <Link
             className={activityActive ? "active" : ""}
-            href="/#operations"
+            href="/app#operations"
             onNavigate={closeMobileNav}
           >
             Activity
             {pending > 0 && <span className="masthead-count">{pending}</span>}
           </Link>
           <Link
-            className={pathname.startsWith("/governance") ? "active" : ""}
-            href="/governance"
+            className={pathname.startsWith("/app/governance") ? "active" : ""}
+            href="/app/governance"
             onNavigate={closeMobileNav}
           >
             Governance
           </Link>
-          <Link
-            className={publicRoute ? "active" : ""}
-            href="/developer"
-            onNavigate={closeMobileNav}
-          >
-            Developer
+          <Link href="/docs" onNavigate={closeMobileNav}>
+            Docs
           </Link>
           <Link
-            className={pathname === "/settings" ? "active" : ""}
-            href="/settings"
+            className={pathname === "/app/settings" ? "active" : ""}
+            href="/app/settings"
             onNavigate={closeMobileNav}
           >
             Settings
           </Link>
           <Link
             className="mobile-primary-action"
-            href="/?action=new-run"
+            href="/app?action=new-run"
             onNavigate={closeMobileNav}
           >
             New Run
@@ -138,20 +137,16 @@ export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
         </nav>
 
         <div className="masthead-actions">
-          {/* Both are for signed-in operators only. No poll feeds the state pill
-              on public routes, so "Operational" would be a claim nothing is
-              checking; and New Run would send an anonymous reader to /login. */}
-          {!publicRoute && (
-            <>
-              <div className="masthead-state" title={online ? "Control plane online" : "Control plane offline"}>
-                <span className={`signal ${online ? "" : "down"}`} />
-                <span>{online ? "Operational" : "Offline"}</span>
-              </div>
-              <Link className="topbar-action" href="/?action=new-run">
-                New Run
-              </Link>
-            </>
-          )}
+          <div
+            className="masthead-state"
+            title={online ? "Control plane online" : "Control plane offline"}
+          >
+            <span className={`signal ${online ? "" : "down"}`} />
+            <span>{online ? "Operational" : "Offline"}</span>
+          </div>
+          <Link className="topbar-action" href="/app?action=new-run">
+            New Run
+          </Link>
           <ThemeToggle />
           {mode === "sso" && me?.user && (
             <div

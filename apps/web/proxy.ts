@@ -1,5 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { gateDecision, SESSION_COOKIE } from "./app/lib/auth-gate";
+import { gateDecision, APP_HOME, SESSION_COOKIE } from "./app/lib/auth-gate";
 import { webMode } from "./app/lib/proxy-auth";
 
 // Server-side navigation gate (Next 16 renamed `middleware` to `proxy`). All
@@ -20,22 +20,24 @@ export function proxy(request: NextRequest) {
     hasSession: request.cookies.has(SESSION_COOKIE),
   });
   if (decision.kind === "to-app") {
-    return NextResponse.redirect(new URL("/", request.url));
+    return NextResponse.redirect(new URL(APP_HOME, request.url));
   }
   if (decision.kind === "to-login") {
     const url = new URL("/login", request.url);
-    if (decision.next !== "/") url.searchParams.set("next", decision.next);
+    if (decision.next !== APP_HOME) url.searchParams.set("next", decision.next);
     return NextResponse.redirect(url);
   }
   return NextResponse.next();
 }
 
 export const config = {
-  // Page navigations only. Excluded on purpose:
-  //   api  — the control-plane proxy (/api/fluidbox/*) authenticates every call
-  //          itself; redirecting a fetch to /login would break the 401 handler.
+  // Runs on page navigations AND /api/fluidbox (the control-plane proxy):
+  // gateDecision passes every /api/* path untouched — fetches are never
+  // redirected — but routing them through here is what lets the WorkOS
+  // web-tier gate (FLUIDBOX_WEB_AUTH=workos) stamp its session headers so the
+  // API route can validate the session server-side. Excluded on purpose:
   //   v1   — the sso-mode rewrite surface (next.config.ts): the OIDC callback
   //          rides /v1/auth/callback on THIS origin, before any session exists.
   //   _next/static, _next/image, favicon.ico — assets.
-  matcher: ["/((?!api|v1|_next/static|_next/image|favicon.ico).*)"],
+  matcher: ["/((?!v1|_next/static|_next/image|favicon.ico).*)"],
 };

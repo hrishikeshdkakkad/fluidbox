@@ -126,7 +126,7 @@ docker compose -f deploy/docker-compose.eval.yml --profile runners pull
 ANTHROPIC_API_KEY=sk-ant-... docker compose -f deploy/docker-compose.eval.yml up -d
 ```
 
-Open <http://localhost:3000>. The eval stack uses bundled Postgres and a well-known admin token, and leaves credential-backed integrations and webhook ingress disabled. It is for trying the run loop, not for exposing to a network.
+Open <http://localhost:3000> (the operational dashboard lives at `/app`; the root serves the public site and `/docs`). The eval stack uses bundled Postgres and a well-known admin token, and leaves credential-backed integrations and webhook ingress disabled. It is for trying the run loop, not for exposing to a network.
 
 ### Develop from source
 
@@ -143,7 +143,7 @@ just codex-build    # optional: build the second harness
 just dev            # LiteLLM gateway + Rust control plane + dashboard
 ```
 
-Open <http://localhost:3000>, or start a manual run from the CLI:
+Open <http://localhost:3000> (dashboard at `/app`), or start a manual run from the CLI:
 
 ```bash
 cargo run -p fluidbox-cli -- run \

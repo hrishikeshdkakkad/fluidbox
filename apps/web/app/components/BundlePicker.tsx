@@ -130,7 +130,7 @@ export function BundlePicker({
         {onAddServer ? (
           <button className="btn" type="button" onClick={onAddServer}>Add a tool server</button>
         ) : (
-          <Link href="/capabilities" className="btn">Open MCP</Link>
+          <Link href="/app/capabilities" className="btn">Open MCP</Link>
         )}
       </div>
     );
