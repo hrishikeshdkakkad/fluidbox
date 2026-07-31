@@ -1,6 +1,6 @@
 {
   "name": "fluidbox-codex-runner",
-  "version": "0.4.0-rc.1",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "description": "fluidbox sandbox payload: the OpenAI Codex app-server harness, governed by the fluidbox control plane.",
