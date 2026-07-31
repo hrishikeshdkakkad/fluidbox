@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { apiGet, apiGetCached, AuthMe, logout } from "../lib/api";
+import { isPublicPath } from "../lib/auth-gate";
 import { useSmartPolling } from "../lib/useSmartPolling";
 import { ThemeToggle } from "./ThemeToggle";
 
@@ -23,8 +24,14 @@ export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
   const [me, setMe] = useState<AuthMe | null>(null);
   const [mobileOpen, setMobileOpen] = useState(false);
 
+  // Public routes (/developer) render for anonymous browsers in sso mode, and
+  // the api layer hard-redirects any 401 to /login — so the authed background
+  // work must not run there. The masthead itself stays: signed-in users keep
+  // their nav; anonymous readers see chrome without live state.
+  const publicRoute = isPublicPath(pathname);
+
   useEffect(() => {
-    if (mode !== "sso") return;
+    if (mode !== "sso" || publicRoute) return;
     let alive = true;
     apiGetCached<AuthMe>("/auth/me", { maxAgeMs: 60_000 })
       .then((m) => {
@@ -37,7 +44,7 @@ export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
     return () => {
       alive = false;
     };
-  }, [mode]);
+  }, [mode, publicRoute]);
 
   const poll = useCallback(async () => {
     try {
@@ -48,7 +55,7 @@ export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
       setOnline(false);
     }
   }, []);
-  useSmartPolling(poll, 8000);
+  useSmartPolling(poll, 8000, !publicRoute);
 
   const resourcesActive = ["/agents", "/capabilities", "/integrations"].some(
     (route) => pathname.startsWith(route)
@@ -97,6 +104,13 @@ export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
             Governance
           </Link>
           <Link
+            className={publicRoute ? "active" : ""}
+            href="/developer"
+            onNavigate={closeMobileNav}
+          >
+            Developer
+          </Link>
+          <Link
             className={pathname === "/settings" ? "active" : ""}
             href="/settings"
             onNavigate={closeMobileNav}
@@ -124,13 +138,20 @@ export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
         </nav>
 
         <div className="masthead-actions">
-          <div className="masthead-state" title={online ? "Control plane online" : "Control plane offline"}>
-            <span className={`signal ${online ? "" : "down"}`} />
-            <span>{online ? "Operational" : "Offline"}</span>
-          </div>
-          <Link className="topbar-action" href="/?action=new-run">
-            New Run
-          </Link>
+          {/* Both are for signed-in operators only. No poll feeds the state pill
+              on public routes, so "Operational" would be a claim nothing is
+              checking; and New Run would send an anonymous reader to /login. */}
+          {!publicRoute && (
+            <>
+              <div className="masthead-state" title={online ? "Control plane online" : "Control plane offline"}>
+                <span className={`signal ${online ? "" : "down"}`} />
+                <span>{online ? "Operational" : "Offline"}</span>
+              </div>
+              <Link className="topbar-action" href="/?action=new-run">
+                New Run
+              </Link>
+            </>
+          )}
           <ThemeToggle />
           {mode === "sso" && me?.user && (
             <div

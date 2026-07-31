@@ -1,0 +1,82 @@
+# Redocly project configuration for the fluidbox developer documentation.
+#
+#   npx @redocly/cli preview          # live-reloading site on :4000
+#   npx @redocly/cli lint             # validate the API description
+#   npx @redocly/cli build-docs \
+#     api/openapi.yaml -o ../dist/api.html   # single-file API reference
+#
+# The OpenAPI description in api/openapi.yaml is the source of truth for the
+# HTTP surface. When you add or change a route in the Rust server, change it
+# there too — `lint` is what keeps the two from drifting silently.
+
+extends:
+  - recommended
+
+apis:
+  fluidbox@v1:
+    root: ./api/openapi.yaml
+
+rules:
+  # Every operation should say what a caller gets back.
+  operation-2xx-response: warn
+  operation-4xx-response: warn
+  # Path-level and reference integrity are non-negotiable: a broken $ref or a
+  # mismatched path parameter produces a reference page that lies.
+  no-unresolved-refs: error
+  path-parameters-defined: error
+  no-ambiguous-paths: error
+  operation-operationId-unique: error
+  operation-operationId: error
+  # operationIds are camelCase across the description; keep it that way so
+  # generated clients have predictable method names.
+  rule/operation-id-casing:
+    subject:
+      type: Operation
+      property: operationId
+    assertions:
+      casing: camelCase
+    severity: error
+
+# Six `operation-2xx-response` / `operation-4xx-response` warnings are expected
+# and correct as written:
+#
+#   /v1/health, /v1/health/ready      liveness and readiness probes are
+#                                     unauthenticated and have no 4xx path
+#   /v1/auth/login/{slug}/start       302 IS the success — these are browser
+#   /v1/auth/callback                 redirect legs, not JSON endpoints
+#   /v1/oauth/go
+#   /v1/github/app/install/go
+#
+# They are left as warnings rather than suppressed so the count stays visible:
+# if it moves, something new is genuinely missing a response.
+
+openapi:
+  hideDownloadButtons: false
+  jsonSamplesExpandLevel: 2
+  expandResponses: '200'
+  generateCodeSamples:
+    languages:
+      - lang: curl
+      - lang: JavaScript
+      - lang: Python
+
+seo:
+  title: fluidbox — governed AI coding agents
+  description: >-
+    API reference and guides for fluidbox, a control plane that runs AI coding
+    agents in governed, disposable sandboxes.
+
+navbar:
+  items:
+    - page: index.md
+      label: Home
+    - page: guides/quickstart.md
+      label: Quickstart
+    - page: api/openapi.yaml
+      label: API reference
+    - label: GitHub
+      href: https://github.com/hrishikeshdkakkad/fluidbox
+      external: true
+
+footer:
+  copyrightText: fluidbox — MIT licensed.

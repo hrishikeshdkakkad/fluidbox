@@ -1,0 +1,28 @@
+- page: index.md
+  label: Overview
+
+- group: Guides
+  expanded: true
+  items:
+    - page: guides/quickstart.md
+      label: Quickstart
+    - page: guides/authentication.md
+      label: Authentication
+    - page: guides/governance.md
+      label: The permission gate
+    - page: guides/runner-contract.md
+      label: Building a harness
+
+- group: Reference
+  expanded: true
+  items:
+    - page: api/openapi.yaml
+      label: API reference
+    - page: guides/capabilities.md
+      label: Capabilities
+    - page: guides/policies.md
+      label: Policies
+    - page: guides/triggers.md
+      label: Triggers
+    - page: guides/kubernetes.md
+      label: Kubernetes
