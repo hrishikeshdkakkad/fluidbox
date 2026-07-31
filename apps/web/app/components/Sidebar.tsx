@@ -21,8 +21,26 @@ import { ThemeToggle } from "./ThemeToggle";
  * `mode` is the static deployment configuration (see the proxy route). In
  * `admin` it renders exactly as before — no session UI at all. In `sso` it adds
  * the signed-in organization + email + a Log out control, fed by /auth/me.
+ *
+ * `workosSession` is the WorkOS web-tier badge (FLUIDBOX_WEB_AUTH=workos),
+ * resolved SERVER-SIDE by the /app layout's withAuth() and passed down — the
+ * client never derives auth state. Sign out is a POST server action (never a
+ * GET route: prefetch-safe, CSRF-safe).
  */
-export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
+export interface WorkosSessionBadge {
+  label: string;
+  email: string;
+}
+
+export function Sidebar({
+  mode = "admin",
+  workosSession = null,
+  signOut,
+}: {
+  mode?: "admin" | "sso";
+  workosSession?: WorkosSessionBadge | null;
+  signOut?: () => Promise<void>;
+}) {
   const pathname = usePathname();
   const [pending, setPending] = useState(0);
   const [online, setOnline] = useState(true);
@@ -148,6 +166,35 @@ export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
             New Run
           </Link>
           <ThemeToggle />
+          {workosSession && (
+            <div
+              style={{ display: "flex", alignItems: "center", gap: 10 }}
+              data-testid="workos-session-shell"
+            >
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  lineHeight: 1.15,
+                  textAlign: "right",
+                }}
+              >
+                <span style={{ fontSize: 12, color: "var(--ds-gray-1000)", fontWeight: 500 }}>
+                  {workosSession.label}
+                </span>
+                <span style={{ fontSize: 11, color: "var(--ds-gray-800)" }}>
+                  {workosSession.email}
+                </span>
+              </div>
+              {signOut && (
+                <form action={signOut}>
+                  <button className="btn sm ghost" type="submit">
+                    Sign out
+                  </button>
+                </form>
+              )}
+            </div>
+          )}
           {mode === "sso" && me?.user && (
             <div
               style={{ display: "flex", alignItems: "center", gap: 10 }}
