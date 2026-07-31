@@ -149,6 +149,37 @@ test:
 version-check:
     bash scripts/version-check.sh
 
+# ── Developer documentation (Redocly) ────────────────────────────────────
+#
+# docs/api/openapi.yaml is the source of truth for the HTTP surface. Change a
+# route in the Rust server, change it there too — `docs-lint` is what stops the
+# two drifting silently. Needs no DB and no running server.
+#
+# Pinned (not @latest): a Redocly release must not silently change lint
+# results or generated output. Keep in sync with
+# apps/web/scripts/sync-developer-docs.mjs.
+
+redocly := "@redocly/cli@2.41.2"
+
+docs-lint:
+    cd docs && npx --yes {{redocly}} lint
+
+# Live-reloading docs site on :4000.
+docs:
+    cd docs && npx --yes {{redocly}} preview
+
+# Single-file API reference into dist/.
+docs-build:
+    mkdir -p dist
+    cd docs && npx --yes {{redocly}} build-docs api/openapi.yaml -o ../dist/api.html
+
+# Regenerate the public /docs pages from docs/ and /changelog from
+# CHANGELOG.md (guides + search index + the slim reference model + the
+# downloadable spec). Output is checked in — run this after editing docs/ or
+# CHANGELOG.md and commit the diff.
+docs-sync:
+    cd apps/web && node scripts/sync-developer-docs.mjs
+
 check: fmt lint test version-check
     cd apps/web && pnpm test
     cd apps/web && pnpm build

@@ -12,11 +12,35 @@ import { ThemeToggle } from "./ThemeToggle";
  * product navigation is now a compact masthead. The dashboard owns the
  * information architecture; this shell only provides global context.
  *
+ * Since the 2026-07-30 public-site split this masthead renders ONLY under
+ * /app/* (the dashboard layout mounts it), so every viewer is inside the
+ * authenticated area: the /approvals poll and /auth/me lookup run
+ * unconditionally, and the old public-route suppression is gone with the
+ * public routes themselves (marketing + /docs carry their own chrome).
+ *
  * `mode` is the static deployment configuration (see the proxy route). In
  * `admin` it renders exactly as before — no session UI at all. In `sso` it adds
  * the signed-in organization + email + a Log out control, fed by /auth/me.
+ *
+ * `workosSession` is the WorkOS web-tier badge (FLUIDBOX_WEB_AUTH=workos),
+ * resolved SERVER-SIDE by the /app layout's withAuth() and passed down — the
+ * client never derives auth state. Sign out is a POST server action (never a
+ * GET route: prefetch-safe, CSRF-safe).
  */
-export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
+export interface WorkosSessionBadge {
+  label: string;
+  email: string;
+}
+
+export function Sidebar({
+  mode = "admin",
+  workosSession = null,
+  signOut,
+}: {
+  mode?: "admin" | "sso";
+  workosSession?: WorkosSessionBadge | null;
+  signOut?: () => Promise<void>;
+}) {
   const pathname = usePathname();
   const [pending, setPending] = useState(0);
   const [online, setOnline] = useState(true);
@@ -48,12 +72,12 @@ export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
       setOnline(false);
     }
   }, []);
-  useSmartPolling(poll, 8000);
+  useSmartPolling(poll, 8000, true);
 
-  const resourcesActive = ["/agents", "/capabilities", "/integrations"].some(
+  const resourcesActive = ["/app/agents", "/app/capabilities", "/app/integrations"].some(
     (route) => pathname.startsWith(route)
   );
-  const activityActive = ["/sessions", "/automations"].some(
+  const activityActive = ["/app/sessions", "/app/automations"].some(
     (route) => pathname.startsWith(route)
   );
   const closeMobileNav = () => setMobileOpen(false);
@@ -61,7 +85,7 @@ export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
   return (
     <header className="topbar">
       <div className="topbar-inner">
-        <Link href="/" className="brand masthead-brand" onNavigate={closeMobileNav}>
+        <Link href="/app" className="brand masthead-brand" onNavigate={closeMobileNav}>
           <span className="wordmark">fluidbox</span>
           <span className="product-label">control plane</span>
         </Link>
@@ -71,41 +95,48 @@ export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
           id="primary-navigation"
           aria-label="Primary navigation"
         >
-          <Link className={pathname === "/" ? "active" : ""} href="/" onNavigate={closeMobileNav}>
+          <Link
+            className={pathname === "/app" ? "active" : ""}
+            href="/app"
+            onNavigate={closeMobileNav}
+          >
             Overview
           </Link>
           <Link
             className={resourcesActive ? "active" : ""}
-            href="/#configuration"
+            href="/app#configuration"
             onNavigate={closeMobileNav}
           >
             Resources
           </Link>
           <Link
             className={activityActive ? "active" : ""}
-            href="/#operations"
+            href="/app#operations"
             onNavigate={closeMobileNav}
           >
             Activity
             {pending > 0 && <span className="masthead-count">{pending}</span>}
           </Link>
           <Link
-            className={pathname.startsWith("/governance") ? "active" : ""}
-            href="/governance"
+            className={pathname.startsWith("/app/governance") ? "active" : ""}
+            href="/app/governance"
             onNavigate={closeMobileNav}
           >
             Governance
           </Link>
+          <Link href="/docs" onNavigate={closeMobileNav}>
+            Docs
+          </Link>
           <Link
-            className={pathname === "/settings" ? "active" : ""}
-            href="/settings"
+            className={pathname === "/app/settings" ? "active" : ""}
+            href="/app/settings"
             onNavigate={closeMobileNav}
           >
             Settings
           </Link>
           <Link
             className="mobile-primary-action"
-            href="/?action=new-run"
+            href="/app?action=new-run"
             onNavigate={closeMobileNav}
           >
             New Run
@@ -124,14 +155,45 @@ export function Sidebar({ mode = "admin" }: { mode?: "admin" | "sso" }) {
         </nav>
 
         <div className="masthead-actions">
-          <div className="masthead-state" title={online ? "Control plane online" : "Control plane offline"}>
+          <div
+            className="masthead-state"
+            title={online ? "Control plane online" : "Control plane offline"}
+          >
             <span className={`signal ${online ? "" : "down"}`} />
             <span>{online ? "Operational" : "Offline"}</span>
           </div>
-          <Link className="topbar-action" href="/?action=new-run">
+          <Link className="topbar-action" href="/app?action=new-run">
             New Run
           </Link>
           <ThemeToggle />
+          {workosSession && (
+            <div
+              style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}
+              data-testid="workos-session-shell"
+            >
+              <span
+                title={`${workosSession.label} · ${workosSession.email}`}
+                style={{
+                  fontSize: 11.5,
+                  color: "var(--ds-gray-800)",
+                  fontFamily: "var(--font-geist-mono), monospace",
+                  maxWidth: 150,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {workosSession.email}
+              </span>
+              {signOut && (
+                <form action={signOut}>
+                  <button className="btn sm ghost" type="submit">
+                    Sign out
+                  </button>
+                </form>
+              )}
+            </div>
+          )}
           {mode === "sso" && me?.user && (
             <div
               style={{ display: "flex", alignItems: "center", gap: 10 }}
