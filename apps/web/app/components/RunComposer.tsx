@@ -16,7 +16,7 @@ import {
   Revision,
   TriggerSubscription,
 } from "../lib/api";
-import { AddServerWizard } from "../capabilities/AddServerWizard";
+import { AddServerWizard } from "../app/capabilities/AddServerWizard";
 import { defaultModelFor, modelsFor, useHarnesses } from "../lib/harnesses";
 import { CopyBlock, TemplateChips } from "./AutomationContract";
 import { buildCurl, classifyVariables } from "../lib/automation-contract";
@@ -1160,7 +1160,7 @@ export function RunComposer({
                 )}
                 <span className="field-hint">
                   What this agent may do on its own, and what must ask first.{" "}
-                  <Link href="/governance">Manage the rules in Governance.</Link>
+                  <Link href="/app/governance">Manage the rules in Governance.</Link>
                 </span>
               </label>
             )}

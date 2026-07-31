@@ -1,0 +1,25 @@
+- generic [ref=f26e1]:
+  - generic [ref=f26e3]:
+    - generic: This is a temporary environment
+    - generic [ref=f26e61]:
+      - heading "Sign in" [level=1] [ref=f26e63]
+      - generic [ref=f26e67]:
+        - generic [ref=f26e68]:
+          - generic [ref=f26e69]:
+            - generic [ref=f26e70]: Email
+            - link "Change email" [ref=f26e71] [cursor=pointer]:
+              - /url: /?state=Fe26.2%2A1%2A0b1f771650b148d0f261f0178fe852eee0b552aadc2084020649f7e64bb7c533%2Aj4IbOskX6oM0g1H_aQv_Sw%2AlIGeIZvj5NmobBAQRtOE2sBKk5bBmfwmLYGdKjo4AINAKre8UJwAM7t9gAIjQfDVsD3oYsYrMSxFRg42TIPgZ597fRAy9NEt7nk77Q_WT6oCyqeGavH0OozDa2kj0lXAm7ChsStvJYkGZuQEz1ESzR8-T57g4wwZt6Fk0oUJnTT8AHdgsnLTXqlqGSFHlyeW%2A1785473626595%2Ac5d223f419468bfbf13bfeee4a9f48fbcf85f2d45ebe105ffd6986486252e24e%2AKqLDT8Wyof8hfXZUofOzRNI2CeoHV5ooTAihi0Rdhf8~2&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&authorization_session_id=01KYV7RJQBEX01T96WTANJ0CRQ
+          - textbox "Email" [ref=f26e73]: e2e-user@fluidbox-site-test.dev
+        - generic [ref=f26e76]:
+          - generic [ref=f26e77]:
+            - generic [ref=f26e78]: Password
+            - link "Forgot your password?" [ref=f26e79] [cursor=pointer]:
+              - /url: /reset-password?state=Fe26.2%2A1%2A0b1f771650b148d0f261f0178fe852eee0b552aadc2084020649f7e64bb7c533%2Aj4IbOskX6oM0g1H_aQv_Sw%2AlIGeIZvj5NmobBAQRtOE2sBKk5bBmfwmLYGdKjo4AINAKre8UJwAM7t9gAIjQfDVsD3oYsYrMSxFRg42TIPgZ597fRAy9NEt7nk77Q_WT6oCyqeGavH0OozDa2kj0lXAm7ChsStvJYkGZuQEz1ESzR8-T57g4wwZt6Fk0oUJnTT8AHdgsnLTXqlqGSFHlyeW%2A1785473626595%2Ac5d223f419468bfbf13bfeee4a9f48fbcf85f2d45ebe105ffd6986486252e24e%2AKqLDT8Wyof8hfXZUofOzRNI2CeoHV5ooTAihi0Rdhf8~2&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&authorization_session_id=01KYV7RJQBEX01T96WTANJ0CRQ
+          - generic [ref=f26e80]:
+            - textbox "Password" [active] [ref=f26e81]:
+              - /placeholder: Your password
+            - button [ref=f26e83] [cursor=pointer]
+        - button "Sign in" [ref=f26e86] [cursor=pointer]
+      - link "Change method" [ref=f26e89] [cursor=pointer]:
+        - /url: /?state=Fe26.2%2A1%2A0b1f771650b148d0f261f0178fe852eee0b552aadc2084020649f7e64bb7c533%2Aj4IbOskX6oM0g1H_aQv_Sw%2AlIGeIZvj5NmobBAQRtOE2sBKk5bBmfwmLYGdKjo4AINAKre8UJwAM7t9gAIjQfDVsD3oYsYrMSxFRg42TIPgZ597fRAy9NEt7nk77Q_WT6oCyqeGavH0OozDa2kj0lXAm7ChsStvJYkGZuQEz1ESzR8-T57g4wwZt6Fk0oUJnTT8AHdgsnLTXqlqGSFHlyeW%2A1785473626595%2Ac5d223f419468bfbf13bfeee4a9f48fbcf85f2d45ebe105ffd6986486252e24e%2AKqLDT8Wyof8hfXZUofOzRNI2CeoHV5ooTAihi0Rdhf8~2&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&authorization_session_id=01KYV7RJQBEX01T96WTANJ0CRQ
+  - alert [ref=f26e60]

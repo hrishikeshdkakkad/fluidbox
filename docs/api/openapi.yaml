@@ -1,0 +1,5065 @@
+openapi: 3.1.1
+
+info:
+  title: fluidbox Control Plane API
+  version: 0.3.0
+  summary: Run AI coding agents in governed, disposable sandboxes.
+  description: |
+    fluidbox is a control plane that runs AI coding agents in governed,
+    disposable sandboxes. You register a versioned **agent definition**; each
+    **run** freezes an immutable `RunSpec`, provisions a fresh sandbox, streams
+    a live event timeline, pauses for human approval (or auto-decides in
+    autonomous mode), and ends with a diff and a cost report.
+
+    ## The four planes
+
+    This description covers every HTTP surface the control plane exposes. They
+    are separate audiences with separate credentials, and mixing them up is the
+    most common integration mistake:
+
+    | Plane | Base path | Who calls it | Credential |
+    | --- | --- | --- | --- |
+    | **Public API** | `/v1` | Your code, the CLI, the dashboard | Admin token, PAT, or browser session |
+    | **Runner contract** | `/internal` | Only the in-sandbox runner | Audience-scoped session token |
+    | **Operator** | `/v1/admin` | Break-glass operator tooling | Admin token only |
+    | **Ingress** | `/v1/ingress` | GitHub and other connected services | Webhook signature |
+
+    On Kubernetes the runner contract is served on a **separate listener**
+    (`:8788`) and the `/internal` routes do not exist on the public listener at
+    all — route absence is a stronger boundary than bearer auth. On the
+    single-host Docker path both planes ride `:8787` and the bearer token
+    separates them.
+
+    ## Errors
+
+    Every failure across every plane returns the same body: a single `error`
+    string. There are no per-endpoint error envelopes.
+
+    ```json
+    { "error": "agent not found" }
+    ```
+
+    ## Immutability
+
+    Two invariants shape most of this API and will surprise you if you miss
+    them:
+
+    - **A `RunSpec` is frozen at run creation**, including a full policy
+      snapshot. Editing an agent or a policy affects only *future* runs. This
+      is what makes the audit trail trustworthy.
+    - **Agents are append-only.** "Editing" an agent means appending an agent
+      revision; revisions are never mutated. A run uses the current revision's
+      model and system prompt unless the trigger pins one.
+
+  license:
+    name: MIT
+    identifier: MIT
+  contact:
+    name: fluidbox on GitHub
+    url: https://github.com/hrishikeshdkakkad/fluidbox
+
+servers:
+  - url: http://127.0.0.1:8787
+    description: |
+      Local development (`just dev`). Note that `FLUIDBOX_BIND` must be
+      `0.0.0.0:8787` rather than loopback so sandboxes can reach the control
+      plane via `host.docker.internal`.
+  - url: https://{host}
+    description: A deployed control plane.
+    variables:
+      host:
+        default: fluidbox.example.com
+        description: Your control plane hostname.
+  - url: http://{internalHost}:8788
+    description: |
+      The sandbox-facing listener. Serves `/internal` only — no `/v1` route
+      exists here. On Kubernetes this is the sole runner-contract plane.
+    variables:
+      internalHost:
+        default: fluidbox-internal
+        description: The internal Service hostname.
+
+security:
+  - adminToken: []
+
+tags:
+  - name: Runs
+    description: |
+      A run is one governed execution of an agent. Creating a run freezes an
+      immutable `RunSpec` — agent revision, policy snapshot, workspace,
+      budgets, and the frozen capability surface — and everything downstream is
+      judged against that snapshot rather than against current configuration.
+  - name: Events
+    description: |
+      The append-only run timeline. Events carry a gapless per-session `seq`
+      assigned under a row lock, which is what makes both catch-up polling and
+      `Last-Event-ID` stream resume exact. Model prompts never reach the
+      ledger — only digests, usage, and cost.
+  - name: Approvals
+    description: |
+      Human-in-the-loop decisions. Approvals are idempotent by
+      `(session_id, tool_call_id)`: the database row is the source of truth, so
+      a runner retry after a restart re-attaches to the pending row rather than
+      duplicating or hanging.
+  - name: Agents
+    description: |
+      Versioned agent definitions. Append-only: an edit is a new revision. The
+      **system prompt** lives on the revision (who the agent is); the **task**
+      is supplied per run (what to do this time).
+  - name: Policies
+    description: |
+      The governance rules a run is judged against. Publishing is
+      optimistically concurrent — you send the `base_version` you loaded, and a
+      publish over a moved head is a `409` rather than a silent overwrite.
+  - name: Triggers
+    description: |
+      A trigger subscription invokes an agent from outside the dashboard: an
+      API call, a clock, or a connected-service event. A schedule is a trigger
+      subscription with a clock attached, never a separate object.
+  - name: Connections
+    description: |
+      Custodied credentials for external services. The credential is sealed at
+      rest and is only ever used control-plane-side — it never enters a
+      sandbox.
+  - name: Catalog
+    description: |
+      Untrusted reference data describing connectors you can connect to. The
+      catalog suggests; the permission gate decides.
+  - name: Capabilities
+    description: |
+      Sandbox-class MCP servers — credential-free stdio subprocesses packaged
+      in the runner image. Brokered (credentialed) servers are *not* capability
+      bundles; they are connections.
+  - name: Identity
+    description: |
+      Login, sessions, and personal access tokens. Multi-user identity is off
+      by default and enabled with `FLUIDBOX_REQUIRE_SSO=1`.
+  - name: GitHub
+    description: GitHub App registration, installation, and lifecycle.
+  - name: Service
+    description: Health and metadata endpoints.
+  - name: Runner contract
+    description: |
+      The contract every runner image implements. This is how a sandbox talks
+      to the control plane, and implementing it is how you add a new agent
+      harness.
+
+      The sandbox holds **four audience-scoped tokens**, not one bearer. Each
+      guarded route checks the audience as its first statement and answers
+      `403 {"error":"wrong_audience"}` otherwise — that body code is
+      load-bearing, because runners key their fatal abort on it.
+
+      | Audience | Routes |
+      | --- | --- |
+      | `tool` | `/permission`, `/tools/call` |
+      | `control` | `/events`, `/heartbeat`, `/result`, `/token/renew` |
+      | `workspace` | `/workspace` |
+      | `llm` | `/llm/*` |
+  - name: Operator
+    description: |
+      Break-glass and deployment-lifecycle surfaces. Under
+      `FLUIDBOX_REQUIRE_SSO=1` this is the *only* surface the admin token
+      reaches — everywhere else it is refused in favour of user sessions and
+      PATs.
+  - name: Ingress
+    description: |
+      Webhook receivers for connected services. Deliberately unauthenticated in
+      the bearer sense: the signature verified against the connection's sealed
+      secret **is** the authentication, and nothing is stored before it
+      verifies.
+
+x-tagGroups:
+  - name: Public API
+    tags:
+      - Runs
+      - Events
+      - Approvals
+      - Agents
+      - Policies
+      - Triggers
+      - Connections
+      - Catalog
+      - Capabilities
+      - Identity
+      - GitHub
+      - Service
+  - name: Runner contract
+    tags:
+      - Runner contract
+  - name: Operator
+    tags:
+      - Operator
+  - name: Ingress
+    tags:
+      - Ingress
+
+paths:
+  # ---------------------------------------------------------------- Service --
+  /v1/health:
+    get:
+      operationId: getHealth
+      summary: Liveness probe
+      description: Answers as soon as the process is serving. Does not touch the database.
+      tags: [Service]
+      security: []
+      responses:
+        '200':
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    examples: [ok]
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/health/ready:
+    get:
+      operationId: getReadiness
+      summary: Readiness probe
+      description: |
+        Reports whether the control plane can serve real traffic, which
+        includes reaching the database. Use this one for load-balancer
+        readiness; use `/v1/health` for liveness.
+      tags: [Service]
+      security: []
+      responses:
+        '200':
+          description: Ready to serve.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    examples: [ready]
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/harnesses:
+    get:
+      operationId: listHarnesses
+      summary: List supported harnesses and models
+      description: |
+        The single source of truth for which agent harnesses this deployment
+        supports and which models each one accepts. The dashboard pickers read
+        exactly this; build yours from it too rather than hardcoding names.
+      tags: [Service]
+      responses:
+        '200':
+          description: The supported harness catalog.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  harnesses:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          description: Harness identifier, e.g. `claude` or `codex`.
+                        models:
+                          type: array
+                          items:
+                            type: string
+                        default_model:
+                          type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /.well-known/fluidbox-client.json:
+    get:
+      operationId: getClientIdMetadata
+      summary: OAuth client ID metadata document
+      description: |
+        The CIMD document (MCP spec 2025-11-25). **This document's URL is the
+        control plane's OAuth `client_id`** — authorization servers fetch it,
+        so it is public by nature.
+
+        It is only used when `FLUIDBOX_PUBLIC_URL` is HTTPS and non-loopback,
+        because the authorization server has to be able to reach it. Local
+        deployments always fall back to dynamic client registration.
+      tags: [Service]
+      security: []
+      responses:
+        '200':
+          description: The client metadata document.
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          description: |
+            Not served. `FLUIDBOX_PUBLIC_URL` is not HTTPS and non-loopback, so
+            client-ID metadata is unusable and the deployment uses dynamic
+            client registration instead.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ------------------------------------------------------------------- Runs --
+  /v1/sessions:
+    get:
+      operationId: listRuns
+      summary: List runs
+      tags: [Runs]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: The most recent runs visible to the caller.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Session'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      operationId: createRun
+      summary: Start a run
+      description: |
+        Freezes an immutable `RunSpec` and begins provisioning. The response
+        returns immediately with the new run in `created`; watch
+        `/v1/sessions/{id}/events/stream` for progress.
+
+        What gets frozen: the agent revision's model and system prompt, a full
+        policy snapshot, the resolved workspace, the effective budgets, and the
+        capability surface after any per-run narrowing. Nothing you change
+        afterwards affects this run.
+      tags: [Runs]
+      parameters:
+        - $ref: '#/components/parameters/Csrf'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRun'
+            examples:
+              scratch:
+                summary: A scratch run with no repository
+                value:
+                  agent: reviewer
+                  task: Summarize the OWASP top ten for a Rust web service.
+              repository:
+                summary: A governed run against a connected repository
+                value:
+                  agent: fixer
+                  task: Fix the failing test in crates/fluidbox-core.
+                  workspace:
+                    kind: git_repository
+                    connection_id: 6f1a6e6c-1f2b-7c3d-8e4f-9a0b1c2d3e4f
+                    repository: acme/widgets
+                    ref: main
+                  budgets:
+                    max_cost_usd: 2.5
+                    max_wall_clock_secs: 1800
+              autonomous:
+                summary: Autonomous mode with a narrowed capability surface
+                value:
+                  agent: triager
+                  task: Triage the newest issue and label it.
+                  autonomous: true
+                  capabilities: [github-readonly]
+      responses:
+        '200':
+          description: The run was created and is provisioning.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session:
+                    $ref: '#/components/schemas/Session'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: |
+            Refused by the subscription's concurrency policy — an invocation
+            arrived while a run of the same subscription was still active and
+            the policy is `skip_if_running`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/sessions/{id}:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    get:
+      operationId: getRun
+      summary: Get a run
+      description: Returns the run alongside its accumulated usage totals.
+      tags: [Runs]
+      responses:
+        '200':
+          description: The run and its usage.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session:
+                    $ref: '#/components/schemas/Session'
+                  usage:
+                    $ref: '#/components/schemas/UsageTotals'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/sessions/{id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+      - $ref: '#/components/parameters/Csrf'
+    post:
+      operationId: cancelRun
+      summary: Cancel a run
+      description: |
+        Records the intent to cancel and starts finalization. `cancelled` is
+        `false` when the run was already terminal — that is a success, not an
+        error.
+
+        Cancellation is deliberately stricter than run visibility: being able
+        to *see* a run does not mean being able to stop it.
+      tags: [Runs]
+      responses:
+        '200':
+          description: The cancellation intent was recorded.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cancelled:
+                    type: boolean
+                    description: False when the run had already reached a terminal state.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          description: |
+            The intent did not persist. Retry — a `200` here would claim the
+            run is stopping when nothing durable says so.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/sessions/{id}/cost:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    get:
+      operationId: getRunCost
+      summary: Get run cost
+      description: |
+        The metered cost of the run. Usage is teed off the streaming LLM
+        response by the facade, so this is measured rather than estimated.
+      tags: [Runs]
+      responses:
+        '200':
+          description: Cost and token totals.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageTotals'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/sessions/{id}/artifacts:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    get:
+      operationId: listRunArtifacts
+      summary: List run artifacts
+      description: The outputs a finished run produced — most usefully, the diff.
+      tags: [Runs]
+      responses:
+        '200':
+          description: The artifact index.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  artifacts:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Artifact'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/sessions/{id}/artifacts/{aid}:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+      - name: aid
+        in: path
+        required: true
+        description: The artifact identifier.
+        schema:
+          type: string
+    get:
+      operationId: getRunArtifact
+      summary: Get one artifact
+      tags: [Runs]
+      responses:
+        '200':
+          description: The artifact content.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Artifact'
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/sessions/{id}/deliveries:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    get:
+      operationId: listRunDeliveries
+      summary: List result deliveries for a run
+      description: |
+        Result delivery is decoupled from the run lifecycle: a failing webhook
+        or a dead GitHub can never mutate a run. Deliveries are at-least-once
+        and are retried with backoff from 5 seconds to 1 hour over 6 attempts —
+        receivers must deduplicate on the `x-fluidbox-delivery` header.
+      tags: [Runs]
+      responses:
+        '200':
+          description: The delivery attempts for this run.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deliveries:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Delivery'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ----------------------------------------------------------------- Events --
+  /v1/sessions/{id}/events:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    get:
+      operationId: listRunEvents
+      summary: Read the run timeline
+      description: |
+        Returns events after `seq`. This same query backs the live stream, so
+        polling and streaming are exact about each other — you can switch
+        between them without gaps or duplicates.
+      tags: [Events]
+      parameters:
+        - name: after
+          in: query
+          description: Return events with `seq` strictly greater than this.
+          schema:
+            type: integer
+            format: int64
+            default: 0
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            format: int64
+            default: 200
+      responses:
+        '200':
+          description: A page of events.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Event'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/sessions/{id}/events/stream:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    get:
+      operationId: streamRunEvents
+      summary: Stream the run timeline (SSE)
+      description: |
+        A `text/event-stream` of the run timeline.
+
+        Fanout is hybrid on purpose: a database `NOTIFY` is only a wakeup, and
+        the `seq` catch-up query is the delivery source of truth. That makes
+        the stream immune to missed notifications and to the database scaling
+        to zero.
+
+        Send `Last-Event-ID` to resume exactly where you left off.
+
+        ```bash
+        curl -N -H "Authorization: Bearer $FLUIDBOX_TOKEN" \
+          "$FLUIDBOX_URL/v1/sessions/$RUN/events/stream"
+        ```
+      tags: [Events]
+      parameters:
+        - name: Last-Event-ID
+          in: header
+          description: The last `seq` you processed. Delivery resumes after it.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The event stream.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # -------------------------------------------------------------- Approvals --
+  /v1/approvals:
+    get:
+      operationId: listPendingApprovals
+      summary: The approval inbox
+      description: Every approval currently waiting on a human decision.
+      tags: [Approvals]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Pending approvals.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  approvals:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Approval'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/sessions/{id}/approvals:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    get:
+      operationId: listRunApprovals
+      summary: List a run's approvals
+      tags: [Approvals]
+      responses:
+        '200':
+          description: This run's approvals, decided and pending.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  approvals:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Approval'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/approvals/{id}/decision:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The approval identifier.
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/Csrf'
+    post:
+      operationId: decideApproval
+      summary: Approve or deny a paused tool call
+      description: |
+        Unblocks a run waiting at the permission gate.
+
+        The decision is settled by a compare-and-swap, and the resulting
+        `approval.decided` and `tool.decision` events are appended **inside the
+        deciding transaction** — so only the CAS winner emits, and a
+        double-submit produces exactly one decision and one pair of events.
+
+        Authority is not uniform: a call against a **personal** connection is
+        decidable only by the owner who invoked it. There is no role, admin, or
+        operator override, symmetric across approve and deny.
+      tags: [Approvals]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision:
+                  type: string
+                  enum: [approved_once, approved_session, denied]
+                  description: |
+                    `approved_once` allows this single call.
+                    `approved_session` allows this tool for the rest of the run.
+                    `denied` refuses it and returns a tool error to the model.
+            examples:
+              once:
+                value: { decision: approved_once }
+              session:
+                value: { decision: approved_session }
+      responses:
+        '200':
+          description: The decision was recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Approval'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: |
+            The caller may not decide this approval — most often a personal
+            connection's call being decided by someone other than its owner.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ----------------------------------------------------------------- Agents --
+  /v1/agents:
+    get:
+      operationId: listAgents
+      summary: List agents
+      tags: [Agents]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: The agent list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agents:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Agent'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      operationId: createAgent
+      summary: Register an agent
+      description: |
+        Creates the agent and its first revision. The model, system prompt,
+        policy, and budgets all live on the revision — to change any of them
+        later, append a revision rather than mutating this one.
+      tags: [Agents]
+      parameters:
+        - $ref: '#/components/parameters/Csrf'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAgent'
+            examples:
+              minimal:
+                summary: The smallest useful agent
+                value:
+                  name: reviewer
+                  system_prompt: You review diffs for correctness and security.
+              governed:
+                summary: Pinned policy, budgets, and a default workspace
+                value:
+                  name: fixer
+                  description: Fixes failing tests on the default branch.
+                  harness: claude
+                  model: claude-haiku-4-5
+                  system_prompt: You fix failing tests. Change as little as possible.
+                  policy: default
+                  budgets:
+                    max_cost_usd: 2.5
+                    max_wall_clock_secs: 1800
+                    max_tool_calls: 200
+                  default_workspace:
+                    kind: git_repository
+                    connection_id: 6f1a6e6c-1f2b-7c3d-8e4f-9a0b1c2d3e4f
+                    repository: acme/widgets
+                    ref: main
+                  capability_bundles: [github-readonly@3]
+      responses:
+        '200':
+          description: The agent and its first revision.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agent:
+                    $ref: '#/components/schemas/Agent'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/agents/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The agent's id or its name.
+        schema:
+          type: string
+    get:
+      operationId: getAgent
+      summary: Get an agent
+      description: Returns the agent with its revision history.
+      tags: [Agents]
+      responses:
+        '200':
+          description: The agent and its revisions.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agent:
+                    $ref: '#/components/schemas/Agent'
+                  revisions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AgentRevision'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/agents/{id}/revisions:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The agent's id or its name.
+        schema:
+          type: string
+      - $ref: '#/components/parameters/Csrf'
+    post:
+      operationId: addAgentRevision
+      summary: Append a revision
+      description: |
+        The only way to change an agent. Omitted fields inherit from the latest
+        revision; an explicit empty array clears a list (this is how you drop
+        every capability pin, and how a bundle upgrade lands — re-resolving
+        `"name"` pins the newest version as of now).
+
+        In-flight runs are unaffected: they are governed by the snapshot they
+        froze at creation.
+      tags: [Agents]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddRevision'
+            examples:
+              swapModel:
+                summary: Change the model, inherit everything else
+                value:
+                  model: claude-haiku-4-5
+              upgradeBundles:
+                summary: Re-pin capability bundles to their newest versions
+                value:
+                  capability_bundles: [github-readonly, jira]
+      responses:
+        '200':
+          description: The new revision.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revision:
+                    $ref: '#/components/schemas/AgentRevision'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # --------------------------------------------------------------- Policies --
+  /v1/policies:
+    get:
+      operationId: listPolicies
+      summary: List policies
+      tags: [Policies]
+      responses:
+        '200':
+          description: The policy list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  policies:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Policy'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      operationId: upsertPolicy
+      summary: Create or replace a policy from YAML
+      tags: [Policies]
+      parameters:
+        - $ref: '#/components/parameters/Csrf'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, yaml]
+              properties:
+                name:
+                  type: string
+                yaml:
+                  type: string
+                  description: The policy document.
+      responses:
+        '200':
+          description: The stored policy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Policy'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/policies/{name}:
+    parameters:
+      - $ref: '#/components/parameters/PolicyName'
+    get:
+      operationId: getPolicy
+      summary: Get a policy
+      tags: [Policies]
+      responses:
+        '200':
+          description: The policy at its current head version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Policy'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      operationId: deletePolicy
+      summary: Delete a policy
+      description: |
+        Runs that already froze this policy keep their snapshot and continue to
+        be governed by it.
+      tags: [Policies]
+      parameters:
+        - $ref: '#/components/parameters/Csrf'
+      responses:
+        '200':
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/policies/{name}/versions/{version}:
+    parameters:
+      - $ref: '#/components/parameters/PolicyName'
+      - name: version
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int32
+    get:
+      operationId: getPolicyVersion
+      summary: Get one historical policy version
+      tags: [Policies]
+      responses:
+        '200':
+          description: That version's content.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Policy'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/policies/{name}/publish:
+    parameters:
+      - $ref: '#/components/parameters/PolicyName'
+      - $ref: '#/components/parameters/Csrf'
+    post:
+      operationId: publishPolicy
+      summary: Publish a policy draft
+      description: |
+        Publishes a new head version. `base_version` is the head you loaded the
+        draft from — publishing over a moved head is a `409` rather than a
+        silent overwrite of the other editor's intent.
+
+        That same `409` is what makes this safe to retry: a post-commit retry
+        of your own publish also lands on `409`, so a network failure cannot
+        produce two versions.
+      tags: [Policies]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content, summary, base_version]
+              properties:
+                content:
+                  type: object
+                  description: |
+                    The whole draft as structure. The server validates it; the
+                    browser never resolves a verdict.
+                summary:
+                  type: string
+                  description: What changed and why. Required and non-blank.
+                base_version:
+                  type: integer
+                  format: int32
+      responses:
+        '200':
+          description: The published version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Policy'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: |
+            The head moved since `base_version`. Reload, re-apply your change,
+            and publish again.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/policies/{name}/revert:
+    parameters:
+      - $ref: '#/components/parameters/PolicyName'
+      - $ref: '#/components/parameters/Csrf'
+    post:
+      operationId: revertPolicy
+      summary: Revert a policy to an earlier version
+      description: |
+        Publishes the content of `version` as a new head. History is never
+        rewritten — a revert moves forward.
+      tags: [Policies]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version, base_version]
+              properties:
+                version:
+                  type: integer
+                  format: int32
+                  description: The version to restore.
+                base_version:
+                  type: integer
+                  format: int32
+                  description: The head you were looking at. Same guard as publish.
+      responses:
+        '200':
+          description: The new head version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Policy'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/policies/validate:
+    post:
+      operationId: validatePolicy
+      summary: Validate policy YAML
+      description: Parses and checks a policy document without storing anything.
+      tags: [Policies]
+      parameters:
+        - $ref: '#/components/parameters/Csrf'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [yaml]
+              properties:
+                yaml:
+                  type: string
+      responses:
+        '200':
+          description: The validation result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  valid:
+                    type: boolean
+                  errors:
+                    type: array
+                    items:
+                      type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/policies/preview:
+    post:
+      operationId: previewPolicy
+      summary: Preview the effective permission matrix
+      description: |
+        Resolves a draft into the per-tool verdict matrix without publishing —
+        this is how you see what a rule change will actually do before it
+        governs a run.
+
+        Passing an existing policy's `name` folds that policy's agents' `mcp__*`
+        tool roster into the matrix. A brand-new draft previews the canonical
+        tool vocabulary only.
+      tags: [Policies]
+      parameters:
+        - $ref: '#/components/parameters/Csrf'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content:
+                  type: object
+                name:
+                  type: string
+                  description: An existing policy name, to fold in its agents' tools.
+      responses:
+        '200':
+          description: The resolved matrix.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  matrix:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        tool:
+                          type: string
+                        verdict:
+                          $ref: '#/components/schemas/Verdict'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/policies/clone:
+    post:
+      operationId: clonePolicy
+      summary: Clone a policy
+      description: |
+        Creates a new policy from an existing one. Omitting `from` starts blank
+        — an empty rule set under the fail-safe defaults, where everything asks
+        a human.
+      tags: [Policies]
+      parameters:
+        - $ref: '#/components/parameters/Csrf'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  description: The new policy's name.
+                from:
+                  type: string
+                  description: Source policy name. Omit to start blank.
+                from_version:
+                  type: integer
+                  format: int32
+                  description: Pin the exact source version. Omit for its latest.
+      responses:
+        '200':
+          description: The new policy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Policy'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  # --------------------------------------------------------------- Triggers --
+  /v1/triggers:
+    get:
+      operationId: listTriggers
+      summary: List trigger subscriptions
+      tags: [Triggers]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: The subscriptions.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  triggers:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Trigger'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      operationId: createTrigger
+      summary: Create a trigger subscription
+      description: |
+        One object covers all three invocation shapes:
+
+        - **API** — the default. Invoke it with the returned trigger token.
+        - **Schedule** — attach `schedule` with a cron expression.
+        - **Event** — attach `connection` to listen to a connected service.
+
+        `schedule` and `connection` are mutually exclusive.
+
+        The response includes the subscription's **trigger token exactly once**.
+        Store it now; it is stored hashed and is never returned again. That
+        token can invoke this one subscription and poll its runs — never the
+        admin API, and the admin token can never invoke.
+      tags: [Triggers]
+      parameters:
+        - $ref: '#/components/parameters/Csrf'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTrigger'
+            examples:
+              api:
+                summary: An API trigger with a signed callback
+                value:
+                  agent: fixer
+                  name: nightly-fix
+                  task_template: Fix whatever is failing on main.
+                  callback_url: https://hooks.example.com/fluidbox
+              schedule:
+                summary: A weekday 09:00 schedule in London
+                value:
+                  agent: triager
+                  name: morning-triage
+                  task_template: Triage yesterday's new issues.
+                  autonomous: true
+                  schedule:
+                    cron: '0 9 * * 1-5'
+                    timezone: Europe/London
+                    missed_run_policy: skip
+              event:
+                summary: Review pull requests, publish a comment and a check
+                value:
+                  agent: reviewer
+                  name: pr-review
+                  connection: 6f1a6e6c-1f2b-7c3d-8e4f-9a0b1c2d3e4f
+                  repositories: [acme/widgets]
+                  events: [opened, reopened]
+                  publish: [pr_comment, check]
+                  concurrency_policy: skip_if_running
+      responses:
+        '200':
+          description: |
+            The subscription, including its trigger token. This is the only
+            time the token is returned.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Trigger'
+                  - type: object
+                    properties:
+                      token:
+                        type: string
+                        description: The subscription-scoped trigger token, shown once.
+                        examples: ['fbx_trig_2f9c…']
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/triggers/{id}:
+    parameters:
+      - $ref: '#/components/parameters/TriggerId'
+    get:
+      operationId: getTrigger
+      summary: Get a trigger subscription
+      tags: [Triggers]
+      responses:
+        '200':
+          description: The subscription.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Trigger'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/triggers/{id}/invoke:
+    parameters:
+      - $ref: '#/components/parameters/TriggerId'
+    post:
+      operationId: invokeTrigger
+      summary: Invoke a trigger
+      description: |
+        Starts a run through this subscription. Authenticate with the
+        **trigger token**, not the admin token — the admin token can never
+        invoke.
+
+        Overrides can only ever *narrow* authority, and only when the
+        subscription opted in (`allow_task_override`,
+        `allow_workspace_override`, both off by default). A workspace override
+        must stay inside the subscription's existing repository and connection:
+        it can pick a different ref or commit, never a new connection, clone
+        URL, or local path.
+      tags: [Triggers]
+      security:
+        - triggerToken: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                task:
+                  type: string
+                  description: Requires `allow_task_override` on the subscription.
+                context:
+                  type: object
+                  description: Arbitrary context frozen into the run's `InvocationContext`.
+                workspace:
+                  type: object
+                  description: Requires `allow_workspace_override`. Narrowing only.
+                  properties:
+                    repository:
+                      type: string
+                    ref:
+                      type: string
+                    commit_sha:
+                      type: string
+            examples:
+              plain:
+                summary: Fire with the subscription's own task template
+                value: {}
+              narrowed:
+                summary: Same repository, a specific commit
+                value:
+                  task: Re-run the failing integration test.
+                  workspace:
+                    ref: release/1.4
+                    commit_sha: 9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c
+      responses:
+        '200':
+          description: The run that was created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session:
+                    $ref: '#/components/schemas/Session'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: |
+            An override was sent that the subscription did not opt into, or one
+            that would widen authority.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: |
+            Skipped by the concurrency policy — a run of this subscription is
+            already active and the policy is `skip_if_running`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/triggers/{id}/runs/{sid}:
+    parameters:
+      - $ref: '#/components/parameters/TriggerId'
+      - name: sid
+        in: path
+        required: true
+        description: The run identifier.
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: pollTriggerRun
+      summary: Poll a run started by this subscription
+      description: |
+        The trigger token's read side. Polling is scoped to the
+        **subscription**, not to the token: rotation replaces the credential,
+        not the authority, so a replacement token can still poll runs created
+        before the rotation.
+      tags: [Triggers]
+      security:
+        - triggerToken: []
+      responses:
+        '200':
+          description: The run.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session:
+                    $ref: '#/components/schemas/Session'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/triggers/{id}/enable:
+    parameters:
+      - $ref: '#/components/parameters/TriggerId'
+      - $ref: '#/components/parameters/Csrf'
+    post:
+      operationId: enableTrigger
+      summary: Enable a subscription
+      description: |
+        A disabled subscription's schedule does not advance while it is off, so
+        re-enabling goes through the missed-run path — with the default `skip`
+        policy that records exactly one skip row rather than firing a backlog.
+      tags: [Triggers]
+      responses:
+        '200':
+          description: Enabled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Trigger'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/triggers/{id}/disable:
+    parameters:
+      - $ref: '#/components/parameters/TriggerId'
+      - $ref: '#/components/parameters/Csrf'
+    post:
+      operationId: disableTrigger
+      summary: Disable a subscription
+      tags: [Triggers]
+      responses:
+        '200':
+          description: Disabled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Trigger'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/triggers/{id}/rotate_token:
+    parameters:
+      - $ref: '#/components/parameters/TriggerId'
+      - $ref: '#/components/parameters/Csrf'
+    post:
+      operationId: rotateTriggerToken
+      summary: Rotate the trigger token
+      description: |
+        Mints a replacement and retires the old one. The new token is returned
+        exactly once. Rotation replaces the credential, not the authority — the
+        replacement still polls runs created before it existed.
+      tags: [Triggers]
+      responses:
+        '200':
+          description: The replacement token, shown once.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ------------------------------------------------------------ Connections --
+  /v1/connections:
+    get:
+      operationId: listConnections
+      summary: List connections
+      description: |
+        Personal connections are visible only to their owner — administrators
+        are excluded by design.
+      tags: [Connections]
+      responses:
+        '200':
+          description: The connections visible to the caller.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  connections:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Connection'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      operationId: createConnection
+      summary: Create a connection
+      description: |
+        Custodies a credential for an external service. Every secret in this
+        request is consumed here, sealed at rest, and **never returned** by any
+        endpoint.
+
+        Requires `FLUIDBOX_CREDENTIAL_KEY` to be configured — without it the
+        server boots fine but connections are disabled.
+
+        For MCP servers with `auth_kind: oauth`, the connection starts
+        `pending`; run `/v1/connections/{id}/oauth/start` to complete it.
+      tags: [Connections]
+      parameters:
+        - $ref: '#/components/parameters/Csrf'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateConnection'
+            examples:
+              githubPat:
+                summary: GitHub via a personal access token
+                value:
+                  provider: github
+                  token: ghp_xxxxxxxxxxxxxxxxxxxx
+                  display_name: acme org
+              mcpStatic:
+                summary: A brokered MCP server with a static credential
+                value:
+                  provider: mcp_http
+                  base_url: https://mcp.example.com
+                  auth_kind: static
+                  token: sk-xxxxxxxx
+                  scheme: Bearer
+              mcpOauth:
+                summary: A brokered MCP server that will use OAuth
+                value:
+                  provider: mcp_http
+                  base_url: https://mcp.example.com
+                  auth_kind: oauth
+                  scopes: [read, write]
+                  owner: personal
+      responses:
+        '200':
+          description: The connection. Secrets are never echoed back.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Connection'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: |
+            Organization-owned connections require an admin or owner role.
+            Personal custody is open to any signed-in member.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Connections are disabled — `FLUIDBOX_CREDENTIAL_KEY` is not set.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/connections/{id}/approve:
+    parameters:
+      - $ref: '#/components/parameters/ConnectionId'
+      - $ref: '#/components/parameters/Csrf'
+    post:
+      operationId: approveConnection
+      summary: Approve a pending connection
+      description: |
+        Admin intent for a connection that GitHub-initiated discovery created
+        as `pending`. Approving a previously revoked installation revives the
+        same connection id, which keeps its dedup history continuous.
+      tags: [Connections]
+      responses:
+        '200':
+          description: The approved connection.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Connection'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/connections/{id}/revoke:
+    parameters:
+      - $ref: '#/components/parameters/ConnectionId'
+      - $ref: '#/components/parameters/Csrf'
+    post:
+      operationId: revokeConnection
+      summary: Revoke a connection
+      description: |
+        Marks the connection revoked and evicts any cached tokens. In-flight
+        runs holding a binding to it fail closed on their next brokered call —
+        every credential access re-verifies status before the secret is
+        touched.
+      tags: [Connections]
+      responses:
+        '200':
+          description: Revoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Connection'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/connections/{id}/oauth/start:
+    parameters:
+      - $ref: '#/components/parameters/ConnectionId'
+      - $ref: '#/components/parameters/Csrf'
+    post:
+      operationId: startConnectionOauth
+      summary: Begin the OAuth connect flow
+      description: |
+        Returns **only** a `go_url`. Navigate a browser to it — that navigation
+        is what sets the flow cookie and claims the one-time flow row, with the
+        browser hash inside the atomic single-use predicate. A leaked
+        *authorization* URL can therefore neither complete nor burn a flow.
+
+        The flow freezes the authorization and token endpoints, the resolved
+        client, the `resource` parameter, and the PKCE verifier at start, so
+        the callback exchanges against the frozen row rather than
+        re-discovering anything.
+
+        > The `go_url` itself is transferable — whichever browser opens it
+        > becomes the initiating browser. Treat it as a secret and hand it
+        > straight to the intended user.
+      tags: [Connections]
+      responses:
+        '200':
+          description: Navigate a browser to `go_url`.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  go_url:
+                    type: string
+                    format: uri
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/connections/{id}/tools:
+    parameters:
+      - $ref: '#/components/parameters/ConnectionId'
+    get:
+      operationId: getConnectionTools
+      summary: Read the photographed tool surface
+      description: |
+        The latest append-only snapshot of the tools this connection exposes,
+        taken by a forced `initialize` handshake at connect time.
+
+        A run freezes the snapshot it saw. If the upstream server later changes
+        its tools, calls against the drifted set are **denied** rather than
+        silently re-negotiated — re-photograph with `/tools/refresh` and start
+        a new run.
+      tags: [Connections]
+      responses:
+        '200':
+          description: The snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolSnapshot'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/connections/{id}/tools/refresh:
+    parameters:
+      - $ref: '#/components/parameters/ConnectionId'
+      - $ref: '#/components/parameters/Csrf'
+    post:
+      operationId: refreshConnectionTools
+      summary: Re-photograph the tool surface
+      description: |
+        Takes a new snapshot. Existing runs keep the surface they froze; only
+        runs created after this call see the new one.
+      tags: [Connections]
+      responses:
+        '200':
+          description: The new snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolSnapshot'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '502':
+          description: The upstream MCP server could not be photographed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/connections/{id}/repos:
+    parameters:
+      - $ref: '#/components/parameters/ConnectionId'
+    get:
+      operationId: listConnectionRepos
+      summary: List repositories a connection can see
+      tags: [Connections]
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: per_page
+          in: query
+          schema:
+            type: integer
+            default: 30
+      responses:
+        '200':
+          description: A page of repositories.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  repositories:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        full_name:
+                          type: string
+                          examples: [acme/widgets]
+                        default_branch:
+                          type: string
+                        private:
+                          type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/connections/{id}/deliveries:
+    parameters:
+      - $ref: '#/components/parameters/ConnectionId'
+    get:
+      operationId: listConnectionDeliveries
+      summary: List inbound webhook deliveries
+      description: |
+        What this connection received and what it fanned out to. Deliveries are
+        deduplicated at two levels, which is what makes a webhook retry *heal*
+        a partial fan-out rather than duplicate runs or comments.
+      tags: [Connections]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: The delivery log.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deliveries:
+                    type: array
+                    items:
+                      type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ---------------------------------------------------------------- Catalog --
+  /v1/catalog:
+    get:
+      operationId: listCatalog
+      summary: List connector catalog entries
+      description: |
+        Reference data only. Curated and imported entries are deployment-global;
+        custom entries are tenant-scoped, and a tenant entry shadows a global
+        one with the same slug.
+
+        `tool_hints` are display defaults — they are policy *seeds*, never
+        decisions. The permission gate stays the judge.
+      tags: [Catalog]
+      responses:
+        '200':
+          description: The catalog.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CatalogEntry'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      operationId: createCatalogEntry
+      summary: Add a custom catalog entry
+      description: 'Custom entries are forced to `tier: custom`. Requires an admin or owner role.'
+      tags: [Catalog]
+      parameters:
+        - $ref: '#/components/parameters/Csrf'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCatalogEntry'
+      responses:
+        '200':
+          description: The new entry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogEntry'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/catalog/{slug}:
+    parameters:
+      - $ref: '#/components/parameters/CatalogSlug'
+    get:
+      operationId: getCatalogEntry
+      summary: Get a catalog entry
+      tags: [Catalog]
+      responses:
+        '200':
+          description: The entry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogEntry'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/catalog/{slug}/connect:
+    parameters:
+      - $ref: '#/components/parameters/CatalogSlug'
+      - $ref: '#/components/parameters/Csrf'
+    post:
+      operationId: connectCatalogEntry
+      summary: Connect a catalog entry
+      description: |
+        The one-call path from catalog entry to usable connection.
+
+        - `api_key` entries seal the token and immediately photograph the tool
+          surface. If the photograph is refused, the whole connect rolls back.
+        - `oauth` entries return a `go_url` and photograph on callback.
+        - In-image (`none`) entries register a sandbox capability bundle
+          instead — no credential is involved.
+      tags: [Catalog]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConnectCatalogEntry'
+            examples:
+              apiKey:
+                value:
+                  token: sk-xxxxxxxx
+                  display_name: Acme production
+              personalOauth:
+                value:
+                  owner: personal
+                  scopes: [read]
+      responses:
+        '200':
+          description: |
+            The connection, or a `go_url` when the entry uses OAuth.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  connection:
+                    $ref: '#/components/schemas/Connection'
+                  go_url:
+                    type: string
+                    format: uri
+                    description: Present for OAuth entries. Navigate a browser to it.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/mcp/probe:
+    post:
+      operationId: probeMcpServer
+      summary: Probe an MCP server
+      description: |
+        Paste a URL, detect its authentication mode, and preview its tools —
+        without committing anything. Nothing is stored.
+      tags: [Catalog]
+      parameters:
+        - $ref: '#/components/parameters/Csrf'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url:
+                  type: string
+                  format: uri
+      responses:
+        '200':
+          description: What the probe found.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  auth_mode:
+                    type: string
+                    enum: [none, api_key, oauth]
+                  protocol_version:
+                    type: string
+                  tools:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Tool'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          description: The server could not be reached or did not speak MCP.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/mcp/servers:
+    post:
+      operationId: addCustomMcpServer
+      summary: Bring your own MCP server
+      description: |
+        Creates a `tier: custom` catalog entry and connects it in one call.
+        The catalog entry stays organization reference data regardless of
+        `owner` — only the resulting connection carries personal custody.
+      tags: [Catalog]
+      parameters:
+        - $ref: '#/components/parameters/Csrf'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddCustomMcpServer'
+            examples:
+              apiKey:
+                value:
+                  url: https://mcp.example.com
+                  name: acme-tools
+                  auth_mode: api_key
+                  token: sk-xxxxxxxx
+                  header_name: authorization
+                  scheme: Bearer
+      responses:
+        '200':
+          description: The catalog entry and the connection it produced.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entry:
+                    $ref: '#/components/schemas/CatalogEntry'
+                  connection:
+                    $ref: '#/components/schemas/Connection'
+                  go_url:
+                    type: string
+                    format: uri
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  # ----------------------------------------------------------- Capabilities --
+  /v1/capabilities:
+    get:
+      operationId: listCapabilityBundles
+      summary: List capability bundles
+      tags: [Capabilities]
+      responses:
+        '200':
+          description: The registered bundles.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  bundles:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CapabilityBundle'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      operationId: createCapabilityBundle
+      summary: Register a capability bundle
+      description: |
+        Bundles describe **sandbox-class** MCP servers only: credential-free
+        stdio subprocesses packaged in the runner image, contained by the
+        container.
+
+        A brokered (credentialed) server is refused here — those are
+        connections, and the whole point of the split is that their credential
+        never enters a sandbox.
+
+        The registry is append-only: re-registering a name publishes the next
+        version.
+      tags: [Capabilities]
+      parameters:
+        - $ref: '#/components/parameters/Csrf'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, servers]
+              properties:
+                name:
+                  type: string
+                description:
+                  type: string
+                servers:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/CapabilityServer'
+      responses:
+        '200':
+          description: The published bundle version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapabilityBundle'
+        '400':
+          description: |
+            Refused — most often because a server declared `class: brokered`.
+            Use a connection instead.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/capabilities/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The bundle id, or `name@version`.
+        schema:
+          type: string
+    get:
+      operationId: getCapabilityBundle
+      summary: Get a capability bundle
+      tags: [Capabilities]
+      responses:
+        '200':
+          description: The bundle.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapabilityBundle'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # --------------------------------------------------------------- Identity --
+  /v1/auth/login:
+    get:
+      operationId: getLoginPage
+      summary: The login entry page
+      description: |
+        The neutral, IdP-agnostic entry point. Unauthenticated by design.
+      tags: [Identity]
+      security: []
+      parameters:
+        - name: org
+          in: query
+          schema:
+            type: string
+        - name: redirect_to
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The login page.
+          content:
+            text/html:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/auth/login/{slug}/start:
+    parameters:
+      - name: slug
+        in: path
+        required: true
+        description: The organization slug.
+        schema:
+          type: string
+    get:
+      operationId: startLogin
+      summary: Begin OIDC login for an organization
+      description: |
+        Redirects to the organization's configured identity provider. The
+        browser-bound one-time flow row and the sealed `state` are the
+        authentication here — there is no bearer token to present.
+      tags: [Identity]
+      security: []
+      parameters:
+        - name: redirect_to
+          in: query
+          schema:
+            type: string
+      responses:
+        '302':
+          description: Redirect to the identity provider.
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/auth/callback:
+    get:
+      operationId: loginCallback
+      summary: OIDC callback
+      description: |
+        The one stable redirect URI for every organization. Unauthenticated by
+        design — the sealed `state` plus the per-flow cookie **are** the
+        authentication, the same pattern as webhook signatures.
+      tags: [Identity]
+      security: []
+      parameters:
+        - name: code
+          in: query
+          schema:
+            type: string
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: error
+          in: query
+          schema:
+            type: string
+        - name: error_description
+          in: query
+          schema:
+            type: string
+      responses:
+        '302':
+          description: Signed in; redirects onward with the session cookie set.
+          headers:
+            Set-Cookie:
+              description: The `__Host-fbx_web` session cookie.
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /v1/auth/me:
+    get:
+      operationId: getCurrentIdentity
+      summary: Who am I
+      description: |
+        Resolves the caller. Useful for confirming which of the three principal
+        kinds you are actually authenticating as — operator, user, or PAT.
+      tags: [Identity]
+      security:
+        - sessionCookie: []
+        - pat: []
+      responses:
+        '200':
+          description: The resolved principal.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                        format: uuid
+                      email:
+                        type: string
+                        format: email
+                  org:
+                    type: object
+                    properties:
+                      slug:
+                        type: string
+                  roles:
+                    type: array
+                    items:
+                      type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/auth/logout:
+    post:
+      operationId: logout
+      summary: Sign out
+      tags: [Identity]
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/Csrf'
+      responses:
+        '200':
+          description: Signed out; the session cookie is cleared.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/auth/switch/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The pending organization-switch identifier.
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/Csrf'
+    post:
+      operationId: confirmOrgSwitch
+      summary: Confirm an organization switch
+      tags: [Identity]
+      security:
+        - sessionCookie: []
+      responses:
+        '200':
+          description: Switched.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/auth/tokens:
+    get:
+      operationId: listPats
+      summary: List personal access tokens
+      description: Metadata only — token values are stored as SHA-256 digests and cannot be read back.
+      tags: [Identity]
+      security:
+        - sessionCookie: []
+      responses:
+        '200':
+          description: The caller's tokens.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tokens:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PersonalAccessToken'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      operationId: mintPat
+      summary: Mint a personal access token
+      description: |
+        Machine access without a browser flow. **Requires a browser session** —
+        a PAT can never mint another PAT.
+
+        The token value is returned exactly once.
+      tags: [Identity]
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/Csrf'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                expires_in:
+                  type: integer
+                  format: int64
+                  description: Lifetime in seconds. Omit for the deployment default.
+            examples:
+              ci:
+                value:
+                  name: ci-runner
+                  expires_in: 2592000
+      responses:
+        '200':
+          description: The token, shown once.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PersonalAccessToken'
+                  - type: object
+                    properties:
+                      token:
+                        type: string
+                        examples: ['fbx_pat_9c2e…']
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/auth/tokens/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/Csrf'
+    delete:
+      operationId: revokePat
+      summary: Revoke a personal access token
+      tags: [Identity]
+      security:
+        - sessionCookie: []
+      responses:
+        '200':
+          description: Revoked.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/oauth/go:
+    get:
+      operationId: oauthGo
+      summary: Connector OAuth boot leg
+      description: |
+        Sets the flow cookie and redirects to the authorization server.
+        Unauthenticated by design — a browser redirect cannot carry a bearer
+        token, so the sealed boot token plus the one-time flow claim are the
+        authentication.
+
+        Navigate a browser here; do not call it programmatically.
+      tags: [Identity]
+      security: []
+      parameters:
+        - name: f
+          in: query
+          required: true
+          description: The sealed boot token from `oauth/start`.
+          schema:
+            type: string
+      responses:
+        '302':
+          description: Redirect to the authorization server.
+        '400':
+          description: |
+            The boot token was missing, malformed, expired, or its one-time
+            flow had already been claimed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/oauth/callback:
+    get:
+      operationId: oauthCallback
+      summary: Connector OAuth callback
+      description: |
+        The single redirect URI for every connector OAuth flow. The AEAD-sealed
+        `state` carrying the connection id and PKCE verifier **is** the
+        authentication.
+
+        The exchange runs against the endpoints frozen at start (closing
+        authorization-server mix-up) and refuses a moved authorization
+        generation. A successful exchange requires a refresh token.
+      tags: [Identity]
+      security: []
+      parameters:
+        - name: code
+          in: query
+          schema:
+            type: string
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: error
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The connection is active.
+          content:
+            text/html:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  # ----------------------------------------------------------------- GitHub --
+  /v1/github/app:
+    get:
+      operationId: listGithubAppRegistrations
+      summary: List GitHub App registrations
+      description: |
+        A registration custodies an app identity — its private key, webhook
+        secret, and client secret, all sealed. There is one registration per
+        GitHub account or organization, because a private app installs only on
+        its owner.
+      tags: [GitHub]
+      responses:
+        '200':
+          description: The registrations.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  registrations:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/GithubAppRegistration'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/github/app/manifest/start:
+    post:
+      operationId: startGithubAppManifest
+      summary: Begin GitHub App creation
+      description: |
+        Mints a one-time flow and returns a `go_url`. Requires admin intent —
+        activation is never something GitHub can initiate on its own.
+      tags: [GitHub]
+      parameters:
+        - $ref: '#/components/parameters/Csrf'
+      responses:
+        '200':
+          description: Navigate a browser to `go_url`.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  go_url:
+                    type: string
+                    format: uri
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/github/app/manifest/go:
+    get:
+      operationId: githubAppManifestGo
+      summary: GitHub App manifest form
+      description: Browser-facing. Posts the app manifest to GitHub.
+      tags: [GitHub]
+      security: []
+      responses:
+        '200':
+          description: The auto-submitting manifest form.
+          content:
+            text/html:
+              schema:
+                type: string
+        '400':
+          description: The flow token was missing, expired, or already claimed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/github/app/manifest/callback:
+    get:
+      operationId: githubAppManifestCallback
+      summary: GitHub App manifest callback
+      description: Exchanges the manifest code and seals the resulting app credentials.
+      tags: [GitHub]
+      security: []
+      parameters:
+        - name: code
+          in: query
+          schema:
+            type: string
+        - name: state
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The registration was created.
+          content:
+            text/html:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /v1/github/app/{id}/install/start:
+    parameters:
+      - $ref: '#/components/parameters/RegistrationId'
+      - $ref: '#/components/parameters/Csrf'
+    post:
+      operationId: startGithubAppInstall
+      summary: Begin installing the app
+      tags: [GitHub]
+      responses:
+        '200':
+          description: Navigate a browser to `go_url`.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  go_url:
+                    type: string
+                    format: uri
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/github/app/install/go:
+    get:
+      operationId: githubAppInstallGo
+      summary: GitHub App install redirect
+      tags: [GitHub]
+      security: []
+      responses:
+        '302':
+          description: Redirect to GitHub's installation page.
+        '400':
+          description: The flow token was missing, expired, or already claimed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/github/app/{id}/setup:
+    parameters:
+      - $ref: '#/components/parameters/RegistrationId'
+    get:
+      operationId: githubAppSetup
+      summary: GitHub post-install setup landing
+      description: |
+        Where GitHub sends the browser after an installation. A state-less hit
+        performs **zero writes and zero GitHub calls** — `installation_id` from
+        a query string is never trusted. Use `sync` or `approve` to record
+        intent.
+      tags: [GitHub]
+      security: []
+      parameters:
+        - name: installation_id
+          in: query
+          schema:
+            type: string
+        - name: state
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The setup result page.
+          content:
+            text/html:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/github/app/{id}/sync:
+    parameters:
+      - $ref: '#/components/parameters/RegistrationId'
+      - $ref: '#/components/parameters/Csrf'
+    post:
+      operationId: syncGithubApp
+      summary: Reconcile installations against GitHub
+      description: |
+        Reconciles local state against GitHub's truth. Webhook ordering never
+        wins over a sync — an installation id is only ever trusted after it
+        resolves under our own app's JWT.
+      tags: [GitHub]
+      responses:
+        '200':
+          description: What changed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  connections:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Connection'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/github/app/{id}/revoke:
+    parameters:
+      - $ref: '#/components/parameters/RegistrationId'
+      - $ref: '#/components/parameters/Csrf'
+    post:
+      operationId: revokeGithubApp
+      summary: Revoke a registration
+      description: |
+        Cascades to every connection the registration custodies and evicts
+        their cached tokens. Custody resolution is fail-closed: a connection
+        whose registration is missing or inactive is refused rather than
+        falling back to per-connection credentials.
+      tags: [GitHub]
+      responses:
+        '200':
+          description: Revoked.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # -------------------------------------------------------- Runner contract --
+  /internal/sessions/{id}/permission:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    post:
+      operationId: requestToolPermission
+      summary: Ask permission for a tool call
+      description: |
+        **The heart of the system.** Every tool the agent wants to run comes
+        through here, and the answer is authoritative.
+
+        The gate runs a fixed sequence, and the order is the security model:
+
+        1. **Budget** — is there anything left to spend?
+        2. **Frozen-set availability** — is this tool in the surface the run
+           froze? A drifted or withdrawn tool denies with `source=capability`;
+           a missing or stale binding denies with `source=binding`.
+        3. **Frozen schema** — do the arguments validate against the schema
+           frozen at run creation? Denies with `source=schema`.
+        4. **Trust tier** — a `read_only` run (any fork pull request) is
+           refused write and secret-reaching tools here, above policy and above
+           human approval. There is no approval escape from this tier.
+        5. **Policy** — the run's frozen policy snapshot.
+        6. **Approval** — pause for a human, or auto-decide in autonomous mode.
+
+        The permission callback stays wired in **both** autonomy modes. An
+        autonomous run rewrites a `require_approval` verdict to the policy
+        fallback inside the evaluation and records both the original and the
+        rewritten verdict — it never bypasses the gate.
+
+        Decisions are idempotent by `(session_id, tool_call_id)`, so retrying
+        after a restart re-attaches to the pending row.
+
+        Tool names must use the canonical vocabulary — `Bash{command}`,
+        `Edit`/`Write`/`MultiEdit{file_path}`, `Read`/`Glob`/`Grep`/`LS`, and
+        `mcp__<server>__<tool>`. Canonicalization is the runner's job.
+      tags: [Runner contract]
+      security:
+        - sessionToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tool_call_id, tool]
+              properties:
+                tool_call_id:
+                  type: string
+                tool:
+                  type: string
+                input:
+                  type: object
+            examples:
+              bash:
+                value:
+                  tool_call_id: toolu_01ABC
+                  tool: Bash
+                  input:
+                    command: cargo test -p fluidbox-core
+      responses:
+        '200':
+          description: |
+            The verdict. A blocked call holds this request open until a human
+            decides or the approval expires.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PermissionDecision'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/WrongAudience'
+
+  /internal/sessions/{id}/tools/call:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    post:
+      operationId: callBrokeredTool
+      summary: Invoke a brokered tool
+      description: |
+        Intent in, governed result out. The sealed credential turns
+        **server-side** — it never enters the sandbox, the same inversion as
+        the LLM facade and the credentialed git fetch.
+
+        Runners auto-allow brokered `mcp__*` calls in their own permission
+        callback precisely because the broker runs the identical gate here.
+
+        Every dispatch is wrapped in a durable four-state execution claim keyed
+        `(session_id, tool_call_id, input_digest)`. A reused id with different
+        arguments is a new claim, never an adoption. Only
+        `failed_before_send` — which requires positive proof nothing was
+        written — is re-claimable; a definitive upstream response is terminal.
+
+        The ledger records `tool.requested` → `tool.decision` →
+        `tool.brokered`, carrying latency and a result digest, never payloads
+        or secrets.
+      tags: [Runner contract]
+      security:
+        - sessionToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tool_call_id, tool]
+              properties:
+                tool_call_id:
+                  type: string
+                tool:
+                  type: string
+                  description: The prefixed name, e.g. `mcp__issues__create_issue`.
+                input:
+                  type: object
+      responses:
+        '200':
+          description: |
+            The tool result. Note the deliberate split: every definitive
+            outcome renders `ok: true` with the error surfaced inside `result`
+            (MCP's convention), while the audit ledger records the real
+            success or failure.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  result:
+                    type: object
+                    properties:
+                      content:
+                        type: array
+                        items:
+                          type: object
+                      is_error:
+                        type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/WrongAudience'
+
+  /internal/sessions/{id}/events:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    post:
+      operationId: reportEvent
+      summary: Report a timeline event
+      description: |
+        Appends to the run ledger. The ledger only accepts redacted envelopes —
+        model prompts never reach it, only digests, usage, and cost. Session
+        tokens (`fbx_sess_`), web tokens, and PATs are all scrubbed by the
+        redactor.
+
+        `seq` is assigned server-side, gaplessly, under a row lock.
+      tags: [Runner contract]
+      security:
+        - sessionToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [actor, body]
+              properties:
+                actor:
+                  type: string
+                body:
+                  type: object
+      responses:
+        '200':
+          description: Appended.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  seq:
+                    type: integer
+                    format: int64
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/WrongAudience'
+
+  /internal/sessions/{id}/heartbeat:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    post:
+      operationId: heartbeat
+      summary: Report liveness
+      description: |
+        Keeps the watchdog satisfied. A run that stops heartbeating is reaped
+        by the heartbeat worker — the server is the single status writer, and
+        the runner only ever reports.
+      tags: [Runner contract]
+      security:
+        - sessionToken: []
+      responses:
+        '200':
+          description: Acknowledged.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/WrongAudience'
+
+  /internal/sessions/{id}/result:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    post:
+      operationId: reportResult
+      summary: Report the final outcome
+      description: |
+        The runner's last call. The **server** decides the terminal status from
+        this report; the runner never writes status itself.
+
+        The audience is checked *before* the revoked-token leniency, so a
+        revoked `control` token still acknowledges here — but an `llm` or
+        `tool` token never does.
+      tags: [Runner contract]
+      security:
+        - sessionToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [outcome]
+              properties:
+                outcome:
+                  type: string
+                  examples: [completed]
+                summary:
+                  type: string
+      responses:
+        '200':
+          description: Acknowledged; finalization begins.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/WrongAudience'
+
+  /internal/sessions/{id}/workspace:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    get:
+      operationId: fetchWorkspaceArchive
+      summary: Fetch the workspace archive
+      description: |
+        The immutable workspace archive the Kubernetes init container pulls.
+        Credential-free and digest-verified.
+
+        Workspace initialization is control-plane-side by design: the
+        credentialed fetch happens in the orchestrator before the agent starts,
+        so the original repository is never touched and the sandbox stays
+        egress-free. The agent only ever sees a copy at `/workspace`.
+      tags: [Runner contract]
+      security:
+        - sessionToken: []
+      responses:
+        '200':
+          description: The archive.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/WrongAudience'
+
+  /internal/token/renew:
+    post:
+      operationId: renewSessionToken
+      summary: Renew a session token
+      description: Extends the calling token's lifetime for a long-running run.
+      tags: [Runner contract]
+      security:
+        - sessionToken: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ttl_secs:
+                  type: integer
+                  format: int64
+      responses:
+        '200':
+          description: The renewed token.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                  expires_at:
+                    type: string
+                    format: date-time
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/WrongAudience'
+
+  /internal/llm/{rest}:
+    parameters:
+      - name: rest
+        in: path
+        required: true
+        description: |
+          The provider path the harness appends, e.g. `v1/messages`. The Claude
+          Agent SDK appends it to `ANTHROPIC_BASE_URL`.
+        schema:
+          type: string
+    post:
+      operationId: llmFacade
+      summary: The LLM facade
+      description: |
+        The sandbox's `ANTHROPIC_API_KEY` **is its session token** — there is no
+        real provider key inside a sandbox, ever.
+
+        The facade validates the token, enforces the budget stop, swaps in the
+        real upstream credential, forwards to the gateway, and tees the
+        streaming response to meter usage. It dispatches on the run's harness,
+        speaking the Anthropic Messages dialect or the OpenAI Responses dialect
+        as appropriate.
+
+        Admission books a durable, request-keyed reservation whose primary key
+        becomes the usage entry's external id — which is what makes a retry and
+        a late drain idempotent.
+      tags: [Runner contract]
+      security:
+        - sessionToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: The upstream response, streamed through.
+          content:
+            application/json:
+              schema:
+                type: object
+            text/event-stream:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/WrongAudience'
+        '429':
+          description: The run's budget is exhausted, or too many reservations are in flight.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: |
+            `tenant_llm_keys_required` (multi-user deployments must use
+            per-tenant keys) or `tenant_llm_key_unavailable`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /internal/llm-usage:
+    post:
+      operationId: ingestGatewayUsage
+      summary: Gateway usage callback
+      description: The LiteLLM usage callback. Called by the gateway, not by a runner.
+      tags: [Runner contract]
+      security:
+        - sessionToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Recorded.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # --------------------------------------------------------------- Operator --
+  /v1/admin/orgs:
+    get:
+      operationId: listOrgs
+      summary: List organizations
+      tags: [Operator]
+      security:
+        - adminToken: []
+      responses:
+        '200':
+          description: The organizations.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orgs:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Org'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      operationId: createOrg
+      summary: Create an organization
+      tags: [Operator]
+      security:
+        - adminToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [slug]
+              properties:
+                slug:
+                  type: string
+                name:
+                  type: string
+      responses:
+        '200':
+          description: The new organization.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Org'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/orgs/{slug}/idp:
+    parameters:
+      - $ref: '#/components/parameters/OrgSlug'
+    get:
+      operationId: listIdpConfigs
+      summary: List identity provider configurations
+      tags: [Operator]
+      security:
+        - adminToken: []
+      responses:
+        '200':
+          description: The configurations.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  idps:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/IdpConfig'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      operationId: createIdpConfig
+      summary: Add an identity provider
+      description: |
+        Created inactive. Activate it explicitly once discovery has been
+        verified — the whole lifecycle is deliberately multi-step so a
+        misconfigured issuer cannot lock an organization out.
+      tags: [Operator]
+      security:
+        - adminToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IdpConfigInput'
+      responses:
+        '200':
+          description: The configuration.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdpConfig'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/admin/orgs/{slug}/idp/{id}:
+    parameters:
+      - $ref: '#/components/parameters/OrgSlug'
+      - $ref: '#/components/parameters/IdpId'
+    patch:
+      operationId: patchIdpConfig
+      summary: Update an identity provider
+      tags: [Operator]
+      security:
+        - adminToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IdpConfigInput'
+      responses:
+        '200':
+          description: The updated configuration.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdpConfig'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/admin/orgs/{slug}/idp/{id}/activate:
+    parameters:
+      - $ref: '#/components/parameters/OrgSlug'
+      - $ref: '#/components/parameters/IdpId'
+    post:
+      operationId: activateIdpConfig
+      summary: Activate an identity provider
+      tags: [Operator]
+      security:
+        - adminToken: []
+      responses:
+        '200':
+          description: Activated.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/orgs/{slug}/idp/{id}/disable:
+    parameters:
+      - $ref: '#/components/parameters/OrgSlug'
+      - $ref: '#/components/parameters/IdpId'
+    post:
+      operationId: disableIdpConfig
+      summary: Disable an identity provider
+      tags: [Operator]
+      security:
+        - adminToken: []
+      responses:
+        '200':
+          description: Disabled.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/admin/orgs/{slug}/idp/{id}/reactivate:
+    parameters:
+      - $ref: '#/components/parameters/OrgSlug'
+      - $ref: '#/components/parameters/IdpId'
+    post:
+      operationId: reactivateIdpConfig
+      summary: Reactivate an identity provider
+      tags: [Operator]
+      security:
+        - adminToken: []
+      responses:
+        '200':
+          description: Reactivated.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/admin/orgs/{slug}/idp/{id}/migrate:
+    parameters:
+      - $ref: '#/components/parameters/OrgSlug'
+      - $ref: '#/components/parameters/IdpId'
+    post:
+      operationId: migrateIdpIssuer
+      summary: Migrate to a new issuer
+      description: Moves an organization's users to a new issuer without re-inviting them.
+      tags: [Operator]
+      security:
+        - adminToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [issuer]
+              properties:
+                issuer:
+                  type: string
+                  format: uri
+      responses:
+        '200':
+          description: Migrated.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/admin/orgs/{slug}/break-glass-owner:
+    parameters:
+      - $ref: '#/components/parameters/OrgSlug'
+    post:
+      operationId: armBreakGlassOwner
+      summary: Arm a break-glass owner
+      description: |
+        The recovery path when an organization has locked itself out. Every
+        accepted mutation audits inside its own transaction; rejected attempts
+        audit separately.
+      tags: [Operator]
+      security:
+        - adminToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email:
+                  type: string
+                  format: email
+      responses:
+        '200':
+          description: Armed.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/admin/orgs/{slug}/members:
+    parameters:
+      - $ref: '#/components/parameters/OrgSlug'
+    get:
+      operationId: listOrgMembers
+      summary: List members
+      tags: [Operator]
+      security:
+        - adminToken: []
+      responses:
+        '200':
+          description: The members.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  members:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Membership'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/admin/orgs/{slug}/members/{membership_id}/roles:
+    parameters:
+      - $ref: '#/components/parameters/OrgSlug'
+      - $ref: '#/components/parameters/MembershipId'
+    post:
+      operationId: setMemberRoles
+      summary: Set a member's roles
+      tags: [Operator]
+      security:
+        - adminToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [roles]
+              properties:
+                roles:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '200':
+          description: The updated membership.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Membership'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/admin/orgs/{slug}/members/{membership_id}/deactivate:
+    parameters:
+      - $ref: '#/components/parameters/OrgSlug'
+      - $ref: '#/components/parameters/MembershipId'
+    post:
+      operationId: deactivateMember
+      summary: Deactivate a member
+      description: |
+        This is also the kill switch for that member's **personal**
+        connections: every brokered call re-verifies owner-membership before
+        touching a credential, so deactivation cuts them off mid-run.
+      tags: [Operator]
+      security:
+        - adminToken: []
+      responses:
+        '200':
+          description: Deactivated.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/admin/orgs/{slug}/llm-key/rotate:
+    parameters:
+      - $ref: '#/components/parameters/OrgSlug'
+    post:
+      operationId: rotateTenantLlmKey
+      summary: Rotate a tenant's LLM key
+      description: |
+        Mints a fresh gateway virtual key, swaps the sealed row, and retires the
+        old key upstream. The key itself is never returned.
+      tags: [Operator]
+      security:
+        - adminToken: []
+      responses:
+        '200':
+          description: Rotated.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/admin/reseal:
+    get:
+      operationId: getResealStatus
+      summary: Re-seal job status
+      description: |
+        Progress of the legacy-to-envelope re-seal, including the v1 row count
+        that gates retiring `FLUIDBOX_CREDENTIAL_KEY`.
+      tags: [Operator]
+      security:
+        - adminToken: []
+      responses:
+        '200':
+          description: The job status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResealStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      operationId: startReseal
+      summary: Start the re-seal job
+      description: |
+        Re-seals every legacy (v1) sealed column under per-tenant envelope
+        encryption. Resumable, compare-and-swap guarded, count-parity checked,
+        and a singleton.
+
+        This is the supported path to retiring the legacy credential key.
+        **Do not drop `FLUIDBOX_CREDENTIAL_KEY` until this job proves zero v1
+        rows** — and be aware that from the moment any v2 row exists, custody
+        roots on the KEK, so losing the KEK is unrecoverable. Back it up.
+      tags: [Operator]
+      security:
+        - adminToken: []
+      responses:
+        '200':
+          description: The job started.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResealStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Already running, or envelope sealing is off.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/admin/metrics:
+    get:
+      operationId: getMetrics
+      summary: Prometheus metrics
+      description: |
+        Bounded-cardinality counters, gauges, and histograms. There are
+        deliberately **no per-tenant labels** — per-tenant accounting lives in
+        the usage ledger, not in metrics.
+
+        The optional `FLUIDBOX_METRICS_BIND` listener serves this same body
+        unauthenticated on its own port; point it at a private interface only.
+      tags: [Operator]
+      security:
+        - adminToken: []
+      responses:
+        '200':
+          description: Prometheus exposition format.
+          content:
+            text/plain:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /metrics:
+    get:
+      operationId: getUnauthenticatedMetrics
+      summary: Prometheus metrics (private listener)
+      description: |
+        The same body as `/v1/admin/metrics`, served **unauthenticated** on the
+        optional listener configured by `FLUIDBOX_METRICS_BIND`.
+
+        This path exists only on that listener — it is not mounted on the
+        public or sandbox planes. Because it carries no authentication, bind it
+        to a private interface only. A bad address fails boot by design, but a
+        *reachable* one is your responsibility.
+      tags: [Operator]
+      security: []
+      responses:
+        '200':
+          description: Prometheus exposition format.
+          content:
+            text/plain:
+              schema:
+                type: string
+        '404':
+          description: The metrics listener is not enabled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------- Ingress --
+  /v1/ingress/{provider}/{connection_id}:
+    parameters:
+      - name: provider
+        in: path
+        required: true
+        description: The connector provider, e.g. `github`.
+        schema:
+          type: string
+      - name: connection_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      operationId: receiveWebhook
+      summary: Receive a connected-service webhook
+      description: |
+        Unauthenticated in the bearer sense **by design**: the signature
+        verified against the connection's sealed secret is the authentication,
+        and nothing is stored before it verifies.
+
+        The pipeline is provider-ignorant — ingress, verify, normalize, match,
+        create run, publish — with all provider knowledge behind a single
+        dispatch.
+
+        Retries are safe and in fact *healing*: two database-unique dedup levels
+        (delivery per connection, dispatch per subscription) mean a retry
+        completes a partial fan-out rather than duplicating runs or comments.
+
+        A pull request from a fork freezes `trust_tier: read_only`, enforced at
+        the permission gate above policy and above human approval. The check
+        fails toward "fork" when the head repository is hidden.
+      tags: [Ingress]
+      security: []
+      parameters:
+        - name: X-Hub-Signature-256
+          in: header
+          description: The HMAC signature over the raw body.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '202':
+          description: |
+            Accepted. Also the answer for pings and for events that match no
+            subscription — acknowledging keeps the provider from retrying
+            something we deliberately ignored.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: The signature did not verify. Nothing was stored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/ingress/github/app/{registration_id}:
+    parameters:
+      - $ref: '#/components/parameters/RegistrationIdIngress'
+    post:
+      operationId: receiveGithubAppWebhook
+      summary: Receive an app-level GitHub webhook
+      description: |
+        App-level ingress, verified against the **registration's** sealed
+        webhook secret. The connection is resolved from the verified payload's
+        installation id and fed into the same pipeline as connection-level
+        ingress.
+
+        Lifecycle database failures answer `5xx` on purpose so GitHub retries —
+        never swallow-and-acknowledge.
+      tags: [Ingress]
+      security: []
+      parameters:
+        - name: X-Hub-Signature-256
+          in: header
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '202':
+          description: Accepted, or acknowledged as a ping / unknown installation.
+        '401':
+          description: The signature did not verify.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: A lifecycle write failed. GitHub should retry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  securitySchemes:
+    adminToken:
+      type: http
+      scheme: bearer
+      description: |
+        The deployment admin token.
+
+        In single-user deployments this reaches the whole `/v1` surface. Under
+        `FLUIDBOX_REQUIRE_SSO=1` it is confined to `/v1/admin/*` as a
+        break-glass credential — everywhere else the principal resolver refuses
+        it in favour of user sessions and PATs.
+    pat:
+      type: http
+      scheme: bearer
+      description: |
+        A personal access token (`fbx_pat_…`), for machine access without a
+        browser. Minted from a browser session only, stored as a SHA-256
+        digest, and scrubbed from the event ledger by the redactor.
+    triggerToken:
+      type: http
+      scheme: bearer
+      description: |
+        A subscription-scoped trigger token. It can invoke its **one**
+        subscription and poll that subscription's runs — never the admin API.
+        Symmetrically, the admin token can never invoke a trigger.
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: __Host-fbx_web
+      description: |
+        The browser session cookie. Non-safe methods additionally require the
+        `x-fluidbox-csrf` header and a same-origin `Origin` — there is no CORS
+        layer, because the dashboard is a same-origin proxy and a cross-origin
+        write to `/v1` is never legitimate.
+    sessionToken:
+      type: http
+      scheme: bearer
+      description: |
+        An audience-scoped sandbox session token (`fbx_sess_…`). The sandbox
+        holds four of them — `llm`, `tool`, `control`, and `workspace` — and
+        each guarded route checks the audience first, answering
+        `403 {"error":"wrong_audience"}` on a mismatch.
+
+        For the LLM facade this token doubles as the sandbox's
+        `ANTHROPIC_API_KEY`.
+
+  parameters:
+    SessionId:
+      name: id
+      in: path
+      required: true
+      description: The run (session) identifier.
+      schema:
+        type: string
+        format: uuid
+    TriggerId:
+      name: id
+      in: path
+      required: true
+      description: The trigger subscription identifier.
+      schema:
+        type: string
+        format: uuid
+    ConnectionId:
+      name: id
+      in: path
+      required: true
+      description: The connection identifier.
+      schema:
+        type: string
+        format: uuid
+    RegistrationId:
+      name: id
+      in: path
+      required: true
+      description: The GitHub App registration identifier.
+      schema:
+        type: string
+        format: uuid
+    RegistrationIdIngress:
+      name: registration_id
+      in: path
+      required: true
+      description: The GitHub App registration identifier.
+      schema:
+        type: string
+        format: uuid
+    PolicyName:
+      name: name
+      in: path
+      required: true
+      description: The policy name.
+      schema:
+        type: string
+    CatalogSlug:
+      name: slug
+      in: path
+      required: true
+      description: The connector slug.
+      schema:
+        type: string
+    OrgSlug:
+      name: slug
+      in: path
+      required: true
+      description: The organization slug.
+      schema:
+        type: string
+    IdpId:
+      name: id
+      in: path
+      required: true
+      description: The identity provider configuration identifier.
+      schema:
+        type: string
+        format: uuid
+    MembershipId:
+      name: membership_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    Limit:
+      name: limit
+      in: query
+      description: Maximum items to return.
+      schema:
+        type: integer
+        format: int64
+        default: 50
+    Csrf:
+      name: x-fluidbox-csrf
+      in: header
+      description: |
+        Required on non-safe methods **when authenticating with the session
+        cookie**. Bearer principals are exempt. Send `1`.
+      schema:
+        type: string
+        examples: ['1']
+
+  responses:
+    BadRequest:
+      description: The request was malformed or failed validation.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: No valid credential was presented.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Authenticated, but not permitted to do this.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: |
+        No such resource — or none visible to this caller. Tenant isolation
+        makes another tenant's resource indistinguishable from a missing one.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: The request conflicts with current state.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unavailable:
+      description: The control plane cannot serve this request right now.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    WrongAudience:
+      description: |
+        The session token's audience does not cover this route. The body code
+        is stable and load-bearing — runners abort on it.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            wrongAudience:
+              value:
+                error: wrong_audience
+
+  schemas:
+    Error:
+      type: object
+      description: The uniform error body used by every plane.
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: A human-readable message. Not a stable machine code, with the deliberate exception of `wrong_audience`.
+      examples:
+        - error: agent not found
+
+    Budgets:
+      type: object
+      description: |
+        Spending limits. Anything omitted falls back to the policy's value.
+        Budgets can be tightened per run but never loosened past the policy.
+      properties:
+        max_wall_clock_secs:
+          type: integer
+          format: int64
+          examples: [1800]
+        max_tokens:
+          type: integer
+          format: int64
+          examples: [1000000]
+        max_cost_usd:
+          type: number
+          format: double
+          examples: [2.5]
+        max_tool_calls:
+          type: integer
+          format: int64
+          examples: [200]
+
+    SessionStatus:
+      type: string
+      description: |
+        Where a run is in its lifecycle. The server is the single writer of
+        this field. `completed`, `failed`, `cancelled`, and `budget_exceeded`
+        are terminal.
+      enum:
+        - created
+        - provisioning
+        - initializing
+        - running
+        - awaiting_approval
+        - cancelling
+        - finalizing
+        - completed
+        - failed
+        - cancelled
+        - budget_exceeded
+
+    TrustTier:
+      type: string
+      description: |
+        `read_only` is frozen for untrusted event sources such as fork pull
+        requests: the run may read and review but never write or reach for
+        secrets. It is enforced at the permission gate above policy and above
+        human approval, so there is no approval escape from it.
+      enum: [trusted, read_only]
+      default: trusted
+
+    CheckoutMode:
+      type: string
+      enum: [writable_copy, read_only]
+      default: writable_copy
+
+    Verdict:
+      type: string
+      description: What the policy engine decided for a tool call.
+      enum: [allow, deny, require_approval]
+
+    WorkspaceInput:
+      type: object
+      description: |
+        Where the agent works. Resolved and validated into a frozen
+        `WorkspaceSpec` before anything is stored — a connection-bound
+        repository is checked against the connection for existence, tenant,
+        status, and host, so an invocation can narrow authority but never
+        escape it.
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [scratch, local_copy, git_repository]
+      oneOf:
+        - title: Scratch
+          description: No repository. An empty working directory.
+          properties:
+            kind:
+              const: scratch
+        - title: Local copy
+          description: |
+            A copy of a path on the control-plane host. Local development only.
+          required: [path]
+          properties:
+            kind:
+              const: local_copy
+            path:
+              type: string
+        - title: Git repository
+          description: |
+            Fetched control-plane-side using the connection's sealed
+            credential, then bind-mounted into the sandbox as a copy. The
+            original is never touched and the sandbox stays egress-free.
+
+            Credentials pass to git through `GIT_CONFIG_*` environment
+            variables only — never on the command line, never in on-disk
+            config.
+          properties:
+            kind:
+              const: git_repository
+            connection_id:
+              type: string
+              format: uuid
+            repository:
+              type: string
+              description: '`owner/name`, used with a connection to derive the clone URL.'
+              examples: [acme/widgets]
+            clone_url:
+              type: string
+            ref:
+              type: string
+              examples: [main]
+            commit_sha:
+              type: string
+            checkout_mode:
+              $ref: '#/components/schemas/CheckoutMode'
+
+    ConnectorSelector:
+      type: object
+      description: |
+        How a requirement names the connector it needs. `url` is the
+        load-bearing selector; `slug` is a display hint only — the resolved
+        connection is the authority, never the slug.
+      required: [url]
+      properties:
+        url:
+          type: string
+          format: uri
+        slug:
+          type: string
+
+    ConnectionRequirement:
+      type: object
+      description: |
+        What an agent declares it needs — **what**, never **whose**. Resolved
+        per run into a concrete binding.
+
+        `required_tools` is a contract with fail-closed satisfaction: every
+        entry must exist in the bound connection's snapshot at run creation, or
+        the run does not start. The effective surface is exactly this set.
+      required: [slot, connector, required_tools, binding_mode]
+      properties:
+        slot:
+          type: string
+          description: |
+            Local alias for the bound server; it becomes the
+            `mcp__<slot>__<tool>` prefix. 1–64 characters of `[a-z0-9-]`,
+            unique within the list.
+        connector:
+          $ref: '#/components/schemas/ConnectorSelector'
+        required_tools:
+          type: array
+          items:
+            type: string
+        binding_mode:
+          type: string
+          enum: [invoking_user, organization]
+          description: |
+            `invoking_user` binds the invoker's own connection; `organization`
+            binds an organization-owned one.
+
+    CreateAgent:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        harness:
+          type: string
+          description: From `/v1/harnesses`. Defaults to the deployment default.
+        model:
+          type: string
+        system_prompt:
+          type: string
+          description: Who the agent is. Distinct from the per-run task.
+        policy:
+          type: string
+          description: Policy name.
+        runner_image:
+          type: string
+          description: |
+            Defaults to the configured sandbox image. Note that a seeded agent
+            pins the image reference from its creation time.
+        budgets:
+          $ref: '#/components/schemas/Budgets'
+        default_workspace:
+          $ref: '#/components/schemas/WorkspaceInput'
+        capability_bundles:
+          type: array
+          description: |
+            `"name"` pins the newest version **as of now**; `"name@3"` pins
+            explicitly. Nothing floats — a pin taken today does not change
+            under you tomorrow.
+          items:
+            type: string
+        connection_requirements:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConnectionRequirement'
+
+    AddRevision:
+      type: object
+      description: |
+        Every field is optional. Omitted fields inherit from the latest
+        revision; an explicit `[]` clears a list, and an explicit
+        `{"kind":"scratch"}` clears the default workspace.
+      properties:
+        harness:
+          type: string
+        model:
+          type: string
+        system_prompt:
+          type: string
+        policy:
+          type: string
+        runner_image:
+          type: string
+        budgets:
+          $ref: '#/components/schemas/Budgets'
+        default_workspace:
+          $ref: '#/components/schemas/WorkspaceInput'
+        capability_bundles:
+          type: array
+          items:
+            type: string
+        connection_requirements:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConnectionRequirement'
+
+    Policy:
+      type: object
+      description: |
+        A governance policy at one version. Publishing never mutates history —
+        a new version is appended and becomes the head, and a revert publishes
+        an old version's content forward as a new head.
+
+        Runs freeze a full snapshot of their policy at creation, so changing a
+        policy here never changes how an in-flight run is judged.
+      properties:
+        name:
+          type: string
+        version:
+          type: integer
+          format: int32
+          description: The head version. Send this back as `base_version` when publishing.
+        content:
+          type: object
+          description: The policy document as structure.
+        yaml:
+          type: string
+          description: The document's YAML form, when it was authored as YAML.
+        summary:
+          type: string
+          description: The review note recorded with this version.
+        published_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    Agent:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        description:
+          type: string
+        current_revision_id:
+          type: string
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+
+    AgentRevision:
+      type: object
+      description: Immutable once written.
+      properties:
+        id:
+          type: string
+          format: uuid
+        agent_id:
+          type: string
+          format: uuid
+        revision:
+          type: integer
+        harness:
+          type: string
+        model:
+          type: string
+        system_prompt:
+          type: string
+        policy_name:
+          type: string
+        runner_image:
+          type: string
+        budgets:
+          $ref: '#/components/schemas/Budgets'
+        capability_bundles:
+          type: array
+          items:
+            type: string
+        connection_requirements:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConnectionRequirement'
+        created_at:
+          type: string
+          format: date-time
+
+    CreateRun:
+      type: object
+      required: [agent, task]
+      properties:
+        agent:
+          type: string
+          description: The agent's name or id.
+        task:
+          type: string
+          description: What to do this time. Distinct from the agent's system prompt.
+        workspace:
+          $ref: '#/components/schemas/WorkspaceInput'
+        autonomous:
+          type: boolean
+          default: false
+          description: |
+            Auto-decides approvals using the policy fallback. The permission
+            gate stays wired either way — this is not a bypass, and both the
+            original and the rewritten verdict are recorded.
+        budgets:
+          $ref: '#/components/schemas/Budgets'
+        capabilities:
+          type: array
+          description: |
+            A keep-list of bundle names, intersected with the revision's
+            attachments. Remove-only — it can never add a capability.
+          items:
+            type: string
+        bindings:
+          type: object
+          description: |
+            Explicit requirement-slot to connection-id overrides. Each entry is
+            verified for tenant, caller permission, connector match, and
+            snapshot before the run starts. Unknown slots are rejected.
+          additionalProperties:
+            type: string
+            format: uuid
+
+    Session:
+      type: object
+      description: |
+        A run. The `run_spec` is frozen at creation and is what actually
+        governs the run — current agent and policy configuration is irrelevant
+        to it.
+      properties:
+        id:
+          type: string
+          format: uuid
+        agent_id:
+          type: string
+          format: uuid
+        agent_revision_id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/SessionStatus'
+        trust_tier:
+          $ref: '#/components/schemas/TrustTier'
+        task:
+          type: string
+        autonomous:
+          type: boolean
+        run_spec:
+          type: object
+          description: The immutable frozen specification, including the policy snapshot.
+        created_at:
+          type: string
+          format: date-time
+        ended_at:
+          type: string
+          format: date-time
+
+    UsageTotals:
+      type: object
+      properties:
+        input_tokens:
+          type: integer
+          format: int64
+        output_tokens:
+          type: integer
+          format: int64
+        cost_usd:
+          type: number
+          format: double
+        tool_calls:
+          type: integer
+          format: int64
+
+    Event:
+      type: object
+      description: |
+        One redacted ledger entry. `seq` is gapless per run, which is what
+        makes catch-up and stream resume exact.
+      properties:
+        seq:
+          type: integer
+          format: int64
+        session_id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          examples: [tool.requested, tool.decision, tool.brokered, approval.decided]
+        actor:
+          type: string
+        body:
+          type: object
+          description: Redacted. Prompts never appear here — only digests, usage, and cost.
+        created_at:
+          type: string
+          format: date-time
+
+    Approval:
+      type: object
+      description: Idempotent by `(session_id, tool_call_id)`.
+      properties:
+        id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+          format: uuid
+        tool_call_id:
+          type: string
+        tool:
+          type: string
+        status:
+          type: string
+          enum: [pending, approved_once, approved_session, denied, expired]
+        requested_at:
+          type: string
+          format: date-time
+        decided_at:
+          type: string
+          format: date-time
+        decided_by:
+          type: string
+
+    PermissionDecision:
+      type: object
+      properties:
+        allow:
+          type: boolean
+        verdict:
+          $ref: '#/components/schemas/Verdict'
+        source:
+          type: string
+          description: |
+            Which gate stage produced a denial — useful for diagnosing why a
+            call was refused.
+          enum: [budget, capability, binding, schema, trust_tier, policy, approval]
+        reason:
+          type: string
+
+    Artifact:
+      type: object
+      properties:
+        id:
+          type: string
+        kind:
+          type: string
+          examples: [diff]
+        size_bytes:
+          type: integer
+          format: int64
+        digest:
+          type: string
+
+    Delivery:
+      type: object
+      description: |
+        One result-delivery attempt. Payloads are signed
+        `v1=hmac-sha256(secret, "{ts}.{body}")` with the subscription's sealed
+        secret.
+      properties:
+        id:
+          type: string
+          format: uuid
+        destination:
+          type: string
+        status:
+          type: string
+          enum: [pending, delivered, failed]
+        attempts:
+          type: integer
+        next_attempt_at:
+          type: string
+          format: date-time
+
+    ScheduleInput:
+      type: object
+      required: [cron]
+      properties:
+        cron:
+          type: string
+          examples: ['0 9 * * 1-5']
+        timezone:
+          type: string
+          description: An IANA name. Explicit so the next fire time is DST-correct.
+          default: UTC
+          examples: [Europe/London]
+        missed_run_policy:
+          type: string
+          description: |
+            `skip` records one skip row for a gap. `catch_up` fires exactly one
+            make-up run — never a backlog of every missed fire.
+          enum: [skip, catch_up]
+          default: skip
+
+    CreateTrigger:
+      type: object
+      required: [agent, name]
+      properties:
+        agent:
+          type: string
+        name:
+          type: string
+        task_template:
+          type: string
+        allow_task_override:
+          type: boolean
+          default: false
+        allow_workspace_override:
+          type: boolean
+          default: false
+        autonomous:
+          type: boolean
+          default: false
+        budgets:
+          $ref: '#/components/schemas/Budgets'
+        workspace:
+          $ref: '#/components/schemas/WorkspaceInput'
+        callback_url:
+          type: string
+          format: uri
+          description: |
+            A pre-registered signed-webhook destination. Destinations are
+            approved at subscription time and can never be invented by a
+            caller. Validated against the egress policy on save.
+        pinned_revision_id:
+          type: string
+          format: uuid
+          description: Pin runs to one revision. Omit to always use the latest.
+        concurrency_policy:
+          type: string
+          enum: [allow, skip_if_running, replace]
+          default: allow
+        schedule:
+          $ref: '#/components/schemas/ScheduleInput'
+        connection:
+          type: string
+          description: Listen to a connection's events. Mutually exclusive with `schedule`.
+        repositories:
+          type: array
+          description: Only these repositories match. Omit for every repository the connection sees.
+          items:
+            type: string
+        events:
+          type: array
+          description: |
+            Omit for the connector's defaults — `opened` and `reopened`.
+            `synchronize` is an explicit opt-in because it fires on every push.
+          items:
+            type: string
+        publish:
+          type: array
+          description: |
+            Omit for `["pr_comment"]`. An explicit `[]` publishes only to the
+            dashboard and webhook. Results publish under the App identity —
+            checks require it, and attribution rides in the content.
+          items:
+            type: string
+            enum: [pr_comment, check]
+        capabilities:
+          type: array
+          description: Keep-list, intersected with the revision's attachments. Remove-only.
+          items:
+            type: string
+
+    Trigger:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        agent_id:
+          type: string
+          format: uuid
+        trigger_kind:
+          type: string
+          enum: [api, schedule, event]
+        enabled:
+          type: boolean
+        concurrency_policy:
+          type: string
+          enum: [allow, skip_if_running, replace]
+        callback_url:
+          type: string
+          format: uri
+        schedule:
+          $ref: '#/components/schemas/ScheduleInput'
+        next_fire_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+
+    CreateConnection:
+      type: object
+      description: Every secret here is consumed, sealed, and never returned.
+      required: [provider]
+      properties:
+        provider:
+          type: string
+          examples: [github, mcp_http]
+        token:
+          type: string
+          description: Personal-access-token flavor.
+          format: password
+        app_id:
+          type: string
+        installation_id:
+          type: string
+        private_key:
+          type: string
+          format: password
+        webhook_secret:
+          type: string
+          format: password
+        display_name:
+          type: string
+        base_url:
+          type: string
+          format: uri
+          description: |
+            For `mcp_http`, the base URL its credential is audience-bound to.
+            Validated against the egress policy on save.
+        header_name:
+          type: string
+          default: authorization
+        scheme:
+          type: string
+          description: '`Bearer` (default), `Basic` for base64(email:token), or `""` for a bare token.'
+          default: Bearer
+        auth_kind:
+          type: string
+          enum: [static, oauth, none]
+          default: static
+        scopes:
+          type: array
+          items:
+            type: string
+        client_id:
+          type: string
+        client_secret:
+          type: string
+          format: password
+        owner:
+          type: string
+          description: |
+            `organization` is visible to every member and requires an admin or
+            owner role. `personal` is one member's private custody, allowed for
+            any signed-in member — and administrators are excluded from it by
+            design.
+          enum: [organization, personal]
+          default: organization
+
+    Connection:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        provider:
+          type: string
+        display_name:
+          type: string
+        status:
+          type: string
+          enum: [pending, active, error, revoked]
+          description: |
+            `error` is terminal until a reconnect — most often an
+            `invalid_grant` from the authorization server. Run creation,
+            photographing, and brokering all fail closed off this field.
+        auth_kind:
+          type: string
+          enum: [static, oauth, none]
+        owner_type:
+          type: string
+          enum: [organization, personal]
+        base_url:
+          type: string
+          format: uri
+        authorization_generation:
+          type: integer
+          description: |
+            Bumped when an ever-activated OAuth connection is reconnected.
+            Bindings from an earlier generation refuse mid-run. Ordinary token
+            rotation within a generation is fine, and GitHub App lifecycle
+            never bumps it.
+        created_at:
+          type: string
+          format: date-time
+
+    Tool:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        input_schema:
+          type: object
+          description: |
+            Frozen at run creation and enforced server-side. The dialect
+            follows the snapshot's protocol version.
+        output_schema:
+          type: object
+          description: |
+            Preserved and relayed, but results are **not** validated against
+            it.
+
+    ToolSnapshot:
+      type: object
+      description: An append-only photograph of a connection's tool surface.
+      properties:
+        connection_id:
+          type: string
+          format: uuid
+        version:
+          type: integer
+        protocol_version:
+          type: string
+          description: |
+            The negotiated MCP version. At call time this must match the frozen
+            surface exactly — drift denies the call rather than silently
+            re-negotiating.
+          examples: ['2025-11-25']
+        tools:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tool'
+        digest:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    CatalogEntry:
+      type: object
+      properties:
+        slug:
+          type: string
+        name:
+          type: string
+        icon:
+          type: string
+        description:
+          type: string
+        tier:
+          type: string
+          enum: [curated, imported, custom]
+        url:
+          type: string
+          format: uri
+        transport:
+          type: string
+        auth_mode:
+          type: string
+          enum: [none, api_key, oauth]
+        auth_hints:
+          type: object
+        scopes:
+          type: array
+          items:
+            type: string
+        tool_hints:
+          type: object
+          description: Policy-default seeds for display. The gate stays the judge.
+
+    CreateCatalogEntry:
+      type: object
+      required: [slug, name]
+      properties:
+        slug:
+          type: string
+        name:
+          type: string
+        icon:
+          type: string
+        description:
+          type: string
+        categories:
+          type: array
+          items:
+            type: string
+        url:
+          type: string
+          format: uri
+        transport:
+          type: string
+        auth_mode:
+          type: string
+          enum: [none, api_key, oauth]
+        auth_hints:
+          type: object
+        scopes:
+          type: array
+          items:
+            type: string
+        egress:
+          type: object
+        tool_hints:
+          type: object
+        sandbox_launch:
+          type: object
+
+    ConnectCatalogEntry:
+      type: object
+      properties:
+        display_name:
+          type: string
+        token:
+          type: string
+          format: password
+          description: |
+            For `api_key` entries. Basic-composite connectors take
+            `email:api_token` — check the entry's `auth_hints`.
+        bundle_name:
+          type: string
+        client_id:
+          type: string
+        client_secret:
+          type: string
+          format: password
+        scopes:
+          type: array
+          items:
+            type: string
+        owner:
+          type: string
+          enum: [organization, personal]
+          default: organization
+
+    AddCustomMcpServer:
+      type: object
+      required: [url, name]
+      properties:
+        url:
+          type: string
+          format: uri
+        name:
+          type: string
+        auth_mode:
+          type: string
+          enum: [none, api_key, oauth]
+          default: none
+        token:
+          type: string
+          format: password
+        display_name:
+          type: string
+        icon:
+          type: string
+        description:
+          type: string
+        header_name:
+          type: string
+          default: authorization
+        scheme:
+          type: string
+          default: Bearer
+        scopes:
+          type: array
+          items:
+            type: string
+        client_id:
+          type: string
+        client_secret:
+          type: string
+          format: password
+        owner:
+          type: string
+          enum: [organization, personal]
+          default: organization
+
+    CapabilityServer:
+      type: object
+      description: |
+        A sandbox-class stdio MCP server packaged in the runner image. There is
+        no `brokered` class here by design — that would put a credential inside
+        a sandbox.
+      required: [alias]
+      properties:
+        alias:
+          type: string
+          description: 1–64 characters of `[a-z0-9-]`; prefixes `mcp__<alias>__<tool>`.
+        command:
+          type: string
+        args:
+          type: array
+          items:
+            type: string
+        tools:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tool'
+
+    CapabilityBundle:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        version:
+          type: integer
+        description:
+          type: string
+        servers:
+          type: array
+          items:
+            $ref: '#/components/schemas/CapabilityServer'
+        created_at:
+          type: string
+          format: date-time
+
+    PersonalAccessToken:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
+
+    Org:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        slug:
+          type: string
+        name:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    IdpConfigInput:
+      type: object
+      required: [issuer, client_id]
+      properties:
+        issuer:
+          type: string
+          format: uri
+        client_id:
+          type: string
+        client_secret:
+          type: string
+          format: password
+        scopes:
+          type: array
+          items:
+            type: string
+
+    IdpConfig:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        issuer:
+          type: string
+          format: uri
+        client_id:
+          type: string
+        status:
+          type: string
+          enum: [inactive, active, disabled]
+        created_at:
+          type: string
+          format: date-time
+
+    Membership:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        roles:
+          type: array
+          items:
+            type: string
+        active:
+          type: boolean
+
+    GithubAppRegistration:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        app_slug:
+          type: string
+        owner_login:
+          type: string
+        status:
+          type: string
+          enum: [pending, active, revoked]
+        created_at:
+          type: string
+          format: date-time
+
+    ResealStatus:
+      type: object
+      properties:
+        state:
+          type: string
+          enum: [idle, running, completed, failed]
+        v1_rows_remaining:
+          type: integer
+          format: int64
+          description: |
+            The retirement gate. `FLUIDBOX_CREDENTIAL_KEY` may only be dropped
+            once boot proves this is zero.
+        v2_rows:
+          type: integer
+          format: int64
+        started_at:
+          type: string
+          format: date-time

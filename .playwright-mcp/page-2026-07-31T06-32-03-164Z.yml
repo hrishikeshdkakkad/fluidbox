@@ -1,0 +1,37 @@
+- generic [active] [ref=f53e1]:
+  - generic [ref=f53e2]:
+    - banner [ref=f53e3]:
+      - generic [ref=f53e4]:
+        - link "fluidbox control plane" [ref=f53e5] [cursor=pointer]:
+          - /url: /app
+          - generic [ref=f53e6]: fluidbox
+          - generic [ref=f53e7]: control plane
+        - navigation "Primary navigation" [ref=f53e8]:
+          - link "Overview" [ref=f53e9] [cursor=pointer]:
+            - /url: /app
+          - link "Resources" [ref=f53e10] [cursor=pointer]:
+            - /url: /app#configuration
+          - link "Activity" [ref=f53e11] [cursor=pointer]:
+            - /url: /app#operations
+          - link "Governance" [ref=f53e12] [cursor=pointer]:
+            - /url: /app/governance
+          - link "Docs" [ref=f53e13] [cursor=pointer]:
+            - /url: /docs
+          - link "Settings" [ref=f53e14] [cursor=pointer]:
+            - /url: /app/settings
+        - generic [ref=f53e15]:
+          - generic "Control plane online" [ref=f53e16]: Operational
+          - link "New Run" [ref=f53e19] [cursor=pointer]:
+            - /url: /app?action=new-run
+          - button "Use dark theme" [ref=f53e20] [cursor=pointer]:
+            - generic [ref=f53e23]: Dark
+    - main [ref=f53e24]:
+      - generic [ref=f53e26]:
+        - generic [ref=f53e27]:
+          - link "Runs" [ref=f53e28] [cursor=pointer]:
+            - /url: /app
+          - generic [ref=f53e29]: /
+          - generic [ref=f53e30]: 019fb2e5
+        - heading "…" [level=1] [ref=f53e31]
+      - generic "Loading" [ref=f53e33]
+  - alert [ref=f53e50]

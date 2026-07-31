@@ -1,0 +1,387 @@
+- generic [active] [ref=f2e1]:
+  - generic [ref=f2e2]:
+    - link "Skip to content" [ref=f2e3] [cursor=pointer]:
+      - /url: "#content"
+    - banner [ref=f2e4]:
+      - generic [ref=f2e5]:
+        - link "fluidbox" [ref=f2e6] [cursor=pointer]:
+          - /url: /
+        - navigation "Site" [ref=f2e8]:
+          - link "Product" [ref=f2e9] [cursor=pointer]:
+            - /url: /product
+          - link "Open Source" [ref=f2e10] [cursor=pointer]:
+            - /url: /open-source
+          - link "Docs" [ref=f2e11] [cursor=pointer]:
+            - /url: /docs
+          - link "Security" [ref=f2e12] [cursor=pointer]:
+            - /url: /security
+          - link "GitHub ↗" [ref=f2e13] [cursor=pointer]:
+            - /url: https://github.com/hrishikeshdkakkad/fluidbox
+        - generic [ref=f2e14]:
+          - button "Use light theme" [ref=f2e15] [cursor=pointer]:
+            - generic [ref=f2e19]: Light
+          - link "Sign in" [ref=f2e20] [cursor=pointer]:
+            - /url: /sign-in
+          - link "Get started" [ref=f2e21] [cursor=pointer]:
+            - /url: /docs/getting-started
+    - main [ref=f2e22]:
+      - generic [ref=f2e24]:
+        - complementary [ref=f2e25]:
+          - navigation "Documentation" [ref=f2e26]:
+            - link "Documentation" [ref=f2e27] [cursor=pointer]:
+              - /url: /docs
+              - generic [ref=f2e28]: ⌘
+              - text: Documentation
+            - button "Search docs… ⌘K" [ref=f2e29] [cursor=pointer]:
+              - generic [ref=f2e30]: Search docs…
+              - generic [ref=f2e31]: ⌘K
+            - generic [ref=f2e32]:
+              - generic [ref=f2e33]: Start here
+              - link "Getting started" [ref=f2e34] [cursor=pointer]:
+                - /url: /docs/getting-started
+              - link "Concepts" [ref=f2e35] [cursor=pointer]:
+                - /url: /docs/concepts
+            - generic [ref=f2e36]:
+              - generic [ref=f2e37]: Running agents
+              - link "Agents & revisions" [ref=f2e38] [cursor=pointer]:
+                - /url: /docs/agents
+              - link "Runs & the timeline" [ref=f2e39] [cursor=pointer]:
+                - /url: /docs/runs
+              - link "Triggers & schedules" [ref=f2e40] [cursor=pointer]:
+                - /url: /docs/triggers
+            - generic [ref=f2e41]:
+              - generic [ref=f2e42]: Governance
+              - link "The permission gate" [ref=f2e43] [cursor=pointer]:
+                - /url: /docs/governance
+              - link "Policies" [ref=f2e44] [cursor=pointer]:
+                - /url: /docs/policies
+              - link "Approvals" [ref=f2e45] [cursor=pointer]:
+                - /url: /docs/approvals
+              - link "Capabilities" [ref=f2e46] [cursor=pointer]:
+                - /url: /docs/capabilities
+            - generic [ref=f2e47]:
+              - generic [ref=f2e48]: Deployment
+              - link "Docker" [ref=f2e49] [cursor=pointer]:
+                - /url: /docs/docker
+              - link "Kubernetes" [ref=f2e50] [cursor=pointer]:
+                - /url: /docs/kubernetes
+              - link "Security model" [ref=f2e51] [cursor=pointer]:
+                - /url: /docs/security
+            - generic [ref=f2e52]:
+              - generic [ref=f2e53]: Extending
+              - link "Building a harness" [ref=f2e54] [cursor=pointer]:
+                - /url: /docs/runner-contract
+            - generic [ref=f2e55]:
+              - generic [ref=f2e56]: Reference
+              - link "API overview" [ref=f2e57] [cursor=pointer]:
+                - /url: /docs/api
+              - link "Authentication" [ref=f2e58] [cursor=pointer]:
+                - /url: /docs/authentication
+              - link "API reference" [ref=f2e59] [cursor=pointer]:
+                - /url: /docs/api/reference
+            - generic [ref=f2e60]:
+              - generic [ref=f2e61]: Spec
+              - link "Schemas & examples" [ref=f2e62] [cursor=pointer]:
+                - /url: /docs/api.html
+              - link "openapi.yaml ↓" [ref=f2e63] [cursor=pointer]:
+                - /url: /docs/openapi.yaml
+        - generic [ref=f2e65]:
+          - article [ref=f2e66]:
+            - generic [ref=f2e67]:
+              - link "Docs" [ref=f2e68] [cursor=pointer]:
+                - /url: /docs
+              - generic [ref=f2e69]: /
+              - generic [ref=f2e70]: Governance
+            - heading "The permission gate" [level=1] [ref=f2e71]
+            - generic [ref=f2e72]:
+              - paragraph [ref=f2e73]:
+                - text: There is exactly one place in fluidbox where "can this happen?" is answered. Every tool call — from the model's own
+                - code [ref=f2e74]: Bash
+                - text: to a brokered MCP call reaching a customer's Jira — passes through it, and the
+                - strong [ref=f2e75]: order of its stages is the security model
+                - text: .
+              - heading [level=3] [ref=f2e76]:
+                - link "The sequence" [ref=f2e77] [cursor=pointer]:
+                  - /url: "#the-sequence"
+              - code [ref=f2e79]: "flowchart TD A[Tool call] --> B{Budget} B -->|exhausted| X1[deny] B --> C{In the frozen tool set?} C -->|drifted / withdrawn| X2[\"deny — source=capability\"] C -->|binding missing or stale| X3[\"deny — source=binding\"] C --> D{Arguments match the frozen schema?} D -->|no| X4[\"deny — source=schema\"] D --> E{Trust tier} E -->|read_only + write tool| X5[\"deny — no approval escape\"] E --> F{Policy} F -->|deny| X6[deny] F -->|allow| OK[allow] F -->|require approval| G{Autonomous?} G -->|no| H[Pause for a human] G -->|yes| I[Rewrite to the policy fallback] H --> OK I --> OK"
+              - paragraph [ref=f2e80]: Each stage exists because the one after it cannot be trusted to catch that class of problem.
+              - heading [level=4] [ref=f2e81]:
+                - link "1. Budget" [ref=f2e82] [cursor=pointer]:
+                  - /url: "#1-budget"
+              - paragraph [ref=f2e83]: Cheapest check first. A run that has spent its allowance stops before anything else is evaluated.
+              - paragraph [ref=f2e84]:
+                - text: Admission books a
+                - strong [ref=f2e85]: durable, request-keyed reservation
+                - text: rather than checking a running total, because two concurrent requests can each read a total that is under budget and both proceed. The reservation's primary key becomes the usage entry's external id, which is what makes a retry or a late drain idempotent.
+              - paragraph [ref=f2e86]: The booking is deliberately pessimistic — the declared maximum output plus a genuine upper bound on input tokens — and is reconciled against real usage when the response drains.
+              - heading [level=4] [ref=f2e87]:
+                - link "2. Frozen tool set" [ref=f2e88] [cursor=pointer]:
+                  - /url: "#2-frozen-tool-set"
+              - paragraph [ref=f2e89]: The run froze the exact set of tools it may call, including a digest.
+              - paragraph [ref=f2e90]:
+                - text: If an upstream MCP server later changes its tools — adds one, withdraws one, changes a signature — the call is
+                - strong [ref=f2e91]: denied
+                - text: "rather than silently re-negotiated. This is the rug-pull defence: the surface a human approved when the run started is the surface the run gets."
+              - paragraph [ref=f2e92]: "Two denial sources distinguish the cases:"
+              - list [ref=f2e93]:
+                - listitem [ref=f2e94]:
+                  - code [ref=f2e95]: source=capability
+                  - text: — the tool is not in the frozen set, or the set drifted.
+                - listitem [ref=f2e96]:
+                  - code [ref=f2e97]: source=binding
+                  - text: — the binding to the connection is missing or stale.
+              - paragraph [ref=f2e98]:
+                - text: Re-photograph a connection with
+                - code [ref=f2e99]: "POST /v1/connections/{id}/tools/refresh"
+                - text: and start a
+                - emphasis [ref=f2e100]: new
+                - text: run; existing runs keep what they froze.
+              - heading [level=4] [ref=f2e101]:
+                - link "3. Frozen argument schema" [ref=f2e102] [cursor=pointer]:
+                  - /url: "#3-frozen-argument-schema"
+              - paragraph [ref=f2e103]: Arguments are validated server-side against the schema frozen at run creation.
+              - paragraph [ref=f2e104]:
+                - text: The schema is
+                - strong [ref=f2e105]: untrusted input
+                - text: "— it came from an external MCP server — so it is pre-guarded before compilation: bounded size, bounded depth, and every"
+                - code [ref=f2e106]: $ref
+                - text: must be local. A schema that violates those bounds makes the tool
+                - strong [ref=f2e107]: un-callable
+                - text: rather than being quietly ignored, which is the fail-closed choice.
+              - paragraph [ref=f2e108]:
+                - text: A denial here is rendered to the model as a
+                - emphasis [ref=f2e109]: tool execution error
+                - text: ", never as a protocol error, so the model can correct itself and try again."
+              - heading [level=4] [ref=f2e110]:
+                - link "4. Trust tier" [ref=f2e111] [cursor=pointer]:
+                  - /url: "#4-trust-tier"
+              - paragraph [ref=f2e112]:
+                - text: A run from an untrusted source freezes
+                - code [ref=f2e113]: "trust_tier: read_only"
+                - text: . In practice that means
+                - strong [ref=f2e114]: any pull request from a fork
+                - text: — and the check fails
+                - emphasis [ref=f2e115]: toward
+                - text: "\"fork\" when the head repository is hidden."
+              - paragraph [ref=f2e116]:
+                - text: A
+                - code [ref=f2e117]: read_only
+                - text: run may read and review but never write or reach for secrets, and this is enforced
+                - strong [ref=f2e118]: above policy and above human approval
+                - text: ". There is no approval escape from this tier: nobody can click \"allow\" past it."
+              - paragraph [ref=f2e119]: This is the stage that makes it safe to run an agent against a pull request from a stranger.
+              - heading [level=4] [ref=f2e120]:
+                - link "5. Policy" [ref=f2e121] [cursor=pointer]:
+                  - /url: "#5-policy"
+              - paragraph [ref=f2e122]:
+                - text: The run's
+                - strong [ref=f2e123]: frozen policy snapshot
+                - text: — not the policy's current content.
+              - paragraph [ref=f2e124]: "Editing a policy affects only future runs. This is what makes the audit trail trustworthy: you cannot retroactively make a past run look compliant by loosening a rule today."
+              - paragraph [ref=f2e125]:
+                - text: "Policies produce one of three verdicts:"
+                - code [ref=f2e126]: allow
+                - text: ","
+                - code [ref=f2e127]: deny
+                - text: ", or"
+                - code [ref=f2e128]: require_approval
+                - text: .
+              - heading [level=4] [ref=f2e129]:
+                - link "6. Approval" [ref=f2e130] [cursor=pointer]:
+                  - /url: "#6-approval"
+              - paragraph [ref=f2e131]:
+                - text: A
+                - code [ref=f2e132]: require_approval
+                - text: verdict pauses the run in
+                - code [ref=f2e133]: awaiting_approval
+                - text: and emits an
+                - code [ref=f2e134]: approval.requested
+                - text: event.
+              - paragraph [ref=f2e135]:
+                - text: "**Idempotent by"
+                - code [ref=f2e136]: (session_id, tool_call_id)
+                - text: .** The database row is the source of truth; an in-memory notification only wakes a blocked handler early. On a restart the runner's retry re-attaches to the pending row — nothing duplicates and nothing hangs.
+              - paragraph [ref=f2e137]:
+                - text: The decision is settled by a compare-and-swap, and the resulting
+                - code [ref=f2e138]: approval.decided
+                - text: and
+                - code [ref=f2e139]: tool.decision
+                - text: events are appended
+                - strong [ref=f2e140]: inside the deciding transaction
+                - text: ". Only the winner emits; waiters emit nothing. One consequence worth knowing: a failure to append the ledger entry rolls the"
+                - emphasis [ref=f2e141]: decision
+                - text: back. That is fail-closed on purpose.
+              - heading [level=5] [ref=f2e142]:
+                - link "Who may decide" [ref=f2e143] [cursor=pointer]:
+                  - /url: "#who-may-decide"
+              - paragraph [ref=f2e144]:
+                - text: Authority is not uniform. A call against a
+                - strong [ref=f2e145]: personal
+                - text: connection is decidable only by the owner who invoked it — with no role, admin, or operator override, symmetric across approve and deny.
+              - paragraph [ref=f2e146]: The reasoning is that a personal connection is one human's custody of their own credential. An administrator being able to approve its use would make "personal" meaningless.
+              - separator [ref=f2e147]
+              - heading [level=3] [ref=f2e148]:
+                - link "Autonomous mode is not a bypass" [ref=f2e149] [cursor=pointer]:
+                  - /url: "#autonomous-mode-is-not-a-bypass"
+              - paragraph [ref=f2e150]: This is the point most often misread.
+              - paragraph [ref=f2e151]:
+                - text: The permission callback stays wired in
+                - strong [ref=f2e152]: both
+                - text: autonomy modes. fluidbox never uses the agent SDK's own permission-bypass mode.
+              - paragraph [ref=f2e153]:
+                - text: "What autonomy changes is one thing: a"
+                - code [ref=f2e154]: require_approval
+                - text: verdict is rewritten to the policy's fallback
+                - emphasis [ref=f2e155]: inside the evaluation
+                - text: ", and"
+                - strong [ref=f2e156]: both
+                - text: the original and the rewritten verdict are recorded in the ledger. Every other stage — budget, frozen set, schema, trust tier, policy — runs identically.
+              - paragraph [ref=f2e157]:
+                - text: So an autonomous run against a fork pull request still cannot write. And the record still shows exactly what a human
+                - emphasis [ref=f2e158]: would
+                - text: have been asked.
+              - separator [ref=f2e159]
+              - heading [level=3] [ref=f2e160]:
+                - link "What the ledger records" [ref=f2e161] [cursor=pointer]:
+                  - /url: "#what-the-ledger-records"
+              - paragraph [ref=f2e162]: "Per tool call:"
+              - generic [ref=f2e163]:
+                - code [ref=f2e165]: tool.requested → tool.decision → tool.brokered
+                - button "Copy code" [ref=f2e166] [cursor=pointer]: Copy
+              - paragraph [ref=f2e167]:
+                - code [ref=f2e168]: tool.brokered
+                - text: carries latency and a digest of the result —
+                - strong [ref=f2e169]: never payloads and never secrets
+                - text: .
+              - paragraph [ref=f2e170]:
+                - text: More broadly, the ledger only accepts
+                - emphasis [ref=f2e171]: redacted
+                - text: "envelopes, and that is enforced by the type system rather than by convention: the redacted type is constructible only through the redactor. Model prompts never reach the ledger. Only digests, usage, and cost do."
+              - paragraph [ref=f2e172]:
+                - code [ref=f2e173]: seq
+                - text: is assigned server-side, gaplessly, under a row lock — which is what makes both timeline catch-up and stream resume exact.
+              - separator [ref=f2e174]
+              - heading [level=3] [ref=f2e175]:
+                - link "Two tool classes, and why the split *is* the model" [ref=f2e176] [cursor=pointer]:
+                  - /url: "#two-tool-classes-and-why-the-split-is-the-model"
+              - paragraph [ref=f2e177]: fluidbox has exactly two classes of tool, and the boundary between them is a security boundary rather than a packaging convenience.
+              - paragraph [ref=f2e178]:
+                - strong [ref=f2e179]: Sandbox tools
+                - text: are stdio subprocesses packaged in the runner image. They hold no credential and are contained by the container. Register these as
+                - link "capability bundles" [ref=f2e180] [cursor=pointer]:
+                  - /url: /docs/capabilities
+                - text: .
+              - paragraph [ref=f2e181]:
+                - strong [ref=f2e182]: Brokered tools
+                - text: are called
+                - strong [ref=f2e183]: by the control plane
+                - text: ", with a sealed credential that never enters a sandbox. The sandbox sends intent and receives a governed result."
+              - paragraph [ref=f2e184]: That is the same inversion used for model access (the sandbox's API key is its session token) and for git (the credentialed fetch happens control-plane-side). In all three cases the sandbox is the untrusted party and never holds the secret.
+              - paragraph [ref=f2e185]: Attaching a tool is not the same as allowing it. Attachment puts a tool in the frozen set; the gate still decides every individual call.
+              - paragraph [ref=f2e186]: Before any brokered secret is touched, the binding is re-verified — status, authorization generation, and for personal connections the owner's membership being active — and it fails closed. An authorization generation bump (a reconnected OAuth connection) makes in-flight bindings refuse mid-run.
+              - separator [ref=f2e187]
+              - heading [level=3] [ref=f2e188]:
+                - link "Related" [ref=f2e189] [cursor=pointer]:
+                  - /url: "#related"
+              - list [ref=f2e190]:
+                - listitem [ref=f2e191]:
+                  - link "Policies" [ref=f2e192] [cursor=pointer]:
+                    - /url: /docs/policies
+                  - text: — authoring the rules
+                - listitem [ref=f2e193]:
+                  - link "Capabilities" [ref=f2e194] [cursor=pointer]:
+                    - /url: /docs/capabilities
+                  - text: — sandbox tool bundles
+                - listitem [ref=f2e195]:
+                  - link "API reference" [ref=f2e196] [cursor=pointer]:
+                    - /url: /docs/api/reference
+                  - text: — the permission endpoint itself
+            - link "Edit this page on GitHub ↗" [ref=f2e198] [cursor=pointer]:
+              - /url: https://github.com/hrishikeshdkakkad/fluidbox/edit/main/docs/guides/governance.md
+            - navigation "Pagination" [ref=f2e199]:
+              - link "← Previous Triggers & schedules" [ref=f2e200] [cursor=pointer]:
+                - /url: /docs/triggers
+                - generic [ref=f2e201]: ← Previous
+                - generic [ref=f2e202]: Triggers & schedules
+              - link "Next → Policies" [ref=f2e203] [cursor=pointer]:
+                - /url: /docs/policies
+                - generic [ref=f2e204]: Next →
+                - generic [ref=f2e205]: Policies
+          - navigation "On this page" [ref=f2e206]:
+            - link "The sequence" [ref=f2e208] [cursor=pointer]:
+              - /url: "#the-sequence"
+            - link "Autonomous mode is not a bypass" [ref=f2e209] [cursor=pointer]:
+              - /url: "#autonomous-mode-is-not-a-bypass"
+            - link "What the ledger records" [ref=f2e210] [cursor=pointer]:
+              - /url: "#what-the-ledger-records"
+            - link "Two tool classes, and why the split *is* the model" [ref=f2e211] [cursor=pointer]:
+              - /url: "#two-tool-classes-and-why-the-split-is-the-model"
+            - link "Related" [ref=f2e212] [cursor=pointer]:
+              - /url: "#related"
+    - contentinfo [ref=f2e213]:
+      - generic [ref=f2e214]:
+        - generic [ref=f2e215]:
+          - generic [ref=f2e216]:
+            - text: fluidbox
+            - paragraph [ref=f2e217]: The open-source control plane for governed AI agents. Run agents without giving them God mode.
+          - navigation "Product" [ref=f2e218]:
+            - list [ref=f2e220]:
+              - listitem [ref=f2e221]:
+                - link "Overview" [ref=f2e222] [cursor=pointer]:
+                  - /url: /product
+              - listitem [ref=f2e223]:
+                - link "Pricing" [ref=f2e224] [cursor=pointer]:
+                  - /url: /pricing
+              - listitem [ref=f2e225]:
+                - link "Changelog" [ref=f2e226] [cursor=pointer]:
+                  - /url: /changelog
+              - listitem [ref=f2e227]:
+                - link "Dashboard" [ref=f2e228] [cursor=pointer]:
+                  - /url: /app
+          - navigation "Documentation" [ref=f2e229]:
+            - list [ref=f2e231]:
+              - listitem [ref=f2e232]:
+                - link "Getting started" [ref=f2e233] [cursor=pointer]:
+                  - /url: /docs/getting-started
+              - listitem [ref=f2e234]:
+                - link "Concepts" [ref=f2e235] [cursor=pointer]:
+                  - /url: /docs/concepts
+              - listitem [ref=f2e236]:
+                - link "API" [ref=f2e237] [cursor=pointer]:
+                  - /url: /docs/api
+              - listitem [ref=f2e238]:
+                - link "Kubernetes" [ref=f2e239] [cursor=pointer]:
+                  - /url: /docs/kubernetes
+          - navigation "Project" [ref=f2e240]:
+            - list [ref=f2e242]:
+              - listitem [ref=f2e243]:
+                - link "GitHub ↗" [ref=f2e244] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox
+              - listitem [ref=f2e245]:
+                - link "Roadmap ↗" [ref=f2e246] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/ROADMAP.md
+              - listitem [ref=f2e247]:
+                - link "Contributing ↗" [ref=f2e248] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/CONTRIBUTING.md
+              - listitem [ref=f2e249]:
+                - link "Good first issues ↗" [ref=f2e250] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22
+          - navigation "Trust" [ref=f2e251]:
+            - list [ref=f2e253]:
+              - listitem [ref=f2e254]:
+                - link "Security" [ref=f2e255] [cursor=pointer]:
+                  - /url: /security
+              - listitem [ref=f2e256]:
+                - link "Disclosure policy ↗" [ref=f2e257] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/SECURITY.md
+              - listitem [ref=f2e258]:
+                - link "MIT license ↗" [ref=f2e259] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/LICENSE
+              - listitem [ref=f2e260]:
+                - link "Code of conduct ↗" [ref=f2e261] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/CODE_OF_CONDUCT.md
+        - generic [ref=f2e262]:
+          - generic [ref=f2e263]: fluidbox — MIT licensed, built in the open.
+          - link "github.com/hrishikeshdkakkad/fluidbox" [ref=f2e264] [cursor=pointer]:
+            - /url: https://github.com/hrishikeshdkakkad/fluidbox
+  - alert [ref=f2e265]

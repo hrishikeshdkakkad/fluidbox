@@ -1,0 +1,432 @@
+- generic [active] [ref=f54e1]:
+  - generic [ref=f54e2]:
+    - link "Skip to content" [ref=f54e3] [cursor=pointer]:
+      - /url: "#content"
+    - banner [ref=f54e4]:
+      - generic [ref=f54e5]:
+        - link "fluidbox" [ref=f54e6] [cursor=pointer]:
+          - /url: /
+        - navigation "Site" [ref=f54e8]:
+          - link "Product" [ref=f54e9] [cursor=pointer]:
+            - /url: /product
+          - link "Open Source" [ref=f54e10] [cursor=pointer]:
+            - /url: /open-source
+          - link "Docs" [ref=f54e11] [cursor=pointer]:
+            - /url: /docs
+          - link "Security" [ref=f54e12] [cursor=pointer]:
+            - /url: /security
+          - link "GitHub ↗" [ref=f54e13] [cursor=pointer]:
+            - /url: https://github.com/hrishikeshdkakkad/fluidbox
+        - generic [ref=f54e14]:
+          - button "Use dark theme" [ref=f54e15] [cursor=pointer]:
+            - generic [ref=f54e18]: Dark
+          - link "Sign in" [ref=f54e19] [cursor=pointer]:
+            - /url: /sign-in
+          - link "Get started" [ref=f54e20] [cursor=pointer]:
+            - /url: /docs/getting-started
+    - main [ref=f54e21]:
+      - generic [ref=f54e22]:
+        - generic [ref=f54e23]:
+          - generic [ref=f54e24]: open-source control plane for governed AI agents
+          - heading "Run AI agents without giving them God mode." [level=1] [ref=f54e26]
+          - paragraph [ref=f54e27]: "fluidbox sits underneath agent harnesses like the Claude Agent SDK and Codex: every run in a disposable sandbox, every tool call through a server-side policy gate, every decision in an append-only ledger. Not another reasoning framework — the infrastructure underneath one."
+          - generic [ref=f54e28]:
+            - link "Try the demo" [ref=f54e29] [cursor=pointer]:
+              - /url: "#try-it"
+            - link "Read the docs" [ref=f54e30] [cursor=pointer]:
+              - /url: /docs
+            - link "GitHub ↗" [ref=f54e31] [cursor=pointer]:
+              - /url: https://github.com/hrishikeshdkakkad/fluidbox
+            - link "Sign in" [ref=f54e32] [cursor=pointer]:
+              - /url: /sign-in
+          - generic [ref=f54e33]:
+            - generic [ref=f54e34]:
+              - strong [ref=f54e35]: MIT
+              - text: licensed
+            - generic [ref=f54e36]:
+              - strong [ref=f54e37]: "106"
+              - text: API operations
+            - generic [ref=f54e38]:
+              - strong [ref=f54e39]: "2"
+              - text: harnesses, one contract
+            - generic [ref=f54e40]:
+              - strong [ref=f54e41]: Docker + K8s
+              - text: deploys
+        - figure "A governed run as the event ledger records it" [ref=f54e42]:
+          - generic [ref=f54e43]:
+            - generic [ref=f54e45]: run 0198f2c4
+            - generic [ref=f54e46]: agent fixer · policy default v7 · RunSpec frozen
+          - generic [ref=f54e47]:
+            - generic [ref=f54e48]:
+              - generic [ref=f54e49]: "14"
+              - generic [ref=f54e50]: tool.requested
+              - generic [ref=f54e52]: Edit crates/core/src/policy.rs
+            - generic [ref=f54e53]:
+              - generic [ref=f54e54]: "15"
+              - generic [ref=f54e55]: tool.decision
+              - generic [ref=f54e56]: allow
+              - generic [ref=f54e57]: policy · paths /workspace/**
+            - generic [ref=f54e58]:
+              - generic [ref=f54e59]: "16"
+              - generic [ref=f54e60]: tool.requested
+              - generic [ref=f54e62]: Bash cargo test -p fluidbox-core
+            - generic [ref=f54e63]:
+              - generic [ref=f54e64]: "17"
+              - generic [ref=f54e65]: tool.decision
+              - generic [ref=f54e66]: allow
+              - generic [ref=f54e67]: policy · shell prefix "cargo test"
+            - generic [ref=f54e68]:
+              - generic [ref=f54e69]: "18"
+              - generic [ref=f54e70]: tool.requested
+              - generic [ref=f54e72]: mcp__linear__create_issue (brokered)
+            - generic [ref=f54e73]:
+              - generic [ref=f54e74]: "19"
+              - generic [ref=f54e75]: tool.decision
+              - generic [ref=f54e76]: approve
+              - generic [ref=f54e77]: policy · pausing for a human · ttl 600s
+            - generic [ref=f54e78]: ── awaiting_approval · 38s · approved_once by an owner ──
+            - generic [ref=f54e80]:
+              - generic [ref=f54e81]: "22"
+              - generic [ref=f54e82]: tool.brokered
+              - generic [ref=f54e83]: ok
+              - generic [ref=f54e84]: control-plane call · 212ms · result sha256:9f2c…
+            - generic [ref=f54e85]:
+              - generic [ref=f54e86]: "23"
+              - generic [ref=f54e87]: usage
+              - generic [ref=f54e89]: 2,148 tokens · $0.011 of $2.50 budget · wall 4m12s
+            - generic [ref=f54e90]: prompts ▮▮▮▮▮▮▮▮▮▮ redacted at ingest — only digests reach the ledger
+      - generic [ref=f54e92]:
+        - generic [ref=f54e93]: the permission gate
+        - heading "Every tool call passes one gate, in one fixed order." [level=2] [ref=f54e94]
+        - paragraph [ref=f54e95]:
+          - text: Both harnesses, both tool classes, every autonomy mode. Autonomous runs don't bypass the gate — an ask-a-human verdict is rewritten to the policy's fallback and
+          - emphasis [ref=f54e96]: both verdicts are recorded
+          - text: ". Two stages sit above policy and can't be approved away: budgets, and the read-only trust tier frozen onto fork pull requests."
+        - list "The permission gate's decision order" [ref=f54e98]:
+          - listitem [ref=f54e99]:
+            - generic [ref=f54e100]: "1"
+            - generic [ref=f54e101]: budget
+            - generic [ref=f54e102]: cost, tokens, wall-clock, tool calls
+          - listitem [ref=f54e103]:
+            - generic [ref=f54e104]: "2"
+            - generic [ref=f54e105]: frozen surface
+            - generic [ref=f54e106]: only tools the RunSpec froze exist
+          - listitem [ref=f54e107]:
+            - generic [ref=f54e108]: "3"
+            - generic [ref=f54e109]: schema
+            - generic [ref=f54e110]: arguments validated server-side
+          - listitem [ref=f54e111]:
+            - generic [ref=f54e112]: "4"
+            - generic [ref=f54e113]: trust tier
+            - generic [ref=f54e114]: fork PRs are read-only, always
+          - listitem [ref=f54e115]:
+            - generic [ref=f54e116]: "5"
+            - generic [ref=f54e117]: policy
+            - generic [ref=f54e118]: allow · deny · ask a human
+          - listitem [ref=f54e119]:
+            - generic [ref=f54e120]: "6"
+            - generic [ref=f54e121]: approval
+            - generic [ref=f54e122]: expiry denies; decisions idempotent
+        - paragraph [ref=f54e123]:
+          - text: "The full sequence, with sources for every denial:"
+          - link "the permission gate" [ref=f54e124] [cursor=pointer]:
+            - /url: /docs/governance
+          - text: .
+      - generic [ref=f54e125]:
+        - generic [ref=f54e126]: capabilities
+        - heading "The parts you'd otherwise build around your agent runtime." [level=2] [ref=f54e127]
+        - paragraph [ref=f54e128]: fluidbox is deliberately not a reasoning framework. It's the governance and execution layer that makes whichever harness you already use safe to hand a repository and a credential.
+        - generic [ref=f54e129]:
+          - article [ref=f54e130]:
+            - generic [ref=f54e131]: policy
+            - heading "Server-side tool policy" [level=3] [ref=f54e132]
+            - paragraph [ref=f54e133]: Ordered rules over tools, paths, and shell commands decide allow, deny, or ask-a-human — evaluated in the control plane, where the agent can't reach. Versioned, append-only, authorable from the dashboard.
+            - generic [ref=f54e134]: "- match: [\"Bash\"] action: allow shell: deny_regex: [\"rm\\\\s+-rf\\\\s+/\"] on_no_match: approve"
+            - link "Policies →" [ref=f54e135] [cursor=pointer]:
+              - /url: /docs/policies
+          - article [ref=f54e136]:
+            - generic [ref=f54e137]: approvals
+            - heading "Human approval gates" [level=3] [ref=f54e138]
+            - paragraph [ref=f54e139]: An approve verdict pauses the run until someone decides — once, for the session, or deny. Decisions are idempotent; an unanswered approval expires to deny. Absence never widens permission.
+            - generic [ref=f54e140]: "POST /v1/approvals/{id}/decision { \"decision\": \"approved_once\" }"
+            - link "Approvals →" [ref=f54e141] [cursor=pointer]:
+              - /url: /docs/approvals
+          - article [ref=f54e142]:
+            - generic [ref=f54e143]: sandbox
+            - heading "Isolated execution" [level=3] [ref=f54e144]
+            - paragraph [ref=f54e145]: Every run gets a fresh, disposable container with a bind-mounted copy of your repository and no network egress. Credentials never enter it — model, git, and tool calls all terminate control-plane-side.
+            - generic [ref=f54e146]: "workspace /workspace (copy — original untouched) egress none · credentials: none"
+            - link "Security model →" [ref=f54e147] [cursor=pointer]:
+              - /url: /docs/security
+          - article [ref=f54e148]:
+            - generic [ref=f54e149]: budgets
+            - heading "Cost, token, and time budgets" [level=3] [ref=f54e150]
+            - paragraph [ref=f54e151]: Ceilings frozen per run; usage metered off the streamed model response and enforced server-side. A run that hits its budget stops, and the spend that stopped it is in the ledger.
+            - generic [ref=f54e152]: "budgets: { max_cost_usd: 2.50, max_wall_clock_secs: 1800 } spent: $0.011 · 2,148 tokens"
+            - link "Runs & budgets →" [ref=f54e153] [cursor=pointer]:
+              - /url: /docs/runs
+          - article [ref=f54e154]:
+            - generic [ref=f54e155]: ledger
+            - heading "Append-only audit timeline" [level=3] [ref=f54e156]
+            - paragraph [ref=f54e157]: "Every request, verdict, approval, and dollar — gapless sequence numbers, resumable streaming, and redaction enforced by construction: prompts can't reach the ledger, digests can."
+            - generic [ref=f54e158]: seq 23 · tool.brokered · 212ms result sha256:9f2c… (digest, never payload)
+            - link "The timeline →" [ref=f54e159] [cursor=pointer]:
+              - /url: /docs/runs
+          - article [ref=f54e160]:
+            - generic [ref=f54e161]: triggers
+            - heading "Agents, triggers, schedules" [level=3] [ref=f54e162]
+            - paragraph [ref=f54e163]: Versioned agent definitions with append-only revisions; runs started by API tokens, cron schedules (exactly-once), or GitHub pull requests — all frozen into the same governed RunSpec.
+            - generic [ref=f54e164]: "POST /v1/triggers/{id}/invoke schedule: \"0 9 * * 1-5\" · concurrency: skip"
+            - link "Triggers & schedules →" [ref=f54e165] [cursor=pointer]:
+              - /url: /docs/triggers
+          - article [ref=f54e166]:
+            - generic [ref=f54e167]: deploy
+            - heading "Docker and Kubernetes" [level=3] [ref=f54e168]
+            - paragraph [ref=f54e169]: One compose command for evaluation; a Helm chart for production-shaped clusters, where sandboxes are Jobs behind admission-gated deny-all NetworkPolicies. Published images, OCI chart.
+            - generic [ref=f54e170]: helm install fluidbox \ oci://ghcr.io/hrishikeshdkakkad/charts/fluidbox
+            - link "Kubernetes →" [ref=f54e171] [cursor=pointer]:
+              - /url: /docs/kubernetes
+      - generic [ref=f54e173]:
+        - generic [ref=f54e174]: what teams run through it
+        - heading "The jobs this was built for." [level=2] [ref=f54e175]
+        - paragraph [ref=f54e176]: Every card is a shipped capability, not an aspiration — and links to the documentation that proves it.
+        - generic [ref=f54e177]:
+          - article [ref=f54e178]:
+            - heading "Review every pull request" [level=3] [ref=f54e179]
+            - paragraph [ref=f54e180]: A GitHub event starts a governed run per PR; results publish as one comment updated in place plus a check per head SHA. Fork PRs are frozen read-only — no approval can widen them.
+            - link "GitHub triggers →" [ref=f54e181] [cursor=pointer]:
+              - /url: /docs/triggers
+          - article [ref=f54e182]:
+            - heading "Maintenance agents on a schedule" [level=3] [ref=f54e183]
+            - paragraph [ref=f54e184]: Cron subscriptions fire exactly once per tick with explicit concurrency and missed-run policy — dependency bumps, triage sweeps, report generation, all with receipts.
+            - link "Schedules →" [ref=f54e185] [cursor=pointer]:
+              - /url: /docs/triggers
+          - article [ref=f54e186]:
+            - heading "Human-in-the-loop changes" [level=3] [ref=f54e187]
+            - paragraph [ref=f54e188]: The run pauses on the risky call and resumes on your decision — approve once, approve for the session, or deny. Unanswered approvals expire to deny.
+            - link "Approvals →" [ref=f54e189] [cursor=pointer]:
+              - /url: /docs/approvals
+          - article [ref=f54e190]:
+            - heading "Autonomous batches, with rails" [level=3] [ref=f54e191]
+            - paragraph [ref=f54e192]: "No human watching: ask-a-human verdicts rewrite to the policy fallback with both verdicts recorded, and cost/token/time budgets stop runaways server-side."
+            - link "Autonomy & budgets →" [ref=f54e193] [cursor=pointer]:
+              - /url: /docs/runs
+          - article [ref=f54e194]:
+            - heading "Credentialed tools, no credential handout" [level=3] [ref=f54e195]
+            - paragraph [ref=f54e196]: Brokered MCP tools run control-plane-side against per-run frozen bindings; the sandbox sends intent and gets a governed result. Your Jira token never meets the model.
+            - link "Capabilities →" [ref=f54e197] [cursor=pointer]:
+              - /url: /docs/capabilities
+          - article [ref=f54e198]:
+            - heading "Bring your own agent" [level=3] [ref=f54e199]
+            - paragraph [ref=f54e200]: Two harnesses ship — Claude Agent SDK and Codex — behind one HTTP runner contract. Implement the contract and your agent inherits the whole governance stack.
+            - link "The runner contract →" [ref=f54e201] [cursor=pointer]:
+              - /url: /docs/runner-contract
+      - generic [ref=f54e203]:
+        - generic [ref=f54e204]: architecture
+        - heading "Underneath the harness. In front of everything it touches." [level=2] [ref=f54e205]
+        - paragraph [ref=f54e206]: The harness runs inside the sandbox and speaks one HTTP contract. Models, credentials, tools, and the audit trail all live on the other side of it — in a Rust control plane that answers before anything happens.
+        - 'img "Architecture: CLI, dashboard, CI, and webhooks call the /v1 API of the Rust control plane, which contains the permission gate, approvals, orchestrator, append-only ledger, broker, and LLM facade over Postgres. The disposable sandbox running the agent harness speaks the /internal runner contract; the LLM facade forwards to the LiteLLM gateway which alone holds provider keys; the broker calls credentialed MCP services control-plane-side." [ref=f54e208]':
+          - generic [ref=f54e210]: your systems
+          - generic [ref=f54e211]: dashboard · CLI · CI
+          - generic [ref=f54e212]: API triggers · schedules
+          - generic [ref=f54e213]: GitHub webhooks
+          - generic [ref=f54e214]: /v1
+          - generic [ref=f54e216]: fluidbox control plane · Rust
+          - generic [ref=f54e218]: permission gate
+          - generic [ref=f54e219]: budget → surface → schema
+          - generic [ref=f54e220]: → trust → policy → approval
+          - generic [ref=f54e222]: approvals
+          - generic [ref=f54e223]: idempotent decisions
+          - generic [ref=f54e224]: expiry = deny
+          - generic [ref=f54e226]: orchestrator
+          - generic [ref=f54e227]: frozen RunSpecs
+          - generic [ref=f54e228]: workspace fetch, lifecycle
+          - generic [ref=f54e230]: append-only ledger
+          - generic [ref=f54e231]: redacted events, gapless seq
+          - generic [ref=f54e232]: SSE timeline
+          - generic [ref=f54e234]: broker
+          - generic [ref=f54e235]: credentialed MCP calls,
+          - generic [ref=f54e236]: executed control-plane-side
+          - generic [ref=f54e238]: LLM facade
+          - generic [ref=f54e239]: budget stop · metering
+          - generic [ref=f54e240]: credential swap
+          - generic [ref=f54e242]: Postgres
+          - generic [ref=f54e243]: RunSpecs · policies · ledger · approvals · sealed credentials
+          - generic [ref=f54e245]: disposable sandbox
+          - generic [ref=f54e246]: Docker / Kubernetes Job
+          - generic [ref=f54e247]: "harness: Claude Agent SDK,"
+          - generic [ref=f54e248]: Codex — via one contract
+          - generic [ref=f54e249]: /workspace = bind-mounted copy
+          - generic [ref=f54e250]: no network egress
+          - generic [ref=f54e251]: /internal
+          - generic [ref=f54e252]: every tool call · session token is its only credential
+          - generic [ref=f54e254]: LiteLLM gateway
+          - generic [ref=f54e255]: the only holder of
+          - generic [ref=f54e256]: provider API keys
+          - generic [ref=f54e258]: model providers
+          - generic [ref=f54e259]: Anthropic · OpenAI · …
+          - generic [ref=f54e261]: credentialed services
+          - generic [ref=f54e262]: MCP servers · GitHub
+          - generic [ref=f54e263]: credentials sealed at rest,
+          - generic [ref=f54e264]: never inside a sandbox
+        - paragraph [ref=f54e265]:
+          - text: "The reader's tour:"
+          - link "concepts" [ref=f54e266] [cursor=pointer]:
+            - /url: /docs/concepts
+          - text: ·
+          - link "docs/ARCHITECTURE.md ↗" [ref=f54e267] [cursor=pointer]:
+            - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/docs/ARCHITECTURE.md
+      - generic [ref=f54e269]:
+        - generic [ref=f54e270]: the record
+        - heading "Watch it decide — then keep the receipts." [level=2] [ref=f54e271]
+        - paragraph [ref=f54e272]: "The dashboard renders what the control plane already knows: live runs, pending approvals, agents and their revisions, and a per-run timeline where every verdict names the stage that made it. This is a real capture of the shipped product, not a mockup."
+        - 'img "The fluidbox dashboard overview: operations counters for active sandboxes, runs needing review, and completions; the agent, integration, and MCP resource lists; and run history." [ref=f54e274]'
+        - paragraph [ref=f54e275]:
+          - text: "The timeline vocabulary, event by event:"
+          - link "runs & the timeline" [ref=f54e276] [cursor=pointer]:
+            - /url: /docs/runs
+          - text: .
+      - generic [ref=f54e277]:
+        - generic [ref=f54e278]: developer experience
+        - heading "A governed run on your machine, two ways." [level=2] [ref=f54e279]
+        - paragraph [ref=f54e280]:
+          - text: The eval stack runs entirely from published images — bundled Postgres, a well-known admin token, nothing built locally. The from-source path is three commands, and
+          - code [ref=f54e281]: just doctor
+          - text: explains anything that's off.
+        - generic [ref=f54e282]:
+          - generic [ref=f54e283]:
+            - heading "Docker — published images" [level=3] [ref=f54e284]
+            - generic [ref=f54e285]:
+              - code [ref=f54e288]:
+                - generic [ref=f54e289]: git clone https://github.com/hrishikeshdkakkad/fluidbox.git
+                - generic [ref=f54e290]: cd fluidbox
+                - generic [ref=f54e291]: docker compose -f deploy/docker-compose.eval.yml --profile runners pull
+                - generic [ref=f54e292]: ANTHROPIC_API_KEY=sk-ant-... docker compose -f deploy/docker-compose.eval.yml up -d
+              - button "Copy code" [ref=f54e293] [cursor=pointer]: Copy
+            - paragraph [ref=f54e294]:
+              - text: "Open localhost:3000 — the dashboard lives at /app. Eval only: see"
+              - link "Docker" [ref=f54e295] [cursor=pointer]:
+                - /url: /docs/docker
+              - text: for what's deliberately disabled.
+          - generic [ref=f54e296]:
+            - heading "From source" [level=3] [ref=f54e297]
+            - generic [ref=f54e298]:
+              - code [ref=f54e301]:
+                - generic [ref=f54e302]: "just setup # .env + secrets, web deps, runner image"
+                - generic [ref=f54e303]: "just doctor # validates every gotcha, prints the fix"
+                - generic [ref=f54e304]: "just dev # gateway + control plane + dashboard"
+              - button "Copy code" [ref=f54e305] [cursor=pointer]: Copy
+            - paragraph [ref=f54e306]:
+              - text: "Then register an agent and start a run that pauses for your approval:"
+              - link "getting started" [ref=f54e307] [cursor=pointer]:
+                - /url: /docs/getting-started
+              - text: .
+      - generic [ref=f54e310]:
+        - generic [ref=f54e311]:
+          - generic [ref=f54e312]: open source
+          - heading "MIT-licensed. Self-hosted. No black boxes." [level=2] [ref=f54e313]
+          - paragraph [ref=f54e314]: "The repository is the product: the Rust control plane, both runner images, the dashboard, the Helm chart, the OpenAPI description, the threat model, and the end-to-end acceptance suites that drive real sandboxes and real approval flows."
+          - paragraph [ref=f54e315]: Governance infrastructure only earns trust when you can read it. The security model is documented, the residual risks are written down rather than rounded away, and every release is built in the open.
+        - list [ref=f54e317]:
+          - listitem [ref=f54e318]:
+            - link "Repository github.com/hrishikeshdkakkad/fluidbox" [ref=f54e319] [cursor=pointer]:
+              - /url: https://github.com/hrishikeshdkakkad/fluidbox
+              - text: Repository
+              - generic [ref=f54e320]: github.com/hrishikeshdkakkad/fluidbox
+          - listitem [ref=f54e321]:
+            - link "Public roadmap what's next, in order" [ref=f54e322] [cursor=pointer]:
+              - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/ROADMAP.md
+              - text: Public roadmap
+              - generic [ref=f54e323]: what's next, in order
+          - listitem [ref=f54e324]:
+            - link "Contributing clone → merged PR" [ref=f54e325] [cursor=pointer]:
+              - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/CONTRIBUTING.md
+              - text: Contributing
+              - generic [ref=f54e326]: clone → merged PR
+          - listitem [ref=f54e327]:
+            - link "Good first issues labeled on the tracker" [ref=f54e328] [cursor=pointer]:
+              - /url: https://github.com/hrishikeshdkakkad/fluidbox/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22
+              - text: Good first issues
+              - generic [ref=f54e329]: labeled on the tracker
+          - listitem [ref=f54e330]:
+            - link "The open-source model what's OSS vs hosted" [ref=f54e331] [cursor=pointer]:
+              - /url: /open-source
+              - text: The open-source model
+              - generic [ref=f54e332]: what's OSS vs hosted
+      - generic [ref=f54e333]:
+        - generic [ref=f54e334]: start here
+        - heading "Give your agents rules, receipts, and a place to run." [level=2] [ref=f54e335]
+        - generic [ref=f54e336]:
+          - link "Try the demo" [ref=f54e337] [cursor=pointer]:
+            - /url: "#try-it"
+          - link "View GitHub ↗" [ref=f54e338] [cursor=pointer]:
+            - /url: https://github.com/hrishikeshdkakkad/fluidbox
+          - link "Sign in" [ref=f54e339] [cursor=pointer]:
+            - /url: /sign-in
+    - contentinfo [ref=f54e340]:
+      - generic [ref=f54e341]:
+        - generic [ref=f54e342]:
+          - generic [ref=f54e343]:
+            - text: fluidbox
+            - paragraph [ref=f54e344]: The open-source control plane for governed AI agents. Run agents without giving them God mode.
+          - navigation "Product" [ref=f54e345]:
+            - list [ref=f54e347]:
+              - listitem [ref=f54e348]:
+                - link "Overview" [ref=f54e349] [cursor=pointer]:
+                  - /url: /product
+              - listitem [ref=f54e350]:
+                - link "Pricing" [ref=f54e351] [cursor=pointer]:
+                  - /url: /pricing
+              - listitem [ref=f54e352]:
+                - link "Changelog" [ref=f54e353] [cursor=pointer]:
+                  - /url: /changelog
+              - listitem [ref=f54e354]:
+                - link "Dashboard" [ref=f54e355] [cursor=pointer]:
+                  - /url: /app
+          - navigation "Documentation" [ref=f54e356]:
+            - list [ref=f54e358]:
+              - listitem [ref=f54e359]:
+                - link "Getting started" [ref=f54e360] [cursor=pointer]:
+                  - /url: /docs/getting-started
+              - listitem [ref=f54e361]:
+                - link "Concepts" [ref=f54e362] [cursor=pointer]:
+                  - /url: /docs/concepts
+              - listitem [ref=f54e363]:
+                - link "API" [ref=f54e364] [cursor=pointer]:
+                  - /url: /docs/api
+              - listitem [ref=f54e365]:
+                - link "Kubernetes" [ref=f54e366] [cursor=pointer]:
+                  - /url: /docs/kubernetes
+          - navigation "Project" [ref=f54e367]:
+            - list [ref=f54e369]:
+              - listitem [ref=f54e370]:
+                - link "GitHub ↗" [ref=f54e371] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox
+              - listitem [ref=f54e372]:
+                - link "Roadmap ↗" [ref=f54e373] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/ROADMAP.md
+              - listitem [ref=f54e374]:
+                - link "Contributing ↗" [ref=f54e375] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/CONTRIBUTING.md
+              - listitem [ref=f54e376]:
+                - link "Good first issues ↗" [ref=f54e377] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22
+          - navigation "Trust" [ref=f54e378]:
+            - list [ref=f54e380]:
+              - listitem [ref=f54e381]:
+                - link "Security" [ref=f54e382] [cursor=pointer]:
+                  - /url: /security
+              - listitem [ref=f54e383]:
+                - link "Disclosure policy ↗" [ref=f54e384] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/SECURITY.md
+              - listitem [ref=f54e385]:
+                - link "MIT license ↗" [ref=f54e386] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/LICENSE
+              - listitem [ref=f54e387]:
+                - link "Code of conduct ↗" [ref=f54e388] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/CODE_OF_CONDUCT.md
+        - generic [ref=f54e389]:
+          - generic [ref=f54e390]: fluidbox — MIT licensed, built in the open.
+          - link "github.com/hrishikeshdkakkad/fluidbox" [ref=f54e391] [cursor=pointer]:
+            - /url: https://github.com/hrishikeshdkakkad/fluidbox
+  - alert [ref=f54e392]
