@@ -115,7 +115,7 @@ Every managed cloud follows the same five steps; only the **CNI enforcement** an
 2. **Create the namespace and the `fluidbox-secrets` Secret** ([Secrets](#secrets)).
 3. **`helm install` from the OCI registry** with the cloud's values preset:
    ```bash
-   FLUIDBOX_VERSION=0.4.0-rc.1 # x-release-please-version
+   FLUIDBOX_VERSION=0.5.0-rc.1 # x-release-please-version
    helm install fluidbox oci://ghcr.io/hrishikeshdkakkad/charts/fluidbox \
      --version "$FLUIDBOX_VERSION" \
      -n fluidbox --create-namespace \
@@ -179,7 +179,7 @@ kubectl apply -f scripts/eks-gp3-storageclass.yaml
 kubectl create namespace fluidbox
 # ...create fluidbox-secrets (see Secrets)...
 
-FLUIDBOX_VERSION=0.4.0-rc.1 # x-release-please-version
+FLUIDBOX_VERSION=0.5.0-rc.1 # x-release-please-version
 helm install fluidbox oci://ghcr.io/hrishikeshdkakkad/charts/fluidbox \
   --version "$FLUIDBOX_VERSION" -n fluidbox \
   -f deploy/helm/fluidbox/values/eks.yaml \

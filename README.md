@@ -284,7 +284,7 @@ The Helm chart is published as an OCI artifact:
 
 ```bash
 # First create the required `fluidbox-secrets` Secret and a values file.
-FLUIDBOX_VERSION=0.4.0-rc.1 # x-release-please-version
+FLUIDBOX_VERSION=0.5.0-rc.1 # x-release-please-version
 
 helm show values oci://ghcr.io/hrishikeshdkakkad/charts/fluidbox \
   --version "$FLUIDBOX_VERSION" > fluidbox-values.yaml
