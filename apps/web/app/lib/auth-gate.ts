@@ -31,6 +31,15 @@ export type GateDecision =
   | { kind: "to-login"; next: string }
   | { kind: "to-app" };
 
+/** Routes readable without a session in sso mode. Developer documentation is
+ *  public by convention (you read the API docs before you have an account);
+ *  the pages under it render generated static content and call no
+ *  authenticated API — the Sidebar suppresses its polls there too, because a
+ *  background /approvals 401 would bounce the anonymous reader to /login. */
+export function isPublicPath(pathname: string): boolean {
+  return pathname === "/developer" || pathname.startsWith("/developer/");
+}
+
 /** Where a page navigation should go, given the deployment mode and whether
  *  the browser carries a session cookie.
  *
@@ -54,6 +63,7 @@ export function gateDecision(input: {
     return pathname === "/login" ? { kind: "to-app" } : { kind: "pass" };
   }
   if (pathname === "/login") return { kind: "pass" };
+  if (isPublicPath(pathname)) return { kind: "pass" };
   if (!hasSession) return { kind: "to-login", next: `${pathname}${search}` };
   return { kind: "pass" };
 }
