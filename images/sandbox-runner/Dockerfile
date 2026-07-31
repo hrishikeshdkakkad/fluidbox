@@ -13,8 +13,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/fluidbox-runner
-COPY sandbox-runner/runner/package.json ./package.json
-RUN npm install --omit=dev && npm cache clean --force
+# package-lock.json is COPIED and `npm ci` is used so the image is built from
+# a RESOLVED dependency graph rather than re-resolving at build time. With
+# `npm install` and no lock, two builds of the same commit could differ --
+# for the code that runs beside an untrusted workspace, that is the least
+# verifiable thing we shipped. `npm ci` also FAILS if the lock and the
+# manifest disagree, instead of silently drifting.
+COPY sandbox-runner/runner/package.json sandbox-runner/runner/package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
 
 COPY sandbox-runner/runner/index.mjs ./index.mjs
 COPY sandbox-runner/runner/servers ./servers

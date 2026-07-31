@@ -72,8 +72,8 @@ named. **INFERRED** — correct by reading the code, with no executable assertio
 | # | Claim | Class |
 |---|---|---|
 | D1 | Release images are signed / an SBOM is published / provenance is attested / the chart is signed / checksums are published. | **NOT CLAIMED — and none of these exist.** See the compatibility matrix for the full table. |
-| D2 | Runner images are reproducible. | **NOT CLAIMED — they are not.** No lockfile for either runner; `npm install`, not `npm ci`. The *mechanism* is verified; drift was not observed in a one-week window (two builds produced byte-identical 106-package trees). |
-| D3 | Runner dependencies are monitored for CVEs. | **NOT CLAIMED — they are not.** No npm Dependabot entry for either runner directory. |
+| D2 | Runner images are reproducible. | **PARTIAL — the dependency graph is now pinned; the image still is not.** Both runners carry a `package-lock.json` and build with `npm ci` (2026-07-31), so two builds of one commit resolve the SAME dependency tree and a lock/manifest disagreement FAILS the build. That is not full reproducibility: the base image tag, apt/apk layers and build timestamps are still unpinned, so image digests can differ. Verified: the sandbox runner rebuilt under `npm ci` and passed `gate-proof.sh` 14/14. |
+| D3 | Runner dependencies are monitored for CVEs. | **NOW TRUE (2026-07-31).** Both runner directories have an npm Dependabot entry, grouped minor/patch weekly. Agent-SDK and MCP-SDK **majors are deliberately excluded** — a major can change the harness contract the permission gate depends on, so it is taken by hand with `gate-proof.sh` adjudicating. Watching them at all was only possible once each directory had a lockfile. |
 | D4 | This candidate does not claim a proven 300-run production ceiling. | **CORRECTLY SCOPED** | The 60/150/300-concurrent-run campaign has not been executed. Capacity remains a deployment gate. |
 
 ## Maturity
