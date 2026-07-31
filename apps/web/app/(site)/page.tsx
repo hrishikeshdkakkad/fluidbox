@@ -111,6 +111,47 @@ schedule: "0 9 * * 1-5" · concurrency: skip`,
   },
 ];
 
+// Honest pattern cards: each one is a shipped capability framed as a job —
+// no customer claims, every card links to the doc that proves it.
+const PATTERNS: { t: string; b: string; href: string; link: string }[] = [
+  {
+    t: "Review every pull request",
+    b: "A GitHub event starts a governed run per PR; results publish as one comment updated in place plus a check per head SHA. Fork PRs are frozen read-only — no approval can widen them.",
+    href: "/docs/triggers",
+    link: "GitHub triggers",
+  },
+  {
+    t: "Maintenance agents on a schedule",
+    b: "Cron subscriptions fire exactly once per tick with explicit concurrency and missed-run policy — dependency bumps, triage sweeps, report generation, all with receipts.",
+    href: "/docs/triggers",
+    link: "Schedules",
+  },
+  {
+    t: "Human-in-the-loop changes",
+    b: "The run pauses on the risky call and resumes on your decision — approve once, approve for the session, or deny. Unanswered approvals expire to deny.",
+    href: "/docs/approvals",
+    link: "Approvals",
+  },
+  {
+    t: "Autonomous batches, with rails",
+    b: "No human watching: ask-a-human verdicts rewrite to the policy fallback with both verdicts recorded, and cost/token/time budgets stop runaways server-side.",
+    href: "/docs/runs",
+    link: "Autonomy & budgets",
+  },
+  {
+    t: "Credentialed tools, no credential handout",
+    b: "Brokered MCP tools run control-plane-side against per-run frozen bindings; the sandbox sends intent and gets a governed result. Your Jira token never meets the model.",
+    href: "/docs/capabilities",
+    link: "Capabilities",
+  },
+  {
+    t: "Bring your own agent",
+    b: "Two harnesses ship — Claude Agent SDK and Codex — behind one HTTP runner contract. Implement the contract and your agent inherits the whole governance stack.",
+    href: "/docs/runner-contract",
+    link: "The runner contract",
+  },
+];
+
 const JSON_LD = {
   "@context": "https://schema.org",
   "@graph": [
@@ -247,8 +288,31 @@ export default function HomePage() {
         </div>
       </section>
 
-      {/* ── Architecture ── */}
+      {/* ── Patterns (honest use cases, each backed by a doc) ── */}
       <section className="site-band">
+        <div className="site-container site-section">
+          <div className="site-kicker">what teams run through it</div>
+          <h2 className="site-h2">The jobs this was built for.</h2>
+          <p className="site-lead">
+            Every card is a shipped capability, not an aspiration — and links
+            to the documentation that proves it.
+          </p>
+          <div className="features">
+            {PATTERNS.map((p) => (
+              <article className="feature" key={p.t}>
+                <h3 className="feature-t">{p.t}</h3>
+                <p className="feature-b">{p.b}</p>
+                <Link className="feature-link" href={p.href}>
+                  {p.link} →
+                </Link>
+              </article>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* ── Architecture ── */}
+      <section>
         <div className="site-container site-section">
           <div className="site-kicker">architecture</div>
           <h2 className="site-h2">
@@ -273,6 +337,33 @@ export default function HomePage() {
             >
               docs/ARCHITECTURE.md ↗
             </a>
+          </p>
+        </div>
+      </section>
+
+      {/* ── Visibility: the real product, not a mockup ── */}
+      <section className="site-band">
+        <div className="site-container site-section">
+          <div className="site-kicker">the record</div>
+          <h2 className="site-h2">Watch it decide — then keep the receipts.</h2>
+          <p className="site-lead">
+            The dashboard renders what the control plane already knows: live
+            runs, pending approvals, agents and their revisions, and a
+            per-run timeline where every verdict names the stage that made
+            it. This is a real capture of the shipped product, not a mockup.
+          </p>
+          <div className="shot-frame">
+            <img
+              src="/product/overview-light.png"
+              width={1440}
+              height={900}
+              loading="lazy"
+              alt="The fluidbox dashboard overview: operations counters for active sandboxes, runs needing review, and completions; the agent, integration, and MCP resource lists; and run history."
+            />
+          </div>
+          <p className="try-note" style={{ marginTop: 14 }}>
+            The timeline vocabulary, event by event:{" "}
+            <Link href="/docs/runs">runs &amp; the timeline</Link>.
           </p>
         </div>
       </section>
