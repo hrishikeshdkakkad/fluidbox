@@ -14,7 +14,9 @@ import { signOutAction } from "./actions";
 // robots.txt disallow are the two halves of that statement.
 export const metadata: Metadata = {
   title: {
-    default: "Overview · fluidbox",
+    // The root template appends "· fluidbox"; section layouts (Agents,
+    // Settings, …) override through this template.
+    default: "Overview",
     template: "%s · fluidbox",
   },
   robots: { index: false, follow: false },
