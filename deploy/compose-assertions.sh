@@ -105,16 +105,23 @@ fi
 # product on some engines — but "8787 is bind-configurable and the file explains
 # the trade-off", plus "everything else is loopback".
 published_ports() { # file -> lines like `- "127.0.0.1:5433:5432"`
+  # BOTH quoted and unquoted short syntax. The quote is optional in compose, and
+  # an earlier version of this pattern required it — so `- 9999:9999` was a real
+  # all-interfaces publish that this guard could not see. Verified: adding that
+  # line left the suite fully green.
+  #
   # POSIX classes, not \s: BSD sed (macOS) does not understand \s, and this
   # script has to give the same answer on a maintainer's laptop and in CI.
-  grep -nE '^[[:space:]]*-[[:space:]]*"[^"]*:[0-9]+"' "$1" 2>/dev/null || true
+  grep -nE '^[[:space:]]*-[[:space:]]*"?[^"#]*:[0-9]+"?[[:space:]]*$' "$1" 2>/dev/null || true
 }
 
 check_loopback() { # file, allow-regex-for-exceptions
   local f="$1" exc="$2" line spec bad_any=0
   while IFS= read -r line; do
     [ -z "$line" ] && continue
-    spec=$(sed -E 's/^[0-9]+:[[:space:]]*-[[:space:]]*"([^"]*)".*/\1/' <<<"$line")
+    # Quoted OR unquoted: compose accepts both, so strip an optional quote
+    # rather than requiring one.
+    spec=$(sed -E 's/^[0-9]+:[[:space:]]*-[[:space:]]*"?([^"[:space:]]*)"?[[:space:]]*$/\1/' <<<"$line")
     # An exception is allowed through by pattern.
     if [ -n "$exc" ] && printf '%s' "$spec" | grep -qE "$exc"; then
       continue
