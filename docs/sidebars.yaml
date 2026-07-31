@@ -1,0 +1,58 @@
+- page: index.md
+  label: Overview
+
+- group: Start here
+  expanded: true
+  items:
+    - page: guides/getting-started.md
+      label: Getting started
+    - page: guides/concepts.md
+      label: Concepts
+
+- group: Running agents
+  expanded: true
+  items:
+    - page: guides/agents.md
+      label: Agents & revisions
+    - page: guides/runs.md
+      label: Runs & the timeline
+    - page: guides/triggers.md
+      label: Triggers & schedules
+
+- group: Governance
+  expanded: true
+  items:
+    - page: guides/governance.md
+      label: The permission gate
+    - page: guides/policies.md
+      label: Policies
+    - page: guides/approvals.md
+      label: Approvals
+    - page: guides/capabilities.md
+      label: Capabilities
+
+- group: Deployment
+  expanded: true
+  items:
+    - page: guides/docker.md
+      label: Docker
+    - page: guides/kubernetes.md
+      label: Kubernetes
+    - page: guides/security.md
+      label: Security model
+
+- group: Extending
+  expanded: true
+  items:
+    - page: guides/runner-contract.md
+      label: Building a harness
+
+- group: Reference
+  expanded: true
+  items:
+    - page: guides/api.md
+      label: API overview
+    - page: api/openapi.yaml
+      label: API reference
+    - page: guides/authentication.md
+      label: Authentication

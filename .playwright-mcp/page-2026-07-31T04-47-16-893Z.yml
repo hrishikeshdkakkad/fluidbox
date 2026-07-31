@@ -1,0 +1,30 @@
+- generic [ref=f37e1]:
+  - generic [ref=f37e3]:
+    - generic: This is a temporary environment
+    - generic [ref=f37e16]:
+      - heading "Sign in" [level=1] [ref=f37e18]
+      - generic [ref=f37e19]:
+        - generic [ref=f37e21]:
+          - generic [ref=f37e22]:
+            - generic [ref=f37e23]:
+              - generic [ref=f37e24]: Email
+              - textbox "Email" [active] [ref=f37e27]:
+                - /placeholder: Your email address
+            - button "Continue with email Last used" [ref=f37e28] [cursor=pointer]:
+              - generic [ref=f37e29]: Continue with email
+              - generic [ref=f37e30]: Last used
+          - generic [ref=f37e31]: OR
+          - generic [ref=f37e33]:
+            - link [ref=f37e35] [cursor=pointer]:
+              - /url: ./api/login?provider=GoogleOAuth&state=Fe26.2%2A1%2Af88dbe0f78fab8fb346f3e04b4c78ae8cb6a0adc52efe00eadc809f495e1f90b%2ATbD-zqGDjSJjcJSCBw86eA%2AWe42JmCWWTg4m-yOHHPOggmrXffEanX984gjeC8-HwkeqU4QkcJPgUCvTFmkyC38YjzirDvqKG0alH_4T4cvYDmO2Y488mzsGy6P5qIUr-i9D1QxWZSkEMqWWUoO-mcblHytSYs_q5tyBLjnbwh0Fs7AFRkX3-8oIDRmjGbL14HQZ-C6KazFOTAhoPBM2rxm%2A1785473836108%2A1c40a3b16e3192731f4790ef60e6d50b31f22c9f99f36a3ad3487f1207574a77%2AI84_5h1HU8WM7jfIA_uOv-gnIBj2WuwA03kDIKLMoaA~2&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&client_id=client_01KYV410MB035TNSMAK24K659Z&source=signin&authorization_session_id=01KYV7YZAE80MVCMZX0X3X6TNH
+            - link [ref=f37e43] [cursor=pointer]:
+              - /url: ./api/login?provider=MicrosoftOAuth&state=Fe26.2%2A1%2Af88dbe0f78fab8fb346f3e04b4c78ae8cb6a0adc52efe00eadc809f495e1f90b%2ATbD-zqGDjSJjcJSCBw86eA%2AWe42JmCWWTg4m-yOHHPOggmrXffEanX984gjeC8-HwkeqU4QkcJPgUCvTFmkyC38YjzirDvqKG0alH_4T4cvYDmO2Y488mzsGy6P5qIUr-i9D1QxWZSkEMqWWUoO-mcblHytSYs_q5tyBLjnbwh0Fs7AFRkX3-8oIDRmjGbL14HQZ-C6KazFOTAhoPBM2rxm%2A1785473836108%2A1c40a3b16e3192731f4790ef60e6d50b31f22c9f99f36a3ad3487f1207574a77%2AI84_5h1HU8WM7jfIA_uOv-gnIBj2WuwA03kDIKLMoaA~2&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&client_id=client_01KYV410MB035TNSMAK24K659Z&source=signin&authorization_session_id=01KYV7YZAE80MVCMZX0X3X6TNH
+            - link [ref=f37e51] [cursor=pointer]:
+              - /url: ./api/login?provider=GitHubOAuth&state=Fe26.2%2A1%2Af88dbe0f78fab8fb346f3e04b4c78ae8cb6a0adc52efe00eadc809f495e1f90b%2ATbD-zqGDjSJjcJSCBw86eA%2AWe42JmCWWTg4m-yOHHPOggmrXffEanX984gjeC8-HwkeqU4QkcJPgUCvTFmkyC38YjzirDvqKG0alH_4T4cvYDmO2Y488mzsGy6P5qIUr-i9D1QxWZSkEMqWWUoO-mcblHytSYs_q5tyBLjnbwh0Fs7AFRkX3-8oIDRmjGbL14HQZ-C6KazFOTAhoPBM2rxm%2A1785473836108%2A1c40a3b16e3192731f4790ef60e6d50b31f22c9f99f36a3ad3487f1207574a77%2AI84_5h1HU8WM7jfIA_uOv-gnIBj2WuwA03kDIKLMoaA~2&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&client_id=client_01KYV410MB035TNSMAK24K659Z&source=signin&authorization_session_id=01KYV7YZAE80MVCMZX0X3X6TNH
+            - link [ref=f37e55] [cursor=pointer]:
+              - /url: ./api/login?provider=AppleOAuth&state=Fe26.2%2A1%2Af88dbe0f78fab8fb346f3e04b4c78ae8cb6a0adc52efe00eadc809f495e1f90b%2ATbD-zqGDjSJjcJSCBw86eA%2AWe42JmCWWTg4m-yOHHPOggmrXffEanX984gjeC8-HwkeqU4QkcJPgUCvTFmkyC38YjzirDvqKG0alH_4T4cvYDmO2Y488mzsGy6P5qIUr-i9D1QxWZSkEMqWWUoO-mcblHytSYs_q5tyBLjnbwh0Fs7AFRkX3-8oIDRmjGbL14HQZ-C6KazFOTAhoPBM2rxm%2A1785473836108%2A1c40a3b16e3192731f4790ef60e6d50b31f22c9f99f36a3ad3487f1207574a77%2AI84_5h1HU8WM7jfIA_uOv-gnIBj2WuwA03kDIKLMoaA~2&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&client_id=client_01KYV410MB035TNSMAK24K659Z&source=signin&authorization_session_id=01KYV7YZAE80MVCMZX0X3X6TNH
+        - paragraph [ref=f37e59]:
+          - text: Don't have an account?
+          - link "Sign up" [ref=f37e60] [cursor=pointer]:
+            - /url: /sign-up?state=Fe26.2%2A1%2Af88dbe0f78fab8fb346f3e04b4c78ae8cb6a0adc52efe00eadc809f495e1f90b%2ATbD-zqGDjSJjcJSCBw86eA%2AWe42JmCWWTg4m-yOHHPOggmrXffEanX984gjeC8-HwkeqU4QkcJPgUCvTFmkyC38YjzirDvqKG0alH_4T4cvYDmO2Y488mzsGy6P5qIUr-i9D1QxWZSkEMqWWUoO-mcblHytSYs_q5tyBLjnbwh0Fs7AFRkX3-8oIDRmjGbL14HQZ-C6KazFOTAhoPBM2rxm%2A1785473836108%2A1c40a3b16e3192731f4790ef60e6d50b31f22c9f99f36a3ad3487f1207574a77%2AI84_5h1HU8WM7jfIA_uOv-gnIBj2WuwA03kDIKLMoaA~2&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&authorization_session_id=01KYV7YZAE80MVCMZX0X3X6TNH
+  - alert [ref=f37e61]

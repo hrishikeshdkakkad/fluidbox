@@ -1,0 +1,77 @@
+- generic [active] [ref=f35e1]:
+  - generic [ref=f35e2]:
+    - banner [ref=f35e3]:
+      - generic [ref=f35e4]:
+        - link "fluidbox control plane" [ref=f35e5] [cursor=pointer]:
+          - /url: /app
+          - generic [ref=f35e6]: fluidbox
+          - generic [ref=f35e7]: control plane
+        - navigation "Primary navigation" [ref=f35e8]:
+          - link "Overview" [ref=f35e9] [cursor=pointer]:
+            - /url: /app
+          - link "Resources" [ref=f35e10] [cursor=pointer]:
+            - /url: /app#configuration
+          - link "Activity" [ref=f35e11] [cursor=pointer]:
+            - /url: /app#operations
+          - link "Governance" [ref=f35e12] [cursor=pointer]:
+            - /url: /app/governance
+          - link "Docs" [ref=f35e13] [cursor=pointer]:
+            - /url: /docs
+          - link "Settings" [ref=f35e14] [cursor=pointer]:
+            - /url: /app/settings
+        - generic [ref=f35e15]:
+          - generic "Control plane online" [ref=f35e16]: Operational
+          - link "New Run" [ref=f35e19] [cursor=pointer]:
+            - /url: /app?action=new-run
+          - button "Use dark theme" [ref=f35e20] [cursor=pointer]:
+            - generic [ref=f35e23]: Dark
+          - generic [ref=f35e24]:
+            - generic "Signed in · e2e-user@fluidbox-site-test.dev" [ref=f35e25]: e2e-user@fluidbox-site-test.dev
+            - button "Sign out" [ref=f35e27] [cursor=pointer]
+    - main [ref=f35e28]:
+      - generic [ref=f35e30]:
+        - heading "Overview" [level=1] [ref=f35e31]
+        - paragraph [ref=f35e32]: Configure, automate, and monitor governed agent runs.
+      - region [ref=f35e33]:
+        - generic [ref=f35e34]:
+          - generic [ref=f35e35]:
+            - heading "Operations" [level=2] [ref=f35e36]
+            - paragraph [ref=f35e37]: Current activity across manual runs and automations.
+          - generic [ref=f35e38]: Checking
+        - generic "Run summary" [ref=f35e40]:
+          - generic [ref=f35e41]:
+            - text: Active
+            - strong [ref=f35e42]: —
+            - generic [ref=f35e43]: control plane unavailable
+          - generic [ref=f35e44]:
+            - text: Needs Review
+            - strong [ref=f35e45]: —
+            - generic [ref=f35e46]: status unavailable
+          - generic [ref=f35e47]:
+            - text: Completed
+            - strong [ref=f35e48]: —
+            - generic [ref=f35e49]: history unavailable
+          - generic [ref=f35e50]:
+            - text: Success Rate
+            - strong [ref=f35e51]: —
+            - generic [ref=f35e52]: history unavailable
+      - region [ref=f35e53]:
+        - generic [ref=f35e54]:
+          - generic [ref=f35e55]:
+            - heading "Resources" [level=2] [ref=f35e56]
+            - paragraph [ref=f35e57]: Reusable definitions and connections available to every run.
+          - generic [ref=f35e60]:
+            - strong [ref=f35e61]: Setup Required
+            - generic [ref=f35e62]: Create an agent
+        - generic "Loading" [ref=f35e64]
+      - tablist "Runs and automations" [ref=f35e77]:
+        - tab "Run history 0" [selected] [ref=f35e78] [cursor=pointer]
+        - tab "Automations" [ref=f35e79] [cursor=pointer]
+      - tabpanel [ref=f35e80]:
+        - generic [ref=f35e81]:
+          - generic [ref=f35e82]:
+            - text: Every invocation
+            - heading "Run history" [level=2] [ref=f35e83]
+          - generic [ref=f35e84]: Manual and automated runs share one timeline.
+        - generic "Loading" [ref=f35e86]
+  - alert [ref=f35e103]
