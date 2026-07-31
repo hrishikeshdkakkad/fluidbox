@@ -1,6 +1,9 @@
 import type { Metadata } from "next";
-import { Sidebar } from "../components/Sidebar";
+import { AuthKitProvider } from "@workos-inc/authkit-nextjs/components";
+import { Sidebar, type WorkosSessionBadge } from "../components/Sidebar";
 import { webMode } from "../lib/proxy-auth";
+import { webAuthMode } from "../lib/web-auth";
+import { signOutAction } from "./actions";
 
 // The authenticated application shell. Everything under /app/* renders inside
 // this chrome; the masthead's background polls (/approvals, /auth/me) belong
@@ -17,13 +20,43 @@ export const metadata: Metadata = {
   robots: { index: false, follow: false },
 };
 
-const WEB_MODE = webMode(process.env.FLUIDBOX_WEB_MODE);
+// Deployment configuration can differ between build and runtime (the Docker
+// image is built once, configured per environment). Rendering per request
+// keeps the workos defense-in-depth check and the session UI on the RUNTIME
+// configuration instead of whatever the build machine had; these pages are
+// client-driven shells, so nothing meaningful was static here anyway.
+export const dynamic = "force-dynamic";
 
-export default function AppLayout({ children }: LayoutProps<"/app">) {
-  return (
+const WEB_MODE = webMode(process.env.FLUIDBOX_WEB_MODE);
+const AUTH = webAuthMode(process.env.FLUIDBOX_WEB_AUTH);
+
+export default async function AppLayout({ children }: LayoutProps<"/app">) {
+  // Defense in depth behind proxy.ts: any document request that reaches this
+  // segment in workos mode re-validates the session server-side and redirects
+  // to AuthKit when it is missing or expired. Also the (only) source of the
+  // session badge — the client never derives auth state.
+  let workosSession: WorkosSessionBadge | null = null;
+  if (AUTH === "workos") {
+    const { withAuth } = await import("@workos-inc/authkit-nextjs");
+    const { user, organizationId } = await withAuth({ ensureSignedIn: true });
+    const name = [user.firstName, user.lastName].filter(Boolean).join(" ");
+    workosSession = {
+      label: name || organizationId || "Signed in",
+      email: user.email,
+    };
+  }
+
+  const shell = (
     <div className="shell">
-      <Sidebar mode={WEB_MODE} />
+      <Sidebar mode={WEB_MODE} workosSession={workosSession} signOut={signOutAction} />
       <main className="main">{children}</main>
     </div>
   );
+
+  // AuthKitProvider carries client-side auth state (useAuth) for the app
+  // subtree. Scoped here rather than the root layout on purpose: public
+  // marketing/docs pages must not mount auth context, and every conceivable
+  // useAuth consumer lives under /app. Not rendered in `none` mode, where
+  // its background session endpoints have no configuration to talk to.
+  return AUTH === "workos" ? <AuthKitProvider>{shell}</AuthKitProvider> : shell;
 }
