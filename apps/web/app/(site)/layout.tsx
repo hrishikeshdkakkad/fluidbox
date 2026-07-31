@@ -1,3 +1,4 @@
+import { SectionReveal } from "./components/SectionReveal";
 import { SiteHeader } from "./components/SiteHeader";
 import { SiteFooter } from "./components/SiteFooter";
 
@@ -14,6 +15,7 @@ export default function SiteLayout({ children }: { children: React.ReactNode }) 
       <main id="content" className="site-main">
         {children}
       </main>
+      <SectionReveal />
       <SiteFooter />
     </div>
   );

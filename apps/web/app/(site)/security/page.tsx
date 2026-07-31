@@ -39,7 +39,7 @@ const POSTURE: { t: string; b: string }[] = [
 
 export default function SecurityPage() {
   return (
-    <>
+    <div className="st">
       <section className="site-container site-section tight">
         <div className="site-kicker">security</div>
         <h1 className="site-h2" style={{ maxWidth: 720 }}>
@@ -151,6 +151,6 @@ export default function SecurityPage() {
           </div>
         </div>
       </section>
-    </>
+    </div>
   );
 }

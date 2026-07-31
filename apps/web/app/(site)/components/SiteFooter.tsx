@@ -51,10 +51,18 @@ export function SiteFooter() {
       <div className="site-container">
         <div className="site-footer-grid">
           <div className="site-footer-brand">
-            <span className="wordmark">fluidbox</span>
+            <span className="st-brand">
+              <span className="st-mark" aria-hidden>
+                <i />
+                <i />
+                <i />
+                <i />
+              </span>
+              <span className="st-wordmark">fluidbox</span>
+            </span>
             <p>
-              The open-source control plane for governed AI agents. Run agents
-              without giving them God&nbsp;mode.
+              The open-source control plane for governed AI agents. Rules,
+              receipts, and a place to&nbsp;run.
             </p>
           </div>
           {COLUMNS.map((col) => (

@@ -23,7 +23,7 @@ scripts/                   the e2e acceptance suites (real sandboxes)`;
 
 export default function OpenSourcePage() {
   return (
-    <>
+    <div className="st">
       <section className="site-container site-section tight">
         <div className="site-kicker">open source</div>
         <h1 className="site-h2" style={{ maxWidth: 720 }}>
@@ -150,6 +150,6 @@ export default function OpenSourcePage() {
           </p>
         </div>
       </section>
-    </>
+    </div>
   );
 }
