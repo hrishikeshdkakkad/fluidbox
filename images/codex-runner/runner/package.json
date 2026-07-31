@@ -5,7 +5,7 @@
   "type": "module",
   "description": "fluidbox sandbox payload: the OpenAI Codex app-server harness, governed by the fluidbox control plane.",
   "dependencies": {
-    "@openai/codex": "0.144.1",
-    "@modelcontextprotocol/sdk": "1.29.0"
+    "@openai/codex": "0.145.0",
+    "@modelcontextprotocol/sdk": "1.30.0"
   }
 }
