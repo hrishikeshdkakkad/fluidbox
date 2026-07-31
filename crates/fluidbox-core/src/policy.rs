@@ -1310,6 +1310,78 @@ tools:
         assert_eq!(p.budgets.max_tool_calls, Some(100));
     }
 
+    /// The seed states an opinion about EVERY registered tool, and never
+    /// `allow`s one that starts sub-execution.
+    ///
+    /// Both halves exist because of a real regression. Making the permission
+    /// gate mandatory (the PreToolUse hook) changed which tool names the control
+    /// plane ever sees: names that used to be auto-approved inside the CLI now
+    /// arrive at the gate, and an unmatched name falls to
+    /// `defaults.tool_action` — `approve`, i.e. every supervised run pauses on
+    /// ordinary agent tooling, and every autonomous run DENIES it via
+    /// `autonomy.on_approval_rule`. Registering a name in `CANONICAL` without
+    /// giving it a rule reintroduces exactly that, silently, so this test makes
+    /// the two files move together.
+    #[test]
+    fn seed_policy_governs_the_advertised_surface() {
+        let yaml = include_str!("../../../policies/default.yaml");
+        let p = Policy::parse_yaml(yaml).expect("seed policy parses");
+
+        let names: Vec<String> = crate::tools::CANONICAL
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let m: std::collections::HashMap<String, ToolStatus> =
+            p.tool_matrix(&names).into_iter().collect();
+
+        for name in &names {
+            assert!(
+                !matches!(m[name], ToolStatus::Default { .. }),
+                "canonical tool {name:?} has no rule in the seed policy, so it falls to \
+                 defaults.tool_action — that pauses every supervised run and denies every \
+                 autonomous one. Give it a rule in policies/default.yaml."
+            );
+        }
+
+        // Sub-execution must never be pre-authorised. `approve` would be a human
+        // authorising an unbounded, unobserved nested tool tree; `allow` would
+        // skip even that. See the NESTING note in tools.rs.
+        for name in crate::tools::NESTING {
+            let v = p
+                .evaluate(&req(name, json!({})), Autonomy::Supervised)
+                .effective;
+            assert!(
+                matches!(v, Verdict::Deny { .. }),
+                "{name:?} starts sub-execution whose nested tool calls the gate may never \
+                 see; the seed must deny it, got {v:?}"
+            );
+        }
+
+        // Spot-checks of the three dispositions, so a careless bulk edit that
+        // collapses them into one action fails here.
+        let verdict = |t: &str| {
+            p.evaluate(&req(t, json!({})), Autonomy::Supervised)
+                .effective
+        };
+        assert_eq!(verdict("ExitPlanMode"), Verdict::Allow, "observational");
+        assert_eq!(verdict("TaskList"), Verdict::Allow, "read-only bookkeeping");
+        assert!(
+            matches!(verdict("CronCreate"), Verdict::RequireApproval { .. }),
+            "outlives the run — a human decides"
+        );
+        assert!(
+            matches!(verdict("DesignSync"), Verdict::Deny { .. }),
+            "external egress, same answer as WebFetch"
+        );
+
+        // And the fail-safe default still applies to anything unregistered: the
+        // fix must not have introduced a catch-all rule.
+        assert!(matches!(
+            verdict("SomeToolInventedTomorrow"),
+            Verdict::RequireApproval { .. }
+        ));
+    }
+
     #[test]
     fn autonomy_summary_of_the_seed_policy() {
         let yaml = include_str!("../../../policies/default.yaml");
