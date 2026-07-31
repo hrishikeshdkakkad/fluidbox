@@ -568,18 +568,15 @@ async fn resolve_params(
                 // Early, deploy-time mirror of the run-time snapshot-subset
                 // check: fail here with a pick-list-shaped error rather than
                 // at first fire.
-                let snapshot = fluidbox_db::latest_connection_tool_snapshot(
-                    &state.pool,
-                    scope,
-                    conn_id,
-                )
-                .await?
-                .ok_or_else(|| {
-                    ApiError::UnprocessableEntity(format!(
+                let snapshot =
+                    fluidbox_db::latest_connection_tool_snapshot(&state.pool, scope, conn_id)
+                        .await?
+                        .ok_or_else(|| {
+                            ApiError::UnprocessableEntity(format!(
                         "param '{}': the connection has no tool snapshot — refresh its tools",
                         spec.name
                     ))
-                })?;
+                        })?;
                 let available: BTreeSet<&str> = snapshot
                     .tools_json
                     .as_array()
