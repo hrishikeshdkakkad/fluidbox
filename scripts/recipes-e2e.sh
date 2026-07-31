@@ -38,7 +38,7 @@ for p in $PORT $INTERNAL_PORT $GH_PORT; do
     echo "port $p is already in use — the recipes suite owns 18797/18798/18899"; exit 1
   fi
 done
-ADMIN="recipes-e2e-admin-$$"
+ADMIN="${FLUIDBOX_RECIPES_ADMIN:-recipes-e2e-admin-$$}"
 H="authorization: Bearer $ADMIN"
 CT="content-type: application/json"
 # WORK must live under a path the docker VM bind-mounts ($HOME is mounted in
@@ -518,4 +518,11 @@ fi
 # ═══ Result ════════════════════════════════════════════════════════════════
 say "RESULT"
 echo "  pass=$pass fail=$fail  (db: $DATABASE_URL, log: $SERVER_LOG)"
+
+# Dev/browser-validation convenience: keep the fully seeded stack alive.
+if [ -n "${FLUIDBOX_RECIPES_HOLD:-}" ]; then
+  echo "HOLD: control plane live at $API (admin token: $ADMIN); ctrl-c to stop"
+  fail=1  # keep $WORK for inspection while held
+  wait "$SRV_PID"
+fi
 [ "$fail" = "0" ] || exit 1

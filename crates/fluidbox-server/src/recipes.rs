@@ -568,15 +568,18 @@ async fn resolve_params(
                 // Early, deploy-time mirror of the run-time snapshot-subset
                 // check: fail here with a pick-list-shaped error rather than
                 // at first fire.
-                let snapshot =
-                    fluidbox_db::latest_connection_tool_snapshot(&state.pool, scope, conn_id)
-                        .await?
-                        .ok_or_else(|| {
-                            ApiError::UnprocessableEntity(format!(
-                                "param '{}': the connection has no tool snapshot — refresh its tools",
-                                spec.name
-                            ))
-                        })?;
+                let snapshot = fluidbox_db::latest_connection_tool_snapshot(
+                    &state.pool,
+                    scope,
+                    conn_id,
+                )
+                .await?
+                .ok_or_else(|| {
+                    ApiError::UnprocessableEntity(format!(
+                        "param '{}': the connection has no tool snapshot — refresh its tools",
+                        spec.name
+                    ))
+                })?;
                 let available: BTreeSet<&str> = snapshot
                     .tools_json
                     .as_array()
@@ -802,7 +805,11 @@ async fn prepare_objects(
 
     let mut subscriptions = Vec::with_capacity(rendered.subscriptions.len());
     for s in rendered.subscriptions {
-        let template = s.task_template.as_deref().map(str::trim).filter(|t| !t.is_empty());
+        let template = s
+            .task_template
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
         if template.is_none() && !s.allow_task_override {
             return Err(ApiError::UnprocessableEntity(format!(
                 "subscriptions[{}]: provide a task_template or set allow_task_override",
@@ -860,11 +867,9 @@ async fn prepare_objects(
                     )
                     .await?
                     .is_some(),
-                    None => {
-                        fluidbox_db::connection_webhook_secret_sealed(&state.pool, scope, cid)
-                            .await?
-                            .is_some()
-                    }
+                    None => fluidbox_db::connection_webhook_secret_sealed(&state.pool, scope, cid)
+                        .await?
+                        .is_some(),
                 };
                 if !can_receive {
                     return Err(ApiError::UnprocessableEntity(format!(
@@ -1033,10 +1038,7 @@ async fn prepare_objects(
             None => None,
             Some(v) => {
                 let b: Budgets = serde_json::from_value(v.clone()).map_err(|e| {
-                    ApiError::UnprocessableEntity(format!(
-                        "subscriptions[{}].budgets: {e}",
-                        s.slot
-                    ))
+                    ApiError::UnprocessableEntity(format!("subscriptions[{}].budgets: {e}", s.slot))
                 })?;
                 Some(serde_json::to_value(&b)?)
             }
@@ -1046,9 +1048,12 @@ async fn prepare_objects(
         let capability_keep = match &s.capabilities {
             None => None,
             Some(keep) => {
-                let agent = agents.iter().find(|a| a.slot == s.agent_slot).ok_or_else(|| {
-                    ApiError::Internal("subscription references unknown agent slot".into())
-                })?;
+                let agent = agents
+                    .iter()
+                    .find(|a| a.slot == s.agent_slot)
+                    .ok_or_else(|| {
+                        ApiError::Internal("subscription references unknown agent slot".into())
+                    })?;
                 let pins: Vec<fluidbox_core::capability::BundleRef> =
                     serde_json::from_value(agent.capability_pins.clone())
                         .map_err(|e| ApiError::Internal(format!("bad rendered pins: {e}")))?;
@@ -1170,7 +1175,10 @@ pub async fn deploy(
     let prepared = prepare(&state, &principal, &version, name, &body.params).await?;
 
     if body.dry_run {
-        return Ok((axum::http::StatusCode::OK, Json(json!({ "plan": prepared.plan }))));
+        return Ok((
+            axum::http::StatusCode::OK,
+            Json(json!({ "plan": prepared.plan })),
+        ));
     }
 
     // Resolve the fallback policy id BEFORE the stamp so the transaction does
@@ -1240,7 +1248,8 @@ pub async fn deploy(
             )
             .await?;
             agent_ids.insert(a.slot.clone(), agent.id);
-            objects.push(json!({ "kind": "agent", "id": agent.id, "slot": a.slot, "name": a.name }));
+            objects
+                .push(json!({ "kind": "agent", "id": agent.id, "slot": a.slot, "name": a.name }));
         }
         let mut secrets_tokens: Map<String, Value> = Map::new();
         let mut secrets_callbacks: Map<String, Value> = Map::new();
@@ -1249,10 +1258,13 @@ pub async fn deploy(
             let agent_id = *agent_ids
                 .get(&s.agent_slot)
                 .ok_or_else(|| ApiError::Internal("agent slot vanished".into()))?;
-            let sealed_owned = s.callback_secret.as_ref().map(|(_, sealed)| crate::seal::Sealed {
-                bytes: sealed.bytes.clone(),
-                key_version: sealed.key_version,
-            });
+            let sealed_owned = s
+                .callback_secret
+                .as_ref()
+                .map(|(_, sealed)| crate::seal::Sealed {
+                    bytes: sealed.bytes.clone(),
+                    key_version: sealed.key_version,
+                });
             let (cb_bytes, cb_kv) = crate::seal::Sealed::split(&sealed_owned);
             let sub = fluidbox_db::create_trigger_subscription_tx(
                 &mut tx,
@@ -1297,8 +1309,10 @@ pub async fn deploy(
                 )
                 .await?;
             }
-            objects.push(json!({ "kind": "subscription", "id": sub.id, "slot": s.slot,
-                                 "name": s.name, "trigger_kind": s.kind }));
+            objects.push(
+                json!({ "kind": "subscription", "id": sub.id, "slot": s.slot,
+                                 "name": s.name, "trigger_kind": s.kind }),
+            );
             sub_rows.push((s.slot.clone(), sub));
         }
         let instance = db::create_recipe_instance_tx(
@@ -1327,7 +1341,13 @@ pub async fn deploy(
             )
             .await?;
         }
-        Ok((instance, objects, secrets_tokens, secrets_callbacks, sub_rows))
+        Ok((
+            instance,
+            objects,
+            secrets_tokens,
+            secrets_callbacks,
+            sub_rows,
+        ))
     }
     .await;
 
@@ -1490,7 +1510,10 @@ pub async fn list_instances(
     let out: Vec<Value> = instances
         .into_iter()
         .map(|i| {
-            let newest = latest.get(&i.recipe_id).copied().unwrap_or(i.recipe_version);
+            let newest = latest
+                .get(&i.recipe_id)
+                .copied()
+                .unwrap_or(i.recipe_version);
             json!({
                 "instance": i,
                 "latest_version": newest,
@@ -1641,10 +1664,14 @@ pub async fn run_instance(
     }
     // Render the INSTANCE's pinned version with its saved params — never the
     // latest (upgrade is explicit).
-    let version =
-        db::get_recipe_version(&state.pool, scope, instance.recipe_id, instance.recipe_version)
-            .await?
-            .ok_or_else(|| ApiError::Internal("instance version row missing".into()))?;
+    let version = db::get_recipe_version(
+        &state.pool,
+        scope,
+        instance.recipe_id,
+        instance.recipe_version,
+    )
+    .await?
+    .ok_or_else(|| ApiError::Internal("instance version row missing".into()))?;
     let (def, specs) = parse_stored(&version)?;
     let Some(fr) = &def.first_run else {
         return Err(ApiError::BadRequest(
@@ -1685,7 +1712,10 @@ pub async fn run_instance(
         Ok((axum::http::StatusCode::CREATED, Json(result)))
     } else {
         Err(ApiError::Conflict(
-            result["error"].as_str().unwrap_or("run not started").to_string(),
+            result["error"]
+                .as_str()
+                .unwrap_or("run not started")
+                .to_string(),
         ))
     }
 }
@@ -1752,7 +1782,10 @@ pub async fn upgrade_instance(
     };
     let stamped_agents = by_slot("agent");
     let stamped_subs = by_slot("subscription");
-    let stamped_policy = objects.iter().find(|o| o.kind == "policy").map(|o| o.object_id);
+    let stamped_policy = objects
+        .iter()
+        .find(|o| o.kind == "policy")
+        .map(|o| o.object_id);
 
     // Structural guard: slot sets must match exactly.
     let new_agents: BTreeSet<&str> = prepared.agents.iter().map(|a| a.slot.as_str()).collect();
@@ -1777,7 +1810,8 @@ pub async fn upgrade_instance(
     }
     if prepared.policy.is_some() != stamped_policy.is_some() {
         return Err(ApiError::UnprocessableEntity(
-            "structural change: the new version adds or removes the embedded policy — redeploy".into(),
+            "structural change: the new version adds or removes the embedded policy — redeploy"
+                .into(),
         ));
     }
 
@@ -1825,9 +1859,7 @@ pub async fn upgrade_instance(
                 let sched = fluidbox_db::schedule_for_subscription(&state.pool, scope, sub_id)
                     .await?
                     .ok_or_else(|| ApiError::Internal("stamped schedule missing".into()))?;
-                sched.cron != *cron
-                    || sched.timezone != *tz
-                    || sched.missed_run_policy != *missed
+                sched.cron != *cron || sched.timezone != *tz || sched.missed_run_policy != *missed
             }
             _ => false,
         };
