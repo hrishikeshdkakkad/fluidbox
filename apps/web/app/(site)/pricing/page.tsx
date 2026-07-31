@@ -12,7 +12,8 @@ export const metadata: Metadata = {
 
 export default function PricingPage() {
   return (
-    <section className="site-container site-section tight">
+    <div className="st">
+      <section className="site-container site-section tight">
       <div className="site-kicker">pricing</div>
       <h1 className="site-h2" style={{ maxWidth: 700 }}>
         The control plane is free. Someone operating it for you is what will
@@ -80,6 +81,7 @@ export default function PricingPage() {
         </a>
         .
       </p>
-    </section>
+      </section>
+    </div>
   );
 }
