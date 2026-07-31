@@ -241,7 +241,7 @@ $fbx${
     "tools": [
       { "match": ["Read", "Glob", "Grep", "LS"], "action": "allow", "risk": "low" },
       { "match": ["Bash"], "action": "allow",
-        "shell": { "allow_prefixes": ["ls", "cat", "head", "tail", "grep", "rg", "find", "wc", "git log", "git show", "git diff", "git status", "git branch", "cargo check", "cargo test", "npm test", "pnpm test", "npx vitest", "pytest", "go test", "make test"],
+        "shell": { "allow_prefixes": ["ls", "cat", "head", "tail", "grep", "rg", "find", "wc", "sed -n", "pwd", "git rev-parse", "git log", "git show", "git diff", "git status", "git branch", "cargo check", "cargo test", "npm test", "pnpm test", "npx vitest", "pytest", "go test", "make test"],
                    "on_no_match": "deny" } },
       { "match": ["Edit", "Write", "MultiEdit"], "action": "deny" },
       { "match": ["mcp__*"], "action": "deny" }
@@ -362,7 +362,7 @@ $fbx${
       { "match": ["Edit", "Write", "MultiEdit"], "action": "allow",
         "risk": "medium" },
       { "match": ["Bash"], "action": "allow",
-        "shell": { "allow_prefixes": ["ls", "cat", "head", "tail", "grep", "rg", "find", "wc", "git log", "git show", "git diff", "git status", "git bisect", "cargo build", "cargo check", "cargo test", "npm test", "npm run", "pnpm test", "pnpm run", "npx", "pytest", "python -m pytest", "go build", "go test", "make"],
+        "shell": { "allow_prefixes": ["ls", "cat", "head", "tail", "grep", "rg", "find", "wc", "sed -n", "pwd", "git rev-parse", "git log", "git show", "git diff", "git status", "git bisect", "cargo build", "cargo check", "cargo test", "npm test", "npm run", "pnpm test", "pnpm run", "npx", "pytest", "python -m pytest", "go build", "go test", "make"],
                    "on_no_match": "deny" } },
       { "match": ["mcp__*"], "action": "deny" }
     ]
@@ -446,7 +446,7 @@ $fbx${
     "tools": [
       { "match": ["Read", "Glob", "Grep", "LS"], "action": "allow", "risk": "low" },
       { "match": ["Bash"], "action": "allow",
-        "shell": { "allow_prefixes": ["ls", "cat", "head", "tail", "grep", "rg", "find", "wc", "git log", "git show", "git diff", "git status", "git ls-files", "sha256sum", "du"],
+        "shell": { "allow_prefixes": ["ls", "cat", "head", "tail", "grep", "rg", "find", "wc", "sed -n", "pwd", "git rev-parse", "git log", "git show", "git diff", "git status", "git ls-files", "sha256sum", "du"],
                    "on_no_match": "deny" } },
       { "match": ["Edit", "Write", "MultiEdit"], "action": "deny" },
       { "match": ["mcp__*"], "action": "deny" }
@@ -541,7 +541,7 @@ $fbx${
     "tools": [
       { "match": ["Read", "Glob", "Grep", "LS"], "action": "allow", "risk": "low" },
       { "match": ["Bash"], "action": "allow",
-        "shell": { "allow_prefixes": ["ls", "cat", "head", "tail", "grep", "rg", "find", "wc", "git log", "git show", "git diff", "git status", "git blame"],
+        "shell": { "allow_prefixes": ["ls", "cat", "head", "tail", "grep", "rg", "find", "wc", "sed -n", "pwd", "git rev-parse", "git log", "git show", "git diff", "git status", "git blame"],
                    "on_no_match": "deny" } },
       { "match": ["Edit", "Write", "MultiEdit"], "action": "deny" },
       { "match": ["mcp__*"], "action": "allow", "risk": "medium" }
@@ -642,7 +642,7 @@ $fbx${
     "tools": [
       { "match": ["Read", "Glob", "Grep", "LS"], "action": "allow", "risk": "low" },
       { "match": ["Bash"], "action": "allow",
-        "shell": { "allow_prefixes": ["ls", "cat", "head", "tail", "grep", "rg", "find", "wc", "git log", "git show", "git diff", "git status", "git ls-files"],
+        "shell": { "allow_prefixes": ["ls", "cat", "head", "tail", "grep", "rg", "find", "wc", "sed -n", "pwd", "git rev-parse", "git log", "git show", "git diff", "git status", "git ls-files"],
                    "on_no_match": "deny" } },
       { "match": ["Edit", "Write", "MultiEdit"], "action": "deny" },
       { "match": ["mcp__*"], "action": "deny" }
