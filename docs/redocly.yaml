@@ -70,8 +70,8 @@ navbar:
   items:
     - page: index.md
       label: Home
-    - page: guides/quickstart.md
-      label: Quickstart
+    - page: guides/getting-started.md
+      label: Getting started
     - page: api/openapi.yaml
       label: API reference
     - label: GitHub

@@ -1,9 +1,9 @@
 import Link from "next/link";
 import React from "react";
-import { parseMarkdown, type Block, type Inline } from "../lib/markdown";
+import { parseMarkdown, type Block, type Inline } from "../../lib/markdown";
 import { CodeBlock } from "./CodeBlock";
 
-// Server-rendered markdown for the developer docs. All parsing lives in
+// Server-rendered markdown for the public docs. All parsing lives in
 // lib/markdown.ts (pure, unit-tested); this file only maps blocks to JSX.
 
 function InlineSpan({ parts }: { parts: Inline[] }) {
@@ -20,7 +20,7 @@ function InlineSpan({ parts }: { parts: Inline[] }) {
           case "link": {
             // Guide cross-links were authored for the docs/ tree
             // (./governance.md, ../api/openapi.yaml). Rewrite them onto the
-            // in-app routes; anything absolute passes through untouched.
+            // site routes; anything absolute passes through untouched.
             const href = rewriteHref(p.href);
             return href.startsWith("/") ? (
               <Link key={i} href={href}>
@@ -40,16 +40,25 @@ function InlineSpan({ parts }: { parts: Inline[] }) {
   );
 }
 
-/** Map docs-tree relative links onto /developer routes. Exported for reuse in
- *  tests if the mapping grows; today it is small enough to eyeball. */
+/** Map docs-tree relative links onto site routes. Guide-to-guide links become
+ *  /docs/<slug>; the spec becomes the reference page; any OTHER relative path
+ *  (../../policies/default.yaml, a repo file) resolves to its GitHub blob URL
+ *  relative to docs/guides/ — a working link beats a broken relative one. */
 export function rewriteHref(href: string): string {
   if (/^[a-z]+:\/\//.test(href) || href.startsWith("#") || href.startsWith("/")) {
     return href;
   }
   const m = href.match(/^(?:\.\/)?([a-z-]+)\.md(#.*)?$/);
-  if (m) return `/developer/${m[1]}${m[2] ?? ""}`;
-  if (/openapi\.yaml/.test(href)) return "/developer/reference";
-  return href;
+  if (m) return `/docs/${m[1]}${m[2] ?? ""}`;
+  if (/openapi\.yaml/.test(href)) return "/docs/api/reference";
+  try {
+    return new URL(
+      href,
+      "https://github.com/hrishikeshdkakkad/fluidbox/blob/main/docs/guides/"
+    ).toString();
+  } catch {
+    return href;
+  }
 }
 
 function BlockView({ block }: { block: Block }) {

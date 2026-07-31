@@ -17,9 +17,11 @@ exactly what it did and why it was allowed to.
 
 | I want to… | Go to |
 | --- | --- |
-| Start a run in five minutes | [Quickstart](./guides/quickstart.md) |
+| Start a run in five minutes | [Getting started](./guides/getting-started.md) |
+| Learn the object model | [Concepts](./guides/concepts.md) |
 | Understand which credential to use | [Authentication](./guides/authentication.md) |
 | Understand what an agent is allowed to do | [The permission gate](./guides/governance.md) |
+| Deploy with published images | [Docker](./guides/docker.md) |
 | Build my own agent harness | [Building a harness](./guides/runner-contract.md) |
 | Look up an endpoint | [API reference](./api/openapi.yaml) |
 

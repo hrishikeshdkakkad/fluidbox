@@ -5564,3 +5564,147 @@ html[data-theme="light"] .docs-body .shiki span {
   max-width: 100%;
   height: auto;
 }
+
+/* ─── Docs search (⌘K) + edit-upstream link ──────────────────────────────
+   Added with the public /docs platform (2026-07-30). Tokens only — no new
+   colors; the dialog is the standard floating material (12px radius). */
+
+.docs-search-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  margin: 2px 0 14px;
+  padding: 7px 10px;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--ink-3);
+  background: var(--interactive-subtle, var(--ds-gray-alpha-100));
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: border-color 120ms ease, color 120ms ease;
+}
+.docs-search-trigger:hover,
+.docs-search-trigger:focus-visible {
+  color: var(--ink-2);
+  border-color: var(--border-strong);
+}
+.docs-search-trigger kbd,
+.docs-search-foot kbd {
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 10.5px;
+  line-height: 1;
+  padding: 3px 5px;
+  color: var(--ink-3);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+}
+
+.docs-search-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: min(14vh, 140px) 16px 16px;
+  background: var(--overlay-bg, rgba(0, 0, 0, 0.5));
+  backdrop-filter: blur(2px);
+}
+.docs-search-panel {
+  width: 100%;
+  max-width: 580px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--modal-shadow, 0 28px 80px rgba(0, 0, 0, 0.5));
+  overflow: hidden;
+}
+.docs-search-input {
+  width: 100%;
+  padding: 14px 16px;
+  font: inherit;
+  font-size: 14.5px;
+  color: var(--ink);
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  outline: none;
+}
+.docs-search-results {
+  list-style: none;
+  margin: 0;
+  padding: 6px;
+  max-height: min(48vh, 420px);
+  overflow-y: auto;
+}
+.docs-search-empty {
+  padding: 14px 12px;
+  font-size: 13px;
+  color: var(--ink-3);
+}
+.docs-search-hit {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 9px 10px;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+.docs-search-hit.active {
+  background: var(--interactive-hover, var(--ds-gray-alpha-200));
+}
+.docs-search-hit-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink);
+}
+.docs-search-hit-heading {
+  color: var(--accent);
+  font-weight: 400;
+}
+.docs-search-hit-text {
+  font-size: 12px;
+  color: var(--ink-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.docs-search-foot {
+  display: flex;
+  gap: 14px;
+  padding: 8px 14px;
+  font-size: 11.5px;
+  color: var(--ink-3);
+  border-top: 1px solid var(--border);
+}
+.docs-search-foot span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.docs-edit {
+  margin-top: 28px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+}
+.docs-edit a {
+  color: var(--ink-3);
+  text-decoration: none;
+}
+.docs-edit a:hover {
+  color: var(--accent);
+}
+
+.docs-hub-section {
+  margin-top: 34px;
+}
+.docs-hub-section .docs-hub-grid {
+  margin-top: 12px;
+}

@@ -150,9 +150,10 @@ docs-build:
     mkdir -p dist
     cd docs && npx --yes {{redocly}} build-docs api/openapi.yaml -o ../dist/api.html
 
-# Regenerate the dashboard's /developer pages from docs/ (guides + the slim
-# reference model + the downloadable spec). Output is checked in — run this
-# after editing docs/ and commit the diff.
+# Regenerate the public /docs pages from docs/ and /changelog from
+# CHANGELOG.md (guides + search index + the slim reference model + the
+# downloadable spec). Output is checked in — run this after editing docs/ or
+# CHANGELOG.md and commit the diff.
 docs-sync:
     cd apps/web && node scripts/sync-developer-docs.mjs
 
