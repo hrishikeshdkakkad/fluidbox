@@ -54,13 +54,27 @@ jobs:
       # and it runs on the Release PR, which the header above calls the last
       # checkpoint before public artifacts. So the lock is re-resolved here
       # rather than left for a human to notice.
-      - if: steps.release.outputs.prs_created == 'true'
+      # NOTE: `pr` is passed as a RAW STRING and parsed in the shell, never with
+      # `fromJSON(...)` in `env:`. A template expression is evaluated before the
+      # step's `if` can skip it, so when the action fails before setting `pr`,
+      # `fromJSON('')` aborts the whole job with
+      #   The template is not valid ... Error reading JToken from JsonReader
+      # which REPLACES the real error with a confusing one. Observed exactly
+      # that on f699bbe: release-please failed for an unrelated reason, and this
+      # step's template error was the second annotation on the run.
+      - if: steps.release.outputs.prs_created == 'true' && steps.release.outputs.pr != ''
         name: re-resolve Cargo.lock on the release branch
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BRANCH: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+          PR_JSON: ${{ steps.release.outputs.pr }}
         run: |
           set -euo pipefail
+          BRANCH=$(printf '%s' "$PR_JSON" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("headBranchName",""))')
+          if [ -z "$BRANCH" ]; then
+            echo "::warning::release PR JSON carried no headBranchName; skipping Cargo.lock re-resolve"
+            exit 0
+          fi
           git clone --branch "$BRANCH" --depth 1 \
             "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" rp
           cd rp
