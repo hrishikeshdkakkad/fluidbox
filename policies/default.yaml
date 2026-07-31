@@ -33,9 +33,64 @@ autonomy:
   permitted: true
   on_approval_rule: deny
 tools:
-  # Reading and searching are safe anywhere in the sandbox.
-  - match: ["Read", "Glob", "Grep", "LS", "TodoWrite", "Task", "NotebookRead"]
+  # Reading, searching, and the agent's own bookkeeping are safe anywhere in
+  # the sandbox: none of these execute anything or leave the run.
+  #
+  # Everything after ToolSearch on this list is here because the gate can now
+  # SEE it. Until the PreToolUse hook landed, the Claude Code CLI auto-approved
+  # these whole classes and the calls never reached /permission at all; with the
+  # gate mandatory they do, and an unmatched tool falls to defaults.tool_action
+  # (approve), which would pause every supervised run on the agent's own
+  # plan-mode toggles and task bookkeeping — and DENY them in autonomous runs
+  # via autonomy.on_approval_rule. Registering an opinion per tool is what makes
+  # the mandatory gate usable without widening it.
+  #
+  # `Task` is deliberately NOT on this list any more — see the deny rule below.
+  - match:
+      [
+        "Read",
+        "Glob",
+        "Grep",
+        "LS",
+        "TodoWrite",
+        "NotebookRead",
+        "ToolSearch",
+        "EnterPlanMode",
+        "ExitPlanMode",
+        "AskUserQuestion",
+        "ReportFindings",
+        "Monitor",
+        "TaskGet",
+        "TaskList",
+        "TaskOutput",
+        "CronList",
+      ]
     action: allow
+
+  # Sub-execution: DENIED. This is the one disposition in this file that is a
+  # security decision rather than ergonomics, so it is stated at length.
+  #
+  # These tools do not act themselves — they start an agent, workflow, skill, or
+  # background task that then calls tools of its own. Those nested calls may
+  # never surface as top-level tool_use/tool_result blocks, which means they
+  # would be neither routed to this gate by the runner's PreToolUse hook nor
+  # caught by the GateWitness tripwire — which documents itself as "a knowingly
+  # incomplete detector" precisely here. Nested-call gating is UNPROVEN
+  # (docs/reviews/claude-tool-gate-validation.md §6 calls it "the most important
+  # open question left").
+  #
+  # `approve` would therefore be worse than it looks: one human click would
+  # authorise an unbounded, unobserved tool tree. Until nested calls are
+  # measured reaching /permission, the seed fails closed. An operator who has
+  # measured it can widen this deliberately, per agent.
+  #
+  # `Task` is included even though the pinned CLI advertises `Agent` instead:
+  # the previous seed ALLOWED `Task`, which was inert only by accident of
+  # naming. A latent allow-rule for a sub-execution tool is a bypass waiting for
+  # an upstream rename.
+  - match: ["Agent", "Task", "Workflow", "Skill", "TaskCreate"]
+    action: deny
+    risk: spawns sub-execution whose nested tool calls the gate may never see
 
   # Edits are free inside the workspace; anything else asks a human.
   # (These path globs are hygiene, not hard security: shell redirection via
@@ -125,9 +180,37 @@ tools:
       on_no_match: approve
 
   # Network tools: the sandbox has no business fetching the internet.
-  - match: ["WebFetch", "WebSearch"]
+  # DesignSync joins them because it syncs to an external service — same egress
+  # shape, same answer.
+  - match: ["WebFetch", "WebSearch", "DesignSync"]
     action: deny
     risk: network egress from sandbox
+
+  # Effects that OUTLIVE the run or leave it. A run's workspace is disposable
+  # and its sandbox is torn down; a schedule, a wake-up, a notification, or a
+  # message to another agent is none of those. They are allowed to exist, but a
+  # human decides — which is exactly what defaults.tool_action would have done
+  # anyway. Naming them explicitly buys two things the fallback does not: a
+  # `risk` string on the approval card, and a visible row in the Governance
+  # matrix instead of a silent "default".
+  #
+  # EnterWorktree/ExitWorktree are here rather than in the allow list because
+  # `EnterWorktree` can move the agent to a tree the Edit rule's
+  # `/workspace/**` path constraint no longer describes.
+  - match:
+      [
+        "TaskStop",
+        "TaskUpdate",
+        "SendMessage",
+        "CronCreate",
+        "CronDelete",
+        "ScheduleWakeup",
+        "PushNotification",
+        "EnterWorktree",
+        "ExitWorktree",
+      ]
+    action: approve
+    risk: effect outside this run's disposable workspace
 
   # MCP tools ask a human by default. Bundles (Phase 5) make tools
   # AVAILABLE; this rule still judges every call (attach ≠ allow) — grant

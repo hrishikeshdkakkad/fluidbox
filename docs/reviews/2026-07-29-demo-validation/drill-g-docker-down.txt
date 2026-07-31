@@ -1,0 +1,4 @@
+
+[1;36m== preflight (no API key required — this demo is a deterministic replay) ==[0m
+  [1;31m✗ Docker is not running.[0m
+    Start Docker Desktop (or `colima start`), wait for it to be ready, then re-run `just demo`.

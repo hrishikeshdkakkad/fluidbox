@@ -532,6 +532,108 @@ export class RunnerClient {
   }
 }
 
+// ─── Why the gate is a HOOK, not the permission callback ───────────────────
+//
+// `canUseTool` is NOT an interception point. The Agent SDK does not call it
+// per tool call; it translates the callback into `--permission-prompt-tool
+// stdio` on the Claude Code CLI it spawns, and the CLI consults that prompt
+// tool ONLY for calls it decides to ASK about. Anything the CLI approves on
+// its own first — its read-only / safe-command classification, an
+// `allowedTools` entry, an allow rule from a settings file, a permissionMode
+// that auto-accepts — executes with the callback never running at all.
+//
+// Measured on @anthropic-ai/claude-agent-sdk 0.3.205 in the shipped image: an
+// ordinary coding workload (list files, read one, grep, `wc -l`) produced FOUR
+// tool calls and ZERO canUseTool invocations, and `printf '<nonce>' |
+// sha256sum` executed and returned the digest of a nonce minted seconds
+// earlier while the gate was never consulted. The SDK states the rule itself:
+// "Bare allowedTools entries auto-approve the whole tool before the callback
+// is consulted... To gate every tool call, use a PreToolUse hook instead."
+//
+// A PreToolUse hook fires for EVERY tool call, underneath that short-circuit.
+// So the hook is what makes the gate mandatory. It deliberately does NO I/O:
+// it answers `ask`, which forces the call onto the canUseTool path, and the
+// blocking /permission round trip still happens THERE. Keeping the blocking on
+// the callback is the point — a supervised approval can hold for minutes,
+// `requestPermission` already owns the 12-minute timeout and forever-retry
+// semantics for exactly that, and a hook that never awaits anything cannot
+// time out, throw, or become a new way to lose a decision.
+export const GATE_ASK_REASON =
+  "fluidbox governs this run: every tool call needs a control-plane decision";
+
+/// The PreToolUse hook return that forces a call onto the gate. Pure and
+/// synchronous by construction — see the note above for why that matters.
+export function forceGateDecision() {
+  return {
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "ask",
+      permissionDecisionReason: GATE_ASK_REASON,
+    },
+  };
+}
+
+// A tool that executed without a fluidbox decision is a governance failure,
+// not a verdict — the same class as EXIT_AUDIENCE_MISMATCH and treated the
+// same way. It means the harness lost mediation (an SDK/CLI that stopped
+// firing the hook, a tool class routed around it), and the honest response is
+// to stop the run loudly rather than finish a run whose audit trail claims
+// decisions it never made.
+export const EXIT_UNGOVERNED_TOOL = 5;
+
+export function ungovernedToolDiagnostic(tool, toolCallId) {
+  return (
+    `fluidbox-runner: FATAL — the tool '${tool}' (call ${toolCallId}) produced a result but ` +
+    `NEVER received a fluidbox decision. The permission gate was bypassed, which means this ` +
+    `runner image can no longer mediate tool calls for this agent SDK. Aborting the run: ` +
+    `continuing would execute ungoverned tools while the ledger showed a clean timeline.`
+  );
+}
+
+/// Tripwire bookkeeping for the gate.
+///
+/// The hook above PREVENTS the bypass; this detects one anyway. It pairs the
+/// `tool_use` blocks the harness observes on the message stream with the calls
+/// the gate actually decided, and reports any call that produced a RESULT
+/// without one. That ordering is what makes it sound: the SDK emits the
+/// assistant `tool_use`, then the hook/callback run, then the `tool_result`
+/// arrives — so by result time a governed call is always already decided.
+///
+/// Deliberately conservative: it only trips on a call it watched being
+/// emitted, so a tool_result the harness never saw the request for (a nested
+/// subagent transcript, a future message shape) is ignored rather than
+/// failing a legitimate run. That is a knowingly incomplete detector — it is
+/// a backstop for regression, not the guarantee. The guarantee is the hook.
+export class GateWitness {
+  constructor() {
+    this.emittedTools = new Map(); // tool_call_id -> tool name
+    this.decidedCalls = new Set(); // tool_call_ids the gate answered
+  }
+
+  /// A `tool_use` block seen on the message stream.
+  sawToolUse(toolCallId, tool) {
+    if (typeof toolCallId === "string" && toolCallId) {
+      this.emittedTools.set(toolCallId, tool);
+    }
+  }
+
+  /// The gate produced a decision for this call (allow, deny, or a brokered
+  /// wave-through — all three are decisions, made in exactly one place).
+  sawDecision(toolCallId) {
+    if (typeof toolCallId === "string" && toolCallId) {
+      this.decidedCalls.add(toolCallId);
+    }
+  }
+
+  /// The tool name when this result belongs to an observed-but-undecided
+  /// call, else null.
+  ungovernedResult(toolCallId) {
+    if (typeof toolCallId !== "string" || !toolCallId) return null;
+    if (this.decidedCalls.has(toolCallId)) return null;
+    return this.emittedTools.get(toolCallId) ?? null;
+  }
+}
+
 /// Env a brokered server's broker-shim needs. Shared by every harness — the
 /// broker path is identical for claude and codex (control-plane gate +
 /// execute). The shim calls /tools/call, so it receives the TOOL-INTENT token
