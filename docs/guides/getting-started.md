@@ -1,4 +1,4 @@
-# Quickstart
+# Getting started
 
 Get a governed run — one that actually pauses for your approval — in about five
 minutes.
@@ -8,6 +8,10 @@ minutes.
 - Docker (a container runtime for the sandbox and the local database)
 - Rust and pnpm
 - An `ANTHROPIC_API_KEY`, if you want a live agent rather than a replay
+
+No Rust toolchain handy? The [Docker eval stack](./docker.md) runs the same
+governed loop from published images in one command — come back here when you
+want to develop against it.
 
 ## 1. Bootstrap
 
@@ -151,6 +155,7 @@ fluidbox agents
 
 ## Next
 
+- [Concepts](./concepts.md) — the object model in ten minutes
 - [Authentication](./authentication.md) — which of the four credentials you
   actually want
 - [The permission gate](./governance.md) — what the agent is allowed to do, and

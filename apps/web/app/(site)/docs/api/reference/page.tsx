@@ -1,13 +1,25 @@
+import type { Metadata } from "next";
 import Link from "next/link";
-import { MarkdownView } from "../MarkdownView";
-import { API_VERSION, GROUPS, OPERATION_COUNT, type Operation } from "../generated/reference";
-import { PrevNext } from "../PrevNext";
+import { MarkdownView } from "../../MarkdownView";
+import {
+  API_VERSION,
+  GROUPS,
+  OPERATION_COUNT,
+  type Operation,
+} from "../../generated/reference";
+import { PrevNext } from "../../PrevNext";
 
 // The in-app API reference: a browsable operation index generated from
 // docs/api/openapi.yaml (just docs-sync). Deliberately slim — summaries and
 // descriptions render here; full request/response schemas and examples live
-// in the Redoc-built /developer/api.html (same bundle), and the raw spec
-// stays downloadable for generators and agents.
+// in the Redoc-built /docs/api.html (same bundle), and the raw spec stays
+// downloadable for generators and agents.
+
+export const metadata: Metadata = {
+  title: "API reference",
+  description: `Every fluidbox endpoint across the four planes — ${OPERATION_COUNT} operations generated from the OpenAPI description.`,
+  alternates: { canonical: "/docs/api/reference" },
+};
 
 const METHOD_ORDER: Record<string, number> = { GET: 0, POST: 1, PATCH: 2, PUT: 3, DELETE: 4 };
 
@@ -46,7 +58,9 @@ export default function ReferencePage() {
     <div className="docs-columns">
       <article className="docs-article docs-reference">
         <div className="docs-crumbs">
-          <Link href="/developer">Docs</Link>
+          <Link href="/docs">Docs</Link>
+          <span aria-hidden>/</span>
+          <Link href="/docs/api">API</Link>
           <span aria-hidden>/</span>
           <span>Reference</span>
         </div>
@@ -54,8 +68,8 @@ export default function ReferencePage() {
         <p className="docs-lead">
           {OPERATION_COUNT} operations · v{API_VERSION} · generated from the OpenAPI description.
           Request and response schemas live in the{" "}
-          <a href="/developer/api.html">full reference</a>; the{" "}
-          <a href="/developer/openapi.yaml" download>
+          <a href="/docs/api.html">full reference</a>; the{" "}
+          <a href="/docs/openapi.yaml" download>
             raw spec
           </a>{" "}
           is what a generator or agent wants.
@@ -84,7 +98,7 @@ export default function ReferencePage() {
             ))}
           </section>
         ))}
-        <PrevNext href="/developer/reference" />
+        <PrevNext href="/docs/api/reference" />
       </article>
       <nav className="docs-toc" aria-label="Sections">
         <div className="docs-toc-title">Planes</div>
