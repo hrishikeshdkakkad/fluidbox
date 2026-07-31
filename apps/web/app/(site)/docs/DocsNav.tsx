@@ -2,34 +2,30 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { DOC_LINKS, type DocLink } from "./nav";
+import { NAV_GROUPS } from "./nav";
+import { DocsSearch } from "./Search";
 
 // The persistent docs rail. Groups render in DOC_LINKS order; the active item
-// carries the accent hairline. "Docs home" is the way back to the hub from
-// anywhere in the section.
+// carries the accent hairline. "Documentation" is the way back to the hub
+// from anywhere in the section.
 export function DocsNav() {
   const pathname = usePathname();
-
-  const groups: { name: string; links: DocLink[] }[] = [];
-  for (const link of DOC_LINKS) {
-    const last = groups[groups.length - 1];
-    if (last && last.name === link.group) last.links.push(link);
-    else groups.push({ name: link.group, links: [link] });
-  }
 
   return (
     <nav className="docs-nav" aria-label="Documentation">
       <Link
-        href="/developer"
-        className={`docs-nav-home ${pathname === "/developer" ? "active" : ""}`}
+        href="/docs"
+        className={`docs-nav-home ${pathname === "/docs" ? "active" : ""}`}
       >
         <span className="docs-nav-home-mark" aria-hidden>
           ⌘
         </span>
-        Developer docs
+        Documentation
       </Link>
 
-      {groups.map((group) => (
+      <DocsSearch />
+
+      {NAV_GROUPS.map((group) => (
         <div key={group.name} className="docs-nav-group">
           <div className="docs-nav-label">{group.name}</div>
           {group.links.map((link) => (
@@ -46,10 +42,10 @@ export function DocsNav() {
 
       <div className="docs-nav-group">
         <div className="docs-nav-label">Spec</div>
-        <a className="docs-nav-item" href="/developer/api.html">
+        <a className="docs-nav-item" href="/docs/api.html">
           Schemas &amp; examples
         </a>
-        <a className="docs-nav-item" href="/developer/openapi.yaml" download>
+        <a className="docs-nav-item" href="/docs/openapi.yaml" download>
           openapi.yaml ↓
         </a>
       </div>

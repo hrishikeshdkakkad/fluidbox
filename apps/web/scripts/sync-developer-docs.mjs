@@ -1,25 +1,25 @@
 #!/usr/bin/env node
-// Regenerates the dashboard's /developer content from docs/ at the repo root.
+// Regenerates the public /docs content from docs/ at the repo root, plus the
+// /changelog module from CHANGELOG.md.
 //
 //   node scripts/sync-developer-docs.mjs          (or: just docs-sync)
 //
 // docs/ is the source of truth (authored for the Redocly toolchain and linted
-// by `just docs-lint`); the dashboard renders a generated COPY so the web
-// build stays self-contained — no fs reads at request time, no markdown
-// dependency, no Redocly license. The generated module is checked in: a
-// missing regeneration shows up as a diff, not as a broken page.
+// by `just docs-lint`); the web app renders a generated COPY so the build
+// stays self-contained — no fs reads at request time, no markdown dependency,
+// no Redocly license, and no repo files outside apps/web at Docker build time
+// (deploy/web.Dockerfile's context is apps/web alone — this constraint is why
+// generated modules exist). The generated modules are checked in: a missing
+// regeneration shows up as a diff, not as a broken page.
 //
 // Outputs:
-//   app/developer/generated/content.ts    guide markdown as string exports
-//   app/developer/generated/reference.ts  slim operation index from the spec
-//   public/developer/openapi.yaml         the full spec, downloadable
-//   public/developer/api.html             the full Redoc reference (schemas,
-//                                         examples), one static self-contained
-//                                         page served next to the app
-//
-// The in-app reference model stays slim (group → tag → operations with
-// method/path/summary/description/security) — full request/response schemas
-// render in api.html, which Redoc generates from the same bundle.
+//   app/(site)/docs/generated/content.ts    guide markdown as string exports
+//   app/(site)/docs/generated/reference.ts  slim operation index from the spec
+//   app/(site)/docs/generated/search.ts     per-section full-text search index
+//   app/(site)/docs/generated/changelog.ts  parsed CHANGELOG.md releases
+//   public/docs/openapi.yaml                the full spec, downloadable
+//   public/docs/api.html                    the full Redoc reference (schemas,
+//                                           examples), one static page
 
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync, copyFileSync } from "node:fs";
@@ -33,23 +33,30 @@ const REDOCLY = "@redocly/cli@2.41.2";
 const webRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = join(webRoot, "..", "..");
 const docsRoot = join(repoRoot, "docs");
-const outDir = join(webRoot, "app", "developer", "generated");
-const publicDir = join(webRoot, "public", "developer");
+const outDir = join(webRoot, "app", "(site)", "docs", "generated");
+const publicDir = join(webRoot, "public", "docs");
 
 // ---------------------------------------------------------------- guides --
-// Order here is presentation order on the hub. EVERY file in docs/guides/
-// must be listed: guides cross-link each other by `<slug>.md`, and the
-// MarkdownView href rewriter maps those onto /developer/<slug> routes — an
-// unlisted guide turns each of those links into a 404 (a check below refuses).
+// EVERY file in docs/guides/ must be listed: guides cross-link each other by
+// `<slug>.md`, and the MarkdownView href rewriter maps those onto /docs/<slug>
+// routes — an unlisted guide turns each of those links into a 404 (a check
+// below refuses). Presentation order/grouping lives app-side in nav.ts.
 const GUIDES = [
-  { slug: "quickstart", file: "guides/quickstart.md", title: "Quickstart" },
-  { slug: "authentication", file: "guides/authentication.md", title: "Authentication" },
+  { slug: "getting-started", file: "guides/getting-started.md", title: "Getting started" },
+  { slug: "concepts", file: "guides/concepts.md", title: "Concepts" },
+  { slug: "agents", file: "guides/agents.md", title: "Agents & revisions" },
+  { slug: "runs", file: "guides/runs.md", title: "Runs & the timeline" },
+  { slug: "triggers", file: "guides/triggers.md", title: "Triggers & schedules" },
   { slug: "governance", file: "guides/governance.md", title: "The permission gate" },
   { slug: "policies", file: "guides/policies.md", title: "Policies" },
+  { slug: "approvals", file: "guides/approvals.md", title: "Approvals" },
   { slug: "capabilities", file: "guides/capabilities.md", title: "Capabilities" },
-  { slug: "triggers", file: "guides/triggers.md", title: "Triggers & schedules" },
-  { slug: "runner-contract", file: "guides/runner-contract.md", title: "Building a harness" },
+  { slug: "docker", file: "guides/docker.md", title: "Docker" },
   { slug: "kubernetes", file: "guides/kubernetes.md", title: "Kubernetes" },
+  { slug: "security", file: "guides/security.md", title: "Security model" },
+  { slug: "runner-contract", file: "guides/runner-contract.md", title: "Building a harness" },
+  { slug: "authentication", file: "guides/authentication.md", title: "Authentication" },
+  { slug: "api", file: "guides/api.md", title: "API overview" },
 ];
 
 // The hub card shows plain text, so inline markdown is stripped rather than
@@ -64,10 +71,10 @@ const stripInline = (s) =>
 const guides = GUIDES.map(({ slug, file, title }) => {
   const md = readFileSync(join(docsRoot, file), "utf8");
   // Drop the H1 (the page renders its own header) and pull the first
-  // paragraph as the hub-card blurb.
+  // paragraph as the hub-card blurb / meta description.
   const body = md.replace(/^#\s+.*\n+/, "");
   const firstPara = stripInline(body.split(/\n\n/)[0].replace(/\n/g, " ").trim());
-  return { slug, title, blurb: firstPara, md: body };
+  return { slug, title, file: `docs/${file}`, blurb: firstPara, md: body };
 });
 
 // Refuse to generate a 404: every same-folder .md cross-link in a synced
@@ -99,6 +106,72 @@ if (planesStart === -1) {
 const planesRest = indexMd.slice(planesStart + planesHeading.length);
 const planesEnd = planesRest.search(/\n---|\n## /);
 const planesMd = (planesEnd === -1 ? planesRest : planesRest.slice(0, planesEnd)).trim();
+
+// ---------------------------------------------------------------- search --
+// One entry per heading-delimited section (plus the intro before the first
+// heading). Anchors are NOT computed here: the client derives them with the
+// SAME slugify the renderer uses (lib/markdown.ts), so index and page can
+// never drift. Text is flattened to plain lowercase-searchable prose; code
+// fences are kept (people search for flags and env vars) but fence markers
+// and table pipes are dropped.
+const searchSections = [];
+for (const g of guides) {
+  const lines = g.md.split("\n");
+  let heading = null; // null = the intro section
+  let buf = [];
+  const flush = () => {
+    const text = stripInline(
+      buf
+        .join(" ")
+        .replace(/```\S*/g, " ")
+        .replace(/\|/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+    );
+    if (text || heading) {
+      searchSections.push({
+        slug: g.slug,
+        title: g.title,
+        heading: heading ?? "",
+        text: text.slice(0, 1200),
+      });
+    }
+    buf = [];
+  };
+  for (const line of lines) {
+    const h = line.match(/^(#{2,3})\s+(.*)$/);
+    if (h) {
+      flush();
+      heading = h[2].replace(/\s+#*\s*$/, "");
+    } else {
+      buf.push(line);
+    }
+  }
+  flush();
+}
+
+// ------------------------------------------------------------- changelog --
+// CHANGELOG.md → one entry per `## ` release heading. The preamble above the
+// first release is dropped (the page carries its own intro); each entry keeps
+// its body as markdown for MarkdownView.
+const changelogMd = readFileSync(join(repoRoot, "CHANGELOG.md"), "utf8");
+const releases = [];
+{
+  const parts = changelogMd.split(/^## /m).slice(1); // drop preamble
+  for (const part of parts) {
+    const nl = part.indexOf("\n");
+    const headline = part.slice(0, nl).trim();
+    const body = part.slice(nl + 1).trim();
+    // "[0.3.0] — 2026-07-24" | "[Unreleased]"
+    const m = headline.match(/^\[([^\]]+)\](?:\s*[—-]\s*(.*))?$/);
+    const version = m ? m[1] : headline;
+    const date = m && m[2] ? m[2].trim() : null;
+    releases.push({ version, date, md: body });
+  }
+  if (releases.length === 0) {
+    throw new Error("CHANGELOG.md yielded zero releases — parser or file moved");
+  }
+}
 
 // ------------------------------------------------------------- reference --
 // Bundle the spec to JSON with the same CLI that lints it, so $refs resolve
@@ -167,13 +240,41 @@ const banner = `// GENERATED by scripts/sync-developer-docs.mjs — do not edit.
 writeFileSync(
   join(outDir, "content.ts"),
   `${banner}
-export type Guide = { slug: string; title: string; blurb: string; md: string };
+export type Guide = {
+  slug: string;
+  title: string;
+  /** Repo-relative source path — feeds the "Edit this page on GitHub" link. */
+  file: string;
+  blurb: string;
+  md: string;
+};
 
 export const GUIDES: Guide[] = ${JSON.stringify(guides, null, 2)};
 
 /** The "four planes" section of docs/index.md — intro, table, and the
- *  Kubernetes note — rendered verbatim on the developer hub. */
+ *  Kubernetes note — rendered verbatim on the docs hub. */
 export const PLANES_MD: string = ${JSON.stringify(planesMd)};
+`
+);
+
+writeFileSync(
+  join(outDir, "search.ts"),
+  `${banner}
+/** One heading-delimited section of a guide. \`heading\` is "" for the intro
+ *  before the first heading; anchors are derived client-side with the same
+ *  slugify the renderer uses. */
+export type SearchSection = { slug: string; title: string; heading: string; text: string };
+
+export const SEARCH_SECTIONS: SearchSection[] = ${JSON.stringify(searchSections, null, 1)};
+`
+);
+
+writeFileSync(
+  join(outDir, "changelog.ts"),
+  `${banner}
+export type Release = { version: string; date: string | null; md: string };
+
+export const RELEASES: Release[] = ${JSON.stringify(releases, null, 2)};
 `
 );
 
@@ -202,7 +303,7 @@ export const GROUPS: TagGroup[] = ${JSON.stringify(groups, null, 2)};
 copyFileSync(join(docsRoot, "api", "openapi.yaml"), join(publicDir, "openapi.yaml"));
 
 // The full reference — request/response schemas, examples — as one static
-// Redoc page. Served at /developer/api.html; the in-app browser links to it.
+// Redoc page. Served at /docs/api.html; the in-app browser links to it.
 execFileSync(
   "npx",
   ["--yes", REDOCLY, "build-docs", "api/openapi.yaml", "-o", join(publicDir, "api.html")],
@@ -210,5 +311,6 @@ execFileSync(
 );
 
 console.log(
-  `synced ${guides.length} guides, ${opCount} operations across ${groups.length} groups`
+  `synced ${guides.length} guides, ${searchSections.length} search sections, ` +
+    `${releases.length} changelog entries, ${opCount} operations across ${groups.length} groups`
 );
