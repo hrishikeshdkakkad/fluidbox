@@ -113,6 +113,11 @@ describe("slugify", () => {
     expect(slugify("Four tokens, not one")).toBe("four-tokens-not-one");
     expect(slugify("The `go_url` leg")).toBe("the-go_url-leg");
   });
+
+  it("keeps consecutive hyphens where punctuation dropped between spaces (GitHub convention)", () => {
+    expect(slugify("Local (kind + Calico)")).toBe("local-kind--calico");
+    expect(slugify("AWS EKS — step by step")).toBe("aws-eks--step-by-step");
+  });
 });
 
 describe("outline", () => {

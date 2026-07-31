@@ -1,0 +1,8 @@
+- generic [active] [ref=f36e1]:
+  - generic [ref=f36e6]:
+    - heading "Error" [level=1] [ref=f36e7]
+    - generic [ref=f36e8]:
+      - paragraph [ref=f36e13]:
+        - strong [ref=f36e14]: Something went wrong
+      - paragraph [ref=f36e15]: Couldn’t sign in. If you are not sure what happened, please contact your organization admin.
+  - alert [ref=f36e16]: Something went wrong

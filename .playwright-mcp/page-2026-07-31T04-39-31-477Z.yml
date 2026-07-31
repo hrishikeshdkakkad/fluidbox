@@ -1,0 +1,893 @@
+- generic [active] [ref=f12e1]:
+  - generic [ref=f12e2]:
+    - link "Skip to content" [ref=f12e3] [cursor=pointer]:
+      - /url: "#content"
+    - banner [ref=f12e4]:
+      - generic [ref=f12e5]:
+        - link "fluidbox" [ref=f12e6] [cursor=pointer]:
+          - /url: /
+        - navigation "Site" [ref=f12e8]:
+          - link "Product" [ref=f12e9] [cursor=pointer]:
+            - /url: /product
+          - link "Open Source" [ref=f12e10] [cursor=pointer]:
+            - /url: /open-source
+          - link "Docs" [ref=f12e11] [cursor=pointer]:
+            - /url: /docs
+          - link "Security" [ref=f12e12] [cursor=pointer]:
+            - /url: /security
+          - link "GitHub ↗" [ref=f12e13] [cursor=pointer]:
+            - /url: https://github.com/hrishikeshdkakkad/fluidbox
+        - generic [ref=f12e14]:
+          - button "Use dark theme" [ref=f12e15] [cursor=pointer]:
+            - generic [ref=f12e18]: Dark
+          - link "Sign in" [ref=f12e19] [cursor=pointer]:
+            - /url: /sign-in
+          - link "Get started" [ref=f12e20] [cursor=pointer]:
+            - /url: /docs/getting-started
+    - main [ref=f12e21]:
+      - generic [ref=f12e22]:
+        - generic [ref=f12e23]: changelog
+        - heading "What shipped, when, and why." [level=1] [ref=f12e24]
+        - paragraph [ref=f12e25]:
+          - text: Generated from the repository's
+          - link "CHANGELOG.md" [ref=f12e26] [cursor=pointer]:
+            - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/CHANGELOG.md
+          - text: . Versions follow SemVer; entries follow Keep a Changelog.
+        - generic [ref=f12e27]:
+          - article [ref=f12e28]:
+            - generic [ref=f12e29]: Unreleased
+            - generic [ref=f12e32]:
+              - heading [level=4] [ref=f12e33]:
+                - link "Added" [ref=f12e34] [cursor=pointer]:
+                  - /url: "#added"
+              - list [ref=f12e35]:
+                - listitem [ref=f12e36]:
+                  - strong [ref=f12e37]: "DB-native policies (§17 #11)"
+                  - text: — policies are now versioned, authorable, and attachable from the dashboard. Every edit is an immutable
+                  - code [ref=f12e38]: policy_versions
+                  - text: row (author, summary, date; migration
+                  - code [ref=f12e39]: "0026"
+                  - text: ); publish/revert/clone ride optimistic concurrency (
+                  - code [ref=f12e40]: base_version
+                  - text: → 409 on a moved head) and a strict parser (an unknown field is a 422, never a silently-weaker policy); history is append-only at the database level (the runtime role can only read and append). The Governance page gains a draft rule editor (ordered rules, path/shell constraints, budgets/approvals/autonomy/egress forms), version history with diff and one-click revert, New policy (clone or blank), and Delete; the run composer gains a policy select and disables autonomy when the policy forbids it.
+                  - code [ref=f12e41]: managed_overrides
+                  - text: folds into ordinary head rules (verdict-preserving, property-tested);
+                  - code [ref=f12e42]: just policy-sync
+                  - text: is retired — YAML survives as a boot seed and an idempotent import/export format (
+                  - code [ref=f12e43]: POST /v1/policies
+                  - text: ).
+                - listitem [ref=f12e44]:
+                  - text: "**"
+                  - code [ref=f12e45]: "DELETE /v1/policies/{name}"
+                  - text: "** — removes a policy and cascades its version history. Refused (409) while any agent revision names it, including historical revisions, which stay immutable. Runs are never affected: each froze its own policy snapshot."
+              - heading [level=4] [ref=f12e46]:
+                - link "Changed" [ref=f12e47] [cursor=pointer]:
+                  - /url: "#changed"
+              - list [ref=f12e48]:
+                - listitem [ref=f12e49]:
+                  - strong [ref=f12e50]: Seed policy files are parsed STRICTLY, and an invalid one can refuse the boot.
+                  - code [ref=f12e51]: policies/*.yaml
+                  - text: "now goes through the same strict parser as the API, so an unknown key is an error rather than a silently-dropped field. The refusal is scoped to where it matters: if the policy does"
+                  - strong [ref=f12e52]: not yet exist in the database
+                  - text: ", the file is its only source and the server refuses to start (naming the file, the key, and the policy); if the policy"
+                  - strong [ref=f12e53]: already exists
+                  - text: ", its stored versions govern, the file writes nothing, and the server logs a warning and boots. Upgrading with a hand-edited policies directory: run"
+                  - code [ref=f12e54]: POST /v1/policies/validate
+                  - text: against each file first, or expect a startup warning.
+              - heading [level=4] [ref=f12e55]:
+                - link "Upgrade notes" [ref=f12e56] [cursor=pointer]:
+                  - /url: "#upgrade-notes"
+              - list [ref=f12e57]:
+                - listitem [ref=f12e58]:
+                  - text: Migration
+                  - code [ref=f12e59]: "0026"
+                  - text: drops
+                  - code [ref=f12e60]: "policies.{parsed,yaml_source,managed_overrides,version}"
+                  - text: ", so this is"
+                  - strong [ref=f12e61]: stop the old binary, migrate, then deploy
+                  - text: (the
+                  - code [ref=f12e62]: "0018"
+                  - text: posture) and there is no binary rollback past it — a pre-0026 binary refuses to boot against a 0026 database (
+                  - code [ref=f12e63]: migration 26 was previously applied but is missing in the resolved migrations
+                  - text: ), so the failure is loud rather than silent.
+                - listitem [ref=f12e64]:
+                  - strong [ref=f12e65]: Helm, default values — no action needed.
+                  - code [ref=f12e66]: "server.archiveStore: \"\""
+                  - text: (the default) and
+                  - code [ref=f12e67]: values/eks.yaml
+                  - text: render
+                  - code [ref=f12e68]: "strategy: Recreate"
+                  - text: with
+                  - code [ref=f12e69]: "replicas: 1"
+                  - text: ", which satisfies stop-the-old-binary by construction: the old pod is fully terminated before the new one starts, so"
+                  - code [ref=f12e70]: "0026"
+                  - text: runs only after the old binary is gone. Cost is ~30s of downtime, not a correctness risk.
+                - listitem [ref=f12e71]:
+                  - text: "**Helm,"
+                  - code [ref=f12e72]: "server.archiveStore: \"s3\""
+                  - text: — act before upgrading.** Only that configuration (the multi-replica shape) renders
+                  - code [ref=f12e73]: RollingUpdate
+                  - text: ", where old and new pods coexist."
+                  - strong [ref=f12e74]: Scale the server Deployment to zero, upgrade, then scale back up.
+                  - text: "Note there is no values knob for this: the strategy is derived from"
+                  - code [ref=f12e75]: archiveStore
+                  - text: alone (
+                  - code [ref=f12e76]: values.yaml:57
+                  - text: ), so it cannot be forced to
+                  - code [ref=f12e77]: Recreate
+                  - text: for one release, and patching the Deployment does not help because the same
+                  - code [ref=f12e78]: helm upgrade
+                  - text: rewrites the field. Without the scale-to-zero, surviving old replicas answer policy queries with
+                  - code [ref=f12e79]: column "version" does not exist
+                  - text: (42703) until they are replaced, and their in-flight transactions can block the migration's
+                  - code [ref=f12e80]: ACCESS EXCLUSIVE
+                  - text: DDL against its 5s
+                  - code [ref=f12e81]: lock_timeout
+                  - text: .
+                - listitem [ref=f12e82]:
+                  - text: A
+                  - code [ref=f12e83]: managed_overrides
+                  - text: entry naming a
+                  - strong [ref=f12e84]: wildcard
+                  - text: tool (e.g.
+                  - code [ref=f12e85]: mcp__*
+                  - text: ) is dropped with a warning rather than folded. Such an entry was unreachable — the retired engine matched overrides by exact name — and folding it into a rule would have matched the whole namespace. The API never allowed one, so this should log nothing.
+          - article [ref=f12e86]:
+            - generic [ref=f12e87]:
+              - generic [ref=f12e88]: v0.3.0
+              - generic [ref=f12e89]: 2026-07-24
+            - generic [ref=f12e91]:
+              - paragraph [ref=f12e92]:
+                - strong [ref=f12e93]: Multi-user MCP control plane.
+                - text: Six phases (A–F) and migrations
+                - code [ref=f12e94]: "0011"
+                - text: →
+                - code [ref=f12e95]: "0025"
+                - text: turn fluidbox from a single-admin control plane into one that can host many organizations, many users, and many separately-owned credentials without ever letting a model pick an identity. Every hosted capability is
+                - strong [ref=f12e96]: opt-in behind a flag, and the default single-admin Docker deployment is byte-for-byte the same product
+                - text: —
+                - code [ref=f12e97]: FLUIDBOX_REQUIRE_SSO
+                - text: unset means today's behavior, unchanged.
+              - paragraph [ref=f12e98]:
+                - text: "The organizing idea:"
+                - strong [ref=f12e99]: connector definition ≠ credential-bearing connection ≠ agent connection requirement ≠ per-run resource binding.
+                - text: An agent declares
+                - emphasis [ref=f12e100]: what
+                - text: it requires, never
+                - emphasis [ref=f12e101]: whose
+                - text: credential satisfies it. Run creation resolves each requirement to an explicit, frozen authority source before any model spend. The model picks tools; it can never pick an identity.
+              - paragraph [ref=f12e102]: "Highlights:"
+              - list [ref=f12e103]:
+                - listitem [ref=f12e104]:
+                  - strong [ref=f12e105]: Per-organization, IdP-agnostic identity
+                  - text: —
+                  - code [ref=f12e106]: FLUIDBOX_REQUIRE_SSO=1
+                  - text: confines the admin token to
+                  - code [ref=f12e107]: /v1/admin/*
+                  - text: "as break-glass and introduces three principals: Operator (admin token), User ("
+                  - code [ref=f12e108]: __Host-fbx_web
+                  - text: session cookie), and Pat (
+                  - code [ref=f12e109]: fbx_pat_
+                  - text: bearer). Any conformant OIDC issuer is configured
+                  - strong [ref=f12e110]: per org
+                  - text: (issuer + client + sealed secret + claim mappings); logins are two-phase and browser-bound; sessions are server-side with idle/absolute/re-auth windows. No IdP configured ⇒ single-admin mode.
+                - listitem [ref=f12e111]:
+                  - strong [ref=f12e112]: Tenant isolation with a database floor
+                  - text: — every tenant-owned
+                  - code [ref=f12e113]: fluidbox-db
+                  - text: method now takes a
+                  - code [ref=f12e114]: TenantScope
+                  - text: that carries its id into a
+                  - code [ref=f12e115]: tenant_id = $n
+                  - text: predicate, so isolation is a
+                  - emphasis [ref=f12e116]: signature requirement
+                  - text: rather than a remember-to-filter convention. Migration
+                  - code [ref=f12e117]: "0018"
+                  - text: "adds the floor underneath: 37 tables"
+                  - code [ref=f12e118]: ENABLE
+                  - text: +
+                  - code [ref=f12e119]: FORCE
+                  - text: row-level security keyed on a transaction-local
+                  - code [ref=f12e120]: fluidbox.tenant_id
+                  - text: GUC, with
+                  - code [ref=f12e121]: FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime
+                  - text: splitting the pool onto a non-owner role holding enumerated per-table grants. Cross-tenant access exists only through a short, named, grep-able set of audited bypasses.
+                - listitem [ref=f12e122]:
+                  - strong [ref=f12e123]: Connection ownership and per-run resource bindings
+                  - text: "— brokered MCP tools moved off capability bundles onto four objects: catalog connector definition →"
+                  - strong [ref=f12e124]: connection
+                  - text: (owns the credential, plus append-only tool snapshots) → agent-revision **
+                  - code [ref=f12e125]: connection_requirements
+                  - strong [ref=f12e126]: → per-run
+                  - code [ref=f12e127]: run_resource_bindings
+                  - text: "** (migration"
+                  - code [ref=f12e128]: "0013"
+                  - text: ), resolved to a tagged authority (
+                  - code [ref=f12e129]: connection
+                  - text: "|"
+                  - code [ref=f12e130]: subscription_secret
+                  - text: "|"
+                  - code [ref=f12e131]: none
+                  - text: ) across typed slots (
+                  - code [ref=f12e132]: mcp
+                  - text: "|"
+                  - code [ref=f12e133]: workspace_fetch
+                  - text: "|"
+                  - code [ref=f12e134]: result_publish
+                  - text: )
+                  - emphasis [ref=f12e135]: before
+                  - text: provisioning. Connections gained personal vs. organization ownership; a personal-connection approval is decidable
+                  - strong [ref=f12e136]: only by its owner-who-invoked
+                  - text: — no role, admin, or operator override.
+                - listitem [ref=f12e137]:
+                  - strong [ref=f12e138]: Versioned envelope sealing with a real key-retirement path
+                  - text: — migration
+                  - code [ref=f12e139]: "0014"
+                  - text: makes every sealed column carry a
+                  - code [ref=f12e140]: _key_version
+                  - text: "companion:"
+                  - code [ref=f12e141]: "1"
+                  - text: is the legacy
+                  - code [ref=f12e142]: FLUIDBOX_CREDENTIAL_KEY
+                  - text: format,
+                  - code [ref=f12e143]: "2"
+                  - text: is a per-tenant DEK wrapped by a KEK (
+                  - code [ref=f12e144]: FLUIDBOX_KMS_MODE=off|static|aws
+                  - text: ) with AAD binding
+                  - code [ref=f12e145]: "fbx:v2:{tenant}:{table.column}"
+                  - text: so a blob is untransplantable across tenants
+                  - emphasis [ref=f12e146]: or
+                  - text: columns. Thirteen sealed families; a resumable, CAS-guarded
+                  - code [ref=f12e147]: POST /v1/admin/reseal
+                  - text: "migrates v1→v2; two boot gates fail closed in both directions. Runbook:"
+                  - code [ref=f12e148]: docs/hosted/kms-operations.md
+                  - text: .
+                - listitem [ref=f12e149]:
+                  - strong [ref=f12e150]: One hardened egress boundary for all control-plane traffic
+                  - text: — two filtering-resolver clients plus a pure
+                  - code [ref=f12e151]: admit_url
+                  - text: pre-flight that blocks private/loopback/link-local/multicast/reserved and cloud-metadata address classes at every dial site (reqwest dials an IP literal without consulting a resolver, so the pre-flight is what actually stops
+                  - code [ref=f12e152]: 169.254.169.254
+                  - text: ). Broker, delivery callbacks, and both connector-OAuth token legs ride a client that
+                  - strong [ref=f12e153]: refuses redirects outright
+                  - text: . Git gets its own out-of-process policy.
+                  - code [ref=f12e154]: FLUIDBOX_EGRESS_ALLOW_CIDRS
+                  - text: opts specific CIDRs back in;
+                  - code [ref=f12e155]: FLUIDBOX_EGRESS_PROXY
+                  - text: re-points everything, including the git subprocess, through one waypoint.
+                - listitem [ref=f12e156]:
+                  - text: "**MCP"
+                  - code [ref=f12e157]: 2025-11-25
+                  - text: conformance, with version drift denying the call** — upstream MCP is now a per-run session (
+                  - code [ref=f12e158]: initialize
+                  - text: +
+                  - code [ref=f12e159]: notifications/initialized
+                  - text: before every call,
+                  - code [ref=f12e160]: MCP-Protocol-Version
+                  - text: on every request, credential re-resolved live on the terminal
+                  - code [ref=f12e161]: DELETE
+                  - text: ). A run's negotiated version must match its frozen surface exactly or the call is denied with a message naming the refresh endpoint. SSE is a real incremental assembler with per-event and total ceilings;
+                  - code [ref=f12e162]: outputSchema
+                  - text: /
+                  - code [ref=f12e163]: structuredContent
+                  - text: are preserved.
+                - listitem [ref=f12e164]:
+                  - strong [ref=f12e165]: Frozen tool schemas enforced server-side
+                  - text: — arguments are validated against the schema photographed at freeze time, with the JSON Schema dialect chosen by the snapshot's protocol version (
+                  - code [ref=f12e166]: 2025-11-25
+                  - text: ⇒ 2020-12 per SEP-1613, otherwise draft-07). The schema is untrusted input, so it is pre-guarded (size, depth, local-
+                  - code [ref=f12e167]: $ref
+                  - text: "-only) before compilation; a violation makes the tool un-callable rather than being silently ignored. This inserts exactly one new stage into the permission gate and moves nothing else."
+                - listitem [ref=f12e168]:
+                  - strong [ref=f12e169]: At-most-once brokered dispatch
+                  - text: — migration
+                  - code [ref=f12e170]: "0019"
+                  - text: wraps every brokered call in a durable four-state execution claim keyed
+                  - code [ref=f12e171]: (session, tool_call_id, input_digest)
+                  - text: .
+                  - code [ref=f12e172]: failed_before_send
+                  - text: requires positive proof nothing was written and is the only re-claimable state; a definitive upstream response is terminal; timeouts and mid-stream failures are recorded as
+                  - code [ref=f12e173]: ambiguous
+                  - text: rather than retried. Decision idempotency and execution idempotency are now distinct properties.
+                - listitem [ref=f12e174]:
+                  - strong [ref=f12e175]: Audience-scoped sandbox credentials
+                  - text: — migration
+                  - code [ref=f12e176]: "0020"
+                  - text: splits the sandbox's single bearer into four tokens (
+                  - code [ref=f12e177]: llm
+                  - text: "|"
+                  - code [ref=f12e178]: tool
+                  - text: "|"
+                  - code [ref=f12e179]: control
+                  - text: "|"
+                  - code [ref=f12e180]: workspace
+                  - text: ), each checked as the first statement of its handler. Kubernetes ships one Secret with four keys routed per container, so the workspace init container never sees the others.
+                - listitem [ref=f12e181]:
+                  - strong [ref=f12e182]: Replica coordination primitives
+                  - text: — migration
+                  - code [ref=f12e183]: "0021"
+                  - text: ": approval emission rides the deciding CAS inside one transaction (only the winner emits) with cross-replica"
+                  - code [ref=f12e184]: pg_notify
+                  - text: wakeups and the poll floor kept as a missed-notify backstop; sessions carry an orchestrator lease + epoch so a fenced-out driver cannot mutate lifecycle while a user's cancel stays deliberately unfenced; deliveries claim rows
+                  - code [ref=f12e185]: FOR UPDATE SKIP LOCKED
+                  - text: ", and the GitHub double-post window closes by reconcile-before-create on both comments and checks."
+                - listitem [ref=f12e186]:
+                  - strong [ref=f12e187]: Durable LLM budget admission
+                  - text: — migration
+                  - code [ref=f12e188]: "0022"
+                  - text: replaces best-effort budget checks with a request-keyed reservation whose primary key
+                  - emphasis [ref=f12e189]: is
+                  - text: the usage entry's external id, which is what makes a 401 replay and a late drain idempotent. Booking uses a deliberately-high upper bound; release happens only on positively-proven non-dispatch; charging requires a durable usage write before the CAS.
+                - listitem [ref=f12e190]:
+                  - strong [ref=f12e191]: Operations
+                  - text: — a bounded-cardinality metrics registry at admin-gated
+                  - code [ref=f12e192]: GET /v1/admin/metrics
+                  - text: (plus optional unauthenticated
+                  - code [ref=f12e193]: FLUIDBOX_METRICS_BIND
+                  - text: ), durable cross-replica egress governance and capacity ceilings (
+                  - code [ref=f12e194]: "0023"
+                  - text: ), cross-replica MCP session teardown (
+                  - code [ref=f12e195]: "0024"
+                  - text: ), workload identity (
+                  - code [ref=f12e196]: "0025"
+                  - text: ), S3-compatible archive storage alongside the filesystem backend, and a guarded load harness (
+                  - code [ref=f12e197]: fluidbox-loadgen
+                  - text: ) with its own manual
+                  - code [ref=f12e198]: scale
+                  - text: CI job.
+              - paragraph [ref=f12e199]:
+                - text: "Validation: five hermetic acceptance suites green against CI-identical throwaway databases — identity"
+                - strong [ref=f12e200]: 87/0
+                - text: ", bindings"
+                - strong [ref=f12e201]: 104/0
+                - text: ", secrets"
+                - strong [ref=f12e202]: 128/0
+                - text: ", hardening"
+                - strong [ref=f12e203]: 274/0
+                - text: ", scale"
+                - strong [ref=f12e204]: 18/0
+                - text: =
+                - strong [ref=f12e205]: 611/0
+                - text: — plus live Docker-provider tiers (demo A, Codex) and a second live EKS acceptance on arm64/Graviton with the runtime-role RLS split active and an AWS-audited zero-orphan teardown (
+                - code [ref=f12e206]: docs/reviews/2026-07-22-eks-acceptance-phase-f.md
+                - text: ).
+              - paragraph [ref=f12e207]:
+                - text: "Still deferred: the gated 60/150/300-seat load campaign and the final two rollout gates (owner approval + cost estimate) remain open on"
+                - link "#34" [ref=f12e208] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/issues/34
+                - text: "— real spend, tracked separately from code. The hosted OAuth Connect flow also carries one documented residual: a deliberately-shared"
+                - emphasis [ref=f12e209]: start
+                - text: URL can still route a victim's grant into the initiating connection, closed only by moving the browser-facing leg onto the dashboard origin (full write-up in
+                - code [ref=f12e210]: docs/hosted/threat-model.md
+                - text: ).
+              - heading [level=4] [ref=f12e211]:
+                - link "Added" [ref=f12e212] [cursor=pointer]:
+                  - /url: "#added"
+              - list [ref=f12e213]:
+                - listitem [ref=f12e214]:
+                  - strong [ref=f12e215]: Identity and access
+                  - text: — per-org OIDC login (
+                  - code [ref=f12e216]: /v1/auth/*
+                  - text: ), logout,
+                  - code [ref=f12e217]: /v1/auth/me
+                  - text: ", PAT mint/list/revoke, org + IdP-config lifecycle and membership roles ("
+                  - code [ref=f12e218]: /v1/admin/orgs*
+                  - text: ), break-glass owner arming, and staged issuer migration. All three token shapes (
+                  - code [ref=f12e219]: fbx_sess_
+                  - text: ","
+                  - code [ref=f12e220]: fbx_web_
+                  - text: ","
+                  - code [ref=f12e221]: fbx_pat_
+                  - text: ) are sha256-only at rest and scrubbed by the ledger redactor.
+                - listitem [ref=f12e222]:
+                  - strong [ref=f12e223]: Dashboard SSO mode
+                  - text: —
+                  - code [ref=f12e224]: FLUIDBOX_WEB_MODE=admin|sso
+                  - text: (static per deployment). In
+                  - code [ref=f12e225]: sso
+                  - text: the proxy carries no admin token and forwards the session cookie plus a CSRF header on same-origin non-GETs;
+                  - code [ref=f12e226]: apps/web/proxy.ts
+                  - text: redirects sessionless browsers to
+                  - code [ref=f12e227]: /login?next=…
+                  - text: before first paint while authority stays in the control plane.
+                - listitem [ref=f12e228]:
+                  - strong [ref=f12e229]: Per-tenant LLM keys
+                  - text: —
+                  - code [ref=f12e230]: FLUIDBOX_LLM_KEY_MODE=tenant
+                  - text: (migration
+                  - code [ref=f12e231]: "0017"
+                  - text: ) mints a per-tenant LiteLLM virtual key and confines the master key to provisioning;
+                  - code [ref=f12e232]: "POST /v1/admin/orgs/{slug}/llm-key/rotate"
+                  - text: . Requires a LiteLLM backed by its own Postgres, so local deployments stay on
+                  - code [ref=f12e233]: shared
+                  - text: .
+                - listitem [ref=f12e234]:
+                  - strong [ref=f12e235]: Connection tool snapshots
+                  - text: — a forced-
+                  - code [ref=f12e236]: initialize
+                  - text: photograph per connection (
+                  - code [ref=f12e237]: "GET /v1/connections/{id}/tools"
+                  - text: ","
+                  - code [ref=f12e238]: "POST /v1/connections/{id}/tools/refresh"
+                  - text: ) recording the negotiated protocol version, with cursor caps fail-closed.
+                - listitem [ref=f12e239]:
+                  - strong [ref=f12e240]: Hosted operator documentation
+                  - text: —
+                  - code [ref=f12e241]: docs/hosted/
+                  - text: ": product compatibility matrix, threat model, network architecture, connector admission policy, rollout gates, and KMS operations runbook. Plus"
+                  - code [ref=f12e242]: docs/guides/kubernetes.md
+                  - text: ", a zero-to-certified-cluster guide with real cloud acceptance costs and gotchas."
+              - heading [level=4] [ref=f12e243]:
+                - link "Changed" [ref=f12e244] [cursor=pointer]:
+                  - /url: "#changed"
+              - list [ref=f12e245]:
+                - listitem [ref=f12e246]:
+                  - strong [ref=f12e247]: Brokered tools no longer ride capability bundles.
+                  - code [ref=f12e248]: capability_bundles
+                  - text: survives for sandbox stdio tools only; registering a
+                  - code [ref=f12e249]: class:brokered
+                  - text: server is refused with a cutover error. Migration
+                  - code [ref=f12e250]: "0013"
+                  - text: appends converted agent revisions and repoints pinned subscriptions; a revision still pinning a brokered bundle is refused at run creation. Mixed brokered+sandbox bundles drop whole, with a raise-notice.
+                - listitem [ref=f12e251]:
+                  - strong [ref=f12e252]: Custom connector-catalog entries are tenant-scoped.
+                  - text: Curated and imported entries stay deployment-global; a tenant's custom entry shadows a same-slug global one. Migration
+                  - code [ref=f12e253]: "0013"
+                  - text: backfills the single boot tenant, otherwise disabling the row.
+                - listitem [ref=f12e254]:
+                  - strong [ref=f12e255]: Connector OAuth is a one-time, browser-bound flow.
+                  - code [ref=f12e256]: oauth/start
+                  - text: returns only a
+                  - code [ref=f12e257]: go_url
+                  - text: ; navigating it sets a
+                  - code [ref=f12e258]: __Host-
+                  - text: flow cookie whose hash sits inside the atomic single-use claim, so a leaked authorization URL can neither complete nor burn a flow. Endpoints, resolved client,
+                  - code [ref=f12e259]: resource
+                  - text: ", sealed PKCE verifier, and expected generation are frozen at start and the callback exchanges against that row. Client identities are shared per"
+                  - code [ref=f12e260]: (issuer, redirect_uri)
+                  - text: ", DCR singleflighted by advisory lock. The stateless"
+                  - code [ref=f12e261]: seal_state
+                  - text: /
+                  - code [ref=f12e262]: open_state
+                  - text: helpers are gone.
+                - listitem [ref=f12e263]:
+                  - text: "**"
+                  - code [ref=f12e264]: authorization_generation
+                  - text: bumps on reconnect of ever-activated OAuth connections**, so stale-generation bindings refuse mid-run. Rotation within a generation is unaffected, and GitHub App lifecycle never bumps.
+                - listitem [ref=f12e265]:
+                  - text: Multi-user boot now
+                  - strong [ref=f12e266]: refuses
+                  - text: a pool role that bypasses RLS (
+                  - code [ref=f12e267]: SUPERUSER
+                  - text: /
+                  - code [ref=f12e268]: BYPASSRLS
+                  - text: ", e.g. Neon's default owner) unless"
+                  - code [ref=f12e269]: FLUIDBOX_ALLOW_RLS_BYPASS=1
+                  - text: ; single-user only warns.
+                  - code [ref=f12e270]: just doctor
+                  - text: inspects the role the server will actually run as and fails on every unbootable combination.
+              - heading [level=4] [ref=f12e271]:
+                - link "Security" [ref=f12e272] [cursor=pointer]:
+                  - /url: "#security"
+              - list [ref=f12e273]:
+                - listitem [ref=f12e274]: Prompts still never reach the ledger, and the redactor now also scrubs every session, web-session, and PAT token shape.
+                - listitem [ref=f12e275]: "The permission gate grew exactly one stage (frozen-schema argument validation) and reordered nothing: budget → frozen-set availability → schema → trust tier → policy → approvals."
+                - listitem [ref=f12e276]:
+                  - text: Before any brokered secret access, binding status,
+                  - code [ref=f12e277]: authorization_generation
+                  - text: ", and — for personal connections — owner-membership-active are re-verified fail-closed."
+                - listitem [ref=f12e278]: "Both connector-OAuth token legs ride the no-redirect client on purpose: a 307/308 replays the request body, which would forward an authorization code plus PKCE verifier, or a refresh token, to the redirect target. A source-grep test pins this."
+              - heading [level=4] [ref=f12e279]:
+                - link "Upgrading" [ref=f12e280] [cursor=pointer]:
+                  - /url: "#upgrading"
+              - paragraph [ref=f12e281]:
+                - text: Migration
+                - code [ref=f12e282]: "0018"
+                - text: (RLS enforcement) is
+                - strong [ref=f12e283]: stop the old binary, migrate, then deploy
+                - text: — not a rolling upgrade. A pre-
+                - code [ref=f12e284]: "0018"
+                - text: binary sets no tenant GUC and would therefore see zero rows, and it holds transactions across outbound HTTP that would block the migration's
+                - code [ref=f12e285]: ACCESS EXCLUSIVE
+                - text: locks.
+              - paragraph [ref=f12e286]:
+                - text: Do not drop
+                - code [ref=f12e287]: FLUIDBOX_CREDENTIAL_KEY
+                - text: when enabling
+                - code [ref=f12e288]: FLUIDBOX_KMS_MODE
+                - text: ": run"
+                - code [ref=f12e289]: POST /v1/admin/reseal
+                - text: and let boot prove zero remaining v1 rows first. From the moment any v2 row exists,
+                - strong [ref=f12e290]: the KEK is the root of custody and losing it is unrecoverable
+                - text: — back it up before enabling.
+          - article [ref=f12e291]:
+            - generic [ref=f12e292]:
+              - generic [ref=f12e293]: v0.2.0
+              - generic [ref=f12e294]: 2026-07-17
+            - generic [ref=f12e296]:
+              - paragraph [ref=f12e297]:
+                - strong [ref=f12e298]: Kubernetes-native execution provider.
+                - text: "Runs now execute as bare Pods in a dedicated, zero-egress sandbox namespace — additive to Docker (dual-provider permanence: Docker stays the default and fully supported). Highlights:"
+              - list [ref=f12e299]:
+                - listitem [ref=f12e300]:
+                  - text: "**"
+                  - code [ref=f12e301]: FLUIDBOX_PROVIDER=kubernetes
+                  - text: "** — one Pod per run (init → runner → collector), per-run Secrets with ownerRef GC, UID-preconditioned mutations, immutable workspace archives pulled by the pod, and in-pod diff collection against a pristine"
+                  - code [ref=f12e302]: .git
+                  - text: baseline (agent-mutated git state is never executed).
+                - listitem [ref=f12e303]:
+                  - strong [ref=f12e304]: Helm chart on OCI
+                  - text: —
+                  - code [ref=f12e305]: helm install fluidbox oci://ghcr.io/hrishikeshdkakkad/charts/fluidbox --version 0.2.0
+                  - text: "works out of the box: chart"
+                  - code [ref=f12e306]: appVersion
+                  - text: is bound to the release images at package time; digest pinning (
+                  - code [ref=f12e307]: images.*.digest
+                  - text: ) validated at render time; per-cloud presets (
+                  - code [ref=f12e308]: "values/{eks,gke,aks,doks,kind}.yaml"
+                  - text: ); Ingress routes
+                  - code [ref=f12e309]: /
+                  - text: → dashboard,
+                  - code [ref=f12e310]: /v1
+                  - text: → API.
+                - listitem [ref=f12e311]:
+                  - strong [ref=f12e312]: Verified network enforcement, fail-closed
+                  - text: — a boot probe (carrying the sandbox's own placement) plus
+                  - code [ref=f12e313]: helm test
+                  - text: must prove the CNI enforces NetworkPolicy (+:8788 / −:8787) before any run is admitted.
+                - listitem [ref=f12e314]:
+                  - strong [ref=f12e315]: Durable finalization
+                  - text: — every terminal path funnels through a persisted intent; collection happens before the terminal transition; crash-recovery re-drives interrupted finalizations;
+                  - code [ref=f12e316]: /result
+                  - text: is no longer lossy. Fixes land on the Docker path too.
+                - listitem [ref=f12e317]:
+                  - strong [ref=f12e318]: Self-healing reconciliation
+                  - text: — a periodic adopt-or-terminate sweep heals crash windows (orphaned pods, handle-less sessions) in ≤60 s; node loss maps to
+                  - code [ref=f12e319]: Unknown
+                  - text: instead of live-forever; rolling-deploy-safe strict status parsing.
+                - listitem [ref=f12e320]:
+                  - strong [ref=f12e321]: Streaming archives with safety ceilings
+                  - text: — pack/serve/download never hold the archive in RAM;
+                  - code [ref=f12e322]: FLUIDBOX_MAX_ARCHIVE_BYTES
+                  - text: fails oversized runs at zero model spend (malformed caps fail boot); atomic
+                  - code [ref=f12e323]: .partial
+                  - text: +rename writes; a session-state-aware TTL sweep reclaims leaks.
+                - listitem [ref=f12e324]:
+                  - strong [ref=f12e325]: Hardening series
+                  - text: — all 30 findings (5 High / 10 Medium / 15 Low) from a three-round joint Claude+Codex review of the epic fixed or explicitly dispositioned (
+                  - code [ref=f12e326]: docs/reviews/2026-07-16-pr47-k8s-review-findings.md
+                  - text: "): symlink-safe extraction with"
+                  - code [ref=f12e327]: canonicalize
+                  - text: as the sole containment authority, integrity-checked exec collection with resume, dual-listener isolation (no
+                  - code [ref=f12e328]: /internal
+                  - text: on the public plane under K8s), UID-guarded deletes, quiesce replay, and more.
+                - listitem [ref=f12e329]:
+                  - strong [ref=f12e330]: New crates/images
+                  - text: —
+                  - code [ref=f12e331]: fluidbox-workspace
+                  - text: ","
+                  - code [ref=f12e332]: fluidbox-provider-k8s
+                  - text: ","
+                  - code [ref=f12e333]: workspaced
+                  - text: (+ the
+                  - code [ref=f12e334]: fluidbox-workspaced
+                  - text: image, published multi-arch from this release); kind+Calico CI tier green on fresh installs.
+              - paragraph [ref=f12e335]: "Still deferred: live EKS acceptance + teardown (kind+Calico is CI-proven; one managed cloud remains the epic's acceptance bar)."
+              - heading [level=4] [ref=f12e336]:
+                - link "Added" [ref=f12e337] [cursor=pointer]:
+                  - /url: "#added"
+              - list [ref=f12e338]:
+                - listitem [ref=f12e339]:
+                  - strong [ref=f12e340]: Connector-catalog bulk import (schema + tooling)
+                  - text: — the catalog is now import-ready without importing a single row. A
+                  - code [ref=f12e341]: provenance
+                  - text: column (migration 0009) makes every entry auditable and refreshable; curated seeds carry
+                  - code [ref=f12e342]: "{\"source\":\"fluidbox\"}"
+                  - text: and can never be clobbered by an import. A new reference-only transport,
+                  - code [ref=f12e343]: rest_action
+                  - text: ", lets an imported entry that has no hosted MCP endpoint to photograph show up as a browsable Store card whose"
+                  - strong [ref=f12e344]: Connect is refused
+                  - text: (
+                  - code [ref=f12e345]: "400"
+                  - text: ", \"reference-only\");"
+                  - code [ref=f12e346]: GET /v1/catalog
+                  - text: now derives a
+                  - code [ref=f12e347]: connectable
+                  - text: flag per entry so the dashboard can badge those cards. An offline dev tool,
+                  - code [ref=f12e348]: just catalog-import-registry
+                  - text: (
+                  - code [ref=f12e349]: crates/fluidbox-catalog-import
+                  - text: ), imports from
+                  - strong [ref=f12e350]: two Apache-2.0 sources
+                  - text: ": the official"
+                  - strong [ref=f12e351]: "[MCP Registry](https://github.com/modelcontextprotocol/registry)"
+                  - text: (primary — real MCP servers; entries with a
+                  - code [ref=f12e352]: streamable-http
+                  - text: remote import
+                  - strong [ref=f12e353]: connectable today
+                  - text: through the existing broker/photograph path) and
+                  - strong [ref=f12e354]: "[open-connector](https://github.com/oomol-lab/open-connector)"
+                  - text: (supplement — REST-only reference cards). It pages the Registry live (or from a pinned snapshot), keeps only
+                  - code [ref=f12e355]: active
+                  - text: /latest servers, merges Registry-wins on slug collision, runs the SAME poison screen as capability registration over every imported string (offenders drop their whole entry), and emits a deterministic, append-only, sorted
+                  - code [ref=f12e356]: INSERT … ON CONFLICT
+                  - text: migration of untrusted
+                  - strong [ref=f12e357]: community
+                  - text: "-tier rows — each provenance-tagged with its source + pinned snapshot/commit. The tool never runs at boot or request time and is not in the server crate graph; attribution is recorded in"
+                  - code [ref=f12e358]: NOTICE
+                  - text: . The actual breadth (the generated import migration) is a separate, legally-gated merge.
+                - listitem [ref=f12e359]:
+                  - strong [ref=f12e360]: Bring your own MCP server
+                  - text: "— a guided \"Add your own server\" flow on the Capabilities page: paste a URL, and a non-committing probe ("
+                  - code [ref=f12e361]: POST /v1/mcp/probe
+                  - text: ) detects whether it needs no auth, an API key, or OAuth and previews its tools without storing anything or sending a secret; one confirm (
+                  - code [ref=f12e362]: POST /v1/mcp/servers
+                  - text: ) registers a
+                  - code [ref=f12e363]: tier=custom
+                  - text: catalog entry and connects it in a single call, rolling the entry back if the connect fails so no orphan card survives. Bundle rows now expand to show their photographed tools.
+                - listitem [ref=f12e364]:
+                  - strong [ref=f12e365]: Server-authoritative harness/model catalog
+                  - text: —
+                  - code [ref=f12e366]: GET /v1/harnesses
+                  - text: is the single source of truth for the supported harness + model set; the dashboard's pickers fetch it instead of hardcoding models, and
+                  - code [ref=f12e367]: create_agent
+                  - text: /
+                  - code [ref=f12e368]: add_revision
+                  - text: now reject a model that doesn't belong to its harness with a clean
+                  - strong [ref=f12e369]: "422"
+                  - text: at agent-write time instead of a murky failure at the first model call.
+                - listitem [ref=f12e370]:
+                  - strong [ref=f12e371]: CI now tells the truth
+                  - text: — the rust job runs against a real Postgres service (the DB tests no longer silently self-skip), an
+                  - code [ref=f12e372]: e2e
+                  - text: "job builds both runner images and runs the full no-model acceptance suite (closes the vacuous-green gap of #14), and"
+                  - code [ref=f12e373]: cargo deny check
+                  - text: (advisories/licenses/bans/sources,
+                  - code [ref=f12e374]: deny.toml
+                  - text: ) gates the supply chain. The
+                  - code [ref=f12e375]: e2e
+                  - text: job is
+                  - strong [ref=f12e376]: manual-only
+                  - text: (
+                  - code [ref=f12e377]: workflow_dispatch
+                  - text: ) — it costs real Actions minutes, so it never runs on a PR or push; the cheap gates (rust/web/deny) still run on every PR. Live model tiers stay local/manual — CI never spends credits. Coverage (lcov artifact) runs on main pushes.
+                - listitem [ref=f12e378]:
+                  - strong [ref=f12e379]: Property tests for the policy engine
+                  - text: — generated-input invariants in
+                  - code [ref=f12e380]: fluidbox-core
+                  - text: ": an autonomous run can never surface"
+                  - code [ref=f12e381]: RequireApproval
+                  - text: ", autonomy rewrites exactly the approval verdicts (original always ledgered), the read-only tier denies any shell metacharacter and any unlisted tool, shell prefixes are token-bounded, first match wins."
+                - listitem [ref=f12e382]:
+                  - strong [ref=f12e383]: Try-it-with-Docker distribution
+                  - text: —
+                  - code [ref=f12e384]: deploy/server.Dockerfile
+                  - text: +
+                  - code [ref=f12e385]: deploy/web.Dockerfile
+                  - text: (Next standalone output), a
+                  - code [ref=f12e386]: release
+                  - text: workflow publishing multi-arch images to GHCR on version tags or manual dispatch, and
+                  - code [ref=f12e387]: deploy/docker-compose.eval.yml
+                  - text: ": bundled Postgres + LiteLLM + server + dashboard in one"
+                  - code [ref=f12e388]: docker compose up
+                  - text: .
+                - listitem [ref=f12e389]:
+                  - strong [ref=f12e390]: User guides
+                  - text: (
+                  - code [ref=f12e391]: docs/guides/
+                  - text: ) — writing policies, triggers/schedules/signed results (with the HMAC verification recipe and a pinned test vector), and capabilities (sandbox vs brokered MCP tools, pinning, the connector catalog).
+                - listitem [ref=f12e392]:
+                  - text: "**"
+                  - code [ref=f12e393]: ROADMAP.md
+                  - text: "** — the public distillation of"
+                  - code [ref=f12e394]: PLAN.md
+                  - text: §7.
+              - list [ref=f12e395]:
+                - listitem [ref=f12e396]:
+                  - text: "**"
+                  - code [ref=f12e397]: just setup
+                  - text: "** — one-command idempotent bootstrap for a fresh clone: tools check,"
+                  - code [ref=f12e398]: .env
+                  - text: with generated secrets (
+                  - code [ref=f12e399]: FLUIDBOX_ADMIN_TOKEN
+                  - text: ","
+                  - code [ref=f12e400]: FLUIDBOX_CREDENTIAL_KEY
+                  - text: ","
+                  - code [ref=f12e401]: LITELLM_MASTER_KEY
+                  - text: ), dashboard env (
+                  - code [ref=f12e402]: apps/web/.env.local
+                  - text: ) kept in sync,
+                  - code [ref=f12e403]: pnpm install
+                  - text: ", and the sandbox runner image build. Only fills placeholders — never overwrites values you set."
+                - listitem [ref=f12e404]:
+                  - text: "**"
+                  - code [ref=f12e405]: just doctor
+                  - text: "** — environment preflight (#13): validates every documented gotcha (pooled vs direct"
+                  - code [ref=f12e406]: DATABASE_URL
+                  - text: ", loopback"
+                  - code [ref=f12e407]: FLUIDBOX_BIND
+                  - text: ", credential key shape, missing runner images, dashboard token drift, missing web deps) and prints the exact fix per failure; exits non-zero only on hard failures, never echoes secret values."
+              - heading [level=4] [ref=f12e408]:
+                - link "Changed" [ref=f12e409] [cursor=pointer]:
+                  - /url: "#changed"
+              - list [ref=f12e410]:
+                - listitem [ref=f12e411]:
+                  - code [ref=f12e412]: just neon-setup
+                  - text: now writes the DIRECT connection string into
+                  - code [ref=f12e413]: .env
+                  - text: when
+                  - code [ref=f12e414]: DATABASE_URL
+                  - text: is still the placeholder (an existing value is never clobbered).
+                - listitem [ref=f12e415]:
+                  - text: README quickstart, CONTRIBUTING dev setup, and the dashboard README (
+                  - code [ref=f12e416]: apps/web/README.md
+                  - text: ) rewritten around the
+                  - code [ref=f12e417]: just setup
+                  - text: →
+                  - code [ref=f12e418]: just neon-setup
+                  - text: →
+                  - code [ref=f12e419]: just dev
+                  - text: flow.
+          - article [ref=f12e420]:
+            - generic [ref=f12e421]:
+              - generic [ref=f12e422]: v0.1.0
+              - generic [ref=f12e423]: 2026-07-12
+            - generic [ref=f12e425]:
+              - paragraph [ref=f12e426]: "The first tagged release: the complete governed vertical slice, verified by a 10-phase live-inclusive acceptance suite (468 checks)."
+              - heading [level=4] [ref=f12e427]:
+                - link "Highlights" [ref=f12e428] [cursor=pointer]:
+                  - /url: "#highlights"
+              - list [ref=f12e429]:
+                - listitem [ref=f12e430]:
+                  - strong [ref=f12e431]: Governed agent runs end to end
+                  - text: — frozen RunSpecs, fresh sandboxes, live timelines, policy-gated tool calls with human approvals, and a diff + cost report per run.
+                - listitem [ref=f12e432]:
+                  - strong [ref=f12e433]: Two harnesses behind one contract
+                  - text: — Claude Agent SDK and Codex, with an in-server LLM facade that meters usage and keeps provider keys out of every sandbox.
+                - listitem [ref=f12e434]:
+                  - strong [ref=f12e435]: Borrow the agent, on demand
+                  - text: — API triggers, signed webhooks, cron schedules, and GitHub PR fan-out, all converging on one governed run path.
+              - heading [level=4] [ref=f12e436]:
+                - link "Added" [ref=f12e437] [cursor=pointer]:
+                  - /url: "#added"
+              - list [ref=f12e438]:
+                - listitem [ref=f12e439]:
+                  - strong [ref=f12e440]: Governed runs end to end
+                  - text: — versioned agent definitions, immutable per-run
+                  - code [ref=f12e441]: RunSpec
+                  - text: snapshots (model, prompts, policy, capability pins), fresh Docker sandboxes per run, live SSE event timelines with
+                  - code [ref=f12e442]: Last-Event-ID
+                  - text: resume, and a final diff + cost report.
+                - listitem [ref=f12e443]:
+                  - strong [ref=f12e444]: Policy engine & human approvals
+                  - text: — YAML policies evaluated on every tool call (allow / deny / require-approval), idempotent restart-safe approvals with expiry, and an autonomous mode that rewrites approval verdicts to a policy fallback while recording both verdicts.
+                - listitem [ref=f12e445]:
+                  - strong [ref=f12e446]: Append-only audit ledger
+                  - text: — redaction enforced at the type level; prompts never reach the database, only digests, usage, cost, and decisions, with gapless per-session sequencing.
+                - listitem [ref=f12e447]:
+                  - strong [ref=f12e448]: Two agent harnesses
+                  - text: — Claude Agent SDK and Codex runner images behind one HTTP runner contract; the LLM facade speaks both the Anthropic Messages and OpenAI Responses dialects.
+                - listitem [ref=f12e449]:
+                  - strong [ref=f12e450]: Credential inversion
+                  - text: — the sandbox's
+                  - code [ref=f12e451]: ANTHROPIC_API_KEY
+                  - text: is a session token; an in-server LLM facade validates it, enforces budget stops, meters streamed usage, and swaps in the real upstream credential held only by the LiteLLM gateway.
+                - listitem [ref=f12e452]:
+                  - strong [ref=f12e453]: Git workspaces
+                  - text: — credentialed fetch/copy happens control-plane-side before the agent starts; sandboxes only ever see a bind-mounted copy and stay egress-free.
+                - listitem [ref=f12e454]:
+                  - strong [ref=f12e455]: Triggers
+                  - text: — subscription-scoped API tokens, signed webhook ingress with two-level dedup that heals partial fan-outs, cron schedules with exactly-once firing and explicit missed-run/concurrency policies, and HMAC-signed result delivery with retry/backoff.
+                - listitem [ref=f12e456]:
+                  - strong [ref=f12e457]: GitHub integration
+                  - text: — seamless GitHub App connect (manifest + install flows), PR fan-out with one stable comment per PR and one check per head SHA, and fork PRs frozen to
+                  - code [ref=f12e458]: ReadOnly
+                  - text: trust with no approval escape.
+                - listitem [ref=f12e459]:
+                  - strong [ref=f12e460]: Capability catalog
+                  - text: — append-only versioned MCP tool bundles pinned at run creation; sandbox tools run as contained stdio subprocesses while brokered tools execute on the control plane with sealed credentials the sandbox never sees.
+                - listitem [ref=f12e461]:
+                  - strong [ref=f12e462]: Connector catalog + OAuth
+                  - text: — catalog-driven connect flows with PKCE (S256), RFC 8707 resource indicators, DCR/CIMD client identity, sealed refresh tokens with atomic rotation, and fail-closed error states.
+                - listitem [ref=f12e463]:
+                  - strong [ref=f12e464]: Dashboard
+                  - text: — Next.js UI (Runs, Agents, Integrations, Automations, Settings); presentation-only, all logic in the Rust API.
+                - listitem [ref=f12e465]:
+                  - strong [ref=f12e466]: CLI
+                  - text: —
+                  - code [ref=f12e467]: fluidbox run --repo … --task …
+                  - text: to drive runs from the terminal.
+                - listitem [ref=f12e468]:
+                  - strong [ref=f12e469]: Ops
+                  - text: —
+                  - code [ref=f12e470]: just
+                  - text: recipes for the full dev loop, an end-to-end acceptance suite (
+                  - code [ref=f12e471]: just e2e
+                  - text: ), Neon setup and DB-cleanup scripts, and CI (fmt, clippy
+                  - code [ref=f12e472]: "-D warnings"
+                  - text: ", tests, dashboard build)."
+              - heading [level=4] [ref=f12e473]:
+                - link "Changed" [ref=f12e474] [cursor=pointer]:
+                  - /url: "#changed"
+              - list [ref=f12e475]:
+                - listitem [ref=f12e476]:
+                  - text: "Dependency refresh:"
+                  - code [ref=f12e477]: sha2
+                  - text: 0.11,
+                  - code [ref=f12e478]: hmac
+                  - text: 0.13,
+                  - code [ref=f12e479]: chacha20poly1305
+                  - text: 0.11,
+                  - code [ref=f12e480]: jsonwebtoken
+                  - text: 10 (pinned to the pure-Rust
+                  - code [ref=f12e481]: rust_crypto
+                  - text: provider), React 19.2.7, TypeScript 6, and current GitHub Actions. The sealed-credential wire format (
+                  - code [ref=f12e482]: nonce ‖ ciphertext
+                  - text: ) is unchanged — existing sealed credentials open fine.
+    - contentinfo [ref=f12e483]:
+      - generic [ref=f12e484]:
+        - generic [ref=f12e485]:
+          - generic [ref=f12e486]:
+            - text: fluidbox
+            - paragraph [ref=f12e487]: The open-source control plane for governed AI agents. Run agents without giving them God mode.
+          - navigation "Product" [ref=f12e488]:
+            - list [ref=f12e490]:
+              - listitem [ref=f12e491]:
+                - link "Overview" [ref=f12e492] [cursor=pointer]:
+                  - /url: /product
+              - listitem [ref=f12e493]:
+                - link "Pricing" [ref=f12e494] [cursor=pointer]:
+                  - /url: /pricing
+              - listitem [ref=f12e495]:
+                - link "Changelog" [ref=f12e496] [cursor=pointer]:
+                  - /url: /changelog
+              - listitem [ref=f12e497]:
+                - link "Dashboard" [ref=f12e498] [cursor=pointer]:
+                  - /url: /app
+          - navigation "Documentation" [ref=f12e499]:
+            - list [ref=f12e501]:
+              - listitem [ref=f12e502]:
+                - link "Getting started" [ref=f12e503] [cursor=pointer]:
+                  - /url: /docs/getting-started
+              - listitem [ref=f12e504]:
+                - link "Concepts" [ref=f12e505] [cursor=pointer]:
+                  - /url: /docs/concepts
+              - listitem [ref=f12e506]:
+                - link "API" [ref=f12e507] [cursor=pointer]:
+                  - /url: /docs/api
+              - listitem [ref=f12e508]:
+                - link "Kubernetes" [ref=f12e509] [cursor=pointer]:
+                  - /url: /docs/kubernetes
+          - navigation "Project" [ref=f12e510]:
+            - list [ref=f12e512]:
+              - listitem [ref=f12e513]:
+                - link "GitHub ↗" [ref=f12e514] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox
+              - listitem [ref=f12e515]:
+                - link "Roadmap ↗" [ref=f12e516] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/ROADMAP.md
+              - listitem [ref=f12e517]:
+                - link "Contributing ↗" [ref=f12e518] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/CONTRIBUTING.md
+              - listitem [ref=f12e519]:
+                - link "Good first issues ↗" [ref=f12e520] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22
+          - navigation "Trust" [ref=f12e521]:
+            - list [ref=f12e523]:
+              - listitem [ref=f12e524]:
+                - link "Security" [ref=f12e525] [cursor=pointer]:
+                  - /url: /security
+              - listitem [ref=f12e526]:
+                - link "Disclosure policy ↗" [ref=f12e527] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/SECURITY.md
+              - listitem [ref=f12e528]:
+                - link "MIT license ↗" [ref=f12e529] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/LICENSE
+              - listitem [ref=f12e530]:
+                - link "Code of conduct ↗" [ref=f12e531] [cursor=pointer]:
+                  - /url: https://github.com/hrishikeshdkakkad/fluidbox/blob/main/CODE_OF_CONDUCT.md
+        - generic [ref=f12e532]:
+          - generic [ref=f12e533]: fluidbox — MIT licensed, built in the open.
+          - link "github.com/hrishikeshdkakkad/fluidbox" [ref=f12e534] [cursor=pointer]:
+            - /url: https://github.com/hrishikeshdkakkad/fluidbox
+  - alert [ref=f12e535]
