@@ -18,6 +18,8 @@ import {
 } from "../lib/api";
 import { AddServerWizard } from "../capabilities/AddServerWizard";
 import { defaultModelFor, modelsFor, useHarnesses } from "../lib/harnesses";
+import { CopyBlock, TemplateChips } from "./AutomationContract";
+import { buildCurl, classifyVariables } from "../lib/automation-contract";
 import { useAuthMe } from "../lib/useAuthMe";
 import { AppPicker } from "./AppPicker";
 import { HarnessPicker } from "./HarnessPicker";
@@ -614,6 +616,9 @@ export function RunComposer({
       if (mode === "automation" && !task.trim() && !allowTask) {
         return "Describe the task, or allow the caller to provide one (under advanced controls).";
       }
+      if (mode === "automation" && (kind === "schedule" || kind === "event") && !task.trim()) {
+        return "This trigger fires without a caller — write the task template it should run.";
+      }
     }
     if (agentsLoading || revisionLoading) return "Loading the agent configuration…";
     if (agentChoice === "existing" && !selectedAgentName) return "Choose an agent or create one here.";
@@ -757,10 +762,10 @@ export function RunComposer({
 
   const templateHint =
     kind === "schedule"
-      ? "You can use {{fire_time}} in these instructions."
+      ? "Saved with the automation. {{fire_time}} is filled in at each firing; any other {{name}} is refused at save (a schedule has no caller to supply it)."
       : kind === "event"
-        ? "Pull request values such as {{repository}}, {{pr_number}}, and {{pr_title}} are available."
-        : "API callers can supply values for placeholders such as {{ticket}}.";
+        ? "Saved with the automation. Pull-request values ({{repository}}, {{pr_number}}, {{pr_title}}, {{pr_url}}, {{pr_author}}, …) are filled from the event; any other {{name}} is refused at save."
+        : "Saved with the automation. Every {{name}} you add becomes a required context value the API caller sends on invoke.";
 
   const agentDisplayName = agentChoice === "new" ? newAgentName.trim() || "New agent" : selectedAgentName;
   const finalAction = agentOnly ? "Create Agent" : mode === "once" ? "Start Run" : "Save Automation";
@@ -953,15 +958,32 @@ export function RunComposer({
 
             <label className="field">
               <span className="lab">
-                {mode === "once" ? "What should the agent accomplish?" : "What should happen each time?"}
-                {mode === "automation" && <span className="optional-label"> optional template</span>}
+                {mode === "once"
+                  ? "What should the agent accomplish?"
+                  : kind === "api"
+                    ? "Task template — rendered for every API invocation"
+                    : kind === "schedule"
+                      ? "Task template — rendered at every scheduled firing"
+                      : "Task template — rendered for every matching PR event"}
+                {mode === "automation" && kind === "api" && allowTask && (
+                  <span className="optional-label"> optional — callers may send their own task</span>
+                )}
               </span>
               <textarea
                 className="inp run-task-input"
                 value={task}
                 onChange={(event) => setTask(event.target.value)}
-                placeholder={mode === "once" ? "Review the latest changes, identify regressions, and prepare a safe patch…" : "Investigate {{ticket}} and report the root cause…"}
+                placeholder={
+                  mode === "once"
+                    ? "Review the latest changes, identify regressions, and prepare a safe patch…"
+                    : kind === "schedule"
+                      ? "Sweep the queue as of {{fire_time}} and file a summary…"
+                      : kind === "event"
+                        ? "Review {{repository}} PR #{{pr_number}}: {{pr_title}}…"
+                        : "Investigate {{ticket}} and report the root cause…"
+                }
               />
+              {mode === "automation" && <TemplateChips kind={kind} template={task} />}
               {mode === "automation" && <span className="field-hint">{templateHint}</span>}
             </label>
           </ComposerSection>
@@ -1618,6 +1640,10 @@ export function RunComposer({
               />
             )}
 
+            {!agentOnly && mode === "automation" && kind === "api" && !blockingIssue && (
+              <ApiPreview task={task} allowTask={allowTask} />
+            )}
+
             {agentChoice === "existing" && revisionTouched && (
               <p className="rc-note">
                 One new revision will be appended to {selectedAgentName}. Active runs keep the
@@ -1698,34 +1724,36 @@ function SpecRow({
   );
 }
 
-/* ─── Automation integration contract ─────────────────────────────────────
-   What a caller needs to actually integrate, in one copyable place: the real
-   endpoint (absolute, from the control plane — never a `<placeholder>` host),
-   the secrets that exist only in this response, the variables this automation
-   declares, and the responses to expect. */
-
-/** Placeholders the platform fills in itself, per trigger kind. Anything else
- *  in the template is the caller's to supply in `context`. */
-const SYSTEM_VARIABLES: Record<string, string[]> = {
-  schedule: ["fire_time"],
-  event: ["repository", "pr_number", "pr_title"],
-  api: [],
-};
-
-function templateVariables(template: string | null): string[] {
-  if (!template) return [];
-  const found = new Set<string>();
-  for (const match of template.matchAll(/\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g)) {
-    found.add(match[1]);
-  }
-  return [...found];
-}
-
-function CopyBlock({ label, value, hint }: { label: string; value: string; hint?: string }) {
+/** Pre-save preview of the integration contract. Deliberately labeled a
+ *  preview: the id and token exist only after save, so those two are
+ *  placeholders — but the base URL is the server's real answer. */
+function ApiPreview({ task, allowTask }: { task: string; allowTask: boolean }) {
   const [copied, setCopied] = useState(false);
+  const [baseUrl, setBaseUrl] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    apiGetCached<{ base_url?: string }>("/triggers", { maxAgeMs: 60_000 })
+      .then((response) => {
+        if (!cancelled && response.base_url) setBaseUrl(response.base_url);
+      })
+      .catch(() => {
+        /* preview keeps the {base_url} placeholder */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const { caller } = classifyVariables("api", task || null);
+  const hasTemplate = task.trim().length > 0;
+  const curl = buildCurl({
+    invokeUrl: `${baseUrl ?? "{base_url}"}/v1/triggers/{id-assigned-on-save}/invoke`,
+    token: "<minted-on-save>",
+    caller,
+    hasTemplate: hasTemplate || !allowTask,
+  });
   const copy = async () => {
     try {
-      await navigator.clipboard.writeText(value);
+      await navigator.clipboard.writeText(curl);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1600);
     } catch {
@@ -1733,18 +1761,28 @@ function CopyBlock({ label, value, hint }: { label: string; value: string; hint?
     }
   };
   return (
-    <div className="field">
+    <div className="rc-api-preview">
       <div className="contract-head">
-        <span className="lab">{label}</span>
+        <span className="rc-row-label">API preview</span>
         <button type="button" className="btn ghost sm" onClick={copy}>
-          {copied ? "Copied" : "Copy"}
+          {copied ? "Copied" : "Copy preview"}
         </button>
       </div>
-      <pre className="token">{value}</pre>
-      {hint && <span className="field-hint">{hint}</span>}
+      <pre className="token rc-api-preview-curl">{curl}</pre>
+      <span className="field-hint">
+        The id and one-time token are minted when you save; the full contract then lives on
+        the automation&apos;s page.
+      </span>
     </div>
   );
 }
+
+/* ─── One-time secrets modal ───────────────────────────────────────────────
+   Shown once after minting or rotating an automation's credentials. The token
+   and signing secret are stored hashed/sealed and can never be re-displayed,
+   so this panel exists solely to hand them over. Everything else about the
+   automation (endpoint, request shape, variables, responses) lives on the
+   durable /automations/{id} page via <AutomationContract>. */
 
 export function ShowAutomationSecrets({
   minted,
@@ -1754,48 +1792,11 @@ export function ShowAutomationSecrets({
   onClose: () => void;
 }) {
   const sub = minted.subscription;
-  const kind = sub.trigger_kind;
-  // Fall back to a relative path only if an older control plane omitted the
-  // absolute URLs; the placeholder is then honest about being one.
-  const invokeUrl = minted.invoke_url || `<control-plane>/v1/triggers/${sub.id}/invoke`;
-  const pollUrl = minted.poll_url_template || `<control-plane>/v1/triggers/${sub.id}/runs/{session_id}`;
-
-  const system = SYSTEM_VARIABLES[kind] ?? [];
-  const declared = templateVariables(sub.task_template);
-  const callerVars = declared.filter((name) => !system.includes(name));
-  const systemVars = declared.filter((name) => system.includes(name));
-
-  const contextExample =
-    callerVars.length > 0
-      ? `{"context": {${callerVars.map((name) => `"${name}": "…"`).join(", ")}}}`
-      : `{}`;
-
-  const curl = [
-    `curl -X POST '${invokeUrl}' \\`,
-    `  -H 'Authorization: Bearer ${minted.token}' \\`,
-    `  -H 'Content-Type: application/json' \\`,
-    `  -H 'Idempotency-Key: <your-unique-key>' \\`,
-    `  -d '${contextExample}'`,
-  ].join("\n");
-
-  const responseExample = [
-    "200 OK",
-    JSON.stringify(
-      {
-        session_id: "019f…",
-        status: "queued",
-        replay: false,
-        poll_url: `/v1/triggers/${sub.id}/runs/{session_id}`,
-      },
-      null,
-      2
-    ),
-  ].join("\n");
 
   return (
     <ModalShell
       title={minted.rotated ? "Token rotated" : `“${sub.name}” is live`}
-      sub="The token and signing secret exist only in this response — they are stored hashed and sealed and can never be shown again."
+      sub="The token and signing secret exist only in this response — they are stored hashed and sealed and can never be shown again. Everything else stays available on the automation's page."
       onClose={onClose}
       maxWidth="min(760px, 96vw)"
       dirty
@@ -1820,100 +1821,16 @@ export function ShowAutomationSecrets({
         </section>
 
         <section className="contract-section">
-          <h4>Endpoint</h4>
-          <CopyBlock label="Invoke" value={`POST ${invokeUrl}`} />
-          <CopyBlock
-            label="Poll a run"
-            value={`GET ${pollUrl}`}
-            hint="Substitute the session_id returned by invoke."
-          />
-          {minted.ingress_url && (
-            <CopyBlock
-              label="Webhook ingress"
-              value={minted.ingress_url}
-              hint="Deliveries are authenticated by their signature, so this URL needs no token."
-            />
-          )}
-        </section>
-
-        <section className="contract-section">
-          <h4>Variables</h4>
-          {declared.length === 0 ? (
-            <p className="contract-note">
-              This automation&apos;s task has no placeholders, so callers send an empty body.
-              Add <code>{"{{name}}"}</code> to the task template to accept values.
-            </p>
-          ) : (
-            <div className="rows">
-              {callerVars.map((name) => (
-                <div key={name} className="row contract-var">
-                  <span className="mono">{`{{${name}}}`}</span>
-                  <span className="faint">
-                    you supply it in <code>context</code>
-                  </span>
-                </div>
-              ))}
-              {systemVars.map((name) => (
-                <div key={name} className="row contract-var">
-                  <span className="mono">{`{{${name}}}`}</span>
-                  <span className="faint">filled in by fluidbox</span>
-                </div>
-              ))}
-            </div>
-          )}
+          <h4>Where everything else lives</h4>
           <p className="contract-note">
-            <strong>{sub.allow_task_override ? "Task override allowed" : "Task override refused"}</strong> ·{" "}
-            <strong>{sub.allow_workspace_override ? "workspace override allowed" : "workspace override refused"}</strong>.
-            Sending a refused field returns 400. Context values must be flat strings.
+            The endpoint, request shape, variables, and response contract are always
+            available at{" "}
+            <Link className="link" href={`/automations/${sub.id}`} onClick={onClose}>
+              Automations → {sub.name} → API
+            </Link>
+            {" "}— only the secrets above are shown once. Lost token? Rotate it there.
           </p>
         </section>
-
-        <section className="contract-section">
-          <h4>Request</h4>
-          <CopyBlock
-            label="Example"
-            value={curl}
-            hint="Idempotency-Key is optional but strongly recommended: replaying the same key returns the original run instead of starting a second one."
-          />
-        </section>
-
-        <section className="contract-section">
-          <h4>Responses</h4>
-          <pre className="token">{responseExample}</pre>
-          <div className="rows">
-            <div className="row contract-var">
-              <span className="mono">409</span>
-              <span className="faint">
-                a run is already active and this automation is set to{" "}
-                <code>{sub.concurrency_policy}</code>, or the key was reused with a different body
-              </span>
-            </div>
-            <div className="row contract-var">
-              <span className="mono">400</span>
-              <span className="faint">an override this subscription does not allow</span>
-            </div>
-            <div className="row contract-var">
-              <span className="mono">401</span>
-              <span className="faint">wrong token, or the token was revoked</span>
-            </div>
-          </div>
-        </section>
-
-        {minted.callback_secret && (
-          <section className="contract-section">
-            <h4>Result delivery</h4>
-            <p className="contract-note">
-              When the run finishes, fluidbox POSTs the result to your callback URL and retries
-              with backoff over roughly an hour. Delivery is at-least-once — deduplicate on{" "}
-              <code>x-fluidbox-delivery</code>.
-            </p>
-            <CopyBlock
-              label="Signature"
-              value={'x-fluidbox-signature: v1=hmac-sha256(secret, "{timestamp}.{body}")'}
-              hint="Also sent: x-fluidbox-delivery (unique id) and x-fluidbox-timestamp. Verify before trusting the payload."
-            />
-          </section>
-        )}
       </div>
 
       <div className="modal-footer secret-footer">

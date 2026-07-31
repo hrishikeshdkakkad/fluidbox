@@ -212,7 +212,9 @@ function AutomationRow({
         <KindIcon kind={subscription.trigger_kind} />
         <div className="automation-copy">
           <div className="automation-title-line">
-            <strong>{subscription.name}</strong>
+            <Link className="link" href={`/automations/${subscription.id}`}>
+              <strong>{subscription.name}</strong>
+            </Link>
             <span className={`badge ${subscription.enabled ? "ok" : ""}`}>
               {subscription.enabled ? "enabled" : "disabled"}
             </span>
@@ -233,6 +235,9 @@ function AutomationRow({
           <button className="btn ghost sm" type="button" onClick={() => setOpen((current) => !current)}>
             {open ? "Hide activity" : "Activity"}
           </button>
+          <Link className="btn ghost sm" href={`/automations/${subscription.id}`}>
+            Open →
+          </Link>
           <button className="btn ghost sm" type="button" onClick={() => onRotate(subscription)}>
             Rotate token
           </button>
@@ -250,7 +255,7 @@ function AutomationRow({
   );
 }
 
-function AutomationActivity({ id }: { id: string }) {
+export function AutomationActivity({ id }: { id: string }) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [deliveries, setDeliveries] = useState<ResultDelivery[]>([]);
   const [invocations, setInvocations] = useState<TriggerInvocation[]>([]);

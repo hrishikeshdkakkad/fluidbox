@@ -1401,6 +1401,11 @@ h1.title {
   color: var(--ink-3);
   font-size: 11.5px;
 }
+.automation-detail { max-width: 880px; margin: 0 auto; padding: 24px 16px 64px; }
+.automation-detail-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 8px; }
+.automation-detail-head h1 { font-size: 20px; margin: 0; }
+.automation-detail-section { margin-top: 28px; }
+.automation-detail-section > h2 { font-size: 15px; margin: 0 0 10px; }
 .activity-line {
   min-height: 28px;
   display: flex;
@@ -4384,6 +4389,8 @@ select.inp {
   letter-spacing: 0.07em;
   color: var(--ink-3);
 }
+.rc-api-preview { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+.rc-api-preview-curl { font-size: 11px; max-height: 140px; overflow: auto; }
 .rc-row-value {
   font-size: 13px;
   color: var(--ink);
@@ -4608,6 +4615,35 @@ select.inp {
 .contract-var .faint {
   font-size: 11.5px;
   line-height: 1.45;
+}
+.contract-var .mono.invalid,
+.contract-var .faint.invalid {
+  color: var(--red);
+}
+.contract-stamp {
+  font-size: 12px;
+  color: var(--ink-3);
+  margin: 4px 0 0;
+}
+.tpl-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+.tpl-chip {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+}
+.tpl-chip.system {
+  opacity: 0.7;
+}
+.tpl-chip.invalid {
+  border-color: var(--red);
+  color: var(--red);
 }
 
 /* A pinned bundle that Phase C refuses at run creation. Kept visible so a
