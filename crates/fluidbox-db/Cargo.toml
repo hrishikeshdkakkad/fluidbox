@@ -1,6 +1,6 @@
 [package]
 name = "fluidbox-db"
-version.workspace = true
+version = "0.4.0-rc.1"
 edition.workspace = true
 license.workspace = true
 
