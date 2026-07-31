@@ -9,6 +9,12 @@ import LoginForm from "./login-form";
 // stale redirect for a deployment configured in the other.
 export const dynamic = "force-dynamic";
 
+// A pre-auth surface: never indexed (robots.txt disallows it too).
+export const metadata = {
+  title: "Sign in",
+  robots: { index: false, follow: false },
+};
+
 const API = process.env.FLUIDBOX_API_URL || "http://127.0.0.1:8787";
 
 /** Is the browser's session cookie a LIVE session? Asked of the control plane
