@@ -165,3 +165,34 @@ just demo                              # a full governed run, no API key
 
 Then confirm on your own deployment that a supervised run does **not** pause on
 ordinary agent tooling — which is the symptom of having skipped §1.
+
+---
+
+## A note on the version number (2026-07-31)
+
+The first release cut after this candidate is **`0.4.0`**, not `0.4.0-rc.1` and
+not `0.5.0-rc.1`. Both of those appeared along the way and neither was right:
+
+`0.4.0-rc.1` was written into `.release-please-manifest.json` by the RC
+preparation, but **no `v0.4.0-rc.1` tag or GitHub Release was ever created**.
+The manifest is release-please's record of the *last released* version, so it
+claimed a release that did not exist.
+
+Working from that phantom, release-please then computed **`0.5.0-rc.1`** — a
+minor bump that carried the `-rc.1` suffix forward and skipped the candidate
+entirely. Publishing it would also have been actively misleading: this project
+sets `prerelease: false`, and release-please marks a GitHub Release as a
+prerelease only when
+
+```js
+config.prerelease && (!!version.preRelease || version.major === 0)
+```
+
+so with `prerelease: false` the flag is *always* false — a version string
+ending in `-rc.1` would have been published as an ordinary release and labelled
+**"Latest"** on the releases page.
+
+A `Release-As: 0.4.0` footer pins the next release to the version the work
+actually represents, which also clears the phantom from the manifest on the way
+through. `0.4.0` carries no prerelease component, so it is published as the
+ordinary release it is.
