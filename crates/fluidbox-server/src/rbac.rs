@@ -214,6 +214,15 @@ pub fn can_mutate_resources(principal: &Principal) -> bool {
     principal.is_operator() || any_role(principal, &["admin", "owner"])
 }
 
+/// May deploy recipes and manage recipe instances (`recipes.deploy`) —
+/// admin/owner. A deploy stamps agents + policies + trigger subscriptions in
+/// one transaction, so it requires the UNION of `resources.mutate` and
+/// `subscriptions.manage`; both resolve to the same role set today, and one
+/// named verb keeps that conjunction explicit rather than accidental.
+pub fn can_deploy_recipes(principal: &Principal) -> bool {
+    principal.is_operator() || any_role(principal, &["admin", "owner"])
+}
+
 /// May this principal create a PERSONAL (user-owned) connection? Any User
 /// principal qualifies: the extractor liveness-gates every request, so the
 /// principal's existence already proves an active membership — no elevated role

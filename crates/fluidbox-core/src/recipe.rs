@@ -732,6 +732,41 @@ fn interpolate(s: &str, ctx: &RenderCtx<'_>) -> Result<String, String> {
     Ok(out)
 }
 
+/// Every parameter name a definition references (`$param:name`,
+/// `$param:name.field`, `{{recipe.name}}`), for authoring-time typo defense:
+/// a reference to an undeclared parameter is dead config and refused at
+/// recipe create/append, never discovered at deploy.
+pub fn referenced_params(def: &Value) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut stack = vec![def];
+    while let Some(node) = stack.pop() {
+        match node {
+            Value::String(s) => {
+                if let Some(rest) = s.strip_prefix("$param:") {
+                    let name = rest.split('.').next().unwrap_or(rest);
+                    if !name.is_empty() {
+                        out.insert(name.to_string());
+                    }
+                } else {
+                    let mut rest = s.as_str();
+                    while let Some(i) = rest.find("{{") {
+                        let after = &rest[i + 2..];
+                        let Some(j) = after.find("}}") else { break };
+                        if let Some(p) = after[..j].trim().strip_prefix("recipe.") {
+                            out.insert(p.to_string());
+                        }
+                        rest = &after[j + 2..];
+                    }
+                }
+            }
+            Value::Array(a) => stack.extend(a.iter()),
+            Value::Object(m) => stack.extend(m.values()),
+            _ => {}
+        }
+    }
+    out
+}
+
 // ─── Rendered (post-render, strictly typed) shapes ────────────────────────
 
 #[derive(Debug, Clone, Serialize)]

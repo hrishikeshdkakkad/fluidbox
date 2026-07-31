@@ -873,7 +873,7 @@ pub enum AppendPolicyVersion {
 /// refuses (writes NOTHING) unless the current head equals it — two editors
 /// publishing from the same loaded version cannot silently overwrite each
 /// other's intent. `RowNotFound` when the policy is not this tenant's.
-async fn append_policy_version_tx(
+pub async fn append_policy_version_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant_id: Uuid,
     policy_id: Uuid,
