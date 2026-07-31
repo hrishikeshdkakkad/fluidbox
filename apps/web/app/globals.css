@@ -6558,3 +6558,20 @@ html[data-theme="light"] .docs-body .shiki span {
     gap: 6px;
   }
 }
+
+/* Product screenshot frame (homepage visibility section) — a real capture in
+   a quiet card; the screenshot's own light chrome reads as content, not
+   theme leakage. */
+.shot-frame {
+  margin-top: 30px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background: var(--surface);
+  box-shadow: var(--modal-shadow, 0 24px 70px rgba(0, 0, 0, 0.35));
+}
+.shot-frame img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
