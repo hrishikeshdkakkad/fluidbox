@@ -322,11 +322,11 @@ $fbx${
     },
     "events": {
       "type": "array",
-      "items": { "enum": ["opened", "reopened", "synchronize"] },
+      "items": { "enum": ["pull_request.opened", "pull_request.reopened", "pull_request.synchronize"] },
       "minItems": 1,
-      "default": ["opened", "reopened"],
+      "default": ["pull_request.opened", "pull_request.reopened"],
       "title": "Pull request events",
-      "description": "synchronize fires on every push to an open PR — opt in deliberately.",
+      "description": "pull_request.synchronize fires on every push to an open PR — opt in deliberately.",
       "x-fluidbox": { "widget": "events" }
     },
     "model": {
