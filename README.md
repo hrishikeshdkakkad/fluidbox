@@ -21,22 +21,29 @@ https://github.com/user-attachments/assets/579df2f1-9c55-4946-988b-952d15feb35d
 
 ## What is fluidbox?
 
-fluidbox sits between an external event and an AI agent. Register a versioned agent once, then borrow it from a pull request, a cron schedule, a scoped API call, a webhook, or a manual run — every invocation becomes the same governed run: configuration frozen at start, workspace isolated in a fresh sandbox, every action gated by policy, and the outcome recorded and delivered.
+fluidbox sits between an external event and an AI agent. Register a versioned agent once, then borrow it from a pull request, a cron schedule, a scoped API call, a webhook, or a manual run — every invocation becomes the same governed run: configuration frozen at start, workspace isolated in a fresh sandbox, tool actions routed through the server-side policy gate, and the outcome recorded and delivered.
 
 The control plane is written in Rust. It runs the Claude Agent SDK and Codex behind one runner contract, executes on Docker or Kubernetes, and keeps every upstream credential — model keys, git credentials, MCP secrets — out of the sandbox.
 
 ## Get started quickly
 
-The fastest path is Docker Compose — no Rust toolchain, Node, or external Postgres required:
+Watch a full governed run in five minutes, no API key required — a deterministic replay driving the real control plane, policy gate, and sandbox:
 
 ```bash
 git clone https://github.com/hrishikeshdkakkad/fluidbox.git
 cd fluidbox
+just demo        # prerequisites: Rust, Docker, just — fully isolated, `just demo-down` removes every trace
+```
+
+To run live agents without a Rust toolchain, use Docker Compose:
+
+```bash
 docker compose -f deploy/docker-compose.eval.yml --profile runners pull
+export FLUIDBOX_ADMIN_TOKEN=$(openssl rand -hex 32)   # required; there is no default
 ANTHROPIC_API_KEY=sk-ant-... docker compose -f deploy/docker-compose.eval.yml up -d
 ```
 
-Open <http://localhost:3000> and start a run. The eval stack is for trying the run loop locally, not for exposing to a network.
+Open <http://localhost:3000> (the dashboard lives at `/app`) and start a run. The eval stack publishes the API port on all interfaces and mounts the Docker socket — the admin token is the control, so run it on a network you trust, not exposed to the internet.
 
 - To develop from source, see [Contributing](./CONTRIBUTING.md) — `just setup`, `just dev`, and `just doctor` cover the whole loop.
 - To deploy on a cluster, see the [Kubernetes deployment guide](./docs/guides/kubernetes.md) — the Helm chart is published as an OCI artifact.

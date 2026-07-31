@@ -35,6 +35,16 @@ pub struct K8sConfig {
     /// `imagePullSecrets` names for private runner/collector/probe images in
     /// the sandbox namespace (the Secret must exist there).
     pub image_pull_secrets: Vec<String>,
+    /// The image the `netpol-gate` init container runs (needs sh + nc; the
+    /// same image the boot-time certification probe uses —
+    /// `FLUIDBOX_NETPOL_PROBE_IMAGE`, one knob for both).
+    pub netpol_probe_image: String,
+    /// Mirror of the server's `FLUIDBOX_REQUIRE_ENFORCED_NETPOL` (same env
+    /// var, same falsey parse, read in-process from the same environment).
+    /// Defense in depth: when enforcement is required, `provision` REFUSES a
+    /// spec that carries no `NetworkAdmission` — a server-side wiring bug can
+    /// then never silently skip the startup-isolation gate.
+    pub require_enforced_netpol: bool,
 }
 
 /// `deny_unknown_fields`: a misspelled field (e.g. `tolerationSecond`)
@@ -89,8 +99,19 @@ impl K8sConfig {
             tolerations: parse_tolerations(get("FLUIDBOX_K8S_TOLERATIONS")),
             priority_class_name: get("FLUIDBOX_K8S_PRIORITY_CLASS"),
             image_pull_secrets: parse_list(get("FLUIDBOX_K8S_IMAGE_PULL_SECRETS")),
+            netpol_probe_image: get("FLUIDBOX_NETPOL_PROBE_IMAGE")
+                .unwrap_or_else(|| "busybox:1.36".into()),
+            require_enforced_netpol: parse_enforced_flag(get("FLUIDBOX_REQUIRE_ENFORCED_NETPOL")),
         }
     }
+}
+
+/// The server's exact falsey parse for `FLUIDBOX_REQUIRE_ENFORCED_NETPOL`
+/// (`fluidbox-server::config`): anything but `false`/`0` is true, unset is
+/// true. The two readers see the same process environment, so agreeing on the
+/// parse is what keeps them the same knob.
+fn parse_enforced_flag(v: Option<String>) -> bool {
+    v.map(|v| v != "false" && v != "0").unwrap_or(true)
 }
 
 /// Parse `k1=v1,k2=v2` into pairs (node selector labels).
@@ -203,5 +224,18 @@ mod tests {
         assert_eq!(parse_list(Some("a, b ,c".into())), vec!["a", "b", "c"]);
         assert!(parse_list(Some(" , ".into())).is_empty());
         assert!(parse_list(None).is_empty());
+    }
+
+    /// Must match the server's parse of the SAME env var exactly — unset and
+    /// unrecognized values default to ENFORCING (fail closed), only the two
+    /// documented falsey spellings opt out.
+    #[test]
+    fn enforced_flag_parses_like_the_server() {
+        assert!(parse_enforced_flag(None));
+        assert!(parse_enforced_flag(Some("true".into())));
+        assert!(parse_enforced_flag(Some("1".into())));
+        assert!(parse_enforced_flag(Some("yes".into())));
+        assert!(!parse_enforced_flag(Some("false".into())));
+        assert!(!parse_enforced_flag(Some("0".into())));
     }
 }

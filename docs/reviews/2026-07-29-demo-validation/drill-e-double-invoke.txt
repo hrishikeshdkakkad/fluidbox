@@ -1,0 +1,5 @@
+
+[1;36m== preflight (no API key required — this demo is a deterministic replay) ==[0m
+  [1;32m✓[0m docker daemon reachable
+  [1;31m✗ a demo is already running (pid 62504).[0m
+    Run `just demo-down` first, then `just demo` again.

@@ -99,7 +99,7 @@ const TOOLS = [
 ];
 
 const server = new Server(
-  { name: "fluidbox-workspace-info", version: "0.3.0" }, // x-release-please-version
+  { name: "fluidbox-workspace-info", version: "0.4.0-rc.1" }, // x-release-please-version
   { capabilities: { tools: {} } },
 );
 
