@@ -370,16 +370,16 @@ async fn main() -> anyhow::Result<()> {
             "/policies/{name}/versions/{version}",
             get(api::get_policy_version),
         )
-        .route(
-            "/recipes",
-            get(recipes::list).post(recipes::create_custom),
-        )
+        .route("/recipes", get(recipes::list).post(recipes::create_custom))
         .route("/recipes/instances", get(recipes::list_instances))
         .route(
             "/recipes/instances/{id}",
             get(recipes::get_instance).delete(recipes::delete_instance),
         )
-        .route("/recipes/instances/{id}/pause", post(recipes::pause_instance))
+        .route(
+            "/recipes/instances/{id}/pause",
+            post(recipes::pause_instance),
+        )
         .route(
             "/recipes/instances/{id}/resume",
             post(recipes::resume_instance),
