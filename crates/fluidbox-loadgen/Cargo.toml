@@ -1,6 +1,6 @@
 [package]
 name = "fluidbox-loadgen"
-version = "0.4.0-rc.1"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Phase F load-test harness: drives a RUNNING fluidbox control plane and reports percentiles + an error taxonomy."
