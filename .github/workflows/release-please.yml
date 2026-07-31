@@ -36,6 +36,47 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
+      # Re-resolve Cargo.lock on the Release PR branch.
+      #
+      # release-type is `simple`, not `rust`, because the rust strategy is
+      # structurally incompatible with this workspace: it rewrites
+      # `package.version` in every member (ours inherit via
+      # `version.workspace = true`, so there is no literal to rewrite) and then
+      # requires the ROOT manifest to be a package (ours is a VIRTUAL workspace
+      # manifest, no [package] section). It threw `is not a package manifest
+      # (might be a cargo workspace)` on every merge to main from 2026-07-29
+      # until this was fixed.
+      #
+      # `simple` bumps the one canonical site — [workspace.package] version in
+      # Cargo.toml, via the x-release-please-version annotation — but it has no
+      # Cargo.lock updater, and the members' recorded versions in the lock go
+      # stale the moment that bumps. `version-check.sh` fails on exactly that,
+      # and it runs on the Release PR, which the header above calls the last
+      # checkpoint before public artifacts. So the lock is re-resolved here
+      # rather than left for a human to notice.
+      - if: steps.release.outputs.prs_created == 'true'
+        name: re-resolve Cargo.lock on the release branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+        run: |
+          set -euo pipefail
+          git clone --branch "$BRANCH" --depth 1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" rp
+          cd rp
+          # Rewrites Cargo.lock in place if the workspace version moved.
+          cargo metadata --format-version 1 >/dev/null
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock already agrees with the bumped version"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "chore: re-resolve Cargo.lock for the release version"
+          git push origin "$BRANCH"
+          echo "Cargo.lock re-resolved and pushed to $BRANCH"
+
   # Only runs on the push that merged a Release PR.
   publish:
     needs: release-please
