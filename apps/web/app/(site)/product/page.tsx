@@ -85,7 +85,7 @@ const GUARANTEES: { t: string; b: string; href: string; link: string }[] = [
 
 export default function ProductPage() {
   return (
-    <>
+    <div className="st">
       <section className="site-container site-section tight">
         <div className="site-kicker">product</div>
         <h1 className="site-h2" style={{ maxWidth: 720 }}>
@@ -96,6 +96,26 @@ export default function ProductPage() {
           fluidbox runs underneath agent harnesses, not instead of them. You
           register versioned agents; it gives every run an isolated sandbox, a
           policy gate, human approvals, budgets, and an append-only record.
+        </p>
+        <div className="shot-frame">
+          <div className="st-shot-head" aria-hidden>
+            <span className="st-dots">
+              <i />
+              <i />
+              <i />
+            </span>
+            <span className="st-window-title">fluidbox — operations</span>
+          </div>
+          <img
+            src="/product/overview-light.png"
+            width={1440}
+            height={900}
+            loading="lazy"
+            alt="The fluidbox dashboard overview: operations counters for active sandboxes, runs needing review, and completions; the agent, integration, and MCP resource lists; and run history."
+          />
+        </div>
+        <p className="try-note" style={{ marginTop: 14 }}>
+          A capture of the shipped product, not a mockup.
         </p>
       </section>
 
@@ -131,7 +151,7 @@ export default function ProductPage() {
       <section className="site-band">
         <div className="site-container site-section tight">
           <div className="site-kicker">guarantees</div>
-          <h2 className="site-h2">What the design actually promises.</h2>
+          <h2 className="site-h2">What the design promises.</h2>
           <div className="features" style={{ marginTop: 26 }}>
             {GUARANTEES.map((g) => (
               <article className="feature" key={g.t}>
@@ -179,6 +199,6 @@ export default function ProductPage() {
           </Link>
         </div>
       </section>
-    </>
+    </div>
   );
 }

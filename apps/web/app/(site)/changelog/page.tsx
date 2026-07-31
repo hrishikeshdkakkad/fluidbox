@@ -13,7 +13,8 @@ export const metadata: Metadata = {
 // of truth, same as the docs. Author there, never here.
 export default function ChangelogPage() {
   return (
-    <section className="site-container site-section tight">
+    <div className="st">
+      <section className="site-container site-section tight">
       <div className="site-kicker">changelog</div>
       <h1 className="site-h2">What shipped, when, and why.</h1>
       <p className="site-lead">
@@ -43,6 +44,7 @@ export default function ChangelogPage() {
           </article>
         ))}
       </div>
-    </section>
+      </section>
+    </div>
   );
 }
