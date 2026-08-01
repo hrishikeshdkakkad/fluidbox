@@ -207,10 +207,10 @@ pub fn canonical_digest(
 
 // ─── Admin: subscription management ───────────────────────────────────────
 
-const TOKEN_PREFIX: &str = "fbx_trig_";
-const SECRET_PREFIX: &str = "fbx_whsec_";
+pub(crate) const TOKEN_PREFIX: &str = "fbx_trig_";
+pub(crate) const SECRET_PREFIX: &str = "fbx_whsec_";
 
-fn random_hex_token(prefix: &str) -> String {
+pub(crate) fn random_hex_token(prefix: &str) -> String {
     // 2 × v4 uuid = 256 bits of entropy, no extra deps (same trick as
     // orchestrator::uuid_token).
     format!(
@@ -225,7 +225,7 @@ fn random_hex_token(prefix: &str) -> String {
 /// (the dashboard reaches it through a same-origin proxy), so create,
 /// rotate, get, and update all hand these over rather than letting a client
 /// guess. Nothing here is secret: it is public_url + subscription id.
-fn contract_urls(
+pub(crate) fn contract_urls(
     base: &str,
     sub_id: Uuid,
     ingress_path: Option<&str>,
