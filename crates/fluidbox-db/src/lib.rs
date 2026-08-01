@@ -14,6 +14,7 @@ use uuid::Uuid;
 pub mod governance;
 pub mod identity;
 pub mod mcp_sessions;
+pub mod recipes;
 pub mod seed;
 pub mod system_worker;
 
@@ -299,8 +300,8 @@ pub async fn connect_with(
     }
     // `migrate!` BAKES the migrations directory into the binary at COMPILE time —
     // adding a .sql file only takes effect once this crate recompiles, so any
-    // change under migrations/ must touch this file. Latest: 0026
-    // (mcp_upstream_sessions — cross-replica teardown of upstream MCP sessions).
+    // change under migrations/ must touch this file. Latest: 0027
+    // (recipes — catalog + versions + instances + object links, seeded v1 catalog).
     // This line was stale at 0020 through all four Phase E migrations: the
     // mechanism still worked, because every one of them also edited this file for
     // its own reasons, but the note itself was a lie for four migrations running.
@@ -872,7 +873,7 @@ pub enum AppendPolicyVersion {
 /// refuses (writes NOTHING) unless the current head equals it — two editors
 /// publishing from the same loaded version cannot silently overwrite each
 /// other's intent. `RowNotFound` when the policy is not this tenant's.
-async fn append_policy_version_tx(
+pub async fn append_policy_version_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant_id: Uuid,
     policy_id: Uuid,
@@ -960,20 +961,32 @@ pub async fn create_policy(
     v: NewPolicyVersion<'_>,
 ) -> sqlx::Result<(PolicyRow, PolicyVersionRow)> {
     let mut tx = scoped_tx(pool, scope).await?;
+    let out = create_policy_tx(&mut tx, scope.tenant_id(), name, v).await?;
+    tx.commit().await?;
+    Ok(out)
+}
+
+/// [`create_policy`] inside a caller-owned transaction — the recipes deploy
+/// engine stamps a policy alongside agents/subscriptions in ONE atomic tx.
+pub async fn create_policy_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    name: &str,
+    v: NewPolicyVersion<'_>,
+) -> sqlx::Result<(PolicyRow, PolicyVersionRow)> {
     let policy: PolicyRow = sqlx::query_as(
         "insert into policies (id, tenant_id, name) values ($1, $2, $3) returning *",
     )
     .bind(Uuid::now_v7())
-    .bind(scope.tenant_id())
+    .bind(tenant_id)
     .bind(name)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
     let AppendPolicyVersion::Appended(version) =
-        append_policy_version_tx(&mut tx, scope.tenant_id(), policy.id, None, v).await?
+        append_policy_version_tx(tx, tenant_id, policy.id, None, v).await?
     else {
         unreachable!("expected_base is None: the append cannot be stale");
     };
-    tx.commit().await?;
     Ok((policy, version))
 }
 
@@ -1555,7 +1568,42 @@ pub async fn append_agent_revision(
     connection_requirements: &Value,
 ) -> sqlx::Result<AgentRevisionRow> {
     let mut tx = scoped_tx(pool, scope).await?;
+    let __rls_out = append_agent_revision_tx(
+        &mut tx,
+        scope.tenant_id(),
+        agent_id,
+        harness,
+        runner_image,
+        model,
+        system_prompt,
+        policy_id,
+        budgets,
+        default_workspace,
+        capability_bundles,
+        connection_requirements,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
+}
 
+/// [`append_agent_revision`] inside a caller-owned transaction (the recipes
+/// deploy engine's atomic stamp).
+#[allow(clippy::too_many_arguments)]
+pub async fn append_agent_revision_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    agent_id: Uuid,
+    harness: &str,
+    runner_image: &str,
+    model: &str,
+    system_prompt: Option<&str>,
+    policy_id: Uuid,
+    budgets: &Value,
+    default_workspace: Option<&Value>,
+    capability_bundles: &Value,
+    connection_requirements: &Value,
+) -> sqlx::Result<AgentRevisionRow> {
     // Revisions carry no tenant column of their own; the tenant boundary is the
     // parent agent — the insert only lands when the agent AND the referenced
     // policy both belong to the scope (a cross-tenant policy_id is proven
@@ -1585,10 +1633,9 @@ pub async fn append_agent_revision(
     .bind(default_workspace)
     .bind(capability_bundles)
     .bind(connection_requirements)
-    .bind(scope.tenant_id())
-    .fetch_one(&mut *tx)
+    .bind(tenant_id)
+    .fetch_one(&mut **tx)
     .await?;
-    tx.commit().await?;
     Ok(__rls_out)
 }
 
@@ -3781,7 +3828,60 @@ pub async fn create_trigger_subscription(
     capability_bundles: Option<&Value>,
 ) -> sqlx::Result<TriggerSubscriptionRow> {
     let mut tx = scoped_tx(pool, scope).await?;
+    let __rls_out = create_trigger_subscription_tx(
+        &mut tx,
+        scope.tenant_id(),
+        agent_id,
+        name,
+        trigger_kind,
+        pinned_revision_id,
+        task_template,
+        allow_task_override,
+        allow_workspace_override,
+        autonomy,
+        concurrency_policy,
+        budget_override,
+        workspace_override,
+        result_destinations,
+        callback_secret_sealed,
+        callback_secret_key_version,
+        connection_id,
+        resource_selector,
+        event_filter,
+        event_publish,
+        capability_bundles,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
+}
 
+/// [`create_trigger_subscription`] inside a caller-owned transaction (the
+/// recipes deploy engine's atomic stamp).
+#[allow(clippy::too_many_arguments)]
+pub async fn create_trigger_subscription_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    agent_id: Uuid,
+    name: &str,
+    trigger_kind: &str,
+    pinned_revision_id: Option<Uuid>,
+    task_template: Option<&str>,
+    allow_task_override: bool,
+    allow_workspace_override: bool,
+    autonomy: Option<&str>,
+    concurrency_policy: &str,
+    budget_override: Option<&Value>,
+    workspace_override: Option<&Value>,
+    result_destinations: &Value,
+    callback_secret_sealed: Option<&[u8]>,
+    callback_secret_key_version: i16,
+    connection_id: Option<Uuid>,
+    resource_selector: Option<&Value>,
+    event_filter: Option<&Value>,
+    event_publish: Option<&Value>,
+    capability_bundles: Option<&Value>,
+) -> sqlx::Result<TriggerSubscriptionRow> {
     // Prove every referenced parent belongs to this tenant IN SQL (the handler
     // pre-validates too, but this is the relational backstop): the agent is
     // in-scope; a Some pinned_revision is a revision of THAT agent; a Some
@@ -3803,7 +3903,7 @@ pub async fn create_trigger_subscription(
          returning {SUBSCRIPTION_COLS}"
     )))
     .bind(Uuid::now_v7())
-    .bind(scope.tenant_id())
+    .bind(tenant_id)
     .bind(agent_id)
     .bind(name)
     .bind(trigger_kind)
@@ -3823,9 +3923,8 @@ pub async fn create_trigger_subscription(
     .bind(event_publish)
     .bind(capability_bundles)
     .bind(callback_secret_key_version)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
-    tx.commit().await?;
     Ok(__rls_out)
 }
 
@@ -3893,18 +3992,30 @@ pub async fn set_trigger_subscription_enabled(
     enabled: bool,
 ) -> sqlx::Result<Option<TriggerSubscriptionRow>> {
     let mut tx = scoped_tx(pool, scope).await?;
+    let __rls_out =
+        set_trigger_subscription_enabled_tx(&mut tx, scope.tenant_id(), id, enabled).await?;
+    tx.commit().await?;
+    Ok(__rls_out)
+}
 
-    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+/// [`set_trigger_subscription_enabled`] inside a caller-owned transaction —
+/// recipe instance pause/resume flips every stamped subscription and the
+/// instance status atomically.
+pub async fn set_trigger_subscription_enabled_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    id: Uuid,
+    enabled: bool,
+) -> sqlx::Result<Option<TriggerSubscriptionRow>> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update trigger_subscriptions set enabled = $2, updated_at = now()
          where id = $1 and tenant_id = $3 returning {SUBSCRIPTION_COLS}"
     )))
     .bind(id)
     .bind(enabled)
-    .bind(scope.tenant_id())
-    .fetch_optional(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(__rls_out)
+    .bind(tenant_id)
+    .fetch_optional(&mut **tx)
+    .await
 }
 
 /// What PATCH does to the callback destination: leave it alone, remove it,
@@ -7025,7 +7136,31 @@ pub async fn create_schedule(
     missed_run_policy: &str,
 ) -> sqlx::Result<ScheduleRow> {
     let mut tx = scoped_tx(pool, scope).await?;
+    let __rls_out = create_schedule_tx(
+        &mut tx,
+        scope.tenant_id(),
+        subscription,
+        cron,
+        timezone,
+        next_fire_at,
+        missed_run_policy,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(__rls_out)
+}
 
+/// [`create_schedule`] inside a caller-owned transaction (the recipes deploy
+/// engine's atomic stamp).
+pub async fn create_schedule_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    subscription: Uuid,
+    cron: &str,
+    timezone: &str,
+    next_fire_at: DateTime<Utc>,
+    missed_run_policy: &str,
+) -> sqlx::Result<ScheduleRow> {
     let __rls_out = sqlx::query_as(
         "insert into schedules (id, subscription_id, cron, timezone, next_fire_at, missed_run_policy)
          select $1, $2, $3, $4, $5, $6
@@ -7038,10 +7173,9 @@ pub async fn create_schedule(
     .bind(timezone)
     .bind(next_fire_at)
     .bind(missed_run_policy)
-    .bind(scope.tenant_id())
-    .fetch_one(&mut *tx)
+    .bind(tenant_id)
+    .fetch_one(&mut **tx)
     .await?;
-    tx.commit().await?;
     Ok(__rls_out)
 }
 
@@ -7122,17 +7256,30 @@ pub async fn create_trigger_token(
     token_plain: &str,
 ) -> sqlx::Result<()> {
     let mut tx = scoped_tx(pool, scope).await?;
+    create_trigger_token_tx(&mut tx, scope.tenant_id(), subscription, token_plain).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// [`create_trigger_token`] inside a caller-owned transaction (the recipes
+/// deploy engine mints each stamped subscription's token in the same atomic
+/// stamp; the plaintext is returned once, in the deploy response).
+pub async fn create_trigger_token_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    subscription: Uuid,
+    token_plain: &str,
+) -> sqlx::Result<()> {
     sqlx::query(
         "insert into api_tokens (id, tenant_id, kind, subscription_id, token_sha256)
          values ($1, $2, 'trigger', $3, $4)",
     )
     .bind(Uuid::now_v7())
-    .bind(scope.tenant_id())
+    .bind(tenant_id)
     .bind(subscription)
     .bind(sha256_hex(token_plain))
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
-    tx.commit().await?;
     Ok(())
 }
 
