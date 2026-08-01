@@ -27,6 +27,7 @@ mod metrics;
 mod oauth;
 mod orchestrator;
 mod rbac;
+mod recipes;
 mod reseal;
 mod run_service;
 mod scheduler;
@@ -369,6 +370,28 @@ async fn main() -> anyhow::Result<()> {
             "/policies/{name}/versions/{version}",
             get(api::get_policy_version),
         )
+        .route("/recipes", get(recipes::list).post(recipes::create_custom))
+        .route("/recipes/instances", get(recipes::list_instances))
+        .route(
+            "/recipes/instances/{id}",
+            get(recipes::get_instance).delete(recipes::delete_instance),
+        )
+        .route(
+            "/recipes/instances/{id}/pause",
+            post(recipes::pause_instance),
+        )
+        .route(
+            "/recipes/instances/{id}/resume",
+            post(recipes::resume_instance),
+        )
+        .route("/recipes/instances/{id}/run", post(recipes::run_instance))
+        .route(
+            "/recipes/instances/{id}/upgrade",
+            post(recipes::upgrade_instance),
+        )
+        .route("/recipes/{slug}", get(recipes::get))
+        .route("/recipes/{slug}/versions", post(recipes::append_version))
+        .route("/recipes/{slug}/deploy", post(recipes::deploy))
         .route(
             "/sessions",
             get(api::list_sessions).post(api::create_session),
