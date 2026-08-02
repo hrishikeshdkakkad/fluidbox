@@ -1348,6 +1348,18 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
         workspace_archive,
         active_deadline_secs: run_spec.budgets.max_wall_clock_secs,
         network: state.cfg.network_mode,
+        // The frozen grant the datapath must program, plus the identity its
+        // policy selects on. Carried from the RunSpec so the provider programs
+        // EXACTLY what the control plane resolved — never a re-derivation.
+        // Always present: an OFFLINE grant is still an answer, and letting the
+        // provider see it is what lets a no-enforcer deployment refuse a wider
+        // one instead of silently running it unenforced.
+        network_grant: Some(fluidbox_core::traits::GrantedNetwork {
+            grant: run_spec.network.clone(),
+            tenant_id: session.tenant_id,
+            run_id: session_id,
+            grant_digest: run_spec.network.digest(),
+        }),
         network_admission: network_admission(&state),
     };
 
