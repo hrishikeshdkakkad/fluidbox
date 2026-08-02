@@ -56,6 +56,15 @@ pub struct SandboxSpec {
     /// compute if the control plane is down. None = installation default.
     pub active_deadline_secs: Option<u64>,
     pub network: NetworkMode,
+    /// The run's frozen network grant plus the identity the datapath policy is
+    /// keyed on (design "governed sandbox network access"). Carried here rather
+    /// than re-read from the RunSpec because the provider must program
+    /// enforcement from EXACTLY what the control plane resolved and froze —
+    /// re-deriving it would be a second source of truth.
+    ///
+    /// `None` for a run resolved before governed networking; providers treat
+    /// that as offline, which is what those runs had.
+    pub network_grant: Option<GrantedNetwork>,
     /// Startup network-isolation admission (Kubernetes netpol race fix): when
     /// set, the provider MUST prove — from inside the sandbox's own network
     /// identity, BEFORE any untrusted runner code starts — that the positive
@@ -67,6 +76,110 @@ pub struct SandboxSpec {
     /// verified enforcement (dev posture) or the provider has no such race
     /// (Docker's per-session bridge is synchronous with container start).
     pub network_admission: Option<NetworkAdmission>,
+}
+
+/// A run's network authority as the datapath needs it: the frozen grant plus
+/// the identity its policy object selects on.
+///
+/// **All three identity fields are load-bearing, not decoration.** The Phase 0
+/// Cilium spike proved that within a single policy's selector, an FQDN grant's
+/// resolved addresses become reachable by EVERY endpoint that policy selects —
+/// including a pod that never performed the lookup, because resolution produces
+/// cluster-wide CIDR identities. A per-run policy selecting only
+/// `app: fluidbox-sandbox` would therefore pool every concurrent run's granted
+/// addresses into one reachable set. Keying on session + tenant + run is what
+/// makes cross-run isolation real; widening the selector silently removes it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GrantedNetwork {
+    pub grant: crate::network::NetworkGrant,
+    pub tenant_id: Uuid,
+    pub run_id: Uuid,
+    /// The consent anchor, carried so a programmed policy can be traced back to
+    /// exactly the authority a human (or a policy) approved.
+    pub grant_digest: String,
+}
+
+/// Why a network-policy operation failed. Every variant is FAIL-CLOSED at the
+/// call site: the caller refuses the run rather than proceeding unenforced.
+/// There is deliberately no "degraded" or "partial" variant — a grant is
+/// programmed and proven, or the run does not start.
+#[derive(Debug, thiserror::Error)]
+pub enum NetworkPolicyError {
+    /// This deployment has no enforcer for the requested mode.
+    #[error("network grants are not enforceable here: {0}")]
+    Unsupported(String),
+    /// The grant could not be lowered to a datapath object.
+    #[error("network grant could not be lowered: {0}")]
+    Lowering(String),
+    /// The policy object could not be written, or was rejected.
+    #[error("network policy write failed: {0}")]
+    Write(String),
+    /// Enforcement could not be PROVEN within the deadline. Never "probably
+    /// fine": an unproven policy is treated exactly like a refused one.
+    #[error("network policy enforcement could not be verified: {0}")]
+    Unverified(String),
+}
+
+/// Programs and proves a run's network authority in the datapath.
+///
+/// Provider-neutral by construction: Kubernetes/Cilium implements it, Docker
+/// refuses anything above `offline`, and a cluster without an enforcer is
+/// offline-only. The control plane never learns what a `CiliumNetworkPolicy`
+/// is — it asks for a grant to be in force and is told yes or no.
+#[async_trait]
+pub trait NetworkPolicyProvider: Send + Sync {
+    /// Program the grant. Called BEFORE any untrusted code can run, and its
+    /// failure means the run does not start.
+    async fn prepare(&self, granted: &GrantedNetwork) -> Result<(), NetworkPolicyError>;
+    /// Prove the programmed policy is realized for this run's identity. Belt
+    /// and braces beside the in-pod admission gate, which proves the same thing
+    /// from the pod's own network namespace; either failing is fail-closed.
+    async fn verify(&self, granted: &GrantedNetwork) -> Result<(), NetworkPolicyError>;
+    /// Tear the grant's objects down. MUST be idempotent — it is called from
+    /// terminal cleanup, the abandon paths, and the reconcile sweep.
+    async fn revoke(&self, granted: &GrantedNetwork) -> Result<(), NetworkPolicyError>;
+    /// Human-readable enforcer name for boot logging and diagnostics.
+    fn enforcer_name(&self) -> &'static str;
+    /// Can this enforcer deliver anything above `offline`? Feeds the fail-closed
+    /// run gate, so a deployment that answers `false` refuses wider grants at
+    /// create time instead of at provision time.
+    fn supports_egress_grants(&self) -> bool;
+}
+
+/// The enforcer for a deployment that has none: `offline` is delivered by the
+/// absence of any allow rule (exactly today's `zeroEgress` posture), and
+/// anything wider is REFUSED rather than silently unenforced.
+pub struct NoNetworkEnforcer;
+
+#[async_trait]
+impl NetworkPolicyProvider for NoNetworkEnforcer {
+    async fn prepare(&self, granted: &GrantedNetwork) -> Result<(), NetworkPolicyError> {
+        if granted.grant.grants_egress() {
+            return Err(NetworkPolicyError::Unsupported(format!(
+                "this deployment has no network-policy enforcer, so a '{}' grant cannot be \
+                 programmed (offline runs are unaffected)",
+                granted.grant.mode.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    async fn verify(&self, granted: &GrantedNetwork) -> Result<(), NetworkPolicyError> {
+        // Offline needs no proof of an allow rule; it IS the absence of one.
+        self.prepare(granted).await
+    }
+
+    async fn revoke(&self, _granted: &GrantedNetwork) -> Result<(), NetworkPolicyError> {
+        Ok(())
+    }
+
+    fn enforcer_name(&self) -> &'static str {
+        "none"
+    }
+
+    fn supports_egress_grants(&self) -> bool {
+        false
+    }
 }
 
 /// The observable startup-isolation protocol's frozen targets: one address
