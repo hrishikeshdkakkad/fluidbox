@@ -52,6 +52,27 @@ jobs:
   # kind + Calico (NOT kindnet — kindnet does not enforce NetworkPolicy). The
   # netpol probe is the load-bearing assertion: it proves enforcement, and the
   # boot run-gate depends on it. A tiny contract-stub runner keeps images small.
+  # Governed sandbox network access — the DATAPATH gate. The script owns its own
+  # cluster (kind + Cilium) end to end and NOTHING self-skips: a missing
+  # prerequisite fails the job, because a validation that quietly skips is worse
+  # than no validation.
+  #
+  # `kind-calico` below deliberately STAYS: it is now the regression proving a
+  # NON-Cilium cluster still enforces `offline` on plain NetworkPolicy, which is
+  # the concrete meaning of "CI must preserve offline".
+  kind-cilium:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: netgrant datapath matrix
+        env:
+          # PR runs take the light matrix (busybox/nc, no real toolchains);
+          # the nightly schedule adds real images, DNS rebinding, and failure
+          # injection.
+          NETGRANT_HEAVY: ${{ github.event_name == 'schedule' && '1' || '0' }}
+        run: bash scripts/netgrant-kind-validation.sh
+
   kind-calico:
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
