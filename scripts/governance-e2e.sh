@@ -440,6 +440,179 @@ if dec:
 
 curl -s -X POST -H "$H" "$API/v1/sessions/$S2/cancel" >/dev/null
 
+# ── Network grants (design "governed sandbox network access") ───────────
+#
+# Three properties over real HTTP, hermetic and with zero model spend:
+#   1. REFUSE-ON-UNENFORCEABLE against the MAIN server, which runs the shipped
+#      default (`FLUIDBOX_NETWORK_ENFORCER` unset ⇒ none). This is the real
+#      posture of a Docker deployment: a deployment that cannot enforce a grant
+#      is offline-only and says so.
+#   2/3. APPROVE and DENY of the pre-provisioning pause. Those need an enforcer,
+#      so this section starts its OWN server on a second port with
+#      `FLUIDBOX_NETWORK_ENFORCER=cilium` rather than skipping — the governance
+#      choreography is what is under test here; the DATAPATH is Phase 4/6's job.
+say "NETWORK GRANTS — refusal, pause, approve, deny"
+
+NETPOL=netgrant-e2e
+del "/policies/$NETPOL" >/dev/null
+NET_YAML=$(cat <<'EOF'
+name: netgrant-e2e
+defaults:
+  tool_action: approve
+network:
+  max_mode: approved
+  require_approval: true
+  allow:
+    - kind: dns
+      pattern: { kind: wildcard, suffix: "example.com" }
+      ports: [{ from: 443, to: 443 }]
+      protocol: tcp
+tools:
+  - match: ["Read"]
+    action: allow
+EOF
+)
+CODE=$(post "/policies" "$(printf '%s' "$NET_YAML" | python3 -c "import json,sys;print(json.dumps({'name':'netgrant-e2e','yaml':sys.stdin.read()}))")")
+[ "$CODE" = "200" ] && ok "policy with a network section imported" || no "network policy import → $CODE: $(cat "$GB")"
+
+# An agent DECLARING the access it needs. Without a declaration on the revision
+# every scheduled/webhook run would be offline-only (a schedule has no caller).
+NET_AGENT=netgrant-e2e-agent
+NET_DECL='{"mode":"approved","targets":[{"kind":"dns","pattern":{"kind":"wildcard","suffix":"example.com"},"ports":[{"from":443,"to":443}],"protocol":"tcp"}]}'
+# Agents have no DELETE route, so this is create-or-append-a-revision: either
+# way the LATEST revision ends up carrying the declaration, which is what
+# governs a run.
+CODE=$(post "/agents" "{\"name\":\"$NET_AGENT\",\"policy\":\"$NETPOL\",\"network\":$NET_DECL}")
+if [ "$CODE" = "200" ]; then
+  ok "agent created with a declared network request"
+else
+  AID_AGENT=$(get "/agents/$NET_AGENT" | j "['agent']['id']")
+  if [ -n "$AID_AGENT" ]; then
+    CODE=$(post "/agents/$AID_AGENT/revisions" "{\"policy\":\"$NETPOL\",\"network\":$NET_DECL}")
+    [ "$CODE" = "200" ] && ok "agent revision appended with the declared network request" \
+      || no "revision append → $CODE: $(cat "$GB")"
+  else
+    no "agent create → $CODE: $(cat "$GB")"
+  fi
+fi
+
+# 1. REFUSE-ON-UNENFORCEABLE (main server, shipped default).
+CODE=$(post "/sessions" "{\"agent\":\"$NET_AGENT\",\"task\":\"net probe\",\"repo\":{\"kind\":\"none\"}}")
+BODY=$(cat "$GB")
+if [ "$CODE" = "422" ] && echo "$BODY" | grep -qi "cannot enforce network grants"; then
+  ok "a deployment with no enforcer REFUSES a non-offline run (422, enumerated reason)"
+else
+  no "expected 422 unenforceable, got $CODE: $BODY"
+fi
+# …and the refusal created nothing.
+NRUNS=$(get "/sessions?limit=200" | python3 -c "
+import sys,json
+print(sum(1 for s in json.load(sys.stdin)['sessions'] if s['task']=='net probe'))" 2>/dev/null)
+[ "$NRUNS" = "0" ] && ok "…and created no session (refusal costs nothing)" || no "refusal left $NRUNS session(s)"
+
+# An OFFLINE run under the same policy is unaffected — the floor still works.
+CODE=$(post "/sessions" "{\"agent\":\"claude-fixer\",\"task\":\"offline regression\",\"repo\":{\"kind\":\"none\"}}")
+[ "$CODE" = "200" ] && ok "an offline run is unaffected by the enforcer being absent" || no "offline run → $CODE"
+OFFS=$(python3 -c "import json;print(json.load(open('$GB'))['session']['id'])" 2>/dev/null)
+[ -n "$OFFS" ] && curl -s -X POST -H "$H" "$API/v1/sessions/$OFFS/cancel" >/dev/null
+
+# 2/3. The PAUSE, on a dedicated server that has an enforcer configured.
+NET_API=http://127.0.0.1:8799
+NET_LOG=/tmp/fbx_netgrant_server.log
+( cd "$(pwd)" && exec env FLUIDBOX_BIND=0.0.0.0:8799 \
+    FLUIDBOX_INTERNAL_BIND=0.0.0.0:8798 \
+    FLUIDBOX_NETWORK_ENFORCER=cilium \
+    ./target/debug/fluidbox-server >>"$NET_LOG" 2>&1 ) &
+NET_PID=$!
+NET_UP=0
+for _ in $(seq 1 60); do
+  curl -fsS -m 2 "$NET_API/v1/health" >/dev/null 2>&1 && { NET_UP=1; break; }
+  sleep 1
+done
+if [ "$NET_UP" != "1" ]; then
+  no "enforcer-configured server did not come up; last log: $(tail -5 $NET_LOG)"
+else
+  ok "second server up with FLUIDBOX_NETWORK_ENFORCER=cilium"
+
+  nsess() { # task -> session json
+    curl -s -X POST -H "$H" -H "$CT" \
+      -d "{\"agent\":\"$NET_AGENT\",\"task\":\"$1\",\"repo\":{\"kind\":\"none\"}}" \
+      "$NET_API/v1/sessions"
+  }
+  nget() { curl -s -H "$H" "$NET_API/v1$1"; }
+
+  # ── The pause ────────────────────────────────────────────────────────
+  NS=$(nsess "netgrant approve" | j "['session']['id']")
+  [ -n "$NS" ] && ok "run created with an enforcer present ($NS)" || no "run create failed"
+  ST=$(nget "/sessions/$NS" | j "['session']['status']")
+  [ "$ST" = "awaiting_authorization" ] \
+    && ok "…and PARKED in awaiting_authorization (no sandbox provisioned)" \
+    || no "expected awaiting_authorization, got '$ST'"
+  # No container may exist for a parked run — the whole point of the pause.
+  sleep 2
+  NCONT=$(docker ps --filter "label=fluidbox.session=$NS" -q | wc -l | tr -d ' ')
+  [ "$NCONT" = "0" ] && ok "…with ZERO sandboxes (enforcement precedes any code)" || no "$NCONT sandbox(es) exist for a parked run"
+
+  # The approval carries the grant digest as its consent anchor.
+  NAID=$(nget "/sessions/$NS/approvals" | python3 -c "
+import sys,json
+a=[x for x in json.load(sys.stdin)['approvals'] if x['tool']=='network.grant']
+print(a[0]['id'] if a else '')" 2>/dev/null)
+  [ -n "$NAID" ] && ok "a network.grant approval is pending" || no "no network.grant approval row"
+  NDIG=$(nget "/sessions/$NS/approvals" | python3 -c "
+import sys,json
+a=[x for x in json.load(sys.stdin)['approvals'] if x['tool']=='network.grant']
+print(a[0].get('input_digest','') if a else '')" 2>/dev/null)
+  SDIG=$(nget "/sessions/$NS" | python3 -c "
+import sys,json
+print(json.load(sys.stdin)['session']['run_spec']['network'].get('mode',''))" 2>/dev/null)
+  [ -n "$NDIG" ] && ok "…whose input_digest is the grant digest (a stable thing to consent to)" || no "approval carries no input_digest"
+  [ "$SDIG" = "approved" ] && ok "the frozen RunSpec carries the resolved grant (mode=approved)" || no "run_spec.network.mode = '$SDIG'"
+
+  # ── APPROVE → released ───────────────────────────────────────────────
+  curl -s -X POST -H "$H" -H "$CT" -d '{"decision":"approved_once"}' \
+    "$NET_API/v1/approvals/$NAID/decision" >/dev/null
+  REL=""
+  for _ in $(seq 1 30); do
+    ST=$(nget "/sessions/$NS" | j "['session']['status']")
+    [ "$ST" != "awaiting_authorization" ] && { REL=$ST; break; }
+    sleep 1
+  done
+  [ -n "$REL" ] && ok "approved grant released the pause (→ $REL)" || no "still parked 30s after approval"
+  curl -s -X POST -H "$H" "$NET_API/v1/sessions/$NS/cancel" >/dev/null
+
+  # ── DENY → the run never provisions ──────────────────────────────────
+  NS2=$(nsess "netgrant deny" | j "['session']['id']")
+  NAID2=$(nget "/sessions/$NS2/approvals" | python3 -c "
+import sys,json
+a=[x for x in json.load(sys.stdin)['approvals'] if x['tool']=='network.grant']
+print(a[0]['id'] if a else '')" 2>/dev/null)
+  [ -n "$NAID2" ] && ok "second run parked with its own approval" || no "no approval for the deny case"
+  curl -s -X POST -H "$H" -H "$CT" -d '{"decision":"denied"}' \
+    "$NET_API/v1/approvals/$NAID2/decision" >/dev/null
+  DST=""
+  for _ in $(seq 1 30); do
+    ST=$(nget "/sessions/$NS2" | j "['session']['status']")
+    case "$ST" in failed|cancelled|finalizing|cancelling) DST=$ST; break;; esac
+    sleep 1
+  done
+  [ -n "$DST" ] && ok "denied grant wound the run down (→ $DST) — it never provisioned" || no "denied run stuck in '$ST'"
+  NCONT2=$(docker ps --filter "label=fluidbox.session=$NS2" -q | wc -l | tr -d ' ')
+  [ "$NCONT2" = "0" ] && ok "…with ZERO sandboxes ever created" || no "$NCONT2 sandbox(es) for a denied run"
+  # The timeline records both the freeze and the refusal.
+  NEV=$(nget "/sessions/$NS2/events?limit=200" | python3 -c "
+import sys,json
+t=[e['type'] for e in json.load(sys.stdin)['events']]
+print(','.join(sorted({x for x in t if x.startswith('network.grant')})))" 2>/dev/null)
+  echo "$NEV" | grep -q "network.grant.frozen" \
+    && ok "ledger carries network.grant.frozen (+ $NEV)" || no "timeline network events: '$NEV'"
+
+  kill "$NET_PID" 2>/dev/null; wait "$NET_PID" 2>/dev/null
+fi
+
+# The agent stays (no DELETE route); its policy goes.
+del "/policies/$NETPOL" >/dev/null 2>&1
+
 say "RESULT"
 printf "  \033[1;32m%d passed\033[0m, \033[1;31m%d failed\033[0m\n" "$pass" "$fail"
 sleep 3

@@ -1739,7 +1739,14 @@ async fn legacy_connection_authority(
 async fn maybe_resume(state: &AppState, scope: TenantScope, session_id: uuid::Uuid) {
     // If nothing else is pending, return the session to running.
     if let Ok(approvals) = fluidbox_db::session_approvals(&state.pool, scope, session_id).await {
-        let still_pending = approvals.iter().any(|a| a.status == "pending");
+        // The network-grant approval shares this table but gates PROVISIONING,
+        // not the mid-run resume. Excluding it keeps the two decoupled: without
+        // this, a still-pending grant approval would hold a running session in
+        // `awaiting_approval` after its tool decision had already been made.
+        let still_pending = approvals
+            .iter()
+            .filter(|a| a.tool_call_id != crate::netgrant::GRANT_TOOL_CALL_ID)
+            .any(|a| a.status == "pending");
         if !still_pending {
             fluidbox_db::transition_session(
                 &state.pool,
