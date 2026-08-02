@@ -1192,6 +1192,8 @@ pub async fn clone_policy(
                 name: req.name.clone(),
                 defaults: Default::default(),
                 egress: Default::default(),
+                // Fail-safe: a blank policy caps sandbox network at `offline`.
+                network: Default::default(),
                 budgets: Default::default(),
                 approvals: Default::default(),
                 autonomy: Default::default(),

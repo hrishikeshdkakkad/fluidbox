@@ -4022,8 +4022,13 @@ components:
         Where a run is in its lifecycle. The server is the single writer of
         this field. `completed`, `failed`, `cancelled`, and `budget_exceeded`
         are terminal.
+
+        `awaiting_authorization` is the pre-provisioning pause: the run's spec
+        (including its network grant) is frozen, but no sandbox exists and no
+        model spend is possible until a human authorizes the grant.
       enum:
         - created
+        - awaiting_authorization
         - provisioning
         - initializing
         - running

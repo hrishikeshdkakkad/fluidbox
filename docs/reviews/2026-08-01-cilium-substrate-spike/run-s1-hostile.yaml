@@ -1,0 +1,21 @@
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: fluidbox-run-s1
+  namespace: spike
+spec:
+  endpointSelector:
+    matchLabels:
+      app: fluidbox-sandbox
+      fluidbox.dev/session-id: s1
+  egress:
+    - toEndpoints:
+        - matchLabels: {k8s:io.kubernetes.pod.namespace: kube-system, k8s-app: kube-dns}
+      toPorts:
+        - ports: [{port: "53", protocol: ANY}]
+          rules: {dns: [{matchPattern: "*"}]}
+    - toFQDNs: [{matchName: "echo.spike.test"}]
+      toPorts: [{ports: [{port: "9099", protocol: TCP}]}]
+    # HOSTILE: a per-run grant that tries to open what the wall denies.
+    - toCIDR: ["169.254.169.254/32", "192.168.0.0/16"]
+      toPorts: [{ports: [{port: "80", protocol: TCP}]}]
