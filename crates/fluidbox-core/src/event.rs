@@ -126,6 +126,34 @@ pub enum EventBody {
         awaiting_authorization: bool,
         expires_at: Option<String>,
     },
+    /// A flow the datapath DENIED, surfaced so an operator can see what a run
+    /// tried to reach. Never a payload and never a byte count — Hubble flows
+    /// carry no reliable per-flow totals, so volume comes from the collector
+    /// instead, and the two halves are honestly separate.
+    #[serde(rename = "network.denied")]
+    NetworkDenied {
+        target: String,
+        port: u16,
+        protocol: String,
+        decision: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule: Option<String>,
+    },
+    /// The periodic summary of denials past the per-session unique cap. Exists
+    /// because `append_event` takes a per-session row lock, so an unbounded
+    /// event stream from a port scan is a database problem, not just noise.
+    /// `targets_truncated` marks a distinct-target count that is a FLOOR.
+    #[serde(rename = "network.denied.rollup")]
+    NetworkDeniedRollup {
+        suppressed: u64,
+        distinct_targets: u64,
+        top_targets: Vec<String>,
+        targets_truncated: bool,
+    },
+    /// Observation itself was unavailable for a window. Emitted so the absence
+    /// of denial events is never read as evidence there were none.
+    #[serde(rename = "network.observation.degraded")]
+    NetworkObservationDegraded { reason: String },
     /// The grant's authority was surrendered — at terminal cleanup, on an
     /// abandon path, or because a human refused it.
     #[serde(rename = "network.grant.revoked")]
