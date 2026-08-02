@@ -74,6 +74,7 @@ fn main() {
                 active_deadline_secs: Some(600),
                 network: NetworkMode::Hardened,
                 network_admission: Some(a),
+                network_grant: None,
             };
             let pod = manifest::build_pod(&spec, &K8sConfig::from_env());
             println!("{}", serde_json::to_string_pretty(&pod).unwrap());

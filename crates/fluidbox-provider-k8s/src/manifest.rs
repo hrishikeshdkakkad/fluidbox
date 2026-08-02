@@ -350,6 +350,7 @@ mod tests {
             active_deadline_secs: Some(600),
             network: NetworkMode::Hardened,
             network_admission: None,
+            network_grant: None,
         }
     }
 

@@ -30,6 +30,7 @@ use uuid::Uuid;
 
 pub mod config;
 pub mod manifest;
+pub mod netgrant;
 pub mod netpol;
 
 use config::K8sConfig;
@@ -1226,6 +1227,7 @@ mod tests {
             active_deadline_secs: None,
             network: fluidbox_core::traits::NetworkMode::Hardened,
             network_admission: admission,
+            network_grant: None,
         }
     }
 
