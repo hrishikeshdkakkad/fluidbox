@@ -394,6 +394,11 @@ pub async fn create_run(
     // id (invariant 21). The RunSpec then references each binding row 1:1.
     bindings::apply_binding_ids(&resolved, &mut workspace, &mut result_destinations);
 
+    // Sandbox network authority. Every run is offline until grant resolution
+    // lands beside the autonomy gate above; an offline grant is the floor, so
+    // this is the correct value rather than a placeholder.
+    let network_grant = fluidbox_core::network::NetworkGrant::offline();
+
     let run_spec = RunSpec {
         agent_id: agent.id,
         agent_revision_id: rev.id,
@@ -416,6 +421,7 @@ pub async fn create_run(
         // Frozen brokered surfaces from binding resolution (the connection-free
         // successor to embedding a connection_id in a `capabilities` server).
         brokered,
+        network: network_grant,
     };
 
     // 512 KiB serialized runner-env ceiling (design 2026-07-15): env injection
