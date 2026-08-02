@@ -565,6 +565,43 @@ function TimelineItem({ ev }: { ev: EventRow }) {
       );
       break;
     }
+    case "network.denied":
+      cls = "danger";
+      tag = "network";
+      body = (
+        <>
+          denied <span className="em">{s("target")}:{s("port")}</span>
+          <span className="mut"> · {s("protocol")}</span>
+          {s("rule") ? <span className="mut"> · {s("rule")}</span> : null}
+        </>
+      );
+      break;
+    case "network.denied.rollup": {
+      const tops = (d.top_targets as string[]) || [];
+      cls = "danger";
+      tag = "network";
+      body = (
+        <>
+          and <span className="em">{s("suppressed")}</span> more denials across{" "}
+          {s("distinct_targets")}
+          {d.targets_truncated === true ? "+" : ""} targets
+          {tops.length > 0 ? <span className="mut"> · {tops.join(", ")}</span> : null}
+        </>
+      );
+      break;
+    }
+    case "network.observation.degraded":
+      // Amber, not red, and deliberately NOT silent: an observation gap must
+      // never read as "there were no denials".
+      cls = "human";
+      tag = "network";
+      body = (
+        <>
+          network observation unavailable
+          {s("reason") ? <span className="mut"> · {s("reason")}</span> : null}
+        </>
+      );
+      break;
     case "network.grant.revoked":
       cls = "mut";
       tag = "network";
