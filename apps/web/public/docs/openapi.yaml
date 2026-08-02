@@ -4040,6 +4040,78 @@ components:
         - cancelled
         - budget_exceeded
 
+    NetworkRequest:
+      type: object
+      description: |
+        Sandbox network access an agent declares, or a per-run narrowing of it.
+        Policy caps what may actually be granted; a downstream override may only
+        narrow (a smaller mode, a subset of the declared targets, a shorter
+        lifetime). A target the declaration never carried is dropped, so an
+        override can never introduce reach.
+      properties:
+        mode:
+          type: string
+          description: |
+            `offline` = no egress beyond the control plane (the default, and what
+            every run had before governed networking). `approved` = exactly the
+            listed targets. `public` = everything the deployment's deny wall
+            permits; refused for a run holding brokered tool surfaces unless
+            policy opts in.
+          enum: [offline, approved, public]
+          default: offline
+        targets:
+          type: array
+          description: |
+            Where the run may connect. Must be empty for `public`. DNS and CIDR
+            are distinct selectors — a DNS grant is not an IP grant, even for an
+            address the name currently resolves to.
+          items:
+            $ref: '#/components/schemas/NetworkTarget'
+        duration_secs:
+          type: integer
+          description: |
+            Requested grant lifetime. Clamped by the policy ceiling, and
+            validated to outlive the run's own wall-clock budget so authority
+            never lapses mid-run.
+          nullable: true
+
+    NetworkTarget:
+      type: object
+      required: [kind, ports, protocol]
+      properties:
+        kind:
+          type: string
+          enum: [dns, cidr]
+        pattern:
+          type: object
+          description: |
+            DNS targets only. `exact` matches one name; `wildcard` matches
+            exactly ONE additional label (`*.example.com` covers
+            `api.example.com` but not `a.b.example.com` and not the bare apex) —
+            this mirrors what the datapath can actually enforce.
+          properties:
+            kind:
+              type: string
+              enum: [exact, wildcard]
+            name:
+              type: string
+            suffix:
+              type: string
+        cidr:
+          type: string
+          description: CIDR targets only, in `addr/prefix` form.
+        ports:
+          type: array
+          items:
+            type: object
+            required: [from, to]
+            properties:
+              from: { type: integer }
+              to: { type: integer }
+        protocol:
+          type: string
+          enum: [tcp, udp]
+
     TrustTier:
       type: string
       description: |

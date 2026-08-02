@@ -367,6 +367,26 @@ pub struct CreateAgent {
     /// (validated) on the initial revision; resolved per-run into bindings.
     #[serde(default)]
     pub connection_requirements: Option<Vec<ConnectionRequirement>>,
+    /// The sandbox network the agent DECLARES it needs. Policy caps it and a
+    /// per-run override may only narrow it; omitted means offline.
+    #[serde(default)]
+    pub network: Option<fluidbox_core::network::NetworkRequest>,
+}
+
+/// Validate a revision's declared network request into stored jsonb. Validation
+/// happens HERE, at authoring, so a target that could never be lowered to a
+/// datapath rule is a 422 on the agent — not a refusal on every run that agent
+/// ever attempts.
+fn network_json(req: Option<&fluidbox_core::network::NetworkRequest>) -> ApiResult<Option<Value>> {
+    match req {
+        Some(r) => {
+            r.validate().map_err(|e| {
+                ApiError::UnprocessableEntity(format!("invalid network declaration: {e}"))
+            })?;
+            Ok(Some(serde_json::to_value(r)?))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Validate a revision's declared connection requirements into stored jsonb
@@ -516,6 +536,7 @@ pub async fn create_agent(
         default_workspace.as_ref(),
         &capability_pins,
         &requirements_json(req.connection_requirements.as_ref())?,
+        network_json(req.network.as_ref())?.as_ref(),
     )
     .await?;
 
@@ -565,6 +586,10 @@ pub struct AddRevision {
     /// clears them; a list is validated + stored (append-only, like the pins).
     #[serde(default)]
     pub connection_requirements: Option<Vec<ConnectionRequirement>>,
+    /// Omitted → inherit the latest revision's declaration; an explicit
+    /// `{"mode":"offline"}` clears it. Append-only, like the pins.
+    #[serde(default)]
+    pub network: Option<fluidbox_core::network::NetworkRequest>,
 }
 
 pub async fn add_revision(
@@ -645,6 +670,13 @@ pub async fn add_revision(
             .map(|r| r.connection_requirements.clone())
             .unwrap_or_else(|| json!([])),
     };
+    // Same inheritance rule as the pins: omitted keeps what the previous
+    // revision declared, so appending a revision for an unrelated reason never
+    // silently drops the agent's network declaration.
+    let network = match &req.network {
+        Some(_) => network_json(req.network.as_ref())?,
+        None => latest.as_ref().and_then(|r| r.network.clone()),
+    };
 
     let rev = fluidbox_db::append_agent_revision(
         &state.pool,
@@ -671,6 +703,7 @@ pub async fn add_revision(
         default_workspace.as_ref(),
         &capability_pins,
         &requirements,
+        network.as_ref(),
     )
     .await?;
     Ok(Json(json!({ "revision": rev })))
@@ -1337,6 +1370,12 @@ pub struct CreateSession {
     /// entry (tenant, caller may use it, connector match, snapshot).
     #[serde(default)]
     pub bindings: Option<HashMap<String, Uuid>>,
+    /// Optional per-run network narrowing, intersected with the revision's
+    /// declaration (remove-only, like `capabilities`): a smaller mode, a subset
+    /// of the declared targets, a shorter lifetime. A target the revision never
+    /// declared is DROPPED — this can never introduce reach.
+    #[serde(default)]
+    pub network: Option<fluidbox_core::network::NetworkRequest>,
 }
 
 pub async fn create_session(
@@ -1409,6 +1448,7 @@ pub async fn create_session(
             result_destinations: vec![],
             bound_invocation: None,
             bound_dispatch: None,
+            network_override: req.network.clone(),
         },
     )
     .await?;

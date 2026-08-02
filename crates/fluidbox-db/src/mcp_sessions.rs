@@ -403,6 +403,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             &serde_json::json!([]),
+            None,
         )
         .await
         .unwrap();
@@ -425,6 +426,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .unwrap()
