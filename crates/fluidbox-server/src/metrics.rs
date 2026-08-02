@@ -574,7 +574,10 @@ pub async fn metrics_endpoint(State(state): State<AppState>) -> impl IntoRespons
 
 /// Whether a session status counts as an in-flight run for [`Metrics::active_runs`]:
 /// a sandbox exists / capacity is held from `provisioning` through `finalizing`.
-/// `created` is pre-sandbox; the four terminal states have released it.
+/// `created` and `awaiting_authorization` are both PRE-SANDBOX — a run parked
+/// for network authorization holds no compute, and counting it would make the
+/// gauge report capacity that is not held. The four terminal states have
+/// released it.
 pub fn status_is_active(status: fluidbox_core::state::SessionStatus) -> bool {
     use fluidbox_core::state::SessionStatus::*;
     matches!(

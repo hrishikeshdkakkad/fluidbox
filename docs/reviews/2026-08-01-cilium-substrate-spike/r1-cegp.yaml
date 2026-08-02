@@ -1,0 +1,17 @@
+apiVersion: cilium.io/v2
+kind: CiliumEgressGatewayPolicy
+metadata:
+  name: fluidbox-sandbox-egress
+spec:
+  selectors:
+    - podSelector:
+        matchLabels:
+          io.kubernetes.pod.namespace: spike
+          app: fluidbox-sandbox
+  destinationCIDRs: ["0.0.0.0/0"]
+  excludedCIDRs: ["10.244.0.0/16", "10.96.0.0/12"]
+  egressGateway:
+    nodeSelector:
+      matchLabels:
+        egress-gateway: "true"
+    interface: eth0

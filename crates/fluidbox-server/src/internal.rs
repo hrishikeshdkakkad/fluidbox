@@ -2243,6 +2243,7 @@ mod schema_gate_tests {
             result_destinations: vec![],
             capabilities: vec![],
             brokered: vec![],
+            network: Default::default(),
         }
     }
 

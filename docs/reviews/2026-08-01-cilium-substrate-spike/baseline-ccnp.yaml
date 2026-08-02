@@ -1,0 +1,20 @@
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: fluidbox-sandbox-baseline
+spec:
+  endpointSelector:
+    matchLabels:
+      app: fluidbox-sandbox
+  # The standing control-plane allow, by SERVER POD IDENTITY (survives DNS
+  # failure and gateway failure — neither is in this path).
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            app: fluidbox-server
+      toPorts: [{ports: [{port: "8788", protocol: TCP}]}]
+  # The deny wall. Lives in a DIFFERENT policy from the per-run grant on
+  # purpose: if deny precedence is global, no per-run grant can ever open these.
+  egressDeny:
+    - toCIDR: ["169.254.0.0/16", "127.0.0.0/8", "192.168.0.0/16", "100.64.0.0/10"]
+    - toEntities: ["host", "remote-node", "kube-apiserver"]

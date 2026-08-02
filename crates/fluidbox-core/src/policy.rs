@@ -11,6 +11,11 @@ pub struct Policy {
     pub defaults: PolicyDefaults,
     #[serde(default)]
     pub egress: Egress,
+    /// The CAP on sandbox network grants (design "governed sandbox network
+    /// access"). Distinct from [`Egress`] above, which has always described
+    /// CONTROL-PLANE egress posture and is dormant — see its doc comment.
+    #[serde(default)]
+    pub network: crate::network::NetworkPolicy,
     #[serde(default)]
     pub budgets: crate::spec::Budgets,
     #[serde(default)]
@@ -30,6 +35,8 @@ struct PolicyDe {
     defaults: PolicyDefaults,
     #[serde(default)]
     egress: Egress,
+    #[serde(default)]
+    network: crate::network::NetworkPolicy,
     #[serde(default)]
     budgets: crate::spec::Budgets,
     #[serde(default)]
@@ -113,6 +120,7 @@ impl<'de> Deserialize<'de> for Policy {
             name: raw.name,
             defaults: raw.defaults,
             egress: raw.egress,
+            network: raw.network,
             budgets: raw.budgets,
             approvals: raw.approvals,
             autonomy: raw.autonomy,
@@ -149,6 +157,16 @@ pub enum EgressMode {
     Allowlist,
 }
 
+/// CONTROL-PLANE egress posture. **Dormant, and superseded for sandboxes.**
+///
+/// This key predates governed sandbox networking and no code has ever read
+/// `mode` to decide anything. Sandbox network authority lives in
+/// [`crate::network::NetworkPolicy`] under the `network:` key instead of being
+/// overloaded onto this one, deliberately: the two answer different questions
+/// (how the CONTROL PLANE reaches upstreams, versus where a SANDBOX may
+/// connect), and a run's grant is a frozen, digestible, approvable object
+/// where this is a single enum. It is kept because stored policies carry it
+/// and must keep deserializing.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Egress {
     #[serde(default)]
@@ -298,6 +316,8 @@ struct DraftPolicy {
     #[serde(default)]
     egress: DraftEgress,
     #[serde(default)]
+    network: crate::network::NetworkPolicy,
+    #[serde(default)]
     budgets: DraftBudgets,
     #[serde(default)]
     approvals: DraftApprovals,
@@ -430,6 +450,7 @@ impl From<DraftPolicy> for Policy {
             egress: Egress {
                 mode: d.egress.mode,
             },
+            network: d.network,
             budgets: crate::spec::Budgets {
                 max_wall_clock_secs: d.budgets.max_wall_clock_secs,
                 max_tokens: d.budgets.max_tokens,
@@ -740,6 +761,7 @@ impl Policy {
         if self.name.trim().is_empty() {
             return Err("policy name must not be empty".into());
         }
+        self.network.validate()?;
         for (i, rule) in self.tools.iter().enumerate() {
             if rule.r#match.is_empty() {
                 return Err(format!("tools[{i}]: match must not be empty"));
@@ -2134,6 +2156,7 @@ mod proptests {
                         tool_action: default_action,
                     },
                     egress: Egress::default(),
+                    network: crate::network::NetworkPolicy::default(),
                     budgets: crate::spec::Budgets::default(),
                     approvals: ApprovalSettings {
                         default_ttl_secs: ttl,

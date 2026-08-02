@@ -165,6 +165,15 @@ fn reconcile_action(session: SessionLookup, has_handle: bool) -> ReconcileAction
         SessionLookup::Missing => ReconcileAction::Terminate,
         SessionLookup::Unparseable => ReconcileAction::Leave,
         SessionLookup::Known(s) if s.is_terminal() => ReconcileAction::Terminate,
+        // A session parked for network authorization has no sandbox BY
+        // CONSTRUCTION — provisioning has not run. A pod that exists for one
+        // is therefore a leak, and nothing has authorized it to run, so it is
+        // killed rather than adopted. (Adopting would also fail: the
+        // `adopt_sandbox_handle` status list excludes this state, so the
+        // reconcile would retry forever instead of converging.)
+        SessionLookup::Known(fluidbox_core::state::SessionStatus::AwaitingAuthorization) => {
+            ReconcileAction::Terminate
+        }
         // The finalizer owns winding-down sandboxes — collection may be in
         // flight; it reaps on completion, and recovery re-drives it.
         SessionLookup::Known(s) if s.is_winding_down() => ReconcileAction::Leave,
@@ -1028,6 +1037,32 @@ mod tests {
         assert_eq!(
             reconcile_action(Known(SessionStatus::AwaitingApproval), true),
             Leave
+        );
+    }
+
+    #[test]
+    fn a_sandbox_for_an_unauthorized_session_is_killed_not_adopted() {
+        use ReconcileAction::*;
+        use SessionLookup::Known;
+        // A run parked for network authorization has no sandbox by
+        // construction: provisioning has not happened. A pod that exists for
+        // one has not been authorized to run, so reconcile must TERMINATE it
+        // — with or without a recorded handle. Adopting would be doubly wrong:
+        // it would keep unauthorized code alive, and `adopt_sandbox_handle`
+        // refuses this status anyway, so the sweep would never converge.
+        assert_eq!(
+            reconcile_action(Known(SessionStatus::AwaitingAuthorization), false),
+            Terminate
+        );
+        assert_eq!(
+            reconcile_action(Known(SessionStatus::AwaitingAuthorization), true),
+            Terminate
+        );
+        // Guard against passing by terminating everything: the ordinary
+        // handle-less active session is still ADOPTED.
+        assert_eq!(
+            reconcile_action(Known(SessionStatus::Running), false),
+            Adopt
         );
     }
 }
