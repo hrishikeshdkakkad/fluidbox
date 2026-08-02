@@ -55,6 +55,10 @@ const MAX_STREAM_RESUMES: u32 = 4;
 pub struct KubernetesProvider {
     pods: Api<Pod>,
     secrets: Api<Secret>,
+    /// `cilium.io/v2` CiliumNetworkPolicy, as a dynamic resource — the CRD has
+    /// no typed Rust binding and pulling one in for four fields would be a
+    /// dependency we would then have to keep in step with Cilium's schema.
+    cnps: Api<kube::api::DynamicObject>,
     cfg: K8sConfig,
     namespace: String,
     /// The control plane's data dir: pre-launch collection (no pod ever
@@ -73,12 +77,81 @@ impl KubernetesProvider {
 
     pub fn with_client(client: Client, cfg: K8sConfig, data_dir: PathBuf) -> Self {
         let namespace = cfg.namespace.clone();
+        let cnp_resource = kube::api::ApiResource {
+            group: "cilium.io".into(),
+            version: "v2".into(),
+            api_version: "cilium.io/v2".into(),
+            kind: "CiliumNetworkPolicy".into(),
+            plural: "ciliumnetworkpolicies".into(),
+        };
         Self {
             pods: Api::namespaced(client.clone(), &namespace),
-            secrets: Api::namespaced(client, &namespace),
+            secrets: Api::namespaced(client.clone(), &namespace),
+            cnps: Api::namespaced_with(client, &namespace, &cnp_resource),
             cfg,
             namespace,
             data_dir,
+        }
+    }
+
+    /// Program the per-run `CiliumNetworkPolicy` for a grant, if it needs one.
+    ///
+    /// An OFFLINE grant needs no object: offline is the ABSENCE of an allow,
+    /// delivered by the chart-static baseline's default-deny. A run with no
+    /// grant at all (resolved before governed networking) is offline too.
+    ///
+    /// Fails closed: a rejected or unwritable policy aborts provisioning rather
+    /// than letting the pod start unenforced. A grant whose enforcement we
+    /// cannot program is a refused run, never a quiet downgrade.
+    async fn apply_run_policy(
+        &self,
+        spec: &SandboxSpec,
+        pod_name: &str,
+        pod_uid: &str,
+    ) -> Result<(), ProviderError> {
+        let Some(granted) = &spec.network_grant else {
+            return Ok(());
+        };
+        let ctx = netgrant::PolicyContext {
+            namespace: self.namespace.clone(),
+            resolver_labels: self.cfg.sandbox_resolver_labels(),
+            owner_pod_uid: pod_uid.to_string(),
+            owner_pod_name: pod_name.to_string(),
+        };
+        let Some(policy) = netgrant::build_run_policy(granted, spec.session_id, &ctx) else {
+            return Ok(());
+        };
+        let obj: kube::api::DynamicObject = serde_json::from_value(policy)
+            .map_err(|e| ProviderError::Other(format!("bad network policy manifest: {e}")))?;
+        // A structurally invalid policy is rejected by CRD schema validation at
+        // THIS call — which the Phase 0 spike confirmed is a hard API error, and
+        // is a better fail-closed signal than any status poll: there is no
+        // window in which a bad policy sits silently pending.
+        self.cnps
+            .create(&Default::default(), &obj)
+            .await
+            .map_err(|e| {
+                ProviderError::Other(format!(
+                    "programming the network grant for {} failed: {e}",
+                    spec.session_id
+                ))
+            })?;
+        Ok(())
+    }
+
+    /// Delete a run's network policy. Idempotent — a missing object is success,
+    /// because this is called from teardown paths that must be safe to retry.
+    /// Owner-reference GC is the primary collector; this is the prompt path and
+    /// the belt-and-braces one.
+    pub async fn revoke_run_policy(&self, session_id: uuid::Uuid) -> Result<(), ProviderError> {
+        match self
+            .cnps
+            .delete(&netgrant::policy_name(session_id), &DeleteParams::default())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+            Err(e) => Err(map_err(e)),
         }
     }
 
@@ -363,13 +436,36 @@ impl ExecutionProvider for KubernetesProvider {
             .clone()
             .ok_or_else(|| ProviderError::Other("created pod has no uid".into()))?;
 
-        // 2. Create the immutable Secret with an ownerReference → Pod UID.
+        // 2. Program the run's network grant, OWNED by the pod.
+        //
+        // Between the pod and the Secret on purpose. Creating the policy BEFORE
+        // the pod would leave it with no ownerReference, and nothing today
+        // would collect it — `terminate()` deletes only Pods and
+        // `list_managed()` lists only Pods — so it would leak on four paths
+        // (crash after create, pod-create failure, revoke failure, forgotten
+        // retry). Because Cilium allow rules are ADDITIVE, a surviving policy
+        // that later matched a re-created pod for the same session would
+        // silently REOPEN traffic.
+        //
+        // Putting it here is safe because the pod cannot RUN yet: its
+        // containers reference a Secret that does not exist, and the kubelet
+        // holds container start until it does. So enforcement is programmed
+        // strictly before any untrusted code, GC backstops cleanup, and this is
+        // a one-step delta from the pre-existing Pod-then-Secret order.
+        if let Err(e) = self.apply_run_policy(spec, &name, &uid).await {
+            let _ = self.delete_pod(&name, Some(&uid)).await;
+            return Err(e);
+        }
+
+        // 3. Create the immutable Secret with an ownerReference → Pod UID.
+        //    LAST: it is what releases the pod to start.
         let secret: Secret = serde_json::from_value(build_secret(spec, &uid))
             .map_err(|e| ProviderError::Other(format!("bad secret manifest: {e}")))?;
         if let Err(e) = self.secrets.create(&Default::default(), &secret).await {
             // Secret create failed → clean up the Pod (UID-guarded) so nothing
             // orphans, and surface the error (the orchestrator revokes the
-            // token on the failed-run path).
+            // token on the failed-run path). The policy is owned by the pod, so
+            // deleting the pod collects it too.
             let _ = self.delete_pod(&name, Some(&uid)).await;
             return Err(map_err(e));
         }
@@ -521,6 +617,21 @@ impl ExecutionProvider for KubernetesProvider {
     }
 
     async fn terminate(&self, handle: &SandboxHandle) -> Result<(), ProviderError> {
+        // Belt and braces on the network policy. The pod owns it, so deleting
+        // the pod collects it via owner-reference GC — but GC is not a
+        // guarantee to rely on when the consequence of a survivor is that a
+        // re-created pod for the same session silently regains its allow rules.
+        // A failure here is logged, never fatal: the pod delete below is what
+        // actually stops the workload, and the reconcile sweep re-drives this.
+        if let Some(sid) = handle
+            .external_id
+            .strip_prefix("fluidbox-")
+            .and_then(|s| Uuid::parse_str(s).ok())
+        {
+            if let Err(e) = self.revoke_run_policy(sid).await {
+                tracing::warn!("revoking network policy for {sid} failed: {e}");
+            }
+        }
         self.delete_pod(&handle.external_id, self.handle_uid(handle))
             .await
     }
