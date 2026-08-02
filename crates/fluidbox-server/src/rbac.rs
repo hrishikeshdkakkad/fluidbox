@@ -83,6 +83,13 @@ pub fn classify_approval_authority(
     tool: &str,
     binding: Option<&ApprovalBindingFacts>,
 ) -> ApprovalAuthority {
+    // Widening a sandbox's network reach is an ORGANIZATION decision, never a
+    // self-approval: the run's own initiator must not be able to authorize the
+    // authority their run will then exercise. It is not a tool call and carries
+    // no binding, so it is classified by name before the mcp branch below.
+    if tool == crate::netgrant::GRANT_TOOL {
+        return ApprovalAuthority::Organization;
+    }
     if !tool.starts_with("mcp__") {
         return ApprovalAuthority::Credentialless;
     }

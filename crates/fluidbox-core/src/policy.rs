@@ -4,6 +4,12 @@ use serde_json::Value;
 
 // ─── Policy document (YAML v0) ────────────────────────────────────────────
 
+/// True for the fail-safe default section — the one a policy that never
+/// mentions the network resolves to.
+fn network_policy_is_default(n: &crate::network::NetworkPolicy) -> bool {
+    *n == crate::network::NetworkPolicy::default()
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Policy {
     pub name: String,
@@ -14,7 +20,14 @@ pub struct Policy {
     /// The CAP on sandbox network grants (design "governed sandbox network
     /// access"). Distinct from [`Egress`] above, which has always described
     /// CONTROL-PLANE egress posture and is dormant — see its doc comment.
-    #[serde(default)]
+    ///
+    /// A DEFAULT (offline-capped) section is omitted from the wire form, so a
+    /// policy that says nothing about the network serializes byte-identically
+    /// to how it did before this field existed. That is not cosmetic: the
+    /// frozen `policy_snapshot` in a RunSpec is asserted byte-equal to the
+    /// stored policy version it froze, and every policy written before
+    /// governed networking must keep satisfying it.
+    #[serde(default, skip_serializing_if = "network_policy_is_default")]
     pub network: crate::network::NetworkPolicy,
     #[serde(default)]
     pub budgets: crate::spec::Budgets,
@@ -1263,6 +1276,38 @@ tools:
     /// engine's — this is the PLAN §10 #1 shell-risk classifier decision and
     /// the #3 budget decision, tested. governance-e2e.sh relies on the
     /// Read/WebFetch/`git push` anchors staying exactly like this.
+    #[test]
+    fn a_policy_without_a_network_section_serializes_as_it_always_did() {
+        // The frozen `policy_snapshot` in a RunSpec is asserted BYTE-EQUAL to
+        // the stored policy version it froze (governance-e2e pins this). Adding
+        // the `network` section must therefore be invisible on the wire for
+        // every policy that does not use it — otherwise every pre-existing
+        // stored policy would fail that equality the moment this shipped.
+        let p = Policy::parse_yaml("name: p").unwrap();
+        let v = serde_json::to_value(&p).unwrap();
+        assert!(
+            v.get("network").is_none(),
+            "a default network section must not appear on the wire: {v}"
+        );
+        assert_eq!(
+            p.network.max_mode,
+            crate::network::NetworkGrantMode::Offline,
+            "and the default it deserializes to is the fail-safe one"
+        );
+
+        // A policy that DOES configure the network serializes it.
+        let configured = Policy::parse_yaml(
+            "name: p\nnetwork:\n  max_mode: approved\n  require_approval: true\n",
+        )
+        .unwrap();
+        let v = serde_json::to_value(&configured).unwrap();
+        assert_eq!(v["network"]["max_mode"], "approved");
+        assert_eq!(v["network"]["require_approval"], true);
+        // …and round-trips.
+        let back: Policy = serde_json::from_value(v).unwrap();
+        assert_eq!(back.network, configured.network);
+    }
+
     #[test]
     fn seed_policy_semantics() {
         let yaml = include_str!("../../../policies/default.yaml");

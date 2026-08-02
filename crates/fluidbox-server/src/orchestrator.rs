@@ -259,6 +259,10 @@ async fn transition_inner(
                 if let Err(e) = fluidbox_db::revoke_session_tokens(&state.pool, scope, id).await {
                     tracing::warn!("revoke_session_tokens {id} failed: {e}");
                 }
+                // Same reasoning for network authority: surrender it the moment
+                // the run is over. Idempotent by CAS, so the reconciler's retry
+                // below and the abandon paths can all call it safely.
+                crate::netgrant::revoke(state, scope, id, "run terminal").await;
                 // Publication is decoupled: enqueue rows; the delivery worker
                 // owns retries. Fires on terminal entry — reachable ONLY from
                 // `finalizing`, so the diff artifact is already stored when
@@ -1044,6 +1048,7 @@ async fn finish_terminal_cleanup(
         tracing::warn!("terminal reconcile {id}: token revoke failed: {e}");
         return;
     }
+    crate::netgrant::revoke(state, scope, id, "terminal reconcile").await;
     // Delivery enqueue is owed only when the RunSpec names destinations.
     // enqueue_for_session is per-destination idempotent and returns true only
     // when EVERY destination has a row — partial success (destination A
@@ -1183,6 +1188,42 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
     // pre-existing intra-replica fences (`launch_ownership`, the
     // `set_sandbox_handle` attach fence) are unchanged and still do their job —
     // the lease is the CROSS-replica layer above them.
+    // Network-grant gate: nothing provisions until the run's grant is IN FORCE.
+    // Fails closed on every axis — a missing row, a status that is not `active`,
+    // and an expiry that has passed all refuse — so a parked, denied, revoked,
+    // or lapsed grant can never reach a sandbox. This is the last check before
+    // any pod exists, and it is deliberately independent of how the session got
+    // here: the gate worker's release and this gate agree, or nothing runs.
+    match fluidbox_db::network_grants::get_network_grant(&state.pool, scope, session_id).await {
+        Ok(Some(g)) if g.is_in_force(chrono::Utc::now()) => {}
+        Ok(Some(g)) => {
+            anyhow::bail!(
+                "network grant for this run is not in force (status '{}', mode '{}') —                  refusing to provision",
+                g.status,
+                g.mode
+            );
+        }
+        // No row at all. `create_session` writes one in the same transaction as
+        // the session, so this only happens for a run created BEFORE migration
+        // 0028 — i.e. one still in flight across the deploy. Such a run's frozen
+        // spec deserializes to an OFFLINE grant (that is what it actually had),
+        // and an offline run needs no authority to be in force, so it proceeds.
+        // A missing row with a spec that claims egress is corruption, and
+        // refuses.
+        Ok(None) if !run_spec.network.grants_egress() => {
+            tracing::debug!(
+                session_id = %session_id,
+                "no network grant row (pre-0028 run); proceeding offline"
+            );
+        }
+        Ok(None) => anyhow::bail!(
+            "this run's spec claims network mode '{}' but no grant is recorded — \
+             refusing to provision",
+            run_spec.network.mode.as_str()
+        ),
+        Err(e) => anyhow::bail!("network grant lookup failed: {e}"),
+    }
+
     let Some(mut epoch) = hold_lease(&state, scope, session_id).await else {
         anyhow::bail!("another replica owns this session's orchestrator lease");
     };

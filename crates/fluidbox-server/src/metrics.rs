@@ -293,6 +293,15 @@ pub struct Metrics {
     pub deliveries: Family,
     // ── Run lifecycle. `outcome` = completed | failed | cancelled | budget_exceeded.
     pub runs_terminal: Family,
+    // ── Network grants (design "governed sandbox network access"). Both
+    // families are FIXED-cardinality on purpose: the label is the grant mode or
+    // the enumerated denial code, never a target, host, or tenant. A target
+    // label would be unbounded operator text and a tenant label belongs in the
+    // ledger, not a metric.
+    /// `outcome` = active | awaiting_authorization | denied | revoked.
+    pub network_grants: Family,
+    /// `reason` = the `DenialReason`/`ReleaseRefusal` code that refused a grant.
+    pub network_grant_refusals: Family,
     /// In-flight runs (provisioning..finalizing). Replica-local; resets on restart.
     pub active_runs: Gauge,
     pub run_provisioning_ms: Histogram,
@@ -369,6 +378,30 @@ impl Default for Metrics {
                 "fluidbox_runs_terminal_total",
                 "outcome",
                 &["completed", "failed", "cancelled", "budget_exceeded"],
+            ),
+            network_grants: Family::new(
+                "fluidbox_network_grants_total",
+                "outcome",
+                &["active", "awaiting_authorization", "denied", "revoked"],
+            ),
+            network_grant_refusals: Family::new(
+                "fluidbox_network_grant_refusals_total",
+                "reason",
+                &[
+                    "invalid_target",
+                    "blocked_range",
+                    "policy_deny",
+                    "mode_ceiling",
+                    "public_with_brokered",
+                    "not_in_catalog",
+                    "unenforceable",
+                    "expiry_too_short",
+                    "grant_digest_mismatch",
+                    "grant_expired",
+                    "policy_moved",
+                    "grant_not_pending",
+                    "grant_schema_unsupported",
+                ],
             ),
             active_runs: Gauge::default(),
             run_provisioning_ms: Histogram::new(
@@ -460,6 +493,10 @@ pub fn render(m: &Metrics, live: &Live) -> String {
         .render(&mut out, "Result-delivery callback outcomes.");
     m.runs_terminal
         .render(&mut out, "Runs reaching a terminal state by outcome.");
+    m.network_grants
+        .render(&mut out, "Sandbox network grants by resolved outcome.");
+    m.network_grant_refusals
+        .render(&mut out, "Network grants refused, by enumerated reason.");
 
     gauge_i64(
         &mut out,

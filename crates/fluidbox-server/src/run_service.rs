@@ -8,6 +8,7 @@
 use crate::api::LocalPathAuthority;
 use crate::bindings::{self, BindingInputs, WorkspaceBindingInput};
 use crate::error::{ApiError, ApiResult};
+use crate::netgrant;
 use crate::orchestrator;
 use crate::state::AppState;
 use fluidbox_core::capability::{
@@ -87,6 +88,11 @@ pub struct CreateRun {
     /// Event fan-out claim (trigger_dispatches), bound in the same
     /// transaction — same crash-safety argument as bound_invocation.
     pub bound_dispatch: Option<Uuid>,
+    /// Per-run narrowing of the revision's declared network request. May only
+    /// SHRINK it (`NetworkRequest::narrowed_by`): a smaller mode, a subset of
+    /// the declared targets, a shorter lifetime. A target the revision never
+    /// declared is dropped, so this can never introduce reach.
+    pub network_override: Option<fluidbox_core::network::NetworkRequest>,
 }
 
 pub enum RunCreation {
@@ -394,10 +400,47 @@ pub async fn create_run(
     // id (invariant 21). The RunSpec then references each binding row 1:1.
     bindings::apply_binding_ids(&resolved, &mut workspace, &mut result_destinations);
 
-    // Sandbox network authority. Every run is offline until grant resolution
-    // lands beside the autonomy gate above; an offline grant is the floor, so
-    // this is the correct value rather than a placeholder.
-    let network_grant = fluidbox_core::network::NetworkGrant::offline();
+    // ── Sandbox network authority ────────────────────────────────────────
+    //
+    // Resolved BEFORE anything is created, so a refusal costs nothing and no
+    // pod ever exists for an unresolved grant. The request is what the revision
+    // DECLARES, narrowed by any per-run override (remove-only); the policy caps
+    // it; the deny order in `fluidbox_core::network` decides.
+    let network_request =
+        netgrant::effective_request(rev.network.as_ref(), req.network_override.as_ref())
+            .map_err(ApiError::UnprocessableEntity)?;
+    let network_resolution = netgrant::resolve_for_run(
+        &network_request,
+        &policy,
+        &fluidbox_core::network::ResolutionContext {
+            now: chrono::Utc::now(),
+            // The grant must outlive the run it governs, so authority cannot
+            // lapse mid-flight.
+            run_wall_clock_secs: effective_budgets.max_wall_clock_secs,
+            // The dangerous pairing is credentials plus reach: a `public` run
+            // that also holds brokered tool results is refused unless policy
+            // opts in.
+            has_brokered_surfaces: !brokered.is_empty(),
+            enforcement_available: state.cfg.network_enforcer
+                != crate::config::NetworkEnforcer::None,
+        },
+    )
+    // Tail 3 — REFUSE. Nothing has been created; the reason is enumerated.
+    .map_err(|reason| {
+        state.metrics.network_grant_refusals.inc(reason.code());
+        ApiError::UnprocessableEntity(reason.message())
+    })?;
+    state
+        .metrics
+        .network_grants
+        .inc(if network_resolution.needs_authorization {
+            "awaiting_authorization"
+        } else {
+            "active"
+        });
+    let network_grant = network_resolution.grant.clone();
+    // Captured before `policy` moves into the frozen RunSpec below.
+    let approval_ttl_secs = policy.approvals.default_ttl_secs;
 
     let run_spec = RunSpec {
         agent_id: agent.id,
@@ -421,7 +464,7 @@ pub async fn create_run(
         // Frozen brokered surfaces from binding resolution (the connection-free
         // successor to embedding a connection_id in a `capabilities` server).
         brokered,
-        network: network_grant,
+        network: network_grant.clone(),
     };
 
     // 512 KiB serialized runner-env ceiling (design 2026-07-15): env injection
@@ -472,6 +515,10 @@ pub async fn create_run(
         // (design `:391-463`; invariant 21): a run and the frozen record of what
         // it resolved land together, or not at all.
         &binding_rows,
+        // Same reasoning for the network grant: a session whose grant row is
+        // missing cannot be provisioned (the orchestrator gate fails closed on
+        // it), so they commit together.
+        Some(&network_resolution.row),
     )
     .await?;
 
@@ -513,7 +560,47 @@ pub async fn create_run(
         .await;
     }
 
-    // Kick off the run.
+    // Timeline visibility for the frozen network grant. Targets are the
+    // operator-authored selectors, never a resolved address.
+    if network_grant.grants_egress() || network_resolution.needs_authorization {
+        crate::ledger::record(
+            state,
+            scope,
+            session.id,
+            fluidbox_core::event::Actor::System,
+            fluidbox_core::event::EventBody::NetworkGrantFrozen {
+                mode: network_grant.mode.as_str().into(),
+                targets: network_grant.targets.iter().map(|t| t.describe()).collect(),
+                digest: network_resolution.row.grant_digest.clone(),
+                awaiting_authorization: network_resolution.needs_authorization,
+                expires_at: network_grant.expires_at.map(|t| t.to_rfc3339()),
+            },
+        )
+        .await;
+    }
+
+    if network_resolution.needs_authorization {
+        // ── Tail 2 — FREEZE AND PARK ─────────────────────────────────────
+        //
+        // The spec is frozen; provisioning is not released until a human
+        // authorizes THIS digest. The pause is durable state, not an in-memory
+        // wait: the `network_grant_gate` worker resumes it, so a restart mid-
+        // pause loses nothing and nothing spawns here.
+        netgrant::park_for_authorization(
+            state,
+            scope,
+            session.id,
+            &network_resolution,
+            approval_ttl_secs,
+        )
+        .await?;
+        let parked = fluidbox_db::get_session(&state.pool, scope, session.id)
+            .await?
+            .unwrap_or(session);
+        return Ok(RunCreation::Created(Box::new(parked)));
+    }
+
+    // ── Tail 1 — FREEZE AND SPAWN ────────────────────────────────────────
     orchestrator::spawn_run(state.clone(), session.id);
 
     Ok(RunCreation::Created(Box::new(session)))

@@ -548,6 +548,33 @@ function TimelineItem({ ev }: { ev: EventRow }) {
         </>
       );
       break;
+    case "network.grant.frozen": {
+      const targets = (d.targets as string[]) || [];
+      const parked = d.awaiting_authorization === true;
+      // Amber while a human is being waited on, accent once it is in force.
+      cls = parked ? "human" : "accent";
+      tag = "network";
+      body = (
+        <>
+          network grant <span className="em">{s("mode")}</span>
+          {targets.length > 0 ? (
+            <span className="mut"> · {targets.join(", ")}</span>
+          ) : null}
+          {parked ? <span className="mut"> · awaiting authorization</span> : null}
+        </>
+      );
+      break;
+    }
+    case "network.grant.revoked":
+      cls = "mut";
+      tag = "network";
+      body = (
+        <>
+          network grant revoked
+          {s("reason") ? <span className="mut"> · {s("reason")}</span> : null}
+        </>
+      );
+      break;
     case "tool.brokered": {
       const ok = d.ok === true;
       const outcome = s("outcome");

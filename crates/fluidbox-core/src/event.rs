@@ -113,6 +113,23 @@ pub enum EventBody {
     /// is the authoritative copy). `bundles` are "name@version" strings.
     #[serde(rename = "capability.frozen")]
     CapabilitiesFrozen { bundles: Vec<String>, tools: u64 },
+    /// The run's frozen network grant. `targets` are the operator-authored
+    /// selector strings (`TargetRule::describe`) — never a resolved address,
+    /// which would be a DNS answer this event has no business asserting.
+    /// `awaiting_authorization` records that the run parked rather than
+    /// starting, so the timeline shows the pause as a decision point.
+    #[serde(rename = "network.grant.frozen")]
+    NetworkGrantFrozen {
+        mode: String,
+        targets: Vec<String>,
+        digest: String,
+        awaiting_authorization: bool,
+        expires_at: Option<String>,
+    },
+    /// The grant's authority was surrendered — at terminal cleanup, on an
+    /// abandon path, or because a human refused it.
+    #[serde(rename = "network.grant.revoked")]
+    NetworkGrantRevoked { mode: String, reason: String },
     /// Terminal artifact collection metadata — size/digest/truncation only,
     /// never payloads (the artifact row holds the content).
     #[serde(rename = "artifact.collected")]
