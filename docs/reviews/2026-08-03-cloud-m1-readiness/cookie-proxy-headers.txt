@@ -1,0 +1,11 @@
+HTTP/1.1 303 See Other
+vary: rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch
+content-type: text/plain
+location: /app
+set-cookie: __Host-fbx_web=probe-session-value; Path=/; Secure; HttpOnly; SameSite=Lax
+set-cookie: __Host-fbx_login_probe=; Path=/; Secure; HttpOnly; Max-Age=0
+Date: Mon, 03 Aug 2026 17:25:57 GMT
+Connection: keep-alive
+Keep-Alive: timeout=5
+Transfer-Encoding: chunked
+
