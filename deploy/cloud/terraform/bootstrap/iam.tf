@@ -392,6 +392,16 @@ resource "aws_iam_policy" "deployer_infra" {
           "cloudtrail:LookupEvents",
           "health:Describe*",
           "sts:GetCallerIdentity",
+          # Resource discovery by tag: how rotate-origin-secret.sh and
+          # teardown.sh find the controller-created ALB (its ARN is not in any
+          # Terraform state). Read-only and un-scopable by design.
+          "tag:GetResources",
+          "tag:GetTagKeys",
+          "tag:GetTagValues",
+          # verify-bootstrap.sh reads AccountAccessKeysPresent to prove the
+          # root key is retired. Account-summary is counts only — it exposes no
+          # principal, policy, or credential material.
+          "iam:GetAccountSummary",
         ]
         Resource = "*"
       },
