@@ -104,6 +104,10 @@ echo "$SID" > "$EV/session-id"
   done ) &
 PODWATCH=$!
 
+# set +e around the pipeline: with `set -e -o pipefail`, a FAILED replay would
+# abort the script here and skip the artifact capture below — which is exactly
+# the evidence needed to diagnose the failure.
+set +e
 FBX_API="$API" FBX_TOKEN="$ADMIN_TOKEN" FBX_SID="$SID" FBX_EV="$EV" FBX_DECISION="$DECISION" \
 python3 -u - <<'PYEOF' | tee "$EV/timeline.txt"
 import json, os, sys, time, urllib.request
@@ -150,6 +154,7 @@ with open(os.path.join(EV, "terminal-status.txt"), "w") as f:
 sys.exit(0 if (status == "completed" or DECISION != "approve") else 1)
 PYEOF
 REPLAY_RC=${PIPESTATUS[0]}
+set -e
 wait "$PODWATCH" 2>/dev/null || true
 
 say "5. artifacts + GC evidence"
@@ -170,7 +175,10 @@ if diff:
 PYEOF
 [ -s "$EV/changes.patch" ] && ok "diff artifact captured ($EV/changes.patch)" || warn "no diff artifact (expected on the deny path)"
 sleep 20
-kubectl get pods -n "$CLOUD_SANDBOX_NS" > "$EV/sandbox-after.txt" 2>&1 || true
-grep -qv '^NAME' "$EV/sandbox-after.txt" 2>/dev/null && warn "sandbox namespace not yet empty (GC may lag terminal by a few s)" || ok "sandbox namespace empty after terminal (GC clean)"
+kubectl get pods -n "$CLOUD_SANDBOX_NS" --no-headers > "$EV/sandbox-after.txt" 2>/dev/null || true
+LEFT=$(grep -c . "$EV/sandbox-after.txt" 2>/dev/null || echo 0)
+[ "$LEFT" -eq 0 ] \
+  && ok "sandbox namespace empty after terminal (ownerRef GC clean)" \
+  || warn "$LEFT pod(s) still in $CLOUD_SANDBOX_NS — GC can lag terminal by a few seconds; re-check before treating it as a leak"
 
 [ "$REPLAY_RC" = "0" ] && ok "replay journey PASSED (evidence: $EV/)" || die "replay journey FAILED (see $EV/timeline.txt)"
