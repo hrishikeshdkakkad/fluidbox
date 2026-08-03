@@ -21,10 +21,10 @@ against the M1 brief §6 list, item by item.
 | **Vercel cookie + SSE probe** | ✅ **code path PASS** (9/9); platform cap pending project link | below + `sse-*`, `cookie-*` files here |
 | Fallback if Vercel can't carry streams | ✅ **documented** | `docs/hosted/cloud-architecture.md` §"Event streaming" |
 
-**Verdict:** the gate is **not yet closed** — it closes when the bootstrap
-apply + ceremony run and `verify-bootstrap.sh` reports all-pass. Everything
-that could be proved without spending money or making a reserved decision has
-been proved.
+**Verdict (superseded — see "M1.0 gate — CLOSED by apply" at the end of this
+file):** the bootstrap stack was applied on 2026-08-03 with explicit approval.
+The rows above marked "BUILT, awaiting apply" are now LIVE and verified; two
+human steps remain (SNS email confirmation, and the root-key decision).
 
 ## Proof 1 — OIDC login path (17/18)
 
