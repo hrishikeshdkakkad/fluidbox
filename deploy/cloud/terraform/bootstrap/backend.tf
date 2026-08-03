@@ -10,12 +10,12 @@
 # The bucket name is fluidbox-cloud-tfstate-<account-id>; the first apply
 # prints it as the `state_bucket` output.
 
-# terraform {
-#   backend "s3" {
-#     bucket       = "fluidbox-cloud-tfstate-471112572248"
-#     key          = "bootstrap.tfstate"
-#     region       = "us-east-1"
-#     encrypt      = true
-#     use_lockfile = true
-#   }
-# }
+terraform {
+  backend "s3" {
+    bucket       = "fluidbox-cloud-tfstate-471112572248"
+    key          = "bootstrap.tfstate"
+    region       = "us-east-1"
+    encrypt      = true
+    use_lockfile = true
+  }
+}

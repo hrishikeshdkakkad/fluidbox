@@ -157,3 +157,61 @@ methods), `p5-activate.txt`, `p6-start-headers.txt`, `p6-authorize-url.txt`,
 `p7-idp-response-headers.txt`, `p7-idp-body.html`,
 `p7-client-id-comparison.txt`, `sse-stream-sample.txt`,
 `sse-resume-sample.txt`, `cookie-proxy-headers.txt`.
+
+## M1.0 gate — CLOSED by apply (2026-08-03)
+
+The bootstrap stack was applied with explicit user approval: **27 added, 0
+changed, 0 destroyed**. Live and verified:
+
+| guardrail | state |
+|---|---|
+| Scoped deployer role | `arn:aws:iam::471112572248:role/fluidbox-cloud/fluidbox-cloud-deployer` |
+| Operator user + both AWS profiles | configured; `fluidbox-operator` → assumes deployer, verified |
+| Account-wide breaker | **$600/mo** (the decided number) |
+| Tag-filtered fluidbox budget | $50/mo (raise to ~175 with the platform apply) |
+| CloudTrail `fluidbox-cloud` | `IsLogging=True`, validation on, 90-day lifecycle |
+| Root-activity alarm | EventBridge rule `ENABLED` |
+| Terraform state | S3, versioned, encrypted, public-access-blocked, TLS-only; migrated off local disk |
+
+`verify-bootstrap.sh` as the **assumed deployer**: 10 pass, 2 outstanding —
+both human steps (below).
+
+### Two findings from the apply itself
+
+1. **The bootstrap stack is root-only for every change** — verified, not
+   assumed. Both non-root profiles were tried against the applied stack and
+   both fail at *plan*: the deployer deliberately lacks `iam:GetUser` on the
+   operator, `budgets:ListTagsForResource`, `events:DescribeRule`,
+   `sns:GetTopicAttributes` and the trail bucket's `s3:GetBucket*`. Granting
+   them would let the deployer read and then rewrite the policies that bound
+   it. An earlier draft of the bootstrap README claimed budget tuning could be
+   applied with the deployer profile; that was wrong and is corrected.
+2. **The root key is still ACTIVE, deliberately.** §9-1's *capability* is
+   already proven — the scoped deployer applied and verified without it. But
+   CloudTrail shows root was used on **2026-08-01** (a broad read-only account
+   inventory: ListStacks, ListSecrets, ListHostedZones, ListClusters,
+   ListFunctions, ListBuckets…) and **2026-07-30** (ECR
+   `DescribeRepositories`) — i.e. by something other than this session, on an
+   account shared with four other projects. Deactivating it could break
+   another project's tooling, which was not part of the approval given. The
+   decision is one command once you have confirmed nothing else depends on it:
+
+   ```bash
+   aws iam update-access-key --access-key-id AKIAW3MD7LVMAE45DEVP --status Inactive
+   AWS_PROFILE=fluidbox-deployer scripts/cloud/verify-bootstrap.sh   # expect 12/12
+   # then, after a day with nothing broken:
+   aws iam delete-access-key --access-key-id AKIAW3MD7LVMAE45DEVP
+   ```
+
+   Reversible from the console if anything does break. The
+   `fluidbox-root-activity` alarm now announces every future root use, so a
+   surprise consumer will identify itself.
+
+### Also outstanding
+
+- **SNS email subscription is `PendingConfirmation`** — budget and root alarms
+  will not reach you until you click the link SNS sent to
+  hrishidkakkad@gmail.com.
+- **Cost-allocation tag `project` is `Inactive`** — expected: AWS refuses to
+  activate a tag it has never seen on billed usage. Re-apply bootstrap with
+  `-var activate_cost_allocation_tag=true` ~24h after the platform stack bills.

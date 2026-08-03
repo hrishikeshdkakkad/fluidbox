@@ -1,5 +1,15 @@
 # Cloud M1 — decision sheet (§12) + apply queue
 
+> **DECISIONS TAKEN 2026-08-03** (answered directly): identity = **bring-your-own
+> IdP per org**; account breaker = **$600/mo**; IAM bootstrap = **approved and
+> APPLIED**; Vercel = **approved to link**. Still open: first beta org + owner,
+> and approval for a real-model run.
+>
+> **BOOTSTRAP IS APPLIED** — 27 resources, state migrated to
+> `s3://fluidbox-cloud-tfstate-471112572248`, both scoped profiles configured
+> and verified. Two ceremony steps remain, both yours: confirm the SNS email,
+> and decide on the root key (see below).
+
 Prepared 2026-08-03 during the autonomous M1 build session. Everything
 buildable was built and validated; the items below are the SEVEN decisions
 the M1 brief reserves for you (§12), each with the evidence-backed

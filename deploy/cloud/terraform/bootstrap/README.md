@@ -93,10 +93,21 @@ Then, in order:
 - **Scripts (`scripts/cloud/*.sh`): `AWS_PROFILE=fluidbox-deployer`.** They
   call the AWS CLI directly and need deployer authority with no provider in
   the middle.
-- Routine budget tuning: the deployer role can `budgets:ModifyBudget` on
-  `fluidbox-*` budgets — edit the variable here and apply *with the deployer
-  profile* (this stack's resources are deliberately deployer-adjustable only
-  for budgets; IAM changes need break-glass).
+- **This stack is root-only, for every change — verified 2026-08-03, not
+  assumed.** An earlier version of this file claimed budget tuning could be
+  applied with the deployer profile. It cannot, and the reason is a feature:
+  terraform must *read* every resource in the stack to plan it, and the
+  deployer deliberately lacks `iam:GetUser` on the operator,
+  `budgets:ListTagsForResource`, `events:DescribeRule`,
+  `sns:GetTopicAttributes` and the trail bucket's `s3:GetBucket*`. Granting
+  them would let the deployer read — and then rewrite — the policies that
+  bound the deployer. Both non-root profiles were tried against the applied
+  stack and both fail at plan with AccessDenied; that is the separation
+  working.
+  - Change a budget *value*: reactivate a root access key briefly, apply,
+    deactivate again — or edit in the console and accept that the next root
+    apply reverts it.
+  - Everything else here is apply-once by design.
 - IAM/bootstrap changes: break-glass root **console** session (no key). The
   root-activity alarm announcing it is the control working, not a bug.
   **Known consequence:** after retirement there is no non-root Terraform path
