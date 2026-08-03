@@ -32,6 +32,19 @@ HTTP level), and **#5 is now a link-only step** (the proxy code path is
 already proven; only the platform cap is outstanding). Full ledger:
 `docs/reviews/2026-08-03-cloud-m1-readiness/README.md`.
 
+## Start here
+
+```bash
+scripts/cloud/cloud-preflight.sh --write-tfvars
+```
+
+Read-only. Checks tooling, which identity you are, whether the root key is
+still live, the EKS version's support tier (a 6x billing difference), account
+capacity and name collisions — and detects your public IP to stage
+`operator_cidrs`, the one input the platform stack cannot default. It ends by
+listing exactly these decisions. Verified on this machine: 12 ready, 0
+blocked.
+
 ## The apply queue (in order, each gated on your explicit go)
 
 Profiles matter here and are counter-intuitive: **terraform runs as
