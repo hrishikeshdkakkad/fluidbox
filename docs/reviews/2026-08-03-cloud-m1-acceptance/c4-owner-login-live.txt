@@ -1,0 +1,25 @@
+# §9-4 — invited owner logs in through the Vercel origin: PASS (2026-08-03T22:18:23Z)
+
+Driven with Playwright against the LIVE deployment, end to end:
+  1. https://fluidbox-cloud-dashboard.vercel.app/v1/auth/login/fluidzero/start
+  2. -> Dex hosted login (through the org's own OIDC issuer)
+  3. credentials submitted as the armed bootstrap owner
+  4. -> back to the VERCEL origin; __Host-fbx_web session established
+  5. GET /v1/auth/me returned:
+     {"auth_kind":"browser","org":{"display_name":"Fluidzero (M1 internal drill org)","slug":"fluidzero"},
+      "roles":["member","owner"],"user":{"email":"owner@fluidzero.test","name":"drill-owner"},
+      "user_id":"019fc9b4-280c-7de3-893e-d0b10905fc5b"}
+  6. /app rendered (title: 'Overview · fluidbox')
+
+This proves the whole M1.2 identity chain on real infrastructure:
+  - per-org OIDC config created + activated through the documented admin API
+  - bootstrap_owner_email armed the owner, who arrived with roles [member, owner]
+  - FLUIDBOX_PUBLIC_URL = the Vercel origin, so the callback and the
+    __Host-fbx_web cookie land on the dashboard host (the callback-host trap)
+  - the session authenticates against core through CloudFront -> ALB -> EKS
+
+IdP: Dex v2.41.1, a STANDARDS-CONFORMANT OIDC provider, exposed over HTTPS.
+It is the bring-your-own-IdP path chosen in decision §12#4, and PLAN rev 3
+§P1 already names Dex for exactly this purpose. Core was NOT modified.
+Swapping in a customer's Auth0/Okta/Entra/Google issuer is the same three
+fields; WorkOS remains unusable for the reason recorded in the readiness ledger.
