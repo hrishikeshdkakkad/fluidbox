@@ -53,13 +53,17 @@ pass "database $DB ready"
 say "1. boot core in the M1.2 posture (REQUIRE_SSO=1 + RLS runtime role)"
 ADMIN="fbx_admin_$(openssl rand -hex 16)"
 ABS_BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
-( cd "$WORK" && env -i PATH="$PATH" HOME="$HOME" \
+# `exec` + the & OUTSIDE the parens so $! is the SERVER's pid, not the
+# subshell's — otherwise cleanup kills a wrapper and leaves the server holding
+# the port for whatever runs next.
+( cd "$WORK" && exec env -i PATH="$PATH" HOME="$HOME" \
   DATABASE_URL="$DB_URL" FLUIDBOX_RUNTIME_ROLE=fluidbox_runtime FLUIDBOX_REQUIRE_SSO=1 \
   FLUIDBOX_ADMIN_TOKEN="$ADMIN" FLUIDBOX_CREDENTIAL_KEY="$(openssl rand -hex 32)" \
   FLUIDBOX_BIND="127.0.0.1:$PORT" FLUIDBOX_INTERNAL_BIND="127.0.0.1:$INTERNAL_PORT" \
   FLUIDBOX_PUBLIC_URL="$API" FLUIDBOX_DATA_DIR="$WORK/data" \
   LITELLM_MASTER_KEY=rehearsal-no-model-calls LLM_UPSTREAM_URL="http://127.0.0.1:4999" \
-  "$ABS_BIN" > "$WORK/server.log" 2>&1 & echo $! > "$WORK/server.pid" )
+  "$ABS_BIN" ) > "$WORK/server.log" 2>&1 &
+echo $! > "$WORK/server.pid"
 for _ in $(seq 1 60); do curl -fsS --max-time 2 "$API/v1/health" >/dev/null 2>&1 && break; sleep 0.5; done
 curl -fsS --max-time 2 "$API/v1/health" >/dev/null 2>&1 \
   || { tail -20 "$WORK/server.log"; die "core did not boot" "$WORK/server.log"; }

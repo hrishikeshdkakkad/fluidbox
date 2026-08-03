@@ -11,9 +11,9 @@ are per-action user-approved). Criteria fall into three honest states:
 - **MECHANISM PROVEN** — the product behaviour was demonstrated on a *real*
   Kubernetes cluster with the *released* artifacts and the *actual* M1 values,
   or at the enforced database floor; what remains is re-running it on EKS
-  (5, 6, 7, 9, 10, 11).
+  (5, 6, 7, 9, 10, 11, 13, 14).
 - **PENDING-APPLY** — genuinely needs AWS or Vercel and cannot be faked
-  (1, 2, 3, 4, 12, 13, 14, 15, 17, and the CF/ALB half of 8).
+  (1, 2, 3, 4, 12, 15, 17, and the CF/ALB half of 8).
 
 "Mechanism proven" is deliberately not "pass": it says the code path works
 and the values are right, not that it works *on the deployed edge*. Both
@@ -93,8 +93,8 @@ Pod Identity (the default root statement lets the IAM role policy govern).
 | 10 | sandbox cannot make disallowed connections | **MECHANISM PROVEN** — `helm test` netpol probe passes on Calico (`:8788` reachable, `:8787` blocked) **and** policy denied `curl` mid-run; EKS (VPC-CNI standard mode) re-run pending | `…-cloud-m1-kind/README.md` |
 | 11 | cross-tenant read/mutate impossible | **PROVEN AT THE ENFORCED FLOOR** — RLS under the non-owner runtime role: A sees only A, B only B, no-GUC sees zero, A selecting B's tenant_id gets nothing | `…-cloud-m1-readiness/cross-tenant-rls.txt` |
 | 12 | direct ALB requests rejected | PENDING-APPLY | `direct-alb-check.sh` |
-| 13 | operator cancellation stops a run | PENDING-APPLY | harness c13 |
-| 14 | containment runbook exercised, limits recorded | PENDING-APPLY | runbook §7 drill |
+| 13 | operator cancellation stops a run | **MECHANISM PROVEN** — cancelled a run genuinely blocked on a human approval: `{"cancelled":true}` → `cancelled`, sandbox reclaimed, second cancel idempotent | `…-cloud-m1-readiness/containment-drill.md` |
+| 14 | containment runbook exercised, limits recorded | **EXERCISED** against a real multi-user control plane; five limitations recorded from observation, incl. a previously-unknown ordering trap that changed the runbook | `…-cloud-m1-readiness/containment-drill.md` |
 | 15 | sandbox capacity returns to zero | PENDING-APPLY | `idle-scaledown-watch.sh` |
 | 16 | core/chart/suites green, unmodified | ✅ **PASS (both halves)** | §1 above |
 | 17 | measured idle cost reconciled with ~$130–140 | MODEL ✅ / MEASURED pending | `cloud-cost-model.md` + harness c17 |
