@@ -13,6 +13,15 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
 . scripts/cloud/lib.sh
 
+# THIS SCRIPT CERTIFIES THE SCOPED-IDENTITY POSTURE, SO IT MUST NOT VIOLATE IT.
+# It had no root guard at all, and on this machine the `default` AWS profile is
+# the account ROOT — so a profile-less invocation silently ran as root. That is
+# not hypothetical: on 2026-08-03 a run of criterion 2 issued GetCallerIdentity,
+# DescribeBudget x2 and ListCostAllocationTags as root (CloudTrail 18:08:44Z).
+# Reads only, nothing mutated, but a harness that proves "root is retired" while
+# itself authenticating as root proves nothing. Fail closed instead.
+require_non_root
+
 EV=$(evidence_dir cloud-m1-acceptance)
 SUMMARY="$EV/summary.md"
 [ -f "$SUMMARY" ] || printf "# M1 §9 acceptance — evidence ledger (%s)\n\n| # | criterion | verdict | evidence |\n|---|---|---|---|\n" "$(date -u +%F)" > "$SUMMARY"
@@ -67,14 +76,20 @@ c1()  { say "[1] scoped deployer applies without a root key"
         then ok "root access key retired (hygiene, M1.0 gate — not §9-1)"
         else warn "root access key STILL ACTIVE (hygiene, M1.0 gate — not §9-1; owner-owned)"; fi }
 
-# Run an aws command under whichever of our identities can actually do it.
-# The split is genuinely counter-intuitive and cost us a false PASS: only the
-# OPERATOR user may read budgets, only the DEPLOYER role may read Cost Explorer.
-# Trying ambient first keeps this working under either.
+# Run an aws command under whichever of our SCOPED identities can do it. The
+# split is genuinely counter-intuitive: only the OPERATOR user may read budgets,
+# only the DEPLOYER role may read Cost Explorer.
+#
+# NEVER falls through to ambient credentials. An earlier version tried a bare
+# `aws` first "so it works under either profile" — but `default` here is the
+# account ROOT, so that fallback was a silent privilege escalation that fired on
+# its first real use. Named profiles only; if neither can do it, that is a
+# finding, not something to paper over with a bigger identity.
 as_any() {
-  aws "$@" 2>/dev/null && return 0
-  AWS_PROFILE=fluidbox-operator aws "$@" 2>/dev/null && return 0
-  AWS_PROFILE=fluidbox-deployer aws "$@" 2>/dev/null && return 0
+  local p
+  for p in ${AWS_PROFILE:+"$AWS_PROFILE"} fluidbox-operator fluidbox-deployer; do
+    AWS_PROFILE="$p" aws "$@" 2>/dev/null && return 0
+  done
   return 1
 }
 

@@ -20,6 +20,22 @@ KUBECTX="${KUBECTX:-fluidbox-cloud}"
 KUBECONFIG_PROFILE="${KUBECONFIG_PROFILE:-fluidbox-operator}"
 
 # Refuse root for anything except the bootstrap ceremony.
+#
+# CALL THIS FROM ANY SCRIPT THAT ACTS ON AWS. It matters more than it looks:
+# the `default` profile on the operator's machine is the account ROOT, so a
+# script that issues a bare `aws` call without an explicit profile silently
+# runs as root. That is not theoretical — cloud-m1-acceptance.sh shipped
+# without this guard and ran DescribeBudget/ListCostAllocationTags as root on
+# 2026-08-03 (CloudTrail 18:08:44Z, reads only).
+#
+# THREE SCRIPTS DELIBERATELY DO NOT CALL IT, and adding it would BREAK them:
+#   * verify-bootstrap.sh  — its job is to REPORT which identity you are,
+#                            including `fail` on root. Dying first would make
+#                            the criterion unmeasurable.
+#   * cloud-preflight.sh   — same: it warns that root is correct for exactly
+#                            the one bootstrap apply and wrong after.
+#   * iam-simulate.sh      — read-only policy evaluation, no mutation.
+# entra-idp-setup.sh needs no guard either: it pins AWS_PROFILE inline.
 require_non_root() {
   local arn
   arn=$(aws sts get-caller-identity --query Arn --output text 2>/dev/null) \
