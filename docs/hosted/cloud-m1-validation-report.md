@@ -43,6 +43,8 @@ statements are needed, and only one of them was purchasable without an apply.
 | `operator_cidrs` guard proven to refuse `[]` and `0.0.0.0/0`, accept a `/32` | ✅ |
 | **M1 values INSTALL on a real enforcing cluster** (kind + Calico, released 0.4.0 chart/images), server READY, netpol `helm test` passes, governed replay run completes with approval + diff | ✅ 15/15 |
 | **M1.2 onboarding procedure rehearsed** (two orgs, per-org IdP, admin confinement) + cross-tenant denial at the RLS floor | ✅ 14/14 |
+| **§9-13 cancellation proven + §9-14 containment drill exercised** (five limitations recorded from observation; one corrected the runbook) | ✅ 13/13 |
+| **IAM policies SIMULATED** against the real AWS evaluator (`simulate-custom-policy`, read-only): every action the applies need is allowed, and 12 negative cases prove the scoping refuses what it must | ✅ 42/42 |
 
 Evidence: `docs/reviews/2026-08-03-cloud-m1-readiness/`.
 
