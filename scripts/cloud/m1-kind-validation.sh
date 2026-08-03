@@ -105,14 +105,25 @@ litellm:
 llm:
   upstreamUrl: ""
 sandbox:
-  nodeSelector: {}
+  # Lists are REPLACED by a later -f, so emptying this one works.
   tolerations: []
 EOF
+# sandbox.nodeSelector must be unset with --set …=null, NOT with `{}` in the
+# overlay: Helm DEEP-MERGES maps across -f files, so an empty map cannot remove
+# keys the earlier file set. Written the obvious way, the EKS
+# `fluidbox.dev/role: sandbox` selector survives, every sandbox pod (including
+# the netpol probe) becomes unschedulable on kind's single untainted node, and
+# the failure surfaces minutes later as an inscrutable Pending. Lists are
+# replaced rather than merged, which is why `tolerations: []` above is fine.
 helm install fluidbox "oci://ghcr.io/hrishikeshdkakkad/charts/fluidbox" \
   --version "$CHART_VERSION" -n "$NS" \
   -f deploy/cloud/values/eks-m1.yaml -f "$WORK/kind-overlay.yaml" \
+  --set sandbox.nodeSelector=null \
   --wait --timeout 600s > "$WORK/helm.log" 2>&1 \
   || { tail -20 "$WORK/helm.log"; dump; die "helm install FAILED with the M1 values" "$WORK/helm.log"; }
+kubectl -n "$NS" get deploy fluidbox-server -o yaml | grep -q "FLUIDBOX_K8S_NODE_SELECTOR" \
+  && { dump; die "sandbox nodeSelector survived the override — sandbox pods cannot schedule on kind"; }
+pass "sandbox nodeSelector correctly unset for this substrate"
 pass "chart installed with deploy/cloud/values/eks-m1.yaml — server READY (readiness probe gated the wait)"
 
 kubectl -n "$NS" get all,ingress,networkpolicy -o wide > "$EV/installed-objects.txt" 2>&1
