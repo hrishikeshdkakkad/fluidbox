@@ -14,6 +14,15 @@
 > and client secret from any conformant provider (Auth0, Okta, Entra, Google
 > Workspace, Keycloak, Dex). Nothing else is outstanding on the platform side.
 >
+> **Root key — asked twice, answered twice (2026-08-03): the owner retires it
+> personally.** Not an oversight and not an open task; §9-1 therefore rests at
+> 11/12 by deliberate choice. Rationale on the record: this account is shared
+> with four other projects and CloudTrail shows root used on 08-01 (a broad
+> read-only inventory) and 07-30 (ECR) by something outside the build session,
+> so deactivating it could break another team's tooling. The capability §9-1
+> actually tests — that a scoped, non-root deployer can build the platform — is
+> already proven by all four stacks having been applied that way.
+>
 > **BOOTSTRAP IS APPLIED** — 27 resources, state migrated to
 > `s3://fluidbox-cloud-tfstate-471112572248`, both scoped profiles configured
 > and verified. Two ceremony steps remain, both yours: confirm the SNS email,
