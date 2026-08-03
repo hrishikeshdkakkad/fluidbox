@@ -79,6 +79,22 @@ the S3 backend uses ambient credentials), while **plain scripts run as
 6. Vercel project link + env → deploy → M1.2 app apply (`require_sso=true`, `public_url=<vercel origin>`) → onboard drill org via the checklist.
 7. `cloud-m1-acceptance.sh` (the §9 ledger) + validation report → M1.3 sign-off.
 
+**Ready now (checked 2026-08-03 22:2xZ):** AWS already lists `project` as a
+`UserDefined` cost-allocation tag, so the precondition ("the tag must have been
+seen on billed usage") is MET — no more waiting. Activating it needs
+`ce:UpdateCostAllocationTagsStatus`, which lives in the root-applied bootstrap
+stack by design (the deployer is refused, verified). So from a root session:
+
+```bash
+cd deploy/cloud/terraform/bootstrap
+terraform apply -var account_budget_limit=600 -var activate_cost_allocation_tag=true
+```
+
+That switches the tag-filtered `fluidbox-cloud-monthly` budget from matching
+nothing to actually tracking this project. Also consider raising
+`fluidbox_budget_limit` 50 → ~175 in the same apply, since the real floor is
+~$157/mo. Original note follows.
+
 Once the platform stack is up and has been billing for ~24h, re-apply
 `bootstrap` with `-var activate_cost_allocation_tag=true` so the tag-filtered
 budget starts matching (AWS refuses to activate a tag it has never seen on
