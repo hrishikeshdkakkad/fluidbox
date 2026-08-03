@@ -4,10 +4,20 @@ The M1 brief §9 hard-acceptance ledger, plus the pre-apply verifications that
 back it. Living document: `scripts/cloud/cloud-m1-acceptance.sh` writes the
 per-criterion evidence and prints the table to paste into §2 below.
 
-Status as of **2026-08-03**: M1.0 proofs run; nothing applied to AWS
-(applies are per-action user-approved). §9 criteria 1–18 are therefore
-`PENDING-APPLY` except where a criterion could be honestly closed without a
-deployment.
+Status as of **2026-08-03**: M1.0 proofs run; nothing applied to AWS (applies
+are per-action user-approved). Criteria fall into three honest states:
+
+- **PASS** — closed without a deployment (16, 18).
+- **MECHANISM PROVEN** — the product behaviour was demonstrated on a *real*
+  Kubernetes cluster with the *released* artifacts and the *actual* M1 values,
+  or at the enforced database floor; what remains is re-running it on EKS
+  (5, 6, 7, 9, 10, 11).
+- **PENDING-APPLY** — genuinely needs AWS or Vercel and cannot be faked
+  (1, 2, 3, 4, 12, 13, 14, 15, 17, and the CF/ALB half of 8).
+
+"Mechanism proven" is deliberately not "pass": it says the code path works
+and the values are right, not that it works *on the deployed edge*. Both
+statements are needed, and only one of them was purchasable without an apply.
 
 ## 1. Pre-apply verification (done, no AWS mutations)
 
@@ -31,6 +41,8 @@ deployment.
 | Vercel proxy cookie + SSE code path | ✅ 9/9 (platform cap pending project link) |
 | Independent IaC security review (separate agent, full stack read) | ✅ ran; 1 blocker + 4 medium + 3 nits, **all fixed** |
 | `operator_cidrs` guard proven to refuse `[]` and `0.0.0.0/0`, accept a `/32` | ✅ |
+| **M1 values INSTALL on a real enforcing cluster** (kind + Calico, released 0.4.0 chart/images), server READY, netpol `helm test` passes, governed replay run completes with approval + diff | ✅ 15/15 |
+| **M1.2 onboarding procedure rehearsed** (two orgs, per-org IdP, admin confinement) + cross-tenant denial at the RLS floor | ✅ 14/14 |
 
 Evidence: `docs/reviews/2026-08-03-cloud-m1-readiness/`.
 
@@ -73,13 +85,13 @@ Pod Identity (the default root statement lets the IAM role policy govern).
 | 2 | both budget controls active | PENDING-APPLY | acceptance harness c2 |
 | 3 | operator provisions an org by documented steps | PENDING-APPLY | `cloud-onboarding-checklist.md`, filled |
 | 4 | invited owner logs in through the Vercel origin | PENDING-APPLY (blocked on decision §12#4) | manual + screenshots |
-| 5 | user submits a replay run | PENDING-APPLY | `replay-on-cluster.sh` |
-| 6 | EKS creates an isolated sandbox | PENDING-APPLY | `sandbox-pods.txt` |
-| 7 | run pauses for approval and resumes | PENDING-APPLY | replay timeline |
+| 5 | user submits a replay run | **MECHANISM PROVEN** on a real cluster; EKS re-run pending | `…-cloud-m1-kind/` (released 0.4.0 chart + M1 values) |
+| 6 | EKS creates an isolated sandbox | **MECHANISM PROVEN** (sandbox pod scheduled under the quota + both NetworkPolicies); EKS re-run pending | `…-cloud-m1-kind/sandbox-plane.txt` |
+| 7 | run pauses for approval and resumes | **MECHANISM PROVEN** — `approval.requested` → `approval.decided` → `tool.decision(source=human)` → `completed` | `…-cloud-m1-kind/timeline-verified.txt` |
 | 8 | events stream through Vercel→CloudFront→ALB (or documented fallback) | PARTIAL — proxy code path ✅, CF/ALB legs pending apply | readiness ledger proof 2 |
-| 9 | artifacts + usage recorded | PENDING-APPLY | `changes.patch`, `cost.json` |
-| 10 | sandbox cannot make disallowed connections | PENDING-APPLY | harness c10 netpol probe |
-| 11 | cross-tenant read/mutate impossible | PENDING-APPLY | harness c11 (two-PAT probe) |
+| 9 | artifacts + usage recorded | **MECHANISM PROVEN** (diff artifact with the canonical fix + cost record); EKS re-run pending | `…-cloud-m1-kind/changes.patch`, `cost.json` |
+| 10 | sandbox cannot make disallowed connections | **MECHANISM PROVEN** — `helm test` netpol probe passes on Calico (`:8788` reachable, `:8787` blocked) **and** policy denied `curl` mid-run; EKS (VPC-CNI standard mode) re-run pending | `…-cloud-m1-kind/README.md` |
+| 11 | cross-tenant read/mutate impossible | **PROVEN AT THE ENFORCED FLOOR** — RLS under the non-owner runtime role: A sees only A, B only B, no-GUC sees zero, A selecting B's tenant_id gets nothing | `…-cloud-m1-readiness/cross-tenant-rls.txt` |
 | 12 | direct ALB requests rejected | PENDING-APPLY | `direct-alb-check.sh` |
 | 13 | operator cancellation stops a run | PENDING-APPLY | harness c13 |
 | 14 | containment runbook exercised, limits recorded | PENDING-APPLY | runbook §7 drill |
