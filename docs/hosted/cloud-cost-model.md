@@ -1,5 +1,27 @@
 # Fluidbox Cloud M1 — Idle & Light-Use Cost Model (re-verification)
 
+> ## ⚠️ REVISED 2026-08-03 BY A LIVE FAILURE: idle floor is now ≈ **$156/mo**, not $131
+>
+> The system node had to move from **t4g.medium → t4g.large** (+$24.53/mo).
+> This was not a preference: the DB-backed LiteLLM image was **OOMKilled
+> (exit 137) before logging a line** on the t4g.medium. That node has ~3.2 GiB
+> allocatable, kube-system already requested ~1.6 GiB, and node limits were
+> already 186% overcommitted — so ~1.6 GiB remained for a container that runs
+> prisma at startup.
+>
+> The original recipe's "t4g.medium + LiteLLM 2Gi" was validated with the
+> chart's **bundled** LiteLLM. M1 cannot use that one: per-tenant virtual keys
+> are a Postgres-backed LiteLLM feature, and hosted + shared-key mode is a
+> deliberate 503 in core. The heavier image is a requirement, so the bigger
+> node is too.
+>
+> **Every figure below still describes the t4g.medium model.** Add $24.53 to
+> the node line and to both totals: idle ≈ **$156/mo**, light use ≈ **$162/mo**.
+> The band in the M1 brief (§11, $130–140) is therefore **exceeded by ~$16**,
+> and that is a real finding rather than an estimation error — the brief's band
+> was computed before anyone tried to run a DB-backed LiteLLM beside the server
+> on one 4 GiB node.
+
 **Milestone:** M1.0 gate proof — "Re-verify the idle and light-use cost model, including public IPv4 and ALB costs" (brief §6 M1.0, §9 criterion 17).
 **Date:** 2026-08-03 · **Region:** us-east-1 · **Pricing source:** AWS Price List API, pulled live this date.
 **Claimed floor (brief §11):** ≈ **$130–140 / month**.

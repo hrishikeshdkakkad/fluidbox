@@ -76,3 +76,15 @@ variable "helm_timeout_seconds" {
   type        = number
   default     = 900
 }
+
+variable "litellm_memory_limit" {
+  description = "LiteLLM container memory limit. 4Gi, not the bundled image's 2Gi: the DB-backed variant runs prisma at startup and was OOMKilled at 2Gi on a node that was only 22% committed (2026-08-03, live)."
+  type        = string
+  default     = "4Gi"
+}
+
+variable "litellm_memory_request" {
+  description = "LiteLLM memory request (scheduling floor; the limit above is what prisma actually needs at boot)."
+  type        = string
+  default     = "1Gi"
+}

@@ -11,7 +11,7 @@
 resource "kubernetes_config_map_v1" "litellm" {
   metadata {
     name      = "litellm"
-    namespace = kubernetes_namespace_v1.fluidbox.metadata[0].name
+    namespace = local.namespace
   }
 
   data = {
@@ -36,7 +36,7 @@ resource "kubernetes_config_map_v1" "litellm" {
 resource "kubernetes_deployment_v1" "litellm" {
   metadata {
     name      = "litellm"
-    namespace = kubernetes_namespace_v1.fluidbox.metadata[0].name
+    namespace = local.namespace
     labels    = { app = "litellm" }
   }
 
@@ -111,13 +111,17 @@ resource "kubernetes_deployment_v1" "litellm" {
           resources {
             requests = {
               cpu    = "250m"
-              memory = "512Mi"
+              memory = var.litellm_memory_request
             }
-            # The proven 2Gi (the chart's 1Gi default OOMKilled on EKS —
-            # 2026-07-17 finding, re-confirmed 2026-07-22).
+            # The 2Gi figure came from the chart's BUNDLED LiteLLM (2026-07-17,
+            # re-confirmed 2026-07-22). The DB-BACKED image M1 needs is a
+            # different animal: it runs prisma at startup and was OOMKilled
+            # (exit 137) at 2Gi twenty-five seconds into boot — on a node that
+            # was only 22% committed, so this is the CGROUP limit, not node
+            # pressure. Do not "fix" a recurrence by shrinking it.
             limits = {
               cpu    = "1"
-              memory = "2Gi"
+              memory = var.litellm_memory_limit
             }
           }
 
@@ -148,7 +152,7 @@ resource "kubernetes_deployment_v1" "litellm" {
 resource "kubernetes_service_v1" "litellm" {
   metadata {
     name      = "litellm"
-    namespace = kubernetes_namespace_v1.fluidbox.metadata[0].name
+    namespace = local.namespace
     labels    = { app = "litellm" }
   }
 
