@@ -96,6 +96,7 @@ pub async fn run(
             None,
             &serde_json::json!([]),
             &serde_json::json!([]),
+            None,
         )
         .await?;
         tracing::info!("seeded agent claude-fixer rev 1");

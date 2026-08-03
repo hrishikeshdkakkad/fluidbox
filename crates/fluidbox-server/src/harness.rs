@@ -230,6 +230,7 @@ mod tests {
             provider: "docker".into(),
             network_mode: fluidbox_core::traits::NetworkMode::HostDev,
             require_enforced_netpol: false,
+            network_enforcer: crate::config::NetworkEnforcer::None,
             netpol_probe_image: "busybox:1.36".into(),
             netpol_wait_secs: crate::config::DEFAULT_NETPOL_WAIT_SECS,
             internal_service: None,

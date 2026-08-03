@@ -68,6 +68,20 @@ pub struct Toleration {
 }
 
 impl K8sConfig {
+    /// Labels selecting the CONTROLLED resolver a per-run policy may allow :53
+    /// to — the chart's forward-only CoreDNS, which has no `kubernetes` plugin
+    /// and therefore cannot resolve in-cluster Service names for a sandbox.
+    ///
+    /// Derived from the release namespace + the chart's component label rather
+    /// than configured: an operator who could point this at kube-dns would
+    /// silently hand every granted run in-cluster service discovery.
+    pub fn sandbox_resolver_labels(&self) -> serde_json::Value {
+        serde_json::json!({
+            "k8s:io.kubernetes.pod.namespace": self.namespace,
+            "app.kubernetes.io/component": "sandbox-dns",
+        })
+    }
+
     /// Build from the process environment (Helm sets these). Defaults are the
     /// design's documented baseline.
     pub fn from_env() -> Self {

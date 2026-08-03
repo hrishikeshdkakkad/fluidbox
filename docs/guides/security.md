@@ -51,11 +51,30 @@ requests.
   digests, verdicts, usage, and cost can. Events carry a gapless
   per-session sequence, so a gap is evidence, not noise.
 
-## The workload has nowhere to go
+## The workload goes only where it was granted
 
-Sandboxes run with **no network egress**: Docker locally, and on Kubernetes
-a deny-all NetworkPolicy admission-gated before the untrusted payload
-starts. Separately, the **control plane's own egress** rides one hardened
+A sandbox's network is **default-deny, and anything wider is an explicit,
+frozen, auditable grant** — never an ambient capability.
+
+By default a run is `offline`: on Kubernetes a deny-all NetworkPolicy,
+admission-gated before the untrusted payload starts, and on Docker a
+per-session internal bridge under the `hardened` profile. (The Docker
+`host-dev` default is a local-development posture and has never been a hosted
+boundary — it deliberately injects a host gateway.)
+
+A run may instead be granted `approved` (exactly the FQDN/CIDR targets its
+agent declared, capped by policy) or `public` (everything the deployment's deny
+wall permits). Both are resolved BEFORE any sandbox exists, frozen into the
+immutable RunSpec, and enforced at L3/L4 in the datapath — so there is no
+application shim to bypass and nothing for the workload to opt into. A
+deployment with no enforcer refuses a wider grant at create time rather than
+running it unenforced, and `public` is refused outright for a run that also
+holds brokered tool results unless policy explicitly opts in: the dangerous
+pairing is credentials plus reach.
+
+Policy may require a human to authorize a grant, which parks the run BEFORE
+provisioning — no pod, no tokens, no model spend until someone consents to a
+specific digest. See [network grants](../hosted/network-grants-operations.md). Separately, the **control plane's own egress** rides one hardened
 boundary: destination admission that blocks private, loopback, link-local,
 and cloud-metadata address classes at every dial site; redirect refusal on
 the clients that carry credentials; and per-tenant/host rate limits with a

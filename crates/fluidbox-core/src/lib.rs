@@ -8,7 +8,9 @@
 
 pub mod capability;
 pub mod event;
+pub mod netobserve;
 pub mod netpolicy;
+pub mod network;
 pub mod policy;
 pub mod recipe;
 pub mod schedule;

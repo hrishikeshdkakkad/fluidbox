@@ -32,11 +32,23 @@ pub fn object_name(session_id: uuid::Uuid) -> String {
     format!("fluidbox-{session_id}")
 }
 
-fn labels(session_id: uuid::Uuid) -> Value {
-    json!({
-        LABEL_SESSION: session_id.to_string(),
+/// Pod labels. `session` + `managed` have always been here; `tenant` and `run`
+/// are the other two thirds of the identity a per-run network policy selects
+/// on, and the selector is a SECURITY control — the Phase 0 spike showed that a
+/// policy selecting a shared label pools every concurrent run's resolved FQDN
+/// addresses into one reachable set. A pod that is missing them would simply
+/// not be selected by its own policy, so it would run offline rather than
+/// unrestricted; fail-closed, but still a bug.
+fn labels(spec: &SandboxSpec) -> Value {
+    let mut l = json!({
+        LABEL_SESSION: spec.session_id.to_string(),
         LABEL_MANAGED: "true",
-    })
+    });
+    if let Some(g) = &spec.network_grant {
+        l["fluidbox.dev/tenant"] = json!(g.tenant_id.to_string());
+        l["fluidbox.dev/run"] = json!(g.run_id.to_string());
+    }
+    l
 }
 
 /// The per-run Secret carrying the FOUR audience-scoped session tokens — created
@@ -51,7 +63,7 @@ pub fn build_secret(spec: &SandboxSpec, pod_uid: &str) -> Value {
         "kind": "Secret",
         "metadata": {
             "name": name,
-            "labels": labels(spec.session_id),
+            "labels": labels(spec),
             "ownerReferences": [{
                 "apiVersion": "v1",
                 "kind": "Pod",
@@ -230,7 +242,7 @@ pub fn build_pod(spec: &SandboxSpec, cfg: &K8sConfig) -> Value {
     json!({
         "apiVersion": "v1",
         "kind": "Pod",
-        "metadata": { "name": name, "labels": labels(spec.session_id) },
+        "metadata": { "name": name, "labels": labels(spec) },
         "spec": pod_spec,
     })
 }
@@ -350,6 +362,7 @@ mod tests {
             active_deadline_secs: Some(600),
             network: NetworkMode::Hardened,
             network_admission: None,
+            network_grant: None,
         }
     }
 
@@ -365,6 +378,37 @@ mod tests {
 
     fn cfg() -> K8sConfig {
         K8sConfig::from_env()
+    }
+
+    /// The pod must carry all three labels its own network policy selects on.
+    /// Missing them is fail-closed (the policy would not select the pod, so it
+    /// would run offline rather than unrestricted) but still a bug, and a
+    /// silent one — this catches it.
+    #[test]
+    fn the_pod_carries_the_network_identity_triple() {
+        let tenant = uuid::Uuid::now_v7();
+        let run = uuid::Uuid::now_v7();
+        let mut s = spec();
+        s.network_grant = Some(fluidbox_core::traits::GrantedNetwork {
+            grant: fluidbox_core::network::NetworkGrant::offline(),
+            tenant_id: tenant,
+            run_id: run,
+            grant_digest: "sha256:x".into(),
+        });
+        let pod = build_pod(&s, &cfg());
+        let l = &pod["metadata"]["labels"];
+        assert_eq!(l[LABEL_SESSION], s.session_id.to_string());
+        assert_eq!(l["fluidbox.dev/tenant"], tenant.to_string());
+        assert_eq!(l["fluidbox.dev/run"], run.to_string());
+        assert_eq!(l[LABEL_MANAGED], "true");
+
+        // A run with no grant (resolved before governed networking) keeps
+        // exactly the labels it always had — no empty tenant/run keys that a
+        // selector could accidentally match.
+        let plain = build_pod(&spec(), &cfg());
+        assert!(plain["metadata"]["labels"]
+            .get("fluidbox.dev/tenant")
+            .is_none());
     }
 
     #[test]

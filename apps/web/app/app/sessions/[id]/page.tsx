@@ -548,6 +548,70 @@ function TimelineItem({ ev }: { ev: EventRow }) {
         </>
       );
       break;
+    case "network.grant.frozen": {
+      const targets = (d.targets as string[]) || [];
+      const parked = d.awaiting_authorization === true;
+      // Amber while a human is being waited on, accent once it is in force.
+      cls = parked ? "human" : "accent";
+      tag = "network";
+      body = (
+        <>
+          network grant <span className="em">{s("mode")}</span>
+          {targets.length > 0 ? (
+            <span className="mut"> · {targets.join(", ")}</span>
+          ) : null}
+          {parked ? <span className="mut"> · awaiting authorization</span> : null}
+        </>
+      );
+      break;
+    }
+    case "network.denied":
+      cls = "danger";
+      tag = "network";
+      body = (
+        <>
+          denied <span className="em">{s("target")}:{s("port")}</span>
+          <span className="mut"> · {s("protocol")}</span>
+          {s("rule") ? <span className="mut"> · {s("rule")}</span> : null}
+        </>
+      );
+      break;
+    case "network.denied.rollup": {
+      const tops = (d.top_targets as string[]) || [];
+      cls = "danger";
+      tag = "network";
+      body = (
+        <>
+          and <span className="em">{s("suppressed")}</span> more denials across{" "}
+          {s("distinct_targets")}
+          {d.targets_truncated === true ? "+" : ""} targets
+          {tops.length > 0 ? <span className="mut"> · {tops.join(", ")}</span> : null}
+        </>
+      );
+      break;
+    }
+    case "network.observation.degraded":
+      // Amber, not red, and deliberately NOT silent: an observation gap must
+      // never read as "there were no denials".
+      cls = "human";
+      tag = "network";
+      body = (
+        <>
+          network observation unavailable
+          {s("reason") ? <span className="mut"> · {s("reason")}</span> : null}
+        </>
+      );
+      break;
+    case "network.grant.revoked":
+      cls = "mut";
+      tag = "network";
+      body = (
+        <>
+          network grant revoked
+          {s("reason") ? <span className="mut"> · {s("reason")}</span> : null}
+        </>
+      );
+      break;
     case "tool.brokered": {
       const ok = d.ok === true;
       const outcome = s("outcome");

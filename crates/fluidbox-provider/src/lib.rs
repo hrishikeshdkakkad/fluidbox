@@ -75,6 +75,21 @@ fn map_err(e: impl std::fmt::Display) -> ProviderError {
 #[async_trait]
 impl ExecutionProvider for DockerProvider {
     async fn provision(&self, spec: &SandboxSpec) -> Result<SandboxHandle, ProviderError> {
+        // Docker enforces `offline` ONLY, and only under `Hardened` (a
+        // per-session internal bridge with no route out). It has no L3/L4
+        // target enforcement, so a grant above offline is REFUSED here rather
+        // than run unenforced — the same fail-closed answer the create-time
+        // gate gives, repeated at the last moment before a container exists in
+        // case a deployment was misconfigured into reaching this point.
+        if let Some(g) = &spec.network_grant {
+            if g.grant.grants_egress() {
+                return Err(ProviderError::Other(format!(
+                    "the Docker provider cannot enforce a '{}' network grant — it has no                      target-level egress enforcement. Use the Kubernetes provider with a                      network enforcer, or run this agent offline.",
+                    g.grant.mode.as_str()
+                )));
+            }
+        }
+
         let name = format!("fluidbox-{}", spec.session_id);
         let net_name = format!("fluidbox-net-{}", spec.session_id);
 

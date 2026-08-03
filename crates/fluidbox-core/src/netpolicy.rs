@@ -42,6 +42,16 @@ impl IpCidr {
     }
 }
 
+/// The canonical `addr/prefix` form — the exact shape [`FromStr`] accepts, so a
+/// value that round-trips through a string (which is how a `NetworkGrant`'s CIDR
+/// targets are serialized into the frozen RunSpec) is byte-stable and reparses
+/// to itself. Pinned by `network::tests::cidr_string_form_roundtrips`.
+impl std::fmt::Display for IpCidr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.addr, self.prefix)
+    }
+}
+
 impl FromStr for IpCidr {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, String> {

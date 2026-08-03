@@ -365,6 +365,50 @@ pub async fn expired_pending_approvals(
     Ok(out)
 }
 
+/// A run parked for network authorization, joined to the decision its release
+/// waits on. `approval_status` is `None` when the grant has no approval row yet
+/// (the create-time crash window) — the gate treats that as "not authorized",
+/// which is the fail-closed reading.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ParkedGrantRow {
+    pub tenant_id: Uuid,
+    pub session_id: Uuid,
+    pub grant_digest: String,
+    pub grant_status: String,
+    pub approval_status: Option<String>,
+}
+
+/// Every session parked on a network grant, whatever tenant it belongs to —
+/// the `network_grant_gate` worker's scan. Principal-less by necessity (a
+/// worker has no tenant), so it lives here with the other bypass loaders.
+///
+/// It selects on the SESSION being parked, not on the grant being pending, so
+/// it also returns the crash window: a grant that was ACTIVATED but whose run
+/// was never spawned (the process died between the CAS and the spawn). Without
+/// that arm such a run would sit parked forever holding authority it had
+/// already been granted, and nothing would ever notice.
+///
+/// The approval join is LEFT: a grant row whose approval insert did not land
+/// still appears, so the gate can act on it rather than leave it parked.
+pub async fn parked_network_grants(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<ParkedGrantRow>> {
+    let mut tx = crate::worker_tx(pool).await?;
+    let out = sqlx::query_as(
+        "select s.tenant_id, g.session_id, g.grant_digest,
+                g.status as grant_status, a.status as approval_status
+           from session_network_grants g
+           join sessions s on s.id = g.session_id
+           left join approvals a on a.id = g.approval_id
+          where s.status = 'awaiting_authorization'
+            and g.status in ('pending', 'active')
+          order by g.created_at limit $1",
+    )
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(out)
+}
+
 /// One reservation the expiry sweep converted into a conservative charge.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SweptReservation {

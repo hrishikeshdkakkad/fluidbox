@@ -14,6 +14,7 @@ use uuid::Uuid;
 pub mod governance;
 pub mod identity;
 pub mod mcp_sessions;
+pub mod network_grants;
 pub mod recipes;
 pub mod seed;
 pub mod system_worker;
@@ -681,6 +682,10 @@ pub struct AgentRevisionRow {
     /// Append-only with the revision; validated app-side, never an FK
     /// (agent_revisions has no tenant column). Defaults to `[]`.
     pub connection_requirements: Value,
+    /// The DECLARED sandbox network request (a `NetworkRequest` jsonb: mode +
+    /// targets + duration). `None` = offline, which is what every revision
+    /// written before governed networking means — and keeps meaning.
+    pub network: Option<Value>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -1566,6 +1571,7 @@ pub async fn append_agent_revision(
     default_workspace: Option<&Value>,
     capability_bundles: &Value,
     connection_requirements: &Value,
+    network: Option<&Value>,
 ) -> sqlx::Result<AgentRevisionRow> {
     let mut tx = scoped_tx(pool, scope).await?;
     let __rls_out = append_agent_revision_tx(
@@ -1581,6 +1587,7 @@ pub async fn append_agent_revision(
         default_workspace,
         capability_bundles,
         connection_requirements,
+        network,
     )
     .await?;
     tx.commit().await?;
@@ -1603,6 +1610,7 @@ pub async fn append_agent_revision_tx(
     default_workspace: Option<&Value>,
     capability_bundles: &Value,
     connection_requirements: &Value,
+    network: Option<&Value>,
 ) -> sqlx::Result<AgentRevisionRow> {
     // Revisions carry no tenant column of their own; the tenant boundary is the
     // parent agent — the insert only lands when the agent AND the referenced
@@ -1614,10 +1622,10 @@ pub async fn append_agent_revision_tx(
     let __rls_out = sqlx::query_as(
         "insert into agent_revisions
            (id, agent_id, rev, harness, runner_image, model, system_prompt, policy_id, budgets,
-            default_workspace, capability_bundles, connection_requirements)
+            default_workspace, capability_bundles, connection_requirements, network)
          select $1, $2,
            coalesce((select max(rev) from agent_revisions where agent_id = $2), 0) + 1,
-           $3, $4, $5, $6, $7, $8, $9, $10, $11
+           $3, $4, $5, $6, $7, $8, $9, $10, $11, $13
          where exists (select 1 from agents a where a.id = $2 and a.tenant_id = $12)
            and exists (select 1 from policies p where p.id = $7 and p.tenant_id = $12)
          returning *",
@@ -1634,6 +1642,7 @@ pub async fn append_agent_revision_tx(
     .bind(capability_bundles)
     .bind(connection_requirements)
     .bind(tenant_id)
+    .bind(network)
     .fetch_one(&mut **tx)
     .await?;
     Ok(__rls_out)
@@ -4337,6 +4346,7 @@ pub async fn create_session(
     bind_invocation: Option<Uuid>,
     bind_dispatch: Option<Uuid>,
     bindings: &[NewRunResourceBinding],
+    network_grant: Option<&crate::network_grants::NewNetworkGrant>,
 ) -> sqlx::Result<SessionRow> {
     let mut tx = scoped_tx(pool, scope).await?;
     // Prove the agent AND the pinned revision both belong to this tenant in SQL
@@ -4372,6 +4382,13 @@ pub async fn create_session(
     // (tenant, session) does not match this session's.
     if !bindings.is_empty() {
         insert_run_resource_bindings(&mut tx, scope, row.id, bindings).await?;
+    }
+    // The network grant commits with the run for the same reason (design
+    // "governed sandbox network access"): a session whose grant row is missing
+    // cannot be provisioned at all, because the orchestrator gate fails closed
+    // on it — atomicity turns that unrecoverable state into a create failure.
+    if let Some(g) = network_grant {
+        crate::network_grants::insert_network_grant(&mut tx, scope, row.id, g).await?;
     }
     // Atomic claim bind: the run and its idempotency claim commit together,
     // so a crash can never orphan a created run from its claim (which would
@@ -7919,6 +7936,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             &serde_json::json!([]),
+            None,
         )
         .await
         .unwrap();
@@ -7942,6 +7960,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
             )
         };
         let racer = mk("finalize-test race").await.unwrap();
@@ -8204,6 +8223,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             &serde_json::json!([]),
+            None,
         )
         .await
         .unwrap();
@@ -8224,6 +8244,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -8295,6 +8316,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             &serde_json::json!([]),
+            None,
         )
         .await
         .unwrap();
@@ -8315,6 +8337,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -8406,6 +8429,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -8498,6 +8522,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             &serde_json::json!([]),
+            None,
         )
         .await
         .unwrap();
@@ -8518,6 +8543,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -8641,6 +8667,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             &serde_json::json!([]),
+            None,
         )
         .await
         .unwrap();
@@ -8663,6 +8690,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -8683,6 +8711,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -8818,6 +8847,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             &serde_json::json!([]),
+            None,
         )
         .await
         .unwrap();
@@ -8840,6 +8870,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -8989,6 +9020,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             &serde_json::json!([]),
+            None,
         )
         .await
         .unwrap();
@@ -9108,6 +9140,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             &serde_json::json!([]),
+            None,
         )
         .await
         .unwrap();
@@ -9172,6 +9205,7 @@ mod tests {
             Some(invocation_id),
             None,
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -9388,6 +9422,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             &serde_json::json!([]),
+            None,
         )
         .await
         .unwrap();
@@ -9408,6 +9443,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -9534,6 +9570,7 @@ mod tests {
             Some(&ws),
             &serde_json::json!([]),
             &serde_json::json!([]),
+            None,
         )
         .await
         .unwrap();
@@ -9553,6 +9590,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             &serde_json::json!([]),
+            None,
         )
         .await
         .unwrap();
@@ -9646,6 +9684,7 @@ mod tests {
             None,
             &pins,
             &serde_json::json!([]),
+            None,
         )
         .await
         .unwrap();
@@ -10740,6 +10779,7 @@ mod tests {
                 None,
                 &serde_json::json!([]),
                 &serde_json::json!([]),
+                None,
             )
             .await
             .unwrap();
@@ -11344,6 +11384,7 @@ mod tests {
                 None,
                 &pins,
                 &reqs,
+                None,
             )
         };
 
@@ -11415,6 +11456,7 @@ mod tests {
                 None,
                 &pins,
                 &serde_json::json!([]),
+                None,
             )
             .await
             .unwrap();
@@ -11656,6 +11698,7 @@ mod tests {
             Some(&serde_json::json!({ "kind": "scratch" })),
             &pins,
             &serde_json::json!([]),
+            None,
         )
         .await
         .unwrap();
@@ -11932,6 +11975,7 @@ mod tests {
             None,
             &pins_a,
             &serde_json::json!([]),
+            None,
         )
         .await
         .unwrap();
@@ -11968,6 +12012,7 @@ mod tests {
             None,
             &pins_b,
             &serde_json::json!([]),
+            None,
         )
         .await
         .unwrap();
@@ -12185,6 +12230,7 @@ mod tests {
                     None,
                     &pins,
                     &serde_json::json!([]),
+                    None,
                 )
                 .await
                 .unwrap()
@@ -12680,6 +12726,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             &serde_json::json!([]),
+            None,
         )
         .await
         .unwrap();
@@ -12700,6 +12747,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -13665,6 +13713,7 @@ mod tests {
                     None,
                     &serde_json::json!([]),
                     &serde_json::json!([]),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -13685,6 +13734,7 @@ mod tests {
                     None,
                     None,
                     &bindings,
+                    None,
                 )
                 .await
                 .unwrap()
@@ -13932,6 +13982,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             &serde_json::json!([]),
+            None,
         )
         .await
         .unwrap();
@@ -14005,6 +14056,7 @@ mod tests {
             Some(invocation_id),
             None,
             &[bad],
+            None,
         )
         .await;
 
@@ -15135,6 +15187,7 @@ mod tests {
                 None,
                 &serde_json::json!([]),
                 &serde_json::json!([]),
+                None,
             )
             .await
             .unwrap();
@@ -15157,6 +15210,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
             )
             .await
             .unwrap();
@@ -15334,6 +15388,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             &serde_json::json!([]),
+            None,
         )
         .await
         .unwrap();
@@ -15356,6 +15411,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .unwrap();

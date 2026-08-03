@@ -1795,10 +1795,15 @@ a.row:hover,
     animation: none;
   }
 }
-.pill.awaiting_approval {
+/* Both pauses read amber: a human is being waited on. `awaiting_approval` is
+   a mid-run tool decision; `awaiting_authorization` is the pre-provisioning
+   network-grant pause, where no sandbox exists yet. */
+.pill.awaiting_approval,
+.pill.awaiting_authorization {
   color: var(--amber);
 }
-.pill.awaiting_approval .dot {
+.pill.awaiting_approval .dot,
+.pill.awaiting_authorization .dot {
   background: var(--amber);
 }
 /* Wind-down states: the run is finishing (collecting its diff) or cancelling.

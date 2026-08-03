@@ -35,6 +35,19 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["create", "delete"]
+{{- if .Values.networkGrants.enabled }}
+  # Governed sandbox network access needs EXACTLY these two, both NAMESPACED.
+  # The cluster-scoped objects (the baseline + deny wall, the egress-gateway
+  # policy) stay chart-static precisely so the server never needs
+  # cluster-scoped write — a compromised control plane cannot rewrite the wall
+  # that contains its own sandboxes.
+  - apiGroups: ["cilium.io"]
+    resources: ["ciliumnetworkpolicies"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: ["cilium.io"]
+    resources: ["ciliumendpoints"]
+    verbs: ["get", "list", "watch"]
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

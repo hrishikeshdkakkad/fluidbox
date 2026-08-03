@@ -330,3 +330,45 @@ netpol:
   # stores rendered test hooks in the release, so render-time resolution is
   # empty on a fresh install — see templates/tests/netpol-probe.yaml.
   resolverImage: curlimages/curl:8.14.1
+
+# ── Governed sandbox network access ────────────────────────────────────────
+#
+# Off by default: enabling it is a deliberate posture change, and with it off
+# every run is offline-only exactly as before. Requires Cilium as the CNI —
+# `just doctor` and the server's boot log both say so if it is missing.
+networkGrants:
+  enabled: false
+  # The cluster's OWN pod / service / node ranges. They go in the deny wall
+  # (reaching another tenant's pod by address is lateral movement, not egress)
+  # and are excluded from the egress gateway. CIDR selectors never bind
+  # in-cluster identities, so this cannot blackhole the control-plane allow.
+  clusterCIDRs:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+  # THIS deployment's own public addresses. A `public` grant is 0.0.0.0/0,
+  # which would otherwise reopen the public API by hairpinning through the
+  # deployment's own load balancer or Ingress. The chart cannot discover these;
+  # supply them (the LB address(es), and the Ingress address if separate).
+  deploymentPublicCIDRs: []
+  # Upstream resolvers the CONTROLLED CoreDNS forwards to. It has no
+  # `kubernetes` plugin, so in-cluster Service names stay unresolvable from a
+  # sandbox whatever these are.
+  upstreamResolvers:
+    - 1.1.1.1
+    - 8.8.8.8
+  dnsImage: registry.k8s.io/coredns/coredns:v1.11.3
+  dnsReplicas: 2
+  # Pin this when the sandbox pods' `dnsPolicy: None` config needs a stable
+  # address known before the Service exists. Empty = allocate normally.
+  dnsClusterIP: ""
+  dnsResources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+  egressGateway:
+    # SNAT + attribution only — never the security boundary. Needs Cilium's
+    # egressGateway feature and at least one labelled node.
+    enabled: false
+    nodeSelector:
+      fluidbox.dev/egress-gateway: "true"
+    interface: ""

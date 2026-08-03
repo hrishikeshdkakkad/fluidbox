@@ -1,0 +1,244 @@
+{{- if .Values.networkGrants.enabled }}
+{{- /*
+Governed sandbox network access — the CHART-STATIC half.
+
+Three objects live here rather than being written by the server, and the split
+is deliberate: these are CLUSTER-SCOPED or deployment-wide, so keeping them in
+the chart means the server never needs cluster-scoped write permission. It gets
+exactly two namespaced `cilium.io` rules (see server.yaml) and nothing more.
+
+Everything below was validated against real Cilium 1.19.6 in the Phase 0 spike
+(docs/reviews/2026-08-01-cilium-substrate-spike.md).
+*/ -}}
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: {{ include "fluidbox.fullname" . }}-sandbox-baseline
+  labels:
+    {{- include "fluidbox.labels" . | nindent 4 }}
+spec:
+  endpointSelector:
+    matchLabels:
+      {{ "fluidbox.dev/managed" }}: "true"
+  # ── The standing control-plane allow ──────────────────────────────────
+  #
+  # By SERVER POD IDENTITY, not by address: it therefore survives DNS failure
+  # and egress-gateway failure, neither of which is in this path. A run must be
+  # able to report its result even when everything else about the network is
+  # broken.
+  #
+  # Selecting on the baseline at all is what puts every sandbox endpoint into
+  # DEFAULT-DENY: Cilium only enforces on endpoints some policy selects, so
+  # without this object a pod would have unrestricted egress in the window
+  # between its creation and its per-run policy landing.
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ .Release.Namespace }}
+            app.kubernetes.io/name: {{ include "fluidbox.name" . }}
+            app.kubernetes.io/component: server
+      toPorts:
+        - ports:
+            - port: "8788"
+              protocol: TCP
+
+  # ── The deny wall ─────────────────────────────────────────────────────
+  #
+  # Deny precedence in Cilium is GLOBAL ACROSS POLICY OBJECTS — the spike
+  # proved a per-run policy explicitly allowing 169.254.169.254/32 was still
+  # denied by a wall in a different object. That is what makes this the floor:
+  # no per-run grant, however it was computed, can open any of it.
+  #
+  # Carrying cluster ranges here is safe because CIDR selectors never bind
+  # in-cluster identities (also proven in the spike: a deny on the server pod's
+  # exact /32 did not touch its identity-based allow above). So the wall cannot
+  # blackhole :8788 or the controlled resolver.
+  egressDeny:
+    - toCIDR:
+        # Cloud metadata — the single most valuable target in any sandbox
+        # escape, and blocked even under the dev seam elsewhere in the codebase.
+        - 169.254.0.0/16
+        - fd00:ec2::254/128
+        # Loopback, RFC1918, CGNAT, link-local, and the documentation ranges.
+        - 127.0.0.0/8
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+        - 100.64.0.0/10
+        - 0.0.0.0/8
+        - 192.0.0.0/24
+        - 198.18.0.0/15
+        - 224.0.0.0/4
+        - 240.0.0.0/4
+        # IPv6: a v6-capable cluster must not leave the v6 path open when the
+        # v4 one is walled. `::/0` is deliberately NOT here — that would deny
+        # all v6 including nothing useful to allow back; these are the classes
+        # that mirror the v4 list.
+        - ::1/128
+        - fc00::/7
+        - fe80::/10
+        - ff00::/8
+        - 2001:db8::/32
+    {{- with .Values.networkGrants.clusterCIDRs }}
+        # The cluster's own pod/service/node ranges, injected by the operator.
+        # Reaching another tenant's pod by address is not egress, it is lateral
+        # movement — and the identity-based allows above are unaffected.
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
+    {{- with .Values.networkGrants.deploymentPublicCIDRs }}
+        # ── The deployment's OWN public addresses ──────────────────────────
+        #
+        # A `public` grant is `0.0.0.0/0`, which would otherwise reopen this
+        # deployment's public API on :8787 by HAIRPINNING through its own load
+        # balancer or Ingress — reaching unauthenticated auth/OAuth/webhook
+        # surfaces and adding a DoS path, even though a sandbox's
+        # audience-scoped session tokens carry no authority there. The chart
+        # cannot discover these addresses, so the operator supplies them.
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
+    # Entity-level denies: the nodes themselves and the apiserver. A sandbox
+    # that can reach the kubelet or the API server has escaped the sandbox in
+    # every way that matters.
+    - toEntities:
+        - host
+        - remote-node
+        - kube-apiserver
+---
+{{- /*
+The CONTROLLED resolver.
+
+Forward-only, with NO `kubernetes` plugin — so a sandbox cannot resolve
+in-cluster Service names even when its grant lets it resolve public ones.
+Sandbox pods point at this ClusterIP via `dnsPolicy: None`, and the per-run
+policy allows :53 ONLY to it.
+
+This is safe for the control path because nothing in it needs cluster DNS: the
+runner dials a raw ClusterIP resolved at boot, and the archive fetch, facade,
+and collector all ride that same address.
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "fluidbox.fullname" . }}-sandbox-dns
+  labels:
+    {{- include "fluidbox.labels" . | nindent 4 }}
+data:
+  Corefile: |
+    .:53 {
+        errors
+        health {
+            lameduck 5s
+        }
+        ready
+        # Deliberately NO `kubernetes` plugin: in-cluster Service names must not
+        # be resolvable from a sandbox. Removing this line is a security change,
+        # not a convenience one.
+        forward . {{ .Values.networkGrants.upstreamResolvers | join " " }} {
+            max_concurrent 1000
+        }
+        cache 30
+        loop
+        reload
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "fluidbox.fullname" . }}-sandbox-dns
+  labels:
+    {{- include "fluidbox.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sandbox-dns
+spec:
+  replicas: {{ .Values.networkGrants.dnsReplicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "fluidbox.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: sandbox-dns
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "fluidbox.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: sandbox-dns
+    spec:
+      containers:
+        - name: coredns
+          image: {{ .Values.networkGrants.dnsImage }}
+          args: ["-conf", "/etc/coredns/Corefile"]
+          ports:
+            - { containerPort: 53, protocol: UDP }
+            - { containerPort: 53, protocol: TCP }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet: { path: /health, port: 8080 }
+            initialDelaySeconds: 10
+          readinessProbe:
+            httpGet: { path: /ready, port: 8181 }
+          resources:
+            {{- toYaml .Values.networkGrants.dnsResources | nindent 12 }}
+          volumeMounts:
+            - { name: config, mountPath: /etc/coredns }
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "fluidbox.fullname" . }}-sandbox-dns
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "fluidbox.fullname" . }}-sandbox-dns
+  labels:
+    {{- include "fluidbox.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sandbox-dns
+spec:
+  {{- with .Values.networkGrants.dnsClusterIP }}
+  clusterIP: {{ . }}
+  {{- end }}
+  selector:
+    app.kubernetes.io/name: {{ include "fluidbox.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: sandbox-dns
+  ports:
+    - { name: dns, port: 53, protocol: UDP, targetPort: 53 }
+    - { name: dns-tcp, port: 53, protocol: TCP, targetPort: 53 }
+{{- if .Values.networkGrants.egressGateway.enabled }}
+---
+{{- /*
+The egress gateway: stable SNAT plus per-run attribution.
+
+NEVER the security boundary — the L3/L4 policy above is. The Phase 0 spike
+confirmed data traffic still transits the gateway on both the plain L3/L4 and
+the toFQDNs (DNS-proxy) paths, but the design does not depend on that: if the
+gateway were bypassed, the policy still decides what may be reached.
+*/ -}}
+apiVersion: cilium.io/v2
+kind: CiliumEgressGatewayPolicy
+metadata:
+  name: {{ include "fluidbox.fullname" . }}-sandbox-egress
+  labels:
+    {{- include "fluidbox.labels" . | nindent 4 }}
+spec:
+  selectors:
+    - podSelector:
+        matchLabels:
+          io.kubernetes.pod.namespace: {{ .Release.Namespace }}
+          {{ "fluidbox.dev/managed" }}: "true"
+  destinationCIDRs: ["0.0.0.0/0"]
+  excludedCIDRs:
+    {{- toYaml .Values.networkGrants.clusterCIDRs | nindent 4 }}
+  egressGateway:
+    nodeSelector:
+      matchLabels:
+        {{- toYaml .Values.networkGrants.egressGateway.nodeSelector | nindent 8 }}
+    {{- with .Values.networkGrants.egressGateway.interface }}
+    interface: {{ . }}
+    {{- end }}
+{{- end }}
+{{- end }}

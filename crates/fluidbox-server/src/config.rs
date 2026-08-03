@@ -302,6 +302,13 @@ pub struct Config {
     /// Block runs until a probe proves the CNI enforces NetworkPolicy
     /// (Kubernetes only; fails closed). Default true; `false` is dev-only.
     pub require_enforced_netpol: bool,
+    /// Which datapath enforces GOVERNED NETWORK GRANTS (design "governed
+    /// sandbox network access"). `none` (default) = grants above `offline` are
+    /// refused at create time with an enumerated reason, so a deployment that
+    /// cannot enforce is offline-only and fails closed rather than pretending.
+    /// `cilium` = the Kubernetes Cilium enforcer. `auto` probes for the
+    /// `cilium.io/v2` CRD at boot and resolves to one of the two.
+    pub network_enforcer: NetworkEnforcer,
     /// The probe image used by the boot-time netpol run-gate.
     pub netpol_probe_image: String,
     /// The bounded observation window (seconds) for netpol enforcement: the
@@ -643,6 +650,10 @@ impl Config {
             require_enforced_netpol: get("FLUIDBOX_REQUIRE_ENFORCED_NETPOL")
                 .map(|v| v != "false" && v != "0")
                 .unwrap_or(true),
+            network_enforcer: parse_network_enforcer(
+                "FLUIDBOX_NETWORK_ENFORCER",
+                get("FLUIDBOX_NETWORK_ENFORCER").ok(),
+            )?,
             netpol_probe_image: get("FLUIDBOX_NETPOL_PROBE_IMAGE")
                 .unwrap_or_else(|_| "busybox:1.36".into()),
             netpol_wait_secs: get("FLUIDBOX_NETPOL_WAIT_SECS")
@@ -958,6 +969,47 @@ fn parse_opt_i64(name: &str, raw: Option<String>) -> anyhow::Result<Option<i64>>
             .parse()
             .map(Some)
             .map_err(|e| anyhow::anyhow!("{name}='{v}' is not a valid i64: {e}")),
+    }
+}
+
+/// Which datapath programs and proves sandbox network grants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetworkEnforcer {
+    /// No enforcer: the deployment is offline-only and says so.
+    #[default]
+    None,
+    /// Kubernetes + Cilium (CiliumNetworkPolicy / CiliumClusterwideNetworkPolicy).
+    Cilium,
+    /// Detect at boot by probing for the `cilium.io/v2` CRD.
+    Auto,
+}
+
+impl NetworkEnforcer {
+    /// Boot-log form: the operator sees the RESOLVED enforcer rather than
+    /// inferring it from an env var they may not have set.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Cilium => "cilium",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+/// Parse `FLUIDBOX_NETWORK_ENFORCER`. An unrecognized value FAILS BOOT naming
+/// the variable and the accepted set — the same discipline as the egress knobs,
+/// and for a stronger reason: a typo here would silently fall back to "no
+/// enforcement", which reads as a working deployment right up until a run that
+/// should have been contained is not.
+fn parse_network_enforcer(name: &str, raw: Option<String>) -> anyhow::Result<NetworkEnforcer> {
+    match raw.map(|v| v.trim().to_lowercase()).as_deref() {
+        None | Some("") => Ok(NetworkEnforcer::default()),
+        Some("none") => Ok(NetworkEnforcer::None),
+        Some("cilium") => Ok(NetworkEnforcer::Cilium),
+        Some("auto") => Ok(NetworkEnforcer::Auto),
+        Some(other) => Err(anyhow::anyhow!(
+            "{name}='{other}' is not a known enforcer (expected one of: none, cilium, auto)"
+        )),
     }
 }
 

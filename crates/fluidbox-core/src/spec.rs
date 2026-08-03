@@ -340,6 +340,19 @@ pub struct RunSpec {
     /// [`RunSpec::mcp_tool_available`] alongside `capabilities`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub brokered: Vec<BrokeredSurface>,
+    /// The frozen network grant (design "governed sandbox network access").
+    /// Resolved BEFORE provisioning against the policy snapshot above, and
+    /// immutable for the life of the run: editing the policy afterwards
+    /// governs only future runs, which is what makes the grant digest a stable
+    /// thing for a human to authorize.
+    ///
+    /// `#[serde(default)]` keeps every pre-network frozen RunSpec
+    /// deserializable — and the default is `offline`, which is what those runs
+    /// actually had. Always serialized (unlike `capabilities`/`brokered`):
+    /// this is security-relevant authority, and an audit trail that omits
+    /// "this run had no network" is weaker than one that says so.
+    #[serde(default)]
+    pub network: crate::network::NetworkGrant,
 }
 
 impl RunSpec {
@@ -496,6 +509,70 @@ mod tests {
     }
 
     #[test]
+    fn run_spec_without_network_grant_defaults_to_offline() {
+        // Every frozen RunSpec written before governed networking lacks the
+        // `network` key. Those runs WERE offline, so that is what they must
+        // deserialize to — forever. Mirrors
+        // `run_spec_without_invocation_defaults_to_manual`, the same additive
+        // pattern `invocation` and `brokered` already proved.
+        let old = serde_json::json!({
+            "agent_id": Uuid::now_v7(), "agent_revision_id": Uuid::now_v7(),
+            "agent_name": "a", "harness": "claude-agent-sdk", "runner_image": "img",
+            "model": "m", "system_prompt": null, "task": "t",
+            "workspace": {"kind": "scratch"},
+            "autonomy": "supervised", "trust_tier": "trusted",
+            "budgets": {"max_wall_clock_secs": 1, "max_tokens": 1, "max_cost_usd": 1.0, "max_tool_calls": 1},
+            "policy_id": Uuid::now_v7(), "policy_version": 1,
+            "policy_snapshot": {"name": "p"}
+        });
+        let spec: RunSpec = serde_json::from_value(old).unwrap();
+        assert_eq!(spec.network.mode, crate::network::NetworkGrantMode::Offline);
+        assert!(!spec.network.grants_egress());
+        assert!(spec.network.targets.is_empty());
+        assert!(spec.network.expires_at.is_none());
+        // An offline grant never expires — a historical run must not become
+        // retroactively "lapsed" and trip a fail-closed check somewhere.
+        assert!(!spec.network.is_expired(chrono::Utc::now()));
+        assert!(spec.network.schema_supported());
+        // The policy snapshot's network section defaults to the fail-safe cap.
+        assert_eq!(
+            spec.policy_snapshot.network.max_mode,
+            crate::network::NetworkGrantMode::Offline
+        );
+    }
+
+    #[test]
+    fn run_spec_network_grant_roundtrips() {
+        use crate::network::{
+            FqdnPattern, L4Protocol, NetworkGrant, NetworkGrantMode, PortSpec, TargetRule,
+            SCHEMA_VERSION,
+        };
+        let mut spec = sample_run_spec();
+        let expires = chrono::Utc::now() + chrono::Duration::seconds(3600);
+        spec.network = NetworkGrant {
+            schema_version: SCHEMA_VERSION,
+            mode: NetworkGrantMode::Approved,
+            targets: vec![TargetRule::dns(
+                FqdnPattern::Wildcard {
+                    suffix: "pypi.org".into(),
+                },
+                vec![PortSpec::single(443)],
+                L4Protocol::Tcp,
+            )],
+            expires_at: Some(expires),
+            policy_digest: "sha256:abcd".into(),
+        };
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v["network"]["mode"], "approved");
+        assert_eq!(v["network"]["targets"][0]["pattern"]["kind"], "wildcard");
+        assert_eq!(v["network"]["targets"][0]["protocol"], "tcp");
+        let back: RunSpec = serde_json::from_value(v).unwrap();
+        assert_eq!(back.network, spec.network);
+        // The digest an approver consented to survives the freeze/thaw.
+        assert_eq!(back.network.digest(), spec.network.digest());
+    }
+
+    #[test]
     fn run_spec_capabilities_roundtrip_and_stay_optional() {
         use crate::capability::{CapabilityServer, FrozenBundle, ToolSnapshot};
         let bundle = FrozenBundle {
@@ -542,6 +619,7 @@ mod tests {
             result_destinations: vec![],
             capabilities: vec![],
             brokered: vec![],
+            network: crate::network::NetworkGrant::offline(),
         })
         .unwrap();
         assert!(spec_json.get("capabilities").is_none());
@@ -697,6 +775,7 @@ mod tests {
             result_destinations: vec![],
             capabilities: vec![],
             brokered: vec![],
+            network: crate::network::NetworkGrant::offline(),
         }
     }
 
