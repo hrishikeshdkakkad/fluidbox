@@ -1242,6 +1242,7 @@ pub async fn deploy(
                 a.default_workspace.as_ref().filter(|w| !w.is_null()),
                 &a.capability_pins,
                 &a.requirements,
+                None,
             )
             .await?;
             agent_ids.insert(a.slot.clone(), agent.id);
@@ -1468,6 +1469,7 @@ async fn start_instance_run(
         result_destinations: vec![],
         bound_invocation: None,
         bound_dispatch: None,
+        network_override: None,
     };
     match run_service::create_run(state, scope, req).await {
         Ok(RunCreation::Created(session)) => {
@@ -1935,6 +1937,7 @@ pub async fn upgrade_instance(
             a.default_workspace.as_ref().filter(|w| !w.is_null()),
             &a.capability_pins,
             &a.requirements,
+            None,
         )
         .await?;
     }

@@ -1,0 +1,21 @@
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: fluidbox-run-s2
+  namespace: spike
+spec:
+  endpointSelector:
+    matchLabels:
+      app: fluidbox-sandbox
+      fluidbox.dev/session-id: s2
+  egress:
+    - toEndpoints:
+        - matchLabels: {app: fluidbox-server}
+      toPorts: [{ports: [{port: "8788", protocol: TCP}]}]
+    - toEndpoints:
+        - matchLabels: {k8s:io.kubernetes.pod.namespace: kube-system, k8s-app: kube-dns}
+      toPorts:
+        - ports: [{port: "53", protocol: ANY}]
+          rules: {dns: [{matchPattern: "*"}]}
+    - toFQDNs: [{matchName: "echo2.spike.test"}]
+      toPorts: [{ports: [{port: "9099", protocol: TCP}]}]
