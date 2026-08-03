@@ -37,6 +37,23 @@ the 2026-07-22 run saw 50 min of AWS-side variance once).
 
 After apply: `terraform output kubeconfig_hint` prints the kubeconfig command.
 
+## Known first-apply behaviours
+
+- **The kubernetes/helm providers are configured from `aws_eks_cluster.this`,
+  created in this same apply.** Terraform tolerates this because nothing here
+  *reads* a kubernetes data source during plan — every kubernetes/helm entry
+  is a resource being created, so provider configuration is deferred to
+  apply. If a future edit adds a kubernetes **data source** to this stack, or
+  a plan errors with *"configuration depends on values that cannot be
+  determined until apply"*, stage it:
+  `terraform apply -target=aws_eks_cluster.this` then a normal apply.
+- **Cluster Autoscaler ASG tags are two separate resources on purpose** — the
+  ASG name is unknown until apply, and `for_each`/`count` values must be
+  known at plan time (see the comment in `eks.tf`).
+- **Destroy** has the same provider-dependency caveat: destroy the app stack
+  first (`scripts/cloud/teardown.sh` does), so nothing kubernetes-shaped is
+  left for this stack to reconcile as the cluster disappears.
+
 ## Order notes
 
 - coredns / ebs-csi / metrics-server addons intentionally depend on the system
