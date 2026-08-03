@@ -1501,6 +1501,7 @@ pub async fn invoke(
             result_destinations: destinations,
             bound_invocation: Some(invocation_id),
             bound_dispatch: None,
+            network_override: None,
         },
     )
     .await;

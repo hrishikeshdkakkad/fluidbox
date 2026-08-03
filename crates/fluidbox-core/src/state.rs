@@ -11,10 +11,22 @@ use serde::{Deserialize, Serialize};
 /// progress. EVERY terminal path rides them — the transition matrix has no
 /// direct active→terminal edge, which is what makes "collect before
 /// terminal" structural rather than disciplinary.
+///
+/// `awaiting_authorization` is the PRE-PROVISIONING pause (network grants):
+/// the RunSpec is frozen and a human must authorize its network grant before
+/// any sandbox exists. It is deliberately NOT a reuse of `awaiting_approval` —
+/// that variant already has a `→ Running` edge, so reusing it would open
+/// `Created → AwaitingApproval → Running` and skip init entirely.
+/// `no_skipping_init` only checks DIRECT edges and would miss that transitive
+/// bypass, which is exactly why this is its own variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     Created,
+    /// Frozen, parked, and waiting on a human to authorize the network grant.
+    /// No sandbox, no runner, no tokens — nothing to reap, and nothing that
+    /// can spend. The approval TTL is its only reaper.
+    AwaitingAuthorization,
     Provisioning,
     Initializing,
     Running,
@@ -31,6 +43,7 @@ impl SessionStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Created => "created",
+            Self::AwaitingAuthorization => "awaiting_authorization",
             Self::Provisioning => "provisioning",
             Self::Initializing => "initializing",
             Self::Running => "running",
@@ -47,6 +60,7 @@ impl SessionStatus {
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "created" => Self::Created,
+            "awaiting_authorization" => Self::AwaitingAuthorization,
             "provisioning" => Self::Provisioning,
             "initializing" => Self::Initializing,
             "running" => Self::Running,
@@ -77,8 +91,25 @@ impl SessionStatus {
     }
 
     /// Accepting new agent work (facade calls, tool decisions, renewals).
+    ///
+    /// Written as a WILDCARD-FREE match, not the old
+    /// `!is_terminal() && !is_winding_down()`. That negative form silently
+    /// answered `true` for any variant nobody had classified — so a new state
+    /// defaulted to "yes, this may spend money and call tools". Now a new
+    /// variant fails to compile here and its author has to decide.
+    /// `awaiting_authorization` is the first beneficiary: it is neither
+    /// terminal nor winding down, so the old form would have admitted work for
+    /// a session that has no sandbox at all.
     pub fn accepts_work(&self) -> bool {
-        !self.is_terminal() && !self.is_winding_down()
+        use SessionStatus::*;
+        match self {
+            Created | Provisioning | Initializing | Running | AwaitingApproval => true,
+            // Parked before provisioning: no runner exists to do work, and no
+            // token has been minted that could ask for any.
+            AwaitingAuthorization => false,
+            Cancelling | Finalizing => false,
+            Completed | Failed | Cancelled | BudgetExceeded => false,
+        }
     }
 
     /// The server is the single status writer; every write goes through this.
@@ -90,15 +121,28 @@ impl SessionStatus {
         matches!(
             (self, next),
             (Created, Provisioning)
+                // The pre-provisioning authorization pause. There is
+                // deliberately NO (AwaitingAuthorization, Running) edge: the
+                // released session provisions like any other, so init can
+                // never be skipped.
+                | (Created, AwaitingAuthorization)
+                | (AwaitingAuthorization, Provisioning)
                 | (Provisioning, Initializing)
                 | (Initializing, Running)
                 | (Running, AwaitingApproval)
                 | (AwaitingApproval, Running)
                 // Wind-down entry: any active state can begin cancelling or
                 // finalizing (crash recovery must be able to finalize a
-                // session wherever the control plane left it).
+                // session wherever the control plane left it). A parked
+                // session winds down the same way when its grant is denied,
+                // expires, or the run is cancelled.
                 | (
-                    Created | Provisioning | Initializing | Running | AwaitingApproval,
+                    Created
+                        | AwaitingAuthorization
+                        | Provisioning
+                        | Initializing
+                        | Running
+                        | AwaitingApproval,
                     Cancelling | Finalizing,
                 )
                 // Quiesce resolved (runner stopped or deadline passed) →
@@ -119,8 +163,9 @@ impl SessionStatus {
 mod tests {
     use super::SessionStatus::{self, *};
 
-    const ACTIVE: [SessionStatus; 5] = [
+    const ACTIVE: [SessionStatus; 6] = [
         Created,
+        AwaitingAuthorization,
         Provisioning,
         Initializing,
         Running,
@@ -195,7 +240,16 @@ mod tests {
             assert!(!s.can_transition_to(Running));
             assert!(!s.can_transition_to(AwaitingApproval));
         }
+        // "Active" and "accepts work" were once the same set. They are not
+        // any more: `awaiting_authorization` is active (it is neither terminal
+        // nor winding down, so the sweepers and concurrency counters correctly
+        // treat it as a live run) yet accepts NO work, because it is parked
+        // before any sandbox or token exists. Everything else still coincides.
         for s in ACTIVE {
+            if s == AwaitingAuthorization {
+                assert!(!s.accepts_work());
+                continue;
+            }
             assert!(s.accepts_work());
         }
         for s in TERMINAL {
@@ -207,12 +261,35 @@ mod tests {
     fn no_skipping_init() {
         assert!(!Provisioning.can_transition_to(Running));
         assert!(!Created.can_transition_to(Running));
+        // The authorization pause is why this variant exists rather than a
+        // reuse of `awaiting_approval`: that one HAS a `→ Running` edge, so
+        // reusing it would have opened `Created → … → Running`, and this test
+        // — which only inspects DIRECT edges — would not have caught it.
+        assert!(!AwaitingAuthorization.can_transition_to(Running));
+        assert!(!AwaitingAuthorization.can_transition_to(Initializing));
+        // A released grant provisions like any other run.
+        assert!(Created.can_transition_to(AwaitingAuthorization));
+        assert!(AwaitingAuthorization.can_transition_to(Provisioning));
+    }
+
+    #[test]
+    fn the_authorization_pause_holds_no_work_and_no_sandbox() {
+        // Parked BEFORE provisioning: nothing exists that could spend money or
+        // call a tool. `accepts_work` is a wildcard-free match precisely so
+        // this variant had to be classified rather than defaulting to `true`.
+        assert!(!AwaitingAuthorization.accepts_work());
+        assert!(!AwaitingAuthorization.is_terminal());
+        assert!(!AwaitingAuthorization.is_winding_down());
+        // It can always be wound down — a denied or expired grant, or a cancel.
+        assert!(AwaitingAuthorization.can_transition_to(Cancelling));
+        assert!(AwaitingAuthorization.can_transition_to(Finalizing));
     }
 
     #[test]
     fn roundtrip_strings() {
         for s in [
             Created,
+            AwaitingAuthorization,
             Provisioning,
             Initializing,
             Running,

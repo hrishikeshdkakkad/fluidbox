@@ -283,6 +283,10 @@ mod tests {
         use SessionStatus::*;
         let all = vec![
             Created,
+            // Parked pre-provisioning: NOT terminal, so the sweeper must not
+            // see it — and it never has an upstream MCP session to retire
+            // anyway, because no sandbox and no broker call exist yet.
+            AwaitingAuthorization,
             Provisioning,
             Initializing,
             Running,
@@ -296,8 +300,18 @@ mod tests {
         ];
         for s in &all {
             match s {
-                Created | Provisioning | Initializing | Running | AwaitingApproval | Cancelling
-                | Finalizing | Completed | Failed | Cancelled | BudgetExceeded => {}
+                Created
+                | AwaitingAuthorization
+                | Provisioning
+                | Initializing
+                | Running
+                | AwaitingApproval
+                | Cancelling
+                | Finalizing
+                | Completed
+                | Failed
+                | Cancelled
+                | BudgetExceeded => {}
             }
         }
         all
@@ -389,6 +403,7 @@ mod tests {
             None,
             &serde_json::json!([]),
             &serde_json::json!([]),
+            None,
         )
         .await
         .unwrap();
@@ -411,6 +426,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .unwrap()

@@ -124,6 +124,7 @@ pub fn spawn_all(state: AppState) {
     tokio::spawn(watchdog(state.clone()));
     tokio::spawn(budget_sweeper(state.clone()));
     tokio::spawn(approval_expiry(state.clone()));
+    tokio::spawn(network_grant_gate(state.clone()));
     // Cross-replica approval wakeups (Gap 13): every replica wakes its OWN
     // waiters off the shared NOTIFY channel.
     spawn_approval_wakeups(state.clone());
@@ -165,6 +166,15 @@ fn reconcile_action(session: SessionLookup, has_handle: bool) -> ReconcileAction
         SessionLookup::Missing => ReconcileAction::Terminate,
         SessionLookup::Unparseable => ReconcileAction::Leave,
         SessionLookup::Known(s) if s.is_terminal() => ReconcileAction::Terminate,
+        // A session parked for network authorization has no sandbox BY
+        // CONSTRUCTION — provisioning has not run. A pod that exists for one
+        // is therefore a leak, and nothing has authorized it to run, so it is
+        // killed rather than adopted. (Adopting would also fail: the
+        // `adopt_sandbox_handle` status list excludes this state, so the
+        // reconcile would retry forever instead of converging.)
+        SessionLookup::Known(fluidbox_core::state::SessionStatus::AwaitingAuthorization) => {
+            ReconcileAction::Terminate
+        }
         // The finalizer owns winding-down sandboxes — collection may be in
         // flight; it reaps on completion, and recovery re-drives it.
         SessionLookup::Known(s) if s.is_winding_down() => ReconcileAction::Leave,
@@ -751,6 +761,63 @@ async fn approval_expiry(state: AppState) {
     }
 }
 
+/// Release (or refuse) runs parked on a network-grant authorization.
+///
+/// STATE-DRIVEN rather than a special case in the approval decision handler,
+/// and that is the whole design: the pause is durable, so a restart mid-pause
+/// loses nothing, a decision that lands on another replica is still acted on
+/// here, and there is exactly one place that can release provisioning. It is
+/// woken by the `fluidbox_approvals` NOTIFY that `decide_approval_tx` already
+/// emits in-transaction; the poll floor below is the missed-notify backstop,
+/// exactly as it is for the approval waiters.
+///
+/// Modelled on `approval_expiry`: scan, act, and let the CAS decide who wins.
+async fn network_grant_gate(state: AppState) {
+    let mut tick = periodic(Duration::from_secs(2));
+    loop {
+        tick.tick().await;
+        let parked =
+            match fluidbox_db::system_worker::parked_network_grants(&state.pool, SWEEP_BATCH).await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("parked network grant scan failed: {e}");
+                    continue;
+                }
+            };
+        for p in parked {
+            let scope = TenantScope::assume(p.tenant_id);
+            // Crash window: the grant was already activated but the run was
+            // never spawned. Re-spawn; `run()` performs the transition out of
+            // the pause itself, and its own grant gate re-checks authority.
+            if p.grant_status == "active" {
+                crate::orchestrator::spawn_run(state.clone(), p.session_id);
+                continue;
+            }
+            match p.approval_status.as_deref() {
+                // Still waiting on a human — and `None` (no approval row) waits
+                // too, until the approval TTL sweep or a cancel resolves it.
+                // Fail-closed by construction: no branch here provisions.
+                None | Some("pending") | Some("intent") => {}
+                Some("approved_once") | Some("approved_session") | Some("auto_allowed") => {
+                    crate::netgrant::release_authorized_grant(&state, scope, p.session_id).await;
+                }
+                // denied / auto_denied / expired — anything that is not an
+                // approval is a refusal.
+                Some(_) => {
+                    crate::netgrant::refuse_parked_grant(
+                        &state,
+                        scope,
+                        p.session_id,
+                        "network grant was not authorized",
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+}
+
 /// Relay committed approval decisions from the `fluidbox_approvals` LISTEN
 /// channel into THIS replica's in-memory waiter registry (Phase E, #33; Gap 13).
 ///
@@ -1028,6 +1095,32 @@ mod tests {
         assert_eq!(
             reconcile_action(Known(SessionStatus::AwaitingApproval), true),
             Leave
+        );
+    }
+
+    #[test]
+    fn a_sandbox_for_an_unauthorized_session_is_killed_not_adopted() {
+        use ReconcileAction::*;
+        use SessionLookup::Known;
+        // A run parked for network authorization has no sandbox by
+        // construction: provisioning has not happened. A pod that exists for
+        // one has not been authorized to run, so reconcile must TERMINATE it
+        // — with or without a recorded handle. Adopting would be doubly wrong:
+        // it would keep unauthorized code alive, and `adopt_sandbox_handle`
+        // refuses this status anyway, so the sweep would never converge.
+        assert_eq!(
+            reconcile_action(Known(SessionStatus::AwaitingAuthorization), false),
+            Terminate
+        );
+        assert_eq!(
+            reconcile_action(Known(SessionStatus::AwaitingAuthorization), true),
+            Terminate
+        );
+        // Guard against passing by terminating everything: the ordinary
+        // handle-less active session is still ADOPTED.
+        assert_eq!(
+            reconcile_action(Known(SessionStatus::Running), false),
+            Adopt
         );
     }
 }
