@@ -43,6 +43,20 @@ only. State therefore stays secret-free (PLAN §P0 requirement).
 
 `bootstrap` is the exception: root for its single apply (see its README).
 
+## Values gotcha: an empty map does not unset anything
+
+Helm **deep-merges maps** across `-f` files and merges the Terraform overlay
+the same way, but **replaces lists**. So in a later values file:
+
+- `sandbox: { tolerations: [] }` — works, the list is replaced.
+- `sandbox: { nodeSelector: {} }` — **silently does nothing**; the earlier
+  file's keys survive. Use `--set sandbox.nodeSelector=null` (or `--set-json`).
+
+This is not academic: it bit the kind validation, where the surviving
+`fluidbox.dev/role: sandbox` selector made every sandbox pod unschedulable and
+surfaced minutes later as an inscrutable `Pending`. Anything overriding a map
+in `values/eks-m1.yaml` needs the same treatment.
+
 ## Why there are no `just` recipes for any of this
 
 `justfile` sets `dotenv-load := true`, so **every** `just` recipe injects the
