@@ -167,6 +167,33 @@ Pod Identity (the default root statement lets the IAM role policy govern).
    the next bootstrap apply. A cost control repairable only as root is a cost
    control that will not get repaired.
 
+3. **🚩 The acceptance harness had no root guard, and `default` is root.** The
+   `default` AWS profile on the operator machine resolves to
+   `arn:aws:iam::471112572248:root`, so any script issuing a bare `aws` call
+   without an explicit profile authenticates as the account root. The §9
+   harness — the very thing that certifies root retirement — had zero
+   `require_non_root` calls.
+
+   This fired: on 2026-08-03 a profile-less run of criterion 2 issued
+   `GetCallerIdentity`, `DescribeBudget` ×2 and `ListCostAllocationTags` **as
+   root** (CloudTrail 18:08:44–18:08:47Z). Read-only, nothing mutated, no
+   configuration changed — but a harness that proves "root is retired" while
+   authenticating as root proves nothing, and on a confirmed SNS subscription
+   it would have paged the owner for apparent root compromise.
+
+   Fixed: `require_non_root` now gates the harness (verified — it refuses with
+   no profile set), and the `as_any` helper no longer falls back to ambient
+   credentials. Three scripts deliberately remain unguarded and MUST stay that
+   way — `verify-bootstrap.sh` and `cloud-preflight.sh` exist to *report* which
+   identity you are (dying first makes §9-1 unmeasurable), and
+   `iam-simulate.sh` is read-only. That exemption list is now recorded in
+   `lib.sh` beside the guard so it does not get "fixed" into a regression.
+
+   *Standing risk, unfixed by design:* while the root key is active, `default`
+   remains root, and any tool on that machine that forgets `--profile` runs as
+   root. This is an independent argument for §9-1's hygiene step beyond the
+   criterion itself.
+
 ## 4. How to close this report
 
 Run the phases in `docs/plans/2026-08-03-cloud-m1-decisions.md` §"apply
