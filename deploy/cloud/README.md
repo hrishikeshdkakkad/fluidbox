@@ -34,6 +34,14 @@ only. State therefore stays secret-free (PLAN §P0 requirement).
 | `cloud-m1-acceptance.sh` | the §9 harness (18 criteria → one evidence ledger) |
 | `teardown.sh` | reverse-order destroy + the two documented EKS leak sweeps |
 
+## Why there are no `just` recipes for any of this
+
+`justfile` sets `dotenv-load := true`, so **every** `just` recipe injects the
+local `.env` — which carries `DATABASE_URL` for the local dev database and a
+model key. A `just cloud-deploy` would silently push laptop dev settings at a
+production apply. Cloud commands are therefore invoked as plain scripts with
+explicit env, and each one that touches a database refuses the dev name.
+
 ## The staged flags (all helm values, never chart edits)
 
 M1.1 platform gate runs **single-user** (`require_sso=false`) so the admin
@@ -49,4 +57,6 @@ browsers authenticate through each org's OIDC.
 - `docs/hosted/cloud-operator-runbook.md` — the §8 procedures (containment explicitly incomplete)
 - `docs/hosted/cloud-onboarding-checklist.md` — provision a beta org end to end
 - `docs/hosted/cloud-cost-model.md` — the re-verified ~$131/mo idle floor
+- `docs/hosted/cloud-m1-validation-report.md` — the §9 acceptance ledger (living)
 - `docs/plans/2026-08-03-cloud-m1-decisions.md` — the §12 decision sheet
+- `docs/reviews/2026-08-03-cloud-m1-readiness/` — the M1.0 gate proofs + findings

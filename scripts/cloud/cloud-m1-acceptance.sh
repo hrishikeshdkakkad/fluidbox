@@ -168,7 +168,7 @@ c18() { say "[18] documentation set complete"
         local missing=0
         for f in docs/hosted/cloud-threat-model-m1.md docs/hosted/cloud-architecture.md \
                  docs/hosted/cloud-operator-runbook.md docs/hosted/cloud-onboarding-checklist.md \
-                 docs/hosted/cloud-cost-model.md; do
+                 docs/hosted/cloud-cost-model.md docs/hosted/cloud-m1-validation-report.md; do
           [ -s "$f" ] || { echo "  missing: $f"; missing=1; }
         done
         [ "$missing" = "0" ] \
