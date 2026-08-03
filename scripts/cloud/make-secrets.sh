@@ -19,9 +19,9 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
 . scripts/cloud/lib.sh
 
-require_non_root
-ensure_kubeconfig
-
+# Cheap local checks FIRST, remote work after: an operator who forgot to export
+# a variable should be told THAT, immediately — not made to wait for a
+# kubeconfig round-trip and then handed an unrelated-looking error.
 : "${FLUIDBOX_CLOUD_DATABASE_URL:?set FLUIDBOX_CLOUD_DATABASE_URL (Neon DIRECT non-pooler URL — pgbouncer breaks sqlx + LISTEN/NOTIFY)}"
 : "${FLUIDBOX_CLOUD_LITELLM_DATABASE_URL:?set FLUIDBOX_CLOUD_LITELLM_DATABASE_URL (dedicated small DB; NEVER the app DB)}"
 : "${FLUIDBOX_CLOUD_ANTHROPIC_API_KEY:?set FLUIDBOX_CLOUD_ANTHROPIC_API_KEY}"
@@ -29,6 +29,9 @@ ensure_kubeconfig
 case "$FLUIDBOX_CLOUD_DATABASE_URL" in
   *-pooler*) die "DATABASE_URL looks like a POOLER endpoint" "use the DIRECT Neon connection string (CLAUDE.md gotcha: PgBouncer transaction mode breaks sqlx prepared statements and PgListener)";;
 esac
+
+require_non_root
+ensure_kubeconfig
 
 ssm_get() { aws ssm get-parameter --with-decryption --name "$1" --query Parameter.Value --output text 2>/dev/null || true; }
 ssm_put() { aws ssm put-parameter --name "$1" --type SecureString --value "$2" --overwrite >/dev/null; }
