@@ -34,10 +34,21 @@ already proven; only the platform cap is outstanding). Full ledger:
 
 ## The apply queue (in order, each gated on your explicit go)
 
-1. `bootstrap` apply (root, once) → ceremony → `verify-bootstrap.sh` PASS → **root key retired**.
-2. `platform` apply (deployer; needs `operator_cidrs` = your IP).
+Profiles matter here and are counter-intuitive: **terraform runs as
+`fluidbox-operator`** (each stack's provider assumes the deployer itself, and
+the S3 backend uses ambient credentials), while **plain scripts run as
+`fluidbox-deployer`**. `deploy/cloud/README.md` has the one-table version.
+
+1. `bootstrap` apply (root, once) → ceremony → `AWS_PROFILE=fluidbox-deployer scripts/cloud/verify-bootstrap.sh` PASS → **root key retired**.
+2. `platform` apply (`AWS_PROFILE=fluidbox-operator`; needs `operator_cidrs` = your IP — `[]` and `0.0.0.0/0` are refused at plan time).
 3. Neon: create the two databases (runbook §11 note; direct URLs) → `make-secrets.sh` → `deploy-app.sh`.
 4. `edge` apply → `rotate-origin-secret.sh` → `direct-alb-check.sh` (M1.1 edge gate).
 5. `replay-on-cluster.sh` (M1.1 acceptance gate, $0).
 6. Vercel project link + env → deploy → M1.2 app apply (`require_sso=true`, `public_url=<vercel origin>`) → onboard drill org via the checklist.
 7. `cloud-m1-acceptance.sh` (the §9 ledger) + validation report → M1.3 sign-off.
+
+Once the platform stack is up and has been billing for ~24h, re-apply
+`bootstrap` with `-var activate_cost_allocation_tag=true` so the tag-filtered
+budget starts matching (AWS refuses to activate a tag it has never seen on
+billed usage). Consider raising `fluidbox_budget_limit` 50 → ~175 in the same
+apply, or the tag budget alerts on day one against a ~$131 idle floor.
