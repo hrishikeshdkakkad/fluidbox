@@ -82,11 +82,26 @@ Then, in order:
 
 ## After retirement
 
-- Platform/app/edge applies: `AWS_PROFILE=fluidbox-deployer` (they refuse root —
-  each stack's provider pins the assumed role).
+- **Platform/app/edge applies: `AWS_PROFILE=fluidbox-operator`.** This looks
+  backwards and is not: each stack's *provider* assumes the deployer role
+  itself, so the ambient identity must be the operator user that the deployer
+  trusts. Using a role-assuming `fluidbox-deployer` profile would make the
+  provider try to assume the deployer role *from* the deployer role, which its
+  trust policy does not allow. Terraform's S3 **backend** also runs as the
+  ambient identity — it does not inherit the provider's `assume_role` — which
+  is why the operator user holds state-bucket object access (`iam.tf`).
+- **Scripts (`scripts/cloud/*.sh`): `AWS_PROFILE=fluidbox-deployer`.** They
+  call the AWS CLI directly and need deployer authority with no provider in
+  the middle.
 - Routine budget tuning: the deployer role can `budgets:ModifyBudget` on
   `fluidbox-*` budgets — edit the variable here and apply *with the deployer
   profile* (this stack's resources are deliberately deployer-adjustable only
   for budgets; IAM changes need break-glass).
 - IAM/bootstrap changes: break-glass root **console** session (no key). The
   root-activity alarm announcing it is the control working, not a bug.
+  **Known consequence:** after retirement there is no non-root Terraform path
+  for *this* stack (the deployer deliberately lacks `iam:CreateUser`,
+  `cloudtrail:CreateTrail`, account-wide budget writes), so console-made
+  guardrail tweaks drift from state. Acceptable while this stack is
+  apply-once; if bootstrap starts changing often, re-apply it during a
+  short-lived root session rather than editing in the console.

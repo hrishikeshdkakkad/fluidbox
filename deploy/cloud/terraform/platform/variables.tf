@@ -31,8 +31,22 @@ variable "kubernetes_version" {
 }
 
 variable "operator_cidrs" {
-  description = "REQUIRED (no default on purpose): CIDRs allowed to reach the EKS public API endpoint — the operator workstation(s). The M1 brief mandates a restricted endpoint; 0.0.0.0/0 here is a decision, not a fallback."
+  description = "REQUIRED (no default on purpose): CIDRs allowed to reach the EKS public API endpoint — the operator workstation(s). The M1 brief mandates a restricted endpoint."
   type        = list(string)
+
+  # An empty list makes EKS fall back to 0.0.0.0/0 — i.e. a world-open API
+  # server produced by omission rather than intent. The brief mandates a
+  # RESTRICTED endpoint, so refuse both the empty list and the explicit
+  # open-world CIDR at plan time rather than discovering it in an audit.
+  validation {
+    condition     = length(var.operator_cidrs) > 0
+    error_message = "operator_cidrs must not be empty: EKS treats an empty list as 0.0.0.0/0, silently world-opening the API server."
+  }
+
+  validation {
+    condition     = !contains(var.operator_cidrs, "0.0.0.0/0")
+    error_message = "operator_cidrs must not contain 0.0.0.0/0. If a fully public API endpoint is genuinely wanted, remove this validation deliberately and record the decision."
+  }
 }
 
 variable "vpc_cidr" {

@@ -180,6 +180,16 @@ scripts/cloud/direct-alb-check.sh         # evidence refresh
 
 Cadence: monthly, and immediately after any suspected leak of the SSM value.
 
+**If the ALB is ever REPLACED** (platform rebuild, Ingress recreated), the
+CloudFront origin will keep pointing at the dead hostname: the edge stack
+carries `ignore_changes = [origin]` to protect the rotated header, and that
+freezes `domain_name` with it. Re-point manually:
+
+```bash
+cd deploy/cloud/terraform/edge && terraform apply -replace=aws_cloudfront_distribution.api
+scripts/cloud/rotate-origin-secret.sh      # re-establish the header lock afterwards
+```
+
 ## 10. Recover Core after a node or pod failure
 
 The declared beta tier is single-node/RWO — recovery is REPLACEMENT, not

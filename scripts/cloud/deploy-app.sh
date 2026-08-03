@@ -3,6 +3,16 @@
 # exist BEFORE terraform runs (a missing secret otherwise surfaces as a
 # 15-minute helm wait timeout). Terraform's own interactive approval prompt is
 # the per-action user approval — this wrapper never passes -auto-approve.
+#
+#   AWS_PROFILE=fluidbox-operator scripts/cloud/deploy-app.sh
+#
+# OPERATOR profile, not deployer — this script ends in `terraform apply`, and
+# the stack's provider assumes the deployer role itself, so the ambient
+# identity must be the operator user that role trusts. (Terraform's S3 backend
+# also runs as the ambient identity; it does not inherit the provider's
+# assume_role.) Pure-script operations — verify-bootstrap, rotate-origin-secret,
+# direct-alb-check, replay-on-cluster, idle-scaledown-watch, teardown — take
+# the DEPLOYER profile instead, because they call AWS directly.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
 . scripts/cloud/lib.sh

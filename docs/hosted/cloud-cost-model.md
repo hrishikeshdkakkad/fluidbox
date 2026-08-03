@@ -64,5 +64,15 @@ The ~$130 idle floor is the deliberate price of running the **unchanged Kubernet
 ## 5. Caveats and non-AWS costs
 
 - **NAT gateway is assumed absent.** This model puts the system/sandbox nodes in **public subnets** (the node carries a public IP — that is the 3rd billed IPv4). A private-subnet topology instead would drop the node's public IP (−$3.65/mo) but add a **NAT gateway ≈ $0.045/hr = ~$32.85/mo + $0.045/GB** processing — a material ~**+$30/mo**. Hold the public-subnet topology to keep the floor as modeled.
+- **The tag-filtered budget under-reports unless node ASGs propagate the tag.**
+  EKS managed-node-group tags do **not** reach the EC2 instances or their
+  volumes, so `default_tags` alone would leave the single biggest line item
+  (the always-on t4g.medium, $24.53) outside a `project=fluidbox` filter. The
+  platform stack therefore sets `project=fluidbox` on both node ASGs with
+  `propagate_at_launch = true`. **Residual:** EBS volumes are tagged from the
+  launch template's TagSpecifications, which the EKS-managed template does not
+  carry, so gp3 storage (~$3.20/mo) can still fall outside the filter. The
+  account-wide breaker is unfiltered and catches everything — which is exactly
+  why it is the primary control and the tag-filtered budget is the secondary.
 - **Not live-verified (flagged above):** CloudWatch Logs archived-storage rate ($0.03/GB-mo), regional data-transfer-out rate ($0.09/GB), CloudTrail first-trail-free and the CloudFront 1 TB / regional 100 GB always-free allowances — these are AWS free-tier/policy facts, not Pricing-API line items, and drive several $0 rows.
 - **External (informational, not AWS, not from the Pricing API):** Neon $0–19/mo, WorkOS $0 (under 1M MAU), Vercel Hobby/Pro $0–20/mo. Not included in the AWS floor above.
