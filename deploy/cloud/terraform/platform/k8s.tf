@@ -124,6 +124,7 @@ resource "helm_release" "cluster_autoscaler" {
     aws_eks_node_group.system,
     aws_eks_pod_identity_association.cluster_autoscaler,
     aws_eks_addon.coredns,
-    aws_autoscaling_group_tag.sandbox_ca,
+    aws_autoscaling_group_tag.sandbox_ca_enabled,
+    aws_autoscaling_group_tag.sandbox_ca_cluster,
   ]
 }
