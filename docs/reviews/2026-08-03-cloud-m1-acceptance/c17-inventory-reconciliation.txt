@@ -41,3 +41,31 @@ today — model corrected against real inventory — is done; measuring it again
 a full idle month is a calendar dependency, not a task.
 
 Re-run when a month has passed: scripts/cloud/cloud-m1-acceptance.sh 17
+
+## First empirical attempt (2026-08-03T22:22Z) — data not yet available
+
+Pulled daily UnblendedCost for the account to see whether a first signal was
+extractable rather than waiting a month:
+
+    2026-07-28  $6.14      2026-08-01  $7.66
+    2026-07-29  $6.58      2026-08-02  $5.68
+    2026-07-30  $6.96      2026-08-03  $1.54   <- deployment day
+    2026-07-31  $5.78
+
+**Today's figure is not usable.** $1.54 against a ~$6.5/day baseline for the
+account's OTHER projects is proof of incompleteness, not of cheapness: Cost
+Explorer lags, and the platform only came up around 20:50Z. Grouping by
+service confirms it — **EKS does not appear at all**, and EC2-Compute shows
+$0.06, far below one hour of a running t4g.large.
+
+Fragments that ARE attributable to this deployment appear: KMS $0.062 (the CMK
+created today), ECR $0.013 (the replay image push), ELB $0.158 (our ALB). They
+are partial-day and interleaved with other projects, so they support no
+reconciliation.
+
+**Conclusion: the empirical idle floor is a calendar dependency.** It needs a
+full idle month with the `project` cost-allocation tag ACTIVE (it is currently
+Inactive — AWS refuses to activate a tag it has never seen on billed usage;
+re-apply bootstrap with `-var activate_cost_allocation_tag=true` about a day
+from now). Until then the reconciliation of record is the inventory check
+above: model corrected to ~$157/mo and matched line-for-line to what exists.
