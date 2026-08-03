@@ -18,18 +18,22 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
 . scripts/cloud/lib.sh
 
-require_non_root
-ensure_kubeconfig
 command -v jq >/dev/null || die "jq required"
 
 HEADER_NAME="x-fluidbox-origin-auth"
 ANNOT_KEY="alb.ingress.kubernetes.io/conditions.fluidbox-server"
 INGRESS="fluidbox-server"
 
+# Resolve WHICH distribution to rotate before any remote setup. Rotating
+# against an unknown target is unrecoverable operator confusion, and a
+# kubeconfig failure here would obscure the actual problem.
 say "resolve edge identifiers"
 DIST_ID="${DIST_ID:-$(cd deploy/cloud/terraform/edge && terraform output -raw distribution_id 2>/dev/null)}" \
   || true
 [ -n "${DIST_ID:-}" ] || die "distribution id unknown" "apply the edge stack first, or pass DIST_ID=…"
+
+require_non_root
+ensure_kubeconfig
 CF_DOMAIN=$(aws cloudfront get-distribution --id "$DIST_ID" --query 'Distribution.DomainName' --output text)
 ALB_ARN=$(aws resourcegroupstaggingapi get-resources \
   --tag-filters "Key=ingress.k8s.aws/stack,Values=${CLOUD_NS}/${INGRESS}" \
