@@ -28,9 +28,24 @@ resource "aws_iam_user" "operator" {
   path = "/fluidbox-cloud/"
 }
 
+locals {
+  # Both ARNs are fully determined by names we choose, so they are written out
+  # rather than read back off the resources. That keeps the two policy
+  # documents KNOWN AT PLAN TIME — reviewable in `terraform plan`, and
+  # simulatable by scripts/cloud/iam-simulate.sh before anything is applied.
+  # Referencing the resource attributes instead would make both documents
+  # "(known after apply)" and unreviewable, for no gain: an ARN cannot drift
+  # from a name and path this file also owns.
+  operator_user_arn = "arn:aws:iam::${local.account_id}:user/fluidbox-cloud/${var.operator_user_name}"
+  deployer_role_arn = "arn:aws:iam::${local.account_id}:role/fluidbox-cloud/${var.deployer_role_name}"
+}
+
 resource "aws_iam_user_policy" "operator" {
   name = "fluidbox-operator-base"
   user = aws_iam_user.operator.name
+
+  # Ordering only; the document itself is a plain string.
+  depends_on = [aws_iam_role.deployer]
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -39,7 +54,7 @@ resource "aws_iam_user_policy" "operator" {
         Sid      = "AssumeDeployer"
         Effect   = "Allow"
         Action   = "sts:AssumeRole"
-        Resource = aws_iam_role.deployer.arn
+        Resource = local.deployer_role_arn
       },
       {
         Sid    = "SelfServiceCredentials"
@@ -57,7 +72,7 @@ resource "aws_iam_user_policy" "operator" {
           "iam:ResyncMFADevice",
           "iam:DeactivateMFADevice",
         ]
-        Resource = aws_iam_user.operator.arn
+        Resource = local.operator_user_arn
       },
       {
         Sid      = "SelfServiceVirtualMfa"
@@ -128,7 +143,7 @@ resource "aws_iam_role" "deployer" {
       Sid    = "OperatorAssume"
       Effect = "Allow"
       Principal = {
-        AWS = concat([aws_iam_user.operator.arn], var.extra_deployer_principal_arns)
+        AWS = concat([local.operator_user_arn], var.extra_deployer_principal_arns)
       }
       Action    = "sts:AssumeRole"
       Condition = var.require_deployer_mfa ? { Bool = { "aws:MultiFactorAuthPresent" = "true" } } : {}
