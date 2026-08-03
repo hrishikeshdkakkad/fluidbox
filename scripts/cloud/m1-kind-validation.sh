@@ -211,23 +211,35 @@ def api(p, body=None):
     if body is not None:
         r.data = json.dumps(body).encode(); r.add_header("content-type","application/json")
     with urllib.request.urlopen(r, timeout=30) as x: return json.loads(x.read() or b"{}")
-seq=0; status=None; decided=False; paused=False; t0=time.time()
+# §9-7 is "the run pauses for an approval and resumes after approval". The
+# evidence for that is the approval CHAIN — approval.requested, then a decided
+# approval, then a tool.decision with source=human — NOT a session status of
+# `awaiting_approval`. A quickly-decided approval blocks inside the permission
+# handler while the session stays `running` and emits no such transition, so
+# asserting on it fails a perfectly good run (observed: this exact script did).
+seq=0; status=None; decided=False; requested=False; human_allow=False; denied=0; t0=time.time()
 while status is None and time.time()-t0 < 900:
     try: evs = api(f"/v1/sessions/{SID}/events?after={seq}&limit=200").get("events", [])
     except Exception as e: print("poll:", e); time.sleep(2); continue
     for e in evs:
         seq = e["seq"]; k = e["payload"]["type"]; d = e["payload"].get("data") or {}
         print(f"[{seq:>3}] {k}: {json.dumps(d)[:140]}")
-        if k == "session.status_changed":
-            if d.get("to") == "awaiting_approval": paused = True
-            if d.get("to") in ("completed","failed","cancelled","budget_exceeded"): status = d.get("to")
-        if k == "approval.requested" and not decided:
-            time.sleep(1); api(f"/v1/approvals/{d.get('approval_id')}/decision", {"decision":"approved_once"})
-            decided = True; print(">>> operator approved")
+        if k == "session.status_changed" and d.get("to") in ("completed","failed","cancelled","budget_exceeded"):
+            status = d.get("to")
+        if k == "tool.decision":
+            if d.get("source") == "human" and d.get("verdict") == "allow": human_allow = True
+            if d.get("verdict") == "deny": denied += 1
+        if k == "approval.requested":
+            requested = True
+            if not decided:
+                time.sleep(1); api(f"/v1/approvals/{d.get('approval_id')}/decision", {"decision":"approved_once"})
+                decided = True; print(">>> operator approved")
     if not evs: time.sleep(1.5)
-json.dump({"status":status,"paused":paused,"approved":decided}, open(f"{EV}/replay-result.json","w"))
-print("terminal:", status, "paused:", paused, "approved:", decided)
-sys.exit(0 if status=="completed" and paused and decided else 1)
+result = {"status":status,"approval_requested":requested,"approved":decided,
+          "resumed_via_human_allow":human_allow,"policy_denials":denied}
+json.dump(result, open(f"{EV}/replay-result.json","w"))
+print("result:", result)
+sys.exit(0 if status=="completed" and requested and decided and human_allow and denied >= 1 else 1)
 PY
 RC=$?
 [ "$RC" = "0" ] && pass "replay run COMPLETED with a governed approval pause + resume" \
