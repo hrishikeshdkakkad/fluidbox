@@ -178,8 +178,23 @@ Pod Identity (the default root statement lets the IAM role policy govern).
    `GetCallerIdentity`, `DescribeBudget` ×2 and `ListCostAllocationTags` **as
    root** (CloudTrail 18:08:44–18:08:47Z). Read-only, nothing mutated, no
    configuration changed — but a harness that proves "root is retired" while
-   authenticating as root proves nothing, and on a confirmed SNS subscription
-   it would have paged the owner for apparent root compromise.
+   authenticating as root proves nothing.
+
+   **Correction, 2026-08-03:** an earlier revision of this finding said the
+   alarm "would have paged the owner *on a confirmed subscription*", implying
+   the notification was hypothetical. It was not. Re-checked directly: the
+   EventBridge rule `fluidbox-root-activity` is **ENABLED** with pattern
+   `userIdentity.type: ["Root"]` over `AWS API Call via CloudTrail`, and the
+   `fluidbox-cloud-alerts` SNS subscription to the operator's address is
+   **confirmed** (a real SubscriptionArn, not the literal
+   `PendingConfirmation`). Those four calls matched the pattern, so the owner
+   was almost certainly emailed a root-activity alert for them. Anyone
+   reconciling that alert against this document should find it here.
+
+   *Unintended upside worth recording:* this is the first LIVE-FIRE evidence
+   for the M1.0 gate's "CloudTrail/root alarms" item. The rule was previously
+   evidenced as configured; it is now evidenced as actually matching real root
+   API activity end to end, through a confirmed notification path.
 
    Fixed: `require_non_root` now gates the harness (verified — it refuses with
    no profile set), and the `as_any` helper no longer falls back to ambient
