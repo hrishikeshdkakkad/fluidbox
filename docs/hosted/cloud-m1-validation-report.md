@@ -17,6 +17,8 @@ deployment.
 | All four `terraform validate` against **real** provider schemas (aws 6.57.1, kubernetes 2.38.0, helm 2.17.0) | ✅ |
 | Chart `0.4.0` published at `oci://ghcr.io/hrishikeshdkakkad/charts/fluidbox` (appVersion 0.4.0) | ✅ |
 | Product images multi-arch with `linux/arm64` at 0.4.0 (server, workspaced, sandbox-runner, codex-runner) — required for t4g nodes | ✅ |
+| `ghcr.io/berriai/litellm-database:main-stable` exists and ships `linux/arm64` — the composed LiteLLM must schedule on the Graviton system node | ✅ |
+| All six referenced EKS addons exist for K8s 1.35 (vpc-cni, kube-proxy, coredns, ebs-csi, metrics-server, pod-identity-agent) | ✅ |
 | CloudFront managed policy ids resolve: `Managed-CachingDisabled`, `Managed-AllViewerExceptHostHeader` | ✅ |
 | `com.amazonaws.global.cloudfront.origin-facing` prefix list exists in us-east-1 (`pl-3b927c52`) | ✅ |
 | EKS 1.35 is in **standard** support until 2027-03-26 (1.33 moved to extended 2026-07-28) | ✅ |
