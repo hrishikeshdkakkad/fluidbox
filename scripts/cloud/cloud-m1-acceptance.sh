@@ -74,18 +74,36 @@ c10() { say "[10] sandbox egress denial (live negative probe)"
         local o="$EV/c10-netpol-probe.txt"
         # A pod wearing the managed label in the sandbox namespace: external
         # egress must FAIL; the control plane :8788 must connect.
-        local internal_ip
+        local internal_ip WORKDIR_PROBE
+        WORKDIR_PROBE=$(mktemp)
         internal_ip=$(kubectl get svc fluidbox-internal -n "$CLOUD_NS" -o jsonpath='{.spec.clusterIP}')
+        # The sandbox namespace enforces PodSecurity "restricted", so the probe
+        # must carry the same securityContext every real sandbox pod does —
+        # otherwise the API server refuses it and the refusal looks like a
+        # netpol failure. (Observed: it did.)
+        cat > "$WORKDIR_PROBE" <<PROBEJSON
+{"spec":{
+  "nodeSelector":{"fluidbox.dev/role":"sandbox"},
+  "tolerations":[{"key":"fluidbox.dev/sandbox","operator":"Equal","value":"true","effect":"NoSchedule"}],
+  "securityContext":{"runAsNonRoot":true,"runAsUser":10001,"seccompProfile":{"type":"RuntimeDefault"}},
+  "containers":[{"name":"m1-egress-probe","image":"busybox:1.36",
+    "securityContext":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}},
+    "command":["sh","-c","for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do if wget -q -T 4 -O /dev/null http://example.com 2>/dev/null; then echo OPEN_ATTEMPT_\$i; else echo EGRESS_BLOCKED_AT_\$i; break; fi; sleep 3; done; (nc -z -w 5 $internal_ip 8788 && echo INTERNAL_OK) || echo INTERNAL_BLOCKED"]}]
+}}
+PROBEJSON
         kubectl run m1-egress-probe -n "$CLOUD_SANDBOX_NS" --restart=Never --rm -i --pod-running-timeout=3m \
-          --labels=fluidbox.dev/managed=true \
-          --overrides='{"spec":{"nodeSelector":{"fluidbox.dev/role":"sandbox"},"tolerations":[{"key":"fluidbox.dev/sandbox","operator":"Equal","value":"true","effect":"NoSchedule"}]}}' \
-          --image=busybox:1.36 -- sh -c "
-            (wget -q -T 8 -O /dev/null http://example.com && echo EGRESS_OPEN) || echo EGRESS_BLOCKED
-            (nc -z -w 5 $internal_ip 8788 && echo INTERNAL_OK) || echo INTERNAL_BLOCKED
-          " > "$o" 2>&1
-        if grep -q EGRESS_BLOCKED "$o" && grep -q INTERNAL_OK "$o"
-        then record 10 "sandbox egress denied (external blocked, :8788 allowed)" PASS "c10-netpol-probe.txt"
-        else record 10 "sandbox egress denied" FAIL "c10-netpol-probe.txt (mind the standard-mode async-programming window — rerun once)"; fi }
+          --labels=fluidbox.dev/managed=true --image=busybox:1.36 \
+          --overrides="$(cat "$WORKDIR_PROBE")" > "$o" 2>&1
+        # The probe POLLS rather than sampling once. AWS VPC CNI `standard` mode
+        # programs NetworkPolicy ASYNCHRONOUSLY and fails OPEN meanwhile, so a
+        # t=0 sample measures the unprogrammed network and reports EGRESS_OPEN
+        # on a perfectly healthy cluster. Real sandbox pods never see that
+        # window — the chart's netpol-gate init container holds them until
+        # enforcement is OBSERVED — but a bare kubectl-run probe has no gate,
+        # so it must wait for the flip itself.
+        if grep -q EGRESS_BLOCKED_AT_ "$o" && grep -q INTERNAL_OK "$o"
+        then record 10 "sandbox egress denied (external blocked once policy programmed, :8788 allowed)" PASS "c10-netpol-probe.txt"
+        else record 10 "sandbox egress denied" FAIL "c10-netpol-probe.txt (never blocked within ~60s — this is a REAL enforcement failure, not the async window)"; fi }
 
 c11() { say "[11] cross-tenant denial"
         if [ -n "${ORG_A_PAT:-}" ] && [ -n "${ORG_B_PAT:-}" ]; then
@@ -124,8 +142,14 @@ c13() { say "[13] operator cancellation stops an active run"
             "$API/v1/sessions" | python3 -c "import sys,json;print(json.load(sys.stdin)['session']['id'])")
           echo "victim run: $sid"; sleep 8
           curl -fsS -X POST -H "authorization: Bearer $tok" "$API/v1/sessions/$sid/cancel"
-          echo; sleep 10
-          curl -fsS -H "authorization: Bearer $tok" "$API/v1/sessions/$sid" | python3 -c "import sys,json;s=json.load(sys.stdin)['session'];print('status:',s['status']);exit(0 if s['status']=='cancelled' else 1)"
+          echo
+          for _ in $(seq 1 40); do
+            st=$(curl -fsS -H "authorization: Bearer $tok" "$API/v1/sessions/$sid" | python3 -c "import sys,json;print(json.load(sys.stdin)['session']['status'])")
+            echo "  status: $st"
+            case "$st" in cancelled) exit 0;; failed|completed|budget_exceeded) exit 1;; esac
+            sleep 3
+          done
+          exit 1
         } > "$o" 2>&1 \
           && record 13 "operator cancellation" PASS "c13-cancel.txt" \
           || record 13 "operator cancellation" FAIL "c13-cancel.txt"; }

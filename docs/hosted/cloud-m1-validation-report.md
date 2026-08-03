@@ -4,8 +4,11 @@ The M1 brief §9 hard-acceptance ledger, plus the pre-apply verifications that
 back it. Living document: `scripts/cloud/cloud-m1-acceptance.sh` writes the
 per-criterion evidence and prints the table to paste into §2 below.
 
-Status as of **2026-08-03**: M1.0 proofs run; nothing applied to AWS (applies
-are per-action user-approved). Criteria fall into three honest states:
+Status as of **2026-08-03**: **M1.0 and M1.1 are APPLIED AND LIVE on AWS.**
+Bootstrap (27 resources), platform (49), app (chart + composed LiteLLM) and
+edge (CloudFront) are deployed; the origin secret is rotated; the $0 replay
+acceptance passed on-cluster through the public edge. Ten §9 criteria now
+carry live evidence. Criteria fall into these states:
 
 - **PASS** — closed without a deployment (16, 18).
 - **MECHANISM PROVEN** — the product behaviour was demonstrated on a *real*
@@ -85,19 +88,19 @@ Pod Identity (the default root statement lets the IAM role policy govern).
 
 | # | criterion | status | evidence |
 |---|---|---|---|
-| 1 | scoped deployer applies without a root key | PENDING-APPLY — but the policy is **simulation-verified** (42/42) so an AccessDenied at apply is now unlikely | `…-cloud-m1-readiness/iam-simulation.md`, then `verify-bootstrap.sh` |
-| 2 | both budget controls active | PENDING-APPLY | acceptance harness c2 |
+| 1 | scoped deployer applies without a root key | **PARTIAL — the scoped deployer DID apply all three stacks (proven).** `verify-bootstrap.sh` is 11/12; the single gap is that the root access key is still ACTIVE, left so at your instruction after CloudTrail showed non-session use | `…-cloud-m1-acceptance/c1-verify-bootstrap.txt` |
+| 2 | both budget controls active | **PASS** ($600 breaker + $50 tag-filtered, live) | `…-cloud-m1-acceptance/c2-budgets.json` |
 | 3 | operator provisions an org by documented steps | PENDING-APPLY | `cloud-onboarding-checklist.md`, filled |
 | 4 | invited owner logs in through the Vercel origin | PENDING-APPLY (blocked on decision §12#4) | manual + screenshots |
-| 5 | user submits a replay run | **MECHANISM PROVEN** on a real cluster; EKS re-run pending | `…-cloud-m1-kind/` (released 0.4.0 chart + M1 values) |
-| 6 | EKS creates an isolated sandbox | **MECHANISM PROVEN** (sandbox pod scheduled under the quota + both NetworkPolicies); EKS re-run pending | `…-cloud-m1-kind/sandbox-plane.txt` |
-| 7 | run pauses for approval and resumes | **MECHANISM PROVEN** — `approval.requested` → `approval.decided` → `tool.decision(source=human)` → `completed` | `…-cloud-m1-kind/timeline-verified.txt` |
+| 5 | user submits a replay run | **PASS ON EKS** — submitted through the CloudFront edge | `…-cloud-m1-replay/` |
+| 6 | EKS creates an isolated sandbox | **PASS ON EKS** — sandbox pod scheduled on a node the autoscaler woke FROM ZERO | `…-cloud-m1-replay/sandbox-pods.txt` |
+| 7 | run pauses for approval and resumes | **PASS ON EKS** — approval.decided by operator → tool.decision(source=human) → completed | `…-cloud-m1-replay/timeline.txt` |
 | 8 | events stream through Vercel→CloudFront→ALB (or documented fallback) | **Vercel leg PROVEN on the live deployment** (300s cap + resume, fallback ruled out); CF/ALB legs pending apply | readiness ledger, "Vercel platform cap" |
-| 9 | artifacts + usage recorded | **MECHANISM PROVEN** (diff artifact with the canonical fix + cost record); EKS re-run pending | `…-cloud-m1-kind/changes.patch`, `cost.json` |
-| 10 | sandbox cannot make disallowed connections | **MECHANISM PROVEN** — `helm test` netpol probe passes on Calico (`:8788` reachable, `:8787` blocked) **and** policy denied `curl` mid-run; EKS (VPC-CNI standard mode) re-run pending | `…-cloud-m1-kind/README.md` |
+| 9 | artifacts + usage recorded | **PASS ON EKS** — diff carries the real fix; cost ledger records **$0.00 / 0 requests**, confirming a genuinely model-free acceptance | `…-cloud-m1-replay/changes.patch`, `cost.json` |
+| 10 | sandbox cannot make disallowed connections | **PASS ON EKS** — a labelled probe pod in the sandbox namespace: `OPEN_ATTEMPT_1` then `EGRESS_BLOCKED_AT_2` (the VPC-CNI standard-mode programming window, ~3s, measured live), with `:8788` still reachable. Policy also denied `curl` mid-run | `…-cloud-m1-acceptance/c10-netpol-probe.txt` |
 | 11 | cross-tenant read/mutate impossible | **PROVEN AT THE ENFORCED FLOOR** — RLS under the non-owner runtime role: A sees only A, B only B, no-GUC sees zero, A selecting B's tenant_id gets nothing | `…-cloud-m1-readiness/cross-tenant-rls.txt` |
-| 12 | direct ALB requests rejected | PENDING-APPLY | `direct-alb-check.sh` |
-| 13 | operator cancellation stops a run | **MECHANISM PROVEN** — cancelled a run genuinely blocked on a human approval: `{"cancelled":true}` → `cancelled`, sandbox reclaimed, second cancel idempotent | `…-cloud-m1-readiness/containment-drill.md` |
+| 12 | direct ALB requests rejected | **PASS** — CloudFront 200; direct ALB and forged-header both refused (000) | `…-cloud-m1-edge-lock/direct-alb-check.txt` |
+| 13 | operator cancellation stops a run | **PASS ON EKS** — `{"cancelled":true}`, status polled through `finalizing` → `cancelled` | `…-cloud-m1-acceptance/c13-cancel.txt` |
 | 14 | containment runbook exercised, limits recorded | **EXERCISED** against a real multi-user control plane; five limitations recorded from observation, incl. a previously-unknown ordering trap that changed the runbook | `…-cloud-m1-readiness/containment-drill.md` |
 | 15 | sandbox capacity returns to zero | PENDING-APPLY | `idle-scaledown-watch.sh` |
 | 16 | core/chart/suites green, unmodified | ✅ **PASS (both halves)** | §1 above |
