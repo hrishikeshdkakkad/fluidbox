@@ -7,6 +7,12 @@
 # Prereqs: platform+app+edge applied, rotation done, colima running (image
 # build), AWS_PROFILE=fluidbox-deployer.
 #
+# RUN THIS AT THE M1.1 GATE — i.e. while the app stack still has
+# require_sso=false. It drives /v1/sessions with the ADMIN token, and the
+# M1.2 flip deliberately confines that token to /v1/admin/*, after which
+# these calls answer 401 by design. Post-flip, re-run it with an operator PAT
+# in ADMIN_TOKEN instead (the API shape is identical).
+#
 #   scripts/cloud/replay-on-cluster.sh            # full: build+push+seed+run
 #   FLUIDBOX_DEMO_DECISION=deny …                 # exercise the deny path
 #   SKIP_BUILD=1 …                                # reuse the pushed image
