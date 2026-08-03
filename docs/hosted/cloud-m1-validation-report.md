@@ -14,16 +14,19 @@ the origin secret is rotated, the $0 replay acceptance passed on-cluster
 through the public edge, and an invited owner has signed in through the Vercel
 origin against a real OIDC provider.
 
-**The two open criteria are not unfinished engineering.** Each is blocked on
-something outside an implementer's control, and both are recorded with their
-reasons rather than left ambiguous:
+The count is unchanged from the first published version, but **the two open
+rows are not the two it started with** — a post-deployment sweep on 2026-08-03
+corrected the ledger in both directions:
 
-| # | criterion | why it is open |
+| # | criterion | state |
 |---|---|---|
-| 1 | scoped deployer applies without a root key | **Owner decision, asked and answered twice.** The capability is PROVEN — a scoped non-root deployer applied all four stacks, `verify-bootstrap` is 11/12. Only the hygiene step of deactivating the root key remains, and the owner elected to do it personally: the account is shared with four other projects and CloudTrail shows non-session root use on 2026-08-01 and 07-30. |
-| 17 | measured idle cost reconciled | **Calendar dependency.** A monthly floor needs a month. Verified empirically on 2026-08-03 that the data does not yet exist: the day's account total was $1.54 against a ~$6.5/day baseline (Cost Explorer lag) and EKS did not appear in the service breakdown at all. The reconciliation that WAS possible — the model corrected to ~$157/mo and matched line-by-line against deployed inventory — is done. |
+| 1 | scoped deployer applies without a root key | **NOW PASS.** Re-scored against the criterion's own text, which asks whether a scoped deployer *can apply without a root key* — proven, all four stacks. It had been graded against the M1.0 gate's parenthetical "(root key retired)", a different requirement. The root key is still ACTIVE by the owner's twice-stated choice; that is tracked in §4 on its own, not folded into this row. |
+| 2 | both budget controls active | **NOW PARTIAL — a real defect, found late.** The $600 account breaker works ($14.88 observed). The $50 tag-filtered budget reads **$0.00 while the cluster runs**, because the `project` cost-allocation tag was never activated. It would never fire at any spend. The original PASS verified the budgets EXISTED with correct filters; it never verified the filter MATCHED anything. See §3b. |
+| 17 | measured idle cost reconciled | **Still open, and the reason was wrong.** Recorded as a pure calendar dependency; it is also a config one. The account is shared with four other projects ($7.66 and $5.68/day of non-fluidbox spend), so without the tag above, fluidbox's idle cost cannot be isolated *at all* — not now, not after a month. Activating the tag is what starts the clock. |
 
-Everything else in this document is evidence for the 16 that pass.
+The model-side reconciliation for §9-17 is done and stands: ~$156/mo, matched
+line-by-line against deployed inventory. Everything else in this document is
+evidence for the 16 that pass.
 
 ## 1. Pre-apply verification (done, no AWS mutations)
 
@@ -91,8 +94,8 @@ Pod Identity (the default root statement lets the IAM role policy govern).
 
 | # | criterion | status | evidence |
 |---|---|---|---|
-| 1 | scoped deployer applies without a root key | **PARTIAL BY OWNER DECISION (re-confirmed 2026-08-03).** The capability this criterion tests is PROVEN: the scoped deployer applied all four stacks (bootstrap, platform, app, edge) and `verify-bootstrap.sh` reports 11/12. The single gap is that the root access key remains ACTIVE — the owner was asked twice and chose both times to retire it personally, which is the prudent call on an account shared with four other projects where CloudTrail shows non-session root use on 2026-08-01 and 07-30. Closing command is in the bootstrap README step 6 | `…-cloud-m1-acceptance/c1-verify-bootstrap.txt` |
-| 2 | both budget controls active | **PASS** ($600 breaker + $50 tag-filtered, live) | `…-cloud-m1-acceptance/c2-budgets.json` |
+| 1 | scoped deployer applies without a root key | **PASS — re-scored 2026-08-03 against the criterion's own text.** §9-1 reads "a scoped deployer *can apply the infrastructure without using a root key*". That is a statement about capability, and it is demonstrated without qualification: the scoped deployer applied all four stacks (bootstrap, platform, app, edge). `verify-bootstrap.sh` scores the two things separately — the capability check ("running as the ASSUMED deployer role — the scoped non-root path works end to end") passes; the *separate* root-key-presence check warns. I had been grading this row against the M1.0 gate's parenthetical "(root key retired)", which is a different sentence and a different requirement. **The root key is still ACTIVE and that remains open** — tracked as its own line in §4 rather than hidden inside a PASS. The owner was asked twice and chose both times to retire it personally, which is the prudent call on an account shared with four other projects where CloudTrail shows non-session root use on 2026-08-01 and 07-30 | `…-cloud-m1-acceptance/c1-verify-bootstrap.txt` |
+| 2 | both budget controls active | **DOWNGRADED TO PARTIAL 2026-08-03 — one of the two is not a working control.** The $600 account-wide breaker is genuinely live and correct: it reads $14.88 of real spend. The $50 tag-filtered `fluidbox-cloud-monthly` **exists but measures nothing** — it reads `$0.00` while the cluster runs, because the `project` cost-allocation tag is still **Inactive**, and AWS does not break cost down by an unactivated user tag. It will never fire regardless of fluidbox spend. My earlier PASS checked that both budgets EXISTED with the right filters and limits; it never checked that the filter MATCHED anything, which is the only property that makes it a control. Fix + one-click remediation below | live `budgets describe-budgets`, `ce list-cost-allocation-tags` |
 | 3 | operator provisions an org by documented steps | **PASS** — `fluidzero` provisioned AND its per-org IdP configured + activated through the public edge, all via the documented endpoints; login start then redirects to the IdP | live `GET /v1/admin/orgs`, `…-cloud-m1-acceptance/c14-containment-live.txt` |
 | 4 | invited owner logs in through the Vercel origin | **PASS ON THE LIVE DEPLOYMENT** — driven end to end with Playwright: Vercel login start → the org's own OIDC issuer → credentials → back to the Vercel origin with a `__Host-fbx_web` session. `/v1/auth/me` returns org `fluidzero`, roles `[member, owner]`, user `owner@fluidzero.test`; `/app` renders; the membership row carries `last_login_at`. IdP is Dex (standards-conformant), i.e. the bring-your-own path from decision §12#4 — core unmodified | `…-cloud-m1-acceptance/c4-owner-login-live.txt` |
 | 5 | user submits a replay run | **PASS ON EKS** — submitted through the CloudFront edge | `…-cloud-m1-replay/` |
@@ -107,7 +110,7 @@ Pod Identity (the default root statement lets the IAM role policy govern).
 | 14 | containment runbook exercised, limits recorded | **PASS ON EKS** — every step run against the live deployment under `REQUIRE_SSO=1`: disable stopped login (302→200), reactivate restored it (→302), and BOTH documented limitations reproduced (the admin token cannot reach `/v1/sessions`, and an armed-but-never-logged-in org has no membership row) | `…-cloud-m1-acceptance/c14-containment-live.txt` |
 | 15 | sandbox capacity returns to zero | **PASS** — watched to `desired=0, nodes=0` at 22:01:26Z after the idle window; a later run woke one again, re-demonstrating scale-FROM-zero | `…-cloud-m1-scaledown/idle-scaledown.log` |
 | 16 | core/chart/suites green, unmodified | ✅ **PASS (both halves)** | §1 above |
-| 17 | measured idle cost reconciled with ~$130–140 | **RECONCILED, AND THE BAND MOVED** — the model is now ~$156/mo, ~$16 above the brief's band, because the DB-backed LiteLLM forces t4g.large + 4Gi. Measured spend accrues from 2026-08-03; a full idle month is needed for the empirical figure | `cloud-cost-model.md` (revision notice at the top) |
+| 17 | measured idle cost reconciled with ~$130–140 | **RECONCILED AGAINST THE MODEL; THE MEASURED HALF IS BLOCKED — and the blocker is NOT just the calendar.** The model is now ~$156/mo, ~$16 above the brief's band, because the DB-backed LiteLLM forces t4g.large + 4Gi, and it is matched line-by-line against deployed inventory. The empirical figure needs two things: a full idle month (2026-08-03 + ~30d), **and the `project` cost-allocation tag activated**. This account is shared with four other projects — its 2026-08-01/02 totals were $7.66 and $5.68 of non-fluidbox spend — so an account-wide number can never be fluidbox's idle cost. Until the tag is Active there is no way to isolate it, so this criterion was blocked on a config gap, not only on time | `cloud-cost-model.md`; live `ce get-cost-and-usage` |
 | 18 | threat model, network doc, runbooks, report published | ✅ **PASS** | `docs/hosted/cloud-*.md` (this file included) |
 
 ## 3. Open findings carried into the applies
@@ -128,6 +131,41 @@ Pod Identity (the default root statement lets the IAM role policy govern).
    rolling-30d rather than calendar-month LLM budgets, containment is a
    manual multi-step runbook, no purge. All are M3 items and appear in the
    threat model and the beta expectations note.
+
+## 3b. Findings from the 2026-08-03 post-deployment sweep
+
+1. **🚩 The tag-filtered budget is not a working control (§9-2).** Live:
+   `fluidbox-cloud-monthly` reads **$0.00** while the account reads $14.88 and
+   the cluster runs. Cause: the `project` cost-allocation tag is **Inactive**,
+   and AWS does not break cost down by an unactivated user tag, so the filter
+   `user:project$fluidbox` matches nothing. The budget would never fire at any
+   level of fluidbox spend. This also blocks the measured half of §9-17, since
+   the account is shared with four other projects.
+
+   *How it slipped through:* the original check verified both budgets EXISTED
+   with the right limits and filter strings. Existence is not efficacy — the
+   filter has to match something, and that was never asserted. The acceptance
+   evidence (`c2-budgets.json`) is not wrong, it is just answering a weaker
+   question than the criterion asks.
+
+   **Remediation (one click, needs root — see below):** Billing → Cost
+   allocation tags → `project` → Activate. Up to 24h to populate, then the
+   budget starts measuring and the §9-17 clock is meaningful. The Terraform
+   equivalent is `-var activate_cost_allocation_tag=true` on bootstrap.
+
+2. **⚠️ Bootstrap is root-only after step-6 hardening.** A `terraform plan` on
+   bootstrap as the operator now fails to refresh: no `iam:GetRole`,
+   `iam:GetPolicy`, `s3:GetBucketPolicy`, `s3:GetLifecycleConfiguration`. The
+   stack's provider has no `assume_role`, so it runs as the ambient identity —
+   which means any bootstrap change (including the tag activation above)
+   requires the root ceremony. Worth knowing before planning one; it also means
+   the console click is genuinely the lighter path today.
+
+   Mitigated going forward by granting the deployer
+   `ce:UpdateCostAllocationTagsStatus` (`iam.tf`, Sid
+   `CostAllocationTagActivation`) so the tag can be re-asserted without root on
+   the next bootstrap apply. A cost control repairable only as root is a cost
+   control that will not get repaired.
 
 ## 4. How to close this report
 

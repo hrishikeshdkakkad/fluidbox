@@ -428,6 +428,28 @@ resource "aws_iam_policy" "deployer_infra" {
         Resource = "arn:aws:budgets::${local.account_id}:budget/fluidbox-*"
       },
       {
+        # Activating the `project` cost-allocation tag is what lets the
+        # tag-filtered budget see anything AT ALL: on a shared account an
+        # INACTIVE tag makes `fluidbox-cloud-monthly` read $0.00 forever, so
+        # the budget silently stops being a control. Observed live on
+        # 2026-08-03 — account spend $14.88, fluidbox budget $0.00.
+        #
+        # This does NOT unblock the bootstrap path: this stack's provider has
+        # no assume_role, so aws_ce_cost_allocation_tag is created by whoever
+        # runs bootstrap — root, since step-6 hardening left the operator
+        # unable to even refresh this stack. Root already has the permission.
+        #
+        # It is here so the tag can be activated and re-asserted WITHOUT a root
+        # ceremony, which is the whole point of the scoped-deployer posture.
+        # A cost control that can only be repaired as root is a cost control
+        # that will not get repaired. It is a WRITE, so it cannot live in
+        # ReadOnlyPlaneWide below, whose Sid would then be a lie.
+        Sid      = "CostAllocationTagActivation"
+        Effect   = "Allow"
+        Action   = ["ce:UpdateCostAllocationTagsStatus"]
+        Resource = "*"
+      },
+      {
         Sid    = "ReadOnlyPlaneWide"
         Effect = "Allow"
         Action = [
