@@ -26,7 +26,7 @@ replay-runner ECR repo with a keep-5 lifecycle.
 ```bash
 cd deploy/cloud/terraform/platform
 cp terraform.auto.tfvars.example terraform.auto.tfvars   # set operator_cidrs
-AWS_PROFILE=fluidbox-operator terraform init
+AWS_PROFILE=fluidbox-operator terraform init   # operator is ambient; the PROVIDER assumes the deployer
 AWS_PROFILE=fluidbox-operator terraform plan             # per-action user approval required
 AWS_PROFILE=fluidbox-operator terraform apply
 ```

@@ -29,8 +29,41 @@ deployment.
 | Cost model re-verified live (AWS Pricing API) | ✅ ≈$131.6/mo idle, in band |
 | OIDC login path proof | ⚠️ 17/18 — see the blocking finding |
 | Vercel proxy cookie + SSE code path | ✅ 9/9 (platform cap pending project link) |
+| Independent IaC security review (separate agent, full stack read) | ✅ ran; 1 blocker + 4 medium + 3 nits, **all fixed** |
+| `operator_cidrs` guard proven to refuse `[]` and `0.0.0.0/0`, accept a `/32` | ✅ |
 
 Evidence: `docs/reviews/2026-08-03-cloud-m1-readiness/`.
+
+### What the independent review caught (all fixed before handback)
+
+1. **BLOCKER — the Terraform S3 backend does not inherit the provider's
+   `assume_role`.** It resolves credentials independently, so state and lock
+   objects are read/written by the *ambient* identity (the operator user),
+   which had no state-bucket permissions — every platform/app/edge apply would
+   have failed at `init` with AccessDenied before planning a single resource.
+   Fixed by granting the operator state-bucket object access (plus
+   `eks:DescribeCluster`, which `update-kubeconfig` needs ambiently), and by
+   documenting the profile rule: **terraform runs as the operator** (the
+   provider elevates), **scripts run as the deployer**.
+2. The tag-filtered budget would have missed compute — node-group tags don't
+   reach EC2 instances (fixed with propagating ASG tags; EBS residual recorded
+   in the cost model).
+3. `coredns`/`kube-proxy` addons lacked `resolve_conflicts_on_create`, risking
+   `ConfigurationConflict` when adopting the cluster's self-managed copies.
+4. `operator_cidrs` had no guard — an empty list makes EKS default the public
+   API endpoint to `0.0.0.0/0`, world-opening it by omission. Now refused at
+   plan time, and the refusal is proven.
+5. Nits fixed: `activate_cost_allocation_tag` now defaults **false** (the old
+   default made the documented first-apply failure the default path); the
+   `alb_hostname` output documents that it is empty on first apply by design;
+   the runbook covers re-pointing CloudFront after an ALB replacement (the
+   `ignore_changes = [origin]` freeze) and the post-retirement bootstrap drift.
+
+The review independently confirmed the four defects I had already found and
+fixed, and cleared three things I flagged as uncertain: the helm `~> 2.17`
+block syntax is correct for v2.x, the budget `TagKeyValue` filter form is
+correct for provider 6.x, and the KMS key needs no explicit key policy for
+Pod Identity (the default root statement lets the IAM role policy govern).
 
 ## 2. §9 hard acceptance criteria
 

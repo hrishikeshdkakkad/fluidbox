@@ -79,14 +79,17 @@ variable "require_deployer_mfa" {
 variable "activate_cost_allocation_tag" {
   description = <<-EOT
     Activate the `project` user cost-allocation tag so the tag-filtered budget
-    can actually see fluidbox spend. AWS only allows activating a tag AFTER it
-    has been seen on billed usage (up to 24h of lag) — if the first apply fails
-    on aws_ce_cost_allocation_tag, set this false, apply, then flip it true a
-    day later. Until activation the fluidbox budget filter matches nothing and
-    the ACCOUNT-WIDE budget is the working breaker (by design, it always is).
+    can see fluidbox spend.
+
+    DEFAULTS FALSE on purpose: AWS refuses to activate a tag it has never seen
+    on billed usage, and on the very first bootstrap apply — before any tagged
+    resource exists — that is guaranteed to be the case. Defaulting true would
+    make the documented failure the default path. Flip it true and re-apply
+    ~24h after the platform stack is up. Until then the ACCOUNT-WIDE budget is
+    the working breaker, which by design it always is.
   EOT
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "extra_deployer_principal_arns" {
