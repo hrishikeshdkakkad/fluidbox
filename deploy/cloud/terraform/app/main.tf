@@ -67,11 +67,12 @@ provider "helm" {
   }
 }
 
-resource "kubernetes_namespace_v1" "fluidbox" {
-  metadata {
-    name = "fluidbox"
-    labels = {
-      "app.kubernetes.io/part-of" = "fluidbox"
-    }
-  }
+# The namespace is created OUT OF BAND by scripts/cloud/make-secrets.sh — it
+# has to be, because the Secrets live in it and they must exist before the
+# chart installs. Terraform therefore does not own it: managing it here forced
+# a first-run `terraform import`, and the imported object then tripped the
+# kubernetes provider with "Unexpected Identity Change" on every subsequent
+# read. A constant is simpler and matches who actually creates it.
+locals {
+  namespace = "fluidbox"
 }
