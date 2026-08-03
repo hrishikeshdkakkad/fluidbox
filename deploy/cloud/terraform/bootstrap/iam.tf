@@ -72,7 +72,43 @@ resource "aws_iam_user_policy" "operator" {
         Effect   = "Allow"
         Action   = ["budgets:ViewBudget", "ce:GetCostAndUsage", "ce:GetCostForecast"]
         Resource = "*"
-      }]
+      }],
+      # THE TERRAFORM BACKEND RUNS AS THIS USER, NOT AS THE DEPLOYER.
+      # Terraform's S3 backend (and `terraform_remote_state`) resolve
+      # credentials independently — they do NOT inherit the provider's
+      # assume_role block. So while every platform/app/edge RESOURCE is
+      # created by the assumed deployer role, state and lock objects are
+      # read/written by the ambient identity, which is this user. Without
+      # these grants `terraform init` fails with AccessDenied before a single
+      # resource is planned. State carries no secret values by design
+      # (deploy/cloud/README.md), so this is object access to non-sensitive
+      # bookkeeping, not an authority grant.
+      [
+        {
+          Sid      = "TerraformStateBucket"
+          Effect   = "Allow"
+          Action   = ["s3:ListBucket", "s3:GetBucketVersioning", "s3:GetBucketLocation"]
+          Resource = "arn:aws:s3:::fluidbox-cloud-tfstate-*"
+        },
+        {
+          Sid      = "TerraformStateObjects"
+          Effect   = "Allow"
+          Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+          Resource = "arn:aws:s3:::fluidbox-cloud-tfstate-*/*"
+        },
+        {
+          # `aws eks update-kubeconfig --role-arn <deployer>` puts the role in
+          # the GENERATED exec block, but makes the DescribeCluster call with
+          # AMBIENT credentials — so the operator needs this read to build a
+          # kubeconfig at all (scripts/cloud/lib.sh::ensure_kubeconfig, reached
+          # by deploy-app.sh, which runs as the operator because it ends in a
+          # terraform apply). Read-only, and cluster metadata is not sensitive.
+          Sid      = "KubeconfigBootstrap"
+          Effect   = "Allow"
+          Action   = ["eks:DescribeCluster", "eks:ListClusters"]
+          Resource = "*"
+        },
+      ]
     )
   })
 }

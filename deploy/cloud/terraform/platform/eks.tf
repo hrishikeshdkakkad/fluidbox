@@ -111,6 +111,12 @@ resource "aws_eks_addon" "vpc_cni" {
 resource "aws_eks_addon" "kube_proxy" {
   cluster_name = aws_eks_cluster.this.name
   addon_name   = "kube-proxy"
+  # A fresh cluster ships self-managed coredns/kube-proxy; adopting them with
+  # the default NONE conflict policy can fail with ConfigurationConflict.
+  # These two pass no configuration_values, so adoption is normally clean —
+  # OVERWRITE just removes the failure mode (and the asymmetry with vpc-cni).
+  resolve_conflicts_on_create = "OVERWRITE"
+  resolve_conflicts_on_update = "OVERWRITE"
 }
 
 resource "aws_eks_addon" "pod_identity_agent" {
@@ -120,9 +126,11 @@ resource "aws_eks_addon" "pod_identity_agent" {
 
 # These three only reach ACTIVE once pods can schedule → after the system NG.
 resource "aws_eks_addon" "coredns" {
-  cluster_name = aws_eks_cluster.this.name
-  addon_name   = "coredns"
-  depends_on   = [aws_eks_node_group.system]
+  cluster_name                = aws_eks_cluster.this.name
+  addon_name                  = "coredns"
+  resolve_conflicts_on_create = "OVERWRITE"
+  resolve_conflicts_on_update = "OVERWRITE"
+  depends_on                  = [aws_eks_node_group.system]
 }
 
 resource "aws_eks_addon" "ebs_csi" {
@@ -232,7 +240,42 @@ resource "aws_eks_node_group" "sandbox" {
 # "Invalid for_each argument". Passing that unknown as a plain ARGUMENT (as
 # below) is fine.
 locals {
+  system_asg_name  = aws_eks_node_group.system.resources[0].autoscaling_groups[0].name
   sandbox_asg_name = aws_eks_node_group.sandbox.resources[0].autoscaling_groups[0].name
+}
+
+# Cost-allocation tags that actually reach the EC2 INSTANCES.
+#
+# `default_tags` and node-group `tags` land on the node group API object —
+# EKS does NOT propagate them to the instances or their volumes. Without
+# these, the biggest single line item in the cost model (the always-on
+# t4g.medium, ~$24.50/mo) carries no `project` tag and falls OUTSIDE the
+# tag-filtered fluidbox budget, which would then quietly report a fraction of
+# real spend. `propagate_at_launch` is what fixes that.
+#
+# Residual, recorded in docs/hosted/cloud-cost-model.md: EBS volumes are
+# tagged from the launch template's TagSpecifications, which the EKS-managed
+# launch template does not carry, so gp3 storage (~$3.20/mo) can still fall
+# outside the filter. The account-wide breaker covers everything regardless —
+# it is, deliberately, the unfiltered control.
+resource "aws_autoscaling_group_tag" "system_project" {
+  autoscaling_group_name = local.system_asg_name
+
+  tag {
+    key                 = "project"
+    value               = "fluidbox"
+    propagate_at_launch = true
+  }
+}
+
+resource "aws_autoscaling_group_tag" "sandbox_project" {
+  autoscaling_group_name = local.sandbox_asg_name
+
+  tag {
+    key                 = "project"
+    value               = "fluidbox"
+    propagate_at_launch = true
+  }
 }
 
 resource "aws_autoscaling_group_tag" "sandbox_ca_enabled" {

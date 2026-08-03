@@ -34,6 +34,15 @@ only. State therefore stays secret-free (PLAN §P0 requirement).
 | `cloud-m1-acceptance.sh` | the §9 harness (18 criteria → one evidence ledger) |
 | `teardown.sh` | reverse-order destroy + the two documented EKS leak sweeps |
 
+## Which AWS profile to use (this trips everyone once)
+
+| you are running | profile | why |
+|---|---|---|
+| `terraform` in any stack, and `deploy-app.sh` (it wraps terraform) | **`fluidbox-operator`** | each stack's *provider* assumes the deployer role itself, so the ambient identity must be the operator user that role trusts — a deployer-assuming profile would be a self-assume the trust policy refuses. Terraform's S3 **backend** likewise runs as the ambient identity (it does **not** inherit `assume_role`), which is why the operator holds state-bucket object access. |
+| every other `scripts/cloud/*.sh` | **`fluidbox-deployer`** | they call AWS directly with no provider in between, and need deployer authority |
+
+`bootstrap` is the exception: root for its single apply (see its README).
+
 ## Why there are no `just` recipes for any of this
 
 `justfile` sets `dotenv-load := true`, so **every** `just` recipe injects the
