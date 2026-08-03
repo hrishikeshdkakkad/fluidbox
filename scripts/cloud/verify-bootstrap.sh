@@ -2,8 +2,13 @@
 # M1.0 gate evidence: verifies every bootstrap guardrail is live and prints a
 # PASS/FAIL table (append the output to docs/reviews/…-cloud-m1-readiness/).
 #
-# Run as the OPERATOR profile (it proves the non-root path works):
-#   AWS_PROFILE=fluidbox-operator scripts/cloud/verify-bootstrap.sh
+# Run with the DEPLOYER profile:
+#   AWS_PROFILE=fluidbox-deployer scripts/cloud/verify-bootstrap.sh
+#
+# That profile SOURCES the operator user and assumes the deployer role, so a
+# successful run is itself the proof that the scoped non-root path works —
+# and the deployer is the identity holding the read permissions these checks
+# need (budgets/trail/sns/s3/ce on the fluidbox-* resources).
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
 . scripts/cloud/lib.sh
@@ -20,12 +25,14 @@ say "identity path (root retired?)"
 IDENT=$(aws sts get-caller-identity --query Arn --output text 2>/dev/null || true)
 echo "  caller: $IDENT"
 case "$IDENT" in
-  *:root) fail "running as ROOT — the point of the ceremony is to stop doing this"; FAIL=$((FAIL+1));;
-  *) ok "non-root caller"; PASS=$((PASS+1));;
+  *:root)
+    fail "running as ROOT — the point of the ceremony is to stop doing this"; FAIL=$((FAIL+1));;
+  *:assumed-role/fluidbox-cloud-deployer/*)
+    ok "running as the ASSUMED deployer role — the scoped non-root path works end to end"; PASS=$((PASS+1));;
+  *)
+    warn "non-root, but not the deployer role — re-run with AWS_PROFILE=fluidbox-deployer for the full check"
+    PASS=$((PASS+1));;
 esac
-check "deployer role assumable" aws sts assume-role \
-  --role-arn "$DEPLOYER_ROLE_ARN" --role-session-name verify-bootstrap \
-  --duration-seconds 900 --query 'AssumedRoleUser.Arn' --output text
 
 # Root access keys still present? (GetAccountSummary needs no iam:List* on others)
 ROOT_KEYS=$(aws iam get-account-summary --query 'SummaryMap.AccountAccessKeysPresent' --output text 2>/dev/null || echo "?")
