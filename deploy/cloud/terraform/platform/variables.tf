@@ -68,8 +68,23 @@ variable "node_az_index" {
 }
 
 variable "system_instance_type" {
-  type    = string
-  default = "t4g.medium"
+  description = <<-EOT
+    RECIPE DELTA, forced by a live OOMKill on 2026-08-03. The proven recipe's
+    t4g.medium (4 GiB raw, ~3.2 GiB allocatable) was validated with the chart's
+    BUNDLED LiteLLM. M1 needs the DB-BACKED image instead — per-tenant virtual
+    keys are a Postgres-backed LiteLLM feature, and hosted + shared-key mode is
+    a deliberate 503 in core — and that image runs prisma at startup. With
+    kube-system already requesting ~1.6 GiB, only ~1.6 GiB remained; LiteLLM
+    was OOMKilled (exit 137) before it logged a single line, and node limits
+    were already 186% overcommitted.
+
+    t4g.large (8 GiB) fits server (1 GiB) + LiteLLM (2 GiB) + system pods with
+    headroom, and stays on Graviton. COST: ~$49/mo instead of ~$24.50, moving
+    the idle floor from ~$131 to ~$156 — recorded in
+    docs/hosted/cloud-cost-model.md rather than absorbed silently.
+  EOT
+  type        = string
+  default     = "t4g.large"
 }
 
 variable "sandbox_instance_type" {

@@ -37,7 +37,7 @@ resource "helm_release" "fluidbox" {
   repository = "oci://ghcr.io/hrishikeshdkakkad/charts"
   chart      = "fluidbox"
   version    = var.chart_version
-  namespace  = kubernetes_namespace_v1.fluidbox.metadata[0].name
+  namespace  = local.namespace
 
   values = [
     file("${path.module}/../../values/eks-m1.yaml"),
@@ -53,13 +53,3 @@ resource "helm_release" "fluidbox" {
   ]
 }
 
-# The controller-created ALB's hostname (edge stack's origin; also the
-# direct-ALB refusal check target).
-data "kubernetes_ingress_v1" "fluidbox" {
-  metadata {
-    name      = "fluidbox-server"
-    namespace = kubernetes_namespace_v1.fluidbox.metadata[0].name
-  }
-
-  depends_on = [helm_release.fluidbox]
-}
