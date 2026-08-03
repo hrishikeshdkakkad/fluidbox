@@ -1,19 +1,19 @@
 NAME                                   READY   STATUS    RESTARTS   AGE   IP               NODE                        NOMINATED NODE   READINESS GATES
-pod/fluidbox-server-6b6fdfdf58-tjvvw   1/1     Running   0          22s   192.168.158.71   fluidbox-m1-control-plane   <none>           <none>
-pod/postgres-6f49f58599-rzv75          1/1     Running   0          34s   192.168.158.69   fluidbox-m1-control-plane   <none>           <none>
+pod/fluidbox-server-56fc885647-th57m   1/1     Running   0          21s   192.168.158.71   fluidbox-m1-control-plane   <none>           <none>
+pod/postgres-6f49f58599-q4q7z          1/1     Running   0          33s   192.168.158.69   fluidbox-m1-control-plane   <none>           <none>
 
 NAME                        TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)    AGE   SELECTOR
-service/fluidbox-internal   ClusterIP   10.96.40.250   <none>        8788/TCP   22s   app.kubernetes.io/component=server,app.kubernetes.io/name=fluidbox
-service/fluidbox-server     ClusterIP   10.96.8.37     <none>        8787/TCP   22s   app.kubernetes.io/component=server,app.kubernetes.io/name=fluidbox
-service/postgres            ClusterIP   10.96.77.18    <none>        5432/TCP   34s   app=postgres
+service/fluidbox-internal   ClusterIP   10.96.64.140   <none>        8788/TCP   21s   app.kubernetes.io/component=server,app.kubernetes.io/name=fluidbox
+service/fluidbox-server     ClusterIP   10.96.133.85   <none>        8787/TCP   21s   app.kubernetes.io/component=server,app.kubernetes.io/name=fluidbox
+service/postgres            ClusterIP   10.96.194.46   <none>        5432/TCP   33s   app=postgres
 
 NAME                              READY   UP-TO-DATE   AVAILABLE   AGE   CONTAINERS   IMAGES                                            SELECTOR
-deployment.apps/fluidbox-server   1/1     1            1           22s   server       ghcr.io/hrishikeshdkakkad/fluidbox-server:0.4.0   app.kubernetes.io/component=server,app.kubernetes.io/name=fluidbox
-deployment.apps/postgres          1/1     1            1           34s   postgres     postgres:16-alpine                                app=postgres
+deployment.apps/fluidbox-server   1/1     1            1           21s   server       ghcr.io/hrishikeshdkakkad/fluidbox-server:0.4.0   app.kubernetes.io/component=server,app.kubernetes.io/name=fluidbox
+deployment.apps/postgres          1/1     1            1           33s   postgres     postgres:16-alpine                                app=postgres
 
 NAME                                         DESIRED   CURRENT   READY   AGE   CONTAINERS   IMAGES                                            SELECTOR
-replicaset.apps/fluidbox-server-6b6fdfdf58   1         1         1       22s   server       ghcr.io/hrishikeshdkakkad/fluidbox-server:0.4.0   app.kubernetes.io/component=server,app.kubernetes.io/name=fluidbox,pod-template-hash=6b6fdfdf58
-replicaset.apps/postgres-6f49f58599          1         1         1       34s   postgres     postgres:16-alpine                                app=postgres,pod-template-hash=6f49f58599
+replicaset.apps/fluidbox-server-56fc885647   1         1         1       21s   server       ghcr.io/hrishikeshdkakkad/fluidbox-server:0.4.0   app.kubernetes.io/component=server,app.kubernetes.io/name=fluidbox,pod-template-hash=56fc885647
+replicaset.apps/postgres-6f49f58599          1         1         1       33s   postgres     postgres:16-alpine                                app=postgres,pod-template-hash=6f49f58599
 
 NAME                                        CLASS   HOSTS   ADDRESS   PORTS   AGE
-ingress.networking.k8s.io/fluidbox-server   alb     *                 80      22s
+ingress.networking.k8s.io/fluidbox-server   alb     *                 80      21s

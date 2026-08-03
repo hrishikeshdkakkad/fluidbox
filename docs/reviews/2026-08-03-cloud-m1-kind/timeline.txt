@@ -1,0 +1,34 @@
+[  1] session.created: {"agent": "m1-replay", "autonomy": "supervised", "task": "Fix the failing test in demo-service, then deploy. [deterministic replay - no mode
+[  2] session.status_changed: {"from": "created", "reason": null, "to": "provisioning"}
+[  3] session.status_changed: {"from": "provisioning", "reason": null, "to": "initializing"}
+[  4] workspace.initialized: {"base_commit": "e3431b6f1ab1737e251ee3a61e4e187e77f1b92a", "files": 5}
+[  5] agent.message: {"role": "system", "text": "deterministic replay runner starting \u2014 scripted transcript, no model calls (autonomy=supervised)"}
+[  6] agent.message: {"role": "assistant", "text": "This is a replay of a recorded run \u2014 deterministic, no model calls. Task: fix the failing test, then dep
+[  7] session.status_changed: {"from": "initializing", "reason": null, "to": "running"}
+[  8] agent.message: {"role": "system", "text": "sandbox launched (fluidbox-019)"}
+[  9] tool.requested: {"input_digest": "sha256:2447798c1f5cc192", "summary": "./run_tests.sh", "tool": "Bash", "tool_call_id": "rp_001"}
+[ 10] tool.decision: {"original_verdict": null, "reason": null, "source": "policy", "tool": "Bash", "tool_call_id": "rp_001", "verdict": "allow"}
+[ 11] agent.message: {"role": "assistant", "text": "$ ./run_tests.sh\nFAIL greet(\"Ada\") -> \"Hello, name!\" (expected \"Hello, Ada!\")\n\u2192 exit 1"}
+[ 12] agent.message: {"role": "assistant", "text": "greet() returns the literal string \"Hello, name!\" instead of using its argument. Fixing app.js."}
+[ 13] tool.requested: {"input_digest": "sha256:ef68c93cc5a917e0", "summary": "Edit: /workspace/app.js", "tool": "Edit", "tool_call_id": "rp_002"}
+[ 14] tool.decision: {"original_verdict": null, "reason": null, "source": "policy", "tool": "Edit", "tool_call_id": "rp_002", "verdict": "allow"}
+[ 15] agent.message: {"role": "assistant", "text": "edited app.js"}
+[ 16] tool.requested: {"input_digest": "sha256:2447798c1f5cc192", "summary": "./run_tests.sh", "tool": "Bash", "tool_call_id": "rp_003"}
+[ 17] tool.decision: {"original_verdict": null, "reason": null, "source": "policy", "tool": "Bash", "tool_call_id": "rp_003", "verdict": "allow"}
+[ 18] agent.message: {"role": "assistant", "text": "$ ./run_tests.sh\nPASS 1/1 greet returns a personal greeting"}
+[ 19] agent.message: {"role": "assistant", "text": "Tests are green. Checking the service's upstream health endpoint before deploying."}
+[ 20] tool.requested: {"input_digest": "sha256:5f4faddb4235fb5a", "summary": "curl -s https://status.demo.internal/health", "tool": "Bash", "tool_call_id": "rp_00
+[ 21] tool.decision: {"original_verdict": null, "reason": "shell command matches deny pattern \"\\\\bcurl\\\\b\"", "source": "policy", "tool": "Bash", "tool_call
+[ 22] agent.message: {"role": "assistant", "text": "Outbound network calls are denied by policy in this sandbox \u2014 skipping the health check and moving on."}
+[ 23] tool.requested: {"input_digest": "sha256:f1f1973f29125e6d", "summary": "./deploy.sh", "tool": "Bash", "tool_call_id": "rp_005"}
+[ 24] approval.requested: {"approval_id": "019fc8c4-7076-72a0-bf52-3fa1581b4646", "expires_at": "2026-08-03T17:58:44.889757Z", "risk": null, "summary": "./deploy.sh",
+>>> operator approved
+[ 25] approval.decided: {"approval_id": "019fc8c4-7076-72a0-bf52-3fa1581b4646", "decided_by": "operator", "decision": "approved_once", "tool_call_id": "rp_005"}
+[ 26] tool.decision: {"original_verdict": null, "reason": "human:operator", "source": "human", "tool": "Bash", "tool_call_id": "rp_005", "verdict": "allow"}
+[ 27] agent.message: {"role": "assistant", "text": "$ ./deploy.sh\n[deploy] 2026-08-03T17:55:47Z released demo build to demo-target"}
+[ 28] agent.message: {"role": "assistant", "text": "Done. The failing test is fixed and verified; the deploy decision was yours."}
+[ 29] session.status_changed: {"from": "running", "reason": null, "to": "finalizing"}
+[ 30] artifact.collected: {"bytes": 470, "kind": "diff", "name": "changes.patch", "sha256": "sha256:b57adac3f95b93c6c07ab74c83e741502026ec1694eb1a8ddcef08eb9b416439",
+[ 31] session.status_changed: {"from": "finalizing", "reason": null, "to": "completed"}
+[ 32] run.result: {"outcome": "completed", "summary": "Replay complete: 4 executed, 1 denied."}
+terminal: completed paused: False approved: True
