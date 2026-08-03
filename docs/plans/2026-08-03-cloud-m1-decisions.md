@@ -5,6 +5,15 @@
 > APPLIED**; Vercel = **approved to link**. Still open: first beta org + owner,
 > and approval for a real-model run.
 >
+> **UPDATE 2026-08-03 (live):** the identity decision you took —
+> bring-your-own IdP per org — is now **proven necessary**, not merely
+> preferable. WorkOS's authorize endpoint rejects a standards-compliant OIDC
+> request and requires the proprietary `provider=authkit`; supporting it would
+> mean putting a vendor parameter into core, which PLAN rev 3 forbids and the
+> M1 brief says to hand back. To close §9-4, supply ONE org's issuer, client id
+> and client secret from any conformant provider (Auth0, Okta, Entra, Google
+> Workspace, Keycloak, Dex). Nothing else is outstanding on the platform side.
+>
 > **BOOTSTRAP IS APPLIED** — 27 resources, state migrated to
 > `s3://fluidbox-cloud-tfstate-471112572248`, both scoped profiles configured
 > and verified. Two ceremony steps remain, both yours: confirm the SNS email,

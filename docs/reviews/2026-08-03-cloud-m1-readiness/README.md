@@ -250,3 +250,44 @@ Project: `hrishikeshkakkads-projects/fluidbox-cloud-dashboard` →
 `https://fluidbox-cloud-dashboard.vercel.app` (currently pointed at the probe
 origin; it must be re-pointed at the CloudFront API host once the platform
 stack is applied).
+
+## 🚩 DECISIVE IDENTITY FINDING — WorkOS is not usable for M1 at all (2026-08-03, live)
+
+The earlier finding was that a per-org WorkOS **Connect app** is refused at
+authorize. Attempting the real login on the deployed platform produced a
+stronger and simpler result: **WorkOS's `/user_management/authorize` is not a
+standards-conformant OIDC authorization endpoint.**
+
+Core emits a fully compliant authorize request — verified live off the
+deployed cluster:
+
+```
+response_type=code   scope=openid email profile   nonce=…
+code_challenge=…     code_challenge_method=S256   state=…
+redirect_uri=https://fluidbox-cloud-dashboard.vercel.app/v1/auth/callback
+client_id=client_01KGA8ECKMDH8GWPZR00QGPTBZ      (the environment AuthKit client)
+```
+
+WorkOS answers `https://error.workos.com/sso/invalid-connection-selector`.
+
+Appending **`&provider=authkit`** — a WorkOS-proprietary parameter — to that
+same URL makes it work (it redirects to the AuthKit hosted login). The same
+applies to `connection_id` / `organization_id`: WorkOS requires a vendor
+selector that no IdP-agnostic client sends.
+
+**Consequence.** Making WorkOS work would mean teaching core to send a
+WorkOS-specific authorize parameter, or adding a per-org extra-params knob.
+PLAN rev 3 is explicit that WorkOS-shaped concepts must never enter core, and
+the M1 brief says to STOP and hand back if something needs a core change. So
+this is an **M3 core proposal, not an M1 task**, and it is why §9-4 cannot be
+closed with WorkOS.
+
+**This validates the identity decision already taken** (bring-your-own IdP per
+org): any standards-conformant provider — Auth0, Okta, Entra, Google
+Workspace, Keycloak, Dex — works with core unchanged, as the M1.0 proof
+demonstrated for the discovery and authorize legs. Supply one org's issuer,
+client id and secret and §9-4 closes without touching core.
+
+The drill org's WorkOS IdP config has been **disabled** (it can never complete
+a login), and the redirect URI added to the shared staging AuthKit app during
+this test was **removed**, restoring that app to exactly its prior state.
