@@ -1,0 +1,28 @@
+
+[1;36m== identity path (root retired?) ==[0m
+  caller: arn:aws:sts::471112572248:assumed-role/fluidbox-cloud-deployer/botocore-session-1785790513
+  [1;32m✓[0m running as the ASSUMED deployer role — the scoped non-root path works end to end
+  [1;33m⚠[0m root access key STILL PRESENT (AccountAccessKeysPresent=1) — finish README step 6
+
+[1;36m== budgets (two-level breaker) ==[0m
+  [1;32m✓[0m fluidbox-cloud-monthly budget
+  [1;32m✓[0m fluidbox-account-breaker budget
+
+[1;36m== cloudtrail + root alarm ==[0m
+  [1;32m✓[0m trail fluidbox-cloud logging
+  [1;32m✓[0m root-activity rule
+  [1;32m✓[0m alerts SNS topic
+  [1;32m✓[0m email subscription confirmed
+
+[1;36m== terraform state hygiene ==[0m
+  [1;32m✓[0m state bucket exists
+  [1;32m✓[0m state bucket versioned
+  [1;32m✓[0m state bucket encrypted
+  [1;32m✓[0m state bucket public-access-blocked
+
+[1;36m== cost-allocation tag ==[0m
+  [1;33m⚠[0m project tag status: Inactive — the tag-filtered budget matches nothing until Active (24h lag is normal; account breaker covers meanwhile)
+
+[1;36m== result ==[0m
+  PASS=11 FAIL=1
+  [1;31m✗ M1.0 guardrails incomplete — fix the ✗ lines before any platform apply[0m
