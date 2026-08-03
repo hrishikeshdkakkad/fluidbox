@@ -1,0 +1,29 @@
+# §9-14 containment drill — LIVE EKS deployment, 2026-08-03T22:09:24Z
+# org: fluidzero  idp: 019fc9aa-4b9b-7c92-8fd0-5274ec6513aa  posture: FLUIDBOX_REQUIRE_SSO=1
+
+## (c) FIRST — cancel active runs (the runbook's corrected order)
+GET /v1/sessions with the admin token -> 401
+  Confirms the ordering trap on the real deployment: under REQUIRE_SSO the
+  break-glass credential CANNOT list or cancel tenant runs. Cancelling needs
+  an operator PAT from inside the org — which step (a) makes harder to get.
+
+## (a) disable the org's IdP
+before: login start -> 302
+disable -> 200
+after:  login start -> 200  (302 => still redirecting; anything else => login stopped)
+
+## (b) deactivate memberships
+memberships: 0
+  The empty-membership finding reproduces on the real deployment: an org
+  armed with a bootstrap owner who has not yet logged in has NO membership
+  row, so (b) is a no-op and containment rests entirely on (a).
+
+## reversal — re-enable so the drill org stays usable
+reactivate -> 200
+login start -> 302
+
+## verdict
+Every step behaved as the runbook (docs/hosted/cloud-operator-runbook.md §7)
+documents, INCLUDING both limitations it warns about. Reversal is manual and
+step-by-step, which is why the runbook is labelled incomplete and why real
+suspend/reactivate is an M3 core proposal.
