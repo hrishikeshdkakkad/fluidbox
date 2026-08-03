@@ -45,6 +45,8 @@ statements are needed, and only one of them was purchasable without an apply.
 | **M1.2 onboarding procedure rehearsed** (two orgs, per-org IdP, admin confinement) + cross-tenant denial at the RLS floor | ✅ 14/14 |
 | **§9-13 cancellation proven + §9-14 containment drill exercised** (five limitations recorded from observation; one corrected the runbook) | ✅ 13/13 |
 | **IAM policies SIMULATED** against the real AWS evaluator (`simulate-custom-policy`, read-only): every action the applies need is allowed, and 12 negative cases prove the scoping refuses what it must | ✅ 42/42 |
+| **Acceptance harness executed** for the AWS-free criteria (16, 18) — it runs and emits the ledger table rather than crashing on first use | ✅ |
+| **Operator-toolkit failure paths tested** — every script stops fast with an actionable message when a prerequisite is missing; all four destructive scripts refuse the root identity | ✅ 11/11 |
 
 Evidence: `docs/reviews/2026-08-03-cloud-m1-readiness/`.
 
