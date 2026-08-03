@@ -1,0 +1,69 @@
+# Fluidbox Cloud M1 — static chart values for the UNCHANGED released chart.
+# Dynamic values (SG id, KMS ARN, public URL, staged SSO flip) are overlaid by
+# deploy/cloud/terraform/app/fluidbox.tf; secrets never appear in either.
+#
+# NOTE the ingress conditions annotation (the rotating CloudFront origin
+# header check) is deliberately ABSENT here: scripts/cloud/rotate-origin-secret.sh
+# owns it via kubectl annotate, and helm's three-way merge preserves
+# out-of-band annotations across upgrades.
+
+fullnameOverride: fluidbox
+
+web:
+  # The dashboard lives on Vercel in M1 — the chart's bundled web stays off.
+  enabled: false
+
+litellm:
+  # External DB-backed LiteLLM is composed by the app stack (tenant virtual
+  # keys need LiteLLM's own Postgres, which the bundled template does not wire).
+  enabled: false
+
+llm:
+  upstreamUrl: "http://litellm.fluidbox.svc.cluster.local:4000"
+
+server:
+  replicas: 1
+  archivePvc:
+    storageClass: gp3
+  # Chart default, restated because it is load-bearing on Neon: the pool SET
+  # ROLEs to the NOLOGIN runtime role, making RLS the enforced tenant floor.
+  runtimeRole: "fluidbox_runtime"
+
+ingress:
+  enabled: true
+  className: alb
+  host: ""
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /v1/health
+    # SSE keepalive is 15s; 120s idle keeps a quiet stream alive with margin.
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=120,routing.http.drop_invalid_header_fields.enabled=true
+    # Tag-filtered budget coverage for the controller-created ALB.
+    alb.ingress.kubernetes.io/tags: project=fluidbox,fluidbox-cloud=m1
+    alb.ingress.kubernetes.io/manage-backend-security-group-rules: "true"
+    # alb.ingress.kubernetes.io/security-groups is overlaid by terraform (the
+    # CloudFront-prefix-list frontend SG from the platform stack).
+
+sandbox:
+  egressProfile: zeroEgress
+  # Pin sandboxes to the tainted scale-from-zero nodegroup.
+  nodeSelector:
+    fluidbox.dev/role: sandbox
+  tolerations:
+    - key: fluidbox.dev/sandbox
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  quota:
+    enabled: true
+    pods: "20"
+    requestsCpu: "10"
+    requestsMemory: "20Gi"
+
+netpol:
+  requireEnforced: true
+  # AWS VPC CNI standard mode programs policy asynchronously (~1–20s measured);
+  # 60s is the proven observation deadline.
+  waitSeconds: 60

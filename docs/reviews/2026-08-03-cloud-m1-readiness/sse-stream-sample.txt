@@ -1,0 +1,28 @@
+id: 1
+event: probe.open
+data: {"t":1785777889513,"resumed_from":0}
+
+id: 2
+event: probe.tick
+data: {"t":1785777899516,"seq":2}
+
+id: 3
+event: probe.tick
+data: {"t":1785777909518,"seq":3}
+
+id: 4
+event: probe.tick
+data: {"t":1785777919519,"seq":4}
+
+id: 5
+event: probe.tick
+data: {"t":1785777929521,"seq":5}
+
+id: 6
+event: probe.tick
+data: {"t":1785777939523,"seq":6}
+
+id: 7
+event: probe.tick
+data: {"t":1785777949525,"seq":7}
+
