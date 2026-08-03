@@ -92,11 +92,25 @@ kubectl logs -n fluidbox <server-pod> | tail -100     # orchestrator view
 kubectl describe pod -n fluidbox-sandboxes <pod>      # image pulls, netpol-gate init
 ```
 
-Interpretation notes: a run held in `provisioning` with the netpol-gate init
-container running is the enforcement gate doing its job (VPC CNI standard
-mode programs policy asynchronously); `ErrImagePull` on a seeded agent means
-the agent revision pins an unpullable creation-time image — create an agent
-with an explicit `runner_image` (documented gotcha from both EKS acceptances).
+Interpretation notes:
+
+- A run held in `provisioning` with the netpol-gate init container running is
+  the enforcement gate doing its job (VPC CNI standard mode programs policy
+  asynchronously; the gate holds the untrusted runner until it observes
+  enforcement).
+- **Expected on a cold cluster, and it looks like a failure:** the boot-time
+  enforcement probe runs in the sandbox namespace, which is pinned to a
+  nodegroup that sits at ZERO. The first probe is therefore `Unschedulable`
+  (then briefly `NotEnforced` while eBPF programs), the server logs that
+  enforcement is not verified, and **runs are correctly blocked** meanwhile.
+  Cluster Autoscaler brings up a sandbox node (~2–3 min) and a later probe
+  verifies — the 2026-07-22 acceptance saw this exact sequence and it
+  resolved on its own. Do not "fix" it by disabling `netpol.requireEnforced`;
+  wait, then confirm with
+  `kubectl logs -n fluidbox deploy/fluidbox-server | grep -i "netpol gate"`.
+- `ErrImagePull` on a seeded agent means the agent revision pins an
+  unpullable creation-time image — create an agent with an explicit
+  `runner_image` (documented gotcha from both EKS acceptances).
 
 ## 6. Cancel an active run
 
