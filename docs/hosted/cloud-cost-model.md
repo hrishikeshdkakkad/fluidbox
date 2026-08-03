@@ -16,7 +16,10 @@
 > node is too.
 >
 > **Every figure below still describes the t4g.medium model.** Add $24.53 to
-> the node line and to both totals: idle ≈ **$156/mo**, light use ≈ **$162/mo**.
+> the node line, plus $0.80 for EBS (the real idle footprint is 50 GiB — a
+> 40 GiB node root plus the 10 GiB archive PVC — not the 40 GiB modelled;
+> confirmed against deployed inventory 2026-08-03). Idle ≈ **$157/mo**,
+> light use ≈ **$163/mo**.
 > The band in the M1 brief (§11, $130–140) is therefore **exceeded by ~$16**,
 > and that is a real finding rather than an estimation error — the brief's band
 > was computed before anyone tried to run a DB-backed LiteLLM beside the server
