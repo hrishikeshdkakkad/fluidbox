@@ -31,7 +31,7 @@ CF_DOMAIN="${CF_DOMAIN:-$(cd deploy/cloud/terraform/edge 2>/dev/null && terrafor
 API="https://${CF_DOMAIN}"
 
 c1()  { say "[1] scoped deployer, no root key"
-        if AWS_PROFILE="${AWS_PROFILE:-fluidbox-operator}" scripts/cloud/verify-bootstrap.sh > "$EV/c1-verify-bootstrap.txt" 2>&1
+        if scripts/cloud/verify-bootstrap.sh > "$EV/c1-verify-bootstrap.txt" 2>&1
         then record 1 "scoped deployer applies; root retired" PASS "c1-verify-bootstrap.txt"
         else record 1 "scoped deployer applies; root retired" FAIL "c1-verify-bootstrap.txt"; fi }
 
