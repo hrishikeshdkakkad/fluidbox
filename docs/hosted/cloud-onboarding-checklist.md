@@ -22,21 +22,52 @@ Conventions: same as the runbook header (`$API`, `$A`).
 
 ## C. Identity (per-org OIDC app)
 
-Using WorkOS (M1 default — §12 decision) in the **staging** environment for
-drills, **production** environment for real orgs:
+**Bring-your-own IdP per org** (§12 decision #4). The org supplies any
+standards-conformant OIDC issuer; core is untouched.
 
-- [ ] WorkOS dashboard → the fluidbox workspace → create the org's OIDC
-      application (Connect app). Redirect URI = `https://<vercel-origin>/v1/auth/callback`
-      (the sso rewrite carries it to core; the cookie must land on the Vercel
-      origin — never the CloudFront host).
-- [ ] If the app supports an organization restriction, set it to the org —
+> **WorkOS cannot be used.** Its `/user_management/authorize` rejects core's
+> fully compliant request (`response_type=code`, `scope=openid email profile`,
+> nonce, PKCE S256, state) with `invalid-connection-selector`, and only works
+> with the proprietary `provider=authkit` parameter. Supporting that means a
+> vendor parameter in core — forbidden by PLAN rev 3, so it is an M3 proposal,
+> not an onboarding step. Do not spend time on it. Auth0, Okta, Microsoft
+> Entra ID, Google, and Keycloak all work as-is.
+
+- [ ] Create the org's OIDC application at their IdP. Redirect URI =
+      `https://<vercel-origin>/v1/auth/callback` (the sso rewrite carries it to
+      core; the cookie must land on the Vercel origin — never the CloudFront
+      host).
+- [ ] If the IdP supports an organization restriction, set it to the org —
       IdP-side org binding is the zero-core-change control (PLAN rev 3
       identity §1); record whether it is enforced at authorize time.
 - [ ] Collect issuer URL, client id, client secret.
 - [ ] Create the core IdP config (runbook §2) **with
       `bootstrap_owner_email` = the owner** — this is what arms first login.
+      Note it is consumed only when the ID token carries a **true**
+      `email_verified`; issuers that omit it (Entra) need the explicit
+      promotion below instead.
 - [ ] `POST …/idp/<id>/activate`.
 - [ ] Secret handed to core custody only — delete any local copy.
+
+**Microsoft Entra ID is fully scripted** — `scripts/cloud/entra-idp-setup.sh`
+does app registration, optional claims, secret, core registration, and
+activation in one pass. It needs one human step first, a browser consent that
+grants the Azure CLI a Microsoft Graph scope (an ARM session is not enough and
+cannot silently upgrade):
+
+```
+az login --tenant <tenant-id> --scope https://graph.microsoft.com/.default
+scripts/cloud/entra-idp-setup.sh <org-slug>
+# after the owner's first sign-in:
+scripts/cloud/entra-idp-setup.sh --promote <org-slug> <owner-email>
+```
+
+Entra needs two accommodations, both handled by that script and neither
+requiring a core change: it does not advertise
+`code_challenge_methods_supported` (core sends PKCE S256 regardless, and its
+conformance floor accepts "advertised-or-absent"), and it emits no
+`email_verified` boolean (mapped to the `xms_edov` optional claim, with
+`require_email_verified: false` so authentication cannot hard-fail on it).
 
 ## D. Model access
 
