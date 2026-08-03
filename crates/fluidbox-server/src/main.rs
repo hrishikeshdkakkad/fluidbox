@@ -235,11 +235,22 @@ async fn main() -> anyhow::Result<()> {
     // Sandbox network grants. Saying this at boot matters: with no enforcer the
     // deployment is offline-only and every non-offline run is REFUSED, which an
     // operator should learn here rather than from a 422 on their first run.
-    match cfg.network_enforcer {
-        config::NetworkEnforcer::None => tracing::info!(
-            "sandbox network grants: no enforcer (FLUIDBOX_NETWORK_ENFORCER=none) —              runs are offline-only and any wider grant is refused at create time"
-        ),
-        other => tracing::info!("sandbox network grants: enforcer '{}'", other.as_str()),
+    // Report the RESOLVED enforcer, which is what actually governs: `auto` has
+    // been decided by detection at connect time, and the provider is the thing
+    // that knows the answer.
+    let enforcer = provider.network_enforcer();
+    if enforcer.supports_egress_grants() {
+        tracing::info!(
+            "sandbox network grants: enforcer '{}' (requested: {})",
+            enforcer.enforcer_name(),
+            cfg.network_enforcer.as_str()
+        );
+    } else {
+        tracing::info!(
+            "sandbox network grants: NO enforcer resolved (requested: {}) — runs are \
+             offline-only and any wider grant is refused at create time",
+            cfg.network_enforcer.as_str()
+        );
     }
 
     let events_tx = fluidbox_db::spawn_listener(cfg.database_url.clone());
