@@ -1,0 +1,35 @@
+entra-idp-setup.sh --promote — live validation against the deployed control
+plane (https://dw87mc37yx8wp.cloudfront.net), 2026-08-03.
+
+The Entra app-registration path cannot be exercised without a Microsoft Graph
+token, which requires a human browser consent. The --promote path has no such
+dependency, so it was tested end to end for real.
+
+POSITIVE (idempotent by construction — the target already held both roles, so a
+successful run must leave them unchanged):
+
+  roles before : owner@fluidzero.test ['member', 'owner']
+  command      : entra-idp-setup.sh --promote fluidzero owner@fluidzero.test
+  output       : owner@fluidzero.test is now an owner of fluidzero
+  roles after  : owner@fluidzero.test ['member', 'owner']
+  verdict      : PASS — member lookup by email, membership_id extraction, the
+                 POST .../members/{id}/roles call and the response handling all
+                 work against the live API. No state changed.
+
+NEGATIVE (unknown member must fail closed, not silently succeed):
+
+  command   : entra-idp-setup.sh --promote fluidzero nobody@nowhere.test
+  output    : no member with email nobody@nowhere.test in org fluidzero
+              sign in once at the dashboard first — that is what creates the
+              membership
+  exit code : 1
+  verdict   : PASS — actionable message, correct non-zero exit so a caller can
+              detect it. (Measured directly; piping the run through `head`
+              reports HEAD's status, not the script's, and would have shown a
+              misleading 0.)
+
+STILL UNTESTED, and honestly so: P1 app registration, P2 optional claims
+(email + xms_edov), P3 client secret, P4 issuer registration with core, and P5
+activation. All five sit behind `az login --scope https://graph.microsoft.com/
+.default`. The P0 preflight gate that refuses without that token WAS verified,
+including that it interpolates the real tenant id into the command it prints.
