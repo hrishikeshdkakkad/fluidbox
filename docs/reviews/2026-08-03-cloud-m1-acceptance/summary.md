@@ -2,8 +2,8 @@
 
 | # | criterion | verdict | evidence |
 |---|---|---|---|
-| 1 | scoped deployer applies; root retired | **FAIL** | c1-verify-bootstrap.txt |
-| 2 | two-level budgets active | **PASS** | c2-budgets.json |
+| 1 | scoped deployer applies without a root key | **PASS** | c1-verify-bootstrap.txt |
+| 2 | tag-filtered budget measures nothing (tag inactive) | **FAIL** | c2-cost-allocation-tag.json |
 | 5 | replay run submitted | **PASS** | docs/reviews/2026-08-03-cloud-m1-replay/ |
 | 6 | isolated EKS sandbox created | **PASS** | docs/reviews/2026-08-03-cloud-m1-replay/sandbox-pods.txt |
 | 7 | pause + resume on approval | **PASS** | docs/reviews/2026-08-03-cloud-m1-replay/timeline.txt |

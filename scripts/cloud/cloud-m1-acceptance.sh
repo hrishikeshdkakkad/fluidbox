@@ -16,8 +16,28 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
 EV=$(evidence_dir cloud-m1-acceptance)
 SUMMARY="$EV/summary.md"
 [ -f "$SUMMARY" ] || printf "# M1 §9 acceptance — evidence ledger (%s)\n\n| # | criterion | verdict | evidence |\n|---|---|---|---|\n" "$(date -u +%F)" > "$SUMMARY"
+# LATEST WINS, ordered by criterion.
+#
+# This used to be a blind append, which meant re-running a criterion left BOTH
+# verdicts in the ledger — and since the stale one was written first, it sorted
+# ABOVE the fresh one in the table an operator pastes into the validation
+# report. A criterion that regressed from PASS to FAIL therefore still read
+# PASS at a glance. That is not a cosmetic problem: it is a mechanism for
+# keeping a false PASS alive across exactly the re-run meant to catch it.
+ROWS="$EV/.rows"
+if [ ! -f "$ROWS" ] && [ -f "$SUMMARY" ]; then
+  # Preserve verdicts recorded before this change.
+  grep '^| ' "$SUMMARY" | grep -v '^| # |' | grep -v '^|---' > "$ROWS" || true
+fi
+touch "$ROWS"
+
 record() { # record <num> <name> <verdict> <evidence>
-  printf "| %s | %s | **%s** | %s |\n" "$1" "$2" "$3" "$4" >> "$SUMMARY"
+  grep -v "^| $1 | " "$ROWS" > "$ROWS.tmp" 2>/dev/null || : > "$ROWS.tmp"
+  mv "$ROWS.tmp" "$ROWS"
+  printf "| %s | %s | **%s** | %s |\n" "$1" "$2" "$3" "$4" >> "$ROWS"
+  sort -t'|' -k2 -n -o "$ROWS" "$ROWS"
+  { printf "# M1 §9 acceptance — evidence ledger (%s)\n\n| # | criterion | verdict | evidence |\n|---|---|---|---|\n" "$(date -u +%F)"
+    cat "$ROWS"; } > "$SUMMARY"
   case "$3" in PASS) ok "[$1] $2 — PASS";; MANUAL*) warn "[$1] $2 — $3";; *) fail "[$1] $2 — $3";; esac
 }
 manual() { # manual <num> <name> <instructions...>
@@ -30,17 +50,62 @@ manual() { # manual <num> <name> <instructions...>
 CF_DOMAIN="${CF_DOMAIN:-$(cd deploy/cloud/terraform/edge 2>/dev/null && terraform output -raw cloudfront_domain 2>/dev/null || true)}"
 API="https://${CF_DOMAIN}"
 
-c1()  { say "[1] scoped deployer, no root key"
-        if scripts/cloud/verify-bootstrap.sh > "$EV/c1-verify-bootstrap.txt" 2>&1
-        then record 1 "scoped deployer applies; root retired" PASS "c1-verify-bootstrap.txt"
-        else record 1 "scoped deployer applies; root retired" FAIL "c1-verify-bootstrap.txt"; fi }
+# §9-1 asks exactly one thing: "a scoped deployer CAN APPLY the infrastructure
+# without using a root key." That is a capability claim, and verify-bootstrap
+# already scores it separately from root-key hygiene. Conflating the two made
+# this row read FAIL while the property the criterion tests was fully proven,
+# which is just as misleading as the reverse. Report them as two lines: the
+# criterion, and the hygiene item that is NOT part of it.
+c1()  { say "[1] scoped deployer applies without a root key"
+        scripts/cloud/verify-bootstrap.sh > "$EV/c1-verify-bootstrap.txt" 2>&1
+        if grep -q "the scoped non-root path works end to end" "$EV/c1-verify-bootstrap.txt"
+        then record 1 "scoped deployer applies without a root key" PASS "c1-verify-bootstrap.txt"
+        else record 1 "scoped deployer applies without a root key" FAIL "c1-verify-bootstrap.txt"; fi
+
+        # Tracked, never folded into the criterion above.
+        if grep -q "root access key: RETIRED" "$EV/c1-verify-bootstrap.txt"
+        then ok "root access key retired (hygiene, M1.0 gate — not §9-1)"
+        else warn "root access key STILL ACTIVE (hygiene, M1.0 gate — not §9-1; owner-owned)"; fi }
+
+# Run an aws command under whichever of our identities can actually do it.
+# The split is genuinely counter-intuitive and cost us a false PASS: only the
+# OPERATOR user may read budgets, only the DEPLOYER role may read Cost Explorer.
+# Trying ambient first keeps this working under either.
+as_any() {
+  aws "$@" 2>/dev/null && return 0
+  AWS_PROFILE=fluidbox-operator aws "$@" 2>/dev/null && return 0
+  AWS_PROFILE=fluidbox-deployer aws "$@" 2>/dev/null && return 0
+  return 1
+}
 
 c2()  { say "[2] both budgets active"
-        local o="$EV/c2-budgets.json"
-        if aws budgets describe-budget --account-id 471112572248 --budget-name fluidbox-cloud-monthly > "$o" 2>&1 \
-           && aws budgets describe-budget --account-id 471112572248 --budget-name fluidbox-account-breaker >> "$o" 2>&1
-        then record 2 "two-level budgets active" PASS "c2-budgets.json"
-        else record 2 "two-level budgets active" FAIL "c2-budgets.json"; fi }
+        local o="$EV/c2-budgets.json" t="$EV/c2-cost-allocation-tag.json"
+        # (a) both budgets exist with their filters.
+        if ! { as_any budgets describe-budget --account-id 471112572248 --budget-name fluidbox-cloud-monthly > "$o" \
+               && as_any budgets describe-budget --account-id 471112572248 --budget-name fluidbox-account-breaker >> "$o"; }
+        then record 2 "two-level budgets active" FAIL "c2-budgets.json"; return; fi
+
+        # (b) THE PART THAT MATTERS. A budget whose filter matches nothing is
+        # not a control. `fluidbox-cloud-monthly` filters on
+        # user:project$fluidbox, and AWS does not break cost down by an
+        # INACTIVE cost-allocation tag — so an inactive tag makes it read $0.00
+        # forever and never fire, at any level of spend. This was a real
+        # false PASS on 2026-08-03: both budgets existed, correctly filtered,
+        # and the fluidbox one had been measuring nothing since creation.
+        # Existence was asserted; efficacy was not. Assert efficacy.
+        as_any ce list-cost-allocation-tags --region us-east-1 \
+          --query "CostAllocationTags[?TagKey=='project']" --output json > "$t" || {
+            record 2 "two-level budgets active" FAIL "c2-cost-allocation-tag.json"; return; }
+
+        if grep -q '"Status": *"Active"' "$t"; then
+          record 2 "two-level budgets active (tag-filtered budget can see spend)" PASS "c2-budgets.json"
+        else
+          fail "the 'project' cost-allocation tag is NOT Active"
+          fail "  => fluidbox-cloud-monthly reads \$0.00 and can never fire"
+          fail "  => fix: Billing > Cost allocation tags > project > Activate (~24h to populate)"
+          fail "  => or: terraform apply -var activate_cost_allocation_tag=true (bootstrap, root)"
+          record 2 "tag-filtered budget measures nothing (tag inactive)" FAIL "c2-cost-allocation-tag.json"
+        fi }
 
 c3()  { manual 3 "manual org provisioning by documented steps" \
           "Provision the first beta org following docs/hosted/cloud-onboarding-checklist.md" \

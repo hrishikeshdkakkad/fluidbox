@@ -1,6 +1,6 @@
 
 [1;36m== identity path (root retired?) ==[0m
-  caller: arn:aws:sts::471112572248:assumed-role/fluidbox-cloud-deployer/botocore-session-1785790513
+  caller: arn:aws:sts::471112572248:assumed-role/fluidbox-cloud-deployer/botocore-session-1785795950
   [1;32m✓[0m running as the ASSUMED deployer role — the scoped non-root path works end to end
   [1;33m⚠[0m root access key STILL PRESENT (AccountAccessKeysPresent=1) — finish README step 6
 
