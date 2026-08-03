@@ -33,7 +33,7 @@ statements are needed, and only one of them was purchasable without an apply.
 | `com.amazonaws.global.cloudfront.origin-facing` prefix list exists in us-east-1 (`pl-3b927c52`) | ✅ |
 | EKS 1.35 is in **standard** support until 2027-03-26 (1.33 moved to extended 2026-07-28) | ✅ |
 | Target state-bucket name free; account clean of fluidbox EKS leftovers | ✅ |
-| **`terraform plan` on bootstrap against the real account** (read-only): 28 to add, 0 to change, 0 to destroy, no errors; budget filter renders `TagKeyValue = user:project$fluidbox` | ✅ |
+| **`terraform plan` on bootstrap against the real account** (read-only): 27 to add, 0 to change, 0 to destroy, no errors; budget filter renders `TagKeyValue = user:project$fluidbox` | ✅ |
 | Zero changes to `crates/ deploy/helm/ images/ migrations/ apps/web/ Cargo.*` vs main | ✅ (§9-16 half) |
 | Hermetic core suite `cargo test -p fluidbox-core` with `DATABASE_URL` unset | ✅ 167/167 |
 | Cost model re-verified live (AWS Pricing API) | ✅ ≈$131.6/mo idle, in band |
@@ -83,7 +83,7 @@ Pod Identity (the default root statement lets the IAM role policy govern).
 
 | # | criterion | status | evidence |
 |---|---|---|---|
-| 1 | scoped deployer applies without a root key | PENDING-APPLY | `verify-bootstrap.sh` after the ceremony |
+| 1 | scoped deployer applies without a root key | PENDING-APPLY — but the policy is **simulation-verified** (42/42) so an AccessDenied at apply is now unlikely | `…-cloud-m1-readiness/iam-simulation.md`, then `verify-bootstrap.sh` |
 | 2 | both budget controls active | PENDING-APPLY | acceptance harness c2 |
 | 3 | operator provisions an org by documented steps | PENDING-APPLY | `cloud-onboarding-checklist.md`, filled |
 | 4 | invited owner logs in through the Vercel origin | PENDING-APPLY (blocked on decision §12#4) | manual + screenshots |
