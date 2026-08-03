@@ -38,7 +38,7 @@ statements are needed, and only one of them was purchasable without an apply.
 | Hermetic core suite `cargo test -p fluidbox-core` with `DATABASE_URL` unset | ✅ 167/167 |
 | Cost model re-verified live (AWS Pricing API) | ✅ ≈$131.6/mo idle, in band |
 | OIDC login path proof | ⚠️ 17/18 — see the blocking finding |
-| Vercel proxy cookie + SSE code path | ✅ 9/9 (platform cap pending project link) |
+| Vercel proxy cookie + SSE — **code path AND platform cap** | ✅ 9/9 locally; live deployment measures the cap at **exactly 300s** with working `Last-Event-ID` resume ⇒ fallback not needed |
 | Independent IaC security review (separate agent, full stack read) | ✅ ran; 1 blocker + 4 medium + 3 nits, **all fixed** |
 | `operator_cidrs` guard proven to refuse `[]` and `0.0.0.0/0`, accept a `/32` | ✅ |
 | **M1 values INSTALL on a real enforcing cluster** (kind + Calico, released 0.4.0 chart/images), server READY, netpol `helm test` passes, governed replay run completes with approval + diff | ✅ 15/15 |
@@ -92,7 +92,7 @@ Pod Identity (the default root statement lets the IAM role policy govern).
 | 5 | user submits a replay run | **MECHANISM PROVEN** on a real cluster; EKS re-run pending | `…-cloud-m1-kind/` (released 0.4.0 chart + M1 values) |
 | 6 | EKS creates an isolated sandbox | **MECHANISM PROVEN** (sandbox pod scheduled under the quota + both NetworkPolicies); EKS re-run pending | `…-cloud-m1-kind/sandbox-plane.txt` |
 | 7 | run pauses for approval and resumes | **MECHANISM PROVEN** — `approval.requested` → `approval.decided` → `tool.decision(source=human)` → `completed` | `…-cloud-m1-kind/timeline-verified.txt` |
-| 8 | events stream through Vercel→CloudFront→ALB (or documented fallback) | PARTIAL — proxy code path ✅, CF/ALB legs pending apply | readiness ledger proof 2 |
+| 8 | events stream through Vercel→CloudFront→ALB (or documented fallback) | **Vercel leg PROVEN on the live deployment** (300s cap + resume, fallback ruled out); CF/ALB legs pending apply | readiness ledger, "Vercel platform cap" |
 | 9 | artifacts + usage recorded | **MECHANISM PROVEN** (diff artifact with the canonical fix + cost record); EKS re-run pending | `…-cloud-m1-kind/changes.patch`, `cost.json` |
 | 10 | sandbox cannot make disallowed connections | **MECHANISM PROVEN** — `helm test` netpol probe passes on Calico (`:8788` reachable, `:8787` blocked) **and** policy denied `curl` mid-run; EKS (VPC-CNI standard mode) re-run pending | `…-cloud-m1-kind/README.md` |
 | 11 | cross-tenant read/mutate impossible | **PROVEN AT THE ENFORCED FLOOR** — RLS under the non-owner runtime role: A sees only A, B only B, no-GUC sees zero, A selecting B's tenant_id gets nothing | `…-cloud-m1-readiness/cross-tenant-rls.txt` |

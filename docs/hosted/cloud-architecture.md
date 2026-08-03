@@ -97,7 +97,7 @@ Per-hop accounting for a quiet stream (server keepalive ≈ 15s):
 | ALB | `idle_timeout.timeout_seconds` | 120s (chart values annotation) |
 | CloudFront | `origin_read_timeout` (max quiet gap between bytes) | 60s |
 | CloudFront | total duration | unlimited while bytes flow |
-| Vercel route handler | function `maxDuration` | plan-dependent — **measured by the M1.0 probe**, not assumed |
+| Vercel route handler | function max duration | **MEASURED 2026-08-03: exactly 300s** on the live deployment (last tick 290s, next never arrived) |
 
 Delivery is correct even when a hop caps the stream: **SSE fanout is hybrid
 by design** — the `seq` catch-up query is the delivery source of truth and
@@ -105,8 +105,19 @@ by design** — the `seq` catch-up query is the delivery source of truth and
 invariant, unchanged). A capped stream therefore degrades to a reconnect,
 never to loss.
 
-**Documented fallback (M1.0 requirement) if Vercel cannot carry long streams
-acceptably:** the dashboard opens its EventSource against the **CloudFront
+**Measured verdict (M1.0, 2026-08-03): Vercel CAN carry the streams, and the
+fallback is NOT needed.** Against the live deployment
+(`fluidbox-cloud-dashboard.vercel.app`, sso mode, real `/api/fluidbox` proxy):
+first byte in 1s (unbuffered), continuous delivery to **exactly 300s**, then
+the function is cut — and `Last-Event-ID` demonstrably reaches the origin, so
+the browser's `EventSource` reconnects and resumes from the last `seq`. Because
+core's SSE fanout is hybrid (the seq catch-up query is the delivery source of
+truth, NOT the notify), a 5-minute reconnect costs a round-trip, never an
+event. Evidence: `docs/reviews/2026-08-03-cloud-m1-readiness/` (`sse-stream-sample.txt`,
+`sse-resume-sample.txt`, `cookie-proxy-headers.txt`).
+
+**Retained fallback, should a future plan/runtime change shorten that window
+to something users notice:** the dashboard opens its EventSource against the **CloudFront
 API host directly** (`https://<cf-domain>/v1/sessions/{id}/events/stream`)
 instead of the same-origin proxy path. PATs/bearer flows work today;
 cookie-authenticated browser streams on a cross-origin host would need a CORS

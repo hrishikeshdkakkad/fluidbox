@@ -215,3 +215,38 @@ both human steps (below).
 - **Cost-allocation tag `project` is `Inactive`** — expected: AWS refuses to
   activate a tag it has never seen on billed usage. Re-apply bootstrap with
   `-var activate_cost_allocation_tag=true` ~24h after the platform stack bills.
+
+## Vercel platform cap — MEASURED on the live deployment (2026-08-03)
+
+The one M1.0 item that could not be settled locally. With the project linked
+and approved, `apps/web` was deployed in **sso mode** with `FLUIDBOX_API_URL`
+pointed (via ngrok) at the deterministic probe origin, and
+`scripts/cloud/vercel-sse-probe.sh` was run against the real URL.
+
+| measurement | result |
+|---|---|
+| `/v1/*` rewrite reaches the configured API origin | ✅ — proves `FLUIDBOX_WEB_MODE=sso` and `FLUIDBOX_API_URL` were baked in at BUILD time |
+| first byte | 1s — unbuffered |
+| **continuous stream duration** | **exactly 300s** (30 events over 290.1s at a 10s cadence; the 300s tick never arrived) |
+| `Last-Event-ID` forwarded upstream | ✅ origin saw the resume header |
+| `__Host-fbx_web` + second `Set-Cookie` + redirect `Location` | ✅ all survive the proxy hop |
+
+**Verdict: the documented fallback is NOT needed.** A 300s cap plus working
+`Last-Event-ID` resume, on top of core's hybrid SSE contract (the seq
+catch-up query is the delivery source of truth, not the notify), means a
+capped stream costs one reconnect round-trip and never an event. The
+dedicated-stream-host fallback stays documented in
+`docs/hosted/cloud-architecture.md` in case a plan or runtime change shortens
+the window to something users notice.
+
+**Build-time trap confirmed in the field, not just in theory:** the first
+deploy went to *production* while the env vars had been set for *preview*, so
+the rewrite was inert and `/v1/health` did not reach the origin. Setting the
+production-scoped variables and redeploying fixed it. `FLUIDBOX_API_URL` is
+read by `next.config.ts` at build time — changing it always requires a
+redeploy, and it must be set for the environment you actually deploy to.
+
+Project: `hrishikeshkakkads-projects/fluidbox-cloud-dashboard` →
+`https://fluidbox-cloud-dashboard.vercel.app` (currently pointed at the probe
+origin; it must be re-pointed at the CloudFront API host once the platform
+stack is applied).
