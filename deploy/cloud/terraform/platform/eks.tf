@@ -221,31 +221,36 @@ resource "aws_eks_node_group" "sandbox" {
   ]
 }
 
-# Autoscaler ASG discovery tags (managed-NG tags do NOT propagate to the ASG).
+# Cluster Autoscaler ASG discovery tags. Managed node groups usually get these
+# from EKS already; applying them explicitly is idempotent and makes the
+# dependency visible (the autoscaler helm_release depends on them).
+#
+# Deliberately TWO resources rather than one for_each/count: the ASG name is
+# only known after apply, and Terraform requires for_each keys AND count
+# values to be known at PLAN time — deriving either from
+# `aws_eks_node_group.sandbox.resources[…]` fails the first apply with
+# "Invalid for_each argument". Passing that unknown as a plain ARGUMENT (as
+# below) is fine.
 locals {
-  sandbox_asg_names = flatten([
-    for r in aws_eks_node_group.sandbox.resources : [
-      for asg in r.autoscaling_groups : asg.name
-    ]
-  ])
-  ca_asg_tags = {
-    "k8s.io/cluster-autoscaler/enabled"             = "true"
-    "k8s.io/cluster-autoscaler/${var.cluster_name}" = "owned"
-  }
-  sandbox_asg_tag_pairs = {
-    for pair in setproduct(local.sandbox_asg_names, keys(local.ca_asg_tags)) :
-    "${pair[0]}/${pair[1]}" => { asg = pair[0], key = pair[1] }
+  sandbox_asg_name = aws_eks_node_group.sandbox.resources[0].autoscaling_groups[0].name
+}
+
+resource "aws_autoscaling_group_tag" "sandbox_ca_enabled" {
+  autoscaling_group_name = local.sandbox_asg_name
+
+  tag {
+    key                 = "k8s.io/cluster-autoscaler/enabled"
+    value               = "true"
+    propagate_at_launch = false
   }
 }
 
-resource "aws_autoscaling_group_tag" "sandbox_ca" {
-  for_each = local.sandbox_asg_tag_pairs
-
-  autoscaling_group_name = each.value.asg
+resource "aws_autoscaling_group_tag" "sandbox_ca_cluster" {
+  autoscaling_group_name = local.sandbox_asg_name
 
   tag {
-    key                 = each.value.key
-    value               = local.ca_asg_tags[each.value.key]
+    key                 = "k8s.io/cluster-autoscaler/${var.cluster_name}"
+    value               = "owned"
     propagate_at_launch = false
   }
 }
