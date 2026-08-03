@@ -130,21 +130,39 @@ proposal — PLAN rev 3 removed composed suspend from scope because it cannot
 stop in-flight sandbox tokens and has no reactivation API). What you have is
 a manual, multi-step, best-effort lockout:
 
+**⚠️ DO (c) FIRST — the order below is not the order to run them in.** The
+2026-08-03 drill established this by observation: under
+`FLUIDBOX_REQUIRE_SSO=1` the admin token cannot reach `/v1/sessions` (it
+answers 401 — verified), so cancelling runs needs an operator PAT from a
+logged-in identity **inside that org**, and step (a) is exactly what makes
+that credential hard to obtain. Disable login first and you may strand
+yourself outside a tenant whose runs are still executing. Either cancel
+first, or keep a standing operator PAT per beta org.
+
 ```bash
-# a) stop NEW authority: disable login
+# c) FIRST: cancel each active run (operator PAT scoped to that org — NOT the
+#    admin token, which is confined to /v1/admin under REQUIRE_SSO):
+#    list the tenant's active sessions, POST …/cancel each (see §6)
+# a) then stop NEW authority: disable login
 curl -fsS -X POST -H "$A" "$API/v1/admin/orgs/acme/idp/<id>/disable"
 # b) deactivate memberships (kills PAT/session authority per member; also the
 #    personal-connection kill switch):
 curl -fsS -H "$A" "$API/v1/admin/orgs/acme/members"
 curl -fsS -X POST -H "$A" "$API/v1/admin/orgs/acme/members/<membership_id>/deactivate"   # per member
-# c) cancel each active run (operator PAT or drill-owner PAT):
-#    list active sessions for the tenant, POST …/cancel each (see §6)
 # d) disable trigger subscriptions / schedules the tenant owns (they fire
-#    with subscription authority, not member sessions).
+#    with subscription authority, so neither (a) nor (b) stops them).
 ```
 
-Recorded limitations (state them in any incident notes):
-- Steps a–d are not atomic; a run can start between a) and c).
+Full drill transcript and every observed limitation:
+`docs/reviews/2026-08-03-cloud-m1-readiness/containment-drill.md`.
+
+Recorded limitations (all OBSERVED in the drill, not theorised — state them in
+any incident notes):
+- Steps are not atomic; a run can start between them.
+- **Ordering trap:** disabling login first can strip you of the credential
+  needed to cancel runs (above).
+- **An armed-but-never-logged-in org has NO membership row**, so step (b) is a
+  no-op there and containment rests entirely on (a).
 - In-flight sandbox session tokens keep their run alive until cancel lands.
 - "Reactivation" is manual re-inversion of every step (re-enable IdP,
   re-activate every membership, re-enable subscriptions) — easy to get
