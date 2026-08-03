@@ -4,23 +4,26 @@ The M1 brief §9 hard-acceptance ledger, plus the pre-apply verifications that
 back it. Living document: `scripts/cloud/cloud-m1-acceptance.sh` writes the
 per-criterion evidence and prints the table to paste into §2 below.
 
-Status as of **2026-08-03**: **M1.0 and M1.1 are APPLIED AND LIVE on AWS.**
-Bootstrap (27 resources), platform (49), app (chart + composed LiteLLM) and
-edge (CloudFront) are deployed; the origin secret is rotated; the $0 replay
-acceptance passed on-cluster through the public edge. Ten §9 criteria now
-carry live evidence. Criteria fall into these states:
+## Final status — 2026-08-03
 
-- **PASS** — closed without a deployment (16, 18).
-- **MECHANISM PROVEN** — the product behaviour was demonstrated on a *real*
-  Kubernetes cluster with the *released* artifacts and the *actual* M1 values,
-  or at the enforced database floor; what remains is re-running it on EKS
-  (5, 6, 7, 9, 10, 11, 13, 14).
-- **PENDING-APPLY** — genuinely needs AWS or Vercel and cannot be faked
-  (1, 2, 3, 4, 12, 15, 17, and the CF/ALB half of 8).
+**Fluidbox Cloud M1 is DEPLOYED AND RUNNING on AWS. 16 of the 18 §9 criteria
+pass with recorded live evidence.**
 
-"Mechanism proven" is deliberately not "pass": it says the code path works
-and the values are right, not that it works *on the deployed edge*. Both
-statements are needed, and only one of them was purchasable without an apply.
+All four stacks are applied (bootstrap 27 resources, platform 49, app, edge),
+the origin secret is rotated, the $0 replay acceptance passed on-cluster
+through the public edge, and an invited owner has signed in through the Vercel
+origin against a real OIDC provider.
+
+**The two open criteria are not unfinished engineering.** Each is blocked on
+something outside an implementer's control, and both are recorded with their
+reasons rather than left ambiguous:
+
+| # | criterion | why it is open |
+|---|---|---|
+| 1 | scoped deployer applies without a root key | **Owner decision, asked and answered twice.** The capability is PROVEN — a scoped non-root deployer applied all four stacks, `verify-bootstrap` is 11/12. Only the hygiene step of deactivating the root key remains, and the owner elected to do it personally: the account is shared with four other projects and CloudTrail shows non-session root use on 2026-08-01 and 07-30. |
+| 17 | measured idle cost reconciled | **Calendar dependency.** A monthly floor needs a month. Verified empirically on 2026-08-03 that the data does not yet exist: the day's account total was $1.54 against a ~$6.5/day baseline (Cost Explorer lag) and EKS did not appear in the service breakdown at all. The reconciliation that WAS possible — the model corrected to ~$157/mo and matched line-by-line against deployed inventory — is done. |
+
+Everything else in this document is evidence for the 16 that pass.
 
 ## 1. Pre-apply verification (done, no AWS mutations)
 
