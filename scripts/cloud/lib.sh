@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Shared helpers for the fluidbox-cloud operator scripts. Source, don't run.
 
+# shellcheck disable=SC2034  # BOLD/DIM are for the scripts that source this
 BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[1;31m'; GREEN=$'\033[1;32m'
 YELLOW=$'\033[1;33m'; CYAN=$'\033[1;36m'; RESET=$'\033[0m'
 say()  { printf "\n%s== %s ==%s\n" "$CYAN" "$1" "$RESET"; }
