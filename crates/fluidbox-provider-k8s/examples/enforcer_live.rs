@@ -167,6 +167,41 @@ async fn main() -> anyhow::Result<()> {
         Ok(()) => no("verify() still returns Ok after the policy was revoked"),
     }
 
+    // ── an EXPIRED grant must never be programmed ─────────────────────────
+    //
+    // The critical regression. Provisioning checks the grant ONCE, before
+    // workspace materialization; if it expires during that window the sweeper
+    // deletes a not-yet-created policy, marks the row revoked, and then
+    // provisioning creates the policy anyway — resurrecting dead authority
+    // until terminal cleanup, because the sweeper never revisits a revoked row.
+    let mut expired = granted(run_id, NetworkGrantMode::Approved);
+    expired.grant = serde_json::from_value(json!({
+        "schema_version": 1,
+        "mode": "approved",
+        "targets": expired.grant.targets,
+        "expires_at": "2000-01-01T00:00:00Z",
+        "policy_digest": "sha256:live",
+    }))?;
+    match enforcer.prepare(&expired).await {
+        Err(NetworkPolicyError::Unverified(_)) => {
+            ok("prepare() REFUSES an expired grant (no policy for lapsed authority)")
+        }
+        Err(e) => no(&format!(
+            "expected Unverified for an expired grant, got: {e}"
+        )),
+        Ok(()) => no("prepare() programmed a policy for an EXPIRED grant"),
+    }
+    match enforcer.verify(&expired).await {
+        Err(NetworkPolicyError::Unverified(_)) => ok("…and verify() refuses it too"),
+        Err(e) => no(&format!("expected Unverified, got: {e}")),
+        Ok(()) => no("verify() passed an expired grant"),
+    }
+    // Nothing was written under that name.
+    match enforcer.revoke(&expired).await {
+        Ok(()) => ok("…and nothing was left behind to clean up"),
+        Err(e) => no(&format!("revoke after a refused prepare failed: {e}")),
+    }
+
     // ── an OFFLINE grant needs no policy but still needs an endpoint ──────
     let off = granted(run_id, NetworkGrantMode::Offline);
     match enforcer.prepare(&off).await {

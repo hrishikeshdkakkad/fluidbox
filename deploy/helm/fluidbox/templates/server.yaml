@@ -203,6 +203,11 @@ spec:
             # on it, and getting it wrong makes every FQDN grant fail to resolve
             # while the policy still verifies as Valid.
             - { name: FLUIDBOX_SANDBOX_DNS_NAMESPACE, value: {{ .Release.Namespace | quote }} }
+            # Identify OUR resolver specifically. The component label alone
+            # would admit any pod wearing it — including a second release in the
+            # same namespace — as a legitimate resolver.
+            - { name: FLUIDBOX_SANDBOX_DNS_APP_NAME, value: {{ include "fluidbox.name" . | quote }} }
+            - { name: FLUIDBOX_SANDBOX_DNS_INSTANCE, value: {{ .Release.Name | quote }} }
             # Sandbox pods are pointed here via `dnsPolicy: None`, whose
             # `nameservers` MUST be IP addresses — a Service DNS name is not
             # valid there, and kubelet would reject the pod. So this is a
