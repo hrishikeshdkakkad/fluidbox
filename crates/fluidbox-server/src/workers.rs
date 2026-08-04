@@ -791,6 +791,40 @@ async fn network_grant_expiry(state: AppState) {
                 continue;
             }
         };
+        // The UPGRADE path. A run already executing under a policy written by an
+        // older build never calls `prepare` again, so tightening the renderer
+        // does nothing for it — a `public` grant frozen before deny snapshots
+        // existed keeps its world-allow with denies that may simply be missing.
+        // Tearing the enforcement down is the fail-closed answer: the run loses
+        // network rather than keeping reach nobody can account for.
+        match fluidbox_db::system_worker::stale_schema_active_grants(
+            &state.pool,
+            fluidbox_core::network::SCHEMA_WITH_DENIES as i64,
+            SWEEP_BATCH,
+        )
+        .await
+        {
+            Ok(stale) => {
+                for g in stale {
+                    let scope = TenantScope::assume(g.tenant_id);
+                    tracing::warn!(
+                        session_id = %g.session_id,
+                        "active `public` grant predates deny snapshots; revoking its \
+                         enforcement rather than leaving a world-allow whose deny set is \
+                         unknown"
+                    );
+                    crate::netgrant::revoke_enforcement(
+                        &state,
+                        scope,
+                        g.session_id,
+                        "grant schema predates policy deny snapshots",
+                    )
+                    .await;
+                }
+            }
+            Err(e) => tracing::warn!("stale-schema grant scan failed: {e}"),
+        }
+
         for g in due {
             let scope = TenantScope::assume(g.tenant_id);
             tracing::info!(

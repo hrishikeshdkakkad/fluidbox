@@ -185,6 +185,21 @@ pub fn build_run_policy(
     // re-resolved at all. The renderer is the one place EVERY grant passes
     // through, so it is where this has to fail closed.
     if g.grant.mode == NetworkGrantMode::Public {
+        // A grant frozen BEFORE deny snapshots existed carries an empty list
+        // that means "unknown", not "none" — so programming it as a world-allow
+        // could silently drop denies the policy really had. Nothing in the
+        // grant can distinguish the two cases, so the schema version is the
+        // disambiguator and a v1 public grant is refused. Recreate the run:
+        // resolution will freeze a v2 grant with its denies recorded.
+        if g.grant.schema_version < fluidbox_core::network::SCHEMA_WITH_DENIES {
+            return Err(format!(
+                "this `public` grant was frozen under schema v{} — before policy denies \
+                 were recorded in the grant — so its deny set is UNKNOWN rather than \
+                 empty. Refusing to program a world-allow that might be missing them; \
+                 recreate the run to freeze a current grant.",
+                g.grant.schema_version
+            ));
+        }
         if let Some(d) = g
             .grant
             .denied

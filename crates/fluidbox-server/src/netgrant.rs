@@ -151,7 +151,11 @@ pub async fn park_for_authorization(
         Some("network"),
         "once",
         GRANT_TOOL,
-        ttl_secs as i64,
+        // Clamped before the cast: `default_ttl_secs` is an unbounded u64 and
+        // `u64::MAX as i64` is -1, which would mint an already-expired approval
+        // instead of a long one — turning "wait for a human" into "refuse
+        // immediately".
+        ttl_secs.min(MAX_APPROVAL_TTL_SECS) as i64,
     )
     .await?;
     fluidbox_db::network_grants::attach_grant_approval(&state.pool, scope, session_id, approval.id)
@@ -321,6 +325,10 @@ pub fn reverify_before_release(
 /// reaches it, while a permanent failure resolves in about a minute instead of
 /// never.
 const REVERIFY_MAX_ATTEMPTS: u32 = 30;
+
+/// Ceiling on an authorization pause, applied before any `as i64` cast. A week
+/// is far beyond any sensible approval window and keeps the arithmetic in range.
+const MAX_APPROVAL_TTL_SECS: u64 = 7 * 24 * 3600;
 
 /// A human authorized the grant: re-verify, activate, and release provisioning.
 ///

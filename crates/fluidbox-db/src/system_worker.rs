@@ -452,6 +452,36 @@ pub async fn expired_active_grants(
     Ok(out)
 }
 
+/// Active grants whose FROZEN document predates the current schema.
+///
+/// The upgrade path the renderer alone cannot cover: a run already executing
+/// under a policy written by an older build never calls `prepare` again, so
+/// tightening the renderer does nothing for it. This scan finds those runs so
+/// their enforcement can be torn down and re-evaluated.
+pub async fn stale_schema_active_grants(
+    pool: &PgPool,
+    current_schema: i64,
+    limit: i64,
+) -> sqlx::Result<Vec<ExpiredGrantRow>> {
+    let mut tx = crate::worker_tx(pool).await?;
+    let out = sqlx::query_as(
+        "select s.tenant_id, g.session_id, g.mode
+           from session_network_grants g
+           join sessions s on s.id = g.session_id
+          where g.status = 'active'
+            and g.mode = 'public'
+            and coalesce((g.grant_doc->>'schema_version')::int, 1) < $1
+            and s.status not in ('completed','failed','cancelled','budget_exceeded')
+          order by g.created_at limit $2",
+    )
+    .bind(current_schema)
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(out)
+}
+
 /// One reservation the expiry sweep converted into a conservative charge.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SweptReservation {
