@@ -44,7 +44,8 @@ admin_token() { cloud_admin_token; }
 # Shared with auth0-idp-setup.sh — see promote_owner() in lib.sh for why
 # promotion is a separate admin act rather than a bootstrap-owner arm.
 if [ "${1:-}" = "--promote" ]; then
-  promote_owner "${2:?usage: --promote <org-slug> <email>}" "${3:?usage: --promote <org-slug> <email>}"
+  promote_owner "${2:?usage: --promote <org-slug> <email> [membership-id]}" \
+    "${3:?usage: --promote <org-slug> <email> [membership-id]}" "${4:-}"
   exit 0
 fi
 
