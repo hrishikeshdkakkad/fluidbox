@@ -271,6 +271,44 @@ mod tests {
         }
     }
 
+    /// The CAS surface of each mutation, as a matrix — because the blocker an
+    /// adversarial review found lived exactly here.
+    ///
+    /// `deny_network_grant` moves `pending → denied` ONLY. A caller that treated
+    /// its `Ok(None)` as "nothing to do and nothing to clean up" therefore did
+    /// nothing at all for a row that was already `revoked` — which is precisely
+    /// the state the stale-schema sweep leaves behind — and the parked session
+    /// was never wound down. The lesson encoded here: a CAS answers "did I win",
+    /// never "is there work left".
+    #[test]
+    fn the_status_cas_surface_is_explicit() {
+        // Which source states each mutation can move FROM. These mirror the SQL
+        // predicates; a change to one without the other is the bug class above.
+        let deny_from = ["pending"];
+        let activate_from = ["pending"];
+        let revoke_from = ["pending", "active", "denied"]; // anything not already revoked
+
+        for s in ["pending", "active", "denied", "revoked"] {
+            let can_deny = deny_from.contains(&s);
+            let can_activate = activate_from.contains(&s);
+            let can_revoke = revoke_from.contains(&s);
+            // The two states a parked run can be found in AFTER something else
+            // resolved its grant. Neither can be denied again — so a caller
+            // MUST NOT make the session's wind-down conditional on that CAS.
+            if s == "revoked" || s == "denied" {
+                assert!(
+                    !can_deny,
+                    "{s}: deny cannot fire, so wind-down must not depend on it"
+                );
+            }
+            // Revocation stays idempotent from every non-revoked state, which is
+            // what lets terminal cleanup, the abandon paths, and the sweeps all
+            // call it freely.
+            assert_eq!(can_revoke, s != "revoked", "revoke from {s}");
+            assert_eq!(can_activate, s == "pending", "activate from {s}");
+        }
+    }
+
     #[test]
     fn in_force_is_fail_closed_on_every_axis() {
         let now = Utc::now();
