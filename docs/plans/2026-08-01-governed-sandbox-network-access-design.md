@@ -66,12 +66,24 @@ offline-only — a schedule has no caller to pass a request. Mirrors
 `Budgets::tightened_by` and the remove-only capability keep-list.
 
 **Deny precedence is a documented total order**, proven pairwise-exhaustively rather
-than one condition at a time: structural deny → policy deny → mode ceiling →
-`public`+brokered → target-catalog subset → approval → allow. Expiry clamps;
-everything else refuses rather than silently downgrading.
+than one condition at a time. In full, as the code runs it: `offline` short-circuits
+to Active → enforceability → structural validity and blocked ranges → explicit policy
+deny → mode ceiling → `public`+brokered → target-catalog subset → expiry → approval,
+else allow. Expiry clamps first and only then refuses (if the grant would lapse before
+the run ends); everything else refuses rather than silently downgrading.
+
+*(An earlier revision of this list omitted the short-circuit, enforceability, and
+expiry — it described an order the implementation did not have. An adversarial review
+caught it; the list above is the one the code implements and the pairwise test proves.)*
 
 **`public` + brokered surfaces is refused unless policy opts in**, following the
 `TrustTier::ReadOnly` precedent. The dangerous pairing is credentials plus reach.
+
+**An `approved` grant may resolve only the names it was granted.** An unrestricted
+DNS rule is a covert egress channel by itself: a workload encodes data into a lookup
+for a domain the attacker controls, the resolver forwards it, and their nameserver
+receives it — with no connection the policy could have blocked. `public` keeps a
+wildcard because it may already reach anything the wall permits.
 
 ---
 

@@ -141,8 +141,20 @@ human refusing a grant is the system working.
 
 - **An FQDN grant enforces as the RESOLVED ADDRESS SET, not as a per-connection
   binding to a DNS answer.** A run granted `pypi.org` can reach `pypi.org`'s
-  current addresses by raw IP. It cannot reach anything else. This is the same
-  fact as the DNS-rebinding window, seen from the other side.
+  current addresses by raw IP. This is the same fact as the DNS-rebinding
+  window, seen from the other side.
+- **Consequently, a co-hosted virtual service behind a granted address is
+  reachable.** If `pypi.org` shares an address with other sites (a CDN or shared
+  reverse proxy), the datapath admits that address on that port and cannot tell
+  which `Host`/SNI the workload then asks for. A grant is therefore
+  "address × port", not "service identity". Grant names whose addresses you are
+  willing to have reached in full.
+- **An `approved` grant may look up only the names it was granted.** This is
+  enforced, not advisory: an unrestricted DNS rule would be an exfiltration
+  channel on its own (encode data into a lookup for an attacker-controlled
+  domain and their nameserver receives it, with no connection to block).
+  `public` keeps an unrestricted lookup because it may already reach anything
+  the wall permits.
 - **Cross-run isolation depends on the per-run policy's selector.** It carries
   all three run identity labels; a widened selector would pool concurrent runs'
   granted addresses into one reachable set. There is a unit test pinning it.
