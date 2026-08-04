@@ -166,13 +166,38 @@ pub struct PolicyContext {
 /// emitting an empty policy would be noise at best and, if it ever grew an
 /// empty-egress-means-allow-all interpretation, a hazard. The chart-static
 /// baseline already puts every sandbox in default-deny.
+/// `Err` means the grant CANNOT be safely rendered and the run must not start.
 pub fn build_run_policy(
     g: &GrantedNetwork,
     session_id: uuid::Uuid,
     ctx: &PolicyContext,
-) -> Option<Value> {
+) -> Result<Option<Value>, String> {
     if !g.grant.grants_egress() {
-        return None;
+        return Ok(None);
+    }
+    // A NAME-based deny under `public` cannot be rendered (see `egress_deny`
+    // below) and `public` allows the world — so silently filtering it would
+    // leave the allow standing with the deny gone.
+    //
+    // Checked HERE rather than only at resolution because resolution does not
+    // see every path: a grant frozen before that check existed still releases
+    // under the unchanged-policy shortcut, and an already-active grant is never
+    // re-resolved at all. The renderer is the one place EVERY grant passes
+    // through, so it is where this has to fail closed.
+    if g.grant.mode == NetworkGrantMode::Public {
+        if let Some(d) = g
+            .grant
+            .denied
+            .iter()
+            .find(|d| matches!(d, TargetRule::Dns { .. }))
+        {
+            return Err(format!(
+                "this grant is `public` and its policy denies {} by NAME, which Cilium's \
+                 egressDeny cannot express — refusing to program a policy that would allow \
+                 the world with that deny silently absent",
+                d.describe()
+            ));
+        }
     }
     let mut egress: Vec<Value> = Vec::new();
     match g.grant.mode {
@@ -237,7 +262,7 @@ pub fn build_run_policy(
         })
         .collect();
 
-    Some(json!({
+    Ok(Some(json!({
         "apiVersion": "cilium.io/v2",
         "kind": "CiliumNetworkPolicy",
         "metadata": {
@@ -268,7 +293,7 @@ pub fn build_run_policy(
             "egress": egress,
             "egressDeny": egress_deny,
         }
-    }))
+    })))
 }
 
 #[cfg(test)]
@@ -324,7 +349,9 @@ mod tests {
         // existing zeroEgress posture, delivered by the chart-static baseline.
         let sid = uuid::Uuid::now_v7();
         assert!(
-            build_run_policy(&granted(NetworkGrantMode::Offline, vec![]), sid, &ctx()).is_none()
+            build_run_policy(&granted(NetworkGrantMode::Offline, vec![]), sid, &ctx())
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -339,7 +366,7 @@ mod tests {
             NetworkGrantMode::Approved,
             vec![dns_target("example.com", 443)],
         );
-        let p = build_run_policy(&g, sid, &ctx()).unwrap();
+        let p = build_run_policy(&g, sid, &ctx()).unwrap().unwrap();
         let sel = &p["spec"]["endpointSelector"]["matchLabels"];
         assert_eq!(sel[LABEL_SESSION], sid.to_string());
         assert_eq!(sel[LABEL_TENANT], g.tenant_id.to_string());
@@ -362,6 +389,7 @@ mod tests {
             sid,
             &ctx(),
         )
+        .unwrap()
         .unwrap();
         let egress = p["spec"]["egress"].as_array().unwrap();
         // The DNS-visibility rule must be present, and must carry rules.dns —
@@ -410,6 +438,7 @@ mod tests {
             sid,
             &ctx(),
         )
+        .unwrap()
         .unwrap();
         let dns = &p["spec"]["egress"][0]["toPorts"][0]["rules"]["dns"];
         let matchers = dns.as_array().unwrap();
@@ -430,7 +459,9 @@ mod tests {
         // reaches whatever the deny wall permits — and would break ordinary
         // name resolution.
         let sid = uuid::Uuid::now_v7();
-        let p = build_run_policy(&granted(NetworkGrantMode::Public, vec![]), sid, &ctx()).unwrap();
+        let p = build_run_policy(&granted(NetworkGrantMode::Public, vec![]), sid, &ctx())
+            .unwrap()
+            .unwrap();
         let dns = &p["spec"]["egress"][0]["toPorts"][0]["rules"]["dns"];
         assert_eq!(dns[0]["matchPattern"], "*");
     }
@@ -453,6 +484,7 @@ mod tests {
             sid,
             &ctx(),
         )
+        .unwrap()
         .unwrap();
         let egress = p["spec"]["egress"].as_array().unwrap();
         assert_eq!(egress.len(), 1, "only the CIDR allow: {egress:?}");
@@ -473,20 +505,25 @@ mod tests {
     fn a_public_grant_still_carries_the_policys_denies() {
         let sid = uuid::Uuid::now_v7();
         let mut g = granted(NetworkGrantMode::Public, vec![]);
+        // CIDR denies only — a NAME deny under `public` is a REFUSAL, covered by
+        // `a_dns_deny_is_never_rendered_because_cilium_cannot_express_it`.
         g.grant.denied = vec![
             TargetRule::cidr(
                 "203.0.113.0/24".parse().unwrap(),
                 vec![PortSpec::single(443)],
                 L4Protocol::Tcp,
             ),
-            dns_target("corp.example", 443),
+            TargetRule::cidr(
+                "198.51.100.0/24".parse().unwrap(),
+                vec![PortSpec::single(80)],
+                L4Protocol::Tcp,
+            ),
         ];
-        let p = build_run_policy(&g, sid, &ctx()).unwrap();
+        let p = build_run_policy(&g, sid, &ctx()).unwrap().unwrap();
         let deny = p["spec"]["egressDeny"].as_array().unwrap();
-        // Only the CIDR deny: a DNS deny is unrenderable (see
-        // `a_dns_deny_is_never_rendered_because_cilium_cannot_express_it`).
-        assert_eq!(deny.len(), 1, "only the CIDR deny is renderable: {deny:?}");
+        assert_eq!(deny.len(), 2, "both CIDR denies must render: {deny:?}");
         assert_eq!(deny[0]["toCIDR"][0], "203.0.113.0/24");
+        assert_eq!(deny[1]["toCIDR"][0], "198.51.100.0/24");
         // …alongside the world allow, which Cilium's deny precedence outranks.
         let egress = p["spec"]["egress"].as_array().unwrap();
         assert!(egress.iter().any(|r| r["toEntities"][0] == "world"));
@@ -502,16 +539,39 @@ mod tests {
     #[test]
     fn a_dns_deny_is_never_rendered_because_cilium_cannot_express_it() {
         let sid = uuid::Uuid::now_v7();
+        // A `public` grant whose policy denies a NAME is REFUSED outright.
+        // Rendering it with the deny quietly filtered would leave the world
+        // allow standing with the deny gone — a fail-open dressed as a fix.
+        // Refusing HERE (not only at resolution) covers every path, including
+        // grants frozen before the resolution-time check existed, and grants
+        // that are already active and never re-resolved.
         let mut g = granted(NetworkGrantMode::Public, vec![]);
-        g.grant.denied = vec![
-            dns_target("corp.example", 443),
-            TargetRule::cidr(
-                "203.0.113.0/24".parse().unwrap(),
-                vec![PortSpec::single(443)],
-                L4Protocol::Tcp,
-            ),
-        ];
-        let p = build_run_policy(&g, sid, &ctx()).unwrap();
+        g.grant.denied = vec![dns_target("corp.example", 443)];
+        let err = build_run_policy(&g, sid, &ctx())
+            .expect_err("a public grant with a NAME deny must refuse");
+        assert!(err.contains("corp.example"), "the refusal names it: {err}");
+
+        // APPROVED does not refuse: the grant is a closed allow-list and
+        // resolution already refuses any target overlapping a deny, so nothing
+        // is silently lost by not rendering it. (It does NOT enforce the deny
+        // at the datapath either — a denied service co-hosted on a granted
+        // name's address stays reachable. That residual is documented.)
+        let mut appr = granted(
+            NetworkGrantMode::Approved,
+            vec![dns_target("example.com", 443)],
+        );
+        appr.grant.denied = vec![dns_target("corp.example", 443)];
+        assert!(build_run_policy(&appr, sid, &ctx()).is_ok());
+
+        // A CIDR deny renders, with ports and protocol intact — dropping them
+        // would silently WIDEN an authored TCP/443 deny to all-ports.
+        let mut ok_grant = granted(NetworkGrantMode::Public, vec![]);
+        ok_grant.grant.denied = vec![TargetRule::cidr(
+            "203.0.113.0/24".parse().unwrap(),
+            vec![PortSpec::single(443)],
+            L4Protocol::Tcp,
+        )];
+        let p = build_run_policy(&ok_grant, sid, &ctx()).unwrap().unwrap();
         let deny = p["spec"]["egressDeny"].as_array().unwrap();
         assert_eq!(deny.len(), 1, "only the CIDR deny is renderable: {deny:?}");
         assert_eq!(deny[0]["toCIDR"][0], "203.0.113.0/24");
@@ -520,8 +580,6 @@ mod tests {
             !rendered.contains("toFQDNs"),
             "an unrenderable DNS deny must not be emitted: {rendered}"
         );
-        // Ports and protocol survive: dropping them would silently WIDEN an
-        // authored TCP/443 deny into all-ports, all-protocols.
         assert_eq!(deny[0]["toPorts"][0]["ports"][0]["port"], "443");
         assert_eq!(deny[0]["toPorts"][0]["ports"][0]["protocol"], "TCP");
     }
@@ -540,7 +598,7 @@ mod tests {
             vec![PortSpec::single(443)],
             L4Protocol::Tcp,
         )];
-        let p = build_run_policy(&g, sid, &ctx()).unwrap();
+        let p = build_run_policy(&g, sid, &ctx()).unwrap().unwrap();
         assert_eq!(p["spec"]["egressDeny"][0]["toCIDR"][0], "198.51.100.0/24");
     }
 
@@ -551,7 +609,9 @@ mod tests {
         // cluster, and the Phase 0 spike is why it is stated as a rule rather
         // than left to whoever edits this next.
         let sid = uuid::Uuid::now_v7();
-        let p = build_run_policy(&granted(NetworkGrantMode::Public, vec![]), sid, &ctx()).unwrap();
+        let p = build_run_policy(&granted(NetworkGrantMode::Public, vec![]), sid, &ctx())
+            .unwrap()
+            .unwrap();
         let egress = p["spec"]["egress"].as_array().unwrap();
         let entities: Vec<&Value> = egress.iter().filter_map(|r| r.get("toEntities")).collect();
         assert_eq!(entities.len(), 1);
@@ -583,6 +643,7 @@ mod tests {
             sid,
             &ctx(),
         )
+        .unwrap()
         .unwrap();
         let owner = &p["metadata"]["ownerReferences"][0];
         assert_eq!(owner["kind"], "Pod");
@@ -624,6 +685,7 @@ mod tests {
             sid,
             &ctx(),
         )
+        .unwrap()
         .unwrap();
         let allow = &p["spec"]["egress"][1];
         assert_eq!(allow["toFQDNs"][0]["matchName"], "api.example.com");

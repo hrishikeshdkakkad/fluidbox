@@ -86,7 +86,7 @@ counts them, and the API returns the same code's message.
 |---|---|---|
 | `unenforceable` | No enforcer configured or detected. | §2 step 3, or run the agent offline. |
 | `mode_ceiling` | The request exceeds `network.max_mode`. | Raise the policy ceiling, or narrow the agent. |
-| `unenforceable_deny` | The policy has a NAME-based deny and the run asked for `public`. Cilium's `egressDeny` has no FQDN selector, so that deny cannot be programmed — issuing the grant would silently ignore it. | Use `approved` (where the grant is a closed allow-list and the deny is enforced at resolution), or express the deny as a CIDR. |
+| `unenforceable_deny` | The policy has a NAME-based deny and the run asked for `public`. Cilium's `egressDeny` has no FQDN selector, so that deny cannot be programmed — issuing the grant would allow the world with the deny silently absent. | Express the deny as a **CIDR** to have it enforced. `approved` is narrower (resolution refuses to *grant* a denied name) but see the residual below — it does not enforce the deny at the datapath either. |
 | `not_in_catalog` | A target is outside `network.allow`. | Add it to the policy, or drop it from the agent. |
 | `policy_deny` | An explicit `network.deny` rule covers it. | Intended; the deny is doing its job. |
 | `blocked_range` | A CIDR target reaches a structurally blocked class (metadata, RFC1918, loopback…). | Never grant these. The datapath denies them regardless. |
@@ -148,6 +148,13 @@ human refusing a grant is the system working.
   binding to a DNS answer.** A run granted `pypi.org` can reach `pypi.org`'s
   current addresses by raw IP. This is the same fact as the DNS-rebinding
   window, seen from the other side.
+- **A NAME-based deny is never enforced in the datapath — under ANY mode.**
+  Cilium's `egressDeny` has no FQDN selector (verified against the 1.19.6 CRD;
+  Cilium declined the feature in cilium#35494 because such a deny would fail
+  open for names the proxy has not resolved). Under `public` the run is refused
+  outright. Under `approved` the deny still does real work — resolution will not
+  *grant* a denied name — but it is a grant-time control, not a packet-level
+  one, and the residual below is why that distinction matters.
 - **Consequently, a co-hosted virtual service behind a granted address is
   reachable.** If `pypi.org` shares an address with other sites (a CDN or shared
   reverse proxy), the datapath admits that address on that port and cannot tell

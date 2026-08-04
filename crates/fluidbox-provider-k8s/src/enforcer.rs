@@ -223,7 +223,11 @@ impl NetworkPolicyProvider for CiliumNetworkEnforcer {
             owner_pod_uid: uid,
             owner_pod_name: name.clone(),
         };
-        let Some(policy) = netgrant::build_run_policy(granted, granted.run_id, &ctx) else {
+        // An unrenderable grant is a REFUSAL, not a policy with the unrenderable
+        // part quietly dropped.
+        let Some(policy) = netgrant::build_run_policy(granted, granted.run_id, &ctx)
+            .map_err(NetworkPolicyError::Lowering)?
+        else {
             return Ok(());
         };
         let obj: DynamicObject = serde_json::from_value(policy)
@@ -251,7 +255,22 @@ impl NetworkPolicyProvider for CiliumNetworkEnforcer {
                 let existing = self.cnps.get(&name).await.map_err(|e| {
                     NetworkPolicyError::Write(format!("re-reading the existing policy failed: {e}"))
                 })?;
-                if existing.data.get("spec") == obj.data.get("spec") {
+                // Adoption requires BOTH the right spec and OUR ownership
+                // label, because `revoke` refuses to delete an object that is
+                // not labelled ours. Adopting on spec alone while deleting only
+                // on label meant an unlabelled-but-matching object was adopted,
+                // the run started under it, and cleanup then declined to remove
+                // it — after which the row was marked revoked, the sweeper
+                // stopped looking, and the policy leaked with the endpoint
+                // still reachable. The two criteria have to be the same one.
+                let labelled_ours = existing
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|l| l.get(LABEL_SESSION))
+                    .map(|v| v == &granted.run_id.to_string())
+                    .unwrap_or(false);
+                if labelled_ours && existing.data.get("spec") == obj.data.get("spec") {
                     Ok(())
                 } else {
                     Err(NetworkPolicyError::Write(format!(
