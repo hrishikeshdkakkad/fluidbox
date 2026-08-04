@@ -349,6 +349,14 @@ pub trait ExecutionProvider: Send + Sync {
     fn network_enforcer(&self) -> &dyn NetworkPolicyProvider {
         &NoNetworkEnforcer
     }
+    /// Tear down the datapath objects for one run's grant, by run id.
+    ///
+    /// Separate from `NetworkPolicyProvider::revoke` because callers that need
+    /// this — the expired-grant sweep, forced wind-down — hold a session id and
+    /// no grant. Idempotent: a run with nothing programmed is success.
+    async fn revoke_network_policy(&self, _run_id: Uuid) -> Result<(), ProviderError> {
+        Ok(())
+    }
     fn runtime_name(&self) -> &'static str;
 }
 

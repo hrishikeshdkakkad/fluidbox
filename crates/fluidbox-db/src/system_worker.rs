@@ -409,6 +409,49 @@ pub async fn parked_network_grants(pool: &PgPool, limit: i64) -> sqlx::Result<Ve
     Ok(out)
 }
 
+/// An ACTIVE grant whose absolute expiry has passed, with the session it
+/// governs — the expired-grant sweep's worklist.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ExpiredGrantRow {
+    pub tenant_id: Uuid,
+    pub session_id: Uuid,
+    pub mode: String,
+}
+
+/// Grants that are still `active` past `expires_at`, across every tenant.
+///
+/// Uses migration 0028's `session_network_grants_expiry` partial index, which
+/// existed for this sweep from the start but had no consumer — so an expiry was
+/// checked once before provisioning and never again, and a grant that lapsed
+/// mid-run kept its datapath authority. The run's own wall clock does not save
+/// it: that clock starts at `started_at`, while the grant's expiry is absolute
+/// from creation, so provisioning time and any authorization pause are spent
+/// out of the grant's life but not the run's.
+///
+/// Only sessions that are still live are returned — a terminal run's grant is
+/// revoked by the terminal path, and re-revoking it would be noise.
+pub async fn expired_active_grants(
+    pool: &PgPool,
+    limit: i64,
+) -> sqlx::Result<Vec<ExpiredGrantRow>> {
+    let mut tx = crate::worker_tx(pool).await?;
+    let out = sqlx::query_as(
+        "select s.tenant_id, g.session_id, g.mode
+           from session_network_grants g
+           join sessions s on s.id = g.session_id
+          where g.status = 'active'
+            and g.expires_at is not null
+            and g.expires_at < now()
+            and s.status not in ('completed','failed','cancelled','budget_exceeded')
+          order by g.expires_at limit $1",
+    )
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(out)
+}
+
 /// One reservation the expiry sweep converted into a conservative charge.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SweptReservation {
