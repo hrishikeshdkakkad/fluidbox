@@ -419,9 +419,24 @@ a {
   padding: 0 56px;
   margin: 0 auto;
   display: grid;
-  grid-template-columns: minmax(180px, 1fr) auto minmax(180px, 1fr);
+  /* The NAV is the column that flexes; brand and actions size to their content.
+   *
+   * This used to be `minmax(180px, 1fr) auto minmax(180px, 1fr)`, which looks
+   * symmetric but inverts the shrink behaviour: the middle track was `auto`, so
+   * the nav took its full intrinsic width and never yielded, while the actions
+   * track was pinned near its 180px minimum. The actions content (status pill +
+   * New Run + theme toggle + org/email + Log out) is ~450px, so it overflowed
+   * its own track and — being `justify-self: end` — bled LEFTWARDS across the
+   * nav. Measured on the deployed dashboard at 1200px: the "Operational" pill
+   * sat on top of Governance/Docs/Settings and New Run overlapped Settings by
+   * 56px. Nothing was scrolling; the tracks were simply stacked.
+   *
+   * `auto minmax(0, 1fr) auto` gives actions the width it actually needs and
+   * lets the nav shrink (and scroll) instead. This is the same shape the
+   * <=860px breakpoint already used, so the desktop rule was the outlier. */
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
-  gap: 28px;
+  gap: 20px;
 }
 .masthead-brand {
   padding: 0;
@@ -445,11 +460,36 @@ a {
 .masthead-nav {
   display: flex;
   align-items: center;
+  /* min-width:0 is what actually lets the 1fr track shrink — a grid item's
+   * automatic minimum size is its content, so without this the nav would still
+   * refuse to yield and we would be back to overlapping. Overflow scrolls
+   * rather than spilling over the actions cluster. */
+  min-width: 0;
+  overflow-x: auto;
+  justify-content: center;
+  scrollbar-width: none;
   gap: 3px;
   padding: 3px;
   border: 1px solid var(--border);
   border-radius: 9px;
   background: rgba(255, 254, 250, 0.64);
+}
+.masthead-nav::-webkit-scrollbar {
+  display: none;
+}
+/* The org name + email is the widest thing in the actions cluster and is
+ * user-controlled, so it must never be allowed to set the header's width. */
+.masthead-actions [data-testid="session-shell"],
+.masthead-actions [data-testid="workos-session-shell"] {
+  max-width: 170px;
+  min-width: 0;
+}
+.masthead-actions [data-testid="session-shell"] span,
+.masthead-actions [data-testid="workos-session-shell"] span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .masthead-nav a {
   min-height: 30px;
@@ -2892,7 +2932,9 @@ pre.token {
   max-width: 1240px;
   min-height: 64px;
   padding: 0 40px;
-  grid-template-columns: minmax(190px, 1fr) auto minmax(190px, 1fr);
+  /* Same correction as the base rule above — this override was re-introducing
+   * the non-shrinking middle track and would have undone the fix. */
+  grid-template-columns: auto minmax(0, 1fr) auto;
 }
 .masthead-brand {
   gap: 10px;
