@@ -215,6 +215,23 @@ spec:
             runAsUser: 65532
             capabilities:
               drop: ["ALL"]
+              # NET_BIND_SERVICE is REQUIRED, not hardening slack. The resolver
+              # binds :53 — a privileged port — as uid 65532, which the image
+              # supports by shipping /coredns with the `cap_net_bind_service`
+              # FILE capability. Dropping ALL while `allowPrivilegeEscalation:
+              # false` sets NO_NEW_PRIVS makes the kernel refuse to exec a
+              # binary carrying file capabilities at all: the container dies
+              # instantly with `exec /coredns: operation not permitted`, every
+              # granted run loses DNS, and `helm upgrade --wait` hangs until it
+              # times out. Observed on EKS/AL2023 arm64 2026-08-04; the kind
+              # job does not reproduce it, so the render assertion below is
+              # what keeps it fixed.
+              #
+              # This does NOT weaken the sandbox: the capability lets a process
+              # bind a low port, nothing more, and it is added to the RESOLVER
+              # — a forward-only CoreDNS in the control-plane namespace — never
+              # to a sandbox. allowPrivilegeEscalation stays false.
+              add: ["NET_BIND_SERVICE"]
           livenessProbe:
             httpGet: { path: /health, port: 8080 }
             initialDelaySeconds: 10
