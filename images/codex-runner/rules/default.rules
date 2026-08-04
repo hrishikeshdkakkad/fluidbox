@@ -1,30 +1,41 @@
 # fluidbox execpolicy — force EVERY exec through the fluidbox permission gate.
 #
 # codex `approval_policy="untrusted"` AUTO-RUNS its built-in is_known_safe_command
-# set (29 read/util basenames in 0.144.1) WITHOUT firing an approval request —
-# a class of exec that would never cross the fluidbox gate (no ledger, budget,
-# or policy). execpolicy has ONLY prefix_rule (no wildcard: an empty prefix
-# matches nothing), and its match is on the LITERAL first argv token, so we
-# enumerate (a) the complete known-safe basename set and (b) their absolute-path
-# spellings across the standard bin dirs. Strictest decision wins
+# set WITHOUT firing an approval request: a class of exec that would never cross
+# the fluidbox gate (no ledger, budget, or policy). We give every known-safe
+# basename a `prompt` rule below. Strictest decision wins
 # (forbidden > prompt > allow), so a `prompt` rule can only make codex ASK MORE.
-# The result: every listed spelling escalates to item/commandExecution/requestApproval,
-# which the supervisor answers via /permission.
+# The result: every known-safe exec escalates to item/commandExecution/requestApproval,
+# which the supervisor answers via /permission. (execpolicy has ONLY prefix_rule,
+# no wildcard: an empty prefix matches nothing, so the set must be enumerated.)
 #
-# COMPLETENESS (risk-register #1): the 29 basenames are the AUTHORITATIVE
-# 0.144.1 set (codex is the source); the exact version pin freezes it. The
-# reviewer confirmed codex reduces `/bin/cat`→`cat` for its classifier, so a
-# bare `cat` rule would NOT catch `/bin/cat` unless the app-server resolves
-# executables first — hence the absolute-path variants below, AND the e2e
-# tier-2 HARD-asserts that `cat`, `/bin/cat`, and `git status` all gate (the
-# tripwire: if a spelling slips, the assertion fails and blocks the release).
-# RESIDUAL (recorded): a relative-path spelling (`./cat`) of a known-safe READ
-# with a pre-planted executable in the workspace is not caught by prefix rules;
-# it is an ungoverned READ of a disposable, egress-free workspace (no mutation,
-# no egress) — bounded by the containment envelope. All 29 are reads; every
-# WRITE gates via item/fileChange/requestApproval regardless of spelling.
+# COMPLETENESS (risk-register #1): the known-safe set is the AUTHORITATIVE 0.144.1
+# set, and the source is codex itself
+# (codex-rs/shell-command/src/command_safety/is_safe_command.rs); the exact
+# version pin freezes it. It is 31 basenames on the Linux runner image: the 29
+# cross-platform reads PLUS `numfmt` and `tac`, which is_safe_command.rs gates
+# behind `cfg!(target_os = "linux")`. The sandbox is node:24-bookworm-slim, so
+# both auto-run there and MUST be listed. (numfmt/tac were absent before, so they
+# crossed no gate in any spelling; see the bare list below and issue #15.)
 #
-# Validate:  codex execpolicy check --pretty --rules default.rules -- cat x
+# SPELLINGS, SETTLED (rust-v0.144.1, by source + `codex execpolicy check`): the
+# app-server evaluates execpolicy with resolve_host_executables=true
+# (codex-rs/core/src/exec_policy.rs), which basename-resolves argv[0] before rule
+# lookup (codex-rs/execpolicy/src/policy.rs::match_host_executable_rules; a
+# relative path is first absolutized against the cwd). So `/bin/cat` and `./cat`
+# both resolve to `cat`, and ONE bare rule per basename gates EVERY spelling:
+# bare, absolute, AND relative. This CLOSES the previously-recorded `./cat`
+# residual (a relative spelling of a known-safe read IS caught, not ungoverned).
+# The absolute-path block further down is thus redundant belt-and-suspenders,
+# kept only to keep the enumeration explicit. scripts/e2e-codex.sh HARD-asserts
+# (via `codex execpolicy check` against these baked rules) that `git status`,
+# `./cat`, and the numfmt/tac spellings all gate (the tripwire: if a spelling
+# slips on a codex bump, the assertion fails and blocks the release). All
+# known-safe commands are reads; every WRITE gates via
+# item/fileChange/requestApproval regardless of spelling.
+#
+# Validate:  codex execpolicy check --resolve-host-executables --pretty \
+#              --rules default.rules -- ./cat x     # => decision "prompt"
 
 def prompt(cmd):
     prefix_rule(
@@ -42,9 +53,15 @@ def prompt(cmd):
     "printenv", "hostname", "file", "du", "df", "dirname", "basename", "realpath",
     "readlink", "tree", "diff", "cmp", "md5sum", "sha1sum", "sha256sum", "cksum", "jq",
     "yq", "xxd", "od", "strings", "column", "tee", "sh", "bash", "zsh",
+    # numfmt and tac are known-safe reads only on Linux (is_safe_command.rs,
+    # cfg!(target_os = "linux")). The sandbox image is Linux, so both auto-run
+    # there; without these rules they crossed no gate in any spelling (issue #15).
+    "numfmt", "tac",
 ]]
 
-# Absolute-path spellings of the known-safe basenames (bare rules miss these).
+# Absolute-path spellings of the known-safe basenames. REDUNDANT given
+# resolve_host_executables (a bare rule already catches these; see the header),
+# retained as explicit belt-and-suspenders.
 [prompt(c) for c in [
     "/bin/base64", "/usr/bin/base64", "/usr/local/bin/base64", "/sbin/base64",
     "/usr/sbin/base64", "/bin/cat", "/usr/bin/cat", "/usr/local/bin/cat", "/sbin/cat",
@@ -76,4 +93,7 @@ def prompt(cmd):
     "/sbin/wc", "/usr/sbin/wc", "/bin/which", "/usr/bin/which", "/usr/local/bin/which",
     "/sbin/which", "/usr/sbin/which", "/bin/whoami", "/usr/bin/whoami",
     "/usr/local/bin/whoami", "/sbin/whoami", "/usr/sbin/whoami",
+    "/bin/numfmt", "/usr/bin/numfmt", "/usr/local/bin/numfmt", "/sbin/numfmt",
+    "/usr/sbin/numfmt", "/bin/tac", "/usr/bin/tac", "/usr/local/bin/tac",
+    "/sbin/tac", "/usr/sbin/tac",
 ]]

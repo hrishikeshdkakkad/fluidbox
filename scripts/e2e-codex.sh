@@ -67,6 +67,41 @@ facade() { # llm-audience token, suffix, body -> "HTTP <code>"
 # ═══ TIER 1 — no-model parity probes ═══════════════════════════════════════
 say "TIER 1 — harness registry + facade dialect + canonical gate (no model)"
 
+# ── execpolicy gate-parity (issue #15): every codex known-safe read must gate ──
+# codex `approval_policy=untrusted` AUTO-RUNS its is_known_safe_command set
+# without asking, so each such basename needs a `prompt` rule or it bypasses the
+# gate. Assert it with codex's OWN checker, run INSIDE the pinned runner image
+# against the BAKED rules (no model, no key, no session). The app-server
+# evaluates approvals with resolve_host_executables=true (codex core
+# exec_policy.rs), so `--resolve-host-executables` here is faithful: one bare
+# rule must gate bare, absolute, AND relative spellings. This locks in the
+# Linux-only numfmt/tac coverage and the closed ./cat residual against codex
+# version drift. (execpolicy check evaluates the RULES layer only; the
+# "auto-run when unlisted" half lives in is_safe_command.rs, frozen by the pin.)
+CODEX_IMG="${FLUIDBOX_CODEX_SANDBOX_IMAGE:-fluidbox-codex-runner:dev}"
+# --rules path mirrors CODEX_HOME in images/codex-runner/Dockerfile.
+execpolicy_decision() { # argv... -> prompt|allow|forbidden|none
+  docker run --rm --entrypoint /opt/fluidbox-codex/node_modules/.bin/codex "$CODEX_IMG" \
+    execpolicy check --resolve-host-executables \
+      --rules /opt/fluidbox-codex/home/rules/default.rules -- "$@" 2>/dev/null \
+  | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("decision","none"))
+except Exception: print("none")'
+}
+while IFS='|' read -r elabel eargv; do
+  [ -z "$elabel" ] && continue
+  ED=$(execpolicy_decision ${eargv})
+  [ "$ED" = "prompt" ] && ok "execpolicy: $elabel gates (prompt)" \
+    || no "execpolicy: $elabel got '${ED}' (want prompt; an unlisted known-safe read auto-runs, bypassing /permission)"
+done <<'SPELLS'
+git status (control)|git status
+./cat (relative, residual closed)|./cat NOTE.txt
+numfmt (bare, #15)|numfmt 1000
+./numfmt (relative, planted-binary, #15)|./numfmt 1000
+tac (bare, #15)|tac NOTE.txt
+./tac (relative, planted-binary, #15)|./tac NOTE.txt
+SPELLS
+
 # per-harness defaults + validation
 A=$(mk_codex_agent codex-fixer)
 IMG=$(echo "$A" | j "['revision']['runner_image']"); MODEL=$(echo "$A" | j "['revision']['model']")
@@ -137,7 +172,7 @@ say "RESULT"
 # turn a token-grab miss into a recorded failure; this floor ALSO catches an
 # assertion line that gets accidentally dropped or skipped. It's a FLOOR (>=),
 # so adding assertions never trips it; it sits below the happy no-key count
-# (16) and above any token-miss remnant.
+# (22 after the 6 execpolicy gate-parity probes) and above any token-miss remnant.
 EXPECTED_MIN=15
 ran=$((pass + fail))
 [ "$ran" -ge "$EXPECTED_MIN" ] && ok "assertion-count tripwire ($ran ran ≥ $EXPECTED_MIN)" \
