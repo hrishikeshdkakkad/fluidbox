@@ -172,6 +172,24 @@ pub fn build_run_policy(
     session_id: uuid::Uuid,
     ctx: &PolicyContext,
 ) -> Result<Option<Value>, String> {
+    // A schema this binary does not know is refused, and BEFORE the offline
+    // shortcut: an unknown future `offline` might not mean offline under that
+    // schema's semantics, so answering "no policy needed" would be an assumption
+    // this build is not entitled to make.
+    //
+    // The bound is enforced in BOTH directions. Too HIGH and the grant carries
+    // semantics this build cannot interpret — a rollback after a future v3 would
+    // otherwise render a v3 grant under v2 rules and silently ignore whatever v3
+    // added. An old binary cannot be repaired once v3 exists, so the upper bound
+    // has to exist now, before there is anything to enforce it against.
+    if !g.grant.schema_supported() {
+        return Err(format!(
+            "this grant is schema v{}, which this build does not know (it understands up \
+             to v{}) — refusing to interpret it",
+            g.grant.schema_version,
+            fluidbox_core::network::SCHEMA_VERSION
+        ));
+    }
     if !g.grant.grants_egress() {
         return Ok(None);
     }
@@ -184,21 +202,6 @@ pub fn build_run_policy(
     // under the unchanged-policy shortcut, and an already-active grant is never
     // re-resolved at all. The renderer is the one place EVERY grant passes
     // through, so it is where this has to fail closed.
-    // A schema this binary does not know is refused in BOTH directions. Too LOW
-    // and its deny snapshot is unknown (below); too HIGH and it carries
-    // semantics this build cannot interpret — a rollback to this binary after a
-    // future v3 would otherwise render a v3 grant under v2 rules and silently
-    // ignore whatever v3 added. An old binary cannot be repaired once v3 exists,
-    // so the upper bound has to be enforced now, before there is anything to
-    // enforce it against.
-    if !g.grant.schema_supported() {
-        return Err(format!(
-            "this grant is schema v{}, which this build does not know (it understands up \
-             to v{}) — refusing to program a policy from semantics it cannot interpret",
-            g.grant.schema_version,
-            fluidbox_core::network::SCHEMA_VERSION
-        ));
-    }
     if g.grant.mode == NetworkGrantMode::Public {
         // A grant frozen BEFORE deny snapshots existed carries an empty list
         // that means "unknown", not "none" — so programming it as a world-allow

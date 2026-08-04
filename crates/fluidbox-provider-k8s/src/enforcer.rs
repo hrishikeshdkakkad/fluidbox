@@ -462,17 +462,28 @@ impl NetworkPolicyProvider for CiliumNetworkEnforcer {
         let list = self.cnps.list(&lp).await.map_err(|e| {
             NetworkPolicyError::Write(format!("listing network policies failed: {e}"))
         })?;
-        Ok(list
-            .items
-            .iter()
-            .filter_map(|o| {
-                o.metadata
-                    .labels
-                    .as_ref()
-                    .and_then(|l| l.get(LABEL_SESSION))
-                    .and_then(|v| uuid::Uuid::parse_str(v).ok())
-            })
-            .collect())
+        // A managed policy whose session label is missing or malformed cannot be
+        // mapped to a run, so the reconcile cannot judge it. Dropping those
+        // SILENTLY would make "reconciliation backstops every leaked policy"
+        // false, so they are logged loudly for an operator to look at by hand.
+        let mut out = Vec::new();
+        for o in &list.items {
+            match o
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(LABEL_SESSION))
+                .and_then(|v| uuid::Uuid::parse_str(v).ok())
+            {
+                Some(id) => out.push(id),
+                None => tracing::warn!(
+                    name = o.metadata.name.as_deref().unwrap_or("<unnamed>"),
+                    "a managed network policy has no usable session label; the reconcile \
+                     cannot attribute it to a run and will not touch it"
+                ),
+            }
+        }
+        Ok(out)
     }
 
     fn enforcer_name(&self) -> &'static str {
