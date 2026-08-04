@@ -561,6 +561,7 @@ mod tests {
             )],
             expires_at: Some(expires),
             policy_digest: "sha256:abcd".into(),
+            denied: vec![],
         };
         let v = serde_json::to_value(&spec).unwrap();
         assert_eq!(v["network"]["mode"], "approved");
