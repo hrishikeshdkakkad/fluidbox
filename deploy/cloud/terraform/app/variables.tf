@@ -49,9 +49,9 @@ variable "litellm_image" {
 }
 
 variable "llm_tenant_models" {
-  description = "FLUIDBOX_LLM_TENANT_MODELS (CSV allowlist on minted tenant keys). Haiku-only is the standing cost-discipline agreement."
+  description = "FLUIDBOX_LLM_TENANT_MODELS (CSV allowlist on minted tenant keys). Anthropic stays haiku-only (the standing cost-discipline agreement); the three codex-catalog GPT models were added 2026-08-04 (owner-approved) with the $5/30d rolling tenant budget as the backstop. Changing this does NOT touch already-minted keys — rotate via POST /v1/admin/orgs/{slug}/llm-key/rotate."
   type        = string
-  default     = "claude-haiku-4-5"
+  default     = "claude-haiku-4-5,gpt-5.4-mini,gpt-5.4,gpt-5.6-sol"
 }
 
 variable "llm_tenant_max_budget" {
