@@ -23,7 +23,7 @@ ensure_kubeconfig
 say "preflight: out-of-band secrets"
 kubectl get secret fluidbox-secrets -n "$CLOUD_NS" >/dev/null 2>&1 \
   || die "fluidbox-secrets missing in $CLOUD_NS" "run scripts/cloud/make-secrets.sh first"
-for key in DATABASE_URL FLUIDBOX_ADMIN_TOKEN FLUIDBOX_CREDENTIAL_KEY LITELLM_MASTER_KEY ANTHROPIC_API_KEY; do
+for key in DATABASE_URL FLUIDBOX_ADMIN_TOKEN FLUIDBOX_CREDENTIAL_KEY LITELLM_MASTER_KEY ANTHROPIC_API_KEY OPENAI_API_KEY; do
   kubectl get secret fluidbox-secrets -n "$CLOUD_NS" -o jsonpath="{.data.$key}" 2>/dev/null | grep -q . \
     || die "fluidbox-secrets is missing key $key" "re-run scripts/cloud/make-secrets.sh"
 done
