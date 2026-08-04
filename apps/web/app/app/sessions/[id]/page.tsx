@@ -234,32 +234,61 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
               <b className="mono">{a.tool}</b>{" "}
               <span className="mono mut">{a.summary}</span>
             </div>
+            {a.tool === "network.grant" && (
+              <p className="helper" style={{ marginTop: 6 }}>
+                This run is asking for network access before it starts. Authorizing grants it
+                for the run only; the grant expires with the run.
+              </p>
+            )}
           </div>
           <div className="acts">
-            <button
-              className="btn human sm"
-              type="button"
-              disabled={actingOn === a.id}
-              onClick={() => decide(a.id, "approved_once")}
-            >
-              Approve once
-            </button>
-            <button
-              className="btn sm"
-              type="button"
-              disabled={actingOn === a.id}
-              onClick={() => decide(a.id, "approved_session")}
-            >
-              Whole session
-            </button>
-            <button
-              className="btn sm ghost danger"
-              type="button"
-              disabled={actingOn === a.id}
-              onClick={() => decide(a.id, "denied")}
-            >
-              Deny
-            </button>
+            {a.tool === "network.grant" ? (
+              <>
+                <button
+                  className="btn human sm"
+                  type="button"
+                  disabled={actingOn === a.id}
+                  onClick={() => decide(a.id, "approved_once")}
+                >
+                  Authorize
+                </button>
+                <button
+                  className="btn sm ghost danger"
+                  type="button"
+                  disabled={actingOn === a.id}
+                  onClick={() => decide(a.id, "denied")}
+                >
+                  Deny
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  className="btn human sm"
+                  type="button"
+                  disabled={actingOn === a.id}
+                  onClick={() => decide(a.id, "approved_once")}
+                >
+                  Approve once
+                </button>
+                <button
+                  className="btn sm"
+                  type="button"
+                  disabled={actingOn === a.id}
+                  onClick={() => decide(a.id, "approved_session")}
+                >
+                  Whole session
+                </button>
+                <button
+                  className="btn sm ghost danger"
+                  type="button"
+                  disabled={actingOn === a.id}
+                  onClick={() => decide(a.id, "denied")}
+                >
+                  Deny
+                </button>
+              </>
+            )}
           </div>
         </div>
       ))}
