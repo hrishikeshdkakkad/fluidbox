@@ -130,7 +130,62 @@ should raise a policy ceiling on a deployment whose running image predates it.
 
 ---
 
-## 4. Residuals recorded
+## 4. Finishing it — the owner's two edits
+
+Field names below are read from `network.rs` / `policy.rs` at **v0.5.1**.
+`DraftNetwork` carries `deny_unknown_fields`, so a typo is refused rather than
+silently defaulting (that was one of #126's ten fixes). Neither has been
+exercised against the live API — nothing here could authenticate as an owner.
+
+**a. Governance → the policy → add a `network:` section → publish.** Start at
+`approved`, never `public` (see the residual below):
+
+```yaml
+network:
+  max_mode: approved
+  allow:
+    - kind: dns
+      pattern: { kind: wildcard, suffix: nvidia.com }
+      ports: [{ from: 443, to: 443 }]
+      protocol: tcp
+    - kind: dns
+      pattern: { kind: exact, name: nvidia.com }
+      ports: [{ from: 443, to: 443 }]
+      protocol: tcp
+  require_approval: true
+  max_grant_secs: 1800
+```
+
+`wildcard` is a **single-label** wildcard, because that is exactly what
+Cilium's `matchPattern` does — it cannot cross a dot. So `*.nvidia.com` matches
+`api.nvidia.com` but **not** the apex `nvidia.com` and not `a.b.nvidia.com`.
+That is why the apex is listed separately above; the type models the datapath
+honestly rather than looking like it works and under-granting.
+
+**b. Declare what the agent needs**, on a new revision (`PATCH /v1/agents/{id}`
+with a user/PAT bearer — the admin token is 401 here by design):
+
+```json
+{ "network": { "mode": "approved",
+               "targets": [ { "kind": "dns",
+                              "pattern": { "kind": "wildcard", "suffix": "nvidia.com" },
+                              "ports": [ { "from": 443, "to": 443 } ],
+                              "protocol": "tcp" } ],
+               "duration_secs": 1800 } }
+```
+
+The policy is the **ceiling** and the request is narrowed against it; a target
+the policy's catalog does not cover is dropped, not honoured. With
+`require_approval: true` the run parks in `awaiting_authorization` until a human
+decides — which is the whole point of doing this as a governed grant rather
+than by loosening `sandbox.egressProfile`.
+
+**Worth saying plainly:** for the "research the GPU market" agent that started
+this, a **brokered web-search connector** is still the better answer. It needs
+no grant at all — the search executes from the control plane, which already has
+hardened, SSRF-filtered egress, and the sandbox stays offline.
+
+## 5. Residuals recorded
 
 - **`deploymentPublicCIDRs` can go stale.** It carries the ALB's current public
   IPs, which are AWS-managed and change when the load balancer scales or is
