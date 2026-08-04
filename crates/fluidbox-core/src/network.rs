@@ -24,10 +24,22 @@
 //! cannot be rendered is refused HERE, at resolution, with a reason.
 //!
 //! **Deny precedence is a documented total order**, not an emergent property of
-//! evaluation order: structural deny → policy deny → mode ceiling → the
-//! `public`+brokered rule → target-catalog subset → approval → allow.
-//! [`resolve_network_grant`] implements it and
-//! `deny_precedence_total_order` proves it pairwise-exhaustively.
+//! evaluation order. The order the code actually runs, in full:
+//!
+//! 0. `offline` short-circuits to Active — the absence of authority needs no
+//!    enforcer and no policy, which is what keeps every pre-existing run working
+//! 1. enforceability (`Unenforceable`)
+//! 2. structural validity (`InvalidTarget`) and blocked ranges (`BlockedRange`)
+//! 3. explicit policy deny
+//! 4. mode ceiling
+//! 5. `public` + brokered surfaces
+//! 6. target-catalog subset
+//! 7. expiry (clamped first; refuses if it would lapse before the run)
+//! 8. approval requirement, else allow
+//!
+//! An earlier revision of this list omitted 0, 1 and 7, which an adversarial
+//! review caught: the documentation claimed an order the implementation did not
+//! have. `deny_precedence_total_order` proves the ranked part pairwise.
 //!
 //! ## What this module does NOT decide
 //!
@@ -860,13 +872,15 @@ impl GrantResolution {
 /// Resolve a request against a policy. **The order below IS the security
 /// contract** — see `deny_precedence_total_order`, which proves it pairwise.
 ///
-/// 1. structural validity + blocked ranges
-/// 2. explicit policy deny
-/// 3. mode ceiling
-/// 4. `public` + brokered
-/// 5. target-catalog subset
-/// 6. approval requirement
-/// 7. allow
+/// 0. `offline` → Active (short-circuit: no authority, so no enforcer needed)
+/// 1. enforceability
+/// 2. structural validity + blocked ranges
+/// 3. explicit policy deny
+/// 4. mode ceiling
+/// 5. `public` + brokered
+/// 6. target-catalog subset
+/// 7. expiry (clamps, then refuses if it would lapse before the run ends)
+/// 8. approval requirement, else allow
 ///
 /// Expiry CLAMPS (a request may only shorten, the policy ceiling bounds it);
 /// everything else REFUSES rather than silently downgrading, because a run that
@@ -1081,6 +1095,18 @@ mod tests {
             adds_target: bool,
         }
         let conditions: Vec<Cond> = vec![
+            Cond {
+                name: "unenforceable",
+                // Ranked FIRST because the code checks it first: nothing below
+                // can be delivered by a deployment with no enforcer, so there
+                // is no point refusing on a narrower ground. It was previously
+                // excluded from this matrix and tested only in isolation — an
+                // adversarial review flagged exactly that gap.
+                setup: |_req, _p, c| c.enforcement_available = false,
+                code: "unenforceable",
+                needs_public: false,
+                adds_target: false,
+            },
             Cond {
                 name: "invalid_target",
                 setup: |req, _p, _c| {
