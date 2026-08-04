@@ -138,7 +138,31 @@ impl McpUpstreamSession {
 pub(crate) type McpSessionRegistry =
     Mutex<HashMap<(Uuid, McpPeer), Arc<Mutex<McpUpstreamSession>>>>;
 
+/// Consecutive re-verification failures per parked session.
+///
+/// Replica-local and deliberately tiny: it exists only so a PERMANENT failure
+/// to read the governing policy turns into a visible refusal instead of a run
+/// that retries every two seconds forever with nothing in the audit trail. A
+/// restart resets the count, which is correct — a fresh process deserves fresh
+/// attempts.
+#[derive(Default)]
+pub struct ReverifyFailures(std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>);
+
+impl ReverifyFailures {
+    pub fn bump(&self, id: uuid::Uuid) -> u32 {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let n = g.entry(id).or_insert(0);
+        *n += 1;
+        *n
+    }
+    pub fn clear(&self, id: uuid::Uuid) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    }
+}
+
 pub struct AppStateInner {
+    /// See [`ReverifyFailures`].
+    pub netgrant_reverify_failures: ReverifyFailures,
     pub cfg: Config,
     pub pool: PgPool,
     pub tenant_id: Uuid,

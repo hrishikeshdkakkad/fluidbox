@@ -206,21 +206,34 @@ pub fn build_run_policy(
     // these hold even against this policy's own `toEntities: world`. Without
     // them a `public` grant ignored the tenant's denies entirely: resolution
     // iterates REQUESTED targets and a public request has none.
+    //
+    // **CIDR denies ONLY.** `EgressDenyRule` in `cilium.io/v2` has no `toFQDNs`
+    // field — verified against the 1.19.6 CRD schema, where `egress` carries it
+    // and `egressDeny` does not. Cilium declined the feature deliberately
+    // (cilium#35494): a DNS deny would have to fail open for names the proxy has
+    // not yet resolved. Emitting one here would be pruned by the API server,
+    // leaving the `world` allow standing with NO deny — precisely the fail-open
+    // this rendering exists to prevent.
+    //
+    // A DNS deny is therefore enforced at RESOLUTION instead, which refuses the
+    // run outright rather than issuing a grant it cannot contain. See
+    // `resolve_network_grant`'s unenforceable-deny check.
     let egress_deny: Vec<Value> = g
         .grant
         .denied
         .iter()
-        .map(|d| match d {
-            TargetRule::Dns { pattern, .. } => {
-                // A name-based deny lowers to the FQDN selector. It binds only
-                // once the name has been resolved through the DNS proxy, which
-                // is why the deployment-wide CIDR wall remains the floor.
-                json!({ "toFQDNs": [match pattern.normalized() {
-                    FqdnPattern::Exact { name } => json!({ "matchName": name }),
-                    FqdnPattern::Wildcard { suffix } => json!({ "matchPattern": format!("*.{suffix}") }),
-                }] })
-            }
-            TargetRule::Cidr { cidr, .. } => json!({ "toCIDR": [cidr.to_string()] }),
+        .filter_map(|d| match d {
+            TargetRule::Cidr { cidr, .. } => Some(json!({
+                "toCIDR": [cidr.to_string()],
+                // Ports and protocol are part of the deny. Dropping them would
+                // silently WIDEN an authored `TCP/443` deny into all-ports,
+                // all-protocols — safe here by luck, but a lie about what the
+                // operator wrote, and wrong the moment a deny is meant to be
+                // surgical.
+                "toPorts": to_ports(d),
+            })),
+            // Unrenderable; resolution refuses these instead.
+            TargetRule::Dns { .. } => None,
         })
         .collect();
 
@@ -470,12 +483,47 @@ mod tests {
         ];
         let p = build_run_policy(&g, sid, &ctx()).unwrap();
         let deny = p["spec"]["egressDeny"].as_array().unwrap();
-        assert_eq!(deny.len(), 2, "both denies must be rendered: {deny:?}");
+        // Only the CIDR deny: a DNS deny is unrenderable (see
+        // `a_dns_deny_is_never_rendered_because_cilium_cannot_express_it`).
+        assert_eq!(deny.len(), 1, "only the CIDR deny is renderable: {deny:?}");
         assert_eq!(deny[0]["toCIDR"][0], "203.0.113.0/24");
-        assert_eq!(deny[1]["toFQDNs"][0]["matchPattern"], "*.corp.example");
         // …alongside the world allow, which Cilium's deny precedence outranks.
         let egress = p["spec"]["egress"].as_array().unwrap();
         assert!(egress.iter().any(|r| r["toEntities"][0] == "world"));
+    }
+
+    /// A NAME-based deny must NOT be rendered: `EgressDenyRule` has no
+    /// `toFQDNs` in `cilium.io/v2` (verified against the 1.19.6 CRD schema —
+    /// `egress` carries the field, `egressDeny` does not; cilium#35494 declined
+    /// it because a DNS deny would fail open for unresolved names). Emitting
+    /// one would be PRUNED by the API server, leaving the world allow standing
+    /// with no deny at all — a fail-open dressed as a fix. Resolution refuses
+    /// the run instead.
+    #[test]
+    fn a_dns_deny_is_never_rendered_because_cilium_cannot_express_it() {
+        let sid = uuid::Uuid::now_v7();
+        let mut g = granted(NetworkGrantMode::Public, vec![]);
+        g.grant.denied = vec![
+            dns_target("corp.example", 443),
+            TargetRule::cidr(
+                "203.0.113.0/24".parse().unwrap(),
+                vec![PortSpec::single(443)],
+                L4Protocol::Tcp,
+            ),
+        ];
+        let p = build_run_policy(&g, sid, &ctx()).unwrap();
+        let deny = p["spec"]["egressDeny"].as_array().unwrap();
+        assert_eq!(deny.len(), 1, "only the CIDR deny is renderable: {deny:?}");
+        assert_eq!(deny[0]["toCIDR"][0], "203.0.113.0/24");
+        let rendered = serde_json::to_string(&p["spec"]["egressDeny"]).unwrap();
+        assert!(
+            !rendered.contains("toFQDNs"),
+            "an unrenderable DNS deny must not be emitted: {rendered}"
+        );
+        // Ports and protocol survive: dropping them would silently WIDEN an
+        // authored TCP/443 deny into all-ports, all-protocols.
+        assert_eq!(deny[0]["toPorts"][0]["ports"][0]["port"], "443");
+        assert_eq!(deny[0]["toPorts"][0]["ports"][0]["protocol"], "TCP");
     }
 
     /// An APPROVED grant carries them too — defence in depth, since resolution
@@ -487,12 +535,13 @@ mod tests {
             NetworkGrantMode::Approved,
             vec![dns_target("example.com", 443)],
         );
-        g.grant.denied = vec![dns_target("secret.example.com", 443)];
+        g.grant.denied = vec![TargetRule::cidr(
+            "198.51.100.0/24".parse().unwrap(),
+            vec![PortSpec::single(443)],
+            L4Protocol::Tcp,
+        )];
         let p = build_run_policy(&g, sid, &ctx()).unwrap();
-        assert_eq!(
-            p["spec"]["egressDeny"][0]["toFQDNs"][0]["matchPattern"],
-            "*.secret.example.com"
-        );
+        assert_eq!(p["spec"]["egressDeny"][0]["toCIDR"][0], "198.51.100.0/24");
     }
 
     #[test]
