@@ -14,6 +14,22 @@ variable "cluster_name" {
   default = "fluidbox-cloud"
 }
 
+variable "cni" {
+  description = "Cluster CNI: 'vpc-cni' (the original M1 recipe, netpol via the VPC CNI agent) or 'cilium' (ENI IPAM + native routing — the network-grants substrate; see cilium.tf for the full rationale and the live-rollout order)."
+  type        = string
+  default     = "vpc-cni"
+  validation {
+    condition     = contains(["vpc-cni", "cilium"], var.cni)
+    error_message = "cni must be 'vpc-cni' or 'cilium'."
+  }
+}
+
+variable "cilium_chart_version" {
+  description = "Cilium helm chart version. 1.19.6 is the line every network-grants assertion was validated against (kind 37/38 + the substrate spike) — bump only with a revalidation."
+  type        = string
+  default     = "1.19.6"
+}
+
 variable "kubernetes_version" {
   description = <<-EOT
     RECIPE DELTA, decided 2026-08-03: the acceptance runs proved 1.33, but EKS
