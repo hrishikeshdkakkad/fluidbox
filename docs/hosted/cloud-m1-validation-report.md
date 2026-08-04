@@ -97,7 +97,7 @@ Pod Identity (the default root statement lets the IAM role policy govern).
 | 1 | scoped deployer applies without a root key | **PASS — re-scored 2026-08-03 against the criterion's own text.** §9-1 reads "a scoped deployer *can apply the infrastructure without using a root key*". That is a statement about capability, and it is demonstrated without qualification: the scoped deployer applied all four stacks (bootstrap, platform, app, edge). `verify-bootstrap.sh` scores the two things separately — the capability check ("running as the ASSUMED deployer role — the scoped non-root path works end to end") passes; the *separate* root-key-presence check warns. I had been grading this row against the M1.0 gate's parenthetical "(root key retired)", which is a different sentence and a different requirement. **The root key is still ACTIVE and that remains open** — tracked as its own line in §4 rather than hidden inside a PASS. The owner was asked twice and chose both times to retire it personally, which is the prudent call on an account shared with four other projects where CloudTrail shows non-session root use on 2026-08-01 and 07-30 | `…-cloud-m1-acceptance/c1-verify-bootstrap.txt` |
 | 2 | both budget controls active | **DOWNGRADED TO PARTIAL 2026-08-03 — one of the two is not a working control.** The $600 account-wide breaker is genuinely live and correct: it reads $14.88 of real spend. The $50 tag-filtered `fluidbox-cloud-monthly` **exists but measures nothing** — it reads `$0.00` while the cluster runs, because the `project` cost-allocation tag is still **Inactive**, and AWS does not break cost down by an unactivated user tag. It will never fire regardless of fluidbox spend. My earlier PASS checked that both budgets EXISTED with the right filters and limits; it never checked that the filter MATCHED anything, which is the only property that makes it a control. Fix + one-click remediation below | live `budgets describe-budgets`, `ce list-cost-allocation-tags` |
 | 3 | operator provisions an org by documented steps | **PASS** — `fluidzero` provisioned AND its per-org IdP configured + activated through the public edge, all via the documented endpoints; login start then redirects to the IdP | live `GET /v1/admin/orgs`, `…-cloud-m1-acceptance/c14-containment-live.txt` |
-| 4 | invited owner logs in through the Vercel origin | **PASS ON THE LIVE DEPLOYMENT** — driven end to end with Playwright: Vercel login start → the org's own OIDC issuer → credentials → back to the Vercel origin with a `__Host-fbx_web` session. `/v1/auth/me` returns org `fluidzero`, roles `[member, owner]`, user `owner@fluidzero.test`; `/app` renders; the membership row carries `last_login_at`. IdP is Dex (standards-conformant), i.e. the bring-your-own path from decision §12#4 — core unmodified | `…-cloud-m1-acceptance/c4-owner-login-live.txt` |
+| 4 | invited owner logs in through the Vercel origin | **PASS ON THE LIVE DEPLOYMENT, NOW ON A DURABLE ISSUER (re-proven 2026-08-03).** Originally proven against Dex — correct, but Dex ran as a container on the operator's laptop behind an ngrok tunnel, so the criterion passed while the deployment was one reboot from losing sign-in for the whole org. The org was migrated to **Auth0** (hosted; gen 3 active, Dex gen 2 retired) and the whole flow re-driven with Playwright: Vercel login start → Auth0 Universal Login → credentials → back to the Vercel origin with a `__Host-fbx_web` session. `/v1/auth/me` returns org `fluidzero`, user `hrishidkakkad@gmail.com`, roles `[member]` on JIT provision then `[member, owner]` after promotion; `/app` renders. **Durability proven by removing Dex entirely** — login still 302s to Auth0. Auth0 needs zero claim overrides (native `email_verified`, advertised S256); core unmodified throughout | `…-cloud-m1-auth0-idp/durable-idp-cutover.txt` |
 | 5 | user submits a replay run | **PASS ON EKS** — submitted through the CloudFront edge | `…-cloud-m1-replay/` |
 | 6 | EKS creates an isolated sandbox | **PASS ON EKS** — sandbox pod scheduled on a node the autoscaler woke FROM ZERO | `…-cloud-m1-replay/sandbox-pods.txt` |
 | 7 | run pauses for approval and resumes | **PASS ON EKS** — approval.decided by operator → tool.decision(source=human) → completed | `…-cloud-m1-replay/timeline.txt` |
@@ -115,11 +115,16 @@ Pod Identity (the default root statement lets the IAM role policy govern).
 
 ## 3. Open findings carried into the applies
 
-1. **🚩 Identity (blocks §9-4).** WorkOS exposes one OIDC issuer + one client
-   per environment; a per-org Connect app is refused at authorize. PLAN rev 3
-   identity §1 does not hold as written; decision §12#4 must be re-taken from
-   the three options in the readiness ledger. Nothing else in M1 depends on
-   it — the platform, edge, and replay gates are identity-independent.
+1. **✅ Identity — RESOLVED 2026-08-03 (was: blocks §9-4).** WorkOS exposes one
+   OIDC issuer + one client per environment, and its
+   `/user_management/authorize` refuses core's compliant request without the
+   proprietary `provider=authkit` parameter — so PLAN rev 3 identity §1 does
+   not hold as written, and WorkOS cannot be used without a core change (an M3
+   proposal, not an M1 task). Decision §12#4 was re-taken as **bring-your-own
+   conformant IdP per org**, and the drill org now runs on **Auth0**: hosted,
+   durable, zero core changes, zero claim overrides. Scripted for repeat
+   onboarding in `scripts/cloud/auth0-idp-setup.sh`; Entra is a documented
+   alternative (`entra-idp-setup.sh`) for orgs already on Microsoft.
 2. **⚠️ WorkOS token-endpoint auth (only if a WorkOS option is chosen).**
    Discovery omits `token_endpoint_auth_methods_supported`, so core requires
    `client_secret_basic` while WorkOS documents body credentials. Untested —

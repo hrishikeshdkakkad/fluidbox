@@ -49,7 +49,29 @@ standards-conformant OIDC issuer; core is untouched.
 - [ ] `POST …/idp/<id>/activate`.
 - [ ] Secret handed to core custody only — delete any local copy.
 
-**Microsoft Entra ID is fully scripted** — `scripts/cloud/entra-idp-setup.sh`
+**Auth0 is the shipped path and is fully scripted** — this is what the drill
+org runs on (`scripts/cloud/auth0-idp-setup.sh`, proven end to end 2026-08-03):
+
+```
+auth0 login                                    # once per operator machine
+scripts/cloud/auth0-idp-setup.sh <org-slug>
+# after the owner's first sign-in:
+scripts/cloud/auth0-idp-setup.sh --promote <org-slug> <owner-email>
+```
+
+It needs **no claim overrides at all**: Auth0 emits `email_verified` natively as
+a real boolean and advertises `code_challenge_methods_supported: [S256]`, so
+core's defaults are already correct. Re-running is a no-op when the active
+config already points at the same issuer + client — deliberately, because
+re-registering would MIGRATE and a generation bump invalidates live sessions.
+
+Two things it does NOT do, on purpose: it will not create the org's human users
+(a real org's users come from their own directory or an invite, not from us
+minting passwords — `--with-drill-user` exists only for internal drill orgs),
+and it will not arm a bootstrap owner when one already exists, because core
+refuses that with a 409. Promotion is a separate admin act.
+
+**Microsoft Entra ID is also scripted** — `scripts/cloud/entra-idp-setup.sh`
 does app registration, optional claims, secret, core registration, and
 activation in one pass. It needs one human step first, a browser consent that
 grants the Azure CLI a Microsoft Graph scope (an ARM session is not enough and
