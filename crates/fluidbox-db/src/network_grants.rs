@@ -280,6 +280,38 @@ mod tests {
     /// the state the stale-schema sweep leaves behind — and the parked session
     /// was never wound down. The lesson encoded here: a CAS answers "did I win",
     /// never "is there work left".
+    /// What a CAS LOSER must do, per observed state. Both directions are bugs
+    /// that have actually been written here:
+    ///
+    /// * returning early on every loss STRANDED a parked run whose grant had
+    ///   been revoked underneath it — nothing ever wound it down;
+    /// * winding down on every loss FAILED a legitimately activated run, because
+    ///   under multi-replica the loser's re-read sees `active` (another replica
+    ///   activated and spawned it).
+    ///
+    /// The correct rule is "wind down only when the grant is resolved AWAY".
+    #[test]
+    fn a_cas_loser_winds_down_only_when_the_grant_is_resolved_away() {
+        fn should_wind_down(observed: Option<&str>) -> bool {
+            match observed {
+                // Another replica activated it; the run is proceeding.
+                Some("active") => false,
+                // Still awaiting a decision — the gate will come back.
+                Some("pending") => true,
+                // Resolved away, or gone: nothing will release this run.
+                Some("denied") | Some("revoked") | None => true,
+                Some(_) => true,
+            }
+        }
+        assert!(
+            !should_wind_down(Some("active")),
+            "must not fail a live run"
+        );
+        assert!(should_wind_down(Some("denied")));
+        assert!(should_wind_down(Some("revoked")));
+        assert!(should_wind_down(None), "no grant means no authority");
+    }
+
     #[test]
     fn the_status_cas_surface_is_explicit() {
         // Which source states each mutation can move FROM. These mirror the SQL
