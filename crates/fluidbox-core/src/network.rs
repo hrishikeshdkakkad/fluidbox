@@ -33,9 +33,10 @@
 //! 3. explicit policy deny
 //! 4. mode ceiling
 //! 5. `public` + brokered surfaces
-//! 6. target-catalog subset
-//! 7. expiry (clamped first; refuses if it would lapse before the run)
-//! 8. approval requirement, else allow
+//! 6. a deny the datapath cannot express for this mode
+//! 7. target-catalog subset
+//! 8. expiry (clamped first; refuses if it would lapse before the run)
+//! 9. approval requirement, else allow
 //!
 //! An earlier revision of this list omitted 0, 1 and 7, which an adversarial
 //! review caught: the documentation claimed an order the implementation did not
@@ -857,10 +858,13 @@ impl DenialReason {
                  brokered tool surfaces; set network.allow_public_with_brokered to opt in"
                 .into(),
             Self::UnenforceableDeny { target } => format!(
-                "this policy denies {target}, but a NAME-based deny cannot be enforced in \
-                 the datapath under a 'public' grant (Cilium's egressDeny has no FQDN \
-                 selector) — so the run is refused rather than issued a grant that would \
-                 ignore the deny. Use an 'approved' grant, or express the deny as a CIDR."
+                "this policy denies {target} by NAME, and a name-based deny cannot be \
+                 programmed in the datapath (Cilium's egressDeny has no FQDN selector) — \
+                 so a 'public' grant would allow the world with that deny silently absent, \
+                 and is refused. Express the deny as a CIDR to have it enforced. An \
+                 'approved' grant is narrower (resolution refuses to GRANT a denied name), \
+                 but note it does not enforce the deny at the datapath either: a denied \
+                 service co-hosted on a granted name's address stays reachable."
             ),
             Self::NotInCatalog { target } => {
                 format!("network target {target} is not covered by the policy's allowed targets")
@@ -908,9 +912,10 @@ impl GrantResolution {
 /// 3. explicit policy deny
 /// 4. mode ceiling
 /// 5. `public` + brokered
-/// 6. target-catalog subset
-/// 7. expiry (clamps, then refuses if it would lapse before the run ends)
-/// 8. approval requirement, else allow
+/// 6. a deny the datapath cannot express for this mode
+/// 7. target-catalog subset
+/// 8. expiry (clamps, then refuses if it would lapse before the run ends)
+/// 9. approval requirement, else allow
 ///
 /// Expiry CLAMPS (a request may only shorten, the policy ceiling bounds it);
 /// everything else REFUSES rather than silently downgrading, because a run that
@@ -1009,8 +1014,19 @@ pub fn resolve_network_grant(
     }
 
     // ── expiry: clamp, then require it to outlive the run ────────────────
-    let ceiling = policy.max_grant_secs.unwrap_or(DEFAULT_GRANT_SECS);
-    let grant_secs = request.duration_secs.map_or(ceiling, |d| d.min(ceiling));
+    // Clamped to a sane maximum before any i64 arithmetic. An unbounded `u64`
+    // cast with `as i64` wraps — `u64::MAX` becomes -1, which would produce an
+    // "active" grant whose expiry is a second in the PAST. A year is far beyond
+    // any real grant and keeps every downstream `Duration` well inside range.
+    const MAX_GRANT_SECS: u64 = 365 * 24 * 3600;
+    let ceiling = policy
+        .max_grant_secs
+        .unwrap_or(DEFAULT_GRANT_SECS)
+        .min(MAX_GRANT_SECS);
+    let grant_secs = request
+        .duration_secs
+        .map_or(ceiling, |d| d.min(ceiling))
+        .min(MAX_GRANT_SECS);
     if let Some(wall) = ctx.run_wall_clock_secs {
         if grant_secs < wall {
             return GrantResolution::Denied(DenialReason::ExpiryTooShort {
@@ -2063,6 +2079,7 @@ mod tests {
                 ceiling: NetworkGrantMode::Offline,
             },
             DenialReason::PublicWithBrokered,
+            DenialReason::UnenforceableDeny { target: "x".into() },
             DenialReason::NotInCatalog { target: "x".into() },
             DenialReason::Unenforceable { detail: "x".into() },
             DenialReason::ExpiryTooShort {

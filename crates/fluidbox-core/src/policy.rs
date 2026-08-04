@@ -1347,11 +1347,21 @@ tools:
             crate::network::NetworkGrantMode::Approved
         );
 
-        // A typo INSIDE a target rule is refused too.
-        assert!(Policy::parse_yaml_strict(
-            "name: p\nnetwork:\n  allow:\n    - kind: dns\n      pattern: { kind: exact, name: a.test }\n      ports: [{ from: 443, too: 443 }]\n      protocol: tcp\n",
-        )
-        .is_err());
+        // NOTE — a typo INSIDE a target rule is NOT currently refused, and the
+        // test that claimed otherwise was false-green: it wrote `too: 443` while
+        // OMITTING the required `to`, so parsing failed for the missing field
+        // rather than the unknown one. Proven here rather than asserted away:
+        // with `to` present, the unknown key is silently accepted.
+        let with_unknown = Policy::parse_yaml_strict(
+            "name: p\nnetwork:\n  allow:\n    - kind: dns\n      pattern: { kind: exact, name: a.test }\n      ports: [{ from: 443, to: 443, through: 8443 }]\n      protocol: tcp\n",
+        );
+        assert!(
+            with_unknown.is_ok(),
+            "documented residual: nested target fields are lenient — \
+             `TargetRule`/`PortSpec` are shared with the STORED representation, so making \
+             them strict would strand policies already governing runs. Strictness stops at \
+             the `network:` section boundary."
+        );
 
         // STORED blobs stay lenient — an old row carrying an unknown key must
         // keep deserializing forever, or a bound added later strands a policy

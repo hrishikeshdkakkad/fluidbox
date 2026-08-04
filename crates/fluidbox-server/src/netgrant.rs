@@ -287,7 +287,15 @@ pub fn reverify_before_release(
                 // authorized, and the frozen grant carries the OLD deny set —
                 // so activating it would run under denies the operator has
                 // since revoked their consent to.
-                let denies_grew = now_grant.denied.iter().any(|d| !grant.denied.contains(d));
+                // "Grew" means the current policy denies something the frozen one
+                // did NOT — judged by COVERAGE, not exact equality. Equality made
+                // a strictly NARROWER replacement (`203.0.113.0/24` →
+                // `203.0.113.7/32`) read as growth and refuse a release that was
+                // plainly safe; case and port-splitting differences did the same.
+                let denies_grew = now_grant
+                    .denied
+                    .iter()
+                    .any(|d| !grant.denied.iter().any(|frozen| frozen.covers(d)));
                 if now_grant.mode < grant.mode
                     || now_shorter
                     || denies_grew
@@ -358,6 +366,11 @@ pub async fn release_authorized_grant(state: &AppState, scope: TenantScope, sess
             return;
         }
     };
+    // The re-verification completed, whatever it decided — so the failure streak
+    // is over. Clearing here (not only at the threshold) is what makes the
+    // counter CONSECUTIVE rather than cumulative, and what stops it retaining an
+    // entry for every session that ever had one transient blip.
+    state.netgrant_reverify_failures.clear(session_id);
     if let Some(refusal) = refusal {
         state.metrics.network_grant_refusals.inc(refusal.code());
         refuse_parked_grant(state, scope, session_id, &refusal.message()).await;
