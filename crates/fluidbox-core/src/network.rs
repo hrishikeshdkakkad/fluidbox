@@ -59,7 +59,18 @@ use std::net::IpAddr;
 /// Stamped into every grant. Bump ONLY for a change that alters what an
 /// existing frozen grant MEANS — a new field with a fail-safe default does not
 /// qualify. Consumers refuse a version they do not know rather than guessing.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// The first schema that carries [`NetworkGrant::denied`].
+///
+/// Below it, an EMPTY deny list is AMBIGUOUS — it means either "the policy had
+/// no denies" or "this grant predates deny snapshots and its denies are
+/// unknown". Nothing can tell those apart from the grant alone, which is why
+/// the version exists: a `public` grant at v1 is refused rather than programmed
+/// as a world-allow whose denies might simply be missing. `offline` and
+/// `approved` are unaffected — the former programs nothing and the latter is a
+/// closed allow-list that resolution already checked against the live policy.
+pub const SCHEMA_WITH_DENIES: u32 = 2;
 
 /// Grant lifetime when neither the policy ceiling nor the request bounds it.
 /// Comfortably exceeds the default run wall clock (1800 s, `Budgets::default`)
@@ -1239,6 +1250,27 @@ mod tests {
                     p.allow_public_with_brokered = false;
                 },
                 code: "public_with_brokered",
+                needs_public: true,
+                adds_target: false,
+            },
+            Cond {
+                name: "unenforceable_deny",
+                // Ranked between public+brokered and the catalog, matching the
+                // code. It was previously outside this matrix entirely, so a
+                // reordering of that branch could have violated the documented
+                // precedence while this "pairwise-exhaustive" test stayed green.
+                setup: |req, p, _c| {
+                    req.mode = NetworkGrantMode::Public;
+                    p.max_mode = NetworkGrantMode::Public;
+                    p.deny.push(TargetRule::dns(
+                        FqdnPattern::Exact {
+                            name: "corp.example".into(),
+                        },
+                        vec![PortSpec::single(443)],
+                        L4Protocol::Tcp,
+                    ));
+                },
+                code: "unenforceable_deny",
                 needs_public: true,
                 adds_target: false,
             },
