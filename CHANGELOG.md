@@ -4,6 +4,26 @@ All notable, user-visible changes to fluidbox are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org).
 
+## [0.5.0](https://github.com/hrishikeshdkakkad/fluidbox/compare/v0.4.0...v0.5.0) (2026-08-04)
+
+
+### Added
+
+* **core:** bounded denied-flow observation + EKS acceptance runbook ([b0ddb5d](https://github.com/hrishikeshdkakkad/fluidbox/commit/b0ddb5de431549757440492b1264fe0e1ca104e9))
+* **core:** network grant domain, authorization pause, Cilium spike findings ([1145e6e](https://github.com/hrishikeshdkakkad/fluidbox/commit/1145e6e0bf583af6c929c3f0666e5a1f6dd2ba86))
+* Enterprise Recipes — versioned templates that stamp governed automations ([dcacd9b](https://github.com/hrishikeshdkakkad/fluidbox/commit/dcacd9b954200085e8c4438469d1cf2db73d5c1f))
+* governed sandbox network access ([d006881](https://github.com/hrishikeshdkakkad/fluidbox/commit/d0068817fb50b22aeebce6fa1a34a12379731905))
+* **k8s:** actually program the per-run network policy at provision ([29fa915](https://github.com/hrishikeshdkakkad/fluidbox/commit/29fa915054f49ad3864c5425f616ab4cf41ee241))
+* **k8s:** Cilium enforcer + verify() at provision ([d491bc1](https://github.com/hrishikeshdkakkad/fluidbox/commit/d491bc1c33faf46cca48b4e6ae7b732da60633e8))
+* **k8s:** Cilium provider seam, per-run policy lowering, chart-static wall ([9d9c2ac](https://github.com/hrishikeshdkakkad/fluidbox/commit/9d9c2acdaca5dd82e962996cd5243a6383b864f4))
+* **k8s:** implement the Cilium enforcer and invoke verify() at provision ([7df0baf](https://github.com/hrishikeshdkakkad/fluidbox/commit/7df0baf510c7b712a0f5abfd89def970d4391fca))
+* **server:** resolve, park, and revoke sandbox network grants ([96def7a](https://github.com/hrishikeshdkakkad/fluidbox/commit/96def7aa7cbc357edb1a64c02847cee04bec8850))
+
+
+### Documentation
+
+* network-grant runbook, design doc, threat-model residuals, claim fixes ([d317ade](https://github.com/hrishikeshdkakkad/fluidbox/commit/d317adef7fa5307b2276409aed7aa40ede5b4e69))
+
 ## [0.4.0](https://github.com/hrishikeshdkakkad/fluidbox/compare/v0.4.0-rc.1...v0.4.0) (2026-07-31)
 
 
