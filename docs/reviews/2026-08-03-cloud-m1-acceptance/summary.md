@@ -1,4 +1,4 @@
-# M1 §9 acceptance — evidence ledger (2026-08-03)
+# M1 §9 acceptance — evidence ledger (2026-08-04)
 
 | # | criterion | verdict | evidence |
 |---|---|---|---|
@@ -11,3 +11,4 @@
 | 9 | artifacts + usage recorded | **PASS** | docs/reviews/2026-08-03-cloud-m1-replay/changes.patch, docs/reviews/2026-08-03-cloud-m1-replay/cost.json |
 | 10 | sandbox egress denied (external blocked once policy programmed, :8788 allowed) | **PASS** | c10-netpol-probe.txt |
 | 12 | direct ALB refused | **PASS** | c12-direct-alb.log + …-cloud-m1-edge-lock/ |
+| 17 | measured cost not isolable (tag inactive; EKS-only floor $0.0) | **FAIL** | c17-exclusive.json + c17-tag-status.json |

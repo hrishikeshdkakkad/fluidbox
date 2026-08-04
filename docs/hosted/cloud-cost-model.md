@@ -101,3 +101,39 @@ The ~$130 idle floor is the deliberate price of running the **unchanged Kubernet
   why it is the primary control and the tag-filtered budget is the secondary.
 - **Not live-verified (flagged above):** CloudWatch Logs archived-storage rate ($0.03/GB-mo), regional data-transfer-out rate ($0.09/GB), CloudTrail first-trail-free and the CloudFront 1 TB / regional 100 GB always-free allowances — these are AWS free-tier/policy facts, not Pricing-API line items, and drive several $0 rows.
 - **External (informational, not AWS, not from the Pricing API):** Neon $0–19/mo, WorkOS $0 (under 1M MAU), Vercel Hobby/Pro $0–20/mo. Not included in the AWS floor above.
+
+## 6. Measuring this on a SHARED account (added 2026-08-03)
+
+`471112572248` is not a fluidbox-only account — it carries four other projects.
+Measured 2026-08-01/02, before fluidbox existed on it, the daily baseline was
+**~$5.7/day (~$170/mo) of non-fluidbox spend**:
+
+| service | $/day | ours? |
+|---|---|---|
+| Amazon Elastic Container Service | 1.84 | **no** — fluidbox runs on EKS, not ECS |
+| EC2 – Other | 1.12 | shared |
+| Amazon RDS | 0.87 | **no** — fluidbox uses Neon |
+| Elastic Load Balancing | 0.54 | shared |
+| Amazon VPC | 0.48 | shared |
+| EC2 – Compute | 0.30 | shared |
+| KMS / Secrets Manager / S3 / ECR | ~0.35 | shared |
+
+Three consequences, and they are the whole reason §9-17 stayed open:
+
+1. **An account-wide total is never fluidbox's idle cost.** The $600 breaker is
+   deliberately unfiltered — it is the "investigate the whole account" number,
+   not an attribution tool.
+2. **Attribution requires the `project` cost-allocation tag to be ACTIVE.**
+   While it is Inactive, AWS does not break cost down by it at all, so the
+   tag-filtered budget reads $0.00 and no measured fluidbox figure exists. This
+   is a config gap, not merely a calendar one.
+3. **One slice is measurable with no tag at all: Amazon EKS.** It appears
+   nowhere in the pre-fluidbox baseline above, so any EKS spend on this account
+   is ours by construction. `cloud-m1-acceptance.sh 17` reports it as a floor
+   to sanity-check this model against while the tag is pending. Shared services
+   (ELB, EC2, VPC, KMS, S3) cannot be attributed this way and still need the tag.
+
+So the honest reading of §9-17 is: the modelled figure (~$156/mo) is reconciled
+against real deployed inventory, an EKS-only floor becomes available roughly 24h
+after deployment, and the complete measured number needs the tag active plus a
+full idle month.
