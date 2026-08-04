@@ -177,6 +177,28 @@ impl NetworkPolicyProvider for CiliumNetworkEnforcer {
     /// keeps [`NetworkPolicyProvider`] free of Kubernetes concepts, and the pod
     /// provably exists by now because the caller creates it first.
     async fn prepare(&self, granted: &GrantedNetwork) -> Result<(), NetworkPolicyError> {
+        // EXPIRY FENCE. The orchestrator checks the grant once, before workspace
+        // materialization and archive packing — both of which can take minutes.
+        // Without this check the following sequence resurrects dead authority
+        // PERMANENTLY:
+        //
+        //   1. the grant expires while provisioning is still in flight
+        //   2. the expiry sweeper deletes the not-yet-created policy (404 = ok)
+        //   3. it marks the row `revoked`
+        //   4. provisioning continues and creates the policy from the frozen spec
+        //   5. the sweeper never looks at that row again — it is already revoked
+        //
+        // …leaving an allow policy created AFTER expiry and living until
+        // terminal cleanup. The frozen grant carries its own absolute expiry, so
+        // this needs no database read and cannot race the sweeper: a policy is
+        // simply never created for authority that has already lapsed.
+        if granted.grant.is_expired(chrono::Utc::now()) {
+            return Err(NetworkPolicyError::Unverified(format!(
+                "the network grant for run {} expired before enforcement could be \
+                 programmed — refusing to create a policy for lapsed authority",
+                granted.run_id
+            )));
+        }
         if !granted.grant.grants_egress() {
             // Offline is the ABSENCE of an allow, delivered by the chart-static
             // baseline's default-deny. Writing an empty policy would be noise,
@@ -214,24 +236,28 @@ impl NetworkPolicyProvider for CiliumNetworkEnforcer {
             // NOT blindly adopt whatever object holds the name: a stale or
             // foreign policy under the deterministic session name would be
             // accepted, and `verify` only checks that the NAMED policy is
-            // Valid, so a broader one would sail through. Compare the consent
-            // digest; anything else is refused rather than trusted.
+            // Valid, so a broader one would sail through.
+            //
+            // The comparison is the RENDERED SPEC, not the grant digest. The
+            // digest commits to the AUTHORIZATION INTENT, not to the object
+            // that enforces it — so a policy rendered from the same grant by an
+            // OLDER build carries an identical digest while permitting more.
+            // Not hypothetical: when DNS lowering was tightened from
+            // `matchPattern: "*"` to the granted names, both renderings shared
+            // a digest, and a digest-only check would have adopted the
+            // permissive one. Byte-comparing the spec is what actually means
+            // "this is the object we would have written".
             Err(kube::Error::Api(e)) if e.code == 409 => {
                 let existing = self.cnps.get(&name).await.map_err(|e| {
                     NetworkPolicyError::Write(format!("re-reading the existing policy failed: {e}"))
                 })?;
-                let same = existing
-                    .metadata
-                    .annotations
-                    .as_ref()
-                    .and_then(|a| a.get("fluidbox.dev/grant-digest"))
-                    .map(|d| d == &granted.grant_digest)
-                    .unwrap_or(false);
-                if same {
+                if existing.data.get("spec") == obj.data.get("spec") {
                     Ok(())
                 } else {
                     Err(NetworkPolicyError::Write(format!(
-                        "a different network policy already exists under the name for run {}                          (its grant digest does not match this run's) — refusing to adopt it",
+                        "a different network policy already exists under the name for run {} — \
+                         its spec is not the one this run would write, so it is refused rather \
+                         than adopted",
                         granted.run_id
                     )))
                 }
@@ -247,6 +273,16 @@ impl NetworkPolicyProvider for CiliumNetworkEnforcer {
     /// has an identity for it to bind to. See the module docs for exactly what
     /// this does and does not establish.
     async fn verify(&self, granted: &GrantedNetwork) -> Result<(), NetworkPolicyError> {
+        // The second expiry fence. `verify` runs after `prepare` and before the
+        // Secret that releases the pod, so a grant that lapses in between is
+        // caught here and the run never starts. (The provision path deletes the
+        // pod on a verify failure, and the policy is owned by that pod.)
+        if granted.grant.is_expired(chrono::Utc::now()) {
+            return Err(NetworkPolicyError::Unverified(format!(
+                "the network grant for run {} expired during provisioning",
+                granted.run_id
+            )));
+        }
         let name = Self::object_name(granted);
         let deadline = Instant::now() + Duration::from_secs(self.verify_timeout_secs.max(5));
         // Carried out of the loop so a timeout can say WHICH half never
@@ -335,12 +371,37 @@ impl NetworkPolicyProvider for CiliumNetworkEnforcer {
 
     async fn revoke(&self, granted: &GrantedNetwork) -> Result<(), NetworkPolicyError> {
         let name = Self::object_name(granted);
-        match self.cnps.delete(&name, &DeleteParams::default()).await {
+        // Delete only what belongs to THIS run. Deleting by deterministic name
+        // alone would remove the very foreign object `prepare` refused to adopt
+        // — turning a refusal into the deletion of somebody else's policy. The
+        // uid precondition makes the API server enforce that, so it holds even
+        // if the object is replaced between the read and the delete.
+        let uid = match self.cnps.get_opt(&name).await {
+            Ok(Some(o)) => o.metadata.uid,
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                return Err(NetworkPolicyError::Write(format!(
+                    "reading the network policy for run {} before delete failed: {e}",
+                    granted.run_id
+                )))
+            }
+        };
+        let dp = DeleteParams {
+            preconditions: uid.map(|u| kube::api::Preconditions {
+                uid: Some(u),
+                resource_version: None,
+            }),
+            ..DeleteParams::default()
+        };
+        match self.cnps.delete(&name, &dp).await {
             Ok(_) => Ok(()),
             // Already gone — owner-reference GC may have collected it first.
             // Idempotence matters: this runs from terminal cleanup, the abandon
             // paths, and the reconcile sweep.
             Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+            // The object was replaced between our read and the delete: it is no
+            // longer ours to remove, and refusing is the safe answer.
+            Err(kube::Error::Api(e)) if e.code == 409 => Ok(()),
             Err(e) => Err(NetworkPolicyError::Write(format!(
                 "deleting the network policy for run {} failed: {e}",
                 granted.run_id

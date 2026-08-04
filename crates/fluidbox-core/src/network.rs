@@ -138,6 +138,7 @@ impl L4Protocol {
 /// An inclusive port range. A single port is `from == to`; the wire form keeps
 /// both so lowering to Cilium's `{port, endPort}` is mechanical.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PortSpec {
     pub from: u16,
     pub to: u16,
@@ -699,6 +700,17 @@ pub struct NetworkGrant {
     /// Digest of the `NetworkPolicy` section that produced this grant.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub policy_digest: String,
+    /// The governing policy's explicit denies, FROZEN so the datapath can
+    /// enforce them rather than resolution merely checking them.
+    ///
+    /// Resolution alone was not enough: it iterates the REQUESTED targets, and
+    /// a `public` request has none by construction — so every `network.deny`
+    /// entry was skipped and `public` lowered to "the world minus the
+    /// deployment-wide wall", silently ignoring the tenant's own denies. A
+    /// policy that says "public, but never this corporate range" was not
+    /// getting the second half.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied: Vec<TargetRule>,
 }
 
 impl Default for NetworkGrant {
@@ -712,6 +724,7 @@ impl Default for NetworkGrant {
             targets: Vec::new(),
             expires_at: None,
             policy_digest: String::new(),
+            denied: Vec::new(),
         }
     }
 }
@@ -989,6 +1002,10 @@ pub fn resolve_network_grant(
             .collect(),
         expires_at: Some(ctx.now + Duration::seconds(grant_secs as i64)),
         policy_digest: policy.digest(),
+        // Frozen so the datapath enforces them. A `public` grant especially
+        // needs this: it carries no targets, so resolution's deny loop never
+        // sees anything to compare against.
+        denied: policy.deny.clone(),
     };
 
     // ── 6/7. approval, else allow ────────────────────────────────────────
@@ -1935,6 +1952,7 @@ mod tests {
             targets: vec![],
             expires_at: None,
             policy_digest: String::new(),
+            denied: vec![],
         };
         assert!(g.is_expired(now()));
         // …and a future schema version is refused rather than guessed at.
