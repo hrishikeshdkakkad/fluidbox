@@ -40,7 +40,12 @@ export function TargetRuleEditor({
         </p>
       )}
 
-      {value.map((t, i) => (
+      {value.map((t, i) => {
+        // This editor authors a single port range; a rule that arrived via the
+        // API with several ranges is shown read-only so an edit cannot silently
+        // discard the extra ranges (it would rewrite `ports` to just ports[0]).
+        const multiRange = t.ports.length > 1;
+        return (
         <div className="agent-creator-grid" key={i}>
           <label className="field">
             <span className="lab">Match</span>
@@ -98,7 +103,7 @@ export function TargetRuleEditor({
             <input
               className="inp"
               type="number"
-              disabled={disabled}
+              disabled={disabled || multiRange}
               value={t.ports[0]?.from ?? 443}
               onChange={(e) => {
                 const from = Number(e.target.value);
@@ -112,13 +117,17 @@ export function TargetRuleEditor({
             <input
               className="inp"
               type="number"
-              disabled={disabled}
+              disabled={disabled || multiRange}
               value={t.ports[0]?.to ?? 443}
               onChange={(e) =>
                 patch(i, { ...t, ports: [{ from: t.ports[0]?.from ?? 443, to: Number(e.target.value) }] })
               }
             />
           </label>
+
+          {multiRange && (
+            <p className="helper">Multiple port ranges — shown read-only; edit via the API.</p>
+          )}
 
           <button type="button" className="btn ghost" disabled={disabled} onClick={() => remove(i)}>
             Remove
@@ -136,7 +145,8 @@ export function TargetRuleEditor({
             </p>
           )}
         </div>
-      ))}
+        );
+      })}
 
       <button
         type="button"
