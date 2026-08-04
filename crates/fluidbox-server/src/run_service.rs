@@ -421,8 +421,11 @@ pub async fn create_run(
             // that also holds brokered tool results is refused unless policy
             // opts in.
             has_brokered_surfaces: !brokered.is_empty(),
-            enforcement_available: state.cfg.network_enforcer
-                != crate::config::NetworkEnforcer::None,
+            // Ask the PROVIDER, not the config: it is the thing that knows
+            // whether an enforcer actually resolved on this cluster. Config
+            // alone would admit a grant under `auto` with no Cilium present,
+            // or under `cilium` against the Docker provider.
+            enforcement_available: state.provider.network_enforcer().supports_egress_grants(),
         },
     )
     // Tail 3 — REFUSE. Nothing has been created; the reason is enumerated.

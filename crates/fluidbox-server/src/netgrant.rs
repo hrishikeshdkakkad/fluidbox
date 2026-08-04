@@ -370,7 +370,7 @@ async fn reverify_context(
         now: chrono::Utc::now(),
         run_wall_clock_secs: spec.budgets.max_wall_clock_secs,
         has_brokered_surfaces: !spec.brokered.is_empty(),
-        enforcement_available: state.cfg.network_enforcer != crate::config::NetworkEnforcer::None,
+        enforcement_available: state.provider.network_enforcer().supports_egress_grants(),
     };
     Ok(reverify_before_release(row, &current, &request, &ctx).err())
 }

@@ -440,6 +440,31 @@ if [ "$HEAVY" = "1" ]; then
   expect app "http://$DENIED_IP:9099/clientip" BLOCK "DNS rebinding: the grant does not follow a name to a new address"
 fi
 
+# ── The ENFORCER itself, against this live cluster ─────────────────────────
+#
+# Everything above applies policies with kubectl, which proves the OBJECT MODEL
+# but not the Rust that writes it. This runs the real `NetworkPolicyProvider`
+# implementation against this API server — including, most importantly, that
+# `verify()` fails closed rather than rubber-stamping.
+say "ENFORCER — the Rust implementation, live"
+if command -v cargo >/dev/null 2>&1; then
+  # Keyed on the EXIT CODE, not on grepping the output: the example prints
+  # colour, so a pattern spanning "0 failed" and "(enforcer)" matches across
+  # an ANSI escape and silently never fires. The exit code cannot lie.
+  cargo run --quiet -p fluidbox-provider-k8s --example enforcer_live -- "$NS" \
+    > "$WORK/enforcer.log" 2>&1
+  enf_rc=$?
+  sed 's/^/  /' "$WORK/enforcer.log"
+  if [ "$enf_rc" -eq 0 ]; then
+    epass=$(grep -oE "[0-9]+ passed" "$WORK/enforcer.log" | tail -1 | cut -d" " -f1)
+    ok "live enforcer checks passed (${epass:-?} assertions)"
+  else
+    no "live enforcer checks FAILED — see the output above"
+  fi
+else
+  no "cargo is required for the live enforcer checks (no skips)"
+fi
+
 say "RESULT"
 printf "  \033[1;32m%d passed\033[0m, \033[1;31m%d failed\033[0m\n" "$pass" "$fail"
 [ "$fail" -eq 0 ] || echo "  (a failure here is a DATAPATH failure — do not ship past it)"
